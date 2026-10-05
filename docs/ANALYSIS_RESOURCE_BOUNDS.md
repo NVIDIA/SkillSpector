@@ -219,6 +219,7 @@ removes the rejected partial checkout.
 | Static findings | 10,000 | One artifact |
 | Static findings | 10,000 | One analyzer |
 | Static-analysis time | 300 seconds | One artifact, within the workflow deadline |
+| Timed static-pattern matching CPU | 0.25 seconds | One pattern search, within the artifact and workflow deadlines |
 | YARA rule-directory entries | 10,000 | Built-in and optional directories combined |
 | YARA rule files | 1,024 | One rule load |
 | YARA rule source bytes | 1 MiB | One rule file |
@@ -296,6 +297,14 @@ Static pattern analysis and YARA matching allow up to 300 seconds per artifact b
 default. Set `SKILLSPECTOR_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT` to a positive
 finite number of seconds to change that allowance. Invalid, zero, negative,
 infinite, or NaN values log a warning and retain the 300-second default.
+
+The routed prompt-injection, tool-misuse, data-exfiltration, and supply-chain
+patterns also have a fixed 0.25-second matching CPU limit per search. Raising the
+artifact allowance does not raise this limit. Caller work and other threads do
+not consume the matching allowance. If a search expires, its ledger event keeps
+that search's observed time and limit, and the analyzer records partial coverage
+for the artifact. Other catalog modules and helper-specific searches are outside
+this timed matcher; this is not a deadline on every regular expression.
 
 ## Configuring the dependency-source deadline
 

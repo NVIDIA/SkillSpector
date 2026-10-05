@@ -24,6 +24,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 import unicodedata
 from array import array
@@ -304,38 +305,79 @@ _ACTIVE_FINDING_BUDGET: ContextVar[_FindingBudget | None] = ContextVar(
 )
 
 
+_CATEGORY_LOCK = threading.Lock()
+
+
+def _python_categories(ascii_only: bool, ascii_content: bool) -> dict[str, str]:
+    # lru_cache alone permits duplicate builds when analyzer threads miss together.
+    with _CATEGORY_LOCK:
+        return _cached_python_categories(ascii_only, ascii_content)
+
+
 @functools.lru_cache(maxsize=4)
-def _python_category_ranges(ascii_only: bool, ascii_content: bool = False) -> dict[str, str]:
-    """Keep the runtime's Python word/space/digit alphabet, not regex's Unicode version."""
-    categories: dict[str, list[tuple[int, int]]] = {key: [] for key in "wWsSdD"}
+def _cached_python_categories(ascii_only: bool, ascii_content: bool) -> dict[str, str]:
+    """Use native properties with small corrections for Python's Unicode version."""
+    ascii_alphabet = ascii_only or ascii_content
+    alphabet = "".join(map(chr, range(128 if ascii_alphabet else sys.maxunicode + 1)))
+    native_classes = {"w": r"\p{L}\p{N}_", "s": r"\p{White_Space}", "d": r"\p{Nd}"}
+    result: dict[str, str] = {}
     budget = _ACTIVE_FINDING_BUDGET.get()
-    alphabet_size = 128 if ascii_only or ascii_content else sys.maxunicode + 1
-    for value in range(alphabet_size):
-        if budget is not None and value % 4096 == 0:
-            budget.check_runtime()
-        character = chr(value)
-        word = (character.isalnum() or character == "_") and (not ascii_only or value < 128)
-        space = character.isspace() and (not ascii_only or character in " \t\n\r\f\v")
-        digit = character.isdecimal() and (not ascii_only or value < 128)
-        for key in ("w" if word else "W", "s" if space else "S", "d" if digit else "D"):
-            ranges = categories[key]
+
+    def ranges_text(ranges: list[tuple[int, int]]) -> str:
+        return "".join(
+            rf"\U{start:08x}" if start == end else rf"\U{start:08x}-\U{end:08x}"
+            for start, end in ranges
+        )
+
+    for category, native_class in native_classes.items():
+        # These single-character classes scan the finite Unicode alphabet once,
+        # never attacker input. Preserve Python's membership, including its
+        # Unicode version and the extra ASCII whitespace separators.
+        native_members = bytearray(len(alphabet))
+        if not ascii_alphabet:
+            for match in regex.finditer(f"[{native_class}]+", alphabet):
+                native_members[match.start() : match.end()] = b"\1" * len(match.group())
+        additions: list[tuple[int, int]] = []
+        removals: list[tuple[int, int]] = []
+        for value, character in enumerate(alphabet):
+            if budget is not None and value % 4096 == 0:
+                budget.check_runtime()
+            expected = (
+                character.isalnum() or character == "_"
+                if category == "w"
+                else character.isspace()
+                if category == "s"
+                else character.isdecimal()
+            )
+            if ascii_only and category == "s":
+                expected = character in " \t\n\r\f\v"
+            if expected == bool(native_members[value]):
+                continue
+            ranges = additions if expected else removals
             if ranges and ranges[-1][1] == value - 1:
                 ranges[-1] = (ranges[-1][0], value)
             else:
                 ranges.append((value, value))
-    if alphabet_size == 128:
-        for key in "WSD":
-            categories[key].append((128, sys.maxunicode))
-    return {
-        key: "".join(
-            rf"\U{start:08x}" if start == end else rf"\U{start:08x}-\U{end:08x}"
-            for start, end in ranges
-        )
-        for key, ranges in categories.items()
-    }
+        added, removed = ranges_text(additions), ranges_text(removals)
+        if ascii_alphabet:
+            result[category] = f"(?-i:[{added}])"
+            result[category.upper()] = f"(?-i:[^{added}])"
+            continue
+        for key, negation, include, exclude in (
+            (category, "", added, removed),
+            (category.upper(), "^", removed, added),
+        ):
+            atom = f"[{negation}{native_class}]"
+            if include:
+                atom = f"(?:{atom}|[{include}])"
+            if exclude:
+                atom = f"(?![{exclude}]){atom}"
+            result[key] = f"(?-i:{atom})"
+    return result
 
 
-@functools.lru_cache(maxsize=512)
+@functools.lru_cache(maxsize=1024)
+
 def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> regex.Pattern[str]:
     """Translate the static-rule grammar while retaining original match offsets.
 
@@ -362,8 +404,8 @@ def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> rege
     # ASCII input needs only ASCII category members. Keep the original flags:
     # Unicode \s includes ASCII control separators, and Unicode literals can
     # still fold to ASCII letters under IGNORECASE.
-    categories = _python_category_ranges(bool(flags & re.ASCII), ascii_content)
-    word = "(?-i:[" + categories["w"] + "])"
+    categories = _python_categories(bool(flags & re.ASCII), ascii_content)
+    word = categories["w"]
     parts: list[str] = []
     cursor = 0
     while cursor < len(source):
@@ -396,7 +438,7 @@ def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> rege
             if code in "NB":
                 raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
             if code in categories:
-                parts.append("(?-i:[" + categories[code] + "])")
+                parts.append(categories[code])
             elif code == "b":
                 parts.append(rf"(?:(?<!{word})(?={word})|(?<={word})(?!{word}))")
             else:
@@ -420,7 +462,7 @@ def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> rege
                 if len(part) == 2 and part.startswith("\\") and part[1] in categories:
                     # Word/space membership never inherits IGNORECASE. The
                     # regex package may know case pairs newer than this Python.
-                    atoms.append("(?-i:[" + categories[part[1]] + "])")
+                    atoms.append(categories[part[1]])
                 else:
                     literals.append(part)
             if not atoms:
@@ -475,7 +517,8 @@ def iter_pattern_matches(
             # regex's iterator timer includes CPU used by the caller between
             # yields. Restart it while retaining one cumulative matching budget;
             # the artifact deadline separately bounds caller work.
-            started_at = time.process_time()
+            started_at = time.thread_time()
+            expired = False
             try:
                 matches = compiled.finditer(
                     content,
@@ -489,10 +532,16 @@ def iter_pattern_matches(
                     # can still return a nonempty match at the same position.
                     next(matches, None)
                 match = next(matches, None)
+            except TimeoutError:
+                expired = True
             finally:
-                matching_seconds += max(0.0, time.process_time() - started_at)
+                matching_seconds += max(0.0, time.thread_time() - started_at)
             if budget is not None:
                 budget.check_runtime()
+            if expired:
+                # The engine counts all process CPU; native work in other
+                # threads must not consume this thread's matching allowance.
+                continue
             if match is None:
                 return
             start = match.end()
@@ -2803,11 +2852,12 @@ def run_static_patterns_with_ledger(
                             or observed_seconds >= runtime_limit
                         )
                         if expired:
+                            if resource_limit is not LedgerReason.RUNTIME_LIMIT:
+                                resource_metrics = {
+                                    "observed_seconds": observed_seconds,
+                                    "limit_seconds": runtime_limit,
+                                }
                             resource_limit = LedgerReason.RUNTIME_LIMIT
-                            resource_metrics = {
-                                "observed_seconds": observed_seconds,
-                                "limit_seconds": runtime_limit,
-                            }
                             path_findings = _cleanup_expired_path_findings(
                                 pattern_modules,
                                 path_findings,

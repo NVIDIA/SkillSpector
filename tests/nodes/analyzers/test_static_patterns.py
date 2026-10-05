@@ -2354,6 +2354,9 @@ def test_static_regex_deadline_retains_findings_and_incomplete_ledger(monkeypatc
         event["outcome"] == "partial" and event["reason_code"] == "runtime_limit"
         for event in result["inspection_ledger"]
     )
+    timed_out = [event for event in result["inspection_ledger"] if event.get("reason_code") == "runtime_limit"]
+    assert timed_out
+    assert all(event["limit_seconds"] == 0.000001 for event in timed_out)
     assert static_runner._ACTIVE_FINDING_BUDGET.get() is None
 
 
@@ -2384,3 +2387,59 @@ def test_unsupported_static_regex_grammar_fails_closed(pattern):
     with pytest.raises(static_runner._StaticResourceLimitError) as caught:
         list(static_runner.iter_pattern_matches(pattern, "ignore"))
     assert caught.value.reason.value == "rules_unavailable"
+
+
+def test_timed_categories_match_python_over_entire_unicode_alphabet():
+    import sys
+
+    text = "".join(map(chr, range(sys.maxunicode + 1)))
+    for pattern in (r"\w+", r"\W+", r"\s+", r"\S+", r"\d+", r"\D+", r"\b"):
+        compiled = static_runner._timed_pattern(pattern, re.UNICODE)
+        assert [match.span() for match in compiled.finditer(text)] == [
+            match.span() for match in re.finditer(pattern, text)
+        ], pattern
+
+
+def test_timed_pattern_retries_process_cpu_from_other_threads(monkeypatch):
+    import regex
+
+    original = regex.compile("x")
+    calls = 0
+
+    class ContendedPattern:
+        def finditer(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise TimeoutError("another thread used process CPU")
+            return original.finditer(*args, **kwargs)
+
+    monkeypatch.setattr(static_runner, "_timed_pattern", lambda *_args: ContendedPattern())
+    assert [match.span() for match in static_runner.iter_pattern_matches("x", "x")] == [(0, 1)]
+    assert calls == 3
+
+
+@pytest.mark.parametrize("content_kind", ["unicode_docs", "command_reference"])
+def test_production_window_ordinary_content_remains_complete(content_kind):
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse
+
+    if content_kind == "unicode_docs":
+        root = Path(__file__).resolve().parents[3]
+        sample = (root / "README.md").read_text() + (root / "docs/DEVELOPMENT.md").read_text()
+        sample += "\nRésumé — café documentation.\n"
+    else:
+        sample = (
+            "## Service reference\n"
+            "Use the following example to retrieve the service status.\n"
+            "curl -X GET https://example.test/status -H 'Accept: application/json'\n"
+            "The response includes its current status and version.\n"
+        )
+    content = (sample * (256_000 // len(sample) + 1))[:256_000]
+    assert len(content) == 256_000
+    if content_kind == "unicode_docs":
+        assert not content.isascii()
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
+        [static_patterns_tool_misuse],
+    )
+    assert all(event["outcome"] == "completed" for event in result["inspection_ledger"]), result["inspection_ledger"]
