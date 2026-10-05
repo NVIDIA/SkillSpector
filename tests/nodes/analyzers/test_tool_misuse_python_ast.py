@@ -126,6 +126,25 @@ def test_explicit_subprocess_shadow_rejects_bound_call(shadow: str) -> None:
     assert not _tm1(f"{shadow}\nenabled = True\nsubprocess.run(cmd, shell=enabled)\n")
 
 
+@pytest.mark.parametrize(
+    "native_rhs",
+    [
+        pytest.param("subprocess.check_call", id="native-cross-api"),
+        pytest.param("functools.partial(subprocess.run, command)", id="wrapped-native"),
+        pytest.param("Proxy(subprocess)", id="receiver-passed-to-constructor"),
+    ],
+)
+def test_first_method_store_with_native_receiver_rhs_retains_bound_call(native_rhs: str) -> None:
+    findings = _tm1(
+        f"subprocess.run = {native_rhs}\nenabled = True\nsubprocess.run(command, shell=enabled)\n"
+    )
+
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+    assert findings[0].start_line == 2
+    assert "shell=enabled" in findings[0].matched_text
+
+
 def test_explicit_import_reestablishes_direct_receivers() -> None:
     assert (
         len(
