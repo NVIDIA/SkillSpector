@@ -778,7 +778,13 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
   pricing contract.
 - The full per-issue shape is defined by `Finding.to_dict()` in [models.py](src/skillspector/models.py); rely on the fields above and treat any additional fields as best-effort.
 
-For CI/IDE tooling, `--format sarif` emits SARIF 2.1.0.
+For CI/IDE tooling, `--format sarif` emits SARIF 2.1.0. Each result carries its
+security severity; rule descriptors carry a score only when all of their results
+share that severity. Mixed-severity rules remain unannotated, so consumers that
+read only rule-level severity cannot distinguish their result severities.
+Recursive scans chain each percent-encoded skill-directory URI through an
+absolute scan-root file URI. External dependency locations retain their source
+provenance instead of being rebased into the local skill directory.
 
 ### Recommended gate mapping
 
