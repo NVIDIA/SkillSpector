@@ -297,8 +297,16 @@ default. Set `SKILLSPECTOR_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT` to a positi
 finite number of seconds to change that allowance. Invalid, zero, negative,
 infinite, or NaN values log a warning and retain the 300-second default.
 
+## Configuring the dependency-source deadline
+
+Dependency-source redirection analysis allows up to 5 seconds by default. Set
+`SKILLSPECTOR_MAX_DEPENDENCY_SOURCE_ANALYSIS_SECONDS` to a positive finite number of
+seconds to change that allowance. Invalid, zero, negative, infinite, or NaN
+values log a warning and retain the 5-second default.
+
 Each operation still uses the smaller of this allowance and the remaining workflow
-time. Increasing it does not extend the aggregate workflow deadline. A limit
-reached during analysis retains existing findings and reports partial work through
-the inspection ledger. Both environment settings are read when their modules are
-imported, so restart the SkillSpector process after changing them.
+time. Increasing either per-operation setting does not extend the aggregate
+workflow deadline. A limit reached during analysis retains existing findings and
+reports partial work through the inspection ledger. These environment settings
+are read when their modules are imported, so restart the SkillSpector process
+after changing them.

@@ -204,14 +204,30 @@ def _decoded_literal_xor_calls(content: str) -> list[tuple[int, str]]:
     behavioral analyzers. A second parse in static pattern analysis breaks that
     graph-level cache.
     """
-    function_pattern = re.compile(
-        r"^def\s+(?P<name>[A-Za-z_]\w*)\([^)]*\):(?P<body>(?:\n[ \t]+.*)+)",
-        re.MULTILINE,
-    )
-    key_pattern = re.compile(r"\b\w+\s*=\s*b(['\"])(?P<key>(?:\\.|[^'\"])*)\1")
+    function_pattern = re.compile(r"^def\s+(?P<name>[A-Za-z_]\w*)\(", re.MULTILINE)
+    body_pattern = re.compile(r"(?:\n[ \t]+.*)+")
+    # A backslash belongs only to an escape, so a missing closing quote cannot
+    # explore exponentially many partitions of a run of backslashes.
+    key_pattern = re.compile(r"\b\w+\s*=\s*b(['\"])(?P<key>(?:\\[\s\S]|[^'\"\\])*)\1")
     decoded: list[tuple[int, str]] = []
+    closing_paren = -1
+    consumed_until = 0
     for function in function_pattern.finditer(content):
-        body = function.group("body")
+        if function.start() < consumed_until:
+            continue
+        # Reuse the next closing parenthesis across malformed headers instead
+        # of searching the same suffix once for every unclosed function.
+        if closing_paren < function.end():
+            closing_paren = content.find(")", function.end())
+        if closing_paren < 0:
+            break
+        if not content.startswith(":", closing_paren + 1):
+            continue
+        body_match = body_pattern.match(content, closing_paren + 2)
+        if body_match is None:
+            continue
+        consumed_until = body_match.end()
+        body = body_match.group()
         key_match = key_pattern.search(body)
         if key_match is None or "bytes(" not in body or "^" not in body or ".decode(" not in body:
             continue
@@ -483,7 +499,8 @@ _POPULAR_NPM: frozenset[str] = frozenset(
 # in-sample: names outside those two lists can still be flagged. Established
 # packages reported from outside the sample in review (#647) were checked one by
 # one (repository, age, downloads) and added: jets, jqueryui, bootstrap3,
-# bootstrap5 (npm), colormap, python-direnv (PyPI).
+# bootstrap5 (npm), colormap (PyPI). python-direnv (PyPI) was reviewed too and is
+# kept flagged on purpose (#687): little history, two edits from python-dotenv.
 _KNOWN_LEGIT_PYPI: frozenset[str] = frozenset(
     {
         "afsapi",
@@ -554,7 +571,6 @@ _KNOWN_LEGIT_PYPI: frozenset[str] = frozenset(
         "pyrect",
         "pysaml2",
         "pytango",
-        "python-direnv",
         "pytket",
         "pytoml",
         "rltest",

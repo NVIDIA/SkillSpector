@@ -52,6 +52,11 @@ the subprocess starts.
 - `output`: optional report path.
 - `noLlm`: default `true`.
 
+Static scans have a 120-second subprocess limit. With `noLlm=false`, the limit
+is 630 seconds to allow the CLI's default 600-second workflow to finish and
+write its report. Session cancellation still stops the scan; a longer configured
+CLI workflow budget does not extend this tool limit.
+
 Unlike the [Pi extension](PI_EXTENSION.md), this tool has no `provider`, `model`, `yaraRulesDir`, or `verbose` parameters: LLM-backed analysis is configured through the environment instead (see below).
 
 ## LLM-backed analysis

