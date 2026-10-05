@@ -3111,6 +3111,21 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
         # literal branch whose execution is proven can revoke the lexical owner.
         child = node
         parent = parents.get(child)
+        if isinstance(parent, ast.AnnAssign) and parent.value is None and child is parent.target:
+            return
+        if (
+            isinstance(parent, (ast.Assign, ast.AnnAssign))
+            and isinstance(child, ast.Name)
+            and isinstance(parent.value, ast.Name)
+            and parent.value.id == child.id
+        ):
+            return
+        if (
+            isinstance(node, (ast.Assign, ast.AnnAssign))
+            and isinstance(node.value, ast.Name)
+            and node.value.id == name
+        ):
+            return
         while parent is not None and parent is not scope:
             if isinstance(parent, ast.If):
                 if not isinstance(parent.test, ast.Constant):
@@ -5683,16 +5698,35 @@ def _reconcile_variable_shell_findings(
     ownership, emitted = static_python_shell_truthiness.bound_shell_call_state(
         file_path, python_ast
     )
-    retained_companion_locations = {
-        (finding.start_line, finding.start_column)
-        for finding in findings
-        if finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is True
-    }
-    emitted = {
-        key
-        for key in emitted
-        if (key[0], python_ast.character_column(key[0], key[1])) in retained_companion_locations
-    }
+    supported_calls = set(emitted)
+    retained_companion_starts: set[int] = set()
+    retained_companion_sources: set[tuple[int, str]] = set()
+    for finding in findings:
+        if finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is not True:
+            continue
+        start = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE)
+        end = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_END_EVIDENCE)
+        if type(start) is int and type(end) is int and 0 <= start < end <= len(content):
+            retained_companion_starts.add(start)
+            retained_companion_sources.add(
+                (bisect_right(python_ast.line_character_starts, start), content[start:end])
+            )
+    retained_emitted: set[tuple[int, int, int, int]] = set()
+    for key in emitted:
+        start = python_ast.line_character_starts[key[0] - 1] + (
+            python_ast.character_column(key[0], key[1]) or 0
+        )
+        end = python_ast.line_character_starts[key[2] - 1] + (
+            python_ast.character_column(key[2], key[3]) or 0
+        )
+        # The companion shares one report owner for identical same-line calls.
+        # Compare the complete raw source, since displayed previews can collide.
+        if (
+            start in retained_companion_starts
+            or (key[0], content[start:end]) in retained_companion_sources
+        ):
+            retained_emitted.add(key)
+    emitted = retained_emitted
 
     reconciled: list[Finding] = []
     for finding in findings:
@@ -5715,6 +5749,15 @@ def _reconcile_variable_shell_findings(
             ast_index, python_ast, candidate, receiver_trusted=ownership.get(call_key)
         ):
             continue
+        if call_key in supported_calls:
+            retained_owner = static_python_shell_truthiness.bound_shell_finding_for_call(
+                file_path, python_ast, candidate.call
+            )
+            if retained_owner is not None:
+                replacement = static_runner.analyzer_finding_to_finding(retained_owner)
+                replacement.finding_id = finding.finding_id
+                reconciled.append(replacement)
+                continue
         if variable_name.casefold().startswith("true"):
             call = candidate.call
             finding.start_line = getattr(call, "lineno", finding.start_line)
