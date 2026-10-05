@@ -3240,6 +3240,30 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
     declarations: dict[ast.AST, dict[str, str]] = {}
     binding_events: dict[ast.AST, dict[str, list[tuple[int, bool]]]] = {}
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    attribute_identity_stores: set[ast.Attribute] = set()
+
+    def mark_attribute_identity_stores(target: ast.AST, value: ast.AST) -> None:
+        pairs = [(target, value)]
+        while pairs:
+            destination, source = pairs.pop()
+            if (
+                isinstance(destination, ast.Attribute)
+                and isinstance(destination.value, ast.Name)
+                and isinstance(source, ast.Attribute)
+                and isinstance(source.value, ast.Name)
+                and destination.attr == source.attr
+                and destination.value.id == source.value.id
+            ):
+                attribute_identity_stores.add(destination)
+            elif (
+                isinstance(destination, (ast.Tuple, ast.List))
+                and isinstance(source, (ast.Tuple, ast.List))
+                and len(destination.elts) == len(source.elts)
+                and not any(
+                    isinstance(item, ast.Starred) for item in (*destination.elts, *source.elts)
+                )
+            ):
+                pairs.extend(zip(destination.elts, source.elts, strict=True))
 
     def record_binding(scope: ast.AST, name: str, start: int, restores: bool = False) -> None:
         # A conditional store is not affirmative replacement evidence. Only a
@@ -3300,6 +3324,12 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
         start = span[0] if span is not None else 0
         end = span[1] if span is not None else start
 
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                mark_attribute_identity_stores(target, node.value)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            mark_attribute_identity_stores(node.target, node.value)
+
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             bind(scope, node.name, end)
             nested_chain = (*scope_chain, node)
@@ -3354,13 +3384,14 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
             and isinstance(node.ctx, (ast.Store, ast.Del))
             and isinstance(node.value, ast.Name)
         ):
-            # Replacing the called slot is affirmative evidence; unrelated
-            # attributes and protocol effects only make receiver trust unknown.
-            record_binding(
-                scope,
-                node.value.id + "." + node.attr,
-                binding_start if binding_start is not None else end,
-            )
+            if node not in attribute_identity_stores:
+                # Replacing the called slot is affirmative evidence; unrelated
+                # attributes and protocol effects only make receiver trust unknown.
+                record_binding(
+                    scope,
+                    node.value.id + "." + node.attr,
+                    binding_start if binding_start is not None else end,
+                )
 
         if isinstance(node, ast.Global):
             for name in node.names:
@@ -3660,13 +3691,22 @@ def _lexical_shell_has_counterevidence(
     receiver = function.id if isinstance(function, ast.Name) else function.value.id
     receiver_scope = _resolved_name_scope(index, candidate.call_scope_chain, receiver, call_start)
     receiver_events = binding_events(receiver_scope, receiver)
+    method_events: tuple[tuple[int, bool], ...] = ()
     if isinstance(function, ast.Attribute):
         method_name = receiver + "." + function.attr
         method_events = binding_events(receiver_scope, method_name)
         current_scope = candidate.call_scope_chain[-1]
         if current_scope is not receiver_scope:
             method_events += binding_events(current_scope, method_name)
-        receiver_events = tuple(sorted({*receiver_events, *method_events}))
+        # A cached module attribute remains changed after re-importing its
+        # module. Attribute stores on an already replaced receiver do not
+        # mutate the imported module that a later import restores.
+        for start, restores in method_events:
+            if restores or start >= call_start:
+                continue
+            receiver_before_store = bisect_right(receiver_events, (start, True))
+            if receiver_before_store and receiver_events[receiver_before_store - 1][1]:
+                return True
     receiver_index = bisect_right(receiver_events, (call_start, True))
     if receiver_index:
         # An explicit fresh import supersedes earlier replacement evidence.
