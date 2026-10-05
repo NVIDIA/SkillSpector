@@ -3295,13 +3295,15 @@ def mcp(
         typer.Option(
             "--transport",
             "-t",
-            help="Transport: FastMCP stdio for local CLI agents, http for remote/A2A callers.",
+            help="Transport: FastMCP stdio for local CLI agents, http for loopback HTTP clients.",
             case_sensitive=False,
         ),
     ] = TransportChoice.stdio,
     host: Annotated[
         str,
-        typer.Option("--host", help="Host to bind (http transport only)."),
+        typer.Option(
+            "--host", help="Loopback IP to bind (http transport only; localhost is accepted)."
+        ),
     ] = "127.0.0.1",
     port: Annotated[
         int,
@@ -3312,7 +3314,7 @@ def mcp(
     Run SkillSpector as an MCP server.
 
     Exposes a single tool, ``scan_skill``, so any MCP-capable agent (Claude Code,
-    Codex CLI, Gemini CLI) or remote runtime can scan a skill and gate installs
+    Codex CLI, Gemini CLI) can scan a skill locally and gate installs
     on the verdict.
 
     Requires the optional mcp extra. Reinstall the GitHub tool package with
@@ -3327,7 +3329,7 @@ def mcp(
         from skillspector.mcp_server import run as run_mcp
 
         run_mcp(transport=transport.value, host=host, port=port)
-    except ModuleNotFoundError as e:
+    except (ModuleNotFoundError, ValueError) as e:
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
 
