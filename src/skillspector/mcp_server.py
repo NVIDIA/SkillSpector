@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from skillspector import __version__
-from skillspector.cleanup import cleanup_result
+from skillspector.cleanup import TempDirTracker, cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.graph_proxy import restore_package_graph_export
@@ -154,10 +154,14 @@ async def run_scan(
     )
 
     result: dict[str, Any] | None = None
+    # A cancelled or failed scan returns no result to clean up; the tracker still
+    # knows the temp directory resolve_input made.
+    temp_dir_tracker = TempDirTracker()
     try:
         result = await graph.ainvoke(
             state,
             config={
+                "callbacks": [temp_dir_tracker],
                 "run_name": "skillspector-mcp-scan",
                 "tags": ["skillspector", "mcp"],
                 "metadata": {
@@ -229,6 +233,8 @@ async def run_scan(
     finally:
         if result is not None:
             cleanup_result(result)
+        else:
+            temp_dir_tracker.remove()
 
 
 def build_server(name: str = "skillspector", *, allow_local_targets: bool = False) -> FastMCP:

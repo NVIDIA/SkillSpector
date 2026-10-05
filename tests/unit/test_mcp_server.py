@@ -19,8 +19,12 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
+import threading
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -57,6 +61,78 @@ async def test_run_scan_returns_structured_verdict(
     assert isinstance(result["safe_to_install"], bool)
     assert result["safe_to_install"] == (result["risk_score"] <= 50)
     assert result["report"]  # non-empty rendered report
+
+
+def _record_scan_temp_dirs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, list[Path]]:
+    """Build a zipped skill and create the scan temp dirs under tmp_path, recording them."""
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("SKILL.md", "---\nname: demo\ndescription: d\n---\n# Demo\n")
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def recording_mkdtemp(*args: Any, **kwargs: Any) -> str:
+        """Create scan temp dirs under tmp_path and remember them."""
+        if kwargs.get("prefix") != "skillspector_":
+            return real_mkdtemp(*args, **kwargs)
+        path = real_mkdtemp(*args, **{**kwargs, "dir": tmp_path})
+        created.append(Path(path))
+        return path
+
+    monkeypatch.setattr("skillspector.input_handler.tempfile.mkdtemp", recording_mkdtemp)
+    return archive, created
+
+
+async def test_run_scan_that_fails_removes_its_temp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scan failing after input resolution removes the temp dir it made."""
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    archive, created = _record_scan_temp_dirs(monkeypatch, tmp_path)
+
+    def fail(*args: Any, **kwargs: Any) -> str:
+        """Stand in for a failure after the input is materialized."""
+        raise RuntimeError("report failed")
+
+    monkeypatch.setattr("skillspector.nodes.report._format_json", fail)
+
+    with pytest.raises(RuntimeError, match="report failed"):
+        await run_scan(str(archive), use_llm=False, output_format="json")
+
+    assert created
+    assert not any(path.exists() for path in created)
+
+
+async def test_run_scan_that_is_cancelled_removes_its_temp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling the tool call after input resolution removes the temp dir."""
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    archive, created = _record_scan_temp_dirs(monkeypatch, tmp_path)
+    reporting = threading.Event()
+    release = threading.Event()
+
+    def block(*args: Any, **kwargs: Any) -> str:
+        """Hold the report step so the caller can cancel the running scan."""
+        reporting.set()
+        release.wait(timeout=10)
+        raise RuntimeError("released after cancellation")
+
+    monkeypatch.setattr("skillspector.nodes.report._format_json", block)
+
+    scan = asyncio.create_task(run_scan(str(archive), use_llm=False, output_format="json"))
+    try:
+        assert await asyncio.to_thread(reporting.wait, 10)
+        scan.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await scan
+    finally:
+        release.set()
+
+    assert created
+    assert not any(path.exists() for path in created)
 
 
 @pytest.mark.parametrize(

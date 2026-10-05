@@ -22,6 +22,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import zipfile
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from importlib import import_module
@@ -180,6 +182,118 @@ def test_stream_progress_returns_complete_values_state(
     assert result == final_state
 
 
+def _stop_scan_after_input_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: type[BaseException]
+) -> tuple[Path, list[Path]]:
+    """Build a zipped skill, record scan temp dirs, and make the report step raise."""
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("SKILL.md", "---\nname: demo\ndescription: d\n---\n# Demo\n")
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def recording_mkdtemp(*args: Any, **kwargs: Any) -> str:
+        """Create scan temp dirs under tmp_path and remember them."""
+        if kwargs.get("prefix") != "skillspector_":
+            return real_mkdtemp(*args, **kwargs)
+        path = real_mkdtemp(*args, **{**kwargs, "dir": tmp_path})
+        created.append(Path(path))
+        return path
+
+    def stop(*args: Any, **kwargs: Any) -> str:
+        """Stand in for an interrupt or a failure after the input is materialized."""
+        raise error("scan stopped")
+
+    monkeypatch.setattr("skillspector.input_handler.tempfile.mkdtemp", recording_mkdtemp)
+    monkeypatch.setattr("skillspector.nodes.report._format_json", stop)
+    return archive, created
+
+
+@pytest.mark.parametrize("stream_progress", [False, True])
+@pytest.mark.parametrize("error", [KeyboardInterrupt, RuntimeError])
+def test_scan_that_stops_early_removes_its_temp_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stream_progress: bool,
+    error: type[BaseException],
+) -> None:
+    """A scan interrupted or failing after input resolution removes its temp dir."""
+    archive, created = _stop_scan_after_input_resolution(monkeypatch, tmp_path, error)
+
+    with pytest.raises(error):
+        cli._run_graph_scan(
+            input_path=str(archive),
+            format=FormatChoice.json,
+            no_llm=True,
+            stream_progress=stream_progress,
+        )
+
+    assert created
+    assert not any(path.exists() for path in created)
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, RuntimeError])
+def test_transitive_scan_stopped_in_a_child_removes_the_root_temp_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: type[BaseException]
+) -> None:
+    """A --transitive scan of a zipped root that stops while a child is scanning removes the root's temp dir."""
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(
+            "SKILL.md",
+            "---\nname: demo\ndescription: d\n---\n# Demo\n\n"
+            "Install the helper skill from https://github.com/org/dep.git first.\n",
+        )
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def recording_mkdtemp(*args: Any, **kwargs: Any) -> str:
+        """Create scan temp dirs under tmp_path and remember them."""
+        if kwargs.get("prefix") != "skillspector_":
+            return real_mkdtemp(*args, **kwargs)
+        path = real_mkdtemp(*args, **{**kwargs, "dir": tmp_path})
+        created.append(Path(path))
+        return path
+
+    real_scan_for_source = cli._run_graph_scan_for_source
+    child_inputs: list[str] = []
+
+    def scan_for_source(**kwargs: Any) -> dict[str, object]:
+        """Run the root scan for real and stop the first transitive child."""
+        if kwargs["input_path"] == str(archive):
+            return real_scan_for_source(**kwargs)
+        child_inputs.append(kwargs["input_path"])
+        raise error("child scan stopped")
+
+    monkeypatch.setattr("skillspector.input_handler.tempfile.mkdtemp", recording_mkdtemp)
+    monkeypatch.setattr(cli, "_run_graph_scan_for_source", scan_for_source)
+    if error is RuntimeError:
+        # A child failure is recorded as a warning; make the merge step raise instead.
+        def stop_merge(*args: Any, **kwargs: Any) -> None:
+            raise error("merge stopped")
+
+        monkeypatch.setattr(cli, "_ensure_required_failure_events", stop_merge)
+
+    with pytest.raises(error):
+        cli._scan_skill(
+            input_path=str(archive),
+            format=FormatChoice.json,
+            no_llm=True,
+            baseline=None,
+            yara_rules_dir=None,
+            verbose=False,
+            show_suppressed=False,
+            transitive_enabled=True,
+            transitive_depth=1,
+            transitive_allow_prefix=None,
+            transitive_deny_prefix=None,
+        )
+
+    assert child_inputs, "the root should have reached a transitive child scan"
+    assert created
+    assert not any(path.exists() for path in created)
+
+
 @pytest.mark.parametrize(
     ("terminal", "verbose", "expected"),
     [(True, False, True), (False, False, False), (True, True, False)],
@@ -331,6 +445,85 @@ def test_cli_scan_output_to_file(tmp_path: Path) -> None:
     assert out_file.exists()
     content = out_file.read_text()
     assert "out-test" in content or "risk_assessment" in content
+
+
+@pytest.mark.parametrize("format", list(FormatChoice))
+@pytest.mark.parametrize(
+    "alias", ["same-path", "relative-path", "parent-path", "symlink", "symlink-parent", "hard-link"]
+)
+def test_cli_scan_rejects_output_alias_of_input_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, format: FormatChoice, alias: str
+) -> None:
+    """An output alias must not replace the original skill with its report."""
+    source = tmp_path / "SKILL.md"
+    original = b"---\nname: protected\ndescription: Say hello.\n---\n# Hello\n"
+    source.write_bytes(original)
+    output = source
+    monkeypatch.chdir(tmp_path)
+    if alias == "relative-path":
+        output = Path("SKILL.md")
+    elif alias == "parent-path":
+        nested = tmp_path / "nested"
+        nested.mkdir()
+        output = nested / ".." / source.name
+    elif alias == "symlink":
+        output = tmp_path / "report.txt"
+        try:
+            output.symlink_to(source)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+    elif alias == "symlink-parent":
+        linked = tmp_path / "linked"
+        try:
+            linked.symlink_to(tmp_path, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+        output = linked / source.name
+    elif alias == "hard-link":
+        output = tmp_path / "report.txt"
+        try:
+            os.link(source, output)
+        except OSError:
+            pytest.skip("hard links are not supported on this filesystem")
+    scan_skill = MagicMock(return_value={"report_body": "Scan report", "risk_score": 0})
+    monkeypatch.setattr(cli, "_scan_skill", scan_skill)
+
+    result = runner.invoke(
+        app, ["scan", str(source), "--no-llm", "--format", format.value, "--output", str(output)]
+    )
+
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert source.read_bytes() == original
+    assert output.read_bytes() == original
+    scan_skill.assert_not_called()
+
+
+@pytest.mark.parametrize("format", list(FormatChoice))
+@pytest.mark.parametrize("destination", ["new", "existing", "same-name"])
+def test_cli_scan_preserves_input_when_writing_a_separate_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, format: FormatChoice, destination: str
+) -> None:
+    """Separate reports still work, including existing files and matching names."""
+    source = tmp_path / "SKILL.md"
+    original = b"# Original skill\n"
+    source.write_bytes(original)
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    output = reports / (source.name if destination == "same-name" else "report.txt")
+    if destination == "existing":
+        output.write_text("Previous report", encoding="utf-8")
+    scan_skill = MagicMock(return_value={"report_body": "Scan report", "risk_score": 0})
+    monkeypatch.setattr(cli, "_scan_skill", scan_skill)
+
+    result = runner.invoke(
+        app, ["scan", str(source), "--no-llm", "--format", format.value, "--output", str(output)]
+    )
+
+    assert result.exit_code == 0
+    assert source.read_bytes() == original
+    assert output.read_text(encoding="utf-8") == "Scan report"
+    scan_skill.assert_called_once()
 
 
 def test_cli_scan_no_llm(tmp_path: Path) -> None:
