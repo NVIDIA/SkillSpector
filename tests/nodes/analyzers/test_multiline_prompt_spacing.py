@@ -440,7 +440,8 @@ def test_projected_prompt_regex_timeout_records_incomplete_coverage(
     clock = iter((0.0, 0.02, 0.02, 0.04))
     monkeypatch.setattr(artifact_integrity.time, "thread_time", lambda: next(clock))
     monkeypatch.setattr(
-        artifact_integrity, "_multiline_prompt_injection_line",
+        artifact_integrity,
+        "_multiline_prompt_injection_line",
         lambda *_args: pytest.fail("ordinary projection reached the multiline fallback"),
     )
 
@@ -475,7 +476,8 @@ def test_repeated_projected_prompt_prefix_has_engine_deadline(
 ) -> None:
     monkeypatch.setattr(artifact_integrity, "_MULTILINE_PROMPT_PATTERN_SECONDS", 0.000001)
     monkeypatch.setattr(
-        artifact_integrity, "_multiline_prompt_injection_line",
+        artifact_integrity,
+        "_multiline_prompt_injection_line",
         lambda *_args: pytest.fail("ordinary projection reached the multiline fallback"),
     )
     content = "w i t h o u t   t e l l i n g   u s e r " * 1000
@@ -500,7 +502,11 @@ def test_timed_prompt_matches_excludes_consumer_cpu(monkeypatch: pytest.MonkeyPa
     while time.thread_time() < until:
         pass
     assert [first.span(), *(match.span() for match in matches)] == [
-        (0, 0), (0, 1), (1, 1), (1, 2), (2, 2)
+        (0, 0),
+        (0, 1),
+        (1, 1),
+        (1, 2),
+        (2, 2),
     ]
 
 
