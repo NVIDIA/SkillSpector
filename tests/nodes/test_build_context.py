@@ -647,7 +647,10 @@ def test_source_local_only_preserves_excluded_executable_coverage(
 
 
 @pytest.mark.parametrize("client_dir", [".agents", ".claude"])
-def test_conventional_skill_scripts_are_not_concealed(tmp_path: Path, client_dir: str) -> None:
+@pytest.mark.parametrize("use_llm", [True, False])
+def test_conventional_skill_scripts_are_not_concealed(
+    tmp_path: Path, client_dir: str, use_llm: bool
+) -> None:
     skill_root = tmp_path / client_dir / "skills" / "hello"
     (skill_root / "scripts").mkdir(parents=True)
     (skill_root / "SKILL.md").write_text("# Hello\n", encoding="utf-8")
@@ -655,7 +658,7 @@ def test_conventional_skill_scripts_are_not_concealed(tmp_path: Path, client_dir
     hidden_script = skill_root / "scripts" / ".hidden.py"
     hidden_script.write_text('print("hidden")\n', encoding="utf-8")
 
-    result = build_context({"skill_path": str(tmp_path)})
+    result = build_context({"skill_path": str(tmp_path), "use_llm": use_llm})
 
     metadata = {item["path"]: item for item in result["component_metadata"]}
     visible_path = f"{client_dir}/skills/hello/scripts/hello.py"
@@ -666,14 +669,18 @@ def test_conventional_skill_scripts_are_not_concealed(tmp_path: Path, client_dir
     findings = _analyze_concealed_executables(result["component_metadata"])
     assert visible_path not in {finding.file for finding in findings}
     assert hidden_path in {finding.file for finding in findings}
-    coverage = next(
+    coverage = [
         event
         for event in result["inspection_ledger"]
         if event["path"] == visible_path
         and event.get("reason_code") == LedgerReason.HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY
-    )
-    assert coverage["outcome"] == LedgerOutcome.SKIPPED
-    assert "not sent to an external LLM" in coverage["message"]
+    ]
+    if use_llm:
+        assert len(coverage) == 1
+        assert coverage[0]["outcome"] == LedgerOutcome.SKIPPED
+        assert "not sent to an external LLM" in coverage[0]["message"]
+    else:
+        assert coverage == []
 
 
 @pytest.mark.parametrize(

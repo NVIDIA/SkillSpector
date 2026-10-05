@@ -3536,14 +3536,18 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         {item["path"]: item for item in artifact_inventory},
         raw_file_cache,
     )
-    hidden_skill_llm_events = _note_hidden_skill_scripts_not_sent_to_llm(component_metadata)
+    use_llm = state.get("use_llm", True)
+    hidden_skill_llm_events = (
+        _note_hidden_skill_scripts_not_sent_to_llm(component_metadata)
+        if use_llm is not False
+        else []
+    )
     has_executable_scripts = (
         has_executable_scripts
         or any(bool(metadata.get("executable")) for metadata in nested.metadata)
         or any(bool(metadata.get("executable")) for metadata in excluded_component_metadata)
     )
 
-    use_llm = state.get("use_llm", True)
     model_config = build_model_config() if use_llm else {}
     llm_provenance = (
         capture_llm_provenance(model_config)
