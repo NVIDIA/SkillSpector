@@ -23,11 +23,14 @@ produce a string.  The entry shape is defined by
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from datetime import UTC, datetime
+from html import escape as escape_html
 from io import StringIO
 
 from skillspector import __version__ as _skillspector_version
+from skillspector.nodes.report import _clean_text
 
 
 def sorted_results(results: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -373,6 +376,29 @@ def _format_json(results: list[dict[str, object]]) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 
+def _markdown_plain_text(value: object) -> str:
+    """Remove display controls and keep a Markdown field on one line."""
+    text = _clean_text(str(value)) or ""
+    text = "".join(c for c in text if c.isprintable() or c.isspace())
+    return " ".join(text.splitlines())
+
+
+def _markdown_text(value: object) -> str:
+    """Keep scan-derived prose within its own Markdown line."""
+    text = escape_html(_markdown_plain_text(value), quote=False)
+    return re.sub(r"([\\`*_{}\[\]()#+.!|>~-])", r"\\\1", text)
+
+
+def _markdown_code(value: object, *, table_cell: bool = False) -> str:
+    """Quote literal text without allowing code-span or table-cell breakouts."""
+    text = _markdown_plain_text(value)
+    if table_cell:
+        text = text.replace("|", "\\|")
+    delimiter = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
+    padding = " " if text.startswith(("`", " ")) or text.endswith(("`", " ")) else ""
+    return f"{delimiter}{padding}{text}{padding}{delimiter}"
+
+
 def _format_markdown(results: list[dict[str, object]]) -> str:
     lines: list[str] = []
     total = len(results)
@@ -438,9 +464,12 @@ def _format_markdown(results: list[dict[str, object]]) -> str:
         lang = skill.get("language", "en")
 
         if r.get("error"):
-            lines.append(f"| `{name}` | ERR | ERROR | — | {lang} |")
+            lines.append(f"| {_markdown_code(name, table_cell=True)} | ERR | ERROR | — | {_markdown_text(lang)} |")
         else:
-            lines.append(f"| `{name}` | {score}/100 | {sev} | {issues} | {lang} |")
+            lines.append(
+                f"| {_markdown_code(name, table_cell=True)} | {score}/100 | {_markdown_text(sev)} | "
+                f"{issues} | {_markdown_text(lang)} |"
+            )
     lines.append("")
 
     # ── Issue details for HIGH / CRITICAL ────────────────────────
@@ -458,8 +487,8 @@ def _format_markdown(results: list[dict[str, object]]) -> str:
             risk = r.get("risk_assessment", {})
             name = skill.get("name", "?")
             lines.append(
-                f"### {name} — {risk.get('score', 0)}/100 "
-                f"{risk.get('severity', 'HIGH')}\n"
+                f"### {_markdown_text(name)} — {risk.get('score', 0)}/100 "
+                f"{_markdown_text(risk.get('severity', 'HIGH'))}\n"
             )
             for issue in r.get("issues", []):
                 sev = str(issue.get("severity", "LOW")).upper()
@@ -469,14 +498,14 @@ def _format_markdown(results: list[dict[str, object]]) -> str:
                 loc_file = loc.get("file", "") if isinstance(loc, dict) else ""
                 rule_id = issue.get("id", "?")
                 explanation = issue.get("explanation", issue.get("message", ""))
-                lines.append(f"- **{emoji} {rule_id}**: {explanation}")
+                lines.append(f"- **{emoji} {_markdown_text(rule_id)}**: {_markdown_text(explanation)}")
                 if loc_file:
-                    lines.append(f"  - Location: `{loc_file}:{loc_start}`")
+                    lines.append(f"  - Location: {_markdown_code(f'{loc_file}:{loc_start}')}")
                 conf = issue.get("confidence", 0)
                 lines.append(f"  - Confidence: {float(conf):.0%}")
                 rem = issue.get("remediation")
                 if rem:
-                    lines.append(f"  - Remediation: {rem}")
+                    lines.append(f"  - Remediation: {_markdown_text(rem)}")
                 lines.append("")
         lines.append("")
 
@@ -484,11 +513,12 @@ def _format_markdown(results: list[dict[str, object]]) -> str:
     if exception_groups:
         lines.append("## Ledger Exceptions\n")
         for skill_name, exceptions in exception_groups:
-            lines.append(f"### {skill_name}\n")
+            lines.append(f"### {_markdown_text(skill_name)}\n")
             for exception in exceptions:
                 lines.append(
-                    f"- **{exception.get('reason_code', 'unknown')}** "
-                    f"`{exception.get('path', '')}`: {exception.get('message', '')}"
+                    f"- **{_markdown_text(exception.get('reason_code', 'unknown'))}** "
+                    f"{_markdown_code(exception.get('path', ''))}: "
+                    f"{_markdown_text(exception.get('message', ''))}"
                 )
             lines.append("")
 

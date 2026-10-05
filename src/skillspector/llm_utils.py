@@ -44,6 +44,7 @@ import weakref
 from collections.abc import Coroutine
 from typing import Any, NoReturn
 
+from google.auth.exceptions import RefreshError
 from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
@@ -67,6 +68,7 @@ from skillspector.providers import (
     resolve_chat_model_credentials,
     resolve_provider_credentials,
 )
+from skillspector.providers.gemini import GeminiProvider
 from skillspector.providers.openai import OpenAIProvider
 
 _CHAT_MODEL_PROVIDERS: dict[int, tuple[weakref.ReferenceType[object], str]] = {}
@@ -132,7 +134,7 @@ def _resolve_default_chat_model() -> str:
     raise_no_llm_api_key_configured()
 
 
-def is_llm_available() -> tuple[bool, str | None]:
+def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
     """Return ``(available, error_message)`` describing LLM availability.
 
     CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
@@ -154,9 +156,15 @@ def is_llm_available() -> tuple[bool, str | None]:
             create_chat_model(
                 model=model,
                 max_tokens=get_max_output_tokens(model),
-                timeout=120,
+                timeout=timeout,
             )
-        except ValueError as exc:
+        except (ValueError, RefreshError, TimeoutError) as exc:
+            return False, str(exc)
+        return True, None
+    if isinstance(provider, GeminiProvider):
+        try:
+            provider.resolve_credentials(timeout=timeout)
+        except (ValueError, RefreshError, TimeoutError) as exc:
             return False, str(exc)
         return True, None
     try:
@@ -423,20 +431,38 @@ def bind_structured_output(
     """``llm.with_structured_output(schema)`` with the method *model* needs.
 
     A chat model restricted to ``toolChoice`` ``auto`` (Bedrock models that
-    reject a forced tool call) is bound with LangChain's default tool method,
-    the prompt asks for the tool call explicitly, and a prose answer raises
-    :class:`StructuredOutputParseError`, which the analyzers retry like any
-    other malformed structured response.
+    reject a forced tool call, or a ``ChatOpenAI`` with ``tool_choice``
+    disabled) and bound with a tool method gets the tool call asked for in
+    the prompt, and a prose answer raises :class:`StructuredOutputParseError`,
+    which the analyzers retry like any other malformed structured response.
     """
     kwargs = structured_output_kwargs(model, provider, preferred_method=preferred_method)
     structured = llm.with_structured_output(schema, **kwargs)  # type: ignore[attr-defined]
+    if _binds_unforced_tool_call(llm, kwargs.get("method")):
+        return _require_tool_call(structured, schema)
     if kwargs.get("method") == "function_calling" and not isinstance(
         structured, _StructuredAgentCLIModel
     ):
         return _validate_tool_call_result(structured, schema)
-    if kwargs or getattr(llm, "supports_tool_choice_values", None) != ("auto",):
-        return structured
-    return _require_tool_call(structured, schema)
+    return structured
+
+
+def _binds_unforced_tool_call(llm: object, method: str | None) -> bool:
+    """``True`` when *method* binds the schema as a tool *llm* is not forced to call.
+
+    ``ChatBedrockConverse`` binds a tool by default; ``ChatOpenAI`` defaults to
+    ``json_schema``, so its ``tool_choice``-disabled form needs an explicit
+    ``function_calling``.
+    """
+    if getattr(llm, "supports_tool_choice_values", None) == ("auto",):
+        return method in (None, "function_calling")
+    disabled = getattr(llm, "disabled_params", None)
+    return (
+        method == "function_calling"
+        and isinstance(disabled, dict)
+        and "tool_choice" in disabled
+        and disabled["tool_choice"] is None
+    )
 
 
 _TOOL_CALL_INSTRUCTION = (

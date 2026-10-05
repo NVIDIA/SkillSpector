@@ -41,6 +41,7 @@ class LedgerRecordType(StrEnum):
 class LedgerReason(StrEnum):
     """Allowlisted reasons for omitted, skipped, or failed inspection work."""
 
+    USER_EXCLUSION = "user_exclusion"
     EXCLUDED_DIRECTORY = "excluded_directory"
     HIDDEN_FILE = "hidden_file"
     FILE_DISAPPEARED = "file_disappeared"
@@ -102,6 +103,7 @@ class LedgerReason(StrEnum):
 
 
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
+    LedgerReason.USER_EXCLUSION: "File was not inspected because of an explicit caller exclusion.",
     LedgerReason.EXCLUDED_DIRECTORY: ("Directory tree is excluded from the configured scan scope."),
     LedgerReason.HIDDEN_FILE: "Hidden file is excluded from the configured scan scope.",
     LedgerReason.FILE_DISAPPEARED: ("Inventoried file disappeared before it could be inspected."),
@@ -309,6 +311,8 @@ class AnalysisCompleteness(TypedDict):
     entirely_uninspected_files: int
     ledger_exceptions: list[InspectionLedgerException]
     scope_exclusions: list[InspectionLedgerException]
+    exclude_patterns: NotRequired[list[str]]
+    excluded_file_count: NotRequired[int]
     analyzer_statuses: list[dict[str, object]]
     references: NotRequired[list[dict[str, object]]]
     limitations: NotRequired[list[str]]
@@ -1070,6 +1074,12 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_before_filtering": len(findings_by_id),
         "findings_after_filtering": len(validated_effective),
     }
+    patterns = state.get("exclude_patterns", [])
+    if patterns:
+        completeness["exclude_patterns"] = list(patterns)
+        completeness["excluded_file_count"] = sum(
+            item.get("reason") == LedgerReason.USER_EXCLUSION for item in inventory
+        )
     return completeness, validated_effective
 
 

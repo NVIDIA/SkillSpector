@@ -7,6 +7,7 @@ import assert from "node:assert/strict"
 import path from "node:path"
 import {
   CREDENTIAL_ENV_NAMES,
+  LLM_TIMEOUT_MS,
   MAX_STDERR,
   MAX_STDOUT,
   TIMEOUT_MS,
@@ -256,6 +257,37 @@ describe("permissioned execution", () => {
       ask,
     }
   }
+
+  it("lets opted-in LLM scans finish the CLI budget while bounding static scans", async () => {
+    for (const noLlm of [undefined, true, false]) {
+      await executeScan(
+        { target: "./skill", noLlm },
+        context(async () => {}),
+        {
+          runFile: async (_bin, _args, options) => {
+            assert.equal(options.timeout, noLlm === false ? 630_000 : 120_000)
+            return { stdout: "complete report", stderr: "" }
+          },
+          env: {},
+        },
+      )
+    }
+  })
+
+  it("reports the actual LLM process limit and retains partial output on timeout", async () => {
+    const out = await executeScan(
+      { target: "./skill", noLlm: false },
+      context(async () => {}),
+      {
+        runFile: async () => {
+          throw { killed: true, stdout: "partial report" }
+        },
+        env: {},
+      },
+    )
+    assert.ok(out.includes("timed out after 630s"))
+    assert.ok(out.includes("partial report"))
+  })
 
   it("requests scoped host, external-path, process, and LLM permissions", async () => {
     const requests: PermissionRequest[] = []
@@ -688,6 +720,7 @@ describe("childProcessEnv", () => {
 describe("constants", () => {
   it("keeps the documented caps", () => {
     assert.equal(TIMEOUT_MS, 120_000)
+    assert.equal(LLM_TIMEOUT_MS, 630_000)
     assert.equal(MAX_STDOUT, 12_000)
     assert.equal(MAX_STDERR, 6_000)
   })

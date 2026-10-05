@@ -10,6 +10,8 @@ registries, infer ownership/reputation, or trust explanatory prose.
 from __future__ import annotations
 
 import configparser
+import math
+import os
 import re
 import shlex
 import time
@@ -20,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
 from skillspector.inspection_ledger import MAX_FINDING_OUTPUT_RECORDS, LedgerReason
+from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 
 _URL_RE = re.compile(
@@ -42,7 +45,44 @@ _SHELL_SUFFIXES = frozenset({".sh", ".bash", ".zsh"})
 _SHELL_SHEBANG_RE = re.compile(r"^#![^\n]*(?:^|/|\s)(?:ba|z|da|k)?sh(?:\s|$)", re.I)
 
 Assignments = dict[str, list[tuple[int, str | None]]]
-_MAX_ANALYSIS_SECONDS = 5.0
+
+logger = get_logger(__name__)
+
+DEFAULT_MAX_ANALYSIS_SECONDS = 5.0
+
+
+def _max_analysis_seconds_from_environment(value: str | None) -> float:
+    """Return a positive finite dependency-source deadline or the safe default.
+
+    The default is unchanged at 5 s; the setting exists so an operator can raise
+    the ceiling when a slow or loaded machine would otherwise turn the same tree
+    into an incomplete result (#696).
+    """
+    if value is None:
+        return DEFAULT_MAX_ANALYSIS_SECONDS
+    try:
+        seconds = float(value)
+    except ValueError:
+        logger.warning(
+            "SKILLSPECTOR_MAX_DEPENDENCY_SOURCE_ANALYSIS_SECONDS=%r is not numeric, using default %.1fs",
+            value,
+            DEFAULT_MAX_ANALYSIS_SECONDS,
+        )
+        return DEFAULT_MAX_ANALYSIS_SECONDS
+    if not math.isfinite(seconds) or seconds <= 0:
+        logger.warning(
+            "SKILLSPECTOR_MAX_DEPENDENCY_SOURCE_ANALYSIS_SECONDS=%r must be finite and positive, "
+            "using default %.1fs",
+            value,
+            DEFAULT_MAX_ANALYSIS_SECONDS,
+        )
+        return DEFAULT_MAX_ANALYSIS_SECONDS
+    return seconds
+
+
+MAX_ANALYSIS_SECONDS = _max_analysis_seconds_from_environment(
+    os.environ.get("SKILLSPECTOR_MAX_DEPENDENCY_SOURCE_ANALYSIS_SECONDS")
+)
 
 _CANONICAL_DESTINATIONS: dict[str, frozenset[str]] = {
     "npm": frozenset({"https://registry.npmjs.org/"}),
@@ -2193,9 +2233,9 @@ def analyze_dependency_sources_detailed(
     scan = _SourceScan(
         max_findings=max(0, max_findings),
         timeout_seconds=(
-            _MAX_ANALYSIS_SECONDS
+            MAX_ANALYSIS_SECONDS
             if timeout_seconds is None
-            else min(_MAX_ANALYSIS_SECONDS, max(0.0, timeout_seconds))
+            else min(MAX_ANALYSIS_SECONDS, max(0.0, timeout_seconds))
         ),
         local_only_paths={
             str(metadata.get("path", ""))
