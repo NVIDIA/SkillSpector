@@ -323,6 +323,7 @@ The manual `test-provider` CI job and local `make test-provider` target perform 
 | `make test-provider openai` | `OPENAI_API_KEY` | `https://api.openai.com/v1` | `SKILLSPECTOR_OPENAI_TEST_MODEL` |
 | `make test-provider anthropic` | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` | `SKILLSPECTOR_ANTHROPIC_TEST_MODEL` |
 | `make test-provider nv_build` | `NVIDIA_INFERENCE_KEY` | `https://integrate.api.nvidia.com/v1` | `SKILLSPECTOR_NV_BUILD_TEST_MODEL` |
+| `make test-provider gemini` | `GOOGLE_CLOUD_PROJECT` | `https://aiplatform.googleapis.com/v1/...` | `SKILLSPECTOR_GEMINI_TEST_MODEL` |
 | `make test-provider` | Any/all of the provider keys above | All provider default URLs above | Any/all provider model overrides above |
 
 Base URL env vars are not needed for live provider tests; the tests intentionally use provider defaults.
@@ -339,6 +340,7 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
   - `anthropic/` — api.anthropic.com (`ANTHROPIC_API_KEY`)
   - `anthropic_proxy/` — Vertex-style proxy (`ANTHROPIC_PROXY_API_KEY`, `ANTHROPIC_PROXY_ENDPOINT_URL`)
   - `bedrock/` — AWS Bedrock Runtime (standard boto3 credential chain)
+  - `gemini/` — Google Cloud OpenAI-compatible Gemini endpoint (`GOOGLE_CLOUD_PROJECT`, ADC / Workload Identity)
   - `ollama/` — local Ollama OpenAI-compatible endpoint (no API key)
   - `azure_openai/` — Azure OpenAI Service (`AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`)
   - `openai_compatible/` — generic compatible endpoint (`SKILLSPECTOR_COMPAT_API_KEY`, `SKILLSPECTOR_COMPAT_BASE_URL`)
