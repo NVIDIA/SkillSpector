@@ -143,6 +143,15 @@ def test_cached_replacement_analysis_keeps_invalid_python_empty() -> None:
         "subprocess.run = handler\nrestore()\n",
         "original = subprocess.run\ndef restore():\n    subprocess.run = original\n"
         "subprocess.run = handler\ndef unused(default=restore()):\n    pass\n",
+        "subprocess.run = proxy\nsubprocess.__class__ = Restoring\n",
+        "subprocess.__class__ = Restoring\nimport subprocess\nsubprocess.run = proxy\n",
+        "restorer = Untrusted()\nimport subprocess\nsubprocess.run = proxy\ndel restorer\n",
+        "subprocess.run = proxy\ndel subprocess.run\n",
+        "subprocess.run = proxy\nsubprocess.run = handler\n",
+        "subprocess.run = proxy\nimport restore_module\n",
+        "subprocess.run = proxy\nfrom restore_module import restored\n",
+        "subprocess.run = proxy\nimport subprocess, restore_module\n",
+        "restorer = Untrusted()\nimport subprocess\nsubprocess.run = proxy\nrestorer = 0\n",
     ],
 )
 def test_unknown_eager_effect_invalidates_prior_replacement_proof(prefix: str) -> None:

@@ -43,6 +43,9 @@ BOUND_SHELL_VALUE_START_EVIDENCE = "_tm1_bound_shell_value_start"
 BOUND_SHELL_VALUE_END_EVIDENCE = "_tm1_bound_shell_value_end"
 DIRECT_LITERAL_METADATA_EVIDENCE = "_tm1_direct_literal_metadata"
 _DIRECT_CALL_NAMES = frozenset({"subprocess", "Popen"})
+_CACHED_SUBPROCESS_API_SLOTS = frozenset(
+    {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
+)
 _DIRECT_CALLEE = re.compile(r"(?:subprocess\.\w+|Popen)", re.IGNORECASE)
 _SHELL_KEYWORD_PREFIX = re.compile(r"shell\s*=\s*", re.IGNORECASE)
 _MAX_CONTEXT_CHARS = 1024
@@ -1144,6 +1147,9 @@ class _CachedSubprocessState:
         self.changed_methods: set[str] = set()
         self.changed_popen = False
         self.effect_generation = 0
+        self.protocol_unsafe = False
+        self.bound_names: set[str] = set()
+        self.safe_names: set[str] = set()
 
     def copy(self) -> _CachedSubprocessState:
         copied = _CachedSubprocessState()
@@ -1151,6 +1157,9 @@ class _CachedSubprocessState:
         copied.changed_methods = set(self.changed_methods)
         copied.changed_popen = self.changed_popen
         copied.effect_generation = self.effect_generation
+        copied.protocol_unsafe = self.protocol_unsafe
+        copied.bound_names = set(self.bound_names)
+        copied.safe_names = set(self.safe_names)
         return copied
 
     def _invalidate(self) -> None:
@@ -1158,6 +1167,7 @@ class _CachedSubprocessState:
         self.module_names.clear()
         self.changed_methods.clear()
         self.changed_popen = False
+        self.safe_names.clear()
         self.effect_generation += 1
 
     def _passive_value(self, value: ast.expr) -> bool:
@@ -1181,6 +1191,8 @@ class _CachedSubprocessState:
         return True
 
     def blocks(self, call: ast.Call) -> bool:
+        if self.protocol_unsafe:
+            return False
         function = call.func
         if isinstance(function, ast.Name):
             return function.id == "Popen" and self.changed_popen
@@ -1189,7 +1201,31 @@ class _CachedSubprocessState:
     def advance(self, statement: ast.stmt) -> None:
         """Apply only explicit eager bindings; deferred bodies do not execute here."""
         if isinstance(statement, (ast.Import, ast.ImportFrom)):
-            self.module_names.difference_update(_direct_bound_names(statement))
+            imported_names = _direct_bound_names(statement)
+            if any(
+                name in self.bound_names
+                and name not in self.safe_names
+                and name not in self.module_names
+                for name in imported_names
+            ):
+                self._invalidate()
+            ordinary_subprocess_import = (
+                isinstance(statement, ast.Import)
+                and all(imported.name == "subprocess" for imported in statement.names)
+            ) or (
+                isinstance(statement, ast.ImportFrom)
+                and statement.level == 0
+                and statement.module == "subprocess"
+                and all(
+                    imported.name == "Popen" and (imported.asname or imported.name) == "Popen"
+                    for imported in statement.names
+                )
+            )
+            if not ordinary_subprocess_import:
+                self._invalidate()
+            self.module_names.difference_update(imported_names)
+            self.bound_names.update(imported_names)
+            self.safe_names.difference_update(imported_names)
             if isinstance(statement, ast.Import):
                 self.module_names.update(
                     imported.asname or "subprocess"
@@ -1212,8 +1248,16 @@ class _CachedSubprocessState:
                     declarations.visit(child)
                     if isinstance(child, ast.ClassDef):
                         pending_classes.append(child)
+            local_bound = _direct_bound_names(statement).difference(declarations.nonlocal_names)
+            for child in statement.body:
+                local_bound.update(
+                    _direct_bound_names(child).difference(declarations.nonlocal_names)
+                )
+            class_state.bound_names.difference_update(local_bound)
+            class_state.safe_names.difference_update(local_bound)
             for child in statement.body:
                 class_state.advance(child)
+            self.protocol_unsafe |= class_state.protocol_unsafe
             if class_state.effect_generation != self.effect_generation:
                 self.module_names.clear()
                 self.changed_popen = False
@@ -1225,11 +1269,30 @@ class _CachedSubprocessState:
             )
             if "Popen" in declarations.nonlocal_names:
                 self.changed_popen = class_state.changed_popen
+            self.bound_names.update(
+                class_state.bound_names.intersection(declarations.nonlocal_names)
+            )
+            self.safe_names.difference_update(declarations.nonlocal_names)
+            self.safe_names.update(class_state.safe_names.intersection(declarations.nonlocal_names))
+            if (
+                statement.name in self.bound_names
+                and statement.name not in self.safe_names
+                and statement.name not in self.module_names
+            ):
+                self._invalidate()
+            self.bound_names.add(statement.name)
+            self.safe_names.discard(statement.name)
             self.module_names.discard(statement.name)
             return
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if not _function_header_is_passive(statement):
+            if not _function_header_is_passive(statement) or (
+                statement.name in self.bound_names
+                and statement.name not in self.safe_names
+                and statement.name not in self.module_names
+            ):
                 self._invalidate()
+            self.bound_names.add(statement.name)
+            self.safe_names.discard(statement.name)
             self.module_names.discard(statement.name)
             return
         targets: list[ast.expr] = []
@@ -1245,7 +1308,9 @@ class _CachedSubprocessState:
         elif isinstance(statement, ast.AugAssign):
             targets = [statement.target]
         elif isinstance(statement, ast.Delete):
-            targets = list(statement.targets)
+            self._invalidate()
+            self.bound_names.difference_update(_direct_bound_names(statement))
+            return
         else:
             if not (
                 isinstance(statement, (ast.Global, ast.Nonlocal, ast.Pass))
@@ -1261,8 +1326,14 @@ class _CachedSubprocessState:
             and not self._passive_value(value)
         ):
             self._invalidate()
-        before_names = set(self.module_names)
+        rhs_names = (
+            {node.id for node in ast.walk(value) if isinstance(node, ast.Name)}
+            if value is not None
+            else set()
+        )
+        before_names = rhs_names.intersection(self.module_names)
         before_methods = set(self.changed_methods)
+        before_safe = rhs_names.intersection(self.safe_names)
         pending = [(target, value) for target in reversed(targets)]
         while pending:
             target, source = pending.pop()
@@ -1285,14 +1356,32 @@ class _CachedSubprocessState:
             elif isinstance(target, ast.Starred):
                 pending.append((target.value, None))
             elif isinstance(target, ast.Name):
+                self_store = isinstance(source, ast.Name) and source.id == target.id
+                releases_unsafe = (
+                    target.id in self.bound_names
+                    and target.id not in self.safe_names
+                    and target.id not in self.module_names
+                    and not self_store
+                )
+                safe_value = source is not None and _is_finalizer_safe_value(source, before_safe)
                 self.module_names.discard(target.id)
                 if isinstance(source, ast.Name) and source.id in before_names:
                     self.module_names.add(target.id)
+                self.bound_names.add(target.id)
+                self.safe_names.discard(target.id)
+                if safe_value:
+                    self.safe_names.add(target.id)
+                if releases_unsafe:
+                    self._invalidate()
             elif (
                 isinstance(target, ast.Attribute)
                 and isinstance(target.value, ast.Name)
                 and target.value.id in self.module_names
             ):
+                if target.attr not in _CACHED_SUBPROCESS_API_SLOTS or self.protocol_unsafe:
+                    self.protocol_unsafe |= target.attr.startswith("__")
+                    self._invalidate()
+                    continue
                 preserves_slot = (
                     isinstance(source, ast.Attribute)
                     and isinstance(source.value, ast.Name)
@@ -1301,6 +1390,10 @@ class _CachedSubprocessState:
                 )
                 if preserves_slot and target.attr not in before_methods:
                     self.changed_methods.discard(target.attr)
+                elif not preserves_slot and target.attr in before_methods:
+                    # Releasing a previously replaced slot can run an arbitrary
+                    # finalizer after the new store and restore its old value.
+                    self._invalidate()
                 else:
                     self.changed_methods.add(target.attr)
             else:
@@ -1782,6 +1875,12 @@ class _Analyzer:
                 nested_cached.module_names.difference_update(
                     _function_bound_direct_names(statement, nested_cached.module_names)
                 )
+                local_bound = _function_bound_direct_names(statement, nested_cached.bound_names)
+                nested_cached.bound_names.difference_update(local_bound)
+                nested_cached.safe_names.difference_update(local_bound)
+                parameters = _function_parameter_names(statement)
+                nested_cached.bound_names.update(parameters)
+                nested_cached.safe_names.difference_update(parameters)
                 self._scan_block(
                     statement.body,
                     trusted_names=nested_trusted_names,
