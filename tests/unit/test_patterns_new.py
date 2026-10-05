@@ -1850,6 +1850,43 @@ guidance = "Set the flag to --no-verify to skip deterministic result verificatio
         content = "For example, never set privileged: true in your manifests."
         assert any(f.rule_id == "TM4" for f in tm_mod.analyze(content, "README.md", "markdown"))
 
+    def test_tm4_reference_material_is_tagged_with_confidence_unchanged(self) -> None:
+        """A manifest under references/ is tagged for triage but keeps full TM4 confidence."""
+        content = "      securityContext:\n        privileged: true"
+        findings = tm_mod.analyze(content, "references/vendor.md", "markdown")
+        tm4 = [f for f in findings if f.rule_id == "TM4"]
+        assert tm4
+        assert tm4[0].severity == Severity.HIGH
+        assert tm4[0].confidence == pytest.approx(0.7)
+        assert {"contextual-triage", "likely-benign-context"} <= set(tm4[0].tags)
+
+    def test_tm4_skill_md_instruction_keeps_full_confidence(self) -> None:
+        """The same manifest in SKILL.md instructs the agent and is not tagged as reference."""
+        content = "      securityContext:\n        privileged: true"
+        findings = tm_mod.analyze(content, "SKILL.md", "markdown")
+        tm4 = [f for f in findings if f.rule_id == "TM4"]
+        assert tm4
+        assert tm4[0].confidence == pytest.approx(0.7)
+        assert "likely-benign-context" not in tm4[0].tags
+
+    def test_tm4_reference_manifest_is_not_tagged(self) -> None:
+        """Only markdown/text reference material is tagged, never a manifest."""
+        content = "      securityContext:\n        privileged: true"
+        findings = tm_mod.analyze(content, "references/ds.yaml", "yaml")
+        tm4 = [f for f in findings if f.rule_id == "TM4"]
+        assert tm4
+        assert tm4[0].confidence == pytest.approx(0.7)
+        assert "likely-benign-context" not in tm4[0].tags
+
+    def test_tm4_nested_references_dir_is_not_tagged(self) -> None:
+        """Only the top-level references/ directory counts, not a nested one."""
+        content = "      securityContext:\n        privileged: true"
+        findings = tm_mod.analyze(content, "docs/references/vendor.md", "markdown")
+        tm4 = [f for f in findings if f.rule_id == "TM4"]
+        assert tm4
+        assert tm4[0].confidence == pytest.approx(0.7)
+        assert "likely-benign-context" not in tm4[0].tags
+
     def test_safe_content_produces_no_findings(self) -> None:
         findings = tm_mod.analyze(
             "import json\ndata = json.loads(input_str)", "parser.py", "python"
