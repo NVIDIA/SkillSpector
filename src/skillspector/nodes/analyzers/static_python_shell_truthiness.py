@@ -1323,6 +1323,31 @@ class _CachedSubprocessState:
                 self._invalidate()
             return
 
+        native_api_value = value is not None and any(
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in self.module_names
+            and node.attr in _CACHED_SUBPROCESS_API_SLOTS
+            and node.attr not in self.changed_methods
+            or isinstance(node, ast.Name)
+            and node.id == "Popen"
+            and not self.changed_popen
+            for node in ast.walk(value)
+        )
+        same_slot_identity = (
+            len(targets) == 1
+            and isinstance(targets[0], ast.Attribute)
+            and isinstance(targets[0].value, ast.Name)
+            and targets[0].value.id in self.module_names
+            and isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and value.value.id in self.module_names
+            and targets[0].attr == value.attr
+        )
+        # A native callable capture or cross-slot store cannot establish a
+        # custom replacement. Abstain without tracking callable value aliases.
+        if native_api_value and not same_slot_identity:
+            self._invalidate()
         if (
             isinstance(statement, ast.AugAssign)
             or value is not None
