@@ -53,11 +53,13 @@ from skillspector.providers import (
 from skillspector.providers._agent_cli import (
     _OPENCODE_AGENT_PREFIX,
     _OPENCODE_DENY_ALL,
-    _OPENCODE_SUPPORTED_VERSION,
+    _OPENCODE_MAX_VERSION,
+    _OPENCODE_MIN_VERSION,
     AgentCLIError,
     _build_opencode_argv,
     _opencode_auth_check,
     _parse_opencode_output,
+    _parse_opencode_version,
     _prepare_opencode_env,
     _run_bounded,
     run_agent_cli,
@@ -73,7 +75,7 @@ _AUTH_LIST_OK = (
 _AUTH_LIST_EMPTY = b"0 credentials\n0 environment variables\n"
 _AUTH_LIST_SINGULAR = b"1 credential\n1 environment variable\n"
 _AUTH_LIST_UNPARSEABLE = b"authentication status unknown\n"
-_VERSION_OK = f"{_OPENCODE_SUPPORTED_VERSION}\n".encode()
+_VERSION_OK = b"1.18.33\n"
 
 
 def _ok_result(stdout: bytes = _AUTH_LIST_OK) -> SimpleNamespace:
@@ -261,7 +263,7 @@ class TestOpencodeAuthCheck:
         mock_run.return_value = _ok_result(b"1.18.99\n")
         ok, reason = _opencode_auth_check(OPENCODE_BINARY)
         assert ok is False
-        assert _OPENCODE_SUPPORTED_VERSION in (reason or "")
+        assert "1.18.31" in (reason or "") and "1.18.34" in (reason or "")
         mock_run.assert_called_once()
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
@@ -289,6 +291,36 @@ class TestOpencodeAuthCheck:
         ok, reason = _opencode_auth_check(OPENCODE_BINARY)
         assert ok is False
         assert "auth login" in (reason or "")
+
+
+class TestOpencodeVersionRange:
+    @pytest.mark.parametrize("version", ["1.18.31", "1.18.32", "1.18.33", "1.18.34"])
+    def test_parse_supported_versions_compare_in_range(self, version: str) -> None:
+        parsed = _parse_opencode_version(f"{version}\n".encode())
+        assert parsed is not None
+        assert _OPENCODE_MIN_VERSION <= parsed <= _OPENCODE_MAX_VERSION
+
+    @pytest.mark.parametrize(
+        "raw", [b"1.18.30\n", b"1.18.35\n", b"1.18.34-1\n", b"garbage\n", b"\n"]
+    )
+    def test_parse_unsupported_versions_rejected(self, raw: bytes) -> None:
+        parsed = _parse_opencode_version(raw)
+        assert parsed is None or not (_OPENCODE_MIN_VERSION <= parsed <= _OPENCODE_MAX_VERSION)
+
+    @pytest.mark.parametrize("version", ["1.18.31", "1.18.32", "1.18.34"])
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_accepts_range_versions(self, mock_run: MagicMock, version: str) -> None:
+        mock_run.side_effect = [_ok_result(f"{version}\n".encode()), _ok_result()]
+        assert _opencode_auth_check(OPENCODE_BINARY) == (True, None)
+
+    @pytest.mark.parametrize("version", ["1.18.30", "1.18.35"])
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_rejects_out_of_range_versions(self, mock_run: MagicMock, version: str) -> None:
+        mock_run.return_value = _ok_result(f"{version}\n".encode())
+        ok, reason = _opencode_auth_check(OPENCODE_BINARY)
+        assert ok is False
+        assert "1.18.31" in (reason or "") and "1.18.34" in (reason or "")
+        mock_run.assert_called_once()
 
 
 class TestOpencodeDenyAllPolicy:
@@ -335,7 +367,7 @@ class TestOpencodeDenyAllPolicy:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_OPENCODE_VERSION", {_OPENCODE_SUPPORTED_VERSION!r}))
+                    print(os.environ.get("FAKE_OPENCODE_VERSION", '1.18.33'))
                     raise SystemExit(0)
 
                 config = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])
@@ -433,7 +465,7 @@ class TestOpencodeDenyAllPolicy:
         monkeypatch.setenv("FAKE_OPENCODE_VERSION", "1.18.99")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
-        with pytest.raises(AgentCLIError, match=f"only for version {_OPENCODE_SUPPORTED_VERSION}"):
+        with pytest.raises(AgentCLIError, match="only for versions 1.18.31 through 1.18.34"):
             run_agent_cli("opencode", "try a newer runtime", model="")
         assert list(markers.iterdir()) == []
 
