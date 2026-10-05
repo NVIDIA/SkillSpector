@@ -458,15 +458,13 @@ def test_local_registry_bounds_read_before_parsing(
 def test_local_registry_rejects_fifo_swap_without_blocking(tmp_path: Path) -> None:
     capture = tmp_path / "registry.json"
     capture.write_text('{"servers": []}', encoding="utf-8")
-    # Bound the risky operation separately from interpreter/package startup.
-    # Cold imports can exceed five seconds on a busy filesystem.
+    # Keep a regressed blocking open contained in a child with a hard timeout.
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             """
 import os
-import signal
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -483,28 +481,20 @@ def swap_after_check(path):
         os.mkfifo(path)
     return is_file
 
-def timed_out(_signum, _frame):
-    raise TimeoutError("registry scan blocked on the swapped FIFO")
-
-signal.signal(signal.SIGALRM, timed_out)
-signal.alarm(5)
-try:
-    with patch.object(Path, "is_file", swap_after_check):
-        try:
-            scan_registry(str(capture))
-        except ValueError as exc:
-            assert "MCP Registry source failed" in str(exc), str(exc)
-            assert "regular file" in str(exc), str(exc)
-        else:
-            raise AssertionError("swapped FIFO must be rejected")
-finally:
-    signal.alarm(0)
+with patch.object(Path, "is_file", swap_after_check):
+    try:
+        scan_registry(str(capture))
+    except ValueError as exc:
+        assert "MCP Registry source failed" in str(exc), str(exc)
+        assert "regular file" in str(exc), str(exc)
+    else:
+        raise AssertionError("swapped FIFO must be rejected")
 """,
             str(capture),
         ],
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=5,
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr

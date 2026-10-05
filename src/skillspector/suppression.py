@@ -662,8 +662,9 @@ def _restrict_baseline_temporary(descriptor: int) -> None:
         init_acl = libc.acl_init
         set_acl = libc.acl_set_fd_np
         free_acl = libc.acl_free
-    except AttributeError as error:
-        raise OSError(errno.ENOTSUP, "Cannot clear inherited baseline ACLs") from error
+    except AttributeError:
+        # Filesystems/platforms without extended ACL support need only mode bits.
+        return
     init_acl.argtypes = [ctypes.c_int]
     init_acl.restype = ctypes.c_void_p
     set_acl.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
@@ -675,18 +676,57 @@ def _restrict_baseline_temporary(descriptor: int) -> None:
         raise OSError(ctypes.get_errno(), "Could not initialize baseline ACL")
     try:
         if set_acl(descriptor, empty_acl, 0x100) != 0:  # ACL_TYPE_EXTENDED
-            raise OSError(ctypes.get_errno(), "Could not clear inherited baseline ACLs")
+            error = ctypes.get_errno()
+            if error not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+                raise OSError(error, "Could not clear inherited baseline ACLs")
     finally:
         free_acl(empty_acl)
 
 
+def _preserve_baseline_acl(source: int, destination: int) -> None:
+    """Copy an existing access ACL through descriptors before publication."""
+    if sys.platform == "darwin":
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        get_acl = libc.acl_get_fd_np
+        set_acl = libc.acl_set_fd_np
+        free_acl = libc.acl_free
+        get_acl.argtypes = [ctypes.c_int, ctypes.c_int]
+        get_acl.restype = ctypes.c_void_p
+        set_acl.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        set_acl.restype = ctypes.c_int
+        free_acl.argtypes = [ctypes.c_void_p]
+        free_acl.restype = ctypes.c_int
+        acl = get_acl(source, 0x100)
+        if not acl:
+            error = ctypes.get_errno()
+            if error in {errno.ENOENT, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                return
+            raise OSError(error, "Could not read existing baseline ACL")
+        try:
+            if set_acl(destination, acl, 0x100) != 0:
+                raise OSError(ctypes.get_errno(), "Could not preserve existing baseline ACL")
+        finally:
+            free_acl(acl)
+    elif sys.platform.startswith("linux"):
+        try:
+            acl = os.getxattr(source, "system.posix_acl_access")
+        except OSError as error:
+            if error.errno in {errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                return
+            raise
+        os.setxattr(destination, "system.posix_acl_access", acl)
+
+
 def dump_baseline(data: dict[str, object], path: str | Path) -> None:
-    """Validate and atomically replace a regular baseline (``.json`` -> JSON).
+    """Validate and write a regular baseline (``.json`` -> JSON).
 
     On POSIX, new files have owner-only permissions. Replacements preserve
-    ownership and existing owner read/write bits, clearing group/other bits;
-    the old file must be writable. Symlinks and special files are rejected.
-    Concurrent writers publish complete documents; the last replacement wins.
+    ownership and ordinary permission bits; the old file must be writable.
+    Non-owner writers update the validated descriptor in place, preserving its
+    permissions and ACLs without requiring chown. That shared-file path is not
+    atomic for readers or crash-safe. Symlinks and special files are rejected.
     """
     baseline_from_dict(data)
     p = Path(path)
@@ -697,6 +737,11 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
             json.dumps(data, indent=2, ensure_ascii=False)
             .encode("utf-8", errors="backslashreplace")
             .decode("utf-8")
+        )
+        # JSON permits these raw characters, but YAML rejects most of them and
+        # folds NEL into a space. The loader reads both formats through PyYAML.
+        content = re.sub(
+            r"[\x7f-\x9f\ufffe\uffff]", lambda match: f"\\u{ord(match[0]):04x}", content
         )
     else:
         header = (
@@ -726,9 +771,31 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
         flags = os.O_WRONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(p, flags)
         try:
-            destination = os.fstat(descriptor)
-            if not S_ISREG(destination.st_mode):
+            opened = os.fstat(descriptor)
+            if not S_ISREG(opened.st_mode):
                 raise ValueError(f"Baseline output must be a regular file: {p}")
+            if (opened.st_dev, opened.st_ino) != (destination.st_dev, destination.st_ino):
+                raise ValueError(f"Baseline output changed while opening: {p}")
+            destination = opened
+            if os.name == "posix" and os.geteuid() not in {0, destination.st_uid}:
+                # Replacing somebody else's writable file would require chown
+                # and would discard its ACLs. Serialize cooperating shared-file
+                # writers and keep this already validated inode instead.
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                current = p.lstat()
+                if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise ValueError(f"Baseline output changed before writing: {p}")
+                remaining = memoryview(encoded)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise OSError(errno.EIO, "Could not write shared baseline", str(p))
+                    remaining = remaining[written:]
+                os.ftruncate(descriptor, len(encoded))
+                os.fsync(descriptor)
+                return
         finally:
             os.close(descriptor)
 
@@ -745,11 +812,24 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
                 current = os.fstat(temporary.fileno())
                 if (current.st_uid, current.st_gid) != (destination.st_uid, destination.st_gid):
                     os.fchown(temporary.fileno(), destination.st_uid, destination.st_gid)
-                # Do not broaden group/other access when replacing a file whose
-                # ACL metadata may be more restrictive than its mode bits.
-                mode = S_IMODE(destination.st_mode) & 0o600
+                # Keep existing group writers/readers. Newly generated files
+                # remain private; replacing one does not revoke shared access.
+                mode = S_IMODE(destination.st_mode) & 0o777
                 if os.name == "posix":
                     os.fchmod(temporary.fileno(), mode)
+                    # Clearing inherited ACLs must not remove a restrictive or
+                    # shared access ACL from the existing destination.
+                    original = os.open(p, flags)
+                    try:
+                        current = os.fstat(original)
+                        if (current.st_dev, current.st_ino) != (
+                            destination.st_dev,
+                            destination.st_ino,
+                        ):
+                            raise ValueError(f"Baseline output changed before replacement: {p}")
+                        _preserve_baseline_acl(original, temporary.fileno())
+                    finally:
+                        os.close(original)
                 else:
                     os.chmod(temporary_path, mode)
             os.fsync(temporary.fileno())

@@ -1089,7 +1089,14 @@ def test_dump_baseline_rejects_unloadable_output_without_overwriting(
 
 
 @pytest.mark.parametrize("suffix", [".yaml", ".json"])
-@pytest.mark.parametrize("reason", ["Accepted 🚀 𐐷\twith\nnotes", "Accepted \ud800 lone surrogate"])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "Accepted 🚀 𐐷\twith\nnotes",
+        "Accepted \ud800 lone surrogate",
+        "Accepted \x7f\x80\x85\x9f\ufffe\uffff controls",
+    ],
+)
 def test_dump_baseline_preserves_unicode_reason(tmp_path: Path, suffix: str, reason: str) -> None:
     output = tmp_path / f"baseline{suffix}"
     data = build_baseline_dict(
@@ -1157,16 +1164,89 @@ def test_dump_baseline_keeps_destination_on_io_failure(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX file modes")
-@pytest.mark.parametrize("mode", [0o600, 0o640, 0o644])
-def test_dump_baseline_limits_existing_permissions_to_owner(tmp_path: Path, mode: int) -> None:
+@pytest.mark.parametrize("mode", [0o600, 0o640, 0o644, 0o664])
+def test_dump_baseline_preserves_existing_permissions(tmp_path: Path, mode: int) -> None:
     output = tmp_path / "baseline.yaml"
     output.write_text("existing baseline", encoding="utf-8")
     output.chmod(mode)
 
     dump_baseline({"version": 2}, output)
 
-    assert S_IMODE(output.stat().st_mode) == mode & 0o600
+    assert S_IMODE(output.stat().st_mode) == mode
     assert load_baseline(output).is_empty()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_dump_baseline_shared_writer_preserves_inode_and_group_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "baseline.json"
+    output.write_text("old baseline" * 200, encoding="utf-8")
+    output.chmod(0o664)
+    old = output.stat()
+    # Force the non-owner branch without privileged OS ownership changes.
+    monkeypatch.setattr(os, "geteuid", lambda: old.st_uid + 1)
+
+    def no_chown(*args: object) -> None:
+        pytest.fail("a shared writer must not require chown")
+
+    monkeypatch.setattr(os, "fchown", no_chown)
+    dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "shared"}]}, output)
+
+    assert load_baseline(output).rules[0].reason == "shared"
+    assert (output.stat().st_uid, output.stat().st_gid, output.stat().st_ino) == (
+        old.st_uid,
+        old.st_gid,
+        old.st_ino,
+    )
+    assert S_IMODE(output.stat().st_mode) == 0o664
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_dump_baseline_rejects_destination_swap_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.write_text("original", encoding="utf-8")
+    replacement = tmp_path / "other.yaml"
+    replacement.write_text("replacement", encoding="utf-8")
+    original_open = os.open
+
+    def swapped_open(path, flags, *args, **kwargs):
+        if Path(path) == output:
+            os.replace(replacement, output)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapped_open)
+    with pytest.raises(ValueError, match="changed while opening"):
+        dump_baseline({"version": 2}, output)
+    assert output.read_text(encoding="utf-8") == "replacement"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+@pytest.mark.parametrize("error", [errno.ENOTSUP, errno.EOPNOTSUPP])
+def test_dump_baseline_accepts_filesystem_without_extended_acls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: int
+) -> None:
+    import ctypes
+    from types import SimpleNamespace
+
+    def unsupported_acl(descriptor: int, acl: int, acl_type: int) -> int:
+        ctypes.set_errno(error)
+        return -1
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda *args, **kwargs: SimpleNamespace(
+            acl_init=lambda count: 1, acl_set_fd_np=unsupported_acl, acl_free=lambda acl: 0
+        ),
+    )
+    output = tmp_path / "baseline.yaml"
+    dump_baseline({"version": 2}, output)
+    assert load_baseline(output).is_empty()
+    assert S_IMODE(output.stat().st_mode) == 0o600
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX file modes")
@@ -1297,6 +1377,31 @@ def test_dump_baseline_clears_inherited_macos_acl(tmp_path: Path, mode: int | No
             output.read_bytes()
     else:
         assert load_baseline(output).is_empty()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS access ACLs")
+def test_dump_baseline_preserves_existing_macos_access_acl(tmp_path: Path) -> None:
+    import subprocess
+
+    output = tmp_path / "baseline.yaml"
+    output.write_text("existing", encoding="utf-8")
+    output.chmod(0o664)
+    subprocess.run(
+        ["/bin/chmod", "+a", "everyone deny read", str(output)],
+        check=True,
+        capture_output=True,
+    )
+    old_listing = subprocess.run(
+        ["/bin/ls", "-le", str(output)], check=True, capture_output=True, text=True
+    ).stdout.splitlines()[1:]
+
+    dump_baseline({"version": 2}, output)
+
+    listing = subprocess.run(
+        ["/bin/ls", "-le", str(output)], check=True, capture_output=True, text=True
+    ).stdout.splitlines()[1:]
+    assert listing == old_listing
+    assert S_IMODE(output.stat().st_mode) == 0o664
 
 
 @pytest.mark.parametrize("suffix", [".yaml", ".json"])

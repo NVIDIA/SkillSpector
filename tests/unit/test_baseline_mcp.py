@@ -24,7 +24,6 @@ from skillspector.cli import app
 from skillspector.sarif_models import validate_sarif_report
 from skillspector.suppression import load_baseline
 
-pytestmark = pytest.mark.integration
 
 _EXPECTED_LOCATIONS = {
     ("TM1", "SKILL.md", 7),

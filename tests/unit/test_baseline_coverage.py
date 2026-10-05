@@ -22,7 +22,6 @@ from skillspector.cli import app
 from skillspector.graph import graph
 from skillspector.sarif_models import validate_sarif_report
 
-pytestmark = pytest.mark.integration
 
 _EXPECTED_LOCATIONS = {
     ("TM1", "SKILL.md", 7),
@@ -80,6 +79,21 @@ def _generate(skill: Path, destination: Path) -> dict[str, Any]:
     assert result.exit_code == 0, result.stdout + result.stderr
     content = destination.read_text(encoding="utf-8")
     return json.loads(content) if destination.suffix == ".json" else yaml.safe_load(content)
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+def test_cli_baseline_control_character_reason_round_trip(tmp_path: Path, suffix: str) -> None:
+    skill = _write_skill(tmp_path)
+    output = tmp_path / f"baseline{suffix}"
+    reason = "Accepted 🚀 \x7f\x80\x85\x9f\ufffe\uffff controls"
+    generated = _cli("baseline", str(skill), "--no-llm", "-o", str(output), "--reason", reason)
+    assert generated.exit_code == 0, generated.stdout + generated.stderr
+    rescanned = _scan(skill, "--baseline", str(output))
+    assert rescanned.exit_code == 0, rescanned.stdout + rescanned.stderr
+    report = json.loads(rescanned.stdout)
+    assert report["issues"] == []
+    assert {finding["suppression_reason"] for finding in report["suppressed"]} == {reason}
+    assert report["suppressed_count"] == _EXPECTED_COUNT
 
 
 @pytest.mark.parametrize("baseline_mode", ["yaml-explicit", "json-explicit", "yaml-shipped"])
