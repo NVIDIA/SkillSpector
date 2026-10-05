@@ -304,12 +304,13 @@ _ACTIVE_FINDING_BUDGET: ContextVar[_FindingBudget | None] = ContextVar(
 )
 
 
-@functools.lru_cache(maxsize=2)
-def _python_category_ranges(ascii_only: bool) -> dict[str, str]:
+@functools.lru_cache(maxsize=4)
+def _python_category_ranges(ascii_only: bool, ascii_content: bool = False) -> dict[str, str]:
     """Keep the runtime's Python word/space/digit alphabet, not regex's Unicode version."""
     categories: dict[str, list[tuple[int, int]]] = {key: [] for key in "wWsSdD"}
     budget = _ACTIVE_FINDING_BUDGET.get()
-    for value in range(sys.maxunicode + 1):
+    alphabet_size = 128 if ascii_only or ascii_content else sys.maxunicode + 1
+    for value in range(alphabet_size):
         if budget is not None and value % 4096 == 0:
             budget.check_runtime()
         character = chr(value)
@@ -322,6 +323,9 @@ def _python_category_ranges(ascii_only: bool) -> dict[str, str]:
                 ranges[-1] = (ranges[-1][0], value)
             else:
                 ranges.append((value, value))
+    if alphabet_size == 128:
+        for key in "WSD":
+            categories[key].append((128, sys.maxunicode))
     return {
         key: "".join(
             rf"\U{start:08x}" if start == end else rf"\U{start:08x}-\U{end:08x}"
@@ -332,7 +336,7 @@ def _python_category_ranges(ascii_only: bool) -> dict[str, str]:
 
 
 @functools.lru_cache(maxsize=512)
-def _timed_pattern(source: str, flags: int) -> regex.Pattern[str]:
+def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> regex.Pattern[str]:
     """Translate the static-rule grammar while retaining original match offsets.
 
     Scoped flags and verbose rules need their own grammar support. Reject them
@@ -355,7 +359,10 @@ def _timed_pattern(source: str, flags: int) -> regex.Pattern[str]:
                     token = token[:insert] + alias + token[insert:]
         return token
 
-    categories = _python_category_ranges(bool(flags & re.ASCII))
+    # ASCII input needs only ASCII category members. Keep the original flags:
+    # Unicode \s includes ASCII control separators, and Unicode literals can
+    # still fold to ASCII letters under IGNORECASE.
+    categories = _python_category_ranges(bool(flags & re.ASCII), ascii_content)
     word = "(?-i:[" + categories["w"] + "])"
     parts: list[str] = []
     cursor = 0
@@ -452,7 +459,7 @@ def iter_pattern_matches(
     if budget is not None:
         budget.check_runtime()
     original = re.compile(pattern, flags)
-    compiled = _timed_pattern(original.pattern, original.flags)
+    compiled = _timed_pattern(original.pattern, original.flags, content.isascii())
     timeout = _STATIC_PATTERN_SECONDS
     if budget is not None:
         budget.check_runtime()
