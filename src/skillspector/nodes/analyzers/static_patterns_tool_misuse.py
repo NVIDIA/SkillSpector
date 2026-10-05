@@ -3371,7 +3371,7 @@ def _lexical_shell_has_counterevidence(
         current_scope = candidate.call_scope_chain[-1]
         if current_scope is not receiver_scope:
             method_events += binding_events(current_scope, method_name)
-        receiver_events = tuple(sorted(set((*receiver_events, *method_events))))
+        receiver_events = tuple(sorted({*receiver_events, *method_events}))
     receiver_index = bisect_right(receiver_events, (call_start, True))
     if receiver_index:
         # An explicit fresh import supersedes earlier replacement evidence.
