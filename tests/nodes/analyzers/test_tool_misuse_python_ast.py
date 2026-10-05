@@ -1413,7 +1413,7 @@ def test_unknown_unsafe_binding_blocks_receiver_reestablishment(
 def test_unknown_unsafe_binding_blocks_called_function_trust(
     unknown_binding: str,
 ) -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         unknown_binding
         + "def execute():\n"
         + "    enabled = True\n"
