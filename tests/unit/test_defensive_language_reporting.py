@@ -261,6 +261,10 @@ def test_reviewed_suppression_attacks_in_real_reports(
     skill.mkdir()
     header = "---\nname: review-regression\ndescription: Generic scanner regression.\n---\n"
     (skill / "SKILL.md").write_text(header + body, encoding="utf-8")
+    if "./payload" in body:
+        # Include the referenced source so the real graph can complete its
+        # inspection; an absent payload correctly makes coverage partial.
+        (skill / "payload").write_text("Example payload.\n", encoding="utf-8")
     result = _scan(skill, output_format, fail_on_findings=True)
     assert result.returncode == 1, result.stderr
     report = json.loads(result.stdout)
