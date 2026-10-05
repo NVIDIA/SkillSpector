@@ -461,6 +461,11 @@ def _parse_gemini_output(raw: str) -> str:
 _OPENCODE_AGENT_PREFIX = "skillspector-deny-all"
 _OPENCODE_DENY_ALL = json.dumps({"*": "deny"}, separators=(",", ":"))
 _OPENCODE_SUPPORTED_VERSION = "1.18.33"
+# Markers of a Zen free-tier refusal. Zen answers 403 to
+# any call carrying the deny-all isolation (OPENCODE_CONFIG_CONTENT or
+# OPENCODE_PERMISSION alone suffices; verified by env bisect), so free-tier
+# models and this sandbox are mutually exclusive until Zen's policy changes.
+_ZEN_FREE_TIER_MARKERS = ("FreeTierError", "can only be used from within OpenCode")
 
 
 def _opencode_agent_name(argv: list[str]) -> str:
@@ -1245,6 +1250,17 @@ def run_agent_cli(
         raise AgentCLIError(f"{binary_name} timed out after {timeout}s")
     if returncode != 0:
         stderr_snippet = stderr_raw[:500].decode("utf-8", errors="replace")
+        stdout_snippet = stdout_raw[:2000].decode("utf-8", errors="replace")
+        if binary_name == "opencode" and any(
+            marker in stdout_snippet for marker in _ZEN_FREE_TIER_MARKERS
+        ):
+            raise AgentCLIError(
+                "opencode Zen refused the call: its free tier can only be used "
+                "from within OpenCode, and it rejects the deny-all sandbox "
+                "isolation this provider requires. Use a key-backed model "
+                "instead, or retry if Zen's policy changes. Refusing to "
+                "weaken the sandbox: no fallback without isolation."
+            )
         raise AgentCLIError(
             f"{binary_name} exited with code {returncode}; stderr={stderr_snippet!r}"
         )
