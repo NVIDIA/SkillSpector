@@ -191,3 +191,30 @@ def test_cached_replacement_proof_respects_eager_expression_order(
     )
     assert bool(replacements) is replacement
     assert not emitted
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "restorer = 0\nimport subprocess\nclass Tool:\n"
+        "    helper()\n    import subprocess\n    subprocess.run = proxy\n"
+        "restorer = 0\nenabled = True\nsubprocess.run(command, shell=enabled)\n",
+        "helper()\nimport subprocess\nsubprocess.run = proxy\nrestorer = 0\n"
+        "enabled = True\nsubprocess.run(command, shell=enabled)\n",
+        "import subprocess\nenabled = True\nhelper()\nimport subprocess\n"
+        "subprocess.run = proxy\nsubprocess.run(command, shell=enabled)\n",
+        "import subprocess\nsubprocess.run = proxy\ndef work():\n"
+        "    import subprocess\n    enabled = 1\n"
+        "    subprocess.run(command, shell=enabled)\nwork()\nhelper()\n"
+        "import subprocess\nsubprocess.run = proxy\nwork()\n",
+    ],
+    ids=["class-outer-finalizer", "unknown-new-binding", "unknown-protocol", "later-observation"],
+)
+def test_unknown_effect_cannot_reestablish_cached_replacement_proof(source: str) -> None:
+    # Reimporting the same cached module does not establish that an unknown
+    # earlier effect left its lookup protocol or other finalizer bindings intact.
+    ownership, _, replacements = truthiness.bound_shell_call_analysis(
+        "run.py", parse_python_source(source, "run.py")
+    )
+    assert len(ownership) == 1
+    assert not replacements

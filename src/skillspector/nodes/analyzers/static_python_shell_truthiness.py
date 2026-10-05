@@ -1191,7 +1191,9 @@ class _CachedSubprocessState:
         return True
 
     def blocks(self, call: ast.Call) -> bool:
-        if self.protocol_unsafe:
+        # A later import or slot write cannot establish that an unknown earlier
+        # effect left the cached module's protocol and finalizer bindings intact.
+        if self.protocol_unsafe or self.effect_generation > 0:
             return False
         function = call.func
         if isinstance(function, ast.Name):
@@ -1261,6 +1263,7 @@ class _CachedSubprocessState:
             if class_state.effect_generation != self.effect_generation:
                 self.module_names.clear()
                 self.changed_popen = False
+                self.safe_names.clear()
                 self.effect_generation = class_state.effect_generation
             self.changed_methods = class_state.changed_methods
             self.module_names.difference_update(declarations.nonlocal_names)
@@ -1825,6 +1828,9 @@ class _Analyzer:
                             deferred_cached.changed_methods
                         )
                         prior_cached.changed_popen &= deferred_cached.changed_popen
+                        prior_cached.effect_generation = max(
+                            prior_cached.effect_generation, deferred_cached.effect_generation
+                        )
 
             changed_names = _direct_bound_names(candidate)
             for name in changed_names:
