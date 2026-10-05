@@ -96,6 +96,13 @@ def test_cli_version() -> None:
     assert "v" in result.output
 
 
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "example.com"])
+def test_mcp_cli_rejects_exposed_http_binding(host: str) -> None:
+    result = runner.invoke(app, ["mcp", "--transport", "http", "--host", host])
+    assert result.exit_code == 2
+    assert "must bind to a loopback IP" in result.output
+
+
 def test_discovered_files_tree_renders_untrusted_names_literally() -> None:
     """File names cannot inject Rich markup or terminal control sequences."""
     malicious_name = "\x1b]52;c;SGVsbG8=\x1b\\[conceal]hidden.py"
