@@ -4042,11 +4042,30 @@ def postprocess_path_findings(
     ownership, emitted = static_python_shell_truthiness.bound_shell_call_state(
         file_path, python_ast
     )
+    retained_companion_locations = {
+        (finding.start_line, finding.start_column)
+        for finding in findings
+        if finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is True
+    }
+    emitted = {
+        key
+        for key in emitted
+        if (key[0], python_ast.character_column(key[0], key[1])) in retained_companion_locations
+    }
     ownership_by_start = {
         (line, column): trusted
         for (line, byte_column, _, _), trusted in ownership.items()
         if (column := python_ast.character_column(line, byte_column)) is not None
     }
+
+    candidates_by_location: dict[tuple[int, int | None], list[_VariableShellCandidate]] = {}
+    for candidates in resolved.values():
+        for candidate in candidates:
+            location = (
+                candidate.call.lineno,
+                python_ast.character_column(candidate.call.lineno, candidate.call.col_offset),
+            )
+            candidates_by_location.setdefault(location, []).append(candidate)
 
     reconciled: list[Finding] = []
     for finding in findings:
@@ -4055,18 +4074,7 @@ def postprocess_path_findings(
         if direct_true is True:
             location = (finding.start_line, finding.start_column)
             if finding.start_column is not None and ownership_by_start.get(location) is False:
-                matching = [
-                    candidate
-                    for values in resolved.values()
-                    for candidate in values
-                    if (
-                        candidate.call.lineno,
-                        python_ast.character_column(
-                            candidate.call.lineno, candidate.call.col_offset
-                        ),
-                    )
-                    == location
-                ]
+                matching = candidates_by_location.get(location, [])
                 if len(matching) == 1 and _lexical_shell_has_counterevidence(
                     ast_index, python_ast, matching[0], receiver_trusted=False
                 ):
