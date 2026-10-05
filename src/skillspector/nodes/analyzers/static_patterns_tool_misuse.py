@@ -188,11 +188,11 @@ _ROOT_GLOB_AFFIRMATIVE_NEGATION_PREFIX_RE = re.compile(
 
 # Match a literal True assigned to a local name shortly before it is passed as
 # shell=<name> to a subprocess invocation.  The bounded newline gap and the
-# intervening-write guard keep this a local data-flow fact; Python scope
+# AST binding-evidence guard keep this a local data-flow fact; Python scope
 # visibility is enforced separately in analyze() via _VARIABLE_SHELL_FLAG_RE.
 _VARIABLE_SHELL_FLAG_PATTERN = (
     r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*True\s*$\n"
-    r"(?:(?![^\n]*\b\1\s*=)[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
+    r"(?:[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
     r"(?:subprocess\.\w+|Popen)\s*\([^)]*\bshell\s*=\s*\1\b"
 )
 _VARIABLE_SHELL_FLAG_RE = re.compile(_VARIABLE_SHELL_FLAG_PATTERN, re.IGNORECASE | re.MULTILINE)
@@ -3115,6 +3115,7 @@ class _VariableShellAstIndex:
     bindings: dict[ast.AST, frozenset[str]]
     class_binding_starts: dict[ast.ClassDef, dict[str, tuple[int, ...]]]
     declarations: dict[ast.AST, dict[str, str]]
+    binding_events: dict[tuple[ast.AST, ast.AST], dict[str, tuple[tuple[int, bool], ...]]]
 
 
 @dataclass(frozen=True)
@@ -3125,6 +3126,9 @@ class _VariableShellCandidate:
     call: ast.Call
     same_scope: bool
     visible: bool
+    assignment_start: int
+    assignment_scope: ast.AST
+    call_scope_chain: tuple[ast.AST, ...]
 
 
 def _resolved_name_scope(
@@ -3234,9 +3238,42 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
     bindings: dict[ast.AST, set[str]] = {tree: set()}
     class_binding_starts: dict[ast.ClassDef, dict[str, list[int]]] = {}
     declarations: dict[ast.AST, dict[str, str]] = {}
+    binding_events: dict[ast.AST, dict[str, list[tuple[int, bool]]]] = {}
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+
+    def record_binding(scope: ast.AST, name: str, start: int, restores: bool = False) -> None:
+        # A conditional store is not affirmative replacement evidence. Only a
+        # literal branch whose execution is proven can revoke the lexical owner.
+        child = node
+        parent = parents.get(child)
+        while parent is not None and parent is not scope:
+            if isinstance(parent, ast.If):
+                if not isinstance(parent.test, ast.Constant):
+                    return
+                taken = parent.body if bool(parent.test.value) else parent.orelse
+                if child not in taken:
+                    return
+            elif isinstance(
+                parent,
+                (
+                    ast.For,
+                    ast.AsyncFor,
+                    ast.While,
+                    ast.With,
+                    ast.AsyncWith,
+                    ast.Try,
+                    ast.TryStar,
+                    ast.Match,
+                    ast.comprehension,
+                ),
+            ):
+                return
+            child, parent = parent, parents.get(parent)
+        binding_events.setdefault(scope, {}).setdefault(name, []).append((start, restores))
 
     def bind(scope: ast.AST, name: str, start: int) -> None:
         bindings.setdefault(scope, set()).add(name)
+        record_binding(scope, name, start)
         if isinstance(scope, ast.ClassDef):
             class_binding_starts.setdefault(scope, {}).setdefault(name, []).append(start)
 
@@ -3297,18 +3334,45 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
                 stack.append((node.elt, nested_chain, None))
             continue
 
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and isinstance(node.value, ast.Name)
+        ):
+            # Replacing the called slot is affirmative evidence; unrelated
+            # attributes and protocol effects only make receiver trust unknown.
+            record_binding(
+                scope,
+                node.value.id + "." + node.attr,
+                binding_start if binding_start is not None else end,
+            )
+
         if isinstance(node, ast.Global):
             for name in node.names:
                 declarations.setdefault(scope, {})[name] = "global"
         elif isinstance(node, ast.Nonlocal):
             for name in node.names:
                 declarations.setdefault(scope, {})[name] = "nonlocal"
-        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             bind(scope, node.id, binding_start if binding_start is not None else start)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
                 if alias.name != "*":
-                    bind(scope, alias.asname or alias.name.split(".", 1)[0], end)
+                    bound_name = alias.asname or alias.name.split(".", 1)[0]
+                    bind(scope, bound_name, end)
+                    restores = (
+                        isinstance(node, ast.Import)
+                        and alias.name == "subprocess"
+                        and bound_name == "subprocess"
+                    ) or (
+                        isinstance(node, ast.ImportFrom)
+                        and node.level == 0
+                        and node.module == "subprocess"
+                        and alias.name == "Popen"
+                        and bound_name == "Popen"
+                    )
+                    if restores:
+                        record_binding(scope, bound_name, end, True)
         elif isinstance(node, ast.ExceptHandler) and node.name:
             type_span = _node_character_span(parsed, node.type) if node.type is not None else None
             bind(scope, node.name, type_span[1] if type_span is not None else start)
@@ -3336,12 +3400,29 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
         if isinstance(node, ast.Assign):
             stack.append((node.value, scope_chain, None))
             stack.extend((target, scope_chain, end) for target in node.targets)
+            for target in node.targets:
+                if isinstance(target, ast.Name) and (
+                    isinstance(node.value, ast.Constant)
+                    and node.value.value is True
+                    and target.id.casefold() not in {"subprocess", "popen"}
+                    or isinstance(node.value, ast.Name)
+                    and node.value.id == target.id
+                ):
+                    record_binding(scope, target.id, end, True)
         elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
             if node.value is not None:
                 stack.append((node.value, scope_chain, None))
             stack.append((node.target, scope_chain, end))
             if isinstance(node, ast.AnnAssign):
                 stack.append((node.annotation, scope_chain, None))
+                if isinstance(node.target, ast.Name) and (
+                    isinstance(node.value, ast.Constant)
+                    and node.value.value is True
+                    and node.target.id.casefold() not in {"subprocess", "popen"}
+                    or isinstance(node.value, ast.Name)
+                    and node.value.id == node.target.id
+                ):
+                    record_binding(scope, node.target.id, end, True)
         elif isinstance(node, ast.NamedExpr):
             stack.append((node.value, scope_chain, None))
             # PEP 572 makes a walrus target inside one or more
@@ -3371,6 +3452,56 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
                 (child, scope_chain, binding_start) for child in ast.iter_child_nodes(node)
             )
 
+    def execution_scope(scope: ast.AST) -> ast.AST:
+        current: ast.AST | None = scope
+        while current is not None:
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                return current
+            current = parents.get(current)
+        return tree
+
+    # Keep the execution scope of every store. A global/nonlocal declaration
+    # changes the binding namespace; it never proves a deferred body was run.
+    scoped_events: dict[tuple[ast.AST, ast.AST], dict[str, list[tuple[int, bool]]]] = {}
+    for scope, names in binding_events.items():
+        for name, events in names.items():
+            target_scope = scope
+            receiver_name = name.partition(".")[0]
+            declaration = declarations.get(scope, {}).get(receiver_name)
+            if "." in name and declaration is None:
+                # Attribute stores mutate the object resolved by the receiver,
+                # rather than introducing a new binding in the syntactic scope.
+                current: ast.AST | None = scope
+                crossed_function = False
+                while current is not None:
+                    if current is tree:
+                        target_scope = tree
+                        break
+                    if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        if receiver_name in bindings.get(current, set()):
+                            target_scope = current
+                            break
+                        crossed_function = True
+                    elif isinstance(current, ast.ClassDef) and not crossed_function:
+                        starts = class_binding_starts.get(current, {}).get(receiver_name, ())
+                        if any(position <= events[0][0] for position in starts):
+                            target_scope = current
+                            break
+                    current = parents.get(current)
+            if declaration == "global":
+                target_scope = tree
+            elif declaration == "nonlocal":
+                outer = parents.get(scope)
+                while outer is not None:
+                    if isinstance(
+                        outer, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+                    ) and receiver_name in bindings.get(outer, set()):
+                        target_scope = outer
+                        break
+                    outer = parents.get(outer)
+            key = (target_scope, execution_scope(scope))
+            scoped_events.setdefault(key, {}).setdefault(name, []).extend(events)
+
     frozen_calls = {
         name: tuple(sorted(nodes, key=lambda item: item.start)) for name, nodes in calls.items()
     }
@@ -3388,6 +3519,10 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
             for scope, names in class_binding_starts.items()
         },
         declarations=declarations,
+        binding_events={
+            scope: {name: tuple(sorted(set(events))) for name, events in names.items()}
+            for scope, names in scoped_events.items()
+        },
     )
 
 
@@ -3451,7 +3586,89 @@ def _resolve_variable_shell_candidate(
         call=call.node,
         same_scope=assignment.scope_chain == call.scope_chain,
         visible=resolved_scope is assignment_scope,
+        assignment_start=assignment.start,
+        assignment_scope=assignment_scope,
+        call_scope_chain=call.scope_chain,
     )
+
+
+def _lexical_shell_has_counterevidence(
+    index: _VariableShellAstIndex,
+    parsed: ParsedPythonFile,
+    candidate: _VariableShellCandidate,
+    *,
+    receiver_trusted: bool | None,
+) -> bool:
+    """Reject a lexical candidate only for an observed binding replacement.
+
+    The companion's unknown receiver trust is an abstention. Generic calls,
+    protocol effects, and unsupported statements do not prove a replacement.
+    Stores/imports do; use their source order and Python binding scopes.
+    """
+    call_span = _node_character_span(parsed, candidate.call)
+    if call_span is None:
+        return False
+    call_start = call_span[0]
+    shell = next((item.value for item in candidate.call.keywords if item.arg == "shell"), None)
+    shell_span = _node_character_span(parsed, shell) if shell is not None else None
+    shell_start = shell_span[0] if shell_span is not None else call_start
+    current_execution = next(
+        (
+            scope
+            for scope in reversed(candidate.call_scope_chain)
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+        ),
+        index.tree,
+    )
+
+    def binding_events(scope: ast.AST, name: str) -> tuple[tuple[int, bool], ...]:
+        owner_execution = (
+            scope
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+            else index.tree
+        )
+        events = index.binding_events.get((scope, owner_execution), {}).get(name, ())
+        if current_execution is not owner_execution:
+            local_events = index.binding_events.get((scope, current_execution), {}).get(name, ())
+            return tuple(sorted((*events, *local_events)))
+        return events
+
+    flag_events = binding_events(candidate.assignment_scope, candidate.name)
+    flag_index = bisect_right(flag_events, (shell_start, True))
+    if flag_index:
+        last_flag = flag_events[flag_index - 1]
+        if last_flag[0] > candidate.assignment_start and not last_flag[1]:
+            return True
+    if receiver_trusted is True:
+        return False
+    function = candidate.call.func
+    receiver = function.id if isinstance(function, ast.Name) else function.value.id
+    receiver_scope = _resolved_name_scope(index, candidate.call_scope_chain, receiver, call_start)
+    receiver_events = binding_events(receiver_scope, receiver)
+    if isinstance(function, ast.Attribute):
+        method_name = receiver + "." + function.attr
+        method_events = binding_events(receiver_scope, method_name)
+        current_scope = candidate.call_scope_chain[-1]
+        if current_scope is not receiver_scope:
+            method_events += binding_events(current_scope, method_name)
+        receiver_events = tuple(sorted({*receiver_events, *method_events}))
+    receiver_index = bisect_right(receiver_events, (call_start, True))
+    if receiver_index:
+        # An explicit fresh import supersedes earlier replacement evidence.
+        if not receiver_events[receiver_index - 1][1]:
+            return True
+    elif isinstance(receiver_scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        # Compile-time local bindings shadow a global receiver even before store.
+        if receiver in index.bindings.get(receiver_scope, frozenset()):
+            return True
+    # A deferred body may run after a later observed module/outer replacement.
+    # The trusted-call observation above preserves calls seen before that store.
+    deferred = any(
+        isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+        for scope in candidate.call_scope_chain[1:]
+    )
+    future_events = receiver_events[receiver_index:]
+    return bool(deferred and future_events and not future_events[-1][1])
 
 
 def _tm1_candidates(
@@ -4113,7 +4330,12 @@ def analyze(
             for span, (_, match) in variable_matches.items():
                 assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
                 candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)
-                if candidate is not None and not candidate.visible:
+                if candidate is not None and (
+                    not candidate.visible
+                    or _lexical_shell_has_counterevidence(
+                        ast_index, parsed, candidate, receiver_trusted=None
+                    )
+                ):
                     invisible_variable_matches.add(span)
 
     shell_content = (
@@ -5596,7 +5818,19 @@ def _reconcile_variable_shell_findings(
             call_span = _node_character_span(python_ast, candidate.call)
             if call_span is not None:
                 resolved.setdefault((call_span[0], candidate.name), []).append(candidate)
-    ownership = static_python_shell_truthiness.bound_shell_call_ownership(file_path, python_ast)
+    ownership, emitted = static_python_shell_truthiness.bound_shell_call_state(
+        file_path, python_ast
+    )
+    retained_companion_locations = {
+        (finding.start_line, finding.start_column)
+        for finding in findings
+        if finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is True
+    }
+    emitted = {
+        key
+        for key in emitted
+        if (key[0], python_ast.character_column(key[0], key[1])) in retained_companion_locations
+    }
 
     reconciled: list[Finding] = []
     for finding in findings:
@@ -5615,7 +5849,9 @@ def _reconcile_variable_shell_findings(
         if not candidate.visible:
             continue
         call_key = _bound_shell_call_key(candidate.call)
-        if candidate.same_scope or ownership.get(call_key) is False:
+        if call_key in emitted or _lexical_shell_has_counterevidence(
+            ast_index, python_ast, candidate, receiver_trusted=ownership.get(call_key)
+        ):
             continue
         if variable_name.casefold().startswith("true"):
             call = candidate.call

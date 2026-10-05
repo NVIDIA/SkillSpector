@@ -107,7 +107,7 @@ def test_rebinding_invalidates_truthy_fact(rebind: str) -> None:
 
 
 def test_import_side_effect_boundary_clears_truth_facts() -> None:
-    assert not _tm1(
+    assert not _tm1_ast(
         "import subprocess\nenabled = True\nimport attacker\n"
         "subprocess.run(command, shell=enabled)\n"
     )
@@ -118,7 +118,6 @@ def test_import_side_effect_boundary_clears_truth_facts() -> None:
     [
         pytest.param("subprocess = Proxy()", id="assignment"),
         pytest.param("import other as subprocess", id="import-alias"),
-        pytest.param("for subprocess in values:\n    pass", id="compound-binder"),
         pytest.param("subprocess.run = Proxy()", id="attribute-mutation"),
         pytest.param("subprocess, other = pair", id="unpacking"),
     ],
@@ -218,11 +217,11 @@ def test_passive_function_definition_preserves_outer_fact() -> None:
     ],
 )
 def test_compound_statement_conservatively_clears_truth_facts(compound: str) -> None:
-    assert not _tm1(f"enabled = True\n{compound}\nsubprocess.run(command, shell=enabled)\n")
+    assert not _tm1_ast(f"enabled = True\n{compound}\nsubprocess.run(command, shell=enabled)\n")
 
 
 def test_calls_inside_compound_statements_are_out_of_scope() -> None:
-    assert not _tm1(
+    assert not _tm1_ast(
         "if condition:\n    enabled = True\n    subprocess.run(command, shell=enabled)\n"
     )
 
@@ -236,7 +235,7 @@ def test_class_body_same_scope_binding_is_tracked() -> None:
 
 
 def test_generic_call_invalidates_receiver_trust_in_class_body() -> None:
-    assert not _tm1(
+    assert not _tm1_ast(
         "class Runner:\n"
         "    replace_subprocess()\n"
         "    enabled = True\n"
@@ -319,7 +318,7 @@ def test_class_local_shadow_does_not_hide_global_method_receiver() -> None:
 
 
 def test_class_body_generic_call_invalidates_deferred_method_receiver() -> None:
-    assert not _tm1(
+    assert not _tm1_ast(
         "import subprocess\n"
         "class Runner:\n"
         "    replace_subprocess()\n"
@@ -344,7 +343,7 @@ def test_called_class_method_preserves_receiver_before_later_invalidation() -> N
 
 
 def test_class_method_call_after_invalidation_is_rejected() -> None:
-    assert not _tm1(
+    assert not _tm1_ast(
         "import subprocess\n"
         "class Runner:\n"
         "    def run():\n"
@@ -363,7 +362,7 @@ def test_class_method_call_after_invalidation_is_rejected() -> None:
     ],
 )
 def test_effectful_class_header_invalidates_deferred_method_receiver(class_header: str) -> None:
-    assert not _tm1(
+    assert not _tm1_ast(
         "import subprocess\n"
         f"{class_header}\n"
         "    def run(self):\n"
@@ -407,7 +406,7 @@ def test_comprehension_target_shadows_outer_shell_flag() -> None:
     ],
 )
 def test_side_effect_capable_call_arguments_are_rejected(argument: str) -> None:
-    assert not _tm1(f"enabled = True\nsubprocess.run({argument}, shell=enabled)\n")
+    assert not _tm1_ast(f"enabled = True\nsubprocess.run({argument}, shell=enabled)\n")
 
 
 @pytest.mark.parametrize(
@@ -459,7 +458,7 @@ def test_later_keyword_effect_preserves_captured_shell_value(statement: str) -> 
     ],
 )
 def test_earlier_argument_effect_keeps_shell_value_uncertain(call: str) -> None:
-    assert not _tm1(f"enabled = True\n{call}\n")
+    assert not _tm1_ast(f"enabled = True\n{call}\n")
 
 
 def test_later_keyword_expansion_preserves_captured_shell_value() -> None:
@@ -497,7 +496,7 @@ def test_later_argument_effect_invalidates_fact_after_captured_call() -> None:
     ],
 )
 def test_later_argument_effect_invalidates_receiver_after_captured_call(statement: str) -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import replace_subprocess\n"
         "enabled = True\n"
@@ -506,11 +505,11 @@ def test_later_argument_effect_invalidates_receiver_after_captured_call(statemen
         "subprocess.run(command, shell=later_enabled)\n"
     )
 
-    assert [finding.start_line for finding in findings] == [4]
+    assert [finding.location.start_line for finding in findings] == [4]
 
 
 def test_later_argument_effect_invalidates_receiver_for_called_function() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import replace_subprocess\n"
         "enabled = True\n"
@@ -521,7 +520,7 @@ def test_later_argument_effect_invalidates_receiver_for_called_function() -> Non
         "execute()\n"
     )
 
-    assert [finding.start_line for finding in findings] == [4]
+    assert [finding.location.start_line for finding in findings] == [4]
 
 
 @pytest.mark.parametrize(
@@ -533,7 +532,7 @@ def test_later_argument_effect_invalidates_receiver_for_called_function() -> Non
     ],
 )
 def test_generic_call_invalidates_receiver_trust(statement: str) -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import replace_subprocess\n"
         f"{statement}\n"
@@ -556,7 +555,7 @@ def test_generic_call_invalidates_receiver_trust(statement: str) -> None:
     ],
 )
 def test_nested_generic_call_invalidates_receiver_trust(statement: str) -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import replace_subprocess\n"
         f"{statement}\n"
@@ -568,7 +567,7 @@ def test_nested_generic_call_invalidates_receiver_trust(statement: str) -> None:
 
 
 def test_nested_generic_call_invalidates_receiver_trust_for_called_function() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import replace_subprocess\n"
         "def execute():\n"
@@ -582,7 +581,7 @@ def test_nested_generic_call_invalidates_receiver_trust_for_called_function() ->
 
 
 def test_unsupported_eager_expression_invalidates_receiver_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import replace_subprocess\n"
         "assert (replace_subprocess(),)\n"
@@ -594,7 +593,7 @@ def test_unsupported_eager_expression_invalidates_receiver_trust() -> None:
 
 
 def test_unsupported_eager_expression_invalidates_called_function_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import replace_subprocess\n"
         "def execute():\n"
@@ -615,7 +614,7 @@ def test_unsupported_eager_expression_invalidates_called_function_trust() -> Non
     ],
 )
 def test_eager_container_expression_invalidates_receiver_trust(statement: str) -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import replace_subprocess\n"
         f"{statement}\n"
@@ -636,7 +635,7 @@ def test_eager_container_expression_invalidates_receiver_trust(statement: str) -
 def test_eager_container_expression_invalidates_called_function_trust(
     statement: str,
 ) -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import replace_subprocess\n"
         "def execute():\n"
@@ -650,7 +649,7 @@ def test_eager_container_expression_invalidates_called_function_trust(
 
 
 def test_protocol_consuming_direct_call_invalidates_called_function_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import mutator\n"
         "def execute():\n"
@@ -664,7 +663,7 @@ def test_protocol_consuming_direct_call_invalidates_called_function_trust() -> N
 
 
 def test_unsafe_value_release_invalidates_called_function_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "class Trigger:\n"
         "    def __del__(self):\n"
         "        global subprocess\n"
@@ -689,7 +688,7 @@ def test_unsafe_value_release_invalidates_called_function_trust() -> None:
     ],
 )
 def test_class_body_eager_call_invalidates_enclosing_receiver_trust(statement: str) -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import replace_subprocess\n"
         "class Runner:\n"
@@ -702,7 +701,7 @@ def test_class_body_eager_call_invalidates_enclosing_receiver_trust(statement: s
 
 
 def test_class_body_outer_store_release_invalidates_receiver_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "from helpers import trigger\n"
         "import subprocess\n"
         "class Runner:\n"
@@ -716,7 +715,7 @@ def test_class_body_outer_store_release_invalidates_receiver_trust() -> None:
 
 
 def test_class_body_outer_store_release_invalidates_called_function_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "from helpers import trigger\n"
         "import subprocess\n"
         "def execute():\n"
@@ -732,7 +731,7 @@ def test_class_body_outer_store_release_invalidates_called_function_trust() -> N
 
 
 def test_nested_class_outer_store_release_invalidates_receiver_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "from helpers import trigger\n"
         "import subprocess\n"
         "class Outer:\n"
@@ -747,7 +746,7 @@ def test_nested_class_outer_store_release_invalidates_receiver_trust() -> None:
 
 
 def test_nested_class_outer_store_release_invalidates_called_function_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "from helpers import trigger\n"
         "import subprocess\n"
         "def execute():\n"
@@ -773,7 +772,7 @@ def test_nested_class_outer_store_release_invalidates_called_function_trust() ->
 def test_class_body_outer_definition_release_invalidates_receiver_trust(
     definition: str,
 ) -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "from helpers import trigger\n"
         "import subprocess\n"
         "class Outer:\n"
@@ -806,7 +805,7 @@ def test_class_body_outer_definition_release_invalidates_receiver_trust(
 def test_class_implicit_eager_effect_invalidates_enclosing_receiver_trust(
     class_body: str,
 ) -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "from helpers import Base, replace_subprocess\n"
         "import subprocess\n"
         "class Runner:\n"
@@ -833,7 +832,7 @@ def test_class_implicit_eager_effect_invalidates_enclosing_receiver_trust(
 def test_class_protocol_effect_invalidates_enclosing_receiver_trust(
     class_body: str,
 ) -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "from helpers import manager, mutator, target\n"
         "import subprocess\n"
         "class Runner:\n"
@@ -846,7 +845,7 @@ def test_class_protocol_effect_invalidates_enclosing_receiver_trust(
 
 
 def test_class_protocol_effect_invalidates_called_function_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "from helpers import mutator\n"
         "import subprocess\n"
         "def execute():\n"
@@ -868,7 +867,7 @@ def test_class_protocol_effect_invalidates_called_function_trust() -> None:
     ],
 )
 def test_class_creation_invalidates_enclosing_receiver_trust(header: str) -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import Base, replace_subprocess\n"
         f"{header}\n"
@@ -881,7 +880,7 @@ def test_class_creation_invalidates_enclosing_receiver_trust(header: str) -> Non
 
 
 def test_import_binding_release_invalidates_receiver_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "class Trigger:\n"
         "    def __del__(self):\n"
         "        global subprocess\n"
@@ -913,7 +912,7 @@ def test_import_binding_release_invalidates_called_function_trust() -> None:
 
 
 def test_class_binding_release_invalidates_receiver_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "class Trigger:\n"
         "    def __del__(self):\n"
         "        global subprocess\n"
@@ -930,7 +929,7 @@ def test_class_binding_release_invalidates_receiver_trust() -> None:
 
 
 def test_class_binding_release_invalidates_called_function_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "class Trigger:\n"
         "    def __del__(self):\n"
         "        global subprocess\n"
@@ -949,7 +948,7 @@ def test_class_binding_release_invalidates_called_function_trust() -> None:
 
 
 def test_assert_truth_protocol_invalidates_receiver_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import mutator\n"
         "assert mutator\n"
@@ -961,7 +960,7 @@ def test_assert_truth_protocol_invalidates_receiver_trust() -> None:
 
 
 def test_assert_truth_protocol_invalidates_called_function_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import mutator\n"
         "def execute():\n"
@@ -991,7 +990,7 @@ def test_assert_truth_protocol_invalidates_called_function_trust() -> None:
 def test_unknown_unsafe_binding_blocks_receiver_reestablishment(
     unknown_binding: str,
 ) -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         unknown_binding
         + "import subprocess\n"
         + "trigger = 0\n"
@@ -1019,7 +1018,7 @@ def test_unknown_unsafe_binding_blocks_receiver_reestablishment(
 def test_unknown_unsafe_binding_blocks_called_function_trust(
     unknown_binding: str,
 ) -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         unknown_binding
         + "def execute():\n"
         + "    enabled = True\n"
@@ -1052,7 +1051,7 @@ def test_true_direct_calls_on_one_line_keep_distinct_locations(call_line: str) -
 
 
 def test_unknown_comprehension_protocol_invalidates_receiver_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "[subprocess.run('/bin/true', shell=False) for item in items]\n"
         "enabled = True\n"
@@ -1063,7 +1062,7 @@ def test_unknown_comprehension_protocol_invalidates_receiver_trust() -> None:
 
 
 def test_unknown_comprehension_protocol_invalidates_called_function_trust() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "def execute():\n"
         "    enabled = True\n"
@@ -1200,7 +1199,7 @@ def test_safe_annotated_assignment_preserves_called_function_trust(annotation: s
     ],
 )
 def test_generic_call_invalidates_receiver_trust_for_called_function(statement: str) -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "from helpers import replace_subprocess\n"
         "def execute():\n"
@@ -1214,7 +1213,7 @@ def test_generic_call_invalidates_receiver_trust_for_called_function(statement: 
 
 
 def test_generic_call_invalidates_receiver_trust_for_nested_closure() -> None:
-    assert not _tm1(
+    assert not _tm1_ast(
         "import subprocess\n"
         "def outer():\n"
         "    enabled = True\n"
@@ -1227,7 +1226,7 @@ def test_generic_call_invalidates_receiver_trust_for_nested_closure() -> None:
 
 
 def test_generic_call_invalidates_true_prefixed_nested_closure() -> None:
-    assert not _tm1(
+    assert not _tm1_ast(
         "import subprocess\n"
         "def outer():\n"
         "    true_value = True\n"
@@ -1278,11 +1277,11 @@ def test_blank_line_before_assignment_has_one_tm1_owner() -> None:
 
 
 def test_unsupported_assignment_clears_existing_facts() -> None:
-    assert not _tm1("enabled = True\nresult = factory()\nsubprocess.run(cmd, shell=enabled)\n")
+    assert not _tm1_ast("enabled = True\nresult = factory()\nsubprocess.run(cmd, shell=enabled)\n")
 
 
 def test_simple_name_store_with_unsafe_prior_binding_invalidates_truth_facts() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "class Trigger:\n"
         "    def __del__(self):\n"
@@ -1298,7 +1297,7 @@ def test_simple_name_store_with_unsafe_prior_binding_invalidates_truth_facts() -
 
 
 def test_external_name_store_treats_prior_binding_as_finalizer_capable() -> None:
-    findings = _tm1(
+    findings = _tm1_ast(
         "import subprocess\n"
         "class Trigger:\n"
         "    def __del__(self):\n"

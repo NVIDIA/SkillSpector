@@ -1157,6 +1157,7 @@ class _Analyzer:
         self.bound_shell_metadata: list[BoundShellMetadata] = []
 
         self.bound_shell_call_ownership: dict[BoundShellCallKey, bool] = {}
+        self.emitted_shell_calls: set[BoundShellCallKey] = set()
 
     def _record_bound_shell_call(self, call: ast.Call, trusted_names: set[str]) -> None:
         """Record whether the companion owns one supported bound-shell call."""
@@ -1358,6 +1359,7 @@ class _Analyzer:
         shell = shell_keyword.value
         if not isinstance(shell, ast.Name) or facts.get(shell.id) is not True:
             return
+        self.emitted_shell_calls.add(_bound_shell_call_key(call))
         self._append_finding(call, shell_keyword, shell)
 
     def _scan_assignment(
@@ -1824,6 +1826,18 @@ def direct_literal_metadata(
         for coordinate in retained_coordinates:
             metadata[coordinate] = direct_metadata
     return metadata
+
+
+def bound_shell_call_state(
+    file_path: str,
+    python_ast: ParsedPythonFile,
+) -> tuple[dict[BoundShellCallKey, bool], set[BoundShellCallKey]]:
+    """Return receiver trust separately from affirmative companion detections."""
+    if python_ast.tree is None:
+        return {}, set()
+    analyzer = _Analyzer(file_path, python_ast, emit_findings=False)
+    analyzer.run(python_ast.tree)
+    return dict(analyzer.bound_shell_call_ownership), set(analyzer.emitted_shell_calls)
 
 
 def bound_shell_call_ownership(

@@ -81,12 +81,12 @@ def test_preparsed_python_is_reused_by_all_ast_analyzers(
 ) -> None:
     """One scan parses each eligible Python file once before analyzer fan-out."""
     (tmp_path / filename).write_text(
-        prefix + "import subprocess\n"
-        "use_shell = True\n"
-        "subprocess.run(output, shell=use_shell)\n"
-        "import os\n"
+        prefix + "import os\n"
         "payload = input()\n"
         "environment = os.environ.copy()\n"
+        "import subprocess\n"
+        "use_shell = True\n"
+        "subprocess.run(output, shell=use_shell)\n"
         "exec(payload)\n",
         encoding="utf-8",
     )
