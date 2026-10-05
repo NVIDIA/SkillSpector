@@ -218,3 +218,38 @@ def test_unknown_effect_cannot_reestablish_cached_replacement_proof(source: str)
     )
     assert len(ownership) == 1
     assert not replacements
+
+
+@pytest.mark.parametrize(
+    ("prefix", "method"),
+    [
+        ("original = subprocess.run\nsubprocess.run = original\n", "run"),
+        ("subprocess.run = subprocess.check_call\n", "run"),
+        (
+            "native_module = subprocess\noriginal = native_module.run\nsubprocess.run = original\n",
+            "run",
+        ),
+        (
+            "import subprocess as native_module\nsubprocess.run = native_module.check_output\n",
+            "run",
+        ),
+        ("original, = (subprocess.run,)\nsubprocess.run = original\n", "run"),
+        ("[original] = [subprocess.run]\nsubprocess.run = original\n", "run"),
+        ("from subprocess import Popen\nsubprocess.run = Popen\n", "run"),
+        ("from subprocess import Popen\noriginal = Popen\nsubprocess.run = original\n", "run"),
+        ("subprocess.Popen = subprocess.run\n", "Popen"),
+    ],
+)
+def test_native_callable_value_does_not_prove_a_custom_replacement(
+    prefix: str, method: str
+) -> None:
+    source = (
+        "import subprocess\n" + prefix + "def work():\n"
+        "    import subprocess\n    enabled = True\n"
+        f"    subprocess.{method}(command, shell=enabled)\nwork()\n"
+    )
+    assert len(truthiness.analyze(source, "run.py", "python")) == 1
+    _, _, replacements = truthiness.bound_shell_call_analysis(
+        "run.py", parse_python_source(source, "run.py")
+    )
+    assert not replacements
