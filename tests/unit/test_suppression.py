@@ -1380,7 +1380,17 @@ def test_dump_baseline_clears_inherited_macos_acl(tmp_path: Path, mode: int | No
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS access ACLs")
-def test_dump_baseline_preserves_existing_macos_access_acl(tmp_path: Path) -> None:
+def test_dump_baseline_installs_destination_acl_before_writing_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_preserve_acl = suppression_module._preserve_baseline_acl
+    target_sizes: list[int] = []
+
+    def assert_empty_acl_target(source: int, destination: int) -> None:
+        target_sizes.append(os.fstat(destination).st_size)
+        original_preserve_acl(source, destination)
+
+    monkeypatch.setattr(suppression_module, "_preserve_baseline_acl", assert_empty_acl_target)
     import subprocess
 
     output = tmp_path / "baseline.yaml"
@@ -1401,7 +1411,32 @@ def test_dump_baseline_preserves_existing_macos_access_acl(tmp_path: Path) -> No
         ["/bin/ls", "-le", str(output)], check=True, capture_output=True, text=True
     ).stdout.splitlines()[1:]
     assert listing == old_listing
+    assert target_sizes == [0]
     assert S_IMODE(output.stat().st_mode) == 0o664
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or os.geteuid() == 0,
+    reason="requires non-root macOS ACL permission evaluation",
+)
+def test_dump_baseline_accepts_acl_write_grant_without_mode_write_bits(tmp_path: Path) -> None:
+    import pwd
+    import subprocess
+
+    output = tmp_path / "baseline.yaml"
+    output.write_text("existing", encoding="utf-8")
+    output.chmod(0o444)
+    username = pwd.getpwuid(os.geteuid()).pw_name
+    subprocess.run(
+        ["/bin/chmod", "+a", f"user:{username} allow write", str(output)],
+        check=True,
+        capture_output=True,
+    )
+
+    dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "shared"}]}, output)
+
+    assert S_IMODE(output.stat().st_mode) == 0o444
+    assert load_baseline(output).rules[0].reason == "shared"
 
 
 @pytest.mark.parametrize("suffix", [".yaml", ".json"])

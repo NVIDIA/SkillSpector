@@ -22,7 +22,6 @@ from skillspector.cli import app
 from skillspector.graph import graph
 from skillspector.sarif_models import validate_sarif_report
 
-
 _EXPECTED_LOCATIONS = {
     ("TM1", "SKILL.md", 7),
     ("TM1", "SKILL.md", 9),

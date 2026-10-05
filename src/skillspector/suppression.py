@@ -757,6 +757,7 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
     yaml.load(content, Loader=_BoundedBaselineLoader)
 
     destination = None
+    access_descriptor = None
     try:
         destination = p.lstat()
     except FileNotFoundError:
@@ -764,10 +765,10 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
     else:
         if not S_ISREG(destination.st_mode):
             raise ValueError(f"Baseline output must be a regular file: {p}")
-        if not destination.st_mode & 0o222:
+        if os.name == "posix" and os.geteuid() == 0 and not destination.st_mode & 0o222:
             raise PermissionError(errno.EACCES, "Baseline output is not writable", str(p))
-        # Atomic replacement needs directory permissions, but must not bypass an
-        # existing file's write restrictions (including ACLs). Never truncate it.
+        # The descriptor check handles ACL grants that mode bits omit. Root
+        # still observes the explicit read-only mode guard above.
         flags = os.O_WRONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(p, flags)
         try:
@@ -796,6 +797,9 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
                 os.ftruncate(descriptor, len(encoded))
                 os.fsync(descriptor)
                 return
+            # Retain the validated inode's access metadata while competing
+            # atomic writers replace the path. There is no need to reopen it.
+            access_descriptor = os.dup(descriptor)
         finally:
             os.close(descriptor)
 
@@ -806,8 +810,6 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
         ) as temporary:
             temporary_path = Path(temporary.name)
             _restrict_baseline_temporary(temporary.fileno())
-            temporary.write(encoded)
-            temporary.flush()
             if destination is not None:
                 current = os.fstat(temporary.fileno())
                 if (current.st_uid, current.st_gid) != (destination.st_uid, destination.st_gid):
@@ -819,21 +821,17 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
                     os.fchmod(temporary.fileno(), mode)
                     # Clearing inherited ACLs must not remove a restrictive or
                     # shared access ACL from the existing destination.
-                    original = os.open(p, flags)
-                    try:
-                        current = os.fstat(original)
-                        if (current.st_dev, current.st_ino) != (
-                            destination.st_dev,
-                            destination.st_ino,
-                        ):
-                            raise ValueError(f"Baseline output changed before replacement: {p}")
-                        _preserve_baseline_acl(original, temporary.fileno())
-                    finally:
-                        os.close(original)
+                    assert access_descriptor is not None
+                    _preserve_baseline_acl(access_descriptor, temporary.fileno())
                 else:
                     os.chmod(temporary_path, mode)
+            # Configure all destination access metadata while the file is empty.
+            temporary.write(encoded)
+            temporary.flush()
             os.fsync(temporary.fileno())
         os.replace(temporary_path, p)
     finally:
+        if access_descriptor is not None:
+            os.close(access_descriptor)
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
