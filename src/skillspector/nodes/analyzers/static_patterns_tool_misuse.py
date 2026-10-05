@@ -3127,7 +3127,7 @@ def _tm1_candidates(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in TM1_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             yield match.start(), match.end(), match.group(0), confidence
@@ -3661,7 +3661,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in TM2_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -3691,7 +3691,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in TM3_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -3710,7 +3710,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     # TM4: privileged K8s workload. Example filtering is delegated to the runner.
     for pattern, confidence in TM4_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(

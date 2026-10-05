@@ -544,7 +544,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in MP2_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             span = match.group(0)

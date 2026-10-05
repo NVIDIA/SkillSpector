@@ -17,11 +17,13 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
 import json
 import math
 import os
 import re
+import sys
 import time
 import unicodedata
 from array import array
@@ -32,6 +34,8 @@ from dataclasses import dataclass, field
 from inspect import getattr_static
 from itertools import chain
 from typing import cast
+
+import regex  # type: ignore[import-untyped]
 
 from skillspector.artifacts import (
     ContentKind,
@@ -294,17 +298,197 @@ def _paragraph_ranges(content: str) -> tuple[tuple[int, int], ...]:
     return result
 
 
+_STATIC_PATTERN_SECONDS = 0.25
+_ACTIVE_FINDING_BUDGET: ContextVar[_FindingBudget | None] = ContextVar(
+    "static_pattern_finding_budget", default=None
+)
+
+
+@functools.lru_cache(maxsize=2)
+def _python_category_ranges(ascii_only: bool) -> dict[str, str]:
+    """Keep the runtime's Python word/space/digit alphabet, not regex's Unicode version."""
+    categories: dict[str, list[tuple[int, int]]] = {key: [] for key in "wWsSdD"}
+    budget = _ACTIVE_FINDING_BUDGET.get()
+    for value in range(sys.maxunicode + 1):
+        if budget is not None and value % 4096 == 0:
+            budget.check_runtime()
+        character = chr(value)
+        word = (character.isalnum() or character == "_") and (not ascii_only or value < 128)
+        space = character.isspace() and (not ascii_only or character in " \t\n\r\f\v")
+        digit = character.isdecimal() and (not ascii_only or value < 128)
+        for key in ("w" if word else "W", "s" if space else "S", "d" if digit else "D"):
+            ranges = categories[key]
+            if ranges and ranges[-1][1] == value - 1:
+                ranges[-1] = (ranges[-1][0], value)
+            else:
+                ranges.append((value, value))
+    return {
+        key: "".join(
+            rf"\U{start:08x}" if start == end else rf"\U{start:08x}-\U{end:08x}"
+            for start, end in ranges
+        )
+        for key, ranges in categories.items()
+    }
+
+
+@functools.lru_cache(maxsize=512)
+def _timed_pattern(source: str, flags: int) -> regex.Pattern[str]:
+    """Translate the static-rule grammar while retaining original match offsets.
+
+    Scoped flags and verbose rules need their own grammar support. Reject them
+    as unavailable coverage rather than silently changing detection semantics.
+    """
+    if flags & re.VERBOSE:
+        raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+    timed_flags = regex.VERSION0
+    for name in ("ASCII", "IGNORECASE", "MULTILINE", "DOTALL", "VERBOSE"):
+        if flags & getattr(re, name):
+            timed_flags |= getattr(regex, name)
+
+    def literal_class(token: str) -> str:
+        if flags & re.IGNORECASE and not flags & re.ASCII:
+            for alias in ("ı", "İ"):
+                if bool(re.fullmatch(token, alias, flags)) != bool(
+                    regex.fullmatch(token, alias, timed_flags)
+                ):
+                    insert = 2 if token.startswith("[^") else 1
+                    token = token[:insert] + alias + token[insert:]
+        return token
+
+    categories = _python_category_ranges(bool(flags & re.ASCII))
+    word = "(?-i:[" + categories["w"] + "])"
+    parts: list[str] = []
+    cursor = 0
+    while cursor < len(source):
+        # Group names are syntax, never case-insensitive literals.
+        if source.startswith(("(?P<", "(?P="), cursor):
+            end = source.index(">" if source.startswith("(?P<", cursor) else ")", cursor) + 1
+            parts.append(source[cursor:end])
+            cursor = end
+            continue
+        flag_group = re.match(r"\(\?[aiLmsux-]+([:)])", source[cursor:])
+        if flag_group is not None:
+            if flag_group.group(1) == ":":
+                raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+            parts.append(flag_group.group(0))
+            cursor += len(flag_group.group(0))
+            continue
+        char = source[cursor]
+        if char == "\\" and cursor + 1 < len(source):
+            code = source[cursor + 1]
+            if code in "xuU":
+                end = cursor + {"x": 4, "u": 6, "U": 10}[code]
+                value = chr(int(source[cursor + 2 : end], 16))
+                parts.append(
+                    "[iIİı]"
+                    if value in "iI" and flags & re.IGNORECASE and not flags & re.ASCII
+                    else source[cursor:end]
+                )
+                cursor = end
+                continue
+            if code in "NB":
+                raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+            if code in categories:
+                parts.append("(?-i:[" + categories[code] + "])")
+            elif code == "b":
+                parts.append(rf"(?:(?<!{word})(?={word})|(?<={word})(?!{word}))")
+            else:
+                parts.append(source[cursor : cursor + 2])
+            cursor += 2
+            continue
+        if char == "[":
+            end = cursor + 1
+            if end < len(source) and source[end] == "^":
+                end += 1
+            if end < len(source) and source[end] == "]":
+                end += 1
+            while end < len(source) and source[end] != "]":
+                end += 2 if source[end] == "\\" else 1
+            token = source[cursor : end + 1]
+            negated = token.startswith("[^")
+            inner = token[2 if negated else 1 : -1]
+            atoms: list[str] = []
+            literals: list[str] = []
+            for part in re.findall(r"\\.|.", inner, re.DOTALL):
+                if len(part) == 2 and part.startswith("\\") and part[1] in categories:
+                    # Word/space membership never inherits IGNORECASE. The
+                    # regex package may know case pairs newer than this Python.
+                    atoms.append("(?-i:[" + categories[part[1]] + "])")
+                else:
+                    literals.append(part)
+            if not atoms:
+                # Keep native character-class scanning for ordinary wildcards.
+                parts.append(literal_class(token))
+                cursor = end + 1
+                continue
+            if literals:
+                literal_text = "".join(literals)
+                if literal_text.startswith("^"):
+                    literal_text = "\\" + literal_text
+                atoms.append(literal_class("[" + literal_text + "]"))
+            union = "(?:" + "|".join(atoms) + ")"
+            rewritten = "(?:(?!" + union + r")[\s\S])" if negated else union
+            parts.append(rewritten)
+            cursor = end + 1
+            continue
+        if char in "iI" and flags & re.IGNORECASE and not flags & re.ASCII:
+            parts.append("[iIİı]")
+        else:
+            parts.append(char)
+        cursor += 1
+    return regex.compile("".join(parts), timed_flags)
+
+
+def iter_pattern_matches(
+    pattern: str | re.Pattern[str],
+    content: str,
+    flags: int = 0,
+    *,
+    start: int = 0,
+    end: int | None = None,
+) -> Iterator[re.Match[str]]:
+    """Interrupt a single pattern search and retain the runner's partial evidence."""
+    budget = _ACTIVE_FINDING_BUDGET.get()
+    if budget is not None:
+        budget.check_runtime()
+    original = re.compile(pattern, flags)
+    compiled = _timed_pattern(original.pattern, original.flags)
+    timeout = _STATIC_PATTERN_SECONDS
+    if budget is not None:
+        budget.check_runtime()
+        timeout = min(timeout, max(0.0, budget.deadline - budget.clock()))
+    started_at = time.monotonic()
+    try:
+        for match in compiled.finditer(
+            content,
+            start,
+            len(content) if end is None else end,
+            timeout=timeout,
+            concurrent=False,
+        ):
+            if budget is not None:
+                budget.check_runtime()
+            yield cast(re.Match[str], match)
+    except TimeoutError as exc:
+        raise _StaticResourceLimitError(
+            LedgerReason.RUNTIME_LIMIT,
+            {
+                "observed_seconds": max(0.0, time.monotonic() - started_at),
+                "limit_seconds": timeout,
+            },
+        ) from exc
+
+
 def iter_paragraph_matches(
     pattern: str | re.Pattern[str], content: str, flags: int = 0
 ) -> Iterator[re.Match[str]]:
     """Match prose within paragraphs; executable and structured rules use finditer."""
-    regex = re.compile(pattern, flags)
     ranges = _paragraph_ranges(content)
     if not ranges:
-        yield from regex.finditer(content)
+        yield from iter_pattern_matches(pattern, content, flags)
         return
     for start, end in ranges:
-        yield from regex.finditer(content, start, end)
+        yield from iter_pattern_matches(pattern, content, flags, start=start, end=end)
 
 
 def security_view_match_is_literal(content: str, start: int, end: int) -> bool:
@@ -895,6 +1079,7 @@ def _scan_path(
         module_finding_start = len(findings)
         occurrence_columns = _OccurrenceColumnResolver(content, line_starts)
         finding_budget.begin_module()
+        budget_token = _ACTIVE_FINDING_BUDGET.set(finding_budget)
         try:
             with observe_analyzer_findings(finding_budget.observe_creation):
                 prepared = (prepared_analyses or {}).get(id(module))
@@ -951,6 +1136,8 @@ def _scan_path(
                     if converted is not None:
                         findings.append(converted)
             return findings, exc
+        finally:
+            _ACTIVE_FINDING_BUDGET.reset(budget_token)
     return findings, None
 
 
