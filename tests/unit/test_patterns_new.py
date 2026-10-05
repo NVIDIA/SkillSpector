@@ -1791,6 +1791,108 @@ guidance = "Set the flag to --no-verify to skip deterministic result verificatio
         assert any(f.rule_id == "TM3" for f in tm_mod.analyze(content, filename, filetype))
 
     @pytest.mark.parametrize(
+        "content,filename,filetype,expected",
+        [
+            pytest.param("mode = 0o777", "fs.py", "python", "mode = 0o777", id="mode_777"),
+            pytest.param(
+                "permission = 0o666", "fs.py", "python", "permission = 0o666", id="permission_666"
+            ),
+            pytest.param(
+                "mode = 0o777 & ~umask | 0o777",
+                "fs.py",
+                "python",
+                "mode = 0o777",
+                id="bits_added_after_umask_mask",
+            ),
+            pytest.param(
+                "mode = 0o777 & ~0", "fs.py", "python", "mode = 0o777", id="mask_is_not_the_umask"
+            ),
+            pytest.param("umask 000", "run.sh", "shell", "umask 000", id="shell_umask_000"),
+            pytest.param("UMASK=0000", "env.sh", "shell", "UMASK=0000", id="env_umask_0000"),
+            pytest.param("umask = 0o000", "cfg.py", "python", "umask = 0o000", id="assign_0o000"),
+            pytest.param("umask 004", "run.sh", "shell", "umask 004", id="world_write_unmasked"),
+            pytest.param(
+                "umask=0o7770", "cfg.py", "python", "umask=0o7770", id="long_value_ending_in_0"
+            ),
+            pytest.param("os.umask(0)", "fs.py", "python", "os.umask(0)", id="py_umask_call"),
+            pytest.param(
+                "process.umask(0o000);", "fs.js", "javascript", "process.umask(0o000)", id="js_call"
+            ),
+            pytest.param("umask(0);", "main.c", "c", "umask(0)", id="c_umask_call"),
+            pytest.param(
+                "fd = os.open(p, flags, mode=0o666 & ~os.umask(0))",
+                "fs.py",
+                "python",
+                "os.umask(0)",
+                id="umask_zero_inside_mask_expression",
+            ),
+        ],
+    )
+    def test_tm3_world_writable_mode_or_umask_detected(
+        self, content: str, filename: str, filetype: str, expected: str
+    ) -> None:
+        """A world-writable mode, or a umask that leaves world-write unmasked, is TM3."""
+        findings = tm_mod.analyze(content, filename, filetype)
+        assert [f.matched_text for f in findings if f.rule_id == "TM3"] == [expected]
+
+    @pytest.mark.parametrize(
+        "content,filename,filetype",
+        [
+            pytest.param("mode = 0o666 & ~umask", "fs.py", "python", id="mode_masked_by_umask"),
+            pytest.param(
+                "os.chmod(path, mode=0o777 & ~current_umask)",
+                "fs.py",
+                "python",
+                id="mode_masked_in_call",
+            ),
+            pytest.param(
+                "const mode = 0o666 & ~process.umask();",
+                "fs.js",
+                "javascript",
+                id="mode_masked_by_process_umask",
+            ),
+            pytest.param("umask = 0o777", "cfg.py", "python", id="most_restrictive_umask"),
+            pytest.param("UMASK=0777", "env.sh", "shell", id="restrictive_env_umask"),
+            pytest.param("umask 077", "run.sh", "shell", id="umask_077"),
+            pytest.param("umask 022", "run.sh", "shell", id="umask_022"),
+            pytest.param("os.umask(0o022)", "fs.py", "python", id="umask_call_022"),
+            pytest.param("os.umask(18)", "fs.py", "python", id="decimal_umask_call_022"),
+            pytest.param(
+                "umask = os.umask(0)\nos.umask(umask)\nos.chmod(tmp, 0o666 & ~umask)",
+                "fs.py",
+                "python",
+                id="read_and_restore_umask",
+            ),
+            pytest.param(
+                "const previous = process.umask(0);", "fs.js", "javascript", id="js_read_umask"
+            ),
+        ],
+    )
+    def test_tm3_umask_masked_mode_or_restrictive_umask_not_flagged(
+        self, content: str, filename: str, filetype: str
+    ) -> None:
+        """A mode masked with the umask and a restrictive umask are not unsafe defaults."""
+        findings = tm_mod.analyze(content, filename, filetype)
+        assert not [f.matched_text for f in findings if f.rule_id == "TM3"]
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param("mode=0o777 & ~" + "a" * 50_000, id="long_mask_operand"),
+            pytest.param("mode=0o777 &" + " " * 50_000 + "~umask |", id="long_gap_before_mask"),
+            pytest.param("mode=0o777 & ~os.umask(" + "0" * 50_000, id="unclosed_mask_call"),
+            pytest.param("umask " + "0" * 50_000 + "2", id="long_umask_value"),
+            pytest.param("umask(0" + "0" * 50_000, id="unclosed_umask_call"),
+            pytest.param("a." * 25_000 + "umask(", id="long_dotted_name"),
+            pytest.param("umask umask " * 4_000, id="repeated_umask_words"),
+        ],
+    )
+    def test_tm3_permission_patterns_are_linear(self, content: str) -> None:
+        started = time.perf_counter()
+        tm_mod.analyze(content, "fs.py", "python")
+        assert time.perf_counter() - started < 1.0
+
+    @pytest.mark.parametrize(
         "content,filename,filetype",
         [
             pytest.param(

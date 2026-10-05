@@ -355,8 +355,20 @@ TM3_CODE_PATTERNS = [
     # Overly permissive CORS / access
     (r"(?:CORS|cors)[^=]*=\s*['\"]?\*['\"]?", 0.65),
     (r"(?:allow|access)[_-]?(?:origin|hosts?)\s*=\s*['\"]?\*['\"]?", 0.7),
-    # Unsafe permissions
-    (r"(?:mode|permission|umask)\s*=\s*(?:0?o?777|0?o?666)", 0.8),
+    # Unsafe permissions. A mode masked with the umask (0o666 & ~umask) respects it,
+    # like a plain open(), unless more bits are added after the mask.
+    (
+        r"(?:mode|permission)\s*=\s*(?:0?o?777|0?o?666)"
+        r"(?![ \t]*&[ \t]*~[ \t]*[\w.]*umask\b(?:\([^()\n]*\))?[ \t]*(?:[),;\]}#]|//|$))",
+        0.8,
+    ),
+    # A umask whose last octal digit leaves the world-write bit (0o002) unmasked, such
+    # as 000, makes new files world-writable. A umask such as 0o777 is restrictive.
+    (r"umask(?:\s*=\s*|[ \t]+)(?:0o)?[0-7]*[0145]\b", 0.8),
+    # umask(0) as a statement or inside an expression. In a call, a number without a
+    # leading 0 is decimal. `old = os.umask(0)` is how Python reads the umask before
+    # restoring it, so a call whose result is assigned is not reported.
+    (r"(?<![\w.])(?<!=)(?<!= )(?:\w+\.)*umask\(\s*0(?:o?[0-7]*[0145])?\s*\)", 0.8),
     (r"world[_-]?(?:readable|writable|executable)", 0.7),
     # Debug/dev mode in production
     (r"(?:debug|dev|development)[_-]?mode\s*=\s*(?:True|true|1|on|yes|enable)", 0.6),
