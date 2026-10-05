@@ -3347,9 +3347,15 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
             and isinstance(node.ctx, ast.Store)
             and isinstance(node.value, ast.Name)
         ):
-            if node not in attribute_identity_stores:
-                # Replacing the called slot is affirmative evidence; unrelated
-                # attributes and protocol effects only make receiver trust unknown.
+            assignment = parents.get(node)
+            if (
+                node not in attribute_identity_stores
+                and isinstance(assignment, ast.Assign)
+                and len(assignment.targets) == 1
+                and assignment.targets[0] is node
+            ):
+                # Only one direct target has an unambiguous completed-store
+                # boundary. Annotations and composed targets can run effects later.
                 record_binding(
                     scope,
                     node.value.id + "." + node.attr,
