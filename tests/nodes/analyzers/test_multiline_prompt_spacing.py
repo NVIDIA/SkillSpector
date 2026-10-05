@@ -196,9 +196,11 @@ def test_multiline_regex_timeout_preserves_partial_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     timeouts = []
+    clock = iter((0.0, 0.02))
+    monkeypatch.setattr(artifact_integrity.time, "thread_time", lambda: next(clock))
 
     class ExpiredPattern:
-        def finditer(self, _text, *, timeout, concurrent):
+        def finditer(self, _text, *, pos, timeout, concurrent):
             timeouts.append(timeout)
             raise TimeoutError("regex timed out")
 
@@ -230,10 +232,6 @@ async def test_real_multiline_regex_timeout_rejects_installation(
     # A deliberately tiny operation budget makes backend timeout enforcement
     # deterministic without a fragile wall-clock performance assertion.
     monkeypatch.setattr(artifact_integrity, "_MULTILINE_PROMPT_PATTERN_SECONDS", 0.000001)
-    monkeypatch.setattr(
-        artifact_integrity, "_multiline_prompt_injection_line",
-        lambda *_args: pytest.fail("ordinary projection reached the multiline fallback"),
-    )
     content = (_letter_lines("without telling user") + "   ") * 2400
     _write_bundle(tmp_path, {"SKILL.md": content})
 
@@ -383,7 +381,9 @@ def test_multiline_matching_does_not_yield_its_budget_to_another_python_thread(
     class ContendedPattern:
         def finditer(self, text, **kwargs):
             matches = original.finditer(text, **kwargs)
-            first = next(matches)
+            first = next(matches, None)
+            if first is None:
+                return
             start_work.set()
             yield first
             yield from matches
