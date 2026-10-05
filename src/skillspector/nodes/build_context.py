@@ -801,6 +801,43 @@ def _is_hidden_component(path: str) -> bool:
     return any(part.startswith(".") for part in path.replace("\\", "/").split("/") if part)
 
 
+def _is_conventional_skill_script(skill_dir: Path, path: str, data: bytes) -> bool:
+    """Return whether a visible source script belongs to a standard agent skill directory."""
+    parts = path.replace("\\", "/").split("/")
+    if len(parts) < 4 or parts[0:2] not in ([".agents", "skills"], [".claude", "skills"]):
+        return False
+    skill_name = parts[2]
+    if (
+        not skill_name
+        or skill_name.startswith(".")
+        or any(part.startswith(".") for part in parts[3:])
+    ):
+        return False
+    if Path(parts[-1]).suffix.lower() not in {
+        ".bash",
+        ".cjs",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".php",
+        ".pl",
+        ".ps1",
+        ".py",
+        ".rb",
+        ".sh",
+        ".ts",
+        ".tsx",
+        ".zsh",
+    } or has_binary_executable_magic(data):
+        return False
+
+    skill_root = skill_dir.joinpath(*parts[:3])
+    return any(
+        (manifest := skill_root / name).is_file() and not _is_symlink(manifest)
+        for name in ("SKILL.md", "skill.md")
+    )
+
+
 def _decode_base64_json(value: object) -> dict[str, object] | None:
     """Decode a strict base64 JSON object, returning ``None`` on malformed input."""
     if not isinstance(value, str) or not value:
@@ -943,6 +980,12 @@ def _build_component_metadata(
             "size_bytes": size_bytes,
         }
         hidden_component = _is_hidden_component(path)
+        conventional_skill_script = (
+            executable
+            and hidden_component
+            and not source_local_only
+            and _is_conventional_skill_script(skill_dir, path, data)
+        )
         if hidden_component or source_local_only:
             component["local_only"] = True
             if hidden_component:
@@ -950,7 +993,7 @@ def _build_component_metadata(
             if source_local_only:
                 component["hidden_ancestor"] = True
                 component["source_local_only"] = True
-            if executable:
+            if executable and (source_local_only or not conventional_skill_script):
                 component.update(
                     {
                         "outer_path": path,
@@ -963,6 +1006,8 @@ def _build_component_metadata(
                         "concealment_reasons": ["hidden_artifact"],
                     }
                 )
+            elif executable:
+                component["concealed_executable"] = False
         metadata.append(component)
         if _expired(path):
             break

@@ -646,6 +646,27 @@ def test_source_local_only_preserves_excluded_executable_coverage(
     )
 
 
+@pytest.mark.parametrize("client_dir", [".agents", ".claude"])
+def test_conventional_skill_scripts_are_not_concealed(tmp_path: Path, client_dir: str) -> None:
+    skill_root = tmp_path / client_dir / "skills" / "hello"
+    (skill_root / "scripts").mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# Hello\n", encoding="utf-8")
+    (skill_root / "scripts" / "hello.py").write_text('print("hello")\n', encoding="utf-8")
+    hidden_script = skill_root / "scripts" / ".hidden.py"
+    hidden_script.write_text('print("hidden")\n', encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    metadata = {item["path"]: item for item in result["component_metadata"]}
+    visible_path = f"{client_dir}/skills/hello/scripts/hello.py"
+    hidden_path = f"{client_dir}/skills/hello/scripts/.hidden.py"
+    assert metadata[visible_path]["concealed_executable"] is False
+    assert metadata[hidden_path]["concealed_executable"] is True
+    findings = _analyze_concealed_executables(result["component_metadata"])
+    assert visible_path not in {finding.file for finding in findings}
+    assert hidden_path in {finding.file for finding in findings}
+
+
 def test_build_context_model_config_uses_bound_provider(tmp_path: Path) -> None:
     class _BoundProvider:
         DEFAULT_MODEL = "bound-default"
