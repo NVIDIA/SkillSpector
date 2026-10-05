@@ -615,7 +615,7 @@ async def test_unavailable_requested_llm_aligns_embedded_json_report(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "not configured"))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (False, "not configured"),
+        lambda **_: (False, "not configured"),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
 
@@ -637,7 +637,7 @@ async def test_empty_runtime_telemetry_aligns_mcp_and_embedded_json_caution(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda **_: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
 
@@ -690,7 +690,7 @@ async def test_malformed_runtime_telemetry_preserves_failed_meta_availability(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda **_: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", render_mixed_telemetry)
 
@@ -742,7 +742,7 @@ async def test_truthy_malformed_ok_is_not_counted_as_runtime_success(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda **_: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", render_truthy_malformed_telemetry)
 
@@ -798,7 +798,7 @@ async def test_failed_meta_analysis_aligns_mcp_and_embedded_json_availability(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda **_: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", render_failed_meta_analysis)
 
@@ -819,7 +819,7 @@ async def test_explicit_static_only_keeps_embedded_json_report_unchanged(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "not configured"))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (False, "not configured"),
+        lambda **_: (False, "not configured"),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
 
