@@ -136,11 +136,62 @@ _RP1_PIP_INSTALL = re.compile(
     re.IGNORECASE,
 )
 _RP1_DOCKER_CMD = re.compile(
-    r"docker\s+(?:pull|run|create)\s+\S+",
+    r"docker\s+(pull|run|create)\s+(\S+)",
     re.IGNORECASE,
 )
 
 _VERSION_PIN_RE = re.compile(r"@[\d.]+\b|==[\d.]+|:[\d.]+|@sha256:")
+
+# Options that take a separate value and boolean options, from docker/cli
+# (cli/command/container/opts.go, run.go and create.go; cli/command/image/pull.go),
+# including hidden and deprecated ones. `docker create` accepts the `docker run`
+# options except -d, --detach-keys and --sig-proxy; sharing one table only changes
+# how commands that docker itself rejects are read.
+_DOCKER_RUN_VALUE_OPTIONS = frozenset(
+    """
+    -a -c -e -h -l -m -p -u -v -w
+    --add-host --annotation --attach --blkio-weight --blkio-weight-device --cap-add
+    --cap-drop --cgroup-parent --cgroupns --cidfile --cpu-count --cpu-percent --cpu-period
+    --cpu-quota --cpu-rt-period --cpu-rt-runtime --cpu-shares --cpus --cpuset-cpus
+    --cpuset-mems --detach-keys --device --device-cgroup-rule --device-read-bps
+    --device-read-iops --device-write-bps --device-write-iops --dns --dns-opt --dns-option
+    --dns-search --domainname --entrypoint --env --env-file --expose --gpus --group-add
+    --health-cmd --health-interval --health-retries --health-start-interval
+    --health-start-period --health-timeout --hostname --io-maxbandwidth --io-maxiops --ip
+    --ip6 --ipc --isolation --kernel-memory --label --label-file --link --link-local-ip
+    --log-driver --log-opt --mac-address --memory --memory-reservation --memory-swap
+    --memory-swappiness --mount --name --net --net-alias --network --network-alias
+    --oom-score-adj --pid --pids-limit --platform --publish --pull --restart --runtime
+    --security-opt --shm-size --stop-signal --stop-timeout --storage-opt --sysctl --tmpfs
+    --ulimit --umask --user --userns --uts --volume --volume-driver --volumes-from --workdir
+    """.split()
+)
+_DOCKER_RUN_FLAG_OPTIONS = frozenset(
+    """
+    -P -d -i -q -t
+    --detach --disable-content-trust --help --init --interactive --no-healthcheck
+    --oom-kill-disable --privileged --publish-all --quiet --read-only --rm --sig-proxy --tty
+    --use-api-socket
+    """.split()
+)
+_DOCKER_OPTIONS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "run": (_DOCKER_RUN_VALUE_OPTIONS, _DOCKER_RUN_FLAG_OPTIONS),
+    "create": (_DOCKER_RUN_VALUE_OPTIONS, _DOCKER_RUN_FLAG_OPTIONS),
+    "pull": (
+        frozenset({"--platform"}),
+        frozenset({"-a", "-q", "--all-tags", "--disable-content-trust", "--help", "--quiet"}),
+    ),
+}
+# One shell word: unquoted text, $(...), backslash escapes (including a line
+# continuation) and complete quoted strings. The alternatives start with distinct
+# characters, so matching is linear; an unterminated quote ends the word.
+_SHELL_WORD_RE = re.compile(
+    r"""(?:[^\s"'\\|&;()`$]+|\$(?:\([^()\n]*\))?|\\(?:\r?\n|.)|"(?:[^"\\\n]|\\.)*"|'[^'\n]*')+"""
+)
+_SHELL_WORD_GAP_RE = re.compile(r"(?:[ \t]+|\\\r?\n)+")
+_SHELL_QUOTING_RE = re.compile(r"""\\(.)|["']""", re.DOTALL)
+# Bound on the text read after `docker <subcommand>` to find the image operand.
+_DOCKER_OPERAND_MAX_CHARS = 1024
 
 # RP2: Manifest-permission pre-staging
 _PERMISSION_EXPANSION_PATTERNS = [
@@ -205,6 +256,58 @@ def _get_parameters_map(
 # ---------------------------------------------------------------------------
 # RP1: Unpinned MCP server references
 # ---------------------------------------------------------------------------
+
+
+def _docker_image_operand(subcommand: str, text: str, truncated: bool) -> tuple[str | None, int]:
+    """Return the image operand of a docker command and where reading stopped.
+
+    *text* starts at the first argument after ``docker run|create|pull``. Options
+    and their values are skipped using docker's option table. The image is None
+    when it cannot be identified (an unknown option, a missing value, the end of
+    the command, or a word cut off by the read bound), so the caller still
+    reports the command.
+    """
+    value_options, flag_options = _DOCKER_OPTIONS[subcommand.lower()]
+    pos = 0
+    expect_value = False
+    end_of_options = False
+    while True:
+        gap = _SHELL_WORD_GAP_RE.match(text, pos)
+        word_match = _SHELL_WORD_RE.match(text, gap.end() if gap else pos)
+        if word_match is None or (truncated and word_match.end() == len(text)):
+            return None, pos
+        pos = word_match.end()
+        word = _SHELL_QUOTING_RE.sub(r"\1", word_match.group(0))
+        if expect_value:
+            expect_value = False
+        elif end_of_options or not word.startswith("-") or word == "-":
+            return word, pos
+        elif word == "--":
+            end_of_options = True
+        elif word.startswith("--"):
+            name, has_value, _ = word.partition("=")
+            if name in value_options and not has_value:
+                expect_value = True
+            elif name not in flag_options and not has_value:
+                return None, pos
+        else:
+            # Short options combine (-it). The first one that takes a value uses
+            # the rest of the word (-p8080:80) or, if nothing is left, the next word.
+            for index, letter in enumerate(word[1:], start=1):
+                if "-" + letter in value_options:
+                    expect_value = index == len(word) - 1
+                    break
+                if "-" + letter not in flag_options:
+                    return None, pos
+
+
+def _docker_image_has_pin(image: str) -> bool:
+    """Return whether *image* has a tag or digest.
+
+    Only the last path component is checked, because a registry port
+    (``localhost:5000/team/tool``) is not a tag.
+    """
+    return _VERSION_PIN_RE.search(image.rsplit("/", 1)[-1]) is not None
 
 
 def _operand_has_version_pin(line_remainder: str) -> bool:
@@ -333,14 +436,21 @@ def _check_rp1(
         # docker without tag or digest
         for m in _RP1_DOCKER_CMD.finditer(content):
             budget.check_runtime(file_path)
-            full_match = m.group(0)
-            if _VERSION_PIN_RE.search(full_match):
+            operand_start = m.start(2)
+            operand_text = content[operand_start : operand_start + _DOCKER_OPERAND_MAX_CHARS]
+            truncated = operand_start + _DOCKER_OPERAND_MAX_CHARS < len(content)
+            image, operand_end = _docker_image_operand(m.group(1), operand_text, truncated)
+            if image is not None and _docker_image_has_pin(image):
                 continue
+            # Report through the image, or through the last word read when the image
+            # could not be identified.
+            span_end = operand_start + operand_end if operand_end else m.end(1)
+            full_match = content[m.start() : span_end]
             line_num = _find_line(content, m.start())
             budget.emit(
                 Finding(
                     rule_id="RP1",
-                    message=f"Docker image referenced without tag or digest: '{full_match[:80]}'.",
+                    message=f"Docker image referenced without tag or digest: '{full_match[:200]}'.",
                     severity="MEDIUM",
                     confidence=0.75,
                     file=file_path,

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from skillspector.nodes.analyzers.mcp_rug_pull import node
 from skillspector.nodes.build_context import build_context
@@ -144,6 +145,104 @@ def test_rp1_docker_unpinned():
     )
     rp1 = [f for f in result2["findings"] if f.rule_id == "RP1"]
     assert len(rp1) >= 1
+
+
+_DIGEST = "sha256:" + "0" * 64
+
+
+def _rp1_matches(content: str) -> list[str]:
+    result = node(_state(file_cache={"setup.sh": content}))
+    return [f.matched_text for f in result["findings"] if f.rule_id == "RP1"]
+
+
+def test_rp1_docker_pinned_image_after_options_no_finding():
+    """Options before a pinned image are not read as the image."""
+    for content in (
+        "docker run --rm alpine:3.20 cat /etc/alpine-release\n",
+        f"docker run -d img@{_DIGEST}\n",
+        f"docker run --rm -e A my-image@{_DIGEST}\n",
+        'docker run -it --rm -v "$(pwd)":/app -w /app node:20 npm test\n',
+        "docker run -dp 8080:80 --name web nginx:1.27\n",
+        "docker run -p8080:80 --network=host nginx:1.27\n",
+        "docker run --gpus all --user 1000:1000 nvcr.io/nvidia/pytorch:24.01-py3\n",
+        'docker run --rm --entrypoint "" -- alpine:3.20\n',
+        'docker run --rm \\\n  -v "$PWD:/work" \\\n  ghcr.io/org/tool:1.4.2 lint\n',
+        "`docker create --name probe alpine:3.20`\n",
+        "docker pull -q --platform linux/amd64 alpine:3.20\n",
+        "docker pull -a localhost:5000/team/tool:1.0\n",
+    ):
+        assert _rp1_matches(content) == [], content
+
+
+def test_rp1_docker_unpinned_image_after_options_names_image():
+    """The finding names the image, and option values are not taken as its tag."""
+    for content, expected in (
+        ("docker run --rm alpine\n", "docker run --rm alpine"),
+        (
+            "docker run --user 1000:1000 evil/image\n",
+            "docker run --user 1000:1000 evil/image",
+        ),
+        (
+            "docker run --rm -e MODE=fast -p 8080:80 evil/image\n",
+            "docker run --rm -e MODE=fast -p 8080:80 evil/image",
+        ),
+        ("docker run --publish=8080:80 evil/image\n", "docker run --publish=8080:80 evil/image"),
+        ("docker run -p8080:80 evil/image\n", "docker run -p8080:80 evil/image"),
+        ("docker run -e TAG=1.2 evil/image:latest\n", "docker run -e TAG=1.2 evil/image:latest"),
+        ('docker run "--env=x:1" evil/image\n', 'docker run "--env=x:1" evil/image'),
+        ('docker run -e "A x:1" evil/image\n', 'docker run -e "A x:1" evil/image'),
+        ("docker run -e A\\ x:1 evil/image\n", "docker run -e A\\ x:1 evil/image"),
+        ("docker run --rm \\\n  evil/image\n", "docker run --rm \\\n  evil/image"),
+        ("docker pull localhost:5000/team/tool\n", "docker pull localhost:5000/team/tool"),
+        ("docker pull -a evil/image\n", "docker pull -a evil/image"),
+        (
+            "docker run --rm --entrypoint /openshell-sandbox "
+            '"${SANDBOX_IMAGE:-ghcr.io/nvidia/openshell/sandbox:latest}" --version\n',
+            "docker run --rm --entrypoint /openshell-sandbox "
+            '"${SANDBOX_IMAGE:-ghcr.io/nvidia/openshell/sandbox:latest}"',
+        ),
+        ("docker run --rm alpine:3.20; docker run evil/image\n", "docker run evil/image"),
+    ):
+        assert _rp1_matches(content) == [expected], content
+
+
+def test_rp1_docker_unresolved_image_is_still_reported():
+    """When the image cannot be identified, the command stays reported."""
+    for content, expected in (
+        ("docker run --rm\n", "docker run --rm"),
+        ("docker run --rm | tee log\n", "docker run --rm"),
+        ("docker run -e\n", "docker run -e"),
+        ("docker run --bogus x:1 evil/image\n", "docker run --bogus"),
+        ("docker run -Z x:1 evil/image\n", "docker run -Z"),
+        ("docker run -dZ x:1 evil/image\n", "docker run -dZ"),
+        ("docker run -e A=$((1+2)) x:1 evil/image\n", "docker run -e A=$"),
+        ('docker run -e "A x:1 evil/image\n', "docker run -e"),
+        ("docker run --rm\nalpine:3.20\n", "docker run --rm"),
+    ):
+        assert _rp1_matches(content) == [expected], content
+
+    # The read bound cuts this image after "localhost:5000"; that prefix is not
+    # taken as a tagged image.
+    padding = "-e A " * 202
+    content = f"docker run {padding}localhost:5000/evil\n"
+    assert _rp1_matches(content) == [f"docker run {padding.rstrip()}"[:200]]
+
+
+def test_rp1_docker_operand_scan_is_linear():
+    """Adversarial lines finish quickly; the operand scan is bounded."""
+    for content in (
+        "docker run " + "-e A " * 10_000,
+        "docker run " * 4_545,
+        'docker run -e "' + "a" * 50_000,
+        "docker run --rm $(" + "a" * 50_000,
+        "docker run -e " + "\\a" * 25_000,
+        "docker run " + "\\\n" * 25_000 + "img",
+        'docker pull -q "' * 3_125,
+    ):
+        started = time.perf_counter()
+        _rp1_matches(content)
+        elapsed = time.perf_counter() - started
+        assert elapsed < 1.0, f"{elapsed:.2f}s for {content[:30]!r}"
 
 
 def test_rp1_docker_credentials_are_redacted_in_reports():
