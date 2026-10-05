@@ -2919,7 +2919,17 @@ def test_cli_shipped_baseline_recursive_path_untouched(
     assert "Applying author-shipped baseline" not in result.stderr
 
 
-@pytest.mark.parametrize("text", ["[/INST]", "[bold]x[/bold]", r"\[bold]x[/bold]"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[/INST]",
+        "[bold]x[/bold]",
+        r"\[bold]x[/bold]",
+        ":white_check_mark:",
+        "2001:db8:a:b:c",
+        "C:\\Users\\",
+    ],
+)
 @pytest.mark.parametrize("write_to_file", [False, True])
 def test_cli_scan_recursive_terminal_preserves_literal_report_text(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str, write_to_file: bool
