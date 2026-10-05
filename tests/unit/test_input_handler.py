@@ -374,12 +374,13 @@ def test_windows_no_follow_open_rejects_canonical_path_mismatch(
         _open_regular_file_from_windows_handle(source)
 
 
-def test_resolve_zip_file(tmp_path: Path) -> None:
-    """Resolving a .zip file extracts and returns the extract dir."""
+@pytest.mark.parametrize("extension", [".zip", ".ZIP", ".ZiP"])
+def test_resolve_zip_file(tmp_path: Path, extension: str) -> None:
+    """ZIP extensions are recognized regardless of case for local inputs."""
     import zipfile
 
     (tmp_path / "SKILL.md").write_text("# Skill", encoding="utf-8")
-    zip_path = tmp_path / "skill.zip"
+    zip_path = tmp_path / f"skill{extension}"
     with zipfile.ZipFile(zip_path, "w") as zf:
         zf.write(tmp_path / "SKILL.md", "SKILL.md")
     handler = InputHandler()
@@ -387,6 +388,7 @@ def test_resolve_zip_file(tmp_path: Path) -> None:
         resolved, source_type = handler.resolve(str(zip_path))
         assert resolved.is_dir()
         assert source_type == "zip"
+        assert (resolved / "SKILL.md").read_text(encoding="utf-8") == "# Skill"
     finally:
         handler.cleanup()
 
@@ -596,6 +598,45 @@ def test_file_page_url_downloads_the_raw_file(
 
         assert source_type == "url"
         assert requested == [raw_url]
+        assert (resolved / "SKILL.md").read_bytes() == skill
+    finally:
+        handler.cleanup()
+
+
+@pytest.mark.parametrize("budgeted", [False, True], ids=["direct", "workflow-budget"])
+@pytest.mark.parametrize("extension", [".zip", ".ZIP", ".ZiP"])
+def test_file_url_download_extracts_zip_regardless_of_extension_case(
+    monkeypatch: pytest.MonkeyPatch, extension: str, budgeted: bool
+) -> None:
+    """ZIP filenames trigger extraction even without a ZIP content type."""
+    import io
+    import zipfile
+
+    skill = b"---\nname: demo\ndescription: demo\n---\n# Demo\n"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("SKILL.md", skill)
+    url = f"https://raw.githubusercontent.com/org/repo/main/skill{extension}"
+    requested: list[str] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(
+            200, content=archive.getvalue(), headers={"content-type": "application/octet-stream"}
+        )
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        "skillspector.input_handler.httpx.Client",
+        lambda *args, **kwargs: real_client(*args, transport=httpx.MockTransport(serve), **kwargs),
+    )
+    monkeypatch.setattr("skillspector.input_handler._is_private_ip", lambda _host: False)
+    handler = InputHandler(transitive_budget=WorkflowResourceBudget() if budgeted else None)
+    try:
+        resolved, source_type = handler.resolve(url)
+
+        assert source_type == "url"
+        assert requested == [url]
         assert (resolved / "SKILL.md").read_bytes() == skill
     finally:
         handler.cleanup()
