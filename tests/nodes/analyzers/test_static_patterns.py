@@ -2223,6 +2223,46 @@ def test_timed_patterns_preserve_python_alphabet_and_evidence(pattern, text, fla
     assert actual == expected
 
 
+@pytest.mark.parametrize("pattern", [r".*?", r"a*|b", r"\b", r"a?", r"(a)?b|", r"(a)?\1|b|"])
+@pytest.mark.parametrize(("start", "end"), [(0, 4), (1, 3), (2, 2)])
+def test_timed_patterns_preserve_empty_match_adjacency(pattern, start, end):
+    text = "abab"
+    expected = [
+        (match.span(), match.group(), match.groups())
+        for match in re.compile(pattern).finditer(text, start, end)
+    ]
+    actual = [
+        (match.span(), match.group(), match.groups())
+        for match in static_runner.iter_pattern_matches(pattern, text, start=start, end=end)
+    ]
+    assert actual == expected
+
+
+def test_timed_pattern_does_not_charge_consumer_cpu(monkeypatch):
+    monkeypatch.setattr(static_runner, "_STATIC_PATTERN_SECONDS", 0.05)
+    matches = static_runner.iter_pattern_matches(r".", "abc")
+    assert next(matches).group() == "a"
+    deadline = static_runner.time.process_time() + 0.1
+    while static_runner.time.process_time() < deadline:
+        pass
+    assert [match.group() for match in matches] == ["b", "c"]
+
+
+def test_timed_pattern_rechecks_artifact_deadline_after_consumer():
+    now = 0.0
+    budget = static_runner._FindingBudget(10, 0.0, 1.0, lambda: now)
+    token = static_runner._ACTIVE_FINDING_BUDGET.set(budget)
+    try:
+        matches = static_runner.iter_pattern_matches(r".", "abc")
+        assert next(matches).group() == "a"
+        now = 2.0
+        with pytest.raises(static_runner._StaticResourceLimitError) as caught:
+            next(matches)
+        assert caught.value.reason.value == "runtime_limit"
+    finally:
+        static_runner._ACTIVE_FINDING_BUDGET.reset(token)
+
+
 def test_static_regex_deadline_retains_findings_and_incomplete_ledger(monkeypatch):
     original = static_runner._timed_pattern
 

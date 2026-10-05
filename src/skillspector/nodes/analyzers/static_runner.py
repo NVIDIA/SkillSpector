@@ -460,28 +460,50 @@ def iter_pattern_matches(
         budget.check_runtime()
     original = re.compile(pattern, flags)
     compiled = _timed_pattern(original.pattern, original.flags, content.isascii())
-    timeout = _STATIC_PATTERN_SECONDS
-    if budget is not None:
-        budget.check_runtime()
-        timeout = min(timeout, max(0.0, budget.deadline - budget.clock()))
-    started_at = time.monotonic()
+    matching_seconds = 0.0
+    matching_limit = _STATIC_PATTERN_SECONDS
+    skip_empty = False
     try:
-        for match in compiled.finditer(
-            content,
-            start,
-            len(content) if end is None else end,
-            timeout=timeout,
-            concurrent=False,
-        ):
+        while True:
+            timeout = _STATIC_PATTERN_SECONDS - matching_seconds
             if budget is not None:
                 budget.check_runtime()
+                timeout = min(timeout, max(0.0, budget.deadline - budget.clock()))
+            matching_limit = matching_seconds + timeout
+            if timeout <= 0:
+                raise TimeoutError
+            # regex's iterator timer includes CPU used by the caller between
+            # yields. Restart it while retaining one cumulative matching budget;
+            # the artifact deadline separately bounds caller work.
+            started_at = time.process_time()
+            try:
+                matches = compiled.finditer(
+                    content,
+                    start,
+                    len(content) if end is None else end,
+                    timeout=timeout,
+                    concurrent=False,
+                )
+                if skip_empty:
+                    # Replay the previous empty match so the native iterator
+                    # can still return a nonempty match at the same position.
+                    next(matches, None)
+                match = next(matches, None)
+            finally:
+                matching_seconds += max(0.0, time.process_time() - started_at)
+            if budget is not None:
+                budget.check_runtime()
+            if match is None:
+                return
+            start = match.end()
+            skip_empty = match.start() == start
             yield cast(re.Match[str], match)
     except TimeoutError as exc:
         raise _StaticResourceLimitError(
             LedgerReason.RUNTIME_LIMIT,
             {
-                "observed_seconds": max(0.0, time.monotonic() - started_at),
-                "limit_seconds": timeout,
+                "observed_seconds": matching_seconds,
+                "limit_seconds": matching_limit,
             },
         ) from exc
 
