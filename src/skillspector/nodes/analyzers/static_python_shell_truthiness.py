@@ -1136,6 +1136,113 @@ def _advance_trusted_names(
     unknown_unsafe_bindings[0] = True
 
 
+class _CachedSubprocessState:
+    """Track explicit writes to cached module slots independently of imports."""
+
+    def __init__(self) -> None:
+        self.module_names = {"subprocess"}
+        self.changed_methods: set[str] = set()
+        self.changed_popen = False
+
+    def copy(self) -> _CachedSubprocessState:
+        copied = _CachedSubprocessState()
+        copied.module_names = set(self.module_names)
+        copied.changed_methods = set(self.changed_methods)
+        copied.changed_popen = self.changed_popen
+        return copied
+
+    def blocks(self, call: ast.Call) -> bool:
+        function = call.func
+        if isinstance(function, ast.Name):
+            return function.id == "Popen" and self.changed_popen
+        return isinstance(function, ast.Attribute) and function.attr in self.changed_methods
+
+    def advance(self, statement: ast.stmt) -> None:
+        """Apply only explicit eager bindings; deferred bodies do not execute here."""
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            self.module_names.difference_update(_direct_bound_names(statement))
+            if isinstance(statement, ast.Import):
+                self.module_names.update(
+                    imported.asname or "subprocess"
+                    for imported in statement.names
+                    if imported.name == "subprocess"
+                )
+            elif statement.level == 0 and statement.module == "subprocess":
+                for imported in statement.names:
+                    if imported.name == "Popen" and (imported.asname or imported.name) == "Popen":
+                        self.changed_popen = "Popen" in self.changed_methods
+            return
+        if isinstance(statement, ast.ClassDef):
+            class_state = self.copy()
+            declarations = _DirectBindingCollector(set())
+            for child in statement.body:
+                declarations.visit(child)
+                class_state.advance(child)
+            self.changed_methods = class_state.changed_methods
+            self.module_names.difference_update(declarations.nonlocal_names)
+            self.module_names.update(
+                class_state.module_names.intersection(declarations.nonlocal_names)
+            )
+            if "Popen" in declarations.nonlocal_names:
+                self.changed_popen = class_state.changed_popen
+            self.module_names.discard(statement.name)
+            return
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            self.module_names.discard(statement.name)
+            return
+        targets: list[ast.expr] = []
+        value: ast.expr | None = None
+        if isinstance(statement, ast.Assign):
+            targets, value = list(statement.targets), statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            if statement.value is None:
+                return
+            targets, value = [statement.target], statement.value
+        elif isinstance(statement, ast.AugAssign):
+            targets = [statement.target]
+        elif isinstance(statement, ast.Delete):
+            targets = list(statement.targets)
+        else:
+            self.module_names.difference_update(_direct_bound_names(statement))
+            return
+
+        before_names = set(self.module_names)
+        before_methods = set(self.changed_methods)
+        pending = [(target, value) for target in reversed(targets)]
+        while pending:
+            target, source = pending.pop()
+            if isinstance(target, (ast.Tuple, ast.List)):
+                sources = (
+                    list(source.elts)
+                    if isinstance(source, (ast.Tuple, ast.List))
+                    and len(target.elts) == len(source.elts)
+                    and not any(isinstance(item, ast.Starred) for item in source.elts)
+                    else [None] * len(target.elts)
+                )
+                pending.extend(reversed(list(zip(target.elts, sources, strict=True))))
+            elif isinstance(target, ast.Starred):
+                pending.append((target.value, None))
+            elif isinstance(target, ast.Name):
+                self.module_names.discard(target.id)
+                if isinstance(source, ast.Name) and source.id in before_names:
+                    self.module_names.add(target.id)
+            elif (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id in self.module_names
+            ):
+                preserves_slot = (
+                    isinstance(source, ast.Attribute)
+                    and isinstance(source.value, ast.Name)
+                    and source.value.id in before_names
+                    and source.attr == target.attr
+                )
+                if preserves_slot and target.attr not in before_methods:
+                    self.changed_methods.discard(target.attr)
+                else:
+                    self.changed_methods.add(target.attr)
+
+
 class _Analyzer:
     def __init__(
         self,
@@ -1158,14 +1265,64 @@ class _Analyzer:
 
         self.bound_shell_call_ownership: dict[BoundShellCallKey, bool] = {}
         self.emitted_shell_calls: set[BoundShellCallKey] = set()
+        self.cached_replacement_by_call: dict[BoundShellCallKey, bool] = {}
+        self.cached_subprocess = _CachedSubprocessState()
+
+    def _record_cached_replacement(self, call: ast.Call) -> None:
+        """Keep explicit cached-slot evidence distinct from receiver uncertainty."""
+        shell = next((item.value for item in call.keywords if item.arg == "shell"), None)
+        if not _is_direct_subprocess_syntax(call) or not isinstance(shell, ast.Name):
+            return
+        key = _bound_shell_call_key(call)
+        blocked = self.cached_subprocess.blocks(call)
+        self.cached_replacement_by_call[key] = (
+            self.cached_replacement_by_call.get(key, True) and blocked
+        )
+
+    def _record_eager_cached_replacements(self, expression: ast.expr) -> None:
+        """Visit eager expression order until an unmodeled effect or scope boundary."""
+        pending: list[ast.expr | None] = [expression]
+        while pending:
+            current = pending.pop()
+            if current is None:
+                return
+            if isinstance(current, ast.Call):
+                function = current.func
+                passive_lookup = isinstance(function, ast.Name) or (
+                    isinstance(function, ast.Attribute)
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id in self.cached_subprocess.module_names
+                )
+                if passive_lookup:
+                    self._record_cached_replacement(current)
+                children = [function, *current.args, *(item.value for item in current.keywords)]
+                pending.append(None)
+                pending.extend(reversed(children))
+            elif isinstance(current, (ast.Name, ast.Constant)):
+                continue
+            elif isinstance(current, (ast.Tuple, ast.List)):
+                pending.extend(reversed(current.elts))
+            elif isinstance(current, ast.Attribute):
+                if not (
+                    isinstance(current.value, ast.Name)
+                    and current.value.id in self.cached_subprocess.module_names
+                ):
+                    pending.append(None)
+                pending.append(current.value)
+            else:
+                return
 
     def _record_bound_shell_call(self, call: ast.Call, trusted_names: set[str]) -> None:
         """Record whether the companion owns one supported bound-shell call."""
         shell = next((item.value for item in call.keywords if item.arg == "shell"), None)
         if not _is_direct_subprocess_syntax(call) or not isinstance(shell, ast.Name):
             return
-        self.bound_shell_call_ownership[_bound_shell_call_key(call)] = bool(
+        self._record_cached_replacement(call)
+        key = _bound_shell_call_key(call)
+        blocked = self.cached_subprocess.blocks(call)
+        self.bound_shell_call_ownership[key] = bool(
             _is_direct_subprocess_call(call, trusted_names)
+            and not blocked
             and _shell_argument_is_captured_before_effects(call)
         )
 
@@ -1357,7 +1514,11 @@ class _Analyzer:
         if shell_keyword is None:
             return
         shell = shell_keyword.value
-        if not isinstance(shell, ast.Name) or facts.get(shell.id) is not True:
+        if (
+            not isinstance(shell, ast.Name)
+            or self.cached_subprocess.blocks(call)
+            or facts.get(shell.id) is not True
+        ):
             return
         self.emitted_shell_calls.add(_bound_shell_call_key(call))
         self._append_finding(call, shell_keyword, shell)
@@ -1452,7 +1613,11 @@ class _Analyzer:
         initial_bound_names: set[str] | None = None,
         nested_function_trusted_names: set[str] | None = None,
         nested_function_trusted_at_call: dict[int, set[str]] | None = None,
+        cached_subprocess: _CachedSubprocessState | None = None,
     ) -> None:
+        previous_cached = self.cached_subprocess
+        self.cached_subprocess = (cached_subprocess or previous_cached).copy()
+        initial_cached = self.cached_subprocess.copy()
         trusted_names = set(_DIRECT_CALL_NAMES if trusted_names is None else trusted_names)
         facts: dict[str, bool] = {}
         bound_names = set(initial_bound_names or ())
@@ -1482,6 +1647,8 @@ class _Analyzer:
         receiver_finalizer_safe_names = set()
         receiver_unknown_unsafe_bindings = [False]
         active_functions: dict[str, int] = {}
+        cached_at_call_by_definition: dict[int, _CachedSubprocessState] = {}
+        deferred_cached = initial_cached.copy()
         for candidate_index, candidate in enumerate(statements):
             call = _passive_direct_call(candidate)
             if call is not None:
@@ -1489,6 +1656,14 @@ class _Analyzer:
                 owner = active_functions.get(call.func.id)
                 if owner is not None:
                     trusted_at_call_by_definition.setdefault(owner, set()).update(receiver_trust)
+                    prior_cached = cached_at_call_by_definition.get(owner)
+                    if prior_cached is None:
+                        cached_at_call_by_definition[owner] = deferred_cached.copy()
+                    else:
+                        prior_cached.changed_methods.intersection_update(
+                            deferred_cached.changed_methods
+                        )
+                        prior_cached.changed_popen &= deferred_cached.changed_popen
 
             changed_names = _direct_bound_names(candidate)
             for name in changed_names:
@@ -1506,10 +1681,14 @@ class _Analyzer:
                 receiver_finalizer_safe_names,
                 receiver_unknown_unsafe_bindings,
             )
+            deferred_cached.advance(candidate)
 
         for index, statement in enumerate(statements):
             if self._check_runtime is not None:
                 self._check_runtime()
+            if isinstance(statement, (ast.Expr, ast.Return, ast.Assign, ast.AnnAssign)):
+                if statement.value is not None:
+                    self._record_eager_cached_replacements(statement.value)
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 passive_header = _function_header_is_passive(statement)
                 if nested_function_trusted_names is None:
@@ -1531,10 +1710,15 @@ class _Analyzer:
                 nested_trusted_names.discard(statement.name)
                 if not passive_header:
                     nested_trusted_names.clear()
+                nested_cached = cached_at_call_by_definition.get(index, deferred_cached).copy()
+                nested_cached.module_names.difference_update(
+                    _function_bound_direct_names(statement, nested_cached.module_names)
+                )
                 self._scan_block(
                     statement.body,
                     trusted_names=nested_trusted_names,
                     initial_bound_names=_function_parameter_names(statement),
+                    cached_subprocess=nested_cached,
                 )
                 releases_unsafe_value = (
                     statement.name in bound_names and statement.name not in finalizer_safe_names
@@ -1720,6 +1904,7 @@ class _Analyzer:
                     trusted_names=class_trusted_names,
                     nested_function_trusted_names=method_trusted_names,
                     nested_function_trusted_at_call=method_trusted_at_call,
+                    cached_subprocess=self.cached_subprocess,
                 )
                 facts.clear()
                 bound_names.update(_direct_bound_names(statement))
@@ -1746,6 +1931,10 @@ class _Analyzer:
                 bound_names.update(_direct_bound_names(statement))
                 trusted_names.clear()
                 unknown_unsafe_bindings[0] = True
+
+            self.cached_subprocess.advance(statement)
+
+        self.cached_subprocess = previous_cached
 
     def run(self, tree: ast.Module) -> list[AnalyzerFinding]:
         self._scan_block(tree.body)
@@ -1842,16 +2031,29 @@ def bound_shell_finding_for_call(
     return analyzer.findings[0] if analyzer.findings else None
 
 
+def bound_shell_call_analysis(
+    file_path: str,
+    python_ast: ParsedPythonFile,
+) -> tuple[dict[BoundShellCallKey, bool], set[BoundShellCallKey], set[BoundShellCallKey]]:
+    """Separate trust, detections, and affirmative cached-slot replacements."""
+    if python_ast.tree is None:
+        return {}, set(), set()
+    analyzer = _Analyzer(file_path, python_ast, emit_findings=False)
+    analyzer.run(python_ast.tree)
+    return (
+        dict(analyzer.bound_shell_call_ownership),
+        set(analyzer.emitted_shell_calls),
+        {key for key, replaced in analyzer.cached_replacement_by_call.items() if replaced},
+    )
+
+
 def bound_shell_call_state(
     file_path: str,
     python_ast: ParsedPythonFile,
 ) -> tuple[dict[BoundShellCallKey, bool], set[BoundShellCallKey]]:
     """Return receiver trust separately from affirmative companion detections."""
-    if python_ast.tree is None:
-        return {}, set()
-    analyzer = _Analyzer(file_path, python_ast, emit_findings=False)
-    analyzer.run(python_ast.tree)
-    return dict(analyzer.bound_shell_call_ownership), set(analyzer.emitted_shell_calls)
+    ownership, emitted, _ = bound_shell_call_analysis(file_path, python_ast)
+    return ownership, emitted
 
 
 def bound_shell_call_ownership(
