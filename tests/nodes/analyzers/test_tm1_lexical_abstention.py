@@ -144,7 +144,6 @@ def test_observed_flag_replacement_removes_stale_lexical_binding(replacement: st
         "subprocess = proxy",
         "subprocess = True",
         "subprocess.run = proxy",
-        "subprocess['run'] = proxy",
         "del subprocess",
         "import settings as subprocess",
     ],
@@ -185,6 +184,42 @@ def test_positive_dataflow_without_retained_finding_keeps_lexical_owner(
 ) -> None:
     source = "import subprocess\nenabled = True\nsubprocess.run(command, shell=enabled)\n"
     monkeypatch.setattr(truthiness, "analyze", lambda *args, **kwargs: [])
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+@pytest.mark.parametrize("replacement", ["enabled = False", "subprocess = proxy"])
+def test_uncalled_deferred_global_store_is_not_counterevidence(replacement: str) -> None:
+    name = replacement.partition(" =")[0]
+    source = (
+        "payload = input()\nimport subprocess\nenabled = True\n"
+        f"def disable():\n    global {name}\n    {replacement}\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+@pytest.mark.parametrize(
+    "mutation", ["subprocess.label = 'documentation'", "subprocess.check_call = proxy"]
+)
+def test_unrelated_receiver_attribute_is_not_counterevidence(mutation: str) -> None:
+    source = (
+        f"import subprocess\n{mutation}\nenabled = True\nsubprocess.run(command, shell=enabled)\n"
+    )
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+def test_later_fresh_import_restores_deferred_receiver_signal() -> None:
+    source = (
+        "import subprocess\ndef run():\n    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "subprocess = proxy\nimport subprocess\nrun()\n"
+    )
     findings = _findings(source)
     assert len(findings) == 1
     assert findings[0].severity == "HIGH"

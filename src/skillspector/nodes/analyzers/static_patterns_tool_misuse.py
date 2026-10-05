@@ -166,11 +166,11 @@ _ROOT_GLOB_AFFIRMATIVE_NEGATION_PREFIX_RE = re.compile(
 
 # Match a literal True assigned to a local name shortly before it is passed as
 # shell=<name> to a subprocess invocation.  The bounded newline gap and the
-# intervening-write guard keep this a local data-flow fact; Python scope
+# AST binding-evidence guard keep this a local data-flow fact; Python scope
 # visibility is enforced separately in analyze() via _VARIABLE_SHELL_FLAG_RE.
 _VARIABLE_SHELL_FLAG_PATTERN = (
     r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*True\s*$\n"
-    r"(?:(?![^\n]*\b\1\s*=)[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
+    r"(?:[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
     r"(?:subprocess\.\w+|Popen)\s*\([^)]*\bshell\s*=\s*\1\b"
 )
 _VARIABLE_SHELL_FLAG_RE = re.compile(_VARIABLE_SHELL_FLAG_PATTERN, re.IGNORECASE | re.MULTILINE)
@@ -2980,7 +2980,7 @@ class _VariableShellAstIndex:
     bindings: dict[ast.AST, frozenset[str]]
     class_binding_starts: dict[ast.ClassDef, dict[str, tuple[int, ...]]]
     declarations: dict[ast.AST, dict[str, str]]
-    binding_events: dict[ast.AST, dict[str, tuple[tuple[int, bool], ...]]]
+    binding_events: dict[tuple[ast.AST, ast.AST], dict[str, tuple[tuple[int, bool], ...]]]
 
 
 @dataclass(frozen=True)
@@ -3199,16 +3199,18 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
                 stack.append((node.elt, nested_chain, None))
             continue
 
-        if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(
-            node.ctx, (ast.Store, ast.Del)
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and isinstance(node.value, ast.Name)
         ):
-            receiver = node.value
-            while isinstance(receiver, (ast.Attribute, ast.Subscript)):
-                receiver = receiver.value
-            if isinstance(receiver, ast.Name):
-                record_binding(
-                    scope, receiver.id, binding_start if binding_start is not None else end
-                )
+            # Replacing the called slot is affirmative evidence; unrelated
+            # attributes and protocol effects only make receiver trust unknown.
+            record_binding(
+                scope,
+                node.value.id + "." + node.attr,
+                binding_start if binding_start is not None else end,
+            )
 
         if isinstance(node, ast.Global):
             for name in node.names:
@@ -3315,13 +3317,42 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
                 (child, scope_chain, binding_start) for child in ast.iter_child_nodes(node)
             )
 
-    # Global/nonlocal stores belong to their declared binding scope rather
-    # than to the syntactic function/class that contains the store.
-    redirected_events: dict[ast.AST, dict[str, list[tuple[int, bool]]]] = {}
+    def execution_scope(scope: ast.AST) -> ast.AST:
+        current: ast.AST | None = scope
+        while current is not None:
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                return current
+            current = parents.get(current)
+        return tree
+
+    # Keep the execution scope of every store. A global/nonlocal declaration
+    # changes the binding namespace; it never proves a deferred body was run.
+    scoped_events: dict[tuple[ast.AST, ast.AST], dict[str, list[tuple[int, bool]]]] = {}
     for scope, names in binding_events.items():
         for name, events in names.items():
             target_scope = scope
-            declaration = declarations.get(scope, {}).get(name)
+            receiver_name = name.partition(".")[0]
+            declaration = declarations.get(scope, {}).get(receiver_name)
+            if "." in name and declaration is None:
+                # Attribute stores mutate the object resolved by the receiver,
+                # rather than introducing a new binding in the syntactic scope.
+                current: ast.AST | None = scope
+                crossed_function = False
+                while current is not None:
+                    if current is tree:
+                        target_scope = tree
+                        break
+                    if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        if receiver_name in bindings.get(current, set()):
+                            target_scope = current
+                            break
+                        crossed_function = True
+                    elif isinstance(current, ast.ClassDef) and not crossed_function:
+                        starts = class_binding_starts.get(current, {}).get(receiver_name, ())
+                        if any(position <= events[0][0] for position in starts):
+                            target_scope = current
+                            break
+                    current = parents.get(current)
             if declaration == "global":
                 target_scope = tree
             elif declaration == "nonlocal":
@@ -3329,12 +3360,12 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
                 while outer is not None:
                     if isinstance(
                         outer, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-                    ) and name in bindings.get(outer, set()):
+                    ) and receiver_name in bindings.get(outer, set()):
                         target_scope = outer
                         break
                     outer = parents.get(outer)
-            redirected_events.setdefault(target_scope, {}).setdefault(name, []).extend(events)
-    binding_events = redirected_events
+            key = (target_scope, execution_scope(scope))
+            scoped_events.setdefault(key, {}).setdefault(name, []).extend(events)
 
     frozen_calls = {
         name: tuple(sorted(nodes, key=lambda item: item.start)) for name, nodes in calls.items()
@@ -3355,7 +3386,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
         declarations=declarations,
         binding_events={
             scope: {name: tuple(sorted(set(events))) for name, events in names.items()}
-            for scope, names in binding_events.items()
+            for scope, names in scoped_events.items()
         },
     )
 
@@ -3446,7 +3477,28 @@ def _lexical_shell_has_counterevidence(
     shell = next((item.value for item in candidate.call.keywords if item.arg == "shell"), None)
     shell_span = _node_character_span(parsed, shell) if shell is not None else None
     shell_start = shell_span[0] if shell_span is not None else call_start
-    flag_events = index.binding_events.get(candidate.assignment_scope, {}).get(candidate.name, ())
+    current_execution = next(
+        (
+            scope
+            for scope in reversed(candidate.call_scope_chain)
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+        ),
+        index.tree,
+    )
+
+    def binding_events(scope: ast.AST, name: str) -> tuple[tuple[int, bool], ...]:
+        owner_execution = (
+            scope
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+            else index.tree
+        )
+        events = index.binding_events.get((scope, owner_execution), {}).get(name, ())
+        if current_execution is not owner_execution:
+            local_events = index.binding_events.get((scope, current_execution), {}).get(name, ())
+            return tuple(sorted((*events, *local_events)))
+        return events
+
+    flag_events = binding_events(candidate.assignment_scope, candidate.name)
     flag_index = bisect_right(flag_events, (shell_start, True))
     if flag_index:
         last_flag = flag_events[flag_index - 1]
@@ -3457,7 +3509,14 @@ def _lexical_shell_has_counterevidence(
     function = candidate.call.func
     receiver = function.id if isinstance(function, ast.Name) else function.value.id
     receiver_scope = _resolved_name_scope(index, candidate.call_scope_chain, receiver, call_start)
-    receiver_events = index.binding_events.get(receiver_scope, {}).get(receiver, ())
+    receiver_events = binding_events(receiver_scope, receiver)
+    if isinstance(function, ast.Attribute):
+        method_name = receiver + "." + function.attr
+        method_events = binding_events(receiver_scope, method_name)
+        current_scope = candidate.call_scope_chain[-1]
+        if current_scope is not receiver_scope:
+            method_events += binding_events(current_scope, method_name)
+        receiver_events = tuple(sorted(set((*receiver_events, *method_events))))
     receiver_index = bisect_right(receiver_events, (call_start, True))
     if receiver_index:
         # An explicit fresh import supersedes earlier replacement evidence.
@@ -3473,9 +3532,8 @@ def _lexical_shell_has_counterevidence(
         isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
         for scope in candidate.call_scope_chain[1:]
     )
-    return deferred and any(
-        not restores for start, restores in receiver_events if start > call_start
-    )
+    future_events = receiver_events[receiver_index:]
+    return bool(deferred and future_events and not future_events[-1][1])
 
 
 def _tm1_candidates(
@@ -4137,7 +4195,12 @@ def analyze(
             for span, (_, match) in variable_matches.items():
                 assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
                 candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)
-                if candidate is not None and not candidate.visible:
+                if candidate is not None and (
+                    not candidate.visible
+                    or _lexical_shell_has_counterevidence(
+                        ast_index, parsed, candidate, receiver_trusted=None
+                    )
+                ):
                     invisible_variable_matches.add(span)
 
     shell_content = (
