@@ -709,10 +709,10 @@ SkillSpector is built to be driven by other tools (CI pipelines, install gates, 
 | Code | Meaning |
 |------|---------|
 | `0` | Scan completed, `risk_score` ≤ 50 (recommendation `SAFE` or `CAUTION`), and no enabled strict gate fired |
-| `1` | Scan completed and either `risk_score` > 50, `--fail-on-findings` found an active finding, or `--fail-on-incomplete` found partial/incomplete analysis |
+| `1` | Scan completed and either `risk_score` > 50, `--fail-on-findings` found an active finding, `--fail-on-incomplete` found partial/incomplete analysis, or `--min-coverage` found coverage below its threshold |
 | `2` | Error (bad input, unreadable source, internal failure) |
 
-> By default, the exit code collapses `SAFE` and `CAUTION` into `0`. Use `--fail-on-findings` to gate on any active finding, `--fail-on-incomplete` to gate on incomplete coverage, or read the JSON `recommendation` field for custom policy.
+> By default, the exit code collapses `SAFE` and `CAUTION` into `0`. Use `--fail-on-findings` to gate on any active finding, `--fail-on-incomplete` to gate on incomplete coverage, `--min-coverage PERCENT` to gate on a coverage floor, or read the JSON `recommendation` field for custom policy.
 
 ### Machine-readable output
 
