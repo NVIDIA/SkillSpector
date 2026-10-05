@@ -214,6 +214,49 @@ def test_unrelated_receiver_attribute_is_not_counterevidence(mutation: str) -> N
     assert findings[0].severity == "HIGH"
 
 
+def test_reimport_restores_method_after_mutating_a_replaced_receiver() -> None:
+    source = (
+        "subprocess = proxy\nsubprocess.run = proxy.run\nimport subprocess\n"
+        "enabled = True\nsubprocess.run(command, shell=enabled)\n"
+    )
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "subprocess.run = subprocess.run",
+        "subprocess.run: object = subprocess.run",
+        "subprocess.run = saved = subprocess.run",
+        "saved = subprocess.run = subprocess.run",
+        "subprocess.run, saved = subprocess.run, 1",
+        "saved, [subprocess.run] = 1, [subprocess.run]",
+    ],
+)
+@pytest.mark.parametrize("intervening", ["", "helper()\n"])
+def test_called_method_self_store_preserves_lexical_finding(
+    assignment: str, intervening: str
+) -> None:
+    source = (
+        f"import subprocess\nenabled = True\n{assignment}\n"
+        f"{intervening}subprocess.run(command, shell=enabled)\n"
+    )
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+@pytest.mark.parametrize("intervening", ["import subprocess\n", "helper()\nimport subprocess\n"])
+def test_cached_method_mutation_survives_reimport(intervening: str) -> None:
+    source = (
+        "import subprocess\nsubprocess.run = proxy\n"
+        f"{intervening}enabled = True\nsubprocess.run(command, shell=enabled)\n"
+    )
+    assert not _findings(source)
+
+
 def test_later_fresh_import_restores_deferred_receiver_signal() -> None:
     source = (
         "import subprocess\ndef run():\n    enabled = True\n"
