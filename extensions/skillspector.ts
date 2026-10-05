@@ -147,7 +147,8 @@ export default function (pi: ExtensionAPI) {
           cwd: ctx.cwd,
           env,
           signal,
-          timeout: 120000,
+          // Match the CLI's 600s workflow budget plus startup/report headroom.
+          timeout: (params.noLlm ?? true) ? 120000 : 630000,
         });
 
         const stdout = truncateText(redactSecrets(result.stdout ?? ""));
