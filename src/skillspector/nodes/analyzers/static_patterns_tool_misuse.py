@@ -3487,8 +3487,15 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
                 and assignment.targets[0] is node
                 and tree.body
                 and assignment is tree.body[0]
+                and not any(
+                    isinstance(value, ast.Name)
+                    and isinstance(value.ctx, ast.Load)
+                    and value.id == node.value.id
+                    for value in ast.walk(assignment.value)
+                )
             ):
                 # Retain the legacy first-statement direct shadow control only.
+                # An RHS using the receiver may preserve a native callable.
                 # Prior stores/protocol effects need the companion's explicit proof.
                 record_binding(
                     scope,
