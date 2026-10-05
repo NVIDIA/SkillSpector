@@ -165,9 +165,20 @@ _STANDARD_SKILL_MKDIR = re.compile(
     r"(?P<quote>['\"]?)(?P<target>~/\.(?:claude|codex|gemini)/skills"
     r"(?:/[a-zA-Z0-9][a-zA-Z0-9_.-]*)?)/?(?P=quote)[ \t]*"
 )
-_SKILL_PAYLOAD_COPY_COMMAND = re.compile(r"[ \t]*(?:cp|mv|install)(?=\s)[^\r\n]*", re.IGNORECASE)
-_MAX_SKILL_COPY_CONTEXT_CHARS = 4_096
-_MAX_SKILL_COPY_CONTEXT_LINES = 4
+_SKILLS_ROOT = re.compile(
+    r"(?:~/|\$(?:HOME|\{HOME\})/|/home/[^/\s]+/)\.(?:claude|codex|gemini)/skills(?=/|\b)",
+    re.IGNORECASE,
+)
+_SKILL_INSTALL_PATH = re.compile(
+    r"(?:~/|\$(?:HOME|\{HOME\})/|/home/[^/\s]+/)"
+    r"(?P<relative>\.(?:claude|codex|gemini)/skills(?:/[a-zA-Z0-9][a-zA-Z0-9_.-]*)*)/?"
+)
+_CLONE_URL = re.compile(
+    r"(?:(?:https?|git|ssh)://[a-zA-Z0-9._~:/%@+-]+"
+    r"|[a-zA-Z0-9_.-]+@[a-zA-Z0-9_.-]+:[a-zA-Z0-9._~/-]+)"
+)
+_SKILL_CONTEXT_LINE = re.compile(rf"[^{LINE_BREAK_CHARS}]+")
+_MAX_SKILL_INSTALL_CONTEXT_CHARS = 4_096
 
 # RA2: Session Persistence — unauthorized persistence across boundaries
 RA2_CODE_PATTERNS = [
@@ -319,18 +330,18 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 # findings even when they mention the same skills directory.
                 standard_mkdir = _STANDARD_SKILL_MKDIR.fullmatch(content[line_start:line_end])
                 if standard_mkdir:
-                    copy_match = _adjacent_skill_payload_copy(
+                    unsafe_context = _unsafe_skill_install_context(
                         content,
                         line_start,
                         standard_mkdir.group("target"),
                         line_starts,
                         line_ends,
                     )
-                    if copy_match is None:
+                    if unsafe_context is None:
                         continue
-                    # Attribute persistence to the operation that puts content
-                    # in the loadable directory, not to creating that directory.
-                    match = copy_match
+                    # Preserve evidence for the nearby skills-root operation.
+                    # Unknown or clipped syntax keeps the mkdir's own evidence.
+                    match = unsafe_context
             line_num = bisect_right(line_starts, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -348,49 +359,62 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     return findings
 
 
-def _adjacent_skill_payload_copy(
+def _unsafe_skill_install_context(
     content: str,
     mkdir_line_start: int,
     target: str,
     line_starts: tuple[int, ...],
     line_ends: tuple[int, ...],
 ) -> re.Match[str] | None:
-    """Find a nearby copy/move/install into the exact directory just created."""
+    """Retain persistence when nearby skills-root use is not a simple install.
+
+    Inspect every neighboring logical line within a 4 KiB window.
+    Blank lines do not prove independence. Any skills-root reference retains
+    detection unless the complete line is a simple clone into the target.
+    Composition, parse errors, alternate writers and destinations are unsafe.
+    """
     mkdir_line_index = bisect_right(line_starts, mkdir_line_start) - 1
-    last_line_index = min(mkdir_line_index + _MAX_SKILL_COPY_CONTEXT_LINES, len(line_starts) - 1)
-    context_end = min(line_ends[last_line_index], mkdir_line_start + _MAX_SKILL_COPY_CONTEXT_CHARS)
-    normalized_target = target.rstrip("/")
+    radius = _MAX_SKILL_INSTALL_CONTEXT_CHARS // 2
+    context_start = max(0, mkdir_line_start - radius)
+    context_end = min(len(content), mkdir_line_start + radius)
+    mkdir_evidence = _SKILL_CONTEXT_LINE.match(
+        content, mkdir_line_start, line_ends[mkdir_line_index]
+    )
 
-    for line_index in range(mkdir_line_index + 1, last_line_index + 1):
-        line_start = line_starts[line_index]
-        line_end = min(line_ends[line_index], context_end)
-        if line_start >= context_end:
-            break
-        line = content[line_start:line_end]
-        if not line.strip():
-            break
-        if line_end != line_ends[line_index] or not _SKILL_PAYLOAD_COPY_COMMAND.match(line):
-            continue
-        if _SHELL_COMMAND_COMPOSITION.search(line):
-            continue
-        try:
-            tokens = shlex.split(line, posix=True)
-        except ValueError:
-            continue
-        if not tokens or tokens[0].lower() not in {"cp", "mv", "install"}:
-            continue
-
-        destination = tokens[-1]
-        for option_index, token in enumerate(tokens[1:-1], start=1):
-            if token in {"-t", "--target-directory"}:
-                destination = tokens[option_index + 1]
+    for direction in (1, -1):
+        line_index = mkdir_line_index + direction
+        while 0 <= line_index < len(line_starts):
+            start, end = line_starts[line_index], line_ends[line_index]
+            if start >= context_end or end <= context_start:
                 break
-            if token.startswith("--target-directory="):
-                destination = token.partition("=")[2]
-                break
-        if destination == normalized_target or destination.startswith(f"{normalized_target}/"):
-            return _SKILL_PAYLOAD_COPY_COMMAND.match(content, line_start, line_end)
+            if start < context_start or end > context_end:
+                return mkdir_evidence
+            line = content[start:end]
+            if _SKILLS_ROOT.search(line) and not _is_simple_skill_clone(line, target):
+                return _SKILL_CONTEXT_LINE.match(content, start, end)
+            line_index += direction
     return None
+
+
+def _is_simple_skill_clone(line: str, target: str) -> bool:
+    """Recognize only git clone <literal URL> <target or child directory>."""
+    if _SHELL_COMMAND_COMPOSITION.search(line) or "`" in line:
+        return False
+    try:
+        tokens = shlex.split(line, posix=True)
+    except ValueError:
+        return False
+    if len(tokens) != 4 or tokens[:2] != ["git", "clone"]:
+        return False
+    if _CLONE_URL.fullmatch(tokens[2]) is None:
+        return False
+    destination = _SKILL_INSTALL_PATH.fullmatch(tokens[3])
+    created = _SKILL_INSTALL_PATH.fullmatch(target)
+    if destination is None or created is None:
+        return False
+    relative = destination.group("relative")
+    created_relative = created.group("relative")
+    return relative == created_relative or relative.startswith(f"{created_relative}/")
 
 
 def _is_signed_companion_cli_update(

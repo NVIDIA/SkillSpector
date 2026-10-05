@@ -18,10 +18,11 @@ from .common import LINE_BREAK_CHARS, LOGICAL_LINE_BREAK
 
 _CONTEXT_CHARS = 512
 _MARKDOWN = str.maketrans("", "", "*_`")
-_SPACE = r"\s+"
+# A negation on another logical line cannot govern an affirmative instruction.
+_SPACE = r"[ \t]+"
 _DIRECT_PREFIX = re.compile(
     r"(?:\A|(?<=[\n\r.!?;,\[]))[ \t]*"
-    r"(?:[-+]\s+|\d+[.)]\s+)?"
+    r"(?:[-+][ \t]+|\d+[.)][ \t]+)?"
     rf"(?:please{_SPACE})?"
     rf"(?:(?:you|(?:the{_SPACE})?(?:agent|assistant|model)){_SPACE})?"
     rf"(?:do{_SPACE}not|don['’]t|never|no|must{_SPACE}not|shall{_SPACE}not){_SPACE}"
@@ -34,7 +35,8 @@ _SENTENCE_END = re.compile(rf"[.!?;{LINE_BREAK_CHARS}]")
 _EXCEPTION = re.compile(r"\b(?:unless|except|until|but|however|instead)\b", re.IGNORECASE)
 
 _DISAVOWAL = re.compile(
-    r"\b(?:ignore|disregard|override|obsolete|invalid|bypass|suspend|violate)\b",
+    r"\b(?:ignore|disregard|override|obsolete|invalid|bypass|suspend|violate|"
+    r"opposite|inverse|invert(?:ed|ing)?|revers(?:e|ed|ing|al)|contrary|negat(?:e|ed|ing))\b",
     re.IGNORECASE,
 )
 
