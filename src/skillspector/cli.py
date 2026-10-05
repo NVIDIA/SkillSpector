@@ -81,6 +81,7 @@ from skillspector.suppression import (
     effective_findings,
     load_baseline,
 )
+from skillspector.terminal_text import visible_terminal_text as _visible_terminal_text
 
 logger = get_logger(__name__)
 
@@ -364,7 +365,7 @@ def _write_result(
             console.print(f"Report saved to: {output}")
     else:
         if format == FormatChoice.terminal:
-            console.print(report_body, markup=False)
+            console.print(report_body, markup=False, emoji=False)
         else:
             print(report_body)
 
@@ -1353,23 +1354,6 @@ def _cache_transitive_result(
         meta_review_required=child_result.get("meta_review_required") is True,
         refs=extraction.references,
     )
-
-
-def _visible_terminal_text(value: str) -> str:
-    """Render untrusted path text without passing terminal control characters."""
-    visible: list[str] = []
-    for character in value:
-        if character.isprintable():
-            visible.append(character)
-            continue
-        codepoint = ord(character)
-        if codepoint <= 0xFF:
-            visible.append(f"\\x{codepoint:02x}")
-        elif codepoint <= 0xFFFF:
-            visible.append(f"\\u{codepoint:04x}")
-        else:
-            visible.append(f"\\U{codepoint:08x}")
-    return "".join(visible)
 
 
 def _discovered_files_tree(paths: list[str]) -> Tree:
@@ -3158,7 +3142,7 @@ def _scan_multi_skill(
             Path(output).write_text(rendered, encoding="utf-8")
             progress_console.print(f"[green]Combined report saved to:[/green] {output}")
         elif format is FormatChoice.terminal:
-            console.print(rendered, markup=False)
+            console.print(rendered, markup=False, emoji=False)
         else:
             sys.stdout.write(rendered)
 
