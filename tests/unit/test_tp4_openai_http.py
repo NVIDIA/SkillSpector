@@ -229,7 +229,11 @@ def test_full_scanner_graph_reports_tp4_http_results(
         assert findings[0].evidence["code_path"] == "format.py"
         assert findings[0].evidence["code_start_line"] == 1
         assert findings[0].evidence["code_end_line"] == 2
-        assert findings[0].fingerprint()
+        assert any(
+            findings[0].finding_id in event.get("emitted_finding_ids", [])
+            for event in result["inspection_ledger"]
+            if event["analyzer_id"] == tp.ANALYZER_ID and event["path"] == "format.py"
+        )
     report = json.loads(result["report_body"])
     complete = mode in {"clean", "mismatch"}
     if output_format == "json":
