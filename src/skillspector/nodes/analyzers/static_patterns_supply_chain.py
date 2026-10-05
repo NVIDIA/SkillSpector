@@ -89,6 +89,13 @@ from .osv_client import (
     was_osv_reachable,
 )
 from .pattern_defaults import PatternCategory
+from .static_patterns_tool_misuse import (
+    _ROOT_GLOB_COMMAND_CHARS,
+    _bounded_shell_tokens,
+    _markdown_shell_text,
+    _skip_backtick_substitution,
+    _skip_command_substitution,
+)
 from .static_runner import analyzer_finding_to_finding
 
 logger = get_logger(__name__)
@@ -145,6 +152,27 @@ SC2_PROSE_PATTERNS = [
     (r"run\s+(?:this|the)\s+(?:following\s+)?(?:curl|wget)\s+command", 0.6),
 ]
 SC2_PATTERNS = SC2_CODE_PATTERNS + SC2_PROSE_PATTERNS
+_SC2_SHELL_PATTERNS = frozenset(SC2_CODE_PATTERNS[:6])
+_SC2_FETCH_COMMAND = re.compile(r"(?:curl|wget)\s+", re.IGNORECASE)
+_SC2_SUBSTITUTION_START = re.compile(r"\$\(|`")
+_SC2_ATTACHED_EXECUTOR = re.compile(
+    r"(?:\||&&)\s*(?:sudo\s+)?(?:bash|sh|python3?|node|ruby|perl)",
+    re.IGNORECASE,
+)
+_SC2_FENCE_LINE = re.compile(
+    rf"(?:\A|{LOGICAL_LINE_BREAK.pattern})[ \t]*(?P<marker>`{{3,}}|~{{3,}})"
+    r"[^\r\n\v\f\x1c-\x1e\x85\u2028\u2029]*"
+)
+_SC2_COMPOUND_TOKEN = re.compile(
+    r"(?P<quoted>\"(?:\\.|[^\"\\])*\"|'[^']*')"
+    r"|(?P<escaped>\\[\s\S])"
+    r"|(?P<comment>(?<![^\s;&|()<>])\#[^\r\n]*)"
+    r"|(?P<heredoc><{2})"
+    r"|(?P<word>(?<![^\s;|&(){}])(?:if|fi|for|while|until|select|done|case|esac|begin|end|function)"
+    r"(?=[\s;|&(){}]|\Z))"
+    r"|(?P<delimiter>[(){}])|(?P<unclosed_quote>['\"`])",
+)
+_SC2_CLAUSE_PREFIX = re.compile(r"[ \t]*(?:(?:then|do|else|elif|time(?:[ \t]+-p)?|!)[ \t]+)*")
 _INSTALLER_WARNING = re.compile(r"\b(?:warning|caution)\b", re.IGNORECASE)
 _INTERNAL_INSTALLER = re.compile(
     r"\binternal\b[^\n]{0,80}\binstaller\b|\binstaller\b[^\n]{0,80}\binternal\b",
@@ -1692,11 +1720,187 @@ def _version_lt(v1: str, v2: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _sc2_substitution_ranges(shell_text: str) -> list[tuple[int, int]]:
+    """Locate nested output flows; Markdown fences are not shell backticks."""
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    while marker := _SC2_SUBSTITUTION_START.search(shell_text, cursor):
+        start = marker.start()
+        limit = min(len(shell_text), start + _ROOT_GLOB_COMMAND_CHARS)
+        skip = (
+            _skip_command_substitution if marker.group(0) == "$(" else _skip_backtick_substitution
+        )
+        end = skip(shell_text, start, limit)
+        if end is None:
+            ranges.append((start, len(shell_text)))
+            break
+        ranges.append((start, end))
+        cursor = end
+    return ranges
+
+
+def _sc2_has_unproved_compound_context(
+    content: str, offset: int, fence_ends: tuple[int, ...]
+) -> bool:
+    """A child terminator cannot disconnect an enclosing command's output flow.
+
+    This is a conservative ownership guard, not a compound-shell evaluator.
+    Balanced quotes and comments cannot close a parent group. Unclosed groups,
+    conditionals, loops, case statements and truncated context retain legacy
+    evidence rather than granting a single-command boundary.
+    """
+    start = max(0, offset - _ROOT_GLOB_COMMAND_CHARS)
+    fence_index = bisect_right(fence_ends, offset)
+    if fence_index and fence_ends[fence_index - 1] >= start:
+        start = fence_ends[fence_index - 1]
+    elif start > 0:
+        return True
+    stack: list[str] = []
+    endings = {
+        "if": "fi",
+        "for": "done",
+        "while": "done",
+        "until": "done",
+        "select": "done",
+        "case": "esac",
+        "begin": "end",
+        "function": "end",
+        "(": ")",
+        "{": "}",
+    }
+    for token in _SC2_COMPOUND_TOKEN.finditer(content, start, offset):
+        if token.lastgroup in {"unclosed_quote", "heredoc"}:
+            return True
+        if token.lastgroup == "escaped" and any(char in token.group(0) for char in "\r\n"):
+            # Shell lexing removes continuations before recognizing reserved words.
+            return True
+        if token.lastgroup not in {"word", "delimiter"}:
+            continue
+        value = token.group(0)
+        if token.lastgroup == "word" or value == "}":
+            boundary = max(content.rfind(char, start, token.start()) for char in "\n;|&(){}")
+            if _SC2_CLAUSE_PREFIX.fullmatch(content[boundary + 1 : token.start()]) is None:
+                if value == "}":
+                    return True
+                continue
+        if value in endings:
+            stack.append(endings[value])
+        elif stack and value == stack[-1]:
+            stack.pop()
+        elif value in {"fi", "done", "esac", "end", "}"}:
+            return True
+        # A case arm's ')' is not a parenthesis-group close.
+        elif value == ")" and ")" in stack:
+            return True
+    return bool(stack)
+
+
+def _sc2_shell_command_ranges(content: str, file_type: str) -> tuple[tuple[int, int | None], ...]:
+    """Bound fetch/executor matches to a shell command without rewriting source.
+
+    A newline or semicolon after a completed fetch is not a pipe into an
+    interpreter elsewhere in the document. Reuse the bounded shell parser so
+    quoted newlines, line continuations and nested substitutions stay intact.
+    An unproved boundary retains the existing conservative regex behavior.
+    """
+    ranges: list[tuple[int, int | None]] = []
+    # Project fence delimiters once. Inline ticks remain conservative shell syntax.
+    shell_text = (
+        _markdown_shell_text(content, lambda: None, complete_context=False)
+        if file_type in {"markdown", "text"}
+        else content
+    )
+    proof_text = shell_text
+    if file_type in {"markdown", "text"}:
+        # Logical lines establish documentary ownership, but Unicode/control
+        # separators remain native shell argument data during command parsing.
+        proof_text = LOGICAL_LINE_BREAK.sub(
+            lambda line_break: "\n" + " " * (len(line_break.group(0)) - 1), shell_text
+        )
+    fences = tuple(
+        (fence.start(), fence.end())
+        for fence in _SC2_FENCE_LINE.finditer(content)
+        if shell_text[fence.start("marker") : fence.end("marker")].isspace()
+    )
+    fence_starts = tuple(start for start, _ in fences)
+    fence_ends = tuple(end for _, end in fences)
+    substitutions = _sc2_substitution_ranges(shell_text)
+    substitution_index = 0
+    for fetch in _SC2_FETCH_COMMAND.finditer(content):
+        while (
+            substitution_index < len(substitutions)
+            and substitutions[substitution_index][1] <= fetch.start()
+        ):
+            substitution_index += 1
+        if (
+            substitution_index < len(substitutions)
+            and substitutions[substitution_index][0] < fetch.start()
+        ):
+            # A parent echo/printf can pass substitution output into a later
+            # interpreter. A child command's newline/closing delimiter does
+            # not prove that the fetch and outer executor are disconnected.
+            ranges.append((fetch.start(), None))
+            break
+        if _sc2_has_unproved_compound_context(
+            shell_text, fetch.start(), fence_ends
+        ) or _sc2_has_unproved_compound_context(proof_text, fetch.start(), fence_ends):
+            ranges.append((fetch.start(), None))
+            break
+        fence_index = bisect_right(fence_starts, fetch.start())
+        document_end = fence_starts[fence_index] if fence_index < len(fences) else len(content)
+        parse_start = max(0, fetch.start() - _ROOT_GLOB_COMMAND_CHARS)
+        # One extra character distinguishes a parser limit from a genuine EOF.
+        parse_end = min(document_end, fetch.start() + 4 + _ROOT_GLOB_COMMAND_CHARS + 1)
+        _, local_end, limited = _bounded_shell_tokens(
+            shell_text[parse_start:parse_end],
+            fetch.start() - parse_start,
+            fetch.start() + 4 - parse_start,
+        )
+        command_end = parse_start + local_end
+        if (
+            limited
+            or content[command_end : command_end + 1] in {"'", '"', "`", ")"}
+            # CMD caret continuation is outside the Bourne parser's proof.
+            or re.search(r"\^[ \t]*\r?$", content[fetch.start() : command_end]) is not None
+            # A logical-line view cannot turn argument data into a group close.
+            or _sc2_has_unproved_compound_context(shell_text, command_end, fence_ends)
+            or _sc2_has_unproved_compound_context(proof_text, command_end, fence_ends)
+        ):
+            # Preserve legacy nonoverlapping matching on uncertain syntax,
+            # rather than repeatedly parsing overlapping suffixes.
+            ranges.append((fetch.start(), None))
+            break
+        executor = _SC2_ATTACHED_EXECUTOR.match(content, command_end)
+        if executor is not None:
+            ranges.append((fetch.start(), executor.end()))
+    return tuple(ranges)
+
+
+def _iter_sc2_shell_matches(
+    pattern: str,
+    content: str,
+    command_ranges: tuple[tuple[int, int | None], ...],
+) -> Iterator[re.Match[str]]:
+    compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    covered = 0
+    for start, end in command_ranges:
+        if end is None:
+            yield from compiled.finditer(content, max(start, covered))
+            return
+        if start < covered:
+            continue
+        match = compiled.match(content, start, end)
+        if match is not None:
+            yield match
+            covered = match.end()
+
+
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for supply chain patterns (SC1–SC3, SC7)."""
     findings: list[AnalyzerFinding] = []
     line_starts = logical_line_starts(content)
     content_lines = content.splitlines()
+    shell_command_ranges = _sc2_shell_command_ranges(content, file_type)
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
@@ -1741,12 +1945,15 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     )
                 )
     for pattern, confidence in SC2_PATTERNS:
-        matches = (
-            static_runner.iter_paragraph_matches
-            if (pattern, confidence) in SC2_PROSE_PATTERNS
-            else re.finditer
-        )
-        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+        if (pattern, confidence) in _SC2_SHELL_PATTERNS:
+            matches = _iter_sc2_shell_matches(pattern, content, shell_command_ranges)
+        elif (pattern, confidence) in SC2_PROSE_PATTERNS:
+            matches = static_runner.iter_paragraph_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            )
+        else:
+            matches = re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE)
+        for match in matches:
             line_num = line_number(match.start())
             mt = match.group(0)
             warned_internal_installer = _is_warned_internal_installer(
