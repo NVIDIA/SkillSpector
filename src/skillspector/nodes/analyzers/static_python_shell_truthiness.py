@@ -1088,6 +1088,7 @@ class _Analyzer:
         self.lines = python_ast.lines
         self.findings: list[AnalyzerFinding] = []
         self.bound_shell_call_ownership: dict[BoundShellCallKey, bool] = {}
+        self.emitted_shell_calls: set[BoundShellCallKey] = set()
 
     def _record_bound_shell_call(self, call: ast.Call, trusted_names: set[str]) -> None:
         """Record whether the companion owns one supported bound-shell call."""
@@ -1107,6 +1108,7 @@ class _Analyzer:
             or facts.get(shell.id) is not True
         ):
             return
+        self.emitted_shell_calls.add(_bound_shell_call_key(call))
         line = getattr(call, "lineno", 1)
         end_line = getattr(call, "end_lineno", None)
         start_byte_column = getattr(call, "col_offset", 0)
@@ -1543,6 +1545,18 @@ def analyze(
     if parsed.tree is None:
         return []
     return _Analyzer(file_path, parsed).run(parsed.tree)
+
+
+def bound_shell_call_state(
+    file_path: str,
+    python_ast: ParsedPythonFile,
+) -> tuple[dict[BoundShellCallKey, bool], set[BoundShellCallKey]]:
+    """Return receiver trust separately from affirmative companion detections."""
+    if python_ast.tree is None:
+        return {}, set()
+    analyzer = _Analyzer(file_path, python_ast)
+    analyzer.run(python_ast.tree)
+    return dict(analyzer.bound_shell_call_ownership), set(analyzer.emitted_shell_calls)
 
 
 def bound_shell_call_ownership(
