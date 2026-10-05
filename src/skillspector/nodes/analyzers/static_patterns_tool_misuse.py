@@ -3194,6 +3194,21 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
                 mark_attribute_identity_stores(target, node.value)
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
             mark_attribute_identity_stores(node.target, node.value)
+        if isinstance(node, ast.Assign):
+            # The RHS is captured before any target is assigned. A final
+            # same-slot store restores that snapshot after earlier writes in
+            # this statement, including chained and repeated unpacking targets.
+            stores: dict[tuple[str, str], list[ast.Attribute]] = {}
+            targets = list(reversed(node.targets))
+            while targets:
+                target = targets.pop()
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                    stores.setdefault((target.value.id, target.attr), []).append(target)
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    targets.extend(reversed(target.elts))
+            for slot_stores in stores.values():
+                if slot_stores[-1] in attribute_identity_stores:
+                    attribute_identity_stores.update(slot_stores)
 
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             bind(scope, node.name, end)
@@ -3374,44 +3389,49 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
     # Keep the execution scope of every store. A global/nonlocal declaration
     # changes the binding namespace; it never proves a deferred body was run.
     scoped_events: dict[tuple[ast.AST, ast.AST], dict[str, list[tuple[int, bool]]]] = {}
+    sorted_class_starts = {
+        scope: {name: tuple(sorted(starts)) for name, starts in names.items()}
+        for scope, names in class_binding_starts.items()
+    }
     for scope, names in binding_events.items():
         for name, events in names.items():
-            target_scope = scope
             receiver_name = name.partition(".")[0]
             declaration = declarations.get(scope, {}).get(receiver_name)
-            if "." in name and declaration is None:
-                # Attribute stores mutate the object resolved by the receiver,
-                # rather than introducing a new binding in the syntactic scope.
-                current: ast.AST | None = scope
-                crossed_function = False
-                while current is not None:
-                    if current is tree:
-                        target_scope = tree
-                        break
-                    if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                        if receiver_name in bindings.get(current, set()):
-                            target_scope = current
+            for event in events:
+                target_scope = scope
+                if "." in name and declaration is None:
+                    # A class body can change where its receiver resolves
+                    # between stores. Resolve each slot store at its own offset.
+                    current: ast.AST | None = scope
+                    crossed_function = False
+                    while current is not None:
+                        if current is tree:
+                            target_scope = tree
                             break
-                        crossed_function = True
-                    elif isinstance(current, ast.ClassDef) and not crossed_function:
-                        starts = class_binding_starts.get(current, {}).get(receiver_name, ())
-                        if any(position <= events[0][0] for position in starts):
-                            target_scope = current
+                        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                            if receiver_name in bindings.get(current, set()):
+                                target_scope = current
+                                break
+                            crossed_function = True
+                        elif isinstance(current, ast.ClassDef) and not crossed_function:
+                            starts = sorted_class_starts.get(current, {}).get(receiver_name, ())
+                            if bisect_right(starts, event[0]):
+                                target_scope = current
+                                break
+                        current = parents.get(current)
+                if declaration == "global":
+                    target_scope = tree
+                elif declaration == "nonlocal":
+                    outer = parents.get(scope)
+                    while outer is not None:
+                        if isinstance(
+                            outer, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+                        ) and receiver_name in bindings.get(outer, set()):
+                            target_scope = outer
                             break
-                    current = parents.get(current)
-            if declaration == "global":
-                target_scope = tree
-            elif declaration == "nonlocal":
-                outer = parents.get(scope)
-                while outer is not None:
-                    if isinstance(
-                        outer, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-                    ) and receiver_name in bindings.get(outer, set()):
-                        target_scope = outer
-                        break
-                    outer = parents.get(outer)
-            key = (target_scope, execution_scope(scope))
-            scoped_events.setdefault(key, {}).setdefault(name, []).extend(events)
+                        outer = parents.get(outer)
+                key = (target_scope, execution_scope(scope))
+                scoped_events.setdefault(key, {}).setdefault(name, []).append(event)
 
     frozen_calls = {
         name: tuple(sorted(nodes, key=lambda item: item.start)) for name, nodes in calls.items()
@@ -3425,10 +3445,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
             name: tuple(item.start for item in nodes) for name, nodes in frozen_calls.items()
         },
         bindings={scope: frozenset(names) for scope, names in bindings.items()},
-        class_binding_starts={
-            scope: {name: tuple(sorted(starts)) for name, starts in names.items()}
-            for scope, names in class_binding_starts.items()
-        },
+        class_binding_starts=sorted_class_starts,
         declarations=declarations,
         binding_events={
             scope: {name: tuple(sorted(set(events))) for name, events in names.items()}
@@ -3555,40 +3572,40 @@ def _lexical_shell_has_counterevidence(
     function = candidate.call.func
     receiver = function.id if isinstance(function, ast.Name) else function.value.id
     receiver_scope = _resolved_name_scope(index, candidate.call_scope_chain, receiver, call_start)
-    receiver_events = binding_events(receiver_scope, receiver)
-    method_events: tuple[tuple[int, bool], ...] = ()
+    event_sources = [(receiver_scope, receiver)]
     if isinstance(function, ast.Attribute):
         method_name = receiver + "." + function.attr
-        method_events = binding_events(receiver_scope, method_name)
+        event_sources.append((receiver_scope, method_name))
         current_scope = candidate.call_scope_chain[-1]
         if current_scope is not receiver_scope:
-            method_events += binding_events(current_scope, method_name)
-        # A cached module attribute remains changed after re-importing its
-        # module. Attribute stores on an already replaced receiver do not
-        # mutate the imported module that a later import restores.
-        for start, restores in method_events:
-            if restores or start >= call_start:
-                continue
-            receiver_before_store = bisect_right(receiver_events, (start, True))
-            if receiver_before_store and receiver_events[receiver_before_store - 1][1]:
-                return True
+            event_sources.append((current_scope, method_name))
+    receiver_events = tuple(
+        sorted({event for scope, name in event_sources for event in binding_events(scope, name)})
+    )
     receiver_index = bisect_right(receiver_events, (call_start, True))
     if receiver_index:
-        # An explicit fresh import supersedes earlier replacement evidence.
         if not receiver_events[receiver_index - 1][1]:
             return True
     elif isinstance(receiver_scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
         # Compile-time local bindings shadow a global receiver even before store.
         if receiver in index.bindings.get(receiver_scope, frozenset()):
             return True
-    # A deferred body may run after a later observed module/outer replacement.
-    # The trusted-call observation above preserves calls seen before that store.
-    deferred = any(
-        isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
-        for scope in candidate.call_scope_chain[1:]
-    )
-    future_events = receiver_events[receiver_index:]
-    return bool(deferred and future_events and not future_events[-1][1])
+    # Deferred bodies may run after a later outer replacement. A later store
+    # in this same body cannot revoke an earlier call; preserve event provenance.
+    future_outer_events: list[tuple[int, bool]] = []
+    for scope, name in event_sources:
+        owner_execution = (
+            scope
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+            else index.tree
+        )
+        if owner_execution is not current_execution:
+            future_outer_events.extend(
+                event
+                for event in index.binding_events.get((scope, owner_execution), {}).get(name, ())
+                if event[0] >= call_start
+            )
+    return bool(future_outer_events and not max(future_outer_events)[1])
 
 
 def _tm1_candidates(
@@ -5735,8 +5752,8 @@ def _reconcile_variable_shell_findings(
             call_span = _node_character_span(python_ast, candidate.call)
             if call_span is not None:
                 resolved.setdefault((call_span[0], candidate.name), []).append(candidate)
-    ownership, emitted = static_python_shell_truthiness.bound_shell_call_state(
-        file_path, python_ast
+    ownership, emitted, cached_replacements = (
+        static_python_shell_truthiness.bound_shell_call_analysis(file_path, python_ast)
     )
     supported_calls = set(emitted)
     retained_companion_starts: set[int] = set()
@@ -5785,8 +5802,12 @@ def _reconcile_variable_shell_findings(
         if not candidate.visible:
             continue
         call_key = _bound_shell_call_key(candidate.call)
-        if call_key in emitted or _lexical_shell_has_counterevidence(
-            ast_index, python_ast, candidate, receiver_trusted=ownership.get(call_key)
+        if (
+            call_key in cached_replacements
+            or call_key in emitted
+            or _lexical_shell_has_counterevidence(
+                ast_index, python_ast, candidate, receiver_trusted=ownership.get(call_key)
+            )
         ):
             continue
         if call_key in supported_calls:
