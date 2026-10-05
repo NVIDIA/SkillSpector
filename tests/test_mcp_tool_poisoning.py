@@ -21,6 +21,7 @@ import base64
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -233,6 +234,46 @@ def _mock_tp4_structured_llm(
         lambda **_kwargs: _FakeChatModel(structured_llm),
     )
     return structured_llm
+
+
+@pytest.fixture
+def patch_openai_chat_model(monkeypatch: pytest.MonkeyPatch):
+    """Use the real ChatOpenAI binder/parser with a recorded model factory."""
+    from langchain_openai import ChatOpenAI
+
+    from skillspector import llm_analyzer_base, llm_utils
+
+    monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_REASONING_EFFORT", raising=False)
+    bindings: list[dict[str, object]] = []
+    original = ChatOpenAI.with_structured_output
+
+    def record_binding(self, schema, **kwargs):
+        bindings.append(kwargs)
+        return original(self, schema, **kwargs)
+
+    monkeypatch.setattr(ChatOpenAI, "with_structured_output", record_binding)
+
+    def configure(provider="openai", *, controls=None, provider_hint=None):
+        def factory(**kwargs):
+            llm = ChatOpenAI(
+                model=kwargs["model"],
+                api_key="sk-test",
+                base_url="https://example.invalid/v1",
+                **(controls or {}),
+            )
+            llm_utils.register_chat_model_provider(llm, provider)
+            return llm
+
+        monkeypatch.setattr(llm_analyzer_base, "get_chat_model", factory)
+        monkeypatch.setattr(
+            llm_utils,
+            "get_active_provider",
+            lambda: SimpleNamespace(structured_output_method=lambda _model: provider_hint),
+        )
+        return bindings
+
+    return configure
 
 
 # Alias used by node import at module level
@@ -1579,83 +1620,109 @@ class TestTP4MarkdownFences:
 
 class TestTP4Fallbacks:
     def test_opus5_openai_tp4_binds_tool_output_for_initial_and_refreshed_models(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, patch_openai_chat_model
     ) -> None:
-        from langchain_openai import ChatOpenAI
-
         from skillspector import llm_analyzer_base
-        from skillspector.llm_utils import register_chat_model_provider
 
-        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
-        bindings: list[dict[str, object]] = []
-        original = ChatOpenAI.with_structured_output
-
-        def record_binding(self, schema, **kwargs):
-            bindings.append(kwargs)
-            return original(self, schema, **kwargs)
-
-        monkeypatch.setattr(ChatOpenAI, "with_structured_output", record_binding)
-
-        def openai_model(**kwargs):
-            llm = ChatOpenAI(
-                model=kwargs["model"], api_key="sk-test", base_url="https://example.invalid/v1"
-            )
-            register_chat_model_provider(llm, "openai")
-            return llm
-
-        monkeypatch.setattr(llm_analyzer_base, "get_chat_model", openai_model)
+        bindings = patch_openai_chat_model()
         analyzer = mcp_tool_poisoning._TP4Analyzer(
             model="azure/anthropic/claude-opus-5", timeout=lambda: 30.0
         )
         monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
         analyzer._model_for_call()
+        assert bindings == [{"method": "function_calling"}, {"method": "function_calling"}]
 
-        assert bindings == [
-            {"method": "function_calling"},
-            {"method": "function_calling"},
-        ]
-
-        # The gateway-specific workaround does not change other OpenAI models.
-        mcp_tool_poisoning._TP4Analyzer(model="azure/anthropic/claude-sonnet-4-6")
-        assert bindings[-1] == {}
-
-        # An explicit user override retains precedence over the workaround.
         monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "json_schema")
         mcp_tool_poisoning._TP4Analyzer(model="azure/anthropic/claude-opus-5")
         assert bindings[-1] == {"method": "json_schema"}
 
+    @pytest.mark.parametrize(
+        "provider", ["openai_compatible", "nv_inference", "azure_openai", "nv_build"]
+    )
     def test_opus5_tp4_does_not_force_tool_output_on_other_providers(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, patch_openai_chat_model, provider
     ) -> None:
-        from langchain_openai import ChatOpenAI
-
         from skillspector import llm_analyzer_base
-        from skillspector.llm_utils import register_chat_model_provider
 
-        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
-        bindings: list[dict[str, object]] = []
-        original = ChatOpenAI.with_structured_output
-
-        def record_binding(self, schema, **kwargs):
-            bindings.append(kwargs)
-            return original(self, schema, **kwargs)
-
-        def compatible_model(**kwargs):
-            llm = ChatOpenAI(
-                model=kwargs["model"], api_key="sk-test", base_url="https://example.invalid/v1"
-            )
-            register_chat_model_provider(llm, "openai_compatible")
-            return llm
-
-        monkeypatch.setattr(ChatOpenAI, "with_structured_output", record_binding)
-        monkeypatch.setattr(llm_analyzer_base, "get_chat_model", compatible_model)
-
+        bindings = patch_openai_chat_model(provider)
         analyzer = mcp_tool_poisoning._TP4Analyzer(
             model="azure/anthropic/claude-opus-5", timeout=lambda: 30.0
         )
         monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
         analyzer._model_for_call()
         assert bindings == [{}, {}]
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "azure/anthropic/claude-sonnet-4-6",
+            "azure/anthropic/claude-opus-5-20260901",
+            "azure/anthropic/claude-opus-5:latest",
+            "claude-opus-5",
+            "AZURE/ANTHROPIC/CLAUDE-OPUS-5",
+        ],
+    )
+    def test_opus5_tp4_exact_label_excludes_aliases(self, patch_openai_chat_model, model):
+        bindings = patch_openai_chat_model()
+        mcp_tool_poisoning._TP4Analyzer(model=model)
+        assert bindings == [{}]
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "none"])
+    def test_reasoning_env_skips_preference_on_initial_and_refreshed_models(
+        self, monkeypatch, patch_openai_chat_model, effort
+    ):
+        from skillspector import llm_analyzer_base
+
+        bindings = patch_openai_chat_model()
+        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", effort)
+        analyzer = mcp_tool_poisoning._TP4Analyzer(
+            model="azure/anthropic/claude-opus-5", timeout=lambda: 30.0
+        )
+        monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
+        analyzer._model_for_call()
+        assert bindings == [{}, {}]
+
+    @pytest.mark.parametrize(
+        "controls",
+        [
+            {"reasoning_effort": "high"},
+            {"reasoning": {"effort": "medium"}},
+            {"model_kwargs": {"thinking": {"type": "enabled", "budget_tokens": 1024}}},
+            {"extra_body": {"thinking": {"type": "enabled", "budget_tokens": 1024}}},
+            {"extra_body": {"reasoning_effort": "high"}},
+        ],
+    )
+    def test_model_reasoning_controls_skip_preference_on_construction_and_refresh(
+        self, monkeypatch, patch_openai_chat_model, controls
+    ):
+        from skillspector import llm_analyzer_base
+
+        bindings = patch_openai_chat_model(controls=controls)
+        analyzer = mcp_tool_poisoning._TP4Analyzer(
+            model="azure/anthropic/claude-opus-5", timeout=lambda: 30.0
+        )
+        monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
+        analyzer._model_for_call()
+        assert bindings == [{}, {}]
+
+    @pytest.mark.parametrize(
+        "override,hint,expected",
+        [
+            ("function_calling", "json_schema", "function_calling"),
+            ("json_schema", "function_calling", "json_schema"),
+            (None, "function_calling", "function_calling"),
+            (None, "json_schema", "json_schema"),
+        ],
+    )
+    def test_explicit_method_choices_win_with_reasoning(
+        self, monkeypatch, patch_openai_chat_model, override, hint, expected
+    ):
+        bindings = patch_openai_chat_model(provider_hint=hint)
+        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", "high")
+        if override is not None:
+            monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", override)
+        mcp_tool_poisoning._TP4Analyzer(model="azure/anthropic/claude-opus-5")
+        assert bindings == [{"method": expected}]
 
     def test_configured_output_language_is_included(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_OUTPUT_LANGUAGE", "German")
@@ -1736,40 +1803,30 @@ class TestTP4Fallbacks:
         )
 
     def test_opus5_function_calling_refusal_stays_incomplete(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, patch_openai_chat_model
     ) -> None:
         from langchain_core.messages import AIMessage
         from langchain_core.outputs import ChatGeneration, ChatResult
         from langchain_openai import ChatOpenAI
 
-        from skillspector import llm_analyzer_base
-        from skillspector.llm_utils import register_chat_model_provider
+        patch_openai_chat_model()
+        calls = []
 
-        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        def refuse(*_args, **_kwargs):
+            calls.append(1)
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="refused"))])
 
-        def openai_model(**kwargs):
-            llm = ChatOpenAI(
-                model=kwargs["model"], api_key="sk-test", base_url="https://example.invalid/v1"
-            )
-            register_chat_model_provider(llm, "openai")
-            return llm
-
-        monkeypatch.setattr(llm_analyzer_base, "get_chat_model", openai_model)
-        monkeypatch.setattr(
-            ChatOpenAI,
-            "_generate",
-            lambda *_args, **_kwargs: ChatResult(
-                generations=[ChatGeneration(message=AIMessage(content="refused"))]
-            ),
-        )
+        monkeypatch.setattr(ChatOpenAI, "_generate", refuse)
+        monkeypatch.setattr("skillspector.llm_analyzer_base.time.sleep", lambda _delay: None)
         state = _make_state("mcp_mismatched_skill", use_llm=True)
         state["model_config"] = {"default": "azure/anthropic/claude-opus-5"}
-
         result = node(state)
-
-        assert result["analyzer_status_events"][0]["status"] == "failed"
+        assert len(calls) == 4
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
         assert any(
-            event["outcome"] is LedgerOutcome.FAILED for event in result["inspection_ledger"]
+            event.get("reason_code") is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+            and event.get("error_class") == "ValidationError"
+            for event in result["inspection_ledger"]
         )
 
     def test_malformed_response_is_retried(self, monkeypatch: pytest.MonkeyPatch):

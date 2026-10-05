@@ -22,14 +22,14 @@ import logging
 import re
 import time
 import unicodedata
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import cast
 
 from langchain_openai.chat_models.base import BaseChatOpenAI
 from pydantic import BaseModel, Field, field_validator
 
-from skillspector.inference_usage import InferenceUsageRecord
+from skillspector.inference_usage import InferenceUsageRecord, chat_model_controls
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
@@ -56,6 +56,7 @@ from skillspector.nodes.analyzers.whitespace_padding import (
     padding_run_match_fingerprint,
 )
 from skillspector.providers import get_active_provider
+from skillspector.providers.chat_models import resolve_reasoning_effort
 from skillspector.state import (
     AnalyzerNodeResponse,
     LLMCallRecord,
@@ -880,6 +881,28 @@ _TP4_EXECUTABLE_TYPES = frozenset(
     {"python", "javascript", "typescript", "shell", "ruby", "go", "rust"}
 )
 
+# Track the exact-label gateway workaround in the public PR:
+# https://github.com/NVIDIA/SkillSpector/pull/691
+# Dated/suffixed aliases are deliberately excluded. Only the openai route has
+# reproduced wrapper evidence; other providers retain their own method hints.
+_TP4_TOOL_OUTPUT_MODELS = frozenset({"azure/anthropic/claude-opus-5"})
+
+
+def _tp4_reasoning_configured(llm: BaseChatOpenAI) -> bool:
+    """Avoid an automatic forced tool choice when reasoning controls are set."""
+    if resolve_reasoning_effort() is not None:
+        return True
+    if chat_model_controls(llm).get("reasoning_effort") is not None:
+        return True
+    if any(getattr(llm, name, None) is not None for name in ("reasoning_effort", "reasoning")):
+        return True
+    for controls in (llm.model_kwargs, llm.extra_body):
+        if isinstance(controls, Mapping) and any(
+            controls.get(name) is not None for name in ("reasoning_effort", "reasoning", "thinking")
+        ):
+            return True
+    return False
+
 
 class _TP4AnalysisResult(BaseModel):
     """Validated response from the description-behavior mismatch check."""
@@ -907,11 +930,14 @@ class _TP4Analyzer(LLMAnalyzerBase):
     def _structured_output_preference(self, llm: object) -> str | None:
         # The OpenAI-compatible Opus 5 gateway sometimes wraps json_schema
         # output in a {"json": ...} object instead of the requested schema.
-        # Tool calling returns the exact TP4 schema on the same gateway.
+        # Tool calling returns the exact TP4 schema on the same gateway, but
+        # forcing a tool may conflict with configured reasoning/thinking.
+        # Explicit environment/provider method choices still take precedence.
         if (
             isinstance(llm, BaseChatOpenAI)
             and chat_model_provider_name(llm) == "openai"
-            and self.model == "azure/anthropic/claude-opus-5"
+            and self.model in _TP4_TOOL_OUTPUT_MODELS
+            and not _tp4_reasoning_configured(llm)
         ):
             return "function_calling"
         return None
