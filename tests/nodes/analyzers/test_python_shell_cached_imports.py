@@ -26,6 +26,10 @@ from skillspector.python_ast import parse_python_source
         "import subprocess\nsubprocess.run = proxy\nclass Tool:\n"
         "    def run(self):\n        import subprocess\n        enabled = True\n"
         "        subprocess.run(command, shell=enabled)\n",
+        "import subprocess\nclass Tool:\n    def alter(self):\n"
+        "        global subprocess\n        subprocess = proxy\n"
+        "subprocess.run = handler\ndef run():\n    import subprocess\n    enabled = 1\n"
+        "    subprocess.run(command, shell=enabled)\n",
     ],
 )
 def test_local_import_does_not_restore_changed_cached_module_slot(source: str) -> None:
@@ -52,6 +56,18 @@ def test_local_import_does_not_restore_changed_cached_module_slot(source: str) -
         "import subprocess\nclass Tool:\n    global subprocess\n    subprocess = proxy\n"
         "subprocess.run = handler\ndef run():\n    import subprocess\n    enabled = 1\n"
         "    subprocess.run(command, shell=enabled)\n",
+        "import subprocess\nclass Outer:\n    class Inner:\n"
+        "        global subprocess\n        subprocess = proxy\n"
+        "subprocess.run = handler\ndef run():\n    import subprocess\n    enabled = 1\n"
+        "    subprocess.run(command, shell=enabled)\n",
+        "import subprocess\nsubprocess.run = (subprocess := proxy)\nimport subprocess\n"
+        "def run():\n    import subprocess\n    enabled = 1\n"
+        "    subprocess.run(command, shell=enabled)\nrun()\n",
+        "import subprocess\ndef replace_receiver():\n    global subprocess\n"
+        "    subprocess = proxy\n    return handler\n"
+        "subprocess.run = replace_receiver()\nimport subprocess\ndef run():\n"
+        "    import subprocess\n    enabled = 1\n"
+        "    subprocess.run(command, shell=enabled)\nrun()\n",
     ],
 )
 def test_cached_module_tracking_preserves_observed_and_unaffected_calls(source: str) -> None:
@@ -115,6 +131,31 @@ def test_cached_replacement_is_separate_from_unknown_receiver_trust(
 def test_cached_replacement_analysis_keeps_invalid_python_empty() -> None:
     parsed = parse_python_source("def incomplete(", "run.py")
     assert truthiness.bound_shell_call_analysis("run.py", parsed) == ({}, set(), set())
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "box[redirect()] = subprocess.run = handler\n",
+        "def unused(default=(subprocess := proxy)):\n    pass\nsubprocess.run = handler\n",
+        "class Tool((subprocess := proxy)):\n    pass\nsubprocess.run = handler\n",
+        "original = subprocess.run\ndef restore():\n    subprocess.run = original\n"
+        "subprocess.run = handler\nrestore()\n",
+        "original = subprocess.run\ndef restore():\n    subprocess.run = original\n"
+        "subprocess.run = handler\ndef unused(default=restore()):\n    pass\n",
+    ],
+)
+def test_unknown_eager_effect_invalidates_prior_replacement_proof(prefix: str) -> None:
+    source = (
+        "import subprocess\n" + prefix + "import subprocess\ndef work():\n"
+        "    import subprocess\n    enabled = 1\n"
+        "    subprocess.run(command, shell=enabled)\nwork()\n"
+    )
+    assert len(truthiness.analyze(source, "run.py", "python")) == 1
+    _, _, replacements = truthiness.bound_shell_call_analysis(
+        "run.py", parse_python_source(source, "run.py")
+    )
+    assert not replacements
 
 
 @pytest.mark.parametrize(

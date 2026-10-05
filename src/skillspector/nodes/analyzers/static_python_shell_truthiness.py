@@ -1088,13 +1088,42 @@ class _CachedSubprocessState:
         self.module_names = {"subprocess"}
         self.changed_methods: set[str] = set()
         self.changed_popen = False
+        self.effect_generation = 0
 
     def copy(self) -> _CachedSubprocessState:
         copied = _CachedSubprocessState()
         copied.module_names = set(self.module_names)
         copied.changed_methods = set(self.changed_methods)
         copied.changed_popen = self.changed_popen
+        copied.effect_generation = self.effect_generation
         return copied
+
+    def _invalidate(self) -> None:
+        """An unmodeled eager effect can change receivers and restore old slots."""
+        self.module_names.clear()
+        self.changed_methods.clear()
+        self.changed_popen = False
+        self.effect_generation += 1
+
+    def _passive_value(self, value: ast.expr) -> bool:
+        pending = [value]
+        while pending:
+            current = pending.pop()
+            if _is_passive_argument(current):
+                continue
+            if (
+                isinstance(current, ast.Attribute)
+                and isinstance(current.value, ast.Name)
+                and current.value.id in self.module_names
+            ):
+                continue
+            if isinstance(current, (ast.Tuple, ast.List)) and not any(
+                isinstance(item, ast.Starred) for item in current.elts
+            ):
+                pending.extend(current.elts)
+                continue
+            return False
+        return True
 
     def blocks(self, call: ast.Call) -> bool:
         function = call.func
@@ -1118,11 +1147,22 @@ class _CachedSubprocessState:
                         self.changed_popen = "Popen" in self.changed_methods
             return
         if isinstance(statement, ast.ClassDef):
+            if not _class_header_is_passive(statement):
+                self._invalidate()
             class_state = self.copy()
             declarations = _DirectBindingCollector(set())
+            pending_classes = [statement]
+            while pending_classes:
+                for child in pending_classes.pop().body:
+                    declarations.visit(child)
+                    if isinstance(child, ast.ClassDef):
+                        pending_classes.append(child)
             for child in statement.body:
-                declarations.visit(child)
                 class_state.advance(child)
+            if class_state.effect_generation != self.effect_generation:
+                self.module_names.clear()
+                self.changed_popen = False
+                self.effect_generation = class_state.effect_generation
             self.changed_methods = class_state.changed_methods
             self.module_names.difference_update(declarations.nonlocal_names)
             self.module_names.update(
@@ -1133,6 +1173,8 @@ class _CachedSubprocessState:
             self.module_names.discard(statement.name)
             return
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not _function_header_is_passive(statement):
+                self._invalidate()
             self.module_names.discard(statement.name)
             return
         targets: list[ast.expr] = []
@@ -1141,6 +1183,8 @@ class _CachedSubprocessState:
             targets, value = list(statement.targets), statement.value
         elif isinstance(statement, ast.AnnAssign):
             if statement.value is None:
+                if not _annotation_is_passive(statement.annotation):
+                    self._invalidate()
                 return
             targets, value = [statement.target], statement.value
         elif isinstance(statement, ast.AugAssign):
@@ -1148,15 +1192,33 @@ class _CachedSubprocessState:
         elif isinstance(statement, ast.Delete):
             targets = list(statement.targets)
         else:
-            self.module_names.difference_update(_direct_bound_names(statement))
+            if not (
+                isinstance(statement, (ast.Global, ast.Nonlocal, ast.Pass))
+                or isinstance(statement, (ast.Expr, ast.Return))
+                and (statement.value is None or self._passive_value(statement.value))
+            ):
+                self._invalidate()
             return
 
+        if (
+            isinstance(statement, ast.AugAssign)
+            or value is not None
+            and not self._passive_value(value)
+        ):
+            self._invalidate()
         before_names = set(self.module_names)
         before_methods = set(self.changed_methods)
         pending = [(target, value) for target in reversed(targets)]
         while pending:
             target, source = pending.pop()
             if isinstance(target, (ast.Tuple, ast.List)):
+                if not isinstance(statement, ast.Delete) and not (
+                    isinstance(source, (ast.Tuple, ast.List))
+                    and len(target.elts) == len(source.elts)
+                    and not any(isinstance(item, ast.Starred) for item in source.elts)
+                    and not any(isinstance(item, ast.Starred) for item in target.elts)
+                ):
+                    self._invalidate()
                 sources = (
                     list(source.elts)
                     if isinstance(source, (ast.Tuple, ast.List))
@@ -1186,6 +1248,12 @@ class _CachedSubprocessState:
                     self.changed_methods.discard(target.attr)
                 else:
                     self.changed_methods.add(target.attr)
+            else:
+                self._invalidate()
+        if isinstance(statement, ast.AnnAssign) and not _annotation_is_passive(
+            statement.annotation
+        ):
+            self._invalidate()
 
 
 class _Analyzer:
