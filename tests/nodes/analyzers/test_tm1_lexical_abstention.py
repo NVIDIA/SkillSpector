@@ -251,13 +251,21 @@ def test_called_method_self_store_preserves_lexical_finding(
     assert findings[0].severity == "HIGH"
 
 
-@pytest.mark.parametrize("intervening", ["import subprocess\n", "helper()\nimport subprocess\n"])
-def test_cached_method_mutation_survives_reimport(intervening: str) -> None:
+@pytest.mark.parametrize(
+    ("intervening", "expected"),
+    [("import subprocess\n", False), ("helper()\nimport subprocess\n", True)],
+)
+def test_reimport_does_not_prove_slot_replacement_after_unknown_effect(
+    intervening: str, expected: bool
+) -> None:
     source = (
         "import subprocess\nsubprocess.run = proxy\n"
         f"{intervening}enabled = True\nsubprocess.run(command, shell=enabled)\n"
     )
-    assert not _findings(source)
+    findings = _findings(source)
+    assert bool(findings) is expected
+    if expected:
+        assert findings[0].severity == "HIGH"
 
 
 def test_later_fresh_import_restores_deferred_receiver_signal() -> None:
