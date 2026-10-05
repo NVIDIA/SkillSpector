@@ -233,6 +233,9 @@ def test_reimport_restores_method_after_mutating_a_replaced_receiver() -> None:
         "saved = subprocess.run = subprocess.run",
         "subprocess.run, saved = subprocess.run, 1",
         "saved, [subprocess.run] = 1, [subprocess.run]",
+        "subprocess.run, subprocess.run = proxy, subprocess.run",
+        "[subprocess.run, subprocess.run] = [proxy, subprocess.run]",
+        "subprocess.run = [subprocess.run] = [subprocess.run]",
     ],
 )
 @pytest.mark.parametrize("intervening", ["", "helper()\n"])
@@ -286,4 +289,103 @@ def test_annotation_without_value_is_not_runtime_counterevidence(annotation: str
 )
 def test_self_store_does_not_undo_observed_replacement(replacement: str) -> None:
     source = f"import subprocess\nenabled = True\n{replacement}\nsubprocess.run(command, shell=enabled)\n"
+    assert not _findings(source)
+
+
+def test_future_module_method_replacement_suppresses_deferred_call() -> None:
+    source = (
+        "import subprocess\ndef run():\n    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\nsubprocess.run = proxy\nrun()\n"
+    )
+    assert not _findings(source)
+
+
+def test_later_method_store_in_same_function_preserves_earlier_call() -> None:
+    source = (
+        "import subprocess\ndef run():\n    helper()\n    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n    subprocess.run = proxy\n"
+    )
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+def test_local_import_restores_module_after_outer_proxy_slot_mutation() -> None:
+    source = (
+        "subprocess = proxy\nsubprocess.run = handler\ndef run(command):\n"
+        "    import subprocess\n    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+    )
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+def test_class_slot_stores_resolve_receiver_at_each_store() -> None:
+    source = (
+        "import subprocess\nclass Tool:\n    subprocess.run = proxy\n"
+        "    subprocess = other\n    subprocess.run = other\n    def run(self):\n"
+        "        enabled = True\n        subprocess.run(command, shell=enabled)\n"
+    )
+    assert not _findings(source)
+
+
+@pytest.mark.parametrize("local_import", [False, True])
+def test_bare_popen_import_captures_cached_module_slot(local_import: bool) -> None:
+    prefix = "import subprocess\nsubprocess.Popen = proxy\n"
+    body = "from subprocess import Popen\nenabled = True\nPopen(command, shell=enabled)\n"
+    source = prefix + (
+        "def run():\n" + "".join("    " + line + "\n" for line in body.splitlines())
+        if local_import
+        else body
+    )
+    assert not _findings(source)
+
+
+def test_bare_popen_import_before_module_mutation_keeps_captured_callable() -> None:
+    source = (
+        "import subprocess\nfrom subprocess import Popen\nsubprocess.Popen = proxy\n"
+        "enabled = True\nPopen(command, shell=enabled)\n"
+    )
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    ["subprocess.run = subprocess = proxy", "subprocess.run, subprocess = proxy, other"],
+)
+def test_class_assignment_target_order_keeps_earlier_module_mutation(assignment: str) -> None:
+    source = (
+        f"import subprocess\nclass Tool:\n    {assignment}\n    def run(self):\n"
+        "        enabled = True\n        subprocess.run(command, shell=enabled)\n"
+    )
+    assert not _findings(source)
+
+
+def test_class_assignment_target_order_ignores_later_proxy_slot_mutation() -> None:
+    source = (
+        "import subprocess\nclass Tool:\n    subprocess, subprocess.run = other, proxy\n"
+        "    def run(self):\n        enabled = True\n        subprocess.run(command, shell=enabled)\n"
+    )
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "return Popen(command, shell=enabled)",
+        "wrapper(Popen(command, shell=enabled))",
+        "return [Popen(command, shell=enabled)]",
+    ],
+)
+def test_local_popen_cached_replacement_in_eager_return_expression(statement: str) -> None:
+    source = (
+        "import subprocess\nsubprocess.Popen = proxy\ndef run():\n"
+        "    from subprocess import Popen\n    enabled = True\n"
+        f"    {statement}\nrun()\n"
+    )
     assert not _findings(source)
