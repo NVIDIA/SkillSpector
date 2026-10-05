@@ -90,6 +90,15 @@ test("finds the Windows virtualenv executable without a PATH fallback", async (t
   }
 });
 
+for (const [noLlm, timeout] of [[undefined, 120000], [true, 120000], [false, 630000]]) {
+  test(`uses ${timeout}ms for noLlm=${noLlm}`, async (t) => {
+    const ctx = await setup(t);
+    await ctx.scan({ noLlm });
+    assert.equal(ctx.calls[0].options.timeout, timeout);
+    assert.equal(ctx.calls[0].args.includes("--no-llm"), noLlm ?? true);
+  });
+}
+
 test("uses an absolute operator override and preserves URL targets", async (t) => {
   const ctx = await setup(t);
   process.env.SKILLSPECTOR_BIN = join(ctx.root, "custom-cli");

@@ -4,6 +4,9 @@
 import path from "node:path"
 
 export const TIMEOUT_MS = 120_000
+// The CLI's default workflow budget is 600s. Allow time to start and report
+// after that deadline; static-only scans retain the shorter process limit.
+export const LLM_TIMEOUT_MS = 630_000
 export const MAX_STDOUT = 12_000
 export const MAX_STDERR = 6_000
 export const INSTALL_HINT =
@@ -169,6 +172,7 @@ export function formatExecError(
   bin: string,
   err: unknown,
   env: Env = process.env,
+  timeoutMs: number = TIMEOUT_MS,
 ): string {
   const e = err as ExecFailure
   const partialOut = typeof e.stdout === "string" ? e.stdout : ""
@@ -185,7 +189,7 @@ export function formatExecError(
   }
   if (e.killed) {
     return (
-      `SkillSpector scan timed out after ${TIMEOUT_MS / 1000}s (killed).` +
+      `SkillSpector scan timed out after ${timeoutMs / 1000}s (killed).` +
       (evidence ? ` Partial output:\n${evidence}` : "")
     )
   }
@@ -518,6 +522,7 @@ export async function executeScan(
     ? pathApi.resolve(baseDir, configuredBin)
     : configuredBin
   const cliArgs = buildCliArgs(prepared)
+  const timeoutMs = (args.noLlm ?? true) ? TIMEOUT_MS : LLM_TIMEOUT_MS
 
   for (const request of buildPermissionRequests(prepared, {
     directory: baseDir,
@@ -552,7 +557,7 @@ export async function executeScan(
 
   try {
     const result = await deps.runFile(bin, cliArgs, {
-      timeout: TIMEOUT_MS,
+      timeout: timeoutMs,
       maxBuffer: 32 * 1024 * 1024,
       cwd: baseDir,
       signal: context.abort,
@@ -561,6 +566,6 @@ export async function executeScan(
     })
     return formatSuccess(output, result.stdout, result.stderr, env)
   } catch (err: unknown) {
-    return formatExecError(bin, err, env)
+    return formatExecError(bin, err, env, timeoutMs)
   }
 }

@@ -333,6 +333,85 @@ def test_cli_scan_output_to_file(tmp_path: Path) -> None:
     assert "out-test" in content or "risk_assessment" in content
 
 
+@pytest.mark.parametrize("format", list(FormatChoice))
+@pytest.mark.parametrize(
+    "alias", ["same-path", "relative-path", "parent-path", "symlink", "symlink-parent", "hard-link"]
+)
+def test_cli_scan_rejects_output_alias_of_input_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, format: FormatChoice, alias: str
+) -> None:
+    """An output alias must not replace the original skill with its report."""
+    source = tmp_path / "SKILL.md"
+    original = b"---\nname: protected\ndescription: Say hello.\n---\n# Hello\n"
+    source.write_bytes(original)
+    output = source
+    monkeypatch.chdir(tmp_path)
+    if alias == "relative-path":
+        output = Path("SKILL.md")
+    elif alias == "parent-path":
+        nested = tmp_path / "nested"
+        nested.mkdir()
+        output = nested / ".." / source.name
+    elif alias == "symlink":
+        output = tmp_path / "report.txt"
+        try:
+            output.symlink_to(source)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+    elif alias == "symlink-parent":
+        linked = tmp_path / "linked"
+        try:
+            linked.symlink_to(tmp_path, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+        output = linked / source.name
+    elif alias == "hard-link":
+        output = tmp_path / "report.txt"
+        try:
+            os.link(source, output)
+        except OSError:
+            pytest.skip("hard links are not supported on this filesystem")
+    scan_skill = MagicMock(return_value={"report_body": "Scan report", "risk_score": 0})
+    monkeypatch.setattr(cli, "_scan_skill", scan_skill)
+
+    result = runner.invoke(
+        app, ["scan", str(source), "--no-llm", "--format", format.value, "--output", str(output)]
+    )
+
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert source.read_bytes() == original
+    assert output.read_bytes() == original
+    scan_skill.assert_not_called()
+
+
+@pytest.mark.parametrize("format", list(FormatChoice))
+@pytest.mark.parametrize("destination", ["new", "existing", "same-name"])
+def test_cli_scan_preserves_input_when_writing_a_separate_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, format: FormatChoice, destination: str
+) -> None:
+    """Separate reports still work, including existing files and matching names."""
+    source = tmp_path / "SKILL.md"
+    original = b"# Original skill\n"
+    source.write_bytes(original)
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    output = reports / (source.name if destination == "same-name" else "report.txt")
+    if destination == "existing":
+        output.write_text("Previous report", encoding="utf-8")
+    scan_skill = MagicMock(return_value={"report_body": "Scan report", "risk_score": 0})
+    monkeypatch.setattr(cli, "_scan_skill", scan_skill)
+
+    result = runner.invoke(
+        app, ["scan", str(source), "--no-llm", "--format", format.value, "--output", str(output)]
+    )
+
+    assert result.exit_code == 0
+    assert source.read_bytes() == original
+    assert output.read_text(encoding="utf-8") == "Scan report"
+    scan_skill.assert_called_once()
+
+
 def test_cli_scan_no_llm(tmp_path: Path) -> None:
     """scan with --no-llm runs without requiring an LLM API key (uses fallback)."""
     (tmp_path / "SKILL.md").write_text("# No LLM test", encoding="utf-8")

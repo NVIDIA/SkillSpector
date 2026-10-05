@@ -711,7 +711,16 @@ def scan(
     if not input_path.startswith(("http://", "https://", "git@")):
         try:
             resolved_path = validate_local_input_path(resolved_path)
-        except ValueError as e:
+            if (
+                output is not None
+                and resolved_path.is_file()
+                and output.exists()
+                and output.samefile(resolved_path)
+            ):
+                raise ValueError(
+                    "--output points to the input file. Choose a different output path."
+                )
+        except (OSError, ValueError) as e:
             err_console.print(f"[red]Error:[/red] {e}")
             raise typer.Exit(code=2) from e
     try:
