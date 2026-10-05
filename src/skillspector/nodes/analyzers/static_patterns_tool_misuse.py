@@ -3149,6 +3149,7 @@ class _VariableShellAstIndex:
     class_binding_starts: dict[ast.ClassDef, dict[str, tuple[int, ...]]]
     declarations: dict[ast.AST, dict[str, str]]
     binding_events: dict[tuple[ast.AST, ast.AST], dict[str, tuple[tuple[int, bool], ...]]]
+    eager_effect_starts: dict[ast.AST, tuple[int, ...]]
 
 
 @dataclass(frozen=True)
@@ -3272,6 +3273,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
     class_binding_starts: dict[ast.ClassDef, dict[str, list[int]]] = {}
     declarations: dict[ast.AST, dict[str, str]] = {}
     binding_events: dict[ast.AST, dict[str, list[tuple[int, bool]]]] = {}
+    eager_effect_starts: dict[ast.AST, list[int]] = {}
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     attribute_identity_stores: set[ast.Attribute] = set()
 
@@ -3356,6 +3358,51 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
         span = _node_character_span(parsed, node)
         start = span[0] if span is not None else 0
         end = span[1] if span is not None else start
+        # A direct observed slot write is useful only before another eager
+        # effect. Cached-module lifetime across imports belongs to the companion.
+        if isinstance(
+            node,
+            (
+                ast.Call,
+                ast.Attribute,
+                ast.Subscript,
+                ast.BinOp,
+                ast.BoolOp,
+                ast.Compare,
+                ast.UnaryOp,
+                ast.NamedExpr,
+                ast.JoinedStr,
+                ast.Import,
+                ast.ImportFrom,
+                ast.Delete,
+                ast.AugAssign,
+                ast.If,
+                ast.For,
+                ast.AsyncFor,
+                ast.While,
+                ast.With,
+                ast.AsyncWith,
+                ast.Try,
+                ast.TryStar,
+                ast.Match,
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.Await,
+                ast.Yield,
+                ast.YieldFrom,
+                *_COMPREHENSION_SCOPE_TYPES,
+            ),
+        ):
+            execution = next(
+                (
+                    item
+                    for item in reversed(scope_chain)
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                ),
+                tree,
+            )
+            eager_effect_starts.setdefault(execution, []).append(start)
 
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -3429,7 +3476,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
 
         if (
             isinstance(node, ast.Attribute)
-            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and isinstance(node.ctx, ast.Store)
             and isinstance(node.value, ast.Name)
         ):
             if node not in attribute_identity_stores:
@@ -3615,6 +3662,9 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
         bindings={scope: frozenset(names) for scope, names in bindings.items()},
         class_binding_starts=sorted_class_starts,
         declarations=declarations,
+        eager_effect_starts={
+            scope: tuple(sorted(set(starts))) for scope, starts in eager_effect_starts.items()
+        },
         binding_events={
             scope: {name: tuple(sorted(set(events))) for name, events in names.items()}
             for scope, names in scoped_events.items()
@@ -3741,12 +3791,8 @@ def _lexical_shell_has_counterevidence(
     receiver = function.id if isinstance(function, ast.Name) else function.value.id
     receiver_scope = _resolved_name_scope(index, candidate.call_scope_chain, receiver, call_start)
     event_sources = [(receiver_scope, receiver)]
-    if isinstance(function, ast.Attribute):
-        method_name = receiver + "." + function.attr
-        event_sources.append((receiver_scope, method_name))
-        current_scope = candidate.call_scope_chain[-1]
-        if current_scope is not receiver_scope:
-            event_sources.append((current_scope, method_name))
+    # Called-module slot replacement is proved only by the companion cache
+    # state, which discards stale proof after an unknown eager effect.
     receiver_events = tuple(
         sorted({event for scope, name in event_sources for event in binding_events(scope, name)})
     )
@@ -3758,6 +3804,24 @@ def _lexical_shell_has_counterevidence(
         # Compile-time local bindings shadow a global receiver even before store.
         if receiver in index.bindings.get(receiver_scope, frozenset()):
             return True
+    if isinstance(function, ast.Attribute):
+        # Preserve a direct same-name replacement only in this execution scope,
+        # after the completed store and before another effect or receiver binding.
+        method_events = index.binding_events.get((receiver_scope, current_execution), {}).get(
+            receiver + "." + function.attr, ()
+        )
+        method_index = bisect_right(method_events, (call_start, True))
+        if method_index:
+            method_start, restores = method_events[method_index - 1]
+            effects = index.eager_effect_starts.get(current_execution, ())
+            effect_index = bisect_right(effects, method_start)
+            later_binding = receiver_index and receiver_events[receiver_index - 1][0] > method_start
+            if (
+                not restores
+                and not later_binding
+                and (effect_index == len(effects) or effects[effect_index] >= call_start)
+            ):
+                return True
     # Deferred bodies may run after a later outer replacement. A later store
     # in this same body cannot revoke an earlier call; preserve event provenance.
     future_outer_events: list[tuple[int, bool]] = []
