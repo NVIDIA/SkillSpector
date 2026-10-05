@@ -1667,7 +1667,10 @@ class TestTP4Fallbacks:
         )
         monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
         analyzer._model_for_call()
-        assert bindings == [{"method": "function_calling"}, {"method": "function_calling"}]
+        assert bindings == [
+            {"method": "function_calling", "include_raw": True},
+            {"method": "function_calling", "include_raw": True},
+        ]
 
         monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "json_schema")
         mcp_tool_poisoning._TP4Analyzer(model="azure/anthropic/claude-opus-5")
@@ -1759,7 +1762,12 @@ class TestTP4Fallbacks:
         if override is not None:
             monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", override)
         mcp_tool_poisoning._TP4Analyzer(model="azure/anthropic/claude-opus-5")
-        assert bindings == [{"method": expected}]
+        assert bindings == [
+            {
+                "method": expected,
+                **({"include_raw": True} if expected == "function_calling" else {}),
+            }
+        ]
 
     def test_configured_output_language_is_included(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_OUTPUT_LANGUAGE", "German")

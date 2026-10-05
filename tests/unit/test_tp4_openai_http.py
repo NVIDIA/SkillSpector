@@ -25,7 +25,7 @@ _MODEL = "azure/anthropic/claude-opus-5"
 @pytest.fixture
 def openai_http_endpoint(monkeypatch):
     requests = []
-    behavior = {"mode": "clean", "tp4_calls": 0}
+    behavior = {"mode": "clean", "tp4_calls": 0, "tool_name": "_TP4AnalysisResult"}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -35,17 +35,20 @@ def openai_http_endpoint(monkeypatch):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append(body)
             tools = body.get("tools", [])
-            is_tp4 = bool(tools and tools[0]["function"]["name"] == "_TP4AnalysisResult")
+            tool_name = behavior["tool_name"]
+            is_tp4 = bool(tools and tools[0]["function"]["name"] == tool_name)
             if not is_tp4:
                 response_format = body.get("response_format", {})
-                is_tp4 = response_format.get("json_schema", {}).get("name") == "_TP4AnalysisResult"
+                is_tp4 = response_format.get("json_schema", {}).get("name") == tool_name
             message = {"role": "assistant", "content": json.dumps({"findings": []})}
             finish_reason = "stop"
             if is_tp4:
                 behavior["tp4_calls"] += 1
                 mode = behavior["mode"]
-                if mode == "recover" and behavior["tp4_calls"] > 1:
+                if mode in {"recover", "recover-multiple"} and behavior["tp4_calls"] > 1:
                     mode = "clean"
+                if mode == "recover-multiple":
+                    mode = "multiple-mismatch"
                 if mode in {"refusal", "recover"}:
                     message = {"role": "assistant", "content": "Cannot provide this assessment."}
                 else:
@@ -59,19 +62,44 @@ def openai_http_endpoint(monkeypatch):
                     }
                     encoded = "not valid JSON" if mode == "malformed" else json.dumps(arguments)
                     if tools:
+                        tool_calls = [
+                            {
+                                "id": "call_tp4",
+                                "type": "function",
+                                "function": {
+                                    "name": tool_name,
+                                    "arguments": encoded,
+                                },
+                            }
+                        ]
+                        if mode.startswith("multiple-"):
+                            second_arguments = dict(arguments)
+                            if mode == "multiple-mismatch":
+                                second_arguments.update(
+                                    is_mismatch=True, mismatched_capabilities=["persistence"]
+                                )
+                            tool_calls.append(
+                                {
+                                    "id": "call_tp4_second",
+                                    "type": "function",
+                                    "function": {
+                                        "name": (
+                                            "UnexpectedAssessment"
+                                            if mode == "multiple-unknown"
+                                            else tool_name
+                                        ),
+                                        "arguments": (
+                                            "not valid JSON"
+                                            if mode == "multiple-malformed"
+                                            else json.dumps(second_arguments)
+                                        ),
+                                    },
+                                }
+                            )
                         message = {
                             "role": "assistant",
                             "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": "call_tp4",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "_TP4AnalysisResult",
-                                        "arguments": encoded,
-                                    },
-                                }
-                            ],
+                            "tool_calls": tool_calls,
                         }
                         finish_reason = "tool_calls"
                     else:
@@ -96,6 +124,7 @@ def openai_http_endpoint(monkeypatch):
     thread.start()
     monkeypatch.setenv("OPENAI_API_KEY", "sk-loopback-test")
     monkeypatch.setenv("OPENAI_BASE_URL", f"http://127.0.0.1:{server.server_port}/v1")
+    monkeypatch.setenv("SKILLSPECTOR_MODEL", _MODEL)
     monkeypatch.setenv("LANGSMITH_TRACING", "false")
     monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_REASONING_EFFORT", raising=False)
@@ -118,6 +147,11 @@ def openai_http_endpoint(monkeypatch):
         ("refusal", 4, False),
         ("malformed", 4, False),
         ("out-of-range", 4, False),
+        ("multiple-clean", 4, False),
+        ("multiple-mismatch", 4, False),
+        ("multiple-unknown", 4, False),
+        ("multiple-malformed", 4, False),
+        ("recover-multiple", 2, True),
     ],
 )
 @pytest.mark.parametrize("refresh", [False, True])
@@ -140,6 +174,7 @@ def test_tp4_real_http_retries_and_deadline_refresh(
             "type": "function",
             "function": {"name": "_TP4AnalysisResult"},
         }
+        assert request["parallel_tool_calls"] is False
         assert "response_format" not in request
         assert "Report your result by calling" not in request["messages"][0]["content"]
     if not complete:
@@ -162,13 +197,41 @@ def test_reasoning_effort_uses_existing_json_schema_route_over_real_http(
     assert "tool_choice" not in requests[0]
 
 
+def test_real_http_validation_uses_schema_title_as_tool_name(openai_http_endpoint):
+    requests, behavior = openai_http_endpoint
+    behavior["tool_name"] = "GatewayTP4Assessment"
+
+    class TitledTP4Assessment(tp._TP4AnalysisResult):
+        model_config = {"title": "GatewayTP4Assessment"}
+
+    class TitledTP4Analyzer(tp._TP4Analyzer):
+        response_schema = TitledTP4Assessment
+
+    analyzer = TitledTP4Analyzer(model=_MODEL, timeout=30.0)
+    outcome = analyzer.run_batches_detailed([tp.Batch(file_path="format.py", content="Assess")])
+
+    assert behavior["tp4_calls"] == 1
+    assert outcome.successful and not outcome.failures
+    assert isinstance(outcome.successful[0][1][0], TitledTP4Assessment)
+    assert requests[0]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "GatewayTP4Assessment"},
+    }
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mode,attempts,complete",
     [
         ("clean", 1, True),
+        ("mismatch", 1, True),
         ("refusal", 4, False),
         ("malformed", 4, False),
+        ("multiple-clean", 4, False),
+        ("multiple-mismatch", 4, False),
+        ("multiple-unknown", 4, False),
+        ("multiple-malformed", 4, False),
+        ("recover-multiple", 2, True),
     ],
 )
 async def test_async_real_http_tool_results_use_same_validation(
@@ -190,9 +253,22 @@ async def test_async_real_http_tool_results_use_same_validation(
 
 
 @pytest.mark.parametrize("output_format", ["json", "sarif"])
-@pytest.mark.parametrize("mode", ["clean", "mismatch", "refusal", "malformed"])
+@pytest.mark.parametrize(
+    "mode,attempts,complete",
+    [
+        ("clean", 1, True),
+        ("mismatch", 1, True),
+        ("refusal", 4, False),
+        ("malformed", 4, False),
+        ("multiple-clean", 4, False),
+        ("multiple-mismatch", 4, False),
+        ("multiple-unknown", 4, False),
+        ("multiple-malformed", 4, False),
+        ("recover-multiple", 2, True),
+    ],
+)
 def test_full_scanner_graph_reports_tp4_http_results(
-    tmp_path: Path, openai_http_endpoint, output_format, mode
+    tmp_path: Path, openai_http_endpoint, output_format, mode, attempts, complete
 ):
     from skillspector.graph import create_graph
 
@@ -220,8 +296,8 @@ def test_full_scanner_graph_reports_tp4_http_results(
         for event in result["analyzer_status_events"]
         if event["analyzer_id"] == tp.ANALYZER_ID
     )
-    assert tp4_status["status"] == ("completed" if mode in {"clean", "mismatch"} else "degraded")
-    assert behavior["tp4_calls"] == (1 if mode in {"clean", "mismatch"} else 4)
+    assert tp4_status["status"] == ("completed" if complete else "degraded")
+    assert behavior["tp4_calls"] == attempts
     findings = [f for f in result["findings"] if f.rule_id == "TP4"]
     assert bool(findings) is (mode == "mismatch")
     if findings:
@@ -235,7 +311,6 @@ def test_full_scanner_graph_reports_tp4_http_results(
             if event["analyzer_id"] == tp.ANALYZER_ID and event["path"] == "format.py"
         )
     report = json.loads(result["report_body"])
-    complete = mode in {"clean", "mismatch"}
     if output_format == "json":
         assert report["execution_successful"] is True
         assert report["analysis_completeness"]["is_complete"] is complete
@@ -249,4 +324,14 @@ def test_full_scanner_graph_reports_tp4_http_results(
         assert bool([item for item in run["results"] if item["ruleId"] == "TP4"]) is (
             mode == "mismatch"
         )
-    assert requests
+    tp4_requests = [
+        request
+        for request in requests
+        if request.get("tools") and request["tools"][0]["function"]["name"] == "_TP4AnalysisResult"
+    ]
+    assert len(tp4_requests) == attempts
+    assert all(request["model"] == _MODEL for request in tp4_requests)
+    assert all(
+        request["tool_choice"] == {"type": "function", "function": {"name": "_TP4AnalysisResult"}}
+        for request in tp4_requests
+    )
