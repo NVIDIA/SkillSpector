@@ -1828,6 +1828,20 @@ def direct_literal_metadata(
     return metadata
 
 
+def bound_shell_finding_for_call(
+    file_path: str,
+    python_ast: ParsedPythonFile,
+    call: ast.Call,
+) -> AnalyzerFinding | None:
+    """Build metadata for a retained owner after positive dataflow confirmation."""
+    shell_keyword = next((item for item in call.keywords if item.arg == "shell"), None)
+    if shell_keyword is None or not isinstance(shell_keyword.value, ast.Name):
+        return None
+    analyzer = _Analyzer(file_path, python_ast)
+    analyzer._append_finding(call, shell_keyword, shell_keyword.value)
+    return analyzer.findings[0] if analyzer.findings else None
+
+
 def bound_shell_call_state(
     file_path: str,
     python_ast: ParsedPythonFile,
