@@ -377,7 +377,6 @@ def _cached_python_categories(ascii_only: bool, ascii_content: bool) -> dict[str
 
 
 @functools.lru_cache(maxsize=1024)
-
 def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> regex.Pattern[str]:
     """Translate the static-rule grammar while retaining original match offsets.
 
@@ -507,11 +506,13 @@ def iter_pattern_matches(
     skip_empty = False
     try:
         while True:
-            timeout = _STATIC_PATTERN_SECONDS - matching_seconds
             if budget is not None:
                 budget.check_runtime()
-                timeout = min(timeout, max(0.0, budget.deadline - budget.clock()))
-            matching_limit = matching_seconds + timeout
+                matching_limit = min(
+                    matching_limit,
+                    matching_seconds + max(0.0, budget.deadline - budget.clock()),
+                )
+            timeout = matching_limit - matching_seconds
             if timeout <= 0:
                 raise TimeoutError
             # regex's iterator timer includes CPU used by the caller between

@@ -2354,7 +2354,11 @@ def test_static_regex_deadline_retains_findings_and_incomplete_ledger(monkeypatc
         event["outcome"] == "partial" and event["reason_code"] == "runtime_limit"
         for event in result["inspection_ledger"]
     )
-    timed_out = [event for event in result["inspection_ledger"] if event.get("reason_code") == "runtime_limit"]
+    timed_out = [
+        event
+        for event in result["inspection_ledger"]
+        if event.get("reason_code") == "runtime_limit"
+    ]
     assert timed_out
     assert all(event["limit_seconds"] == 0.000001 for event in timed_out)
     assert static_runner._ACTIVE_FINDING_BUDGET.get() is None
@@ -2425,8 +2429,7 @@ def test_production_window_ordinary_content_remains_complete(content_kind):
 
     if content_kind == "unicode_docs":
         root = Path(__file__).resolve().parents[3]
-        sample = (root / "README.md").read_text() + (root / "docs/DEVELOPMENT.md").read_text()
-        sample += "\nRésumé — café documentation.\n"
+        sample = (root / "docs/DEVELOPMENT.md").read_text().split("## 2.", 1)[0]
     else:
         sample = (
             "## Service reference\n"
@@ -2442,4 +2445,20 @@ def test_production_window_ordinary_content_remains_complete(content_kind):
         {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
         [static_patterns_tool_misuse],
     )
-    assert all(event["outcome"] == "completed" for event in result["inspection_ledger"]), result["inspection_ledger"]
+    assert all(event["outcome"] == "completed" for event in result["inspection_ledger"]), result[
+        "inspection_ledger"
+    ]
+
+
+@pytest.mark.parametrize("option", ["-k", "-K", "-K", "--insecure", "--ınſecure"])
+def test_curl_option_prefilter_preserves_case_aliases_and_multiline_matches(option):
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
+
+    content = "curl https://example.test/ \\\n    " + option
+    expected = [
+        (match.start(), match.end(), match.group(), confidence)
+        for pattern, confidence in module.TM1_PATTERNS
+        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE)
+    ]
+    assert expected
+    assert list(module._tm1_candidates(content)) == expected

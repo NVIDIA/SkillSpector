@@ -3157,6 +3157,15 @@ def _tm1_candidates(
     shell_content: str | None = None,
 ) -> Iterator[tuple[int, int, str, float]]:
     for pattern, confidence in TM1_PATTERNS:
+        # Curl option rules can otherwise revisit a whole command reference for
+        # every curl mention. Their required suffix is a linear literal search;
+        # checking it first preserves the original matches, including Unicode
+        # IGNORECASE aliases and multiline command spans.
+        curl_prefix = r"curl\s+[^|]*"
+        if pattern.startswith(curl_prefix) and re.search(
+            pattern.removeprefix(curl_prefix), content, re.IGNORECASE
+        ) is None:
+            continue
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in TM1_PROSE_PATTERNS
