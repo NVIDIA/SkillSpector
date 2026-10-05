@@ -24,6 +24,7 @@ from pathlib import Path
 import yaml
 
 from skillspector.nodes.analyzers import mcp_least_privilege
+from skillspector.nodes.analyzers.pattern_defaults import get_remediation
 from skillspector.nodes.report import report
 
 # ---------------------------------------------------------------------------
@@ -266,6 +267,11 @@ class TestLP3NoPermissions:
         )["issues"][0]
         assert issue["pattern"] == lp3.message
         assert issue["finding"] == lp3.message
+        for remediation in (lp3.remediation, get_remediation("LP3")):
+            assert remediation is not None
+            assert "independently approved as necessary" in remediation
+            assert "not to silence this finding" in remediation
+            assert "runtime permissions are unknown unless separately verified" in remediation
 
 
 class TestLP3AllowedTools:
@@ -331,6 +337,14 @@ class TestLP3AllowedTools:
             assert lp1.remediation is not None
             assert "'allowed-tools'" in lp1.remediation
             assert "'permissions'" not in lp1.remediation
+            assert "Add a tool" not in lp1.remediation
+            assert "preapproval" in lp1.remediation
+            assert "do not broaden" in lp1.remediation.lower()
+            assert "runtime permissions are unknown unless separately verified" in lp1.remediation
+            fallback = get_remediation("LP1")
+            assert "do not broaden" in fallback.lower()
+            assert "solely to silence" in fallback
+            assert "runtime permissions are unknown unless separately verified" in fallback
 
     def test_allowed_tools_fully_covered_no_lp1(self):
         """allowed-tools: [Bash] + only shell code → no LP1 (capability is covered)."""

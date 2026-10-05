@@ -44,6 +44,7 @@ from .common import (
     MARKDOWN_FENCE_OPEN,
     get_context,
     get_line_number,
+    is_reference_material,
 )
 from .pattern_defaults import PatternCategory
 
@@ -115,6 +116,12 @@ _SHELL_ASSIGNMENT_PREFIX_WORDS = _SHELL_CLAUSE_PREFIX_WORDS | frozenset(
 _SHELL_REDIRECTION_PREFIX_RE = re.compile(r"(?:[0-9]+)?(?:&>>?|<>|>>?|<<-?|>&|<&|[<>])")
 _RECURSIVE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*[rR]|-recursive)")
 _FORCE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*f|-force)")
+_MARKDOWN_CONTRACTION_PROSE_RE = re.compile(
+    r"(?:The|This|That|These|Those|It|They|We|You|I|A|An)[ \t]+[A-Za-z \t,]*\b"
+    r"(?:doesn|isn|aren|wasn|weren|don|didn|hasn|haven|hadn|can|couldn|shouldn|wouldn|won|mustn)"
+    r"(?P<apostrophe>')t\b[A-Za-z \t,]*[.!?]",
+    re.IGNORECASE,
+)
 _ROOT_GLOB_DOCUMENTATION_LINE_RE = re.compile(
     r"[ \t]*(?:(?:[-*+]|#{1,6})[ \t]+)?"
     r"(?:(?:(?:documentation|note|example)[ \t]*:[ \t]*)"
@@ -212,7 +219,24 @@ TM1_CODE_PATTERNS = [
         0.85,
     ),
     (r"\bshutil\.rmtree\s*\(\s*['\"]\s*/", 0.85),
-    (r"(?:chmod|chown)\s+[^|]*(?:777|666|a\+rwx)", 0.8),
+    # A numeric chmod mode is world-writable when the others-triple carries the
+    # write bit, i.e. its last digit is 2, 3, 6 or 7.  Matching the mode argument
+    # itself rather than a bare `777`/`666` substring also keeps a path or a
+    # trailing comment from being read as the mode (chmod 755 /tmp/6660 is a
+    # chmod 755).  This owns the numeric forms that TM1 already owned for
+    # 777/666, plus the 646/757/0662 spellings the privilege-escalation rule used
+    # to catch as a side effect of matching 4/5/6/7 anywhere in the mode.
+    # Only `chmod` is matched here: `chown` takes an owner rather than a mode, so
+    # a numeric owner ID whose last digit is 2/3/6/7 (Grafana's 472:472, Istio's
+    # 1337:1337) is not a world-writable mode.  The optional [+=] accepts the
+    # operator GNU chmod allows in front of the digits (chmod +777, chmod =666);
+    # BSD chmod rejects those, so they are reported rather than assumed safe.
+    # The option group takes a single leading dash for the reason given in the
+    # privilege-escalation rule: `--?` made the match exponential on a line of
+    # unmatched `-- ` tokens, and `[\w=-]*` already absorbs a long option's
+    # second dash.
+    (r"chmod\s+(?:-[\w=-]*[ \t]+)*[\"']?[+=]?0*[0-7]{2,3}[2367](?![0-9\w])[\"']?", 0.8),
+    (r"(?:chmod|chown)\s+[^|]*a\+rwx", 0.8),
     # Git force operations
     (r"git\s+push\s+[^|]*--force", 0.7),
     (r"git\s+reset\s+--hard", 0.65),
@@ -1932,12 +1956,21 @@ def _has_shell_command_word_exhaustion(
         if parsed.limited:
             return True
         if parsed.dynamic and may_have_destructive_outer_operands:
-            tokens, _, exhausted = _bounded_shell_tokens(
+            tokens, command_end, exhausted = _bounded_shell_tokens(
                 content,
                 start,
                 parsed.end,
                 check_runtime=check_runtime,
             )
+            if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
+                # Earlier prose (for example "row-first") cannot supply this
+                # command's operands. Refine only this candidate's exhausted
+                # span, including nested commands inside the executable word.
+                # Hitting the span bound always remains partial, including when
+                # real operands occur beyond that bound. This rescan is bounded
+                # by the same constant as the tokenizer.
+                check_runtime()
+                exhausted = _may_have_destructive_outer_operands(content[start:command_end])
             if (
                 exhausted
                 or _has_unsupported_brace_expansion(tokens)
@@ -3279,6 +3312,7 @@ def _markdown_shell_text(
     inside their bodies. Pair equal-length runs in linear time.
     """
     output = list(content)
+    prose_apostrophes: set[int] = set()
     runs: list[tuple[int, int]] = []
     list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
     backtick_runs = re.compile(r"`+")
@@ -3489,6 +3523,20 @@ def _markdown_shell_text(
                         if not cells:
                             table_columns = None
                 elif not separator and not empty_list_item:
+                    if (
+                        complete_context
+                        and not runs
+                        and not heading
+                        and len(leading) <= 512
+                        and (prose := _MARKDOWN_CONTRACTION_PROSE_RE.fullmatch(leading))
+                    ):
+                        # A whole plain-language sentence, including a parsed
+                        # list-item body, owns its contraction;
+                        # it is not an unclosed shell quote spanning later prose.
+                        # The restrictive grammar excludes code delimiters and
+                        # shell syntax. Fences, indented code, HTML, tables, and
+                        # pending multiline inline spans never reach this rule.
+                        prose_apostrophes.add(offset + prefix + prose.start("apostrophe"))
                     for match in backtick_runs.finditer(line):
                         check_runtime()
                         runs.append((offset + match.start(), offset + match.end()))
@@ -3505,7 +3553,40 @@ def _markdown_shell_text(
             paragraph_list_indent = 0
         offset += len(line)
     mask_inline_delimiters()
-    return "".join(output)
+    projected = "".join(output)
+    if prose_apostrophes:
+        # A prose-looking line can still be inside an earlier shell word, such
+        # as a multiline bash -c string. Reuse the shell parser to preserve that
+        # ownership before masking any apostrophe. Unresolved words retain all
+        # remaining bytes; this pass never grants ownership past a parse limit.
+        cursor = 0
+        next_runtime_check = 0
+        last_apostrophe = max(prose_apostrophes)
+        parameter_ends: dict[int, _ParameterExpansionEnd] = {}
+        substitution_ends: dict[int, int | None] = {}
+        backtick_ends: dict[int, int | None] = {}
+        while cursor <= last_apostrophe:
+            if cursor >= next_runtime_check:
+                check_runtime()
+                next_runtime_check = cursor + 4096
+            if cursor in prose_apostrophes:
+                output[cursor] = " "
+            elif projected[cursor] in "'\"`$\\":
+                parsed = _parse_shell_command_word(
+                    projected,
+                    cursor,
+                    parameter_ends,
+                    substitution_ends,
+                    backtick_ends,
+                    check_runtime=check_runtime,
+                )
+                if parsed is None or parsed.limited:
+                    break
+                cursor = max(cursor + 1, parsed.end)
+                continue
+            cursor += 1
+        return "".join(output)
+    return projected
 
 
 def has_bounded_parse_exhaustion(
@@ -3708,7 +3789,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     complete_match=match.group(0),
                 )
             )
-    # TM4: privileged K8s workload. Example filtering is delegated to the runner.
+    # TM4: privileged K8s workload. Example filtering is delegated to the runner,
+    # which keeps reference material because it is part of the skill. Findings in
+    # top-level `references/` are tagged for triage only; the agent reads those
+    # files as instructions, so confidence and score are left unchanged.
+    reference_material = is_reference_material(file_path, file_type)
+    tm4_tags = [*tag, "contextual-triage", "likely-benign-context"] if reference_material else tag
     for pattern, confidence in TM4_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -3719,7 +3805,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     severity=Severity.HIGH,
                     location=loc(line_num),
                     confidence=confidence,
-                    tags=tag,
+                    tags=tm4_tags,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
                     complete_match=match.group(0),

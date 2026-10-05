@@ -754,7 +754,14 @@ def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
         )
         for (path, line), finding_ids in coverage_ids_by_line.items()
     ]
+    raw_meta_review_required = state.get("meta_review_required")
+    meta_review_required = (
+        raw_meta_review_required
+        if isinstance(raw_meta_review_required, bool)
+        else bool(state.get("effective_finding_ids") or state.get("findings"))
+    )
     merged_state = dict(state)
+    merged_state["meta_review_required"] = meta_review_required
     all_findings = [*(state.get("findings") or []), *coverage_findings]
     output_events: list[InspectionLedgerEvent] = []
     finding_output_records = sum(max(1, len(finding.occurrences)) for finding in all_findings)
@@ -821,6 +828,7 @@ def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
         "execution_successful": completeness["execution_successful"],
         "findings": coverage_findings,
         "effective_finding_ids": effective_finding_ids,
+        "meta_review_required": meta_review_required,
         "inspection_ledger": [
             *reference_events,
             *output_events,

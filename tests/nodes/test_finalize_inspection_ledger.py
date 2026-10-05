@@ -695,6 +695,49 @@ def test_resolved_partial_reference_produces_one_canonically_counted_ae1() -> No
     assert completeness["is_complete"] is False
 
 
+def test_finalization_coverage_finding_does_not_require_meta_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A coverage finding added after meta-review cannot invent a failed review."""
+    coverage = Finding(
+        rule_id="AE1",
+        message="coverage",
+        finding_id="coverage",
+        severity="HIGH",
+        file="SKILL.md",
+        start_line=1,
+        tags=["coverage"],
+    )
+    monkeypatch.setattr(finalizer_module, "_reference_coverage_findings", lambda _state: [coverage])
+    monkeypatch.setattr(finalizer_module, "_size_coverage_findings", lambda *_args, **_kwargs: [])
+    result = finalize_inspection_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [],
+            "effective_finding_ids": [],
+            "meta_review_required": False,
+            "use_llm": True,
+            "llm_requested": True,
+            "llm_call_log": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(analyzer_id=analyzer_id, status="not_applicable")
+                for analyzer_id in (
+                    "semantic_developer_intent",
+                    "semantic_quality_policy",
+                    "semantic_security_discovery",
+                )
+            ],
+        }
+    )
+
+    assert [finding.rule_id for finding in result["findings"]] == ["AE1"]
+    assert result["meta_review_required"] is False
+    assert not any(
+        event.get("phase") == "semantic_runtime" for event in result["inspection_ledger"]
+    )
+
+
 def test_ae1_reports_target_specific_parser_diagnostics_for_each_reference() -> None:
     target = "scripts/helper.pl"
     event = ledger_event(
