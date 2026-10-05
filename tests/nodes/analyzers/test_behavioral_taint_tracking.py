@@ -45,6 +45,188 @@ def _rule_ids(findings: list) -> set[str]:
 
 
 class TestCredentialExfiltration:
+    @pytest.mark.parametrize(
+        "assignment", ["alias = handle", "alias: object = handle", "alias = handle = handle"]
+    )
+    @pytest.mark.parametrize(
+        ("rebind", "expected"),
+        [
+            ("", True),
+            ("handle = lambda value: value", True),
+            ("alias = lambda value: value", False),
+        ],
+    )
+    def test_reflective_name_alias_retains_its_own_identity(self, assignment, rebind, expected):
+        code = (
+            'import importlib, os\nmodule = importlib.import_module("urllib.request")\n'
+            'handle = getattr(module, "urlopen")\n'
+            f'{assignment}\n{rebind}\nalias(os.environ.get("API_KEY"))\n'
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
+    @pytest.mark.parametrize("source", ["module", "urllib.request"])
+    def test_module_name_alias_retains_reflective_base(self, source):
+        code = (
+            'import importlib, urllib.request, os\nmodule = importlib.import_module("urllib.request")\n'
+            f'alias = {source}\nhandle = getattr(alias, "urlopen")\n'
+            'handle(os.environ.get("API_KEY"))\n'
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize(
+        ("setup", "base", "expected"),
+        [
+            ("import urllib.request", "urllib.request", True),
+            ("import urllib.request\nimport urllib as lib", "lib.request", True),
+            ("import urllib.request as module", "module", True),
+            ("from urllib import request as module", "module", True),
+            ("import urllib.request\nurllib = object()", "urllib.request", False),
+            ("from . import urllib", "urllib.request", False),
+        ],
+    )
+    @pytest.mark.parametrize("inline", [False, True])
+    def test_dotted_reflective_base_uses_current_import_binding(
+        self, setup, base, expected, inline
+    ):
+        call = (
+            f'getattr({base}, "urlopen")(os.environ.get("API_KEY"))'
+            if inline
+            else (f'handle = getattr({base}, "urlopen")\nhandle(os.environ.get("API_KEY"))')
+        )
+        assert ("TT3" in _rule_ids(_run(f"import os\n{setup}\n{call}\n"))) is expected
+
+    @pytest.mark.parametrize("scope", ["module", "function", "global", "nonlocal"])
+    @pytest.mark.parametrize("expected", [False, True])
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "[VALUE for _ in [0]]",
+            "{VALUE for _ in [0]}",
+            "{0: VALUE for _ in [0]}",
+            "[[VALUE for _ in [0]] for outer in [0]]",
+        ],
+    )
+    def test_comprehension_named_expression_updates_containing_scope(
+        self, scope, expected, expression
+    ):
+        dangerous, harmless = 'getattr(module, "urlopen")', "(lambda value: value)"
+        initial, replacement = (harmless, dangerous) if expected else (dangerous, harmless)
+        update = expression.replace("VALUE", f"(opener := {replacement})") + "\n"
+        call = 'opener(os.environ.get("API_KEY"))\n'
+        body = f"opener = {initial}\n" + update + call
+        if scope == "function":
+            body = "def send():\n" + textwrap.indent(body, "    ") + "send()\n"
+        elif scope in {"global", "nonlocal"}:
+            body = (
+                f"opener = {initial}\ndef configure():\n    {scope} opener\n"
+                + textwrap.indent(update, "    ")
+                + "configure()\n"
+                + call
+            )
+            if scope == "nonlocal":
+                body = "def send():\n" + textwrap.indent(body, "    ") + "send()\n"
+        code = 'import importlib, os\nmodule = importlib.import_module("urllib.request")\n' + body
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("[(opener := (lambda value: value)) for _ in []]", True),
+            ("[(opener := (lambda value: value)) for _ in [0] if False]", True),
+            ("[(opener := (lambda value: value)) for _ in input()]", True),
+            ("((opener := (lambda value: value)) for _ in [0])", True),
+            ("[(opener := (lambda value: value)) for _ in [0] if True]", False),
+        ],
+    )
+    def test_comprehension_may_not_execute_clearing_assignment(self, expression, expected):
+        code = (
+            'import importlib, os\nmodule = importlib.import_module("urllib.request")\n'
+            f'opener = getattr(module, "urlopen")\n{expression}\n'
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ('[(opener := getattr(module, "urlopen")) for _ in []]', False),
+            ('[(opener := getattr(module, "urlopen")) for _ in [0] if False]', False),
+            ('[(opener := getattr(module, "urlopen")) for _ in input()]', True),
+            ('((opener := getattr(module, "urlopen")) for _ in [0])', False),
+            ('[(opener := getattr(module, "urlopen")) for _ in [0] if True]', True),
+            ('[(opener := getattr(module, "urlopen")) for _ in [0] for other in []]', False),
+            ('[(opener := getattr(module, "urlopen")) for _ in [] for other in [0]]', False),
+            ('[0 for _ in [0] if (opener := getattr(module, "urlopen"))]', True),
+        ],
+    )
+    def test_comprehension_possible_assignment_does_not_invent_definite_execution(
+        self, expression, expected
+    ):
+        code = (
+            'import importlib, os\nmodule = importlib.import_module("urllib.request")\n'
+            f"opener = lambda value: value\n{expression}\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
+    @pytest.mark.parametrize("scope", ["local", "global", "nonlocal"])
+    def test_comprehension_rhs_uses_containing_declarations(self, scope):
+        declaration = "" if scope == "local" else f"    {scope} handle\n"
+        body = (
+            'handle = getattr(module, "urlopen")\n'
+            "def send():\n"
+            + declaration
+            + "    [(alias := handle) for _ in [0]]\n"
+            + '    alias(os.environ.get("API_KEY"))\nsend()\n'
+        )
+        if scope == "nonlocal":
+            body = "def outer():\n" + textwrap.indent(body, "    ") + "outer()\n"
+        code = 'import importlib, os\nmodule = importlib.import_module("urllib.request")\n' + body
+        assert "TT3" in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            'opener(os.environ.get("API_KEY"))\n[(opener := (lambda value: value)) for _ in []]',
+            'callback = lambda: (opener := (lambda value: value))\nopener(os.environ.get("API_KEY"))',
+            '[lambda: (opener := (lambda value: value)) for _ in [0]]\nopener(os.environ.get("API_KEY"))',
+        ],
+    )
+    @pytest.mark.parametrize("function", [False, True])
+    def test_comprehension_walrus_locality_and_lambda_boundary(self, body, function):
+        # A walrus target anywhere in a function is local even if its iterable
+        # is empty; a walrus inside a lambda must not shadow the containing scope.
+        expected = not (function and body.startswith("opener("))
+        if function:
+            body = "def send():\n" + textwrap.indent(body + "\n", "    ") + "send()\n"
+        code = (
+            'import importlib, os\nmodule = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n' + body + "\n"
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
+    @pytest.mark.parametrize("replacement", ["module = object()", "getattr = lambda *args: print"])
+    def test_dotted_module_alias_respects_current_scope_shadowing(self, replacement):
+        code = (
+            "import urllib.request, os\nmodule = urllib.request\n"
+            f'{replacement}\nhandle = getattr(module, "urlopen")\n'
+            'handle(os.environ.get("API_KEY"))\n'
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize("before", [False, True])
+    def test_comprehension_lambda_default_walrus_is_containing_function_local(self, before):
+        call = 'opener(os.environ.get("API_KEY"))\n'
+        update = "[(lambda value=(opener := (lambda item: item)): value) for _ in [0]]\n"
+        body = call + update if before else update + call
+        code = (
+            'import importlib, os\nmodule = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\ndef send():\n'
+            + textwrap.indent(body, "    ")
+            + "send()\n"
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
     @pytest.mark.parametrize("expected", [False, True])
     @pytest.mark.parametrize("branch", ["straight", "if", "match"])
     def test_nested_function_uses_live_closure_binding(self, expected, branch):

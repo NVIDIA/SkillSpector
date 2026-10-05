@@ -324,6 +324,7 @@ class _ReflectiveScope:
     global_names: set[str] = field(default_factory=set)
     nonlocal_names: set[str] = field(default_factory=set)
     is_class: bool = False
+    is_comprehension: bool = False
 
     def clone(self) -> _ReflectiveScope:
         return _ReflectiveScope(
@@ -334,6 +335,7 @@ class _ReflectiveScope:
             global_names=set(self.global_names),
             nonlocal_names=set(self.nonlocal_names),
             is_class=self.is_class,
+            is_comprehension=self.is_comprehension,
         )
 
     def restore(self, snapshot: _ReflectiveScope) -> None:
@@ -345,6 +347,7 @@ class _ReflectiveScope:
         self.global_names = set(snapshot.global_names)
         self.nonlocal_names = set(snapshot.nonlocal_names)
         self.is_class = snapshot.is_class
+        self.is_comprehension = snapshot.is_comprehension
 
 
 class _LocalBindingCollector(ast.NodeVisitor):
@@ -397,16 +400,37 @@ class _LocalBindingCollector(ast.NodeVisitor):
         return
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
-        return
+        self._collect_comprehension_bindings(node)
 
     def visit_SetComp(self, node: ast.SetComp) -> None:
-        return
+        self._collect_comprehension_bindings(node)
 
     def visit_DictComp(self, node: ast.DictComp) -> None:
-        return
+        self._collect_comprehension_bindings(node)
 
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
-        return
+        self._collect_comprehension_bindings(node)
+
+    def _collect_comprehension_bindings(
+        self, node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp
+    ) -> None:
+        # Iteration targets are comprehension-local; walrus targets belong to
+        # the containing function, including when the comprehension is nested.
+        pending: list[ast.AST] = [node]
+        while pending:
+            if self.check_runtime is not None:
+                self.check_runtime()
+            item = pending.pop()
+            if isinstance(item, ast.Lambda):
+                pending.extend(
+                    default
+                    for default in [*item.args.defaults, *item.args.kw_defaults]
+                    if default is not None
+                )
+                continue
+            if isinstance(item, ast.NamedExpr):
+                self.names.add(item.target.id)
+            pending.extend(ast.iter_child_nodes(item))
 
     def visit_Global(self, node: ast.Global) -> None:
         self.global_names.update(node.names)
@@ -419,10 +443,12 @@ class _LocalBindingCollector(ast.NodeVisitor):
             pending: list[ast.expr] = [node]
             while pending:
                 expression = pending.pop()
+                if isinstance(expression, ast.Lambda):
+                    continue
                 if isinstance(
-                    expression,
-                    (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+                    expression, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
                 ):
+                    self._collect_comprehension_bindings(expression)
                     continue
                 if isinstance(expression, ast.Name):
                     self.visit_Name(expression)
@@ -467,10 +493,15 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
         return self.scopes[-1]
 
     def _lookup_scopes(self, name: str) -> list[_ReflectiveScope]:
-        if name in self.scope.global_names:
-            return self.scopes[:1]
-        if name in self.scope.nonlocal_names:
-            return [self._binding_scope(name)]
+        index = len(self.scopes) - 1
+        while self.scopes[index].is_comprehension:
+            index -= 1
+        containing = self.scopes[index]
+        inner = self.scopes[index + 1 :]
+        if name in containing.global_names:
+            return [self.scopes[0], *inner]
+        if name in containing.nonlocal_names:
+            return [self._binding_scope(name, scope_index=index), *inner]
         return self.scopes
 
     def _lookup(self, kind: str, name: str) -> str | None:
@@ -490,17 +521,28 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
                 return None
         return None
 
-    def _binding_scope(self, name: str) -> _ReflectiveScope:
-        current = self.scope
+    def _binding_scope(self, name: str, *, scope_index: int | None = None) -> _ReflectiveScope:
+        index = len(self.scopes) - 1 if scope_index is None else scope_index
+        current = self.scopes[index]
         if name in current.global_names:
             return self.scopes[0]
         if name in current.nonlocal_names:
-            for scope in reversed(self.scopes[:-1]):
+            for scope in reversed(self.scopes[:index]):
                 if name in scope.modules or name in scope.callables or name in scope.shadowed:
                     return scope
-            if len(self.scopes) > 1:
-                return self.scopes[-2]
+            if index > 0:
+                return self.scopes[index - 1]
         return current
+
+    def _module_name(self, node: ast.expr) -> str | None:
+        """Resolve static dotted bases through live bindings, never by spelling alone."""
+        dotted = resolve_dotted_name(node)
+        if dotted is not None:
+            root, separator, rest = dotted.partition(".")
+            module = self._lookup("module", root)
+            if module is not None:
+                return f"{module}.{rest}" if separator else module
+        return self._dynamic_module_name(node)
 
     def _is_unshadowed_builtin(self, name: str) -> bool:
         for scope in reversed(self._lookup_scopes(name)):
@@ -551,24 +593,36 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
         values[name] = value
         scope.shadowed.add(name)
 
-    def _bind(self, targets: list[ast.expr], value: ast.expr) -> None:
+    def _bind(
+        self, targets: list[ast.expr], value: ast.expr, *, named_expression: bool = False
+    ) -> None:
         names = self._target_names(targets)
-        module = self._dynamic_module_name(value)
-        canonical = self._reflective_callable(value)
+        module = self._module_name(value)
+        canonical = (
+            self._lookup("callable", value.id)
+            if isinstance(value, ast.Name)
+            else self._reflective_callable(value)
+        )
         function = self._lookup_function(value.id) if isinstance(value, ast.Name) else None
-
-        self._shadow_names(names)
-        if module is not None:
+        # Resolve the RHS in the comprehension first, then write through to the
+        # containing scope (and honor its global/nonlocal declarations).
+        caller_scopes = self.scopes
+        if named_expression:
+            index = len(self.scopes) - 1
+            while self.scopes[index].is_comprehension:
+                index -= 1
+            self.scopes = self.scopes[: index + 1]
+        try:
+            self._shadow_names(names)
             for name in names:
-                self._set_binding("module", name, module)
-            return
-        if canonical is not None:
-            for name in names:
-                self._set_binding("callable", name, canonical)
-            return
-        if function is not None:
-            for name in names:
-                self._binding_scope(name).functions[name] = function
+                if module is not None:
+                    self._set_binding("module", name, module)
+                elif canonical is not None:
+                    self._set_binding("callable", name, canonical)
+                elif function is not None:
+                    self._binding_scope(name).functions[name] = function
+        finally:
+            self.scopes = caller_scopes
 
     def _reflective_callable(self, value: ast.expr) -> str | None:
         if (
@@ -579,11 +633,7 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
             and len(value.args) >= 2
         ):
             base = value.args[0]
-            reflected_module = (
-                self._lookup("module", base.id) if isinstance(base, ast.Name) else None
-            )
-            if reflected_module is None:
-                reflected_module = self._dynamic_module_name(base)
+            reflected_module = self._module_name(base)
             attribute = _constant_string(value.args[1])
             candidate = (
                 f"{reflected_module}.{attribute}"
@@ -712,21 +762,63 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
         if not node.generators:
             return
         self.visit(node.generators[0].iter)
+
+        if isinstance(node, ast.GeneratorExp):
+            # Creating a generator evaluates only its outer iterator. Scan the
+            # deferred body for sinks without applying effects to live frames.
+            self._run_isolated(lambda: self._analyze_comprehension_body(node))
+        else:
+            self._analyze_comprehension_body(node)
+
+    @staticmethod
+    def _literal_iteration_state(node: ast.expr) -> bool | None:
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)) and not any(
+            isinstance(item, ast.Starred) for item in node.elts
+        ):
+            return bool(node.elts)
+        if isinstance(node, ast.Dict) and all(key is not None for key in node.keys):
+            return bool(node.keys)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            return bool(node.value)
+        return None
+
+    def _analyze_comprehension_body(
+        self, node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp
+    ) -> None:
+        base = self._snapshot_frames()
+        definite = True
         targets = [
             name for generator in node.generators for name in self._target_names([generator.target])
         ]
-        self.scopes.append(_ReflectiveScope(shadowed=set(targets)))
-        for index, generator in enumerate(node.generators):
-            if index:
-                self.visit(generator.iter)
-            for condition in generator.ifs:
-                self.visit(condition)
-        if isinstance(node, ast.DictComp):
-            self.visit(node.key)
-            self.visit(node.value)
-        else:
-            self.visit(node.elt)
-        self.scopes.pop()
+        self.scopes.append(_ReflectiveScope(shadowed=set(targets), is_comprehension=True))
+        try:
+            for index, generator in enumerate(node.generators):
+                if index:
+                    self.visit(generator.iter)
+                iteration = self._literal_iteration_state(generator.iter)
+                if iteration is False:
+                    return
+                definite = definite and iteration is True and not generator.is_async
+                for condition in generator.ifs:
+                    self.visit(condition)
+                    if isinstance(condition, ast.Constant):
+                        if not condition.value:
+                            return
+                    else:
+                        definite = False
+            if isinstance(node, ast.DictComp):
+                self.visit(node.key)
+                self.visit(node.value)
+            else:
+                self.visit(node.elt)
+        finally:
+            self.scopes.pop()
+            # An unknown iterator/filter may execute zero times. Keep both
+            # feasible binding states rather than clearing a possible sink.
+            if not definite:
+                for scope, snapshot in base.values():
+                    self._check_runtime()
+                    scope.restore(self._merge_scope(snapshot, snapshot, scope))
 
     def _visit_expression(self, expression: ast.expr) -> None:
         pending: list[tuple[str, ast.AST]] = [("visit", expression)]
@@ -735,7 +827,7 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
             action, item = pending.pop()
             if action == "bind_named":
                 assert isinstance(item, ast.NamedExpr)
-                self._bind([item.target], item.value)
+                self._bind([item.target], item.value, named_expression=True)
                 continue
             if action == "finish_call_callee":
                 assert isinstance(item, ast.Call)
