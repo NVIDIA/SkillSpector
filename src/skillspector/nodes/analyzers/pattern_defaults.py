@@ -94,7 +94,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "RA1": "Skill modifies its own code, configuration, or behavior at runtime. Self-modification enables an agent to escalate privileges, disable safety constraints, or install persistent backdoors.",
     "RA2": "Skill establishes unauthorized persistence across sessions via cron jobs, startup scripts, or state files. Session persistence allows an attacker to maintain access beyond the current interaction.",
     # Supply Chain extensions (B.1.4)
-    "SC4": "Dependency has known vulnerabilities (CVEs). Using packages with unpatched security flaws exposes the environment to known exploits.",
+    "SC4": "Dependency vulnerability evidence requires review. This finding does not by itself confirm that the installed release is affected; check the resolved version, advisory applicability, and lookup coverage.",
     "SC5": "Dependency appears abandoned or unmaintained. Abandoned packages no longer receive security patches, leaving known and future vulnerabilities unaddressed.",
     "SC6": "Package name closely resembles a popular package, suggesting possible typosquatting. Attackers publish malicious packages with similar names to trick developers into installing them.",
     "SC7": "Code pulls a container image with signature or registry verification disabled (--disable-content-trust, DOCKER_CONTENT_TRUST=0, --insecure-registry). This accepts tampered or unverified images and is a container supply-chain risk.",
@@ -407,7 +407,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "RA1": "Prevent the skill from modifying its own code, SKILL.md, or configuration files. Treat skill files as read-only at runtime.",
     "RA2": "Remove any persistence mechanisms (cron jobs, startup scripts, state files). Skills should not maintain state across sessions without explicit user consent.",
     # Supply Chain extensions (B.1.4)
-    "SC4": "Update the dependency to a patched version that addresses the known CVE. Check OSV (osv.dev) or NVD for details on the vulnerability.",
+    "SC4": "Determine the dependency's resolved version and verify the advisory evidence and lookup coverage in OSV (osv.dev) or NVD. If the resolved release is affected, update to a verified fixed release when available, or remove or replace the affected dependency when no fix exists. Retry incomplete lookups before relying on their results.",
     "SC5": "Replace the abandoned dependency with an actively maintained alternative. Check the package's repository for last commit date and open issues.",
     "SC6": "Verify the package name is correct and not a typosquatting variant. Compare against the official package name on PyPI or npm.",
     "SC7": "Keep image signature verification (Docker Content Trust / cosign) and registry TLS enabled. Pull only signed images from trusted registries; never disable content-trust or use insecure registries in skill code.",

@@ -568,12 +568,15 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
             if outcome != "confirmed":
                 result.append(_mark_unconfirmed(f, outcome, assessment))
                 continue
-            explanation = (assessment.get("explanation") or "").strip() or get_explanation(
-                f.rule_id
-            )
-            remediation = (assessment.get("remediation") or "").strip() or get_remediation(
-                f.rule_id
-            )
+            explanation = (assessment.get("explanation") or "").strip()
+            remediation = (assessment.get("remediation") or "").strip()
+            # Resolve SC4's evidence-specific fallback per matched finding,
+            # including when one coarse assessment confirms multiple findings.
+            if f.rule_id == "SC4":
+                explanation = explanation or (f.explanation or "").strip()
+                remediation = remediation or (f.remediation or "").strip()
+            explanation = explanation or get_explanation(f.rule_id)
+            remediation = remediation or get_remediation(f.rule_id)
             confidence = float(assessment.get("confidence", 0.7))
             result.append(
                 replace(
