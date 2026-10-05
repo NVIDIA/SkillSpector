@@ -230,6 +230,10 @@ async def test_real_multiline_regex_timeout_rejects_installation(
     # A deliberately tiny operation budget makes backend timeout enforcement
     # deterministic without a fragile wall-clock performance assertion.
     monkeypatch.setattr(artifact_integrity, "_MULTILINE_PROMPT_PATTERN_SECONDS", 0.000001)
+    monkeypatch.setattr(
+        artifact_integrity, "_multiline_prompt_injection_line",
+        lambda *_args: pytest.fail("ordinary projection reached the multiline fallback"),
+    )
     content = (_letter_lines("without telling user") + "   ") * 2400
     _write_bundle(tmp_path, {"SKILL.md": content})
 
@@ -433,9 +437,15 @@ def test_projected_prompt_regex_timeout_records_incomplete_coverage(
     monkeypatch: pytest.MonkeyPatch, irregular: bool
 ) -> None:
     calls = []
+    clock = iter((0.0, 0.02, 0.02, 0.04))
+    monkeypatch.setattr(artifact_integrity.time, "thread_time", lambda: next(clock))
+    monkeypatch.setattr(
+        artifact_integrity, "_multiline_prompt_injection_line",
+        lambda *_args: pytest.fail("ordinary projection reached the multiline fallback"),
+    )
 
     class ExpiredPattern:
-        def finditer(self, text, *, timeout, concurrent):
+        def finditer(self, text, *, pos, timeout, concurrent):
             calls.append((timeout, concurrent))
             # Exercise the irregular projection after the normal search.
             if irregular and len(calls) == 1:
@@ -464,9 +474,52 @@ def test_repeated_projected_prompt_prefix_has_engine_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(artifact_integrity, "_MULTILINE_PROMPT_PATTERN_SECONDS", 0.000001)
+    monkeypatch.setattr(
+        artifact_integrity, "_multiline_prompt_injection_line",
+        lambda *_args: pytest.fail("ordinary projection reached the multiline fallback"),
+    )
     content = "w i t h o u t   t e l l i n g   u s e r " * 1000
     with pytest.raises(artifact_integrity._ArtifactIntegrityResourceLimitError) as caught:
         artifact_integrity._projected_prompt_injection_line(
             content, artifact_integrity._ArtifactIntegrityBudget({})
         )
     assert caught.value.reason == LedgerReason.RUNTIME_LIMIT
+
+
+def test_timed_prompt_matches_excludes_consumer_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+
+    import regex
+
+    monkeypatch.setattr(artifact_integrity, "_MULTILINE_PROMPT_PATTERN_SECONDS", 0.01)
+    matches = artifact_integrity._timed_prompt_matches(
+        regex.compile(r".*?"), "ab", artifact_integrity._ArtifactIntegrityBudget({})
+    )
+    first = next(matches)
+    until = time.thread_time() + 0.03
+    while time.thread_time() < until:
+        pass
+    assert [first.span(), *(match.span() for match in matches)] == [
+        (0, 0), (0, 1), (1, 1), (1, 2), (2, 2)
+    ]
+
+
+def test_timed_prompt_matches_retries_other_thread_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    import regex
+
+    calls = 0
+    original = regex.compile("x")
+
+    class ContendedPattern:
+        def finditer(self, text, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise TimeoutError("another thread used process CPU")
+            return original.finditer(text, **kwargs)
+
+    matches = artifact_integrity._timed_prompt_matches(
+        ContendedPattern(), "x", artifact_integrity._ArtifactIntegrityBudget({})
+    )
+    assert [match.span() for match in matches] == [(0, 1)]
+    assert calls == 3

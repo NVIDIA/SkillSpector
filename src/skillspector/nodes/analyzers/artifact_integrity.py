@@ -757,25 +757,43 @@ def _timed_prompt_matches(
     budget: _ArtifactIntegrityBudget,
 ) -> Iterator[regex.Match[str]]:
     """Apply the same interruptible matching budget to every prompt projection."""
-    budget.check_runtime()
-    remaining = transitive_remaining_seconds(budget.state)
-    timeout = _MULTILINE_PROMPT_PATTERN_SECONDS
-    if remaining is not None:
-        timeout = min(timeout, max(0.0, remaining))
-    started_at = time.monotonic()
-    try:
-        # Keeping the GIL avoids charging another analyzer's work to this search.
-        for match in pattern.finditer(text, timeout=timeout, concurrent=False):
-            budget.check_runtime()
-            yield match
-    except TimeoutError as exc:
-        raise _ArtifactIntegrityResourceLimitError(
-            LedgerReason.RUNTIME_LIMIT,
-            {
-                "observed_seconds": max(0.0, time.monotonic() - started_at),
-                "limit_seconds": timeout,
-            },
-        ) from exc
+    matching_seconds = 0.0
+    matching_limit = _MULTILINE_PROMPT_PATTERN_SECONDS
+    start = 0
+    skip_empty = False
+    while True:
+        budget.check_runtime()
+        remaining = transitive_remaining_seconds(budget.state)
+        if remaining is not None:
+            matching_limit = min(matching_limit, matching_seconds + max(0.0, remaining))
+        timeout = matching_limit - matching_seconds
+        if timeout <= 0:
+            raise _ArtifactIntegrityResourceLimitError(
+                LedgerReason.RUNTIME_LIMIT,
+                {"observed_seconds": matching_seconds, "limit_seconds": matching_limit},
+            )
+        started_at = time.thread_time()
+        expired = False
+        try:
+            # Restart across yields so consumer work never uses the match budget.
+            matches = pattern.finditer(text, pos=start, timeout=timeout, concurrent=False)
+            if skip_empty:
+                next(matches, None)
+            match = next(matches, None)
+        except TimeoutError:
+            expired = True
+        finally:
+            matching_seconds += max(0.0, time.thread_time() - started_at)
+        budget.check_runtime()
+        if expired:
+            # regex counts process CPU, including native work in other threads.
+            # Retry only the same search; the thread and workflow budgets still bound it.
+            continue
+        if match is None:
+            return
+        start = match.end()
+        skip_empty = match.start() == start
+        yield match
 
 
 def _multiline_prompt_injection_line(
