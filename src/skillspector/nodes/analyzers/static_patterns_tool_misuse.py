@@ -44,6 +44,7 @@ from .common import (
     MARKDOWN_FENCE_OPEN,
     get_context,
     get_line_number,
+    is_reference_material,
 )
 from .pattern_defaults import PatternCategory
 
@@ -218,7 +219,24 @@ TM1_CODE_PATTERNS = [
         0.85,
     ),
     (r"\bshutil\.rmtree\s*\(\s*['\"]\s*/", 0.85),
-    (r"(?:chmod|chown)\s+[^|]*(?:777|666|a\+rwx)", 0.8),
+    # A numeric chmod mode is world-writable when the others-triple carries the
+    # write bit, i.e. its last digit is 2, 3, 6 or 7.  Matching the mode argument
+    # itself rather than a bare `777`/`666` substring also keeps a path or a
+    # trailing comment from being read as the mode (chmod 755 /tmp/6660 is a
+    # chmod 755).  This owns the numeric forms that TM1 already owned for
+    # 777/666, plus the 646/757/0662 spellings the privilege-escalation rule used
+    # to catch as a side effect of matching 4/5/6/7 anywhere in the mode.
+    # Only `chmod` is matched here: `chown` takes an owner rather than a mode, so
+    # a numeric owner ID whose last digit is 2/3/6/7 (Grafana's 472:472, Istio's
+    # 1337:1337) is not a world-writable mode.  The optional [+=] accepts the
+    # operator GNU chmod allows in front of the digits (chmod +777, chmod =666);
+    # BSD chmod rejects those, so they are reported rather than assumed safe.
+    # The option group takes a single leading dash for the reason given in the
+    # privilege-escalation rule: `--?` made the match exponential on a line of
+    # unmatched `-- ` tokens, and `[\w=-]*` already absorbs a long option's
+    # second dash.
+    (r"chmod\s+(?:-[\w=-]*[ \t]+)*[\"']?[+=]?0*[0-7]{2,3}[2367](?![0-9\w])[\"']?", 0.8),
+    (r"(?:chmod|chown)\s+[^|]*a\+rwx", 0.8),
     # Git force operations
     (r"git\s+push\s+[^|]*--force", 0.7),
     (r"git\s+reset\s+--hard", 0.65),
@@ -3771,7 +3789,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     complete_match=match.group(0),
                 )
             )
-    # TM4: privileged K8s workload. Example filtering is delegated to the runner.
+    # TM4: privileged K8s workload. Example filtering is delegated to the runner,
+    # which keeps reference material because it is part of the skill. Findings in
+    # top-level `references/` are tagged for triage only; the agent reads those
+    # files as instructions, so confidence and score are left unchanged.
+    reference_material = is_reference_material(file_path, file_type)
+    tm4_tags = [*tag, "contextual-triage", "likely-benign-context"] if reference_material else tag
     for pattern, confidence in TM4_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -3782,7 +3805,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     severity=Severity.HIGH,
                     location=loc(line_num),
                     confidence=confidence,
-                    tags=tag,
+                    tags=tm4_tags,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
                     complete_match=match.group(0),
