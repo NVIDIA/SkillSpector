@@ -824,13 +824,13 @@ def _capped_check_runtime(max_calls: int):
 
 
 def _collect(code: str, check_runtime=None) -> dict:
-    """Run `_collect_tainted` directly on *code* and return name -> source_call."""
+    """Run `_collect_tainted` directly on *code* and return name -> source calls."""
     parsed = get_python_ast(None, code, "t.py")
     type_map = build_type_map(parsed.tree, parsed.import_aliases)
     tainted = behavioral_taint_tracking._collect_tainted(
         parsed.tree, type_map, parsed.import_aliases, check_runtime
     )
-    return {name: tv.source_call for name, tv in tainted.items()}
+    return {name: set(sources) for name, sources in tainted.items()}
 
 
 class TestFixpointTermination:
@@ -855,7 +855,25 @@ class TestFixpointTermination:
         sources = _collect(code, _capped_check_runtime(2000))
         assert set(sources) == {"x", "y", "z"}
         # Every name traces back to one of the two credential sources.
-        assert set(sources.values()) <= {"os.getenv", "os.environ"}
+        assert all(source_set <= {"os.getenv", "os.environ"} for source_set in sources.values())
+        assert sources["x"] == {"os.getenv", "os.environ"}
+        assert sources["y"] == {"os.getenv", "os.environ"}
+        assert sources["z"] == {"os.getenv", "os.environ"}
+
+    def test_reassignment_preserves_stronger_source_through_alias(self) -> None:
+        """A later user-input source must not be hidden by an earlier credential source."""
+        for assignments in (
+            'payload = os.getenv("KEY")\npayload = input()\n',
+            'payload = input()\npayload = os.getenv("KEY")\n',
+        ):
+            code = (
+                "import os, subprocess\n"
+                + assignments
+                + "command = payload\n"
+                + "subprocess.run(command, shell=True)\n"
+            )
+            findings = _run(code)
+            assert any(f.rule_id == "TT5" for f in findings)
 
     def test_cyclic_reassignment_flows_to_sink(self) -> None:
         """End to end: the oscillating module plus a sink still reports TT3."""
@@ -892,7 +910,7 @@ class TestFixpointTermination:
         elapsed = time.monotonic() - start
 
         assert len(sources) == depth + 1
-        assert all(src == "os.getenv" for src in sources.values())
+        assert all(srcs == {"os.getenv"} for srcs in sources.values())
         assert elapsed < 1.0
 
     def test_cyclic_reassignment_does_not_hang_without_cap(self) -> None:
@@ -947,5 +965,5 @@ class TestFixpointTermination:
         assert calls["n"] <= n_assignments
         # All read and target names are tainted, all tracing to os.getenv.
         assert len(sources) == 2 * width
-        assert all(src == "os.getenv" for src in sources.values())
+        assert all(srcs == {"os.getenv"} for srcs in sources.values())
         assert elapsed < 1.0

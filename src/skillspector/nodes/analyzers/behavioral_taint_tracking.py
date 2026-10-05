@@ -392,7 +392,7 @@ def _find_nested_sources(
 
 def _find_tainted_names_in_args(
     node: ast.Call,
-    tainted: dict[str, _TaintedVar],
+    tainted: dict[str, dict[str, _TaintedVar]],
     check_runtime: Callable[[], None] | None = None,
 ) -> list[_TaintedVar]:
     """Find references to tainted variables in a call's arguments and keywords."""
@@ -409,25 +409,26 @@ def _find_tainted_names_in_args(
         elif isinstance(child, ast.Subscript):
             var_name = resolve_dotted_name(child.value)
         if var_name and var_name not in seen:
-            tv = tainted.get(var_name)
-            if tv:
+            sources = tainted.get(var_name)
+            if sources:
                 seen.add(var_name)
-                hits.append(tv)
+                hits.extend(sources.values())
     return hits
 
 
 def _mark_targets(
     targets: list[ast.expr],
-    tainted: dict[str, _TaintedVar],
+    tainted: dict[str, dict[str, _TaintedVar]],
     src_name: str,
     lineno: int,
-) -> list[str]:
-    """Taint each assignment target name that is not tainted yet.
+) -> list[tuple[str, str]]:
+    """Add a source to each assignment target and return newly added facts.
 
-    Add-only: an existing entry is never overwritten, so taint can only grow.
-    Returns the names newly added, for the worklist to propagate from.
+    Each target retains one location for each distinct source. Add-only taint
+    keeps the fixpoint finite while allowing reassignment to add stronger
+    sources instead of silently discarding them.
     """
-    newly_tainted: list[str] = []
+    newly_tainted: list[tuple[str, str]] = []
     names: list[str] = []
     for target in targets:
         if isinstance(target, ast.Name):
@@ -435,9 +436,10 @@ def _mark_targets(
         elif isinstance(target, ast.Tuple):
             names.extend(elt.id for elt in target.elts if isinstance(elt, ast.Name))
     for name in names:
-        if name not in tainted:
-            tainted[name] = _TaintedVar(name, src_name, lineno)
-            newly_tainted.append(name)
+        sources = tainted.setdefault(name, {})
+        if src_name not in sources:
+            sources[src_name] = _TaintedVar(name, src_name, lineno)
+            newly_tainted.append((name, src_name))
     return newly_tainted
 
 
@@ -463,7 +465,7 @@ def _collect_tainted(
     type_map: dict[str, str],
     aliases: dict[str, str],
     check_runtime: Callable[[], None] | None = None,
-) -> dict[str, _TaintedVar]:
+) -> dict[str, dict[str, _TaintedVar]]:
     """Record ``Assign``-based taint, independent of AST visit order.
 
     Any single ordered pass over the tree — breadth-first (``ast.walk``) or
@@ -484,23 +486,18 @@ def _collect_tainted(
       assignment (``b = a``; ``payload = {"k": secret}``) once, keyed by a
       stable id, then indexes it by each name its value reads, as
       ``referenced_name -> [assignment_id, ...]``.
-    * The worklist then drains newly tainted names, firing each assignment that
-      reads a drained name AT MOST ONCE total: the first time any name it reads
-      becomes tainted, its targets are marked and enqueued; later drains of its
-      other reading names skip it. Only names not already tainted are enqueued.
+    * The worklist drains newly discovered (name, source) facts. Each
+      assignment fires at most once for each source, so a stronger source
+      discovered through reassignment propagates without repeating work for
+      already-seen sources.
 
-    Taint is add-only — an entry is never overwritten or removed — so the set
-    can only grow and is bounded by the number of assigned names. The loop
-    therefore cannot oscillate and is guaranteed to terminate. Firing an
-    assignment a second time is sound to skip: its targets are all tainted
-    after the first firing, so a later firing could only re-taint names and
-    add nothing. Each name is dequeued once and each propagating assignment
-    fires at most once, so the work is linear in the number of assignments
-    plus references — not quadratic in the longest chain, nor K×K' for a wide
-    ``a, b, ... = source`` statement read by many tainted names.
+    Taint is add-only and each variable has at most one entry per distinct
+    source call, so cycles terminate. Each source/assignment pair is processed
+    once; the work is bounded by the finite set of source calls and assignment
+    references.
     """
-    tainted: dict[str, _TaintedVar] = {}
-    worklist: deque[str] = deque()
+    tainted: dict[str, dict[str, _TaintedVar]] = {}
+    worklist: deque[tuple[str, str]] = deque()
     # Each propagating assignment, stored once as (targets, lineno) and keyed by
     # its index here (a stable id). ``propagators`` maps a name read by an
     # assignment's value to the ids of the assignments that read it.
@@ -535,18 +532,16 @@ def _collect_tainted(
             for ref in _referenced_names(ast_node.value):
                 propagators.setdefault(ref, []).append(assignment_id)
 
-    fired: set[int] = set()
+    fired: set[tuple[int, str]] = set()
     while worklist:
         if check_runtime is not None:
             check_runtime()
-        name = worklist.popleft()
-        src_call = tainted[name].source_call
+        name, src_call = worklist.popleft()
         for assignment_id in propagators.get(name, ()):
-            if assignment_id in fired:
-                # Already propagated once: its targets are all tainted, so
-                # firing again marks nothing new. Skip to stay linear.
+            assignment_source = (assignment_id, src_call)
+            if assignment_source in fired:
                 continue
-            fired.add(assignment_id)
+            fired.add(assignment_source)
             targets, lineno = propagating[assignment_id]
             worklist.extend(_mark_targets(targets, tainted, src_call, lineno))
 
