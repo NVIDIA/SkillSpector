@@ -1901,6 +1901,8 @@ class TestBuiltInCryptominerRules:
         )
         findings = _run_builtin(content, "loader.js")
         assert _has_rule(findings, "crypto_coinjacking")
+
+
 # ── Built-in agent skill rules ────────────────────────────────────────
 
 
