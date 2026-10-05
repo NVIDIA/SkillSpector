@@ -329,13 +329,14 @@ def test_local_import_restores_module_after_outer_proxy_slot_mutation() -> None:
     assert findings[0].severity == "HIGH"
 
 
-def test_class_slot_stores_resolve_receiver_at_each_store() -> None:
+def test_later_class_proxy_store_keeps_cached_replacement_unknown() -> None:
     source = (
         "import subprocess\nclass Tool:\n    subprocess.run = proxy\n"
         "    subprocess = other\n    subprocess.run = other\n    def run(self):\n"
         "        enabled = True\n        subprocess.run(command, shell=enabled)\n"
     )
-    assert not _findings(source)
+    # The later write on an unknown proxy may have protocol side effects.
+    assert len(_findings(source)) == 1
 
 
 @pytest.mark.parametrize("local_import", [False, True])
@@ -397,3 +398,25 @@ def test_local_popen_cached_replacement_in_eager_return_expression(statement: st
         f"    {statement}\nrun()\n"
     )
     assert not _findings(source)
+
+
+@pytest.mark.parametrize("intervening", ["", "restore()\n"])
+def test_unknown_helper_can_restore_a_changed_module_slot(intervening: str) -> None:
+    source = (
+        "import subprocess\nsubprocess.run = proxy\n"
+        f"{intervening}enabled = True\nsubprocess.run(command, shell=enabled)\n"
+    )
+    findings = _findings(source)
+    assert bool(findings) is bool(intervening)
+    if findings:
+        assert findings[0].severity == "HIGH"
+
+
+@pytest.mark.parametrize("intervening", ["", "restore()\n", "import subprocess\n"])
+def test_direct_effectful_slot_store_has_only_local_lifetime(intervening: str) -> None:
+    source = (
+        "subprocess.run = Proxy()\n"
+        + intervening
+        + "enabled = True\nsubprocess.run(command, shell=enabled)\n"
+    )
+    assert bool(_findings(source)) is bool(intervening)
