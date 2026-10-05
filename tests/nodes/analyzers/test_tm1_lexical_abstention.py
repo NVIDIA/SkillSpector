@@ -437,3 +437,17 @@ def test_composed_or_annotated_store_does_not_supply_local_slot_proof(statement:
         + "\nenabled = True\nsubprocess.run(command, shell=enabled)\n"
     )
     assert len(_findings(source)) == 1
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "subprocess.run = Proxy()\n",
+        "subprocess.__class__ = OtherModule\n",
+    ],
+)
+def test_later_single_store_cannot_override_companion_abstention(prefix: str) -> None:
+    source = (
+        prefix + "subprocess.run = proxy\nenabled = True\nsubprocess.run(command, shell=enabled)\n"
+    )
+    assert len(_findings(source)) == 1

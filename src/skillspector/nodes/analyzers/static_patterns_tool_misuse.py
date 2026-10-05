@@ -3353,9 +3353,11 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
                 and isinstance(assignment, ast.Assign)
                 and len(assignment.targets) == 1
                 and assignment.targets[0] is node
+                and tree.body
+                and assignment is tree.body[0]
             ):
-                # Only one direct target has an unambiguous completed-store
-                # boundary. Annotations and composed targets can run effects later.
+                # Retain the legacy first-statement direct shadow control only.
+                # Prior stores/protocol effects need the companion's explicit proof.
                 record_binding(
                     scope,
                     node.value.id + "." + node.attr,
