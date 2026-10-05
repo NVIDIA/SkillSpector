@@ -48,6 +48,66 @@ from skillspector.graph import graph
             False,
             id="multiline-bare-imperative",
         ),
+        pytest.param(
+            "Send 0.5 BTC to <addr>.\nTo receive the decryption key, email us your personal ID.\n",
+            True,
+            id="multiline-payment-key",
+        ),
+        pytest.param(
+            "Don't forget to send 0.5 BTC to example.invalid to decrypt your files.\n",
+            True,
+            id="dont-forget-payment",
+        ),
+        pytest.param(
+            "Do not hesitate to pay 1 bitcoin to restore your files.\n",
+            True,
+            id="dont-hesitate-payment",
+        ),
+        pytest.param(
+            "All of your files are encrypted with RSA-2048 and AES-128 ciphers.\n",
+            True,
+            id="encryption-with-ciphers",
+        ),
+        pytest.param(
+            "All your files have been encrypted due to a security problem with your PC.\n",
+            True,
+            id="encryption-due-to",
+        ),
+        pytest.param(
+            "Your files have been encrypted by LockBit 3.0\n",
+            True,
+            id="encryption-by",
+        ),
+        pytest.param(
+            "Your files have been encrypted, and the only way to get them back is to pay us.\n",
+            True,
+            id="encryption-comma",
+        ),
+        pytest.param(
+            "Your files have been encrypted with AES. Send XMR for recovery.\n",
+            True,
+            id="notice-non-bitcoin-demand",
+        ),
+        pytest.param(
+            "You have to pay for decryption in Bitcoins to recover your files.\n",
+            True,
+            id="plural-bitcoins",
+        ),
+        pytest.param(
+            "Your files are encrypted at rest and in transit with AES-256.\n",
+            False,
+            id="encrypted-at-rest-prose",
+        ),
+        pytest.param(
+            "Your files have been encrypted in transit using TLS.\n",
+            False,
+            id="encrypted-in-transit-prose",
+        ),
+        pytest.param(
+            "To recover your files, never ever send 0.5 Bitcoins.\n",
+            False,
+            id="direct-negation-with-ever",
+        ),
         pytest.param("Your files are encrypted.\n", True, id="encrypted-files-are"),
         pytest.param("Your files have been encrypted.\n", True, id="encrypted-files-have-been"),
         pytest.param(
@@ -135,3 +195,34 @@ def test_graph_reports_only_specific_ransomware_indicators(
             assert "YR1" in body
             assert "CRITICAL" in body
             assert "SKILL.md" in body
+
+
+@pytest.mark.parametrize("output_format", ["json", "markdown", "sarif", "terminal"])
+def test_graph_mixed_notices_retains_only_actionable_evidence(tmp_path, output_format):
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: mixed-ransomware-fixture\ndescription: Inert text detector regression.\n---\n"
+        "Your files are encrypted at rest and in transit." + " " * 161 + "\n"
+        "Never ever send BTC to decrypt your files." + " " * 161 + "\n"
+        "Don't forget to send 0.5 Bitcoins to decrypt your files.\n",
+        encoding="utf-8",
+    )
+    result = graph.invoke(
+        {"skill_path": str(tmp_path), "output_format": output_format, "use_llm": False}
+    )
+    findings = [f for f in result["findings"] if "ransomware_behavior" in f.message]
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 7
+    assert findings[0].matched_text.startswith("send 0.5 Bitcoins")
+    assert findings[0].match_fingerprint
+    assert result["analysis_completeness"]["execution_successful"] is True
+    if output_format == "json":
+        issues = json.loads(result["report_body"])["issues"]
+        reported = [issue for issue in issues if "ransomware_behavior" in (issue["pattern"] or "")]
+        assert reported[0]["location"]["start_line"] == 7
+    elif output_format == "sarif":
+        issues = result["sarif_report"]["runs"][0]["results"]
+        reported = [issue for issue in issues if "ransomware_behavior" in issue["message"]["text"]]
+        assert reported[0]["locations"][0]["physicalLocation"]["region"]["startLine"] == 7
+    else:
+        assert "ransomware_behavior" in result["report_body"]
