@@ -22,6 +22,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import zipfile
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from importlib import import_module
@@ -178,6 +180,118 @@ def test_stream_progress_returns_complete_values_state(
     )
 
     assert result == final_state
+
+
+def _stop_scan_after_input_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: type[BaseException]
+) -> tuple[Path, list[Path]]:
+    """Build a zipped skill, record scan temp dirs, and make the report step raise."""
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("SKILL.md", "---\nname: demo\ndescription: d\n---\n# Demo\n")
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def recording_mkdtemp(*args: Any, **kwargs: Any) -> str:
+        """Create scan temp dirs under tmp_path and remember them."""
+        if kwargs.get("prefix") != "skillspector_":
+            return real_mkdtemp(*args, **kwargs)
+        path = real_mkdtemp(*args, **{**kwargs, "dir": tmp_path})
+        created.append(Path(path))
+        return path
+
+    def stop(*args: Any, **kwargs: Any) -> str:
+        """Stand in for an interrupt or a failure after the input is materialized."""
+        raise error("scan stopped")
+
+    monkeypatch.setattr("skillspector.input_handler.tempfile.mkdtemp", recording_mkdtemp)
+    monkeypatch.setattr("skillspector.nodes.report._format_json", stop)
+    return archive, created
+
+
+@pytest.mark.parametrize("stream_progress", [False, True])
+@pytest.mark.parametrize("error", [KeyboardInterrupt, RuntimeError])
+def test_scan_that_stops_early_removes_its_temp_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stream_progress: bool,
+    error: type[BaseException],
+) -> None:
+    """A scan interrupted or failing after input resolution removes its temp dir."""
+    archive, created = _stop_scan_after_input_resolution(monkeypatch, tmp_path, error)
+
+    with pytest.raises(error):
+        cli._run_graph_scan(
+            input_path=str(archive),
+            format=FormatChoice.json,
+            no_llm=True,
+            stream_progress=stream_progress,
+        )
+
+    assert created
+    assert not any(path.exists() for path in created)
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, RuntimeError])
+def test_transitive_scan_stopped_in_a_child_removes_the_root_temp_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: type[BaseException]
+) -> None:
+    """A --transitive scan of a zipped root that stops while a child is scanning removes the root's temp dir."""
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(
+            "SKILL.md",
+            "---\nname: demo\ndescription: d\n---\n# Demo\n\n"
+            "Install the helper skill from https://github.com/org/dep.git first.\n",
+        )
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def recording_mkdtemp(*args: Any, **kwargs: Any) -> str:
+        """Create scan temp dirs under tmp_path and remember them."""
+        if kwargs.get("prefix") != "skillspector_":
+            return real_mkdtemp(*args, **kwargs)
+        path = real_mkdtemp(*args, **{**kwargs, "dir": tmp_path})
+        created.append(Path(path))
+        return path
+
+    real_scan_for_source = cli._run_graph_scan_for_source
+    child_inputs: list[str] = []
+
+    def scan_for_source(**kwargs: Any) -> dict[str, object]:
+        """Run the root scan for real and stop the first transitive child."""
+        if kwargs["input_path"] == str(archive):
+            return real_scan_for_source(**kwargs)
+        child_inputs.append(kwargs["input_path"])
+        raise error("child scan stopped")
+
+    monkeypatch.setattr("skillspector.input_handler.tempfile.mkdtemp", recording_mkdtemp)
+    monkeypatch.setattr(cli, "_run_graph_scan_for_source", scan_for_source)
+    if error is RuntimeError:
+        # A child failure is recorded as a warning; make the merge step raise instead.
+        def stop_merge(*args: Any, **kwargs: Any) -> None:
+            raise error("merge stopped")
+
+        monkeypatch.setattr(cli, "_ensure_required_failure_events", stop_merge)
+
+    with pytest.raises(error):
+        cli._scan_skill(
+            input_path=str(archive),
+            format=FormatChoice.json,
+            no_llm=True,
+            baseline=None,
+            yara_rules_dir=None,
+            verbose=False,
+            show_suppressed=False,
+            transitive_enabled=True,
+            transitive_depth=1,
+            transitive_allow_prefix=None,
+            transitive_deny_prefix=None,
+        )
+
+    assert child_inputs, "the root should have reached a transitive child scan"
+    assert created
+    assert not any(path.exists() for path in created)
 
 
 @pytest.mark.parametrize(
