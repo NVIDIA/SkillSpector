@@ -601,6 +601,33 @@ def _single_line_perl_socket_shell() -> str:
     ).decode()
 
 
+# Browser cookie-store paths an information stealer reads (base64 so the test
+# source itself carries no stealer indicator).
+_STEALER_COOKIE_PATHS = {
+    "chrome_windows": "b3MucGF0aC5qb2luKG9zLmVudmlyb25bJ0xPQ0FMQVBQREFUQSddLCAnR29vZ2xlJywgJ0Nocm9tZScsICdVc2VyIERhdGEnLCAnRGVmYXVsdCcsICdOZXR3b3JrJywgJ0Nvb2tpZXMnKQ==",
+    "edge_windows": "Y29weSAlTE9DQUxBUFBEQVRBJVxNaWNyb3NvZnRcRWRnZVxVc2VyIERhdGFcRGVmYXVsdFxOZXR3b3JrXENvb2tpZXMgb3V0LmRi",
+    "brave_linux": "fi8uY29uZmlnL0JyYXZlU29mdHdhcmUvQnJhdmUtQnJvd3Nlci9Vc2VyIERhdGEvRGVmYXVsdC9Db29raWVz",
+    "chrome_macos": "cGF0aCA9IGhvbWUgKyAiL0xpYnJhcnkvQXBwbGljYXRpb24gU3VwcG9ydC9Hb29nbGUvQ2hyb21lL0RlZmF1bHQvQ29va2llcyI=",
+    "opera_windows": "JHAgPSAiJGVudjpBUFBEQVRBXE9wZXJhIFNvZnR3YXJlXE9wZXJhIFN0YWJsZVxOZXR3b3JrXENvb2tpZXMi",
+    "firefox_profile": "c3JjID0gcHJvZmlsZV9kaXIgLyAnY29va2llcy5zcWxpdGUn",
+}
+
+
+def _stealer_cookie_path(name: str) -> str:
+    return base64.b64decode(_STEALER_COOKIE_PATHS[name]).decode()
+
+
+# Documentation that names the browser store and, later on the same line, a
+# browser or product name (issue #751: a Supabase skill description).
+_COOKIE_PROSE = [
+    "description: Auth issues (login, logout, sessions, JWT, cookies, getSession, getUser, "
+    "getClaims, RLS); Supabase CLI or MCP server; debugging timeouts, Edge Function crashes\n",
+    "Set cookies for Edge Functions with the SSR helper.\n",
+    "Cookies set by the Edge middleware are httpOnly.\n",
+    "Forward cookies to Chrome headless through the Playwright context.\n",
+]
+
+
 def _has_rule(findings: list, rule_name: str) -> bool:
     """Return True when a finding message references a specific YARA rule.
 
@@ -1860,6 +1887,25 @@ rule agent_skill_destructive_autonomous_actions {
     def test_known_webshell_rule_matches_family_markers(self, fixture, filename):
         findings = _run_builtin(_webshell_fixture(fixture), filename)
         assert _has_rule(findings, "php_webshell_known")
+
+    @pytest.mark.parametrize(
+        "content",
+        _COOKIE_PROSE,
+        ids=["supabase_description", "edge_functions", "edge_middleware", "chrome_headless"],
+    )
+    def test_info_stealer_ignores_cookie_prose(self, content):
+        findings = _run_builtin(content, "SKILL.md")
+        assert not _has_rule(findings, "info_stealer")
+
+    @pytest.mark.parametrize("name", sorted(_STEALER_COOKIE_PATHS))
+    def test_info_stealer_matches_browser_cookie_store_paths(self, name):
+        findings = _run_builtin(_stealer_cookie_path(name) + "\n", "collect.py")
+        assert _has_rule(findings, "info_stealer")
+
+    def test_info_stealer_matches_cookie_store_path_next_to_prose(self):
+        content = _COOKIE_PROSE[1] + _stealer_cookie_path("chrome_windows") + "\n"
+        findings = _run_builtin(content, "collect.py")
+        assert _has_rule(findings, "info_stealer")
 
 
 # ── Rule caching ──────────────────────────────────────────────────────
