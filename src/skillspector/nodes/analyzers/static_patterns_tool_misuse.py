@@ -5620,6 +5620,16 @@ def _reconcile_variable_shell_findings(
     ownership, emitted = static_python_shell_truthiness.bound_shell_call_state(
         file_path, python_ast
     )
+    retained_companion_locations = {
+        (finding.start_line, finding.start_column)
+        for finding in findings
+        if finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is True
+    }
+    emitted = {
+        key
+        for key in emitted
+        if (key[0], python_ast.character_column(key[0], key[1])) in retained_companion_locations
+    }
 
     reconciled: list[Finding] = []
     for finding in findings:

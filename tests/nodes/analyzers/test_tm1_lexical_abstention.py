@@ -178,3 +178,13 @@ def test_unknown_companion_decision_is_distinct_from_emission() -> None:
     assert next(iter(ownership.values())) is False
     assert not emitted
     assert len(_findings(source)) == 1
+
+
+def test_positive_dataflow_without_retained_finding_keeps_lexical_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "import subprocess\nenabled = True\nsubprocess.run(command, shell=enabled)\n"
+    monkeypatch.setattr(truthiness, "analyze", lambda *args, **kwargs: [])
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
