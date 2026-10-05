@@ -3162,9 +3162,10 @@ def _tm1_candidates(
         # checking it first preserves the original matches, including Unicode
         # IGNORECASE aliases and multiline command spans.
         curl_prefix = r"curl\s+[^|]*"
-        if pattern.startswith(curl_prefix) and re.search(
-            pattern.removeprefix(curl_prefix), content, re.IGNORECASE
-        ) is None:
+        if (
+            pattern.startswith(curl_prefix)
+            and re.search(pattern.removeprefix(curl_prefix), content, re.IGNORECASE) is None
+        ):
             continue
         matches = (
             static_runner.iter_paragraph_matches
