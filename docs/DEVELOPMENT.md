@@ -323,6 +323,7 @@ The manual `test-provider` CI job and local `make test-provider` target perform 
 | `make test-provider openai` | `OPENAI_API_KEY` | `https://api.openai.com/v1` | `SKILLSPECTOR_OPENAI_TEST_MODEL` |
 | `make test-provider anthropic` | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` | `SKILLSPECTOR_ANTHROPIC_TEST_MODEL` |
 | `make test-provider nv_build` | `NVIDIA_INFERENCE_KEY` | `https://integrate.api.nvidia.com/v1` | `SKILLSPECTOR_NV_BUILD_TEST_MODEL` |
+| `make test-provider gemini` | `GOOGLE_CLOUD_PROJECT` | `https://aiplatform.googleapis.com/v1/...` | `SKILLSPECTOR_GEMINI_TEST_MODEL` |
 | `make test-provider` | Any/all of the provider keys above | All provider default URLs above | Any/all provider model overrides above |
 
 Base URL env vars are not needed for live provider tests; the tests intentionally use provider defaults.
@@ -339,13 +340,14 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
   - `anthropic/` — api.anthropic.com (`ANTHROPIC_API_KEY`)
   - `anthropic_proxy/` — Vertex-style proxy (`ANTHROPIC_PROXY_API_KEY`, `ANTHROPIC_PROXY_ENDPOINT_URL`)
   - `bedrock/` — AWS Bedrock Runtime (standard boto3 credential chain)
+  - `gemini/` — Google Cloud OpenAI-compatible Gemini endpoint (`GOOGLE_CLOUD_PROJECT`, ADC / Workload Identity)
   - `ollama/` — local Ollama OpenAI-compatible endpoint (no API key)
   - `azure_openai/` — Azure OpenAI Service (`AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`)
   - `openai_compatible/` — generic compatible endpoint (`SKILLSPECTOR_COMPAT_API_KEY`, `SKILLSPECTOR_COMPAT_BASE_URL`)
   - `claude_cli/` — **local `claude` binary; no API key**. Uses the CLI's own auth session (`claude auth login`). Set `SKILLSPECTOR_PROVIDER=claude_cli`.
   - `codex_cli/` — **local `codex` binary; no API key**. Uses the CLI's own auth session (`codex login`). Set `SKILLSPECTOR_PROVIDER=codex_cli`.
   - `gemini_cli/` — **local `gemini` binary; no API key**. Uses the CLI's own auth session. Set `SKILLSPECTOR_PROVIDER=gemini_cli`.
-  - `opencode_cli/` — **local `opencode` 1.18.32 binary; no API key**. Uses the CLI's own auth session (`opencode auth login`) and fails closed on every other runtime version because the deny-all policy is verified against that exact release. Set `SKILLSPECTOR_PROVIDER=opencode_cli`.
+  - `opencode_cli/` — **local `opencode` 1.18.33 binary; no API key**. Uses the CLI's own auth session (`opencode auth login`) and fails closed on every other runtime version because the deny-all policy is verified against that exact release. Set `SKILLSPECTOR_PROVIDER=opencode_cli`.
 
   CLI providers (`claude_cli`, `codex_cli`, `gemini_cli`, `opencode_cli`) implement the optional `AgentCLICapable` interface (`is_available()` + `complete()`) defined in [providers/base.py](../src/skillspector/providers/base.py). `has_cli_capability(provider)` detects this at runtime. All subprocess calls go through the hardened helper [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py) which enforces: no shell (`shell=False`), untrusted content via stdin only, capability stripping (tools disabled / sandboxed), environment scrubbing (no API keys forwarded), per-call timeout, and fail-closed error handling.
 

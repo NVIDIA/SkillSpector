@@ -269,6 +269,11 @@ When relevant analysis is incomplete:
 - `skillspector scan --fail-on-incomplete` exits with status 1. Without this option, the CLI retains
   its compatibility behavior and still applies its ordinary risk-score exit policy. Execution
   failures exit with status 2.
+- `skillspector scan --min-coverage PERCENT` exits with status 1 when canonical coverage is below
+  `PERCENT`; equality passes. Recursive scans check each scanned child's own coverage, not the
+  aggregate `analysis_completeness.coverage_percent`, and any omitted or unscanned skill fails a
+  positive threshold. Skills that discovery never found because it stopped early are not counted;
+  add `--fail-on-incomplete` to catch that case.
 - MCP responses set `safe_to_install` to `false` when analysis is incomplete, any relevant file is
   entirely uninspected, execution failed, or the risk score exceeds the installation threshold.
 
@@ -292,8 +297,16 @@ default. Set `SKILLSPECTOR_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT` to a positi
 finite number of seconds to change that allowance. Invalid, zero, negative,
 infinite, or NaN values log a warning and retain the 300-second default.
 
+## Configuring the dependency-source deadline
+
+Dependency-source redirection analysis allows up to 5 seconds by default. Set
+`SKILLSPECTOR_MAX_DEPENDENCY_SOURCE_ANALYSIS_SECONDS` to a positive finite number of
+seconds to change that allowance. Invalid, zero, negative, infinite, or NaN
+values log a warning and retain the 5-second default.
+
 Each operation still uses the smaller of this allowance and the remaining workflow
-time. Increasing it does not extend the aggregate workflow deadline. A limit
-reached during analysis retains existing findings and reports partial work through
-the inspection ledger. Both environment settings are read when their modules are
-imported, so restart the SkillSpector process after changing them.
+time. Increasing either per-operation setting does not extend the aggregate
+workflow deadline. A limit reached during analysis retains existing findings and
+reports partial work through the inspection ledger. These environment settings
+are read when their modules are imported, so restart the SkillSpector process
+after changing them.

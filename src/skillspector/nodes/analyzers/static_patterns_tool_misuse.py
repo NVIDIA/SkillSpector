@@ -54,6 +54,7 @@ from .common import (
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
     get_context,
+    is_reference_material,
 )
 from .pattern_defaults import PatternCategory
 
@@ -87,8 +88,27 @@ _DESTRUCTIVE_COMMAND_BASENAMES = frozenset({"rm", "del", "erase"})
 _QUOTED_GLOB_SENTINEL = "\ue000"
 _DYNAMIC_SHELL_WORD_SENTINEL = "\ue001"
 _RUNTIME_SHELL_PARAMETER_SENTINEL = "\ue002"
-_SIMPLE_BRACED_PARAMETER_RE = re.compile(r"\$\{(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])\}")
+# A braced expansion head whose result depends only on parameter values: an
+# optional length prefix, a name with an optional literal subscript or a
+# numeric/special parameter, then the closing brace or a value operator.
+# Indirection, arithmetic subscripts, substring offsets, ``@`` transformations,
+# zsh flags and ``${ cmd; }`` can evaluate code, so they do not match. The
+# documentation placeholder ``${...}`` is a bad substitution in every shell.
+_VALUE_PARAMETER_EXPANSION_HEAD_RE = re.compile(
+    r"\$\{(?:#?(?:[A-Za-z_][A-Za-z0-9_]*(?:\[(?:[@*]|[0-9]+)\])?|[0-9]+|[@*#?$!-])"
+    r"(?:\}|:?[-=?+]|##?|%%?|/[/#%]?|\^\^?|,,?)|\.\.\.\})"
+)
+_VALUE_PARAMETER_EXPANSION_START_RE = re.compile(r"\$\{")
+_EXECUTABLE_EXPANSION_MARKERS = ("`", "$(", "$[", "<(", ">(")
+_SHELL_ASSIGNMENT_PREFIX_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+_SHELL_ASSIGNMENT_NAME_CHARACTERS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+)
+_SHELL_CLAUSE_BOUNDARY_CHARACTERS = "\r\n;|&(){}`"
 _SHELL_DELIMITER_WORD_RE = re.compile(r"[^$'\"`\\(){}<>#;|&!\s]++")
+# A ``#`` that starts a word begins a shell comment. Quoting is not tracked, so
+# ``echo "a # b"`` also matches; callers only use this to restrict ownership.
+_SHELL_COMMENT_START_RE = re.compile(r"(?<![^\s;&|()<>])#")
 _PERL_LITERAL_PRINT_RE = re.compile(
     r"^[ \t]*+print\b(?:[ \t]++(?:STDOUT|STDERR)\b)?[ \t]*+(?P<paren>\()?[ \t]*+"
     r"(?P<literal>\"(?:\\[\\\"'nrt]|[^\\\"$@`\r\n])*+\""
@@ -113,9 +133,18 @@ _POWERSHELL_REPLACE_EXPRESSION_RE = re.compile(
 _SHELL_COMMAND_STRING_SHELLS = frozenset({"sh", "ash", "bash", "dash", "ksh", "yash", "zsh"})
 _SHELL_COMMAND_STRING_ARGUMENTS = 32
 _SHELL_CLAUSE_PREFIX_WORDS = frozenset({"do", "else", "elif", "then", "time", "!"})
+_SHELL_ASSIGNMENT_PREFIX_WORDS = _SHELL_CLAUSE_PREFIX_WORDS | frozenset(
+    {"if", "while", "until", "export", "local", "declare", "readonly", "typeset"}
+)
 _SHELL_REDIRECTION_PREFIX_RE = re.compile(r"(?:[0-9]+)?(?:&>>?|<>|>>?|<<-?|>&|<&|[<>])")
 _RECURSIVE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*[rR]|-recursive)")
 _FORCE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*f|-force)")
+_MARKDOWN_CONTRACTION_PROSE_RE = re.compile(
+    r"(?:The|This|That|These|Those|It|They|We|You|I|A|An)[ \t]+[A-Za-z \t,]*\b"
+    r"(?:doesn|isn|aren|wasn|weren|don|didn|hasn|haven|hadn|can|couldn|shouldn|wouldn|won|mustn)"
+    r"(?P<apostrophe>')t\b[A-Za-z \t,]*[.!?]",
+    re.IGNORECASE,
+)
 _ROOT_GLOB_DOCUMENTATION_LINE_RE = re.compile(
     r"[ \t]*(?:(?:[-*+]|#{1,6})[ \t]+)?"
     r"(?:(?:(?:documentation|note|example)[ \t]*:[ \t]*)"
@@ -215,7 +244,24 @@ TM1_CODE_PATTERNS = [
         0.85,
     ),
     (r"\bshutil\.rmtree\s*\(\s*['\"]\s*/", 0.85),
-    (r"(?:chmod|chown)\s+[^|]*(?:777|666|a\+rwx)", 0.8),
+    # A numeric chmod mode is world-writable when the others-triple carries the
+    # write bit, i.e. its last digit is 2, 3, 6 or 7.  Matching the mode argument
+    # itself rather than a bare `777`/`666` substring also keeps a path or a
+    # trailing comment from being read as the mode (chmod 755 /tmp/6660 is a
+    # chmod 755).  This owns the numeric forms that TM1 already owned for
+    # 777/666, plus the 646/757/0662 spellings the privilege-escalation rule used
+    # to catch as a side effect of matching 4/5/6/7 anywhere in the mode.
+    # Only `chmod` is matched here: `chown` takes an owner rather than a mode, so
+    # a numeric owner ID whose last digit is 2/3/6/7 (Grafana's 472:472, Istio's
+    # 1337:1337) is not a world-writable mode.  The optional [+=] accepts the
+    # operator GNU chmod allows in front of the digits (chmod +777, chmod =666);
+    # BSD chmod rejects those, so they are reported rather than assumed safe.
+    # The option group takes a single leading dash for the reason given in the
+    # privilege-escalation rule: `--?` made the match exponential on a line of
+    # unmatched `-- ` tokens, and `[\w=-]*` already absorbs a long option's
+    # second dash.
+    (r"chmod\s+(?:-[\w=-]*[ \t]+)*[\"']?[+=]?0*[0-7]{2,3}[2367](?![0-9\w])[\"']?", 0.8),
+    (r"(?:chmod|chown)\s+[^|]*a\+rwx", 0.8),
     # Git force operations
     (r"git\s+push\s+[^|]*--force", 0.7),
     (r"git\s+reset\s+--hard", 0.65),
@@ -957,14 +1003,27 @@ def _printf_invocation_arguments(
     return True, arguments
 
 
+def _is_value_parameter_expansion(content: str, start: int, end: int) -> bool:
+    """Return whether a braced expansion and its nested expansions substitute only values."""
+    expansion = content[start:end]
+    if any(marker in expansion for marker in _EXECUTABLE_EXPANSION_MARKERS):
+        return False
+    return all(
+        _VALUE_PARAMETER_EXPANSION_HEAD_RE.match(expansion, nested.start()) is not None
+        for nested in _VALUE_PARAMETER_EXPANSION_START_RE.finditer(expansion)
+    )
+
+
 def _invocation_expansion_marker(content: str, start: int, end: int) -> str:
     """Distinguish runtime-only parameters from possible command reconstruction."""
     if content.startswith("$(", start) or (
-        content.startswith("${", start)
-        and _SIMPLE_BRACED_PARAMETER_RE.fullmatch(content, start, end) is None
+        content.startswith("${", start) and not _is_value_parameter_expansion(content, start, end)
     ):
-        # Complex parameter expansions may contain nested command substitutions.
+        # Other parameter expansions may contain nested command substitutions
+        # or evaluate a value as code.
         return _DYNAMIC_SHELL_WORD_SENTINEL
+    # ``${NAME:-default}``, ``${ARR[@]}`` and similar forms select the same
+    # runtime value as ``$NAME`` and need the same printf invocation evidence.
     return _RUNTIME_SHELL_PARAMETER_SENTINEL
 
 
@@ -1438,6 +1497,50 @@ def _skip_backtick_substitution(
     )
 
 
+def _previous_word_end(content: str, start: int) -> int | None:
+    """Return where the previous word in this clause ends, or ``None`` at a clause start."""
+    cursor = start
+    while cursor > 0 and content[cursor - 1] in " \t":
+        cursor -= 1
+    if cursor == 0 or content[cursor - 1] in _SHELL_CLAUSE_BOUNDARY_CHARACTERS:
+        return None
+    return cursor
+
+
+def _is_assignment_word(content: str, start: int) -> bool:
+    """Return whether ``start`` begins a prefix assignment word or its quoted value."""
+    word_start = start
+    # The exhaustion sweep already skips the checks for a quote after ``=``.
+    # Recognizing it here keeps the parser consistent for any caller and avoids
+    # evaluating printf reconstruction whose result would be discarded.
+    if 0 < start < len(content) and content[start] in "'\"" and content[start - 1] == "=":
+        word_start = start - 1
+        if word_start > 0 and content[word_start - 1] == "+":
+            word_start -= 1
+        while word_start > 0 and content[word_start - 1] in _SHELL_ASSIGNMENT_NAME_CHARACTERS:
+            word_start -= 1
+    prefix = _SHELL_ASSIGNMENT_PREFIX_RE.match(content, word_start)
+    if prefix is None or (word_start != start and prefix.end() != start):
+        return False
+    # The shell recognizes assignments only before the command name. After
+    # ``alias``, ``echo`` or a path prefix, ``NAME=value`` is an ordinary word.
+    previous_end = _previous_word_end(content, word_start)
+    if previous_end is None:
+        return True
+    if previous_end == word_start:
+        return False
+    previous_start = previous_end
+    while (
+        previous_start > 0
+        and content[previous_start - 1] not in " \t" + _SHELL_CLAUSE_BOUNDARY_CHARACTERS
+    ):
+        previous_start -= 1
+    return (
+        content[previous_start:previous_end] in _SHELL_ASSIGNMENT_PREFIX_WORDS
+        and _previous_word_end(content, previous_start) is None
+    )
+
+
 def _parse_shell_command_word(
     content: str,
     start: int,
@@ -1446,9 +1549,31 @@ def _parse_shell_command_word(
     backtick_end_cache: dict[int, int | None] | None = None,
     *,
     check_runtime: Callable[[], None] | None = None,
+    owned_word_positions: set[int] | None = None,
+    enclosing_delimiter: str | None = None,
 ) -> _ShellCommandWord | None:
     runtime_check = check_runtime or (lambda: None)
+    # The shell recognizes ``NAME=value`` before expansion and never runs the
+    # value as the command name. Its substitutions keep their own candidate
+    # positions, and a later ``$NAME`` command word is still checked, so only
+    # this word's printf reconstruction check is skipped.
+    assignment = _is_assignment_word(content, start)
+
+    def reconstructs_command(
+        substitution_start: int, substitution_end: int, *, backtick: bool = False
+    ) -> bool:
+        return not assignment and _is_printf_substitution(
+            content,
+            substitution_start,
+            substitution_end,
+            backtick=backtick,
+            check_runtime=runtime_check,
+        )
+
     output: list[str] = []
+    wrapper_quote = enclosing_delimiter or (
+        _command_wrapper_quote(content, start) if content[start] in "$`" else None
+    )
     quote: str | None = None
     ansi_c_quote = False
     dynamic = False
@@ -1462,6 +1587,8 @@ def _parse_shell_command_word(
         character = content[cursor]
         if quote is not None:
             if character == quote:
+                if owned_word_positions is not None:
+                    owned_word_positions.add(cursor)
                 quote = None
                 ansi_c_quote = False
             elif character == "\\" and ansi_c_quote:
@@ -1496,12 +1623,7 @@ def _parse_shell_command_word(
                     if static_value is None:
                         output.append("$()")
                         dynamic = True
-                        limited = limited or _is_printf_substitution(
-                            content,
-                            cursor,
-                            substitution_end,
-                            check_runtime=runtime_check,
-                        )
+                        limited = limited or reconstructs_command(cursor, substitution_end)
                     else:
                         output.append(static_value)
                     cursor = substitution_end
@@ -1546,12 +1668,8 @@ def _parse_shell_command_word(
                 if static_value is None:
                     output.append("$()")
                     dynamic = True
-                    limited = limited or _is_printf_substitution(
-                        content,
-                        cursor,
-                        substitution_end,
-                        backtick=True,
-                        check_runtime=runtime_check,
+                    limited = limited or reconstructs_command(
+                        cursor, substitution_end, backtick=True
                     )
                 else:
                     output.append(static_value)
@@ -1594,12 +1712,7 @@ def _parse_shell_command_word(
             if static_value is None:
                 output.append("$()")
                 dynamic = True
-                limited = limited or _is_printf_substitution(
-                    content,
-                    cursor,
-                    substitution_end,
-                    check_runtime=runtime_check,
-                )
+                limited = limited or reconstructs_command(cursor, substitution_end)
             else:
                 output.append(static_value)
             cursor = substitution_end
@@ -1623,6 +1736,11 @@ def _parse_shell_command_word(
                 cursor = parameter_end
                 continue
         elif character == "`":
+            if enclosing_delimiter == "`":
+                # The enclosing substitution ends here; this is not an opener.
+                if owned_word_positions is not None:
+                    owned_word_positions.add(cursor)
+                break
             substitution_end = _skip_backtick_substitution(
                 content,
                 cursor,
@@ -1643,18 +1761,14 @@ def _parse_shell_command_word(
             if static_value is None:
                 output.append("$()")
                 dynamic = True
-                limited = limited or _is_printf_substitution(
-                    content,
-                    cursor,
-                    substitution_end,
-                    backtick=True,
-                    check_runtime=runtime_check,
-                )
+                limited = limited or reconstructs_command(cursor, substitution_end, backtick=True)
             else:
                 output.append(static_value)
             cursor = substitution_end
             continue
         elif character in "'\"":
+            if character == wrapper_quote:
+                break
             quote = character
         elif character == "\\" and cursor + 1 < limit:
             if content[cursor + 1] == "\n":
@@ -1751,6 +1865,9 @@ def _has_shell_command_word_exhaustion(
 ) -> bool:
     """Find candidate command words whose deterministic parse hit a safety bound."""
     parsed_through = 0
+    # Completed words own closing quotes, never executable expansion starts.
+    # Inner commands remain independent candidates; never suppress their bodies.
+    owned_word_positions: set[int] = set()
     parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
     substitution_end_cache: dict[int, int | None] = {}
     backtick_end_cache: dict[int, int | None] = {}
@@ -1759,17 +1876,23 @@ def _has_shell_command_word_exhaustion(
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
+        if start in owned_word_positions:
+            continue
         if structural_quote_closers is not None and start in structural_quote_closers:
             continue
         json_string_start = structural_quote_openers is not None and (
             start in structural_quote_openers or start - 1 in structural_quote_openers
         )
+        assignment_quote = start > 0 and content[start - 1] == "=" and content[start] in "'\""
         if start < parsed_through or (
-            not json_string_start and not _is_shell_command_word_start(content, start)
+            not json_string_start
+            and not assignment_quote
+            and not _is_shell_command_word_start(content, start)
         ):
             continue
         if _has_quoted_assignment_prefix(content, start):
             continue
+        candidate_word_positions: set[int] = set()
         parsed = _parse_shell_command_word(
             content,
             start,
@@ -1777,6 +1900,10 @@ def _has_shell_command_word_exhaustion(
             substitution_end_cache,
             backtick_end_cache,
             check_runtime=check_runtime,
+            owned_word_positions=candidate_word_positions,
+            enclosing_delimiter=(
+                _assignment_value_wrapper(content, start) if assignment_quote else None
+            ),
         )
         if parsed is None:
             substitution_start = (
@@ -1814,6 +1941,21 @@ def _has_shell_command_word_exhaustion(
             if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS:
                 return True
             continue
+        # Comments end at a newline, and a quote after ``=`` in prose or host
+        # source may be mis-paired. Such a word cannot own a later line.
+        confined_word = "\n" in content[start : parsed.end] and (
+            assignment_quote
+            or _SHELL_COMMENT_START_RE.search(content, content.rfind("\n", 0, start) + 1, start)
+            is not None
+        )
+        if not confined_word:
+            # A quote that opens a runtime-selected word stays an independent
+            # candidate, so a mis-paired claim cannot hide its operands.
+            owned_word_positions.update(
+                position
+                for position in candidate_word_positions
+                if content[position + 1 : position + 2] not in ("$", "`")
+            )
         # Only executable nested substitutions retain independent command
         # positions. A plain dynamic data argument still owns its inner bytes;
         # revisiting those as commands would turn quoted printf data into code.
@@ -1830,17 +1972,30 @@ def _has_shell_command_word_exhaustion(
             or "$" not in raw_word
             or not any(marker in raw_word for marker in ("$(", "`"))
             or simple_backtick_parameter
-        ):
+        ) and not (assignment_quote and confined_word):
             parsed_through = max(parsed_through, parsed.end)
+        if assignment_quote:
+            # An assignment value never names the command, and main never
+            # parsed this position, so it only claims ownership.
+            continue
         if parsed.limited:
             return True
         if parsed.dynamic and may_have_destructive_outer_operands:
-            tokens, _, exhausted = _bounded_shell_tokens(
+            tokens, command_end, exhausted = _bounded_shell_tokens(
                 content,
                 start,
                 parsed.end,
                 check_runtime=check_runtime,
             )
+            if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
+                # Earlier prose (for example "row-first") cannot supply this
+                # command's operands. Refine only this candidate's exhausted
+                # span, including nested commands inside the executable word.
+                # Hitting the span bound always remains partial, including when
+                # real operands occur beyond that bound. This rescan is bounded
+                # by the same constant as the tokenizer.
+                check_runtime()
+                exhausted = _may_have_destructive_outer_operands(content[start:command_end])
             if (
                 exhausted
                 or _has_unsupported_brace_expansion(tokens)
@@ -2112,6 +2267,19 @@ def _command_wrapper_quote(content: str, command_start: int) -> str | None:
         backslashes += 1
         cursor -= 1
     return content[command_start - 1] if backslashes % 2 == 0 else None
+
+
+def _assignment_value_wrapper(content: str, value_start: int) -> str | None:
+    """Return an unescaped quote or backtick directly enclosing an assignment."""
+    name_start = value_start - 1
+    if name_start > 0 and content[name_start - 1] == "+":
+        name_start -= 1
+    while name_start > 0 and (
+        content[name_start - 1] == "_"
+        or (content[name_start - 1].isascii() and content[name_start - 1].isalnum())
+    ):
+        name_start -= 1
+    return _command_wrapper_quote(content, name_start)
 
 
 def _perl_literal_print_shell_text(
@@ -3864,6 +4032,7 @@ def _markdown_shell_text(
     inside their bodies. Pair equal-length runs in linear time.
     """
     output = list(content)
+    prose_apostrophes: set[int] = set()
     runs: list[tuple[int, int]] = []
     list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
     backtick_runs = re.compile(r"`+")
@@ -4074,6 +4243,20 @@ def _markdown_shell_text(
                         if not cells:
                             table_columns = None
                 elif not separator and not empty_list_item:
+                    if (
+                        complete_context
+                        and not runs
+                        and not heading
+                        and len(leading) <= 512
+                        and (prose := _MARKDOWN_CONTRACTION_PROSE_RE.fullmatch(leading))
+                    ):
+                        # A whole plain-language sentence, including a parsed
+                        # list-item body, owns its contraction;
+                        # it is not an unclosed shell quote spanning later prose.
+                        # The restrictive grammar excludes code delimiters and
+                        # shell syntax. Fences, indented code, HTML, tables, and
+                        # pending multiline inline spans never reach this rule.
+                        prose_apostrophes.add(offset + prefix + prose.start("apostrophe"))
                     for match in backtick_runs.finditer(line):
                         check_runtime()
                         runs.append((offset + match.start(), offset + match.end()))
@@ -4090,7 +4273,40 @@ def _markdown_shell_text(
             paragraph_list_indent = 0
         offset += len(line)
     mask_inline_delimiters()
-    return "".join(output)
+    projected = "".join(output)
+    if prose_apostrophes:
+        # A prose-looking line can still be inside an earlier shell word, such
+        # as a multiline bash -c string. Reuse the shell parser to preserve that
+        # ownership before masking any apostrophe. Unresolved words retain all
+        # remaining bytes; this pass never grants ownership past a parse limit.
+        cursor = 0
+        next_runtime_check = 0
+        last_apostrophe = max(prose_apostrophes)
+        parameter_ends: dict[int, _ParameterExpansionEnd] = {}
+        substitution_ends: dict[int, int | None] = {}
+        backtick_ends: dict[int, int | None] = {}
+        while cursor <= last_apostrophe:
+            if cursor >= next_runtime_check:
+                check_runtime()
+                next_runtime_check = cursor + 4096
+            if cursor in prose_apostrophes:
+                output[cursor] = " "
+            elif projected[cursor] in "'\"`$\\":
+                parsed = _parse_shell_command_word(
+                    projected,
+                    cursor,
+                    parameter_ends,
+                    substitution_ends,
+                    backtick_ends,
+                    check_runtime=check_runtime,
+                )
+                if parsed is None or parsed.limited:
+                    break
+                cursor = max(cursor + 1, parsed.end)
+                continue
+            cursor += 1
+        return "".join(output)
+    return projected
 
 
 def has_bounded_parse_exhaustion(
@@ -4472,7 +4688,12 @@ def analyze(
                     complete_match=match.group(0),
                 )
             )
-    # TM4: privileged K8s workload. Example filtering is delegated to the runner.
+    # TM4: privileged K8s workload. Example filtering is delegated to the runner,
+    # which keeps reference material because it is part of the skill. Findings in
+    # top-level `references/` are tagged for triage only; the agent reads those
+    # files as instructions, so confidence and score are left unchanged.
+    reference_material = is_reference_material(file_path, file_type)
+    tm4_tags = [*tag, "contextual-triage", "likely-benign-context"] if reference_material else tag
     for pattern, confidence in TM4_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = line_number(match.start())
@@ -4483,7 +4704,7 @@ def analyze(
                     severity=Severity.HIGH,
                     location=loc(line_num),
                     confidence=confidence,
-                    tags=tag,
+                    tags=tm4_tags,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
                     complete_match=match.group(0),
