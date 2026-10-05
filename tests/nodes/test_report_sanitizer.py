@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from skillspector.cli import app
@@ -178,7 +179,22 @@ def test_nested_evidence_preserves_scalar_types_and_original_finding() -> None:
     assert "\x1b" in finding.evidence["nested"][0]["dirty\x00key"]
 
 
-@pytest.mark.parametrize("text", ["[/INST]", "[bold]x[/bold]", r"\[bold]x[/bold]"])
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("[/INST]", "[/INST]"),
+        ("[bold]x[/bold]", "[bold]x[/bold]"),
+        (r"\[bold]x[/bold]", r"\[bold]x[/bold]"),
+        ("\x1bc", r"\x1bc"),
+        ("\x1b]8;;x\x1b\\A\x1b]8;;\x1b\\", r"\x1b]8;;x\x1b\A\x1b]8;;\x1b" + "\\"),
+        ("left\nright", r"left\x0aright"),
+        ("\x9b2J", r"\x9b2J"),
+        ("left\u202eright", r"left\u202eright"),
+        ("helper :white_check_mark:", "helper :white_check_mark:"),
+        ("2001:db8:a:b:c", "2001:db8:a:b:c"),
+        ("C:\\Users\\", "C:\\Users\\"),
+    ],
+)
 @pytest.mark.parametrize(
     "field",
     [
@@ -202,9 +218,14 @@ def test_nested_evidence_preserves_scalar_types_and_original_finding() -> None:
         "suppressed_rule_id",
         "suppressed_file",
         "suppressed_reason",
+        "completeness_exclude_pattern",
+        "completeness_path",
+        "completeness_reason",
+        "completeness_message",
+        "completeness_limitation",
     ],
 )
-def test_terminal_displays_dynamic_text_literally(field: str, text: str) -> None:
+def test_terminal_displays_dynamic_text_literally(field: str, text: str, expected: str) -> None:
     finding = Finding(rule_id="R1", message="test", file="SKILL.md", start_line=1)
     manifest: dict[str, object] = {"name": "plain"}
     component: dict[str, object] = {"path": "SKILL.md", "type": "markdown"}
@@ -214,6 +235,7 @@ def test_terminal_displays_dynamic_text_literally(field: str, text: str) -> None
     )
     source = "/skill"
     degraded_notice = None
+    completeness: dict[str, object] = {}
     if field == "name":
         manifest["name"] = text
     elif field == "source":
@@ -231,6 +253,13 @@ def test_terminal_displays_dynamic_text_literally(field: str, text: str) -> None
         summary[key] = [text] if key == "declared_tools" else text
     elif field == "suppressed_reason":
         suppressed = SuppressedFinding(suppressed.finding, text)
+    elif field == "completeness_exclude_pattern":
+        completeness["exclude_patterns"] = [text]
+    elif field == "completeness_limitation":
+        completeness["limitations"] = [text]
+    elif field.startswith("completeness_"):
+        key = field.removeprefix("completeness_")
+        completeness["ledger_exceptions"] = [{"reason_code" if key == "reason" else key: text}]
     else:
         setattr(suppressed.finding, field.removeprefix("suppressed_"), text)
 
@@ -248,9 +277,11 @@ def test_terminal_displays_dynamic_text_literally(field: str, text: str) -> None
         structured_summaries=[summary],
         suppressed=[suppressed],
         show_suppressed=True,
+        analysis_completeness=completeness,
     )
 
-    assert text in body
+    assert expected in body
+    assert all(character.isprintable() or character == "\n" for character in body)
     assert "Risk Assessment" in body
     assert "Location:" in body
 
@@ -263,6 +294,65 @@ def test_terminal_escapes_message_after_truncation() -> None:
     body = _format_terminal([finding], [], {}, None, 5, "LOW", "SAFE", False, use_llm=False)
 
     assert message[:60] + "..." in body
+
+
+def test_terminal_preserves_trailing_backslashes_before_report_delimiters() -> None:
+    message = "x" * 51 + "C:\\Users\\" + "beyond the preview"
+    finding = Finding(rule_id="R1", message=message, file="scripts\\", start_line=1)
+    suppressed = SuppressedFinding(
+        Finding(rule_id="R2", message="suppressed", file="ignored\\"), "reviewed\\"
+    )
+
+    body = _format_terminal(
+        [finding],
+        [],
+        {"name": "helper\\"},
+        None,
+        5,
+        "LOW",
+        "SAFE",
+        False,
+        use_llm=False,
+        suppressed=[suppressed],
+        show_suppressed=True,
+    )
+
+    assert "Skill: helper\\\n" in body
+    assert "Location: scripts\\:1" in body
+    assert message[:60] + "..." in body
+    assert "ignored\\:1 (reason: reviewed\\)" in body
+
+
+@pytest.mark.parametrize("write_to_file", [False, True])
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("helper\x1bc", r"helper\x1bc"),
+        ("helper\x1b]8;;x\x1b\\A\x1b]8;;\x1b\\", r"helper\x1b]8;;x\x1b\A\x1b]8;;\x1b" + "\\"),
+        ("helper\nforged", r"helper\x0aforged"),
+        ("helper :white_check_mark:", "helper :white_check_mark:"),
+    ],
+)
+def test_cli_terminal_displays_untrusted_skill_name_visibly(
+    tmp_path: Path, name: str, expected: str, write_to_file: bool
+) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    manifest = yaml.safe_dump({"name": name, "description": "Explain basic arithmetic."})
+    (skill / "SKILL.md").write_text(
+        f"---\n{manifest}---\n\n# Helper\nExplain basic arithmetic.\n", encoding="utf-8"
+    )
+    output = tmp_path / "report.txt"
+    args = ["scan", str(skill), "--no-llm"]
+    if write_to_file:
+        args += ["--output", str(output)]
+
+    result = CliRunner().invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    body = output.read_text(encoding="utf-8") if write_to_file else result.output
+    assert expected in body
+    assert "\x1b" not in body
 
 
 def test_report_preserves_markup_text_and_canonical_findings() -> None:
