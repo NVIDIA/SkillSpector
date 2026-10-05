@@ -2979,6 +2979,21 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
         # literal branch whose execution is proven can revoke the lexical owner.
         child = node
         parent = parents.get(child)
+        if isinstance(parent, ast.AnnAssign) and parent.value is None and child is parent.target:
+            return
+        if (
+            isinstance(parent, (ast.Assign, ast.AnnAssign))
+            and isinstance(child, ast.Name)
+            and isinstance(parent.value, ast.Name)
+            and parent.value.id == child.id
+        ):
+            return
+        if (
+            isinstance(node, (ast.Assign, ast.AnnAssign))
+            and isinstance(node.value, ast.Name)
+            and node.value.id == name
+        ):
+            return
         while parent is not None and parent is not scope:
             if isinstance(parent, ast.If):
                 if not isinstance(parent.test, ast.Constant):

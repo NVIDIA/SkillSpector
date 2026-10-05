@@ -223,3 +223,24 @@ def test_later_fresh_import_restores_deferred_receiver_signal() -> None:
     findings = _findings(source)
     assert len(findings) == 1
     assert findings[0].severity == "HIGH"
+
+
+@pytest.mark.parametrize(
+    "annotation", ["enabled: bool", "subprocess: object", "subprocess.run: object"]
+)
+def test_annotation_without_value_is_not_runtime_counterevidence(annotation: str) -> None:
+    source = (
+        f"import subprocess\nenabled = True\n{annotation}\nsubprocess.run(command, shell=enabled)\n"
+    )
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    ["enabled = False\nenabled = enabled", "subprocess = proxy\nsubprocess = subprocess"],
+)
+def test_self_store_does_not_undo_observed_replacement(replacement: str) -> None:
+    source = f"import subprocess\nenabled = True\n{replacement}\nsubprocess.run(command, shell=enabled)\n"
+    assert not _findings(source)
