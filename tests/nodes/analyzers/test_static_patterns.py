@@ -2424,10 +2424,20 @@ def test_timed_pattern_retries_process_cpu_from_other_threads(monkeypatch):
 
 
 _TIMED_ANALYZERS = (
-    "agent_snooping", "excessive_agency", "memory_poisoning", "rogue_agent",
-    "prompt_injection", "tool_misuse", "data_exfiltration", "supply_chain",
-    "harmful_content", "system_prompt_leakage", "output_handling", "anti_refusal",
-    "privilege_escalation", "ssrf",
+    "agent_snooping",
+    "excessive_agency",
+    "memory_poisoning",
+    "rogue_agent",
+    "prompt_injection",
+    "tool_misuse",
+    "data_exfiltration",
+    "supply_chain",
+    "harmful_content",
+    "system_prompt_leakage",
+    "output_handling",
+    "anti_refusal",
+    "privilege_escalation",
+    "ssrf",
 )
 
 
@@ -2460,7 +2470,7 @@ def test_production_window_ordinary_content_remains_complete(analyzer, content_k
     ]
 
 
-def test_linear_pipe_registry_covers_routed_catalog_shapes():
+def test_linear_command_registry_covers_routed_catalog_shapes():
     import importlib
 
     actual = set()
@@ -2469,13 +2479,13 @@ def test_linear_pipe_registry_covers_routed_catalog_shapes():
         for key, rules in vars(module).items():
             if key.endswith("_PATTERNS") and isinstance(rules, list):
                 for rule in rules:
-                    if isinstance(rule, tuple) and isinstance(rule[0], str) and "[^|]*" in rule[0]:
+                    if isinstance(rule, tuple) and isinstance(rule[0], str) and ("[^|]*" in rule[0] or "[^&]*" in rule[0]):
                         actual.add(rule[0])
-    assert actual == static_runner._LINEAR_PIPE_PATTERNS
+    assert actual == static_runner._LINEAR_COMMAND_PATTERNS
 
 
-@pytest.mark.parametrize("pattern", sorted(static_runner._LINEAR_PIPE_PATTERNS))
-def test_linear_pipe_matching_preserves_native_spans(pattern):
+@pytest.mark.parametrize("pattern", sorted(static_runner._LINEAR_COMMAND_PATTERNS))
+def test_linear_command_matching_preserves_native_spans(pattern):
     examples = (
         "curl PAYLOAD -k --insecure -d value | sudo bash",
         "wget PAYLOAD --no-check-certificate --post-data=value | sh",
@@ -2486,6 +2496,8 @@ def test_linear_pipe_matching_preserves_native_spans(pattern):
         "git push PAYLOAD --force",
         "; curl PAYLOAD | bash",
         "mkdir PAYLOAD /tmp/.hidden",
+        "curl PAYLOAD -o download && sudo sh",
+        "wget PAYLOAD -O download && bash",
     )
     compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
     positive = next(example for example in examples if compiled.search(example))
@@ -2501,8 +2513,16 @@ def test_linear_pipe_matching_preserves_native_spans(pattern):
         positive.replace("PAYLOAD", "x" * 100_000),
     ):
         for start, end in ((0, len(text)), (1, len(text)), (0, len(text) - 2), (-1, len(text))):
-            expected = [(match.span(), match.group(), match.groups()) for match in compiled.finditer(text, start, end)]
-            actual = [(match.span(), match.group(), match.groups()) for match in static_runner.iter_pattern_matches(compiled, text, start=start, end=end)]
+            expected = [
+                (match.span(), match.group(), match.groups())
+                for match in compiled.finditer(text, start, end)
+            ]
+            actual = [
+                (match.span(), match.group(), match.groups())
+                for match in static_runner.iter_pattern_matches(
+                    compiled, text, start=start, end=end
+                )
+            ]
             assert actual == expected, (pattern, text[:80], start, end)
 
 
@@ -2540,3 +2560,47 @@ def test_bounded_repetition_stays_on_native_engine(monkeypatch):
         [memory_poisoning_module],
     )
     assert any(finding.rule_id == "MP2" for finding in result["findings"])
+
+
+def test_linear_commands_match_native_with_overlapping_suffixes():
+    import random
+
+    randomizer = random.Random(741)
+    tokens = (
+        "curl ", "wget ", "git push ", "chmod ", "mkdir ", "; curl ",
+        "-k ", "--insecure ", "--force ", "-d value ", "-o aa-o ",
+        "-O tmp ", "&&&&sh ", "&& sh ", "| sh ", "| node ",
+        "a+rwx ", "/tmp/.hidden ", "\u00a0", "|", "&", "\n",
+    )
+    for pattern in sorted(static_runner._LINEAR_COMMAND_PATTERNS):
+        compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+        for _ in range(100):
+            text = "".join(randomizer.choices(tokens, k=20))
+            expected = [(match.span(), match.group()) for match in compiled.finditer(text)]
+            actual = [(match.span(), match.group()) for match in static_runner.iter_pattern_matches(compiled, text)]
+            assert actual == expected, (pattern, text)
+
+
+@pytest.mark.parametrize("analyzer", ["tool_misuse", "data_exfiltration", "supply_chain"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "wget https://example.test/status",
+        "git push origin main",
+        "chmod 0644 example.txt",
+        "chown owner example.txt",
+        "curl https://example.test/status -o status.txt",
+    ],
+)
+def test_dense_command_references_remain_complete(analyzer, command):
+    import importlib
+
+    module = importlib.import_module(f"skillspector.nodes.analyzers.static_patterns_{analyzer}")
+    sample = "## Reference\nAn ordinary example follows.\n" + command + "\nReview the result.\n"
+    content = (sample * (256_000 // len(sample) + 1))[:256_000]
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [module]
+    )
+    assert all(event["outcome"] == "completed" for event in result["inspection_ledger"]), result[
+        "inspection_ledger"
+    ]

@@ -306,7 +306,7 @@ it also covers prose rules in harmful content, system prompt leakage, output
 handling, anti-refusal, privilege escalation, and SSRF. Other code rules and
 helper-specific searches remain outside this matcher.
 
-Audited command/option patterns use a linear, pipe-segment search that preserves
+Audited command/option patterns use a linear, command-segment search that preserves
 unbounded command spans and the original greedy matches. Memory poisoning's
 2–20-character repetition rule uses Python's native engine: failed candidates
 examine at most 20 copies, and successful candidates consume the repeated run.

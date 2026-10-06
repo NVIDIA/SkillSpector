@@ -488,10 +488,10 @@ def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> rege
 
 
 # Only these audited shapes use the linear command path. Prefixes and suffixes
-# have no overlapping unbounded repeats; suffix matches cannot overlap. Keep
+# have no overlapping unbounded repeats. Keep
 # this registry explicit so a new catalog shape gets reviewed before bypassing
 # the interruptible engine.
-_LINEAR_PIPE_PATTERNS = frozenset(
+_LINEAR_COMMAND_PATTERNS = frozenset(
     {
         r"curl\s+[^|]*-k\b",
         r"curl\s+[^|]*--insecure\b",
@@ -506,43 +506,50 @@ _LINEAR_PIPE_PATTERNS = frozenset(
         r"wget\s+[^|]*\|\s*(?:sudo\s+)?(?:python|python3|node|ruby|perl)",
         r"(?:&&|;)\s*(?:curl|wget)\s+[^|]*\|\s*(?:ba)?sh",
         r"(?:create|write|mkdir)\s+[^|]*(?:~/|/home/|/tmp/)\.(?!git|ssh|aws)[a-z_-]+",
+        r"curl\s+[^&]*-o\s+\S+\s*&&\s*(?:sudo\s+)?(?:ba)?sh",
+        r"wget\s+[^&]*-O\s+\S+\s*&&\s*(?:sudo\s+)?(?:ba)?sh",
     }
 )
 
 
 @functools.lru_cache(maxsize=128)
-def _linear_pipe_parts(source: str, flags: int) -> tuple[re.Pattern[str], re.Pattern[str]]:
-    prefix, suffix = source.split("[^|]*", 1)
-    return re.compile(prefix, flags), re.compile(suffix, flags)
+def _linear_command_parts(
+    source: str, flags: int
+) -> tuple[re.Pattern[str], re.Pattern[str], str]:
+    separator = "|" if "[^|]*" in source else "&"
+    prefix, suffix = source.split(f"[^{separator}]*", 1)
+    # Lookahead retains overlapping suffix starts. The original anchored match
+    # below chooses the same greedy span as the complete Python pattern.
+    return re.compile(prefix, flags), re.compile(f"(?={suffix})", flags), separator
 
 
-def _linear_pipe_matches(
+def _linear_command_matches(
     original: re.Pattern[str], content: str, start: int, end: int
 ) -> Iterator[re.Match[str]]:
-    """Preserve greedy matches while visiting each pipe-free segment once.
+    """Preserve greedy matches while visiting each delimiter-free segment once.
 
     The wildcard chooses the rightmost possible suffix. If an earlier command
     precedes it, the original pattern can match at that command in one anchored
     pass. Without such a pair, skip the segment without retrying every command.
-    Each successful match consumes the last suffix in its segment, so the total
-    prefix, suffix and anchored scanning is linear in the window length.
+    Audited suffixes may consume delimiters, as in a download followed by && sh.
+    Each successful match consumes its segment's last suffix; the total prefix,
+    suffix and anchored scanning is linear in the window length.
     """
     start, end = max(0, start), min(len(content), max(0, end))
-    prefix, suffix = _linear_pipe_parts(original.pattern, original.flags)
-    pipe_suffix = suffix.pattern.startswith(r"\|")
+    prefix, suffix, separator = _linear_command_parts(original.pattern, original.flags)
+    suffixes = suffix.finditer(content, start, end)
+    candidate = next(suffixes, None)
     budget = _ACTIVE_FINDING_BUDGET.get()
     while start < end:
         if budget is not None:
             budget.check_runtime()
-        pipe = content.find("|", start, end)
-        stop = end if pipe < 0 else pipe
+        delimiter = content.find(separator, start, end)
+        stop = end if delimiter < 0 else delimiter
         last_suffix = None
-        if pipe_suffix:
-            if pipe >= 0:
-                last_suffix = suffix.match(content, pipe, end)
-        else:
-            for candidate in suffix.finditer(content, start, stop):
+        while candidate is not None and candidate.start() <= stop:
+            if candidate.start() >= start:
                 last_suffix = candidate
+            candidate = next(suffixes, None)
         if last_suffix is not None:
             command = prefix.search(content, start, last_suffix.start())
             if command is not None:
@@ -569,8 +576,8 @@ def iter_pattern_matches(
         budget.check_runtime()
     original = re.compile(pattern, flags)
     linear_matches = (
-        _linear_pipe_matches(original, content, start, len(content) if end is None else end)
-        if original.pattern in _LINEAR_PIPE_PATTERNS and not original.flags & re.VERBOSE
+        _linear_command_matches(original, content, start, len(content) if end is None else end)
+        if original.pattern in _LINEAR_COMMAND_PATTERNS and not original.flags & re.VERBOSE
         else None
     )
     compiled = (
