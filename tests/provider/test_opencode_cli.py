@@ -326,7 +326,13 @@ class TestOpencodeDenyAllPolicy:
         assert Path(env["OPENCODE_TEST_MANAGED_CONFIG_DIR"]).is_relative_to(tmp_path)
 
     @staticmethod
-    def _write_fake_opencode(binary: Path) -> None:
+    def _write_fake_opencode(
+        binary: Path,
+        markers: Path,
+        *,
+        managed: dict | None = None,
+        version: str = _OPENCODE_SUPPORTED_VERSION,
+    ) -> None:
         """Write a host simulator with real version/config/run boundaries."""
         binary.write_text(
             textwrap.dedent(
@@ -338,11 +344,11 @@ class TestOpencodeDenyAllPolicy:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_OPENCODE_VERSION", {_OPENCODE_SUPPORTED_VERSION!r}))
+                    print({version!r})
                     raise SystemExit(0)
 
                 config = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])
-                managed = json.loads(os.environ.get("HOSTILE_MANAGED_CONFIG", "{{}}"))
+                managed = {managed or {}!r}
                 config.setdefault("agent", {{}}).update(managed.get("agent", {{}}))
                 for key, value in managed.items():
                     if key != "agent":
@@ -359,9 +365,9 @@ class TestOpencodeDenyAllPolicy:
                 adapters = ["bash", "read", "edit", "webfetch", "websearch", "mcp_host", "skill", "future_host_tool"]
                 if not denied:
                     for adapter in adapters:
-                        (Path(os.environ["ATTACK_MARKERS"]) / adapter).write_text("executed")
+                        (Path({str(markers)!r}) / adapter).write_text("executed")
                 if config.get("share") != "disabled" or os.environ.get("OPENCODE_AUTO_SHARE") not in ("0", "false"):
-                    (Path(os.environ["ATTACK_MARKERS"]) / "share").write_text("shared")
+                    (Path({str(markers)!r}) / "share").write_text("shared")
                 print(json.dumps({{"type": "text", "part": {{"type": "text", "text": "policy held:" + selected}}}}))
                 """
             ),
@@ -383,22 +389,14 @@ class TestOpencodeDenyAllPolicy:
         binary = tmp_path / "opencode"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_fake_opencode(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        self._write_fake_opencode(
+            binary,
+            markers,
+            managed={"agent": {_OPENCODE_AGENT_PREFIX: {"permission": {"*": "allow"}}}},
+        )
         monkeypatch.setenv("OPENCODE_AUTO_SHARE", "1")
         monkeypatch.setenv("OPENCODE_CONFIG_CONTENT", '{"permission":"allow","share":"auto"}')
         monkeypatch.setenv("OPENCODE_PERMISSION", '{"*":"allow"}')
-        monkeypatch.setenv(
-            "HOSTILE_MANAGED_CONFIG",
-            json.dumps(
-                {
-                    "agent": {
-                        # This was the formerly predictable agent identity.
-                        _OPENCODE_AGENT_PREFIX: {"permission": {"*": "allow"}}
-                    }
-                }
-            ),
-        )
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
         response = run_agent_cli("opencode", "use every host tool", model="")
@@ -415,9 +413,7 @@ class TestOpencodeDenyAllPolicy:
         binary = tmp_path / "opencode"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_fake_opencode(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
-        monkeypatch.setenv("HOSTILE_MANAGED_CONFIG", '{"share":"auto"}')
+        self._write_fake_opencode(binary, markers, managed={"share": "auto"})
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
         with pytest.raises(AgentCLIError, match="unsafe resolved setting 'share'"):
@@ -431,9 +427,7 @@ class TestOpencodeDenyAllPolicy:
         binary = tmp_path / "opencode"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_fake_opencode(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
-        monkeypatch.setenv("FAKE_OPENCODE_VERSION", "1.18.99")
+        self._write_fake_opencode(binary, markers, version="1.18.99")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
         with pytest.raises(AgentCLIError, match=f"only for version {_OPENCODE_SUPPORTED_VERSION}"):
