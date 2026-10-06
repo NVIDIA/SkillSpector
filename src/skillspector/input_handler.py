@@ -767,7 +767,10 @@ class InputHandler:
     Normalizes all inputs to a local directory path for scanning.
     """
 
-    def __init__(self, transitive_budget: object | None = None) -> None:
+    def __init__(
+        self, transitive_budget: object | None = None, *, allow_git_credentials: bool = True
+    ) -> None:
+        self._allow_git_credentials = allow_git_credentials
         self._temp_dir: Path | None = None
         self._transitive_budget = transitive_budget
         self.primary_file_path: str | None = None
@@ -1129,23 +1132,99 @@ class InputHandler:
             f"{repository_url} ({'/'.join(segments)})"
         )
 
+    def _git_invocation(self, url: str) -> tuple[list[str], dict[str, str] | None, str]:
+        """Build a Git policy for both ref discovery and cloning.
+
+        Remote MCP callers must not borrow the server's SSH keys, helpers,
+        authorization headers, URL rewrites, client certificates, or netrc.
+        Trusted local callers retain the operator's configured Git identity.
+        """
+        if self._allow_git_credentials:
+            return ["git"], None, url
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.username is not None or parsed.password is not None:
+            raise ValueError("Untrusted Git scans require an unauthenticated HTTPS URL")
+        if parsed.hostname in {"gitlab.com", "bitbucket.org"}:
+            # Browser URLs need the Git endpoint without following a redirect
+            # whose destination has not passed the host/IP checks.
+            path = parsed.path.rstrip("/")
+            if path and not path.endswith(".git"):
+                path += ".git"
+            url = parsed._replace(path=path).geturl()
+        isolated_home = self._get_temp_dir() / "git-home"
+        isolated_home.mkdir(mode=0o700, exist_ok=True)
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key.upper()
+            in {
+                "PATH",
+                "SYSTEMROOT",
+                "WINDIR",
+                "TEMP",
+                "TMP",
+                "TMPDIR",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "NO_PROXY",
+                "GIT_SSL_CAINFO",
+                "GIT_SSL_CAPATH",
+                "SSL_CERT_FILE",
+                "SSL_CERT_DIR",
+                "CURL_CA_BUNDLE",
+            }
+        }
+        env.update(
+            HOME=str(isolated_home),
+            USERPROFILE=str(isolated_home),
+            XDG_CONFIG_HOME=str(isolated_home),
+            GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_CONFIG_SYSTEM=os.devnull,
+            GIT_CONFIG_NOSYSTEM="1",
+            GIT_TERMINAL_PROMPT="0",
+            GIT_ALLOW_PROTOCOL="https",
+            GIT_CEILING_DIRECTORIES=str(isolated_home.parent),
+        )
+        return (
+            [
+                "git",
+                "-C",
+                str(isolated_home),
+                "-c",
+                "credential.helper=",
+                "-c",
+                "core.askPass=",
+                "-c",
+                f"core.hooksPath={os.devnull}",
+                "-c",
+                "http.extraHeader=",
+                "-c",
+                "http.followRedirects=false",
+            ],
+            env,
+            url,
+        )
+
     def _list_remote_refs(self, repository_url: str) -> set[str]:
         """Return the branch/tag names advertised by the remote repository.
 
         Bounded by the ingest deadline; the host allowlist and private-IP
         checks from URL validation apply.
         """
+        git_argv, git_env, repository_url = self._git_invocation(repository_url)
         self._validate_url_host(repository_url, ALLOWED_GIT_HOSTS)
         deadline = self._deadline()
         self._check_deadline(deadline, "git")
         timeout = max(1.0, deadline - monotonic())
         try:
             process = subprocess.run(
-                ["git", "ls-remote", repository_url],
+                [*git_argv, "ls-remote", repository_url],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 timeout=timeout,
                 check=False,
+                **({"env": git_env} if git_env is not None else {}),
             )
         except subprocess.TimeoutExpired as exc:
             raise IngestLimitExceededError("Git ref listing exceeded its time limit") from exc
@@ -1206,6 +1285,7 @@ class InputHandler:
             self._truncate("byte_budget_exhausted", "git")
         if remaining_artifacts is not None and remaining_artifacts <= 0:
             self._truncate("artifact_budget_exhausted", "git")
+        git_argv, git_env, url = self._git_invocation(url)
         self._validate_url_host(url, ALLOWED_GIT_HOSTS)
         deadline = self._deadline()
         self._check_deadline(deadline, "git")
@@ -1225,6 +1305,7 @@ class InputHandler:
             clone_command[6:6] = ["--branch", branch]
         if remaining_bytes is not None:
             clone_command.insert(6, f"--filter=blob:limit={remaining_bytes}")
+        clone_command[:1] = git_argv
         process: subprocess.Popen[bytes] | None = None
         final_measurement: _TreeMeasurement | None = None
         try:
@@ -1233,6 +1314,7 @@ class InputHandler:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 shell=False,
+                **({"env": git_env} if git_env is not None else {}),
             )
             while True:
                 self._check_deadline(deadline, "git")
