@@ -1505,7 +1505,7 @@ def _extract_packages_from_pipenv(
         return [], []
     try:
         data = json.loads(content) if is_lockfile else tomllib.loads(content)
-    except (json.JSONDecodeError, tomllib.TOMLDecodeError, RecursionError) as error:
+    except (ValueError, RecursionError) as error:
         return [], [
             OsvQueryLimitation(
                 reason=LedgerReason.DEPENDENCY_PARSE_ERROR,
