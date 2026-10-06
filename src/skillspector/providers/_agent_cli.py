@@ -879,13 +879,13 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
 
 
 # ---------------------------------------------------------------------------
-# GitHub Copilot CLI invocation  (verified against copilot 1.0.91)
+# GitHub Copilot CLI invocation  (verified against copilot 1.0.92)
 # ---------------------------------------------------------------------------
 
 
 # Single pin both gates compare against, so a bump cannot update one
 # gate but not the other (mirrors _OPENCODE_SUPPORTED_VERSION).
-_COPILOT_SUPPORTED_VERSION = "1.0.91"
+_COPILOT_SUPPORTED_VERSION = "1.0.92"
 
 # Token variables the Copilot CLI silently accepts as credentials, in
 # preference order after COPILOT_GITHUB_TOKEN. GH_TOKEN commonly carries
@@ -974,7 +974,7 @@ def _prepare_copilot_env(
 def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
     """Build the argv list for a non-interactive ``copilot`` call.
 
-    Flags chosen (verified against Copilot CLI 1.0.91 ``--help``):
+    Flags chosen (verified against Copilot CLI 1.0.92 ``--help``):
 
     (no ``-p``)
         With no prompt flag, the prompt is piped to stdin by run_agent_cli —
@@ -1000,7 +1000,7 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
 
     ``--disallow-temp-dir``
         Prevent automatic access to the system temporary directory
-        (verified live on 1.0.91: inference from a temp working dir
+        (verified live on 1.0.92: inference from a temp working dir
         still answers exactly).
 
     Deliberately NOT included:
@@ -1049,7 +1049,7 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
 def _parse_copilot_output(raw: str) -> str:
     """Extract the assistant reply from ``copilot -s`` plain-text output.
 
-    Verified against Copilot CLI 1.0.91: ``-s`` emits only the response text.
+    Verified against Copilot CLI 1.0.92: ``-s`` emits only the response text.
     The whole stripped output is the reply; empty output raises fail-closed
     (an empty response must never be mistaken for a clean analysis).
     """
@@ -1066,7 +1066,7 @@ def _copilot_auth_check(binary: str) -> tuple[bool, str | None]:
     shared scrubbed environment (token re-injection is inference-only and
     version output does not depend on it), performs no inference, and
     completes well under 15s. Fail-closed: probe error/timeout, non-zero
-    exit, or a version other than the verified 1.0.91 all return
+    exit, or a version other than the verified 1.0.92 all return
     ``(False, reason)``.
 
     There is no status subcommand, so a passing probe means the binary runs
@@ -1116,7 +1116,7 @@ def _preflight_copilot_policy(
        runtime. Re-verifies ``[binary, --version]`` under the isolated
        child env on EVERY completion. ``argv`` is unused (CliSpec
        signature uniformity). Fail-closed: probe error/timeout,
-       non-zero exit, or a version other than the verified 1.0.91 all
+       non-zero exit, or a version other than the verified 1.0.92 all
        raise before any prompt bytes move.
     2. Temp-dir tripwire: repo-level hook sources (``.github/hooks/``,
        repo settings) cannot exist in the fresh ``mkdtemp`` dir; any
@@ -1161,7 +1161,7 @@ def _copilot_home(child_env: dict[str, str]) -> str:
 def _audit_copilot_home(child_env: dict[str, str]) -> None:
     """Refuse inference when user or plugin hook material is present.
 
-    The 1.0.91 CLI loads hooks from policy, user, project, then plugin
+    The 1.0.92 CLI loads hooks from policy, user, project, then plugin
     sources with no argv off-switch (verified: no ``--disable*hook*``
     flag in ``copilot --help``), and — as probed 2026-09-19 — silently
     refuses inference under ANY redirected home, so home isolation is
@@ -1289,10 +1289,9 @@ def _audit_server_configs(home: str, kind: str) -> None:
             raise AgentCLIError(
                 f"{kind} {filename} cannot be verified server-free: {path}"
             ) from exc
-        if document in ({}, []):
-            continue
-        if isinstance(document, dict) and all(
-            value in ({}, [], None) for value in document.values()
+        if document in ({}, []) or (
+            isinstance(document, dict)
+            and all(value in ({}, [], None) for value in document.values())
         ):
             continue
         raise AgentCLIError(
@@ -1381,12 +1380,12 @@ def _audit_hook_tree(home: str, kind: str) -> None:
         raise AgentCLIError(
             f"{kind} settings.json cannot be verified hook-free: {settings}"
         ) from exc
-    if isinstance(document, dict) and document.get("hooks"):
-        raise AgentCLIError(
-            f"{kind} settings.json carries an inline hooks block, which loads "
-            f"with no argv off-switch: {settings}"
-        )
     if isinstance(document, dict):
+        if document.get("hooks"):
+            raise AgentCLIError(
+                f"{kind} settings.json carries an inline hooks block, which loads "
+                f"with no argv off-switch: {settings}"
+            )
         for field in ("enabledPlugins", "extraKnownMarketplaces"):
             if document.get(field):
                 raise AgentCLIError(

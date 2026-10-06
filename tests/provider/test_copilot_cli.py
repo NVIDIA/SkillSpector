@@ -79,7 +79,7 @@ from skillspector.providers.copilot_cli import CopilotCLIProvider
 COPILOT_BINARY = "/usr/bin/copilot"
 MODEL = "gpt-5.2"
 
-_VERSION_OK = b"GitHub Copilot CLI 1.0.91.\nRun 'copilot update' to check for updates.\n"
+_VERSION_OK = b"GitHub Copilot CLI 1.0.92.\nRun 'copilot update' to check for updates.\n"
 
 
 def _version_result(stdout: bytes = _VERSION_OK) -> SimpleNamespace:
@@ -214,7 +214,7 @@ def test_hostile_prompt_roundtrips_byte_exact(prompt: str) -> None:
 
 class TestCopilotAuthCheck:
     def test_version_parses(self) -> None:
-        assert _parse_copilot_version(_VERSION_OK) == "1.0.91"
+        assert _parse_copilot_version(_VERSION_OK) == "1.0.92"
 
     def test_version_unparseable_returns_none(self) -> None:
         assert _parse_copilot_version(b"") is None
@@ -269,7 +269,7 @@ class TestCopilotAuthCheck:
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
         ok, reason = _copilot_auth_check(COPILOT_BINARY)
         assert ok is False
-        assert "1.0.91" in (reason or "")
+        assert "1.0.92" in (reason or "")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_unparseable_version_is_fail_closed(self, mock_run: MagicMock) -> None:
@@ -296,13 +296,13 @@ class TestPreflightCopilotPolicy:
     ) -> None:
         # The reviewer's repro: a 9.9.99 binary must never receive scan content.
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
-        with pytest.raises(AgentCLIError, match="1.0.91"):
+        with pytest.raises(AgentCLIError, match="1.0.92"):
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {"PATH": "/bin"}, str(tmp_path))
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_nonzero_exit_rejected(self, mock_run: MagicMock, tmp_path: Path) -> None:
         mock_run.return_value = SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom")
-        with pytest.raises(AgentCLIError, match="preflight|1.0.91"):
+        with pytest.raises(AgentCLIError, match="preflight|1.0.92"):
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {}, str(tmp_path))
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
@@ -588,7 +588,7 @@ class TestAuditCopilotHome:
 
     def test_xdg_state_plugins_raise(self, tmp_path: Path) -> None:
         # Startup migrates $XDG_STATE_HOME/.copilot/installed-plugins
-        # into the home (verified in the 1.0.91 release source: the
+        # into the home (verified in the 1.0.92 release source: the
         # STATE migration set still lists installed-plugins): a
         # plugin-free COPILOT_HOME with plugin material in the STATE
         # source must still refuse.
@@ -1020,7 +1020,7 @@ class TestHookHomeEndToEnd:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.91"))
+                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.92"))
                     raise SystemExit(0)
 
                 markers = Path(os.environ["ATTACK_MARKERS"])
@@ -1099,7 +1099,7 @@ class TestHookHomeEndToEnd:
 
         COPILOT_HOME and the CONFIG source are clean; plugin material
         lives only in the inherited STATE tree that startup would
-        migrate into the home (verified in the 1.0.91 release source).
+        migrate into the home (verified in the 1.0.92 release source).
         Rejection must precede prompt delivery.
         """
         home = tmp_path / "copilot-home"
@@ -1195,7 +1195,7 @@ class TestAdversarialTransport:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.91"))
+                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.92"))
                     raise SystemExit(0)
 
                 markers = Path(os.environ["ATTACK_MARKERS"])
@@ -1293,6 +1293,6 @@ class TestAdversarialTransport:
         monkeypatch.setenv("FAKE_COPILOT_VERSION", "9.9.99")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
-        with pytest.raises(AgentCLIError, match="1.0.91"):
+        with pytest.raises(AgentCLIError, match="1.0.92"):
             run_agent_cli("copilot", "use every host tool", model="")
         assert list(markers.iterdir()) == []
