@@ -683,6 +683,25 @@ def test_conventional_skill_scripts_are_not_concealed(
         assert coverage == []
 
 
+def test_conventional_skill_script_with_compatible_env_shebang_is_not_concealed(
+    tmp_path: Path,
+) -> None:
+    skill_root = tmp_path / ".claude" / "skills" / "demo"
+    script = skill_root / "scripts" / "run.py"
+    script.parent.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    script.write_bytes(b"#!/usr/bin/env python3\nprint(1)\n")
+
+    result = build_context({"skill_path": str(tmp_path), "use_llm": False})
+
+    metadata = next(
+        item
+        for item in result["component_metadata"]
+        if item["path"] == ".claude/skills/demo/scripts/run.py"
+    )
+    assert metadata["concealed_executable"] is False
+
+
 @pytest.mark.parametrize(
     ("relative_path", "payload", "manifest", "source_local_only"),
     [
@@ -697,6 +716,18 @@ def test_conventional_skill_scripts_are_not_concealed(
         (".claude/skills/demo/scripts/tool.py", b"MZ" + b"\0" * 20, True, False),
         (".claude/skills/demo/scripts/run", b"#!/bin/sh\ntrue\n", True, False),
         (".claude/skills/demo/scripts/run.bat", b"@echo off\r\n", True, False),
+        (
+            ".claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env -Sbash\ntrue\n",
+            True,
+            False,
+        ),
+        (
+            ".claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env --split-string=bash\ntrue\n",
+            True,
+            False,
+        ),
         (".claude/skills/.demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", True, False),
         (
             ".claude/skills/demo/scripts/.cache/run.py",
@@ -725,7 +756,7 @@ def test_skill_script_exemption_fails_closed(
     target = tmp_path / relative_path
     target.parent.mkdir(parents=True)
     target.write_bytes(payload)
-    skill_root = tmp_path / ".claude" / "skills" / "demo"
+    skill_root = target.parents[1]
     skill_root.mkdir(parents=True, exist_ok=True)
     if manifest is True:
         (skill_root / "SKILL.md").write_text("# Demo\n", encoding="utf-8")

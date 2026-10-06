@@ -864,7 +864,7 @@ def _is_conventional_skill_script(skill_dir: Path, path: str, data: bytes) -> bo
             ".tsx": {"node", "nodejs", "bun", "deno", "tsx"},
             ".zsh": {"zsh"},
         }
-        if interpreter and interpreter not in compatible[suffix]:
+        if not interpreter or interpreter not in compatible[suffix]:
             return False
 
     skill_root = skill_dir.joinpath(*parts[:3])
