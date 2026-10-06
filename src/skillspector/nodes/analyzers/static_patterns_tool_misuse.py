@@ -2276,8 +2276,10 @@ def _command_string_from_clause(
             wrapper_seen = True
             while True:
                 option, limited = next_word()
-                if limited or option is None:
+                if limited:
                     return True, None
+                if option is None:
+                    return not _ends_wrapped_clause(content, cursor), None
                 if option == "--":
                     pending, limited = next_word()
                     if limited:
@@ -2309,8 +2311,10 @@ def _command_string_from_clause(
             wrapper_seen = True
             while True:
                 option, limited = next_word()
-                if limited or option is None:
+                if limited:
                     return True, None
+                if option is None:
+                    return not _ends_wrapped_clause(content, cursor), None
                 if option in {"-k", "--kill-after", "-s", "--signal"}:
                     _, limited = next_word()
                     if limited:
@@ -2325,6 +2329,24 @@ def _command_string_from_clause(
             continue
         return False, None
     return wrapper_seen, None
+
+
+def _ends_wrapped_clause(content: str, cursor: int) -> bool:
+    """Return whether a wrapper's missing command is a proven end of its clause.
+
+    When a control operator follows ``sudo``, ``nice``, ``xargs`` or
+    ``timeout`` directly, the clause names no wrapped command, so there is no
+    command string to reconstruct. A shell such a wrapper starts on its own
+    (``sudo -s``) reads its input like ``sh`` in a pipeline, which this check
+    does not model either. Commands after the operator start their own
+    clause and are checked separately. A redirection may still precede the
+    wrapped command, and a fragment may continue past its end, so both
+    remain unresolved.
+    """
+    if cursor >= len(content):
+        return False
+    character = content[cursor]
+    return character in ";|)" or (character == "&" and content[cursor + 1 : cursor + 2] != ">")
 
 
 def _command_wrapper_quote(content: str, command_start: int) -> str | None:
