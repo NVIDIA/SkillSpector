@@ -16,7 +16,7 @@
 """GitHub Copilot CLI provider — uses the locally-installed ``copilot`` binary.
 
 No API key required. Authentication is managed by the ``copilot`` CLI's
-own session (``copilot login``) or its token environment variables. Set
+own session (``copilot login``) or ``COPILOT_GITHUB_TOKEN``. Set
 ``SKILLSPECTOR_PROVIDER=copilot_cli`` to activate.
 
 NOTE: copilot_cli support is implemented using the same hardened subprocess

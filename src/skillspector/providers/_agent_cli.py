@@ -94,6 +94,9 @@ _SECRET_ENV_PREFIXES: tuple[str, ...] = (
     "SSH_",
     "GPG_",
     "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
     "GITLAB_TOKEN",
     "HUGGINGFACE_TOKEN",
     "HF_TOKEN",
@@ -884,6 +887,17 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
 # gate but not the other (mirrors _OPENCODE_SUPPORTED_VERSION).
 _COPILOT_SUPPORTED_VERSION = "1.0.91"
 
+# Token variables the Copilot CLI silently accepts as credentials, in
+# preference order after COPILOT_GITHUB_TOKEN. GH_TOKEN commonly carries
+# a CI workflow token for ``gh`` — it must never become the agent's
+# credential. Dropped explicitly here (not only by the shared scrub) so
+# the guarantee holds even for a hand-built base env.
+_COPILOT_DROPPED_AUTH_VARS: tuple[str, ...] = (
+    "GH_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+)
+
 
 def _parse_copilot_version(raw: bytes) -> str | None:
     """Parse an exact stable semantic version from ``copilot --version``."""
@@ -912,7 +926,11 @@ def _prepare_copilot_env(
     argv-level deny rules take precedence over anything a config file
     could add). ``GITHUB_COPILOT_*`` prompt-mode opt-ins (extensions,
     repo hooks, workspace MCP) are dropped outright: they reach past
-    the argv posture straight into CLI behavior. The token is the
+    the argv posture straight into CLI behavior. ``GH_TOKEN`` and the
+    enterprise token variables are dropped outright too: the CLI reads
+    them as credentials (after ``COPILOT_GITHUB_TOKEN``) and an env
+    token silently overrides the stored login, so a CI ``gh`` token
+    must never reach the child. The token is the
     CLI's supported headless auth path and therefore works at inference
     time. In particular ``COPILOT_ALLOW_ALL`` never reaches the child, so
     ambient shell config cannot re-enable tools; ``COPILOT_PROVIDER_*``
@@ -938,7 +956,9 @@ def _prepare_copilot_env(
     env = {
         key: value
         for key, value in base_env.items()
-        if not key.upper().startswith("COPILOT_") and not key.upper().startswith("GITHUB_COPILOT_")
+        if key.upper() not in _COPILOT_DROPPED_AUTH_VARS
+        and not key.upper().startswith("COPILOT_")
+        and not key.upper().startswith("GITHUB_COPILOT_")
     }
     for name in ("COPILOT_GITHUB_TOKEN", "COPILOT_HOME"):
         value = os.environ.get(name, "").strip()
@@ -991,8 +1011,6 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
       by the per-completion preflight instead.
     - ``max_output_tokens`` — copilot has no token flag (accepted for
       CliSpec uniformity and ignored, like codex/gemini).
-
-    ``--available-tools skillspector-no-tools``
 
     ``--available-tools skillspector-no-tools``
         Allowlist holding a fixed implausible name, so the model is offered
@@ -1168,10 +1186,17 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
     Surfaces checked, per tree (home, default home, CONFIG explicit +
     default, STATE explicit + default): user/plugin hooks
     (``installed-plugins/``, ``hooks/*.json``, inline ``hooks``),
-    personal extensions (``extensions/``), user server configs
+    personal extensions (``extensions/``), directory-source plugin
+    refs (``enabledPlugins``, ``extraKnownMarketplaces`` in
+    ``settings.json``), user server configs
     (``mcp-config.json``, ``lsp-config.json`` — any content beyond an
-    empty object/array refuses, since the schema is version-dependent
-    and any entry may spawn a command with env access). Machine-wide
+    empty object/array, or an object with a non-empty collection,
+    refuses, since the schema is version-dependent
+    and any entry may spawn a command with env access), and the BYOK
+    provider registry (``providers.json`` — any content beyond an
+    empty object/array refuses, since it can route completions to a
+    user-configured endpoint outside the verified auth path).
+    Machine-wide
     policy hooks stay residual (admin-owned, unauditable); only
     ``--disable-builtin-mcps`` is argv-denied, so user servers are
     audited, never assumed off.
@@ -1193,6 +1218,7 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
         seen.add(key)
         _audit_hook_tree(tree, kind)
         _audit_server_configs(tree, kind)
+        _audit_byok_registry(tree, kind)
 
     home = _copilot_home(child_env)
     consider(home, "copilot home")
@@ -1243,7 +1269,10 @@ def _audit_server_configs(home: str, kind: str) -> None:
     commands with environment access outside ``--available-tools``,
     and only built-in MCP servers are argv-denied. The schema is
     version-dependent, so anything beyond an empty object/array
-    refuses; missing or empty files pass. Messages name paths only.
+    refuses — except an object whose every collection is itself empty
+    (e.g. a leftover ``{"mcpServers": {}}`` after removing the last
+    server). Missing, empty, or all-empty files pass. Messages name
+    paths only.
     """
     for filename in ("mcp-config.json", "lsp-config.json"):
         path = os.path.join(home, filename)
@@ -1260,11 +1289,45 @@ def _audit_server_configs(home: str, kind: str) -> None:
             raise AgentCLIError(
                 f"{kind} {filename} cannot be verified server-free: {path}"
             ) from exc
-        if document not in ({}, []):
-            raise AgentCLIError(
-                f"{kind} {filename} defines user servers, which spawn "
-                f"commands with env access outside --available-tools: {path}"
-            )
+        if document in ({}, []):
+            continue
+        if isinstance(document, dict) and all(
+            value in ({}, [], None) for value in document.values()
+        ):
+            continue
+        raise AgentCLIError(
+            f"{kind} {filename} defines user servers, which spawn "
+            f"commands with env access outside --available-tools: {path}"
+        )
+
+
+def _audit_byok_registry(home: str, kind: str) -> None:
+    """Refuse inference when a BYOK provider registry defines providers.
+
+    ``providers.json`` can route completions to a user-configured
+    endpoint outside the verified auth path (``COPILOT_GITHUB_TOKEN``
+    or the CLI login session). Anything beyond an empty object/array
+    refuses; missing or empty files pass. Messages name paths only.
+    """
+    path = os.path.join(home, "providers.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise AgentCLIError(f"copilot home audit failed: {exc}") from exc
+    try:
+        document = json.loads(raw) if raw.strip() else {}
+    except ValueError as exc:
+        raise AgentCLIError(
+            f"{kind} providers.json cannot be verified provider-free: {path}"
+        ) from exc
+    if document not in ({}, []):
+        raise AgentCLIError(
+            f"{kind} providers.json defines custom providers, which route "
+            f"completions outside the verified auth path: {path}"
+        )
 
 
 def _audit_hook_tree(home: str, kind: str) -> None:
@@ -1272,11 +1335,15 @@ def _audit_hook_tree(home: str, kind: str) -> None:
 
     ``kind`` names the tree in error messages (``copilot home`` or the
     XDG migration source). Checks ``installed-plugins/``,
-    ``extensions/``, ``hooks/*.json``, and an inline ``hooks`` block in
+    ``extensions/``, ``hooks/*.json``, an inline ``hooks`` block in
+    ``settings.json``, and the directory-source plugin refs
+    (``enabledPlugins``, ``extraKnownMarketplaces``) in
     ``settings.json``; messages name paths only, never contents.
     Personal extensions fork Node.js processes with hook callbacks
     outside ``--available-tools``, so a non-empty ``extensions/``
-    refuses exactly like installed plugins.
+    refuses exactly like installed plugins. Directory-source
+    marketplaces load plugins live from their real directories, so a
+    truthy plugin ref refuses exactly like installed material.
     """
     plugins = os.path.join(home, "installed-plugins")
     if _nonempty_dir(plugins):
@@ -1319,6 +1386,13 @@ def _audit_hook_tree(home: str, kind: str) -> None:
             f"{kind} settings.json carries an inline hooks block, which loads "
             f"with no argv off-switch: {settings}"
         )
+    if isinstance(document, dict):
+        for field in ("enabledPlugins", "extraKnownMarketplaces"):
+            if document.get(field):
+                raise AgentCLIError(
+                    f"{kind} settings.json enables {field}, which loads "
+                    f"directory-source plugins outside the audited trees: {settings}"
+                )
 
 
 _REPO_HOOK_PATHS = (

@@ -313,7 +313,7 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 | `SKILLSPECTOR_MODEL` | Override the active provider's bundled default model (see [README.md](../README.md) for per-provider defaults). CLI providers forward it as `--model`. | `gpt-5.2` |
 
 > **CLI providers** (`claude_cli`, `codex_cli`, `copilot_cli`, `gemini_cli`, `opencode_cli`): no credential env var is needed, except `copilot_cli` deliberately
-preserves only `COPILOT_GITHUB_TOKEN` (see `_prepare_copilot_env`). Authentication is managed by the agent CLI's own session. The subprocess is heavily sandboxed — see [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py).
+preserves only `COPILOT_GITHUB_TOKEN` (see `_prepare_copilot_env`). Authentication is managed by the agent CLI's own session. Residual: Copilot CLI falls back to `gh auth token` when no other credential is available, so a stored gh login can still reach the child. The subprocess is heavily sandboxed — see [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py).
 
 ### Live provider tests
 

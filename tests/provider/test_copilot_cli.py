@@ -30,9 +30,13 @@ Security invariants verified:
     ``--disable-builtin-mcps``, ``--disallow-temp-dir``); user and plugin
     lifecycle hooks stay off via preflight refusal (audit rejects
     ``installed-plugins/``, ``extensions/``, ``hooks/*.json``, inline
-    ``hooks`` in ``settings.json``, user ``mcp-config.json`` /
-    ``lsp-config.json`` with servers defined, and any repo-level hook
+    ``hooks`` and truthy ``enabledPlugins``/``extraKnownMarketplaces``
+    in ``settings.json``, non-empty user ``mcp-config.json`` /
+    ``lsp-config.json`` and ``providers.json``, and any repo-level hook
     material in the temp working dir before stdin moves).
+  - Only COPILOT_GITHUB_TOKEN reaches the child; GH_TOKEN, the
+    enterprise token variables, every other COPILOT_* and all
+    GITHUB_COPILOT_* are dropped.
   - Only the exactly verified Copilot CLI version is accepted.
   - The auth probe (``copilot --version``) is cheap, non-inference, bounded,
     uses the scrubbed environment, and fail-closed.
@@ -67,6 +71,7 @@ from skillspector.providers._agent_cli import (
     _preflight_copilot_policy,
     _prepare_copilot_env,
     _run_bounded,
+    _scrub_env,
     run_agent_cli,
 )
 from skillspector.providers.copilot_cli import CopilotCLIProvider
@@ -281,28 +286,30 @@ class TestCopilotAuthCheck:
 
 class TestPreflightCopilotPolicy:
     @patch("skillspector.providers._agent_cli.subprocess.run")
-    def test_pinned_version_passes(self, mock_run: MagicMock) -> None:
+    def test_pinned_version_passes(self, mock_run: MagicMock, tmp_path: Path) -> None:
         mock_run.return_value = _version_result()
-        _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {"PATH": "/bin"}, "/tmp")
+        _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {"PATH": "/bin"}, str(tmp_path))
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
-    def test_synthetic_future_version_rejected_before_stdin(self, mock_run: MagicMock) -> None:
+    def test_synthetic_future_version_rejected_before_stdin(
+        self, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
         # The reviewer's repro: a 9.9.99 binary must never receive scan content.
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
         with pytest.raises(AgentCLIError, match="1.0.91"):
-            _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {"PATH": "/bin"}, "/tmp")
+            _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {"PATH": "/bin"}, str(tmp_path))
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
-    def test_nonzero_exit_rejected(self, mock_run: MagicMock) -> None:
+    def test_nonzero_exit_rejected(self, mock_run: MagicMock, tmp_path: Path) -> None:
         mock_run.return_value = SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom")
         with pytest.raises(AgentCLIError, match="preflight|1.0.91"):
-            _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {}, "/tmp")
+            _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {}, str(tmp_path))
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
-    def test_timeout_rejected(self, mock_run: MagicMock) -> None:
+    def test_timeout_rejected(self, mock_run: MagicMock, tmp_path: Path) -> None:
         mock_run.side_effect = subprocess.TimeoutExpired(cmd="copilot", timeout=15)
         with pytest.raises(AgentCLIError, match="preflight failed"):
-            _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {}, "/tmp")
+            _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {}, str(tmp_path))
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_preflight_uses_child_env_shell_false_bounded(
@@ -715,6 +722,68 @@ class TestAuditCopilotHome:
         (home / "lsp-config.json").write_text("[]", encoding="utf-8")
         _audit_copilot_home({"COPILOT_HOME": str(home)})
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            '{"mcpServers": {}}',
+            '{"mcpServers": {}, "servers": []}',
+            '{"mcpServers": null}',
+        ],
+    )
+    def test_all_empty_server_collections_pass(self, tmp_path: Path, content: str) -> None:
+        # A leftover shape after removing the last server defines no
+        # commands, so it passes; anything non-empty still refuses.
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "mcp-config.json").write_text(content, encoding="utf-8")
+        _audit_copilot_home({"COPILOT_HOME": str(home)})
+
+    @pytest.mark.parametrize(
+        "field",
+        ["enabledPlugins", "extraKnownMarketplaces"],
+    )
+    def test_directory_source_plugin_refs_raise(self, tmp_path: Path, field: str) -> None:
+        # Directory-source marketplaces load plugins live from their
+        # real directories, outside the installed-plugins audit — a
+        # truthy ref refuses exactly like installed material.
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "settings.json").write_text(
+            f'{{"theme": "dark", "{field}": {{"local": "/opt/mkt"}}}}',
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match=field):
+            _audit_copilot_home({"COPILOT_HOME": str(home)})
+
+    @pytest.mark.parametrize(
+        "content",
+        ['{"enabledPlugins": []}', '{"extraKnownMarketplaces": {}}', '{"theme": "dark"}'],
+    )
+    def test_empty_plugin_refs_pass(self, tmp_path: Path, content: str) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "settings.json").write_text(content, encoding="utf-8")
+        _audit_copilot_home({"COPILOT_HOME": str(home)})
+
+    def test_byok_registry_with_providers_raises(self, tmp_path: Path) -> None:
+        # providers.json routes completions to a user-configured
+        # endpoint outside the verified auth path.
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "providers.json").write_text(
+            '{"custom": {"baseUrl": "https://example.invalid/v1"}}',
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="providers.json"):
+            _audit_copilot_home({"COPILOT_HOME": str(home)})
+
+    @pytest.mark.parametrize("content", ["{}", "[]", ""])
+    def test_empty_byok_registry_passes(self, tmp_path: Path, content: str) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "providers.json").write_text(content, encoding="utf-8")
+        _audit_copilot_home({"COPILOT_HOME": str(home)})
+
     def test_defaults_to_dot_copilot(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         home = tmp_path / "home"
         (home / ".copilot" / "installed-plugins" / "evil").mkdir(parents=True)
@@ -846,25 +915,52 @@ class TestPrepareCopilotEnv:
         # forwarded. GH_TOKEN/GITHUB_TOKEN stay dropped (a CI repo token
         # must not reach an agent process reading untrusted content),
         # and GITHUB_COPILOT_* prompt-mode opt-ins never reach the child.
+        # The base is the real scrubbed environment — not {} — so the
+        # assertions cover the production path (run_agent_cli passes
+        # _scrub_env() as the base).
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok-1")
         monkeypatch.setenv("GH_TOKEN", "tok-2")
         monkeypatch.setenv("GITHUB_TOKEN", "tok-3")
+        monkeypatch.setenv("GH_ENTERPRISE_TOKEN", "tok-5")
+        monkeypatch.setenv("GITHUB_ENTERPRISE_TOKEN", "tok-6")
         monkeypatch.setenv("GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS", "1")
         monkeypatch.setenv("GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS", "1")
         monkeypatch.setenv("GITHUB_COPILOT_AGENT_GITHUB_TOKEN", "tok-4")
-        env = _prepare_copilot_env({}, "/tmp", ["copilot"])
+        base = _scrub_env()
+        assert "GH_TOKEN" not in base
+        assert "GITHUB_TOKEN" not in base
+        assert "GH_ENTERPRISE_TOKEN" not in base
+        assert "GITHUB_ENTERPRISE_TOKEN" not in base
+        env = _prepare_copilot_env(base, "/tmp", ["copilot"])
         assert env["COPILOT_GITHUB_TOKEN"] == "tok-1"
         assert "GH_TOKEN" not in env
         assert "GITHUB_TOKEN" not in env
+        assert "GH_ENTERPRISE_TOKEN" not in env
+        assert "GITHUB_ENTERPRISE_TOKEN" not in env
         assert "GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS" not in env
         assert "GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS" not in env
         assert "GITHUB_COPILOT_AGENT_GITHUB_TOKEN" not in env
+
+    def test_drops_gh_tokens_from_hand_built_base_env(self) -> None:
+        # The explicit drop in _prepare_copilot_env holds even for a
+        # caller-passed base that bypasses the shared scrub.
+        base = {
+            "PATH": "/bin",
+            "GH_TOKEN": "tok-2",
+            "GH_ENTERPRISE_TOKEN": "tok-5",
+            "GITHUB_ENTERPRISE_TOKEN": "tok-6",
+        }
+        env = _prepare_copilot_env(base, "/tmp", ["copilot"])
+        assert "GH_TOKEN" not in env
+        assert "GH_ENTERPRISE_TOKEN" not in env
+        assert "GITHUB_ENTERPRISE_TOKEN" not in env
+        assert env["PATH"] == "/bin"
 
     def test_empty_tokens_are_not_forwarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "")
         monkeypatch.setenv("GH_TOKEN", "   ")
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        env = _prepare_copilot_env({}, "/tmp", ["copilot"])
+        env = _prepare_copilot_env(_scrub_env(), "/tmp", ["copilot"])
         assert "COPILOT_GITHUB_TOKEN" not in env
         assert "GH_TOKEN" not in env
         assert "GITHUB_TOKEN" not in env

@@ -586,7 +586,7 @@ def scan(
         ollama uses the local Ollama service. claude_cli, codex_cli,
         gemini_cli, and opencode_cli use their CLI's existing local
         authentication session. copilot_cli uses the CLI login session or
-        one of COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN.
+        COPILOT_GITHUB_TOKEN.
     """
     if mcp_registry:
         if recursive or baseline is not None or show_suppressed or yara_rules_dir is not None:

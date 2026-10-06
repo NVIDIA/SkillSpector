@@ -16,8 +16,8 @@
 """GitHub Copilot CLI provider — Stage-2 LLM analysis via the local ``copilot`` binary.
 
 Activated by ``SKILLSPECTOR_PROVIDER=copilot_cli``. Authentication is handled by
-the ``copilot`` CLI's own login session (``copilot login``) or one of its
-token environment variables; no OpenAI/Anthropic API key is read or required.
+the ``copilot`` CLI's own login session (``copilot login``) or
+``COPILOT_GITHUB_TOKEN``; no OpenAI/Anthropic API key is read or required.
 
 All behaviour is inherited from
 :class:`skillspector.providers._agent_cli_base.AgentCLIProviderBase`; the

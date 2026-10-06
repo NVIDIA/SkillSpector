@@ -654,6 +654,8 @@ Issues (2)
 > `opencode_cli` currently fails closed unless the installed OpenCode version is exactly `1.18.33`, the version whose configuration precedence and deny-all semantics are verified by this release.
 >
 > `copilot_cli` currently fails closed unless the installed Copilot CLI version is exactly `1.0.91`, the version whose tool-deny behavior is verified by this release.
+>
+> Residual: Copilot CLI falls back to `gh auth token` when no other credential is available, so a stored gh login can still reach the child. This is inherent to Copilot auth.
 
 ### CLI Options
 
