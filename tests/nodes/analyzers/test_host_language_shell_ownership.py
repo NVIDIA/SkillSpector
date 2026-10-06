@@ -11,6 +11,8 @@ shell text keeps its conservative partial outcome.
 
 from __future__ import annotations
 
+import threading
+import warnings
 from pathlib import Path
 
 import pytest
@@ -26,6 +28,9 @@ _TAIL = "".join(f"value_{index} = {index}\n" for index in range(600))
 # A view-level prefilter only considers runtime-selected command operands
 # when recursive/force option text and a path occur somewhere in the source.
 _OPTION_TEXT = 'BUILD_ARGS = ["--recursive", "--force", "/tmp/build"]\n'
+# Read as shell text, the fence backticks open a command substitution that the
+# tail exhausts. Only proven Python token ownership makes them literal.
+_FENCE_SOURCE = 'FENCE = "\\n```\\n"\n' + _TAIL
 
 
 def _python(content: str, *, complete_context: bool = True) -> bool:
@@ -219,6 +224,57 @@ def test_unproven_python_source_has_no_token_ownership(content: str) -> None:
 def test_python_ownership_requires_complete_context() -> None:
     # A fragment can start inside a string and invert code and literal bytes.
     assert _python('FENCE = "\\n```\\n"\n' + _TAIL, complete_context=False) is True
+
+
+def test_bom_prefixed_python_keeps_conservative_result() -> None:
+    # The file cache decodes with utf-8, not utf-8-sig, so a leading U+FEFF is
+    # not Python syntax. Ownership stays unproven until that decoding changes.
+    content = "\ufeff" + _FENCE_SOURCE
+
+    assert tm._python_literal_spans(content, lambda: None) is None
+    assert _python(content) is True
+
+
+# A valid module whose invalid escape makes the compiler emit a SyntaxWarning.
+_WARNING_SOURCE = 'PATTERN = "\\d+"\n' + _FENCE_SOURCE
+
+
+def test_python_ownership_parse_emits_no_warnings() -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        filters = list(warnings.filters)
+
+        assert _python(_WARNING_SOURCE) is False
+        assert list(warnings.filters) == filters
+
+    assert [str(warning.message) for warning in caught] == []
+
+
+@pytest.mark.filterwarnings("error::SyntaxWarning")
+def test_python_ownership_survives_syntax_warnings_as_errors() -> None:
+    assert _python(_WARNING_SOURCE) is False
+
+
+def test_concurrent_ownership_parses_restore_warning_filters() -> None:
+    # Analyzer nodes run on graph worker threads. Interleaved catch_warnings
+    # exits must not leave the ownership parse's ignore filter installed.
+    filters = list(warnings.filters)
+    barrier = threading.Barrier(8)
+    proven: list[bool] = []
+
+    def parse() -> None:
+        barrier.wait()
+        for _ in range(10):
+            proven.append(tm._python_literal_spans(_WARNING_SOURCE, lambda: None) is not None)
+
+    threads = [threading.Thread(target=parse) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert proven == [True] * 80
+    assert list(warnings.filters) == filters
 
 
 @pytest.mark.parametrize(

@@ -29,9 +29,11 @@ import io
 import re
 import sys
 import tokenize
+import warnings
 from bisect import bisect_right
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from threading import Lock
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
@@ -122,6 +124,11 @@ _PYTHON_SHEBANG_RE = re.compile(
     r"#![ \t]*+(?:\S*/)?(?:env[ \t]++(?:-\S*[ \t]++)*(?:\S*/)?)?"
     r"(?:python[0-9.]*|pypy[0-9.]*|uv)(?=[ \t\r\n]|$)"
 )
+# ``warnings.catch_warnings`` swaps the process-global filter list, and analyzer
+# nodes run on concurrent graph worker threads. Two such blocks that exit out of
+# order can leave their ``ignore`` filter installed for the whole process, so
+# the ownership parse serializes its block.
+_PYTHON_OWNERSHIP_PARSE_LOCK = Lock()
 _PYTHON_TEMPLATE_STRING_STARTS = frozenset(
     {tokenize.FSTRING_START, getattr(tokenize, "TSTRING_START", tokenize.FSTRING_START)}
 )
@@ -2553,6 +2560,10 @@ def _python_literal_spans(
     so a fragment, malformed file, or shell-shebang polyglot cannot borrow
     host ownership. Every span is checked against the exact source text.
     """
+    # A leading U+FEFF byte-order mark fails the module parse below and keeps
+    # every conservative bound. The file cache decodes with ``utf-8``, not
+    # ``utf-8-sig``, so the AST analyzers already report such a file as a
+    # syntax error; stripping the mark belongs with that decoding fix.
     if (
         len(content) > MAX_PYTHON_AST_SOURCE_CHARS
         or _LONE_CARRIAGE_RETURN_RE.search(content) is not None
@@ -2564,7 +2575,13 @@ def _python_literal_spans(
         # The lenient tokenizer accepts bytes such as ``$`` and a backtick as
         # operators. Requiring a module parse proves that every byte outside
         # the spans below is Python syntax, never a shell quote or expansion.
-        ast.parse(content)
+        # The scanned module's own parse already reports its compiler warnings
+        # (for example an invalid ``"\d"`` escape). Repeating them here would
+        # duplicate that output, and ``-W error`` would turn them into a
+        # ``SyntaxError`` that silently drops ownership.
+        with _PYTHON_OWNERSHIP_PARSE_LOCK, warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ast.parse(content)
     except (SyntaxError, ValueError, RecursionError):
         return None
     check_runtime()
