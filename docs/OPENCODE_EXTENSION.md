@@ -75,7 +75,7 @@ Use skillspector_scan on ./my-skill with noLlm=false.
 export SKILLSPECTOR_PROVIDER=nv_build
 export NVIDIA_INFERENCE_KEY=nvapi-...
 # Optional; omit to use nv_build's bundled default model.
-# export SKILLSPECTOR_MODEL=z-ai/glm-5.2
+# export SKILLSPECTOR_MODEL=z-ai/glm-5.3
 ```
 
 Other valid providers and their credential variables are listed in the main
