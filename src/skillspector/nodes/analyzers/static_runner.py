@@ -513,9 +513,7 @@ _LINEAR_COMMAND_PATTERNS = frozenset(
 
 
 @functools.lru_cache(maxsize=128)
-def _linear_command_parts(
-    source: str, flags: int
-) -> tuple[re.Pattern[str], re.Pattern[str], str]:
+def _linear_command_parts(source: str, flags: int) -> tuple[re.Pattern[str], re.Pattern[str], str]:
     separator = "|" if "[^|]*" in source else "&"
     prefix, suffix = source.split(f"[^{separator}]*", 1)
     # Lookahead retains overlapping suffix starts. The original anchored match

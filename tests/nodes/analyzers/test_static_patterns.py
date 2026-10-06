@@ -2479,7 +2479,11 @@ def test_linear_command_registry_covers_routed_catalog_shapes():
         for key, rules in vars(module).items():
             if key.endswith("_PATTERNS") and isinstance(rules, list):
                 for rule in rules:
-                    if isinstance(rule, tuple) and isinstance(rule[0], str) and ("[^|]*" in rule[0] or "[^&]*" in rule[0]):
+                    if (
+                        isinstance(rule, tuple)
+                        and isinstance(rule[0], str)
+                        and ("[^|]*" in rule[0] or "[^&]*" in rule[0])
+                    ):
                         actual.add(rule[0])
     assert actual == static_runner._LINEAR_COMMAND_PATTERNS
 
@@ -2567,17 +2571,38 @@ def test_linear_commands_match_native_with_overlapping_suffixes():
 
     randomizer = random.Random(741)
     tokens = (
-        "curl ", "wget ", "git push ", "chmod ", "mkdir ", "; curl ",
-        "-k ", "--insecure ", "--force ", "-d value ", "-o aa-o ",
-        "-O tmp ", "&&&&sh ", "&& sh ", "| sh ", "| node ",
-        "a+rwx ", "/tmp/.hidden ", "\u00a0", "|", "&", "\n",
+        "curl ",
+        "wget ",
+        "git push ",
+        "chmod ",
+        "mkdir ",
+        "; curl ",
+        "-k ",
+        "--insecure ",
+        "--force ",
+        "-d value ",
+        "-o aa-o ",
+        "-O tmp ",
+        "&&&&sh ",
+        "&& sh ",
+        "| sh ",
+        "| node ",
+        "a+rwx ",
+        "/tmp/.hidden ",
+        "\u00a0",
+        "|",
+        "&",
+        "\n",
     )
     for pattern in sorted(static_runner._LINEAR_COMMAND_PATTERNS):
         compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
         for _ in range(100):
             text = "".join(randomizer.choices(tokens, k=20))
             expected = [(match.span(), match.group()) for match in compiled.finditer(text)]
-            actual = [(match.span(), match.group()) for match in static_runner.iter_pattern_matches(compiled, text)]
+            actual = [
+                (match.span(), match.group())
+                for match in static_runner.iter_pattern_matches(compiled, text)
+            ]
             assert actual == expected, (pattern, text)
 
 

@@ -550,6 +550,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             re.finditer
             if pattern == _BOUNDED_REPETITION_PATTERN
             else static_runner.iter_paragraph_matches
+            if (pattern, confidence) in MP2_PROSE_PATTERNS
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             span = match.group(0)
