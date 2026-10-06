@@ -1629,6 +1629,7 @@ def _parse_shell_command_word(
     check_runtime: Callable[[], None] | None = None,
     owned_word_positions: set[int] | None = None,
     enclosing_delimiter: str | None = None,
+    quoted_expansion_starts: set[int] | None = None,
 ) -> _ShellCommandWord | None:
     runtime_check = check_runtime or (lambda: None)
     # The shell recognizes ``NAME=value`` before expansion and never runs the
@@ -1657,6 +1658,9 @@ def _parse_shell_command_word(
     dynamic = False
     limited = False
     unquoted_characters = 0
+    # Expansions directly inside the current double-quoted span. They are
+    # reported only once that span's closing quote is proven.
+    pending_quoted_expansions: list[int] = []
     cursor = start
     limit = len(content)
     while cursor < limit:
@@ -1667,6 +1671,9 @@ def _parse_shell_command_word(
             if character == quote:
                 if owned_word_positions is not None:
                     owned_word_positions.add(cursor)
+                if quoted_expansion_starts is not None:
+                    quoted_expansion_starts.update(pending_quoted_expansions)
+                pending_quoted_expansions.clear()
                 quote = None
                 ansi_c_quote = False
             elif character == "\\" and ansi_c_quote:
@@ -1693,6 +1700,7 @@ def _parse_shell_command_word(
                     )
                     if substitution_end is None:
                         return None
+                    pending_quoted_expansions.append(cursor)
                     static_value = _static_printf_substitution(
                         content,
                         cursor,
@@ -1720,10 +1728,15 @@ def _parse_shell_command_word(
                 if parameter_end is not None:
                     output.append("$PARAM")
                     dynamic = True
-                    cursor = parameter_end
                     if inherited_quote_closed[0]:
+                        # The expansion consumed the closing quote, so this
+                        # span has no proven boundary of its own.
+                        pending_quoted_expansions.clear()
                         quote = None
                         ansi_c_quote = False
+                    else:
+                        pending_quoted_expansions.append(cursor)
+                    cursor = parameter_end
                     continue
             elif quote == '"' and character == "`":
                 substitution_end = _skip_backtick_substitution(
@@ -1737,6 +1750,7 @@ def _parse_shell_command_word(
                 )
                 if substitution_end is None:
                     return None
+                pending_quoted_expansions.append(cursor)
                 static_value = _static_printf_substitution(
                     content,
                     cursor,
@@ -1954,6 +1968,9 @@ def _has_shell_command_word_exhaustion(
     # Completed words own closing quotes, never executable expansion starts.
     # Inner commands remain independent candidates; never suppress their bodies.
     owned_word_positions: set[int] = set()
+    # Expansions that a parsed word placed directly inside a closed
+    # double-quoted span. Their own word and operands end at that quote.
+    quoted_expansion_starts: set[int] = set()
     parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
     substitution_end_cache: dict[int, int | None] = {}
     backtick_end_cache: dict[int, int | None] = {}
@@ -1989,8 +2006,13 @@ def _has_shell_command_word_exhaustion(
             check_runtime=check_runtime,
             owned_word_positions=candidate_word_positions,
             enclosing_delimiter=(
-                _assignment_value_wrapper(content, start) if assignment_quote else None
+                _assignment_value_wrapper(content, start)
+                if assignment_quote
+                else '"'
+                if start in quoted_expansion_starts
+                else None
             ),
+            quoted_expansion_starts=quoted_expansion_starts,
         )
         if parsed is None:
             substitution_start = (
@@ -2079,6 +2101,7 @@ def _has_shell_command_word_exhaustion(
                 start,
                 parsed.end,
                 check_runtime,
+                enclosing_delimiter='"' if start in quoted_expansion_starts else None,
             )
         ):
             comment = python_source.comment(start) if python_source is not None else None
@@ -2119,6 +2142,8 @@ def _has_runtime_command_operand_exhaustion(
     start: int,
     word_end: int,
     check_runtime: Callable[[], None],
+    *,
+    enclosing_delimiter: str | None = None,
 ) -> bool:
     """Return whether a runtime-selected command's operands are undecidable."""
     tokens, command_end, exhausted = _bounded_shell_tokens(
@@ -2126,6 +2151,7 @@ def _has_runtime_command_operand_exhaustion(
         start,
         word_end,
         check_runtime=check_runtime,
+        enclosing_delimiter=enclosing_delimiter,
     )
     if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
         # Earlier prose (for example "row-first") cannot supply this
@@ -2647,6 +2673,7 @@ def _bounded_shell_tokens(
     body_start: int,
     *,
     check_runtime: Callable[[], None] | None = None,
+    enclosing_delimiter: str | None = None,
 ) -> tuple[tuple[_ShellToken, ...], int, bool]:
     """Return argument words from one security-view-bounded shell command."""
     runtime_check = check_runtime or (lambda: None)
@@ -2670,7 +2697,7 @@ def _bounded_shell_tokens(
     parse_limited = False
     cursor = body_start
     limit = min(len(content), body_start + _ROOT_GLOB_COMMAND_CHARS)
-    wrapper_quote = _command_wrapper_quote(content, command_start)
+    wrapper_quote = enclosing_delimiter or _command_wrapper_quote(content, command_start)
 
     def start_word() -> None:
         nonlocal word_started, current_is_argument, expect_redirection_target
