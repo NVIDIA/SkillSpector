@@ -1399,6 +1399,207 @@ _LOCKFILE_PACKAGE_BLOCK_RE = re.compile(
     r"(?ms)^\s*\[\[package\]\]\s*$.*?(?=^\s*\[\[package\]\]\s*$|\Z)"
 )
 
+_PIPFILE_METADATA_SECTIONS = frozenset({"source", "requires", "scripts", "pipenv"})
+_PIPFILE_KEY_RE = re.compile(r"""^[ \t]*("(?:\\.|[^"\\])*"|'[^']*'|[A-Za-z0-9_-]+)[ \t]*=""")
+_JSON_TOKEN_RE = re.compile(r'"(?:\\.|[^"\\])*"|[{}\[\]]')
+_JSON_KEY_SUFFIX_RE = re.compile(r"\s*:")
+_TOML_STRING_TOKEN_RE = re.compile(r'''"""|\x27{3}|"(?:\\.|[^"\\])*"|'[^']*'|\#.*''')
+_TOML_MULTILINE_END_RE = {
+    '"""': re.compile(r'(?<!\\)(?:\\\\)*"""'),
+    "'''": re.compile("'''"),
+}
+
+
+def _pipenv_package_lines(
+    content: str, requested: set[tuple[str, str]], *, is_lockfile: bool
+) -> dict[tuple[str, str], int]:
+    """Index package keys once, retaining separate locations for each category."""
+    locations: dict[tuple[str, str], int] = {}
+    if not requested:
+        return locations
+    if is_lockfile:
+        depth = 0
+        section = ""
+        line = 1
+        position = 0
+        for token in _JSON_TOKEN_RE.finditer(content):
+            line += content.count("\n", position, token.start())
+            position = token.start()
+            value = token.group(0)
+            if value in {"{", "["}:
+                depth += 1
+            elif value in {"}", "]"}:
+                depth -= 1
+            elif depth in {1, 2} and _JSON_KEY_SUFFIX_RE.match(content, token.end()):
+                key = json.loads(value)
+                if depth == 1:
+                    section = key
+                elif (section, key) in requested:
+                    locations[(section, key)] = line
+        return locations
+
+    section = ""
+    multiline_quote: str | None = None
+    for line_number, line in enumerate(io.StringIO(content), 1):
+        was_multiline = multiline_quote is not None
+        position = 0
+        if multiline_quote is not None:
+            closing = _TOML_MULTILINE_END_RE[multiline_quote].search(line)
+            if closing is None:
+                continue
+            multiline_quote = None
+            position = closing.end()
+        while token := _TOML_STRING_TOKEN_RE.search(line, position):
+            quote = token.group(0)
+            if quote.startswith("#"):
+                break
+            position = token.end()
+            if quote in _TOML_MULTILINE_END_RE:
+                closing = _TOML_MULTILINE_END_RE[quote].search(line, position)
+                if closing is None:
+                    multiline_quote = quote
+                    break
+                position = closing.end()
+        if was_multiline:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("["):
+            try:
+                header = tomllib.loads(stripped)
+            except tomllib.TOMLDecodeError:
+                section = ""
+                continue
+            section = next(iter(header), "")
+            children = header.get(section)
+            if isinstance(children, dict):
+                for name in children:
+                    if (section, name) in requested:
+                        locations[(section, name)] = line_number
+            continue
+        key_match = _PIPFILE_KEY_RE.match(line)
+        if key_match is None:
+            continue
+        try:
+            key = next(iter(tomllib.loads(f"{key_match.group(1)} = 0")))
+        except tomllib.TOMLDecodeError:
+            continue
+        if (section, key) in requested:
+            locations[(section, key)] = line_number
+    return locations
+
+
+def _extract_packages_from_pipenv(
+    content: str,
+    *,
+    is_lockfile: bool,
+    limit: int | None = None,
+) -> tuple[list[tuple[str, str | None, int]], list[OsvQueryLimitation]]:
+    """Extract bounded Pipenv registry dependencies without executing project code.
+
+    Pipfile uses TOML package tables; Pipfile.lock uses JSON categories containing
+    all resolved direct and transitive packages. Metadata is never a dependency.
+    Non-registry sources and malformed entries remain explicit coverage gaps.
+    """
+    entry_limit = MAX_DEPENDENCY_PACKAGES_PER_FILE if limit is None else max(0, limit)
+    if entry_limit == 0:
+        return [], []
+    try:
+        data = json.loads(content) if is_lockfile else tomllib.loads(content)
+    except (json.JSONDecodeError, tomllib.TOMLDecodeError, RecursionError) as error:
+        return [], [
+            OsvQueryLimitation(
+                reason=LedgerReason.DEPENDENCY_PARSE_ERROR,
+                error_class=type(error).__name__,
+            )
+        ]
+    if not isinstance(data, dict):
+        return [], [OsvQueryLimitation(reason=LedgerReason.DEPENDENCY_PARSE_ERROR)]
+
+    results: list[tuple[str, str | None, int]] = []
+    location_keys: list[tuple[str, str]] = []
+    limitations: list[OsvQueryLimitation] = []
+    limitation_keys: set[tuple[LedgerReason, str | None]] = set()
+
+    def note(limitation: OsvQueryLimitation) -> None:
+        key = (limitation.reason, limitation.error_class)
+        if key not in limitation_keys:
+            limitations.append(limitation)
+            limitation_keys.add(key)
+
+    seen = 0
+    for section, entries in data.items():
+        if section in ({"_meta"} if is_lockfile else _PIPFILE_METADATA_SECTIONS):
+            continue
+        if not isinstance(entries, dict):
+            note(OsvQueryLimitation(reason=LedgerReason.DEPENDENCY_PARSE_ERROR))
+            continue
+        for name, entry in entries.items():
+            seen += 1
+            if seen > entry_limit:
+                note(
+                    OsvQueryLimitation(
+                        reason=LedgerReason.OUTPUT_LIMIT,
+                        observed_records=seen,
+                        limit_records=entry_limit,
+                    )
+                )
+                break
+            if len(name) > MAX_DEPENDENCY_NAME_CHARS:
+                note(
+                    OsvQueryLimitation(
+                        reason=LedgerReason.SIZE_LIMIT,
+                        observed_characters=len(name),
+                        limit_characters=MAX_DEPENDENCY_NAME_CHARS,
+                    )
+                )
+                continue
+            if isinstance(entry, dict):
+                if any(source in entry for source in ("git", "path", "file", "hg", "svn", "bzr")):
+                    note(
+                        OsvQueryLimitation(
+                            reason=LedgerReason.DEPENDENCY_PARSE_ERROR,
+                            error_class="UnsupportedDependencySource",
+                        )
+                    )
+                    continue
+                spec = entry.get("version", "" if is_lockfile else "*")
+            else:
+                spec = entry if not is_lockfile else None
+            if not isinstance(spec, str):
+                requirement = None
+            elif len(spec) > MAX_DEPENDENCY_SPEC_CHARS:
+                note(
+                    OsvQueryLimitation(
+                        reason=LedgerReason.SIZE_LIMIT,
+                        observed_characters=len(spec),
+                        limit_characters=MAX_DEPENDENCY_SPEC_CHARS,
+                    )
+                )
+                continue
+            else:
+                requirement = _extract_python_requirement(
+                    name if spec.strip() == "*" else f"{name}{spec}"
+                )
+            if requirement is None or requirement[0] != name:
+                note(OsvQueryLimitation(reason=LedgerReason.DEPENDENCY_PARSE_ERROR))
+                continue
+            if is_lockfile and requirement[1] is None:
+                note(OsvQueryLimitation(reason=LedgerReason.DEPENDENCY_PARSE_ERROR))
+                continue
+            results.append((*requirement, 1))
+            location_keys.append((section, name))
+        if seen > entry_limit:
+            break
+    locations = _pipenv_package_lines(content, set(location_keys), is_lockfile=is_lockfile)
+    return [
+        (name, version, locations.get(key, 1))
+        for (name, version, _line), key in zip(results, location_keys, strict=True)
+    ], limitations
+
+
+def _is_pipenv_lockfile(file_path: str) -> bool:
+    return Path(file_path).name.lower() == "pipfile.lock"
+
 
 def _normalize_package_name(name: str) -> str:
     """Normalize package names the same way OSV/fallback coverage does."""
@@ -1407,7 +1608,7 @@ def _normalize_package_name(name: str) -> str:
 
 def _is_python_lockfile(file_path: str) -> bool:
     lower_path = file_path.lower()
-    return "uv.lock" in lower_path or "poetry.lock" in lower_path
+    return "uv.lock" in lower_path or "poetry.lock" in lower_path or _is_pipenv_lockfile(file_path)
 
 
 def _normalize_npm_package_name(name: str) -> str:
@@ -1635,7 +1836,7 @@ def _collect_locked_versions_detailed(
             )
             break
         content = file_cache.get(path)
-        if not content:
+        if content is None or (not content and not _is_pipenv_lockfile(path)):
             continue
         remaining = max(0, limit - packages_seen)
         if remaining <= 0:
@@ -1650,10 +1851,15 @@ def _collect_locked_versions_detailed(
                 )
             )
             break
-        packages = _extract_packages_from_toml_lock(
-            content,
-            limit=remaining + 1,
-        )
+        if _is_pipenv_lockfile(path):
+            packages, parse_limitations = _extract_packages_from_pipenv(
+                content,
+                is_lockfile=True,
+                limit=remaining + 1,
+            )
+            limitations.extend((path, limitation) for limitation in parse_limitations)
+        else:
+            packages = _extract_packages_from_toml_lock(content, limit=remaining + 1)
         if len(packages) > remaining:
             limitations.append(
                 (
@@ -2685,7 +2891,14 @@ def _analyze_dependencies_detailed(
     extraction_limit = package_limit + 1
 
     if is_python_dep:
-        if "pyproject.toml" in lower_path:
+        if Path(file_path).name.lower() in {"pipfile", "pipfile.lock"}:
+            packages, parse_limitations = _extract_packages_from_pipenv(
+                content,
+                is_lockfile=_is_pipenv_lockfile(file_path),
+                limit=extraction_limit,
+            )
+            limitations.extend(parse_limitations)
+        elif "pyproject.toml" in lower_path:
             packages = _extract_packages_from_pyproject(content, limit=extraction_limit)
         elif is_lockfile:
             packages = _extract_packages_from_toml_lock(content, limit=extraction_limit)
@@ -3693,7 +3906,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             )
             break
         content = file_cache.get(path)
-        if not content:
+        if content is None:
             continue
         dep_findings, dependency_limitations, packages_seen = _analyze_dependencies_detailed(
             content,

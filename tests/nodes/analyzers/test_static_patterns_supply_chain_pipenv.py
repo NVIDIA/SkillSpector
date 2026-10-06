@@ -1,0 +1,354 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Pipenv dependency extraction, coverage, and complete CLI regressions."""
+
+import json
+
+import pytest
+from typer.testing import CliRunner
+
+from skillspector.cli import app
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.nodes.analyzers import static_patterns_supply_chain as supply_chain
+from skillspector.nodes.analyzers.osv_client import QueryBatchResults, VulnResult
+
+
+@pytest.fixture
+def osv_packages(monkeypatch):
+    """Isolate extraction from the network and model only the cited affected pin."""
+    seen = []
+
+    def query(packages, ecosystem, **_kwargs):
+        assert ecosystem == "PyPI"
+        seen.extend(packages)
+        return QueryBatchResults(
+            [
+                [
+                    VulnResult(
+                        vuln_id="PYSEC-2021-142",
+                        summary="PyYAML FullLoader processes untrusted input unsafely",
+                        severity="HIGH",
+                        aliases=("CVE-2020-14343",),
+                    )
+                ]
+                if name.lower() == "pyyaml" and version == "5.3.1"
+                else []
+                for name, version in packages
+            ]
+        )
+
+    monkeypatch.setattr(supply_chain, "query_batch", query)
+    monkeypatch.setattr(supply_chain, "was_osv_reachable", lambda: True)
+    return seen
+
+
+def _lock_content(**categories):
+    return json.dumps(
+        {
+            "_meta": {
+                "pipfile-spec": 6,
+                "requires": {"python_version": "3.12"},
+                "sources": [{"name": "pypi", "url": "https://pypi.org/simple"}],
+            },
+            **categories,
+        },
+        indent=2,
+    )
+
+
+def test_pipfile_categories_and_metadata(osv_packages):
+    content = """[[source]]
+name = "pypi"
+url = "https://pypi.org/simple"
+verify_ssl = true
+[requires]
+python_version = "3.12"
+[scripts]
+review = "echo dependency review"
+[pipenv]
+allow_prereleases = true
+[packages]
+pyyaml = "==5.3.1"
+requests = {version = ">=2.31", extras = ["socks"], markers = "python_version >= '3.8'"}
+[dev-packages]
+pytest = "==8.1.1"
+[docs]
+sphinx = "==7.3.0"
+"""
+    findings, limitations, count = supply_chain._analyze_dependencies_detailed(content, "Pipfile")
+
+    assert osv_packages == [
+        ("pyyaml", "5.3.1"),
+        ("requests", None),
+        ("pytest", "8.1.1"),
+        ("sphinx", "7.3.0"),
+    ]
+    assert count == 4
+    assert not limitations
+    finding = next(item for item in findings if item.rule_id == "SC4")
+    assert finding.location.start_line == 12
+    assert "CVE-2020-14343" in finding.message
+
+
+def test_lockfile_checks_all_resolved_categories(osv_packages):
+    content = _lock_content(
+        default={"requests": {"version": "==2.32.4", "hashes": ["sha256:fixture"]}},
+        develop={"pytest": {"version": "==8.1.1"}},
+        docs={"pyyaml": {"version": "==5.3.1", "index": "pypi"}},
+    )
+    findings, limitations, count = supply_chain._analyze_dependencies_detailed(
+        content, "nested/Pipfile.lock"
+    )
+
+    assert osv_packages == [("requests", "2.32.4"), ("pytest", "8.1.1"), ("pyyaml", "5.3.1")]
+    assert count == 3
+    assert not limitations
+    assert any(item.rule_id == "SC4" for item in findings)
+
+
+def test_lockfile_resolves_unpinned_manifest(osv_packages):
+    content = _lock_content(default={"pyyaml": {"version": "==5.3.1"}})
+    locked = supply_chain._collect_locked_versions({"Pipfile.lock": content}, ["Pipfile.lock"])
+    findings = supply_chain._analyze_dependencies('[packages]\npyyaml = "*"\n', "Pipfile", locked)
+
+    assert locked == {"pyyaml": "5.3.1"}
+    assert osv_packages == [("pyyaml", "5.3.1")]
+    assert any(item.rule_id == "SC4" and item.severity == "HIGH" for item in findings)
+
+
+@pytest.mark.parametrize("spec", ["*", ">=5.3", "~=5.3", "==5.3.*"])
+def test_manifest_ranges_are_not_treated_as_installed_versions(spec, osv_packages):
+    findings = supply_chain._analyze_dependencies(f'[packages]\npyyaml = "{spec}"\n', "Pipfile")
+
+    assert osv_packages == [("pyyaml", None)]
+    assert not any(item.rule_id == "SC4" and item.severity == "HIGH" for item in findings)
+
+
+@pytest.mark.parametrize("version", ["5.3.1rc1", "5.3.1.post1", "1!5.3.1"])
+@pytest.mark.parametrize("filename", ["Pipfile", "Pipfile.lock"])
+def test_exact_pep440_versions_are_preserved(version, filename, osv_packages):
+    content = (
+        f'[packages]\nexample = "=={version}"\n'
+        if filename == "Pipfile"
+        else _lock_content(default={"example": {"version": f"=={version}"}})
+    )
+    supply_chain._analyze_dependencies(content, filename)
+    assert osv_packages == [("example", version)]
+
+
+@pytest.mark.parametrize("filename", ["Pipfile", "Pipfile.lock"])
+def test_locations_are_specific_to_each_category(filename, osv_packages):
+    content = (
+        '[scripts]\nexample = "echo hello"\n[packages]\nexample = "==1.0"\n'
+        '[dev-packages]\nexample = "==2.0"\n'
+        if filename == "Pipfile"
+        else _lock_content(
+            default={"example": {"version": "==1.0"}},
+            develop={"example": {"version": "==2.0"}},
+        )
+    )
+    packages, limitations = supply_chain._extract_packages_from_pipenv(
+        content, is_lockfile=filename == "Pipfile.lock"
+    )
+
+    assert not limitations
+    assert [item[:2] for item in packages] == [("example", "1.0"), ("example", "2.0")]
+    assert packages[0][2] != packages[1][2]
+    for _name, _version, line in packages:
+        assert "example" in content.splitlines()[line - 1]
+
+
+def test_quoted_keys_and_expanded_package_tables(osv_packages):
+    content = '["packages"."pyyaml"]\nversion = "==5.3.1"\n'
+    packages, limitations = supply_chain._extract_packages_from_pipenv(content, is_lockfile=False)
+    assert packages == [("pyyaml", "5.3.1", 1)]
+    assert not limitations
+
+
+@pytest.mark.parametrize("quote", ['"""', "'''"])
+def test_multiline_metadata_cannot_supply_a_dependency_location(quote):
+    content = (
+        '[packages]\npyyaml = "==5.3.1"\n[scripts]\n'
+        f"review = [{quote}\n[packages]\npyyaml = 'inert text'\n{quote}]\n"
+    )
+    packages, limitations = supply_chain._extract_packages_from_pipenv(content, is_lockfile=False)
+    assert packages == [("pyyaml", "5.3.1", 2)]
+    assert not limitations
+
+
+def test_escaped_multiline_delimiter_does_not_end_metadata():
+    content = (
+        '[packages]\npyyaml = "==5.3.1"\n[scripts]\nreview = """\n'
+        '\\"""\n[packages]\npyyaml = "inert text"\n"""\n'
+    )
+    packages, limitations = supply_chain._extract_packages_from_pipenv(content, is_lockfile=False)
+    assert packages == [("pyyaml", "5.3.1", 2)]
+    assert not limitations
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        ("Pipfile", "[packages\npyyaml ="),
+        ("Pipfile", "packages = 42\n"),
+        ("Pipfile", "[packages]\npyyaml = false\n"),
+        ("Pipfile.lock", "{"),
+        ("Pipfile.lock", ""),
+        ("Pipfile.lock", "[]"),
+        ("Pipfile.lock", '{"default": []}'),
+        ("Pipfile.lock", '{"default": {"pyyaml": "==5.3.1"}}'),
+        ("Pipfile.lock", '{"default": {"pyyaml": {"version": ">=5.3"}}}'),
+    ],
+)
+def test_malformed_dependency_metadata_is_partial(filename, content, osv_packages):
+    _findings, limitations, count = supply_chain._analyze_dependencies_detailed(content, filename)
+    assert count == 0
+    assert not osv_packages
+    assert any(item.reason is LedgerReason.DEPENDENCY_PARSE_ERROR for item in limitations)
+
+
+@pytest.mark.parametrize("filename", ["Pipfile", "Pipfile.lock"])
+def test_non_registry_sources_are_not_queried_as_pypi(filename, osv_packages):
+    source = {"git": "https://example.invalid/repository.git", "version": "==5.3.1"}
+    content = (
+        '[packages]\npyyaml = {git = "https://example.invalid/repository.git", version = "==5.3.1"}\n'
+        if filename == "Pipfile"
+        else _lock_content(default={"pyyaml": source})
+    )
+    _findings, limitations, count = supply_chain._analyze_dependencies_detailed(content, filename)
+    assert not osv_packages
+    assert count == 0
+    assert any(item.error_class == "UnsupportedDependencySource" for item in limitations)
+
+
+@pytest.mark.parametrize("filename", ["Pipfile", "Pipfile.lock"])
+def test_package_limit_retains_partial_coverage(filename, osv_packages):
+    content = (
+        '[packages]\none = "==1.0"\ntwo = "==2.0"\n'
+        if filename == "Pipfile"
+        else _lock_content(default={"one": {"version": "==1.0"}, "two": {"version": "==2.0"}})
+    )
+    _findings, limitations, count = supply_chain._analyze_dependencies_detailed(
+        content, filename, max_packages=1
+    )
+    assert count == 1
+    assert osv_packages == [("one", "1.0")]
+    assert any(item.reason is LedgerReason.OUTPUT_LIMIT for item in limitations)
+
+
+def test_invalid_entries_cannot_bypass_the_extraction_limit(osv_packages):
+    content = _lock_content(default={f"package-{index}": False for index in range(20)})
+    _findings, limitations, count = supply_chain._analyze_dependencies_detailed(
+        content, "Pipfile.lock", max_packages=1
+    )
+    assert count == 0
+    assert not osv_packages
+    assert any(item.reason is LedgerReason.OUTPUT_LIMIT for item in limitations)
+
+
+def test_repeated_malformed_categories_keep_diagnostics_bounded():
+    content = json.dumps({f"category-{index}": False for index in range(100)})
+    packages, limitations = supply_chain._extract_packages_from_pipenv(content, is_lockfile=True)
+    assert not packages
+    assert len(limitations) == 1
+    assert limitations[0].reason is LedgerReason.DEPENDENCY_PARSE_ERROR
+
+
+def test_oversized_specifier_is_omitted_with_size_accounting(osv_packages):
+    content = '[packages]\nexample = "==' + "1" * supply_chain.MAX_DEPENDENCY_SPEC_CHARS + '"\n'
+    _findings, limitations, count = supply_chain._analyze_dependencies_detailed(content, "Pipfile")
+    assert count == 0
+    assert not osv_packages
+    assert any(item.reason is LedgerReason.SIZE_LIMIT for item in limitations)
+
+
+def test_malformed_lockfile_collector_retains_limitation():
+    versions, limitations = supply_chain._collect_locked_versions_detailed(
+        {"Pipfile.lock": ""}, ["Pipfile.lock"]
+    )
+    assert not versions
+    assert any(
+        path == "Pipfile.lock" and item.reason is LedgerReason.DEPENDENCY_PARSE_ERROR
+        for path, item in limitations
+    )
+
+
+@pytest.mark.parametrize("filename", ["Pipfile", "Pipfile.lock"])
+@pytest.mark.parametrize("version", ["5.3.1", "6.0.2"])
+def test_cli_checks_pipenv_dependencies(tmp_path, filename, version, osv_packages):
+    bundle = tmp_path / "skill"
+    bundle.mkdir()
+    (bundle / "SKILL.md").write_text(
+        "---\nname: dependency-review\n"
+        "description: Summarize project dependencies when the user asks for a dependency review.\n"
+        "---\n# Dependency Review\nRead the bundled project dependency list.\n"
+    )
+    content = (
+        f'[packages]\npyyaml = "=={version}"\n'
+        if filename == "Pipfile"
+        # The lock-only fixture models a transitive dependency without a
+        # matching manifest entry. Its coordinates must still be inspected.
+        else _lock_content(default={"pyyaml": {"version": f"=={version}"}})
+    )
+    (bundle / filename).write_text(content)
+    output = tmp_path / "report.json"
+    result = CliRunner().invoke(
+        app,
+        [
+            "scan",
+            str(bundle),
+            "--no-llm",
+            "--fail-on-findings",
+            "--fail-on-incomplete",
+            "--format",
+            "json",
+            "--output",
+            str(output),
+        ],
+    )
+    report = json.loads(output.read_text())
+
+    assert ("pyyaml", version) in osv_packages
+    assert report["analysis_completeness"]["is_complete"]
+    sc4 = [item for item in report["issues"] if item["id"] == "SC4"]
+    if version == "5.3.1":
+        assert result.exit_code == 1
+        assert len(sc4) == 1
+        assert "CVE-2020-14343" in sc4[0]["pattern"]
+        assert sc4[0]["location"]["file"] == filename
+    else:
+        assert result.exit_code == 0
+        assert not sc4
+
+
+@pytest.mark.parametrize("filename", ["Pipfile", "Pipfile.lock"])
+def test_cli_malformed_pipenv_files_cannot_look_complete(tmp_path, filename, osv_packages):
+    bundle = tmp_path / "skill"
+    bundle.mkdir()
+    (bundle / "SKILL.md").write_text("---\nname: review\n---\n# Review\n")
+    (bundle / filename).write_text("[packages" if filename == "Pipfile" else "")
+    output = tmp_path / "report.json"
+    result = CliRunner().invoke(
+        app,
+        [
+            "scan",
+            str(bundle),
+            "--no-llm",
+            "--fail-on-incomplete",
+            "--format",
+            "json",
+            "--output",
+            str(output),
+        ],
+    )
+    report = json.loads(output.read_text())
+
+    assert result.exit_code == 1
+    assert not report["analysis_completeness"]["is_complete"]
+    assert report["risk_assessment"]["recommendation"] != "SAFE"
+    assert any(
+        event["outcome"] == LedgerOutcome.PARTIAL
+        and event["reason_code"] == LedgerReason.DEPENDENCY_PARSE_ERROR
+        for event in report["analysis_completeness"]["ledger_exceptions"]
+    )
