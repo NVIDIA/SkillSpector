@@ -27,6 +27,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
+from html import escape as escape_html
 from io import StringIO
 from typing import Literal, cast
 
@@ -1407,9 +1408,26 @@ def _format_json(
     return json.dumps(data, indent=2)
 
 
+def _markdown_plain_text(value: object) -> str:
+    """Remove display controls and keep a Markdown field on one line."""
+    text = _clean_text(str(value)) or ""
+    return " ".join("".join(c for c in text if c.isprintable() or c.isspace()).splitlines())
+
+
 def _markdown_cell(value: object) -> str:
-    """Render dynamic report text safely inside a Markdown table cell."""
-    return str(value).replace("|", "\\|").replace("\n", " ")
+    """Render dynamic prose as literal text on one Markdown line."""
+    text = escape_html(_markdown_plain_text(value), quote=False)
+    return re.sub(r"([\\`*_{}\[\]()#+.!|>~-])", r"\\\1", text)
+
+
+def _markdown_code(value: object, *, table_cell: bool = False) -> str:
+    """Keep literal values inside their code spans and table cells."""
+    text = _markdown_plain_text(value)
+    if table_cell:
+        text = text.replace("|", "\\|")
+    delimiter = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
+    padding = " " if text.startswith(("`", " ")) or text.endswith(("`", " ")) else ""
+    return f"{delimiter}{padding}{text}{padding}{delimiter}"
 
 
 def _render_markdown_completeness(
@@ -1437,10 +1455,7 @@ def _render_markdown_completeness(
 
     patterns = completeness.get("exclude_patterns", [])
     if patterns:
-        spans = []
-        for pattern in patterns:
-            delimiter = "`" * (max((len(run) for run in re.findall(r"`+", pattern)), default=0) + 1)
-            spans.append(f"{delimiter} {pattern} {delimiter}")
+        spans = [_markdown_code(pattern) for pattern in patterns]
         lines.append(f"Explicit exclusion patterns: {', '.join(spans)}\n")
         lines.append(
             f"Excluded files (not inspected): {completeness.get('excluded_file_count', 0)}\n"
@@ -1463,7 +1478,7 @@ def _render_markdown_completeness(
                 location += f":{start_line}" + (f"-{end_line}" if end_line else "")
             reason = row.get("reason_code", row.get("status", "status"))
             lines.append(
-                f"| {_markdown_cell(reason)} | `{_markdown_cell(location)}` | "
+                f"| {_markdown_cell(reason)} | {_markdown_code(location, table_cell=True)} | "
                 f"{_markdown_cell(row.get('message', ''))} |"
             )
         lines.append("")
@@ -1504,8 +1519,8 @@ def _format_markdown(
     source = skill_path or ""
 
     lines.append("# SkillSpector Security Report\n")
-    lines.append(f"**Skill:** {skill_name}  ")
-    lines.append(f"**Source:** `{source}`  ")
+    lines.append(f"**Skill:** {_markdown_cell(skill_name)}  ")
+    lines.append(f"**Source:** {_markdown_code(source)}  ")
     lines.append(f"**Scanned:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}  ")
     lines.append("")
 
@@ -1513,15 +1528,15 @@ def _format_markdown(
         use_llm, llm_call_log or []
     )
     if effective_degraded_notice:
-        lines.append(f"> ⚠️ **Degraded scan:** {effective_degraded_notice}")
+        lines.append(f"> ⚠️ **Degraded scan:** {_markdown_cell(effective_degraded_notice)}")
         lines.append("")
 
     lines.append("## Risk Assessment\n")
     lines.append("| Metric | Value |")
     lines.append("|--------|-------|")
     lines.append(f"| Score | {risk_score}/100 |")
-    lines.append(f"| Severity | {risk_severity} |")
-    lines.append(f"| Recommendation | {risk_recommendation.replace('_', ' ')} |")
+    lines.append(f"| Severity | {_markdown_cell(risk_severity)} |")
+    lines.append(f"| Recommendation | {_markdown_cell(risk_recommendation.replace('_', ' '))} |")
     lines.append("")
 
     lines.append(f"## Components ({len(component_metadata)})\n")
@@ -1533,17 +1548,19 @@ def _format_markdown(
         line_count = comp.get("lines", 0)
         exec_flag = comp.get("executable", False)
         exec_marker = "Yes" if exec_flag else "No"
-        lines.append(f"| `{path}` | {typ} | {line_count} | {exec_marker} |")
+        lines.append(
+            f"| {_markdown_code(path, table_cell=True)} | {_markdown_cell(typ)} | {line_count} | {exec_marker} |"
+        )
     lines.append("")
 
     if structured_summaries:
         lines.append(f"## Structured Skill Summary ({len(structured_summaries)})\n")
         for summary in structured_summaries:
-            lines.append(f"### {summary.get('id', 'SSR-1')}\n")
-            lines.append(f"**Message:** {summary.get('message', '')}  ")
+            lines.append(f"### {_markdown_cell(summary.get('id', 'SSR-1'))}\n")
+            lines.append(f"**Message:** {_markdown_cell(summary.get('message', ''))}  ")
             file = _summary_display_value(summary.get("file"))
             if file:
-                lines.append(f"**File:** `{file}`  ")
+                lines.append(f"**File:** {_markdown_code(file)}  ")
             for key, label in (
                 ("protocol", "Protocol"),
                 ("layout_kind", "Layout"),
@@ -1555,7 +1572,7 @@ def _format_markdown(
             ):
                 value = _summary_display_value(summary.get(key))
                 if value:
-                    lines.append(f"**{label}:** {value}  ")
+                    lines.append(f"**{label}:** {_markdown_cell(value)}  ")
             lines.append("")
 
     lines.append(f"## Issues ({len(findings)})\n")
@@ -1566,23 +1583,23 @@ def _format_markdown(
         for f in findings:
             sev = (f.severity or "LOW").upper()
             emoji = severity_emoji.get(sev, "")
-            lines.append(f"### {emoji} {sev}: {f.rule_id}\n")
+            lines.append(f"### {emoji} {_markdown_cell(sev)}: {_markdown_cell(f.rule_id)}\n")
             end = f"–{f.end_line}" if f.end_line and f.end_line != f.start_line else ""
-            lines.append(f"**Location:** `{f.file}:{f.start_line}{end}`  ")
+            lines.append(f"**Location:** {_markdown_code(f'{f.file}:{f.start_line}{end}')}  ")
             if f.source_url:
-                lines.append(f"**Source:** `{f.source_url}`  ")
+                lines.append(f"**Source:** {_markdown_code(f.source_url)}  ")
                 lines.append(f"**Transitive depth:** {f.transitive_depth}  ")
             lines.append(f"**Confidence:** {f.confidence:.0%}  ")
             lines.append("")
-            lines.append(f"**Message:** {f.message}")
+            lines.append(f"**Message:** {_markdown_cell(f.message)}")
             lines.append("")
             if f.remediation:
-                lines.append(f"**Remediation:** {f.remediation}")
+                lines.append(f"**Remediation:** {_markdown_cell(f.remediation)}")
                 lines.append("")
             if f.evidence:
                 lines.append("**Evidence:**")
                 for key, evidence_value in sorted(f.evidence.items()):
-                    lines.append(f"- **{key}:** `{evidence_value}`")
+                    lines.append(f"- **{_markdown_cell(key)}:** {_markdown_code(evidence_value)}")
                 lines.append("")
             lines.append("---\n")
 
@@ -1596,8 +1613,9 @@ def _format_markdown(
             lines.append("|------|----------|--------|")
             for sf in suppressed:
                 f = sf.finding
-                reason = sf.reason.replace("|", "\\|")
-                lines.append(f"| {f.rule_id} | `{f.file}:{f.start_line}` | {reason} |")
+                reason = _markdown_cell(sf.reason)
+                location = _markdown_code(f"{f.file}:{f.start_line}", table_cell=True)
+                lines.append(f"| {_markdown_cell(f.rule_id)} | {location} | {reason} |")
             lines.append("")
         else:
             lines.append("_Run with `--show-suppressed` to list them._\n")
