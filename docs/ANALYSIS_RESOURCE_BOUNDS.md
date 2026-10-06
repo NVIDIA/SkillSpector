@@ -149,6 +149,27 @@ legacy package separators, incomplete fragments, and real parser limits remain
 on the conservative analysis path. A complex helper may therefore still need
 its particular ledger reason and expression reviewed.
 
+Perl `eval BLOCK` (for example `eval { require $module; 1 } or die $@;`) traps
+exceptions in already-compiled code and is not treated as a shell `eval` of a
+string. Its statements are still scanned. String forms such as `eval $code`
+and `eval "..."` remain on the conservative path.
+
+### Python strings and comments
+
+For a complete `.py` module that the Python parser accepts, each string literal
+(including f-strings) and comment owns its bytes. A shell quote or backtick that
+is left open inside one of them, such as a Markdown fence in a string or an
+apostrophe in a comment, is charged only up to the end of that token, never to
+the code that follows. Python code that happens to use a shell wrapper name, as
+in `signal.alarm(timeout)`, is not reparsed as a shell command string. A
+runtime-selected command named in a comment takes operands only from that
+comment.
+
+Literal payloads remain visible to every security check. A single string or
+comment that itself holds more unresolved shell text than the parser bound,
+invalid or fragmentary Python, and source with a non-Python shebang keep the
+conservative result.
+
 ## Structured skill data
 
 AISOP/AISP structured extraction consumes the already-bounded cache and shares the enclosing

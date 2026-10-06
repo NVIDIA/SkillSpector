@@ -25,15 +25,19 @@ Framework: ASI02.
 from __future__ import annotations
 
 import ast
+import io
 import re
 import sys
+import tokenize
+import warnings
 from bisect import bisect_right
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from threading import Lock
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
-from skillspector.python_ast import parse_python_source
+from skillspector.python_ast import MAX_PYTHON_AST_SOURCE_CHARS, parse_python_source
 from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
@@ -104,6 +108,33 @@ _PERL_LITERAL_PRINT_RE = re.compile(
 )
 _PERL_QUOTE_OPERATOR_RE = re.compile(r"\b(?:q[qwxr]?|m|s|tr|y)(?:\s+\S|[^\w\s])")
 _PERL_AMBIGUOUS_SIGIL_RE = re.compile(r"[$@%&*]\s*+[{#'\"`]")
+# Perl's ``eval BLOCK`` runs already-compiled statements and traps exceptions.
+# Only ``eval EXPR`` (a string, variable, or quote operator) reparses source.
+_PERL_EVAL_BLOCK_RE = re.compile(r"\s*+\{")
+# Outside string and comment tokens, valid Python ends a shell word at
+# whitespace or a shell control character. A backslash-newline is a line
+# continuation in both languages, so it does not end the word.
+_PYTHON_SHELL_WORD_BREAK_RE = re.compile(r"(?<!\\)(?<!\\\r)[\s;|&()<>]")
+# The tokenizer and the compiler disagree about a carriage return that does
+# not start CRLF, so such source never acquires token ownership.
+_LONE_CARRIAGE_RETURN_RE = re.compile(r"\r(?!\n)")
+# A shebang that names another interpreter (for example a shell polyglot)
+# makes the Python host ambiguous. Without a shebang, ``.py`` source is Python.
+_PYTHON_SHEBANG_RE = re.compile(
+    r"#![ \t]*+(?:\S*/)?(?:env[ \t]++(?:-\S*[ \t]++)*(?:\S*/)?)?"
+    r"(?:python[0-9.]*|pypy[0-9.]*|uv)(?=[ \t\r\n]|$)"
+)
+# ``warnings.catch_warnings`` swaps the process-global filter list, and analyzer
+# nodes run on concurrent graph worker threads. Two such blocks that exit out of
+# order can leave their ``ignore`` filter installed for the whole process, so
+# the ownership parse serializes its block.
+_PYTHON_OWNERSHIP_PARSE_LOCK = Lock()
+_PYTHON_TEMPLATE_STRING_STARTS = frozenset(
+    {tokenize.FSTRING_START, getattr(tokenize, "TSTRING_START", tokenize.FSTRING_START)}
+)
+_PYTHON_TEMPLATE_STRING_ENDS = frozenset(
+    {tokenize.FSTRING_END, getattr(tokenize, "TSTRING_END", tokenize.FSTRING_END)}
+)
 _PRINTF_FORMAT_CONVERSION_RE = re.compile(r"%[-+ #0-9.*']*[A-Za-z%]")
 _SHELL_ROOT_TARGET_ESCAPE_RE = re.compile(
     r"\\(?:[/~*?]|x(?:2[fF]|7[eE]|2[aA]|3[fF])|"
@@ -1930,9 +1961,17 @@ def _has_shell_command_word_exhaustion(
     *,
     structural_quote_closers: set[int] | None = None,
     structural_quote_openers: set[int] | None = None,
+    python_source: _PythonSourceOwnership | None = None,
+    perl_eval_blocks: bool = False,
     _command_string_depth: int = 0,
 ) -> bool:
-    """Find candidate command words whose deterministic parse hit a safety bound."""
+    """Find candidate command words whose deterministic parse hit a safety bound.
+
+    ``python_source`` supplies proven Python string and comment ownership, so
+    host code is never charged to a shell word or command string.
+    ``perl_eval_blocks`` recognizes Perl's exception-trapping ``eval BLOCK``,
+    which reparses no string.
+    """
     parsed_through = 0
     # Completed words own closing quotes, never executable expansion starts.
     # Inner commands remain independent candidates; never suppress their bodies.
@@ -1942,6 +1981,7 @@ def _has_shell_command_word_exhaustion(
     backtick_end_cache: dict[int, int | None] = {}
     may_have_destructive_outer_operands = _may_have_destructive_outer_operands(content)
     json_openers = sorted(structural_quote_openers or ())
+    complete_comments: set[tuple[int, int]] = set()
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
@@ -2007,6 +2047,10 @@ def _has_shell_command_word_exhaustion(
             unresolved_end = (
                 json_openers[next_json] if next_json < len(json_openers) else len(content)
             )
+            if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS and python_source is not None:
+                # Likewise, a host string or comment token owns its bytes: a
+                # shell quote it opens cannot continue into later host code.
+                unresolved_end = min(unresolved_end, python_source.word_end(start))
             if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS:
                 return True
             continue
@@ -2049,30 +2093,38 @@ def _has_shell_command_word_exhaustion(
             continue
         if parsed.limited:
             return True
-        if parsed.dynamic and may_have_destructive_outer_operands:
-            tokens, command_end, exhausted = _bounded_shell_tokens(
+        if (
+            parsed.dynamic
+            and may_have_destructive_outer_operands
+            and _has_runtime_command_operand_exhaustion(
                 content,
                 start,
                 parsed.end,
-                check_runtime=check_runtime,
+                check_runtime,
             )
-            if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
-                # Earlier prose (for example "row-first") cannot supply this
-                # command's operands. Refine only this candidate's exhausted
-                # span, including nested commands inside the executable word.
-                # Hitting the span bound always remains partial, including when
-                # real operands occur beyond that bound. This rescan is bounded
-                # by the same constant as the tokenizer.
-                check_runtime()
-                exhausted = _may_have_destructive_outer_operands(content[start:command_end])
-            if (
-                exhausted
-                or _has_unsupported_brace_expansion(tokens)
-                or _has_destructive_root_glob(tokens)
-                or _has_destructive_root_path(tokens)
-            ):
+        ):
+            comment = python_source.comment(start) if python_source is not None else None
+            if comment is None:
                 return True
-    for command_string in _shell_command_strings(content, check_runtime):
+            # A Python comment is prose that no shell receives, so a command
+            # named in it can take operands only from the same comment, never
+            # from later host code. Recheck that comment as standalone shell
+            # text. Strings are not confined: concatenation can supply their
+            # runtime operands.
+            if comment not in complete_comments:
+                if _has_shell_command_word_exhaustion(
+                    content[comment[0] : comment[1]],
+                    check_runtime,
+                    _command_string_depth=_command_string_depth,
+                ):
+                    return True
+                complete_comments.add(comment)
+    for command_string in _shell_command_strings(
+        content,
+        check_runtime,
+        perl_eval_blocks=perl_eval_blocks,
+        python_source=python_source,
+    ):
         if command_string is None or _command_string_depth >= 8:
             return True
         if _has_shell_command_word_exhaustion(
@@ -2084,9 +2136,42 @@ def _has_shell_command_word_exhaustion(
     return False
 
 
+def _has_runtime_command_operand_exhaustion(
+    content: str,
+    start: int,
+    word_end: int,
+    check_runtime: Callable[[], None],
+) -> bool:
+    """Return whether a runtime-selected command's operands are undecidable."""
+    tokens, command_end, exhausted = _bounded_shell_tokens(
+        content,
+        start,
+        word_end,
+        check_runtime=check_runtime,
+    )
+    if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
+        # Earlier prose (for example "row-first") cannot supply this
+        # command's operands. Refine only this candidate's exhausted
+        # span, including nested commands inside the executable word.
+        # Hitting the span bound always remains partial, including when
+        # real operands occur beyond that bound. This rescan is bounded
+        # by the same constant as the tokenizer.
+        check_runtime()
+        exhausted = _may_have_destructive_outer_operands(content[start:command_end])
+    return (
+        exhausted
+        or _has_unsupported_brace_expansion(tokens)
+        or _has_destructive_root_glob(tokens)
+        or _has_destructive_root_path(tokens)
+    )
+
+
 def _shell_command_strings(
     content: str,
     check_runtime: Callable[[], None],
+    *,
+    perl_eval_blocks: bool = False,
+    python_source: _PythonSourceOwnership | None = None,
 ) -> Iterator[str | None]:
     """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
     for clause_start in _shell_clause_starts(content, check_runtime):
@@ -2095,9 +2180,20 @@ def _shell_command_strings(
             content,
             clause_start,
             check_runtime,
+            perl_eval_blocks=perl_eval_blocks,
         )
-        if recognized:
-            yield command_string
+        if not recognized:
+            continue
+        if python_source is not None:
+            word_start = clause_start
+            while word_start < len(content) and content[word_start].isspace():
+                word_start += 1
+            if python_source.is_code(word_start):
+                # A clause that begins in Python code is Python, not shell:
+                # ``signal.alarm(timeout)`` names no ``timeout`` command.
+                # Shell text can only be reparsed from a string literal.
+                continue
+        yield command_string
 
 
 def _shell_clause_starts(
@@ -2203,6 +2299,8 @@ def _command_string_from_clause(
     content: str,
     start: int,
     check_runtime: Callable[[], None],
+    *,
+    perl_eval_blocks: bool = False,
 ) -> tuple[bool, str | None]:
     """Resolve a bounded wrapper chain to an ``eval`` or shell command string."""
     cursor = start
@@ -2249,6 +2347,15 @@ def _command_string_from_clause(
         if command in _SHELL_CLAUSE_PREFIX_WORDS:
             continue
         if command == "eval":
+            if (
+                perl_eval_blocks
+                and word == "eval"
+                and _PERL_EVAL_BLOCK_RE.match(content, cursor) is not None
+            ):
+                # Perl ``eval BLOCK`` is exception handling, not a string
+                # reparse. ``{`` starts a new clause, so the statements in the
+                # block are still scanned as ordinary command candidates.
+                return False, None
             return True, _eval_command_string(content, cursor, check_runtime)
         if command in _SHELL_COMMAND_STRING_SHELLS:
             for _ in range(16):
@@ -2441,6 +2548,164 @@ def _perl_literal_print_shell_text(
     for start, end in owned:
         output[start] = output[end - 1] = " "
     return "".join(output)
+
+
+def _python_literal_spans(
+    content: str,
+    check_runtime: Callable[[], None],
+) -> tuple[list[int], list[int]] | None:
+    """Return outermost string and comment token spans of valid Python source.
+
+    Return ``None`` unless the whole text is accepted by the Python parser,
+    so a fragment, malformed file, or shell-shebang polyglot cannot borrow
+    host ownership. Every span is checked against the exact source text.
+    """
+    # A leading U+FEFF byte-order mark fails the module parse below and keeps
+    # every conservative bound. The file cache decodes with ``utf-8``, not
+    # ``utf-8-sig``, so the AST analyzers already report such a file as a
+    # syntax error; stripping the mark belongs with that decoding fix.
+    if (
+        len(content) > MAX_PYTHON_AST_SOURCE_CHARS
+        or _LONE_CARRIAGE_RETURN_RE.search(content) is not None
+        or (content.startswith("#!") and _PYTHON_SHEBANG_RE.match(content) is None)
+    ):
+        return None
+    check_runtime()
+    try:
+        # The lenient tokenizer accepts bytes such as ``$`` and a backtick as
+        # operators. Requiring a module parse proves that every byte outside
+        # the spans below is Python syntax, never a shell quote or expansion.
+        # The scanned module's own parse already reports its compiler warnings
+        # (for example an invalid ``"\d"`` escape). Repeating them here would
+        # duplicate that output, and ``-W error`` would turn them into a
+        # ``SyntaxError`` that silently drops ownership.
+        with _PYTHON_OWNERSHIP_PARSE_LOCK, warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ast.parse(content)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    check_runtime()
+    line_starts = [0]
+    line_starts.extend(match.end() for match in re.finditer("\n", content))
+    starts: list[int] = []
+    ends: list[int] = []
+    template_depth = 0
+    template_start = 0
+
+    def offset(position: tuple[int, int]) -> int:
+        return line_starts[position[0] - 1] + position[1]
+
+    try:
+        for index, token in enumerate(tokenize.generate_tokens(io.StringIO(content).readline)):
+            if index % 256 == 0:
+                check_runtime()
+            if token.type in _PYTHON_TEMPLATE_STRING_STARTS:
+                if template_depth == 0:
+                    template_start = offset(token.start)
+                    if not content.startswith(token.string, template_start):
+                        return None
+                template_depth += 1
+            elif token.type in _PYTHON_TEMPLATE_STRING_ENDS:
+                template_depth -= 1
+                end = offset(token.end)
+                if template_depth < 0 or not content.endswith(token.string, 0, end):
+                    return None
+                if template_depth == 0:
+                    starts.append(template_start)
+                    ends.append(end)
+            elif not template_depth and token.type in (tokenize.STRING, tokenize.COMMENT):
+                # Inside a replacement field, nested strings and comments
+                # belong to the enclosing f-string or t-string span.
+                start, end = offset(token.start), offset(token.end)
+                if content[start:end] != token.string:
+                    return None
+                starts.append(start)
+                ends.append(end)
+    except (tokenize.TokenError, SyntaxError, ValueError, IndexError):
+        return None
+    if template_depth or any(ends[index] > starts[index + 1] for index in range(len(starts) - 1)):
+        return None
+    return starts, ends
+
+
+class _PythonSourceOwnership:
+    """Lazily proven Python string and comment ownership for one source text.
+
+    Python has no shell semantics. Shell text can occur only inside a Python
+    string, which owns its bytes, or as prose in a comment that no shell ever
+    receives. Python code between those tokens contains no shell quote or
+    expansion opener, so an in-phase shell word ends at the first code-level
+    whitespace or control character. A quote or substitution that is still
+    open there was opened inside an earlier string or comment token of the
+    same word, and that token owns the rest of it.
+
+    The token spans are computed lazily, only for source that reaches one of
+    these decisions. Invalid or ambiguous source keeps every conservative bound.
+    """
+
+    def __init__(self, content: str, check_runtime: Callable[[], None]) -> None:
+        self._content = content
+        self._check_runtime = check_runtime
+        self._spans: tuple[list[int], list[int]] | None = None
+        self._spans_computed = False
+        self._cached_word_start = -1
+        self._cached_word_end = -1
+
+    def _owned_spans(self) -> tuple[list[int], list[int]] | None:
+        if not self._spans_computed:
+            self._spans = _python_literal_spans(self._content, self._check_runtime)
+            self._spans_computed = True
+        return self._spans
+
+    def _owner(self, position: int) -> tuple[int, int] | None:
+        spans = self._owned_spans()
+        if spans is None:
+            return None
+        starts, ends = spans
+        index = bisect_right(starts, position) - 1
+        if index >= 0 and position < ends[index]:
+            return starts[index], ends[index]
+        return None
+
+    def is_code(self, position: int) -> bool:
+        """Return whether a position is proven Python code, not a literal."""
+        return self._owned_spans() is not None and self._owner(position) is None
+
+    def comment(self, position: int) -> tuple[int, int] | None:
+        """Return the span of a proven Python comment containing a position."""
+        owner = self._owner(position)
+        if owner is None or self._content[owner[0]] != "#":
+            return None
+        return owner
+
+    def word_end(self, start: int) -> int:
+        """Return the end of the host region a shell word at ``start`` can own."""
+        spans = self._owned_spans()
+        content = self._content
+        if spans is None:
+            return len(content)
+        # Candidates arrive in source order. No code-level break exists
+        # between a cached start and its result, so they share that result.
+        if self._cached_word_start <= start <= self._cached_word_end:
+            return self._cached_word_end
+        starts, ends = spans
+        cursor = start
+        while True:
+            self._check_runtime()
+            index = bisect_right(starts, cursor) - 1
+            if index >= 0 and cursor < ends[index]:
+                cursor = ends[index]
+            segment_end = starts[index + 1] if index + 1 < len(starts) else len(content)
+            match = _PYTHON_SHELL_WORD_BREAK_RE.search(content, cursor, segment_end)
+            if match is not None:
+                result = match.start()
+                break
+            if segment_end == len(content):
+                result = segment_end
+                break
+            cursor = segment_end
+        self._cached_word_start, self._cached_word_end = start, result
+        return result
 
 
 def _skip_command_substitution(
@@ -3697,19 +3962,28 @@ def has_bounded_parse_exhaustion(
     structural_quote_closers = None
     structural_quote_openers = None
     json_strings: list[tuple[int, int]] = []
+    python_source = None
     if file_type == "perl" and complete_context:
         content = _perl_literal_print_shell_text(content, check_runtime)
+    if file_type == "python" and complete_context:
+        # Only a complete module can prove Python token ownership. A fragment
+        # may begin inside a string and would invert code and literal bytes.
+        python_source = _PythonSourceOwnership(content, check_runtime)
     if file_type == "markdown":
         if complete_context:
             json_strings = validated_json_string_spans(content, check_runtime)
             structural_quote_closers = {end - 1 for _, end in json_strings}
             structural_quote_openers = {start for start, _ in json_strings}
         content = _markdown_shell_text(content, check_runtime, complete_context=complete_context)
+    # Perl ``eval BLOCK`` is recognized from its clause-initial ``eval`` and the
+    # adjacent brace alone, so unlike quote ownership it needs no full context.
     if _has_shell_command_word_exhaustion(
         content,
         check_runtime,
         structural_quote_closers=structural_quote_closers,
         structural_quote_openers=structural_quote_openers,
+        python_source=python_source,
+        perl_eval_blocks=file_type == "perl",
     ):
         return True
     covered_until = 0
