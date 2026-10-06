@@ -26,8 +26,8 @@ which enforces:
   adversarial skill content) is written to the process stdin, never
   injected into argv.
 - **Capability stripping** (per-binary): tools disabled, MCP disabled,
-  no extra directories, deny permission mode (claude); read-only sandbox
-  (codex).  ``--dangerously-skip-permissions`` is NEVER used.
+  no extra directories, deny permission mode (claude). Codex is disabled
+  until a complete no-tools policy is verified.  ``--dangerously-skip-permissions`` is NEVER used.
 - **Environment scrubbing**: API keys, SSH keys, cloud credentials, and
   other secrets are stripped from the child environment.
 - **Timeout enforcement**: the call raises ``TimeoutError`` rather than
@@ -41,8 +41,8 @@ which enforces:
   of capability removal).
 
 The JSON output envelope (``claude -p --output-format json``) is parsed
-and the assistant text is returned.  ``codex exec --json`` produces
-JSONL events; the last assistant message is extracted.
+and the assistant text is returned. The Codex JSONL parser is retained for
+compatibility, but Codex inference is disabled before a subprocess is started.
 """
 
 from __future__ import annotations
@@ -276,60 +276,23 @@ def _parse_claude_output(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Registered but disabled. Re-enabling requires a pinned CLI version and a
+# verified policy preflight that denies every model-driven tool and host-file read.
+_CODEX_DISABLED_REASON = (
+    "codex_cli is disabled: its read-only sandbox still permits commands to read "
+    "host files, and SkillSpector has no verified deny-all-tools policy for Codex. "
+    "Use an HTTP API provider or another supported CLI provider instead."
+)
+
+
 def _build_codex_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
-    """Build the argv list for a capability-stripped ``codex exec`` call.
+    """Refuse inference until all model tool execution can be disabled.
 
-    Flags chosen (verified end-to-end against codex 0.139.0):
-
-    ``exec``
-        Non-interactive subcommand. With NO positional prompt, codex reads the
-        instructions from stdin — which is exactly where the runner pipes the
-        prompt. (Passing ``-`` makes the prompt literally ``"-"`` and demotes
-        the real content to a ``<stdin>`` block, so we do not pass it.)
-
-    ``--json``
-        Emit JSONL events to stdout, enabling structured parsing.
-
-    ``--sandbox read-only``
-        Most restrictive sandbox mode. Model-generated shell commands are
-        restricted to read-only filesystem access; no code execution. Unlike
-        claude/gemini (which block model tool use entirely), codex's strictest
-        mode still permits read-only filesystem *reads* by model-generated
-        commands. This is informational, not an exfil channel: the call runs in
-        an isolated empty temp CWD, output returns only to the operator's own
-        report, and there is no network egress path.
-
-    ``--ephemeral``
-        Do not persist session files to disk (no residue from the scan).
-
-    ``--ignore-user-config``
-        Ignore ``$CODEX_HOME/config.toml``; use only our explicit flags.
-
-    ``--ignore-rules``
-        Do not load user/project ``.rules`` files.
-
-    ``--model <label>``
-        Use the requested model.
-
-    ``-m`` / ``--model`` label is validated via ``_validate_model_label``.
+    Read-only access is insufficient for untrusted prompts: host file contents
+    can leave through the model response. Disabling one shell feature does not
+    establish a deny-all policy for other or future tools.
     """
-    return [
-        binary,
-        "exec",
-        "--json",
-        "--sandbox",
-        "read-only",
-        # We run in an isolated empty temp dir (not a git repo); codex refuses
-        # an "untrusted" dir without this. Safe: --sandbox read-only still bars
-        # code execution, and the temp dir holds no project files.
-        "--skip-git-repo-check",
-        "--ephemeral",
-        "--ignore-user-config",
-        "--ignore-rules",
-        # --model omitted by default -> codex uses the account's default model
-        # (forwarded only when SKILLSPECTOR_MODEL is set).
-        *(["--model", _validate_model_label(model)] if model else []),
-    ]
+    raise AgentCLIError(_CODEX_DISABLED_REASON)
 
 
 def _parse_codex_output(raw: str) -> str:
@@ -799,17 +762,8 @@ def _claude_auth_check(binary: str) -> tuple[bool, str | None]:
 
 
 def _codex_auth_check(binary: str) -> tuple[bool, str | None]:
-    """Check codex is authenticated via ``codex login status`` (no inference)."""
-    try:
-        result = subprocess.run(
-            [binary, "login", "status"], capture_output=True, shell=False, timeout=15
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
-        return False, f"codex login status check failed: {exc}"
-    out = (result.stdout or b"").decode("utf-8", errors="replace").lower()
-    if result.returncode != 0 or "not logged in" in out:
-        return False, "codex is not authenticated (run `codex login`)"
-    return True, None
+    """Report Codex unavailable without starting a process (fail closed)."""
+    return False, _CODEX_DISABLED_REASON
 
 
 def _gemini_auth_check(binary: str) -> tuple[bool, str | None]:
