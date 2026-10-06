@@ -193,7 +193,9 @@ class TestBuildClaudeArgv:
         # --no-mcp-config is not a real claude flag and must not be used.
         assert "--no-mcp-config" not in argv
 
-    def test_setting_sources_is_empty_single_token_after_strict_mcp_config(self) -> None:
+    def test_setting_sources_is_empty_single_token_after_strict_mcp_config(
+        self,
+    ) -> None:
         argv = _build_claude_argv(CLAUDE_BINARY, MODEL, 4096)
         assert "--setting-sources=" in argv
         assert argv[argv.index("--strict-mcp-config") + 1] == "--setting-sources="
@@ -278,6 +280,83 @@ class TestScrubEnv:
         assert "PATH" in env
         assert "HOME" in env
 
+    def test_allowlist_preserves_runtime_and_drops_unknown_secrets(self) -> None:
+        runtime = {
+            "PATH": "/usr/bin",
+            "HOME": "/home/operator",
+            "USER": "operator",
+            "LOGNAME": "operator",
+            "USERNAME": "operator",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "TERM": "dumb",
+            "TMPDIR": "/tmp",
+            "SystemRoot": "C:/Windows",
+            "AppData": "C:/Users/operator/AppData",
+            "XDG_DATA_HOME": "/home/operator/.local/share",
+            "CLAUDE_CONFIG_DIR": "/home/operator/claude-login",
+            "HTTPS_PROXY": "http://proxy.example:8080",
+            "https_proxy": "http://proxy.example:8080",
+            "HTTP_PROXY": "http://proxy.example:8080",
+            "http_proxy": "http://proxy.example:8080",
+            "ALL_PROXY": "socks5://proxy.example:1080",
+            "all_proxy": "socks5://proxy.example:1080",
+            "NO_PROXY": "localhost",
+            "no_proxy": "localhost",
+            "NODE_EXTRA_CA_CERTS": "/certs/ca.pem",
+            "SSL_CERT_FILE": "/certs/ca.pem",
+            "SSL_CERT_DIR": "/certs",
+        }
+        secrets = dict.fromkeys(
+            (
+                "ANTHROPIC_AUTH_TOKEN",
+                "GEMINI_API_KEY",
+                "GH_TOKEN",
+                "GH_ENTERPRISE_TOKEN",
+                "GIT_SSL_CERT",
+                "GIT_SSL_KEY",
+                "SSLKEYLOGFILE",
+                "OPENROUTER_API_KEY",
+                "NPM_TOKEN",
+                "PYPI_TOKEN",
+                "DATABASE_URL",
+                "VAULT_TOKEN",
+                "future_vendor_auth",
+                "LC_SECRET",
+                "NODE_OPTIONS",
+                "PYTHONPATH",
+            ),
+            "synthetic-secret",
+        )
+        if sys.platform == "win32":
+            # Windows os.environ uppercases names and collapses case aliases.
+            runtime = {key.upper(): value for key, value in runtime.items()}
+            secrets = {key.upper(): value for key, value in secrets.items()}
+        original = runtime | secrets
+        with patch.dict(_agent_cli.os.environ, original, clear=True):
+            assert _scrub_env() == runtime
+            assert dict(_agent_cli.os.environ) == original
+
+    def test_claude_auth_probe_uses_the_inference_environment(self) -> None:
+        runtime = {
+            "PATH": "/usr/bin",
+            "CLAUDE_CONFIG_DIR": "/home/operator/claude-login",
+            "HTTPS_PROXY": "http://proxy.example:8080",
+        }
+        with (
+            patch.dict(
+                _agent_cli.os.environ, runtime | {"GH_TOKEN": "synthetic-secret"}, clear=True
+            ),
+            patch.object(_agent_cli.subprocess, "run") as run,
+        ):
+            run.return_value = subprocess.CompletedProcess(
+                [CLAUDE_BINARY, "auth", "status"], 0, b'{"loggedIn": true}'
+            )
+            assert _agent_cli._claude_auth_check(CLAUDE_BINARY) == (True, None)
+        assert run.call_args.kwargs["env"] == runtime
+        assert run.call_args.kwargs["shell"] is False
+        assert run.call_args.kwargs["timeout"] == 15
+
     @pytest.mark.parametrize("binary_name", ["claude", "gemini"])
     @pytest.mark.parametrize("lowercase", [False, True])
     def test_project_credentials_never_reach_child(
@@ -297,7 +376,8 @@ class TestScrubEnv:
         output = _GOOD_CLAUDE_OUTPUT
         with (
             patch(
-                "skillspector.providers._agent_cli.find_binary", return_value="/usr/bin/mock-cli"
+                "skillspector.providers._agent_cli.find_binary",
+                return_value="/usr/bin/mock-cli",
             ),
             patch("skillspector.providers._agent_cli.subprocess.Popen") as popen,
         ):
@@ -305,8 +385,8 @@ class TestScrubEnv:
             run_agent_cli(binary_name, PROMPT, model="")
         child_env = popen.call_args.kwargs["env"]
         assert not set(secrets).intersection(child_env)
-        assert child_env["SKILLSPECTOR_MODEL"] == "test-model"
-        assert child_env["SKILLSPECTOR_COMPAT_BASE_URL"] == "https://example.invalid"
+        assert "SKILLSPECTOR_MODEL" not in child_env
+        assert "SKILLSPECTOR_COMPAT_BASE_URL" not in child_env
         for key in secrets:
             assert _agent_cli.os.environ[key] == "synthetic-credential"
 
