@@ -208,7 +208,7 @@ def _sarif_artifact_location(
     if source_identity:
         uri = f"{source_identity}/{file_path}"
     else:
-        uri = str(occurrence.get("file", finding.file)).replace("\\", "/")
+        uri = str(occurrence.get("file", finding.file))
     properties = {
         {
             "source_identity": "sourceIdentity",
@@ -855,9 +855,7 @@ def _build_sarif(
             locations = [
                 SarifLocation(
                     physicalLocation=SarifPhysicalLocation(
-                        artifactLocation=SarifArtifactLocation(
-                            uri=quote(path.replace("\\", "/"), safe="/!")
-                        ),
+                        artifactLocation=SarifArtifactLocation(uri=quote(path, safe="/!")),
                         region=region,
                     )
                 )
