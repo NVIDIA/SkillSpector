@@ -487,6 +487,74 @@ def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> rege
     return regex.compile("".join(parts), timed_flags)
 
 
+# Only these audited shapes use the linear command path. Prefixes and suffixes
+# have no overlapping unbounded repeats; suffix matches cannot overlap. Keep
+# this registry explicit so a new catalog shape gets reviewed before bypassing
+# the interruptible engine.
+_LINEAR_PIPE_PATTERNS = frozenset(
+    {
+        r"curl\s+[^|]*-k\b",
+        r"curl\s+[^|]*--insecure\b",
+        r"wget\s+[^|]*--no-check-certificate",
+        r"(?:chmod|chown)\s+[^|]*a\+rwx",
+        r"git\s+push\s+[^|]*--force",
+        r"curl\s+[^|]*(?:-d|--data|--data-raw|--data-binary)\s+",
+        r"wget\s+[^|]*--post-(?:data|file)",
+        r"curl\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh",
+        r"wget\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh",
+        r"curl\s+[^|]*\|\s*(?:sudo\s+)?(?:python|python3|node|ruby|perl)",
+        r"wget\s+[^|]*\|\s*(?:sudo\s+)?(?:python|python3|node|ruby|perl)",
+        r"(?:&&|;)\s*(?:curl|wget)\s+[^|]*\|\s*(?:ba)?sh",
+        r"(?:create|write|mkdir)\s+[^|]*(?:~/|/home/|/tmp/)\.(?!git|ssh|aws)[a-z_-]+",
+    }
+)
+
+
+@functools.lru_cache(maxsize=128)
+def _linear_pipe_parts(source: str, flags: int) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    prefix, suffix = source.split("[^|]*", 1)
+    return re.compile(prefix, flags), re.compile(suffix, flags)
+
+
+def _linear_pipe_matches(
+    original: re.Pattern[str], content: str, start: int, end: int
+) -> Iterator[re.Match[str]]:
+    """Preserve greedy matches while visiting each pipe-free segment once.
+
+    The wildcard chooses the rightmost possible suffix. If an earlier command
+    precedes it, the original pattern can match at that command in one anchored
+    pass. Without such a pair, skip the segment without retrying every command.
+    Each successful match consumes the last suffix in its segment, so the total
+    prefix, suffix and anchored scanning is linear in the window length.
+    """
+    start, end = max(0, start), min(len(content), max(0, end))
+    prefix, suffix = _linear_pipe_parts(original.pattern, original.flags)
+    pipe_suffix = suffix.pattern.startswith(r"\|")
+    budget = _ACTIVE_FINDING_BUDGET.get()
+    while start < end:
+        if budget is not None:
+            budget.check_runtime()
+        pipe = content.find("|", start, end)
+        stop = end if pipe < 0 else pipe
+        last_suffix = None
+        if pipe_suffix:
+            if pipe >= 0:
+                last_suffix = suffix.match(content, pipe, end)
+        else:
+            for candidate in suffix.finditer(content, start, stop):
+                last_suffix = candidate
+        if last_suffix is not None:
+            command = prefix.search(content, start, last_suffix.start())
+            if command is not None:
+                match = original.match(content, command.start(), end)
+                if match is None:
+                    raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+                start = max(stop + 1, match.end())
+                yield match
+                continue
+        start = stop + 1
+
+
 def iter_pattern_matches(
     pattern: str | re.Pattern[str],
     content: str,
@@ -500,7 +568,16 @@ def iter_pattern_matches(
     if budget is not None:
         budget.check_runtime()
     original = re.compile(pattern, flags)
-    compiled = _timed_pattern(original.pattern, original.flags, content.isascii())
+    linear_matches = (
+        _linear_pipe_matches(original, content, start, len(content) if end is None else end)
+        if original.pattern in _LINEAR_PIPE_PATTERNS and not original.flags & re.VERBOSE
+        else None
+    )
+    compiled = (
+        None
+        if linear_matches is not None
+        else _timed_pattern(original.pattern, original.flags, content.isascii())
+    )
     matching_seconds = 0.0
     matching_limit = _STATIC_PATTERN_SECONDS
     skip_empty = False
@@ -521,27 +598,34 @@ def iter_pattern_matches(
             started_at = time.thread_time()
             expired = False
             try:
-                matches = compiled.finditer(
-                    content,
-                    start,
-                    len(content) if end is None else end,
-                    timeout=timeout,
-                    concurrent=False,
-                )
-                if skip_empty:
-                    # Replay the previous empty match so the native iterator
-                    # can still return a nonempty match at the same position.
-                    next(matches, None)
-                match = next(matches, None)
+                if linear_matches is not None:
+                    match = next(linear_matches, None)
+                else:
+                    assert compiled is not None
+                    matches = compiled.finditer(
+                        content,
+                        start,
+                        len(content) if end is None else end,
+                        timeout=timeout,
+                        concurrent=False,
+                    )
+                    if skip_empty:
+                        # Replay the previous empty match so the native iterator
+                        # can still return a nonempty match at the same position.
+                        next(matches, None)
+                    match = next(matches, None)
             except TimeoutError:
                 expired = True
             finally:
                 matching_seconds += max(0.0, time.thread_time() - started_at)
             if budget is not None:
                 budget.check_runtime()
+            if linear_matches is not None and matching_seconds >= matching_limit:
+                raise TimeoutError
             if expired:
-                # The engine counts all process CPU; native work in other
-                # threads must not consume this thread's matching allowance.
+                # The engine counts all process CPU. Retry within this thread's
+                # allowance; sustained contention can still exhaust it through
+                # repeated searches that make no retained progress.
                 continue
             if match is None:
                 return

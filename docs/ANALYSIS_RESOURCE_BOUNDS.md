@@ -298,13 +298,27 @@ default. Set `SKILLSPECTOR_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT` to a positi
 finite number of seconds to change that allowance. Invalid, zero, negative,
 infinite, or NaN values log a warning and retain the 300-second default.
 
-The routed prompt-injection, tool-misuse, data-exfiltration, and supply-chain
-patterns also have a fixed 0.25-second matching CPU limit per search. Raising the
-artifact allowance does not raise this limit. Caller work and other threads do
-not consume the matching allowance. If a search expires, its ledger event keeps
-that search's observed time and limit, and the analyzer records partial coverage
-for the artifact. Other catalog modules and helper-specific searches are outside
-this timed matcher; this is not a deadline on every regular expression.
+The shared matcher has a fixed 0.25-second matching CPU limit per search.
+Raising the artifact allowance does not raise this limit. It covers routed rules
+in prompt injection, tool misuse, data exfiltration, supply chain, agent snooping,
+excessive agency, memory poisoning, and rogue agents. Through paragraph matching,
+it also covers prose rules in harmful content, system prompt leakage, output
+handling, anti-refusal, privilege escalation, and SSRF. Other code rules and
+helper-specific searches remain outside this matcher.
+
+Audited command/option patterns use a linear, pipe-segment search that preserves
+unbounded command spans and the original greedy matches. Memory poisoning's
+2–20-character repetition rule uses Python's native engine: failed candidates
+examine at most 20 copies, and successful candidates consume the repeated run.
+This linear rule is bounded by the 256,000-character inspection window and the
+artifact deadline, rather than the slower engine's per-search timer.
+
+Matching CPU accounting excludes caller work and other threads. The interruptible
+engine itself measures process CPU, however, so native work in competing threads
+can interrupt a search early. Retrying discards progress and can still exhaust the
+matching allowance under sustained contention. If a search expires, its ledger
+event keeps the observed time and limit, and that analyzer records partial coverage
+for the artifact while retaining findings already produced.
 
 ## Configuring the dependency-source deadline
 

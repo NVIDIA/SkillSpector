@@ -2423,10 +2423,20 @@ def test_timed_pattern_retries_process_cpu_from_other_threads(monkeypatch):
     assert calls == 3
 
 
-@pytest.mark.parametrize("content_kind", ["unicode_docs", "command_reference"])
-def test_production_window_ordinary_content_remains_complete(content_kind):
-    from skillspector.nodes.analyzers import static_patterns_tool_misuse
+_TIMED_ANALYZERS = (
+    "agent_snooping", "excessive_agency", "memory_poisoning", "rogue_agent",
+    "prompt_injection", "tool_misuse", "data_exfiltration", "supply_chain",
+    "harmful_content", "system_prompt_leakage", "output_handling", "anti_refusal",
+    "privilege_escalation", "ssrf",
+)
 
+
+@pytest.mark.parametrize("analyzer", _TIMED_ANALYZERS)
+@pytest.mark.parametrize("content_kind", ["unicode_docs", "command_reference", "unrelated_flag"])
+def test_production_window_ordinary_content_remains_complete(analyzer, content_kind):
+    import importlib
+
+    module = importlib.import_module(f"skillspector.nodes.analyzers.static_patterns_{analyzer}")
     if content_kind == "unicode_docs":
         root = Path(__file__).resolve().parents[3]
         sample = (root / "docs/DEVELOPMENT.md").read_text().split("## 2.", 1)[0]
@@ -2437,28 +2447,96 @@ def test_production_window_ordinary_content_remains_complete(content_kind):
             "curl -X GET https://example.test/status -H 'Accept: application/json'\n"
             "The response includes its current status and version.\n"
         )
-    content = (sample * (256_000 // len(sample) + 1))[:256_000]
+    prefix = "sort -k 2 results.txt\n" if content_kind == "unrelated_flag" else ""
+    content = (prefix + sample * (256_000 // len(sample) + 1))[:256_000]
     assert len(content) == 256_000
     if content_kind == "unicode_docs":
         assert not content.isascii()
     result = static_runner.run_static_patterns_with_ledger(
-        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
-        [static_patterns_tool_misuse],
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [module]
     )
     assert all(event["outcome"] == "completed" for event in result["inspection_ledger"]), result[
         "inspection_ledger"
     ]
 
 
-@pytest.mark.parametrize("option", ["-k", "-K", "-K", "--insecure", "--ınſecure"])
-def test_curl_option_prefilter_preserves_case_aliases_and_multiline_matches(option):
-    from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
+def test_linear_pipe_registry_covers_routed_catalog_shapes():
+    import importlib
 
-    content = "curl https://example.test/ \\\n    " + option
-    expected = [
-        (match.start(), match.end(), match.group(), confidence)
-        for pattern, confidence in module.TM1_PATTERNS
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE)
-    ]
-    assert expected
-    assert list(module._tm1_candidates(content)) == expected
+    actual = set()
+    for name in _TIMED_ANALYZERS:
+        module = importlib.import_module(f"skillspector.nodes.analyzers.static_patterns_{name}")
+        for key, rules in vars(module).items():
+            if key.endswith("_PATTERNS") and isinstance(rules, list):
+                for rule in rules:
+                    if isinstance(rule, tuple) and isinstance(rule[0], str) and "[^|]*" in rule[0]:
+                        actual.add(rule[0])
+    assert actual == static_runner._LINEAR_PIPE_PATTERNS
+
+
+@pytest.mark.parametrize("pattern", sorted(static_runner._LINEAR_PIPE_PATTERNS))
+def test_linear_pipe_matching_preserves_native_spans(pattern):
+    examples = (
+        "curl PAYLOAD -k --insecure -d value | sudo bash",
+        "wget PAYLOAD --no-check-certificate --post-data=value | sh",
+        "curl PAYLOAD | sudo python3",
+        "wget PAYLOAD | node",
+        "chmod PAYLOAD a+rwx",
+        "chown PAYLOAD a+rwx",
+        "git push PAYLOAD --force",
+        "; curl PAYLOAD | bash",
+        "mkdir PAYLOAD /tmp/.hidden",
+    )
+    compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    positive = next(example for example in examples if compiled.search(example))
+    prefix, suffix = positive.split("PAYLOAD", 1)
+    for text in (
+        positive,
+        "sort -k 2 results.txt\n" + positive + "\n" + positive,
+        positive + " | unrelated | " + positive,
+        positive.upper(),
+        positive.replace(" ", "\u00a0"),
+        prefix,
+        suffix,
+        positive.replace("PAYLOAD", "x" * 100_000),
+    ):
+        for start, end in ((0, len(text)), (1, len(text)), (0, len(text) - 2), (-1, len(text))):
+            expected = [(match.span(), match.group(), match.groups()) for match in compiled.finditer(text, start, end)]
+            actual = [(match.span(), match.group(), match.groups()) for match in static_runner.iter_pattern_matches(compiled, text, start=start, end=end)]
+            assert actual == expected, (pattern, text[:80], start, end)
+
+
+@pytest.mark.parametrize(
+    ("analyzer", "rule_id", "content"),
+    [
+        ("tool_misuse", "TM1", "curl " + "x" * 100_000 + " --insecure"),
+        ("data_exfiltration", "E1", "curl " + "x" * 100_000 + " -d private-data"),
+        ("supply_chain", "SC2", "curl " + "x" * 100_000 + " | bash"),
+        ("memory_poisoning", "MP2", "abcde" * 100),
+    ],
+)
+def test_linear_native_paths_retain_detections(analyzer, rule_id, content):
+    import importlib
+
+    module = importlib.import_module(f"skillspector.nodes.analyzers.static_patterns_{analyzer}")
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [module]
+    )
+    assert any(finding.rule_id == rule_id for finding in result["findings"])
+    assert all(event["outcome"] == "completed" for event in result["inspection_ledger"])
+
+
+def test_bounded_repetition_stays_on_native_engine(monkeypatch):
+    original = static_runner.iter_pattern_matches
+    repetition = memory_poisoning_module._BOUNDED_REPETITION_PATTERN
+
+    def checked(pattern, *args, **kwargs):
+        assert pattern != repetition
+        return original(pattern, *args, **kwargs)
+
+    monkeypatch.setattr(static_runner, "iter_pattern_matches", checked)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": "abcde" * 100}},
+        [memory_poisoning_module],
+    )
+    assert any(finding.rule_id == "MP2" for finding in result["findings"])
