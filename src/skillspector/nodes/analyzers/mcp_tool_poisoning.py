@@ -942,7 +942,8 @@ class _TP4Candidate:
     content: str
     start_line: int = 1
     end_line: int = 1
-    context: str = ""
+    context_before: str = ""
+    context_after: str = ""
 
 
 _TP4_MARKDOWN_TYPES = frozenset({"markdown", "text"})
@@ -1016,7 +1017,7 @@ def _tp4_preceding_block(preceding: Sequence[str]) -> list[str]:
 _TP4_HEADING_SHARE_CHARS = 256
 
 
-def _truncate_preceding(text: str) -> str:
+def _truncate_preceding(text: str, max_chars: int = TP4_PRE_CONTEXT_CHARS) -> str:
     """Truncate preceding context, keeping the heading and nearest lines.
 
     A plain head cut would keep the oldest prose and drop the lines nearest
@@ -1027,15 +1028,17 @@ def _truncate_preceding(text: str) -> str:
     same reason: the line just above the fence is the most likely
     introduction to the code.
     """
-    if len(text) <= TP4_PRE_CONTEXT_CHARS:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
         return text
     lines = text.split("\n")
     if lines and _TP4_HEADING_RE.match(lines[0]):
         head = lines[0][:_TP4_HEADING_SHARE_CHARS]
         rest = "\n".join(lines[1:])
-        keep = TP4_PRE_CONTEXT_CHARS - len(head) - 1
-        return head + "\n" + rest[-keep:] if keep > 0 else head[:TP4_PRE_CONTEXT_CHARS]
-    return text[-TP4_PRE_CONTEXT_CHARS:]
+        keep = max_chars - len(head) - 1
+        return head + "\n" + rest[-keep:] if keep > 0 else head[:max_chars]
+    return text[-max_chars:]
 
 
 def _tp4_trailing_block(following: Sequence[str]) -> list[str]:
@@ -1064,35 +1067,37 @@ def _tp4_trailing_block(following: Sequence[str]) -> list[str]:
     return collected
 
 
-def _tp4_fence_context(preceding: Sequence[str], following: Sequence[str]) -> str:
-    """Return the bounded prose around a fence, if any.
+def _tp4_fence_context(preceding: Sequence[str], following: Sequence[str]) -> tuple[str, str]:
+    """Return the bounded prose around a fence as ``(before, after)``.
 
     A fenced block is often introduced (or followed) by text that changes how
     it should be read, such as a heading marking it as an example that must
     not be run, or an instruction to run it. The extractor cannot see that
     framing when only the fence body is sent, so a short window of prose from
     both sides is retained with the code, each side under its own cap so a
-    long warning above the fence cannot starve the instruction below it.
+    long warning above the fence cannot starve the instruction below it. The
+    two sides stay separate so budget pressure can shrink each one with
+    nearest-fence priority instead of cutting the trailing side off.
     """
-    before = _truncate_preceding("\n".join(_tp4_preceding_block(preceding)))
+    before = _truncate_preceding("\n".join(_tp4_preceding_block(preceding)), TP4_PRE_CONTEXT_CHARS)
     after_lines = _tp4_trailing_block(following)
     after = "\n".join(after_lines)
     if len(after) > TP4_POST_CONTEXT_CHARS:
         after = after[:TP4_POST_CONTEXT_CHARS]
-    parts = [part for part in (before, after) if part]
-    return "\n".join(parts)
+    return before, after
 
 
 def _iter_tp4_markdown_fences(
     content: str,
-) -> Iterator[tuple[str, str, int, int, str]]:
+) -> Iterator[tuple[str, str, int, int, str, str]]:
     """Yield labeled, non-empty executable fences and their surrounding context.
 
-    Yields ``(language, body, start_line, end_line, context)`` where ``context``
-    is the bounded prose around the fence. Context is resolved in a second
-    pass so the trailing window is available: ``preceding`` spans from the end
-    of the previous completed fence to the opening fence, exactly as the
-    streaming walk observed it.
+    Yields ``(language, body, start_line, end_line, before, after)`` where
+    ``before`` and ``after`` are the bounded prose around the fence, kept as
+    separate sides so budget pressure can shrink each one with nearest-fence
+    priority. Context is resolved in a second pass so the trailing window is
+    available: ``preceding`` spans from the end of the previous completed
+    fence to the opening fence, exactly as the streaming walk observed it.
     """
     lines = content.splitlines(keepends=True)
     fences: list[tuple[str, str, int, int, int, int, int]] = []
@@ -1139,13 +1144,8 @@ def _iter_tp4_markdown_fences(
                 continue
         body.append(line)
     for language, body_text, start, end, resume, opened, closed in fences:
-        yield (
-            language,
-            body_text,
-            start,
-            end,
-            _tp4_fence_context(lines[resume:opened], lines[closed + 1 :]),
-        )
+        before, after = _tp4_fence_context(lines[resume:opened], lines[closed + 1 :])
+        yield language, body_text, start, end, before, after
 
 
 @dataclass
@@ -1413,24 +1413,41 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
             path = candidate.path
             record_declaration_limit()
             header = f"### {candidate.path} ({candidate.language})\n"
-            context_text = candidate.context
-            if context_text:
-                # Header and context share the prompt with the code, so room
-                # for them comes out of this candidate's chunk budget, in
-                # characters to avoid token-rounding drift. Shrink the context
-                # first and drop it before ever touching code.
-                allowance = (
-                    (code_token_budget - TP4_MIN_CODE_TOKENS) * 4
-                    - len(header)
-                    - len(_TP4_CONTEXT_OPEN)
-                    - 1
-                    - len(_TP4_CONTEXT_CLOSE)
-                )
-                if allowance < len(context_text):
-                    context_text = context_text[: max(0, allowance)] if allowance > 0 else ""
+            before, after = candidate.context_before, candidate.context_after
+            had_context = bool(before or after)
+            # Header and context share the prompt with the code, so room for
+            # them comes out of this candidate's chunk budget, in characters
+            # to avoid token-rounding drift. Each side shrinks independently
+            # with nearest-fence priority: the combined head cut this replaces
+            # kept the preceding side whole and dropped the trailing
+            # instruction first. Shrink the context first and drop it before
+            # ever touching code.
+            fixed = len(header) + len(_TP4_CONTEXT_OPEN) + 1 + len(_TP4_CONTEXT_CLOSE)
+            room = (code_token_budget - TP4_MIN_CODE_TOKENS) * 4 - fixed
+            if had_context:
+                half = max(0, room // 2)
+                before_cap = half + max(0, half - len(after))
+                after_cap = half + max(0, half - len(before))
+                before = _truncate_preceding(before, before_cap) if before else ""
+                after = after[:after_cap] if after else ""
+            parts = [part for part in (before, after) if part]
             context_block = (
-                f"{_TP4_CONTEXT_OPEN}{context_text}\n{_TP4_CONTEXT_CLOSE}" if context_text else ""
+                f"{_TP4_CONTEXT_OPEN}" + "\n".join(parts) + f"\n{_TP4_CONTEXT_CLOSE}"
+                if parts
+                else ""
             )
+            if had_context and not parts:
+                # The budget cannot retain any framing: record the omission
+                # explicitly rather than analyzing bare code as complete.
+                add_partial_once(
+                    _tp4_partial_event(
+                        path,
+                        LedgerReason.SIZE_LIMIT,
+                        observed_characters=len(candidate.context_before)
+                        + len(candidate.context_after),
+                        limit_characters=max(0, room),
+                    )
+                )
             candidate_token_budget = code_token_budget - estimate_tokens(header + context_block)
             if candidate_token_budget < TP4_MIN_CODE_TOKENS and context_block:
                 # Safety net if the token estimate ever diverges from the
@@ -1639,10 +1656,23 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     return
                 if not retained:
                     continue
-                for language, body, start_line, end_line, context in _iter_tp4_markdown_fences(
-                    retained
-                ):
-                    yield _TP4Candidate(path, language, body, start_line, end_line, context)
+                for (
+                    language,
+                    body,
+                    start_line,
+                    end_line,
+                    before,
+                    after,
+                ) in _iter_tp4_markdown_fences(retained):
+                    yield _TP4Candidate(
+                        path,
+                        language,
+                        body,
+                        start_line,
+                        end_line,
+                        before,
+                        after,
+                    )
                     if stop_reason is not None:
                         break
 
