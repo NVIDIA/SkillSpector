@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from skillspector.allowed_tools import allowed_tool_grant_name, iter_allowed_tools_entries
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
@@ -250,18 +251,17 @@ def _normalize_allowed_tools(
 
     Accepts the list form (``[Bash, Read]``), the comma-separated string
     form (``"Bash, Read"``), and the space-separated string form
-    (``"Bash Read"``). Anything else yields an empty list.
+    (``"Bash Read"``). Separators inside a ``Tool(specifier)`` scope do not
+    split, so ``"Bash(git status:*) Read"`` yields two entries. Anything else
+    yields an empty list.
     """
     tools: list[str] = []
     if isinstance(value, list):
         candidates = iter(value)
     elif isinstance(value, str):
-        if "," in value:
-            # A bounded split prevents a comma-dense declaration from creating an
-            # arbitrarily large temporary list before the analyzer can stop it.
-            candidates = iter(value.split(",", _MAX_DECLARATION_VALUES))
-        else:
-            candidates = iter(value.split(None, _MAX_DECLARATION_VALUES))
+        # Entries are produced lazily, so a comma-dense declaration stops at the
+        # limit below without building an arbitrarily large temporary list.
+        candidates = iter_allowed_tools_entries(value)
     else:
         return tools
 
@@ -351,7 +351,7 @@ def _map_permissions_to_categories(
 
 
 # Tool name → capability category (Claude / Agent Skills tool names, case-insensitive exact match
-# on the name before any ``(specifier)``)
+# on the name of a well-formed bare or ``Tool(specifier)`` grant)
 _TOOL_TO_CAPABILITY: dict[str, str] = {
     "bash": "shell",
     "execute": "shell",
@@ -378,19 +378,17 @@ def _map_allowed_tools_to_categories(
 
     Scoped grants in the ``Tool(specifier)`` form, such as ``Bash(git:*)`` or
     ``WebFetch(domain:example.com)``, map by their tool name, so a narrower
-    grant covers the same category as the bare tool.
+    grant covers the same category as the bare tool. Incomplete or malformed
+    grants such as ``Bash(`` or ``Bash(notes).md)`` map to no category.
     """
     categories: set[str] = set()
     for tool in tools:
         if budget is not None:
             budget.check_runtime("SKILL.md")
-        # Only the tool name before an optional ``(specifier)`` is looked up;
-        # bound the search so long specifiers are not copied or case-folded.
-        paren = tool.find("(", 0, 65)
-        name = tool[:paren] if paren != -1 else tool
-        if len(name) > 64:
+        name = allowed_tool_grant_name(tool)
+        if name is None:
             continue
-        cat = _TOOL_TO_CAPABILITY.get(name.lower().strip())
+        cat = _TOOL_TO_CAPABILITY.get(name.lower())
         if cat:
             categories.add(cat)
     return categories

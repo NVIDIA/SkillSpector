@@ -417,6 +417,94 @@ class TestLP3AllowedTools:
         )
         assert categories == {"shell", "network", "file_read", "file_write"}
 
+    @pytest.mark.parametrize(
+        "allowed_tools",
+        [
+            pytest.param("Read(./docs Bash(notes).md)", id="space_string_bash_inside_read_scope"),
+            pytest.param("Read(./docs, Bash(notes).md)", id="comma_string_bash_inside_read_scope"),
+            pytest.param(["Read(./docs Bash(notes).md)"], id="list_bash_inside_read_scope"),
+            pytest.param(["Bash("], id="list_unclosed_bash_scope"),
+            pytest.param(["Bash(notes"], id="list_unterminated_bash_scope"),
+            pytest.param("Bash(notes Read", id="space_string_unterminated_bash_scope"),
+            pytest.param(["Bash()"], id="list_empty_bash_scope"),
+            pytest.param(["Bash(notes).md)"], id="list_text_after_bash_scope"),
+        ],
+    )
+    def test_allowed_tools_malformed_or_nested_bash_still_lp1(self, allowed_tools):
+        """Only a complete grant names a tool. Text inside another grant's
+        scope, such as ``Bash(notes)`` in ``Read(./docs Bash(notes).md)``, and
+        incomplete grants such as ``Bash(`` do not declare Bash, so they do not
+        cover the shell capability."""
+        state = _make_state("mcp_underdeclared_skill")
+        state["manifest"]["permissions"] = None
+        state["manifest"]["allowed-tools"] = allowed_tools
+        state["file_cache"]["skill.py"] = "import subprocess\nsubprocess.run(['git', 'status'])\n"
+        state["component_metadata"] = [
+            {"path": "skill.py", "type": "python", "executable": True, "lines": 2, "size_bytes": 60}
+        ]
+        state["components"] = ["skill.py"]
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp1_findings = [f for f in findings if f.rule_id == "LP1" and "shell" in f.message]
+        assert len(lp1_findings) == 1, (
+            "No complete Bash grant is declared — LP1 for shell expected, got: "
+            f"{[(f.rule_id, f.message) for f in findings]}"
+        )
+
+    @pytest.mark.parametrize(
+        ("allowed_tools", "expected"),
+        [
+            pytest.param(
+                "Bash(git status:*) Read",
+                ["Bash(git status:*)", "Read"],
+                id="space_inside_scope",
+            ),
+            pytest.param(
+                "Bash(git status:*), Read",
+                ["Bash(git status:*)", "Read"],
+                id="comma_string",
+            ),
+            pytest.param(
+                "Read(./docs Bash(notes).md)",
+                ["Read(./docs Bash(notes).md)"],
+                id="nested_parens_inside_scope",
+            ),
+            pytest.param(
+                "Read(./docs, Bash(notes).md)",
+                ["Read(./docs, Bash(notes).md)"],
+                id="comma_inside_scope",
+            ),
+            pytest.param(
+                "Bash(git status:*) Read(./a, b)",
+                ["Bash(git status:*)", "Read(./a, b)"],
+                id="comma_only_inside_scope_keeps_space_form",
+            ),
+            pytest.param("Bash(notes Read", ["Bash(notes Read"], id="unclosed_scope_keeps_rest"),
+            pytest.param("Bash) Read", ["Bash)", "Read"], id="stray_close_paren"),
+        ],
+    )
+    def test_normalize_allowed_tools_keeps_scoped_grants_whole(self, allowed_tools, expected):
+        assert mcp_least_privilege._normalize_allowed_tools(allowed_tools) == expected
+
+    def test_map_allowed_tools_ignores_malformed_grants(self):
+        malformed = [
+            "Bash(",
+            "Bash(notes",
+            "Bash()",
+            "Bash( )",
+            "Bash(notes).md)",
+            "Bash(a)(b)",
+            "Bash)",
+            "(Bash)",
+            "Bash (git:*)",
+            "Read(./docs Bash(notes).md",
+        ]
+        assert mcp_least_privilege._map_allowed_tools_to_categories(malformed) == set()
+        # A scope may itself contain balanced parentheses.
+        assert mcp_least_privilege._map_allowed_tools_to_categories(
+            ["Read(./docs Bash(notes).md)", "Edit(./notes (old)/**)"]
+        ) == {"file_read", "file_write"}
+
 
 class TestLP4OverDeclared:
     def test_over_declared_detected(self):
