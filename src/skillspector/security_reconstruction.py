@@ -236,6 +236,8 @@ _ENCODED_DOUBLE_QUOTE_RE: Final = re.compile(
     re.IGNORECASE,
 )
 _TAG_MARKER_RE: Final = re.compile(r"</?[A-Za-z][A-Za-z0-9:_-]*(?:[ \t]*/)?\>")
+# Every text that _TAG_MARKER_RE can accept, minus the closing ``>``.
+_TAG_MARKER_PREFIX_RE: Final = re.compile(r"</?[A-Za-z][A-Za-z0-9:_-]*[ \t]*/?")
 _UNAMBIGUOUS_ACTION_RE: Final = re.compile(
     r"\b(?:run|execute|invoke|issue|launch|perform|carry[ \t]+out)\b",
     re.IGNORECASE,
@@ -910,6 +912,19 @@ def _empty_replacement_directives(
         )
 
 
+def _can_open_tag_marker(text: str, start: int, limit: int) -> bool:
+    """Return whether the ``<`` at ``start`` can still begin a tag marker.
+
+    Code such as ``len(value.strip()) < 12`` or ``a<=b`` puts a comparison
+    operator after a removal verb. ``_TAG_MARKER_RE`` can never accept it, so
+    the loose fallback header must not search for a distant ``>`` and report
+    lookahead exhaustion. A tag name that is still open at ``limit`` remains
+    viable so a padded marker keeps failing closed.
+    """
+    prefix = _TAG_MARKER_PREFIX_RE.match(text, start, limit)
+    return prefix is not None and (prefix.end() == limit or text[prefix.end()] == ">")
+
+
 def _tag_directives(
     text: str,
     check_runtime: Callable[[], None] | None,
@@ -925,6 +940,8 @@ def _tag_directives(
             continue
         marker_start = match.start("open")
         marker_end_limit = min(len(text), marker_start + MAX_MARKER_LOOKAHEAD_CHARS)
+        if unsupported_header and not _can_open_tag_marker(text, marker_start, marker_end_limit):
+            continue
         marker_end = text.find(">", marker_start + 1, marker_end_limit)
         if marker_end < 0:
             if marker_end_limit < len(text) or end_is_truncated:
