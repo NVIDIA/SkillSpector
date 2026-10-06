@@ -300,7 +300,7 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 | `NVIDIA_INFERENCE_KEY` | Credential for `nv_build`. | `nvapi-...` |
 | `OPENAI_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=openai`. Also tier-2 fallback for non-OpenAI providers. | `sk-...` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | `http://localhost:11434/v1` |
-| `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged; unset or blank preserves provider-default behavior. | `high` |
+| `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3`; other provider/model combinations keep their endpoint defaults. | `high` |
 | `SKILLSPECTOR_OUTPUT_LANGUAGE` | Optional short, single-line language label (letters, numbers, spaces, `_`, or `-`; maximum 64 characters) for human-readable LLM finding text. Rule IDs, severity values, paths, code, and other machine-readable values remain unchanged. Unset, blank, or invalid values preserve the default output language. | `Japanese` |
 | `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves provider defaults. Lower values reduce variation but do not guarantee identical output. | `0` |
 | `SKILLSPECTOR_SEED` | Optional integer sampling seed for OpenAI-compatible and Azure OpenAI providers. Provider/model support is best-effort; CLI providers ignore it. | `42` |
