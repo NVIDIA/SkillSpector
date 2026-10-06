@@ -3,10 +3,13 @@
 
 """Tests for shared analyzer helpers."""
 
+import pytest
+
 from skillspector.nodes.analyzers.common import (
     SourceLocationIndex,
     get_context,
     get_context_from_lines,
+    is_reference_material,
 )
 
 
@@ -49,3 +52,29 @@ def test_source_location_index_reuses_logical_line_offsets() -> None:
         3,
         4,
     )
+
+
+@pytest.mark.parametrize(
+    ("file_path", "file_type", "expected"),
+    [
+        ("references/vendor.md", "markdown", True),
+        ("references/k8s/vendor.md", "markdown", True),
+        (r"references\vendor.md", "markdown", True),
+        ("references/notes.txt", "text", True),
+        ("reference/vendor.md", "markdown", False),
+        ("docs/references/x.md", "markdown", False),
+        ("docs/references/deep/vendor.md", "markdown", False),
+        ("scripts/reference/notes.md", "markdown", False),
+        ("REFERENCES/Vendor.MD", "markdown", False),
+        ("references/SKILL.md", "markdown", False),
+        ("SKILL.md", "markdown", False),
+        ("docs/vendor.md", "markdown", False),
+        ("references/setup.sh", "shell", False),
+        ("references/ds.yaml", "yaml", False),
+        ("my-references-guide.md", "markdown", False),
+    ],
+)
+def test_is_reference_material_matches_top_level_references_only(
+    file_path: str, file_type: str, expected: bool
+) -> None:
+    assert is_reference_material(file_path, file_type) is expected

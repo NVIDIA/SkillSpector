@@ -328,6 +328,7 @@ def provider_name(provider: object) -> str:
         "CodexCLIProvider": "codex_cli",
         "CopilotCLIProvider": "copilot_cli",
         "GeminiCLIProvider": "gemini_cli",
+        "GeminiProvider": "gemini",
         "NvBuildProvider": "nv_build",
         "NvInferenceProvider": "nv_inference",
         "OllamaProvider": "ollama",

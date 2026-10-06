@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -420,35 +421,136 @@ def _mark_targets(
     tainted: dict[str, _TaintedVar],
     src_name: str,
     lineno: int,
-) -> None:
+) -> list[str]:
+    """Taint each assignment target name that is not tainted yet.
+
+    Add-only: an existing entry is never overwritten, so taint can only grow.
+    Returns the names newly added, for the worklist to propagate from.
+    """
+    newly_tainted: list[str] = []
+    names: list[str] = []
     for target in targets:
         if isinstance(target, ast.Name):
-            tainted[target.id] = _TaintedVar(target.id, src_name, lineno)
+            names.append(target.id)
         elif isinstance(target, ast.Tuple):
-            for elt in target.elts:
-                if isinstance(elt, ast.Name):
-                    tainted[elt.id] = _TaintedVar(elt.id, src_name, lineno)
+            names.extend(elt.id for elt in target.elts if isinstance(elt, ast.Name))
+    for name in names:
+        if name not in tainted:
+            tainted[name] = _TaintedVar(name, src_name, lineno)
+            newly_tainted.append(name)
+    return newly_tainted
 
 
-def _find_tainted_in_expr(
-    node: ast.expr,
-    tainted: dict[str, _TaintedVar],
-    check_runtime: Callable[[], None] | None = None,
-) -> _TaintedVar | None:
-    """Return the first tainted variable referenced in *node*, or None.
+def _referenced_names(node: ast.expr) -> list[str]:
+    """Return the distinct variable names (``ast.Name`` ids) referenced in *node*.
 
-    Handles Name references, container literals (dict, list, tuple, set),
-    and f-strings so that taint propagates through re-assignment and
-    data packaging (e.g. ``payload = {"key": secret}``).
+    Mirrors the Name-only domain of taint propagation: a propagating assignment
+    becomes tainted when any name its value reads is tainted. Handles container
+    literals (dict, list, tuple, set) and f-strings because ``ast.walk`` reaches
+    the ``Name`` nodes nested inside them (e.g. ``payload = {"key": secret}``).
     """
+    seen: set[str] = set()
+    names: list[str] = []
     for child in ast.walk(node):
+        if isinstance(child, ast.Name) and child.id not in seen:
+            seen.add(child.id)
+            names.append(child.id)
+    return names
+
+
+def _collect_tainted(
+    tree: ast.AST,
+    type_map: dict[str, str],
+    aliases: dict[str, str],
+    check_runtime: Callable[[], None] | None = None,
+) -> dict[str, _TaintedVar]:
+    """Record ``Assign``-based taint, independent of AST visit order.
+
+    Any single ordered pass over the tree — breadth-first (``ast.walk``) or
+    source-order (pre-order) — misses flows where a sink and the assignment
+    that taints it are visited in the "wrong" relative order for that
+    traversal. Pre-order in particular loses flows where the sink sits inside
+    a function, method or loop body defined BEFORE the tainted assignment in
+    the file: the body is a subtree visited in full before the later sibling
+    statement, even though the code only runs when called, after the
+    assignment has already executed. There is no fixed traversal order that
+    agrees with both "defined before" and "runs after".
+
+    Taint is therefore computed as reachability in the re-assignment graph,
+    using a monotone worklist:
+
+    * One pass over every ``Assign`` seeds the tainted set from direct sources
+      (source calls and credential subscripts) and records every propagating
+      assignment (``b = a``; ``payload = {"k": secret}``) once, keyed by a
+      stable id, then indexes it by each name its value reads, as
+      ``referenced_name -> [assignment_id, ...]``.
+    * The worklist then drains newly tainted names, firing each assignment that
+      reads a drained name AT MOST ONCE total: the first time any name it reads
+      becomes tainted, its targets are marked and enqueued; later drains of its
+      other reading names skip it. Only names not already tainted are enqueued.
+
+    Taint is add-only — an entry is never overwritten or removed — so the set
+    can only grow and is bounded by the number of assigned names. The loop
+    therefore cannot oscillate and is guaranteed to terminate. Firing an
+    assignment a second time is sound to skip: its targets are all tainted
+    after the first firing, so a later firing could only re-taint names and
+    add nothing. Each name is dequeued once and each propagating assignment
+    fires at most once, so the work is linear in the number of assignments
+    plus references — not quadratic in the longest chain, nor K×K' for a wide
+    ``a, b, ... = source`` statement read by many tainted names.
+    """
+    tainted: dict[str, _TaintedVar] = {}
+    worklist: deque[str] = deque()
+    # Each propagating assignment, stored once as (targets, lineno) and keyed by
+    # its index here (a stable id). ``propagators`` maps a name read by an
+    # assignment's value to the ids of the assignments that read it.
+    propagating: list[tuple[list[ast.expr], int]] = []
+    propagators: dict[str, list[int]] = {}
+
+    for ast_node in ast.walk(tree):
         if check_runtime is not None:
             check_runtime()
-        if isinstance(child, ast.Name):
-            tv = tainted.get(child.id)
-            if tv:
-                return tv
-    return None
+        if not isinstance(ast_node, ast.Assign):
+            continue
+
+        src_name = _find_source_in_expr(ast_node.value, type_map, aliases, check_runtime)
+
+        # Subscript sources like os.environ["KEY"] (also os aliased as `o`)
+        if src_name is None and isinstance(ast_node.value, ast.Subscript):
+            base = resolve_dotted_name(ast_node.value.value)
+            if base is not None:
+                base = apply_import_aliases(base, aliases)
+            if base and base in _CREDENTIAL_SOURCES:
+                src_name = base
+
+        if src_name is not None:
+            # Direct source: seed taint for this assignment's targets.
+            worklist.extend(_mark_targets(ast_node.targets, tainted, src_name, ast_node.lineno))
+        else:
+            # Propagating assignment: record it once under a stable id and index
+            # that id by each name its value reads, so it can fire later if/when
+            # one of those names is tainted.
+            assignment_id = len(propagating)
+            propagating.append((ast_node.targets, ast_node.lineno))
+            for ref in _referenced_names(ast_node.value):
+                propagators.setdefault(ref, []).append(assignment_id)
+
+    fired: set[int] = set()
+    while worklist:
+        if check_runtime is not None:
+            check_runtime()
+        name = worklist.popleft()
+        src_call = tainted[name].source_call
+        for assignment_id in propagators.get(name, ()):
+            if assignment_id in fired:
+                # Already propagated once: its targets are all tainted, so
+                # firing again marks nothing new. Skip to stay linear.
+                continue
+            fired.add(assignment_id)
+            targets, lineno = propagating[assignment_id]
+            worklist.extend(_mark_targets(targets, tainted, src_call, lineno))
+
+    return tainted
 
 
 def _analyze_python(
@@ -464,8 +566,10 @@ def _analyze_python(
     type_map = build_type_map(tree, aliases)
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
-    tainted: dict[str, _TaintedVar] = {}
-    seen: set[tuple[str, int, int, int | None, int | None]] = set()
+    tainted = _collect_tainted(
+        tree, type_map, aliases, budget.check_runtime if budget is not None else None
+    )
+    seen: set[tuple[str, ast.Call]] = set()
     contexts: dict[int, str] = {}
 
     def context_for(lineno: int) -> str:
@@ -476,15 +580,18 @@ def _analyze_python(
         return context
 
     def _emit(
+        node_index: int,
         rule_id: str,
         ast_node: ast.Call,
         msg: str,
     ) -> None:
         lineno = getattr(ast_node, "lineno", 1)
         end_lineno = getattr(ast_node, "end_lineno", None)
-        start_byte_column = getattr(ast_node, "col_offset", 0)
+        start_byte_column = getattr(ast_node, "col_offset", None)
         end_byte_column = getattr(ast_node, "end_col_offset", None)
-        key = (rule_id, lineno, start_byte_column, end_lineno, end_byte_column)
+        # Deduplicate flows into the same sink without merging distinct nodes
+        # whose optional source columns are unavailable.
+        key = (rule_id, ast_node)
         if key in seen:
             return
         seen.add(key)
@@ -492,11 +599,7 @@ def _analyze_python(
         if complete_match is None:
             complete_match = get_complete_source_segment(lines, lineno, end_lineno)
         start_column = python_ast.character_column(lineno, start_byte_column)
-        end_column = (
-            python_ast.character_column(end_lineno or lineno, end_byte_column)
-            if end_byte_column is not None
-            else None
-        )
+        end_column = python_ast.character_column(end_lineno or lineno, end_byte_column)
         finding = AnalyzerFinding(
             rule_id=rule_id,
             message=msg,
@@ -513,48 +616,25 @@ def _analyze_python(
             context=context_for(lineno),
             matched_text=complete_match[:200],
             complete_match=complete_match,
+            # Evidence participates in report compaction. Keep distinct syntax
+            # nodes distinguishable when their source spans are incomplete.
+            evidence=(
+                {"python_ast_node_index": node_index}
+                if start_column is None or end_column is None
+                else {}
+            ),
         )
         if budget is None:
             findings.append(finding)
         else:
             budget.emit(finding)
 
-    for ast_node in ast.walk(tree):
+    # `tainted` is fully populated above, independent of traversal order, so
+    # this pass only needs to check sink call sites against it.
+    for node_index, ast_node in enumerate(ast.walk(tree)):
         if budget is not None:
             budget.check_runtime()
-        # Record tainted assignments.
-        if isinstance(ast_node, ast.Assign):
-            src_name = _find_source_in_expr(
-                ast_node.value,
-                type_map,
-                aliases,
-                budget.check_runtime if budget is not None else None,
-            )
 
-            # Subscript sources like os.environ["KEY"] (also os aliased as `o`)
-            if src_name is None and isinstance(ast_node.value, ast.Subscript):
-                base = resolve_dotted_name(ast_node.value.value)
-                if base is not None:
-                    base = apply_import_aliases(base, aliases)
-                if base and base in _CREDENTIAL_SOURCES:
-                    src_name = base
-
-            # Propagate taint through re-assignment and container construction:
-            # data = secret, payload = {"k": secret}, items = [secret], msg = f"{secret}"
-            if src_name is None:
-                tv = _find_tainted_in_expr(
-                    ast_node.value,
-                    tainted,
-                    budget.check_runtime if budget is not None else None,
-                )
-                if tv:
-                    src_name = tv.source_call
-
-            if src_name:
-                _mark_targets(ast_node.targets, tainted, src_name, ast_node.lineno)
-            continue
-
-        # Detect flows at sink call sites.
         if not isinstance(ast_node, ast.Call):
             continue
 
@@ -577,6 +657,7 @@ def _analyze_python(
             src_cat = _classify(src_name, _SOURCE_CATEGORIES, "data source")
             sink_cat = _classify(sink_name, _SINK_CATEGORIES, "data sink")
             _emit(
+                node_index,
                 rule,
                 ast_node,
                 f"Direct flow: {src_name} ({src_cat}) \u2192 {sink_name} ({sink_cat})",
@@ -591,6 +672,7 @@ def _analyze_python(
             src_cat = _classify(tv.source_call, _SOURCE_CATEGORIES, "data source")
             sink_cat = _classify(sink_name, _SINK_CATEGORIES, "data sink")
             _emit(
+                node_index,
                 rule,
                 ast_node,
                 f"Tainted flow: '{tv.name}' from {tv.source_call} (line {tv.lineno}, "

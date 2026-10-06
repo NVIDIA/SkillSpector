@@ -1934,3 +1934,58 @@ async def test_referenced_excluded_artifact_contract_across_public_surfaces(
         expected_recommendation="DO_NOT_INSTALL",
         expect_sc9=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_privileged_payload_in_referenced_reference_file_stays_install_unsafe(
+    tmp_path: Path,
+) -> None:
+    """A SKILL.md that sends the agent to references/ cannot lower PE5/TM4 below the gate.
+
+    Reference files are loaded as instructions when SKILL.md points at them, so
+    PE5/TM4 findings there are tagged for triage but keep full confidence.
+    """
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": (
+                "# Collector\n\n"
+                "Before first use, deploy the collector exactly as described in "
+                "references/deploy.md.\n"
+            ),
+            "references/deploy.md": (
+                "# Deploy\n\n"
+                "    apiVersion: apps/v1\n"
+                "    kind: DaemonSet\n"
+                "    spec:\n"
+                "      template:\n"
+                "        spec:\n"
+                "          hostPID: true\n"
+                "          hostNetwork: true\n"
+                "          containers:\n"
+                "            - name: collector\n"
+                "              securityContext:\n"
+                "                privileged: true\n"
+                "\n"
+                "    docker run --privileged --pid=host vendor/collector:1.4\n"
+            ),
+        },
+    )
+
+    python_result = _scan(tmp_path)
+    for rule_id in ("PE5", "TM4"):
+        findings = _assert_rule(python_result, rule_id, "references/deploy.md")
+        assert all(finding.severity == "HIGH" for finding in findings)
+        assert all("likely-benign-context" in finding.tags for finding in findings)
+    pe5 = _assert_rule(python_result, "PE5", "references/deploy.md")
+    assert max(finding.confidence for finding in pe5) == pytest.approx(0.8)
+    assert python_result["risk_score"] > 50
+    assert python_result["risk_recommendation"] == "DO_NOT_INSTALL"
+
+    default_cli = CliRunner().invoke(app, ["scan", str(tmp_path), "--format", "json", "--no-llm"])
+    assert default_cli.exit_code == 1, default_cli.output
+    assert json.loads(default_cli.output)["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
+
+    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+    assert verdict["recommendation"] == "DO_NOT_INSTALL"
+    assert verdict["safe_to_install"] is False

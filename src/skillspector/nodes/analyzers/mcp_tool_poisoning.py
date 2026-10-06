@@ -45,6 +45,7 @@ from skillspector.llm_analyzer_base import (
     append_output_language_instruction,
     estimate_tokens,
 )
+from skillspector.llm_utils import run_async
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding, compute_match_fingerprint
 from skillspector.nodes.analyzers.static_runner import MAX_FINDINGS_PER_ANALYZER
@@ -1126,16 +1127,21 @@ def _tp4_finding(
     actual = result.actual_behavior_summary[:1024]
     mismatched = [str(item)[:256] for item in result.mismatched_capabilities[:16]]
     mismatched_text = ", ".join(mismatched)[:2048] if mismatched else "unspecified"
+    message = (
+        f"Description-behavior mismatch: declared purpose is '{declared}' "
+        f"but code also performs: {mismatched_text}."
+    )[:4096]
+    from skillspector.nodes.analyzers.pattern_defaults import get_pattern_name
+
     return Finding(
         rule_id="TP4",
-        message=(
-            f"Description-behavior mismatch: declared purpose is '{declared}' "
-            f"but code also performs: {mismatched_text}."
-        )[:4096],
+        message=message,
         severity="HIGH" if result.confidence >= 0.7 else "MEDIUM",
         confidence=result.confidence,
         file="SKILL.md",
         category=_CATEGORY,
+        pattern=get_pattern_name("TP4"),
+        finding=message,
         tags=list(_FRAMEWORK_TAGS),
         explanation=(result.explanation[:4096] or f"Declared: {declared}. Actual: {actual}."),
         remediation=(
@@ -1477,7 +1483,9 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
         )
         analyzer = _TP4Analyzer(model, timeout=timeout)
         attempted = True
-        batch_outcome = analyzer.run_batches_detailed(batches)
+        # Fan out like the semantic analyzers do. The shared limiter still honours
+        # SKILLSPECTOR_MAX_LLM_CONCURRENCY, and results keep the batch order.
+        batch_outcome = run_async(analyzer.arun_batches_detailed(batches))
         result.inference_usage = cast(list[InferenceUsageRecord], analyzer.inference_usage)
         seen_finding_ids: set[str] = set()
         unexpected_response = False

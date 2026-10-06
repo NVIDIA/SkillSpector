@@ -68,6 +68,129 @@ def _document_members(**extra: bytes) -> dict[str, bytes]:
     }
 
 
+def test_typescript_declaration_files_are_not_executable_by_name_alone() -> None:
+    declaration = b"export interface Options { retries?: number; }\nexport type Result = string;\n"
+
+    assert not is_executable_content("types.d.cts", declaration, complete_content=True)
+    assert not is_executable_content("types.d.mts", declaration, complete_content=True)
+
+
+def test_runtime_code_in_typescript_declaration_named_file_stays_executable() -> None:
+    runtime = b'declare const marker: string;\nrequire("child_process").execSync(marker);\n'
+
+    assert is_executable_content("evil.d.cts", runtime)
+
+
+def test_declaration_exemption_requires_complete_content() -> None:
+    declaration = b"export {}"
+
+    assert is_executable_content("types.d.mts", declaration)
+    assert not is_executable_content("types.d.mts", declaration, complete_content=True)
+
+
+def test_runtime_default_import_named_type_is_not_a_type_only_import() -> None:
+    runtime = b'import type from "./payload.mjs";\n'
+
+    assert is_executable_content("evil.d.mts", runtime, complete_content=True)
+
+
+def test_typescript_declaration_span_cannot_cross_asi_line_break() -> None:
+    runtime = b'export type Config = string\nconsole.log("RUNTIME")\n;'
+
+    assert is_executable_content("evil.d.cts", runtime, complete_content=True)
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        b'type A = "/*";\nconsole.log("RUNTIME");\ntype B = "*/";\n',
+        b'type A = "//"; console.log("RUNTIME")\ntype B = string;\n',
+        b'type A = `unterminated;\nconsole.log("RUNTIME");',
+    ],
+)
+def test_comment_markers_inside_literals_cannot_hide_runtime(runtime: bytes) -> None:
+    assert is_executable_content("evil.d.ts", runtime, complete_content=True)
+
+
+def test_typical_typescript_emitted_declaration_file_is_inert() -> None:
+    declaration = (
+        b"export interface Options { retries?: number; }\n"
+        b"export declare function load(options: Options): Promise<void>;\n"
+        b"export type Result = string;\n"
+    )
+
+    assert not is_executable_content("types.d.ts", declaration, complete_content=True)
+
+
+def test_typescript_side_effect_import_in_declaration_named_file_stays_executable() -> None:
+    runtime = b"import './payload.js';\nexport type Result = string;\n"
+
+    assert is_executable_content("evil.d.mts", runtime)
+
+
+def test_mixed_typescript_declaration_and_runtime_stays_executable() -> None:
+    runtime = b"export type Result = string;\nconsole.log('runtime');\n"
+
+    assert is_executable_content("evil.d.ts", runtime)
+
+
+@pytest.mark.parametrize("path", ["types.d.ts", "types.d.cts", "types.d.mts"])
+def test_ambient_typescript_namespaces_and_modules_are_declarations(path: str) -> None:
+    declaration = (
+        b"declare namespace Payload { interface Value { name: string; } }\n"
+        b'declare module "payload" { export function load(): string; }\n'
+    )
+
+    assert not is_executable_content(path, declaration, complete_content=True)
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        b'namespace Payload { console.log("runtime"); }\n',
+        b'export namespace Payload { console.log("runtime"); }\n',
+        b'declare namespace Payload { console.log("runtime"); }\n',
+    ],
+)
+def test_typescript_namespace_bodies_must_be_proven_ambient(runtime: bytes) -> None:
+    assert is_executable_content("evil.d.ts", runtime)
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        b'type = console.log("runtime");\n',
+        b"namespace: { console.log('runtime'); }\n",
+    ],
+)
+def test_ambiguous_typescript_keywords_stay_executable(runtime: bytes) -> None:
+    """Assignments and labels must not be mistaken for declarations."""
+    assert is_executable_content("evil.d.mts", runtime)
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        b'type = console.log("runtime");\n',
+        b"namespace: { console.log('runtime'); }\n",
+    ],
+)
+def test_ambiguous_typescript_keywords_in_hidden_documents_raise_sc9(
+    tmp_path: Path, runtime: bytes
+) -> None:
+    archive_path = tmp_path / ".types.docx.txt"
+    _write_archive(archive_path, _document_members(**{"word/payload.d.mts": runtime}))
+    (tmp_path / "SKILL.md").write_text("# Declaration container\n", encoding="utf-8")
+
+    context = build_context({"skill_path": str(tmp_path)})
+    virtual_path = ".types.docx.txt!/word/payload.d.mts"
+    metadata = next(item for item in context["component_metadata"] if item["path"] == virtual_path)
+    assert metadata["executable"] is True
+    assert metadata["concealed_executable"] is True
+    findings = _analyze_concealed_executables(context["component_metadata"])
+    assert any(finding.rule_id == "SC9" and finding.file == virtual_path for finding in findings)
+
+
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
