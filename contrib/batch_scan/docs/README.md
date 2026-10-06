@@ -330,7 +330,7 @@ fi
 |---------|-----|
 | "No LLM API key configured" | Set up `.env` or use `--no-llm` |
 | Connection errors / 429 | Reduce `--workers` |
-| Skills timing out (90s) | Check network; the scanner skips and continues |
+| Skills timing out (90s of scanning) | Check network and API-pool capacity; the saved report retains an ERROR entry and other skills continue. Worker startup has its own 90s bound. |
 | "Event loop is closed" | Harmless, suppressed |
 | model_info token limit warning | Harmless, 128K default used |
 
