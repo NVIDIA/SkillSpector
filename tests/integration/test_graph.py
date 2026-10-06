@@ -20,6 +20,7 @@ from importlib import import_module
 from pathlib import Path
 
 import pytest
+from markdown_it import MarkdownIt
 
 from skillspector.graph import create_graph, graph
 
@@ -232,9 +233,12 @@ def test_graph_reports_oms_scope_exclusion_in_every_non_json_format(
         )
     else:
         expected_heading = "Scope exclusions" if output_format == "terminal" else "Scope Exclusions"
-        assert expected_heading in result["report_body"]
-        assert "oms_signature" in result["report_body"]
-        assert "skill.oms.sig" in result["report_body"]
+        body = result["report_body"]
+        if output_format == "markdown":
+            body = MarkdownIt().enable("table").render(body)
+        assert expected_heading in body
+        assert "oms_signature" in body
+        assert "skill.oms.sig" in body
 
 
 def test_graph_invoke_returns_findings_and_report(tmp_path: Path) -> None:
@@ -290,7 +294,7 @@ def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.M
         def __init__(self, _model: str, **_kwargs: object) -> None:
             pass
 
-        def run_batches_detailed(self, _batches: object) -> object:
+        async def arun_batches_detailed(self, _batches: object) -> object:
             raise RuntimeError("simulated LLM transport failure")
 
     # Semantic analyzers and meta_analyzer fail while constructing their shared

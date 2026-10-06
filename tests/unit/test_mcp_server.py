@@ -19,8 +19,12 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
+import threading
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -57,6 +61,78 @@ async def test_run_scan_returns_structured_verdict(
     assert isinstance(result["safe_to_install"], bool)
     assert result["safe_to_install"] == (result["risk_score"] <= 50)
     assert result["report"]  # non-empty rendered report
+
+
+def _record_scan_temp_dirs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, list[Path]]:
+    """Build a zipped skill and create the scan temp dirs under tmp_path, recording them."""
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("SKILL.md", "---\nname: demo\ndescription: d\n---\n# Demo\n")
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def recording_mkdtemp(*args: Any, **kwargs: Any) -> str:
+        """Create scan temp dirs under tmp_path and remember them."""
+        if kwargs.get("prefix") != "skillspector_":
+            return real_mkdtemp(*args, **kwargs)
+        path = real_mkdtemp(*args, **{**kwargs, "dir": tmp_path})
+        created.append(Path(path))
+        return path
+
+    monkeypatch.setattr("skillspector.input_handler.tempfile.mkdtemp", recording_mkdtemp)
+    return archive, created
+
+
+async def test_run_scan_that_fails_removes_its_temp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scan failing after input resolution removes the temp dir it made."""
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    archive, created = _record_scan_temp_dirs(monkeypatch, tmp_path)
+
+    def fail(*args: Any, **kwargs: Any) -> str:
+        """Stand in for a failure after the input is materialized."""
+        raise RuntimeError("report failed")
+
+    monkeypatch.setattr("skillspector.nodes.report._format_json", fail)
+
+    with pytest.raises(RuntimeError, match="report failed"):
+        await run_scan(str(archive), use_llm=False, output_format="json")
+
+    assert created
+    assert not any(path.exists() for path in created)
+
+
+async def test_run_scan_that_is_cancelled_removes_its_temp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling the tool call after input resolution removes the temp dir."""
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    archive, created = _record_scan_temp_dirs(monkeypatch, tmp_path)
+    reporting = threading.Event()
+    release = threading.Event()
+
+    def block(*args: Any, **kwargs: Any) -> str:
+        """Hold the report step so the caller can cancel the running scan."""
+        reporting.set()
+        release.wait(timeout=10)
+        raise RuntimeError("released after cancellation")
+
+    monkeypatch.setattr("skillspector.nodes.report._format_json", block)
+
+    scan = asyncio.create_task(run_scan(str(archive), use_llm=False, output_format="json"))
+    try:
+        assert await asyncio.to_thread(reporting.wait, 10)
+        scan.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await scan
+    finally:
+        release.set()
+
+    assert created
+    assert not any(path.exists() for path in created)
 
 
 @pytest.mark.parametrize(
@@ -539,7 +615,7 @@ async def test_unavailable_requested_llm_aligns_embedded_json_report(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "not configured"))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (False, "not configured"),
+        lambda **_: (False, "not configured"),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
 
@@ -561,7 +637,7 @@ async def test_empty_runtime_telemetry_aligns_mcp_and_embedded_json_caution(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda **_: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
 
@@ -614,7 +690,7 @@ async def test_malformed_runtime_telemetry_preserves_failed_meta_availability(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda **_: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", render_mixed_telemetry)
 
@@ -666,7 +742,7 @@ async def test_truthy_malformed_ok_is_not_counted_as_runtime_success(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda **_: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", render_truthy_malformed_telemetry)
 
@@ -722,7 +798,7 @@ async def test_failed_meta_analysis_aligns_mcp_and_embedded_json_availability(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda **_: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", render_failed_meta_analysis)
 
@@ -743,7 +819,7 @@ async def test_explicit_static_only_keeps_embedded_json_report_unchanged(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "not configured"))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (False, "not configured"),
+        lambda **_: (False, "not configured"),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
 
@@ -1066,6 +1142,26 @@ def test_is_local_target_fails_closed_when_home_cannot_be_resolved(
     assert mcp_server._is_local_target("~nosuchuser/skill") is True
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        "git@github.com:org/private.git",
+        "ssh://git@github.com/org/private.git",
+        "git+ssh://git@github.com/org/private.git",
+        "https://token@github.com/org/private.git",
+        "https://user:password@github.com/org/private.git",
+    ],
+)
+async def test_http_rejects_credentialed_targets_before_graph(
+    target: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_ainvoke = AsyncMock()
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", graph_ainvoke)
+    with pytest.raises(ValueError, match="unauthenticated HTTPS"):
+        await run_scan(target, allow_local_targets=False)
+    graph_ainvoke.assert_not_awaited()
+
+
 async def test_run_scan_allows_remote_target_when_local_targets_disallowed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1088,6 +1184,7 @@ async def test_run_scan_allows_remote_target_when_local_targets_disallowed(
     assert result["target"] == target
     assert graph_ainvoke.await_count == 1
     assert graph_ainvoke.await_args.args[0]["input_path"] == target
+    assert graph_ainvoke.await_args.args[0]["allow_git_credentials"] is False
 
 
 async def test_run_scan_keeps_default_local_target_compatibility(
@@ -1111,6 +1208,7 @@ async def test_run_scan_keeps_default_local_target_compatibility(
     assert result["target"] == str(tmp_path)
     assert graph_ainvoke.await_count == 1
     assert graph_ainvoke.await_args.args[0]["input_path"] == str(tmp_path)
+    assert graph_ainvoke.await_args.args[0]["allow_git_credentials"] is True
 
 
 @pytest.mark.parametrize(
@@ -1135,15 +1233,57 @@ def test_run_passes_transport_local_target_policy(
 
     monkeypatch.setattr(mcp_server, "build_server", fake_build_server)
 
-    mcp_server.run(transport=transport, host="0.0.0.0", port=9000)
+    mcp_server.run(transport=transport, host="127.0.0.1", port=9000)
 
     assert captured["allow_local_targets"] is expected_allow_local_targets
     if transport == "http":
-        assert server.settings.host == "0.0.0.0"
+        assert server.settings.host == "127.0.0.1"
         assert server.settings.port == 9000
         server.run.assert_called_once_with(transport="streamable-http")
     else:
         server.run.assert_called_once_with(transport="stdio")
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "0.0.0.0",
+        "::",
+        "10.0.0.1",
+        "192.0.2.1",
+        "example.com",
+        "127.0.0.1.example.com",
+        "127.1",
+        "127.3.2.1",
+        "::1%lo",
+        "2130706433",
+        "",
+    ],
+)
+def test_http_rejects_non_loopback_before_constructing_server(host, monkeypatch):
+    build = MagicMock()
+    monkeypatch.setattr(mcp_server, "build_server", build)
+    with pytest.raises(ValueError, match="must bind to a loopback IP"):
+        mcp_server.run(transport="http", host=host)
+    build.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "host, bound",
+    [
+        ("127.0.0.1", "127.0.0.1"),
+        ("0:0:0:0:0:0:0:1", "::1"),
+        ("::1", "::1"),
+        ("localhost", "127.0.0.1"),
+        ("LOCALHOST", "127.0.0.1"),
+    ],
+)
+def test_http_accepts_only_loopback_bindings(host, bound, monkeypatch):
+    server = SimpleNamespace(settings=SimpleNamespace(host=None, port=None), run=MagicMock())
+    monkeypatch.setattr(mcp_server, "build_server", lambda **_: server)
+    mcp_server.run(transport="http", host=host, port=9000)
+    assert server.settings.host == bound
+    server.run.assert_called_once_with(transport="streamable-http")
 
 
 def test_run_rejects_unknown_transport_without_allowing_local_targets(

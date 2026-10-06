@@ -27,6 +27,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
+from html import escape as escape_html
 from io import StringIO
 from typing import Literal, cast
 
@@ -76,7 +77,7 @@ from skillspector.semantic_runtime import (
     semantic_runtime_ledger_event,
     successful_llm_record,
 )
-from skillspector.state import SkillspectorState
+from skillspector.state import SkillspectorState, transitive_remaining_seconds
 from skillspector.suppression import Baseline, SuppressedFinding, partition_findings
 from skillspector.terminal_text import visible_terminal_text
 
@@ -347,6 +348,9 @@ def _build_sarif_properties(
     metadata: dict[str, object] = {
         "findingId": finding.finding_id,
         "severity": finding_dict["severity"],
+        # GitHub code scanning banding: emitted alongside level so generic
+        # SARIF consumers can distinguish CRITICAL from HIGH.
+        "security-severity": _severity_to_security_severity(str(finding.severity)),
         "category": finding_dict["category"],
         "pattern": finding_dict["pattern"],
         "confidence": finding_dict["confidence"],
@@ -397,6 +401,26 @@ def _severity_to_sarif_level(severity: str) -> Literal["error", "warning", "note
         "MEDIUM": "warning",
         "LOW": "note",
     }.get(severity.upper(), "note")  # type: ignore[return-value]
+
+
+# SARIF has no critical level, so CRITICAL and HIGH both map to "error" above.
+# GitHub code scanning and most SARIF gates band security-severity >= 9.0 as
+# critical, 7.0-8.9 as high, 4.0-6.9 as medium, and 0.1-3.9 as low; the values
+# below keep each SkillSpector severity inside its band.
+_SEVERITY_TO_SECURITY_SEVERITY: dict[str, str] = {
+    "CRITICAL": "9.5",
+    "HIGH": "8.0",
+    "MEDIUM": "5.5",
+    "LOW": "3.0",
+}
+
+
+def _severity_to_security_severity(severity: str) -> str | None:
+    """Map Finding.severity to a SARIF security-severity score string.
+
+    Returns None for unknown severities so no misleading score is emitted.
+    """
+    return _SEVERITY_TO_SECURITY_SEVERITY.get(severity.upper())
 
 
 def _summary_display_value(value: object) -> str | None:
@@ -606,10 +630,12 @@ def _build_sarif(
     """Build one SARIF invocation with canonical inspection notifications."""
     results: list[SarifResult] = []
     seen_rule_ids: dict[str, str] = {}
+    seen_rule_severities: dict[str, set[str]] = {}
 
     for finding in findings:
         if not finding.rule_id or not finding.message:
             continue
+        seen_rule_severities.setdefault(finding.rule_id, set()).add(str(finding.severity).upper())
         occurrences = finding.occurrences or [
             {
                 "file": finding.file,
@@ -655,6 +681,7 @@ def _build_sarif(
         finding = sf.finding
         if not finding.rule_id or not finding.message:
             continue
+        seen_rule_severities.setdefault(finding.rule_id, set()).add(str(finding.severity).upper())
         occurrences = finding.occurrences or [
             {
                 "file": finding.file,
@@ -695,13 +722,24 @@ def _build_sarif(
         if finding.rule_id not in seen_rule_ids:
             seen_rule_ids[finding.rule_id] = finding.message
 
-    rules = [
-        SarifReportingDescriptor(
-            id=rule_id,
-            shortDescription=SarifMessage(text=description),
+    rules = []
+    for rule_id, description in sorted(seen_rule_ids.items()):
+        # A rule carries security-severity only when every reported finding
+        # for it shares one severity; mixed-severity rules stay unannotated
+        # rather than mislabeling some of their results.
+        rule_properties: dict[str, object] | None = None
+        severities = seen_rule_severities.get(rule_id, set())
+        if len(severities) == 1:
+            score = _severity_to_security_severity(next(iter(severities)))
+            if score is not None:
+                rule_properties = {"security-severity": score}
+        rules.append(
+            SarifReportingDescriptor(
+                id=rule_id,
+                shortDescription=SarifMessage(text=description),
+                properties=rule_properties,
+            )
         )
-        for rule_id, description in sorted(seen_rule_ids.items())
-    ]
 
     completeness = analysis_completeness or {}
 
@@ -1233,10 +1271,11 @@ def _build_metadata(
     llm_execution_enabled: bool | None = None,
     semantic_runtime_incomplete: bool = False,
     runtime_available: bool | None = None,
+    provider_availability: tuple[bool, str | None] | None = None,
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
-    provider_available, llm_error = is_llm_available()
+    provider_available, llm_error = provider_availability or is_llm_available()
     attempted, succeeded, call_log_degraded = _llm_runtime_status(use_llm, llm_call_log)
     # meta_analyzer's own record, independent of whether a DIFFERENT
     # LLM-backed node (a semantic_* analyzer) lost coverage to a dropped
@@ -1371,6 +1410,7 @@ def _format_json(
     llm_execution_enabled: bool | None = None,
     semantic_runtime_incomplete: bool = False,
     runtime_available: bool | None = None,
+    provider_availability: tuple[bool, str | None] | None = None,
 ) -> str:
     """Generate JSON report string."""
     suppressed = suppressed or []
@@ -1416,6 +1456,7 @@ def _format_json(
             llm_execution_enabled,
             semantic_runtime_incomplete,
             runtime_available,
+            provider_availability,
         ),
         "execution_successful": execution_successful,
     }
@@ -1423,9 +1464,26 @@ def _format_json(
     return json.dumps(data, indent=2)
 
 
+def _markdown_plain_text(value: object) -> str:
+    """Remove display controls and keep a Markdown field on one line."""
+    text = _clean_text(str(value)) or ""
+    return " ".join("".join(c for c in text if c.isprintable() or c.isspace()).splitlines())
+
+
 def _markdown_cell(value: object) -> str:
-    """Render dynamic report text safely inside a Markdown table cell."""
-    return str(value).replace("|", "\\|").replace("\n", " ")
+    """Render dynamic prose as literal text on one Markdown line."""
+    text = escape_html(_markdown_plain_text(value), quote=False)
+    return re.sub(r"([\\`*_{}\[\]()#+.!|>~-])", r"\\\1", text)
+
+
+def _markdown_code(value: object, *, table_cell: bool = False) -> str:
+    """Keep literal values inside their code spans and table cells."""
+    text = _markdown_plain_text(value)
+    if table_cell:
+        text = text.replace("|", "\\|")
+    delimiter = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
+    padding = " " if text.startswith(("`", " ")) or text.endswith(("`", " ")) else ""
+    return f"{delimiter}{padding}{text}{padding}{delimiter}"
 
 
 def _render_markdown_completeness(
@@ -1453,10 +1511,7 @@ def _render_markdown_completeness(
 
     patterns = completeness.get("exclude_patterns", [])
     if patterns:
-        spans = []
-        for pattern in patterns:
-            delimiter = "`" * (max((len(run) for run in re.findall(r"`+", pattern)), default=0) + 1)
-            spans.append(f"{delimiter} {pattern} {delimiter}")
+        spans = [_markdown_code(pattern) for pattern in patterns]
         lines.append(f"Explicit exclusion patterns: {', '.join(spans)}\n")
         lines.append(
             f"Excluded files (not inspected): {completeness.get('excluded_file_count', 0)}\n"
@@ -1479,7 +1534,7 @@ def _render_markdown_completeness(
                 location += f":{start_line}" + (f"-{end_line}" if end_line else "")
             reason = row.get("reason_code", row.get("status", "status"))
             lines.append(
-                f"| {_markdown_cell(reason)} | `{_markdown_cell(location)}` | "
+                f"| {_markdown_cell(reason)} | {_markdown_code(location, table_cell=True)} | "
                 f"{_markdown_cell(row.get('message', ''))} |"
             )
         lines.append("")
@@ -1520,8 +1575,8 @@ def _format_markdown(
     source = skill_path or ""
 
     lines.append("# SkillSpector Security Report\n")
-    lines.append(f"**Skill:** {skill_name}  ")
-    lines.append(f"**Source:** `{source}`  ")
+    lines.append(f"**Skill:** {_markdown_cell(skill_name)}  ")
+    lines.append(f"**Source:** {_markdown_code(source)}  ")
     lines.append(f"**Scanned:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}  ")
     lines.append("")
 
@@ -1529,15 +1584,15 @@ def _format_markdown(
         use_llm, llm_call_log or []
     )
     if effective_degraded_notice:
-        lines.append(f"> ⚠️ **Degraded scan:** {effective_degraded_notice}")
+        lines.append(f"> ⚠️ **Degraded scan:** {_markdown_cell(effective_degraded_notice)}")
         lines.append("")
 
     lines.append("## Risk Assessment\n")
     lines.append("| Metric | Value |")
     lines.append("|--------|-------|")
     lines.append(f"| Score | {risk_score}/100 |")
-    lines.append(f"| Severity | {risk_severity} |")
-    lines.append(f"| Recommendation | {risk_recommendation.replace('_', ' ')} |")
+    lines.append(f"| Severity | {_markdown_cell(risk_severity)} |")
+    lines.append(f"| Recommendation | {_markdown_cell(risk_recommendation.replace('_', ' '))} |")
     lines.append("")
 
     lines.append(f"## Components ({len(component_metadata)})\n")
@@ -1549,17 +1604,19 @@ def _format_markdown(
         line_count = comp.get("lines", 0)
         exec_flag = comp.get("executable", False)
         exec_marker = "Yes" if exec_flag else "No"
-        lines.append(f"| `{path}` | {typ} | {line_count} | {exec_marker} |")
+        lines.append(
+            f"| {_markdown_code(path, table_cell=True)} | {_markdown_cell(typ)} | {line_count} | {exec_marker} |"
+        )
     lines.append("")
 
     if structured_summaries:
         lines.append(f"## Structured Skill Summary ({len(structured_summaries)})\n")
         for summary in structured_summaries:
-            lines.append(f"### {summary.get('id', 'SSR-1')}\n")
-            lines.append(f"**Message:** {summary.get('message', '')}  ")
+            lines.append(f"### {_markdown_cell(summary.get('id', 'SSR-1'))}\n")
+            lines.append(f"**Message:** {_markdown_cell(summary.get('message', ''))}  ")
             file = _summary_display_value(summary.get("file"))
             if file:
-                lines.append(f"**File:** `{file}`  ")
+                lines.append(f"**File:** {_markdown_code(file)}  ")
             for key, label in (
                 ("protocol", "Protocol"),
                 ("layout_kind", "Layout"),
@@ -1571,7 +1628,7 @@ def _format_markdown(
             ):
                 value = _summary_display_value(summary.get(key))
                 if value:
-                    lines.append(f"**{label}:** {value}  ")
+                    lines.append(f"**{label}:** {_markdown_cell(value)}  ")
             lines.append("")
 
     lines.append(f"## Issues ({len(findings)})\n")
@@ -1582,23 +1639,23 @@ def _format_markdown(
         for f in findings:
             sev = (f.severity or "LOW").upper()
             emoji = severity_emoji.get(sev, "")
-            lines.append(f"### {emoji} {sev}: {f.rule_id}\n")
+            lines.append(f"### {emoji} {_markdown_cell(sev)}: {_markdown_cell(f.rule_id)}\n")
             end = f"–{f.end_line}" if f.end_line and f.end_line != f.start_line else ""
-            lines.append(f"**Location:** `{f.file}:{f.start_line}{end}`  ")
+            lines.append(f"**Location:** {_markdown_code(f'{f.file}:{f.start_line}{end}')}  ")
             if f.source_url:
-                lines.append(f"**Source:** `{f.source_url}`  ")
+                lines.append(f"**Source:** {_markdown_code(f.source_url)}  ")
                 lines.append(f"**Transitive depth:** {f.transitive_depth}  ")
             lines.append(f"**Confidence:** {f.confidence:.0%}  ")
             lines.append("")
-            lines.append(f"**Message:** {f.message}")
+            lines.append(f"**Message:** {_markdown_cell(f.message)}")
             lines.append("")
             if f.remediation:
-                lines.append(f"**Remediation:** {f.remediation}")
+                lines.append(f"**Remediation:** {_markdown_cell(f.remediation)}")
                 lines.append("")
             if f.evidence:
                 lines.append("**Evidence:**")
                 for key, evidence_value in sorted(f.evidence.items()):
-                    lines.append(f"- **{key}:** `{evidence_value}`")
+                    lines.append(f"- **{_markdown_cell(key)}:** {_markdown_code(evidence_value)}")
                 lines.append("")
             lines.append("---\n")
 
@@ -1612,8 +1669,9 @@ def _format_markdown(
             lines.append("|------|----------|--------|")
             for sf in suppressed:
                 f = sf.finding
-                reason = sf.reason.replace("|", "\\|")
-                lines.append(f"| {f.rule_id} | `{f.file}:{f.start_line}` | {reason} |")
+                reason = _markdown_cell(sf.reason)
+                location = _markdown_code(f"{f.file}:{f.start_line}", table_cell=True)
+                lines.append(f"| {_markdown_cell(f.rule_id)} | {location} | {reason} |")
             lines.append("")
         else:
             lines.append("_Run with `--show-suppressed` to list them._\n")
@@ -1729,7 +1787,18 @@ def report(state: SkillspectorState) -> dict[str, object]:
         if analysis_completeness.get("status", "complete") == "complete":
             analysis_completeness["status"] = "partial"
     _attempted, _succeeded, degraded = _llm_runtime_status(llm_requested, llm_call_log)
-    provider_available, provider_error = is_llm_available()
+    remaining = transitive_remaining_seconds(state)
+    if remaining is not None and remaining <= 0:
+        provider_available = any(successful_llm_record(record) for record in llm_call_log)
+        provider_error = (
+            None
+            if provider_available
+            else "Workflow deadline reached before LLM availability could be confirmed."
+        )
+    else:
+        provider_available, provider_error = is_llm_available(
+            timeout=remaining if remaining is not None else 120
+        )
     runtime_available = llm_runtime_available(
         preflight_available=provider_available,
         result=state,
@@ -1883,6 +1952,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             llm_execution_enabled=use_llm,
             semantic_runtime_incomplete=semantic_runtime_incomplete,
             runtime_available=runtime_available,
+            provider_availability=(provider_available, provider_error),
         )
     elif output_format == "markdown":
         report_body = _format_markdown(
