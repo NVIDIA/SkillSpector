@@ -1258,7 +1258,12 @@ def _extract_packages_from_requirements_detailed(
     return results, largest_omitted
 
 
-_NPM_DEPENDENCY_SECTIONS = ("dependencies", "devDependencies", "peerDependencies")
+_NPM_DEPENDENCY_SECTIONS = (
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+)
 
 
 def _package_json_line(content: str, section: str, name: str) -> int:
@@ -1335,7 +1340,9 @@ def _extract_packages_from_package_json_scan(
     in_deps = False
     for i, line in enumerate(content.splitlines(), 1):
         stripped = line.strip()
-        if re.search(r'"(?:dependencies|devDependencies|peerDependencies)"', stripped):
+        if re.search(
+            r'"(?:dependencies|devDependencies|peerDependencies|optionalDependencies)"', stripped
+        ):
             in_deps = True
             continue
         if in_deps and stripped.startswith("}"):
@@ -1370,6 +1377,9 @@ def _extract_packages_from_package_json(
         return _extract_packages_from_package_json_scan(content, limit=limit)
     if not isinstance(data, dict):
         return []
+    # npm installs an optionalDependencies entry in place of a same-name "dependencies" entry.
+    optional = data.get("optionalDependencies")
+    overridden = set(optional) if isinstance(optional, dict) else set()
     dependencies: list[tuple[str, str, str]] = []
     for section in _NPM_DEPENDENCY_SECTIONS:
         deps = data.get(section)
@@ -1377,6 +1387,8 @@ def _extract_packages_from_package_json(
             continue
         for name, spec in deps.items():
             if not isinstance(name, str) or not isinstance(spec, str):
+                continue
+            if section == "dependencies" and name in overridden:
                 continue
             dependencies.append((section, name, spec))
             if limit is not None and len(dependencies) >= max(0, limit):
