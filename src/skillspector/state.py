@@ -235,6 +235,8 @@ class SkillspectorState(TypedDict, total=False):
 
     # Input: resolve_input node consumes input_path or skill_path, sets skill_path
     input_path: str | None
+    # Only trusted local transports may use the operator's Git credentials.
+    allow_git_credentials: bool
     skill_path: str | None
     # Relative identity of a wrapped/downloaded explicit file, distinct from passive assets.
     primary_file_path: str | None
