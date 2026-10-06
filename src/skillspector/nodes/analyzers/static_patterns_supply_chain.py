@@ -775,13 +775,15 @@ _DESCRIPTION_ACTIVATION_CONDITION_RE = re.compile(
 # Universal-scope signals for description clauses. The scope must be
 # unconditional: a subject or domain qualifier such as "about PostgreSQL",
 # "with PDF files" or "related to Kubernetes" keeps the clause describing a
-# capability, not a catch-all trigger. A leading determiner or quantifier is
-# transparent ("about this codebase", "about any AWS service" are still
-# bounded by the noun after it). A qualifier whose object is only a pronoun or
-# a generic noun ("anything with it", "anything with anyone", "anything
-# related to any topic", "any messages with any content") bounds nothing and
-# stays universal. Broad prepositions ("in", "for", "on") are deliberately not
-# qualifiers: "any message in the chat" is still every message.
+# capability, not a catch-all trigger. Up to three leading determiners,
+# quantifiers or "of" are transparent ("about this codebase", "about any AWS
+# service", "about all the services", "about all of the services" are still
+# bounded by the noun after them). A qualifier whose object is only a pronoun
+# or a generic noun ("anything with it", "anything with anyone", "anything
+# with any of them", "anything related to any topic", "any messages with any
+# content") bounds nothing and stays universal. Broad prepositions ("in",
+# "for", "on") are deliberately not qualifiers: "any message in the chat" is
+# still every message.
 _DESCRIPTION_SCOPE_DETERMINER = (
     r"(?:the|a|an|this|that|these|those|any|all|every|each|some|"
     r"my|your|our|their|its|his|her)"
@@ -797,8 +799,8 @@ _DESCRIPTION_UNIVERSAL_SCOPE_RE = re.compile(
     r"(?:all|any|every)\s+(?:messages?|requests?|questions?|queries?|inputs?|tasks?)"
     r")\b"
     r"(?!\s+(?:about|with|involving|regarding|concerning|(?:related|relating)\s+to)\s+"
-    rf"(?:{_DESCRIPTION_SCOPE_DETERMINER}\s+)?"
-    rf"(?!(?:{_DESCRIPTION_UNBOUNDED_OBJECT}|{_DESCRIPTION_SCOPE_DETERMINER})\b)[a-z0-9])",
+    rf"(?:(?:{_DESCRIPTION_SCOPE_DETERMINER}|of)\s+){{0,3}}"
+    rf"(?!(?:{_DESCRIPTION_UNBOUNDED_OBJECT}|{_DESCRIPTION_SCOPE_DETERMINER}|of)\b)[a-z0-9])",
     re.IGNORECASE,
 )
 
@@ -833,9 +835,16 @@ _DESCRIPTION_INTERCEPTION_VERB_RE = re.compile(
     re.IGNORECASE,
 )
 # Passive interception claims name the command before the verb: "the built-in
-# deploy command is intercepted", "types deploy it is intercepted".
+# deploy command is intercepted", "types deploy it is intercepted", "the deploy
+# command will be intercepted", "deploy commands are now shadowed". The
+# auxiliary may be "is"/"are" (optionally "being"), "gets", "will be" or
+# "has/have been", and one adverb may precede the participle. The adverb slot
+# takes a short list plus "-ly" words, so a negation ("is not intercepted",
+# "is never shadowed") does not count.
 _DESCRIPTION_PASSIVE_INTERCEPTION_RE = re.compile(
-    r"(?<![\w/.~-])/?([a-z][\w-]*)\s+(?:commands?\s+|it\s+)?(?:is|are|gets?)\s+"
+    r"(?<![\w/.~-])/?([a-z][\w-]*)\s+(?:commands?\s+|it\s+)?"
+    r"(?:(?:is|are)(?:\s+being)?|gets?|will\s+be|ha(?:s|ve)\s+been)\s+"
+    r"(?:(?:always|now|also|still|already|[a-z]+ly)\s+)?"
     r"(?:intercepted|overridden|shadowed|invoked)\b",
     re.IGNORECASE,
 )
@@ -962,7 +971,8 @@ def _description_shadowed_commands(clause: str) -> list[str]:
     Only commands tied to interception evidence count: a slash-command token
     whose whole name is a built-in, a built-in named anywhere after an
     invocation/interception/override verb in the clause, or a built-in that a
-    passive claim names right before the verb ("deploy is intercepted").
+    passive claim names right before its auxiliary ("deploy is intercepted",
+    "deploy command has been overridden").
     Returns the sorted set of shadowed built-in commands.
     """
     shadowed = {

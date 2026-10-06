@@ -2693,6 +2693,10 @@ class TestTriggerAnalysis:
                 "Diagnose and fix build failures caused by stale overrides",
                 id="capability_prose_overrides",
             ),
+            pytest.param(
+                "The deploy command is not intercepted by this skill",
+                id="passive_negated",
+            ),
         ],
     )
     def test_description_noun_matching_builtin_not_shadow_command(self, description: str) -> None:
@@ -2743,6 +2747,31 @@ class TestTriggerAnalysis:
                 "commit",
                 id="passive_overridden",
             ),
+            pytest.param(
+                "The built-in deploy command is always intercepted by this skill",
+                "deploy",
+                id="passive_adverb",
+            ),
+            pytest.param(
+                "The deploy command is being intercepted by this skill",
+                "deploy",
+                id="passive_is_being",
+            ),
+            pytest.param(
+                "The deploy command will be intercepted by this skill",
+                "deploy",
+                id="passive_will_be",
+            ),
+            pytest.param(
+                "Deploy commands are now shadowed by this skill",
+                "deploy",
+                id="passive_are_now",
+            ),
+            pytest.param(
+                "The git commit command has been overridden by this skill",
+                "commit",
+                id="passive_has_been",
+            ),
         ],
     )
     def test_description_shadow_command_object_still_tr2(
@@ -2790,6 +2819,23 @@ class TestTriggerAnalysis:
                 "Use this skill whenever the user wants to do anything with any PDF file",
                 id="quantifier_any_pdf",
             ),
+            pytest.param(
+                "Use this skill whenever the user asks any questions about all the services "
+                "in the cluster",
+                id="predeterminer_all_the",
+            ),
+            pytest.param(
+                "Use whenever the user asks anything about all your Terraform modules",
+                id="predeterminer_all_your",
+            ),
+            pytest.param(
+                "Use whenever the user asks anything about all these files",
+                id="predeterminer_all_these",
+            ),
+            pytest.param(
+                "Use whenever the user asks anything about all of the services",
+                id="quantifier_of_the",
+            ),
         ],
     )
     def test_description_domain_qualified_scope_not_tr3(self, description: str) -> None:
@@ -2836,6 +2882,14 @@ class TestTriggerAnalysis:
             pytest.param(
                 "Use this skill whenever the user asks anything regarding everyone",
                 id="indefinite_everyone",
+            ),
+            pytest.param(
+                "Use this skill whenever the user does anything with any of them",
+                id="quantifier_any_of_them",
+            ),
+            pytest.param(
+                "Use this skill whenever the user does anything with each of them",
+                id="quantifier_each_of_them",
             ),
         ],
     )
