@@ -619,7 +619,7 @@ def scan(
         SKILLSPECTOR_PROVIDER  Active LLM provider: openai | anthropic |
                                anthropic_proxy | bedrock | nv_build |
                                nv_inference | ollama | azure_openai |
-                               openai_compatible | gemini | claude_cli | codex_cli |
+                               openai_compatible | gemini | claude_cli |
                                gemini_cli | opencode_cli. Defaults to the NVIDIA path
                                (nv_inference, falling back to nv_build in
                                OSS builds).
@@ -645,9 +645,10 @@ def scan(
                                              for gemini (uses Application
                                              Default Credentials / Workload Identity)
 
-        ollama uses the local Ollama service. claude_cli, codex_cli,
+        ollama uses the local Ollama service. claude_cli,
         gemini_cli, and opencode_cli use their CLI's existing local
-        authentication session.
+        authentication session. codex_cli is registered but disabled because
+        its read-only sandbox permits host-file reads; use another provider.
     """
     if mcp_registry_compare is not None and not mcp_registry:
         err_console.print("[red]Error:[/red] --mcp-registry-compare requires --mcp-registry")
