@@ -23,14 +23,14 @@ produce a string.  The entry shape is defined by
 from __future__ import annotations
 
 import json
-import re
 from collections import defaultdict
 from datetime import UTC, datetime
-from html import escape as escape_html
 from io import StringIO
 
 from skillspector import __version__ as _skillspector_version
-from skillspector.nodes.report import _clean_text
+from skillspector.nodes.report import _markdown_cell as _markdown_text
+from skillspector.nodes.report import _markdown_code
+from skillspector.nodes.report import _markdown_plain_text as _markdown_plain_text
 
 
 def sorted_results(results: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -374,29 +374,6 @@ def _format_json(results: list[dict[str, object]]) -> str:
 # ═══════════════════════════════════════════════════════════════════
 #  Markdown
 # ═══════════════════════════════════════════════════════════════════
-
-
-def _markdown_plain_text(value: object) -> str:
-    """Remove display controls and keep a Markdown field on one line."""
-    text = _clean_text(str(value)) or ""
-    text = "".join(c for c in text if c.isprintable() or c.isspace())
-    return " ".join(text.splitlines())
-
-
-def _markdown_text(value: object) -> str:
-    """Keep scan-derived prose within its own Markdown line."""
-    text = escape_html(_markdown_plain_text(value), quote=False)
-    return re.sub(r"([\\`*_{}\[\]()#+.!|>~-])", r"\\\1", text)
-
-
-def _markdown_code(value: object, *, table_cell: bool = False) -> str:
-    """Quote literal text without allowing code-span or table-cell breakouts."""
-    text = _markdown_plain_text(value)
-    if table_cell:
-        text = text.replace("|", "\\|")
-    delimiter = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
-    padding = " " if text.startswith(("`", " ")) or text.endswith(("`", " ")) else ""
-    return f"{delimiter}{padding}{text}{padding}{delimiter}"
 
 
 def _format_markdown(results: list[dict[str, object]]) -> str:
