@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 import pytest
+from markdown_it import MarkdownIt
 from typer.testing import CliRunner
 
 import skillspector.nodes.build_context as build_context_module
@@ -677,7 +678,10 @@ async def test_complete_match_payload_is_bounded_across_public_surfaces(tmp_path
 
     for output_format in ("terminal", "json", "markdown", "sarif"):
         rendered = render_report({**result, "output_format": output_format})
-        assert payload_tail not in rendered["report_body"]
+        body = rendered["report_body"]
+        if output_format == "markdown":
+            body = MarkdownIt().enable("table").render(body)
+        assert payload_tail not in body
 
     verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
     assert payload_tail not in json.dumps(verdict, sort_keys=True)
