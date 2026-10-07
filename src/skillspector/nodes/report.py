@@ -30,6 +30,7 @@ from hashlib import sha256
 from html import escape as escape_html
 from io import StringIO
 from typing import Literal, cast
+from urllib.parse import quote
 
 from rich.console import Console
 from rich.markup import escape
@@ -202,13 +203,14 @@ def _sarif_artifact_location(
 ) -> SarifArtifactLocation:
     """Build a source-scoped SARIF artifact location for one occurrence."""
     occurrence = occurrence or {}
-    file_path = str(occurrence.get("file", finding.file)).replace("\\", "/").lstrip("/")
+    raw_file_path = str(occurrence.get("file", finding.file)).replace("\\", "/").lstrip("/")
+    file_path = quote(raw_file_path, safe="/")
     provenance = _occurrence_provenance(finding, occurrence)
     source_identity = _report_source_identity(provenance)
     if source_identity:
         uri = f"{source_identity}/{file_path}"
     else:
-        uri = str(occurrence.get("file", finding.file))
+        uri = quote(str(occurrence.get("file", finding.file)).replace("\\", "/"), safe="/")
     properties = {
         {
             "source_identity": "sourceIdentity",
