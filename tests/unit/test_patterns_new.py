@@ -1534,21 +1534,24 @@ class TestToolMisuse:
         assert parse.call_count == 1
         assert len([finding for finding in findings if finding.rule_id == "TM1"]) == 300
 
-    @pytest.mark.parametrize("suffix", ["", "\nif :"])
-    def test_tm1_reuses_matching_parse_including_parse_failure(self, suffix: str) -> None:
-        content = "use_shell = True\nsubprocess.run(cmd, shell=use_shell)\n" * 20 + suffix
-        parsed = tm_mod.parse_python_source(content, "runner.py")
-        with patch.object(tm_mod, "parse_python_source", side_effect=AssertionError("reparsed")):
-            findings = tm_mod.analyze(content, "runner.py", "python", python_ast=parsed)
+    def test_tm1_caches_unparseable_window_conservatively(self) -> None:
+        content = "use_shell = True\nsubprocess.run(cmd, shell=use_shell)\n" * 20 + "\nif :"
+        with patch.object(tm_mod, "parse_python_source", wraps=tm_mod.parse_python_source) as parse:
+            findings = tm_mod.analyze(content, "runner.py", "python")
+        assert parse.call_count == 1
         assert len([finding for finding in findings if finding.rule_id == "TM1"]) == 20
 
-    def test_tm1_does_not_reuse_ast_from_a_different_window(self) -> None:
-        content = "use_shell = True\nsubprocess.run(cmd, shell=use_shell)\n"
-        parsed = tm_mod.parse_python_source("pass", "runner.py")
-        with patch.object(tm_mod, "parse_python_source", wraps=tm_mod.parse_python_source) as parse:
-            findings = tm_mod.analyze(content, "runner.py", "python", python_ast=parsed)
-        assert parse.call_count == 1
-        assert any(finding.rule_id == "TM1" for finding in findings)
+    def test_tm1_remains_lexical_for_large_and_normalized_views(self) -> None:
+        from skillspector.nodes.analyzers import static_runner
+
+        for content in (
+            "# ordinary source\n" * 16_000 + "subprocess.run(cmd, shell=True)",
+            "subprocess.run(cmd, shell=Tru\u200be)",
+        ):
+            result = static_runner.run_static_patterns_with_ledger(
+                {"components": ["runner.py"], "file_cache": {"runner.py": content}}, [tm_mod]
+            )
+            assert any(finding.rule_id == "TM1" for finding in result["findings"])
 
     def test_tm1_scope_index_honors_runtime_check(self) -> None:
         content = "use_shell = True\nsubprocess.run(cmd, shell=use_shell)\n" * 300

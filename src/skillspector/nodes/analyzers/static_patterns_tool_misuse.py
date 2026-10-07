@@ -34,7 +34,7 @@ from dataclasses import dataclass
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
-from skillspector.python_ast import ParsedPythonFile, parse_python_source
+from skillspector.python_ast import parse_python_source
 from skillspector.python_tokens import PythonLiteralSpans
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
 from skillspector.security_reconstruction import validated_json_string_spans
@@ -54,7 +54,6 @@ from .pattern_defaults import PatternCategory
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_tool_misuse"
-USES_PYTHON_AST = True
 USES_RUNTIME_CHECK = True
 
 _SHELL_COMMAND_WORD_START_RE = re.compile(r"[rRdDeE$'\"`\\]")
@@ -3258,16 +3257,11 @@ class _VariableShellScopeIndex:
         self,
         content: str,
         file_path: str,
-        python_ast: ParsedPythonFile | None,
         check_runtime: Callable[[], None],
     ) -> None:
         self.check_runtime = check_runtime
         check_runtime()
-        parsed = (
-            python_ast
-            if python_ast is not None and python_ast.content == content
-            else parse_python_source(content, file_path)
-        )
+        parsed = parse_python_source(content, file_path)
         check_runtime()
         self.tree = parsed.tree
         self.line_starts = [0, *(match.end() for match in re.finditer("\n", content))]
@@ -3902,7 +3896,6 @@ def analyze(
     file_path: str,
     file_type: str,
     *,
-    python_ast: ParsedPythonFile | None = None,
     check_runtime: Callable[[], None] | None = None,
 ) -> list[AnalyzerFinding]:
     """Analyze content for tool misuse patterns (TM1–TM3)."""
@@ -3932,7 +3925,7 @@ def analyze(
             runtime_check()
             if scope_index is None:
                 scope_index = _VariableShellScopeIndex(
-                    content, file_path, python_ast, runtime_check
+                    content, file_path, runtime_check
                 )
             if not scope_index.same_scope(variable_match):
                 cross_scope_starts.add(variable_match.start())
