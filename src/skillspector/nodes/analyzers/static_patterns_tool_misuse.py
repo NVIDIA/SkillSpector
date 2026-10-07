@@ -3924,9 +3924,7 @@ def analyze(
         for variable_match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
             runtime_check()
             if scope_index is None:
-                scope_index = _VariableShellScopeIndex(
-                    content, file_path, runtime_check
-                )
+                scope_index = _VariableShellScopeIndex(content, file_path, runtime_check)
             if not scope_index.same_scope(variable_match):
                 cross_scope_starts.add(variable_match.start())
 
