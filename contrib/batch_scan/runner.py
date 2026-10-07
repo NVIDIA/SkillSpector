@@ -130,7 +130,7 @@ _patches_depth: int = 0  # nesting counter — safe for re-entrant context manag
 _original_base_init = LLMAnalyzerBase.__init__
 
 
-def _patched_base_init(self, base_prompt, model, *, node="llm_analyzer"):
+def _patched_base_init(self, base_prompt, model, *, node="llm_analyzer", timeout=None):
     """Set response_schema=None on the instance dict BEFORE original init.
 
     Relies on Python MRO guarantee: instance.__dict__ is always checked
@@ -138,7 +138,7 @@ def _patched_base_init(self, base_prompt, model, *, node="llm_analyzer"):
     a library internal.
     """
     self.response_schema = None
-    _original_base_init(self, base_prompt, model, node=node)
+    _original_base_init(self, base_prompt, model, node=node, timeout=timeout)
 
 
 # -- Patch 2: LLMAnalyzerBase.parse_response handles raw JSON --------------

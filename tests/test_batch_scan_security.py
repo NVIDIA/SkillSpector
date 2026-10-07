@@ -82,7 +82,8 @@ async def test_compat_parse_failures_retry_and_remain_visible(
         assert outcome.failures[0].reason.value == "llm_structured_response_invalid"
         events, _ = llm_analyzer_base.ledger_events_for_batches("compat-test", outcome)
         assert len(events) == 1
-        assert events[0]["outcome"].value == "failed"
+        # Core policy records malformed output as skipped, so coverage is partial.
+        assert events[0]["outcome"].value == "skipped"
         assert events[0]["reason_code"] == "llm_structured_response_invalid"
         assert invalid_response not in json.dumps(events)
 
