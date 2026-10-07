@@ -40,7 +40,9 @@ def write_text_no_follow(path: str | Path, text: str) -> None:
     Platforms without these guarantees must use explicitly managed stdout.
     """
     if not _SECURE_OUTPUT_SUPPORTED:
-        raise ValueError("Safe file output is unsupported on this platform; use stdout redirection.")
+        raise ValueError(
+            "Safe file output is unsupported on this platform; use stdout redirection."
+        )
     absolute = _normalize_root_owned_alias(Path(path))
     flags = os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_PATH", os.O_RDONLY)
     directory_fd = os.open(absolute.anchor, flags)
@@ -59,15 +61,19 @@ def write_text_no_follow(path: str | Path, text: str) -> None:
                 raise ValueError("Refusing to overwrite a non-regular output file.")
         candidate = f".skillspector-output-{token_hex(16)}"
         fd = os.open(
-            candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600, dir_fd=directory_fd,
+            candidate,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
         )
         temporary_name = candidate
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(text)
         os.replace(
-            temporary_name, absolute.name,
-            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+            temporary_name,
+            absolute.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
         )
         temporary_name = None
     finally:

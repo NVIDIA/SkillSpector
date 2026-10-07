@@ -7080,11 +7080,14 @@ def test_report_output_cannot_redirect_to_external_file(tmp_path, monkeypatch, r
     if race == "hard-link":
         os.link(protected, output)
     elif race == "leaf":
+
         def replace_after_swap(src, dst, **kwargs):
             output.symlink_to(protected)
             return original_replace(src, dst, **kwargs)
+
         monkeypatch.setattr(file_output.os, "replace", replace_after_swap)
     else:
+
         def open_after_swap(path, flags, *args, **kwargs):
             if path == parent.name:
                 if race == "parent-after-open":
@@ -7094,6 +7097,7 @@ def test_report_output_cannot_redirect_to_external_file(tmp_path, monkeypatch, r
                 if race == "parent-after-open":
                     return fd
             return original_open(path, flags, *args, **kwargs)
+
         monkeypatch.setattr(file_output.os, "open", open_after_swap)
     if race == "parent-before-open":
         with pytest.raises(OSError):
@@ -7119,8 +7123,10 @@ def test_report_output_rejects_symlinks_and_cleans_failed_replace(tmp_path, monk
         file_output.write_text_no_follow(output, "report")
     output.unlink()
     output.write_text("previous", encoding="utf-8")
+
     def fail_replace(*args, **kwargs):
         raise PermissionError("synthetic replacement failure")
+
     monkeypatch.setattr(file_output.os, "replace", fail_replace)
     with pytest.raises(PermissionError):
         file_output.write_text_no_follow(output, "report")
@@ -7135,8 +7141,12 @@ def test_report_output_unsupported_platform_keeps_stdout(tmp_path, monkeypatch):
     monkeypatch.setattr(file_output, "_SECURE_OUTPUT_SUPPORTED", False)
     skill = tmp_path / "SKILL.md"
     skill.write_text("---\nname: safe\n---\nHello", encoding="utf-8")
-    monkeypatch.setattr(cli, "_scan_skill", lambda **kwargs: {"report_body": "report", "risk_score": 0})
-    result = runner.invoke(app, ["scan", str(skill), "--no-llm", "--output", str(tmp_path / "report")])
+    monkeypatch.setattr(
+        cli, "_scan_skill", lambda **kwargs: {"report_body": "report", "risk_score": 0}
+    )
+    result = runner.invoke(
+        app, ["scan", str(skill), "--no-llm", "--output", str(tmp_path / "report")]
+    )
     assert result.exit_code == 2
     assert "use stdout redirection" in result.output
     assert not (tmp_path / "report").exists()
