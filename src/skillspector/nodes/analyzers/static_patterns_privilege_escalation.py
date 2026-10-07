@@ -363,6 +363,10 @@ _PE3_IGNORE_PATTERN_FILE_NAMES = frozenset(
     }
 )
 # BuildKit also reads ``<Dockerfile name>.dockerignore`` beside a named Dockerfile.
+# The suffix alone is accepted on purpose, with or without a matching Dockerfile
+# in the bundle: the file name only selects the per-line rules below, and every
+# exemption still needs a line that is one pattern token, not a negation, and
+# not a host path.  Prose or commands in such a file keep their PE3 findings.
 _PE3_IGNORE_PATTERN_FILE_SUFFIX = ".dockerignore"
 # One ignore-file entry: a single pattern token, optionally padded by spaces or
 # tabs.  The token cannot open as a comment (``#``) or a negation (``!``), and
