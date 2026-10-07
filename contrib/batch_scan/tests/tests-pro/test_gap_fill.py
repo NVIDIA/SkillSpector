@@ -30,7 +30,7 @@ _project_root = Path(__file__).resolve().parents[3]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from skillspector.llm_analyzer_base import Batch
+from skillspector.llm_analyzer_base import Batch, _StructuredResponseValidationError
 from skillspector.models import Finding
 
 from contrib.batch_scan.gap_fill import (
@@ -210,46 +210,21 @@ class TestParseResponseInvalidInput(unittest.TestCase):
     def setUpClass(cls):
         cls.analyzer = GapFillAnalyzer(language="ko")
 
-    def test_non_json_string_returns_empty_list(self):
-        results = self.analyzer.parse_response("This is not JSON at all.", _batch())
-        self.assertEqual(len(results), 0)
+    def test_invalid_responses_raise_for_core_retry_and_failure_accounting(self):
+        responses = [
+            "This is not JSON at all.", "", 42, "[1, 2, 3]",
+            json.dumps({"findings": "not a list"}),
+            json.dumps({"findings": [_valid_finding(severity="CATASTROPHIC")]}),
+            "\ufeff" + json.dumps({"findings": [_valid_finding()]}),
+            '{"findings": [\x00]}',
+        ]
+        for response in responses:
+            with self.subTest(response=response):
+                with self.assertRaises(_StructuredResponseValidationError):
+                    self.analyzer.parse_response(response, _batch())
 
-    def test_empty_string_returns_empty_list(self):
-        self.assertEqual(len(self.analyzer.parse_response("", _batch())), 0)
-
-    def test_integer_input_returns_empty_list(self):
-        self.assertEqual(len(self.analyzer.parse_response(42, _batch())), 0)
-
-    def test_json_list_instead_of_object_returns_empty_list(self):
-        self.assertEqual(len(self.analyzer.parse_response("[1, 2, 3]", _batch())), 0)
-
-    def test_missing_findings_key_returns_empty_list(self):
-        self.assertEqual(
-            len(self.analyzer.parse_response(json.dumps({"other": "value"}), _batch())), 0
-        )
-
-    def test_findings_value_is_string_not_list_returns_empty_list(self):
-        self.assertEqual(
-            len(self.analyzer.parse_response(json.dumps({"findings": "not a list"}), _batch())), 0
-        )
-
-    def test_invalid_severity_literal_value_returns_empty_list(self):
-        data = {"findings": [_valid_finding(severity="CATASTROPHIC")]}
-        results = self.analyzer.parse_response(json.dumps(data), _batch())
-        self.assertEqual(len(results), 0)
-
-    def test_utf8_bom_prepended_json_does_not_crash(self):
-        """#C3: JSON with UTF-8 BOM prefix — should not crash."""
-        text = "﻿" + json.dumps({"findings": [_valid_finding()]})
-        results = self.analyzer.parse_response(text, _batch())
-        # May or may not parse (BOM handling is platform-dependent), but must not crash
-        self.assertIsInstance(results, list)
-
-    def test_json_with_embedded_null_bytes_does_not_crash(self):
-        """Edge: null bytes in JSON string — should not crash."""
-        text = '{"findings": [\x00]}'
-        results = self.analyzer.parse_response(text, _batch())
-        self.assertIsInstance(results, list)
+    def test_missing_findings_key_keeps_schema_default(self):
+        self.assertEqual(self.analyzer.parse_response('{"other": "value"}', _batch()), [])
 
 
 # ---------------------------------------------------------------------------

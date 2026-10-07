@@ -128,6 +128,72 @@ def test_gap_fill_provider_prompt_excludes_symlink_target(
     assert entry["issues"] == []
 
 
+@pytest.mark.parametrize("failure_mode", ["json", "schema", "provider", "timeout"])
+@pytest.mark.parametrize("partial_success", [False, True])
+def test_gap_fill_failure_is_incomplete_and_preserves_findings(
+    batch_skill, monkeypatch: pytest.MonkeyPatch, failure_mode, partial_success
+) -> None:
+    from contrib.batch_scan import reports
+    from skillspector.inspection_ledger import (
+        LedgerOutcome,
+        analyzer_status_for_events,
+        ledger_event,
+    )
+    from skillspector.models import Finding
+
+    skill, _ = batch_skill
+    core_finding = Finding(rule_id="TM1", message="Existing evidence", severity="HIGH", file="SKILL.md")
+    if partial_success:
+        (skill / "partial.md").write_text(_SAFE_TEXT, encoding="utf-8")
+
+    def keep_core_evidence(context):
+        events = [ledger_event(
+            analyzer_id="core-test", phase="static", path="SKILL.md",
+            outcome=LedgerOutcome.COMPLETED, emitted_finding_ids=[core_finding.finding_id],
+        )]
+        context["findings"] = [core_finding]
+        context["inspection_ledger"] = [*context.get("inspection_ledger", []), *events]
+        context["analyzer_status_events"] = [analyzer_status_for_events("core-test", events)]
+
+    _mock_scan(monkeypatch, keep_core_evidence)
+    monkeypatch.setattr(runner, "run_gap_fill", run_gap_fill)
+    calls = []
+
+    def invoke(prompt):
+        calls.append(prompt)
+        if "File: partial.md" in prompt:
+            return AIMessage(content=json.dumps({"findings": [{
+                "rule_id": "P5", "message": "Retained gap evidence", "severity": "HIGH",
+            }]}))
+        if failure_mode == "provider":
+            raise RuntimeError("synthetic provider failure")
+        if failure_mode == "timeout":
+            raise llm_analyzer_base.LLMRuntimeLimitError("deadline")
+        return AIMessage(content="not JSON" if failure_mode == "json" else '{"findings": 1}')
+
+    monkeypatch.setattr(llm_analyzer_base, "get_chat_model", lambda **kw: SimpleNamespace(invoke=invoke))
+    monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda model: 100_000)
+    monkeypatch.setattr(llm_analyzer_base, "STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS", (0, 0, 0))
+
+    entry, error = runner.run_one(skill, skill.parent, use_llm=True, detected_language="zh", apply_gap_fill=True)
+
+    assert error == "Gap-fill analysis did not complete for 1 batch(es)."
+    assert entry["enhancements"]["gap_fill_applied"] is False
+    assert entry["enhancements"]["gap_fill_findings"] == int(partial_success)
+    assert entry["analysis_completeness"]["is_complete"] is False
+    assert any(issue["rule_id"] == "TM1" for issue in entry["issues"])
+    assert any(issue["rule_id"] == "P5" for issue in entry["issues"]) is partial_success
+    expected_reason = {"json": "llm_structured_response_invalid", "schema": "llm_structured_response_invalid", "provider": "llm_batch_failed", "timeout": "runtime_limit"}[failure_mode]
+    assert any(row["reason_code"] == expected_reason for row in entry["analysis_completeness"]["ledger_exceptions"])
+    payload = json.loads(reports.format_json([entry]))
+    assert payload["batch"]["enhancements"]["gap_fill_applied"] == 0
+    assert payload["batch"]["inspection_completeness"]["incomplete_skills"] == 1
+    assert expected_reason in reports.format_terminal([entry])
+    assert expected_reason.replace("_", "\\_") in reports.format_markdown([entry])
+    expected_failed_calls = 4 if failure_mode in {"json", "schema"} else 1
+    assert len(calls) == expected_failed_calls + int(partial_success)
+
+
 @pytest.mark.parametrize("cache_state", ["empty", "missing"])
 def test_gap_fill_never_falls_back_to_local_content(
     batch_skill, monkeypatch: pytest.MonkeyPatch, cache_state

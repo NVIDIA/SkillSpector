@@ -38,13 +38,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from skillspector.graph import graph
-from skillspector.llm_analyzer_base import LLMAnalyzerBase, LLMAnalysisResult
+from skillspector.inspection_ledger import finalize_ledger
+from skillspector.llm_analyzer_base import LLMAnalyzerBase, LLMAnalysisResult, ledger_events_for_batches
 from skillspector.logging_config import get_logger
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, MetaAnalyzerResult
 
 from .annotation import annotate_findings
 from .detection import detect_skill_language
-from .gap_fill import run_gap_fill
+from .gap_fill import GapFillError, run_gap_fill
 
 logger = get_logger(__name__)
 
@@ -775,12 +776,30 @@ def run_one(
             gap_fill_findings=gap_fill_findings,
         )
         if apply_gap_fill and use_llm and detected_language != "en":
-            gap_findings = run_gap_fill(file_cache, detected_language, api_pool=api_pool)
+            gap_error = None
+            try:
+                gap_findings = run_gap_fill(file_cache, detected_language, api_pool=api_pool)
+            except GapFillError as exc:
+                gap_error = exc
+                gap_findings = [finding for _, findings in exc.outcome.successful for finding in findings]
             entry["issues"] = list(entry.get("issues", [])) + annotate_findings(
                 [finding.to_dict() for finding in gap_findings], detected_language
             )
-            entry["enhancements"]["gap_fill_applied"] = True
+            entry["enhancements"]["gap_fill_applied"] = bool(file_cache) and gap_error is None
             entry["enhancements"]["gap_fill_findings"] = len(gap_findings)
+            if gap_error is not None:
+                events, status = ledger_events_for_batches("gap_fill", gap_error.outcome)
+                completeness, _ = finalize_ledger({
+                    **result,
+                    "findings": [*(result.get("findings") or []), *gap_findings],
+                    "inspection_ledger": [*(result.get("inspection_ledger") or []), *events],
+                    "analyzer_status_events": [*(result.get("analyzer_status_events") or []), status],
+                })
+                entry["analysis_completeness"] = completeness
+                entry["execution_successful"] = completeness["execution_successful"]
+                if entry["risk_assessment"]["recommendation"] == "SAFE":
+                    entry["risk_assessment"]["recommendation"] = "CAUTION"
+                return entry, str(gap_error)
         return entry, None
     except Exception as exc:
         return entry_from_error(skill_dir, root, str(exc), detected_language), str(exc)

@@ -30,10 +30,14 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from skillspector.constants import MODEL_CONFIG
-from skillspector.llm_analyzer_base import LLMAnalyzerBase
+from skillspector.llm_analyzer_base import (
+    BatchExecutionResult,
+    LLMAnalyzerBase,
+    _StructuredResponseValidationError,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 
@@ -88,6 +92,14 @@ class GapFillResult(BaseModel):
     """Structured LLM response for the gap-fill analyzer."""
 
     findings: list[GapFillFinding] = Field(default_factory=list)
+
+
+class GapFillError(RuntimeError):
+    """An incomplete pass, retaining successful batches for the report."""
+
+    def __init__(self, outcome: BatchExecutionResult):
+        self.outcome = outcome
+        super().__init__(f"Gap-fill analysis did not complete for {len(outcome.failures)} batch(es).")
 
 
 # ---------------------------------------------------------------------------
@@ -210,37 +222,10 @@ class GapFillAnalyzer(LLMAnalyzerBase):
         (not a Pydantic model).  We strip markdown code fences, parse JSON,
         validate with :class:`GapFillResult`, and filter to ``confidence >= 0.7``.
         """
-        text = str(response).strip()
-
-        # Strip markdown code fences if present
-        if text.startswith("```"):
-            first_nl = text.find("\n")
-            if first_nl != -1:
-                text = text[first_nl + 1:]
-            if text.rstrip().endswith("```"):
-                text = text.rstrip()[:-3].rstrip()
-
-        # Parse JSON → Pydantic for validation
-        import json
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError as exc:
-            logger.warning(
-                "GapFillAnalyzer: invalid JSON for %s: %s",
-                batch.file_label,
-                exc,
-            )
-            return []
-
-        try:
-            result = GapFillResult.model_validate(data)
-        except Exception as exc:
-            logger.warning(
-                "GapFillAnalyzer: schema validation failed for %s: %s",
-                batch.file_label,
-                exc,
-            )
-            return []
+        if isinstance(response, GapFillResult):
+            result = response
+        else:
+            result = self._parse_json_response(response)
 
         findings: list[Finding] = []
         for item in result.findings:
@@ -255,6 +240,26 @@ class GapFillAnalyzer(LLMAnalyzerBase):
                 continue
             findings.append(item.to_finding(batch.file_path))
         return findings
+
+    @staticmethod
+    def _parse_json_response(response):
+        text = str(response).strip()
+
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            first_nl = text.find("\n")
+            if first_nl != -1:
+                text = text[first_nl + 1:]
+            if text.rstrip().endswith("```"):
+                text = text.rstrip()[:-3].rstrip()
+
+        # Parse JSON → Pydantic for validation
+        import json
+        try:
+            data = json.loads(text)
+            return GapFillResult.model_validate(data)
+        except (json.JSONDecodeError, ValidationError) as exc:
+            raise _StructuredResponseValidationError from exc
 
 
 # ---------------------------------------------------------------------------
@@ -293,13 +298,9 @@ def run_gap_fill(
     if not file_cache:
         return []
 
-    try:
-        analyzer = GapFillAnalyzer(language=language, model=model, api_pool=api_pool)
-        batches = analyzer.get_batches(list(file_cache.keys()), file_cache)
-        results = analyzer.run_batches(batches, language=language)
-        return analyzer.collect_findings(results)
-    except ValueError:
-        raise
-    except Exception as exc:
-        logger.warning("Gap-fill analysis failed: %s", exc)
-        return []
+    analyzer = GapFillAnalyzer(language=language, model=model, api_pool=api_pool)
+    batches = analyzer.get_batches(list(file_cache.keys()), file_cache)
+    outcome = analyzer.run_batches_detailed(batches, language=language)
+    if outcome.failures:
+        raise GapFillError(outcome)
+    return analyzer.collect_findings(outcome.successful)
