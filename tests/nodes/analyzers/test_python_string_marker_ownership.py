@@ -16,6 +16,8 @@ file types, and unproven Python keep the lexical result.
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -90,6 +92,14 @@ _MARKER_INSIDE_TOKEN = [
         id="docstring-quoted-marker",
     ),
 ]
+
+
+@pytest.fixture(autouse=True)
+def _fresh_ownership_memo() -> Iterator[None]:
+    # Ownership proofs are memoized across scans. Each test starts without
+    # them, so its parse counts and runtime checks are its own.
+    python_tokens._PYTHON_LITERAL_SPANS_CACHE.clear()
+    yield
 
 
 def _ledger(path: str, content: str, *modules: object) -> dict:
@@ -199,6 +209,152 @@ def test_string_ownership_is_proven_lazily_and_once(monkeypatch: pytest.MonkeyPa
     assert calls == [len(content)]
 
 
+# --- One ownership parse per module ----------------------------------------
+
+# The marker pass proves the closing quote after "omit", and the tool-misuse
+# shell parser proves the fence backticks literal: both consumers ask.
+_BOTH_CONSUMERS = _ASSERT_FLAG + 'FENCE = "\\n```\\n"\n' + _UNQUOTED_TAIL
+
+
+def _count_parses(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    parses: list[str] = []
+    real_parse = python_tokens._python_literal_spans_uncached
+
+    def counted(content: str, check_runtime: Callable[[], None]):
+        parses.append(content)
+        return real_parse(content, check_runtime)
+
+    monkeypatch.setattr(python_tokens, "_python_literal_spans_uncached", counted)
+    return parses
+
+
+def _literals(content: str, spans: python_tokens.PythonLiteralSpans | None) -> list[str] | None:
+    if spans is None:
+        return None
+    return [content[start:end] for start, end in zip(*spans, strict=True)]
+
+
+def test_marker_pass_and_shell_parser_share_one_parse_per_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parses = _count_parses(monkeypatch)
+    requests: list[int] = []
+    real_spans = python_tokens.python_literal_spans
+
+    def requested(content: str, check_runtime: Callable[[], None]):
+        requests.append(len(content))
+        return real_spans(content, check_runtime)
+
+    monkeypatch.setattr(python_tokens, "python_literal_spans", requested)
+    monkeypatch.setattr(tm_module, "_python_literal_spans", requested)
+
+    result = _ledger("scripts/check.py", _BOTH_CONSUMERS, tm_module, pi_module)
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert requests == [len(_BOTH_CONSUMERS)] * 2
+    assert [len(content) for content in parses] == [len(_BOTH_CONSUMERS)]
+
+
+def test_memo_reuses_proven_and_unproven_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    parses = _count_parses(monkeypatch)
+    proven = 'a = "x"  # note\n'
+    unproven = 'a = "x" + $(\n'
+
+    for _ in range(2):
+        assert _literals(proven, python_tokens.python_literal_spans(proven, lambda: None)) == [
+            '"x"',
+            "# note",
+        ]
+        assert python_tokens.python_literal_spans(unproven, lambda: None) is None
+
+    assert parses == [proven, unproven]
+
+
+def test_memo_tells_apart_sources_in_one_length_and_hash_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every source gets one key here, so only string equality separates them.
+    monkeypatch.setattr(python_tokens, "hash", lambda _content: 0, raising=False)
+    sources = {
+        'a = "x"  # c\n': ['"x"', "# c"],
+        "b = 'y'  # d\n": ["'y'", "# d"],
+        'c = "z" + $(\n': None,
+    }
+    assert len({len(source) for source in sources}) == 1
+
+    for _ in range(2):
+        for source, literals in sources.items():
+            assert _literals(source, python_tokens.python_literal_spans(source, lambda: None)) == (
+                literals
+            )
+    assert len(python_tokens._PYTHON_LITERAL_SPANS_CACHE) == 1
+
+
+def test_memoized_result_still_honors_the_runtime_check() -> None:
+    assert python_tokens.python_literal_spans(_ASSERT_FLAG, lambda: None) is not None
+
+    def expired() -> None:
+        raise TimeoutError("test runtime bound")
+
+    with pytest.raises(TimeoutError, match="test runtime bound"):
+        python_tokens.python_literal_spans(_ASSERT_FLAG, expired)
+
+
+def test_parse_interrupted_by_the_runtime_check_is_not_memoized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parses = _count_parses(monkeypatch)
+    checks = 0
+
+    def expires_after_the_module_parse() -> None:
+        nonlocal checks
+        checks += 1
+        if checks > 1:
+            raise TimeoutError("test runtime bound")
+
+    with pytest.raises(TimeoutError, match="test runtime bound"):
+        python_tokens.python_literal_spans(_ASSERT_FLAG, expires_after_the_module_parse)
+    for _ in range(2):
+        assert python_tokens.python_literal_spans(_ASSERT_FLAG, lambda: None) is not None
+
+    # The interrupted proof is redone once and then shared.
+    assert parses == [_ASSERT_FLAG, _ASSERT_FLAG]
+
+
+def test_concurrent_sources_each_get_their_own_spans() -> None:
+    # Analyzer nodes run on worker threads. More sources than memo entries
+    # keep entries being replaced while other threads look them up.
+    sources = [
+        "".join(f'value_{index} = "{worker}-{index}"  # w{worker}\n' for index in range(worker + 1))
+        for worker in range(6)
+    ] + ['broken = "x" + $(\n']
+    expected = {
+        source: python_tokens._python_literal_spans_uncached(source, lambda: None)
+        for source in sources
+    }
+    assert [spans is None for spans in expected.values()] == [False] * 6 + [True]
+    barrier = threading.Barrier(8)
+    correct: list[bool] = []
+
+    def scan(worker: int) -> None:
+        barrier.wait()
+        for step in range(60):
+            source = sources[(worker + step) % len(sources)]
+            correct.append(
+                python_tokens.python_literal_spans(source, lambda: None) == expected[source]
+            )
+
+    threads = [threading.Thread(target=scan, args=(worker,)) for worker in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert correct == [True] * 480
+    cache_size = python_tokens._PYTHON_LITERAL_SPANS_CACHE_SIZE
+    assert len(python_tokens._PYTHON_LITERAL_SPANS_CACHE) <= cache_size
+
+
 # --- Readings that stay fail-closed ----------------------------------------
 
 
@@ -259,6 +415,21 @@ _GLUED_INVALID_PYTHON = (
 )
 def test_glued_marker_outside_proven_python_still_fails_closed(path: str, content: str) -> None:
     _assert_partial_marker_text(_ledger(path, content))
+
+
+def test_glued_bare_string_statements_in_a_proven_module_are_complete() -> None:
+    # Deliberate parity with validated JSON arrays. In a module the Python
+    # parser accepts, ``_GLUED`` is two bare string statements, so the quotes
+    # around ``;`` are the literals' own delimiters, not a marker, just as
+    # validated JSON array elements own their closing quotes. If this result
+    # flips, in either direction, revisit this rationale and the JSON contract
+    # together.
+    assert python_tokens.python_literal_spans(_GLUED, lambda: None) is not None
+
+    result = _ledger("scripts/check.py", _GLUED)
+
+    assert result["findings"] == []
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
 def test_explicit_declaration_still_reads_a_closing_quote_as_marker_opener() -> None:

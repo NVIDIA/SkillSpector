@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.python_ast import parse_python_source
+from skillspector.python_tokens import PythonLiteralSpans
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
 from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -2545,12 +2546,12 @@ class _PythonSourceOwnership:
     def __init__(self, content: str, check_runtime: Callable[[], None]) -> None:
         self._content = content
         self._check_runtime = check_runtime
-        self._spans: tuple[list[int], list[int]] | None = None
+        self._spans: PythonLiteralSpans | None = None
         self._spans_computed = False
         self._cached_word_start = -1
         self._cached_word_end = -1
 
-    def _owned_spans(self) -> tuple[list[int], list[int]] | None:
+    def _owned_spans(self) -> PythonLiteralSpans | None:
         if not self._spans_computed:
             self._spans = _python_literal_spans(self._content, self._check_runtime)
             self._spans_computed = True

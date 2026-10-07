@@ -18,6 +18,7 @@ import re
 import tokenize
 import warnings
 from bisect import bisect_right
+from collections import OrderedDict
 from collections.abc import Callable
 from threading import Lock
 
@@ -44,25 +45,72 @@ _PYTHON_TEMPLATE_STRING_ENDS = frozenset(
     {tokenize.FSTRING_END, getattr(tokenize, "TSTRING_END", tokenize.FSTRING_END)}
 )
 
+# Start offsets and matching end offsets of a module's outermost string and
+# comment tokens, in source order. Results are shared, so they are immutable.
+PythonLiteralSpans = tuple[tuple[int, ...], tuple[int, ...]]
+
+# One static scan of a module asks for its spans twice: the declared-marker
+# pass proves string closers, and the tool-misuse shell parser proves token
+# ownership. The most recent results are remembered so both share one parse.
+# Entries are keyed by length and hash and confirmed by string equality, which
+# is an identity check when both callers hold the same file-cache string. A
+# second entry absorbs a scan of another file on a concurrent analyzer thread.
+# Oversized source is never stored, and eviction bounds how long a module's
+# text outlives its scan. This lock guards only the entries, so a lookup never
+# waits for another thread's parse.
+_PYTHON_LITERAL_SPANS_CACHE_SIZE = 2
+_PYTHON_LITERAL_SPANS_CACHE_LOCK = Lock()
+_PYTHON_LITERAL_SPANS_CACHE: OrderedDict[tuple[int, int], tuple[str, PythonLiteralSpans | None]] = (
+    OrderedDict()
+)
+
 
 def python_literal_spans(
     content: str,
     check_runtime: Callable[[], None],
-) -> tuple[list[int], list[int]] | None:
+) -> PythonLiteralSpans | None:
     """Return outermost string and comment token spans of valid Python source.
 
     Return ``None`` unless the whole text is accepted by the Python parser,
     so a fragment, malformed file, or shell-shebang polyglot cannot borrow
     host ownership. Every span is checked against the exact source text.
+    Results, including ``None``, are memoized for the most recent sources.
     """
+    if len(content) > MAX_PYTHON_AST_SOURCE_CHARS:
+        return None
+    key = (len(content), hash(content))
+    with _PYTHON_LITERAL_SPANS_CACHE_LOCK:
+        entry = _PYTHON_LITERAL_SPANS_CACHE.get(key)
+        if entry is not None and entry[0] == content:
+            _PYTHON_LITERAL_SPANS_CACHE.move_to_end(key)
+        else:
+            entry = None
+    if entry is not None:
+        # A shared result skips the parse, not the caller's runtime bound.
+        check_runtime()
+        return entry[1]
+    # A runtime-limit exception propagates from here, so a proof that the
+    # bound interrupted is never stored.
+    spans = _python_literal_spans_uncached(content, check_runtime)
+    with _PYTHON_LITERAL_SPANS_CACHE_LOCK:
+        _PYTHON_LITERAL_SPANS_CACHE[key] = (content, spans)
+        _PYTHON_LITERAL_SPANS_CACHE.move_to_end(key)
+        while len(_PYTHON_LITERAL_SPANS_CACHE) > _PYTHON_LITERAL_SPANS_CACHE_SIZE:
+            _PYTHON_LITERAL_SPANS_CACHE.popitem(last=False)
+    return spans
+
+
+def _python_literal_spans_uncached(
+    content: str,
+    check_runtime: Callable[[], None],
+) -> PythonLiteralSpans | None:
+    """Parse and tokenize ``content`` for :func:`python_literal_spans`."""
     # A leading U+FEFF byte-order mark fails the module parse below and keeps
     # every conservative bound. The file cache decodes with ``utf-8``, not
     # ``utf-8-sig``, so the AST analyzers already report such a file as a
     # syntax error; stripping the mark belongs with that decoding fix.
-    if (
-        len(content) > MAX_PYTHON_AST_SOURCE_CHARS
-        or _LONE_CARRIAGE_RETURN_RE.search(content) is not None
-        or (content.startswith("#!") and _PYTHON_SHEBANG_RE.match(content) is None)
+    if _LONE_CARRIAGE_RETURN_RE.search(content) is not None or (
+        content.startswith("#!") and _PYTHON_SHEBANG_RE.match(content) is None
     ):
         return None
     check_runtime()
@@ -120,7 +168,7 @@ def python_literal_spans(
         return None
     if template_depth or any(ends[index] > starts[index + 1] for index in range(len(starts) - 1)):
         return None
-    return starts, ends
+    return tuple(starts), tuple(ends)
 
 
 class PythonStringClosers:
@@ -137,7 +185,7 @@ class PythonStringClosers:
     def __init__(self, content: str, check_runtime: Callable[[], None]) -> None:
         self._content = content
         self._check_runtime = check_runtime
-        self._spans: tuple[list[int], list[int]] | None = None
+        self._spans: PythonLiteralSpans | None = None
         self._spans_computed = False
 
     def closes_string(self, offset: int) -> bool:

@@ -180,6 +180,11 @@ Marker declarations written inside one string or comment are still
 reconstructed or reported as `obfuscated_instruction_text`. Invalid or
 fragmentary Python and other file types keep the lexical reading.
 
+Both consumers share one parse and tokenization of a module. The two most
+recent results, including a failed proof, are reused, and each reuse still
+checks the static runtime budget. A proof interrupted by that budget is not
+kept.
+
 ## Structured skill data
 
 AISOP/AISP structured extraction consumes the already-bounded cache and shares the enclosing
