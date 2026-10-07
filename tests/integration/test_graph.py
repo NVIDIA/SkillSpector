@@ -177,7 +177,11 @@ def test_graph_inspects_real_oms_signature_without_trusting_its_structure(tmp_pa
     assert signature_component["type"] == "oms_signature"
     assert report["analysis_completeness"]["is_complete"] is False
     assert report["analysis_completeness"]["scope_exclusions"] == []
-    assert report["analysis_completeness"]["ledger_exceptions"] == [
+    assert [
+        event
+        for event in report["analysis_completeness"]["ledger_exceptions"]
+        if event["reason_code"] == "oms_signature"
+    ] == [
         {
             "outcome": "partial",
             "phase": "discovery",
@@ -198,8 +202,13 @@ def test_graph_inspects_real_oms_signature_without_trusting_its_structure(tmp_pa
         event["path"] == "skill.oms.sig" and event["outcome"] == "failed"
         for event in result["inspection_ledger"]
     )
-    assert all(finding.file != "skill.oms.sig" for finding in result["findings"])
-    assert all(issue["file"] != "skill.oms.sig" for issue in report["issues"])
+    # The existing long-base64 detector now sees this fixture too. Structural
+    # recognition must not suppress its normal obfuscation findings.
+    signature_findings = [
+        finding for finding in result["findings"] if finding.file == "skill.oms.sig"
+    ]
+    assert signature_findings
+    assert {finding.rule_id for finding in signature_findings} == {"SC3"}
 
 
 @pytest.mark.parametrize("carrier", ["wrapper", "encoded_payload"])
