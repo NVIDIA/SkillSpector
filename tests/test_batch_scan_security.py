@@ -185,11 +185,11 @@ def test_gap_fill_failure_is_incomplete_and_preserves_findings(
     assert any(issue["id"] == "P5" for issue in entry["issues"]) is partial_success
     expected_reason = {"json": "llm_structured_response_invalid", "schema": "llm_structured_response_invalid", "provider": "llm_batch_failed", "timeout": "runtime_limit"}[failure_mode]
     assert any(row["reason_code"] == expected_reason for row in entry["analysis_completeness"]["ledger_exceptions"])
-    payload = json.loads(reports.format_json([entry]))
+    payload = json.loads(reports._format_json([entry]))
     assert payload["batch"]["enhancements"]["gap_fill_applied"] == 0
     assert payload["batch"]["inspection_completeness"]["incomplete_skills"] == 1
-    assert expected_reason in reports.format_terminal([entry])
-    assert expected_reason.replace("_", "\\_") in reports.format_markdown([entry])
+    assert expected_reason in reports._format_terminal([entry])
+    assert expected_reason.replace("_", "\\_") in reports._format_markdown([entry])
     expected_failed_calls = 4 if failure_mode in {"json", "schema"} else 1
     assert len(calls) == expected_failed_calls + int(partial_success)
     monkeypatch.setattr(batch_scan, "_scan_skill_bounded", lambda *args, **kw: (entry, error, skill.name))
