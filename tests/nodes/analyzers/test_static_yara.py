@@ -26,6 +26,7 @@ import dataclasses
 import json
 import logging
 import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -1973,3 +1974,114 @@ class TestRuleSkipAccounting:
 
         assert "\n" not in reason
         assert reason == "line one line two three"
+
+    def test_rule_lock_wait_honours_the_callers_deadline(self, tmp_path, monkeypatch):
+        """A scan queued behind another scan's slow rule load must still stop on time.
+
+        Scan A is held inside the real rule-read path, so it owns the rules lock.
+        Scan B has its own short workflow budget; an unconditional lock wait kept
+        it blocked until A finished, long after B's deadline. B must instead
+        return the existing ``runtime_limit`` result within its own budget, and
+        A must still get its own rules and skip count once it resumes.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        rules_dir = self._rule_dir(tmp_path, "a", broken=1)
+
+        a_reading = threading.Event()
+        release_a = threading.Event()
+        real_read = static_yara._read_rule_bytes_cache
+
+        def paused_read(rule_files):
+            if threading.current_thread().name == "scan-a":
+                a_reading.set()
+                # Bounded so a regression fails the timing assertion below
+                # instead of hanging the suite.
+                release_a.wait(timeout=5.0)
+            return real_read(rule_files)
+
+        monkeypatch.setattr(static_yara, "_read_rule_bytes_cache", paused_read)
+
+        a_result: list[tuple[object, int]] = []
+        a_failures: list[BaseException] = []
+
+        def scan_a() -> None:
+            try:
+                a_result.append(static_yara.load_rules_with_skips(rules_dir))
+            except BaseException as exc:  # noqa: BLE001 - re-raised in the main thread
+                a_failures.append(exc)
+
+        budget_seconds = 1.2
+
+        class Budget:
+            def __init__(self) -> None:
+                self.deadline = time.monotonic() + budget_seconds
+
+            def remaining_seconds(self) -> float:
+                return self.deadline - time.monotonic()
+
+        thread_a = threading.Thread(target=scan_a, name="scan-a")
+        thread_a.start()
+        try:
+            assert a_reading.wait(timeout=5.0), "scan A never reached the rule-read path"
+            started = time.monotonic()
+            b = static_yara.node(
+                {
+                    "components": ["a.py", "b.py"],
+                    "file_cache": {"a.py": "a", "b.py": "b"},
+                    "yara_rules_dir": str(rules_dir),
+                    "transitive_traversal_state": Budget(),
+                }
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            release_a.set()
+            thread_a.join(timeout=10.0)
+
+        assert elapsed < budget_seconds + 0.5, (
+            f"scan B waited {elapsed:.3f}s for another scan's rule load, "
+            f"past its own {budget_seconds}s budget"
+        )
+        assert [event["path"] for event in b["inspection_ledger"]] == ["a.py", "b.py"]
+        assert all(
+            event["reason_code"] == LedgerReason.RUNTIME_LIMIT for event in b["inspection_ledger"]
+        )
+        assert b["analyzer_status_events"][0]["status"] == "degraded"
+
+        # A's transaction is untouched by B giving up: same rules, own count.
+        assert a_failures == [], f"scan A raised: {a_failures!r}"
+        assert len(a_result) == 1
+        rules, skipped = a_result[0]
+        assert rules is not None
+        assert skipped == 1
+
+    def test_rule_lock_reentry_does_not_wait_on_an_expired_deadline(self):
+        """The nested acquire inside ``load_rules_with_skips`` must not time out.
+
+        The thread already owns the reentrant lock, so re-acquiring it is
+        immediate even with no time left, and releasing it leaves the outer
+        hold intact.
+        """
+        expired = static_yara._new_rule_load_budget(
+            1.0,
+            workflow_limit_seconds=0.0,
+            workflow_started_at=time.monotonic() - 1.0,
+        )
+        token = static_yara._RULE_LOAD_DEADLINE.set(expired)
+        try:
+            with static_yara._RULES_LOCK:
+                with static_yara._RulesLockWithinDeadline():
+                    pass
+                held_elsewhere: list[bool] = []
+
+                def probe() -> None:
+                    got = static_yara._RULES_LOCK.acquire(blocking=False)
+                    held_elsewhere.append(not got)
+                    if got:
+                        static_yara._RULES_LOCK.release()
+
+                prober = threading.Thread(target=probe)
+                prober.start()
+                prober.join()
+                assert held_elsewhere == [True], "the inner release dropped the outer hold"
+        finally:
+            static_yara._RULE_LOAD_DEADLINE.reset(token)

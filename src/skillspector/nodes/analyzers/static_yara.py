@@ -210,6 +210,56 @@ _rules_skipped_count: int = 0
 _RULES_LOCK = threading.RLock()
 
 
+class _RulesLockWithinDeadline:
+    """Hold :data:`_RULES_LOCK`, waiting no longer than the caller's rule-load deadline.
+
+    An unconditional wait cannot honour :data:`_RULE_LOAD_DEADLINE`: a scan whose
+    budget has expired would sit behind an unrelated, slow rule load in another
+    MCP/graph request for as long as that load takes. The wait is bounded by
+    the workflow wall-clock deadline (waiting consumes no thread CPU, so the
+    active-processing allowance cannot bound it), and expiry raises the same
+    ``runtime_limit`` signal the loader already raises at its other deadline
+    checks, which :func:`node` reports as partial work.
+
+    Without a deadline (direct callers outside :func:`node`) this blocks as it
+    always did. The lock is reentrant, so a thread that already holds it (the
+    nested :func:`_load_rules` call inside :func:`load_rules_with_skips`)
+    re-acquires it at once whatever time remains.
+
+    A plain class rather than :func:`contextlib.contextmanager`: the generator
+    form re-raises a body exception by assigning its ``__traceback__``, which a
+    frozen, slotted :class:`_YaraRuleResourceLimitError` rejects with a
+    ``TypeError``, so every rule-load limit raised under the lock would surface
+    as a crash instead of its partial result.
+    """
+
+    __slots__ = ()
+
+    def __enter__(self) -> None:
+        budget = _RULE_LOAD_DEADLINE.get()
+        if budget is None:
+            _RULES_LOCK.acquire()
+            return
+        elapsed = max(0.0, time.monotonic() - budget.workflow_started_at)
+        remaining = budget.workflow_limit_seconds - elapsed
+        acquired = (
+            _RULES_LOCK.acquire(timeout=remaining)
+            if remaining > 0
+            else _RULES_LOCK.acquire(blocking=False)
+        )
+        if not acquired:
+            raise _YaraRuleResourceLimitError(
+                LedgerReason.RUNTIME_LIMIT,
+                {
+                    "observed_seconds": max(0.0, time.monotonic() - budget.workflow_started_at),
+                    "limit_seconds": budget.workflow_limit_seconds,
+                },
+            )
+
+    def __exit__(self, *exc_info: object) -> None:
+        _RULES_LOCK.release()
+
+
 def _collect_rule_files(*dirs: Path) -> list[Path]:
     """Collect YARA files with bounded no-follow deterministic traversal."""
     files: list[Path] = []
@@ -498,7 +548,7 @@ def _load_rules(extra_dir: Path | None = None) -> yara.Rules | None:
     """
     global _rule_cache, _rules_skipped_count  # noqa: PLW0603
 
-    with _RULES_LOCK:
+    with _RulesLockWithinDeadline():
         # Cleared up front so that a load which raises part way through cannot
         # leave a previous load's total readable through
         # :func:`rules_skipped_count`. Every return path below assigns its own.
@@ -568,8 +618,14 @@ def load_rules_with_skips(extra_dir: Path | None = None) -> tuple[yara.Rules | N
 
     :func:`_load_rules` is called through the module global so existing
     ``monkeypatch.setattr(static_yara, "_load_rules", ...)`` doubles still apply.
+
+    The lock wait is bounded by the caller's rule-load deadline (see
+    :class:`_RulesLockWithinDeadline`), so a scan queued behind another
+    scan's slow load returns its ``runtime_limit`` result on time instead of
+    waiting the other load out. The snapshot stays atomic either way: rules
+    and count are still read inside one hold of the lock, or not at all.
     """
-    with _RULES_LOCK:
+    with _RulesLockWithinDeadline():
         rules = _load_rules(extra_dir)
         return rules, _rules_skipped_count
 
