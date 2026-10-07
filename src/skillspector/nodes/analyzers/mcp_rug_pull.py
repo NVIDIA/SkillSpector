@@ -141,6 +141,10 @@ _RP1_CONFIG_KEY = re.compile(
 )
 _RP1_CONFIG_ARG_TOKEN = re.compile(r"[\"']([^\"']*)[\"']|([^\s,\[\]#]+)")
 _RP1_CONFIG_MAX_LINES = 8
+# Structural windows count sibling keys, not the physical lines in their values.
+# Independently bound physical traversal and argument collection per command.
+_RP1_CONFIG_MAX_PHYSICAL_LINES = 256
+_RP1_CONFIG_MAX_ARG_LINES = 128
 _RP1_UVX_CMD = re.compile(
     r"(?:uvx|uv\s+tool\s+run)\s+(?:-+\w+\s+)*([a-zA-Z][\w.-]*)",
     re.IGNORECASE,
@@ -224,7 +228,8 @@ def _iter_config_npx_commands(
         for direction in (-1, 1):
             if direction == -1 and command.group("item"):
                 continue  # This command is already the first key in its list item.
-            for distance in range(1, _RP1_CONFIG_MAX_LINES + 1):
+            sibling_count = 0
+            for distance in range(1, _RP1_CONFIG_MAX_PHYSICAL_LINES + 1):
                 index = command_index + direction * distance
                 if not 0 <= index < len(lines):
                     break
@@ -250,12 +255,19 @@ def _iter_config_npx_commands(
                     break
                 if key_indent == command_indent:
                     if key is None:
-                        break
-                    candidate_args = _RP1_CONFIG_ARGS.fullmatch(candidate_line)
-                    if candidate_args is not None:
-                        args_index = index
-                        args_match = candidate_args
-                        break
+                        # An indentless sequence belongs to a sibling value,
+                        # not a new server mapping. Other scalar lines end it.
+                        if not stripped.startswith("- ") and stripped != "-":
+                            break
+                    else:
+                        sibling_count += 1
+                        if sibling_count > _RP1_CONFIG_MAX_LINES:
+                            break
+                        candidate_args = _RP1_CONFIG_ARGS.fullmatch(candidate_line)
+                        if candidate_args is not None:
+                            args_index = index
+                            args_match = candidate_args
+                            break
                 if direction == -1 and first_item_key and key_indent == command_indent:
                     break
             if args_match is not None:
@@ -267,14 +279,23 @@ def _iter_config_npx_commands(
         args_indent = len(args_match.group("indent")) + len(args_match.group("item") or "")
         args_lines = [_strip_yaml_comment(args_match.group("value"))]
         args_end_index = args_index
-        for index in range(args_index + 1, min(len(lines), args_index + _RP1_CONFIG_MAX_LINES + 1)):
+        for index in range(
+            args_index + 1, min(len(lines), args_index + _RP1_CONFIG_MAX_ARG_LINES + 1)
+        ):
             budget.check_runtime(file_path)
             candidate_line = lines[index].rstrip("\r\n")
             stripped = candidate_line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
             indent = len(candidate_line) - len(candidate_line.lstrip(" \t"))
-            if indent <= args_indent:
+            indentless_item = indent == args_indent and (
+                stripped.startswith("- ") or stripped == "-"
+            )
+            if indent < args_indent or (indent == args_indent and not indentless_item):
+                break
+            # A mapping item is not a scalar package argument and may start
+            # another server; never consume its keys as command arguments.
+            if indentless_item and _RP1_CONFIG_KEY.match(candidate_line):
                 break
             args_lines.append(_strip_yaml_comment(candidate_line.lstrip(" \t")))
             args_end_index = index

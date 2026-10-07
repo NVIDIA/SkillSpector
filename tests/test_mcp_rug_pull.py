@@ -184,6 +184,63 @@ def test_rp1_yaml_sibling_layouts_preserve_pin_behavior(layout, pinned):
         )
 
 
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    ("header", "command", "middle", "args"),
+    [
+        (
+            "mcpServers:\n  fs:\n",
+            "    command: npx\n",
+            "",
+            '    args:\n    - -y\n    - "PACKAGE"\n',
+        ),
+        ("servers:\n- name: fs\n", "  command: pnpx\n", "", '  args:\n  - -y\n  - "PACKAGE"\n'),
+        (
+            "mcpServers:\n  fs:\n",
+            "    command: npx\n",
+            "    autoApprove:\n    - read_file\n",
+            '    args: ["PACKAGE"]\n',
+        ),
+        (
+            "mcpServers:\n  fs:\n",
+            "    command: npx\n",
+            "    env:\n"
+            + "      KEY{}: value\n".format(0)
+            + "".join(f"      KEY{i}: value\n" for i in range(1, 12)),
+            '    args: ["PACKAGE"]\n',
+        ),
+        (
+            "mcpServers:\n  fs:\n",
+            "    command: npx\n",
+            "    description: |\n" + "      description text\n" * 12,
+            '    args: ["PACKAGE"]\n',
+        ),
+        (
+            "mcpServers:\n  fs:\n",
+            "    command: npx\n",
+            "",
+            "    args:\n" + "      - -y\n" * 12 + '      - "PACKAGE"\n',
+        ),
+    ],
+)
+def test_rp1_yaml_indentless_and_long_values(
+    header, command, middle, args, pinned, reverse, newline
+):
+    package = "@scope/server@1.2.3" if pinned else "@scope/server"
+    pair = args + middle + command if reverse else command + middle + args
+    content = (header + pair).replace("PACKAGE", package).replace("\n", newline)
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == (0 if pinned else 1)
+    if rp1:
+        assert rp1[0].start_line == next(
+            i for i, line in enumerate(content.splitlines(), 1) if "command:" in line
+        )
+
+
 @pytest.mark.parametrize(
     "args",
     [
@@ -221,7 +278,7 @@ def test_rp1_yaml_does_not_bind_args_from_another_mapping(content):
 def test_rp1_yaml_sibling_search_remains_bounded(direction, distance):
     command = "    command: npx\n"
     args = '    args: ["@scope/server"]\n'
-    intervening = "    # unrelated config comment\n" * (distance - 1)
+    intervening = "".join(f"    field{i}: value\n" for i in range(distance - 1))
     pair = args + intervening + command if direction == "before" else command + intervening + args
     content = "mcpServers:\n  fs:\n" + pair
     rp1 = [
