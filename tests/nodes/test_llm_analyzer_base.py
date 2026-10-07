@@ -992,13 +992,13 @@ class TestMetaAnalyzerResultFindingsValidator:
         result = MetaAnalyzerResult.model_validate({"findings": [self._FINDING]})
         assert len(result.findings) == 1
 
-    def test_findings_invalid_string_yields_empty(self) -> None:
-        result = MetaAnalyzerResult.model_validate({"findings": "not json"})
-        assert result.findings == []
+    def test_findings_invalid_string_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            MetaAnalyzerResult.model_validate({"findings": "not json"})
 
-    def test_findings_non_list_json_yields_empty(self) -> None:
-        result = MetaAnalyzerResult.model_validate({"findings": json.dumps({"a": 1})})
-        assert result.findings == []
+    def test_findings_non_list_json_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            MetaAnalyzerResult.model_validate({"findings": json.dumps({"a": 1})})
 
 
 # ---------------------------------------------------------------------------
