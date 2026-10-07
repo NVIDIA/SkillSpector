@@ -20,8 +20,16 @@ from __future__ import annotations
 import json
 
 import pytest
+import yaml
 
-from skillspector.nodes.analyzers.mcp_rug_pull import _strip_yaml_comment, node
+from skillspector.nodes.analyzers.mcp_rug_pull import (
+    _RP1_CONFIG_MAX_ARG_LINES,
+    _RP1_CONFIG_MAX_PHYSICAL_LINES,
+    _RugPullBudget,
+    _iter_config_npx_commands,
+    _strip_yaml_comment,
+    node,
+)
 from skillspector.nodes.build_context import build_context
 from skillspector.nodes.deduplicate import deduplicate
 from skillspector.nodes.report import report
@@ -206,9 +214,7 @@ def test_rp1_yaml_sibling_layouts_preserve_pin_behavior(layout, pinned):
         (
             "mcpServers:\n  fs:\n",
             "    command: npx\n",
-            "    env:\n"
-            + "      KEY{}: value\n".format(0)
-            + "".join(f"      KEY{i}: value\n" for i in range(1, 12)),
+            "    env:\n" + "".join(f"      KEY{i}: value\n" for i in range(12)),
             '    args: ["PACKAGE"]\n',
         ),
         (
@@ -231,6 +237,9 @@ def test_rp1_yaml_indentless_and_long_values(
     package = "@scope/server@1.2.3" if pinned else "@scope/server"
     pair = args + middle + command if reverse else command + middle + args
     content = (header + pair).replace("PACKAGE", package).replace("\n", newline)
+    parsed = yaml.safe_load(content)
+    server = parsed["servers"][0] if "servers" in parsed else parsed["mcpServers"]["fs"]
+    assert server["args"][-1] == package
     rp1 = [
         f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
     ]
@@ -239,6 +248,56 @@ def test_rp1_yaml_indentless_and_long_values(
         assert rp1[0].start_line == next(
             i for i, line in enumerate(content.splitlines(), 1) if "command:" in line
         )
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_rp1_yaml_indentless_args_in_first_key_list_item(pinned):
+    package = "@scope/server@1.2.3" if pinned else "@scope/server"
+    content = f'servers:\n- command: npx\n  args:\n  - -y\n  - "{package}"\n'
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == (0 if pinned else 1)
+
+
+@pytest.mark.parametrize("direction", ["before", "after"])
+@pytest.mark.parametrize("at_limit", [True, False])
+def test_rp1_yaml_physical_search_hard_limit(direction, at_limit):
+    distance = _RP1_CONFIG_MAX_PHYSICAL_LINES + (0 if at_limit else 1)
+    filler = "    # padding\n" * (distance - 1)
+    command = "    command: npx\n"
+    args = '    args: ["@scope/server"]\n'
+    pair = args + filler + command if direction == "before" else command + filler + args
+    matches = _iter_config_npx_commands(
+        "mcpServers:\n  fs:\n" + pair, _RugPullBudget({}), "mcp.yaml"
+    )
+    assert len(matches) == (1 if at_limit else 0)
+
+
+@pytest.mark.parametrize("indent", ["    ", "      "])
+@pytest.mark.parametrize("at_limit", [True, False])
+def test_rp1_yaml_argument_collection_hard_limit(indent, at_limit):
+    distance = _RP1_CONFIG_MAX_ARG_LINES + (0 if at_limit else 1)
+    content = "mcpServers:\n  fs:\n    command: npx\n    args:\n"
+    content += f"{indent}- -y\n" * (distance - 1) + f'{indent}- "@scope/server"\n'
+    matches = _iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml")
+    assert len(matches) == (1 if at_limit else 0)
+
+
+def test_rp1_yaml_long_value_traversal_checks_runtime(monkeypatch):
+    calls = 0
+
+    def check_runtime(self, path=None):
+        nonlocal calls
+        calls += 1
+        if calls == 20:
+            raise RuntimeError("test deadline")
+
+    monkeypatch.setattr(_RugPullBudget, "check_runtime", check_runtime)
+    content = "    command: npx\n    env:\n" + "      KEY: value\n" * 100
+    with pytest.raises(RuntimeError, match="test deadline"):
+        _iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml")
+    assert calls == 20
 
 
 @pytest.mark.parametrize(
