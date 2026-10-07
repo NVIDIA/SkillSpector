@@ -29,6 +29,64 @@ _SECRET = "DUMMY_EXTERNAL_SECRET_NEVER_SEND"
 _SAFE_TEXT = "# 安全助手\n这是一个帮助用户整理资料的安全技能。\n"
 
 
+@pytest.mark.parametrize("analyzer_kind", ["discovery", "meta"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("invalid_response", ["not JSON", '{"findings": "invalid"}'])
+@pytest.mark.parametrize("recovers", [False, True])
+async def test_compat_parse_failures_retry_and_remain_visible(
+    monkeypatch: pytest.MonkeyPatch,
+    analyzer_kind: str,
+    asynchronous: bool,
+    invalid_response: str,
+    recovers: bool,
+) -> None:
+    calls = []
+
+    def invoke(prompt):
+        calls.append(prompt)
+        response = '{"findings": []}' if recovers and len(calls) > 1 else invalid_response
+        return AIMessage(content=response)
+
+    async def ainvoke(prompt):
+        return invoke(prompt)
+
+    monkeypatch.setattr(
+        llm_analyzer_base,
+        "get_chat_model",
+        lambda **kwargs: SimpleNamespace(invoke=invoke, ainvoke=ainvoke),
+    )
+    monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda model: 100_000)
+    monkeypatch.setattr(llm_analyzer_base, "STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS", (0, 0, 0))
+    batch = llm_analyzer_base.Batch(file_path="SKILL.md", content=_SAFE_TEXT)
+
+    with runner.deepseek_compat():
+        analyzer = (
+            runner.LLMAnalyzerBase(base_prompt="Review the supplied skill", model="test")
+            if analyzer_kind == "discovery"
+            else runner.LLMMetaAnalyzer(model="test")
+        )
+        outcome = (
+            await analyzer.arun_batches_detailed([batch])
+            if asynchronous
+            else analyzer.run_batches_detailed([batch])
+        )
+
+    if recovers:
+        assert len(calls) == 2
+        assert outcome.successful == [(batch, [])]
+        assert outcome.failures == []
+    else:
+        assert len(calls) == llm_analyzer_base.STRUCTURED_RESPONSE_MAX_ATTEMPTS
+        assert outcome.successful == []
+        assert len(outcome.failures) == 1
+        assert outcome.failures[0].reason.value == "llm_structured_response_invalid"
+        events, _ = llm_analyzer_base.ledger_events_for_batches("compat-test", outcome)
+        assert len(events) == 1
+        assert events[0]["outcome"].value == "failed"
+        assert events[0]["reason_code"] == "llm_structured_response_invalid"
+        assert invalid_response not in json.dumps(events)
+
+
 @pytest.fixture
 def batch_skill(tmp_path: Path) -> tuple[Path, Path]:
     skill = tmp_path / "safe-skill"
