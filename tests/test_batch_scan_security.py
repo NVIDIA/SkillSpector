@@ -181,8 +181,8 @@ def test_gap_fill_failure_is_incomplete_and_preserves_findings(
     assert entry["enhancements"]["gap_fill_applied"] is False
     assert entry["enhancements"]["gap_fill_findings"] == int(partial_success)
     assert entry["analysis_completeness"]["is_complete"] is False
-    assert any(issue["rule_id"] == "TM1" for issue in entry["issues"])
-    assert any(issue["rule_id"] == "P5" for issue in entry["issues"]) is partial_success
+    assert any(issue["id"] == "TM1" for issue in entry["issues"])
+    assert any(issue["id"] == "P5" for issue in entry["issues"]) is partial_success
     expected_reason = {"json": "llm_structured_response_invalid", "schema": "llm_structured_response_invalid", "provider": "llm_batch_failed", "timeout": "runtime_limit"}[failure_mode]
     assert any(row["reason_code"] == expected_reason for row in entry["analysis_completeness"]["ledger_exceptions"])
     payload = json.loads(reports.format_json([entry]))
