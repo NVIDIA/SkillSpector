@@ -160,3 +160,16 @@ def test_reviewer_script_is_not_fully_inspected() -> None:
 
     event = result["inspection_ledger"][0]
     assert event["outcome"] is not LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    ("content", "file_type"),
+    [
+        ('cat <<E\n"a $(date)\nE\n$CMD"" -rf /\n', "shell"),
+        ('```sh\n# "a $(date)\n$CMD"" -rf /\n```\n', "markdown"),
+        ('Run "a $(date)\n```sh\n$CMD"" -rf /\n```\n', "markdown"),
+    ],
+    ids=["heredoc-body", "markdown-fence-comment", "markdown-prose-quote"],
+)
+def test_cross_line_quote_pairing_stays_partial(content: str, file_type: str) -> None:
+    assert _exhausted(content, file_type)
