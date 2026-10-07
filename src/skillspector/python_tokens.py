@@ -49,16 +49,27 @@ _PYTHON_TEMPLATE_STRING_ENDS = frozenset(
 # comment tokens, in source order. Results are shared, so they are immutable.
 PythonLiteralSpans = tuple[tuple[int, ...], tuple[int, ...]]
 
-# One static scan of a module asks for its spans twice: the declared-marker
-# pass proves string closers, and the tool-misuse shell parser proves token
-# ownership. The most recent results are remembered so both share one parse.
-# Entries are keyed by length and hash and confirmed by string equality, which
-# is an identity check when both callers hold the same file-cache string. A
-# second entry absorbs a scan of another file on a concurrent analyzer thread.
-# Oversized source is never stored, and eviction bounds how long a module's
-# text outlives its scan. This lock guards only the entries, so a lookup never
-# waits for another thread's parse.
-_PYTHON_LITERAL_SPANS_CACHE_SIZE = 2
+# Three consumers ask for a module's spans during one scan: the declared-marker
+# pass proves string closers, the tool-misuse shell parser proves token
+# ownership, and AR2 proves comment ownership. Recent results are remembered so
+# they share one parse. Entries are keyed by length and hash and confirmed by
+# string equality, which is an identity check when the callers hold the same
+# file-cache string.
+#
+# The consumers run in different analyzer nodes (the marker pass in every
+# static-pattern node). The graph starts all analyzer nodes together on worker
+# threads; the CLI and MCP server set no ``max_concurrency``, so the pool has
+# Python's default size, min(32, CPUs + 4). Every node walks the components in
+# the same order but at its own pace, so requests for other modules arrive
+# between a module's first and last consumer. An entry holds one module however
+# many consumers ask, so eight entries keep a result while up to seven other
+# modules are requested in that gap. A wider gap only repeats the parse.
+# Oversized source is never stored, so eight entries hold at most eight times
+# MAX_PYTHON_AST_SOURCE_CHARS, which equals one scan's AST cache budget
+# (MAX_PYTHON_AST_CACHE_SOURCE_CHARS), and eviction bounds how long that text
+# outlives its scan. This lock guards only the entries, so a lookup never waits
+# for another thread's parse.
+_PYTHON_LITERAL_SPANS_CACHE_SIZE = 8
 _PYTHON_LITERAL_SPANS_CACHE_LOCK = Lock()
 _PYTHON_LITERAL_SPANS_CACHE: OrderedDict[tuple[int, int], tuple[str, PythonLiteralSpans | None]] = (
     OrderedDict()
