@@ -1916,7 +1916,7 @@ def _read_file_cache(
             if (
                 provider_submission_allowed
                 and not _is_hidden_path(path)
-                and artifact["content_kind"] == "text"
+                and (artifact["content_kind"] == "text" or artifact.get("readable_binary"))
             ):
                 if truncated:
                     content = _llm_view_of_truncated_file(

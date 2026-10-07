@@ -2410,7 +2410,9 @@ def run_static_patterns(
         {
             str(item.get("path", ""))
             for item in raw_inventory
-            if isinstance(item, dict) and item.get("content_kind") == ContentKind.BINARY
+            if isinstance(item, dict)
+            and item.get("content_kind") == ContentKind.BINARY
+            and not item.get("readable_binary")
         }
         if isinstance(raw_inventory, list)
         else set()
@@ -2526,7 +2528,11 @@ def run_static_patterns_with_ledger(
                 path=path,
                 reason=LedgerReason.OPAQUE_CONTENT,
             )
-        elif path not in container_paths and artifact.get("content_kind") == ContentKind.BINARY:
+        elif (
+            path not in container_paths
+            and artifact.get("content_kind") == ContentKind.BINARY
+            and not artifact.get("readable_binary")
+        ):
             referenced = bool(artifact.get("referenced"))
             event = ledger_event(
                 outcome=LedgerOutcome.PARTIAL if referenced else LedgerOutcome.OUT_OF_SCOPE,

@@ -64,6 +64,7 @@ class ArtifactRecord(TypedDict):
     contains_nul: bool
     misleading_extension: bool
     referenced: bool
+    readable_binary: NotRequired[bool]
     reason: NotRequired[str]
     inherited_exclusion_reason: NotRequired[str]
 
@@ -364,6 +365,12 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
         decoded = data.decode("utf-8", errors="replace")
         decodable = False
 
+    # These printable prefixes are also valid instruction text. Keep the
+    # claimed binary format's coverage limits, but inspect the readable bytes.
+    readable_binary = decodable and not contains_nul and data.startswith(
+        (b"MZ", b"GIF87a", b"GIF89a", b"%PDF-")
+    )
+
     if has_binary_magic:
         kind = ContentKind.BINARY
     elif decodable:
@@ -384,7 +391,7 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
     )
     disposition = (
         ArtifactDisposition.PARTIAL
-        if referenced and kind is not ContentKind.TEXT
+        if readable_binary or (referenced and kind is not ContentKind.TEXT)
         else ArtifactDisposition.OUT_OF_SCOPE
         if kind is ContentKind.BINARY
         else ArtifactDisposition.ANALYZED
@@ -398,6 +405,7 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
         "contains_nul": contains_nul,
         "misleading_extension": misleading,
         "referenced": referenced,
+        "readable_binary": readable_binary,
     }
 
 

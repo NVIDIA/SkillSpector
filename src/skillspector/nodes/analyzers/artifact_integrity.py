@@ -1054,7 +1054,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                             confidence=1.0,
                         )
                     )
-                if artifact.get("content_kind") not in {
+                if artifact.get("readable_binary") or artifact.get("content_kind") not in {
                     ContentKind.BINARY,
                     ContentKind.OPAQUE,
                 }:
