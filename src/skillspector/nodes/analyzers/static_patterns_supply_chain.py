@@ -31,6 +31,7 @@ Node and analyze() in one module.
 from __future__ import annotations
 
 import ast
+import base64
 import codecs
 import functools
 import io
@@ -262,6 +263,101 @@ def _decoded_literal_xor_calls(content: str) -> list[tuple[int, str]]:
     return decoded
 
 
+_MAX_SHELL_LITERAL_CHARS = 16_384
+# Shell decoders that print a base64, base32 or hex payload. Flag runs stay
+# short and bounded, and the group is atomic, so a flag such as -dddd that
+# parses several ways cannot multiply backtracking.
+_SC3_SHELL_DECODER = (
+    r"(?>\bbase(?:64|32)(?:[ \t]{1,16}--?[A-Za-z][\w=-]{0,20}){0,3}?"
+    r"[ \t]{1,16}(?:--decode|-[A-Za-z]{0,3}d[A-Za-z]{0,3})\b"
+    r"|\bxxd(?:[ \t]{1,16}-[A-Za-z]{1,10}){0,3}?[ \t]{1,16}-(?:r|rp|pr|rps|psr|revert)\b"
+    r"|\bopenssl[ \t]{1,16}(?:base64|enc)(?:[ \t]{1,16}-[A-Za-z0-9-]{1,16}){0,4}?[ \t]{1,16}-d\b)"
+)
+# One pipeline stage. It ends at a pipe, a list operator, a newline, an
+# inline-code backtick or a backslash (so a JSON-escaped \n ends it too), but
+# keeps up to two redirections such as 2>&1 or JSON-escaped quotes. Runs are
+# possessive, so a failed match never backtracks into them.
+_SC3_PIPE_SEGMENT = r"[^|;&\n`\\]{0,256}+(?:(?:&[0-9>-]|\\['\"])[^|;&\n`\\]{0,64}+){0,2}+"
+# A shell reads its program from stdin unless -c or a script operand supplies
+# one. An interpreter counts only without a program argument:
+# `python3 -m json.tool` and `python3 "$dir/render.py"` read data. A sudo
+# option argument cannot start with "-", so each sudo word parses one way.
+_SC3_PIPE_EXECUTOR = (
+    r"\|(?!\|)&?[ \t]{0,16}"
+    r"(?:sudo(?:[ \t]{1,16}+-[A-Za-z]{1,8}+(?:[ \t]{1,16}+[\w.][\w.-]{0,31}+)?){0,4}[ \t]{1,16}+)?"
+    r"(?:(?:/[\w.-]{1,32}){0,4}/)?"
+    r"(?:(?:ba|da|z|k|a)?sh(?![\w.-])"
+    r"(?![ \t]{1,16}(?:-[A-Za-z]{1,8}[ \t]{1,16}){0,3}-[A-Za-z]{0,3}c)"
+    r"(?![ \t]{1,16}(?!-|/dev/stdin\b|[0-9]{0,2}[<>])[^\s|;&)#])"
+    r"|(?:python(?:[23](?:\.[0-9]{1,2})?)?|perl|ruby|node)(?:[ \t]{1,16}-[A-Za-z]{0,4}){0,2}"
+    r"(?=['\"]|[ \t]{0,16}(?:$|[\r;&|)`#]|[0-9]{0,2}>)))"
+)
+# eval, -c and -e run their argument whichever substitution supplies it. A bare
+# shell, interpreter or source runs only content it reads from <(...),
+# < <(...) or a here-string; given "$(...)" it runs a file path. Executor words
+# must start a word, so `deploy.sh "$(...)"` and `--source "$(...)"` do not
+# count. `.` counts only in command position, at a line start or after an
+# operator, a bracket, a backtick or a quote, so `jq . <<< ...` and
+# `tar -C . < <(...)` do not count. A backslash admits JSON-escaped quotes in
+# hook configs.
+_SC3_SUBSTITUTION_EXECUTOR = (
+    r"(?:(?<![\w.-])(?:eval|(?:ba|da|z|k|a)?sh[ \t]{1,16}-[A-Za-z]{0,3}c"
+    r"|python(?:[23](?:\.[0-9]{1,2})?)?[ \t]{1,16}-c|(?:perl|ruby|node)[ \t]{1,16}-e)"
+    r"[ \t]{1,16}\\?[\"']?(?:\$\(|`)"
+    r"|(?:(?<![\w.-])(?:source|(?:ba|da|z|k|a)?sh|python(?:[23](?:\.[0-9]{1,2})?)?|perl|ruby|node)"
+    r"|(?:^|(?<=[;&|(`'\"{]))[ \t]{0,16}\.)"
+    r"(?:[ \t]{1,16}-{1,2}[A-Za-z]{0,16}){0,2}(?:[ \t]{1,16}/dev/stdin)?"
+    r"[ \t]{1,16}(?:<<<[ \t]{0,16}\\?[\"']?(?:\$\(|`)|<(?:[ \t]{0,16}<)?\())"
+)
+# Options and the here-string operator between a decoder and an inline literal.
+_SC3_HERE_STRING = r"(?:[ \t]{1,16}-[A-Za-z0-9-]{1,16}){0,4}[ \t]{0,16}<<<[ \t]{0,16}"
+_SC3_SHELL_LITERAL = (
+    rf"(?P<quote>(?:\\?['\"])?)(?P<literal>[A-Za-z0-9+/=]{{8,{_MAX_SHELL_LITERAL_CHARS}}})"
+)
+_SC3_PIPED_LITERAL = re.compile(
+    r"\b(?:echo(?:[ \t]{1,16}-[neE]{1,3})?"
+    r"|printf(?:[ \t]{1,16}(?P<format_quote>['\"]?)%s(?:\\n)?(?P=format_quote))?)"
+    rf"[ \t]{{1,16}}{_SC3_SHELL_LITERAL}(?P=quote)"
+    rf"[ \t]{{0,16}}\|(?!\|)[ \t]{{0,16}}(?P<decoder>{_SC3_SHELL_DECODER})",
+    re.IGNORECASE,
+)
+_SC3_HERE_STRING_LITERAL = re.compile(
+    rf"(?P<decoder>{_SC3_SHELL_DECODER}){_SC3_HERE_STRING}{_SC3_SHELL_LITERAL}"
+    rf"(?![A-Za-z0-9+/=])(?P=quote)",
+    re.IGNORECASE,
+)
+_SC3_SHELL_DECODE_COMMAND = re.compile(_SC3_SHELL_DECODER, re.IGNORECASE)
+
+
+def _decoded_shell_literal_payloads(content: str) -> list[tuple[int, str]]:
+    """Decode literal payloads fed to a shell decoder.
+
+    Only an inline echo/printf argument or a here-string is decoded, as base64,
+    base32 or (for xxd) hex; an ``openssl enc`` cipher is not applied.
+    Variables, files and downloads stay opaque. Invalid UTF-8 becomes U+FFFD,
+    so a stray byte cannot hide the command. Returns ``(offset, text)`` pairs
+    in source order.
+    """
+    decoded: list[tuple[int, str]] = []
+    for pattern in (_SC3_PIPED_LITERAL, _SC3_HERE_STRING_LITERAL):
+        for match in pattern.finditer(content):
+            literal = match.group("literal")
+            decoder = match.group("decoder").lower()
+            try:
+                if decoder.startswith("xxd"):
+                    # Like xxd -r -p, ignore a trailing odd nibble.
+                    payload = bytes.fromhex(literal[: len(literal) // 2 * 2])
+                elif decoder.startswith("base32"):
+                    payload = base64.b32decode(literal + "=" * (-len(literal) % 8))
+                else:
+                    payload = base64.b64decode(literal + "=" * (-len(literal) % 4), validate=True)
+            except ValueError:
+                continue
+            decoded.append((match.start("literal"), payload.decode("utf-8", errors="replace")))
+    decoded.sort()
+    return decoded
+
+
 SC3_CODE_PATTERNS = [
     (r"exec\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
     (r"eval\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
@@ -284,6 +380,23 @@ SC3_PROSE_PATTERNS = [
     (r"decode\s+(?:this|the)\s+(?:base64|hex)\s+(?:and\s+)?(?:run|execute)", 0.8),
 ]
 SC3_PATTERNS = SC3_CODE_PATTERNS + SC3_PROSE_PATTERNS
+# Shell decode-to-execute chains run on every file type, like SC2, because
+# SKILL.md instructions and hook configs carry shell commands too.
+SC3_SHELL_PATTERNS = [
+    (
+        # A here-string literal can outgrow a pipeline stage, so it is consumed
+        # whole, and possessively, before the first stage.
+        rf"{_SC3_SHELL_DECODER}(?:{_SC3_HERE_STRING}\\?['\"]?"
+        rf"[A-Za-z0-9+/=]{{0,{_MAX_SHELL_LITERAL_CHARS}}}+)?+{_SC3_PIPE_SEGMENT}"
+        rf"(?:\|(?!\|)&?{_SC3_PIPE_SEGMENT}){{0,3}}?{_SC3_PIPE_EXECUTOR}",
+        0.9,
+    ),
+    (
+        rf"{_SC3_SUBSTITUTION_EXECUTOR}[^()`\n]{{0,{_MAX_SHELL_LITERAL_CHARS}}}?"
+        rf"{_SC3_SHELL_DECODER}",
+        0.9,
+    ),
+]
 
 # SC7: Untrusted Container Image — pulling images with signature/registry
 # verification turned off. These flags disable image trust regardless of the
@@ -2124,28 +2237,52 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     )
                 )
                 break
-    if file_type in ("python", "javascript", "shell", "perl", "other"):
-        for pattern, confidence in SC3_PATTERNS:
-            matches = (
-                static_runner.iter_paragraph_matches
-                if (pattern, confidence) in SC3_PROSE_PATTERNS
-                else re.finditer
-            )
-            for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
-                line_num = line_number(match.start())
+    # Every shell decode check needs a decoder command, which most files lack.
+    has_shell_decoder = _SC3_SHELL_DECODE_COMMAND.search(content) is not None
+    if has_shell_decoder:
+        for start, command in _decoded_shell_literal_payloads(content):
+            for pattern, confidence in SC2_PATTERNS:
+                if not re.search(pattern, command, re.IGNORECASE | re.MULTILINE):
+                    continue
                 findings.append(
                     AnalyzerFinding(
-                        rule_id="SC3",
-                        message="Obfuscated Code",
+                        rule_id="SC2",
+                        message="External Script Fetching",
                         severity=Severity.HIGH,
-                        location=loc(line_num),
+                        location=loc(line_number(start)),
                         confidence=confidence,
-                        tags=tag,
-                        context=ctx(match.start()),
-                        matched_text=match.group(0)[:200],
-                        complete_match=match.group(0),
+                        tags=list(tag),
+                        context=ctx(start),
+                        matched_text=command[:200],
                     )
                 )
+                break
+    sc3_patterns = (
+        SC3_PATTERNS if file_type in ("python", "javascript", "shell", "perl", "other") else []
+    )
+    if has_shell_decoder:
+        sc3_patterns = sc3_patterns + SC3_SHELL_PATTERNS
+    for pattern, confidence in sc3_patterns:
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in SC3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = line_number(match.start())
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="SC3",
+                    message="Obfuscated Code",
+                    severity=Severity.HIGH,
+                    location=loc(line_num),
+                    confidence=confidence,
+                    tags=tag,
+                    context=ctx(match.start()),
+                    matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
+                )
+            )
     # SC7: untrusted container image. Example filtering is delegated to the runner.
     for pattern, confidence in SC7_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
