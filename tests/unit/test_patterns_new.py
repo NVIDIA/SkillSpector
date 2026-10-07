@@ -1528,11 +1528,14 @@ class TestToolMisuse:
         assert any(finding.rule_id == "TM1" for finding in findings)
 
     def test_tm1_parses_dense_shell_flags_once(self) -> None:
-        content = "use_shell = True\nsubprocess.run(cmd, shell=use_shell)\n" * 300
+        content = "use_shell = True\nsubprocess.run(cmd, shell=use_shell)\n" * 4000
+        content += "#" + " ordinary" * ((256_000 - len(content)) // 9)
+        content = content.ljust(256_000)
+        assert len(content) == 256_000
         with patch.object(tm_mod, "parse_python_source", wraps=tm_mod.parse_python_source) as parse:
             findings = tm_mod.analyze(content, "runner.py", "python")
         assert parse.call_count == 1
-        assert len([finding for finding in findings if finding.rule_id == "TM1"]) == 300
+        assert len([finding for finding in findings if finding.rule_id == "TM1"]) == 4000
 
     def test_tm1_caches_unparseable_window_conservatively(self) -> None:
         content = "use_shell = True\nsubprocess.run(cmd, shell=use_shell)\n" * 20 + "\nif :"
