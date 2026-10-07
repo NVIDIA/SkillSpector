@@ -169,8 +169,42 @@ def test_reviewer_script_is_not_fully_inspected() -> None:
         ('cat <<E\n"a $(date)\nE\n$CMD"" -rf /\n', "shell"),
         ('```sh\n# "a $(date)\n$CMD"" -rf /\n```\n', "markdown"),
         ('Run "a $(date)\n```sh\n$CMD"" -rf /\n```\n', "markdown"),
+        # A later quote completes the mis-paired parse instead of failing it.
+        ('cat <<E\n"a $(date)\nE\n$CMD"" -rf / # "\n', "shell"),
+        ('cat <<\'E\'\n"a $(date)\nE\n$CMD"" -rf / # "\n', "shell"),
+        ('cat <<E\n"a `date`\nE\n$CMD"" -rf / # "\n', "shell"),
+        ('cat <<E\n"a $(date)\nE\n$CMD""  -rf /\necho "\n', "shell"),
+        ('Run "a $(date)\n```sh\n$CMD"" -rf / # "\n```\n', "markdown"),
+        ('Note: "a $(date)\n```bash\n$CMD"" -rf / #"\n```\n', "markdown"),
     ],
-    ids=["heredoc-body", "markdown-fence-comment", "markdown-prose-quote"],
+    ids=[
+        "heredoc-body",
+        "markdown-fence-comment",
+        "markdown-prose-quote",
+        "heredoc-body-closed-by-comment",
+        "quoted-heredoc-body-closed-by-comment",
+        "heredoc-backtick-closed-by-comment",
+        "heredoc-body-closed-by-later-line",
+        "markdown-prose-closed-by-comment",
+        "markdown-note-closed-by-comment",
+    ],
 )
 def test_cross_line_quote_pairing_stays_partial(content: str, file_type: str) -> None:
+    # A double-quoted span across lines may pair a heredoc or prose quote with
+    # a later command line, so it must never end that command's operands.
     assert _exhausted(content, file_type)
+    assert _exhausted(content + _PADDING, file_type)
+
+
+def test_heredoc_quote_cannot_hide_a_runtime_rm_at_scan_level() -> None:
+    script = (
+        '#!/bin/sh\nCMD="${TOOL:-rm}"\ncat <<EOF\nBuild "$(date)\nEOF\n'
+        '$CMD"" -rf / --no-preserve-root # done "\n'
+    )
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["run.sh"], "file_cache": {"run.sh": script}}, [tm_module]
+    )
+
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is not LedgerOutcome.COMPLETED

@@ -1661,6 +1661,7 @@ def _parse_shell_command_word(
     # Expansions directly inside the current double-quoted span. They are
     # reported only once that span's closing quote is proven.
     pending_quoted_expansions: list[int] = []
+    quote_open = start
     cursor = start
     limit = len(content)
     while cursor < limit:
@@ -1671,7 +1672,10 @@ def _parse_shell_command_word(
             if character == quote:
                 if owned_word_positions is not None:
                     owned_word_positions.add(cursor)
-                if quoted_expansion_starts is not None:
+                # A span across lines may pair a heredoc or prose quote with a
+                # later command line, so only a single-line span ends the word
+                # of an expansion inside it.
+                if quoted_expansion_starts is not None and "\n" not in content[quote_open:cursor]:
                     quoted_expansion_starts.update(pending_quoted_expansions)
                 pending_quoted_expansions.clear()
                 quote = None
@@ -1786,6 +1790,7 @@ def _parse_shell_command_word(
         elif character == "$" and cursor + 1 < limit and content[cursor + 1] in "'\"":
             quote = content[cursor + 1]
             ansi_c_quote = quote == "'"
+            quote_open = cursor
             cursor += 2
             continue
         elif character == "$" and cursor + 1 < limit and content[cursor + 1] == "(":
@@ -1862,6 +1867,7 @@ def _parse_shell_command_word(
             if character == wrapper_quote:
                 break
             quote = character
+            quote_open = cursor
         elif character == "\\" and cursor + 1 < limit:
             if content[cursor + 1] == "\n":
                 cursor += 2
