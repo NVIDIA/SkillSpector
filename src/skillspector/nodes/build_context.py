@@ -3176,28 +3176,48 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             limitation_reason=limitation_reason,
         )
 
+    # The !/ delimiter belongs to virtual archive paths. Real paths using it
+    # must never let a nested member replace the bytes read from disk.
+    reserved_paths = {item["path"] for item in artifact_inventory if "!/" in item["path"]}
+    for artifact in artifact_inventory:
+        if artifact["path"] in reserved_paths:
+            artifact["disposition"] = ArtifactDisposition.FAILED
+            artifact["reason"] = LedgerReason.ARTIFACT_PATH_COLLISION.value
+            prework_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="discovery",
+                    path=artifact["path"],
+                    reason=LedgerReason.ARTIFACT_PATH_COLLISION,
+                )
+            )
+    blocked_nested_paths = excluded_nested_components | reserved_paths
+    nested.metadata = [item for item in nested.metadata if item["path"] not in reserved_paths]
     ordinary_nested_components = [
-        path for path in nested.components if path not in excluded_nested_components
+        path for path in nested.components if path not in blocked_nested_paths
     ]
     local_file_cache = dict(ordinary_file_cache)
     local_file_cache.update(
         {
             path: data
             for path, data in nested.file_cache.items()
-            if path not in excluded_nested_components
+            if path not in blocked_nested_paths
         }
     )
     raw_file_cache.update(
         {
             path: data
             for path, data in nested.raw_file_cache.items()
-            if path not in excluded_nested_components
+            if path not in blocked_nested_paths
         }
     )
-    artifact_inventory.extend(nested.artifact_inventory)
+    artifact_inventory.extend(
+        item for item in nested.artifact_inventory if item["path"] not in reserved_paths
+    )
     for artifact in artifact_inventory:
         override = nested.inventory_overrides.get(artifact["path"])
-        if override is not None:
+        if override is not None and artifact["disposition"] != ArtifactDisposition.FAILED:
             artifact["disposition"], artifact["reason"] = override
     inventory_by_path = {item["path"]: item for item in artifact_inventory}
 
