@@ -192,6 +192,11 @@ def test_gap_fill_failure_is_incomplete_and_preserves_findings(
     assert expected_reason.replace("_", "\\_") in reports.format_markdown([entry])
     expected_failed_calls = 4 if failure_mode in {"json", "schema"} else 1
     assert len(calls) == expected_failed_calls + int(partial_success)
+    monkeypatch.setattr(batch_scan, "_scan_skill_bounded", lambda *args, **kw: (entry, error, skill.name))
+    monkeypatch.setattr(sys, "argv", ["batch_scan", str(skill.parent), "--no-llm", "--format", "json", "--workers", "1"])
+    with pytest.raises(SystemExit) as stopped:
+        batch_scan._main_impl()
+    assert stopped.value.code == 2
 
 
 @pytest.mark.parametrize("cache_state", ["empty", "missing"])
@@ -215,6 +220,7 @@ def test_gap_fill_never_falls_back_to_local_content(
     assert error is None, error
     assert observed["calls"] == [({}, "zh")]
     assert entry["skill"]["language"] == "zh"
+    assert entry["enhancements"]["gap_fill_applied"] is False
 
 
 @pytest.mark.parametrize(
