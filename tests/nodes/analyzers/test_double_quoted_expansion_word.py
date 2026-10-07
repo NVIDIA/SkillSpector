@@ -132,3 +132,31 @@ def test_scan_level_helper_script_is_fully_inspected() -> None:
 
     event = result["inspection_ledger"][0]
     assert event["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '# "prefix $(date)\n$CMD"" -rf /\n',
+        '# "prefix $(date)\n$CMD" x"" -rf /\n',
+        '#!/bin/sh\n# see "notes $(date)\n$CMD"" -rf /\n',
+    ],
+    ids=["failed-comment-parse", "completed-comment-parse", "after-shebang"],
+)
+def test_quote_from_a_comment_parse_grants_no_ownership(content: str) -> None:
+    # A comment ends at the newline, so the real command on the next line owns
+    # its quotes. A discarded or comment-confined parse must not mark that
+    # command as enclosed by a quote and thereby hide ``-rf /``.
+    assert _exhausted(content)
+    assert _exhausted(content + _PADDING)
+
+
+def test_reviewer_script_is_not_fully_inspected() -> None:
+    script = '# "prefix $(date)\n$CMD"" -rf /\n'
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["run.sh"], "file_cache": {"run.sh": script}}, [tm_module]
+    )
+
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is not LedgerOutcome.COMPLETED

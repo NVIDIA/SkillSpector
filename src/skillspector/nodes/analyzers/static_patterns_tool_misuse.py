@@ -1997,6 +1997,7 @@ def _has_shell_command_word_exhaustion(
         if _has_quoted_assignment_prefix(content, start):
             continue
         candidate_word_positions: set[int] = set()
+        candidate_quoted_expansions: set[int] = set()
         parsed = _parse_shell_command_word(
             content,
             start,
@@ -2012,7 +2013,7 @@ def _has_shell_command_word_exhaustion(
                 if start in quoted_expansion_starts
                 else None
             ),
-            quoted_expansion_starts=quoted_expansion_starts,
+            quoted_expansion_starts=candidate_quoted_expansions,
         )
         if parsed is None:
             substitution_start = (
@@ -2069,6 +2070,10 @@ def _has_shell_command_word_exhaustion(
                 for position in candidate_word_positions
                 if content[position + 1 : position + 2] not in ("$", "`")
             )
+            # Quote ownership follows the same rule: a discarded parse, or one
+            # confined to a comment or assignment, never decides where a later
+            # command's operands end.
+            quoted_expansion_starts.update(candidate_quoted_expansions)
         # Only executable nested substitutions retain independent command
         # positions. A plain dynamic data argument still owns its inner bytes;
         # revisiting those as commands would turn quoted printf data into code.
