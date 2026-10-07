@@ -18,8 +18,10 @@
 A string ``allowed-tools`` value lists grants separated by commas or by
 whitespace. Each grant is a bare tool name (``Read``) or a scoped grant in the
 ``Tool(specifier)`` form (``Bash(git status:*)``, ``Read(./docs, notes.md)``).
-A separator inside a specifier belongs to the specifier, so a scoped grant is
-kept whole and its specifier text is never read as another grant.
+As in Claude Code's permission rule syntax, parentheses inside the specifier
+are literal characters, not nested structure: ``Bash(echo '(')`` is a complete
+grant. A separator inside a specifier belongs to the specifier, so a scoped
+grant is kept whole and its specifier text is never read as another grant.
 """
 
 from __future__ import annotations
@@ -30,71 +32,82 @@ from collections.abc import Iterator
 # Tool names longer than this are not looked up.
 MAX_ALLOWED_TOOL_NAME_CHARS = 64
 
-_COMMA_FORM_TOKENS = re.compile(r"[(),]")
-_WHITESPACE_FORM_TOKENS = re.compile(r"[()]|\s+")
-_PARENTHESES = re.compile(r"[()]")
+_TOKENS = re.compile(r"[(),]|\s+")
 _NON_WHITESPACE = re.compile(r"\S")
 # Same tool-name alphabet as the settings permission-rule check in
 # ``nodes/analyzers/bundled_execution_surface.py`` (``_permission_rule_is_valid``).
+# Unlike that check, the specifier's parentheses do not have to balance.
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_*.-]+")
 
 
-def _has_top_level_comma(value: str) -> bool:
-    depth = 0
-    for match in _COMMA_FORM_TOKENS.finditer(value):
+def _ends_specifier(value: str, end: int) -> bool:
+    """Return whether a ``)`` ending at ``end`` is followed by a separator or the end."""
+    return end == len(value) or value[end] == "," or value[end].isspace()
+
+
+def _separators(value: str) -> Iterator[re.Match[str]]:
+    """Yield the commas and whitespace runs of ``value`` that lie outside a specifier.
+
+    A ``(`` outside a specifier opens one. Inside it, ``(`` and ``)`` are
+    literal, except that a ``)`` followed by a comma, whitespace or the end of
+    the value closes it.
+    """
+    in_specifier = False
+    for match in _TOKENS.finditer(value):
         token = match.group()
-        if token == "(":
-            depth += 1
-        elif token == ")":
-            depth = max(0, depth - 1)
-        elif depth == 0:
-            return True
-    return False
+        if in_specifier:
+            if token == ")" and _ends_specifier(value, match.end()):
+                in_specifier = False
+        elif token == "(":
+            in_specifier = True
+        elif token != ")":
+            yield match
 
 
 def iter_allowed_tools_entries(value: str) -> Iterator[str]:
     """Yield the stripped entries of a string ``allowed-tools`` value.
 
-    A comma outside any parentheses selects the comma-separated form;
-    otherwise entries are separated by whitespace. Only separators outside
-    parentheses split, so ``"Bash(git status:*) Read"`` yields
-    ``Bash(git status:*)`` and ``Read``, and ``"Read(./a, b)"`` stays one
-    entry. An unclosed ``(`` keeps the rest of the value in its entry, and a
-    stray ``)`` closes nothing; :func:`allowed_tool_grant_name` rejects both.
+    A comma outside any specifier selects the comma-separated form; otherwise
+    entries are separated by whitespace. Only separators outside a specifier
+    split. A specifier runs from a ``(`` to the first ``)`` that is followed by
+    a comma, whitespace or the end of the value, and any ``(`` or ``)`` in
+    between is literal. So ``"Bash(git status:*) Read"`` and
+    ``"Bash(echo '(') Read"`` each yield two entries, and
+    ``"Read(./docs Bash(notes).md)"`` and ``"Read(./a, b)"`` each stay one
+    entry. A specifier whose own text has a ``)`` followed by a separator
+    cannot be written in a string value; the list form keeps it whole. An
+    unclosed ``(`` keeps the rest of the value in its entry, which
+    :func:`allowed_tool_grant_name` rejects.
 
     Entries are produced lazily. As with ``str.split``, the comma form yields
     an empty entry between adjacent commas and the whitespace form yields no
     empty entries; callers skip empty entries.
     """
-    comma_form = _has_top_level_comma(value)
-    pattern = _COMMA_FORM_TOKENS if comma_form else _WHITESPACE_FORM_TOKENS
-    depth = 0
+    comma_form = any(match.group() == "," for match in _separators(value))
     start = 0
-    for match in pattern.finditer(value):
-        token = match.group()
-        if token == "(":
-            depth += 1
-        elif token == ")":
-            depth = max(0, depth - 1)
-        elif depth == 0:
-            entry = value[start : match.start()].strip()
-            if entry or comma_form:
-                yield entry
-            start = match.end()
+    for match in _separators(value):
+        if comma_form and match.group() != ",":
+            continue
+        entry = value[start : match.start()].strip()
+        if entry or comma_form:
+            yield entry
+        start = match.end()
     entry = value[start:].strip()
     if entry or comma_form:
         yield entry
 
 
 def allowed_tool_grant_name(entry: str) -> str | None:
-    """Return the tool name of a well-formed ``allowed-tools`` grant, else ``None``.
+    """Return the tool name of a complete ``allowed-tools`` grant, else ``None``.
 
-    A well-formed grant is either a bare tool name or ``Tool(specifier)``
-    where the specifier is not blank, its parentheses balance, and the ``)``
-    that closes the first ``(`` is the last character. Incomplete or
-    malformed grants such as ``Bash(``, ``Bash(notes``, ``Bash()`` or
-    ``Bash(notes).md)`` return ``None``, so they name no tool. Names longer
-    than :data:`MAX_ALLOWED_TOOL_NAME_CHARS` also return ``None``.
+    A complete grant is either a bare tool name or ``Tool(specifier)``, where
+    the specifier is everything between the first ``(`` and the final ``)``,
+    which must be the last character, and is not blank. Parentheses inside the
+    specifier are literal, so ``Bash(echo '(')`` and ``Bash(echo ')')`` are
+    complete. Incomplete grants such as ``Bash(``, ``Bash(notes`` or
+    ``Bash(echo '('`` and blank ones such as ``Bash()`` return ``None``, so
+    they name no tool. Names longer than :data:`MAX_ALLOWED_TOOL_NAME_CHARS`
+    also return ``None``.
     """
     entry = entry.strip()
     # Bound the search so a long specifier is not scanned for the name.
@@ -108,9 +121,4 @@ def allowed_tool_grant_name(entry: str) -> str | None:
         return name
     if not entry.endswith(")") or _NON_WHITESPACE.search(entry, paren + 1, len(entry) - 1) is None:
         return None
-    depth = 0
-    for match in _PARENTHESES.finditer(entry, paren + 1, len(entry) - 1):
-        depth += 1 if match.group() == "(" else -1
-        if depth < 0:
-            return None
-    return name if depth == 0 else None
+    return name

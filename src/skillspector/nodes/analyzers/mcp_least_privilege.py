@@ -252,8 +252,8 @@ def _normalize_allowed_tools(
     Accepts the list form (``[Bash, Read]``), the comma-separated string
     form (``"Bash, Read"``), and the space-separated string form
     (``"Bash Read"``). Separators inside a ``Tool(specifier)`` scope do not
-    split, so ``"Bash(git status:*) Read"`` yields two entries. Anything else
-    yields an empty list.
+    split, so ``"Bash(git status:*) Read"`` and ``"Bash(echo '(') Read"`` each
+    yield two entries. Anything else yields an empty list.
     """
     tools: list[str] = []
     if isinstance(value, list):
@@ -378,8 +378,10 @@ def _map_allowed_tools_to_categories(
 
     Scoped grants in the ``Tool(specifier)`` form, such as ``Bash(git:*)`` or
     ``WebFetch(domain:example.com)``, map by their tool name, so a narrower
-    grant covers the same category as the bare tool. Incomplete or malformed
-    grants such as ``Bash(`` or ``Bash(notes).md)`` map to no category.
+    grant covers the same category as the bare tool. Parentheses inside the
+    specifier are literal, so ``Bash(echo '(')`` maps to ``shell``. Incomplete
+    or blank grants such as ``Bash(``, ``Bash(notes`` or ``Bash()`` map to no
+    category.
     """
     categories: set[str] = set()
     for tool in tools:

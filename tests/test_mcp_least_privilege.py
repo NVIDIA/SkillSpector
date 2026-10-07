@@ -371,6 +371,7 @@ class TestLP3AllowedTools:
             pytest.param("Bash(git:*) Bash(jq:*) Read", id="space_string_scoped"),
             pytest.param("Bash(git status:*) Read", id="space_string_scoped_with_space"),
             pytest.param("Bash(git status:*), Read", id="comma_string_scoped"),
+            pytest.param(["Bash(notes).md)"], id="list_literal_close_paren_inside_scope"),
         ],
     )
     def test_allowed_tools_scoped_bash_covers_shell_no_lp1(self, allowed_tools):
@@ -390,6 +391,69 @@ class TestLP3AllowedTools:
         lp1_findings = [f for f in findings if f.rule_id == "LP1" and "shell" in f.message]
         assert lp1_findings == [], (
             "Scoped Bash covers shell capability — no LP1 expected, got: "
+            f"{[(f.rule_id, f.message) for f in findings]}"
+        )
+
+    @pytest.mark.parametrize(
+        "allowed_tools",
+        [
+            pytest.param(["Bash(echo '(')"], id="list_literal_open_paren"),
+            pytest.param(["Bash(echo ')')"], id="list_literal_close_paren"),
+            pytest.param("Bash(echo '(') Read", id="space_string_literal_open_paren"),
+            pytest.param("Bash(echo ')') Read", id="space_string_literal_close_paren"),
+            pytest.param("Bash(echo '('), Read", id="comma_string_literal_open_paren"),
+            pytest.param("Bash(echo ')'), Read", id="comma_string_literal_close_paren"),
+        ],
+    )
+    def test_allowed_tools_bash_scope_with_literal_parens_covers_shell_no_lp1(self, allowed_tools):
+        """Parentheses inside a specifier are literal, as in Claude Code's
+        permission rule syntax, so ``Bash(echo '(')`` is a complete Bash grant
+        and covers the shell capability."""
+        state = _make_state("mcp_underdeclared_skill")
+        state["manifest"]["permissions"] = None
+        state["manifest"]["allowed-tools"] = allowed_tools
+        state["file_cache"]["skill.py"] = (
+            'import subprocess\nsubprocess.run(["echo", "("], check=True)\n'
+        )
+        state["component_metadata"] = [
+            {"path": "skill.py", "type": "python", "executable": True, "lines": 2, "size_bytes": 60}
+        ]
+        state["components"] = ["skill.py"]
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp1_findings = [f for f in findings if f.rule_id == "LP1" and "shell" in f.message]
+        assert lp1_findings == [], (
+            "Bash(echo ...) covers shell capability — no LP1 expected, got: "
+            f"{[(f.rule_id, f.message) for f in findings]}"
+        )
+
+    @pytest.mark.parametrize(
+        "allowed_tools",
+        [
+            pytest.param(["Bash(echo '('"], id="list_unclosed_scope_with_literal_open_paren"),
+            pytest.param(["Bash(echo ')'"], id="list_unclosed_scope_with_literal_close_paren"),
+            pytest.param("Bash(echo '( Read", id="space_string_unclosed_scope"),
+            pytest.param("Bash(echo '(', Read", id="comma_string_unclosed_scope"),
+        ],
+    )
+    def test_allowed_tools_incomplete_bash_scope_with_literal_parens_still_lp1(self, allowed_tools):
+        """A literal parenthesis does not complete a grant: without a final
+        ``)`` the outer ``Bash(`` grant is incomplete and covers nothing."""
+        state = _make_state("mcp_underdeclared_skill")
+        state["manifest"]["permissions"] = None
+        state["manifest"]["allowed-tools"] = allowed_tools
+        state["file_cache"]["skill.py"] = (
+            'import subprocess\nsubprocess.run(["echo", "("], check=True)\n'
+        )
+        state["component_metadata"] = [
+            {"path": "skill.py", "type": "python", "executable": True, "lines": 2, "size_bytes": 60}
+        ]
+        state["components"] = ["skill.py"]
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp1_findings = [f for f in findings if f.rule_id == "LP1" and "shell" in f.message]
+        assert len(lp1_findings) == 1, (
+            "No complete Bash grant is declared — LP1 for shell expected, got: "
             f"{[(f.rule_id, f.message) for f in findings]}"
         )
 
@@ -427,7 +491,6 @@ class TestLP3AllowedTools:
             pytest.param(["Bash(notes"], id="list_unterminated_bash_scope"),
             pytest.param("Bash(notes Read", id="space_string_unterminated_bash_scope"),
             pytest.param(["Bash()"], id="list_empty_bash_scope"),
-            pytest.param(["Bash(notes).md)"], id="list_text_after_bash_scope"),
         ],
     )
     def test_allowed_tools_malformed_or_nested_bash_still_lp1(self, allowed_tools):
@@ -481,6 +544,32 @@ class TestLP3AllowedTools:
             ),
             pytest.param("Bash(notes Read", ["Bash(notes Read"], id="unclosed_scope_keeps_rest"),
             pytest.param("Bash) Read", ["Bash)", "Read"], id="stray_close_paren"),
+            pytest.param(
+                "Bash(echo '(') Read", ["Bash(echo '(')", "Read"], id="literal_open_paren"
+            ),
+            pytest.param(
+                "Bash(echo ')') Read", ["Bash(echo ')')", "Read"], id="literal_close_paren"
+            ),
+            pytest.param(
+                "Bash(echo '('), Read",
+                ["Bash(echo '(')", "Read"],
+                id="comma_string_literal_open_paren",
+            ),
+            pytest.param(
+                "Bash(echo ')'), Read",
+                ["Bash(echo ')')", "Read"],
+                id="comma_string_literal_close_paren",
+            ),
+            pytest.param(
+                "Bash(echo ')') Read(./a, b)",
+                ["Bash(echo ')')", "Read(./a, b)"],
+                id="literal_close_paren_then_comma_inside_scope",
+            ),
+            pytest.param(
+                "Bash(echo ') x') Read",
+                ["Bash(echo ')", "x')", "Read"],
+                id="close_paren_before_space_ends_scope",
+            ),
         ],
     )
     def test_normalize_allowed_tools_keeps_scoped_grants_whole(self, allowed_tools, expected):
@@ -492,18 +581,32 @@ class TestLP3AllowedTools:
             "Bash(notes",
             "Bash()",
             "Bash( )",
-            "Bash(notes).md)",
-            "Bash(a)(b)",
+            "Bash(echo '('",
+            "Bash(echo ')'",
             "Bash)",
             "(Bash)",
             "Bash (git:*)",
             "Read(./docs Bash(notes).md",
         ]
         assert mcp_least_privilege._map_allowed_tools_to_categories(malformed) == set()
-        # A scope may itself contain balanced parentheses.
+        # A scope may itself contain parentheses.
         assert mcp_least_privilege._map_allowed_tools_to_categories(
             ["Read(./docs Bash(notes).md)", "Edit(./notes (old)/**)"]
         ) == {"file_read", "file_write"}
+
+    @pytest.mark.parametrize(
+        "grant",
+        [
+            pytest.param("Bash(echo '(')", id="literal_open_paren"),
+            pytest.param("Bash(echo ')')", id="literal_close_paren"),
+            pytest.param("Bash(notes).md)", id="literal_close_paren_mid_scope"),
+            pytest.param("Bash(a)(b)", id="literal_parens_mid_scope"),
+        ],
+    )
+    def test_map_allowed_tools_treats_scope_parens_as_literal(self, grant):
+        """The specifier runs from the first ``(`` to the final ``)`` and its
+        parentheses are literal, so these are complete Bash grants."""
+        assert mcp_least_privilege._map_allowed_tools_to_categories([grant]) == {"shell"}
 
 
 class TestLP4OverDeclared:

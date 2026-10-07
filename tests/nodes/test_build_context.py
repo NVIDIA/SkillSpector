@@ -1095,6 +1095,22 @@ def test_build_context_parses_allowed_tools_single_space_string(tmp_path: Path) 
             ["Bash(git status:*)", "Read(./a, b)"],
             id="comma_only_inside_scope_keeps_space_form",
         ),
+        pytest.param(
+            "Bash(echo '(') Read", ["Bash(echo '(')", "Read"], id="literal_open_paren_in_scope"
+        ),
+        pytest.param(
+            "Bash(echo ')') Read", ["Bash(echo ')')", "Read"], id="literal_close_paren_in_scope"
+        ),
+        pytest.param(
+            "Bash(echo '('), Read",
+            ["Bash(echo '(')", "Read"],
+            id="comma_string_literal_open_paren_in_scope",
+        ),
+        pytest.param(
+            "Bash(echo ')'), Read",
+            ["Bash(echo ')')", "Read"],
+            id="comma_string_literal_close_paren_in_scope",
+        ),
     ],
 )
 def test_build_context_keeps_scoped_allowed_tools_whole(
