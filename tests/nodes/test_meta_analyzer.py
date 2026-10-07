@@ -1105,10 +1105,12 @@ def test_invalid_stringified_meta_fields_fail_validation(field, value) -> None:
 
 
 def test_valid_stringified_meta_fields_are_supported() -> None:
-    result = MetaAnalyzerResult.model_validate({
-        "findings": "[]",
-        "overall_assessment": '{"risk_level": "LOW", "summary": "No issues found"}',
-    })
+    result = MetaAnalyzerResult.model_validate(
+        {
+            "findings": "[]",
+            "overall_assessment": '{"risk_level": "LOW", "summary": "No issues found"}',
+        }
+    )
     assert result.findings == []
     assert result.overall_assessment.summary == "No issues found"
 
