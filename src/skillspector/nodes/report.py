@@ -210,7 +210,7 @@ def _sarif_artifact_location(
     if source_identity:
         uri = f"{source_identity}/{file_path}"
     else:
-        uri = quote(str(occurrence.get("file", finding.file)).replace("\\", "/"), safe="/")
+        uri = _sarif_uri(raw_file_path)
     properties = {
         {
             "source_identity": "sourceIdentity",
@@ -221,6 +221,11 @@ def _sarif_artifact_location(
         for key, value in provenance.items()
     }
     return SarifArtifactLocation(uri=uri, properties=properties or None)
+
+
+def _sarif_uri(path: str) -> str:
+    """Normalize separators and percent-encode a local artifact path for SARIF."""
+    return quote(path.replace("\\", "/"), safe="/")
 
 
 def _occurrence_columns(
@@ -857,7 +862,7 @@ def _build_sarif(
             locations = [
                 SarifLocation(
                     physicalLocation=SarifPhysicalLocation(
-                        artifactLocation=SarifArtifactLocation(uri=path),
+                        artifactLocation=SarifArtifactLocation(uri=_sarif_uri(path)),
                         region=region,
                     )
                 )

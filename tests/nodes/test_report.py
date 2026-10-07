@@ -2128,6 +2128,59 @@ def test_report_sarif_bounds_completeness_notifications(
     assert projected["notificationsTruncated"] is True
 
 
+def test_report_sarif_encodes_exception_notification_paths() -> None:
+    exceptions = [
+        {
+            "outcome": "failed",
+            "phase": "nested_artifact_inspection",
+            "reason_code": "archive_malformed",
+            "message": "Malformed archive.",
+            "path": "broken#old.zip",
+            "fatal": True,
+        },
+        {
+            "outcome": "skipped",
+            "phase": "nested_artifact_inspection",
+            "reason_code": "archive_unsupported",
+            "message": "Unsupported archive.",
+            "path": "nested\\broken old#archive.zip",
+            "fatal": False,
+        },
+    ]
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "sarif",
+        "analysis_completeness": {  # type: ignore[typeddict-item]
+            "total_components": 2,
+            "coverage_percent": 0.0,
+            "is_complete": False,
+            "status": "partial",
+            "fully_inspected_files": 0,
+            "partially_inspected_files": 0,
+            "entirely_uninspected_files": 2,
+            "ledger_exceptions": exceptions,
+            "scope_exclusions": [],
+            "limitations": [],
+        },
+    }
+
+    invocation = report(state)["sarif_report"]["runs"][0]["invocations"][0]
+    notifications = invocation["toolExecutionNotifications"]
+    notification_uris = [
+        item["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        for item in notifications
+        if item.get("locations")
+    ]
+
+    assert notification_uris == [
+        "broken%23old.zip",
+        "nested/broken%20old%23archive.zip",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Fail-closed: a degraded deep scan must not be able to report SAFE
 # ---------------------------------------------------------------------------

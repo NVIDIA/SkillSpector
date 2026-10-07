@@ -290,7 +290,9 @@ def _main_impl() -> None:
     def _print(*args: object, **kwargs: object) -> None:
         """Print through Rich when available, falling back to plain text."""
         if c:
-            c.print(*args, **{k: v for k, v in kwargs.items() if k != "file"})
+            output = kwargs.pop("file", None)
+            console = Console(file=output, emoji=False) if output is not None else c
+            console.print(*args, **kwargs)
         else:
             msg = " ".join(str(a) for a in args)
             file = kwargs.get("file")
