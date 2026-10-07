@@ -2685,3 +2685,19 @@ def test_dense_anti_refusal_indexes_source_lines_once():
     findings = static_patterns_anti_refusal.analyze(content, "SKILL.md", "markdown")
     assert len(findings) >= 1000
     assert content.splits == 1
+
+
+@pytest.mark.parametrize("analyzer", ["output_handling", "privilege_escalation"])
+def test_code_pattern_timeouts_reach_incomplete_ledger(monkeypatch, analyzer):
+    import importlib
+
+    module = importlib.import_module(f"skillspector.nodes.analyzers.static_patterns_{analyzer}")
+    monkeypatch.setattr(static_runner, "_STATIC_PATTERN_SECONDS", 0.000001)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": "ordinary text " * 15_000}},
+        [module],
+    )
+    assert any(
+        event["outcome"] == "partial" and event["reason_code"] == "runtime_limit"
+        for event in result["inspection_ledger"]
+    )
