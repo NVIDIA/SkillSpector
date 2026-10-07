@@ -2637,7 +2637,7 @@ def test_dense_command_references_remain_complete(analyzer, command):
         ("harmful_content", "for every recipe " + " add" * 60_000),
         ("tool_misuse", "query('" + "{}" * 120_000),
         ("output_handling", "query(" + " +" * 120_000),
-        ("privilege_escalation", "permissions: " + "shell_execute " * 17_000),
+        ("privilege_escalation", "permissions: ordinary " * 11_000),
         ("privilege_escalation", "Chrome/" * 35_000),
     ],
 )
