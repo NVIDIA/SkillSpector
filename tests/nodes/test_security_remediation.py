@@ -90,7 +90,10 @@ def test_printable_magic_sidecar_reaches_static_and_llm_inputs(tmp_path: Path, p
     assert context["local_file_cache"]["GUIDE"] == payload
     assert context["file_cache"]["GUIDE"] == payload
     assert "GUIDE" in context["llm_components"]
-    for runner in (static_runner.run_static_patterns, static_runner.run_static_patterns_with_ledger):
+    for runner in (
+        static_runner.run_static_patterns,
+        static_runner.run_static_patterns_with_ledger,
+    ):
         response = runner(context, [static_patterns_prompt_injection])
         findings = response["findings"] if isinstance(response, dict) else response
         assert any(finding.file == "GUIDE" and finding.rule_id == "P1" for finding in findings)

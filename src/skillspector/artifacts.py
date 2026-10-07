@@ -367,8 +367,8 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
 
     # These printable prefixes are also valid instruction text. Keep the
     # claimed binary format's coverage limits, but inspect the readable bytes.
-    readable_binary = decodable and not contains_nul and data.startswith(
-        (b"MZ", b"GIF87a", b"GIF89a", b"%PDF-")
+    readable_binary = (
+        decodable and not contains_nul and data.startswith((b"MZ", b"GIF87a", b"GIF89a", b"%PDF-"))
     )
 
     if has_binary_magic:

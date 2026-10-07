@@ -343,13 +343,17 @@ def test_graph_detects_instructions_after_printable_magic(tmp_path: Path, prefix
 
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False, "output_format": "json"})
 
-    assert any(finding.file == "GUIDE" and finding.rule_id == "P1" for finding in result["findings"])
+    assert any(
+        finding.file == "GUIDE" and finding.rule_id == "P1" for finding in result["findings"]
+    )
     assert result["analysis_completeness"]["is_complete"] is False
     assert result["analysis_completeness"]["partially_inspected_files"] >= 1
     assert result["risk_recommendation"] != "SAFE"
 
 
-def test_graph_keeps_benign_readable_pdf_partial_without_instruction_findings(tmp_path: Path) -> None:
+def test_graph_keeps_benign_readable_pdf_partial_without_instruction_findings(
+    tmp_path: Path,
+) -> None:
     (tmp_path / "SKILL.md").write_text("---\nname: printable-magic\ndescription: A helper\n---\n")
     (tmp_path / "manual.pdf").write_text("%PDF-1.4\nA plain text reference document.\n")
 
