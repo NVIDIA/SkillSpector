@@ -19,6 +19,7 @@ import json
 from pathlib import Path
 
 import pytest
+from markdown_it import MarkdownIt
 
 from skillspector.graph import graph
 
@@ -190,6 +191,8 @@ def test_graph_reports_only_specific_ransomware_indicators(
             assert location["region"]["startLine"] == 8
     else:
         body = result["report_body"]
+        if output_format == "markdown":
+            body = MarkdownIt().enable("table").render(body)
         assert (rule_name in body) is expected_match
         if expected_match:
             assert "YR1" in body
@@ -225,4 +228,7 @@ def test_graph_mixed_notices_retains_only_actionable_evidence(tmp_path, output_f
         reported = [issue for issue in issues if "ransomware_behavior" in issue["message"]["text"]]
         assert reported[0]["locations"][0]["physicalLocation"]["region"]["startLine"] == 7
     else:
-        assert "ransomware_behavior" in result["report_body"]
+        body = result["report_body"]
+        if output_format == "markdown":
+            body = MarkdownIt().enable("table").render(body)
+        assert "ransomware_behavior" in body
