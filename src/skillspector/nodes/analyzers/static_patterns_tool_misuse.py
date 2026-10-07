@@ -3954,7 +3954,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     # cross-scope candidates for Python files.
     cross_scope_starts: set[int] = set()
     if file_type == "python":
-        for variable_match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
+        for variable_match in static_runner.iter_pattern_matches(_VARIABLE_SHELL_FLAG_RE, content):
             if not _variable_shell_flag_same_scope(content, file_path, variable_match):
                 cross_scope_starts.add(variable_match.start())
 

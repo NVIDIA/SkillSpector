@@ -339,8 +339,9 @@ Raising the artifact allowance does not raise this limit. It covers routed rules
 in prompt injection, tool misuse, data exfiltration, supply chain, agent snooping,
 excessive agency, memory poisoning, and rogue agents. Through paragraph matching,
 it also covers prose rules in harmful content, system prompt leakage, output
-handling, anti-refusal, privilege escalation, and SSRF. Other code rules and
-helper-specific searches remain outside this matcher.
+handling, anti-refusal, privilege escalation, and SSRF. Output-handling and
+privilege-escalation code patterns and the variable shell-flag scope precheck
+also use the timed matcher. Other helper-specific searches remain outside it.
 
 Audited command/option patterns use a linear, command-segment search that preserves
 unbounded command spans and the original greedy matches. Memory poisoning's

@@ -37,7 +37,7 @@ from skillspector.models import AnalyzerFinding, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import SourceLocationIndex, get_context, get_line_number, is_code_example
+from .common import SourceLocationIndex, get_context_from_lines, is_code_example
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -397,6 +397,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     """Analyze content for anti-refusal statements (AR1-AR3)."""
     findings: list[AnalyzerFinding] = []
     locations = SourceLocationIndex(content, file_path)
+    lines = content.splitlines()
     tag = [PatternCategory.ANTI_REFUSAL.value]
 
     for rule_id, patterns in _RULES:
@@ -404,11 +405,10 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             for match in static_runner.iter_paragraph_matches(
                 pattern, content, re.IGNORECASE | re.MULTILINE
             ):
-                lines = content.splitlines()
-                line_num = get_line_number(content, match.start())
+                line_num, column = locations.line_and_column(match.start())
                 match_line = lines[line_num - 1] if lines else content
                 previous_line = lines[line_num - 2] if line_num > 1 else None
-                context = get_context(content, match.start(), context_lines=3)
+                context = get_context_from_lines(lines, line_num, window=3, column=column)
                 security_review_context = bool(
                     _MODE_ENABLED_RE.fullmatch(match.group(0))
                     and _SECURITY_REVIEW_CONTEXT_RE.search(context)
