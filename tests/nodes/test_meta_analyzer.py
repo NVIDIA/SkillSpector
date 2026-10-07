@@ -1092,6 +1092,24 @@ def test_use_llm_false_records_nothing() -> None:
     assert "filtered_findings" not in result
 
 
+@pytest.mark.parametrize("field", ["findings", "overall_assessment"])
+@pytest.mark.parametrize("value", ["invalid JSON", "42", '"wrong type"'])
+def test_invalid_stringified_meta_fields_fail_validation(field, value) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        MetaAnalyzerResult.model_validate({field: value})
+
+
+def test_valid_stringified_meta_fields_are_supported() -> None:
+    result = MetaAnalyzerResult.model_validate({
+        "findings": "[]",
+        "overall_assessment": '{"risk_level": "LOW", "summary": "No issues found"}',
+    })
+    assert result.findings == []
+    assert result.overall_assessment.summary == "No issues found"
+
+
 def test_no_findings_records_nothing() -> None:
     result = meta_analyzer(_degr_state(findings=[]))
     assert "llm_call_log" not in result

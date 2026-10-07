@@ -61,10 +61,11 @@ async def test_compat_parse_failures_retry_and_remain_visible(
 
     with runner.deepseek_compat():
         analyzer = (
-            runner.LLMAnalyzerBase(base_prompt="Review the supplied skill", model="test")
+            runner.LLMAnalyzerBase(base_prompt="Review the supplied skill", model="test", timeout=7)
             if analyzer_kind == "discovery"
-            else runner.LLMMetaAnalyzer(model="test")
+            else runner.LLMMetaAnalyzer(model="test", timeout=7)
         )
+        assert analyzer._timeout == 7
         outcome = (
             await analyzer.arun_batches_detailed([batch])
             if asynchronous

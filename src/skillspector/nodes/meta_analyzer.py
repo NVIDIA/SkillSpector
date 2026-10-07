@@ -130,11 +130,7 @@ class MetaAnalyzerResult(BaseModel):
     def _parse_stringified_findings(cls, v: object) -> object:
         """LLMs sometimes return the findings array as a JSON string."""
         if isinstance(v, str):
-            try:
-                parsed = json.loads(v)
-            except (json.JSONDecodeError, TypeError):
-                return []
-            return parsed if isinstance(parsed, list) else []
+            return json.loads(v)
         return v
 
     @field_validator("overall_assessment", mode="before")
@@ -142,10 +138,7 @@ class MetaAnalyzerResult(BaseModel):
     def _parse_stringified_assessment(cls, v: object) -> object:
         """LLMs sometimes return nested objects as JSON strings."""
         if isinstance(v, str):
-            try:
-                return json.loads(v)
-            except (json.JSONDecodeError, TypeError):
-                return None
+            return json.loads(v)
         return v
 
 
