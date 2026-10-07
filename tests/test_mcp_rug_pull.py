@@ -228,6 +228,88 @@ def test_rp1_docker_unresolved_image_is_still_reported():
     assert _rp1_matches(content) == [f"docker run {padding.rstrip()}"[:200]]
 
 
+def test_rp1_docker_image_pinned_after_an_expansion_no_finding():
+    """A double-quoted expansion cannot change a tag or digest written after it."""
+    for content in (
+        'docker run --rm "${REGISTRY}/tool:1.4" lint\n',
+        'docker run "${REGISTRY:-ghcr.io}/org/tool:1.4.2"\n',
+        f'docker pull "$REGISTRY"/team/tool@{_DIGEST}\n',
+        'docker run "${REGISTRY}/${NAME}:1.4"\n',
+        'docker run --rm "$IMAGE:3.20"\n',
+        f'docker pull "${{IMAGE}}@{_DIGEST}"\n',
+        'docker run -e "MODE=$MODE" --name "$(whoami)-job" alpine:3.20\n',
+    ):
+        assert _rp1_matches(content) == [], content
+
+
+def test_rp1_docker_image_with_unknown_expansion_is_reported():
+    """An image whose tag depends on an expansion's value stays reported."""
+    for content, expected in (
+        ('docker run --rm "${IMAGE:-alpine:3.20}"\n', 'docker run --rm "${IMAGE:-alpine:3.20}"'),
+        ('docker run --rm "${IMAGE:1}"\n', 'docker run --rm "${IMAGE:1}"'),
+        ('docker run "${IMAGE:-x/alpine:3.20}"\n', 'docker run "${IMAGE:-x/alpine:3.20}"'),
+        ('docker run "${X:-\\}/alpine:3.20}"\n', 'docker run "${X:-\\}/alpine:3.20}"'),
+        ('docker run "${IMAGE}:${TAG}"\n', 'docker run "${IMAGE}:${TAG}"'),
+        ("docker run $REGISTRY/tool:1.4\n", "docker run $REGISTRY/tool:1.4"),
+        ('docker run "$@/tool:1.4"\n', 'docker run "$@/tool:1.4"'),
+        ('docker run "${arr[@]}/tool:1.4"\n', 'docker run "${arr[@]}/tool:1.4"'),
+        (
+            'docker run "${IMAGE:-$(echo })/tool:1.4}"\n',
+            'docker run "${IMAGE:-$(echo })/tool:1.4}"',
+        ),
+        ('docker run "$(echo registry)/tool:1.4"\n', 'docker run "$(echo registry)/tool:1.4"'),
+        (
+            'docker run "$(case x in x) echo alpine;; y/z:1) ;; esac)"\n',
+            'docker run "$(case x in x) echo alpine;; y/z:1) ;; esac)"',
+        ),
+        ('docker run "$(echo alpine):3.20"\n', 'docker run "$(echo alpine):3.20"'),
+        ('docker run "`echo alpine`:3.20"\n', 'docker run "`echo alpine`:3.20"'),
+        ("docker run {alpine,alpine:3.20}\n", "docker run {alpine,alpine:3.20}"),
+    ):
+        assert _rp1_matches(content) == [expected], content
+
+
+def test_rp1_docker_redirections_before_pinned_image_no_finding():
+    """Redirections are not read as the image or as an option value."""
+    for content in (
+        "docker pull -q 2>/dev/null alpine:3.20\n",
+        "docker run --rm >out.log 2>&1 alpine:3.20 true\n",
+        "docker run --rm 2> err.log alpine:3.20\n",
+        "docker run -i <input.txt alpine:3.20 cat\n",
+        "docker run -i <<<'hello' alpine:3.20 cat\n",
+        "docker run --rm &>>run.log alpine:3.20\n",
+        "docker run -e 2>err.log MODE=fast alpine:3.20\n",
+        "docker run --rm alpine:3.20>out.log\n",
+    ):
+        assert _rp1_matches(content) == [], content
+
+
+def test_rp1_docker_redirection_target_is_not_taken_as_image():
+    """A redirection's file name cannot pin the image that follows it."""
+    for content, expected in (
+        ("docker run --rm 2>log:1 alpine\n", "docker run --rm 2>log:1 alpine"),
+        ("docker run >out:1 alpine\n", "docker run >out:1 alpine"),
+        ("docker run >> out:1 alpine\n", "docker run >> out:1 alpine"),
+        ("docker run <in:1 alpine\n", "docker run <in:1 alpine"),
+        ("docker run &>out:1 alpine\n", "docker run &>out:1 alpine"),
+        ("docker run 2>&1 >|out:1 alpine\n", "docker run 2>&1 >|out:1 alpine"),
+        ("docker run <<<x:1 alpine\n", "docker run <<<x:1 alpine"),
+        ("docker run -e 2>x:1 A evil/image\n", "docker run -e 2>x:1 A evil/image"),
+        ("docker run --rm alpine>log:1\n", "docker run --rm alpine"),
+    ):
+        assert _rp1_matches(content) == [expected], content
+
+
+def test_rp1_docker_unclear_redirection_is_still_reported():
+    """When a redirection cannot be read, the command stays reported."""
+    for content, expected in (
+        ("docker run --rm 2>\n", "docker run --rm 2>"),
+        ("docker run --rm 2>|\n", "docker run --rm 2>|"),
+        ("docker run --env-file <(env) alpine:3.20\n", "docker run --env-file <"),
+    ):
+        assert _rp1_matches(content) == [expected], content
+
+
 def test_rp1_docker_operand_scan_is_linear():
     """Adversarial lines finish quickly; the operand scan is bounded."""
     for content in (
@@ -238,6 +320,10 @@ def test_rp1_docker_operand_scan_is_linear():
         "docker run -e " + "\\a" * 25_000,
         "docker run " + "\\\n" * 25_000 + "img",
         'docker pull -q "' * 3_125,
+        "docker run " + "2>x " * 10_000,
+        "docker run " + "1" * 50_000 + ">x",
+        'docker run "' + "${a" * 10_000 + '"',
+        'docker run "' + "$(" * 10_000 + '"',
     ):
         started = time.perf_counter()
         _rp1_matches(content)

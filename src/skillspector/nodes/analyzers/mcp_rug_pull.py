@@ -184,12 +184,21 @@ _DOCKER_OPTIONS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
 }
 # One shell word: unquoted text, $(...), backslash escapes (including a line
 # continuation) and complete quoted strings. The alternatives start with distinct
-# characters, so matching is linear; an unterminated quote ends the word.
+# characters, so matching is linear; an unterminated quote ends the word, and so
+# does a redirection operator (alpine>log).
 _SHELL_WORD_RE = re.compile(
-    r"""(?:[^\s"'\\|&;()`$]+|\$(?:\([^()\n]*\))?|\\(?:\r?\n|.)|"(?:[^"\\\n]|\\.)*"|'[^'\n]*')+"""
+    r"""(?:[^\s"'\\|&;()<>`$]+|\$(?:\([^()\n]*\))?|\\(?:\r?\n|.)|"(?:[^"\\\n]|\\.)*"|'[^'\n]*')+"""
 )
 _SHELL_WORD_GAP_RE = re.compile(r"(?:[ \t]+|\\\r?\n)+")
 _SHELL_QUOTING_RE = re.compile(r"""\\(.)|["']""", re.DOTALL)
+# A redirection operator with its optional file descriptor (2>, &>>, 2>&, <<<, {fd}>).
+# The shell removes it and its target word wherever it appears in the command.
+_SHELL_REDIRECTION_RE = re.compile(
+    r"(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:&>>?|<<<|<<-?|<>|<&|>&|>>|>\||[<>])"
+)
+# A parameter name or a special parameter after `$` ($HOME, $1, $?). `$@` is not
+# one of them here: it expands to several words even in double quotes.
+_SHELL_PARAMETER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9*#?$!-]")
 # Bound on the text read after `docker <subcommand>` to find the image operand.
 _DOCKER_OPERAND_MAX_CHARS = 1024
 
@@ -258,14 +267,112 @@ def _get_parameters_map(
 # ---------------------------------------------------------------------------
 
 
+def _next_shell_word(text: str, pos: int, truncated: bool) -> re.Match[str] | None:
+    """Return the shell word after *pos*.
+
+    None at the end of the command or when the word may be cut off by the read
+    bound.
+    """
+    gap = _SHELL_WORD_GAP_RE.match(text, pos)
+    word_match = _SHELL_WORD_RE.match(text, gap.end() if gap else pos)
+    if word_match is None or (truncated and word_match.end() == len(text)):
+        return None
+    return word_match
+
+
+def _expansion_end(word: str, start: int) -> int | None:
+    """Return where the parameter expansion at ``word[start]`` ends.
+
+    None when the expansion cannot be read safely:
+
+    - a command substitution or arithmetic (a backquote, ``$(...)``, ``$[...]``),
+      whose closing character can sit in a ``case`` pattern or a comment;
+    - ``$@`` or a ``${...}`` with ``@`` or ``[``, since ``"$@"`` and
+      ``"${arr[@]}"`` expand to several words even in double quotes;
+    - a ``${...}`` that is unclosed or holds quoting, escapes or a nested
+      substitution, any of which can hide its closing brace.
+    """
+    if word[start] == "`" or word[start + 1 : start + 2] in ("(", "[", "@"):
+        return None
+    if word.startswith("${", start):
+        depth = 0
+        for index in range(start + 1, len(word)):
+            char = word[index]
+            if char in "\\'\"`()[]@":
+                return None
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+        return None
+    # A `$` that starts no expansion ("$" at the end of a string) is literal.
+    parameter = _SHELL_PARAMETER_RE.match(word, start + 1)
+    return parameter.end() if parameter else start + 1
+
+
+def _docker_image_known_text(word: str) -> str | None:
+    """Return the part of an image word whose value is known, without quoting.
+
+    An expansion (``$IMAGE``, ``${IMAGE:-alpine:3.20}``) has a value the scan
+    does not know. The tag or digest is still known when every expansion is
+    double-quoted and the literal text after the last one holds it: that text
+    contains a ``/``, so the last path component is literal
+    (``"${REGISTRY}/tool:1.4"``), or it starts with ``:`` or ``@``
+    (``"${IMAGE}:1.4"``), which with no ``/`` after it can only begin a tag or
+    digest. That literal text is returned. Otherwise None is returned and the
+    command is reported. An unquoted expansion or brace expansion
+    (``{alpine,alpine:3.20}``) is never resolved, because it can change which
+    word is the image, and neither is a command substitution (see
+    ``_expansion_end``).
+    """
+    known_from = 0
+    in_double_quotes = False
+    brace_depth = 0
+    index = 0
+    while index < len(word):
+        char = word[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "'" and not in_double_quotes:
+            close = word.find("'", index + 1)
+            if close < 0:
+                return None
+            index = close + 1
+            continue
+        if char in "$`":
+            end = _expansion_end(word, index) if in_double_quotes else None
+            if end is None:
+                return None
+            index = known_from = end
+            continue
+        if char == '"':
+            in_double_quotes = not in_double_quotes
+        elif not in_double_quotes and char == "{":
+            brace_depth += 1
+        elif not in_double_quotes and char == "}" and brace_depth:
+            brace_depth -= 1
+        elif not in_double_quotes and char == "," and brace_depth:
+            return None
+        index += 1
+    known = _SHELL_QUOTING_RE.sub(r"\1", word[known_from:])
+    if known_from and "/" not in known and not known.startswith((":", "@")):
+        return None
+    return known
+
+
 def _docker_image_operand(subcommand: str, text: str, truncated: bool) -> tuple[str | None, int]:
     """Return the image operand of a docker command and where reading stopped.
 
     *text* starts at the first argument after ``docker run|create|pull``. Options
-    and their values are skipped using docker's option table. The image is None
-    when it cannot be identified (an unknown option, a missing value, the end of
-    the command, or a word cut off by the read bound), so the caller still
-    reports the command.
+    and their values are skipped using docker's option table, and redirections
+    (``2>log``, ``<<<x``) are skipped with their targets. The image is None when
+    it cannot be identified (an unknown option, a missing value or redirection
+    target, the end of the command, a word cut off by the read bound) or when its
+    tag depends on an expansion, so the caller still reports the command. For an
+    image whose value is partly known, only the known part is returned.
     """
     value_options, flag_options = _DOCKER_OPTIONS[subcommand.lower()]
     pos = 0
@@ -273,15 +380,22 @@ def _docker_image_operand(subcommand: str, text: str, truncated: bool) -> tuple[
     end_of_options = False
     while True:
         gap = _SHELL_WORD_GAP_RE.match(text, pos)
-        word_match = _SHELL_WORD_RE.match(text, gap.end() if gap else pos)
-        if word_match is None or (truncated and word_match.end() == len(text)):
+        redirection = _SHELL_REDIRECTION_RE.match(text, gap.end() if gap else pos)
+        if redirection is not None:
+            target = _next_shell_word(text, redirection.end(), truncated)
+            if target is None:
+                return None, redirection.end()
+            pos = target.end()
+            continue
+        word_match = _next_shell_word(text, pos, truncated)
+        if word_match is None:
             return None, pos
         pos = word_match.end()
         word = _SHELL_QUOTING_RE.sub(r"\1", word_match.group(0))
         if expect_value:
             expect_value = False
         elif end_of_options or not word.startswith("-") or word == "-":
-            return word, pos
+            return _docker_image_known_text(word_match.group(0)), pos
         elif word == "--":
             end_of_options = True
         elif word.startswith("--"):
