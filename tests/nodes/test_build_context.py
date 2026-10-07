@@ -693,19 +693,22 @@ def test_build_context_model_config_matches_openai_fallback(
     assert result["model_config"]["default"] == OpenAIProvider.DEFAULT_MODEL
 
 
-def test_build_context_inventories_but_excludes_valid_root_oms_signature(
+def test_build_context_inspects_unverified_root_oms_signature(
     tmp_path: Path,
 ) -> None:
-    """A real OMS signature is reported as metadata but withheld from analyzers."""
+    """Recognized structure is metadata, never permission to exclude content."""
     (tmp_path / "SKILL.md").write_text("---\nname: signed\n---\n# Signed\n", encoding="utf-8")
     signature_path = _write_real_oms_signature(tmp_path)
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert "skill.oms.sig" not in result["components"]
-    assert "skill.oms.sig" not in result["file_cache"]
+    assert "skill.oms.sig" in result["components"]
+    assert result["file_cache"]["skill.oms.sig"] == signature_path.read_text()
+    assert "skill.oms.sig" in result["llm_components"]
     assert any(
-        event["path"] == "skill.oms.sig" and event["reason_code"] == "oms_signature"
+        event["path"] == "skill.oms.sig"
+        and event["reason_code"] == "oms_signature"
+        and event["outcome"] == "partial"
         for event in result["inspection_ledger"]
     )
     signature_meta = next(
@@ -720,8 +723,8 @@ def test_build_context_inventories_but_excludes_valid_root_oms_signature(
     }
 
 
-def test_build_context_excludes_future_oms_predicate_version(tmp_path: Path) -> None:
-    """OMS predicate revisions remain excluded without relaxing the namespace check."""
+def test_build_context_inspects_future_oms_predicate_version(tmp_path: Path) -> None:
+    """Future predicate versions cannot opt content out of inspection."""
     bundle = json.loads(_OMS_FIXTURE.read_text(encoding="utf-8"))
     payload = json.loads(base64.b64decode(bundle["dsseEnvelope"]["payload"]))
     payload["predicateType"] = "https://model_signing/signature/v1.1"
@@ -732,9 +735,12 @@ def test_build_context_excludes_future_oms_predicate_version(tmp_path: Path) -> 
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert "skill.oms.sig" not in result["components"]
+    assert "skill.oms.sig" in result["components"]
+    assert "skill.oms.sig" in result["llm_components"]
     assert any(
-        event["path"] == "skill.oms.sig" and event["reason_code"] == "oms_signature"
+        event["path"] == "skill.oms.sig"
+        and event["reason_code"] == "oms_signature"
+        and event["outcome"] == "partial"
         for event in result["inspection_ledger"]
     )
 

@@ -143,7 +143,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.MANIFEST_ABSENT: ("No compatible manifest was present for this analyzer."),
     LedgerReason.NO_APPLICABLE_FILES: ("No files matched this analyzer's applicability contract."),
     LedgerReason.OMS_SIGNATURE: (
-        "Recognized OMS signature metadata is excluded from content analysis."
+        "OMS bundle contents are unverified; encoded payload interpretation is incomplete."
     ),
     LedgerReason.BASELINE_FILE: (
         "The explicitly selected suppression baseline is excluded from content analysis."
