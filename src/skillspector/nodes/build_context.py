@@ -3202,10 +3202,20 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     inventory_by_path = {item["path"]: item for item in artifact_inventory}
 
     recognized_containers = frozenset(nested.outer_metadata)
-    primary_content_events: list[InspectionLedgerEvent] = []
+    content_interpretation_events: list[InspectionLedgerEvent] = []
     selected_primary = state.get("primary_file_path")
     for artifact in artifact_inventory:
         path = artifact["path"]
+        if artifact.get("readable_binary"):
+            content_interpretation_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path=path,
+                    reason=LedgerReason.OPAQUE_CONTENT,
+                )
+            )
         # A skill entry point retains its role below directory and virtual ZIP
         # boundaries (e.g. bundle.dat!/pkg/SKILL.md). Renaming a supported ZIP
         # must not turn its required instructions into a passive binary asset.
@@ -3225,7 +3235,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         artifact["disposition"] = ArtifactDisposition.FAILED
         artifact["reason"] = LedgerReason.UNSUPPORTED_PRIMARY_CONTENT.value
         llm_file_cache.pop(path, None)
-        primary_content_events.append(
+        content_interpretation_events.append(
             ledger_event(
                 outcome=LedgerOutcome.FAILED,
                 record_type=LedgerRecordType.SYSTEM,
@@ -3471,7 +3481,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 *reference_events,
                 *cache_events,
                 *nested.ledger_events,
-                *primary_content_events,
+                *content_interpretation_events,
                 *excluded_nested_events,
                 *manifest_events,
                 *structured_events,
