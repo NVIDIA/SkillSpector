@@ -46,6 +46,7 @@ from rich.tree import Tree
 from skillspector import __version__, transitive
 from skillspector.cleanup import TempDirTracker, cleanup_result
 from skillspector.constants import RISK_THRESHOLD
+from skillspector.file_output import write_text_no_follow
 from skillspector.graph_proxy import graph
 from skillspector.input_handler import validate_local_input_path
 from skillspector.inspection_ledger import (
@@ -359,7 +360,7 @@ def _write_result(
     """Write report_body to file or stdout. Uses sarif_report if report_body missing."""
     report_body = _result_body(result)
     if output:
-        Path(output).write_text(report_body, encoding="utf-8")
+        write_text_no_follow(output, report_body)
         if format == FormatChoice.terminal:
             console.print(f"\n[green]Report saved to:[/green] {output}")
         else:
@@ -693,7 +694,7 @@ def scan(
             )
             report = json.dumps(result, indent=2)
             if output:
-                output.write_text(report, encoding="utf-8")
+                write_text_no_follow(output, report)
                 console.print(f"Report saved to: {output}")
             else:
                 print(report)
@@ -3232,7 +3233,7 @@ def _scan_multi_skill(
             rendered = json.dumps(combined, indent=2)
         _ensure_recursive_output_bound(rendered)
         if output is not None:
-            Path(output).write_text(rendered, encoding="utf-8")
+            write_text_no_follow(output, rendered)
             progress_console.print(f"[green]Combined report saved to:[/green] {output}")
         else:
             sys.stdout.write(rendered)
@@ -3260,7 +3261,7 @@ def _scan_multi_skill(
             rendered = json.dumps(merged_sarif, indent=2)
         _ensure_recursive_output_bound(rendered)
         if output is not None:
-            Path(output).write_text(rendered, encoding="utf-8")
+            write_text_no_follow(output, rendered)
             progress_console.print(f"[green]Combined report saved to:[/green] {output}")
         else:
             sys.stdout.write(rendered)
@@ -3293,7 +3294,7 @@ def _scan_multi_skill(
             )
         _ensure_recursive_output_bound(rendered)
         if output is not None:
-            Path(output).write_text(rendered, encoding="utf-8")
+            write_text_no_follow(output, rendered)
             progress_console.print(f"[green]Combined report saved to:[/green] {output}")
         elif format is FormatChoice.terminal:
             console.print(rendered)

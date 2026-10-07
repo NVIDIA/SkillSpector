@@ -69,6 +69,7 @@ from typing import Any
 
 import yaml
 
+from skillspector.file_output import write_text_no_follow
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 
@@ -646,10 +647,10 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
     """Write a baseline mapping to *path* as YAML (``.json`` extension -> JSON)."""
     p = Path(path)
     if p.suffix.lower() == ".json":
-        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        write_text_no_follow(p, json.dumps(data, indent=2))
     else:
         header = (
             "# SkillSpector baseline — findings listed here are suppressed on future scans.\n"
             "# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.\n"
         )
-        p.write_text(header + yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        write_text_no_follow(p, header + yaml.safe_dump(data, sort_keys=False))

@@ -7060,3 +7060,86 @@ def test_recursive_sarif_uses_real_encoded_directory_and_preserves_external_sour
     local = locations[1]["physicalLocation"]["artifactLocation"]
     resolved = urljoin(urljoin(bases["SCANROOT"]["uri"], bases["SKILLROOT"]["uri"]), local["uri"])
     assert Path(unquote(urlsplit(resolved).path)) == skill.path / "scripts/helper.py"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative output requires POSIX")
+@pytest.mark.parametrize("race", ["leaf", "parent-before-open", "parent-after-open", "hard-link"])
+def test_report_output_cannot_redirect_to_external_file(tmp_path, monkeypatch, race):
+    from skillspector import file_output
+
+    parent = tmp_path / "reports"
+    parent.mkdir()
+    moved = tmp_path / "original-reports"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    protected = outside / "report.json"
+    protected.write_text("protected", encoding="utf-8")
+    output = parent / protected.name
+    original_open = os.open
+    original_replace = os.replace
+    if race == "hard-link":
+        os.link(protected, output)
+    elif race == "leaf":
+        def replace_after_swap(src, dst, **kwargs):
+            output.symlink_to(protected)
+            return original_replace(src, dst, **kwargs)
+        monkeypatch.setattr(file_output.os, "replace", replace_after_swap)
+    else:
+        def open_after_swap(path, flags, *args, **kwargs):
+            if path == parent.name:
+                if race == "parent-after-open":
+                    fd = original_open(path, flags, *args, **kwargs)
+                parent.rename(moved)
+                parent.symlink_to(outside, target_is_directory=True)
+                if race == "parent-after-open":
+                    return fd
+            return original_open(path, flags, *args, **kwargs)
+        monkeypatch.setattr(file_output.os, "open", open_after_swap)
+    if race == "parent-before-open":
+        with pytest.raises(OSError):
+            file_output.write_text_no_follow(output, "report")
+    else:
+        file_output.write_text_no_follow(output, "report")
+        written = (moved if race == "parent-after-open" else parent) / output.name
+        assert written.read_text(encoding="utf-8") == "report"
+        assert written.stat().st_mode & 0o777 == 0o600
+        assert not written.is_symlink()
+    assert protected.read_text(encoding="utf-8") == "protected"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative output requires POSIX")
+def test_report_output_rejects_symlinks_and_cleans_failed_replace(tmp_path, monkeypatch):
+    from skillspector import file_output
+
+    protected = tmp_path / "protected"
+    protected.write_text("original", encoding="utf-8")
+    output = tmp_path / "report"
+    output.symlink_to(protected)
+    with pytest.raises(ValueError, match="non-regular"):
+        file_output.write_text_no_follow(output, "report")
+    output.unlink()
+    output.write_text("previous", encoding="utf-8")
+    def fail_replace(*args, **kwargs):
+        raise PermissionError("synthetic replacement failure")
+    monkeypatch.setattr(file_output.os, "replace", fail_replace)
+    with pytest.raises(PermissionError):
+        file_output.write_text_no_follow(output, "report")
+    assert output.read_text(encoding="utf-8") == "previous"
+    assert protected.read_text(encoding="utf-8") == "original"
+    assert not list(tmp_path.glob(".skillspector-output-*"))
+
+
+def test_report_output_unsupported_platform_keeps_stdout(tmp_path, monkeypatch):
+    from skillspector import file_output
+
+    monkeypatch.setattr(file_output, "_SECURE_OUTPUT_SUPPORTED", False)
+    skill = tmp_path / "SKILL.md"
+    skill.write_text("---\nname: safe\n---\nHello", encoding="utf-8")
+    monkeypatch.setattr(cli, "_scan_skill", lambda **kwargs: {"report_body": "report", "risk_score": 0})
+    result = runner.invoke(app, ["scan", str(skill), "--no-llm", "--output", str(tmp_path / "report")])
+    assert result.exit_code == 2
+    assert "use stdout redirection" in result.output
+    assert not (tmp_path / "report").exists()
+    result = runner.invoke(app, ["scan", str(skill), "--no-llm", "--format", "json"])
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "report"
