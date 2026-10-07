@@ -25,8 +25,8 @@ import yaml
 from skillspector.nodes.analyzers.mcp_rug_pull import (
     _RP1_CONFIG_MAX_ARG_LINES,
     _RP1_CONFIG_MAX_PHYSICAL_LINES,
-    _RugPullBudget,
     _iter_config_npx_commands,
+    _RugPullBudget,
     _strip_yaml_comment,
     node,
 )
