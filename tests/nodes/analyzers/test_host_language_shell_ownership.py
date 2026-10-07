@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import threading
 import warnings
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
+from skillspector import python_tokens
 from skillspector.graph import graph
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
@@ -31,6 +33,14 @@ _OPTION_TEXT = 'BUILD_ARGS = ["--recursive", "--force", "/tmp/build"]\n'
 # Read as shell text, the fence backticks open a command substitution that the
 # tail exhausts. Only proven Python token ownership makes them literal.
 _FENCE_SOURCE = 'FENCE = "\\n```\\n"\n' + _TAIL
+
+
+@pytest.fixture(autouse=True)
+def _fresh_ownership_memo() -> Iterator[None]:
+    # Ownership proofs are memoized across scans. Each test starts without
+    # them, so its parse, warning, and runtime-check assertions are its own.
+    python_tokens._PYTHON_LITERAL_SPANS_CACHE.clear()
+    yield
 
 
 def _python(content: str, *, complete_context: bool = True) -> bool:
@@ -262,12 +272,14 @@ def test_concurrent_ownership_parses_restore_warning_filters() -> None:
     barrier = threading.Barrier(8)
     proven: list[bool] = []
 
-    def parse() -> None:
+    def parse(worker: int) -> None:
         barrier.wait()
-        for _ in range(10):
-            proven.append(tm._python_literal_spans(_WARNING_SOURCE, lambda: None) is not None)
+        for index in range(10):
+            # A distinct source per call misses the memo, so every call parses.
+            source = f"{_WARNING_SOURCE}# {worker}-{index}\n"
+            proven.append(tm._python_literal_spans(source, lambda: None) is not None)
 
-    threads = [threading.Thread(target=parse) for _ in range(8)]
+    threads = [threading.Thread(target=parse, args=(worker,)) for worker in range(8)]
     for thread in threads:
         thread.start()
     for thread in threads:
