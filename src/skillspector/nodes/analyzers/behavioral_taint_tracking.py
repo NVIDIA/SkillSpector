@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import ast
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -111,8 +111,6 @@ _ALL_SOURCES = (
     _CREDENTIAL_SOURCES | _FILE_READ_SOURCES | _NETWORK_INPUT_SOURCES | _USER_INPUT_SOURCES
 )
 
-_INLINE_URLLIB_OPENER_SINK = "urllib.request.build_opener().open"
-
 _NETWORK_OUTPUT_SINKS = frozenset(
     {
         "requests.post",
@@ -124,7 +122,7 @@ _NETWORK_OUTPUT_SINKS = frozenset(
         "httpx.patch",
         "httpx.get",
         "urllib.request.urlopen",
-        _INLINE_URLLIB_OPENER_SINK,
+        "urllib.request.build_opener.open",
         "socket.socket.send",
         "socket.socket.sendall",
         "socket.socket.sendto",
@@ -288,108 +286,6 @@ _SINK_CATEGORIES: list[tuple[frozenset[str], str]] = [
 ]
 
 
-def _inline_urllib_opener_calls(
-    tree: ast.Module, check_runtime: Callable[[], None] | None = None
-) -> set[ast.Call]:
-    """Recognize inline ``build_opener(...).open(...)`` with conservative bindings.
-
-    Only absolute, module-level imports preceding the call are accepted. Any
-    rebinding of the import root anywhere in the file disqualifies it. This
-    deliberately conservative gate does not infer stored opener objects or
-    attempt closure/call-site binding analysis.
-    """
-    imports: dict[str, list[tuple[str, tuple[int, int]]]] = {}
-    module_imports: set[ast.AST] = set()
-    for statement in tree.body:
-        if check_runtime is not None:
-            check_runtime()
-        if isinstance(statement, ast.Import):
-            bindings = [
-                (
-                    item.asname or item.name.split(".")[0],
-                    item.name if item.asname else item.name.split(".")[0],
-                )
-                for item in statement.names
-            ]
-        elif isinstance(statement, ast.ImportFrom):
-            bindings = (
-                [
-                    (item.asname or item.name, f"{statement.module}.{item.name}")
-                    for item in statement.names
-                ]
-                if statement.level == 0
-                else [(item.asname or item.name, "") for item in statement.names]
-            )
-        else:
-            continue
-        module_imports.add(statement)
-        for local, canonical in bindings:
-            imports.setdefault(local, []).append(
-                (canonical, (statement.lineno, statement.col_offset))
-            )
-
-    allowed = {"urllib", "urllib.request", "urllib.request.build_opener"}
-    roots = {
-        local: entries[0]
-        for local, entries in imports.items()
-        if entries[0][0] in allowed and all(entry[0] == entries[0][0] for entry in entries)
-    }
-    if not roots:
-        return set()
-
-    invalid: set[str] = set()
-    candidates: list[tuple[ast.Call, str]] = []
-    for node in ast.walk(tree):
-        if check_runtime is not None:
-            check_runtime()
-        bound: str | None = None
-        if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(
-            node.ctx, (ast.Store, ast.Del)
-        ):
-            name = resolve_dotted_name(node)
-            bound = name.split(".")[0] if name else None
-        elif isinstance(node, ast.arg):
-            bound = node.arg
-        elif isinstance(
-            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)
-        ):
-            bound = node.name
-        elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
-            bound = node.name
-        elif isinstance(node, ast.MatchMapping):
-            bound = node.rest
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            if any(item.name == "*" for item in node.names):
-                invalid.update(roots)
-            elif node not in module_imports:
-                invalid.update(item.asname or item.name.split(".")[0] for item in node.names)
-        if bound in roots:
-            assert bound is not None
-            invalid.add(bound)
-
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        if node.func.attr != "open" or not isinstance(node.func.value, ast.Call):
-            continue
-        factory = node.func.value
-        name = resolve_dotted_name(factory.func)
-        if name is None:
-            continue
-        root, _, suffix = name.partition(".")
-        imported = roots.get(root)
-        if imported is None:
-            continue
-        canonical, position = imported
-        factory_name = f"{canonical}.{suffix}" if suffix else canonical
-        if factory_name == "urllib.request.build_opener" and position < (
-            factory.lineno,
-            factory.col_offset,
-        ):
-            candidates.append((node, root))
-
-    return {call for call, root in candidates if root not in invalid}
-
-
 def _resolve_sink_name(
     node: ast.Call,
     type_map: dict[str, str] | None = None,
@@ -402,6 +298,14 @@ def _resolve_sink_name(
     ``importlib.import_module('subprocess').run(...)`` resolves to ``'subprocess.run'``
     and re-enters ``_EXEC_SINKS`` like the statically-imported form would.
     """
+    if (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "open"
+        and isinstance(node.func.value, ast.Call)
+        and resolve_call_name_typed(node.func.value, type_map, aliases)
+        == "urllib.request.build_opener"
+    ):
+        return "urllib.request.build_opener.open"
     name = resolve_call_name_typed(node, type_map, aliases)
     if name is None:
         name = resolve_dynamic_import_call(node, aliases)
@@ -473,28 +377,15 @@ def _find_source_in_expr(
     return None
 
 
-def _walk_call_payload(node: ast.Call, arguments_only: bool) -> Iterator[ast.AST]:
-    """Keep inline opener construction separate from data passed to ``open``."""
-    if arguments_only:
-        for argument in node.args:
-            yield from ast.walk(argument)
-        for keyword in node.keywords:
-            yield from ast.walk(keyword.value)
-    else:
-        yield from ast.walk(node)
-
-
 def _find_nested_sources(
     node: ast.Call,
     type_map: dict[str, str] | None = None,
     aliases: dict[str, str] | None = None,
     check_runtime: Callable[[], None] | None = None,
-    *,
-    arguments_only: bool = False,
 ) -> list[tuple[str, ast.Call]]:
     """Walk children to find source calls nested inside a sink call."""
     results: list[tuple[str, ast.Call]] = []
-    for child in _walk_call_payload(node, arguments_only):
+    for child in ast.walk(node):
         if check_runtime is not None:
             check_runtime()
         if child is node:
@@ -511,13 +402,11 @@ def _find_tainted_names_in_args(
     node: ast.Call,
     tainted: dict[str, _TaintedVar],
     check_runtime: Callable[[], None] | None = None,
-    *,
-    arguments_only: bool = False,
 ) -> list[_TaintedVar]:
     """Find references to tainted variables in a call's arguments and keywords."""
     seen: set[str] = set()
     hits: list[_TaintedVar] = []
-    for child in _walk_call_payload(node, arguments_only):
+    for child in ast.walk(node):
         if check_runtime is not None:
             check_runtime()
         if child is node:
@@ -582,9 +471,6 @@ def _analyze_python(
 
     aliases = python_ast.import_aliases
     type_map = build_type_map(tree, aliases)
-    inline_openers = _inline_urllib_opener_calls(
-        tree, budget.check_runtime if budget is not None else None
-    )
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
     tainted: dict[str, _TaintedVar] = {}
@@ -681,11 +567,7 @@ def _analyze_python(
         if not isinstance(ast_node, ast.Call):
             continue
 
-        sink_name = (
-            _INLINE_URLLIB_OPENER_SINK
-            if ast_node in inline_openers
-            else _resolve_sink_name(ast_node, type_map, aliases)
-        )
+        sink_name = _resolve_sink_name(ast_node, type_map, aliases)
         if not sink_name or sink_name not in _ALL_SINKS:
             continue
 
@@ -697,7 +579,6 @@ def _analyze_python(
             type_map,
             aliases,
             budget.check_runtime if budget is not None else None,
-            arguments_only=ast_node in inline_openers,
         ):
             if src_name == "open" and _is_open_for_write(src_node):
                 continue
@@ -714,7 +595,6 @@ def _analyze_python(
             ast_node,
             tainted,
             budget.check_runtime if budget is not None else None,
-            arguments_only=ast_node in inline_openers,
         ):
             rule = _pick_rule(tv.source_call, sink_name, is_direct=False)
             src_cat = _classify(tv.source_call, _SOURCE_CATEGORIES, "data source")
