@@ -2668,7 +2668,9 @@ def test_reported_backtracking_rules_keep_positive_controls(analyzer, rule_id, c
     import importlib
 
     module = importlib.import_module(f"skillspector.nodes.analyzers.static_patterns_{analyzer}")
-    assert any(finding.rule_id == rule_id for finding in module.analyze(content, "SKILL.md", "markdown"))
+    assert any(
+        finding.rule_id == rule_id for finding in module.analyze(content, "SKILL.md", "markdown")
+    )
 
 
 def test_dense_anti_refusal_indexes_source_lines_once():
