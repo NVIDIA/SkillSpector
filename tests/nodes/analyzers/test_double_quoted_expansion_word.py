@@ -140,13 +140,14 @@ def test_scan_level_helper_script_is_fully_inspected() -> None:
         '# "prefix $(date)\n$CMD"" -rf /\n',
         '# "prefix $(date)\n$CMD" x"" -rf /\n',
         '#!/bin/sh\n# see "notes $(date)\n$CMD"" -rf /\n',
+        '"\'$(x)\'"$CMD\n$CMD"" -rf /\n',
     ],
-    ids=["failed-comment-parse", "completed-comment-parse", "after-shebang"],
+    ids=["failed-comment-parse", "completed-comment-parse", "after-shebang", "failed-code-parse"],
 )
-def test_quote_from_a_comment_parse_grants_no_ownership(content: str) -> None:
-    # A comment ends at the newline, so the real command on the next line owns
-    # its quotes. A discarded or comment-confined parse must not mark that
-    # command as enclosed by a quote and thereby hide ``-rf /``.
+def test_quote_from_a_discarded_or_comment_parse_grants_no_ownership(content: str) -> None:
+    # The real command on the last line owns its quotes. A discarded parse, or
+    # one confined to a comment, must not mark that command as enclosed by a
+    # quote and thereby hide ``-rf /``.
     assert _exhausted(content)
     assert _exhausted(content + _PADDING)
 
