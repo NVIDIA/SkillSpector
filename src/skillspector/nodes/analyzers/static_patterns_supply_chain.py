@@ -1770,19 +1770,26 @@ def _apply_locked_versions(
     return resolved
 
 
+def _python_lock_scope(file_path: str) -> tuple[str, bool]:
+    """Associate Pipenv locks only with sibling Pipfiles, not other manifests."""
+    path = Path(file_path)
+    return str(path.parent), path.name.lower() in {"pipfile", "pipfile.lock"}
+
+
 def _collect_locked_versions(
     file_cache: dict[str, str],
     components: list[str],
     *,
+    file_path: str = "requirements.txt",
     limit: int = MAX_DEPENDENCY_PACKAGES_PER_SCAN,
 ) -> dict[str, str]:
-    """Build package -> exact version map from Python lockfiles in the project."""
+    """Build the exact version map associated with a Python manifest."""
     locked_versions, _limitations = _collect_locked_versions_detailed(
         file_cache,
         components,
         limit=limit,
     )
-    return locked_versions
+    return locked_versions.get(_python_lock_scope(file_path), {})
 
 
 def _collect_locked_versions_detailed(
@@ -1792,9 +1799,10 @@ def _collect_locked_versions_detailed(
     limit: int = MAX_DEPENDENCY_PACKAGES_PER_SCAN,
     max_files: int | None = None,
     timeout_seconds: float | None = None,
-) -> tuple[dict[str, str], list[tuple[str, OsvQueryLimitation]]]:
+) -> tuple[dict[tuple[str, bool], dict[str, str]], list[tuple[str, OsvQueryLimitation]]]:
     """Build a bounded lock map and identify any manifest whose tail was omitted."""
-    locked_versions: dict[str, str] = {}
+    locked_versions: dict[tuple[str, bool], dict[str, str]] = {}
+    ambiguous_versions: set[tuple[tuple[str, bool], str]] = set()
     limitations: list[tuple[str, OsvQueryLimitation]] = []
     packages_seen = 0
     lockfiles_seen = 0
@@ -1873,9 +1881,22 @@ def _collect_locked_versions_detailed(
             )
             packages = packages[:remaining]
         packages_seen += len(packages)
+        scope = _python_lock_scope(path)
         for name, version, _line_num in packages:
             if version:
-                locked_versions[_normalize_package_name(name)] = version
+                project_versions = locked_versions.setdefault(scope, {})
+                normalized_name = _normalize_package_name(name)
+                key = scope, normalized_name
+                if key in ambiguous_versions:
+                    continue
+                previous_version = project_versions.get(normalized_name)
+                if previous_version is not None and previous_version != version:
+                    # Different categories or lockfiles can pin different versions.
+                    # Keep scanning each pin, but do not guess for an unpinned manifest.
+                    project_versions.pop(normalized_name)
+                    ambiguous_versions.add(key)
+                else:
+                    project_versions[normalized_name] = version
         if limitations:
             break
     return locked_versions, limitations
@@ -3911,7 +3932,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         dep_findings, dependency_limitations, packages_seen = _analyze_dependencies_detailed(
             content,
             path,
-            locked_versions,
+            locked_versions.get(_python_lock_scope(path)),
             npm_locked_versions,
             max_packages=min(MAX_DEPENDENCY_PACKAGES_PER_FILE, remaining_packages),
             max_findings=min(MAX_DEPENDENCY_FINDINGS_PER_FILE, remaining_dependency_findings),
