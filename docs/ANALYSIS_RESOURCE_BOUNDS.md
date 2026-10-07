@@ -170,6 +170,21 @@ comment that itself holds more unresolved shell text than the parser bound,
 invalid or fragmentary Python, and source with a non-Python shebang keep the
 conservative result.
 
+Declared-marker reconstruction uses the same proof, as it does for validated
+JSON strings. When a removal verb is followed later on its line by the closing
+quote of a Python string, as in `assert "please omit --hours" in out`, that
+quote is not paired with the next literal's opening quote across the code
+between them. An explicit declaration, where only a short phrase such as
+`the marker` separates the verb from the quote, keeps the lexical reading.
+Marker declarations written inside one string or comment are still
+reconstructed or reported as `obfuscated_instruction_text`. Invalid or
+fragmentary Python and other file types keep the lexical reading.
+
+Both consumers share one parse and tokenization of a module. The two most
+recent results, including a failed proof, are reused, and each reuse still
+checks the static runtime budget. A proof interrupted by that budget is not
+kept.
+
 ## Structured skill data
 
 AISOP/AISP structured extraction consumes the already-bounded cache and shares the enclosing
