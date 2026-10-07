@@ -3199,11 +3199,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     ]
     local_file_cache = dict(ordinary_file_cache)
     local_file_cache.update(
-        {
-            path: data
-            for path, data in nested.file_cache.items()
-            if path not in blocked_nested_paths
-        }
+        {path: data for path, data in nested.file_cache.items() if path not in blocked_nested_paths}
     )
     raw_file_cache.update(
         {

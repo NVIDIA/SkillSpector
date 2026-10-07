@@ -1245,7 +1245,9 @@ def test_real_paths_cannot_be_overwritten_by_archive_members(
     if not archive_name.startswith("."):
         assert result["raw_file_cache"][path] == malicious
         assert result["local_file_cache"][path] == malicious.decode()
-        assert any(finding.file == path and finding.rule_id == "P1" for finding in result["findings"])
+        assert any(
+            finding.file == path and finding.rule_id == "P1" for finding in result["findings"]
+        )
     assert result["analysis_completeness"]["is_complete"] is False
     assert result["risk_recommendation"] != "SAFE"
 
@@ -1257,7 +1259,9 @@ def test_reserved_disk_path_fails_even_without_an_archive(tmp_path: Path) -> Non
 
     context = build_context({"skill_path": str(tmp_path)})
 
-    artifact = next(item for item in context["artifact_inventory"] if item["path"] == "real!/notes.txt")
+    artifact = next(
+        item for item in context["artifact_inventory"] if item["path"] == "real!/notes.txt"
+    )
     assert artifact["disposition"] == ArtifactDisposition.FAILED
     assert any(
         event.get("reason_code") == LedgerReason.ARTIFACT_PATH_COLLISION
