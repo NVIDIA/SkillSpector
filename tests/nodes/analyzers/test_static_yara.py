@@ -33,6 +33,7 @@ from unittest.mock import MagicMock
 import pytest
 from typer.testing import CliRunner
 
+from skillspector import cli
 from skillspector.cli import app
 from skillspector.inspection_ledger import LedgerReason
 from skillspector.nodes.analyzers import static_yara
@@ -2085,3 +2086,90 @@ class TestRuleSkipAccounting:
                 assert held_elsewhere == [True], "the inner release dropped the outer hold"
         finally:
             static_yara._RULE_LOAD_DEADLINE.reset(token)
+
+    def test_rule_set_work_survives_transitive_status_scoping(self, tmp_path, monkeypatch):
+        """Every scope's rule-set work must be counted, not just the root's.
+
+        ``_source_aware_ledger`` re-scopes the rule-set row with its own
+        ``rule_set:static`` identity, but the status path rebuilt the matching
+        planned target with ``static_yara``, so in each child the target no
+        longer matched any retained row and was dropped. The exceptions survived
+        while the per-analyzer counts silently lost each child's rejected rule:
+        4 planned / 1 partial instead of 6 / 3 for a root plus two children.
+        Driven through the real CLI and the real graph for all three scopes.
+        """
+        children = {
+            "https://github.com/org/child-one": tmp_path / "child-one",
+            "https://github.com/org/child-two": tmp_path / "child-two",
+        }
+        root = tmp_path / "root"
+        for directory in (root, *children.values()):
+            directory.mkdir()
+        (root / "SKILL.md").write_text(
+            "---\nname: root\ndescription: A harmless root skill.\n---\n\n"
+            "# Root\n\nUses https://github.com/org/child-one.git and "
+            "https://github.com/org/child-two.git.\n",
+            encoding="utf-8",
+        )
+        for url, directory in children.items():
+            name = url.rsplit("/", 1)[-1]
+            (directory / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: A harmless child skill.\n---\n\n# Child\n",
+                encoding="utf-8",
+            )
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "valid.yar").write_text("rule never_fires { condition: false }\n")
+        (rules_dir / "broken.yar").write_text('rule broken { strings: $a = "x" condition: $a\n')
+
+        real_run_graph_scan = cli._run_graph_scan
+        scanned: list[str] = []
+
+        def run_graph_scan(input_path: str, *args, **kwargs):
+            scanned.append(input_path)
+            for url, directory in children.items():
+                if input_path.rstrip("/").removesuffix(".git") == url:
+                    input_path = str(directory)
+                    break
+            return real_run_graph_scan(input_path, *args, **kwargs)
+
+        monkeypatch.setattr(cli, "_run_graph_scan", run_graph_scan)
+        out = tmp_path / "report.json"
+        result = CliRunner().invoke(
+            app,
+            [
+                "scan",
+                str(root),
+                "--no-llm",
+                "--yara-rules-dir",
+                str(rules_dir),
+                "--transitive",
+                "--transitive-depth",
+                "1",
+                "--format",
+                "json",
+                "--output",
+                str(out),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert len(scanned) == 3, f"expected root plus two children, scanned {scanned}"
+        completeness = json.loads(out.read_text(encoding="utf-8"))["analysis_completeness"]
+
+        rule_set_rows = [
+            row for row in completeness["ledger_exceptions"] if row.get("scope") == "rule_set"
+        ]
+        assert len(rule_set_rows) == 3, "one rule-set exception per scope"
+
+        yara_statuses = [
+            row for row in completeness["analyzer_statuses"] if row["analyzer_id"] == "static_yara"
+        ]
+        assert yara_statuses
+        planned = sum(row["planned_work"] for row in yara_statuses)
+        partial = sum(row["partial"] for row in yara_statuses)
+        assert (planned, partial) == (6, 3), (
+            "each scope plans its SKILL.md plus its rule set, and each rule set "
+            f"is partial; got {planned} planned / {partial} partial"
+        )
+        assert all(row["unaccounted"] == 0 for row in yara_statuses)
+        assert all(row["status"] == "degraded" for row in yara_statuses)
