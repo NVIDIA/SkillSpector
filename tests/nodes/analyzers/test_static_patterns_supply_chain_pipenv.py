@@ -201,12 +201,169 @@ def test_lockfile_checks_all_resolved_categories(osv_packages):
 
 def test_lockfile_resolves_unpinned_manifest(osv_packages):
     content = _lock_content(default={"pyyaml": {"version": "==5.3.1"}})
-    locked = supply_chain._collect_locked_versions({"Pipfile.lock": content}, ["Pipfile.lock"])
+    locked = supply_chain._collect_locked_versions(
+        {"Pipfile.lock": content}, ["Pipfile.lock"], file_path="Pipfile"
+    )
     findings = supply_chain._analyze_dependencies('[packages]\npyyaml = "*"\n', "Pipfile", locked)
 
     assert locked == {"pyyaml": "5.3.1"}
     assert osv_packages == [("pyyaml", "5.3.1")]
     assert any(item.rule_id == "SC4" and item.severity == "HIGH" for item in findings)
+
+
+@pytest.mark.parametrize("with_root_project", [False, True])
+def test_cli_pipenv_lock_versions_stay_with_their_project(
+    tmp_path, osv_packages, with_root_project
+):
+    bundle = tmp_path / "skill"
+    bundle.mkdir()
+    (bundle / "SKILL.md").write_text(
+        "---\nname: dependency-review\n"
+        "description: Summarize project dependencies when the user asks for a dependency review.\n"
+        "---\n# Dependency Review\nRead the bundled project dependency lists.\n"
+    )
+    files = {
+        "requirements.txt": "pyyaml\n",
+        "docs/Pipfile": '[packages]\npyyaml = "==5.3.1"\n',
+        "docs/Pipfile.lock": _lock_content(default={"pyyaml": {"version": "==5.3.1"}}),
+    }
+    if with_root_project:
+        files["Pipfile"] = '[packages]\npyyaml = "*"\n'
+        files["Pipfile.lock"] = _lock_content(default={"pyyaml": {"version": "==6.0.2"}})
+    for path, content in files.items():
+        target = bundle / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    output = tmp_path / "report.json"
+    result = CliRunner().invoke(
+        app,
+        [
+            "scan",
+            str(bundle),
+            "--no-llm",
+            "--fail-on-findings",
+            "--fail-on-incomplete",
+            "--format",
+            "json",
+            "--output",
+            str(output),
+        ],
+    )
+    report = json.loads(output.read_text())
+
+    assert result.exit_code == 1
+    assert ("pyyaml", None) in osv_packages
+    if with_root_project:
+        assert ("pyyaml", "6.0.2") in osv_packages
+    assert ("pyyaml", "5.3.1") in osv_packages
+    assert report["analysis_completeness"]["is_complete"]
+    sc4_paths = {issue["location"]["file"] for issue in report["issues"] if issue["id"] == "SC4"}
+    assert sc4_paths == {"docs/Pipfile", "docs/Pipfile.lock"}
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+@pytest.mark.parametrize(
+    "manifest_path",
+    ["requirements.txt", "docs/requirements.txt", "Pipfile", "examples/Pipfile"],
+)
+def test_node_does_not_reuse_unrelated_pipenv_lock_versions(
+    monkeypatch, osv_packages, manifest_path, reverse_order
+):
+    monkeypatch.setattr(
+        supply_chain.static_runner,
+        "run_static_patterns_with_ledger",
+        lambda _state, _modules: {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+        },
+    )
+    files = {
+        manifest_path: (
+            '[packages]\npyyaml = "*"\n' if manifest_path.endswith("Pipfile") else "pyyaml\n"
+        ),
+        "docs/Pipfile": '[packages]\npyyaml = "*"\n',
+        "docs/Pipfile.lock": _lock_content(default={"pyyaml": {"version": "==5.3.1"}}),
+    }
+    components = list(files)
+    if reverse_order:
+        components.reverse()
+    response = supply_chain.node(
+        {
+            "skill_path": "",
+            "components": components,
+            "file_cache": files,
+            "local_file_cache": files,
+            "manifest": {},
+            "component_metadata": [],
+        }
+    )
+
+    assert ("pyyaml", None) in osv_packages
+    sc4_paths = {item.file for item in response["findings"] if item.rule_id == "SC4"}
+    assert sc4_paths == {"docs/Pipfile", "docs/Pipfile.lock"}
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_conflicting_lock_categories_leave_manifest_version_unresolved(osv_packages, reverse_order):
+    categories = {
+        "default": {"pyyaml": {"version": "==5.3.1"}},
+        "develop": {"pyyaml": {"version": "==6.0.2"}},
+        "docs": {"pyyaml": {"version": "==5.3.1"}},
+    }
+    if reverse_order:
+        categories = dict(reversed(list(categories.items())))
+    content = _lock_content(**categories)
+    locked = supply_chain._collect_locked_versions(
+        {"docs/Pipfile.lock": content}, ["docs/Pipfile.lock"], file_path="docs/Pipfile"
+    )
+    findings = supply_chain._analyze_dependencies(
+        '[packages]\npyyaml = "*"\n', "docs/Pipfile", locked
+    )
+    assert not locked
+    assert osv_packages == [("pyyaml", None)]
+    assert not any(item.rule_id == "SC4" for item in findings)
+
+    supply_chain._analyze_dependencies(content, "docs/Pipfile.lock")
+    assert ("pyyaml", "5.3.1") in osv_packages
+    assert ("pyyaml", "6.0.2") in osv_packages
+
+
+@pytest.mark.parametrize("lock_name", ["uv.lock", "poetry.lock"])
+@pytest.mark.parametrize(
+    ("manifest_path", "expected_version"),
+    [
+        ("docs/requirements.txt", "5.3.1"),
+        ("docs/pyproject.toml", "5.3.1"),
+        ("requirements.txt", None),
+        ("examples/pyproject.toml", None),
+        ("docs/Pipfile", None),
+    ],
+)
+def test_python_lock_versions_follow_directory_and_manifest_type(
+    lock_name, manifest_path, expected_version
+):
+    lock_path = f"docs/{lock_name}"
+    content = '[[package]]\nname = "pyyaml"\nversion = "5.3.1"\n'
+    locked = supply_chain._collect_locked_versions(
+        {lock_path: content}, [lock_path], file_path=manifest_path
+    )
+    assert locked.get("pyyaml") == expected_version
+
+
+def test_project_scoping_keeps_the_aggregate_lock_package_budget():
+    files = {
+        "Pipfile.lock": _lock_content(default={"first": {"version": "==1.0"}}),
+        "docs/Pipfile.lock": _lock_content(default={"second": {"version": "==2.0"}}),
+    }
+    locked, limitations = supply_chain._collect_locked_versions_detailed(
+        files, list(files), limit=1
+    )
+    assert sum(len(versions) for versions in locked.values()) == 1
+    assert any(
+        path == "docs/Pipfile.lock" and limitation.reason is LedgerReason.OUTPUT_LIMIT
+        for path, limitation in limitations
+    )
 
 
 @pytest.mark.parametrize("spec", ["*", ">=5.3", "~=5.3", "==5.3.*"])
