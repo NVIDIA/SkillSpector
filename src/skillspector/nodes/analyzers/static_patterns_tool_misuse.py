@@ -46,9 +46,7 @@ from .common import (
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
     SourceLocationIndex,
-    get_context,
     get_context_from_lines,
-    get_line_number,
     is_reference_material,
 )
 from .pattern_defaults import PatternCategory
@@ -3326,7 +3324,9 @@ class _VariableShellScopeIndex:
                 bound.add(node.id)
             if isinstance(node, (ast.Global, ast.Nonlocal)):
                 for name in node.names:
-                    declarations.setdefault(name, "global" if isinstance(node, ast.Global) else "nonlocal")
+                    declarations.setdefault(
+                        name, "global" if isinstance(node, ast.Global) else "nonlocal"
+                    )
             stack.extend(ast.iter_child_nodes(node))
         self.bindings[scope] = bound
         self.declarations[scope] = declarations
@@ -3354,7 +3354,7 @@ class _VariableShellScopeIndex:
         if assign_chain is None or use is None:
             return True
         use_chain = use[2]
-        if use_chain[:len(assign_chain)] == assign_chain:
+        if use_chain[: len(assign_chain)] == assign_chain:
             return True
         use_scope = use_chain[-1]
         declaration = self.declarations[use_scope].get(name)
@@ -3363,7 +3363,10 @@ class _VariableShellScopeIndex:
         if declaration == "nonlocal":
             for scope in use_chain[-2::-1]:
                 self.check_runtime()
-                if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and name in self.bindings[scope]:
+                if (
+                    isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                    and name in self.bindings[scope]
+                ):
                     return assign_chain[-1] is scope
         return False
 
@@ -3928,7 +3931,9 @@ def analyze(
         for variable_match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
             runtime_check()
             if scope_index is None:
-                scope_index = _VariableShellScopeIndex(content, file_path, python_ast, runtime_check)
+                scope_index = _VariableShellScopeIndex(
+                    content, file_path, python_ast, runtime_check
+                )
             if not scope_index.same_scope(variable_match):
                 cross_scope_starts.add(variable_match.start())
 
