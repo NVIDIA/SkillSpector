@@ -176,6 +176,9 @@ def test_reviewer_script_is_not_fully_inspected() -> None:
         ('cat <<E\n"a $(date)\nE\n$CMD""  -rf /\necho "\n', "shell"),
         ('Run "a $(date)\n```sh\n$CMD"" -rf / # "\n```\n', "markdown"),
         ('Note: "a $(date)\n```bash\n$CMD"" -rf / #"\n```\n', "markdown"),
+        # A lone carriage return also ends a line in Markdown.
+        ('Run "a $(date)\r```sh\r$CMD"" -rf / # "\r```\r', "markdown"),
+        ('cat <<E\r"a $(date)\rE\r$CMD"" -rf / # "\r', "shell"),
     ],
     ids=[
         "heredoc-body",
@@ -187,6 +190,8 @@ def test_reviewer_script_is_not_fully_inspected() -> None:
         "heredoc-body-closed-by-later-line",
         "markdown-prose-closed-by-comment",
         "markdown-note-closed-by-comment",
+        "markdown-carriage-return-lines",
+        "heredoc-carriage-return-lines",
     ],
 )
 def test_cross_line_quote_pairing_stays_partial(content: str, file_type: str) -> None:

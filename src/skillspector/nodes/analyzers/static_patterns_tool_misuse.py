@@ -1674,8 +1674,10 @@ def _parse_shell_command_word(
                     owned_word_positions.add(cursor)
                 # A span across lines may pair a heredoc or prose quote with a
                 # later command line, so only a single-line span ends the word
-                # of an expansion inside it.
-                if quoted_expansion_starts is not None and "\n" not in content[quote_open:cursor]:
+                # of an expansion inside it. A lone carriage return also ends
+                # a line in Markdown.
+                span = content[quote_open:cursor]
+                if quoted_expansion_starts is not None and "\n" not in span and "\r" not in span:
                     quoted_expansion_starts.update(pending_quoted_expansions)
                 pending_quoted_expansions.clear()
                 quote = None
