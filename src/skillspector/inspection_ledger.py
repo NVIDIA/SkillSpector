@@ -526,8 +526,10 @@ def analyzer_status_event(
 def analyzer_status_for_events(
     analyzer_id: str, events: Iterable[InspectionLedgerEvent]
 ) -> AnalyzerStatusEvent:
-    """Summarize an analyzer's terminal work without exposing event payloads."""
-    terminal_events = list(events)
+    """Summarize analyzer work; scope-boundary records remain separate exclusions."""
+    terminal_events = [
+        event for event in events if event.get("record_type") != LedgerRecordType.SCOPE_BOUNDARY
+    ]
     if not terminal_events:
         return analyzer_status_event(
             analyzer_id=analyzer_id,
