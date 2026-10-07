@@ -17,7 +17,9 @@
 
 Parses Python AST to identify data sources (env vars, file reads, network input)
 and sinks (network output, exec, file writes), then tracks flows between them
-to flag potential credential/data exfiltration chains.
+to flag potential credential/data exfiltration chains. Taint follows Python's
+lexical scopes and crosses calls to functions defined in the same file
+(arguments into parameters, return values back to callers).
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from __future__ import annotations
 import ast
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -327,9 +329,24 @@ def _pick_rule(source_name: str, sink_name: str, is_direct: bool) -> str:
 
 
 class _TaintedVar(NamedTuple):
+    """One taint fact: data from ``source_call`` reaches the variable ``name``.
+
+    ``lineno`` is the line of the original source call (``os.getenv(...)``,
+    ``input()``, ...), carried unchanged through every propagation step, so a
+    finding names where the data entered the program rather than the last
+    assignment that copied it.
+    """
+
     name: str
     source_call: str
     lineno: int
+
+
+class _Target(NamedTuple):
+    """A taint destination: a scope-qualified ``key`` and its display ``name``."""
+
+    key: str
+    name: str
 
 
 def _is_open_for_write(node: ast.Call) -> bool:
@@ -349,11 +366,12 @@ def _find_source_in_expr(
     type_map: dict[str, str] | None = None,
     aliases: dict[str, str] | None = None,
     check_runtime: Callable[[], None] | None = None,
-) -> str | None:
+) -> tuple[str, int] | None:
     """Find a source call anywhere in an expression tree (handles chained calls).
 
     Handles patterns like ``open("f").read()``, ``requests.get(url).text``,
-    and plain ``os.environ.get("K")``.
+    and plain ``os.environ.get("K")``. Returns the source name and the line of
+    the source call itself.
     """
     for child in ast.walk(node):
         if check_runtime is not None:
@@ -365,7 +383,27 @@ def _find_source_in_expr(
             continue
         if name == "open" and _is_open_for_write(child):
             continue
-        return name
+        return name, child.lineno
+    return None
+
+
+def _direct_source(
+    node: ast.expr,
+    type_map: dict[str, str],
+    aliases: dict[str, str],
+    check_runtime: Callable[[], None] | None = None,
+) -> tuple[str, int] | None:
+    """Return the source (name, line) a value reads directly, if any."""
+    found = _find_source_in_expr(node, type_map, aliases, check_runtime)
+    if found is not None:
+        return found
+    # Subscript sources like os.environ["KEY"] (also os aliased as `o`)
+    if isinstance(node, ast.Subscript):
+        base = resolve_dotted_name(node.value)
+        if base is not None:
+            base = apply_import_aliases(base, aliases)
+        if base and base in _CREDENTIAL_SOURCES:
+            return base, node.lineno
     return None
 
 
@@ -390,72 +428,420 @@ def _find_nested_sources(
     return results
 
 
+# ── Lexical scopes ──────────────────────────────────────────────────────
+#
+# Taint is keyed by scope-qualified variable keys rather than bare names, so a
+# tainted local in one function cannot taint an unrelated same-named variable
+# or parameter in another. Keys are plain strings:
+#
+# * module globals keep their bare name (``TOKEN``);
+# * function locals and parameters are prefixed with the function's qualified
+#   name (``upload.<locals>.payload``, ``Client.send.<locals>.body``);
+# * a class body and ``self.<attr>`` / ``cls.<attr>`` in its methods share one
+#   attribute namespace per in-module inheritance family (``Client.token``);
+# * every callable group (see ``_ScopeIndex.callee_groups``) has argument slots
+#   (``upload()#0``, ``upload()#kw:payload``) and a return value
+#   (``upload()<return>``).
+#
+# Lambdas and comprehensions are folded into their enclosing scope, and match
+# captures do not bind: both resolve names more widely than Python does, which
+# can only add taint, never drop it.
+
+_FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
+
+# Call-site positional arguments at or beyond this index (and anything after a
+# ``*args`` unpacking) share one wildcard slot, keeping the per-definition
+# binding work bounded by a constant.
+_MAX_POSITIONAL_SLOTS = 16
+
+
+@dataclass(eq=False)
+class _ClassInfo:
+    node: ast.ClassDef
+    qualname: str
+    # Attribute-namespace prefix shared by the class's in-module inheritance
+    # family; assigned once every class in the module is known.
+    prefix: str = ""
+
+
+@dataclass(eq=False)
+class _FunctionInfo:
+    node: _FunctionNode
+    scope: _Scope
+    # (callable group key, number of leading parameters bound by the receiver)
+    groups: list[tuple[str, int]] = field(default_factory=list)
+
+
+@dataclass(eq=False)
+class _Scope:
+    """One Python namespace: the module, a function body, or a class body."""
+
+    kind: str  # "module" | "function" | "class"
+    qualname: str
+    parent: _Scope | None
+    bound: set[str] = field(default_factory=set)
+    declared_global: set[str] = field(default_factory=set)
+    declared_nonlocal: set[str] = field(default_factory=set)
+    class_info: _ClassInfo | None = None
+    function: _FunctionInfo | None = None
+
+    @property
+    def prefix(self) -> str:
+        if self.class_info is not None:
+            return self.class_info.prefix
+        if self.kind == "function":
+            return f"{self.qualname}.<locals>."
+        return ""
+
+
+@dataclass(eq=False)
+class _ScopeIndex:
+    """Lexical scopes of one module plus what is needed to bind call sites."""
+
+    module: _Scope
+    aliases: dict[str, str]
+    type_map: dict[str, str]
+    # Assign / Return / Call nodes with their scope, in ``ast.walk`` order.
+    statements: list[tuple[ast.Assign | ast.Return | ast.Call, _Scope]] = field(
+        default_factory=list
+    )
+    call_scope: dict[ast.Call, _Scope] = field(default_factory=dict)
+    functions: list[_FunctionInfo] = field(default_factory=list)
+    classes: list[tuple[_ClassInfo, _Scope]] = field(default_factory=list)
+    # Callable group keys with at least one definition in this module.
+    groups: set[str] = field(default_factory=set)
+    class_bindings: dict[str, list[_ClassInfo]] = field(default_factory=dict)
+    classes_by_name: dict[str, list[_ClassInfo]] = field(default_factory=dict)
+    # Key of each method's receiver parameter (``self``/``cls``) -> its class.
+    self_keys: dict[str, _ClassInfo] = field(default_factory=dict)
+    _resolved: dict[tuple[_Scope, str], str] = field(default_factory=dict)
+
+    def resolve(self, scope: _Scope, name: str) -> str:
+        """Return the key *name* refers to when read or written in *scope*.
+
+        Follows Python's rules: a name bound anywhere in a function body is
+        local to it unless declared ``global``/``nonlocal``; free names resolve
+        through enclosing function scopes (closures) to the module. Class
+        bodies are visible only to their own statements, not to methods.
+        """
+        cache_key = (scope, name)
+        key = self._resolved.get(cache_key)
+        if key is None:
+            key = name
+            current: _Scope | None = scope
+            while current is not None and current.kind != "module":
+                if current is scope or current.kind != "class":
+                    if name in current.declared_global:
+                        break
+                    if name in current.bound and name not in current.declared_nonlocal:
+                        key = current.prefix + name
+                        break
+                current = current.parent
+            self._resolved[cache_key] = key
+        return key
+
+    def attribute(self, node: ast.Attribute, scope: _Scope) -> _Target | None:
+        """Map ``self.x`` / ``cls.x`` / ``Class.x`` to its class attribute key."""
+        if not isinstance(node.value, ast.Name):
+            return None
+        key = self.resolve(scope, node.value.id)
+        cls = self.self_keys.get(key)
+        if cls is None:
+            classes = self.class_bindings.get(key)
+            cls = classes[0] if classes else None
+        if cls is None:
+            return None
+        return _Target(cls.prefix + node.attr, f"{node.value.id}.{node.attr}")
+
+    def callee_groups(
+        self, func: ast.expr, scope: _Scope, *, any_method: bool = False
+    ) -> list[str]:
+        """Callable groups in this module that ``func`` may refer to.
+
+        A plain name resolves lexically to the functions bound to it (several
+        when redefined), or to the ``__init__`` methods of a class it names.
+        ``self.m``/``cls.m``/``Class.m``/``obj.m`` with ``obj = Class(...)``
+        resolve to ``m`` in that class family. With *any_method*, any other
+        ``obj.m`` not rooted at an imported name resolves to every method named
+        ``m`` in the module. That fallback is used only to bind arguments,
+        which can taint nothing but parameters of this module's own methods;
+        reading return values through it would taint every ``x.get(...)`` in a
+        file that defines a ``get`` method.
+        """
+        groups: list[str] = []
+        if isinstance(func, ast.Name):
+            key = self.resolve(scope, func.id)
+            if f"{key}()" in self.groups:
+                groups.append(f"{key}()")
+            for cls in self.class_bindings.get(key, ()):
+                group = f"{cls.prefix}__init__()"
+                if group in self.groups and group not in groups:
+                    groups.append(group)
+            return groups
+        if not isinstance(func, ast.Attribute):
+            return groups
+        if isinstance(func.value, ast.Name):
+            key = self.resolve(scope, func.value.id)
+            receivers = list(self.class_bindings.get(key, ()))
+            if key in self.self_keys:
+                receivers.append(self.self_keys[key])
+            constructed = self.type_map.get(func.value.id)
+            if constructed is not None:
+                if constructed.split(".")[0] in self.aliases:
+                    return groups  # an instance of an imported (library) class
+                receivers.extend(self.classes_by_name.get(constructed, ()))
+            for cls in receivers:
+                group = f"{cls.prefix}{func.attr}()"
+                if group in self.groups and group not in groups:
+                    groups.append(group)
+            if groups:
+                return groups
+        root = func.value
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        if not any_method or (isinstance(root, ast.Name) and root.id in self.aliases):
+            return groups
+        if f"<method>.{func.attr}()" in self.groups:
+            groups.append(f"<method>.{func.attr}()")
+        return groups
+
+    def references(
+        self,
+        node: ast.AST,
+        scope: _Scope,
+        check_runtime: Callable[[], None] | None = None,
+        *,
+        skip_root: bool = False,
+    ) -> Iterator[str]:
+        """Yield every taint key an expression reads, in ``ast.walk`` order.
+
+        Names resolve through *scope*; ``self.x`` resolves to the class
+        attribute key; a call to a function defined in this module also reads
+        that function's return value. Handles container literals and f-strings
+        because ``ast.walk`` reaches the names nested inside them.
+        """
+        for child in ast.walk(node):
+            if check_runtime is not None:
+                check_runtime()
+            if skip_root and child is node:
+                continue
+            if isinstance(child, ast.Name):
+                yield self.resolve(scope, child.id)
+            elif isinstance(child, ast.Attribute):
+                target = self.attribute(child, scope)
+                if target is not None:
+                    yield target.key
+            elif isinstance(child, ast.Call):
+                for group in self.callee_groups(child.func, scope):
+                    yield f"{group}<return>"
+
+    def assign_targets(self, target: ast.expr, scope: _Scope) -> list[_Target]:
+        """Keys written by one assignment target (names, ``self.x``, tuples of them)."""
+        elements = target.elts if isinstance(target, ast.Tuple) else [target]
+        targets: list[_Target] = []
+        for element in elements:
+            if isinstance(element, ast.Name):
+                targets.append(_Target(self.resolve(scope, element.id), element.id))
+            elif isinstance(element, ast.Attribute):
+                attribute = self.attribute(element, scope)
+                if attribute is not None:
+                    targets.append(attribute)
+        return targets
+
+
+def _parameters(args: ast.arguments) -> list[ast.arg]:
+    """Every parameter a function binds, in signature order."""
+    params = [*args.posonlyargs, *args.args]
+    if args.vararg is not None:
+        params.append(args.vararg)
+    params.extend(args.kwonlyargs)
+    if args.kwarg is not None:
+        params.append(args.kwarg)
+    return params
+
+
+def _build_scope_index(
+    tree: ast.AST,
+    aliases: dict[str, str],
+    type_map: dict[str, str],
+    check_runtime: Callable[[], None] | None = None,
+) -> _ScopeIndex:
+    """Assign every node to its lexical scope and index callable definitions.
+
+    Visits nodes in ``ast.walk`` (breadth-first) order so statements are
+    recorded in the same order the order-independent taint pass always used.
+    """
+    module = _Scope("module", "", None)
+    index = _ScopeIndex(module, aliases, type_map)
+    qualname_counts: dict[str, int] = {}
+
+    def child_scope(kind: str, name: str, parent: _Scope) -> _Scope:
+        if parent.kind == "module":
+            qualname = name
+        elif parent.kind == "class":
+            qualname = f"{parent.qualname}.{name}"
+        else:
+            qualname = f"{parent.qualname}.<locals>.{name}"
+        # Redefinitions get distinct namespaces; calls still reach all of them.
+        count = qualname_counts.get(qualname, 0) + 1
+        qualname_counts[qualname] = count
+        return _Scope(kind, qualname if count == 1 else f"{qualname}#{count}", parent)
+
+    # (node, scope it belongs to, whether a Store name binds in that scope)
+    queue: deque[tuple[ast.AST, _Scope, bool]] = deque(
+        (child, module, True) for child in ast.iter_child_nodes(tree)
+    )
+    while queue:
+        if check_runtime is not None:
+            check_runtime()
+        node, scope, binds = queue.popleft()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            scope.bound.add(node.name)
+            if isinstance(node, ast.ClassDef):
+                inner = child_scope("class", node.name, scope)
+                inner.class_info = _ClassInfo(node, inner.qualname)
+                index.classes.append((inner.class_info, scope))
+            else:
+                inner = child_scope("function", node.name, scope)
+                inner.function = _FunctionInfo(node, inner)
+                index.functions.append(inner.function)
+                inner.bound.update(arg.arg for arg in _parameters(node.args))
+            # Only the body runs in the new scope; decorators, defaults,
+            # annotations and bases are evaluated where the def/class stands.
+            body = {id(statement) for statement in node.body}
+            for child in ast.iter_child_nodes(node):
+                queue.append((child, inner if id(child) in body else scope, True))
+            continue
+        if isinstance(node, ast.comprehension):
+            # Comprehension targets bind in the comprehension's own scope in
+            # Python 3; not binding them here keeps outer names visible.
+            queue.append((node.target, scope, False))
+            queue.extend((child, scope, binds) for child in (node.iter, *node.ifs))
+            continue
+        if isinstance(node, ast.Name):
+            if binds and isinstance(node.ctx, (ast.Store, ast.Del)):
+                scope.bound.add(node.id)
+        elif isinstance(node, ast.Global):
+            scope.declared_global.update(node.names)
+        elif isinstance(node, ast.Nonlocal):
+            scope.declared_nonlocal.update(node.names)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name != "*":
+                    scope.bound.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            scope.bound.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.Return)):
+            index.statements.append((node, scope))
+        elif isinstance(node, ast.Call):
+            index.call_scope[node] = scope
+            index.statements.append((node, scope))
+        for child in ast.iter_child_nodes(node):
+            if not isinstance(child, ast.expr_context):
+                queue.append((child, scope, binds))
+
+    _assign_class_families(index)
+
+    for function in index.functions:
+        node = function.node
+        parent = function.scope.parent or module
+        if parent.class_info is not None:
+            static = any(
+                isinstance(decorator, ast.Name) and decorator.id == "staticmethod"
+                for decorator in node.decorator_list
+            )
+            offset = 0 if static else 1
+            function.groups.append((f"{parent.class_info.prefix}{node.name}()", offset))
+            function.groups.append((f"<method>.{node.name}()", offset))
+            positional = [*node.args.posonlyargs, *node.args.args]
+            if offset and positional:
+                index.self_keys[function.scope.prefix + positional[0].arg] = parent.class_info
+        else:
+            function.groups.append((f"{index.resolve(parent, node.name)}()", 0))
+        index.groups.update(group for group, _ in function.groups)
+    for cls, parent in index.classes:
+        index.class_bindings.setdefault(index.resolve(parent, cls.node.name), []).append(cls)
+    return index
+
+
+def _assign_class_families(index: _ScopeIndex) -> None:
+    """Give classes linked by in-module inheritance one attribute namespace.
+
+    ``self.token`` set in a base class and read in a subclass (or the other way
+    round) must meet. Same-named classes are merged as well, so the work stays
+    linear: union-find over (class, first class with the base's name) pairs.
+    """
+    parent: dict[_ClassInfo, _ClassInfo] = {}
+    order = {cls: position for position, (cls, _) in enumerate(index.classes)}
+
+    def find(cls: _ClassInfo) -> _ClassInfo:
+        root = cls
+        while parent.get(root, root) is not root:
+            root = parent[root]
+        while cls is not root:
+            following = parent[cls]
+            parent[cls] = root
+            cls = following
+        return root
+
+    def union(first: _ClassInfo, second: _ClassInfo) -> None:
+        first, second = find(first), find(second)
+        if first is not second:
+            # The earliest-defined class names the family, for stable keys.
+            if order[second] < order[first]:
+                first, second = second, first
+            parent[second] = first
+
+    by_name = index.classes_by_name
+    for cls, _ in index.classes:
+        same_name = by_name.setdefault(cls.node.name, [])
+        same_name.append(cls)
+        union(same_name[0], cls)
+    for cls, _ in index.classes:
+        for base in cls.node.bases:
+            if isinstance(base, ast.Name) and base.id in by_name:
+                union(cls, by_name[base.id][0])
+    for cls, _ in index.classes:
+        cls.prefix = f"{find(cls).qualname}."
+
+
 def _find_tainted_names_in_args(
     node: ast.Call,
     tainted: dict[str, _TaintedVar],
+    scopes: _ScopeIndex,
+    scope: _Scope,
     check_runtime: Callable[[], None] | None = None,
 ) -> list[_TaintedVar]:
-    """Find references to tainted variables in a call's arguments and keywords."""
+    """Find tainted variables, attributes and helper results a call reads."""
     seen: set[str] = set()
     hits: list[_TaintedVar] = []
-    for child in ast.walk(node):
-        if check_runtime is not None:
-            check_runtime()
-        if child is node:
+    for key in scopes.references(node, scope, check_runtime, skip_root=True):
+        if key in seen:
             continue
-        var_name: str | None = None
-        if isinstance(child, ast.Name):
-            var_name = child.id
-        elif isinstance(child, ast.Subscript):
-            var_name = resolve_dotted_name(child.value)
-        if var_name and var_name not in seen:
-            tv = tainted.get(var_name)
-            if tv:
-                seen.add(var_name)
-                hits.append(tv)
+        tv = tainted.get(key)
+        if tv:
+            seen.add(key)
+            hits.append(tv)
     return hits
 
 
 def _mark_targets(
-    targets: list[ast.expr],
+    targets: Sequence[_Target],
     tainted: dict[str, _TaintedVar],
     src_name: str,
     lineno: int,
 ) -> list[str]:
-    """Taint each assignment target name that is not tainted yet.
+    """Taint each target key that is not tainted yet.
 
     Add-only: an existing entry is never overwritten, so taint can only grow.
-    Returns the names newly added, for the worklist to propagate from.
+    Returns the keys newly added, for the worklist to propagate from.
     """
     newly_tainted: list[str] = []
-    names: list[str] = []
-    for target in targets:
-        if isinstance(target, ast.Name):
-            names.append(target.id)
-        elif isinstance(target, ast.Tuple):
-            names.extend(elt.id for elt in target.elts if isinstance(elt, ast.Name))
-    for name in names:
-        if name not in tainted:
-            tainted[name] = _TaintedVar(name, src_name, lineno)
-            newly_tainted.append(name)
+    for key, name in targets:
+        if key not in tainted:
+            tainted[key] = _TaintedVar(name, src_name, lineno)
+            newly_tainted.append(key)
     return newly_tainted
-
-
-def _referenced_names(node: ast.expr) -> list[str]:
-    """Return the distinct variable names (``ast.Name`` ids) referenced in *node*.
-
-    Mirrors the Name-only domain of taint propagation: a propagating assignment
-    becomes tainted when any name its value reads is tainted. Handles container
-    literals (dict, list, tuple, set) and f-strings because ``ast.walk`` reaches
-    the ``Name`` nodes nested inside them (e.g. ``payload = {"key": secret}``).
-    """
-    seen: set[str] = set()
-    names: list[str] = []
-    for child in ast.walk(node):
-        if isinstance(child, ast.Name) and child.id not in seen:
-            seen.add(child.id)
-            names.append(child.id)
-    return names
 
 
 def _collect_tainted(
@@ -463,92 +849,168 @@ def _collect_tainted(
     type_map: dict[str, str],
     aliases: dict[str, str],
     check_runtime: Callable[[], None] | None = None,
+    scopes: _ScopeIndex | None = None,
 ) -> dict[str, _TaintedVar]:
-    """Record ``Assign``-based taint, independent of AST visit order.
+    """Compute scope-aware taint, independent of AST visit order.
 
-    Any single ordered pass over the tree — breadth-first (``ast.walk``) or
-    source-order (pre-order) — misses flows where a sink and the assignment
-    that taints it are visited in the "wrong" relative order for that
-    traversal. Pre-order in particular loses flows where the sink sits inside
-    a function, method or loop body defined BEFORE the tainted assignment in
-    the file: the body is a subtree visited in full before the later sibling
-    statement, even though the code only runs when called, after the
-    assignment has already executed. There is no fixed traversal order that
-    agrees with both "defined before" and "runs after".
+    Any single ordered pass over the tree misses flows where a sink and the
+    assignment that taints it are visited in the "wrong" relative order: a
+    function body defined before the module-level assignment it reads only
+    runs after that assignment. Taint is therefore computed as reachability in
+    a flow graph whose nodes are scope-qualified keys (see ``_ScopeIndex``):
 
-    Taint is therefore computed as reachability in the re-assignment graph,
-    using a monotone worklist:
+    * every ``Assign`` flows from the keys its value reads to its targets;
+    * every argument of a call to a function defined in this module flows to
+      that callee's argument slot, and each slot flows to the parameter it
+      binds (positionally, by keyword, or into ``*args``/``**kwargs``); a
+      function passed as an argument (``Thread(target=f, args=(x,))``,
+      ``executor.submit(f, x)``) receives the arguments that follow it;
+    * every ``return`` flows into the function's return key, which any call
+      to that function reads, so ``key = get_key()`` carries the helper's
+      taint into the caller; parameter defaults flow into their parameter.
 
-    * One pass over every ``Assign`` seeds the tainted set from direct sources
-      (source calls and credential subscripts) and records every propagating
-      assignment (``b = a``; ``payload = {"k": secret}``) once, keyed by a
-      stable id, then indexes it by each name its value reads, as
-      ``referenced_name -> [assignment_id, ...]``.
-    * The worklist then drains newly tainted names, firing each assignment that
-      reads a drained name AT MOST ONCE total: the first time any name it reads
-      becomes tainted, its targets are marked and enqueued; later drains of its
-      other reading names skip it. Only names not already tainted are enqueued.
+    A flow whose value contains a source call (or ``os.environ[...]``) seeds
+    its targets directly. The remaining flows are recorded once each, keyed by
+    a stable id and indexed by every key they read. A monotone worklist then
+    drains newly tainted keys, firing each flow AT MOST ONCE: its targets are
+    all tainted after the first firing, so a later firing could add nothing.
 
-    Taint is add-only — an entry is never overwritten or removed — so the set
-    can only grow and is bounded by the number of assigned names. The loop
-    therefore cannot oscillate and is guaranteed to terminate. Firing an
-    assignment a second time is sound to skip: its targets are all tainted
-    after the first firing, so a later firing could only re-taint names and
-    add nothing. Each name is dequeued once and each propagating assignment
-    fires at most once, so the work is linear in the number of assignments
-    plus references — not quadratic in the longest chain, nor K×K' for a wide
-    ``a, b, ... = source`` statement read by many tainted names.
+    Taint is add-only and bounded by the number of keys, so the loop cannot
+    oscillate and terminates; each key is dequeued once and each flow fires at
+    most once, so the work is linear in the flows plus their references. A
+    fact keeps the original source call and its line through every hop.
+
+    Before scoping, keys were bare names shared by the whole file, so a
+    tainted ``headers`` local in one function tainted an unrelated
+    ``headers`` parameter elsewhere — reported as TT3 once 26bc7d6 (#611)
+    made propagation order-independent.
     """
+    if scopes is None:
+        scopes = _build_scope_index(tree, aliases, type_map, check_runtime)
     tainted: dict[str, _TaintedVar] = {}
     worklist: deque[str] = deque()
-    # Each propagating assignment, stored once as (targets, lineno) and keyed by
-    # its index here (a stable id). ``propagators`` maps a name read by an
-    # assignment's value to the ids of the assignments that read it.
-    propagating: list[tuple[list[ast.expr], int]] = []
+    # Each propagating flow's targets, stored once and keyed by its index here
+    # (a stable id). ``propagators`` maps a key read by a flow to its ids.
+    propagating: list[list[_Target]] = []
     propagators: dict[str, list[int]] = {}
 
-    for ast_node in ast.walk(tree):
-        if check_runtime is not None:
-            check_runtime()
-        if not isinstance(ast_node, ast.Assign):
-            continue
+    def add_edge(reads: Iterable[str], targets: list[_Target]) -> None:
+        flow_id = len(propagating)
+        propagating.append(targets)
+        for key in dict.fromkeys(reads):
+            propagators.setdefault(key, []).append(flow_id)
 
-        src_name = _find_source_in_expr(ast_node.value, type_map, aliases, check_runtime)
-
-        # Subscript sources like os.environ["KEY"] (also os aliased as `o`)
-        if src_name is None and isinstance(ast_node.value, ast.Subscript):
-            base = resolve_dotted_name(ast_node.value.value)
-            if base is not None:
-                base = apply_import_aliases(base, aliases)
-            if base and base in _CREDENTIAL_SOURCES:
-                src_name = base
-
-        if src_name is not None:
-            # Direct source: seed taint for this assignment's targets.
-            worklist.extend(_mark_targets(ast_node.targets, tainted, src_name, ast_node.lineno))
+    def add_flow(value: ast.expr, scope: _Scope, targets: list[_Target]) -> None:
+        if not targets:
+            return
+        source = _direct_source(value, type_map, aliases, check_runtime)
+        if source is not None:
+            # Direct source: seed taint for this flow's targets.
+            worklist.extend(_mark_targets(targets, tainted, *source))
         else:
-            # Propagating assignment: record it once under a stable id and index
-            # that id by each name its value reads, so it can fire later if/when
-            # one of those names is tainted.
-            assignment_id = len(propagating)
-            propagating.append((ast_node.targets, ast_node.lineno))
-            for ref in _referenced_names(ast_node.value):
-                propagators.setdefault(ref, []).append(assignment_id)
+            add_edge(scopes.references(value, scope, check_runtime), targets)
+
+    def bind_arguments(
+        groups: list[str],
+        args: Sequence[ast.expr],
+        keywords: Sequence[tuple[str | None, ast.expr]],
+        scope: _Scope,
+    ) -> None:
+        unpacked = False
+        for position, arg in enumerate(args):
+            if isinstance(arg, ast.Starred):
+                unpacked, arg = True, arg.value
+            slot = "#*" if unpacked or position >= _MAX_POSITIONAL_SLOTS else f"#{position}"
+            add_flow(arg, scope, [_Target(group + slot, group + slot) for group in groups])
+        for name, value in keywords:
+            slots = ("#**",) if name is None else (f"#kw:{name}", "#kw*")
+            add_flow(
+                value, scope, [_Target(group + s, group + s) for group in groups for s in slots]
+            )
+
+    def bind_call(call: ast.Call, scope: _Scope) -> None:
+        groups = scopes.callee_groups(call.func, scope, any_method=True)
+        if groups:
+            bind_arguments(groups, call.args, [(k.arg, k.value) for k in call.keywords], scope)
+        # A module function passed as an argument receives the positional
+        # arguments after it, plus ``args=(...)`` / ``kwargs={...}``.
+        for position, arg in enumerate([*call.args, *(k.value for k in call.keywords)]):
+            if not isinstance(arg, (ast.Name, ast.Attribute)):
+                continue
+            callback = scopes.callee_groups(arg, scope)
+            if not callback:
+                continue
+            forwarded = list(call.args[position + 1 :])
+            forwarded_keywords: list[tuple[str | None, ast.expr]] = []
+            for keyword in call.keywords:
+                if keyword.arg == "args" and isinstance(keyword.value, (ast.Tuple, ast.List)):
+                    forwarded.extend(keyword.value.elts)
+                elif keyword.arg == "kwargs" and isinstance(keyword.value, ast.Dict):
+                    for key, value in zip(keyword.value.keys, keyword.value.values, strict=True):
+                        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                            forwarded_keywords.append((key.value, value))
+                        elif key is None:
+                            forwarded_keywords.append((None, value))
+            bind_arguments(callback, forwarded, forwarded_keywords, scope)
+            break  # only the first function argument, keeping the work linear
+
+    for node, scope in scopes.statements:
+        if isinstance(node, ast.Assign):
+            targets = [t for target in node.targets for t in scopes.assign_targets(target, scope)]
+            add_flow(node.value, scope, targets)
+        elif isinstance(node, ast.Return):
+            function = scope.function
+            if node.value is not None and function is not None:
+                label = f"{function.node.name}()"
+                returns = [_Target(f"{group}<return>", label) for group, _ in function.groups]
+                add_flow(node.value, scope, returns)
+        else:
+            bind_call(node, scope)
+
+    for function in scopes.functions:
+        args = function.node.args
+        defining = function.scope.parent or scopes.module
+        prefix = function.scope.prefix
+        param = {arg.arg: [_Target(prefix + arg.arg, arg.arg)] for arg in _parameters(args)}
+        positional = [*args.posonlyargs, *args.args]
+        defaulted = positional[len(positional) - len(args.defaults) :]
+        for arg, default in zip(defaulted, args.defaults, strict=True):
+            add_flow(default, defining, param[arg.arg])
+        for arg, kw_default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
+            if kw_default is not None:
+                add_flow(kw_default, defining, param[arg.arg])
+        for group, offset in function.groups:
+            bound = positional[offset:]
+            for position, arg in enumerate(bound):
+                reads = [f"{group}#*"]
+                if position < _MAX_POSITIONAL_SLOTS:
+                    reads.append(f"{group}#{position}")
+                if arg not in args.posonlyargs:
+                    reads += [f"{group}#kw:{arg.arg}", f"{group}#**"]
+                add_edge(reads, param[arg.arg])
+            for arg in args.kwonlyargs:
+                add_edge([f"{group}#kw:{arg.arg}", f"{group}#**"], param[arg.arg])
+            if args.vararg is not None:
+                extra = range(len(bound), _MAX_POSITIONAL_SLOTS)
+                add_edge([f"{group}#*", *(f"{group}#{i}" for i in extra)], param[args.vararg.arg])
+            if args.kwarg is not None:
+                add_edge([f"{group}#kw*", f"{group}#**"], param[args.kwarg.arg])
 
     fired: set[int] = set()
     while worklist:
         if check_runtime is not None:
             check_runtime()
-        name = worklist.popleft()
-        src_call = tainted[name].source_call
-        for assignment_id in propagators.get(name, ()):
-            if assignment_id in fired:
+        key = worklist.popleft()
+        origin = tainted[key]
+        for flow_id in propagators.get(key, ()):
+            if flow_id in fired:
                 # Already propagated once: its targets are all tainted, so
                 # firing again marks nothing new. Skip to stay linear.
                 continue
-            fired.add(assignment_id)
-            targets, lineno = propagating[assignment_id]
-            worklist.extend(_mark_targets(targets, tainted, src_call, lineno))
+            fired.add(flow_id)
+            worklist.extend(
+                _mark_targets(propagating[flow_id], tainted, origin.source_call, origin.lineno)
+            )
 
     return tainted
 
@@ -566,9 +1028,9 @@ def _analyze_python(
     type_map = build_type_map(tree, aliases)
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
-    tainted = _collect_tainted(
-        tree, type_map, aliases, budget.check_runtime if budget is not None else None
-    )
+    check_runtime = budget.check_runtime if budget is not None else None
+    scopes = _build_scope_index(tree, aliases, type_map, check_runtime)
+    tainted = _collect_tainted(tree, type_map, aliases, check_runtime, scopes)
     seen: set[tuple[str, ast.Call]] = set()
     contexts: dict[int, str] = {}
 
@@ -649,7 +1111,7 @@ def _analyze_python(
             ast_node,
             type_map,
             aliases,
-            budget.check_runtime if budget is not None else None,
+            check_runtime,
         ):
             if src_name == "open" and _is_open_for_write(src_node):
                 continue
@@ -660,13 +1122,15 @@ def _analyze_python(
                 node_index,
                 rule,
                 ast_node,
-                f"Direct flow: {src_name} ({src_cat}) \u2192 {sink_name} ({sink_cat})",
+                f"Direct flow: {src_name} ({src_cat}) → {sink_name} ({sink_cat})",
             )
 
         for tv in _find_tainted_names_in_args(
             ast_node,
             tainted,
-            budget.check_runtime if budget is not None else None,
+            scopes,
+            scopes.call_scope.get(ast_node, scopes.module),
+            check_runtime,
         ):
             rule = _pick_rule(tv.source_call, sink_name, is_direct=False)
             src_cat = _classify(tv.source_call, _SOURCE_CATEGORIES, "data source")
@@ -676,7 +1140,7 @@ def _analyze_python(
                 rule,
                 ast_node,
                 f"Tainted flow: '{tv.name}' from {tv.source_call} (line {tv.lineno}, "
-                f"{src_cat}) \u2192 {sink_name} ({sink_cat})",
+                f"{src_cat}) → {sink_name} ({sink_cat})",
             )
 
     return findings if budget is None else list(budget.current_findings)

