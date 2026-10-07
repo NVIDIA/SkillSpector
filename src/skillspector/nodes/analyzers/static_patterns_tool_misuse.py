@@ -25,19 +25,17 @@ Framework: ASI02.
 from __future__ import annotations
 
 import ast
-import io
 import re
 import sys
-import tokenize
-import warnings
 from bisect import bisect_right
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from threading import Lock
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
-from skillspector.python_ast import MAX_PYTHON_AST_SOURCE_CHARS, parse_python_source
+from skillspector.python_ast import parse_python_source
+from skillspector.python_tokens import PythonLiteralSpans
+from skillspector.python_tokens import python_literal_spans as _python_literal_spans
 from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
@@ -115,26 +113,6 @@ _PERL_EVAL_BLOCK_RE = re.compile(r"\s*+\{")
 # whitespace or a shell control character. A backslash-newline is a line
 # continuation in both languages, so it does not end the word.
 _PYTHON_SHELL_WORD_BREAK_RE = re.compile(r"(?<!\\)(?<!\\\r)[\s;|&()<>]")
-# The tokenizer and the compiler disagree about a carriage return that does
-# not start CRLF, so such source never acquires token ownership.
-_LONE_CARRIAGE_RETURN_RE = re.compile(r"\r(?!\n)")
-# A shebang that names another interpreter (for example a shell polyglot)
-# makes the Python host ambiguous. Without a shebang, ``.py`` source is Python.
-_PYTHON_SHEBANG_RE = re.compile(
-    r"#![ \t]*+(?:\S*/)?(?:env[ \t]++(?:-\S*[ \t]++)*(?:\S*/)?)?"
-    r"(?:python[0-9.]*|pypy[0-9.]*|uv)(?=[ \t\r\n]|$)"
-)
-# ``warnings.catch_warnings`` swaps the process-global filter list, and analyzer
-# nodes run on concurrent graph worker threads. Two such blocks that exit out of
-# order can leave their ``ignore`` filter installed for the whole process, so
-# the ownership parse serializes its block.
-_PYTHON_OWNERSHIP_PARSE_LOCK = Lock()
-_PYTHON_TEMPLATE_STRING_STARTS = frozenset(
-    {tokenize.FSTRING_START, getattr(tokenize, "TSTRING_START", tokenize.FSTRING_START)}
-)
-_PYTHON_TEMPLATE_STRING_ENDS = frozenset(
-    {tokenize.FSTRING_END, getattr(tokenize, "TSTRING_END", tokenize.FSTRING_END)}
-)
 _PRINTF_FORMAT_CONVERSION_RE = re.compile(r"%[-+ #0-9.*']*[A-Za-z%]")
 _SHELL_ROOT_TARGET_ESCAPE_RE = re.compile(
     r"\\(?:[/~*?]|x(?:2[fF]|7[eE]|2[aA]|3[fF])|"
@@ -2550,84 +2528,6 @@ def _perl_literal_print_shell_text(
     return "".join(output)
 
 
-def _python_literal_spans(
-    content: str,
-    check_runtime: Callable[[], None],
-) -> tuple[list[int], list[int]] | None:
-    """Return outermost string and comment token spans of valid Python source.
-
-    Return ``None`` unless the whole text is accepted by the Python parser,
-    so a fragment, malformed file, or shell-shebang polyglot cannot borrow
-    host ownership. Every span is checked against the exact source text.
-    """
-    # A leading U+FEFF byte-order mark fails the module parse below and keeps
-    # every conservative bound. The file cache decodes with ``utf-8``, not
-    # ``utf-8-sig``, so the AST analyzers already report such a file as a
-    # syntax error; stripping the mark belongs with that decoding fix.
-    if (
-        len(content) > MAX_PYTHON_AST_SOURCE_CHARS
-        or _LONE_CARRIAGE_RETURN_RE.search(content) is not None
-        or (content.startswith("#!") and _PYTHON_SHEBANG_RE.match(content) is None)
-    ):
-        return None
-    check_runtime()
-    try:
-        # The lenient tokenizer accepts bytes such as ``$`` and a backtick as
-        # operators. Requiring a module parse proves that every byte outside
-        # the spans below is Python syntax, never a shell quote or expansion.
-        # The scanned module's own parse already reports its compiler warnings
-        # (for example an invalid ``"\d"`` escape). Repeating them here would
-        # duplicate that output, and ``-W error`` would turn them into a
-        # ``SyntaxError`` that silently drops ownership.
-        with _PYTHON_OWNERSHIP_PARSE_LOCK, warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            ast.parse(content)
-    except (SyntaxError, ValueError, RecursionError):
-        return None
-    check_runtime()
-    line_starts = [0]
-    line_starts.extend(match.end() for match in re.finditer("\n", content))
-    starts: list[int] = []
-    ends: list[int] = []
-    template_depth = 0
-    template_start = 0
-
-    def offset(position: tuple[int, int]) -> int:
-        return line_starts[position[0] - 1] + position[1]
-
-    try:
-        for index, token in enumerate(tokenize.generate_tokens(io.StringIO(content).readline)):
-            if index % 256 == 0:
-                check_runtime()
-            if token.type in _PYTHON_TEMPLATE_STRING_STARTS:
-                if template_depth == 0:
-                    template_start = offset(token.start)
-                    if not content.startswith(token.string, template_start):
-                        return None
-                template_depth += 1
-            elif token.type in _PYTHON_TEMPLATE_STRING_ENDS:
-                template_depth -= 1
-                end = offset(token.end)
-                if template_depth < 0 or not content.endswith(token.string, 0, end):
-                    return None
-                if template_depth == 0:
-                    starts.append(template_start)
-                    ends.append(end)
-            elif not template_depth and token.type in (tokenize.STRING, tokenize.COMMENT):
-                # Inside a replacement field, nested strings and comments
-                # belong to the enclosing f-string or t-string span.
-                start, end = offset(token.start), offset(token.end)
-                if content[start:end] != token.string:
-                    return None
-                starts.append(start)
-                ends.append(end)
-    except (tokenize.TokenError, SyntaxError, ValueError, IndexError):
-        return None
-    if template_depth or any(ends[index] > starts[index + 1] for index in range(len(starts) - 1)):
-        return None
-    return starts, ends
-
-
 class _PythonSourceOwnership:
     """Lazily proven Python string and comment ownership for one source text.
 
@@ -2646,12 +2546,12 @@ class _PythonSourceOwnership:
     def __init__(self, content: str, check_runtime: Callable[[], None]) -> None:
         self._content = content
         self._check_runtime = check_runtime
-        self._spans: tuple[list[int], list[int]] | None = None
+        self._spans: PythonLiteralSpans | None = None
         self._spans_computed = False
         self._cached_word_start = -1
         self._cached_word_end = -1
 
-    def _owned_spans(self) -> tuple[list[int], list[int]] | None:
+    def _owned_spans(self) -> PythonLiteralSpans | None:
         if not self._spans_computed:
             self._spans = _python_literal_spans(self._content, self._check_runtime)
             self._spans_computed = True
