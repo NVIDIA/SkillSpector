@@ -31,6 +31,7 @@ from skillspector.nodes.analyzers import static_patterns_anti_refusal
 from skillspector.nodes.analyzers.static_runner import analyzer_finding_to_finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
+    MetaAnalyzerResult,
     _meta_ledger_response,
     meta_analyzer,
 )
