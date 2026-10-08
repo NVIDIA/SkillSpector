@@ -1205,6 +1205,32 @@ def test_dump_baseline_shared_writer_preserves_inode_and_group_access(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_dump_baseline_owner_outside_destination_group_rewrites_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.write_text("old baseline", encoding="utf-8")
+    output.chmod(0o664)
+    groups = [gid for gid in os.getgroups() if gid != tmp_path.stat().st_gid]
+    if not groups:
+        pytest.skip("requires a supplementary group distinct from the directory group")
+    os.chown(output, -1, groups[0])
+    old = output.stat()
+
+    def denied_chown(*args: object) -> None:
+        # A non-root owner cannot assign a group it is not a member of.
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "fchown", denied_chown)
+    dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "owner"}]}, output)
+
+    assert load_baseline(output).rules[0].reason == "owner"
+    assert (output.stat().st_gid, output.stat().st_ino) == (old.st_gid, old.st_ino)
+    assert S_IMODE(output.stat().st_mode) == 0o664
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
 def test_dump_baseline_rejects_destination_swap_before_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

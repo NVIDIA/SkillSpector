@@ -719,14 +719,35 @@ def _preserve_baseline_acl(source: int, destination: int) -> None:
         os.setxattr(destination, "system.posix_acl_access", acl)
 
 
+def _write_baseline_in_place(
+    descriptor: int, encoded: bytes, p: Path, opened: os.stat_result
+) -> None:
+    """Rewrite a validated inode in place, keeping its owner, group, mode and ACLs."""
+    import fcntl
+
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    current = p.lstat()
+    if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+        raise ValueError(f"Baseline output changed before writing: {p}")
+    remaining = memoryview(encoded)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError(errno.EIO, "Could not write shared baseline", str(p))
+        remaining = remaining[written:]
+    os.ftruncate(descriptor, len(encoded))
+    os.fsync(descriptor)
+
+
 def dump_baseline(data: dict[str, object], path: str | Path) -> None:
     """Validate and write a regular baseline (``.json`` -> JSON).
 
     On POSIX, new files have owner-only permissions. Replacements preserve
     ownership and ordinary permission bits; the old file must be writable.
-    Non-owner writers update the validated descriptor in place, preserving its
-    permissions and ACLs without requiring chown. That shared-file path is not
-    atomic for readers or crash-safe. Symlinks and special files are rejected.
+    Non-owner writers, and owners that cannot assign the destination's group,
+    update the validated descriptor in place, preserving its permissions and
+    ACLs without requiring chown. That shared-file path is not atomic for
+    readers or crash-safe. Symlinks and special files are rejected.
     """
     baseline_from_dict(data)
     p = Path(path)
@@ -786,20 +807,7 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
                 # Replacing somebody else's writable file would require chown
                 # and would discard its ACLs. Serialize cooperating shared-file
                 # writers and keep this already validated inode instead.
-                import fcntl
-
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
-                current = p.lstat()
-                if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
-                    raise ValueError(f"Baseline output changed before writing: {p}")
-                remaining = memoryview(encoded)
-                while remaining:
-                    written = os.write(descriptor, remaining)
-                    if written <= 0:
-                        raise OSError(errno.EIO, "Could not write shared baseline", str(p))
-                    remaining = remaining[written:]
-                os.ftruncate(descriptor, len(encoded))
-                os.fsync(descriptor)
+                _write_baseline_in_place(descriptor, encoded, p, opened)
                 return
             # Retain the validated inode's access metadata while competing
             # atomic writers replace the path. There is no need to reopen it.
@@ -817,7 +825,15 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
             if destination is not None:
                 current = os.fstat(temporary.fileno())
                 if (current.st_uid, current.st_gid) != (destination.st_uid, destination.st_gid):
-                    os.fchown(temporary.fileno(), destination.st_uid, destination.st_gid)
+                    try:
+                        os.fchown(temporary.fileno(), destination.st_uid, destination.st_gid)
+                    except PermissionError:
+                        if access_descriptor is None:
+                            raise
+                        # A non-root owner cannot assign a group it is not a
+                        # member of. Rewrite the validated inode, keeping its group.
+                        _write_baseline_in_place(access_descriptor, encoded, p, destination)
+                        return
                 # Keep existing group writers/readers. Newly generated files
                 # remain private; replacing one does not revoke shared access.
                 mode = S_IMODE(destination.st_mode) & 0o777
