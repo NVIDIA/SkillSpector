@@ -1231,24 +1231,96 @@ def test_dump_baseline_owner_outside_destination_group_rewrites_in_place(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
-def test_dump_baseline_rejects_destination_swap_before_writing(
+def test_dump_baseline_revalidates_destination_replaced_while_opening(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     output = tmp_path / "baseline.yaml"
     output.write_text("original", encoding="utf-8")
+    output.chmod(0o600)
     replacement = tmp_path / "other.yaml"
     replacement.write_text("replacement", encoding="utf-8")
+    replacement.chmod(0o640)
     original_open = os.open
 
     def swapped_open(path, flags, *args, **kwargs):
+        # A cooperating writer atomically publishes once, between lstat and open.
+        if Path(path) == output and replacement.exists():
+            os.replace(replacement, output)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapped_open)
+    dump_baseline({"version": 2}, output)
+
+    assert load_baseline(output).is_empty()
+    # The replacement, not the stale first observation, supplies access metadata.
+    assert S_IMODE(output.stat().st_mode) == 0o640
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_dump_baseline_rejects_destination_that_keeps_changing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.write_text("original", encoding="utf-8")
+    original_open = os.open
+    swaps = 0
+
+    def swapped_open(path, flags, *args, **kwargs):
+        nonlocal swaps
         if Path(path) == output:
+            swaps += 1
+            replacement = tmp_path / f"replacement-{swaps}.yaml"
+            replacement.write_text(f"replacement {swaps}", encoding="utf-8")
             os.replace(replacement, output)
         return original_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(os, "open", swapped_open)
     with pytest.raises(ValueError, match="changed while opening"):
         dump_baseline({"version": 2}, output)
-    assert output.read_text(encoding="utf-8") == "replacement"
+
+    assert swaps == suppression_module._BASELINE_DESTINATION_ATTEMPTS
+    assert output.read_text(encoding="utf-8") == f"replacement {swaps}"
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+@pytest.mark.parametrize("persistent", [False, True])
+def test_dump_baseline_shared_writer_revalidates_destination_replaced_before_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, persistent: bool
+) -> None:
+    import fcntl
+
+    output = tmp_path / "baseline.yaml"
+    output.write_text("original", encoding="utf-8")
+    output.chmod(0o664)
+    monkeypatch.setattr(os, "geteuid", lambda: output.stat().st_uid + 1)
+    original_flock = fcntl.flock
+    replaced: list[int] = []
+
+    def replacing_flock(descriptor: int, operation: int) -> None:
+        # Another writer publishes after this one opened the path, before the lock.
+        if persistent or not replaced:
+            replacement = tmp_path / f"replacement-{len(replaced)}.yaml"
+            replacement.write_text("replacement", encoding="utf-8")
+            replacement.chmod(0o664)
+            os.replace(replacement, output)
+            replaced.append(output.stat().st_ino)
+        original_flock(descriptor, operation)
+
+    monkeypatch.setattr(fcntl, "flock", replacing_flock)
+    data = {"version": 2, "rules": [{"id": "TM1", "reason": "shared"}]}
+    if persistent:
+        with pytest.raises(ValueError, match="changed before writing"):
+            dump_baseline(data, output)
+        assert len(replaced) == suppression_module._BASELINE_DESTINATION_ATTEMPTS
+        # Every validated inode was replaced before anything was written.
+        assert output.read_text(encoding="utf-8") == "replacement"
+    else:
+        dump_baseline(data, output)
+        assert load_baseline(output).rules[0].reason == "shared"
+        assert output.stat().st_ino == replaced[0]
+    assert list(tmp_path.iterdir()) == [output]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")

@@ -83,6 +83,8 @@ MAX_BASELINE_NODES = 100_000
 MAX_BASELINE_DEPTH = 64
 MAX_BASELINE_RECORDS = 10_000
 MAX_BASELINE_SCALAR_CHARS = 64 * 1024
+# Validation passes for an output path that concurrent writers replace.
+_BASELINE_DESTINATION_ATTEMPTS = 2
 _FINGERPRINT_SCHEMA = "skillspector-finding-fingerprint-v2"
 _FINGERPRINT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SOURCE_IDENTITY_RE = re.compile(r"external/[0-9a-f]{64}\Z")
@@ -721,14 +723,17 @@ def _preserve_baseline_acl(source: int, destination: int) -> None:
 
 def _write_baseline_in_place(
     descriptor: int, encoded: bytes, p: Path, opened: os.stat_result
-) -> None:
-    """Rewrite a validated inode in place, keeping its owner, group, mode and ACLs."""
+) -> bool:
+    """Rewrite a validated inode in place, keeping its owner, group, mode and ACLs.
+
+    Returns False, without writing, when *p* no longer names *opened*.
+    """
     import fcntl
 
     fcntl.flock(descriptor, fcntl.LOCK_EX)
     current = p.lstat()
     if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
-        raise ValueError(f"Baseline output changed before writing: {p}")
+        return False
     remaining = memoryview(encoded)
     while remaining:
         written = os.write(descriptor, remaining)
@@ -737,6 +742,7 @@ def _write_baseline_in_place(
         remaining = remaining[written:]
     os.ftruncate(descriptor, len(encoded))
     os.fsync(descriptor)
+    return True
 
 
 def dump_baseline(data: dict[str, object], path: str | Path) -> None:
@@ -783,11 +789,16 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
 
     destination = None
     access_descriptor = None
-    try:
-        destination = p.lstat()
-    except FileNotFoundError:
-        pass
-    else:
+    # A cooperating writer can atomically replace the path between validating
+    # and opening or locking it. Validate the replacement from the start, but
+    # only a bounded number of times; a path that keeps changing fails closed.
+    for attempt in range(1, _BASELINE_DESTINATION_ATTEMPTS + 1):
+        final_attempt = attempt == _BASELINE_DESTINATION_ATTEMPTS
+        try:
+            destination = p.lstat()
+        except FileNotFoundError:
+            destination = None
+            break
         if not S_ISREG(destination.st_mode):
             raise ValueError(f"Baseline output must be a regular file: {p}")
         if os.name == "posix" and os.geteuid() == 0 and not destination.st_mode & 0o222:
@@ -801,17 +812,23 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
             if not S_ISREG(opened.st_mode):
                 raise ValueError(f"Baseline output must be a regular file: {p}")
             if (opened.st_dev, opened.st_ino) != (destination.st_dev, destination.st_ino):
-                raise ValueError(f"Baseline output changed while opening: {p}")
+                if final_attempt:
+                    raise ValueError(f"Baseline output changed while opening: {p}")
+                continue
             destination = opened
             if os.name == "posix" and os.geteuid() not in {0, destination.st_uid}:
                 # Replacing somebody else's writable file would require chown
                 # and would discard its ACLs. Serialize cooperating shared-file
                 # writers and keep this already validated inode instead.
-                _write_baseline_in_place(descriptor, encoded, p, opened)
-                return
+                if _write_baseline_in_place(descriptor, encoded, p, opened):
+                    return
+                if final_attempt:
+                    raise ValueError(f"Baseline output changed before writing: {p}")
+                continue
             # Retain the validated inode's access metadata while competing
             # atomic writers replace the path. There is no need to reopen it.
             access_descriptor = os.dup(descriptor)
+            break
         finally:
             os.close(descriptor)
 
@@ -832,7 +849,10 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
                             raise
                         # A non-root owner cannot assign a group it is not a
                         # member of. Rewrite the validated inode, keeping its group.
-                        _write_baseline_in_place(access_descriptor, encoded, p, destination)
+                        if not _write_baseline_in_place(access_descriptor, encoded, p, destination):
+                            raise ValueError(
+                                f"Baseline output changed before writing: {p}"
+                            ) from None
                         return
                 # Keep existing group writers/readers. Newly generated files
                 # remain private; replacing one does not revoke shared access.
