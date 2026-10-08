@@ -113,6 +113,26 @@ def test_leading_condition_or_scope_retains_prohibited_action(
     _assert_retained(rule, _findings(rule, module, content), action)
 
 
+@pytest.mark.parametrize("rule,module,action", _ACTIONS)
+@pytest.mark.parametrize(
+    "answer,line",
+    [
+        ("? No ", 1),
+        ("? No  ", 1),
+        ("? No\t", 1),
+        ("? **No** ", 1),
+        ("?\nNo ", 2),
+        ("?\r\nNo\t", 2),
+        ("?\u2028No ", 2),
+    ],
+)
+def test_answered_question_does_not_prohibit_following_instruction(
+    rule, module, action, answer, line
+):
+    content = f"Should the assistant keep anything private{answer}{action}."
+    _assert_retained(rule, _findings(rule, module, content), action, line)
+
+
 def test_issue_652_sample_remains_clean():
     from tests.unit.test_defensive_language_reporting import _BENIGN_FILES
 

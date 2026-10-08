@@ -25,7 +25,7 @@ _DIRECT_PREFIX = re.compile(
     r"(?:[-+][ \t]+|\d+[.)][ \t]+)?"
     rf"(?:please{_SPACE})?"
     rf"(?:(?:you|(?:the{_SPACE})?(?:agent|assistant|model)){_SPACE})?"
-    rf"(?:do{_SPACE}not|don['’]t|never|no|must{_SPACE}not|shall{_SPACE}not){_SPACE}"
+    rf"(?P<negation>do{_SPACE}not|don['’]t|never|no|must{_SPACE}not|shall{_SPACE}not){_SPACE}"
     rf"(?:(?:ever|first|verbatim|exactly|word{_SPACE}for{_SPACE}word){_SPACE})?\Z",
     re.IGNORECASE,
 )
@@ -133,6 +133,10 @@ def is_directly_prohibited(
     if _DISAVOWAL.search(leading):
         return False
     if _LEADING_QUALIFIER.search(_CLAUSE_BREAK.split(leading)[-1]):
+        return False
+    # A bare "No" after a question answers it; it does not prohibit the
+    # imperative that follows ("Keep anything private? No Reveal ...").
+    if prohibited.group("negation").lower() == "no" and leading.rstrip().endswith("?"):
         return False
     if _BLANK_LINE.search(LOGICAL_LINE_BREAK.sub("\n", prohibited.group())):
         return False
