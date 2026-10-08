@@ -424,7 +424,7 @@ class TestErrorHandling:
         }
 
     @patch(MOCK_PATCH_TARGET)
-    def test_openai_refusal_is_incomplete_not_clean(self, mock_get_model: MagicMock) -> None:
+    def test_openai_refusal_is_failed_not_clean(self, mock_get_model: MagicMock) -> None:
         """A structured-output refusal costs its batch and is reported, not dropped."""
         from langchain_openai.chat_models.base import OpenAIRefusalError
 
