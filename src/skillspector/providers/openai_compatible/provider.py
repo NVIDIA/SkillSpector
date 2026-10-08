@@ -40,7 +40,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 
 from skillspector.providers import registry
 from skillspector.providers.chat_models import create_openai_compatible_chat_model
-from skillspector.providers.structured_output import claude_model_name, rejects_forced_tool_call
+from skillspector.providers.structured_output import rejects_forced_tool_call
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -97,7 +97,7 @@ class OpenAICompatibleProvider:
         declared = registry.lookup_setting(REGISTRY_PATH, model, "tool_choice")
         if declared:
             return declared != "auto"
-        return not rejects_forced_tool_call(claude_model_name(model))
+        return not rejects_forced_tool_call(model)
 
     def structured_output_method(self, model: str) -> str | None:
         """``with_structured_output`` method: registry entry, else tool calling for ``tool_choice: auto``."""

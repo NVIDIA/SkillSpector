@@ -30,10 +30,7 @@ from skillspector.inference_usage import (
     register_chat_model_controls,
     retained_chat_model_controls,
 )
-from skillspector.providers.structured_output import (
-    claude_model_name,
-    rejects_sampling_controls,
-)
+from skillspector.providers.structured_output import rejects_sampling_controls
 
 logger = logging.getLogger(__name__)
 MIN_SAMPLING_SEED = -(1 << 63)
@@ -106,7 +103,7 @@ def reject_unsupported_controls(
     """
     is_gpt_6_1_sol = _GPT_6_1_SOL.search(model.lower()) is not None
     if "temperature" in sampling_parameters and (
-        is_gpt_6_1_sol or rejects_sampling_controls(claude_model_name(model))
+        is_gpt_6_1_sol or rejects_sampling_controls(model)
     ):
         raise ValueError(
             f"SKILLSPECTOR_TEMPERATURE is not supported by {model}; unset it to use this model"

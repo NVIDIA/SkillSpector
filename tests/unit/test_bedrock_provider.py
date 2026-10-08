@@ -39,7 +39,7 @@ from skillspector.providers.bedrock import (
     BEDROCK_SDK_TOTAL_MAX_ATTEMPTS,
     BedrockProvider,
 )
-from skillspector.providers.structured_output import claude_model_from_bedrock_id
+from skillspector.providers.structured_output import claude_model_name
 
 # A real application-inference-profile ARN shape for testing ARN-specific
 # behavior.  Account ID and profile ID are placeholders — no live resource.
@@ -381,15 +381,15 @@ class TestBedrockProviderToolChoice:
             ("us-gov.anthropic.claude-mythos-5-1", "claude-mythos-5-1"),
             (
                 "arn:aws:bedrock:eu-west-1::foundation-model/anthropic.claude-sonnet-4-6-20250915-v1:0",
-                "claude-sonnet-4-6-20250915-v1:0",
+                "claude-sonnet-4-6-20250915-v1",
             ),
             (_TEST_ARN, None),
             ("amazon.nova-pro-v1:0", None),
             ("anthropic.", None),
         ],
     )
-    def test_claude_model_from_bedrock_id(self, model: str, expected: str | None) -> None:
-        assert claude_model_from_bedrock_id(model) == expected
+    def test_claude_model_name_reads_bedrock_ids(self, model: str, expected: str | None) -> None:
+        assert claude_model_name(model) == expected
 
     @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
     @patch("skillspector.providers.bedrock.provider.boto3.Session")

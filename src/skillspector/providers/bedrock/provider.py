@@ -53,10 +53,7 @@ from skillspector.providers.chat_models import (
     reject_unsupported_controls,
     resolve_sampling_parameters,
 )
-from skillspector.providers.structured_output import (
-    claude_model_from_bedrock_id,
-    rejects_forced_tool_call,
-)
+from skillspector.providers.structured_output import rejects_forced_tool_call
 
 BEDROCK_DEFAULT_REGION = "us-west-2"
 # Cross-region inference profile ID for Claude Sonnet 4.6. Public,
@@ -192,5 +189,4 @@ class BedrockProvider:
         declared = registry.lookup_setting(REGISTRY_PATH, model, "tool_choice")
         if declared:
             return declared != "auto"
-        family = claude_model_from_bedrock_id(model)
-        return not (family and rejects_forced_tool_call(family))
+        return not rejects_forced_tool_call(model)

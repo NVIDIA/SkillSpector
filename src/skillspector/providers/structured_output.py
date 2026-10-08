@@ -33,8 +33,8 @@ this model``).  What replaces it depends on the platform:
   ``tool_choice`` left at ``auto`` and ask for the call in the prompt, as on
   Bedrock.
 
-Gateway model IDs namespace or prefix the Claude name
-(``azure/anthropic/claude-opus-5-5``, ``aws/anthropic/bedrock-claude-opus-5-5``);
+Gateway and Bedrock model IDs namespace or prefix the Claude name
+(``azure/anthropic/claude-opus-5-5``, ``us.anthropic.claude-opus-5-5``);
 :func:`claude_model_name` reads it back so every route applies the same rules.
 """
 
@@ -53,27 +53,24 @@ FORCED_TOOL_CALL_REJECTED_MODELS = (
 # Bare model names documented to reject sampling controls (``temperature``) with HTTP 400.
 SAMPLING_REJECTED_MODELS = ("claude-opus-5-5", "claude-sonnet-5-5")
 
-_BEDROCK_VENDOR_PREFIX = "anthropic."
-
 # A Claude model name ending an identifier, at its start or after a ``-``/``.``
 # routing prefix (``bedrock-claude-...``, ``us.anthropic.claude-...``).
 _CLAUDE_MODEL_NAME = re.compile(r"(?:^|[-.])(claude-[a-z0-9][a-z0-9.-]*)$")
 _DOTTED_VERSION = re.compile(r"(?<=\d)\.(?=\d)")
 
 
-def _names_model(model: str | None, names: tuple[str, ...]) -> bool:
-    return model is not None and any(
-        model == name or model.startswith(name + "-") for name in names
-    )
+def _names_model(model: str, names: tuple[str, ...]) -> bool:
+    name = claude_model_name(model)
+    return name is not None and any(name == bare or name.startswith(bare + "-") for bare in names)
 
 
-def rejects_forced_tool_call(model: str | None) -> bool:
-    """Return ``True`` when the bare *model* name (optionally version-suffixed) rejects forced tool calls."""
+def rejects_forced_tool_call(model: str) -> bool:
+    """Return ``True`` when *model* names a Claude model that rejects forced tool calls."""
     return _names_model(model, FORCED_TOOL_CALL_REJECTED_MODELS)
 
 
-def rejects_sampling_controls(model: str | None) -> bool:
-    """Return ``True`` when the bare *model* name (optionally version-suffixed) rejects ``temperature``."""
+def rejects_sampling_controls(model: str) -> bool:
+    """Return ``True`` when *model* names a Claude model that rejects ``temperature``."""
     return _names_model(model, SAMPLING_REJECTED_MODELS)
 
 
@@ -83,24 +80,12 @@ def claude_model_name(model: str) -> str | None:
     Reads the identifier's last path segment, case-insensitively and up to any
     ``@`` or ``:`` suffix (``@20260922``, ``:latest``, Bedrock's ``:0``), so
     gateway IDs (``azure/anthropic/claude-opus-5-5``), routing prefixes
-    (``bedrock-claude-opus-5-5``, ``us.anthropic.claude-opus-5-5``) and dotted
-    versions (``claude-opus-5.5``) all resolve to ``claude-opus-5-5``.
+    (``bedrock-claude-opus-5-5``, ``us.anthropic.claude-opus-5-5``), Bedrock
+    foundation-model and inference-profile ARNs, and dotted versions
+    (``claude-opus-5.5``) all resolve to ``claude-opus-5-5``.  Returns ``None``
+    for identifiers that do not name the model, such as Bedrock
+    application-inference-profile ARNs; declare those in the registry.
     """
     name = re.split(r"[@:]", model.rpartition("/")[2].lower(), maxsplit=1)[0]
     match = _CLAUDE_MODEL_NAME.search(name)
     return _DOTTED_VERSION.sub("-", match.group(1)) if match else None
-
-
-def claude_model_from_bedrock_id(model: str) -> str | None:
-    """Return the bare Claude model name carried by a Bedrock *model* identifier.
-
-    Handles plain model IDs (``anthropic.claude-fable-5-1``), geo and global
-    inference-profile IDs (``us.``/``eu.``/``global.`` prefixes), and
-    foundation-model / inference-profile ARNs whose last path segment is one
-    of those.  Returns ``None`` for identifiers that do not name the model,
-    such as application-inference-profile ARNs; declare those in the registry.
-    """
-    _, _, name = model.rpartition("/")
-    if _BEDROCK_VENDOR_PREFIX not in name:
-        return None
-    return name.split(_BEDROCK_VENDOR_PREFIX, 1)[1] or None

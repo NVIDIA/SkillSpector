@@ -49,7 +49,7 @@ from skillspector.providers.chat_models import (
     resolve_reasoning_effort,
     resolve_sampling_parameters,
 )
-from skillspector.providers.structured_output import claude_model_name, rejects_forced_tool_call
+from skillspector.providers.structured_output import rejects_forced_tool_call
 
 # Default endpoint; overridden by ``ANTHROPIC_BASE_URL`` when set.
 ANTHROPIC_BASE_URL = "https://api.anthropic.com"
@@ -145,4 +145,4 @@ class AnthropicProvider:
         declared = registry.lookup_structured_output_method(REGISTRY_PATH, model)
         if declared:
             return declared
-        return "json_schema" if rejects_forced_tool_call(claude_model_name(model)) else None
+        return "json_schema" if rejects_forced_tool_call(model) else None

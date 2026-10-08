@@ -92,9 +92,17 @@ class TestClaudeModelRules:
 
     @pytest.mark.parametrize(
         "model",
-        ["claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-sonnet-4-6", None],
+        [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "azure/anthropic/claude-opus-5",
+            "claude-opus-5-50",
+            "gpt-6.1-sol",
+        ],
     )
-    def test_other_models_keep_both(self, model: str | None) -> None:
+    def test_other_models_keep_both(self, model: str) -> None:
         assert not rejects_forced_tool_call(model)
         assert not rejects_sampling_controls(model)
 
@@ -138,13 +146,8 @@ class TestClaudeModelRules:
         ],
     )
     def test_normalized_ids_carry_the_claude_5_5_rules(self, model: str) -> None:
-        assert rejects_forced_tool_call(claude_model_name(model))
-        assert rejects_sampling_controls(claude_model_name(model))
-
-    @pytest.mark.parametrize("model", ["azure/anthropic/claude-opus-5", "claude-opus-5-50"])
-    def test_lookalike_ids_keep_both(self, model: str) -> None:
-        assert not rejects_forced_tool_call(claude_model_name(model))
-        assert not rejects_sampling_controls(claude_model_name(model))
+        assert rejects_forced_tool_call(model)
+        assert rejects_sampling_controls(model)
 
 
 def _anthropic_provider(
