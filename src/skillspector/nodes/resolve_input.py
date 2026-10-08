@@ -56,7 +56,10 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
     workflow_budget = ensure_workflow_resource_budget(state)
 
     if input_path and isinstance(input_path, str) and input_path.strip():
-        handler = InputHandler(transitive_budget=workflow_budget)
+        handler = InputHandler(
+            transitive_budget=workflow_budget,
+            allow_git_credentials=state.get("allow_git_credentials", True),
+        )
         try:
             resolved, source_type = handler.resolve(input_path.strip())
             temp_dir = handler.temp_dir_for_cleanup()

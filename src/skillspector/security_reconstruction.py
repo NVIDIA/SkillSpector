@@ -206,10 +206,13 @@ _TAG_DIRECTIVE_START_RE: Final = re.compile(
     re.IGNORECASE,
 )
 _UNSUPPORTED_TAG_DIRECTIVE_START_RE: Final = re.compile(
-    rf"\b(?:{_FALLBACK_REMOVAL_VERBS})\b[^.!?\n]{{0,{_MAX_FALLBACK_PREFIX_CHARS}}}?"
+    rf"\b(?:{_FALLBACK_REMOVAL_VERBS})\b"
+    rf"(?P<header>[^.!?\n]{{0,{_MAX_FALLBACK_PREFIX_CHARS}}}?)"
     r"(?P<open><)",
     re.IGNORECASE,
 )
+# Characters the loose fallback header above can never cross.
+_FALLBACK_HEADER_BOUNDARY_RE: Final = re.compile(r"[.!?\n]")
 _ENCODED_TAG_DIRECTIVE_START_RE: Final = re.compile(
     rf"\b(?:{_REMOVAL_VERBS})\b{_DECLARED_MARKER_PREFIX}"
     rf"(?P<open>&(?:lt|#{_ENTITY_ZERO_PADDING}60|#x{_ENTITY_ZERO_PADDING}3c);)",
@@ -236,6 +239,10 @@ _ENCODED_DOUBLE_QUOTE_RE: Final = re.compile(
     re.IGNORECASE,
 )
 _TAG_MARKER_RE: Final = re.compile(r"</?[A-Za-z][A-Za-z0-9:_-]*(?:[ \t]*/)?\>")
+# Accepts at least every prefix of a _TAG_MARKER_RE match. It also accepts
+# blanks with no ``/`` (``<br  ``), which _TAG_MARKER_RE rejects, so a marker
+# padded with blanks past the lookahead still reads as viable and fails closed.
+_TAG_MARKER_PREFIX_RE: Final = re.compile(r"</?[A-Za-z][A-Za-z0-9:_-]*[ \t]*/?")
 _UNAMBIGUOUS_ACTION_RE: Final = re.compile(
     r"\b(?:run|execute|invoke|issue|launch|perform|carry[ \t]+out)\b",
     re.IGNORECASE,
@@ -745,17 +752,36 @@ def _verb_is_in_cli_flag_token(text: str, start: int) -> bool:
     return token_start < start and text[token_start] == "-"
 
 
+def _view_string_closer(
+    view: SecurityTextView, validated_string_closer: Callable[[int], bool]
+) -> Callable[[int], bool]:
+    """Map a source-offset string-closer test onto ``view`` character indexes.
+
+    A derived view keeps the source offset of every character, so only an ASCII
+    quote that maps onto a proven closing delimiter is that delimiter.
+    """
+
+    def closes_owned_string(index: int) -> bool:
+        return view.text[index] in "'\"" and validated_string_closer(view.source_offset(index))
+
+    return closes_owned_string
+
+
 def _quoted_directives(
     text: str,
     check_runtime: Callable[[], None] | None,
     *,
     end_is_truncated: bool,
+    closes_owned_string: Callable[[int], bool] | None = None,
     pattern: re.Pattern[str] = _QUOTED_DIRECTIVE_START_RE,
     unsupported_header: bool = False,
 ) -> Iterator[_Directive]:
     # A complete JSON representation owns its closing quotes; JSON-looking
     # fragments in prose and instructions do not. Only structural closing
     # delimiters are excluded; instruction contents remain available below.
+    # ``closes_owned_string`` extends this to proven host-language strings.
+    # Like JSON closers, it only stops the loose fallback header: an explicit
+    # declared-marker header keeps reading any quote as a marker opener.
     json_value_closers = (
         validated_json_string_closers(text, check_runtime) if unsupported_header else set()
     )
@@ -767,6 +793,12 @@ def _quoted_directives(
         if unsupported_header and _is_quoted_mapping_key(text, match.start()):
             continue
         if match.end() - 1 in json_value_closers:
+            continue
+        if (
+            unsupported_header
+            and closes_owned_string is not None
+            and closes_owned_string(match.start("quote"))
+        ):
             continue
         quote = _QUOTE_OPEN_TO_CLOSE[match.group("quote")]
         marker_start = match.end()
@@ -910,6 +942,48 @@ def _empty_replacement_directives(
         )
 
 
+def _can_open_tag_marker(text: str, start: int, limit: int) -> bool:
+    """Return whether the ``<`` at ``start`` can still begin a tag marker.
+
+    Code such as ``len(value.strip()) < 12`` or ``a<=b`` puts a comparison
+    operator after a removal verb. ``_TAG_MARKER_RE`` can never accept it, so
+    the loose fallback header must not search for a distant ``>`` and report
+    lookahead exhaustion. A tag name that is still open at ``limit`` remains
+    viable so a padded marker keeps failing closed.
+    """
+    prefix = _TAG_MARKER_PREFIX_RE.match(text, start, limit)
+    return prefix is not None and (prefix.end() == limit or text[prefix.end()] == ">")
+
+
+def _next_tag_opener(
+    text: str,
+    start: int,
+    header_end: int,
+    check_runtime: Callable[[], None] | None,
+) -> int | None:
+    """Return the first ``<`` in ``text[start:header_end]`` that can open a tag marker.
+
+    The loose fallback header stops lazily at the first ``<`` after the verb,
+    but it reaches every later ``<`` up to ``header_end`` that no sentence
+    boundary or newline separates from the verb. A comparison such as
+    ``1 < 2`` must not hide a real marker later in that span, so non-viable
+    openers are passed over rather than ending the search. Openers are
+    examined left to right and each prefix match stops at the next ``<``, so
+    the work stays linear in the bounded header span plus one lookahead.
+    """
+    boundary = _FALLBACK_HEADER_BOUNDARY_RE.search(text, start, header_end)
+    end = boundary.start() if boundary is not None else header_end
+    opener = text.find("<", start, end)
+    while opener >= 0:
+        if check_runtime is not None:
+            check_runtime()
+        limit = min(len(text), opener + MAX_MARKER_LOOKAHEAD_CHARS)
+        if _can_open_tag_marker(text, opener, limit):
+            return opener
+        opener = text.find("<", opener + 1, end)
+    return None
+
+
 def _tag_directives(
     text: str,
     check_runtime: Callable[[], None] | None,
@@ -924,6 +998,18 @@ def _tag_directives(
         if unsupported_header and _verb_is_in_cli_flag_token(text, match.start()):
             continue
         marker_start = match.start("open")
+        if unsupported_header:
+            # The header's filler may be at most _MAX_FALLBACK_PREFIX_CHARS
+            # long, so an opener can sit at most that far past the verb.
+            opener = _next_tag_opener(
+                text,
+                marker_start,
+                match.start("header") + _MAX_FALLBACK_PREFIX_CHARS + 1,
+                check_runtime,
+            )
+            if opener is None:
+                continue
+            marker_start = opener
         marker_end_limit = min(len(text), marker_start + MAX_MARKER_LOOKAHEAD_CHARS)
         marker_end = text.find(">", marker_start + 1, marker_end_limit)
         if marker_end < 0:
@@ -1050,6 +1136,7 @@ def _directives(
     check_runtime: Callable[[], None] | None,
     *,
     end_is_truncated: bool,
+    closes_owned_string: Callable[[int], bool] | None = None,
 ) -> list[_Directive]:
     candidates = [
         *_passive_quoted_directives(
@@ -1072,6 +1159,7 @@ def _directives(
             text,
             check_runtime,
             end_is_truncated=end_is_truncated,
+            closes_owned_string=closes_owned_string,
             pattern=_UNSUPPORTED_QUOTED_DIRECTIVE_START_RE,
             unsupported_header=True,
         ),
@@ -1798,6 +1886,7 @@ def build_declared_marker_views(
     owned_source_start: int | None = None,
     owned_source_end: int | None = None,
     source_end_is_truncated: bool = False,
+    validated_string_closer: Callable[[int], bool] | None = None,
 ) -> DeclaredMarkerViewResult:
     """Build one-pass payload views for explicit literal-removal instructions.
 
@@ -1811,6 +1900,13 @@ def build_declared_marker_views(
     the next window. ``source_end_is_truncated`` separately records whether the
     physical view ends before the source, so ownership alone never degrades a
     complete end-of-file directive.
+
+    ``validated_string_closer`` optionally reports whether a source offset, in
+    the same coordinates, is the closing delimiter of a string literal that a
+    complete host-language parse has proven. Such a quote is syntax that ends a
+    literal, so the loose fallback header never reads it as a marker opener,
+    exactly as for a validated JSON string. Explicit declared-marker headers and
+    callers without the test keep the lexical reading.
     """
     if check_runtime is not None:
         check_runtime()
@@ -1822,6 +1918,11 @@ def build_declared_marker_views(
     ):
         return DeclaredMarkerViewResult((), False)
 
+    closes_owned_string = (
+        None
+        if validated_string_closer is None
+        else _view_string_closer(view, validated_string_closer)
+    )
     active_directives = 0
     limited = False
     projection_blocked = False
@@ -1830,6 +1931,7 @@ def build_declared_marker_views(
         view.text,
         check_runtime,
         end_is_truncated=source_end_is_truncated,
+        closes_owned_string=closes_owned_string,
     ):
         if check_runtime is not None:
             check_runtime()
