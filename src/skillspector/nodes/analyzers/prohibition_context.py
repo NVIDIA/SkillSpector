@@ -42,9 +42,11 @@ _LEADING_QUALIFIER = re.compile(
     re.IGNORECASE,
 )
 
+# Reversal wording is matched by stem so that every inflection ("negation",
+# "inverts", "opposites", "contrarily", ...) retains detection.
 _DISAVOWAL = re.compile(
-    r"\b(?:ignore|disregard|override|obsolete|invalid|bypass|suspend|violate|"
-    r"opposite|inverse|invert(?:ed|ing)?|revers(?:e|ed|ing|al)|contrary|negat(?:e|ed|ing))\b",
+    r"\b(?:ignore|disregard|override|obsolete|invalid|bypass|suspend|violat\w*|"
+    r"opposit\w*|invers\w*|invert\w*|revers\w*|contrar\w*|negat\w*)\b",
     re.IGNORECASE,
 )
 
