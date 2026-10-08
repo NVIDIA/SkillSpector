@@ -1488,3 +1488,76 @@ def test_true_named_shell_window_has_one_owner_per_call(content: str) -> None:
 
     assert len(findings) == 1
     assert not findings[0].evidence
+
+
+@pytest.mark.parametrize(
+    ("path", "prefix", "suffix"),
+    [
+        pytest.param("run.js", "", "", id="javascript"),
+        pytest.param("SKILL.md", "# Skill\n```python\n", "```\n", id="fenced-markdown"),
+        pytest.param("notes.md", "", "", id="plain-markdown"),
+    ],
+)
+def test_true_prefixed_window_reports_non_python_call(path: str, prefix: str, suffix: str) -> None:
+    findings = _tm1(
+        f"{prefix}true_value = True\nsubprocess.run(command, shell=true_value)\n{suffix}",
+        path,
+    )
+
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+    assert (findings[0].start_line, findings[0].start_column) == (prefix.count("\n") + 2, 0)
+    assert not findings[0].evidence
+
+
+def test_true_prefixed_call_after_unknown_receiver_effect_keeps_lexical_signal() -> None:
+    findings = _tm1(
+        "true_value = True\n"
+        "subprocess.run(command, shell=true_value)\n"
+        "replace_subprocess()\n"
+        "subprocess.run(command, shell=true_value)\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [2, 4]
+
+
+def test_true_prefixed_call_window_keeps_binding_counterevidence() -> None:
+    findings = _tm1(
+        "true_value = True\n"
+        "subprocess.run(command, shell=true_value)\n"
+        "true_value = False\n"
+        "subprocess.run(command, shell=true_value)\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [2]
+
+
+@pytest.mark.parametrize(
+    ("name", "path", "suffix"),
+    [
+        pytest.param("true_value", "run.py", "if:\n", id="true-prefixed-malformed-python"),
+        pytest.param("true", "run.js", "", id="true-non-python"),
+    ],
+)
+def test_true_named_calls_on_one_line_without_ast_keep_distinct_locations(
+    name: str, path: str, suffix: str
+) -> None:
+    call = f"subprocess.run(command, shell={name})"
+    findings = _tm1(f"{name} = True\n{call}; {call}\n{suffix}", path)
+
+    assert sorted((finding.start_line, finding.start_column) for finding in findings) == [
+        (2, 0),
+        (2, len(call) + 2),
+    ]
+
+
+def test_true_prefixed_assignment_inside_earlier_window_owns_its_call() -> None:
+    findings = _tm1(
+        "true_value = True\n"
+        "true_other = True\n"
+        "subprocess.run(command, shell=true_value)\n"
+        "subprocess.run(command, shell=true_other)\n",
+        "run.js",
+    )
+
+    assert [finding.start_line for finding in findings] == [3, 4]
