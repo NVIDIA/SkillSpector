@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Behavioral taint-tracking analyzer (TT1–TT5): sources -> sinks data-flow analysis.
+"""Behavioral taint-tracking analyzer (TT1–TT6): sources -> sinks data-flow analysis.
 
 Parses Python AST to identify data sources (env vars, file reads, network input)
 and sinks (network output, exec, file writes), then tracks flows between them
 to flag potential credential/data exfiltration chains. Taint follows Python's
-lexical scopes and crosses calls to functions defined in the same file
-(arguments into parameters, return values back to callers).
+lexical scopes and crosses direct calls to functions and methods defined in the
+same file (arguments into parameters, return values back to callers).
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from __future__ import annotations
 import ast
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -328,20 +328,12 @@ def _pick_rule(source_name: str, sink_name: str, is_direct: bool) -> str:
     return "TT1" if is_direct else "TT2"
 
 
-_SEVERITY_RANK: dict[Severity, int] = {
-    Severity.LOW: 0,
-    Severity.MEDIUM: 1,
-    Severity.HIGH: 2,
-    Severity.CRITICAL: 3,
-}
-
-
 class _TaintedVar(NamedTuple):
     """One reported taint fact: data from ``source_call`` reaches ``name``.
 
     ``lineno`` is the line of the statement that last tainted ``name`` (the
-    assignment, the call that bound a parameter), the wording earlier releases
-    used, so messages, exact baselines and message-glob rules keep matching.
+    assignment, or the call that bound a parameter), the wording earlier
+    releases used, so messages and message-based baselines keep matching.
     """
 
     name: str
@@ -375,46 +367,16 @@ def _call_source(
     return name
 
 
-def _direct_sources(
-    node: ast.expr,
-    type_map: dict[str, str] | None,
-    aliases: dict[str, str],
-    check_runtime: Callable[[], None] | None = None,
-    stop: Callable[[ast.AST], bool] | None = None,
-) -> list[tuple[str, ast.AST]]:
-    """Every distinct source a value reads directly, in ``ast.walk`` order.
-
-    Finds source calls anywhere in the expression (``open("f").read()``,
-    ``requests.get(url).text``, ``os.environ.get("K")``) and an
-    ``os.environ["K"]`` subscript (also ``os`` aliased) that is the whole
-    value. Returns ``(source name, source node)`` for the first occurrence of
-    each source. *stop* prunes subtrees whose sources are accounted elsewhere.
-    """
-    found: dict[str, ast.AST] = {}
-    if stop is not None and stop(node):
-        return []
-    queue: deque[ast.AST] = deque([node])
-    while queue:
-        if check_runtime is not None:
-            check_runtime()
-        child = queue.popleft()
-        if isinstance(child, ast.Call):
-            name = _call_source(child, type_map, aliases)
-            if name is not None and name not in found:
-                found[name] = child
-        for grandchild in ast.iter_child_nodes(child):
-            if isinstance(grandchild, ast.expr_context):
-                continue
-            if stop is not None and stop(grandchild):
-                continue
-            queue.append(grandchild)
-    if isinstance(node, ast.Subscript):
-        base = resolve_dotted_name(node.value)
-        if base is not None:
-            base = apply_import_aliases(base, aliases)
-        if base and base in _CREDENTIAL_SOURCES and base not in found:
-            found[base] = node
-    return list(found.items())
+def _credential_subscript(node: ast.AST, aliases: dict[str, str]) -> str | None:
+    """``os.environ["K"]`` (also with ``os`` aliased) as a whole value is a source."""
+    if not isinstance(node, ast.Subscript):
+        return None
+    base = resolve_dotted_name(node.value)
+    if base is not None:
+        base = apply_import_aliases(base, aliases)
+    if base and base in _CREDENTIAL_SOURCES:
+        return base
+    return None
 
 
 def _find_nested_sources(
@@ -438,248 +400,203 @@ def _find_nested_sources(
     return results
 
 
-# ── Lexical scopes ──────────────────────────────────────────────────────
+# ── Lexical scopes and direct calls ─────────────────────────────────────
 #
 # Taint is keyed by lexical scope rather than by bare name, so a tainted local
 # in one function cannot taint an unrelated same-named variable or parameter
-# in another. Keys are small integers (see ``_Keys``) built from a scope or
-# class id plus the identifier the source spells; no key ever embeds a
-# qualified name, so memory stays linear in the file even for very long names.
+# in another. Keys are small integers; a key is built from a scope id plus a
+# reference to the identifier string already in the tree, never from a
+# qualified name, so memory does not grow with identifier length.
 #
-# * Names follow Python's rules: parameters and names bound in a function,
-#   lambda or comprehension are local to it unless declared ``global`` /
-#   ``nonlocal``; free names resolve through enclosing functions to the
-#   module; class bodies are visible only to their own statements.
-# * ``self.x`` / ``cls.x`` / ``Class.x`` and class-body names are attributes of
-#   the class. A store in class C reaches a read in class E when C and E share
-#   a descendant (E is C, a subclass, a base, or a mixin combined with C), so
-#   sibling subclasses stay apart. Very large hierarchies share one namespace.
-# * Calls to functions and methods defined in the file bind their arguments to
-#   the callee's parameters through per-callee argument slots, and read the
-#   callee's return value. Taint that reached a function only through its own
-#   parameters never enters its return value: each call site already reads its
-#   own arguments, so one caller's secret cannot taint other callers' results.
+# Interprocedural flow is deliberately narrow. Only calls whose callee is
+# known from syntax alone, in O(1), bind arguments and read return values:
+#
+# * ``f(...)`` where ``f`` resolves lexically to functions (or a lambda
+#   assigned to the name) defined in this file; every definition bound to the
+#   name is one callee, so redefinitions cost nothing per call;
+# * ``self.m(...)`` / ``cls.m(...)`` in a method, ``Class.m(...)`` and
+#   ``super().m(...)``, through the class's own methods or those of its
+#   nearest in-file base (a bounded, precomputed lookup);
+# * ``Class(...)`` / ``cls(...)``, which bind to ``__init__``.
+#
+# Receivers of any other shape (``obj.m(...)``) are not resolved and bind
+# nothing, exactly as before. ``self.x`` / ``cls.x`` attributes are per class:
+# a read sees stores in the class and its in-file bases, never in siblings.
+
+_MODULE = 0
+_FUNCTION = 1
+_LAMBDA = 2
+_COMPREHENSION = 3
+_CLASS = 4
 
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
-_Comprehension = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
-# Values that can never be an instance of a class defined in this file.
-_LITERAL_VALUES = (
-    ast.Constant,
-    ast.JoinedStr,
-    ast.Dict,
-    ast.List,
-    ast.Set,
-    ast.Tuple,
-    ast.ListComp,
-    ast.SetComp,
-    ast.DictComp,
-    ast.GeneratorExp,
-)
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
 
-# Call-site positional arguments at or beyond this parameter index (and
-# anything after a ``*args`` unpacking) share one wildcard slot, keeping the
-# per-definition binding work bounded by a constant.
+# Call-site positional arguments at or beyond this parameter index (and any
+# after a ``*args`` unpacking) share one wildcard slot, so binding work per
+# definition is bounded by a constant.
 _MAX_POSITIONAL_SLOTS = 16
+# The in-file base lookup visits at most this many classes, scanning at most
+# this many bases of each, so it is a constant per class.
+_MAX_ANCESTORS = 8
+_MAX_BASES = 8
 
-# Inheritance components up to this many classes track attributes per class;
-# larger ones share one attribute namespace, keeping the work linear.
-_PRECISE_HIERARCHY_LIMIT = 32
-
-# Higher-order calls that run a callback with the remaining arguments, and the
-# position of the callback among their positional arguments.
-_CALLBACK_POSITIONS: dict[str, int] = {
-    "Thread": 1,
-    "Process": 1,
-    "Timer": 1,
-    "submit": 0,
-    "map": 0,
-    "imap": 0,
-    "imap_unordered": 0,
-    "starmap": 0,
-    "apply": 0,
-    "apply_async": 0,
-    "map_async": 0,
-    "starmap_async": 0,
-    "run_in_executor": 1,
-    "to_thread": 0,
-    "call_soon": 0,
-    "call_soon_threadsafe": 0,
-    "call_later": 1,
-    "call_at": 1,
-    "partial": 0,
-    "start_new_thread": 0,
-}
-_CALLBACK_KEYWORDS = frozenset({"target", "function", "func", "fn", "callback"})
-_PROPERTY_DECORATORS = frozenset({"property", "cached_property", "abstractproperty"})
-
-_NO_OWNER = -1
-
-# How a flow changes the facts it carries (see ``_mark_targets``).
+# How a flow changes the fact it carries (see ``_mark_targets``).
 _ASSIGN = 0  # cites the flow's own line
 _PASS = 1  # keeps the line of the fact it forwards
-_RETURN = 2  # into a function's return value
-_BIND = 3  # into a parameter, from a call site
+_RETURN = 2  # into a function's return summary: never carries bound facts
+_BIND = 3  # from a call-site argument into a callee's parameter slot
 
-_SOURCE_NAMES = tuple(sorted(_ALL_SOURCES))
-_SOURCE_INDEX = {name: index for index, name in enumerate(_SOURCE_NAMES)}
-# A fact label is ``2 * source index + from_parameter``.
-_LABELS = 2 * len(_SOURCE_NAMES)
+# One source per key, the most severe one. Which source is most severe
+# depends on the sink, so a key keeps it for two sink lanes; when the lanes
+# agree (almost always) they share one fact, which propagates once:
+#
+# * lane 0, network output: credential (TT3) > file read (TT4) > external
+#   input (TT2), so a helper's network or file source never hides a credential;
+# * lane 1, code execution and deserialization: external input (TT5/TT6) >
+#   file read (TT6) > credential (TT2), so a helper's credential never hides
+#   user or network input reaching ``exec`` or ``pickle.loads``.
+#
+# A sink reads its own lane; file writes (TT2 for every source) read lane 0.
+_SOURCE_NAMES: tuple[str, ...] = tuple(sorted(_ALL_SOURCES))
+_SOURCE_INDEX: dict[str, int] = {name: index for index, name in enumerate(_SOURCE_NAMES)}
+_LANE_RANKS: tuple[tuple[int, int], ...] = tuple(
+    (2, 0) if name in _CREDENTIAL_SOURCES else (0, 2) if name in _EXTERNAL_INPUT_SOURCES else (1, 1)
+    for name in _SOURCE_NAMES
+)
+_BOTH_LANES = 3
 
-
-class _Keys:
-    """Dense integer ids for taint keys, with their owner and display name.
-
-    A key's owner is the function whose locals it belongs to (or
-    ``_NO_OWNER``); its display is the spelling used in messages, kept as a
-    reference to identifiers already in the tree and joined only on output.
-    """
-
-    def __init__(self) -> None:
-        self.ids: dict[tuple[object, ...], int] = {}
-        self.owner: list[int] = []
-        self.display: list[str | tuple[str, ...]] = []
-        self.describe: list[tuple[object, ...]] = []
-
-    def get(
-        self, descriptor: tuple[object, ...], owner: int, display: str | tuple[str, ...]
-    ) -> int:
-        key = self.ids.get(descriptor)
-        if key is None:
-            key = self.fresh(owner, display, descriptor)
-            self.ids[descriptor] = key
-        return key
-
-    def fresh(
-        self, owner: int, display: str | tuple[str, ...], descriptor: tuple[object, ...]
-    ) -> int:
-        key = len(self.owner)
-        self.owner.append(owner)
-        self.display.append(display)
-        self.describe.append(descriptor)
-        return key
-
-    def name(self, key: int) -> str:
-        display = self.display[key]
-        return display if isinstance(display, str) else "".join(display)
+# A fact is (source index, line).
+_Fact = tuple[int, int]
 
 
-@dataclass(eq=False)
+def _noop() -> None:
+    return None
+
+
 class _Scope:
     """One Python namespace: module, function, lambda, comprehension or class body."""
 
-    kind: str
-    name: str
-    parent: _Scope | None
-    id: int
-    # Function whose locals live here (comprehensions belong to theirs).
-    owner: int
-    bound: set[str] = field(default_factory=set)
-    declared_global: set[str] = field(default_factory=set)
-    declared_nonlocal: set[str] = field(default_factory=set)
-    class_info: _ClassInfo | None = None
-    function: _FunctionInfo | None = None
+    __slots__ = (
+        "kind",
+        "parent",
+        "id",
+        "name",
+        "in_function",
+        "bound",
+        "declared_global",
+        "declared_nonlocal",
+        "children",
+        "names",
+        "definitions",
+        "function",
+        "class_def",
+    )
+
+    def __init__(self, kind: int, parent: _Scope | None, scope_id: int, name: str) -> None:
+        self.kind = kind
+        self.parent = parent
+        self.id = scope_id
+        self.name = name
+        # Whether facts bound from a call site stay bound in this scope's keys.
+        self.in_function = kind in (_FUNCTION, _LAMBDA) or (
+            kind == _COMPREHENSION and parent is not None and parent.in_function
+        )
+        self.bound: set[str] | None = None
+        self.declared_global: set[str] | None = None
+        self.declared_nonlocal: set[str] | None = None
+        self.children: list[_Scope] | None = None
+        # Name nodes, and def/class statements, whose names resolve in this scope.
+        self.names: list[ast.Name] | None = None
+        self.definitions: list[tuple[str, _Function | _ClassDef]] | None = None
+        self.function: _Function | None = None
+        self.class_def: _ClassDef | None = None
+
+    def bind(self, name: str) -> None:
+        if self.bound is None:
+            self.bound = set()
+        self.bound.add(name)
+
+    def request(self, node: ast.Name) -> None:
+        if self.names is None:
+            self.names = []
+        self.names.append(node)
+
+    def define(self, name: str, definition: _Function | _ClassDef) -> None:
+        self.bind(name)
+        if self.definitions is None:
+            self.definitions = []
+        self.definitions.append((name, definition))
 
 
-@dataclass(eq=False)
-class _ClassInfo:
-    node: ast.ClassDef
-    scope: _Scope
-    parent: _Scope
-    logical: _LogicalClass | None = None
+class _Function:
+    """A ``def``/``async def`` or lambda, with the callee groups it belongs to."""
+
+    __slots__ = ("node", "scope", "kind", "key", "groups")
+
+    def __init__(self, node: _FunctionNode | ast.Lambda, scope: _Scope) -> None:
+        self.node = node
+        self.scope = scope
+        self.kind = "function"  # function | instance | class | static
+        self.key = -1  # key of the name the definition binds
+        self.groups: list[_Group] = []
 
 
-@dataclass(eq=False)
-class _LogicalClass:
-    """Every ``class`` statement bound to one name in one scope (redefinitions merge)."""
+class _ClassDef:
+    __slots__ = ("node", "scope", "key", "cls")
 
-    id: int
-    name: str
-    infos: list[_ClassInfo] = field(default_factory=list)
-    bases: list[_LogicalClass] = field(default_factory=list)
-    subclasses: list[_LogicalClass] = field(default_factory=list)
-    methods: set[str] = field(default_factory=set)
-    properties: set[str] = field(default_factory=set)
-    component: int = -1
-    # Attribute namespace: the class itself, or its whole component when large.
-    unit: int = -1
-    precise: bool = True
-    mro: list[_LogicalClass] = field(default_factory=list)
-    ancestors: set[int] = field(default_factory=set)
-    descendants: set[int] = field(default_factory=set)
-    # Classes sharing a descendant with this one (including itself).
-    sharing: list[_LogicalClass] = field(default_factory=list)
-    sharing_ids: set[int] = field(default_factory=set)
+    def __init__(self, node: ast.ClassDef, scope: _Scope) -> None:
+        self.node = node
+        self.scope = scope
+        self.key = -1
+        self.cls: _Class | None = None
 
 
-@dataclass(eq=False)
-class _FunctionInfo:
-    node: _FunctionNode | ast.Lambda
-    scope: _Scope
-    kind: str = "function"  # function | instance | class | static
-    # Groups whose return value this function produces.
-    groups: list[_Group] = field(default_factory=list)
+class _Class:
+    """Every ``class`` statement bound to one name (redefinitions merge)."""
+
+    __slots__ = ("id", "defs", "bases", "methods", "ancestors")
+
+    def __init__(self, class_id: int) -> None:
+        self.id = class_id
+        self.defs: list[_ClassDef] = []
+        self.bases: list[_Class] = []
+        self.methods: dict[str, dict[str, _Group]] = {}
+        self.ancestors: list[_Class] | None = None
 
 
-@dataclass(eq=False)
 class _Group:
-    """Functions reached through one callable name; they share argument slots."""
+    """One callee: every function bound to a name, or every same-kind method
+    of a class with one name. Call sites bind into its argument slots, which
+    flow into each definition's parameters once."""
 
-    id: int
-    kind: str
-    label: str
-    functions: list[_FunctionInfo] = field(default_factory=list)
-    keyword_params: set[str] = field(default_factory=set)
-    has_kwarg: bool = False
-    slots: dict[object, int] = field(default_factory=dict)
-    returns: int | None = None
+    __slots__ = ("id", "kind", "functions", "keyword_params", "has_kwarg", "slots")
 
-    def add(self, function: _FunctionInfo) -> None:
+    def __init__(self, group_id: int, kind: str) -> None:
+        self.id = group_id
+        self.kind = kind
+        self.functions: list[_Function] = []
+        self.keyword_params: set[str] = set()
+        self.has_kwarg = False
+        self.slots: dict[object, int] = {}
+
+    def add(self, function: _Function) -> None:
         self.functions.append(function)
+        function.groups.append(self)
         args = function.node.args
         self.keyword_params.update(arg.arg for arg in args.args)
         self.keyword_params.update(arg.arg for arg in args.kwonlyargs)
         self.has_kwarg = self.has_kwarg or args.kwarg is not None
 
 
-@dataclass(eq=False)
-class _BindingSet:
-    """The callees one call site binds into, each with its receiver offset."""
-
-    id: int
+class _CallTargets(NamedTuple):
+    # (callee, receiver offset) pairs the call binds its arguments into.
     members: tuple[tuple[_Group, int], ...]
-    targets: dict[object, tuple[int, ...]] = field(default_factory=dict)
-
-
-@dataclass(eq=False)
-class _CallInfo:
-    binding: _BindingSet | None
+    # Callees whose return summary the call's value reads.
     results: tuple[_Group, ...]
-    # Key of the call's value (return plus arguments), for in-file callees.
-    value: int | None
 
 
-@dataclass(eq=False)
-class _TypeInfo:
-    """What a variable or attribute is assigned, as far as call binding cares.
-
-    A recorded binding that is neither an in-file instance nor unknown is a
-    literal, library object, function or module: no in-file method.
-    """
-
-    classes: list[_LogicalClass] = field(default_factory=list)
-    dynamic: bool = False  # instance of a class or of any subclass (``cls()``)
-    unknown: bool = False  # some value of unknown type
-
-
-class _Receiver(NamedTuple):
-    classes: list[_LogicalClass]
-    dynamic: bool  # may be any subclass instance (``self``, ``cls()``)
-    class_object: bool  # the class itself rather than an instance
-    fallback: bool  # unknown: may be an instance of any class in the file
-
-
-_UNKNOWN_VALUE = object()
-_KNOWN_VALUE = object()
+_NO_TARGETS = _CallTargets((), ())
 
 
 def _parameters(args: ast.arguments) -> list[ast.arg]:
@@ -712,8 +629,12 @@ def _method_kind(node: _FunctionNode) -> str:
     return "instance"
 
 
-def _receiver_offset(class_object: bool, kind: str) -> int:
-    """Leading parameters a call binds implicitly (``self`` / ``cls``)."""
+def _receiver_offset(kind: str, class_object: bool) -> int:
+    """Leading parameters a call binds implicitly (``self`` / ``cls``).
+
+    ``self.m(x)`` binds ``x`` to an instance method's second parameter;
+    ``Class.m(obj, x)`` and ``cls.m(obj, x)`` pass ``obj`` explicitly.
+    """
     if kind == "class":
         return 1
     if kind == "instance":
@@ -721,593 +642,276 @@ def _receiver_offset(class_object: bool, kind: str) -> int:
     return 0
 
 
-def _root_name(node: ast.expr) -> str | None:
-    """The name at the root of ``a.b().c[0]``, if any."""
-    while True:
-        if isinstance(node, ast.Name):
-            return node.id
-        if isinstance(node, (ast.Attribute, ast.Subscript)):
-            node = node.value
-        elif isinstance(node, ast.Call):
-            node = node.func
-        else:
-            return None
-
-
-def _is_super_call(node: ast.expr) -> bool:
-    return (
-        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "super"
-    )
-
-
-def _callee_name(func: ast.expr) -> str | None:
-    if isinstance(func, ast.Name):
-        return func.id
-    if isinstance(func, ast.Attribute):
-        return func.attr
-    return None
-
-
-def _noop() -> None:
-    return None
-
-
-def _linearize(cls: _LogicalClass) -> list[_LogicalClass]:
-    """C3 method resolution order over in-file bases; DFS order if inconsistent."""
-    order: list[_LogicalClass] = []
-    pending: list[tuple[_LogicalClass, bool]] = [(cls, False)]
-    linearized: dict[int, list[_LogicalClass]] = {}
-    visiting: set[int] = set()
-    while pending:
-        current, expanded = pending.pop()
-        if current.id in linearized:
-            continue
-        if not expanded:
-            if current.id in visiting:  # inheritance cycle through redefinitions
-                linearized[current.id] = [current]
-                continue
-            visiting.add(current.id)
-            pending.append((current, True))
-            pending.extend((base, False) for base in reversed(current.bases))
-            continue
-        visiting.discard(current.id)
-        sequences = [list(linearized.get(base.id, [base])) for base in current.bases]
-        sequences.append(list(current.bases))
-        merged = [current]
-        while True:
-            sequences = [sequence for sequence in sequences if sequence]
-            if not sequences:
-                break
-            for sequence in sequences:
-                head = sequence[0]
-                if not any(head in other[1:] for other in sequences):
-                    break
-            else:
-                merged = []
-                break
-            merged.append(head)
-            for sequence in sequences:
-                if sequence[0] is head:
-                    del sequence[0]
-        if not merged:
-            seen: set[int] = set()
-            stack = [current]
-            while stack:
-                item = stack.pop()
-                if item.id in seen:
-                    continue
-                seen.add(item.id)
-                merged.append(item)
-                stack.extend(reversed(item.bases))
-        linearized[current.id] = merged
-    order = linearized.get(cls.id, [cls])
-    return order
-
-
-@dataclass(eq=False)
 class _ScopeIndex:
-    """Lexical scopes of one module plus what is needed to bind call sites."""
+    """Lexical scopes of one module plus the in-file callees calls can bind to."""
 
-    aliases: dict[str, str]
-    type_map: dict[str, str]
-    keys: _Keys = field(default_factory=_Keys)
-    scopes: list[_Scope] = field(default_factory=list)
-    # Assign / Return / Call / Lambda / comprehension nodes with their scope,
-    # in ``ast.walk`` order.
-    statements: list[tuple[ast.AST, _Scope]] = field(default_factory=list)
-    call_scope: dict[ast.Call, _Scope] = field(default_factory=dict)
-    # Nodes evaluated in a different scope than their parent (lambda bodies,
-    # comprehension elements, targets and conditions).
-    scope_switch: dict[ast.AST, _Scope] = field(default_factory=dict)
-    functions: list[_FunctionInfo] = field(default_factory=list)
-    lambdas: dict[ast.Lambda, _FunctionInfo] = field(default_factory=dict)
-    classes: list[_ClassInfo] = field(default_factory=list)
-    logical: list[_LogicalClass] = field(default_factory=list)
-    groups: dict[tuple[object, ...], _Group] = field(default_factory=dict)
-    function_groups: dict[int, list[_Group]] = field(default_factory=dict)
-    unit_groups: dict[tuple[int, str], list[_Group]] = field(default_factory=dict)
-    fallback_groups: dict[str, list[_Group]] = field(default_factory=dict)
-    definers: dict[tuple[int, str], list[_LogicalClass]] = field(default_factory=dict)
-    classes_by_key: dict[int, list[_LogicalClass]] = field(default_factory=dict)
-    # Key of each method's receiver parameter -> (class, whether it is ``cls``).
-    self_keys: dict[int, tuple[_LogicalClass, bool]] = field(default_factory=dict)
-    var_types: dict[int, _TypeInfo] = field(default_factory=dict)
-    # Raw bindings recorded while scoping, typed once classes are known.
-    name_stores: list[tuple[_Scope, str, object]] = field(default_factory=list)
-    attribute_stores: list[tuple[_Scope, ast.Attribute, object]] = field(default_factory=list)
-    lambda_bindings: list[tuple[_Scope, str, ast.Lambda]] = field(default_factory=list)
-    attribute_loads: list[tuple[ast.Attribute, _Scope]] = field(default_factory=list)
-    attribute_reads: dict[tuple[int, str], int] = field(default_factory=dict)
-    binding_sets: dict[tuple[tuple[int, int], ...], _BindingSet] = field(default_factory=dict)
-    alias_roots: set[str] = field(default_factory=set)
-    _resolved: dict[tuple[int, str], int] = field(default_factory=dict)
-    _calls: dict[ast.Call, _CallInfo] = field(default_factory=dict)
-    _methods: dict[tuple[int, str, bool], list[_Group]] = field(default_factory=dict)
+    def __init__(self, aliases: dict[str, str], type_map: dict[str, str]) -> None:
+        self.aliases = aliases
+        self.type_map = type_map
+        self.scopes: list[_Scope] = []
+        # Statements and expressions that create flows, with their scope, in
+        # ``ast.walk`` (breadth-first) order: Assign, Return and Call.
+        self.statements: list[tuple[ast.AST, _Scope]] = []
+        self.functions: list[_Function] = []
+        self.lambdas: dict[ast.Lambda, _Function] = {}
+        self.lambda_bindings: list[tuple[ast.Name, ast.Lambda]] = []
+        self.class_defs: list[_ClassDef] = []
+        self.classes: list[_Class] = []
+        self.attributes: list[ast.Attribute] = []
+        self.super_scopes: dict[ast.Call, _Scope] = {}
+        # Keys: an id per (scope id, name) or per synthetic descriptor.
+        self._ids: dict[tuple[object, ...], int] = {}
+        self.key_scope: list[_Scope | None] = []
+        self.key_name: list[str] = []
+        # 1 when a fact bound from a call site stays bound in the key (function
+        # locals); 0 for module, class and attribute state, where it becomes
+        # an ordinary fact.
+        self.local = bytearray()
+        self.name_key: dict[ast.Name, int] = {}
+        self.class_of_key: dict[int, _Class] = {}
+        self.function_groups: dict[int, _Group] = {}
+        self.groups: list[_Group] = []
+        # Key of each method's ``self``/``cls`` parameter -> (class, is ``cls``).
+        self.receivers: dict[int, tuple[_Class, bool]] = {}
+        # Attribute read keys (``self.x`` / ``cls.x``) by node and by (class, attr).
+        self.views: dict[ast.Attribute, int] = {}
+        self.view_list: list[tuple[_Class, str, int]] = []
+        self._calls: dict[ast.Call, _CallTargets] = {}
+        self._lookups: dict[tuple[int, str, int], tuple[_Group, ...]] = {}
+        self._lambda_groups: dict[ast.Lambda, _Group] = {}
 
     @property
     def module(self) -> _Scope:
         return self.scopes[0]
 
-    def new_scope(self, kind: str, name: str, parent: _Scope | None) -> _Scope:
-        scope_id = len(self.scopes)
-        if kind in ("function", "lambda"):
-            owner = scope_id
-        elif kind == "comprehension" and parent is not None:
-            owner = parent.owner
-        else:
-            owner = _NO_OWNER
-        scope = _Scope(kind, name, parent, scope_id, owner)
+    def new_scope(self, kind: int, parent: _Scope | None, name: str) -> _Scope:
+        scope = _Scope(kind, parent, len(self.scopes), name)
         self.scopes.append(scope)
+        if parent is not None:
+            if parent.children is None:
+                parent.children = []
+            parent.children.append(scope)
         return scope
 
-    # ── names ──
+    # ── keys ──
 
-    def binding_scope(self, scope: _Scope, name: str) -> _Scope:
-        """The scope *name* is bound in when read or written in *scope*.
-
-        Follows Python's rules: a name bound anywhere in a function body is
-        local to it unless declared ``global``/``nonlocal``; free names
-        resolve through enclosing function scopes (closures) to the module.
-        Class bodies are visible only to their own statements, not to methods.
-        """
-        current: _Scope | None = scope
-        while current is not None and current.kind != "module":
-            if current is scope or current.kind != "class":
-                if name in current.declared_global:
-                    break
-                if name in current.bound and name not in current.declared_nonlocal:
-                    return current
-            current = current.parent
-        return self.module
-
-    def binding_key(self, scope: _Scope, name: str) -> int:
-        """Key of *name* bound in *scope* itself."""
-        if scope.kind == "class" and scope.class_info is not None:
-            logical = scope.class_info.logical
-            if logical is not None:
-                return self.keys.get((-1, logical.unit, name), _NO_OWNER, name)
-        return self.keys.get((scope.id, name), scope.owner, name)
-
-    def resolve(self, scope: _Scope, name: str) -> int:
-        """Return the key *name* refers to when read or written in *scope*."""
-        cache_key = (scope.id, name)
-        key = self._resolved.get(cache_key)
-        if key is None:
-            key = self.binding_key(self.binding_scope(scope, name), name)
-            self._resolved[cache_key] = key
+    def _new_key(self, scope: _Scope | None, name: str, local: bool) -> int:
+        key = len(self.key_scope)
+        self.key_scope.append(scope)
+        self.key_name.append(name)
+        self.local.append(1 if local else 0)
         return key
 
-    def is_module_import(self, scope: _Scope, name: str) -> bool:
-        """Whether *name* is an imported module/object or a builtin, not a local."""
-        bound = self.binding_scope(scope, name)
-        if bound.kind != "module":
-            return False
-        return name in self.alias_roots or name not in bound.bound
+    def key(self, scope: _Scope, name: str) -> int:
+        """Key of *name* bound in *scope* itself."""
+        ident = (scope.id, name)
+        key = self._ids.get(ident)
+        if key is None:
+            key = self._new_key(scope, name, scope.in_function)
+            self._ids[ident] = key
+        return key
 
-    # ── classes and attributes ──
+    def synthetic(self, ident: tuple[object, ...], local: bool, name: str = "") -> int:
+        key = self._ids.get(ident)
+        if key is None:
+            key = self._new_key(None, name, local)
+            self._ids[ident] = key
+        return key
 
-    def receiver_classes(self, scope: _Scope, name: str) -> list[_LogicalClass]:
-        """Classes whose attribute namespace ``name.x`` refers to.
+    def visible(self, key: int, root: _Scope) -> bool:
+        """Whether a read evaluated from *root* carries *key*'s data.
 
-        ``self``/``cls`` in a method, a class itself, or a variable assigned an
-        instance of an in-file class in its own scope (``cfg = Config()``).
+        A lambda's parameters and a comprehension's targets live only inside
+        it: an expression that merely contains the lambda or comprehension
+        does not hold their values (a function object does not carry its
+        arguments), so they are skipped unless the walk starts in that scope.
         """
-        key = self.resolve(scope, name)
-        entry = self.self_keys.get(key)
-        if entry is not None:
-            return [entry[0]]
-        classes = self.classes_by_key.get(key)
-        if classes:
-            return classes
-        info = self.var_types.get(key)
-        return info.classes if info is not None else []
+        owner = self.key_scope[key]
+        return owner is None or owner is root or owner.kind not in (_LAMBDA, _COMPREHENSION)
 
-    def attribute_store(self, node: ast.Attribute, scope: _Scope) -> list[int]:
-        """Keys written by ``self.x = ...`` / ``cls.x = ...`` / ``Class.x = ...``."""
-        if not isinstance(node.value, ast.Name):
-            return []
-        display = (node.value.id, ".", node.attr)
-        return [
-            self.keys.get((-1, cls.unit, node.attr), _NO_OWNER, display)
-            for cls in self.receiver_classes(scope, node.value.id)
-        ]
+    # ── callees ──
 
-    def attribute_load(self, node: ast.Attribute, scope: _Scope) -> list[int]:
-        """Keys read by ``self.x`` / ``cls.x`` / ``Class.x``."""
-        if not isinstance(node.value, ast.Name):
-            return []
-        classes = self.receiver_classes(scope, node.value.id)
-        if not classes:
-            return []
-        display = (node.value.id, ".", node.attr)
-        keys: list[int] = []
-        for cls in classes:
-            if not cls.precise:
-                keys.append(self.keys.get((-1, cls.unit, node.attr), _NO_OWNER, display))
-                continue
-            read_key = (cls.id, node.attr)
-            key = self.attribute_reads.get(read_key)
-            if key is None:
-                key = self.keys.get((-2, cls.id, node.attr), _NO_OWNER, display)
-                self.attribute_reads[read_key] = key
-            keys.append(key)
-        return keys
-
-    def attribute_type(self, cls: _LogicalClass, attr: str) -> _TypeInfo:
-        """Union of what ``self.<attr>`` is assigned across the classes that see it."""
-        result = _TypeInfo()
-        recorded = False
-        for other in cls.sharing if cls.precise else [cls]:
-            key = self.keys.ids.get((-1, other.unit, attr))
-            info = self.var_types.get(key) if key is not None else None
-            if info is None:
-                continue
-            recorded = True
-            result.classes.extend(c for c in info.classes if c not in result.classes)
-            result.dynamic = result.dynamic or info.dynamic
-            result.unknown = result.unknown or info.unknown
-        if not recorded:
-            result.unknown = True
-        return result
-
-    # ── call resolution ──
-
-    def group(self, identity: tuple[object, ...], kind: str, label: str) -> _Group:
-        group = self.groups.get(identity)
+    def function_group(self, key: int) -> _Group:
+        group = self.function_groups.get(key)
         if group is None:
-            group = _Group(len(self.groups), kind, label)
-            self.groups[identity] = group
+            group = self._new_group("function")
+            self.function_groups[key] = group
         return group
 
-    def method_groups(self, cls: _LogicalClass, name: str, *, exact: bool) -> list[_Group]:
-        """Groups ``obj.<name>`` may dispatch to when ``obj`` is a *cls* instance.
+    def _new_group(self, kind: str) -> _Group:
+        group = _Group(len(self.groups), kind)
+        self.groups.append(group)
+        return group
 
-        *exact* means the receiver is exactly *cls* (``Cls()``, ``obj = Cls()``);
-        otherwise it may be any subclass (``self``, ``cls``), so overrides in
-        subclasses and in mixins combined with *cls* are included too.
+    def method_group(self, cls: _Class, name: str, kind: str) -> _Group:
+        kinds = cls.methods.setdefault(name, {})
+        group = kinds.get(kind)
+        if group is None:
+            group = self._new_group(kind)
+            kinds[kind] = group
+        return group
+
+    def ancestors(self, cls: _Class, tick: Callable[[], None]) -> list[_Class]:
+        """*cls* then its in-file bases, depth-first left to right, bounded."""
+        if cls.ancestors is None:
+            tick()
+            order: list[_Class] = []
+            seen: set[int] = set()
+            stack = [cls]
+            while stack and len(order) < _MAX_ANCESTORS:
+                current = stack.pop()
+                if current.id in seen:
+                    continue
+                seen.add(current.id)
+                order.append(current)
+                stack.extend(reversed(current.bases[:_MAX_BASES]))
+            cls.ancestors = order
+        return cls.ancestors
+
+    def lookup(
+        self, cls: _Class, name: str, skip: int, tick: Callable[[], None]
+    ) -> tuple[_Group, ...]:
+        """Method groups named *name* on the nearest class in *cls*'s lookup chain.
+
+        *skip* is 1 for ``super()``, which starts after the class itself.
         """
-        cache_key = (cls.id, name, exact)
-        cached = self._methods.get(cache_key)
-        if cached is not None:
-            return cached
-        result: list[_Group] = []
-        if not cls.precise:
-            result.extend(self.unit_groups.get((cls.unit, name), ()))
-        else:
-            first = next((c for c in cls.mro if name in c.methods), None)
-            if first is not None:
-                result.extend(self.unit_groups.get((first.unit, name), ()))
-            if not exact:
-                for other in self.definers.get((cls.component, name), ()):
-                    if (
-                        other is not first
-                        and other.id in cls.sharing_ids
-                        and other.id not in cls.ancestors
-                    ):
-                        result.extend(self.unit_groups.get((other.unit, name), ()))
-        self._methods[cache_key] = result
-        return result
+        memo = (cls.id, name, skip)
+        found = self._lookups.get(memo)
+        if found is None:
+            found = ()
+            for candidate in self.ancestors(cls, tick)[skip:]:
+                kinds = candidate.methods.get(name)
+                if kinds:
+                    found = tuple(kinds.values())
+                    break
+            self._lookups[memo] = found
+        return found
 
-    def super_groups(self, cls: _LogicalClass, name: str) -> list[_Group]:
-        """Groups ``super().<name>`` may reach from a method of *cls*."""
-        if not cls.precise:
-            return list(self.unit_groups.get((cls.unit, name), ()))
-        result: list[_Group] = []
-        first = next((c for c in cls.mro[1:] if name in c.methods), None)
-        if first is not None:
-            result.extend(self.unit_groups.get((first.unit, name), ()))
-        for other in self.definers.get((cls.component, name), ()):
-            if (
-                other is not first
-                and other.id in cls.sharing_ids
-                and other.id not in cls.ancestors
-                and other.id not in cls.descendants
-            ):
-                result.extend(self.unit_groups.get((other.unit, name), ()))
-        return result
-
-    def super_class(self, call: ast.Call, scope: _Scope) -> _LogicalClass | None:
+    def super_class(self, call: ast.Call) -> _Class | None:
+        """The class whose bases ``super()`` / ``super(C, obj)`` starts from."""
+        func = call.func
+        if not isinstance(func, ast.Name) or func.id != "super":
+            return None
+        key = self.name_key.get(func)
+        if key is None or self.key_scope[key] is not self.module:
+            return None
+        if self.module.bound is not None and "super" in self.module.bound:
+            return None  # shadowed builtin
         if call.args:
             first = call.args[0]
             if isinstance(first, ast.Name):
-                classes = self.classes_by_key.get(self.resolve(scope, first.id))
-                return classes[0] if classes else None
+                return self.class_of_key.get(self.name_key.get(first, -1))
             return None
-        current: _Scope | None = scope
-        while current is not None and current.kind in ("comprehension", "lambda"):
-            current = current.parent
-        if current is None or current.kind != "function":
+        scope = self.super_scopes.get(call)
+        while scope is not None and scope.kind in (_LAMBDA, _COMPREHENSION):
+            scope = scope.parent
+        if scope is None or scope.kind != _FUNCTION:
             return None
-        parent = current.parent
-        if parent is None or parent.class_info is None:
+        parent = scope.parent
+        if parent is None or parent.class_def is None:
             return None
-        return parent.class_info.logical
+        return parent.class_def.cls
 
-    def value_type(self, value: ast.expr, scope: _Scope) -> object:
-        """Classes *value* is an instance of: a ``(classes, dynamic)`` pair,
-        ``_KNOWN_VALUE`` (literal, library object, function) or ``_UNKNOWN_VALUE``."""
-        if isinstance(value, _LITERAL_VALUES) or isinstance(value, ast.Lambda):
-            return _KNOWN_VALUE
-        if not isinstance(value, ast.Call):
-            return _UNKNOWN_VALUE
-        func = value.func
-        if isinstance(func, ast.Name):
-            key = self.resolve(scope, func.id)
-            classes = self.classes_by_key.get(key)
-            if classes:
-                return classes, False
-            entry = self.self_keys.get(key)
-            if entry is not None and entry[1]:
-                return [entry[0]], True
-            if key in self.function_groups:
-                return _UNKNOWN_VALUE
-            return _KNOWN_VALUE if self.is_module_import(scope, func.id) else _UNKNOWN_VALUE
-        root = _root_name(func)
-        if root is not None and root in self.alias_roots and self.is_module_import(scope, root):
-            return _KNOWN_VALUE
-        return _UNKNOWN_VALUE
-
-    def receiver(self, node: ast.expr, scope: _Scope) -> _Receiver:
-        """What ``node.m(...)`` may dispatch on."""
-        none = _Receiver([], False, False, False)
-        if isinstance(node, ast.Name):
-            key = self.resolve(scope, node.id)
-            entry = self.self_keys.get(key)
-            if entry is not None:
-                return _Receiver([entry[0]], True, entry[1], False)
-            classes = self.classes_by_key.get(key)
-            if classes:
-                return _Receiver(classes, False, True, False)
-            info = self.var_types.get(key)
-            if info is None:
-                # Never bound in this file: a builtin or a star import.
-                unbound_local = not self.is_module_import(scope, node.id)
-                return _Receiver([], False, False, unbound_local)
-            if info.classes:
-                return _Receiver(info.classes, info.dynamic, False, False)
-            return _Receiver([], False, False, info.unknown)
-        if isinstance(node, _LITERAL_VALUES):
-            return none
-        if isinstance(node, ast.Call):
-            found = self.value_type(node, scope)
-            if isinstance(found, tuple):
-                classes, dynamic = found
-                return _Receiver(classes, dynamic, False, False)
-            return _Receiver([], False, False, found is _UNKNOWN_VALUE)
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            classes = self.receiver_classes(scope, node.value.id)
-            if classes:
-                result = _TypeInfo()
-                for cls in classes:
-                    info = self.attribute_type(cls, node.attr)
-                    result.classes.extend(c for c in info.classes if c not in result.classes)
-                    result.dynamic = result.dynamic or info.dynamic
-                    result.unknown = result.unknown or info.unknown
-                if result.classes:
-                    return _Receiver(result.classes, result.dynamic, False, False)
-                return _Receiver([], False, False, result.unknown)
-        root = _root_name(node)
-        if root is not None and root in self.alias_roots and self.is_module_import(scope, root):
-            return none
-        return _Receiver([], False, False, True)
-
-    def resolve_callee(
-        self, func: ast.expr, scope: _Scope, *, fallback: bool
-    ) -> tuple[list[tuple[_Group, int]], list[_Group]]:
-        """Callees ``func(...)`` may run: ``(group, receiver offset)`` pairs to
-        bind arguments into, and the groups whose return value the call yields.
-
-        A plain name resolves lexically to the functions bound to it, or to the
-        ``__init__`` of a class it names (``cls(...)`` in a classmethod too).
-        ``obj.m`` resolves through ``obj``'s class: ``self``/``cls``, a class,
-        an instance built in this scope or stored on ``self``, or
-        ``super()``. With *fallback*, a receiver of unknown type binds into
-        every method named ``m`` in the file, but its return value is not read.
-        """
+    def call_targets(self, call: ast.Call, tick: Callable[[], None]) -> _CallTargets:
+        """The in-file callees a call reaches, resolved from syntax alone."""
+        cached = self._calls.get(call)
+        if cached is not None:
+            return cached
         members: list[tuple[_Group, int]] = []
         results: list[_Group] = []
+        func = call.func
         if isinstance(func, ast.Name):
-            key = self.resolve(scope, func.id)
-            for group in self.function_groups.get(key, ()):
+            key = self.name_key.get(func, -1)
+            group = self.function_groups.get(key)
+            if group is not None:
                 members.append((group, 0))
                 results.append(group)
-            constructed = list(self.classes_by_key.get(key, ()))
-            exact = True
-            entry = self.self_keys.get(key)
-            if entry is not None and entry[1]:
-                constructed.append(entry[0])
-                exact = False
-            for cls in constructed:
-                for group in self.method_groups(cls, "__init__", exact=exact):
-                    members.append((group, _receiver_offset(False, group.kind)))
-            return members, results
-        if not isinstance(func, ast.Attribute):
-            return members, results
-        if _is_super_call(func.value):
-            assert isinstance(func.value, ast.Call)
-            cls = self.super_class(func.value, scope)
+            constructed = self.class_of_key.get(key)
+            receiver = self.receivers.get(key)
+            if receiver is not None and receiver[1]:
+                constructed = receiver[0]  # cls(...) in a classmethod
+            if constructed is not None:
+                for group in self.lookup(constructed, "__init__", 0, tick):
+                    members.append((group, 0 if group.kind == "static" else 1))
+        elif isinstance(func, ast.Lambda):
+            function = self.lambdas.get(func)
+            if function is not None:
+                group = self._lambda_groups.get(func)
+                if group is None:
+                    group = self._new_group("function")
+                    group.add(function)
+                    self._lambda_groups[func] = group
+                members.append((group, 0))
+        elif isinstance(func, ast.Attribute):
+            value = func.value
+            cls: _Class | None = None
+            class_object = False
+            skip = 0
+            if isinstance(value, ast.Name):
+                key = self.name_key.get(value, -1)
+                receiver = self.receivers.get(key)
+                if receiver is not None:
+                    cls, class_object = receiver
+                else:
+                    cls = self.class_of_key.get(key)
+                    class_object = True
+            elif isinstance(value, ast.Call):
+                cls = self.super_class(value)
+                skip = 1
             if cls is not None:
-                for group in self.super_groups(cls, func.attr):
-                    members.append((group, _receiver_offset(False, group.kind)))
+                for group in self.lookup(cls, func.attr, skip, tick):
+                    members.append((group, _receiver_offset(group.kind, class_object)))
                     results.append(group)
-            return members, results
-        receiver = self.receiver(func.value, scope)
-        if receiver.classes:
-            for cls in receiver.classes:
-                for group in self.method_groups(cls, func.attr, exact=not receiver.dynamic):
-                    members.append((group, _receiver_offset(receiver.class_object, group.kind)))
-                    results.append(group)
-        elif receiver.fallback and fallback and not func.attr.startswith("__"):
-            # Dunder methods run through syntax (``Cls(...)``, ``super()``),
-            # not through explicit calls on unknown objects.
-            for group in self.fallback_groups.get(func.attr, ()):
-                members.append((group, _receiver_offset(False, group.kind)))
-        return members, results
+        found = _CallTargets(tuple(members), tuple(results)) if members else _NO_TARGETS
+        self._calls[call] = found
+        return found
 
-    def binding_set(self, members: list[tuple[_Group, int]]) -> _BindingSet:
-        identity = tuple(dict.fromkeys((group.id, offset) for group, offset in members))
-        bset = self.binding_sets.get(identity)
-        if bset is None:
-            by_id = {group.id: group for group, _ in members}
-            bset = _BindingSet(
-                len(self.binding_sets),
-                tuple((by_id[group_id], offset) for group_id, offset in identity),
-            )
-            self.binding_sets[identity] = bset
-        return bset
+    # ── attributes ──
 
-    def call_info(self, call: ast.Call, scope: _Scope) -> _CallInfo:
-        info = self._calls.get(call)
-        if info is None:
-            members, results = self.resolve_callee(call.func, scope, fallback=True)
-            binding = self.binding_set(members) if members else None
-            value = None
-            if members:
-                name = _callee_name(call.func) or "<call>"
-                value = self.keys.fresh(scope.owner, (name, "()"), ("call", call))
-            info = _CallInfo(binding, tuple(dict.fromkeys(results)), value)
-            self._calls[call] = info
-        return info
+    def receiver_class(self, node: ast.Attribute) -> _Class | None:
+        """The class of ``self`` / ``cls`` in ``self.x`` / ``cls.x``, if it is one."""
+        if not isinstance(node.value, ast.Name):
+            return None
+        receiver = self.receivers.get(self.name_key.get(node.value, -1))
+        return receiver[0] if receiver is not None else None
 
-    def is_value_call(self, node: ast.AST) -> bool:
-        if not isinstance(node, ast.Call):
-            return False
-        scope = self.call_scope.get(node)
-        return scope is not None and self.call_info(node, scope).value is not None
+    def attribute_store(self, node: ast.Attribute) -> int | None:
+        cls = self.receiver_class(node)
+        if cls is None:
+            return None
+        return self.synthetic(("store", cls.id, node.attr), False)
 
-    # ── reads ──
-
-    def flow_reads(
-        self, node: ast.AST, scope: _Scope, check_runtime: Callable[[], None]
-    ) -> Iterator[int]:
-        """Keys an expression's value depends on, for building flows.
-
-        Names resolve through their scope; ``self.x`` resolves to the class
-        attribute; a call to a function defined in this file is read through
-        its value key and not re-walked, keeping nested calls linear.
-        """
-        switch = self.scope_switch
-        queue: deque[tuple[ast.AST, _Scope]] = deque([(node, scope)])
-        while queue:
-            check_runtime()
-            child, current = queue.popleft()
-            if isinstance(child, ast.Name):
-                yield self.resolve(current, child.id)
-                continue
-            if isinstance(child, ast.Call):
-                info = self.call_info(child, current)
-                if info.value is not None:
-                    yield info.value
-                    continue
-            elif isinstance(child, ast.Attribute):
-                yield from self.attribute_load(child, current)
-            for grandchild in ast.iter_child_nodes(child):
-                if not isinstance(grandchild, ast.expr_context):
-                    queue.append((grandchild, switch.get(grandchild, current)))
-
-    def references(
-        self,
-        node: ast.AST,
-        scope: _Scope,
-        check_runtime: Callable[[], None],
-        *,
-        skip_root: bool = False,
-    ) -> Iterator[tuple[int, bool]]:
-        """Yield ``(key, plain_name)`` for every key an expression reads.
-
-        Walks in ``ast.walk`` order. ``plain_name`` marks keys read through a
-        variable name (or ``name[...]``), the only reads earlier releases saw;
-        ``self.x`` and calls to functions defined in this file are the rest.
-        """
-        switch = self.scope_switch
-        queue: deque[tuple[ast.AST, _Scope]] = deque([(node, scope)])
-        while queue:
-            check_runtime()
-            child, current = queue.popleft()
-            if not (skip_root and child is node):
-                if isinstance(child, ast.Name):
-                    yield self.resolve(current, child.id), True
-                elif isinstance(child, ast.Subscript) and isinstance(child.value, ast.Name):
-                    yield self.resolve(current, child.value.id), True
-                elif isinstance(child, ast.Attribute):
-                    for key in self.attribute_load(child, current):
-                        yield key, False
-                elif isinstance(child, ast.Call):
-                    info = self.call_info(child, current)
-                    if info.value is not None:
-                        yield info.value, False
-            for grandchild in ast.iter_child_nodes(child):
-                if not isinstance(grandchild, ast.expr_context):
-                    queue.append((grandchild, switch.get(grandchild, current)))
-
-    def assign_targets(self, target: ast.expr, scope: _Scope) -> list[int]:
-        """Keys written by one assignment target (names, ``self.x``, tuples of them)."""
-        elements = target.elts if isinstance(target, ast.Tuple) else [target]
-        targets: list[int] = []
-        for element in elements:
-            if isinstance(element, ast.Name):
-                targets.append(self.resolve(scope, element.id))
-            elif isinstance(element, ast.Attribute):
-                targets.extend(self.attribute_store(element, scope))
-        return targets
+    def attribute_view(self, node: ast.Attribute) -> int | None:
+        """Key read by ``self.x`` / ``cls.x``: stores in the class and its bases."""
+        key = self.views.get(node)
+        if key is not None:
+            return key
+        if not isinstance(node.ctx, ast.Load):
+            return None
+        cls = self.receiver_class(node)
+        if cls is None:
+            return None
+        ident = ("view", cls.id, node.attr)
+        key = self._ids.get(ident)
+        if key is None:
+            key = self.synthetic(ident, False)
+            self.view_list.append((cls, node.attr, key))
+        self.views[node] = key
+        return key
 
     # ── debugging / tests ──
 
     def qualname(self, scope: _Scope) -> str:
         parts: list[str] = []
         current: _Scope | None = scope
-        while current is not None and current.kind != "module":
+        while current is not None and current.kind != _MODULE:
             parent = current.parent
-            if parent is not None and parent.kind in ("function", "lambda", "comprehension"):
+            if parent is not None and parent.kind in (_FUNCTION, _LAMBDA, _COMPREHENSION):
                 parts.append(f"<locals>.{current.name}")
             else:
                 parts.append(current.name)
             current = parent
         return ".".join(reversed(parts))
-
-    def debug_name(self, key: int) -> str:
-        descriptor = self.keys.describe[key]
-        tag = descriptor[0]
-        if tag == "call":
-            call = descriptor[1]
-            assert isinstance(call, ast.Call)
-            return f"{self.keys.name(key)}@{call.lineno}:{call.col_offset}"
-        if isinstance(tag, int) and tag >= 0:
-            scope = self.scopes[tag]
-            name = str(descriptor[1])
-            if scope.kind == "module":
-                return name
-            return f"{self.qualname(scope)}.<locals>.{name}"
-        if tag in (-1, -2):
-            unit = descriptor[1]
-            assert isinstance(unit, int)
-            owner = self.logical[unit] if unit < len(self.logical) else None
-            label = self.qualname(owner.infos[0].scope) if owner is not None else f"<{unit}>"
-            prefix = "" if tag == -1 else "<read>"
-            return f"{prefix}{label}.{descriptor[2]}"
-        if tag in (-3, -4, -5, -6):
-            return f"<{tag}>{descriptor[1:]}"
-        return repr(descriptor)
 
 
 def _build_scope_index(
@@ -1316,55 +920,68 @@ def _build_scope_index(
     type_map: dict[str, str],
     check_runtime: Callable[[], None] | None = None,
 ) -> _ScopeIndex:
-    """Assign every node to its lexical scope and index callable definitions.
+    """Assign every name to its lexical scope and index in-file callees.
 
-    Visits nodes in ``ast.walk`` (breadth-first) order so statements are
-    recorded in the same order the order-independent taint pass always used.
+    Three linear passes: a breadth-first visit (the same order as
+    ``ast.walk``) that records scopes, bindings and flow statements; a
+    depth-first pass over the scope tree that resolves every name with one
+    stack per identifier, O(1) per name however deep the nesting; and an
+    indexing pass over class and function definitions.
     """
     tick = check_runtime or _noop
     index = _ScopeIndex(aliases, type_map)
-    index.alias_roots = {name.split(".")[0] for name in aliases}
-    module = index.new_scope("module", "", None)
-    switch = index.scope_switch
+    module = index.new_scope(_MODULE, None, "")
+    # Nodes evaluated in a different scope than their parent (bodies of
+    # functions, classes and lambdas; comprehension elements).
+    switch: dict[ast.AST, _Scope] = {}
     # Walrus targets bind in the nearest enclosing non-comprehension scope.
-    walrus_scopes: dict[ast.Name, _Scope] = {}
-    # Values assigned to name / attribute targets, for receiver typing.
-    stored_values: dict[ast.AST, object] = {}
+    walrus: dict[ast.Name, _Scope] = {}
 
-    queue: deque[tuple[ast.AST, _Scope]] = deque(
-        (child, module) for child in ast.iter_child_nodes(tree)
-    )
+    queue: deque[tuple[ast.AST, _Scope]] = deque([(tree, module)])
     while queue:
         tick()
         node, scope = queue.popleft()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            scope.bound.add(node.name)
-            index.name_stores.append((scope, node.name, _KNOWN_VALUE))
-            if isinstance(node, ast.ClassDef):
-                inner = index.new_scope("class", node.name, scope)
-                inner.class_info = _ClassInfo(node, inner, scope)
-                index.classes.append(inner.class_info)
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Load):
+                scope.request(node)
             else:
-                inner = index.new_scope("function", node.name, scope)
-                inner.function = _FunctionInfo(node, inner)
-                index.functions.append(inner.function)
-                _bind_parameters(index, inner, node.args)
-            # Only the body runs in the new scope; decorators, defaults,
-            # annotations and bases are evaluated where the def/class stands.
+                binding = walrus.pop(node, scope)
+                binding.bind(node.id)
+                binding.request(node)
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            inner = index.new_scope(_FUNCTION, scope, node.name)
+            function = _Function(node, inner)
+            inner.function = function
+            index.functions.append(function)
+            scope.define(node.name, function)
+            for arg in _parameters(node.args):
+                inner.bind(arg.arg)
+            # Only the body runs in the new scope; decorators, defaults and
+            # annotations are evaluated where the def stands.
+            for statement in node.body:
+                switch[statement] = inner
+        elif isinstance(node, ast.ClassDef):
+            inner = index.new_scope(_CLASS, scope, node.name)
+            class_def = _ClassDef(node, inner)
+            inner.class_def = class_def
+            index.class_defs.append(class_def)
+            scope.define(node.name, class_def)
             for statement in node.body:
                 switch[statement] = inner
         elif isinstance(node, ast.Lambda):
-            inner = index.new_scope("lambda", "<lambda>", scope)
-            inner.function = _FunctionInfo(node, inner)
-            index.functions.append(inner.function)
-            index.lambdas[node] = inner.function
-            _bind_parameters(index, inner, node.args)
+            inner = index.new_scope(_LAMBDA, scope, "<lambda>")
+            function = _Function(node, inner)
+            inner.function = function
+            index.functions.append(function)
+            index.lambdas[node] = function
+            for arg in _parameters(node.args):
+                inner.bind(arg.arg)
             switch[node.body] = inner
-            index.statements.append((node, inner))
-        elif isinstance(node, _Comprehension):
+        elif isinstance(node, _COMPREHENSIONS):
             # Python 3 comprehensions have their own scope; only the first
             # iterable is evaluated in the enclosing one.
-            inner = index.new_scope("comprehension", f"<{type(node).__name__.lower()}>", scope)
+            inner = index.new_scope(_COMPREHENSION, scope, f"<{type(node).__name__.lower()}>")
             if isinstance(node, ast.DictComp):
                 switch[node.key] = inner
                 switch[node.value] = inner
@@ -1376,334 +993,242 @@ def _build_scope_index(
                     switch[condition] = inner
                 if position:
                     switch[generator.iter] = inner
-                index.statements.append((generator, inner))
         elif isinstance(node, ast.NamedExpr):
             binding = scope
-            while binding.kind == "comprehension" and binding.parent is not None:
+            while binding.kind == _COMPREHENSION and binding.parent is not None:
                 binding = binding.parent
-            walrus_scopes[node.target] = binding
-            stored_values[node.target] = node.value
-        elif isinstance(node, ast.Name):
-            if isinstance(node.ctx, (ast.Store, ast.Del)):
-                binding = walrus_scopes.pop(node, scope)
-                binding.bound.add(node.id)
-                if isinstance(node.ctx, ast.Store):
-                    value = stored_values.pop(node, _UNKNOWN_VALUE)
-                    index.name_stores.append((binding, node.id, value))
-        elif isinstance(node, ast.Attribute):
-            if isinstance(node.value, ast.Name):
-                if isinstance(node.ctx, ast.Load):
-                    index.attribute_loads.append((node, scope))
-                elif isinstance(node.ctx, ast.Store):
-                    value = stored_values.pop(node, _UNKNOWN_VALUE)
-                    index.attribute_stores.append((scope, node, value))
+            if isinstance(node.target, ast.Name):
+                walrus[node.target] = binding
         elif isinstance(node, ast.Global):
+            if scope.declared_global is None:
+                scope.declared_global = set()
             scope.declared_global.update(node.names)
         elif isinstance(node, ast.Nonlocal):
+            if scope.declared_nonlocal is None:
+                scope.declared_nonlocal = set()
             scope.declared_nonlocal.update(node.names)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
                 if alias.name != "*":
-                    local = alias.asname or alias.name.split(".")[0]
-                    scope.bound.add(local)
-                    index.name_stores.append((scope, local, _KNOWN_VALUE))
-        elif isinstance(node, ast.ExceptHandler) and node.name:
-            scope.bound.add(node.name)
-            index.name_stores.append((scope, node.name, _UNKNOWN_VALUE))
-        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
-            scope.bound.add(node.name)
-            index.name_stores.append((scope, node.name, _UNKNOWN_VALUE))
-        elif isinstance(node, ast.MatchMapping) and node.rest:
-            scope.bound.add(node.rest)
-            index.name_stores.append((scope, node.rest, _UNKNOWN_VALUE))
+                    scope.bind(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                scope.bind(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            if node.name:
+                scope.bind(node.name)
+        elif isinstance(node, ast.MatchMapping):
+            if node.rest:
+                scope.bind(node.rest)
         elif isinstance(node, ast.Assign):
             index.statements.append((node, scope))
-            for target in node.targets:
-                if isinstance(target, (ast.Name, ast.Attribute)):
-                    stored_values[target] = node.value
-                    if isinstance(target, ast.Name) and isinstance(node.value, ast.Lambda):
-                        index.lambda_bindings.append((scope, target.id, node.value))
-        elif isinstance(node, ast.AnnAssign):
-            if node.value is not None and isinstance(node.target, (ast.Name, ast.Attribute)):
-                stored_values[node.target] = node.value
-        elif isinstance(node, (ast.With, ast.AsyncWith)):
-            for item in node.items:
-                target = item.optional_vars
-                if isinstance(target, (ast.Name, ast.Attribute)):
-                    stored_values[target] = item.context_expr
+            if isinstance(node.value, ast.Lambda):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        index.lambda_bindings.append((target, node.value))
         elif isinstance(node, ast.Return):
             index.statements.append((node, scope))
         elif isinstance(node, ast.Call):
-            index.call_scope[node] = scope
             index.statements.append((node, scope))
+            if isinstance(node.func, ast.Name) and node.func.id == "super":
+                index.super_scopes[node] = scope
+        elif isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name):
+                index.attributes.append(node)
         for child in ast.iter_child_nodes(node):
             if not isinstance(child, ast.expr_context):
-                queue.append((child, switch.get(child, scope)))
+                queue.append((child, switch.pop(child, scope)))
 
-    _index_classes(index, tick)
-    _index_callables(index, tick)
-    _index_types(index, tick)
+    _resolve_names(index, tick)
+    _index_definitions(index, tick)
     return index
 
 
-def _bind_parameters(index: _ScopeIndex, scope: _Scope, args: ast.arguments) -> None:
-    """Parameters are local, and hold whatever callers pass (untyped)."""
-    for arg in _parameters(args):
-        scope.bound.add(arg.arg)
-        index.name_stores.append((scope, arg.arg, _UNKNOWN_VALUE))
+def _resolve_names(index: _ScopeIndex, tick: Callable[[], None]) -> None:
+    """Resolve every recorded name by Python's rules, O(1) per name.
 
-
-def _index_classes(index: _ScopeIndex, tick: Callable[[], None]) -> None:
-    """Merge redefinitions, link in-file bases lexically, and size each hierarchy.
-
-    Attributes are tracked per class in hierarchies of at most
-    ``_PRECISE_HIERARCHY_LIMIT`` classes and per hierarchy above that.
+    A depth-first walk of the scope tree keeps, per identifier, a stack of
+    the function-like scopes that bind it (``global`` pushes the module).
+    A name read in a function, lambda or comprehension is local if bound
+    there unless declared ``global``/``nonlocal``, and otherwise resolves to
+    the nearest enclosing binder, then the module. Class bodies see their own
+    names but are invisible to the functions and comprehensions inside them.
     """
-    by_binding: dict[tuple[int, str], _LogicalClass] = {}
-    for info in index.classes:
+    module = index.module
+    stacks: dict[str, list[_Scope]] = {}
+
+    def binding_scope(scope: _Scope, name: str) -> _Scope:
+        if scope.declared_global is not None and name in scope.declared_global:
+            return module
+        if scope.kind == _MODULE:
+            return module
+        if scope.kind == _CLASS:
+            nonlocal_names = scope.declared_nonlocal
+            if (
+                scope.bound is not None
+                and name in scope.bound
+                and (nonlocal_names is None or name not in nonlocal_names)
+            ):
+                return scope
+        stack = stacks.get(name)
+        return stack[-1] if stack else module
+
+    work: list[tuple[_Scope, list[str] | None]] = [(module, None)]
+    while work:
+        scope, pushed = work.pop()
+        if pushed is not None:
+            for name in pushed:
+                stacks[name].pop()
+            continue
         tick()
-        binding = index.binding_scope(info.parent, info.node.name)
-        identity = (binding.id, info.node.name)
-        cls = by_binding.get(identity)
+        names: list[str] = []
+        if scope.kind not in (_MODULE, _CLASS):
+            declared_global = scope.declared_global or set()
+            declared_nonlocal = scope.declared_nonlocal or set()
+            for name in declared_global:
+                stacks.setdefault(name, []).append(module)
+                names.append(name)
+            for name in scope.bound or ():
+                if name not in declared_global and name not in declared_nonlocal:
+                    stacks.setdefault(name, []).append(scope)
+                    names.append(name)
+        for node in scope.names or ():
+            tick()
+            index.name_key[node] = index.key(binding_scope(scope, node.id), node.id)
+        for name, definition in scope.definitions or ():
+            tick()
+            definition.key = index.key(binding_scope(scope, name), name)
+        work.append((scope, names))
+        if scope.children:
+            work.extend((child, None) for child in reversed(scope.children))
+
+
+def _index_definitions(index: _ScopeIndex, tick: Callable[[], None]) -> None:
+    """Merge class redefinitions, link in-file bases, and group callees."""
+    for class_def in index.class_defs:
+        tick()
+        cls = index.class_of_key.get(class_def.key)
         if cls is None:
-            cls = _LogicalClass(len(index.logical), info.node.name)
-            index.logical.append(cls)
-            by_binding[identity] = cls
-        cls.infos.append(info)
-        info.logical = cls
-    for cls in index.logical:
+            cls = _Class(len(index.classes))
+            index.classes.append(cls)
+            index.class_of_key[class_def.key] = cls
+        cls.defs.append(class_def)
+        class_def.cls = cls
+    for cls in index.classes:
         linked = {cls.id}
-        for info in cls.infos:
-            for base in info.node.bases:
+        for class_def in cls.defs:
+            for base in class_def.node.bases:
                 tick()
+                if isinstance(base, ast.Subscript):  # Base[T]
+                    base = base.value
                 if not isinstance(base, ast.Name):
                     continue
-                binding = index.binding_scope(info.parent, base.id)
-                parent = by_binding.get((binding.id, base.id))
+                parent = index.class_of_key.get(index.name_key.get(base, -1))
                 if parent is not None and parent.id not in linked:
                     linked.add(parent.id)
                     cls.bases.append(parent)
-                    parent.subclasses.append(cls)
-
-    components: list[list[_LogicalClass]] = []
-    for cls in index.logical:
-        tick()
-        if cls.component >= 0:
-            continue
-        cls.component = len(components)
-        members = [cls]
-        stack = [cls]
-        while stack:
-            current = stack.pop()
-            for other in (*current.bases, *current.subclasses):
-                if other.component < 0:
-                    other.component = cls.component
-                    members.append(other)
-                    stack.append(other)
-        components.append(members)
-
-    for members in components:
-        precise = len(members) <= _PRECISE_HIERARCHY_LIMIT
-        merged_unit = len(index.logical) + members[0].component
-        for cls in members:
-            tick()
-            cls.precise = precise
-            cls.unit = cls.id if precise else merged_unit
-            if not precise:
-                continue
-            cls.ancestors = _closure(cls, lambda c: c.bases)
-            cls.descendants = _closure(cls, lambda c: c.subclasses)
-            cls.mro = _linearize(cls)
-        if not precise:
-            continue
-        by_id = {cls.id: cls for cls in members}
-        for cls in members:
-            tick()
-            sharing: set[int] = set()
-            for descendant in cls.descendants:
-                sharing |= by_id[descendant].ancestors
-            cls.sharing_ids = sharing
-            cls.sharing = [other for other in members if other.id in sharing]
-
-
-def _closure(cls: _LogicalClass, edges: Callable[[_LogicalClass], list[_LogicalClass]]) -> set[int]:
-    seen = {cls.id}
-    stack = [cls]
-    while stack:
-        for other in edges(stack.pop()):
-            if other.id not in seen:
-                seen.add(other.id)
-                stack.append(other)
-    return seen
-
-
-def _index_callables(index: _ScopeIndex, tick: Callable[[], None]) -> None:
-    """Group functions by the name calls reach them through."""
     for function in index.functions:
         tick()
         node = function.node
         if isinstance(node, ast.Lambda):
             continue
         parent = function.scope.parent
-        assert parent is not None
-        if parent.kind == "class" and parent.class_info is not None:
-            cls = parent.class_info.logical
-            assert cls is not None
-            kind = _method_kind(node)
-            function.kind = kind
-            cls.methods.add(node.name)
-            group = index.group(("method", cls.unit, node.name, kind), kind, node.name)
-            if not group.functions:
-                index.unit_groups.setdefault((cls.unit, node.name), []).append(group)
-            group.add(function)
-            function.groups.append(group)
-            fallback = index.group(("any", node.name, kind), kind, node.name)
-            if not fallback.functions:
-                index.fallback_groups.setdefault(node.name, []).append(fallback)
-            fallback.add(function)
-            if any(_decorator_name(d) in _PROPERTY_DECORATORS for d in node.decorator_list):
-                cls.properties.add(node.name)
-            positional = [*node.args.posonlyargs, *node.args.args]
-            if kind != "static" and positional:
-                key = index.binding_key(function.scope, positional[0].arg)
-                index.self_keys[key] = (cls, kind == "class")
-        else:
-            key = index.resolve(parent, node.name)
-            _add_function_group(index, key, node.name, function)
-    for scope, name, lambda_node in index.lambda_bindings:
+        if parent is None or parent.class_def is None or parent.class_def.cls is None:
+            index.function_group(function.key).add(function)
+            continue
+        # A method is reached through its class, never by its bare name.
+        cls = parent.class_def.cls
+        kind = _method_kind(node)
+        function.kind = kind
+        index.method_group(cls, node.name, kind).add(function)
+        positional = [*node.args.posonlyargs, *node.args.args]
+        if kind != "static" and positional:
+            receiver_key = index.key(function.scope, positional[0].arg)
+            index.receivers[receiver_key] = (cls, kind == "class")
+    for target, lambda_node in index.lambda_bindings:
         tick()
         function = index.lambdas.get(lambda_node)
-        if function is not None:
-            _add_function_group(index, index.resolve(scope, name), name, function)
-    for cls in index.logical:
-        tick()
-        if cls.precise:
-            for name in cls.methods:
-                index.definers.setdefault((cls.component, name), []).append(cls)
-        # Redefinitions share one binding, so this runs once per class.
-        key = index.resolve(cls.infos[0].parent, cls.name)
-        index.classes_by_key.setdefault(key, []).append(cls)
-
-
-def _add_function_group(index: _ScopeIndex, key: int, name: str, function: _FunctionInfo) -> None:
-    group = index.group(("function", key), "function", name)
-    if not group.functions:
-        index.function_groups.setdefault(key, []).append(group)
-    group.add(function)
-    function.groups.append(group)
-
-
-def _index_types(index: _ScopeIndex, tick: Callable[[], None]) -> None:
-    """Record which in-file classes each variable and attribute may hold."""
-
-    def record(key: int, scope: _Scope, value: object) -> None:
-        info = index.var_types.get(key)
-        if info is None:
-            info = _TypeInfo()
-            index.var_types[key] = info
-        if value is _UNKNOWN_VALUE or value is _KNOWN_VALUE:
-            found = value
-        else:
-            assert isinstance(value, ast.expr)
-            found = index.value_type(value, scope)
-        if isinstance(found, tuple):
-            classes, dynamic = found
-            info.classes.extend(cls for cls in classes if cls not in info.classes)
-            info.dynamic = info.dynamic or dynamic
-        elif found is _UNKNOWN_VALUE:
-            info.unknown = True
-
-    for scope, name, value in index.name_stores:
-        tick()
-        record(index.resolve(scope, name), scope, value)
-    for scope, attribute, value in index.attribute_stores:
-        tick()
-        for key in index.attribute_store(attribute, scope):
-            record(key, scope, value)
+        key = index.name_key.get(target)
+        if function is not None and key is not None:
+            index.function_group(key).add(function)
 
 
 def _mark_targets(
     graph: _TaintGraph,
     targets: Sequence[int],
     kind: int,
-    arg: int,
-    source_owner: int,
-    label: int,
     line: int,
-    node: ast.AST,
-) -> list[tuple[int, int]]:
-    """Add one source fact to each target that lacks it.
+    fact: _Fact,
+    bound: int,
+    lanes: int = _BOTH_LANES,
+) -> list[tuple[int, int, int]]:
+    """Give each target *fact*, in each of *lanes*, where it outranks what it holds.
 
-    Add-only: an existing fact is never overwritten, so taint can only grow.
-    A fact that reached a function through one of its own parameters keeps
-    that mark while it stays in the function's locals and is dropped at the
-    function's own ``return``. Returns the facts newly added, for the
-    worklist to propagate from.
+    Monotone: a target's fact in a lane is only ever replaced by a strictly
+    more severe source for that lane, so each key changes at most twice per
+    lane and slot, and the worklist terminates. A key has two slots: ordinary
+    facts, and facts bound from a call site into a function's parameters
+    (``bound``). A bound fact stays bound in function locals; module, class
+    and attribute state turns it into an ordinary fact. Returns the
+    (key, slot, changed lanes) triples to propagate from.
     """
-    newly_tainted: list[tuple[int, int]] = []
-    source_label = label & ~1
-    from_parameter = label & 1
-    if kind == _ASSIGN:
-        line = arg
-    owners = graph.keys.owner
+    source, fact_line = fact
+    if kind != _PASS:
+        fact_line = line
+    if kind == _BIND:
+        bound = 1
+    new_fact = (source, fact_line)
+    ranks = _LANE_RANKS[source]
+    local = graph.index.local
     facts = graph.facts
-    for target in targets:
-        if kind == _BIND:
-            out = source_label | 1
-        elif kind == _RETURN:
-            if from_parameter and source_owner == arg:
+    ordinary = facts[0]
+    tick = graph.tick
+    changed: list[tuple[int, int, int]] = []
+    for position, target in enumerate(targets):
+        if position and not position & 1023:
+            tick()
+        slot = 1 if bound and local[target] else 0
+        held = facts[slot]
+        mask = 0
+        for lane in (0, 1):
+            if not lanes >> lane & 1:
                 continue
-            out = source_label
-        elif from_parameter and owners[target] == source_owner:
-            out = label
-        else:
-            out = source_label
-        entry = facts.get(target)
-        if entry is None:
-            facts[target] = {out: (line, node)}
-        elif out in entry:
-            continue
-        else:
-            entry[out] = (line, node)
-        newly_tainted.append((target, out))
-    return newly_tainted
+            rank = ranks[lane]
+            current = ordinary[lane].get(target)
+            if current is not None and _LANE_RANKS[current[0]][lane] >= rank:
+                continue
+            if slot:
+                current = held[lane].get(target)
+                if current is not None and _LANE_RANKS[current[0]][lane] >= rank:
+                    continue
+            held[lane][target] = new_fact
+            mask |= 1 << lane
+        if mask:
+            changed.append((target, slot, mask))
+    return changed
 
 
 class _TaintGraph:
     """Scope-aware taint, independent of AST visit order.
 
-    Any single ordered pass over the tree misses flows where a sink and the
-    assignment that taints it are visited in the "wrong" relative order: a
-    function body defined before the module-level assignment it reads only
-    runs after that assignment. Taint is therefore computed as reachability in
-    a flow graph whose nodes are keys (see ``_Keys``):
+    Taint is reachability in a flow graph over keys, computed with a monotone
+    worklist that fires each flow at most once per (lane, source rank, slot),
+    so at most 12 times whatever the number of sources:
 
-    * every ``Assign`` flows from the keys its value reads to its targets;
-    * every argument of a call to a function defined in this file flows to
-      that callee's argument slot, and each slot flows to the parameter it
-      binds (positionally, by keyword, or into ``*args``/``**kwargs``); a
-      function passed as a callback (``Thread(target=f, args=(x,))``,
-      ``executor.submit(f, x)``) receives the arguments that follow it;
-    * every ``return`` flows into the function's return value, which each
-      call to it reads; parameter defaults flow into their parameter; a
-      comprehension's iterable flows into its targets.
+    * phase A replays exactly the assignment flows earlier releases used
+      (``x = <expr>`` reads every name in ``<expr>``), in the same order, so a
+      flow both versions report cites the same variable, source and line;
+    * phase B adds what scoping makes precise: arguments of direct in-file
+      calls bind into parameters (as bound facts), parameter defaults,
+      return summaries read by callers, and ``self.x`` / ``cls.x`` attributes.
+      Phase B never replaces a fact by one of equal rank, so it only fills
+      keys phase A left clean or upgrades them to a more severe source.
 
-    A flow whose value contains source calls (or ``os.environ[...]``) seeds
-    its targets with each of them. Each key keeps one fact per source, so a
-    later, stronger source is never hidden by an earlier one. Flows are
-    recorded once each, keyed by a stable id and indexed by every key they
-    read. A monotone worklist then drains new facts, firing each flow AT MOST
-    ONCE per source: its targets already hold that source after the first
-    firing, so a later firing could add nothing.
-
-    Taint is add-only and bounded by keys x sources, so the loop cannot
-    oscillate and terminates; the work is linear in the flows plus their
-    references.
-
-    Before scoping, keys were bare names shared by the whole file, so a
-    tainted ``headers`` local in one function tainted an unrelated
-    ``headers`` parameter elsewhere — reported as TT3 once 26bc7d6 (#611)
-    made propagation order-independent.
+    A callee's return summary carries only facts that do not depend on its
+    parameters: bound facts never enter it. What a call returns from its
+    own arguments is read at that call site, from those arguments (every
+    call's value includes its arguments, as before), so one caller's secret
+    cannot taint another caller's result, also through closures and lambdas.
     """
 
     def __init__(
@@ -1714,367 +1239,325 @@ class _TaintGraph:
         check_runtime: Callable[[], None] | None = None,
     ) -> None:
         self.index = index
-        self.keys = index.keys
         self.type_map = type_map
         self.aliases = aliases
         self.tick = check_runtime or _noop
-        self.check_runtime = check_runtime
-        # key -> {label: (line, source node)}
-        self.facts: dict[int, dict[int, tuple[int, ast.AST]]] = {}
-        # Each flow's (targets, kind, kind argument), keyed by its index here
-        # (a stable id). ``propagators`` maps a key read by a flow to its ids.
+        # facts[slot][lane]: key -> fact; slot 1 holds facts bound from a call site.
+        self.facts: tuple[tuple[dict[int, _Fact], dict[int, _Fact]], ...] = (
+            ({}, {}),
+            ({}, {}),
+        )
+        # Each flow's (targets, kind, line), keyed by its index (a stable id).
+        # ``prop_a`` / ``prop_b`` map a key read by a phase A / B flow to its ids.
         self.flows: list[tuple[tuple[int, ...], int, int]] = []
-        self.propagators: dict[int, list[int]] = {}
-        self.worklist: deque[tuple[int, int]] = deque()
-        self._result_sets: dict[tuple[int, ...], int] = {}
-        # Reads and direct sources of a call's arguments, walked once for both
-        # the call's value and its argument binding.
-        self._arguments: dict[ast.AST, tuple[list[int], list[tuple[str, ast.AST]]]] = {}
+        self.prop_a: dict[int, list[int]] = {}
+        self.prop_b: dict[int, list[int]] = {}
+        self.worklist: deque[tuple[int, int, int]] = deque()
+        self.seeds: list[tuple[tuple[int, ...], int, int, _Fact, int]] = []
+        # Per flow, one bit per (lane, source rank, slot) it has already propagated.
+        self.fired: list[int] = []
+        self.returns: dict[int, int] = {}  # group id -> return summary key
+        self._values: dict[ast.Call, int] = {}
+        self._class_links: set[tuple[int, str]] = set()
 
     # ── building ──
 
-    def add_edge(self, reads: Iterable[int], targets: tuple[int, ...], kind: int, arg: int) -> None:
+    def add_flow(
+        self, reads: Iterable[int], targets: Sequence[int], kind: int, line: int, phase_a: bool
+    ) -> None:
         if not targets:
+            return
+        keys = list(dict.fromkeys(reads))
+        if not keys:
             return
         flow_id = len(self.flows)
-        self.flows.append((targets, kind, arg))
-        propagators = self.propagators
-        for key in dict.fromkeys(reads):
-            propagators.setdefault(key, []).append(flow_id)
+        self.flows.append((tuple(targets), kind, line))
+        table = self.prop_a if phase_a else self.prop_b
+        for key in keys:
+            table.setdefault(key, []).append(flow_id)
 
     def seed(
-        self,
-        targets: tuple[int, ...],
-        kind: int,
-        arg: int,
-        sources: list[tuple[str, ast.AST]],
-        line: int,
+        self, targets: Sequence[int], kind: int, line: int, sources: list[tuple[str, int]]
     ) -> None:
-        for name, node in sources:
-            label = 2 * _SOURCE_INDEX[name]
-            self.worklist.extend(
-                _mark_targets(self, targets, kind, arg, _NO_OWNER, label, line, node)
-            )
+        """Queue phase B sources for *targets* (applied after phase A)."""
+        if targets:
+            for source, lanes in sources:
+                fact = (_SOURCE_INDEX[source], line)
+                self.seeds.append((tuple(targets), kind, line, fact, lanes))
 
-    def flow(
-        self,
-        value: ast.expr,
-        scope: _Scope,
-        targets: tuple[int, ...],
-        kind: int,
-        arg: int,
-        line: int,
-    ) -> None:
-        """Flow *value* into *targets*: seed its direct sources, edge its reads."""
-        if not targets:
-            return
-        sources = _direct_sources(value, self.type_map, self.aliases, self.check_runtime)
-        if sources:
-            self.seed(targets, kind, arg, sources, line)
-        self.add_edge(self.index.flow_reads(value, scope, self.tick), targets, kind, arg)
-
-    def argument(
-        self, value: ast.expr, scope: _Scope
-    ) -> tuple[list[int], list[tuple[str, ast.AST]]]:
-        """Reads and direct sources of one call argument, walked once.
-
-        Stops at calls to functions defined in this file: their own value key
-        already carries the sources in their arguments, so nested calls are
-        walked once each rather than once per enclosing call.
-        """
-        cached = self._arguments.pop(value, None)
-        if cached is None:
-            cached = (
-                list(dict.fromkeys(self.index.flow_reads(value, scope, self.tick))),
-                _direct_sources(
-                    value, self.type_map, self.aliases, self.check_runtime, self.index.is_value_call
-                ),
-            )
-        return cached
-
-    def argument_flow(
-        self, value: ast.expr, scope: _Scope, targets: tuple[int, ...], line: int
-    ) -> None:
-        if not targets:
-            return
-        reads, sources = self.argument(value, scope)
-        if sources:
-            self.seed(targets, _ASSIGN, line, sources, line)
-        self.add_edge(reads, targets, _ASSIGN, line)
-
-    def group_returns(self, group: _Group) -> int:
-        if group.returns is None:
-            group.returns = self.keys.get((-4, group.id), _NO_OWNER, (group.label, "()"))
-        return group.returns
-
-    def result_key(self, groups: tuple[_Group, ...]) -> int:
-        if len(groups) == 1:
-            return self.group_returns(groups[0])
-        identity = tuple(group.id for group in groups)
-        key = self._result_sets.get(identity)
+    def ret_key(self, group: _Group) -> int:
+        key = self.returns.get(group.id)
         if key is None:
-            key = self.keys.get((-5, identity), _NO_OWNER, (groups[0].label, "()"))
-            self._result_sets[identity] = key
-            self.add_edge([self.group_returns(group) for group in groups], (key,), _PASS, 0)
+            key = self.index.synthetic(("return", group.id), False)
+            self.returns[group.id] = key
         return key
+
+    def value_key(self, call: ast.Call, root: _Scope) -> int | None:
+        """Key of an in-file call's value, for an enclosing call's arguments.
+
+        Reading a nested in-file call through its own value key walks each
+        argument once, however deeply such calls nest.
+        """
+        if self.index.call_targets(call, self.tick) is _NO_TARGETS:
+            return None
+        key = self._values.get(call)
+        if key is None:
+            key = self.index.synthetic(("value", id(call)), root.in_function)
+            self._values[call] = key
+        return key
+
+    def scan(
+        self, node: ast.AST, root: _Scope, nested_values: bool
+    ) -> tuple[list[int], list[int], list[tuple[str, int]]]:
+        """Walk an expression once: (names read, other keys read, sources).
+
+        Names are the reads earlier releases used. Other keys are the return
+        summaries of in-file calls and ``self.x`` attributes. With
+        *nested_values*, an in-file call is read through its value key and not
+        walked. Sources are the most severe source call per lane (first in walk
+        order among equals), with the lanes each one is for, or an
+        ``os.environ[...]`` subscript as the whole expression.
+        """
+        index = self.index
+        name_key = index.name_key
+        tick = self.tick
+        names: dict[int, None] = {}
+        others: dict[int, None] = {}
+        best: list[str | None] = [None, None]
+        best_rank = [-1, -1]
+        queue: deque[ast.AST] = deque([node])
+        while queue:
+            tick()
+            child = queue.popleft()
+            if isinstance(child, ast.Name):
+                key = name_key.get(child)
+                if key is not None and index.visible(key, root):
+                    names[key] = None
+                continue
+            if isinstance(child, ast.Call):
+                if nested_values:
+                    value = self.value_key(child, root)
+                    if value is not None:
+                        others[value] = None
+                        continue
+                source = _call_source(child, self.type_map, self.aliases)
+                if source is not None:
+                    ranks = _LANE_RANKS[_SOURCE_INDEX[source]]
+                    for lane in (0, 1):
+                        if ranks[lane] > best_rank[lane]:
+                            best[lane], best_rank[lane] = source, ranks[lane]
+                for group in index.call_targets(child, tick).results:
+                    others[self.ret_key(group)] = None
+            elif isinstance(child, ast.Attribute):
+                view = index.attribute_view(child)
+                if view is not None:
+                    others[view] = None
+            for grandchild in ast.iter_child_nodes(child):
+                if not isinstance(grandchild, ast.expr_context):
+                    queue.append(grandchild)
+        if best[0] is None:
+            best[0] = best[1] = _credential_subscript(node, self.aliases)
+        sources: list[tuple[str, int]] = []
+        if best[0] is not None and best[0] == best[1]:
+            sources.append((best[0], _BOTH_LANES))
+        else:
+            sources.extend((source, 1 << lane) for lane, source in enumerate(best) if source)
+        return list(names), list(others), sources
+
+    def assign(self, node: ast.Assign, scope: _Scope) -> None:
+        index = self.index
+        names, others, sources = self.scan(node.value, scope, False)
+        # Phase A targets are the ones earlier releases tainted: names and
+        # tuples of names. ``self.x`` / ``cls.x`` targets are phase B.
+        plain: list[int] = []
+        attributes: list[int] = []
+        for target in node.targets:
+            elements = target.elts if isinstance(target, ast.Tuple) else [target]
+            for element in elements:
+                if isinstance(element, ast.Name):
+                    plain.append(index.name_key[element])
+                    if scope.kind == _CLASS:
+                        self.class_attribute(scope, element.id, index.name_key[element])
+                elif isinstance(element, ast.Attribute):
+                    store = index.attribute_store(element)
+                    if store is not None:
+                        attributes.append(store)
+        line = node.lineno
+        if sources:
+            # A direct source seeds its targets in phase A, as before; a more
+            # severe source among the names it reads may still upgrade them.
+            for source, lanes in sources:
+                fact = (_SOURCE_INDEX[source], line)
+                self.worklist.extend(_mark_targets(self, plain, _ASSIGN, line, fact, 0, lanes))
+            self.seed(attributes, _ASSIGN, line, sources)
+            self.add_flow([*names, *others], [*plain, *attributes], _ASSIGN, line, False)
+        else:
+            self.add_flow(names, plain, _ASSIGN, line, True)
+            self.add_flow(others, plain, _ASSIGN, line, False)
+            self.add_flow([*names, *others], attributes, _ASSIGN, line, False)
+
+    def class_attribute(self, scope: _Scope, name: str, key: int) -> None:
+        """A name assigned in a class body is also the class's attribute."""
+        class_def = scope.class_def
+        if class_def is None or class_def.cls is None:
+            return
+        link = (scope.id, name)
+        if link in self._class_links:
+            return
+        self._class_links.add(link)
+        store = self.index.synthetic(("store", class_def.cls.id, name), False)
+        self.add_flow((key,), (store,), _PASS, 0, False)
+
+    def returned(self, value: ast.expr, scope: _Scope, line: int) -> None:
+        function = scope.function
+        if function is None or not function.groups:
+            return
+        targets = [self.ret_key(group) for group in function.groups]
+        names, others, sources = self.scan(value, scope, False)
+        self.seed(targets, _RETURN, line, sources)
+        self.add_flow([*names, *others], targets, _RETURN, line, False)
+
+    def call(self, node: ast.Call, scope: _Scope) -> None:
+        targets = self.index.call_targets(node, self.tick)
+        value = self._values.get(node)
+        if not targets.members and value is None:
+            return
+        parts = [arg.value if isinstance(arg, ast.Starred) else arg for arg in node.args]
+        parts.extend(keyword.value for keyword in node.keywords)
+        scans = [self.scan(part, scope, True) for part in parts]
+        line = node.lineno
+        if value is not None:
+            reads: list[int] = []
+            for names, others, sources in scans:
+                reads.extend(names)
+                reads.extend(others)
+                self.seed((value,), _ASSIGN, line, sources)
+            reads.extend(self.ret_key(group) for group in targets.results)
+            self.add_flow(reads, (value,), _ASSIGN, line, False)
+        if targets.members:
+            self.bind_arguments(node, targets.members, scans, line)
+
+    def bind_arguments(
+        self,
+        node: ast.Call,
+        members: tuple[tuple[_Group, int], ...],
+        scans: list[tuple[list[int], list[int], list[tuple[str, int]]]],
+        line: int,
+    ) -> None:
+        slots: list[list[int]] = []
+        unpacked = False
+        for position, arg in enumerate(node.args):
+            if isinstance(arg, ast.Starred):
+                unpacked = True
+            keys: list[int] = []
+            for group, offset in members:
+                slot: object = position + offset
+                if unpacked or position + offset >= _MAX_POSITIONAL_SLOTS:
+                    slot = "*"
+                keys.append(self.slot(group, slot))
+            slots.append(keys)
+        for keyword in node.keywords:
+            keys = []
+            for group, _offset in members:
+                if keyword.arg is None:
+                    keys.append(self.slot(group, "**"))
+                    continue
+                if keyword.arg in group.keyword_params:
+                    keys.append(self.slot(group, ("kw", keyword.arg)))
+                if group.has_kwarg:
+                    keys.append(self.slot(group, "kw*"))
+            slots.append(keys)
+        for keys, (names, others, sources) in zip(slots, scans, strict=True):
+            self.seed(keys, _BIND, line, sources)
+            self.add_flow([*names, *others], keys, _BIND, line, False)
 
     def slot(self, group: _Group, slot: object) -> int:
         key = group.slots.get(slot)
         if key is None:
-            key = self.keys.get((-3, group.id, slot), _NO_OWNER, "")
+            key = self.index.synthetic(("slot", group.id, slot), True)
             group.slots[slot] = key
         return key
 
-    def member_slots(self, group: _Group, offset: int, slot: object) -> list[int]:
-        if isinstance(slot, int):
-            position = slot + offset
-            return [self.slot(group, position if position < _MAX_POSITIONAL_SLOTS else "*")]
-        if slot in ("*", "**"):
-            return [self.slot(group, slot)]
-        assert isinstance(slot, str)
-        keys: list[int] = []
-        if slot in group.keyword_params:
-            keys.append(self.slot(group, slot))
-        if group.has_kwarg:
-            keys.append(self.slot(group, "kw*"))
-        return keys
-
-    def binding_targets(self, bset: _BindingSet, slot: object) -> tuple[int, ...]:
-        """Slot keys an argument in call-relative *slot* flows into.
-
-        Several callees share one intermediate key per slot, so each argument
-        is one edge however many methods a receiver may dispatch to.
-        """
-        cached = bset.targets.get(slot)
-        if cached is None:
-            member_keys: list[int] = []
-            for group, offset in bset.members:
-                member_keys.extend(self.member_slots(group, offset, slot))
-            members = tuple(dict.fromkeys(member_keys))
-            if len(members) > 1:
-                key = self.keys.get((-6, bset.id, slot), _NO_OWNER, "")
-                self.add_edge((key,), members, _PASS, 0)
-                cached = (key,)
-            else:
-                cached = members
-            bset.targets[slot] = cached
-        return cached
-
-    def bind_arguments(
-        self,
-        bset: _BindingSet,
-        args: Sequence[ast.expr],
-        keywords: Sequence[tuple[str | None, ast.expr]],
-        scope: _Scope,
-        line: int,
-    ) -> None:
-        unpacked = False
-        for position, arg in enumerate(args):
-            if isinstance(arg, ast.Starred):
-                unpacked, arg = True, arg.value
-            slot: object = "*" if unpacked or position >= _MAX_POSITIONAL_SLOTS else position
-            self.argument_flow(arg, scope, self.binding_targets(bset, slot), line)
-        for name, value in keywords:
-            slot = "**" if name is None else name
-            self.argument_flow(value, scope, self.binding_targets(bset, slot), line)
-
-    def call(self, call: ast.Call, scope: _Scope) -> None:
-        info = self.index.call_info(call, scope)
-        if info.value is not None:
-            # The call's value: the callees' return values plus everything its
-            # receiver and arguments read (an over-approximation earlier
-            # releases also made for every call).
-            func = call.func
-            receiver = func.value if isinstance(func, ast.Attribute) else func
-            arguments = [arg.value if isinstance(arg, ast.Starred) else arg for arg in call.args]
-            arguments.extend(keyword.value for keyword in call.keywords)
-            reads: list[int] = []
-            for part in (receiver, *arguments):
-                part_reads, sources = self.argument(part, scope)
-                if part is not receiver:
-                    self._arguments[part] = (part_reads, sources)
-                reads.extend(part_reads)
-                if sources:
-                    self.seed((info.value,), _ASSIGN, call.lineno, sources, call.lineno)
-            if info.results:
-                reads.append(self.result_key(info.results))
-            self.add_edge(reads, (info.value,), _PASS, 0)
-        if info.binding is not None:
-            self.bind_arguments(
-                info.binding,
-                call.args,
-                [(keyword.arg, keyword.value) for keyword in call.keywords],
-                scope,
-                call.lineno,
-            )
-        self.callbacks(call, scope)
-
-    def callbacks(self, call: ast.Call, scope: _Scope) -> None:
-        """Bind the arguments a higher-order call forwards to its callback."""
-        index = self.index
-        members: list[tuple[_Group, int]] = []
-        position: int | None = None
-        for keyword in call.keywords:
-            if keyword.arg in _CALLBACK_KEYWORDS:
-                members, _ = index.resolve_callee(keyword.value, scope, fallback=True)
-                if members:
-                    break
-        if not members:
-            spawner = _CALLBACK_POSITIONS.get(_callee_name(call.func) or "")
-            if spawner is not None and spawner < len(call.args):
-                candidate = call.args[spawner]
-                if not any(isinstance(arg, ast.Starred) for arg in call.args[: spawner + 1]):
-                    members, _ = index.resolve_callee(candidate, scope, fallback=True)
-                    position = spawner
-        if not members:
-            position = None
-            for at, arg in enumerate(call.args):
-                if isinstance(arg, ast.Starred):
-                    break
-                if isinstance(arg, (ast.Name, ast.Attribute)):
-                    members, _ = index.resolve_callee(arg, scope, fallback=False)
-                    if members:
-                        position = at
-                        break
-        if not members:
-            return
-        forwarded = list(call.args[position + 1 :]) if position is not None else []
-        forwarded_keywords: list[tuple[str | None, ast.expr]] = []
-        for keyword in call.keywords:
-            if keyword.arg == "args" and isinstance(keyword.value, (ast.Tuple, ast.List)):
-                forwarded.extend(keyword.value.elts)
-            elif keyword.arg == "kwargs" and isinstance(keyword.value, ast.Dict):
-                for key, value in zip(keyword.value.keys, keyword.value.values, strict=True):
-                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                        forwarded_keywords.append((key.value, value))
-                    elif key is None:
-                        forwarded_keywords.append((None, value))
-        self.bind_arguments(
-            index.binding_set(members), forwarded, forwarded_keywords, scope, call.lineno
-        )
-
-    def returns(self, node: ast.Return, scope: _Scope) -> None:
-        function = scope.function
-        if node.value is None or function is None:
-            return
-        targets = tuple(self.group_returns(group) for group in function.groups)
-        self.flow(node.value, scope, targets, _RETURN, scope.owner, node.lineno)
-
-    def lambda_returns(self, node: ast.Lambda, scope: _Scope) -> None:
-        function = scope.function
-        if function is None or not function.groups:
-            return
-        targets = tuple(self.group_returns(group) for group in function.groups)
-        self.flow(node.body, scope, targets, _RETURN, scope.owner, node.lineno)
-
-    def iteration(self, generator: ast.comprehension, scope: _Scope) -> None:
-        targets = tuple(self.index.assign_targets(generator.target, scope))
-        iter_scope = self.index.scope_switch.get(generator.iter, scope.parent or scope)
-        line = generator.target.lineno
-        self.flow(generator.iter, iter_scope, targets, _ASSIGN, line, line)
-
-    def defaults(self, function: _FunctionInfo) -> None:
+    def defaults(self, function: _Function) -> None:
         args = function.node.args
         defining = function.scope.parent or self.index.module
         positional = [*args.posonlyargs, *args.args]
         defaulted = positional[len(positional) - len(args.defaults) :]
-        pairs = [
-            *zip(defaulted, args.defaults, strict=True),
-            *((arg, d) for arg, d in zip(args.kwonlyargs, args.kw_defaults, strict=True) if d),
-        ]
+        pairs: list[tuple[ast.arg, ast.expr]] = list(zip(defaulted, args.defaults, strict=True))
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
+            if default is not None:
+                pairs.append((arg, default))
         for arg, default in pairs:
-            assert default is not None
-            target = (self.index.binding_key(function.scope, arg.arg),)
-            self.flow(default, defining, target, _ASSIGN, default.lineno, default.lineno)
-
-    def attribute_edges(self) -> None:
-        """Connect attribute stores to the reads that may see them.
-
-        A read of ``x`` through class E sees stores of ``x`` in every class
-        sharing a descendant with E, plus ``@property`` getters named ``x``.
-        """
-        index = self.index
-        for node, scope in index.attribute_loads:
             self.tick()
-            index.attribute_load(node, scope)
-        for (class_id, attr), key in index.attribute_reads.items():
-            self.tick()
-            cls = index.logical[class_id]
-            reads: list[int] = []
-            for other in cls.sharing:
-                store = self.keys.ids.get((-1, other.unit, attr))
-                if store is not None:
-                    reads.append(store)
-                if attr in other.properties:
-                    for group in index.unit_groups.get((other.unit, attr), ()):
-                        reads.append(self.group_returns(group))
-            self.add_edge(reads, (key,), _PASS, 0)
-        for cls in index.logical:
-            if cls.precise or not cls.properties:
-                continue
-            self.tick()
-            for attr in cls.properties:
-                store = self.keys.get((-1, cls.unit, attr), _NO_OWNER, attr)
-                for group in index.unit_groups.get((cls.unit, attr), ()):
-                    self.add_edge((self.group_returns(group),), (store,), _PASS, 0)
+            target = (self.index.key(function.scope, arg.arg),)
+            names, others, sources = self.scan(default, defining, False)
+            self.seed(target, _ASSIGN, default.lineno, sources)
+            self.add_flow([*names, *others], target, _ASSIGN, default.lineno, False)
 
-    def parameter_edges(self) -> None:
+    def link_callees(self) -> None:
         """Flow each callee's argument slots into the parameters they bind."""
-        for group in self.index.groups.values():
+        index = self.index
+        for group in index.groups:
             if not group.slots:
                 continue
             slots = group.slots
             for function in group.functions:
                 self.tick()
                 args = function.node.args
-                key = self.index.binding_key
                 scope = function.scope
                 positional = [*args.posonlyargs, *args.args]
                 for position, arg in enumerate(positional):
                     reads = [
-                        slots.get(position) if position < _MAX_POSITIONAL_SLOTS else None,
+                        slots.get(position if position < _MAX_POSITIONAL_SLOTS else "*"),
                         slots.get("*"),
-                        None if position < len(args.posonlyargs) else slots.get(arg.arg),
+                        None if position < len(args.posonlyargs) else slots.get(("kw", arg.arg)),
                         slots.get("**"),
                     ]
-                    self.bind(reads, key(scope, arg.arg))
+                    self.bind_parameter(reads, index.key(scope, arg.arg))
                 for arg in args.kwonlyargs:
-                    self.bind([slots.get(arg.arg), slots.get("**")], key(scope, arg.arg))
+                    reads = [slots.get(("kw", arg.arg)), slots.get("**")]
+                    self.bind_parameter(reads, index.key(scope, arg.arg))
                 if args.vararg is not None:
                     extra = range(len(positional), _MAX_POSITIONAL_SLOTS)
-                    reads = [slots.get("*"), *(slots.get(i) for i in extra)]
-                    self.bind(reads, key(scope, args.vararg.arg))
+                    reads = [slots.get("*"), *(slots.get(position) for position in extra)]
+                    self.bind_parameter(reads, index.key(scope, args.vararg.arg))
                 if args.kwarg is not None:
-                    self.bind([slots.get("kw*"), slots.get("**")], key(scope, args.kwarg.arg))
+                    reads = [slots.get("kw*"), slots.get("**")]
+                    self.bind_parameter(reads, index.key(scope, args.kwarg.arg))
 
-    def bind(self, reads: list[int | None], target: int) -> None:
-        present = [key for key in reads if key is not None]
-        if present:
-            self.add_edge(present, (target,), _BIND, 0)
+    def bind_parameter(self, reads: list[int | None], target: int) -> None:
+        self.add_flow([key for key in reads if key is not None], (target,), _PASS, 0, False)
+
+    def link_attributes(self) -> None:
+        """A ``self.x`` read sees stores of ``x`` in its class and in-file bases."""
+        index = self.index
+        for node in index.attributes:
+            self.tick()
+            index.attribute_view(node)
+        for cls, attr, view in index.view_list:
+            self.tick()
+            reads = []
+            for owner in index.ancestors(cls, self.tick):
+                store = index._ids.get(("store", owner.id, attr))
+                if store is not None:
+                    reads.append(store)
+            self.add_flow(reads, (view,), _PASS, 0, False)
 
     def build(self) -> None:
         for node, scope in self.index.statements:
             self.tick()
             if isinstance(node, ast.Assign):
-                targets = tuple(
-                    key
-                    for target in node.targets
-                    for key in self.index.assign_targets(target, scope)
-                )
-                self.flow(node.value, scope, targets, _ASSIGN, node.lineno, node.lineno)
+                self.assign(node, scope)
             elif isinstance(node, ast.Return):
-                self.returns(node, scope)
+                if node.value is not None:
+                    self.returned(node.value, scope, node.lineno)
             elif isinstance(node, ast.Call):
                 self.call(node, scope)
-            elif isinstance(node, ast.Lambda):
-                self.lambda_returns(node, scope)
-            elif isinstance(node, ast.comprehension):
-                self.iteration(node, scope)
         for function in self.index.functions:
             self.tick()
             self.defaults(function)
-        self.attribute_edges()
-        self.parameter_edges()
+        self.link_attributes()
+        self.link_callees()
 
     # ── fixpoint ──
 
@@ -2083,60 +1566,90 @@ class _TaintGraph:
         self.propagate()
 
     def propagate(self) -> None:
-        """Drain the worklist until no flow adds a new fact."""
-        facts = self.facts
+        # Phase A: the assignment flows earlier releases propagated, in order.
+        self.drain(self.worklist, (self.prop_a,))
+        # Phase B: every flow. Phase A facts are read again through the new
+        # flows (each phase A flow already fired for them and is skipped).
+        worklist: deque[tuple[int, int, int]] = deque(
+            (key, 0, _BOTH_LANES) for key in self.facts[0][0]
+        )
+        for targets, kind, line, fact, lanes in self.seeds:
+            self.tick()
+            worklist.extend(_mark_targets(self, targets, kind, line, fact, 0, lanes))
+        self.drain(worklist, (self.prop_a, self.prop_b))
+
+    def drain(
+        self, worklist: deque[tuple[int, int, int]], tables: tuple[dict[int, list[int]], ...]
+    ) -> None:
         flows = self.flows
-        propagators = self.propagators
-        owners = self.keys.owner
-        worklist = self.worklist
-        fired: set[object] = set()
+        fired = self.fired
+        if len(fired) < len(flows):
+            fired.extend([0] * (len(flows) - len(fired)))
+        facts = self.facts
         while worklist:
             self.tick()
-            key, label = worklist.popleft()
-            line, node = facts[key][label]
-            owner = owners[key]
-            for flow_id in propagators.get(key, ()):
-                # A fact from a function's own parameter propagates differently
-                # depending on which function's key carries it.
-                mark: object = (flow_id, label, owner) if label & 1 else flow_id * _LABELS + label
-                if mark in fired:
-                    # Already propagated this source: its targets hold it, so
-                    # firing again marks nothing new. Skip to stay linear.
-                    continue
-                fired.add(mark)
-                targets, kind, arg = flows[flow_id]
-                worklist.extend(_mark_targets(self, targets, kind, arg, owner, label, line, node))
+            key, slot, lanes = worklist.popleft()
+            held = facts[slot]
+            first = held[0].get(key) if lanes & 1 else None
+            second = held[1].get(key) if lanes & 2 else None
+            if first is not None and first is second:
+                carried = [(first, _BOTH_LANES)]
+            else:
+                carried = [(fact, 1 << lane) for lane, fact in enumerate((first, second)) if fact]
+            for fact, fact_lanes in carried:
+                ranks = _LANE_RANKS[fact[0]]
+                # One bit per (lane, rank, slot): 12 bits per flow.
+                bits = [1 << (6 * lane + 2 * ranks[lane] + slot) for lane in (0, 1)]
+                for table in tables:
+                    for flow_id in table.get(key, ()):
+                        mark = fired[flow_id]
+                        todo = 0
+                        for lane in (0, 1):
+                            if fact_lanes >> lane & 1 and not mark & bits[lane]:
+                                todo |= 1 << lane
+                        if not todo:
+                            # Already propagated a source of this rank: its targets
+                            # hold one at least as severe. Skip to stay linear.
+                            continue
+                        targets, kind, line = flows[flow_id]
+                        if slot and kind == _RETURN:
+                            continue
+                        for lane in (0, 1):
+                            if todo >> lane & 1:
+                                mark |= bits[lane]
+                        fired[flow_id] = mark
+                        worklist.extend(_mark_targets(self, targets, kind, line, fact, slot, todo))
 
     # ── results ──
 
-    def strongest(self, key: int, sink_name: str, excluded: set[ast.AST]) -> _TaintedVar | None:
-        """The fact at *key* giving the most severe rule for *sink_name*.
+    def fact(self, key: int, lane: int = 0) -> _Fact | None:
+        """The most severe fact at *key* for *lane* (an ordinary one on ties)."""
+        ordinary = self.facts[0][lane].get(key)
+        bound = self.facts[1][lane].get(key)
+        if bound is not None and (
+            ordinary is None or _LANE_RANKS[bound[0]][lane] > _LANE_RANKS[ordinary[0]][lane]
+        ):
+            return bound
+        return ordinary
 
-        Facts whose source is one of *excluded* (sources nested directly in
-        the sink, already reported as direct flows) are skipped.
-        """
-        best: _TaintedVar | None = None
-        best_rank = -1
-        for label, (line, node) in self.facts.get(key, {}).items():
-            if node in excluded:
+    def tainted_names(self) -> dict[str, _TaintedVar]:
+        """Tainted variables by readable name (module globals keep their bare name)."""
+        index = self.index
+        result: dict[str, _TaintedVar] = {}
+        for key in (*self.facts[0][0], *self.facts[1][0]):
+            scope = index.key_scope[key]
+            fact = self.fact(key)
+            if scope is None or fact is None:
                 continue
-            source = _SOURCE_NAMES[label >> 1]
-            rank = _SEVERITY_RANK[_RULE_SEVERITIES[_pick_rule(source, sink_name, False)]]
-            if rank > best_rank:
-                best = _TaintedVar(self.keys.name(key), source, line)
-                best_rank = rank
-        return best
-
-    def view(self) -> dict[str, dict[str, _TaintedVar]]:
-        """Tainted keys by readable name, each with one fact per source."""
-        view: dict[str, dict[str, _TaintedVar]] = {}
-        for key, entry in self.facts.items():
-            sources = view.setdefault(self.index.debug_name(key), {})
-            for label, (line, _node) in entry.items():
-                source = _SOURCE_NAMES[label >> 1]
-                if source not in sources:
-                    sources[source] = _TaintedVar(self.keys.name(key), source, line)
-        return view
+            name = index.key_name[key]
+            if scope.kind == _MODULE:
+                label = name
+            elif scope.kind == _CLASS:
+                label = f"{index.qualname(scope)}.{name}"
+            else:
+                label = f"{index.qualname(scope)}.<locals>.{name}"
+            result.setdefault(label, _TaintedVar(name, _SOURCE_NAMES[fact[0]], fact[1]))
+        return result
 
 
 def _collect_tainted(
@@ -2144,8 +1657,8 @@ def _collect_tainted(
     type_map: dict[str, str],
     aliases: dict[str, str],
     check_runtime: Callable[[], None] | None = None,
-) -> dict[str, dict[str, _TaintedVar]]:
-    """Compute taint for *tree*: readable key -> {source call: fact}.
+) -> dict[str, _TaintedVar]:
+    """Compute taint for *tree*: readable variable name -> its fact.
 
     Module globals keep their bare name; function locals read
     ``qualname.<locals>.name``. See ``_TaintGraph`` for the propagation rules.
@@ -2153,40 +1666,88 @@ def _collect_tainted(
     index = _build_scope_index(tree, aliases, type_map, check_runtime)
     graph = _TaintGraph(index, type_map, aliases, check_runtime)
     graph.run()
-    return graph.view()
+    return graph.tainted_names()
+
+
+# Identifiers longer than this are shortened in messages (``prefix...``), so
+# message bytes stay bounded per finding instead of growing with identifier
+# length times the number of sinks. Real identifiers are far shorter, so their
+# messages are unchanged.
+_MAX_NAME_CHARS = 120
+
+
+def _shorten(name: str) -> str:
+    return name if len(name) <= _MAX_NAME_CHARS else name[: _MAX_NAME_CHARS - 3] + "..."
+
+
+def _spelling(node: ast.AST) -> str:
+    """How a sink spells what it reads: ``name``, ``self.x``, ``helper()``, ``self.m()``.
+
+    Built from the sink's own nodes, so a message never copies an identifier
+    spelled elsewhere in the file, and shortened to a bounded length.
+    """
+    if isinstance(node, ast.Name):
+        return _shorten(node.id)
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return _shorten(f"{_shorten(node.value.id)}.{_shorten(node.attr)}")
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Name):
+            return _shorten(f"{_shorten(func.id)}()")
+        if isinstance(func, ast.Attribute):
+            value = func.value
+            if isinstance(value, ast.Name):
+                return _shorten(f"{_shorten(value.id)}.{_shorten(func.attr)}()")
+            if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+                return _shorten(f"{_shorten(value.func.id)}().{_shorten(func.attr)}()")
+    return "<lambda>()"
 
 
 def _find_tainted_names_in_args(
     node: ast.Call,
     graph: _TaintGraph,
-    scope: _Scope,
     sink_name: str,
-    direct_sources: set[ast.AST],
     check_runtime: Callable[[], None] | None = None,
 ) -> list[_TaintedVar]:
-    """Find tainted variables, attributes and helper results a sink call reads.
+    """Find tainted variables, ``self.x`` attributes and helper results a sink reads.
 
     Plain variable reads come first, in ``ast.walk`` order, so a flow earlier
     releases reported keeps its message; attributes and in-file call results
-    follow. Each key reports its most severe source.
+    follow. Each is named as the sink spells it, and reported once.
     """
+    tick = check_runtime or _noop
+    index = graph.index
+    lane = 1 if sink_name in _EXEC_SINKS or sink_name in _DESERIALIZATION_SINKS else 0
     seen: set[int] = set()
-    names: list[int] = []
-    others: list[int] = []
-    facts = graph.facts
-    for key, plain_name in graph.index.references(
-        node, scope, check_runtime or _noop, skip_root=True
-    ):
-        if key in seen or key not in facts:
+    names: list[_TaintedVar] = []
+    others: list[_TaintedVar] = []
+    for child in ast.walk(node):
+        tick()
+        if child is node:
             continue
-        seen.add(key)
-        (names if plain_name else others).append(key)
-    hits: list[_TaintedVar] = []
-    for key in (*names, *others):
-        tv = graph.strongest(key, sink_name, direct_sources)
-        if tv is not None:
-            hits.append(tv)
-    return hits
+        reads: list[tuple[int | None, ast.AST, list[_TaintedVar]]]
+        if isinstance(child, ast.Name):
+            reads = [(index.name_key.get(child), child, names)]
+        elif isinstance(child, ast.Subscript) and isinstance(child.value, ast.Name):
+            reads = [(index.name_key.get(child.value), child.value, names)]
+        elif isinstance(child, ast.Attribute):
+            reads = [(index.views.get(child), child, others)]
+        elif isinstance(child, ast.Call):
+            reads = [
+                (graph.returns.get(group.id), child, others)
+                for group in index.call_targets(child, tick).results
+            ]
+        else:
+            continue
+        for key, spelled, out in reads:
+            if key is None or key in seen:
+                continue
+            fact = graph.fact(key, lane)
+            if fact is None:
+                continue
+            seen.add(key)
+            out.append(_TaintedVar(_spelling(spelled), _SOURCE_NAMES[fact[0]], fact[1]))
+    return names + others
 
 
 def _analyze_python(
@@ -2203,8 +1764,8 @@ def _analyze_python(
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
     check_runtime = budget.check_runtime if budget is not None else None
-    scopes = _build_scope_index(tree, aliases, type_map, check_runtime)
-    graph = _TaintGraph(scopes, type_map, aliases, check_runtime)
+    index = _build_scope_index(tree, aliases, type_map, check_runtime)
+    graph = _TaintGraph(index, type_map, aliases, check_runtime)
     graph.run()
     seen: set[tuple[str, ast.Call]] = set()
     contexts: dict[int, str] = {}
@@ -2282,7 +1843,6 @@ def _analyze_python(
         if sink_name == "open" and not _is_open_for_write(ast_node):
             continue
 
-        direct: set[ast.AST] = set()
         for src_name, src_node in _find_nested_sources(
             ast_node,
             type_map,
@@ -2291,7 +1851,6 @@ def _analyze_python(
         ):
             if src_name == "open" and _is_open_for_write(src_node):
                 continue
-            direct.add(src_node)
             rule = _pick_rule(src_name, sink_name, is_direct=True)
             src_cat = _classify(src_name, _SOURCE_CATEGORIES, "data source")
             sink_cat = _classify(sink_name, _SINK_CATEGORIES, "data sink")
@@ -2299,19 +1858,10 @@ def _analyze_python(
                 node_index,
                 rule,
                 ast_node,
-                f"Direct flow: {src_name} ({src_cat}) → {sink_name} ({sink_cat})",
+                f"Direct flow: {src_name} ({src_cat}) \u2192 {sink_name} ({sink_cat})",
             )
 
-        # A source nested in this sink, even inside a helper call, is already
-        # reported as a direct flow above; report each source once.
-        for tv in _find_tainted_names_in_args(
-            ast_node,
-            graph,
-            scopes.call_scope.get(ast_node, scopes.module),
-            sink_name,
-            direct,
-            check_runtime,
-        ):
+        for tv in _find_tainted_names_in_args(ast_node, graph, sink_name, check_runtime):
             rule = _pick_rule(tv.source_call, sink_name, is_direct=False)
             src_cat = _classify(tv.source_call, _SOURCE_CATEGORIES, "data source")
             sink_cat = _classify(sink_name, _SINK_CATEGORIES, "data sink")
@@ -2320,7 +1870,7 @@ def _analyze_python(
                 rule,
                 ast_node,
                 f"Tainted flow: '{tv.name}' from {tv.source_call} (line {tv.lineno}, "
-                f"{src_cat}) → {sink_name} ({sink_cat})",
+                f"{src_cat}) \u2192 {sink_name} ({sink_cat})",
             )
 
     return findings if budget is None else list(budget.current_findings)
