@@ -27,13 +27,13 @@ from __future__ import annotations
 import ast
 import re
 import sys
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 from skillspector.logging_config import get_logger
-from skillspector.models import AnalyzerFinding, Location, Severity
-from skillspector.python_ast import parse_python_source
+from skillspector.models import AnalyzerFinding, Finding, Location, Severity
+from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_tokens import PythonLiteralSpans
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
 from skillspector.security_reconstruction import validated_json_string_spans
@@ -53,6 +53,11 @@ from .pattern_defaults import PatternCategory
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_tool_misuse"
+ANALYZE_USES_POSTPROCESS = True
+POSTPROCESS_USES_PYTHON_AST = True
+_VARIABLE_SHELL_FLAG_EVIDENCE = "_tm1_variable_shell_flag"
+_TRUE_SHELL_DIRECT_EVIDENCE = "_tm1_true_shell_direct"
+_TRUE_SHELL_ARGUMENT_RE = re.compile(r"\bshell\s*=\s*true", re.IGNORECASE)
 
 _SHELL_COMMAND_WORD_START_RE = re.compile(r"[rRdDeE$'\"`\\]")
 _SHELL_COMMAND_WORD_CHARS = 4096
@@ -190,11 +195,11 @@ _ROOT_GLOB_AFFIRMATIVE_NEGATION_PREFIX_RE = re.compile(
 
 # Match a literal True assigned to a local name shortly before it is passed as
 # shell=<name> to a subprocess invocation.  The bounded newline gap and the
-# intervening-write guard keep this a local data-flow fact; Python scope
+# AST binding-evidence guard keep this a local data-flow fact; Python scope
 # visibility is enforced separately in analyze() via _VARIABLE_SHELL_FLAG_RE.
 _VARIABLE_SHELL_FLAG_PATTERN = (
     r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*True\s*$\n"
-    r"(?:(?![^\n]*\b\1\s*=)[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
+    r"(?:[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
     r"(?:subprocess\.\w+|Popen)\s*\([^)]*\bshell\s*=\s*\1\b"
 )
 _VARIABLE_SHELL_FLAG_RE = re.compile(_VARIABLE_SHELL_FLAG_PATTERN, re.IGNORECASE | re.MULTILINE)
@@ -3246,167 +3251,916 @@ def _has_unsupported_brace_expansion(tokens: tuple[_ShellToken, ...]) -> bool:
 
 
 _SCOPE_NODE_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+_COMPREHENSION_SCOPE_TYPES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+_NATIVE_SHELL_RECEIVERS = frozenset({"subprocess", "Popen"})
 
 
-def _scope_chain(tree: ast.Module, target: ast.AST) -> tuple[ast.AST, ...] | None:
-    """Return the chain of enclosing scopes for *target*, outermost first.
-
-    The module itself is the outermost scope.  Returns None when *target* is
-    not part of *tree*.
-    """
-    parents: dict[ast.AST, ast.AST] = {}
-    stack: list[ast.AST] = [tree]
-    found = False
-    while stack:
-        node = stack.pop()
-        if node is target:
-            found = True
-            break
-        for child in ast.iter_child_nodes(node):
-            parents[child] = node
-            stack.append(child)
-    if not found:
-        return None
-    chain: list[ast.AST] = []
-    current: ast.AST | None = target
-    while current is not None:
-        if isinstance(current, _SCOPE_NODE_TYPES) or current is tree:
-            chain.append(current)
-        current = parents.get(current)
-    chain.reverse()
-    return tuple(chain)
+def _paired_store_values(target: ast.AST, value: ast.AST) -> Iterator[tuple[ast.AST, ast.AST]]:
+    """Yield each store target with the RHS element it receives, when the shapes match."""
+    pairs = [(target, value)]
+    while pairs:
+        destination, source = pairs.pop()
+        if (
+            isinstance(destination, (ast.Tuple, ast.List))
+            and isinstance(source, (ast.Tuple, ast.List))
+            and len(destination.elts) == len(source.elts)
+            and not any(isinstance(item, ast.Starred) for item in (*destination.elts, *source.elts))
+        ):
+            pairs.extend(zip(destination.elts, source.elts, strict=True))
+        else:
+            yield destination, source
 
 
-def _scope_binds_name(scope_node: ast.AST, name: str) -> bool:
-    """Return whether *name* is bound directly in *scope_node*.
-
-    Nested function/class/lambda bodies are not descended into: their bindings
-    belong to those scopes, not this one.
-    """
-    if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-        args = scope_node.args
-        named = [arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)]
-        if args.vararg is not None:
-            named.append(args.vararg.arg)
-        if args.kwarg is not None:
-            named.append(args.kwarg.arg)
-        if name in named:
-            return True
-        bodies: list[ast.AST] = (
-            [scope_node.body] if isinstance(scope_node, ast.Lambda) else list(scope_node.body)
-        )
-    elif isinstance(scope_node, (ast.ClassDef, ast.Module)):
-        bodies = list(scope_node.body)
-    else:
-        return False
-    stack = list(bodies)
-    while stack:
-        node = stack.pop()
-        if isinstance(node, _SCOPE_NODE_TYPES):
-            continue
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == name:
-            return True
-        stack.extend(ast.iter_child_nodes(node))
-    return False
+def _captures_native_receiver(value: ast.AST, receiver: str) -> bool:
+    """Return whether *value* reads the native *receiver* callable or module."""
+    if isinstance(value, ast.Name):
+        return value.id == receiver
+    return (
+        receiver == "Popen"
+        and isinstance(value, ast.Attribute)
+        and value.attr == "Popen"
+        and isinstance(value.value, ast.Name)
+        and value.value.id == "subprocess"
+    )
 
 
-def _direct_global_nonlocal(scope_node: ast.AST, name: str) -> str | None:
-    """Return 'global'/'nonlocal' when *scope_node* declares *name* as such.
-
-    Only declarations directly in the scope are considered; nested scopes are
-    not descended into.
-    """
-    if isinstance(scope_node, ast.Lambda):
-        return None
-    bodies: list[ast.stmt] | None = None
-    if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
-        bodies = scope_node.body
-    if bodies is None:
-        return None
-    stack: list[ast.AST] = list(bodies)
-    while stack:
-        node = stack.pop()
-        if isinstance(node, _SCOPE_NODE_TYPES):
-            continue
-        if isinstance(node, ast.Global) and name in node.names:
-            return "global"
-        if isinstance(node, ast.Nonlocal) and name in node.names:
-            return "nonlocal"
-        stack.extend(ast.iter_child_nodes(node))
-    return None
-
-
-def _variable_shell_flag_same_scope(content: str, file_path: str, match: re.Match[str]) -> bool:
-    """Return whether a variable-shell-flag match is a same-scope data flow.
-
-    The regex cannot see Python scopes, so ``use_shell = True`` in one
-    function followed by ``shell=use_shell`` in another still matches.  Resolve
-    the matched assignment and the ``shell=`` use through the Python AST and
-    require the assignment to be visible from the use: identical scope chains,
-    a closure read from an enclosing scope, or a matching global/nonlocal
-    declaration.  Unparseable content keeps the candidate so a syntax error
-    cannot silence the signal.
-    """
-    var_name = match.group(1)
-    assign_line = content.count("\n", 0, match.start()) + 1
-    use_line = content.count("\n", 0, match.end()) + 1
-    tree = parse_python_source(content, file_path).tree
-    if tree is None:
-        return True
-    assign_node: ast.Assign | None = None
-    call_node: ast.Call | None = None
+def _native_receiver_aliases(tree: ast.Module) -> dict[str, str]:
+    """Map each name whose every binding captures one native receiver to it."""
+    paired: dict[ast.AST, ast.AST] = {}
     for node in ast.walk(tree):
-        if (
-            assign_node is None
-            and isinstance(node, ast.Assign)
-            and node.lineno == assign_line
-            and isinstance(node.value, ast.Constant)
-            and node.value.value is True
-            and any(
-                isinstance(target, ast.Name) and target.id == var_name for target in node.targets
-            )
-        ):
-            assign_node = node
-        if (
-            call_node is None
-            and isinstance(node, ast.Call)
-            and any(
-                keyword.arg == "shell"
-                and isinstance(keyword.value, ast.Name)
-                and keyword.value.id == var_name
-                and assign_line <= keyword.value.lineno <= use_line
-                for keyword in node.keywords
-            )
-        ):
-            call_node = node
-    if assign_node is None or call_node is None:
-        return True
-    assign_chain = _scope_chain(tree, assign_node)
-    use_chain = _scope_chain(tree, call_node)
-    if assign_chain is None or use_chain is None:
-        return True
-    if assign_chain == use_chain:
-        return True
-    if len(assign_chain) < len(use_chain) and use_chain[: len(assign_chain)] == assign_chain:
-        # Closure read: the use sits in a scope nested inside the assignment's
-        # scope, so the name resolves to the assigned value.
-        return True
-    use_scope = use_chain[-1]
-    if use_scope is not tree:
-        declaration = _direct_global_nonlocal(use_scope, var_name)
-        if declaration == "global":
-            return assign_chain == (tree,)
-        if declaration == "nonlocal":
-            binding = next(
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                paired.update(_paired_store_values(target, node.value))
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+            paired[node.target] = node.value
+    captures: dict[str, set[str | None]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                native = (
+                    "subprocess"
+                    if isinstance(node, ast.Import) and alias.name == "subprocess"
+                    else "Popen"
+                    if isinstance(node, ast.ImportFrom)
+                    and node.level == 0
+                    and node.module == "subprocess"
+                    and alias.name == "Popen"
+                    else None
+                )
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                captures.setdefault(bound, set()).add(native)
+            continue
+        name: str | None = None
+        native = None
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            name = node.id
+            value = paired.get(node) if isinstance(node.ctx, ast.Store) else None
+            native = next(
                 (
-                    scope
-                    for scope in use_chain[-2::-1]
-                    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
-                    and _scope_binds_name(scope, var_name)
+                    receiver
+                    for receiver in sorted(_NATIVE_SHELL_RECEIVERS)
+                    if value is not None and _captures_native_receiver(value, receiver)
                 ),
                 None,
             )
-            return binding is not None and assign_chain == _scope_chain(tree, binding)
+        elif isinstance(node, ast.arg):
+            name = node.arg
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            name = node.name
+        elif isinstance(node, ast.MatchMapping):
+            name = node.rest
+        if name is not None:
+            captures.setdefault(name, set()).add(native)
+    return {
+        name: receiver
+        for name, values in captures.items()
+        if len(values) == 1 and (receiver := next(iter(values))) is not None
+    }
+
+
+def _store_keeps_shell_signal(name: str, value: ast.AST, aliases: dict[str, str]) -> bool | None:
+    """Classify one simple-name store for lexical TM1 reconciliation.
+
+    ``None`` means an identity store that leaves the binding unchanged. ``True``
+    means the store keeps the native receiver or a truthy shell flag. ``False``
+    means the store may replace the binding.
+    """
+    if isinstance(value, ast.Name) and value.id == name:
+        return None
+    if name in _NATIVE_SHELL_RECEIVERS:
+        return _captures_native_receiver(value, name) or (
+            isinstance(value, ast.Name) and aliases.get(value.id) == name
+        )
+    if name.casefold() in {"subprocess", "popen"}:
+        return False
+    return isinstance(value, ast.Constant) and bool(value.value)
+
+
+@dataclass(frozen=True)
+class _ScopedShellNode:
+    """One relevant AST node plus its source and lexical-scope identity."""
+
+    node: ast.Assign | ast.Call
+    scope_chain: tuple[ast.AST, ...]
+    start: int
+
+
+@dataclass(frozen=True)
+class _VariableShellAstIndex:
+    """Linear-time index used to reconcile every bounded regex candidate."""
+
+    tree: ast.Module
+    line_character_starts: tuple[int, ...]
+    assignments: dict[tuple[int, str], tuple[_ScopedShellNode, ...]]
+    calls: dict[str, tuple[_ScopedShellNode, ...]]
+    call_starts: dict[str, tuple[int, ...]]
+    bindings: dict[ast.AST, frozenset[str]]
+    class_binding_starts: dict[ast.ClassDef, dict[str, tuple[int, ...]]]
+    declarations: dict[ast.AST, dict[str, str]]
+    binding_events: dict[tuple[ast.AST, ast.AST], dict[str, tuple[tuple[int, bool], ...]]]
+    eager_effect_starts: dict[ast.AST, tuple[int, ...]]
+    reference_starts: dict[str, tuple[int, ...]]
+
+
+@dataclass(frozen=True)
+class _VariableShellCandidate:
+    """One raw variable-shell regex candidate resolved against the shared AST."""
+
+    name: str
+    call: ast.Call
+    same_scope: bool
+    visible: bool
+    assignment_start: int
+    assignment_scope: ast.AST
+    call_scope_chain: tuple[ast.AST, ...]
+
+
+def _resolved_name_scope(
+    index: _VariableShellAstIndex,
+    use_chain: tuple[ast.AST, ...],
+    name: str,
+    use_start: int,
+) -> ast.AST:
+    """Return the Python scope that resolves *name* at one use site."""
+    crossed_function = False
+    nonlocal_lookup = False
+    seen_class_scope = False
+    for scope in reversed(use_chain):
+        if scope is index.tree:
+            return index.tree
+        declaration = index.declarations.get(scope, {}).get(name)
+        if declaration == "global":
+            return index.tree
+        if declaration == "nonlocal":
+            nonlocal_lookup = True
+            crossed_function = True
+            continue
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if name in index.bindings.get(scope, frozenset()):
+                return scope
+            crossed_function = True
+            continue
+        if isinstance(scope, _COMPREHENSION_SCOPE_TYPES):
+            if name in index.bindings.get(scope, frozenset()):
+                return scope
+            # Comprehensions use an implicit function scope.  Free names skip a
+            # surrounding class namespace just like names in a method body.
+            crossed_function = True
+            continue
+        if isinstance(scope, ast.ClassDef):
+            # A method does not close over its class namespace.  A call evaluated
+            # directly in the class body sees assignments already executed, but
+            # a later class assignment does not create a compile-time local.
+            starts = index.class_binding_starts.get(scope, {}).get(name, ())
+            if (
+                not crossed_function
+                and not nonlocal_lookup
+                and not seen_class_scope
+                and bisect_left(starts, use_start)
+            ):
+                return scope
+            seen_class_scope = True
+    return index.tree
+
+
+def _node_character_span(parsed: ParsedPythonFile, node: ast.AST) -> tuple[int, int] | None:
+    """Return one AST node's absolute character span."""
+    line = getattr(node, "lineno", None)
+    end_line = getattr(node, "end_lineno", None)
+    byte_column = getattr(node, "col_offset", None)
+    end_byte_column = getattr(node, "end_col_offset", None)
+    if not all(isinstance(value, int) for value in (line, end_line, byte_column, end_byte_column)):
+        return None
+    assert isinstance(line, int)
+    assert isinstance(end_line, int)
+    assert isinstance(byte_column, int)
+    assert isinstance(end_byte_column, int)
+    start_column = parsed.character_column(line, byte_column)
+    end_column = parsed.character_column(end_line, end_byte_column)
+    if start_column is None or end_column is None:
+        return None
+    start = parsed.line_character_starts[line - 1] + start_column
+    end = parsed.line_character_starts[end_line - 1] + end_column
+    return start, end
+
+
+def _parameter_names(arguments: ast.arguments) -> tuple[str, ...]:
+    names = [
+        argument.arg
+        for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)
+    ]
+    if arguments.vararg is not None:
+        names.append(arguments.vararg.arg)
+    if arguments.kwarg is not None:
+        names.append(arguments.kwarg.arg)
+    return tuple(names)
+
+
+def _direct_shell_name(call: ast.Call) -> str | None:
+    function = call.func
+    direct = isinstance(function, ast.Name) and function.id == "Popen"
+    direct = direct or (
+        isinstance(function, ast.Attribute)
+        and isinstance(function.value, ast.Name)
+        and function.value.id == "subprocess"
+    )
+    if not direct:
+        return None
+    for keyword in call.keywords:
+        if keyword.arg == "shell" and isinstance(keyword.value, ast.Name):
+            return keyword.value.id
+    return None
+
+
+def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellAstIndex | None:
+    """Index relevant nodes, bindings, and declarations in one AST traversal."""
+    tree = parsed.tree
+    if tree is None:
+        return None
+    assignments: dict[tuple[int, str], list[_ScopedShellNode]] = {}
+    calls: dict[str, list[_ScopedShellNode]] = {}
+    bindings: dict[ast.AST, set[str]] = {tree: set()}
+    class_binding_starts: dict[ast.ClassDef, dict[str, list[int]]] = {}
+    declarations: dict[ast.AST, dict[str, str]] = {}
+    binding_events: dict[ast.AST, dict[str, list[tuple[int, bool]]]] = {}
+    eager_effect_starts: dict[ast.AST, list[int]] = {}
+    reference_starts: dict[str, list[int]] = {}
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    attribute_identity_stores: set[ast.Attribute] = set()
+    # Simple-name stores that keep the current binding, including unpacked
+    # self-stores. They neither replace nor restore a binding.
+    identity_name_stores: set[ast.Name] = set()
+    native_aliases = _native_receiver_aliases(tree)
+
+    def mark_attribute_identity_stores(target: ast.AST, value: ast.AST) -> None:
+        for destination, source in _paired_store_values(target, value):
+            if (
+                isinstance(destination, ast.Attribute)
+                and isinstance(destination.value, ast.Name)
+                and isinstance(source, ast.Attribute)
+                and isinstance(source.value, ast.Name)
+                and destination.attr == source.attr
+                and destination.value.id == source.value.id
+            ):
+                attribute_identity_stores.add(destination)
+
+    def record_name_store_values(scope: ast.AST, target: ast.AST, value: ast.AST, end: int) -> None:
+        # Pair unpacked targets with their RHS elements so a native alias, a
+        # truthy flag, or a self-store is not mistaken for a replacement.
+        for destination, source in _paired_store_values(target, value):
+            if not isinstance(destination, ast.Name):
+                continue
+            keeps_signal = _store_keeps_shell_signal(destination.id, source, native_aliases)
+            if keeps_signal is None:
+                identity_name_stores.add(destination)
+            elif keeps_signal:
+                record_binding(scope, destination.id, end, True)
+
+    def record_binding(scope: ast.AST, name: str, start: int, restores: bool = False) -> None:
+        # A conditional store is not affirmative replacement evidence. Only a
+        # literal branch whose execution is proven can revoke the lexical owner.
+        child = node
+        if child in identity_name_stores:
+            return
+        parent = parents.get(child)
+        if isinstance(parent, ast.AnnAssign) and parent.value is None and child is parent.target:
+            return
+        while parent is not None and parent is not scope:
+            if isinstance(parent, ast.If):
+                if not isinstance(parent.test, ast.Constant):
+                    return
+                taken = parent.body if bool(parent.test.value) else parent.orelse
+                if child not in taken:
+                    return
+            elif isinstance(parent, ast.BoolOp):
+                # Later operands run only after every earlier operand lets the
+                # short circuit continue. Only constant operands prove that.
+                continues = isinstance(parent.op, ast.And)
+                for operand in parent.values:
+                    if operand is child:
+                        break
+                    if (
+                        not isinstance(operand, ast.Constant)
+                        or bool(operand.value) is not continues
+                    ):
+                        return
+            elif isinstance(parent, ast.IfExp) and child is not parent.test:
+                if not isinstance(parent.test, ast.Constant):
+                    return
+                if child is not (parent.body if bool(parent.test.value) else parent.orelse):
+                    return
+            elif isinstance(
+                parent,
+                (
+                    ast.For,
+                    ast.AsyncFor,
+                    ast.While,
+                    ast.With,
+                    ast.AsyncWith,
+                    ast.Try,
+                    ast.TryStar,
+                    ast.Match,
+                    ast.comprehension,
+                    *_COMPREHENSION_SCOPE_TYPES,
+                ),
+            ):
+                return
+            child, parent = parent, parents.get(parent)
+        binding_events.setdefault(scope, {}).setdefault(name, []).append((start, restores))
+
+    def bind(scope: ast.AST, name: str, start: int) -> None:
+        bindings.setdefault(scope, set()).add(name)
+        record_binding(scope, name, start)
+        if isinstance(scope, ast.ClassDef):
+            class_binding_starts.setdefault(scope, {}).setdefault(name, []).append(start)
+
+    stack: list[tuple[ast.AST, tuple[ast.AST, ...], int | None]] = [(tree, (tree,), None)]
+    while stack:
+        node, scope_chain, binding_start = stack.pop()
+        scope = scope_chain[-1]
+        span = _node_character_span(parsed, node)
+        start = span[0] if span is not None else 0
+        end = span[1] if span is not None else start
+        # A direct observed slot write is useful only before another eager
+        # effect. Cached-module lifetime across imports belongs to the companion.
+        if isinstance(
+            node,
+            (
+                ast.Call,
+                ast.Attribute,
+                ast.Subscript,
+                ast.BinOp,
+                ast.BoolOp,
+                ast.Compare,
+                ast.UnaryOp,
+                ast.NamedExpr,
+                ast.JoinedStr,
+                ast.Import,
+                ast.ImportFrom,
+                ast.Delete,
+                ast.AugAssign,
+                ast.If,
+                ast.For,
+                ast.AsyncFor,
+                ast.While,
+                ast.With,
+                ast.AsyncWith,
+                ast.Try,
+                ast.TryStar,
+                ast.Match,
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.Await,
+                ast.Yield,
+                ast.YieldFrom,
+                *_COMPREHENSION_SCOPE_TYPES,
+            ),
+        ):
+            execution = next(
+                (
+                    item
+                    for item in reversed(scope_chain)
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                ),
+                tree,
+            )
+            eager_effect_starts.setdefault(execution, []).append(start)
+        # Any later reference may invoke a deferred body, so keep every load.
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            reference_starts.setdefault(node.id, []).append(start)
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+            reference_starts.setdefault(node.attr, []).append(start)
+
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                mark_attribute_identity_stores(target, node.value)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            mark_attribute_identity_stores(node.target, node.value)
+        if isinstance(node, ast.Assign):
+            # The RHS is captured before any target is assigned. A final
+            # same-slot store restores that snapshot after earlier writes in
+            # this statement, including chained and repeated unpacking targets.
+            stores: dict[tuple[str, str], list[ast.Attribute]] = {}
+            targets = list(reversed(node.targets))
+            while targets:
+                target = targets.pop()
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                    stores.setdefault((target.value.id, target.attr), []).append(target)
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    targets.extend(reversed(target.elts))
+            for slot_stores in stores.values():
+                if slot_stores[-1] in attribute_identity_stores:
+                    attribute_identity_stores.update(slot_stores)
+
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bind(scope, node.name, end)
+            nested_chain = (*scope_chain, node)
+            bindings.setdefault(node, set()).update(_parameter_names(node.args))
+            header_nodes: list[ast.AST] = [*node.decorator_list, node.args]
+            if node.returns is not None:
+                header_nodes.append(node.returns)
+            header_nodes.extend(getattr(node, "type_params", []))
+            stack.extend((child, scope_chain, None) for child in header_nodes)
+            stack.extend((child, nested_chain, None) for child in node.body)
+            continue
+        if isinstance(node, ast.Lambda):
+            nested_chain = (*scope_chain, node)
+            bindings.setdefault(node, set()).update(_parameter_names(node.args))
+            stack.append((node.args, scope_chain, None))
+            stack.append((node.body, nested_chain, None))
+            continue
+        if isinstance(node, ast.ClassDef):
+            bind(scope, node.name, end)
+            nested_chain = (*scope_chain, node)
+            bindings.setdefault(node, set())
+            header_nodes = [*node.decorator_list, *node.bases]
+            header_nodes.extend(keyword.value for keyword in node.keywords)
+            header_nodes.extend(getattr(node, "type_params", []))
+            stack.extend((child, scope_chain, None) for child in header_nodes)
+            stack.extend((child, nested_chain, None) for child in node.body)
+            continue
+        if isinstance(node, _COMPREHENSION_SCOPE_TYPES):
+            nested_chain = (*scope_chain, node)
+            bindings.setdefault(node, set())
+            generators = node.generators
+            if generators:
+                first, *remaining = generators
+                # The leftmost iterable is the only comprehension expression
+                # evaluated in the enclosing scope.
+                stack.append((first.iter, scope_chain, None))
+                stack.append((first.target, nested_chain, None))
+                stack.extend((condition, nested_chain, None) for condition in first.ifs)
+                for generator in remaining:
+                    stack.append((generator.iter, nested_chain, None))
+                    stack.append((generator.target, nested_chain, None))
+                    stack.extend((condition, nested_chain, None) for condition in generator.ifs)
+            if isinstance(node, ast.DictComp):
+                stack.append((node.key, nested_chain, None))
+                stack.append((node.value, nested_chain, None))
+            else:
+                stack.append((node.elt, nested_chain, None))
+            continue
+
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Store)
+            and isinstance(node.value, ast.Name)
+        ):
+            assignment = parents.get(node)
+            if (
+                node not in attribute_identity_stores
+                and isinstance(assignment, ast.Assign)
+                and len(assignment.targets) == 1
+                and assignment.targets[0] is node
+                and tree.body
+                and assignment is tree.body[0]
+                and not any(
+                    isinstance(value, ast.Name)
+                    and isinstance(value.ctx, ast.Load)
+                    and value.id in {node.value.id, "Popen"}
+                    for value in ast.walk(assignment.value)
+                )
+            ):
+                # Retain the legacy first-statement direct shadow control only.
+                # An RHS using the receiver or Popen may preserve a native callable.
+                # Prior stores/protocol effects need the companion's explicit proof.
+                record_binding(
+                    scope,
+                    node.value.id + "." + node.attr,
+                    binding_start if binding_start is not None else end,
+                )
+
+        if isinstance(node, ast.Global):
+            for name in node.names:
+                declarations.setdefault(scope, {})[name] = "global"
+        elif isinstance(node, ast.Nonlocal):
+            for name in node.names:
+                declarations.setdefault(scope, {})[name] = "nonlocal"
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bind(scope, node.id, binding_start if binding_start is not None else start)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name != "*":
+                    bound_name = alias.asname or alias.name.split(".", 1)[0]
+                    bind(scope, bound_name, end)
+                    restores = (
+                        isinstance(node, ast.Import)
+                        and alias.name == "subprocess"
+                        and bound_name == "subprocess"
+                    ) or (
+                        isinstance(node, ast.ImportFrom)
+                        and node.level == 0
+                        and node.module == "subprocess"
+                        and alias.name == "Popen"
+                        and bound_name == "Popen"
+                    )
+                    if restores:
+                        record_binding(scope, bound_name, end, True)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            type_span = _node_character_span(parsed, node.type) if node.type is not None else None
+            bind(scope, node.name, type_span[1] if type_span is not None else start)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            bind(scope, node.name, start)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bind(scope, node.rest, start)
+
+        if (
+            isinstance(node, ast.Assign)
+            and span is not None
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is True
+        ):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    scoped = _ScopedShellNode(node=node, scope_chain=scope_chain, start=start)
+                    assignments.setdefault((node.lineno, target.id), []).append(scoped)
+        elif isinstance(node, ast.Call) and span is not None:
+            shell_name = _direct_shell_name(node)
+            if shell_name is not None:
+                scoped = _ScopedShellNode(node=node, scope_chain=scope_chain, start=start)
+                calls.setdefault(shell_name, []).append(scoped)
+
+        if isinstance(node, ast.Assign):
+            stack.append((node.value, scope_chain, None))
+            stack.extend((target, scope_chain, end) for target in node.targets)
+            for target in node.targets:
+                record_name_store_values(scope, target, node.value, end)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            if node.value is not None:
+                stack.append((node.value, scope_chain, None))
+            stack.append((node.target, scope_chain, end))
+            if isinstance(node, ast.AnnAssign):
+                stack.append((node.annotation, scope_chain, None))
+                if node.value is not None:
+                    record_name_store_values(scope, node.target, node.value, end)
+        elif isinstance(node, ast.NamedExpr):
+            stack.append((node.value, scope_chain, None))
+            # PEP 572 makes a walrus target inside one or more
+            # comprehensions local to the nearest containing real scope.
+            # Comprehension ``for`` targets remain local to their implicit
+            # scope, but the named-expression target skips those scopes.
+            target_chain = scope_chain
+            while len(target_chain) > 1 and isinstance(
+                target_chain[-1], _COMPREHENSION_SCOPE_TYPES
+            ):
+                target_chain = target_chain[:-1]
+            stack.append((node.target, target_chain, end))
+            record_name_store_values(target_chain[-1], node.target, node.value, end)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            iteration_span = _node_character_span(parsed, node.iter)
+            iteration_end = iteration_span[1] if iteration_span is not None else end
+            stack.append((node.iter, scope_chain, None))
+            stack.append((node.target, scope_chain, iteration_end))
+            stack.extend((child, scope_chain, None) for child in (*node.body, *node.orelse))
+        elif isinstance(node, ast.withitem):
+            context_span = _node_character_span(parsed, node.context_expr)
+            context_end = context_span[1] if context_span is not None else end
+            stack.append((node.context_expr, scope_chain, None))
+            if node.optional_vars is not None:
+                stack.append((node.optional_vars, scope_chain, context_end))
+        else:
+            stack.extend(
+                (child, scope_chain, binding_start) for child in ast.iter_child_nodes(node)
+            )
+
+    def execution_scope(scope: ast.AST) -> ast.AST:
+        current: ast.AST | None = scope
+        while current is not None:
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                return current
+            current = parents.get(current)
+        return tree
+
+    # Keep the execution scope of every store. A global/nonlocal declaration
+    # changes the binding namespace; it never proves a deferred body was run.
+    scoped_events: dict[tuple[ast.AST, ast.AST], dict[str, list[tuple[int, bool]]]] = {}
+    sorted_class_starts = {
+        scope: {name: tuple(sorted(starts)) for name, starts in names.items()}
+        for scope, names in class_binding_starts.items()
+    }
+    for scope, names in binding_events.items():
+        for name, events in names.items():
+            receiver_name = name.partition(".")[0]
+            declaration = declarations.get(scope, {}).get(receiver_name)
+            for event in events:
+                target_scope = scope
+                if "." in name and declaration is None:
+                    # A class body can change where its receiver resolves
+                    # between stores. Resolve each slot store at its own offset.
+                    current: ast.AST | None = scope
+                    crossed_function = False
+                    while current is not None:
+                        if current is tree:
+                            target_scope = tree
+                            break
+                        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                            if receiver_name in bindings.get(current, set()):
+                                target_scope = current
+                                break
+                            crossed_function = True
+                        elif isinstance(current, ast.ClassDef) and not crossed_function:
+                            starts = sorted_class_starts.get(current, {}).get(receiver_name, ())
+                            if bisect_right(starts, event[0]):
+                                target_scope = current
+                                break
+                        current = parents.get(current)
+                if declaration == "global":
+                    target_scope = tree
+                elif declaration == "nonlocal":
+                    outer = parents.get(scope)
+                    while outer is not None:
+                        if isinstance(
+                            outer, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+                        ) and receiver_name in bindings.get(outer, set()):
+                            target_scope = outer
+                            break
+                        outer = parents.get(outer)
+                key = (target_scope, execution_scope(scope))
+                scoped_events.setdefault(key, {}).setdefault(name, []).append(event)
+
+    frozen_calls = {
+        name: tuple(sorted(nodes, key=lambda item: item.start)) for name, nodes in calls.items()
+    }
+    return _VariableShellAstIndex(
+        tree=tree,
+        line_character_starts=parsed.line_character_starts,
+        assignments={key: tuple(nodes) for key, nodes in assignments.items()},
+        calls=frozen_calls,
+        call_starts={
+            name: tuple(item.start for item in nodes) for name, nodes in frozen_calls.items()
+        },
+        bindings={scope: frozenset(names) for scope, names in bindings.items()},
+        class_binding_starts=sorted_class_starts,
+        declarations=declarations,
+        eager_effect_starts={
+            scope: tuple(sorted(set(starts))) for scope, starts in eager_effect_starts.items()
+        },
+        reference_starts={name: tuple(sorted(starts)) for name, starts in reference_starts.items()},
+        binding_events={
+            scope: {name: tuple(sorted(set(events))) for name, events in names.items()}
+            for scope, names in scoped_events.items()
+        },
+    )
+
+
+def _assignment_name_scope(
+    index: _VariableShellAstIndex,
+    scope_chain: tuple[ast.AST, ...],
+    name: str,
+) -> ast.AST:
+    """Return the scope mutated by a simple-name assignment."""
+    scope = scope_chain[-1]
+    declaration = index.declarations.get(scope, {}).get(name)
+    if declaration == "global":
+        return index.tree
+    if declaration == "nonlocal":
+        for outer in reversed(scope_chain[:-1]):
+            if isinstance(outer, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and name in (
+                index.bindings.get(outer, frozenset())
+            ):
+                return outer
+    return scope
+
+
+def _resolve_variable_shell_candidate(
+    index: _VariableShellAstIndex,
+    match: re.Match[str],
+    assignment_line: int,
+) -> _VariableShellCandidate | None:
+    """Resolve a bounded regex match to its exact assignment, call, and binding."""
+    name = match.group(1)
+    assignment_nodes = [
+        item
+        for item in index.assignments.get((assignment_line, name), ())
+        if match.start() <= item.start < match.end()
+    ]
+    call_nodes = index.calls.get(name, ())
+    starts = index.call_starts.get(name, ())
+    call_index = bisect_left(starts, match.start())
+    if len(assignment_nodes) != 1 or call_index >= len(call_nodes):
+        return None
+    assignment = assignment_nodes[0]
+    call = call_nodes[call_index]
+    if call.start >= match.end():
+        return None
+    assignment_scope = _assignment_name_scope(index, assignment.scope_chain, name)
+    resolved_scope = _resolved_name_scope(index, call.scope_chain, name, call.start)
+    return _VariableShellCandidate(
+        name=name,
+        call=call.node,
+        same_scope=assignment.scope_chain == call.scope_chain,
+        visible=resolved_scope is assignment_scope,
+        assignment_start=assignment.start,
+        assignment_scope=assignment_scope,
+        call_scope_chain=call.scope_chain,
+    )
+
+
+def _earliest_deferred_invocation(
+    index: _VariableShellAstIndex,
+    parsed: ParsedPythonFile,
+    call_scope_chain: tuple[ast.AST, ...],
+    owner_execution: ast.AST,
+) -> float:
+    """Return the earliest owner-scope offset at which a deferred call may run.
+
+    A function, method, or lambda can run once it exists and something refers to
+    it: a call in any statement (including ``if``/``try``/main guards), a callback
+    registration, a decorator, or another body. Without a visible reference it
+    runs only after the owner scope finishes.
+    """
+    owner_position = next(
+        (position for position, scope in enumerate(call_scope_chain) if scope is owner_execution),
+        None,
+    )
+    if owner_position is None or owner_position + 1 >= len(call_scope_chain):
+        return 0
+    entries = call_scope_chain[owner_position + 1 :]
+    span = _node_character_span(parsed, entries[0])
+    if span is None:
+        return 0
+    defined = span[1]
+    if any(
+        isinstance(entry, (ast.Lambda, ast.GeneratorExp)) or getattr(entry, "decorator_list", None)
+        for entry in entries
+    ):
+        return defined
+    names = {
+        entry.name
+        for entry in entries
+        if isinstance(entry, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    references = [
+        start
+        for name in names
+        for start in index.reference_starts.get(name, ())
+        if not span[0] <= start < span[1]
+    ]
+    if not references:
+        return float("inf")
+    return max(defined, min(references))
+
+
+def _deferred_receiver_is_replaced(
+    index: _VariableShellAstIndex,
+    parsed: ParsedPythonFile,
+    candidate: _VariableShellCandidate,
+    receiver: str,
+    receiver_scope: ast.AST,
+    receiver_execution: ast.AST,
+    current_execution: ast.AST,
+    call_start: int,
+) -> bool:
+    """Return whether every possible invocation of a deferred call sees a replacement."""
+    local_events = index.binding_events.get((receiver_scope, current_execution), {}).get(
+        receiver, ()
+    )
+    local_index = bisect_right(local_events, (call_start, True))
+    if local_index:
+        # A store earlier in the same invocation decides the receiver.
+        return not local_events[local_index - 1][1]
+    outer_events = index.binding_events.get((receiver_scope, receiver_execution), {}).get(
+        receiver, ()
+    )
+    first_invocation = _earliest_deferred_invocation(
+        index, parsed, candidate.call_scope_chain, receiver_execution
+    )
+    keeps_receiver: dict[int, bool] = {}
+    for start, restores in outer_events:
+        keeps_receiver[start] = keeps_receiver.get(start, False) or restores
+    starts = sorted(keeps_receiver)
+    earlier = bisect_left(starts, first_invocation)
+    if not earlier:
+        return False
+    # The binding seen by the first possible invocation, then every later one.
+    return not any(keeps_receiver[start] for start in starts[earlier - 1 :])
+
+
+def _lexical_shell_has_counterevidence(
+    index: _VariableShellAstIndex,
+    parsed: ParsedPythonFile,
+    candidate: _VariableShellCandidate,
+    *,
+    receiver_trusted: bool | None,
+) -> bool:
+    """Reject a lexical candidate only for an observed binding replacement.
+
+    The companion's unknown receiver trust is an abstention. Generic calls,
+    protocol effects, and unsupported statements do not prove a replacement.
+    Stores/imports do; use their source order and Python binding scopes.
+    """
+    call_span = _node_character_span(parsed, candidate.call)
+    if call_span is None:
+        return False
+    call_start = call_span[0]
+    shell = next((item.value for item in candidate.call.keywords if item.arg == "shell"), None)
+    shell_span = _node_character_span(parsed, shell) if shell is not None else None
+    shell_start = shell_span[0] if shell_span is not None else call_start
+    current_execution = next(
+        (
+            scope
+            for scope in reversed(candidate.call_scope_chain)
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+        ),
+        index.tree,
+    )
+
+    def binding_events(scope: ast.AST, name: str) -> tuple[tuple[int, bool], ...]:
+        owner_execution = (
+            scope
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+            else index.tree
+        )
+        events = index.binding_events.get((scope, owner_execution), {}).get(name, ())
+        if current_execution is not owner_execution:
+            local_events = index.binding_events.get((scope, current_execution), {}).get(name, ())
+            return tuple(sorted((*events, *local_events)))
+        return events
+
+    flag_events = binding_events(candidate.assignment_scope, candidate.name)
+    flag_index = bisect_right(flag_events, (shell_start, True))
+    if flag_index:
+        last_flag = flag_events[flag_index - 1]
+        if last_flag[0] > candidate.assignment_start and not last_flag[1]:
+            return True
+    if receiver_trusted is True:
+        return False
+    function = candidate.call.func
+    receiver = function.id if isinstance(function, ast.Name) else function.value.id
+    receiver_scope = _resolved_name_scope(index, candidate.call_scope_chain, receiver, call_start)
+    receiver_execution = (
+        receiver_scope
+        if isinstance(receiver_scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+        else index.tree
+    )
+    # Called-module slot replacement is proved only by the companion cache
+    # state, which discards stale proof after an unknown eager effect.
+    receiver_events = binding_events(receiver_scope, receiver)
+    receiver_index = bisect_right(receiver_events, (call_start, True))
+    if receiver_execution is not current_execution:
+        # Source order does not order a deferred body against outer stores.
+        # Require a replacement at every invocation the outer scope can reach.
+        if _deferred_receiver_is_replaced(
+            index,
+            parsed,
+            candidate,
+            receiver,
+            receiver_scope,
+            receiver_execution,
+            current_execution,
+            call_start,
+        ):
+            return True
+    elif receiver_index:
+        if not receiver_events[receiver_index - 1][1]:
+            return True
+    elif isinstance(receiver_scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        # Compile-time local bindings shadow a global receiver even before store.
+        if receiver in index.bindings.get(receiver_scope, frozenset()):
+            return True
+    if isinstance(function, ast.Attribute):
+        # Preserve a direct same-name replacement only in this execution scope,
+        # after the completed store and before another effect or receiver binding.
+        method_events = index.binding_events.get((receiver_scope, current_execution), {}).get(
+            receiver + "." + function.attr, ()
+        )
+        method_index = bisect_right(method_events, (call_start, True))
+        if method_index:
+            method_start, restores = method_events[method_index - 1]
+            effects = index.eager_effect_starts.get(current_execution, ())
+            effect_index = bisect_right(effects, method_start)
+            later_binding = receiver_index and receiver_events[receiver_index - 1][0] > method_start
+            if (
+                not restores
+                and not later_binding
+                and (effect_index == len(effects) or effects[effect_index] >= call_start)
+            ):
+                return True
     return False
 
 
@@ -3936,7 +4690,33 @@ def _line_containing(content: str, start: int, end: int) -> str:
     return content[line_start:line_end]
 
 
-def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+def _classify_tm1(
+    context: str,
+    matched_text: str,
+    matched_line: str,
+    confidence: float,
+    file_type: str,
+) -> tuple[Severity, float]:
+    """Apply the existing TM1 contextual classification to one candidate."""
+    if (
+        _is_safe_container_command(context)
+        or _is_safe_dockerfile_idiom(context, matched_text)
+        or _is_safe_cache_cleanup(matched_line)
+    ):
+        return Severity.LOW, min(confidence, 0.15)
+    adjusted = (
+        min(1.0, confidence + 0.1) if file_type in ("python", "shell", "javascript") else confidence
+    )
+    return Severity.HIGH, adjusted
+
+
+def analyze(
+    content: str,
+    file_path: str,
+    file_type: str,
+    *,
+    defer_variable_reconciliation: bool = False,
+) -> list[AnalyzerFinding]:
     """Analyze content for tool misuse patterns (TM1–TM3)."""
     findings: list[AnalyzerFinding] = []
 
@@ -3947,16 +4727,27 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         return get_context(content, start)
 
     tag = [PatternCategory.TOOL_MISUSE.value]
-    tm1_findings_by_key: dict[tuple[int, str], AnalyzerFinding] = {}
+    tm1_findings_by_key: dict[tuple[int, str, int], AnalyzerFinding] = {}
 
-    # The variable-shell-flag regex cannot see Python scopes, so an assignment
-    # in one function and a shell= use in another still match.  Drop those
-    # cross-scope candidates for Python files.
-    cross_scope_starts: set[int] = set()
-    if file_type == "python":
-        for variable_match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
-            if not _variable_shell_flag_same_scope(content, file_path, variable_match):
-                cross_scope_starts.add(variable_match.start())
+    variable_matches = {
+        (match.start(), match.end()): (match.group(1), match)
+        for match in _VARIABLE_SHELL_FLAG_RE.finditer(content)
+    }
+    invisible_variable_matches: set[tuple[int, int]] = set()
+    if file_type == "python" and variable_matches and not defer_variable_reconciliation:
+        parsed = parse_python_source(content, file_path)
+        ast_index = _build_variable_shell_ast_index(parsed)
+        if ast_index is not None:
+            for span, (_, match) in variable_matches.items():
+                assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
+                candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)
+                if candidate is not None and (
+                    not candidate.visible
+                    or _lexical_shell_has_counterevidence(
+                        ast_index, parsed, candidate, receiver_trusted=None
+                    )
+                ):
+                    invisible_variable_matches.add(span)
 
     shell_content = (
         _perl_literal_print_shell_text(content, lambda: None) if file_type == "perl" else None
@@ -3964,34 +4755,37 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     for match_start, match_end, matched_text, confidence in _tm1_candidates(
         content, shell_content=shell_content
     ):
-        if match_start in cross_scope_starts:
+        variable_match = variable_matches.get((match_start, match_end))
+        if variable_match is not None and variable_match[0].casefold().startswith("true"):
+            # The case-insensitive direct ``shell=True`` pattern already owns
+            # true-prefixed names at the exact call location.
+            continue
+        if variable_match is not None and (match_start, match_end) in invisible_variable_matches:
             continue
         line_num = get_line_number(content, match_start)
         context_text = ctx(match_start)
         matched = matched_text[:200]
         matched_line = _line_containing(content, match_start, match_end)
 
-        if (
-            _is_safe_container_command(context_text)
-            or _is_safe_dockerfile_idiom(context_text, matched)
-            or _is_safe_cache_cleanup(matched_line)
-        ):
-            adj = min(confidence, 0.15)
-            sev = Severity.LOW
-        else:
-            adj = (
-                min(1.0, confidence + 0.1)
-                if file_type in ("python", "shell", "javascript")
-                else confidence
-            )
-            sev = Severity.HIGH
-        candidate_key = (line_num, " ".join(matched.strip().split()))
+        sev, adj = _classify_tm1(
+            context_text,
+            matched,
+            matched_line,
+            confidence,
+            file_type,
+        )
+        candidate_key = (line_num, " ".join(matched.strip().split()), match_start)
         existing = tm1_findings_by_key.get(candidate_key)
         if existing is not None:
             if adj > existing.confidence:
                 existing.confidence = adj
                 existing.severity = sev
             continue
+        evidence: dict[str, object] = {static_runner._VIEW_START_EVIDENCE: match_start}
+        if variable_match is not None and defer_variable_reconciliation:
+            evidence[_VARIABLE_SHELL_FLAG_EVIDENCE] = variable_match[0]
+        elif defer_variable_reconciliation and _TRUE_SHELL_ARGUMENT_RE.search(matched_text):
+            evidence[_TRUE_SHELL_DIRECT_EVIDENCE] = True
         finding = AnalyzerFinding(
             rule_id="TM1",
             message="Tool Parameter Abuse",
@@ -4002,7 +4796,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             context=context_text,
             matched_text=matched,
             complete_match=matched_text,
-            evidence={static_runner._VIEW_START_EVIDENCE: match_start},
+            evidence=evidence,
         )
         tm1_findings_by_key[candidate_key] = finding
         findings.append(finding)
@@ -4082,8 +4876,171 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     return findings
 
 
+def _bound_shell_call_key(call: ast.Call) -> tuple[int, int, int, int]:
+    """Return the call key shared with the flow-sensitive companion."""
+    return (
+        getattr(call, "lineno", 1),
+        getattr(call, "col_offset", 0),
+        getattr(call, "end_lineno", getattr(call, "lineno", 1)),
+        getattr(call, "end_col_offset", getattr(call, "col_offset", 0)),
+    )
+
+
+def cleanup_path_findings(findings: list[Finding]) -> list[Finding]:
+    """Remove private reconciliation evidence when postprocessing times out."""
+    for finding in findings:
+        finding.evidence.pop(_VARIABLE_SHELL_FLAG_EVIDENCE, None)
+        finding.evidence.pop(_TRUE_SHELL_DIRECT_EVIDENCE, None)
+    return findings
+
+
+def postprocess_path_findings(
+    content: str,
+    findings: list[Finding],
+    *,
+    python_ast: ParsedPythonFile | None,
+) -> list[Finding]:
+    """Reconcile the legacy variable regex with the Python AST companion."""
+    marked = [
+        finding
+        for finding in findings
+        if isinstance(finding.evidence.get(_VARIABLE_SHELL_FLAG_EVIDENCE), str)
+        or finding.evidence.get(_TRUE_SHELL_DIRECT_EVIDENCE) is True
+    ]
+    if not marked:
+        return findings
+
+    file_path = marked[0].file
+    file_type = static_runner._infer_file_type(file_path)
+    if file_type != "python":
+        reconciled: list[Finding] = []
+        for finding in findings:
+            variable_name = finding.evidence.pop(_VARIABLE_SHELL_FLAG_EVIDENCE, None)
+            finding.evidence.pop(_TRUE_SHELL_DIRECT_EVIDENCE, None)
+            if not isinstance(variable_name, str):
+                reconciled.append(finding)
+        return reconciled
+    if python_ast is None or python_ast.tree is None:
+        return cleanup_path_findings(findings)
+
+    from . import static_python_shell_truthiness
+
+    ast_index = _build_variable_shell_ast_index(python_ast)
+    if ast_index is None:
+        return cleanup_path_findings(findings)
+    resolved: dict[tuple[int, str], list[_VariableShellCandidate]] = {}
+    for match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
+        finding_line = bisect_right(ast_index.line_character_starts, match.start())
+        assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
+        candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)
+        if candidate is None:
+            continue
+        key = (finding_line, candidate.name)
+        resolved.setdefault(key, []).append(candidate)
+    ownership, emitted, cached_replacements = (
+        static_python_shell_truthiness.bound_shell_call_analysis(file_path, python_ast)
+    )
+    retained_companion_locations = {
+        (finding.start_line, finding.start_column)
+        for finding in findings
+        if finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is True
+    }
+    emitted = {
+        key
+        for key in emitted
+        if (key[0], python_ast.character_column(key[0], key[1])) in retained_companion_locations
+    }
+    cached_replacements_by_start = {
+        (line, column)
+        for line, byte_column, _, _ in cached_replacements
+        if (column := python_ast.character_column(line, byte_column)) is not None
+    }
+    ownership_by_start = {
+        (line, column): trusted
+        for (line, byte_column, _, _), trusted in ownership.items()
+        if (column := python_ast.character_column(line, byte_column)) is not None
+    }
+
+    candidates_by_location: dict[tuple[int, int | None], list[_VariableShellCandidate]] = {}
+    for candidates in resolved.values():
+        for candidate in candidates:
+            location = (
+                candidate.call.lineno,
+                python_ast.character_column(candidate.call.lineno, candidate.call.col_offset),
+            )
+            candidates_by_location.setdefault(location, []).append(candidate)
+
+    reconciled: list[Finding] = []
+    for finding in findings:
+        variable_name = finding.evidence.pop(_VARIABLE_SHELL_FLAG_EVIDENCE, None)
+        direct_true = finding.evidence.pop(_TRUE_SHELL_DIRECT_EVIDENCE, None)
+        if direct_true is True:
+            location = (finding.start_line, finding.start_column)
+            if location in cached_replacements_by_start:
+                continue
+            if finding.start_column is not None and ownership_by_start.get(location) is False:
+                matching = candidates_by_location.get(location, [])
+                if len(matching) == 1 and _lexical_shell_has_counterevidence(
+                    ast_index, python_ast, matching[0], receiver_trusted=False
+                ):
+                    continue
+            reconciled.append(finding)
+            continue
+        if not isinstance(variable_name, str):
+            reconciled.append(finding)
+            continue
+        candidates = resolved.get((finding.start_line, variable_name), [])
+        if len(candidates) != 1:
+            # Derived views and ambiguous recovery candidates retain the
+            # conservative lexical signal.
+            reconciled.append(finding)
+            continue
+        candidate = candidates[0]
+        if variable_name.casefold().startswith("true") or not candidate.visible:
+            continue
+        call_key = _bound_shell_call_key(candidate.call)
+        if (
+            call_key in cached_replacements
+            or call_key in emitted
+            or _lexical_shell_has_counterevidence(
+                ast_index, python_ast, candidate, receiver_trusted=ownership.get(call_key)
+            )
+        ):
+            continue
+        reconciled.append(finding)
+    return reconciled
+
+
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run tool_misuse patterns and return findings."""
-    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    from . import static_python_shell_truthiness
+
+    response = static_runner.run_static_patterns_with_ledger(
+        state,
+        [sys.modules[__name__], static_python_shell_truthiness],
+    )
+    file_cache = state.get("file_cache", {})
+    for finding in response["findings"]:
+        if (
+            finding.evidence.pop(
+                static_python_shell_truthiness.BOUND_SHELL_EVIDENCE,
+                None,
+            )
+            is not True
+        ):
+            continue
+        content = file_cache.get(finding.file, "")
+        content_lines = content.splitlines()
+        line_index = max(0, finding.start_line - 1)
+        matched = (finding.matched_text or "")[:200]
+        matched_line = content_lines[line_index] if line_index < len(content_lines) else matched
+        severity, finding.confidence = _classify_tm1(
+            finding.context or "",
+            matched,
+            matched_line,
+            finding.confidence,
+            "python",
+        )
+        finding.severity = severity.value
     logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
     return response
