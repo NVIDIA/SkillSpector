@@ -183,6 +183,15 @@ def _validate_model_label(model: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Fixed text, never derived from untrusted input. Short on purpose: it replaces
+# Claude Code's default agent prompt, which is sent again on every call.
+_CLAUDE_SYSTEM_PROMPT = (
+    "You are a non-interactive text analysis component. You have no tools. "
+    "Follow the instructions in the user message and reply only with the "
+    "requested output."
+)
+
+
 def _build_claude_argv(binary: str, model: str, max_output_tokens: int) -> list[str]:
     """Build the argv list for a capability-stripped ``claude -p`` call.
 
@@ -231,6 +240,23 @@ def _build_claude_argv(binary: str, model: str, max_output_tokens: int) -> list[
     ``--disable-slash-commands``
         Prevents skill/plugin invocations from within the sandboxed call.
 
+    ``--tools ""``
+        Removes every built-in tool definition from the model's context.
+        ``--allowed-tools ""`` only denies tool *use*; without ``--tools ""``
+        each call still carries the full tool schemas, which a scan pays for
+        once per LLM call.
+
+    ``--system-prompt <_CLAUDE_SYSTEM_PROMPT>``
+        Replaces Claude Code's default agent system prompt, which describes
+        tools and coding workflows this call cannot use. The analyzer's own
+        instructions still arrive on stdin. Together with ``--tools ""`` this
+        is most of the fixed per-call startup cost.
+
+    ``--no-session-persistence``
+        Do not write a session transcript. Each call runs in a fresh temporary
+        cwd, so without this every call leaves a new project folder under
+        ``~/.claude/projects``.
+
     Deliberately NOT included:
     - ``--dangerously-skip-permissions`` / ``--allow-dangerously-skip-permissions``
       — explicitly forbidden.
@@ -256,6 +282,11 @@ def _build_claude_argv(binary: str, model: str, max_output_tokens: int) -> list[
         "--strict-mcp-config",
         "--setting-sources=",
         "--disable-slash-commands",
+        "--tools",
+        "",
+        "--system-prompt",
+        _CLAUDE_SYSTEM_PROMPT,
+        "--no-session-persistence",
     ]
 
 

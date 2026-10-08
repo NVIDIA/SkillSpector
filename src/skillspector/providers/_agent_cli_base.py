@@ -28,7 +28,27 @@ from __future__ import annotations
 
 import os
 
+from skillspector.logging_config import get_logger
 from skillspector.providers import _agent_cli, registry
+
+logger = get_logger(__name__)
+
+# CLIs already warned about in this process, so a scan warns once, not per probe.
+_cost_warned: set[str] = set()
+
+
+def _warn_session_cost_once(binary_name: str) -> None:
+    if binary_name in _cost_warned:
+        return
+    _cost_warned.add(binary_name)
+    logger.warning(
+        "LLM analysis via the local %r CLI starts a separate %s session for every "
+        "LLM call, and each one counts against your own plan. A scan can make dozens "
+        "of calls per skill. Use --no-llm for a static-only scan, or lower "
+        "SKILLSPECTOR_MAX_LLM_CONCURRENCY to slow the fan-out.",
+        binary_name,
+        binary_name,
+    )
 
 
 class AgentCLIProviderBase:
@@ -52,8 +72,15 @@ class AgentCLIProviderBase:
     # -- Availability --------------------------------------------------------
 
     def is_available(self) -> tuple[bool, str | None]:
-        """Binary on PATH AND authenticated (delegates to the registry probe)."""
-        return _agent_cli.is_available(self.BINARY_NAME)
+        """Binary on PATH AND authenticated (delegates to the registry probe).
+
+        Warns once per process when the CLI is usable, before any LLM call
+        fans out, because each call is a full agent session on the user's plan.
+        """
+        available, error = _agent_cli.is_available(self.BINARY_NAME)
+        if available:
+            _warn_session_cost_once(self.BINARY_NAME)
+        return available, error
 
     # -- Transport -----------------------------------------------------------
 

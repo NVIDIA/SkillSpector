@@ -64,6 +64,7 @@ from pydantic import ValidationError
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import (
     API_CONNECTION_MAX_RETRIES,
+    DEFAULT_CLI_MAX_LLM_CONCURRENCY,
     DEFAULT_MAX_LLM_CONCURRENCY,
     OUTPUT_LANGUAGE_MAX_LENGTH,
     PROVIDER_RETRY_AFTER_MAX_SECONDS,
@@ -130,6 +131,21 @@ class TestResolveMaxConcurrency:
     def test_below_one_clamps_to_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "0")
         assert resolve_max_concurrency() == 1
+
+    def test_cli_provider_unset_uses_cli_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", raising=False)
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        assert resolve_max_concurrency() == DEFAULT_CLI_MAX_LLM_CONCURRENCY
+
+    def test_cli_provider_explicit_value_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "6")
+        assert resolve_max_concurrency() == 6
+
+    def test_unknown_provider_uses_http_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", raising=False)
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "not-a-provider")
+        assert resolve_max_concurrency() == DEFAULT_MAX_LLM_CONCURRENCY
 
 
 class TestOutputLanguage:
