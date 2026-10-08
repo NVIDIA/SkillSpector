@@ -1267,7 +1267,7 @@ def test_import_binding_release_invalidates_receiver_trust() -> None:
 
 
 def test_import_binding_release_invalidates_called_function_trust() -> None:
-    findings = _tm1(
+    source = (
         "class Trigger:\n"
         "    def __del__(self):\n"
         "        global subprocess\n"
@@ -1280,7 +1280,13 @@ def test_import_binding_release_invalidates_called_function_trust() -> None:
         "execute()\n"
     )
 
-    assert not findings
+    # The release is an unknown effect: the companion abstains, and like the
+    # module-level layout the lexical signal stays because no store proves a
+    # replacement before the call.
+    assert not _tm1_ast(source)
+    findings = _tm1(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
 
 
 def test_class_binding_release_invalidates_receiver_trust() -> None:

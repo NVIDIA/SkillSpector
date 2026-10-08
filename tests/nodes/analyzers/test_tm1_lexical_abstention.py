@@ -451,3 +451,183 @@ def test_later_single_store_cannot_override_companion_abstention(prefix: str) ->
         prefix + "subprocess.run = proxy\nenabled = True\nsubprocess.run(command, shell=enabled)\n"
     )
     assert len(_findings(source)) == 1
+
+
+@pytest.mark.parametrize(
+    "store",
+    [
+        pytest.param("False and (enabled := False)", id="and-flag"),
+        pytest.param("False and (subprocess := None)", id="and-receiver"),
+        pytest.param("True or (enabled := False)", id="or-flag"),
+        pytest.param("ready and (enabled := False)", id="unknown-and-flag"),
+        pytest.param("result = 1 if ready else (enabled := False)", id="ifexp-flag"),
+        pytest.param("result = (subprocess := None) if False else 1", id="ifexp-receiver"),
+        pytest.param("result = [(enabled := False) for _ in values]", id="listcomp-flag"),
+        pytest.param("result = ((subprocess := None) for _ in values)", id="genexp-receiver"),
+    ],
+)
+def test_untaken_expression_store_is_not_counterevidence(store: str) -> None:
+    source = (
+        f'import subprocess\nenabled = True\n{store}\nsubprocess.run("echo ok", shell=enabled)\n'
+    )
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+@pytest.mark.parametrize(
+    "store",
+    [
+        "True and (enabled := False)",
+        "False or (subprocess := None)",
+        "result = (enabled := False) if True else 1",
+        "result = 1 if False else (subprocess := None)",
+    ],
+)
+def test_executed_expression_store_removes_lexical_candidate(store: str) -> None:
+    source = (
+        f'import subprocess\nenabled = True\n{store}\nsubprocess.run("echo ok", shell=enabled)\n'
+    )
+    assert not _findings(source)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "call"),
+    [
+        pytest.param(
+            "import subprocess\nsaved = subprocess\nsubprocess = saved\n",
+            'subprocess.run("echo ok", shell=enabled)',
+            id="native-alias-round-trip",
+        ),
+        pytest.param(
+            "import subprocess as saved\nimport subprocess\nsubprocess = saved\n",
+            'subprocess.run("echo ok", shell=enabled)',
+            id="native-import-alias",
+        ),
+        pytest.param(
+            "import subprocess\nsubprocess, saved = subprocess, 1\n",
+            'subprocess.run("echo ok", shell=enabled)',
+            id="unpacked-receiver-self-store",
+        ),
+        pytest.param(
+            "import subprocess\n[subprocess, saved] = [subprocess, 1]\n",
+            'subprocess.run("echo ok", shell=enabled)',
+            id="list-unpacked-receiver-self-store",
+        ),
+        pytest.param(
+            "from subprocess import Popen\nsaved = Popen\nPopen = saved\n",
+            'Popen("echo ok", shell=enabled)',
+            id="native-popen-alias",
+        ),
+        pytest.param(
+            "import subprocess\nfrom subprocess import Popen\nPopen = subprocess.Popen\n",
+            'Popen("echo ok", shell=enabled)',
+            id="native-popen-attribute",
+        ),
+    ],
+)
+def test_native_identity_store_keeps_lexical_high(prefix: str, call: str) -> None:
+    source = f"{prefix}enabled = True\n{call}\n"
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+@pytest.mark.parametrize(
+    "store",
+    [
+        "enabled, ignored = True, 1",
+        "[enabled, ignored] = [True, 1]",
+        "enabled, ignored = 'yes', 1",
+        "(enabled := True)",
+        "enabled = 1",
+    ],
+)
+def test_truthy_flag_store_keeps_lexical_high(store: str) -> None:
+    source = (
+        f'import subprocess\nenabled = True\n{store}\nsubprocess.run("echo ok", shell=enabled)\n'
+    )
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+@pytest.mark.parametrize(
+    "store",
+    [
+        "enabled, ignored = False, 1",
+        "enabled, ignored = dynamic, 1",
+        "subprocess, saved = proxy, 1",
+        "saved = proxy\nsubprocess = saved",
+        "saved = subprocess\nsaved = proxy\nsubprocess = saved",
+    ],
+)
+def test_unpacked_or_aliased_replacement_removes_lexical_candidate(store: str) -> None:
+    source = (
+        f'import subprocess\nenabled = True\n{store}\nsubprocess.run("echo ok", shell=enabled)\n'
+    )
+    assert not _findings(source)
+
+
+_DEFERRED_RUN = (
+    "import subprocess\ndef run(command):\n    enabled = True\n"
+    "    subprocess.run(command, shell=enabled)\n"
+)
+
+
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        pytest.param('if True:\n    run("echo ok")\n', id="literal-branch"),
+        pytest.param('if __name__ == "__main__":\n    run("echo ok")\n', id="main-guard"),
+        pytest.param('try:\n    run("echo ok")\nfinally:\n    pass\n', id="try"),
+        pytest.param('for _ in range(1):\n    run("echo ok")\n', id="loop"),
+        pytest.param('with context:\n    run("echo ok")\n', id="with"),
+        pytest.param(
+            'threading.Thread(target=run, args=("echo ok",)).start()\n', id="thread-start"
+        ),
+        pytest.param('def main():\n    run("echo ok")\nmain()\n', id="nested-caller"),
+    ],
+)
+@pytest.mark.parametrize("replacement", ["subprocess = None", "subprocess = proxy"])
+def test_invocation_before_future_store_keeps_lexical_high(
+    invocation: str, replacement: str
+) -> None:
+    source = f"{_DEFERRED_RUN}{invocation}{replacement}\n"
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+def test_method_invoked_before_future_store_keeps_lexical_high() -> None:
+    source = (
+        "import subprocess\nclass Tool:\n    def run(self, command):\n        enabled = True\n"
+        '        subprocess.run(command, shell=enabled)\nif True:\n    Tool().run("echo ok")\n'
+        "subprocess = None\n"
+    )
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+def test_reimport_before_invocation_restores_deferred_receiver() -> None:
+    source = (
+        "import subprocess\nsubprocess = proxy\n"
+        f"{_DEFERRED_RUN.removeprefix('import subprocess')}"
+        'import subprocess\nif True:\n    run("echo ok")\n'
+    )
+    findings = _findings(source)
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        pytest.param('subprocess = None\nrun("echo ok")\n', id="store-before-call"),
+        pytest.param('subprocess = None\nif True:\n    run("echo ok")\n', id="store-before-branch"),
+        pytest.param("subprocess = None\n", id="never-called-in-module"),
+    ],
+)
+def test_store_before_every_invocation_removes_deferred_candidate(tail: str) -> None:
+    assert not _findings(f"{_DEFERRED_RUN}{tail}")
