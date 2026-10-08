@@ -1640,9 +1640,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                     analyzer_id=ANALYZER_ID,
                     path=path,
                     reason=LedgerReason.STATIC_PARSE_LIMIT,
-                    message=budget.reflection_limit,
                     emitted_finding_ids=[finding.finding_id for finding in path_findings],
                 )
+                event["message"] = budget.reflection_limit
             else:
                 event = ledger_event(
                     outcome=LedgerOutcome.COMPLETED,

@@ -601,6 +601,75 @@ class TestCredentialExfiltration:
         behavioral_taint_tracking._build_reflective_sink_aliases(ast.parse(source), check_runtime)
 
     @pytest.mark.parametrize(
+        ("limit", "value"),
+        [
+            ("_REFLECTIVE_MAX_DEPTH", 1),
+            ("_REFLECTIVE_MAX_BODIES", 1),
+            ("_REFLECTIVE_MAX_WORK", 100),
+        ],
+    )
+    def test_reflective_limits_keep_prefix_and_ordinary_findings(self, monkeypatch, limit, value):
+        monkeypatch.setattr(behavioral_taint_tracking, limit, value)
+        prefix = (
+            "import importlib, os, urllib.request\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            'opener(os.getenv("API_KEY"))\n'
+        )
+        chain = (
+            "def f0():\n    pass\n"
+            + "".join(f"def f{i}():\n    f{i - 1}()\n" for i in range(1, 50))
+            + "f49()\n"
+        )
+        direct = 'urllib.request.urlopen(os.environ["API_KEY"])\n'
+        result = behavioral_taint_tracking.node(
+            {
+                "components": ["limited.py", "later.py"],
+                "file_cache": {
+                    "limited.py": prefix + chain + direct,
+                    "later.py": "import os, urllib.request\n" + direct,
+                },
+            }
+        )
+        tt3 = [f for f in result["findings"] if f.rule_id == "TT3"]
+        assert len([f for f in tt3 if f.file == "limited.py"]) == 2
+        assert len([f for f in tt3 if f.file == "later.py"]) == 1
+        events = result["inspection_ledger"]
+        assert [e["outcome"] for e in events] == ["partial", "completed"]
+        assert events[0]["reason_code"] == "static_parse_limit"
+        assert set(events[0]["emitted_finding_ids"]) == {
+            f.finding_id for f in tt3 if f.file == "limited.py"
+        }
+
+    def test_reflective_recursion_fallback_keeps_normal_analysis(self, monkeypatch):
+        original = behavioral_taint_tracking._ReflectiveSinkResolver.visit
+
+        def visit(self, node):
+            if isinstance(node, ast.Name) and node.id == "explode":
+                raise RecursionError("synthetic recursion limit")
+            return original(self, node)
+
+        monkeypatch.setattr(behavioral_taint_tracking._ReflectiveSinkResolver, "visit", visit)
+        code = 'import os, urllib.request\nexplode\nurllib.request.urlopen(os.environ["API_KEY"])\n'
+        result = behavioral_taint_tracking.node(
+            {"components": ["script.py"], "file_cache": {"script.py": code}}
+        )
+        assert "TT3" in _rule_ids(result["findings"])
+        assert result["inspection_ledger"][0]["outcome"] == "partial"
+
+    def test_reflective_prepass_does_not_swallow_shared_deadline(self):
+        class DeadlineExpired(RuntimeError):
+            pass
+
+        def check_runtime():
+            raise DeadlineExpired
+
+        with pytest.raises(DeadlineExpired):
+            behavioral_taint_tracking._build_reflective_sink_aliases(
+                ast.parse("pass"), check_runtime
+            )
+
+    @pytest.mark.parametrize(
         ("replacement", "call"),
         [
             ("send = lambda value: value", "send(None)"),
