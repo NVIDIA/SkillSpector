@@ -1001,6 +1001,40 @@ def _ledger_work_identity(entry: dict[str, object]) -> str:
     return f"{record_value}:{entry.get('phase', '')}"
 
 
+def _ledger_work_identities(value: object) -> dict[str, str]:
+    """Map each child ledger row's own work ID to the identity it was built from.
+
+    A status ``planned_work`` target carries only the child's work ID, path and
+    range, not the identity behind it. Rows whose identity is not the
+    analyzer's own -- the static_yara rule-set row is ``rule_set:static``, not
+    ``static_yara`` -- must be re-scoped with that same identity in the status
+    path, or the status target and its ledger row get different scoped IDs
+    and the target is dropped as unretained.
+    """
+    identities: dict[str, str] = {}
+    for event in _coerce_dict_list(value):
+        work_id = event.get("work_id")
+        if isinstance(work_id, str) and work_id:
+            identities[work_id] = _ledger_work_identity(event)
+    return identities
+
+
+def _source_scoped_work_id(identity: str, item: dict[str, object]) -> str:
+    """Build the scoped work ID for an already re-pathed ledger row or status target.
+
+    Shared by :func:`_source_aware_ledger` and :func:`_source_aware_status_events`
+    so the two scoping paths cannot derive different IDs for the same work.
+    """
+    start_line = item.get("start_line")
+    end_line = item.get("end_line")
+    return inspection_work_id(
+        identity,
+        str(item.get("path", "SKILL.md")),
+        start_line if isinstance(start_line, int) else None,
+        end_line if isinstance(end_line, int) else None,
+    )
+
+
 def _source_aware_ledger(
     value: object,
     *,
@@ -1026,15 +1060,7 @@ def _source_aware_ledger(
                     for item in ids
                     if isinstance(item, str)
                 ]
-        scoped_path = str(entry.get("path", "SKILL.md"))
-        start_line = entry.get("start_line")
-        end_line = entry.get("end_line")
-        entry["work_id"] = inspection_work_id(
-            _ledger_work_identity(entry),
-            scoped_path,
-            start_line if isinstance(start_line, int) else None,
-            end_line if isinstance(end_line, int) else None,
-        )
+        entry["work_id"] = _source_scoped_work_id(_ledger_work_identity(entry), entry)
         events.append(entry)
     return events
 
@@ -1047,8 +1073,10 @@ def _source_aware_status_events(
     source_digest: str,
     retained_work_ids: set[str],
     max_planned_work: int,
+    work_identities: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
     statuses: list[dict[str, object]] = []
+    identities = work_identities or {}
     planned_retained = 0
     for status in _coerce_dict_list(value):
         if len(statuses) >= _TRANSITIVE_MAX_STATUS_EVENTS:
@@ -1070,14 +1098,11 @@ def _source_aware_status_events(
                 path = scoped_target.get("path")
                 if isinstance(path, str) and path:
                     scoped_target["path"] = _transitive_component_key(source_identity, path)
-                start_line = scoped_target.get("start_line")
-                end_line = scoped_target.get("end_line")
-                scoped_target["work_id"] = inspection_work_id(
-                    analyzer_id,
-                    str(scoped_target.get("path", "SKILL.md")),
-                    start_line if isinstance(start_line, int) else None,
-                    end_line if isinstance(end_line, int) else None,
-                )
+                # Re-scope with the identity the matching ledger row used, so
+                # both paths agree on the scoped ID; the analyzer ID is only the
+                # fallback for targets with no child ledger row.
+                identity = identities.get(str(target.get("work_id", "")), analyzer_id)
+                scoped_target["work_id"] = _source_scoped_work_id(identity, scoped_target)
                 if scoped_target["work_id"] not in retained_work_ids:
                     continue
                 scoped_work.append(scoped_target)
@@ -1375,6 +1400,7 @@ def _cache_transitive_result(
         source_digest=source_digest,
         retained_work_ids=retained_work_ids,
         max_planned_work=len(retained_work_ids),
+        work_identities=_ledger_work_identities(child_result.get("inspection_ledger")),
     )
     child_metadata = _decorate_component_metadata(
         _coerce_component_metadata(child_result.get("component_metadata")),
