@@ -1688,6 +1688,59 @@ class TestBuiltInRansomwareRule:
 
         assert not _has_rule(_run_builtin(content), "ransomware_behavior")
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "If you don't pay 0.5 bitcoin within 48 hours, your files will be deleted.",
+            "If you don’t pay 0.5 bitcoin within 48 hours, your files will be deleted.",
+            "If you do not pay 1 Bitcoin within 72 hours, all your files will be lost forever.",
+            "If you do not send 1 BTC to the address below, we will publish your stolen data.",
+            "Never pay less than 1 bitcoin or your files will be deleted.",
+            "Never send less than 0.5 BTC to decrypt your files.",
+            "Do not pay less than 1 BTC or your files will be destroyed.",
+            "Don't send anything less than 0.5 BTC to decrypt your files.",
+            (
+                "We have downloaded your confidential data.\n"
+                "If you do not send 5 BTC to the address below within 72 hours, "
+                "we will publish your stolen data."
+            ),
+            (
+                "All your important files are encrypted!\n"
+                "If you don't pay 0.5 bitcoin within 48 hours, your files will be deleted."
+            ),
+        ],
+    )
+    def test_conditional_and_minimum_amount_demands_remain_critical(self, content):
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.md")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].rule_id == "YR1"
+        assert ransomware[0].severity == "CRITICAL"
+        assert ransomware[0].start_line == content.count("\n") + 1
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Never send BTC to strangers.",
+            "Never send BTC to anyone who promises to decrypt your files.",
+            "Never pay the ransom in Bitcoin; report it to your security team.",
+            "Do not pay the ransom in Bitcoin.",
+            "If you are attacked, do not pay the ransom in Bitcoin.",
+            "You should never pay the ransom in Bitcoin.",
+            "You must not send BTC to anyone who offers to decrypt your files.",
+            "- Never pay the ransom in Bitcoin.",
+            "> **Never** pay the ransom in Bitcoin.",
+            "1. Do not send BTC to anyone who offers to decrypt your files.",
+            "Don’t send BTC to anyone promising to decrypt your files.",
+        ],
+    )
+    def test_clause_opening_payment_advice_is_not_ransomware(self, content):
+        assert not _has_rule(_run_builtin(content, "advice.md"), "ransomware_behavior")
+
     @pytest.mark.parametrize("separator", ["\n", "\r\n"])
     def test_storage_notice_does_not_hide_later_encryption_notice(self, separator):
         content = (

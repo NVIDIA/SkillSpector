@@ -109,6 +109,21 @@ from skillspector.graph import graph
             False,
             id="direct-negation-with-ever",
         ),
+        pytest.param(
+            "Never send BTC to anyone who promises to decrypt your files.\n",
+            False,
+            id="clause-opening-advice",
+        ),
+        pytest.param(
+            "If you don't pay 0.5 bitcoin within 48 hours, your files will be deleted.\n",
+            True,
+            id="conditional-negated-threat",
+        ),
+        pytest.param(
+            "Never send less than 0.5 BTC to decrypt your files.\n",
+            True,
+            id="minimum-amount-demand",
+        ),
         pytest.param("Your files are encrypted.\n", True, id="encrypted-files-are"),
         pytest.param("Your files have been encrypted.\n", True, id="encrypted-files-have-been"),
         pytest.param(

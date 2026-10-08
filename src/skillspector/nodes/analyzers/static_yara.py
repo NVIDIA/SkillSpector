@@ -93,9 +93,23 @@ _RANSOMWARE_PAYMENT_IDENTIFIERS = frozenset(
     {"$payment_then_context", "$context_then_payment", "$explicit_ransom_payment"}
 )
 _RANSOMWARE_PAYMENT_VERB = re.compile(rb"\b(?:pay|send)\b", re.IGNORECASE)
+# Advice such as "Never pay the ransom" opens its clause with the negator (after
+# optional list/quote markup or a "you should" subject). A negator that follows
+# other words, as in "If you don't pay ... your files will be deleted", is part of
+# a conditional threat and must not suppress the demand.
 _DIRECT_RANSOMWARE_NEGATION = re.compile(
-    rb"\b(?:never|do[ \t]+not|don't|must[ \t]+not|should[ \t]+not|avoid)"
-    rb"(?:[ \t]+ever)?[ \t]+$",
+    rb"(?:^|(?<=[\r\n.;:!?,]))[ \t]*"
+    rb"(?:(?:[-*+>]|\d{1,3}[.)])[ \t]+){0,3}"
+    rb"(?:[\"'(\[]|\xe2\x80[\x98\x9c])?[*_]{0,2}"
+    rb"(?:you[ \t]+(?:(?:should|must)[ \t]+)?)?"
+    rb"(?:never|do[ \t]+not|don(?:'|\xe2\x80\x99)t|must[ \t]+not|should[ \t]+not|avoid)"
+    rb"[*_]{0,2}(?:[ \t]+ever)?[ \t]+$",
+    re.IGNORECASE,
+)
+# "Never pay less than 1 BTC" sets a minimum amount; it is a demand, not advice.
+_RANSOMWARE_MINIMUM_PAYMENT = re.compile(
+    rb"(?:pay|send)[ \t]{1,8}(?:(?:anything|any[ \t]{1,8}amount)[ \t]{1,8})?"
+    rb"(?:less|fewer)[ \t]{1,8}than\b",
     re.IGNORECASE,
 )
 _RANSOMWARE_STORAGE_CONTINUATION = re.compile(
@@ -653,13 +667,17 @@ def _has_local_destructive_autonomy_evidence(
 
 
 def _payment_is_directly_negated(data: bytes, payment_offset: int) -> bool:
-    """Check the immediate payment prefix without inventing a clipped word boundary."""
+    """Return whether the payment verb is clause-opening advice such as ``Never pay``.
+
+    The search runs over the original buffer (``pos``/``endpos``), so the clause
+    boundary lookbehind sees the real preceding byte instead of a clipped window
+    edge. Conditional threats (``If you don't pay``) and minimum-amount demands
+    (``Never send less than 0.5 BTC``) are not advice.
+    """
     prefix_start = max(0, payment_offset - 80)
-    negation = _DIRECT_RANSOMWARE_NEGATION.search(data[prefix_start:payment_offset])
-    if negation is None:
+    if _DIRECT_RANSOMWARE_NEGATION.search(data, prefix_start, payment_offset) is None:
         return False
-    start = prefix_start + negation.start()
-    return start == 0 or not (data[start - 1 : start].isalnum() or data[start - 1 : start] == b"_")
+    return _RANSOMWARE_MINIMUM_PAYMENT.match(data, payment_offset) is None
 
 
 def _accepted_builtin_ransomware_instances(
