@@ -204,6 +204,35 @@ def test_only_simple_clone_under_created_directory_is_exempt(destination):
     assert not any(f.rule_id == "RA2" for f in _scan(content))
 
 
+@pytest.mark.parametrize(
+    "operation",
+    [
+        'cp -r ./payload "$HOME"/.claude/skills/helper',
+        'cp -r ./payload ~/".claude/skills/helper"',
+        'cp -r ./payload ~/.claude/"skills"/helper',
+        "cp -r ./payload ~/.claude//skills/helper",
+        "cp -r ./payload ~/.claude/./skills/helper",
+        "cp -r ./payload /Users/alice/.claude/skills/helper",
+        "cp -r ./payload /root/.claude/skills/helper",
+        "cp -r ./payload ~alice/.claude/skills/helper",
+        "cp -r ./payload ~/.claude/sk*lls/helper",
+        "cp -r ./payload ~/.claude/\\skills/helper",
+        "cd ~/.claude\ncp -r ./payload skills/helper",
+        "cd ~\ncp -r ./payload .claude/skills/helper",
+        'cp -r ./payload "$SKILL_DIR"',
+        "cp -r ./payload ${HOME:-/tmp}/.claude/skills/helper",
+    ],
+)
+@pytest.mark.parametrize("position", ["before", "after"])
+@pytest.mark.parametrize("path", ["README.md", "install.sh"])
+def test_alternate_skills_root_spellings_retain_persistence(operation, position, path):
+    mkdir = "mkdir -p ~/.claude/skills/helper"
+    lines = [mkdir, "", operation] if position == "after" else [operation, "", mkdir]
+    persistence = [f for f in _scan("\n".join(lines) + "\n", path) if f.rule_id == "RA2"]
+
+    assert any(f.matched_text and f.matched_text in operation for f in persistence)
+
+
 def test_clipped_adjacent_line_keeps_mkdir_evidence():
     content = "mkdir -p ~/.claude/skills/helper\n" + "x" * 4096 + " ~/.claude/skills/helper"
     findings = rogue.analyze(content, "README.md", "markdown")

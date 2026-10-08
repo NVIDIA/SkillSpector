@@ -165,10 +165,11 @@ _STANDARD_SKILL_MKDIR = re.compile(
     r"(?P<quote>['\"]?)(?P<target>~/\.(?:claude|codex|gemini)/skills"
     r"(?:/[a-zA-Z0-9][a-zA-Z0-9_.-]*)?)/?(?P=quote)[ \t]*"
 )
-_SKILLS_ROOT = re.compile(
-    r"(?:~/|\$(?:HOME|\{HOME\})/|/home/[^/\s]+/)\.(?:claude|codex|gemini)/skills(?=/|\b)",
-    re.IGNORECASE,
-)
+# Anything that may address a skills root: any agent configuration directory,
+# any "skills" word, or any shell expansion. Quoting, duplicate or dot path
+# segments, other home spellings, globs, cd plus relative paths and variables
+# must not make a nearby writer look unrelated to the created directory.
+_SKILLS_ROOT = re.compile(r"\.(?:claude|codex|gemini)\b|\bskills\b|\$", re.IGNORECASE)
 _SKILL_INSTALL_PATH = re.compile(
     r"(?:~/|\$(?:HOME|\{HOME\})/|/home/[^/\s]+/)"
     r"(?P<relative>\.(?:claude|codex|gemini)/skills(?:/[a-zA-Z0-9][a-zA-Z0-9_.-]*)*)/?"
@@ -369,8 +370,9 @@ def _unsafe_skill_install_context(
     """Retain persistence when nearby skills-root use is not a simple install.
 
     Inspect every neighboring logical line within a 4 KiB window.
-    Blank lines do not prove independence. Any skills-root reference retains
-    detection unless the complete line is a simple clone into the target.
+    Blank lines do not prove independence. Any possible skills-root reference
+    (however spelled) retains detection unless the complete line is a simple
+    clone into the target.
     Composition, parse errors, alternate writers and destinations are unsafe.
     """
     mkdir_line_index = bisect_right(line_starts, mkdir_line_start) - 1

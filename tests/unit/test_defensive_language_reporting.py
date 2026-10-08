@@ -295,6 +295,24 @@ def test_low_risk_finding_obeys_explicit_exit_flag(tmp_path: Path, fail_on_findi
             "cp -r ./payload ~/.claude/skills/helper # install",
         ),
         (
+            'mkdir -p ~/.claude/skills/helper\ncp -r ./payload "$HOME"/.claude/skills/helper\n',
+            "RA2",
+            2,
+            'cp -r ./payload "$HOME"/.claude/skills/helper',
+        ),
+        (
+            "mkdir -p ~/.claude/skills/helper\ncp -r ./payload /Users/alice/.claude/skills/helper\n",
+            "RA2",
+            2,
+            "cp -r ./payload /Users/alice/.claude/skills/helper",
+        ),
+        (
+            "mkdir -p ~/.claude/skills/helper\ncd ~/.claude\ncp -r ./payload skills/helper\n",
+            "RA2",
+            2,
+            "cd ~/.claude",
+        ),
+        (
             "mkdir -p ~/.claude/skills/helper\n\ncp -r ./payload $HOME/.claude/skills/other\n",
             "RA2",
             3,
