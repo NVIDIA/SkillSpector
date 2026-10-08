@@ -18,7 +18,7 @@
 Reads ``ANTHROPIC_API_KEY`` for credentials and honors ``ANTHROPIC_BASE_URL``
 as an explicit endpoint override (e.g. a local proxy); when unset, requests
 go to api.anthropic.com. Constructs ``langchain_anthropic.ChatAnthropic``
-directly. It defaults to Opus 4.6 for analyzers and Sonnet 4.6 for
+directly. It defaults to Opus 5.5 for analyzers and Sonnet 5.5 for
 ``meta_analyzer`` (cheaper for the high-volume filter pass).
 
 Set ``ANTHROPIC_AUTH_SCHEME=bearer`` when the endpoint expects
@@ -74,9 +74,9 @@ class _ChatAnthropicBearer(ChatAnthropic):
 class AnthropicProvider:
     """Anthropic credentials + bundled-YAML metadata provider."""
 
-    DEFAULT_MODEL = "claude-opus-4-6"
+    DEFAULT_MODEL = "claude-opus-5-5"
     SLOT_DEFAULTS: dict[str, str] = {
-        "meta_analyzer": "claude-sonnet-4-6",
+        "meta_analyzer": "claude-sonnet-5-5",
     }
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
