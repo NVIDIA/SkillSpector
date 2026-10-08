@@ -1508,3 +1508,84 @@ def test_python_window_surface_enables_ast_companion() -> None:
     )
 
     assert len(findings) == 1
+
+
+@pytest.mark.parametrize("name", ["true", "TRUE", "TrUe"])
+def test_case_variant_true_has_one_direct_owner(name: str) -> None:
+    findings = _tm1(f"{name} = True\nsubprocess.run(command, shell={name})\n")
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 2
+    assert not findings[0].evidence
+
+
+def test_normalized_prefix_keeps_lexical_signal_after_unknown_receiver_effect() -> None:
+    assert (
+        len(
+            _tm1(
+                "true_value = True\n"
+                "def inner():\n"
+                "    ﬀ; subprocess.run(command, shell=true_value)\n"
+                "replace_subprocess()\n"
+                "inner()\n"
+            )
+        )
+        == 1
+    )
+
+
+def test_normalized_prefix_does_not_duplicate_true_direct_fallback() -> None:
+    findings = _tm1("true = True\nﬀ; subprocess.run(command, shell=true)\n")
+
+    assert len(findings) == 1
+    assert (findings[0].start_line, findings[0].start_column) == (2, 3)
+    assert not findings[0].evidence
+
+
+def test_true_direct_lexical_signal_survives_unknown_receiver_effect() -> None:
+    findings = _tm1(
+        "true = True\n"
+        "subprocess.run(command, shell=true)\n"
+        "replace_subprocess()\n"
+        "subprocess.run(command, shell=true)\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [2, 4]
+
+
+@pytest.mark.parametrize(
+    ("path", "suffix"),
+    [
+        pytest.param("run.py", "if:\n", id="malformed-python"),
+        pytest.param("run.js", "", id="non-python"),
+    ],
+)
+def test_true_direct_fallback_survives_without_ast_ownership(path: str, suffix: str) -> None:
+    findings = _tm1(f"true = True\nsubprocess.run(command, shell=true)\n{suffix}", path)
+
+    assert len(findings) == 1
+    assert not findings[0].evidence
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(
+            "true = True\n"
+            "def inner():\n"
+            "    subprocess.run(command, shell=true)\n"
+            "replace_subprocess()\n"
+            "inner()\n",
+            id="direct-true-after-unknown-receiver-effect",
+        ),
+        pytest.param(
+            "true_value = True\nﬀ; subprocess.run(command, shell=true_value)\nif:\n",
+            id="normalized-prefix-without-ast",
+        ),
+    ],
+)
+def test_true_named_shell_window_has_one_owner_per_call(content: str) -> None:
+    findings = _tm1(content)
+
+    assert len(findings) == 1
+    assert not findings[0].evidence
