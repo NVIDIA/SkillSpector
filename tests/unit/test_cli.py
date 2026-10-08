@@ -4584,7 +4584,7 @@ def test_scan_transitive_preserves_root_cleanup_and_counts_findings(
     assert merged["transitive_sources"] == ["https://github.com/org/transitive"]
 
 
-def test_scan_transitive_counts_only_active_post_active_findings(
+def test_scan_transitive_counts_only_active_post_baseline_findings(
     tmp_path: Path, monkeypatch
 ) -> None:
     """A root glob baseline cannot suppress a dependency finding."""
@@ -6959,10 +6959,12 @@ def test_cli_recursive_summary_count_excludes_suppressed(
     assert row.split() == ["solo", "0", "LOW", "0", "successful"]
 
 
-@pytest.mark.parametrize("has_active_findings", [False, True])
+@pytest.mark.parametrize(
+    "report_lists_findings", [False, True], ids=["filtered-empty", "filtered-nonempty"]
+)
 def test_cli_baseline_command_excludes_filtered_out_findings(
     tmp_path: Path,
-    has_active_findings: bool,
+    report_lists_findings: bool,
 ) -> None:
     """`skillspector baseline` fingerprints what the scan reported, not raw findings.
 
@@ -6988,8 +6990,8 @@ def test_cli_baseline_command_excludes_filtered_out_findings(
         "risk_score": 0,
     }
 
-    if has_active_findings:
-        result["active_findings"] = []
+    if report_lists_findings:
+        # The compacted report list must not stand in for the active findings.
         result["filtered_findings"] = result["findings"]
 
     with patch("skillspector.cli.graph.invoke", return_value=result):
