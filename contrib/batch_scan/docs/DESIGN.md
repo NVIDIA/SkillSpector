@@ -16,10 +16,10 @@ batch_scan.py :: main()
  ├─ detect language (Unicode script-ratio, per skill)
  ├─ create API pool (optional, 10-key scheduler)
  ├─ ThreadPoolExecutor(max_workers=N)
- │   ├─ Thread A: skill_1 → graph.invoke() + gap-fill
- │   ├─ Thread B: skill_2 → graph.invoke() + gap-fill
+ │   ├─ Thread A: supervise process → skill_1 → graph.invoke() + gap-fill
+ │   ├─ Thread B: supervise process → skill_2 → graph.invoke() + gap-fill
  │   └─ ...
- ├─ collect results, sort by risk score
+ ├─ retain successful, timed-out and crashed scans; sort by risk score
  └─ report (terminal / JSON / Markdown)
 ```
 
@@ -39,7 +39,7 @@ run_one(skill_dir)
 ## Three-layer concurrency
 
 ```
-Layer 3 — batch_scan.py:        ThreadPoolExecutor(max_workers=N)  [CONTRIB]
+Layer 3 — batch_scan.py:        ThreadPoolExecutor → per-skill processes  [CONTRIB]
 Layer 2 — llm_analyzer_base:    asyncio.Semaphore(10)               [UPSTREAM]
 Layer 1 — graph.py:             20 analyzers fan-out                [UPSTREAM]
 ```
@@ -47,11 +47,20 @@ Layer 1 — graph.py:             20 analyzers fan-out                [UPSTREAM]
 Each layer is unaware of the others.  The graph doesn't know it's being called
 concurrently; the workers don't know the graph fans out internally.
 
-## Why ThreadPoolExecutor
+## Why supervised scan processes
 
-- ProcessPoolExecutor hangs on macOS (spawn mode reimports LangGraph per child)
-- `graph.invoke()` is a pure function — same state → same result, no shared state
-- Each thread operates on its own state dict, isolated from other threads
+Threads supervise independently killable processes; they do not run scans themselves.
+A worker has up to 90 seconds to start its interpreter and import the graph. It then
+signals that scanning has begun, starting a separate 90-second work deadline.
+Timeouts and crashes remain ERROR entries in every saved report, and other skills
+continue. The work deadline includes provider-pool waits and gap-fill.
+
+Each worker owns a process group. The supervisor kills that group on timeout,
+reclaims API-pool leases, and removes scratch files. A worker also watches its
+parent's process sentinel so parent termination stops the group and removes its
+scratch. Descendants that deliberately start a new session are outside this group.
+The API-pool manager also watches its parent and exits if the supervisor dies.
+Verbose logging is forwarded explicitly to spawned workers.
 
 ## DeepSeek compatibility patches
 
@@ -173,7 +182,8 @@ Windows.
 
 ## Per-skill timeout (90s)
 
-A skill that takes >90s is marked TIMEOUT and skipped.  Other workers continue.
+A skill that takes more than 90 seconds of scan time is retained as an ERROR
+entry in the report. Startup has a separate 90-second bound. Other workers continue.
 HTTP-level timeouts (Patch 6) prevent most hangs from reaching the 90s ceiling.
 
 ## Exit codes
@@ -189,7 +199,7 @@ HTTP-level timeouts (Patch 6) prevent most hangs from reaching the 90s ceiling.
 ```
 contrib/batch_scan/
 ├── __init__.py          # package init + dotenv preload
-├── batch_scan.py        # CLI + ThreadPoolExecutor
+├── batch_scan.py        # CLI + supervised scan processes
 ├── runner.py            # graph wrapper + setup_deepseek_compat()
 ├── discovery.py         # SKILL.md finder
 ├── detection.py         # language detection
@@ -228,9 +238,10 @@ requirement.  It would also require all batch orchestration code to be async,
 complicating the CLI layer (`argparse`, Rich console output) with no throughput
 gain.
 
-`ProcessPoolExecutor` was tested and rejected: macOS Python 3.13 `spawn` mode
-reimports LangGraph + LangChain per child process, causing 30+ second startup
-timeouts.  `fork` mode is unavailable on macOS since Python 3.8.
+The earlier `ProcessPoolExecutor` experiment had 30+ second startup delays on
+macOS because `spawn` reimports LangGraph and LangChain. The current supervisor
+still pays this import cost per skill, but accounts for it separately from scan
+time. It uses `spawn` consistently rather than forking a threaded scanner.
 
 ### Why monkey-patch, not fork upstream?
 

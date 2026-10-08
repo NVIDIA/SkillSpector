@@ -1142,6 +1142,26 @@ def test_is_local_target_fails_closed_when_home_cannot_be_resolved(
     assert mcp_server._is_local_target("~nosuchuser/skill") is True
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        "git@github.com:org/private.git",
+        "ssh://git@github.com/org/private.git",
+        "git+ssh://git@github.com/org/private.git",
+        "https://token@github.com/org/private.git",
+        "https://user:password@github.com/org/private.git",
+    ],
+)
+async def test_http_rejects_credentialed_targets_before_graph(
+    target: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_ainvoke = AsyncMock()
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", graph_ainvoke)
+    with pytest.raises(ValueError, match="unauthenticated HTTPS"):
+        await run_scan(target, allow_local_targets=False)
+    graph_ainvoke.assert_not_awaited()
+
+
 async def test_run_scan_allows_remote_target_when_local_targets_disallowed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1164,6 +1184,7 @@ async def test_run_scan_allows_remote_target_when_local_targets_disallowed(
     assert result["target"] == target
     assert graph_ainvoke.await_count == 1
     assert graph_ainvoke.await_args.args[0]["input_path"] == target
+    assert graph_ainvoke.await_args.args[0]["allow_git_credentials"] is False
 
 
 async def test_run_scan_keeps_default_local_target_compatibility(
@@ -1187,6 +1208,7 @@ async def test_run_scan_keeps_default_local_target_compatibility(
     assert result["target"] == str(tmp_path)
     assert graph_ainvoke.await_count == 1
     assert graph_ainvoke.await_args.args[0]["input_path"] == str(tmp_path)
+    assert graph_ainvoke.await_args.args[0]["allow_git_credentials"] is True
 
 
 @pytest.mark.parametrize(
