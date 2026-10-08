@@ -1527,6 +1527,67 @@ class TestToolMisuse:
         findings = tm_mod.analyze(content, "runner.py", "python")
         assert any(finding.rule_id == "TM1" for finding in findings)
 
+    def test_tm1_parses_dense_shell_flags_once(self) -> None:
+        content = "use_shell = True\nsubprocess.run(cmd, shell=use_shell)\n" * 4000
+        content += "#" + " ordinary" * ((256_000 - len(content)) // 9)
+        content = content.ljust(256_000)
+        assert len(content) == 256_000
+        with patch.object(tm_mod, "parse_python_source", wraps=tm_mod.parse_python_source) as parse:
+            findings = tm_mod.analyze(content, "runner.py", "python")
+        assert parse.call_count == 1
+        assert len([finding for finding in findings if finding.rule_id == "TM1"]) == 4000
+
+    def test_tm1_caches_unparseable_window_conservatively(self) -> None:
+        content = "use_shell = True\nsubprocess.run(cmd, shell=use_shell)\n" * 20 + "\nif :"
+        with patch.object(tm_mod, "parse_python_source", wraps=tm_mod.parse_python_source) as parse:
+            findings = tm_mod.analyze(content, "runner.py", "python")
+        assert parse.call_count == 1
+        assert len([finding for finding in findings if finding.rule_id == "TM1"]) == 20
+
+    def test_tm1_remains_lexical_for_large_and_normalized_views(self) -> None:
+        from skillspector.nodes.analyzers import static_runner
+
+        for content in (
+            "# ordinary source\n" * 16_000 + "subprocess.run(cmd, shell=True)",
+            "subprocess.run(cmd, shell=Tru\u200be)",
+        ):
+            result = static_runner.run_static_patterns_with_ledger(
+                {"components": ["runner.py"], "file_cache": {"runner.py": content}}, [tm_mod]
+            )
+            assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+    def test_tm1_scope_index_honors_runtime_check(self) -> None:
+        content = "use_shell = True\nsubprocess.run(cmd, shell=use_shell)\n" * 300
+        calls = 0
+
+        def check_runtime() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 20:
+                raise RuntimeError("deadline")
+
+        with pytest.raises(RuntimeError, match="deadline"):
+            tm_mod.analyze(content, "runner.py", "python", check_runtime=check_runtime)
+        assert calls == 20
+
+    def test_tm1_skips_parse_without_variable_shell_flags(self) -> None:
+        with patch.object(tm_mod, "parse_python_source", side_effect=AssertionError("parsed")):
+            findings = tm_mod.analyze("subprocess.run(cmd, shell=True)", "runner.py", "python")
+        assert any(finding.rule_id == "TM1" for finding in findings)
+
+    def test_tm1_preserves_nonlocal_binding_scope(self) -> None:
+        content = (
+            "def outer():\n"
+            "    use_shell = False\n"
+            "    def assign():\n"
+            "        use_shell = True\n"
+            "    def run():\n"
+            "        nonlocal use_shell\n"
+            "        subprocess.run(cmd, shell=use_shell)\n"
+        )
+        findings = tm_mod.analyze(content, "runner.py", "python")
+        assert not any(finding.rule_id == "TM1" for finding in findings)
+
     def test_application_specific_no_verify_flag_is_not_tool_misuse(self) -> None:
         content = """\
 print("verification: skipped (--no-verify)")
