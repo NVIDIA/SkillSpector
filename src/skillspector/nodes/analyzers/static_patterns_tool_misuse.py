@@ -5160,6 +5160,9 @@ def analyze(
             if call_start is not None:
                 if variable_match[0].casefold().startswith("true"):
                     evidence[static_runner._VIEW_START_EVIDENCE] = call_start
+                    # Like a direct owner, a call-anchored window keeps one
+                    # identity across raw and normalized security views.
+                    complete_identity_match = normalized_security_view(matched_text).text
                 evidence[static_runner._VIEW_ANCHOR_EVIDENCE] = call_start
         finding = AnalyzerFinding(
             rule_id="TM1",
@@ -5275,12 +5278,26 @@ def coalesce_path_findings(content: str, findings: list[Finding]) -> list[Findin
         )
         is int
     }
+    # The case-insensitive direct ``shell=True`` pattern also matches a name
+    # spelled ``true``, so its lexical owner already reports that exact call
+    # even when no Python AST can reconcile the variable window.
+    true_name_call_starts = bound_call_starts | {
+        coordinate
+        for finding in findings
+        if finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is True
+        for key in (
+            static_runner._ABSOLUTE_START_EVIDENCE,
+            static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+        )
+        if type(coordinate := finding.evidence.get(key)) is int
+    }
     findings = [
         finding
         for finding in findings
         if not (
-            isinstance(finding.evidence.get(_VARIABLE_SHELL_FLAG_EVIDENCE), str)
-            and finding.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE) in bound_call_starts
+            isinstance(variable_name := finding.evidence.get(_VARIABLE_SHELL_FLAG_EVIDENCE), str)
+            and finding.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE)
+            in (true_name_call_starts if variable_name.casefold() == "true" else bound_call_starts)
         )
     ]
     canonical_bound_calls: dict[tuple[str, int, str], set[int]] = {}
