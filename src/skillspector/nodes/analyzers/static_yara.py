@@ -27,6 +27,7 @@ import binascii
 import hashlib
 import math
 import os
+import re
 import stat
 import time
 from collections.abc import Callable
@@ -86,6 +87,37 @@ _DEFAULT_CONFIDENCE = 0.7
 _DESTRUCTIVE_AUTONOMY_NAMESPACE = "agent_skills"
 _DESTRUCTIVE_AUTONOMY_RULE = "agent_skill_destructive_autonomous_actions"
 _MAX_DESTRUCTIVE_AUTONOMY_LINE_DISTANCE = 3
+_BUILTIN_RANSOMWARE_NAMESPACE = "malware"
+_BUILTIN_RANSOMWARE_RULE = "ransomware_behavior"
+_RANSOMWARE_PAYMENT_IDENTIFIERS = frozenset(
+    {"$payment_then_context", "$context_then_payment", "$explicit_ransom_payment"}
+)
+_RANSOMWARE_PAYMENT_FIRST_IDENTIFIERS = frozenset(
+    {"$payment_then_context", "$explicit_ransom_payment"}
+)
+_RANSOMWARE_PAYMENT_VERB = re.compile(rb"\b(?:pay|send)\b", re.IGNORECASE)
+# Advice such as "Never pay the ransom" opens its clause with the negator (after
+# optional list/quote markup or a "you should" subject). A negator that follows
+# other words, as in "If you don't pay ... your files will be deleted", is part of
+# a conditional threat and must not suppress the demand.
+_DIRECT_RANSOMWARE_NEGATION = re.compile(
+    rb"(?:^|(?<=[\r\n.;:!?,]))[ \t]*"
+    rb"(?:(?:[-*+>]|\d{1,3}[.)])[ \t]+){0,3}"
+    rb"(?:[\"'(\[]|\xe2\x80[\x98\x9c])?[*_]{0,2}"
+    rb"(?:you[ \t]+(?:(?:should|must)[ \t]+)?)?"
+    rb"(?:never|do[ \t]+not|don(?:'|\xe2\x80\x99)t|must[ \t]+not|should[ \t]+not|avoid)"
+    rb"[*_]{0,2}(?:[ \t]+ever)?[ \t]+$",
+    re.IGNORECASE,
+)
+# "Never pay less than 1 BTC" sets a minimum amount; it is a demand, not advice.
+_RANSOMWARE_MINIMUM_PAYMENT = re.compile(
+    rb"(?:pay|send)[ \t]{1,8}(?:(?:anything|any[ \t]{1,8}amount)[ \t]{1,8})?"
+    rb"(?:less|fewer)[ \t]{1,8}than\b",
+    re.IGNORECASE,
+)
+_RANSOMWARE_STORAGE_CONTINUATION = re.compile(
+    rb"[ \t]+(?:at[ \t]+rest|in[ \t]+transit)\b", re.IGNORECASE
+)
 MAX_YARA_MATCH_INSTANCES_PER_RULE = 4_096
 MAX_YARA_RULE_FILES = 1_024
 MAX_YARA_RULE_DIRECTORY_ENTRIES = 10_000
@@ -637,6 +669,74 @@ def _has_local_destructive_autonomy_evidence(
     )
 
 
+def _payment_is_directly_negated(data: bytes, payment_offset: int) -> bool:
+    """Return whether the payment verb is clause-opening advice such as ``Never pay``.
+
+    The search runs over the original buffer (``pos``/``endpos``), so the clause
+    boundary lookbehind sees the real preceding byte instead of a clipped window
+    edge. Conditional threats (``If you don't pay``) and minimum-amount demands
+    (``Never send less than 0.5 BTC``) are not advice.
+    """
+    prefix_start = max(0, payment_offset - 80)
+    if _DIRECT_RANSOMWARE_NEGATION.search(data, prefix_start, payment_offset) is None:
+        return False
+    return _RANSOMWARE_MINIMUM_PAYMENT.match(data, payment_offset) is None
+
+
+def _accepted_builtin_ransomware_instances(
+    match: yara.Match,
+    instances: list[tuple[str, object]],
+    data: bytes,
+) -> list[tuple[str, object]]:
+    """Drop direct payment negation and storage prose from the bundled ransomware rule.
+
+    The bounded YARA expressions establish local payment and extortion context,
+    while this per-instance check distinguishes an affirmative demand from advice
+    such as ``Never pay the ransom in Bitcoin``. Encryption notices retain their
+    recall except when immediately continued with storage-protection wording.
+    Custom rules are never filtered.
+    """
+    if match.namespace != _BUILTIN_RANSOMWARE_NAMESPACE or match.rule != _BUILTIN_RANSOMWARE_RULE:
+        return instances
+
+    accepted: list[tuple[str, object]] = []
+    for identifier, instance in instances:
+        if identifier == "$ransom_note":
+            offset = max(0, int(getattr(instance, "offset", 0)))
+            matched_length = max(0, int(getattr(instance, "matched_length", 0)))
+            end = offset + matched_length
+            continuation = _RANSOMWARE_STORAGE_CONTINUATION.match(data[end : end + 81])
+            # The extra byte proves a real word boundary at the bounded edge.
+            if continuation is not None and continuation.end() <= 80:
+                continue
+        if identifier not in _RANSOMWARE_PAYMENT_IDENTIFIERS:
+            accepted.append((identifier, instance))
+            continue
+
+        offset = max(0, int(getattr(instance, "offset", 0)))
+        matched_length = max(0, int(getattr(instance, "matched_length", 0)))
+        local_start = max(0, offset - 80)
+        local_end = min(len(data), offset + matched_length)
+        prefix = data[local_start:offset]
+        local_match = prefix + data[offset:local_end]
+        match_start = len(prefix)
+        payment_offsets = [
+            payment.start()
+            for payment in _RANSOMWARE_PAYMENT_VERB.finditer(local_match)
+            if payment.start() >= match_start
+        ]
+        if identifier in _RANSOMWARE_PAYMENT_FIRST_IDENTIFIERS:
+            # The leading verb owns the currency. A wrapped match can run into a
+            # later demand, which YARA reports as its own instance and location.
+            payment_offsets = payment_offsets[:1]
+        if payment_offsets and all(
+            _payment_is_directly_negated(data, local_start + payment) for payment in payment_offsets
+        ):
+            continue
+        accepted.append((identifier, instance))
+    return accepted
+
+
 def _parse_meta(match: yara.Match) -> tuple[str, Severity, float, str | None]:
     """Extract rule_id, severity, confidence, and description from a YARA match's meta."""
     meta: dict[str, object] = match.meta or {}
@@ -757,6 +857,15 @@ def _match_file(
                 file_path,
             )
             continue
+        if not limited:
+            instances = _accepted_builtin_ransomware_instances(match, instances, data)
+            if not instances:
+                logger.debug(
+                    "%s: ignored non-extortion ransomware evidence in %s",
+                    ANALYZER_ID,
+                    file_path,
+                )
+                continue
         rule_id, severity, confidence, description = _parse_meta(match)
         first_offset, matched_text = _extract_match_strings(instances)
         fingerprint_limit: _YaraFingerprintLimitError | None = None
