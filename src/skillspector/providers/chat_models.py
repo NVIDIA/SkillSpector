@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from urllib.parse import urlparse
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -37,6 +38,12 @@ from skillspector.providers.structured_output import (
 logger = logging.getLogger(__name__)
 MIN_SAMPLING_SEED = -(1 << 63)
 MAX_SAMPLING_SEED = (1 << 63) - 1
+
+# Reasoning efforts GPT-6.1 Sol accepts; it rejects ``none`` and ``minimal``.
+GPT_6_1_SOL_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# GPT-6.1 Sol, bare or behind a gateway namespace or prefix
+# (``openai/openai/gpt-6.1-sol``), optionally with a snapshot suffix.
+_GPT_6_1_SOL = re.compile(r"(?:^|[/.-])gpt-6\.1-sol(?:-[^/]*)?$")
 
 
 def resolve_reasoning_effort() -> str | None:
@@ -86,15 +93,32 @@ def resolve_sampling_parameters(*, include_seed: bool = False) -> dict[str, floa
     return parameters
 
 
-def reject_unsupported_controls(model: str, sampling_parameters: dict[str, float | int]) -> None:
+def reject_unsupported_controls(
+    model: str,
+    sampling_parameters: dict[str, float | int],
+    reasoning_effort: str | None = None,
+) -> None:
     """Raise ``ValueError`` before any request when *model* rejects a requested control.
 
-    Any explicit ``temperature``, ``1.0`` included, fails for the Claude models
-    in ``SAMPLING_REJECTED_MODELS``, which reject sampling controls.
+    Any explicit ``temperature``, ``1.0`` included, fails for GPT-6.1 Sol and
+    the Claude models in ``SAMPLING_REJECTED_MODELS``, which reject sampling
+    controls.  GPT-6.1 Sol also accepts only ``GPT_6_1_SOL_REASONING_EFFORTS``.
     """
-    if "temperature" in sampling_parameters and rejects_sampling_controls(claude_model_name(model)):
+    is_gpt_6_1_sol = _GPT_6_1_SOL.search(model.lower()) is not None
+    if "temperature" in sampling_parameters and (
+        is_gpt_6_1_sol or rejects_sampling_controls(claude_model_name(model))
+    ):
         raise ValueError(
             f"SKILLSPECTOR_TEMPERATURE is not supported by {model}; unset it to use this model"
+        )
+    if (
+        is_gpt_6_1_sol
+        and reasoning_effort is not None
+        and reasoning_effort not in GPT_6_1_SOL_REASONING_EFFORTS
+    ):
+        raise ValueError(
+            f"SKILLSPECTOR_REASONING_EFFORT={reasoning_effort!r} is not supported by {model}; "
+            f"use one of {', '.join(GPT_6_1_SOL_REASONING_EFFORTS)} or unset it"
         )
 
 
@@ -155,6 +179,7 @@ def create_openai_compatible_chat_model(
     if reasoning_effort or default_reasoning_effort:
         kwargs["reasoning_effort"] = reasoning_effort or default_reasoning_effort
     sampling_parameters = resolve_sampling_parameters(include_seed=True)
+    reject_unsupported_controls(model, sampling_parameters, reasoning_effort)
     kwargs.update(sampling_parameters)
     chat_model = ChatOpenAI(**kwargs)
     register_chat_model_controls(

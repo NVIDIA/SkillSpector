@@ -25,10 +25,15 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
+from skillspector.inference_usage import chat_model_controls, chat_model_requested_controls
 from skillspector.llm_utils import StructuredOutputParseError, bind_structured_output
 from skillspector.providers import registry
 from skillspector.providers.anthropic import AnthropicProvider
 from skillspector.providers.anthropic_proxy import AnthropicProxyProvider
+from skillspector.providers.chat_models import (
+    GPT_6_1_SOL_REASONING_EFFORTS,
+    reject_unsupported_controls,
+)
 from skillspector.providers.openai import OpenAIProvider
 from skillspector.providers.openai_compatible import OpenAICompatibleProvider
 from skillspector.providers.structured_output import (
@@ -360,3 +365,114 @@ class TestOpenAICompatibleClaude55:
         provider = OpenAICompatibleProvider()
         assert provider.forced_tool_choice_supported("anthropic/claude-opus-5-5")
         assert provider.structured_output_method("anthropic/claude-opus-5-5") is None
+
+
+def _openai_protocol_provider(
+    monkeypatch: pytest.MonkeyPatch, provider_cls: type
+) -> OpenAIProvider | OpenAICompatibleProvider:
+    if provider_cls is OpenAIProvider:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    else:
+        monkeypatch.setenv("SKILLSPECTOR_COMPAT_API_KEY", "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_COMPAT_BASE_URL", "https://gateway.example.com/v1")
+    return provider_cls()
+
+
+_OPENAI_PROTOCOL_PROVIDERS = pytest.mark.parametrize(
+    "provider_cls", [OpenAIProvider, OpenAICompatibleProvider]
+)
+
+
+class TestOpenAIProtocolControls:
+    """The shared OpenAI-protocol builder rejects controls GPT-6.1 Sol and Claude 5.5 refuse."""
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "gpt-6.1-sol",
+            "openai/openai/gpt-6.1-sol",
+            "azure/openai/gpt-6.1-sol-2026-09-15",
+            "openai.gpt-6.1-sol",
+            "GPT-6.1-Sol",
+        ],
+    )
+    def test_gpt_6_1_sol_ids_reject_temperature_and_unsupported_effort(self, model: str) -> None:
+        with pytest.raises(ValueError, match="SKILLSPECTOR_TEMPERATURE"):
+            reject_unsupported_controls(model, {"temperature": 1.0})
+        with pytest.raises(ValueError, match="SKILLSPECTOR_REASONING_EFFORT"):
+            reject_unsupported_controls(model, {}, "minimal")
+
+    @pytest.mark.parametrize(
+        "model", ["gpt-5.4", "gpt-4.1", "gpt-6-sol", "gpt-6.1-solar", "vendor/x/notgpt-6.1-sol"]
+    )
+    def test_other_models_keep_both(self, model: str) -> None:
+        reject_unsupported_controls(model, {"temperature": 0.0}, "minimal")
+
+    @_OPENAI_PROTOCOL_PROVIDERS
+    @pytest.mark.parametrize(
+        "model", ["gpt-6.1-sol", "openai/openai/gpt-6.1-sol", "azure/anthropic/claude-opus-5-5"]
+    )
+    @pytest.mark.parametrize("temperature", ["0", "1.0"])
+    def test_explicit_temperature_fails_before_any_request(
+        self, monkeypatch: pytest.MonkeyPatch, provider_cls: type, model: str, temperature: str
+    ) -> None:
+        provider = _openai_protocol_provider(monkeypatch, provider_cls)
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", temperature)
+
+        with pytest.raises(
+            ValueError, match=f"SKILLSPECTOR_TEMPERATURE is not supported by {model}; unset it"
+        ):
+            provider.create_chat_model(model, max_tokens=1_000)
+
+    @_OPENAI_PROTOCOL_PROVIDERS
+    @pytest.mark.parametrize("effort", ["none", "minimal", "High"])
+    def test_unsupported_effort_fails_before_any_request(
+        self, monkeypatch: pytest.MonkeyPatch, provider_cls: type, effort: str
+    ) -> None:
+        provider = _openai_protocol_provider(monkeypatch, provider_cls)
+        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", effort)
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                f"SKILLSPECTOR_REASONING_EFFORT='{effort}' is not supported by gpt-6.1-sol; "
+                "use one of low, medium, high, xhigh, max or unset it"
+            ),
+        ):
+            provider.create_chat_model("gpt-6.1-sol", max_tokens=1_000)
+
+    @pytest.mark.parametrize("effort", GPT_6_1_SOL_REASONING_EFFORTS)
+    def test_supported_effort_is_forwarded(
+        self, monkeypatch: pytest.MonkeyPatch, effort: str
+    ) -> None:
+        provider = _openai_protocol_provider(monkeypatch, OpenAIProvider)
+        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", effort)
+        llm = provider.create_chat_model("gpt-6.1-sol", max_tokens=1_000)
+        assert chat_model_controls(llm)["reasoning_effort"] == effort
+
+    def test_missing_credentials_win_over_incompatible_controls(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No credentials keep returning None, so the no-credentials path is unchanged.
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", "minimal")
+        assert OpenAIProvider().create_chat_model("gpt-6.1-sol", max_tokens=1_000) is None
+
+    @pytest.mark.parametrize("model", ["gpt-5.4", "gpt-4.1"])
+    def test_other_models_pass_controls_through(
+        self, monkeypatch: pytest.MonkeyPatch, model: str
+    ) -> None:
+        provider = _openai_protocol_provider(monkeypatch, OpenAIProvider)
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.2")
+        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", "minimal")
+        llm = provider.create_chat_model(model, max_tokens=1_000)
+        assert chat_model_requested_controls(llm)["temperature"] == 0.2
+        assert llm.reasoning_effort == "minimal"
+
+    def test_seed_is_forwarded_to_gpt_6_1_sol(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        provider = _openai_protocol_provider(monkeypatch, OpenAIProvider)
+        monkeypatch.setenv("SKILLSPECTOR_SEED", "42")
+        llm = provider.create_chat_model("gpt-6.1-sol", max_tokens=1_000)
+        # Sent and recorded, though OpenAI treats the seed as best-effort only.
+        assert chat_model_requested_controls(llm)["seed"] == 42
+        assert chat_model_controls(llm)["seed"] == 42

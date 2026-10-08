@@ -38,7 +38,7 @@ make install-dev
   - **Provider credential**: depends on the active provider. Hosted providers use the matching variables in [.env.example](../.env.example); Ollama and CLI providers do not require an API key. See [providers/](../src/skillspector/providers/).
   - **`OPENAI_BASE_URL`**: Override the OpenAI endpoint (e.g. point at Ollama).
   - **`SKILLSPECTOR_MODEL`**: Override default model; see [constants.py](../src/skillspector/constants.py).
-  - **`SKILLSPECTOR_TEMPERATURE`**: Optional hosted-provider sampling temperature from `0` to `1`.
+  - **`SKILLSPECTOR_TEMPERATURE`**: Optional hosted-provider sampling temperature from `0` to `1`. `gpt-6.1-sol`, `claude-opus-5-5`, and `claude-sonnet-5-5` reject any explicit value before a request.
   - **`SKILLSPECTOR_SEED`**: Optional integer seed for OpenAI-compatible and Azure OpenAI providers.
 
 - **Logging**: Internal/operational logging uses the stdlib `logging` module. User-facing output (report body, errors, progress) uses Rich `console.print()`.
@@ -300,9 +300,9 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 | `NVIDIA_INFERENCE_KEY` | Credential for `nv_build`. | `nvapi-...` |
 | `OPENAI_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=openai`. Also tier-2 fallback for non-OpenAI providers. | `sk-...` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | `http://localhost:11434/v1` |
-| `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3`; other provider/model combinations keep their endpoint defaults. | `high` |
+| `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3`; other provider/model combinations keep their endpoint defaults. `gpt-6.1-sol` accepts only `low`, `medium`, `high`, `xhigh`, or `max`; any other value fails before a request. | `high` |
 | `SKILLSPECTOR_OUTPUT_LANGUAGE` | Optional short, single-line language label (letters, numbers, spaces, `_`, or `-`; maximum 64 characters) for human-readable LLM finding text. Rule IDs, severity values, paths, code, and other machine-readable values remain unchanged. Unset, blank, or invalid values preserve the default output language. | `Japanese` |
-| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves provider defaults. Lower values reduce variation but do not guarantee identical output. Any explicit value fails before a request for `claude-opus-5-5` and `claude-sonnet-5-5`. | `0` |
+| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves provider defaults. Lower values reduce variation but do not guarantee identical output. Any explicit value fails before a request for `gpt-6.1-sol`, `claude-opus-5-5`, and `claude-sonnet-5-5`. | `0` |
 | `SKILLSPECTOR_SEED` | Optional integer sampling seed for OpenAI-compatible and Azure OpenAI providers. Provider/model support is best-effort; CLI providers ignore it. | `42` |
 | `ANTHROPIC_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=anthropic`. | `sk-ant-...` |
 | `OLLAMA_BASE_URL` | Optional Ollama endpoint override. | `http://localhost:11434/v1` |
