@@ -893,7 +893,14 @@ class TestReportNode:
 
         rendered = MarkdownIt().render(body) if output_format == "markdown" else body
         assert "archive_member_limit" in rendered
-        assert "outer.zip!/nested.zip" in body
+        if output_format == "sarif":
+            notification = json.loads(body)["runs"][0]["invocations"][0][
+                "toolExecutionNotifications"
+            ][0]
+            location = notification["locations"][0]["physicalLocation"]["artifactLocation"]
+            assert location["uri"] == "outer.zip%21/nested.zip"
+        else:
+            assert "outer.zip!/nested.zip" in body
 
     def test_report_default_output_format_is_sarif(self) -> None:
         """When output_format is missing, report uses sarif."""
