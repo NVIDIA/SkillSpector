@@ -19,9 +19,11 @@
 # Mythos 5.1, Opus 5.5, Sonnet 5.5).
 
 models:
-  "us.anthropic.claude-sonnet-4-6-20250915-v1:0":
+  # BedrockProvider's default.  The AWS model card lists this suffix-free
+  # profile ID and caps Claude Sonnet 4.6 output at 64K tokens on Bedrock.
+  "us.anthropic.claude-sonnet-4-6":
     context_length: 1000000
-    max_output_tokens: 128000
+    max_output_tokens: 64000
 
   "us.anthropic.claude-opus-4-6-20250915-v1:0":
     context_length: 1000000

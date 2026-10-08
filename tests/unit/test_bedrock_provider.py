@@ -82,7 +82,7 @@ class TestBedrockProviderMetadata:
     def test_metadata_known_default_model(self) -> None:
         provider = BedrockProvider()
         assert provider.get_context_length(BEDROCK_DEFAULT_MODEL) == 1_000_000
-        assert provider.get_max_output_tokens(BEDROCK_DEFAULT_MODEL) == 128_000
+        assert provider.get_max_output_tokens(BEDROCK_DEFAULT_MODEL) == 64_000
 
     def test_metadata_known_inference_profile_id(self) -> None:
         provider = BedrockProvider()
@@ -102,8 +102,10 @@ class TestBedrockProviderResolveModel:
     def test_default_model_is_public_cross_region_inference_profile(self) -> None:
         # The default must be a public Bedrock model ID, not a private ARN —
         # this is checked in the OSS PR review and is load-bearing.
-        assert BEDROCK_DEFAULT_MODEL == "us.anthropic.claude-sonnet-4-6-20250915-v1:0"
+        assert BEDROCK_DEFAULT_MODEL == "us.anthropic.claude-sonnet-4-6"
         assert not BEDROCK_DEFAULT_MODEL.startswith("arn:")
+        # Claude 5.5 profiles are explicit opt-in only.
+        assert "-5-5" not in BEDROCK_DEFAULT_MODEL
         assert BedrockProvider().resolve_model() == BEDROCK_DEFAULT_MODEL
 
     def test_env_overrides_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -130,7 +132,7 @@ class TestBedrockProviderCreateChatModel:
         mock_session.return_value.get_credentials.return_value = None
 
         result = BedrockProvider().create_chat_model(
-            "us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            "us.anthropic.claude-sonnet-4-6",
             max_tokens=1024,
             timeout=60,
         )
@@ -153,7 +155,7 @@ class TestBedrockProviderCreateChatModel:
         mock_session.return_value.client.return_value = MagicMock()
 
         BedrockProvider().create_chat_model(
-            "us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            "us.anthropic.claude-sonnet-4-6",
             max_tokens=1024,
             timeout=60,
         )
@@ -176,7 +178,7 @@ class TestBedrockProviderCreateChatModel:
         mock_session.return_value.client.return_value = MagicMock()
 
         BedrockProvider().create_chat_model(
-            "us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            "us.anthropic.claude-sonnet-4-6",
             max_tokens=1024,
             timeout=60,
         )
@@ -200,7 +202,7 @@ class TestBedrockProviderCreateChatModel:
         mock_session.return_value.client.return_value = MagicMock()
 
         BedrockProvider().create_chat_model(
-            "us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            "us.anthropic.claude-sonnet-4-6",
             max_tokens=1024,
             timeout=90,
         )
@@ -246,7 +248,7 @@ class TestBedrockProviderCreateChatModel:
         mock_session.return_value.client.return_value = MagicMock()
 
         BedrockProvider().create_chat_model(
-            "us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            "us.anthropic.claude-sonnet-4-6",
             max_tokens=1024,
             timeout=60,
         )
@@ -267,7 +269,7 @@ class TestBedrockProviderCreateChatModel:
         monkeypatch.setenv("SKILLSPECTOR_SEED", "42")
 
         BedrockProvider().create_chat_model(
-            "us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            "us.anthropic.claude-sonnet-4-6",
             max_tokens=1024,
         )
 

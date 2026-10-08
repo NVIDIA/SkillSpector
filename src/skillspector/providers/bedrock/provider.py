@@ -63,7 +63,7 @@ BEDROCK_DEFAULT_REGION = "us-west-2"
 # available to any account with Anthropic-on-Bedrock model access.
 # Users can override with SKILLSPECTOR_MODEL to point at a different
 # model or their own application-inference-profile ARN.
-BEDROCK_DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-6-20250915-v1:0"
+BEDROCK_DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-6"
 # Connect timeout for the Bedrock Runtime client. The per-call
 # ``timeout`` from ``create_chat_model`` is applied as the read timeout.
 _BEDROCK_CONNECT_TIMEOUT = 10

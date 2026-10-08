@@ -289,7 +289,7 @@ inference gateways.
 | `openai` | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`) | api.openai.com (or any OpenAI-compatible URL) | `gpt-5.4` |
 | `anthropic` | `ANTHROPIC_API_KEY` | api.anthropic.com | `claude-opus-4-6` |
 | `anthropic_proxy` | `ANTHROPIC_PROXY_API_KEY` + `ANTHROPIC_PROXY_ENDPOINT_URL` | Any Vertex-style raw-predict proxy | `claude-sonnet-4-6` |
-| `bedrock` | `AWS_PROFILE` (optional) + `AWS_REGION` — SigV4 via boto3 | AWS Bedrock Runtime | `us.anthropic.claude-sonnet-4-6-20250915-v1:0` |
+| `bedrock` | `AWS_PROFILE` (optional) + `AWS_REGION` — SigV4 via boto3 | AWS Bedrock Runtime | `us.anthropic.claude-sonnet-4-6` |
 | `nv_build` | `NVIDIA_INFERENCE_KEY` | build.nvidia.com | `z-ai/glm-5.3` |
 | `gemini` | `GOOGLE_CLOUD_PROJECT` (+ optional `GOOGLE_CLOUD_LOCATION`) via ADC | Google Cloud OpenAI-compatible Gemini endpoint | `gemini-3.8-flash` |
 | `ollama` | _(none)_ | `OLLAMA_BASE_URL` (default `http://localhost:11434/v1`) | `llama3.1:8b` |
@@ -354,7 +354,7 @@ export SKILLSPECTOR_PROVIDER=bedrock
 # boto3 credential chain (env vars, instance metadata, SSO, etc.) resolves.
 # export AWS_PROFILE=my-profile
 export AWS_REGION=us-west-2  # default if unset
-# Default model: us.anthropic.claude-sonnet-4-6-20250915-v1:0
+# Default model: us.anthropic.claude-sonnet-4-6
 # Override with any Bedrock model ID, cross-region inference-profile
 # ID, or your own application-inference-profile ARN. Claude 5.5 is opt-in:
 # us./eu. profiles keep requests in that geography, global. routes worldwide.
