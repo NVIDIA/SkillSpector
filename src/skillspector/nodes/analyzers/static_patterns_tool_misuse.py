@@ -215,12 +215,16 @@ _ROOT_GLOB_AFFIRMATIVE_NEGATION_PREFIX_RE = re.compile(
 # shell=<name> to a subprocess invocation.  The bounded newline gap and the
 # AST binding-evidence guard keep this a local data-flow fact; Python scope
 # visibility is enforced separately in analyze() via _VARIABLE_SHELL_FLAG_RE.
+_VARIABLE_SHELL_ASSIGNMENT_PATTERN = r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*True\s*$\n"
 _VARIABLE_SHELL_FLAG_PATTERN = (
-    r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*True\s*$\n"
-    r"(?:[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
+    _VARIABLE_SHELL_ASSIGNMENT_PATTERN + r"(?:[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
     r"(?:subprocess\.\w+|Popen)\s*\([^)]*\bshell\s*=\s*\1\b"
 )
 _VARIABLE_SHELL_FLAG_RE = re.compile(_VARIABLE_SHELL_FLAG_PATTERN, re.IGNORECASE | re.MULTILINE)
+_VARIABLE_SHELL_ASSIGNMENT_RE = re.compile(
+    _VARIABLE_SHELL_ASSIGNMENT_PATTERN, re.IGNORECASE | re.MULTILINE
+)
+_SHELL_NAME_ARGUMENT_RE = re.compile(r"\bshell\s*=\s*\w+", re.IGNORECASE)
 
 # TM1: Tool Parameter Abuse — dangerous parameter values
 DIRECT_SHELL_TRUE_PATTERNS: tuple[tuple[str, float], ...] = (
@@ -4085,6 +4089,46 @@ def _variable_shell_call_start(match: re.Match[str]) -> int | None:
     return match.start() + callees[-1].start() if callees else None
 
 
+def _is_true_prefixed_name(name: str) -> bool:
+    """Return whether a variable window keeps a call-anchored fallback for a name."""
+    return name.casefold().startswith("true")
+
+
+def _variable_shell_matches(content: str) -> list[re.Match[str]]:
+    """Return bounded variable-shell windows, one per call for true-prefixed names.
+
+    The non-overlapping scan pairs an assignment with one call and skips an
+    assignment inside an earlier window. The ``\\b``-bounded direct pattern
+    does not report ``shell=true_value`` and folds identical same-line
+    ``shell=true`` calls into one candidate, so every assignment of a
+    true-prefixed name is also paired with each call its bounded window
+    reaches. The nearest assignment owns each call.
+    """
+    windows: dict[int, re.Match[str]] = {}
+
+    def keep(window: re.Match[str]) -> None:
+        previous = windows.get(window.end())
+        if previous is None or window.start() > previous.start():
+            windows[window.end()] = window
+
+    for match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
+        keep(match)
+    for assignment in _VARIABLE_SHELL_ASSIGNMENT_RE.finditer(content):
+        if not _is_true_prefixed_name(assignment.group(1)):
+            continue
+        search_end = assignment.end() - 1
+        for _ in range(5):
+            search_end = content.find("\n", search_end + 1)
+            if search_end == -1:
+                search_end = len(content)
+                break
+        for argument in _SHELL_NAME_ARGUMENT_RE.finditer(content, assignment.end(), search_end):
+            window = _VARIABLE_SHELL_FLAG_RE.fullmatch(content, assignment.start(), argument.end())
+            if window is not None:
+                keep(window)
+    return sorted(windows.values(), key=lambda window: (window.start(), window.end()))
+
+
 def _resolve_variable_shell_candidate(
     index: _VariableShellAstIndex,
     match: re.Match[str],
@@ -4379,6 +4423,10 @@ def _tm1_candidates(
         pattern: str,
         confidence: float,
     ) -> Iterator[tuple[int, int, re.Match[str], float]]:
+        if pattern == _VARIABLE_SHELL_FLAG_PATTERN:
+            for match in _variable_shell_matches(content):
+                yield match.start(), pattern_index, match, confidence
+            return
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in TM1_PROSE_PATTERNS
@@ -5014,7 +5062,7 @@ def analyze(
         if _direct_shell_only
         else {
             (match.start(), match.end()): (match.group(1), match)
-            for match in _VARIABLE_SHELL_FLAG_RE.finditer(content)
+            for match in _variable_shell_matches(content)
         }
     )
     invisible_variable_matches: set[tuple[int, int]] = set()
@@ -5089,7 +5137,9 @@ def analyze(
                 confidence,
                 file_type,
             )
-        candidate_identity = matched_text if is_direct_shell_true else matched
+        candidate_identity = (
+            matched_text if is_direct_shell_true or variable_match is not None else matched
+        )
         complete_identity_match = matched_text
         candidate_key = (
             line_num,
@@ -5154,7 +5204,9 @@ def analyze(
                     :200
                 ]
         if variable_match is not None and defer_variable_reconciliation:
-            if file_type != "python":
+            # Without Python bindings, keep only call-anchored windows for
+            # true-prefixed names; coalescing drops one a direct owner reports.
+            if file_type != "python" and not _is_true_prefixed_name(variable_match[0]):
                 continue
             evidence[_VARIABLE_SHELL_FLAG_EVIDENCE] = variable_match[0]
             evidence[static_runner._PRESERVE_SOURCE_START_EVIDENCE] = True
@@ -6528,7 +6580,7 @@ def _reconcile_variable_shell_findings(
     if ast_index is None:
         return findings
     resolved: dict[tuple[int, str], list[_VariableShellCandidate]] = {}
-    for match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
+    for match in _variable_shell_matches(content):
         assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
         candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)
         if candidate is not None:
