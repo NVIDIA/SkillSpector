@@ -576,7 +576,7 @@ class TestCredentialExfiltration:
         chain = "def f0():\n    pass\n" + "".join(
             f"def f{i}():\n    f{i - 1}()\n" for i in range(1, 201)
         )
-        direct = 'import os, urllib.request\nurllib.request.urlopen(os.environ["API_KEY"])\n'
+        direct = 'import os, urllib.request\nsecret = os.environ["API_KEY"]\nurllib.request.urlopen(secret)\n'
         result = behavioral_taint_tracking.node(
             {
                 "components": ["chain.py", "later.py"],
@@ -621,7 +621,7 @@ class TestCredentialExfiltration:
             + "".join(f"def f{i}():\n    f{i - 1}()\n" for i in range(1, 50))
             + "f49()\n"
         )
-        direct = 'urllib.request.urlopen(os.environ["API_KEY"])\n'
+        direct = 'secret = os.environ["API_KEY"]\nurllib.request.urlopen(secret)\n'
         result = behavioral_taint_tracking.node(
             {
                 "components": ["limited.py", "later.py"],
@@ -650,7 +650,7 @@ class TestCredentialExfiltration:
             return original(self, node)
 
         monkeypatch.setattr(behavioral_taint_tracking._ReflectiveSinkResolver, "visit", visit)
-        code = 'import os, urllib.request\nexplode\nurllib.request.urlopen(os.environ["API_KEY"])\n'
+        code = 'import os, urllib.request\nexplode\nsecret = os.environ["API_KEY"]\nurllib.request.urlopen(secret)\n'
         result = behavioral_taint_tracking.node(
             {"components": ["script.py"], "file_cache": {"script.py": code}}
         )
@@ -658,13 +658,13 @@ class TestCredentialExfiltration:
         assert result["inspection_ledger"][0]["outcome"] == "partial"
 
     def test_reflective_prepass_does_not_swallow_shared_deadline(self):
-        class DeadlineExpired(RuntimeError):
+        class DeadlineExpiredError(RuntimeError):
             pass
 
         def check_runtime():
-            raise DeadlineExpired
+            raise DeadlineExpiredError
 
-        with pytest.raises(DeadlineExpired):
+        with pytest.raises(DeadlineExpiredError):
             behavioral_taint_tracking._build_reflective_sink_aliases(
                 ast.parse("pass"), check_runtime
             )
