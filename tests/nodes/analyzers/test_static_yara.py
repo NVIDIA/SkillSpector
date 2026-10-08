@@ -1568,6 +1568,367 @@ class TestBuiltInMalwarePackaging:
         assert _has_rule(findings, "reverse_shell")
 
 
+class TestBuiltInRansomwareRule:
+    @pytest.mark.parametrize("filename", ["api.md", "wallet.txt", "wallet.py"])
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Send BTC on the returned network from an external wallet you control.",
+            "SEND BTC to fund your own account.",
+            "send 0.01 btc to your wallet on the correct network.",
+            "Pay with Bitcoin at checkout.",
+            "PAY the invoice using BITCOIN.",
+            "Send BTC to your wallet.\nBackups use encryption to protect account data.",
+            "Never pay Bitcoin ransomware demands; report them to your security team.",
+            "Never pay the ransom in Bitcoin; report the demand to your security team.",
+            "Do not pay a ransom with BTC. Restore from backups instead.",
+            "Your data has been encrypted. Never pay the ransom in Bitcoin; report it.",
+            "Your data has been encrypted. Do not pay the ransom in Bitcoin.",
+            "Send BTC after you recover your wallet backup.",
+            "Pay Bitcoin to unlock premium account features.",
+            "Send BTC for encrypted cloud backup storage.",
+            "Data recovery service: pay with Bitcoin at checkout.",
+            "Send BTC, then publish your transaction receipt.",
+            "Send BTC " + "x" * 161 + " to receive the decryption key.",
+            "Your files are encrypted at rest and in transit with AES-256.",
+            "Your files have been encrypted at rest with AES-256.",
+            "Your files are encrypted in transit using TLS.",
+            "YOUR FILES HAVE BEEN ENCRYPTED\tAT\tREST.",
+        ],
+    )
+    def test_wallet_payment_text_is_not_ransomware(self, content, filename):
+        findings = _run_builtin(content, filename)
+
+        assert not _has_rule(findings, "ransomware_behavior")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Your files are encrypted.",
+            "Your files have been encrypted.",
+            "YOUR FILES ARE ENCRYPTED. Send BTC for recovery.",
+            "your\tfiles\thave\tbeen\tencrypted",
+            "your\nfiles\nare\nencrypted",
+            "All of your files are encrypted with RSA-2048 and AES-128 ciphers.",
+            "All your files have been encrypted due to a security problem with your PC.",
+            "Your files have been encrypted by LockBit 3.0",
+            "Your files have been encrypted, and the only way to get them back is to pay us.",
+            "Your files have been encrypted with AES. Send XMR for recovery.",
+        ],
+    )
+    def test_encrypted_files_notice_remains_critical(self, content):
+        findings = _run_builtin("# Notice\n\n" + content, "notice.md")
+        ransomware = [f for f in findings if "ransomware_behavior" in f.message]
+
+        assert len(ransomware) == 1
+        finding = ransomware[0]
+        assert finding.rule_id == "YR1"
+        assert finding.severity == "CRITICAL"
+        assert finding.confidence == 0.8
+        assert finding.file == "notice.md"
+        assert finding.start_line == 3
+        assert finding.matched_text
+        assert "encrypted" in finding.matched_text.lower()
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Your files are locked. Send BTC to receive the decryption key.",
+            "Your data has been encrypted. Pay the ransom in Bitcoin to recover your files.",
+            "You must pay the ransom in Bitcoin to recover your files.",
+            "Send 0.5 BTC to obtain the decryption key.",
+            "Don't forget to send 0.5 BTC to example.invalid to decrypt your files.",
+            "Do not hesitate to pay 1 bitcoin to restore your files.",
+            "You have to pay for decryption in Bitcoins to recover your files.",
+            "Send 0.5 Bitcoins to decrypt your files.",
+            "To restore your files, pay 1 Bitcoins.",
+            "Pay the ransom in Bitcoins.",
+            "To receive the decryption key, send 1 BTC.",
+            "We will delete your files unless you pay 0.5 Bitcoin.",
+            "Send BTC or we will publish your data.",
+            "Pay Bitcoin or your files will be destroyed.",
+            "Your data has been encrypted.\nPay the ransom in Bitcoin.",
+            "Send 0.5 BTC to <addr> to decrypt your files.",
+            "Pay 1 bitcoin within 72 hours or your files will be lost forever.",
+            "To recover your files, pay 0.3 Bitcoin to <addr>.",
+            "Send BTC\nTo receive the decryption key, contact support.",
+            (
+                "Your documents, photos and databases have been encrypted.\n"
+                "To decrypt them, send 0.5 BTC to <addr>."
+            ),
+            (
+                "Send 0.5 BTC to <addr>.\n"
+                "After payment you will get the decryption key.\n"
+                "If payment is not received, your files will be deleted."
+            ),
+        ],
+    )
+    def test_payment_with_explicit_extortion_context_remains_critical(self, content):
+        findings = _run_builtin(content, "notice.md")
+        ransomware = [f for f in findings if "ransomware_behavior" in f.message]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].rule_id == "YR1"
+        assert ransomware[0].severity == "CRITICAL"
+        assert ransomware[0].confidence == 0.8
+
+    @pytest.mark.parametrize("negator", ["Never", "Do not", "Don't", "Must not", "Should not"])
+    @pytest.mark.parametrize("modifier", ["", " ever"])
+    @pytest.mark.parametrize("payment", ["pay", "send"])
+    @pytest.mark.parametrize("context_first", [False, True])
+    def test_only_directly_negated_payments_are_filtered(
+        self, negator, modifier, payment, context_first
+    ):
+        demand = f"{negator}{modifier} {payment} 0.5 Bitcoins"
+        content = (
+            f"To recover your files, {demand}."
+            if context_first
+            else f"{demand} to decrypt your files."
+        )
+
+        assert not _has_rule(_run_builtin(content), "ransomware_behavior")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "If you don't pay 0.5 bitcoin within 48 hours, your files will be deleted.",
+            "If you don’t pay 0.5 bitcoin within 48 hours, your files will be deleted.",
+            "If you do not pay 1 Bitcoin within 72 hours, all your files will be lost forever.",
+            "If you do not send 1 BTC to the address below, we will publish your stolen data.",
+            "Never pay less than 1 bitcoin or your files will be deleted.",
+            "Never send less than 0.5 BTC to decrypt your files.",
+            "Do not pay less than 1 BTC or your files will be destroyed.",
+            "Don't send anything less than 0.5 BTC to decrypt your files.",
+            (
+                "We have downloaded your confidential data.\n"
+                "If you do not send 5 BTC to the address below within 72 hours, "
+                "we will publish your stolen data."
+            ),
+            (
+                "All your important files are encrypted!\n"
+                "If you don't pay 0.5 bitcoin within 48 hours, your files will be deleted."
+            ),
+        ],
+    )
+    def test_conditional_and_minimum_amount_demands_remain_critical(self, content):
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.md")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].rule_id == "YR1"
+        assert ransomware[0].severity == "CRITICAL"
+        assert ransomware[0].start_line == content.count("\n") + 1
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Never send BTC to strangers.",
+            "Never send BTC to anyone who promises to decrypt your files.",
+            "Never pay the ransom in Bitcoin; report it to your security team.",
+            "Do not pay the ransom in Bitcoin.",
+            "If you are attacked, do not pay the ransom in Bitcoin.",
+            "You should never pay the ransom in Bitcoin.",
+            "You must not send BTC to anyone who offers to decrypt your files.",
+            "- Never pay the ransom in Bitcoin.",
+            "> **Never** pay the ransom in Bitcoin.",
+            "1. Do not send BTC to anyone who offers to decrypt your files.",
+            "Don’t send BTC to anyone promising to decrypt your files.",
+        ],
+    )
+    def test_clause_opening_payment_advice_is_not_ransomware(self, content):
+        assert not _has_rule(_run_builtin(content, "advice.md"), "ransomware_behavior")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "To decrypt your files you must send\n0.5 BTC to the address below.",
+            "To decrypt your files you must send\r\n0.5 BTC to the address below.",
+            "Send 1 BTC to the wallet below\nto decrypt\nyour files.",
+            (
+                "Your network has been breached and your documents are locked. To decrypt\n"
+                "your files you must send 0.5 BTC to the address below."
+            ),
+            (
+                "Your network has been breached and your documents are locked. To decrypt your\n"
+                "files you must pay 0.5 bitcoin to the address below."
+            ),
+            "Pay the\nransom in Bitcoin.",
+            "Pay the ransom\nin Bitcoin.",
+            "Send 0.5BTC to example.invalid to decrypt your files.",
+            "To restore your files, pay 1bitcoin.",
+        ],
+    )
+    def test_hard_wrapped_and_glued_amount_demands_remain_critical(self, content):
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.txt")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].rule_id == "YR1"
+        assert ransomware[0].severity == "CRITICAL"
+        assert ransomware[0].start_line == 1
+
+    @pytest.mark.parametrize("filler, expected", [(79, True), (80, False)])
+    def test_wrapped_payment_currency_window_remains_bounded(self, filler, expected):
+        content = "To decrypt your files you must send\n" + "x" * filler + " BTC."
+
+        assert _has_rule(_run_builtin(content, "notice.txt"), "ransomware_behavior") is expected
+
+    def test_payment_currency_allows_only_one_line_break(self):
+        content = "To decrypt your files you must send\n\n0.5 BTC to the address below."
+
+        assert not _has_rule(_run_builtin(content, "notice.txt"), "ransomware_behavior")
+
+    def test_negated_advice_does_not_own_a_later_wrapped_demand(self):
+        content = "Never send BTC to strangers.\nSend 1 BTC to decrypt your files.\n"
+
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.md")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].start_line == 2
+        assert ransomware[0].matched_text.startswith("Send 1 BTC")
+
+    @pytest.mark.parametrize("separator", ["\n", "\r\n"])
+    def test_storage_notice_does_not_hide_later_encryption_notice(self, separator):
+        content = (
+            "Your files are encrypted at rest with AES-256."
+            + separator
+            + "Your files have been encrypted by a ransomware operator."
+        )
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.md")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].start_line == 2
+        assert ransomware[0].matched_text == "Your files have been encrypted"
+        assert ransomware[0].match_fingerprint
+
+    def test_storage_notice_does_not_hide_independent_payment_demand(self):
+        content = (
+            "Your files are encrypted at rest with AES-256." + " " * 161 + "\n"
+            "Don't forget to send 0.5 BTC to decrypt your files."
+        )
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.md")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].start_line == 2
+        assert ransomware[0].matched_text.startswith("send 0.5 BTC")
+
+    def test_clipped_prefix_cannot_manufacture_a_negator_word(self):
+        content = "xnever" + " " * 75 + "send BTC to decrypt your files."
+
+        assert _has_rule(_run_builtin(content), "ransomware_behavior")
+
+    def test_storage_filter_does_not_change_custom_rule_evidence(self, tmp_path):
+        _write_rule(
+            tmp_path,
+            "ransomware_behavior",
+            category="malware",
+            severity="CRITICAL",
+            strings={"ransom_note": "Your files are encrypted at rest"},
+        )
+
+        findings = _run("Your files are encrypted at rest.", "storage.md", str(tmp_path))
+
+        assert len(findings) == 1
+        assert findings[0].matched_text == "Your files are encrypted at rest"
+        assert "[malware]" not in findings[0].message
+
+    @pytest.mark.parametrize("spacing, expected", [(160, True), (161, False)])
+    @pytest.mark.parametrize("context_first", [False, True])
+    def test_cross_line_extortion_window_remains_bounded(self, spacing, expected, context_first):
+        gap = "\n" + "x" * (spacing - 2) + " "
+        content = (
+            "to decrypt your files" + gap + "send BTC"
+            if context_first
+            else "send BTC" + gap + "to decrypt your files"
+        )
+
+        assert _has_rule(_run_builtin(content), "ransomware_behavior") is expected
+
+    def test_real_demand_after_negated_advice_supplies_evidence_and_location(self):
+        content = (
+            "Never pay the ransom in Bitcoin; report the demand.\nPay the ransom in Bitcoin.\n"
+        )
+
+        findings = _run_builtin(content, "notice.md")
+        ransomware = [finding for finding in findings if "ransomware_behavior" in finding.message]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].start_line == 2
+        assert ransomware[0].matched_text == "Pay the ransom in Bitcoin"
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "os.walk(root) ... .encrypt(data)",
+            "os.walk(root) ... .cipher(data)",
+            "os.rename(path, path + '.locked')",
+            "os.rename(path, path + '.encrypted')",
+            "os.rename(path, path + '.crypt')",
+            "os.rename(path, path + '.enc')",
+            "os.walk(root) ... open(path, 'wb')",
+        ],
+    )
+    def test_behavior_indicators_remain_detected(self, content):
+        # Inert source fragments are scanned as text, never executed.
+        findings = _run_builtin(content, "sample.txt")
+
+        assert _has_rule(findings, "ransomware_behavior")
+
+    def test_multiline_encrypt_and_drop_note_script_is_detected(self):
+        content = """\
+from cryptography.fernet import Fernet
+import os
+
+for root, _dirs, files in os.walk(os.path.expanduser("~")):
+    for filename in files:
+        path = os.path.join(root, filename)
+        with open(path, "rb") as source:
+            encrypted = Fernet(key).encrypt(source.read())
+        with open(path, "wb") as destination:
+            destination.write(encrypted)
+
+with open("README_RESTORE_FILES.txt", "w") as note:
+    note.write("Your documents have been encrypted.\\n")
+    note.write("Send 0.5 BTC to <addr> to decrypt your files.\\n")
+"""
+
+        findings = _run_builtin(content, "encrypt.py")
+
+        assert _has_rule(findings, "ransomware_behavior")
+
+    def test_wallet_text_still_reaches_custom_rules(self, tmp_path):
+        _write_rule(
+            tmp_path,
+            "wallet_policy",
+            category="hack_tool",
+            severity="MEDIUM",
+            strings={"payment": "Send BTC"},
+        )
+
+        findings = _run("Send BTC to your own wallet.", "api.md", str(tmp_path))
+
+        assert _has_rule(findings, "wallet_policy")
+        assert not _has_rule(findings, "ransomware_behavior")
+
+
 # ── Built-in cryptominer rules ───────────────────────────────────────
 
 
