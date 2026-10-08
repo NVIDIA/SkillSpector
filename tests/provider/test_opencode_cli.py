@@ -317,7 +317,10 @@ class TestOpencodeDenyAllPolicy:
         assert config["autoshare"] is False
         assert env["OPENCODE_AUTO_SHARE"] == "0"
         assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
-        assert env["OPENCODE_DISABLE_DEFAULT_PLUGINS"] == "1"
+        # Internal plugins carry the OAuth logins (ChatGPT, Copilot, ...) and
+        # register no tools; disabling them breaks the user's login (#809).
+        # External plugins stay off through OPENCODE_PURE below.
+        assert "OPENCODE_DISABLE_DEFAULT_PLUGINS" not in env
         assert env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] == "1"
         assert env["OPENCODE_DISABLE_CLAUDE_CODE"] == "1"
         assert env["OPENCODE_PURE"] == "1"

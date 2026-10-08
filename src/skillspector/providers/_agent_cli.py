@@ -503,7 +503,10 @@ def _prepare_opencode_env(
     independently as defense in depth.
 
     The real OpenCode authentication store remains available so this CLI
-    provider can use the user's existing login. All mutable config, cache,
+    provider can use the user's existing login. OpenCode's internal plugins stay
+    enabled for the same reason: they implement the OAuth logins (ChatGPT,
+    Copilot, GitLab, ...) and register no tools. External plugins remain off
+    through ``--pure`` / ``OPENCODE_PURE``. All mutable config, cache,
     state, database, and temporary paths are redirected below the invocation's
     already-isolated temporary root.
     """
@@ -536,7 +539,6 @@ def _prepare_opencode_env(
             "OPENCODE_DISABLE_AUTOCOMPACT": "1",
             "OPENCODE_DISABLE_AUTOUPDATE": "1",
             "OPENCODE_DISABLE_CLAUDE_CODE": "1",
-            "OPENCODE_DISABLE_DEFAULT_PLUGINS": "1",
             "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
             "OPENCODE_DISABLE_LSP_DOWNLOAD": "1",
             "OPENCODE_DISABLE_MODELS_FETCH": "1",
