@@ -239,6 +239,37 @@ def test_clipped_adjacent_line_keeps_mkdir_evidence():
     assert any(f.rule_id == "RA2" and f.location.start_line == 1 for f in findings)
 
 
+_RADIUS = rogue._MAX_SKILL_INSTALL_CONTEXT_CHARS // 2
+_EDGE_MKDIR = "mkdir -p ~/.claude/skills/helper\n"
+_EDGE_COPY = "cp -r ./payload ~/.claude/skills/helper\n"
+
+
+@pytest.mark.parametrize("position", ["after", "before"])
+def test_copy_just_beyond_an_exact_window_edge_keeps_persistence(position):
+    if position == "after":
+        # The filler line ends exactly where the forward window ends.
+        filler = "#" + "x" * (_RADIUS - len(_EDGE_MKDIR) - 1) + "\n"
+        content = _EDGE_MKDIR + filler + _EDGE_COPY
+        assert content.index(_EDGE_COPY) == _RADIUS + 1
+        mkdir_line = 1
+    else:
+        # The copy line ends exactly where the backward window starts.
+        filler = "#" + "x" * (_RADIUS - 3) + "\n"
+        content = _EDGE_COPY + filler + _EDGE_MKDIR
+        assert content.index(_EDGE_MKDIR) - _RADIUS == len(_EDGE_COPY) - 1
+        mkdir_line = 3
+    findings = rogue.analyze(content, "install.sh", "shell")
+
+    assert any(f.rule_id == "RA2" and f.location.start_line == mkdir_line for f in findings)
+
+
+def test_whitespace_beyond_window_edge_is_not_evidence():
+    filler = "#" + "x" * (_RADIUS - len(_EDGE_MKDIR) - 1) + "\n"
+    content = _EDGE_MKDIR + filler + "\n   \n\t\n"
+
+    assert not any(f.rule_id == "RA2" for f in rogue.analyze(content, "install.sh", "shell"))
+
+
 def test_extra_benign_lines_do_not_hide_skills_root_use_inside_context_window():
     content = (
         "mkdir -p ~/.claude/skills/helper\n"

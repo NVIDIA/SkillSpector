@@ -179,6 +179,7 @@ _CLONE_URL = re.compile(
     r"|[a-zA-Z0-9_.-]+@[a-zA-Z0-9_.-]+:[a-zA-Z0-9._~/-]+)"
 )
 _SKILL_CONTEXT_LINE = re.compile(rf"[^{LINE_BREAK_CHARS}]+")
+_NON_WHITESPACE = re.compile(r"\S")
 _MAX_SKILL_INSTALL_CONTEXT_CHARS = 4_096
 
 # RA2: Session Persistence — unauthorized persistence across boundaries
@@ -388,6 +389,15 @@ def _unsafe_skill_install_context(
         while 0 <= line_index < len(line_starts):
             start, end = line_starts[line_index], line_ends[line_index]
             if start >= context_end or end <= context_start:
+                # A line can end exactly at the window edge. Uninspected
+                # content beyond the window cannot prove independence.
+                beyond = (
+                    _NON_WHITESPACE.search(content, context_end)
+                    if direction > 0
+                    else _NON_WHITESPACE.search(content, 0, context_start)
+                )
+                if beyond is not None:
+                    return mkdir_evidence
                 break
             if start < context_start or end > context_end:
                 return mkdir_evidence

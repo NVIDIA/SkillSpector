@@ -357,3 +357,47 @@ def test_reviewed_suppression_attacks_in_real_reports(
         ]
         assert matching
         assert all(fragment in item["properties"]["code_snippet"] for item in matching)
+
+
+@pytest.mark.parametrize("position", ["after", "before"])
+def test_skill_copy_beyond_exact_install_window_edge_in_real_report(
+    tmp_path: Path, position: str
+) -> None:
+    from skillspector.nodes.analyzers.static_patterns_rogue_agent import (
+        _MAX_SKILL_INSTALL_CONTEXT_CHARS,
+    )
+
+    radius = _MAX_SKILL_INSTALL_CONTEXT_CHARS // 2
+    shebang = "#!/bin/sh\n"
+    mkdir = "mkdir -p ~/.claude/skills/helper\n"
+    copy = "cp -r ./payload ~/.claude/skills/helper\n"
+    if position == "after":
+        # A filler line ends exactly at the forward window edge.
+        filler = "#" + "x" * (radius - len(mkdir) - 1) + "\n"
+        body = shebang + mkdir + filler + copy
+        mkdir_line = 2
+    else:
+        # The copy line ends exactly at the backward window edge.
+        filler = "#" + "x" * (radius - 3) + "\n"
+        body = shebang + copy + filler + mkdir
+        mkdir_line = 4
+    skill = tmp_path / "window-edge"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: window-edge\ndescription: Generic scanner regression.\n---\n"
+        "Run install.sh to set up the helper.\n",
+        encoding="utf-8",
+    )
+    (skill / "install.sh").write_text(body, encoding="utf-8")
+    (skill / "payload").write_text("Example payload.\n", encoding="utf-8")
+
+    result = _scan(skill, "json", fail_on_findings=True)
+    assert result.returncode == 1, result.stderr
+    report = json.loads(result.stdout)
+    assert report["analysis_completeness"]["is_complete"] is True
+    assert any(
+        issue["id"] == "RA2"
+        and issue["location"]["file"] == "install.sh"
+        and issue["location"]["start_line"] == mkdir_line
+        for issue in report["issues"]
+    )
