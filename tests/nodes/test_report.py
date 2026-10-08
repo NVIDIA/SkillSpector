@@ -719,6 +719,56 @@ class TestReportNode:
         assert "static_patterns_tool_misuse" in body
         assert "semantic_quality_policy" in body
 
+    @pytest.mark.parametrize("output_format", ["markdown", "terminal"])
+    def test_report_labels_rule_set_exception_as_rule_set_not_file(
+        self, output_format: str
+    ) -> None:
+        """A rule-set row must not read like a file row that shares its path label."""
+        state: SkillspectorState = {
+            "filtered_findings": [],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "skill_path": None,
+            "output_format": output_format,
+            "execution_successful": True,
+            "analysis_completeness": {
+                "coverage_percent": 100.0,
+                "fully_inspected_files": 1,
+                "partially_inspected_files": 0,
+                "entirely_uninspected_files": 0,
+                "is_complete": False,
+                "execution_successful": True,
+                "ledger_exceptions": [
+                    {
+                        "reason_code": "read_error",
+                        "path": "yara_rules",
+                        "message": "Rule dropped.",
+                        "fatal": False,
+                        "scope": "rule_set",
+                    },
+                    {
+                        "reason_code": "read_error",
+                        "path": "yara_rules",
+                        "message": "File unreadable.",
+                        "fatal": False,
+                    },
+                ],
+                "scope_exclusions": [],
+                "analyzer_statuses": [],
+                "limitations": [],
+            },
+        }
+
+        body = report(state)["report_body"]
+
+        if output_format == "markdown":
+            assert r"| read\_error | rule set `yara_rules` | Rule dropped\. |" in body
+            assert r"| read\_error | `yara_rules` | File unreadable\. |" in body
+        else:
+            assert "read_error rule set yara_rules: Rule dropped." in body
+            assert "read_error yara_rules: File unreadable." in body
+
     def test_report_output_format_terminal(self) -> None:
         """output_format terminal produces Rich-formatted output."""
         state: SkillspectorState = {
