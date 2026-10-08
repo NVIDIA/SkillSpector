@@ -951,7 +951,7 @@ class LLMAnalyzerBase:
             max_retries=native_retries,
         )
         self._structured_llm = (
-            bind_structured_output(self._llm, self.response_schema, model)
+            self._bind_structured_output(self._llm, self.response_schema)
             if self.response_schema
             else None
         )
@@ -960,6 +960,18 @@ class LLMAnalyzerBase:
             request_kind="structured_output" if self.response_schema else "chat_completion",
             model=model,
             chat_model=self._llm,
+        )
+
+    def _structured_output_preference(self, llm: object) -> str | None:
+        """Return an analyzer-specific binding preference, if any."""
+        return None
+
+    def _bind_structured_output(self, llm: object, schema: type) -> object:
+        return bind_structured_output(
+            llm,
+            schema,
+            self.model,
+            preferred_method=self._structured_output_preference(llm),
         )
 
     def _remaining_timeout(self) -> float | None:
@@ -1022,7 +1034,7 @@ class LLMAnalyzerBase:
             chat_model_controls(llm),
         )
         structured = (
-            bind_structured_output(llm, self.response_schema, self.model)
+            self._bind_structured_output(llm, self.response_schema)
             if self.response_schema
             else None
         )
