@@ -321,6 +321,12 @@ registry (`SKILLSPECTOR_MODEL_REGISTRY`) with `tool_choice: auto`.
 The `openai_compatible` provider honours the same `tool_choice: auto` entry
 for endpoints that ignore both `response_format` and a forced `tool_choice`
 and answer in prose (for example iFlytek's `spark-x2.5`, which is bundled).
+The `anthropic`, `anthropic_proxy`, `openai`, and `openai_compatible` providers
+also recognise those Claude models inside gateway model IDs such as
+`anthropic/claude-opus-5-5` or `aws/anthropic/bedrock-claude-opus-5-5`. Some
+OpenAI-compatible gateways turn a `json_schema` response format for Claude into
+a forced tool call, so the `openai` and `openai_compatible` providers bind the
+schema as a tool with `tool_choice` left at `auto` and retry a prose answer.
 `SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD=json_schema|function_calling`
 overrides the method for any provider.
 

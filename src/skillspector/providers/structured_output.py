@@ -27,6 +27,15 @@ this model``).  What replaces it depends on the platform:
   not permitted``), so ``BedrockProvider`` leaves ``toolChoice`` at ``auto``
   and :func:`skillspector.llm_utils.bind_structured_output` asks for the
   tool call in the prompt and retries when the model answers in prose.
+- OpenAI-compatible gateways serving Claude can turn a ``json_schema``
+  response format into a forced tool call too, so the ``openai`` and
+  ``openai_compatible`` providers bind the schema as a tool with
+  ``tool_choice`` left at ``auto`` and ask for the call in the prompt, as on
+  Bedrock.
+
+Gateway model IDs namespace or prefix the Claude name
+(``azure/anthropic/claude-opus-5-5``, ``aws/anthropic/bedrock-claude-opus-5-5``);
+:func:`claude_model_name` reads it back so every route applies the same rules.
 """
 
 from __future__ import annotations

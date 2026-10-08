@@ -62,7 +62,7 @@ from skillspector.providers.chat_models import (
     resolve_reasoning_effort,
     resolve_sampling_parameters,
 )
-from skillspector.providers.structured_output import rejects_forced_tool_call
+from skillspector.providers.structured_output import claude_model_name, rejects_forced_tool_call
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -282,8 +282,8 @@ class AnthropicProxyProvider:
         return user_input or self.SLOT_DEFAULTS.get(slot, "") or self.DEFAULT_MODEL
 
     def structured_output_method(self, model: str) -> str | None:
-        """``with_structured_output`` method for *model*: registry entry, then family prefix, else ``None``."""
+        """``with_structured_output`` method for *model*: registry entry, then Claude name, else ``None``."""
         declared = registry.lookup_structured_output_method(REGISTRY_PATH, model)
         if declared:
             return declared
-        return "json_schema" if rejects_forced_tool_call(model) else None
+        return "json_schema" if rejects_forced_tool_call(claude_model_name(model)) else None

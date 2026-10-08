@@ -26,7 +26,9 @@ Required env vars:
 Some endpoints ignore both ``response_format`` and a forced ``tool_choice``
 and answer in prose.  A registry entry with ``tool_choice: auto`` binds the
 schema as a tool with ``tool_choice`` left at ``auto``; the prompt then asks
-for the tool call and a prose answer is retried.
+for the tool call and a prose answer is retried.  Model IDs that name a Claude
+model rejecting forced tool calls (``anthropic/claude-opus-5-5``) take the same
+path without a registry entry.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 
 from skillspector.providers import registry
 from skillspector.providers.chat_models import create_openai_compatible_chat_model
+from skillspector.providers.structured_output import claude_model_name, rejects_forced_tool_call
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -86,8 +89,15 @@ class OpenAICompatibleProvider:
         return user_input or self.SLOT_DEFAULTS.get(slot, "") or self.DEFAULT_MODEL
 
     def forced_tool_choice_supported(self, model: str) -> bool:
-        """``False`` when the registry declares ``tool_choice: auto`` for *model*."""
-        return registry.lookup_setting(REGISTRY_PATH, model, "tool_choice") != "auto"
+        """``False`` when the registry declares ``tool_choice: auto`` for *model*.
+
+        Without a registry entry, ``False`` when *model* names a Claude model
+        that rejects a forced tool call.
+        """
+        declared = registry.lookup_setting(REGISTRY_PATH, model, "tool_choice")
+        if declared:
+            return declared != "auto"
+        return not rejects_forced_tool_call(claude_model_name(model))
 
     def structured_output_method(self, model: str) -> str | None:
         """``with_structured_output`` method: registry entry, else tool calling for ``tool_choice: auto``."""

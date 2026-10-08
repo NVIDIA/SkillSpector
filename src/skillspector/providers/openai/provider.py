@@ -29,6 +29,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 
 from skillspector.providers import registry
 from skillspector.providers.chat_models import create_openai_compatible_chat_model
+from skillspector.providers.structured_output import claude_model_name, rejects_forced_tool_call
 
 # Documented for completeness — ChatOpenAI defaults here when base_url=None.
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -71,6 +72,9 @@ class OpenAIProvider:
             max_tokens=max_tokens,
             timeout=timeout,
             default_headers=_resolve_openai_project_headers(),
+            disabled_params=(
+                None if self.forced_tool_choice_supported(model) else {"tool_choice": None}
+            ),
         )
 
     def get_context_length(self, model: str) -> int | None:
@@ -83,3 +87,11 @@ class OpenAIProvider:
         """Resolve model: ``SKILLSPECTOR_MODEL`` env > slot default > ``DEFAULT_MODEL``."""
         user_input = os.environ.get("SKILLSPECTOR_MODEL", "").strip()
         return user_input or self.SLOT_DEFAULTS.get(slot, "") or self.DEFAULT_MODEL
+
+    def forced_tool_choice_supported(self, model: str) -> bool:
+        """``False`` when *model* names a Claude model that rejects a forced tool call."""
+        return not rejects_forced_tool_call(claude_model_name(model))
+
+    def structured_output_method(self, model: str) -> str | None:
+        """``with_structured_output`` method: tool calling when ``tool_choice`` must stay ``auto``."""
+        return None if self.forced_tool_choice_supported(model) else "function_calling"
