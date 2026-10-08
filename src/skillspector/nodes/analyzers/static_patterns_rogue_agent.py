@@ -166,10 +166,15 @@ _STANDARD_SKILL_MKDIR = re.compile(
     r"(?:/[a-zA-Z0-9][a-zA-Z0-9_.-]*)?)/?(?P=quote)[ \t]*"
 )
 # Anything that may address a skills root: any agent configuration directory,
-# any "skills" word, or any shell expansion. Quoting, duplicate or dot path
-# segments, other home spellings, globs, cd plus relative paths and variables
-# must not make a nearby writer look unrelated to the created directory.
-_SKILLS_ROOT = re.compile(r"\.(?:claude|codex|gemini)\b|\bskills\b|\$", re.IGNORECASE)
+# a "skills" path segment, or a shell parameter expansion or command
+# substitution. Quoting, duplicate or dot path segments, other home spellings,
+# globs, cd plus relative paths and variables must not make a nearby writer
+# look unrelated to the created directory. Prose such as "skills directory" or
+# "$0" is not a path or an expansion.
+_SKILLS_ROOT = re.compile(
+    r"\.(?:claude|codex|gemini)\b|/skills\b|\bskills/|\$(?:\{|\(|[A-Za-z_@*])",
+    re.IGNORECASE,
+)
 _SKILL_INSTALL_PATH = re.compile(
     r"(?:~/|\$(?:HOME|\{HOME\})/|/home/[^/\s]+/)"
     r"(?P<relative>\.(?:claude|codex|gemini)/skills(?:/[a-zA-Z0-9][a-zA-Z0-9_.-]*)*)/?"

@@ -239,6 +239,31 @@ def test_clipped_adjacent_line_keeps_mkdir_evidence():
     assert any(f.rule_id == "RA2" and f.location.start_line == 1 for f in findings)
 
 
+@pytest.mark.parametrize(
+    "operation",
+    ['cp -r ./payload "$(cat destination.txt)"', 'cp -r ./payload "${1}"', 'cp -r ./payload "$@"'],
+)
+def test_expansion_destinations_retain_persistence(operation):
+    content = f"mkdir -p ~/.claude/skills/helper\n{operation}\n"
+    persistence = [f for f in _scan(content, "install.sh") if f.rule_id == "RA2"]
+
+    assert any(f.start_line == 2 and f.matched_text in operation for f in persistence)
+
+
+@pytest.mark.parametrize(
+    "prose",
+    ["Install into your Claude Code skills directory:", "The skill is free ($0)."],
+)
+@pytest.mark.parametrize("path", ["README.md", "SKILL.md"])
+def test_prose_near_simple_install_block_is_not_persistence(prose, path):
+    content = (
+        f"## Installation\n\n{prose}\n\n```sh\nmkdir -p ~/.claude/skills\n"
+        "git clone https://github.com/example/helper.git ~/.claude/skills/helper\n```\n"
+    )
+
+    assert not {"AS3", "RA2"}.intersection(f.rule_id for f in _scan(content, path))
+
+
 _RADIUS = rogue._MAX_SKILL_INSTALL_CONTEXT_CHARS // 2
 _EDGE_MKDIR = "mkdir -p ~/.claude/skills/helper\n"
 _EDGE_COPY = "cp -r ./payload ~/.claude/skills/helper\n"
