@@ -48,6 +48,7 @@ from google.auth.exceptions import RefreshError
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable, RunnableLambda
 
+from skillspector.constants import build_model_config
 from skillspector.inference_usage import (
     InferenceUsageCollector,
     chat_model_controls,
@@ -67,6 +68,7 @@ from skillspector.providers import (
     resolve_chat_model_credentials,
     resolve_provider_credentials,
 )
+from skillspector.providers.chat_models import UnsupportedControlError
 from skillspector.providers.gemini import GeminiProvider
 from skillspector.providers.openai import OpenAIProvider
 
@@ -140,7 +142,9 @@ def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
     ``opencode_cli``) are checked through their ``is_available()`` method
     first. Other providers probe the same native chat-model path used by
     :func:`get_chat_model`; unbound HTTP providers keep the
-    credential-resolution and OpenAI fallback path.
+    credential-resolution and OpenAI fallback path.  A configured model that
+    rejects a requested control makes the LLM unavailable, with the reason
+    from :func:`unsupported_control_error`.
     """
     try:
         provider = get_active_provider()
@@ -149,28 +153,52 @@ def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
     if has_cli_capability(provider):
         return provider.is_available()  # type: ignore[attr-defined]
 
-    if has_provider_binding():
-        try:
+    try:
+        if has_provider_binding():
             model = provider.resolve_model()
             create_chat_model(
                 model=model,
                 max_tokens=get_max_output_tokens(model),
                 timeout=timeout,
             )
-        except (ValueError, RefreshError, TimeoutError) as exc:
-            return False, str(exc)
-        return True, None
-    if isinstance(provider, GeminiProvider):
-        try:
+        elif isinstance(provider, GeminiProvider):
             provider.resolve_credentials(timeout=timeout)
-        except (ValueError, RefreshError, TimeoutError) as exc:
-            return False, str(exc)
-        return True, None
-    try:
-        _resolve_llm_credentials()
-    except ValueError as exc:
+        else:
+            _resolve_llm_credentials()
+    except (ValueError, RefreshError, TimeoutError) as exc:
         return False, str(exc)
-    return True, None
+    control_error = unsupported_control_error(timeout)
+    return control_error is None, control_error
+
+
+def unsupported_control_error(timeout: float | None = 120) -> str | None:
+    """Return why a configured slot model rejects a requested control, else ``None``.
+
+    Only ``SKILLSPECTOR_TEMPERATURE`` and ``SKILLSPECTOR_REASONING_EFFORT`` can
+    be rejected, so nothing runs when both are unset.  Otherwise each distinct
+    slot model is built the way the analyzers build it, so the provider's own
+    guard (model name or registry entry) reports an
+    :class:`~skillspector.providers.chat_models.UnsupportedControlError`
+    before any analysis.  Other failures, such as missing credentials, are
+    left to the regular availability path.
+    """
+    if not any(
+        os.environ.get(name, "").strip()
+        for name in ("SKILLSPECTOR_TEMPERATURE", "SKILLSPECTOR_REASONING_EFFORT")
+    ):
+        return None
+    try:
+        if has_cli_capability(get_active_provider()):
+            return None
+        models = dict.fromkeys(build_model_config().values())
+        for model in models:
+            get_chat_model(model, timeout=timeout)
+    except UnsupportedControlError as exc:
+        return str(exc)
+    except Exception:
+        # Not a control rejection; availability checks report it.
+        return None
+    return None
 
 
 def fetch_model_token_limits(model_label: str) -> tuple[int, int]:

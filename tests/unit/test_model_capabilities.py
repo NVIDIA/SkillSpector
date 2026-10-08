@@ -17,6 +17,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import patch
+
 import pytest
 from langchain_anthropic import ChatAnthropic
 from langchain_core.exceptions import OutputParserException
@@ -24,9 +27,17 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
+from typer.testing import CliRunner
 
+from skillspector.cli import app
+from skillspector.constants import _MODEL_SLOTS
 from skillspector.inference_usage import chat_model_controls, chat_model_requested_controls
-from skillspector.llm_utils import StructuredOutputParseError, bind_structured_output
+from skillspector.llm_utils import (
+    StructuredOutputParseError,
+    bind_structured_output,
+    is_llm_available,
+    unsupported_control_error,
+)
 from skillspector.providers import registry
 from skillspector.providers.anthropic import AnthropicProvider
 from skillspector.providers.anthropic_proxy import AnthropicProxyProvider
@@ -77,6 +88,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch):
         "AZURE_OPENAI_API_KEY",
         "AZURE_OPENAI_ENDPOINT",
         "AZURE_OPENAI_DEPLOYMENT",
+        *(f"SKILLSPECTOR_MODEL_{slot.upper()}" for slot in _MODEL_SLOTS),
     ):
         monkeypatch.delenv(name, raising=False)
     registry._load.cache_clear()
@@ -531,3 +543,96 @@ class TestAzureOpenAIControls:
         monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.2")
         llm = AzureOpenAIProvider().create_chat_model("gpt-4o", max_tokens=1_000)
         assert chat_model_requested_controls(llm)["temperature"] == 0.2
+
+
+_DEFAULT_PROVIDER_ENV = pytest.mark.parametrize(
+    ("provider", "credential", "model"),
+    [
+        ("openai", "OPENAI_API_KEY", "gpt-6.1-sol"),
+        ("anthropic", "ANTHROPIC_API_KEY", "claude-opus-5-5"),
+    ],
+)
+
+
+class TestScanPreflightControls:
+    """A rejected control stops the scan before analysis and names the setting."""
+
+    @_DEFAULT_PROVIDER_ENV
+    def test_scan_exits_before_analysis_with_the_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        provider: str,
+        credential: str,
+        model: str,
+    ) -> None:
+        (tmp_path / "SKILL.md").write_text("---\nname: demo\n---\nHello.\n", encoding="utf-8")
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", provider)
+        monkeypatch.setenv(credential, "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+
+        with patch("skillspector.cli.graph.invoke") as invoke:
+            result = CliRunner().invoke(app, ["scan", str(tmp_path), "--format", "json"])
+
+        assert result.exit_code == 2
+        assert f"SKILLSPECTOR_TEMPERATURE is not supported by {model}" in result.output
+        invoke.assert_not_called()
+
+    @_DEFAULT_PROVIDER_ENV
+    def test_preflight_reports_the_reason_as_llm_error(
+        self, monkeypatch: pytest.MonkeyPatch, provider: str, credential: str, model: str
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", provider)
+        monkeypatch.setenv(credential, "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+
+        available, error = is_llm_available()
+
+        assert available is False
+        assert error is not None and f"not supported by {model}; unset it" in error
+
+    def test_sol_effort_is_checked_on_every_slot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", "minimal")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "gpt-5.4")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_META_ANALYZER", "gpt-6.1-sol")
+
+        error = unsupported_control_error()
+
+        assert error is not None and "SKILLSPECTOR_REASONING_EFFORT='minimal'" in error
+
+    def test_supported_controls_and_missing_credentials_pass(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+        # Missing credentials are reported by the availability path, not as a control error.
+        assert unsupported_control_error() is None
+
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "gpt-5.4")
+        assert unsupported_control_error() is None
+        assert is_llm_available() == (True, None)
+
+    def test_cli_providers_are_not_checked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "gpt-6.1-sol")
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+        assert unsupported_control_error() is None
+
+    def test_no_llm_scan_ignores_rejected_controls(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        (tmp_path / "SKILL.md").write_text("---\nname: demo\n---\nHello.\n", encoding="utf-8")
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+
+        with patch("skillspector.cli.unsupported_control_error") as check:
+            result = CliRunner().invoke(
+                app, ["scan", str(tmp_path), "--format", "json", "--no-llm"]
+            )
+
+        check.assert_not_called()
+        assert "SKILLSPECTOR_TEMPERATURE" not in result.output
