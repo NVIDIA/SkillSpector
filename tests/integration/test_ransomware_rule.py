@@ -124,6 +124,16 @@ from skillspector.graph import graph
             True,
             id="minimum-amount-demand",
         ),
+        pytest.param(
+            "To decrypt your files you must send\n0.5 BTC to the address below.\n",
+            True,
+            id="hard-wrapped-payment",
+        ),
+        pytest.param(
+            "Send 0.5BTC to example.invalid to decrypt your files.\n",
+            True,
+            id="glued-amount-payment",
+        ),
         pytest.param("Your files are encrypted.\n", True, id="encrypted-files-are"),
         pytest.param("Your files have been encrypted.\n", True, id="encrypted-files-have-been"),
         pytest.param(

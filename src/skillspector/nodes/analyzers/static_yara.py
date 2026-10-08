@@ -92,6 +92,9 @@ _BUILTIN_RANSOMWARE_RULE = "ransomware_behavior"
 _RANSOMWARE_PAYMENT_IDENTIFIERS = frozenset(
     {"$payment_then_context", "$context_then_payment", "$explicit_ransom_payment"}
 )
+_RANSOMWARE_PAYMENT_FIRST_IDENTIFIERS = frozenset(
+    {"$payment_then_context", "$explicit_ransom_payment"}
+)
 _RANSOMWARE_PAYMENT_VERB = re.compile(rb"\b(?:pay|send)\b", re.IGNORECASE)
 # Advice such as "Never pay the ransom" opens its clause with the negator (after
 # optional list/quote markup or a "you should" subject). A negator that follows
@@ -722,6 +725,10 @@ def _accepted_builtin_ransomware_instances(
             for payment in _RANSOMWARE_PAYMENT_VERB.finditer(local_match)
             if payment.start() >= match_start
         ]
+        if identifier in _RANSOMWARE_PAYMENT_FIRST_IDENTIFIERS:
+            # The leading verb owns the currency. A wrapped match can run into a
+            # later demand, which YARA reports as its own instance and location.
+            payment_offsets = payment_offsets[:1]
         if payment_offsets and all(
             _payment_is_directly_negated(data, local_start + payment) for payment in payment_offsets
         ):
