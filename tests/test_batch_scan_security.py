@@ -209,12 +209,14 @@ def test_runner_cleans_up_with_optional_gap_fill(
 
 @pytest.mark.parametrize("rich_available", [True, False])
 @pytest.mark.parametrize("skill_name", ["safe-skill", "x\\"])
+@pytest.mark.parametrize("output_format", ["json", "markdown"])
 def test_cli_warns_using_detected_language(
     batch_skill,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     rich_available: bool,
     skill_name: str,
+    output_format: str,
 ) -> None:
     skill, _ = batch_skill
     if skill.name != skill_name:
@@ -228,26 +230,31 @@ def test_cli_warns_using_detected_language(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["batch_scan", str(skill.parent), "--no-llm", "--workers", "1", "-f", "json"],
+        ["batch_scan", str(skill.parent), "--no-llm", "--workers", "1", "-f", output_format],
     )
 
     batch_scan._main_impl()
 
     output = capsys.readouterr()
-    output_text = " ".join((output.out + output.err).split())
-    assert "WARNING:" in output_text
-    assert f"skill '{skill_name}' (zh) scanned with --no-llm." in output_text
+    assert "WARNING:" in output.err
+    assert f"skill '{skill_name}' (zh) scanned with --no-llm." in output.err
+    if output_format == "json":
+        json.loads(output.out)
+    else:
+        assert output.out.startswith("# SkillSpector Batch Scan Report")
     assert observed["calls"] == []
 
 
 @pytest.mark.parametrize("rich_available", [True, False])
 @pytest.mark.parametrize("has_error", [True, False])
+@pytest.mark.parametrize("output_format", ["terminal", "json", "markdown"])
 def test_cli_prints_literal_skill_names_and_errors(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     rich_available,
     has_error,
+    output_format: str,
 ) -> None:
     import builtins
 
@@ -273,19 +280,26 @@ def test_cli_prints_literal_skill_names_and_errors(
     monkeypatch.setattr(batch_scan, "run_one", lambda *args, **kwargs: (entry, error))
     monkeypatch.setattr(batch_scan, "_scan_skill_bounded", batch_scan._scan_skill)
     monkeypatch.setattr(batch_scan, "create_api_key_pool_from_env", lambda: None)
-    monkeypatch.setattr(sys, "argv", ["batch_scan", str(tmp_path), "--no-llm", "--workers", "1"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["batch_scan", str(tmp_path), "--no-llm", "--workers", "1", "-f", output_format],
+    )
 
     with pytest.raises(SystemExit) as exited:
         batch_scan._main_impl()
 
     assert exited.value.code == (2 if has_error else 1)
-    rendered = capsys.readouterr().out
-    assert "[/bad] [31mchild:smile:" in rendered
-    assert "\x1b" not in rendered
-    if has_error:
-        assert "[/bad] [31mfailed" in rendered
+    captured = capsys.readouterr()
+    if output_format == "terminal":
+        assert "[/bad] [31mchild:smile:" in captured.out
+        assert "\x1b" not in captured.out
+    elif output_format == "json":
+        json.loads(captured.out)
     else:
-        assert "90/100 CRITICAL" in rendered
+        assert captured.out.startswith("# SkillSpector Batch Scan Report")
+    if has_error:
+        assert "[/bad] [31mfailed" in captured.err
 
 
 def _stalled_scan_process(skill_dir, root, result_path, options, started):

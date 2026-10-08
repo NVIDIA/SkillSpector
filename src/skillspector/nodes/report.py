@@ -30,6 +30,7 @@ from hashlib import sha256
 from html import escape as escape_html
 from io import StringIO
 from typing import Literal, cast
+from urllib.parse import quote
 
 from rich.console import Console
 from rich.markup import escape
@@ -202,13 +203,14 @@ def _sarif_artifact_location(
 ) -> SarifArtifactLocation:
     """Build a source-scoped SARIF artifact location for one occurrence."""
     occurrence = occurrence or {}
-    file_path = str(occurrence.get("file", finding.file)).replace("\\", "/").lstrip("/")
+    raw_file_path = str(occurrence.get("file", finding.file)).replace("\\", "/").lstrip("/")
+    file_path = quote(raw_file_path, safe="/")
     provenance = _occurrence_provenance(finding, occurrence)
     source_identity = _report_source_identity(provenance)
     if source_identity:
         uri = f"{source_identity}/{file_path}"
     else:
-        uri = str(occurrence.get("file", finding.file))
+        uri = _sarif_uri(raw_file_path)
     properties = {
         {
             "source_identity": "sourceIdentity",
@@ -219,6 +221,11 @@ def _sarif_artifact_location(
         for key, value in provenance.items()
     }
     return SarifArtifactLocation(uri=uri, properties=properties or None)
+
+
+def _sarif_uri(path: str) -> str:
+    """Normalize separators and percent-encode a local artifact path for SARIF."""
+    return quote(path.replace("\\", "/"), safe="/")
 
 
 def _occurrence_columns(
@@ -855,7 +862,7 @@ def _build_sarif(
             locations = [
                 SarifLocation(
                     physicalLocation=SarifPhysicalLocation(
-                        artifactLocation=SarifArtifactLocation(uri=path),
+                        artifactLocation=SarifArtifactLocation(uri=_sarif_uri(path)),
                         region=region,
                     )
                 )

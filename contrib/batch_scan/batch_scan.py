@@ -290,7 +290,9 @@ def _main_impl() -> None:
     def _print(*args: object, **kwargs: object) -> None:
         """Print through Rich when available, falling back to plain text."""
         if c:
-            c.print(*args, **{k: v for k, v in kwargs.items() if k != "file"})
+            output = kwargs.pop("file", None)
+            console = Console(file=output, emoji=False) if output is not None else c
+            console.print(*args, **kwargs)
         else:
             msg = " ".join(str(a) for a in args)
             file = kwargs.get("file")
@@ -397,7 +399,8 @@ def _main_impl() -> None:
     _print(
         f"\n[bold]SkillSpector Batch Scan[/bold] — "
         f"{len(skill_dirs)} skill(s) in [dim]{display(root)}[/dim]"
-        f"  ([cyan]{args.workers} workers[/cyan]{pool_note})\n"
+        f"  ([cyan]{args.workers} workers[/cyan]{pool_note})\n",
+        file=sys.stderr,
     )
 
     # -- Scan (parallel) -----------------------------------------------------
@@ -469,7 +472,8 @@ def _main_impl() -> None:
                     errors += 1
                     _print(
                         f"  [{idx}/{total}] [cyan]{display(rel_name)}[/cyan] → "
-                        f"[red]ERROR: {display(error_msg)}[/red]"
+                        f"[red]ERROR: {display(error_msg)}[/red]",
+                        file=sys.stderr,
                     )
                 else:
                     risk = entry.get("risk_assessment", {})
@@ -482,7 +486,8 @@ def _main_impl() -> None:
                     _print(
                         f"  [{idx}/{total}] [cyan]{display(rel_name)}[/cyan] → "
                         f"[{color}]{score}/100 {display(severity)}[/{color}] "
-                        f"({n_issues} issue(s))"
+                        f"({n_issues} issue(s))",
+                        file=sys.stderr,
                     )
 
         if api_pool is not None:
@@ -510,7 +515,7 @@ def _main_impl() -> None:
                 f"{snap['retry_successes']} retried"
             )
         _parts.append(f"{snap['keys_configured']} keys")
-        _print(f"\n[dim]API Pool: {', '.join(_parts)}[/dim]")
+        _print(f"\n[dim]API Pool: {', '.join(_parts)}[/dim]", file=sys.stderr)
 
     # -- Output --------------------------------------------------------------
     fmt = args.format
@@ -523,7 +528,7 @@ def _main_impl() -> None:
 
     if args.output:
         args.output.write_text(report_body, encoding="utf-8")
-        _print(f"\n[green]Batch report saved to:[/green] {display(args.output)}")
+        _print(f"\n[green]Batch report saved to:[/green] {display(args.output)}", file=sys.stderr)
     else:
         if fmt == "terminal":
             _print(report_body, markup=False, highlight=False)
