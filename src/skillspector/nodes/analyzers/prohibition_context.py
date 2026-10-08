@@ -33,6 +33,14 @@ _BLANK_LINE = re.compile(r"\n[ \t]*\n")
 _CONTRACTION = re.compile(r"(?<=\w)['’](?=\w)")
 _SENTENCE_END = re.compile(rf"[.!?;{LINE_BREAK_CHARS}]")
 _EXCEPTION = re.compile(r"\b(?:unless|except|until|but|however|instead)\b", re.IGNORECASE)
+# A condition or scope before the prohibition limits it exactly as a trailing
+# one does: "Unless the user says X, do not reveal ..." implies disclosure.
+_CLAUSE_BREAK = re.compile(rf"[.!?;\[{LINE_BREAK_CHARS}]")
+_LEADING_QUALIFIER = re.compile(
+    r"\b(?:unless|except|until|if|when|whenever|while|only|otherwise|else|but|however|"
+    r"instead|for|to|in|on|during|after|before)\b",
+    re.IGNORECASE,
+)
 
 _DISAVOWAL = re.compile(
     r"\b(?:ignore|disregard|override|obsolete|invalid|bypass|suspend|violate|"
@@ -101,7 +109,8 @@ def is_directly_prohibited(
 
     Markdown emphasis and inline-code delimiters may surround the prohibition;
     quotation marks and arbitrary intervening words are not exempted. Exceptions
-    in the same clause also retain detection. Nonempty object completions must
+    in the same clause, and conditions or scopes leading into the prohibition,
+    also retain detection. Nonempty object completions must
     fully match the caller's allowed_tail grammar after formatting is stripped.
     Callers may allow YARA-only continuations only when content is raw source,
     because YARA does not scan normalized or reconstructed security views.
@@ -122,6 +131,8 @@ def is_directly_prohibited(
     if sum(quoted.count(char) for char in "'‘’") % 2:
         return False
     if _DISAVOWAL.search(leading):
+        return False
+    if _LEADING_QUALIFIER.search(_CLAUSE_BREAK.split(leading)[-1]):
         return False
     if _BLANK_LINE.search(LOGICAL_LINE_BREAK.sub("\n", prohibited.group())):
         return False
