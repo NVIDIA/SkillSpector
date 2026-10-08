@@ -386,6 +386,53 @@ def test_pep263_python_source_is_decoded_before_analysis(tmp_path: Path) -> None
     assert result["analysis_completeness"]["is_complete"] is True
 
 
+@pytest.mark.parametrize(
+    ("filename", "prefix"),
+    [
+        pytest.param("run.py", "", id="python-suffix"),
+        pytest.param("run.pyw", "", id="python-window"),
+        pytest.param("run", "#!/usr/bin/env python3\n", id="extensionless-shebang"),
+    ],
+)
+def test_direct_pep263_python_file_is_decoded_not_rejected(
+    tmp_path: Path,
+    filename: str,
+    prefix: str,
+) -> None:
+    target = tmp_path / filename
+    target.write_bytes(
+        (
+            prefix
+            + "# coding: latin-1\n# café\nimport subprocess\nsubprocess.run(command, shell=True)\n"
+        ).encode("latin-1")
+    )
+
+    result = _scan(target)
+    completeness = result["analysis_completeness"]
+
+    assert filename in _tm1_paths(result)
+    assert "café" in result["local_file_cache"][filename]
+    assert completeness["status"] == "complete"
+    assert completeness["is_complete"] is True
+    assert not any(row["fatal"] for row in completeness["ledger_exceptions"])
+
+
+def test_direct_undecodable_python_file_remains_fatal(tmp_path: Path) -> None:
+    target = tmp_path / "run.py"
+    target.write_bytes(b"# coding: ascii\n# caf\xe9\nvalue = 1\n")
+
+    result = _scan(target)
+    completeness = result["analysis_completeness"]
+
+    assert completeness["status"] == "failed"
+    assert any(
+        row["path"] == "run.py"
+        and row["reason_code"] == "unsupported_primary_content"
+        and row["fatal"]
+        for row in completeness["ledger_exceptions"]
+    )
+
+
 def test_nested_extensionless_python_surface_is_analyzed(tmp_path: Path) -> None:
     archive_bytes = io.BytesIO()
     with zipfile.ZipFile(archive_bytes, "w") as archive:

@@ -2560,12 +2560,37 @@ def _parse_manifest(
     return {}
 
 
-def _unsupported_primary_bytes(artifact: ArtifactRecord, data: bytes) -> bool:
+def _decodes_as_declared_python(
+    path: str,
+    data: bytes,
+    classification: PythonSourceClassification | None,
+) -> bool:
+    """Return whether Python bytes decode under their declared PEP 263 encoding."""
+    if classification is None:
+        classification = classify_python_source(path, data)
+    if classification is PythonSourceClassification.NON_PYTHON:
+        return False
+    try:
+        decode_python_source(data)
+    except Exception:
+        return False
+    return True
+
+
+def _unsupported_primary_bytes(
+    artifact: ArtifactRecord,
+    data: bytes,
+    *,
+    python_classification: PythonSourceClassification | None,
+    deadline: float,
+) -> bool:
     """Recognize opaque primary content without opening or expanding containers.
 
     ZIPs are handled separately by bounded nested inspection. Other archive
     headers and UTF-16/32 instructions must not count as decoded source text,
     even when their bytes happen to be valid UTF-8 (for example an ASCII TAR).
+    Python source is decoded by its PEP 263 declaration rather than as UTF-8,
+    so only a failed declared decode leaves non-UTF-8 Python unsupported.
     """
     split_utf8 = False
     if not artifact["decodable"] and artifact["size_bytes"] > len(data):
@@ -2589,12 +2614,22 @@ def _unsupported_primary_bytes(artifact: ArtifactRecord, data: bytes) -> bool:
         and sample[3:4] in b"123456789"
         and sample[4:10] in (b"1AY&SY", b"\x17rE8P\x90")
     )
-    return (
+    utf8_unsupported = (
         (artifact["content_kind"] != ContentKind.TEXT and not split_utf8)
         # A bounded prefix can split a valid UTF-8 code point. Existing size
         # accounting already marks that scan partial; it is not proof that the
         # complete source uses an unsupported encoding.
         or (not artifact["decodable"] and not split_utf8)
+    )
+    if (
+        utf8_unsupported
+        # Post-cache Python decoding must not begin after the shared deadline.
+        and monotonic() < deadline
+        and _decodes_as_declared_python(artifact["path"], data, python_classification)
+    ):
+        utf8_unsupported = False
+    return (
+        utf8_unsupported
         or sample.startswith((b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff"))
         or sample.startswith((b"\x1f\x8b", b"\xfd7zXZ\x00", b"7z\xbc\xaf\x27\x1c", b"Rar!\x1a\x07"))
         or is_tar
@@ -3249,7 +3284,12 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         if not required or path in nested.recognized_zip_paths:
             continue
         data = raw_file_cache.get(path)
-        if data is None or not _unsupported_primary_bytes(artifact, data):
+        if data is None or not _unsupported_primary_bytes(
+            artifact,
+            data,
+            python_classification=nested.python_source_classifications.get(path),
+            deadline=processing_deadline,
+        ):
             continue
         # Explicit input and primary instructions cannot be passive exclusions.
         # Keep canonical bytes for byte-based analysis and source attribution,
