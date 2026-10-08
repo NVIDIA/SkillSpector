@@ -373,6 +373,35 @@ class TestBedrockProviderToolChoice:
         monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(override))
         assert BedrockProvider().forced_tool_choice_supported(_TEST_ARN) is False
 
+    @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
+    @patch("skillspector.providers.bedrock.provider.boto3.Session")
+    def test_registry_entry_rejects_temperature_for_an_opaque_arn(
+        self,
+        mock_session: MagicMock,
+        mock_chat: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_session.return_value.get_credentials.return_value = MagicMock()
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+        provider = BedrockProvider()
+
+        # Without a declaration the ARN carries no model name, so temperature is sent.
+        provider.create_chat_model(_TEST_ARN, max_tokens=1024)
+        assert mock_chat.call_args.kwargs["temperature"] == 0.0
+
+        override = tmp_path / "registry.yaml"
+        override.write_text(
+            f'models:\n  "{_TEST_ARN}":\n    context_length: 1000000\n'
+            "    tool_choice: auto\n    sampling: rejected\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(override))
+        mock_chat.reset_mock()
+        with pytest.raises(ValueError, match="SKILLSPECTOR_TEMPERATURE is not supported"):
+            provider.create_chat_model(_TEST_ARN, max_tokens=1024)
+        mock_chat.assert_not_called()
+
     @pytest.mark.parametrize(
         ("model", "expected"),
         [

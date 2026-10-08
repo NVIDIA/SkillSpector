@@ -31,7 +31,9 @@ Environment variables:
 
 Claude models that reject a forced ``toolChoice`` (HTTP 400) get a client
 restricted to ``toolChoice`` ``auto``; Bedrock has no JSON-schema output for
-them either.  See ``forced_tool_choice_supported``.
+them either.  See ``forced_tool_choice_supported``.  A registry entry with
+``sampling: rejected`` makes ``SKILLSPECTOR_TEMPERATURE`` fail before any
+request for an application-inference-profile ARN that serves Claude 5.5.
 """
 
 from __future__ import annotations
@@ -49,11 +51,8 @@ from skillspector.inference_usage import (
     retained_chat_model_controls,
 )
 from skillspector.providers import registry
-from skillspector.providers.chat_models import (
-    reject_unsupported_controls,
-    resolve_sampling_parameters,
-)
-from skillspector.providers.structured_output import rejects_forced_tool_call
+from skillspector.providers.chat_models import resolve_sampling_parameters
+from skillspector.providers.structured_output import forced_tool_choice_supported
 
 BEDROCK_DEFAULT_REGION = "us-west-2"
 # Cross-region inference profile ID for Claude Sonnet 4.6. Public,
@@ -154,8 +153,7 @@ class BedrockProvider:
             # JSON-schema outputConfig for them too; bind tools with toolChoice auto
             # and let bind_structured_output ask for the call in the prompt.
             kwargs["supports_tool_choice_values"] = ("auto",)
-        sampling_parameters = resolve_sampling_parameters()
-        reject_unsupported_controls(model, sampling_parameters)
+        sampling_parameters = resolve_sampling_parameters(model, registry_path=REGISTRY_PATH)
         kwargs.update(sampling_parameters)
 
         chat_model = ChatBedrockConverse(**kwargs)
@@ -186,7 +184,4 @@ class BedrockProvider:
         application-inference-profile ARN carries no model name, so declare
         it in the registry.
         """
-        declared = registry.lookup_setting(REGISTRY_PATH, model, "tool_choice")
-        if declared:
-            return declared != "auto"
-        return not rejects_forced_tool_call(model)
+        return forced_tool_choice_supported(model, REGISTRY_PATH)

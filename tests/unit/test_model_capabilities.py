@@ -30,14 +30,18 @@ from skillspector.llm_utils import StructuredOutputParseError, bind_structured_o
 from skillspector.providers import registry
 from skillspector.providers.anthropic import AnthropicProvider
 from skillspector.providers.anthropic_proxy import AnthropicProxyProvider
+from skillspector.providers.azure_openai import AzureOpenAIProvider
 from skillspector.providers.chat_models import (
     GPT_6_1_SOL_REASONING_EFFORTS,
+    UnsupportedControlError,
     reject_unsupported_controls,
 )
 from skillspector.providers.openai import OpenAIProvider
 from skillspector.providers.openai_compatible import OpenAICompatibleProvider
 from skillspector.providers.structured_output import (
     claude_model_name,
+    is_gpt_6_1_sol,
+    model_name,
     rejects_forced_tool_call,
     rejects_sampling_controls,
 )
@@ -70,6 +74,9 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch):
         "OPENAI_PROJECT_ID",
         "SKILLSPECTOR_COMPAT_API_KEY",
         "SKILLSPECTOR_COMPAT_BASE_URL",
+        "AZURE_OPENAI_API_KEY",
+        "AZURE_OPENAI_ENDPOINT",
+        "AZURE_OPENAI_DEPLOYMENT",
     ):
         monkeypatch.delenv(name, raising=False)
     registry._load.cache_clear()
@@ -397,13 +404,34 @@ class TestOpenAIProtocolControls:
             "azure/openai/gpt-6.1-sol-2026-09-15",
             "openai.gpt-6.1-sol",
             "GPT-6.1-Sol",
+            "gpt-6.1-sol:latest",
+            "openai/gpt-6.1-sol:nitro",
+            "gpt-6.1-sol@2026",
         ],
     )
     def test_gpt_6_1_sol_ids_reject_temperature_and_unsupported_effort(self, model: str) -> None:
-        with pytest.raises(ValueError, match="SKILLSPECTOR_TEMPERATURE"):
+        assert is_gpt_6_1_sol(model)
+        with pytest.raises(UnsupportedControlError, match="SKILLSPECTOR_TEMPERATURE"):
             reject_unsupported_controls(model, {"temperature": 1.0})
-        with pytest.raises(ValueError, match="SKILLSPECTOR_REASONING_EFFORT"):
+        with pytest.raises(UnsupportedControlError, match="SKILLSPECTOR_REASONING_EFFORT"):
             reject_unsupported_controls(model, {}, "minimal")
+
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            ("openai/gpt-6.1-sol:nitro", "gpt-6.1-sol"),
+            ("azure/anthropic/Claude-Opus-5-5@20260922", "claude-opus-5-5"),
+            (
+                "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-opus-5-5-v1:0",
+                "anthropic.claude-opus-5-5-v1",
+            ),
+            ("gpt-6.1-sol", "gpt-6.1-sol"),
+        ],
+    )
+    def test_model_name_reads_the_last_segment_up_to_any_suffix(
+        self, model: str, expected: str
+    ) -> None:
+        assert model_name(model) == expected
 
     @pytest.mark.parametrize(
         "model", ["gpt-5.4", "gpt-4.1", "gpt-6-sol", "gpt-6.1-solar", "vendor/x/notgpt-6.1-sol"]
@@ -479,3 +507,27 @@ class TestOpenAIProtocolControls:
         # Sent and recorded, though OpenAI treats the seed as best-effort only.
         assert chat_model_requested_controls(llm)["seed"] == 42
         assert chat_model_controls(llm)["seed"] == 42
+
+
+class TestAzureOpenAIControls:
+    """Azure OpenAI deployments of GPT-6.1 Sol get the same temperature guard."""
+
+    @pytest.fixture(autouse=True)
+    def _azure_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-test")
+        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com")
+
+    def test_explicit_temperature_fails_before_any_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+        with pytest.raises(
+            UnsupportedControlError,
+            match="SKILLSPECTOR_TEMPERATURE is not supported by gpt-6.1-sol",
+        ):
+            AzureOpenAIProvider().create_chat_model("gpt-6.1-sol", max_tokens=1_000)
+
+    def test_other_models_keep_temperature(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.2")
+        llm = AzureOpenAIProvider().create_chat_model("gpt-4o", max_tokens=1_000)
+        assert chat_model_requested_controls(llm)["temperature"] == 0.2

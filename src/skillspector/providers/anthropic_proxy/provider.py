@@ -58,7 +58,6 @@ from skillspector.inference_usage import (
 )
 from skillspector.providers import registry
 from skillspector.providers.chat_models import (
-    reject_unsupported_controls,
     resolve_reasoning_effort,
     resolve_sampling_parameters,
 )
@@ -253,8 +252,7 @@ class AnthropicProxyProvider:
         effort = resolve_reasoning_effort()
         if effort is not None:
             kwargs["effort"] = effort
-        sampling_parameters = resolve_sampling_parameters()
-        reject_unsupported_controls(model, sampling_parameters)
+        sampling_parameters = resolve_sampling_parameters(model)
         kwargs.update(sampling_parameters)
         chat_model = _ChatAnthropicProxy(**kwargs)
         register_chat_model_controls(

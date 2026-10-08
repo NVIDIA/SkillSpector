@@ -8,6 +8,7 @@
 #       context_length: <int>          # total context window in tokens (required)
 #       max_output_tokens: <int>       # model's max output cap (optional)
 #       tool_choice: auto              # when the model rejects a forced toolChoice (optional)
+#       sampling: rejected             # when the model rejects temperature (optional)
 #
 # Keys are public Bedrock model IDs and cross-region inference profile
 # IDs.  Users can also point SKILLSPECTOR_MODEL at their own
@@ -16,7 +17,9 @@
 # models.  Add entries here if you have a private ARN you want metadata
 # for; an ARN hides the model name, so also declare ``tool_choice: auto``
 # when it serves a model that rejects a forced toolChoice (Fable 5.1,
-# Mythos 5.1, Opus 5.5, Sonnet 5.5).
+# Mythos 5.1, Opus 5.5, Sonnet 5.5), and ``sampling: rejected`` when it
+# serves Opus 5.5 or Sonnet 5.5 so SKILLSPECTOR_TEMPERATURE fails before
+# any request.
 
 models:
   # BedrockProvider's default.  The AWS model card lists this suffix-free
