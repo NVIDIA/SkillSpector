@@ -1,5 +1,6 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
+* fix(taint): key TT1-TT6 taint by lexical scope and follow direct calls to functions and methods defined in the same file, so a tainted variable no longer taints same-named variables in other functions (#799). Exact baseline fingerprints and message-glob rules from earlier versions keep matching TT findings whose rule and message are unchanged. They stop matching where the earlier message came from a same-named variable in another scope (the message now names the variable, source and line that reach the sink), where a more severe source now applies at the sink (TT2/TT4 to TT3, TT2 to TT5/TT6), and where an identifier longer than 120 characters is now shortened; re-accept those findings or regenerate the baseline. `match_fingerprint` changes only when the rule does.
 * fix(static): stop code comparisons after removal verbs from reading as unterminated tag-marker directives (#777)
 * fix(baseline): fingerprint every occurrence of a deduplicated finding so the next scan suppresses all of them (#633)
 * fix(security): retain incomplete coverage for runtime-selected commands and remeasure active Git clones strictly (#514)
