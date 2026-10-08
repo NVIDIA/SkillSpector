@@ -432,6 +432,15 @@ _GLUED_INVALID_PYTHON = (
     ],
 )
 def test_glued_marker_outside_proven_python_still_fails_closed(path: str, content: str) -> None:
+    if path.endswith(".py"):
+        # Tool misuse parses Python for TM1 reconciliation, so the
+        # higher-precedence syntax error names its partial event. A lexical-only
+        # analyzer still reports the unproven marker reading.
+        _assert_partial_marker_text(_ledger(path, content, ar_module))
+        event = _ledger(path, content)["inspection_ledger"][0]
+        assert event["outcome"] is LedgerOutcome.PARTIAL
+        assert event["reason_code"] is LedgerReason.SYNTAX_ERROR
+        return
     _assert_partial_marker_text(_ledger(path, content))
 
 
