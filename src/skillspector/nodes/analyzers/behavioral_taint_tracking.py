@@ -204,6 +204,14 @@ _RULE_CONFIDENCES: dict[str, float] = {
 
 _TAG = "Data Flow"
 
+_REFLECTIVE_MAX_DEPTH = 16
+_REFLECTIVE_MAX_BODIES = 1024
+_REFLECTIVE_MAX_WORK = 20000
+
+
+class _ReflectiveLimitError(RuntimeError):
+    """Stop only the optional reflective prepass, not ordinary taint analysis."""
+
 
 class _BehavioralResourceLimitError(RuntimeError):
     """Internal signal that retains findings constructed before a hard limit."""
@@ -223,9 +231,11 @@ class _BehavioralBudget:
     initial_allowance: float | None = None
     total_findings: int = 0
     current_findings: list[AnalyzerFinding] = field(default_factory=list)
+    reflection_limit: str | None = None
 
     def begin_artifact(self) -> None:
         self.current_findings = []
+        self.reflection_limit = None
         self.check_runtime()
 
     def check_runtime(self) -> None:
@@ -442,6 +452,8 @@ class _LocalBindingCollector(ast.NodeVisitor):
         if isinstance(node, ast.expr):
             pending: list[ast.expr] = [node]
             while pending:
+                if self.check_runtime is not None:
+                    self.check_runtime()
                 expression = pending.pop()
                 if isinstance(expression, ast.Lambda):
                     continue
@@ -479,10 +491,18 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
             ast.FunctionDef | ast.AsyncFunctionDef, list[_ReflectiveScope]
         ] = {}
         self.check_runtime = check_runtime
+        self.work = 0
+        self.body_analyses = 0
 
     def _check_runtime(self) -> None:
         if self.check_runtime is not None:
             self.check_runtime()
+        self._charge_work(1)
+
+    def _charge_work(self, count: int) -> None:
+        self.work += count
+        if self.work > _REFLECTIVE_MAX_WORK:
+            raise _ReflectiveLimitError("Reflective analysis work limit reached.")
 
     def visit(self, node: ast.AST) -> object:
         self._check_runtime()
@@ -706,13 +726,28 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
     def _snapshot_frames(self) -> dict[int, tuple[_ReflectiveScope, _ReflectiveScope]]:
         """Snapshot active and captured frames once, preserving shared cells."""
         frames: dict[int, tuple[_ReflectiveScope, _ReflectiveScope]] = {}
-        for scope in [
-            *self.scopes,
-            *(scope for closure in self.function_closures.values() for scope in closure),
-        ]:
+        self._charge_work(len(self.function_closures))
+        for scope in self.scopes:
             self._check_runtime()
             if id(scope) not in frames:
+                self._charge_work(
+                    len(scope.modules)
+                    + len(scope.callables)
+                    + len(scope.functions)
+                    + len(scope.shadowed)
+                )
                 frames[id(scope)] = (scope, scope.clone())
+        for closure in self.function_closures.values():
+            for scope in closure:
+                self._check_runtime()
+                if id(scope) not in frames:
+                    self._charge_work(
+                        len(scope.modules)
+                        + len(scope.callables)
+                        + len(scope.functions)
+                        + len(scope.shadowed)
+                    )
+                    frames[id(scope)] = (scope, scope.clone())
         return frames
 
     def _run_isolated(self, operation: Callable[[], None]) -> None:
@@ -741,6 +776,11 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
         if node in self.active_functions:
             return
         self._check_runtime()
+        if len(self.active_functions) >= _REFLECTIVE_MAX_DEPTH:
+            raise _ReflectiveLimitError("Reflective call-depth limit reached.")
+        self.body_analyses += 1
+        if self.body_analyses > _REFLECTIVE_MAX_BODIES:
+            raise _ReflectiveLimitError("Reflective function-expansion limit reached.")
         self.called_functions.add(node)
         self.active_functions.add(node)
         caller_scopes = self.scopes
@@ -1120,10 +1160,13 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
             self.visit(statement)
         if self.scope.is_class:
             return  # Class methods are scanned against the completed namespace.
+        surviving: set[ast.FunctionDef | ast.AsyncFunctionDef] = set()
+        for scope in self.scopes:
+            self._charge_work(len(scope.functions))
+            surviving.update(scope.functions.values())
         for function in deferred:
-            if function in self.called_functions or not any(
-                function in scope.functions.values() for scope in self.scopes
-            ):
+            self._check_runtime()
+            if function in self.called_functions or function not in surviving:
                 continue
             self._analyze_uncalled_function(function)
 
@@ -1132,10 +1175,20 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
 
 
 def _build_reflective_sink_aliases(
-    tree: ast.Module, check_runtime: Callable[[], None] | None = None
+    tree: ast.Module,
+    check_runtime: Callable[[], None] | None = None,
+    on_limit: Callable[[str], None] | None = None,
 ) -> dict[ast.Call, str]:
     resolver = _ReflectiveSinkResolver(check_runtime=check_runtime)
-    resolver.visit(tree)
+    try:
+        resolver.visit(tree)
+    except (_ReflectiveLimitError, RecursionError) as exc:
+        if on_limit is not None:
+            on_limit(
+                str(exc)
+                if isinstance(exc, _ReflectiveLimitError)
+                else "Reflective analysis recursion limit reached."
+            )
     return resolver.call_sinks
 
 
@@ -1320,7 +1373,11 @@ def _analyze_python(
     aliases = python_ast.import_aliases
     type_map = build_type_map(tree, aliases)
     reflective_sinks = _build_reflective_sink_aliases(
-        tree, budget.check_runtime if budget is not None else None
+        tree,
+        budget.check_runtime if budget is not None else None,
+        (lambda message: setattr(budget, "reflection_limit", message))
+        if budget is not None
+        else None,
     )
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
@@ -1575,6 +1632,16 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                     analyzer_id=ANALYZER_ID,
                     path=path,
                     reason=LedgerReason.SYNTAX_ERROR,
+                )
+            elif budget.reflection_limit is not None:
+                event = ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="behavioral",
+                    analyzer_id=ANALYZER_ID,
+                    path=path,
+                    reason=LedgerReason.STATIC_PARSE_LIMIT,
+                    message=budget.reflection_limit,
+                    emitted_finding_ids=[finding.finding_id for finding in path_findings],
                 )
             else:
                 event = ledger_event(

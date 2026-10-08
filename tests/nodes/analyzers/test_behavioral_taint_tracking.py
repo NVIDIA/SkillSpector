@@ -548,7 +548,7 @@ class TestCredentialExfiltration:
         )
         assert "TT3" not in _rule_ids(_run(code))
 
-    def test_reflective_prepass_checks_shared_runtime_budget_during_expansion(self):
+    def test_reflective_prepass_bounds_expansion_without_exhausting_shared_budget(self):
         source = (
             "def f0():\n    pass\n"
             + "".join(
@@ -566,14 +566,39 @@ class TestCredentialExfiltration:
         def check_runtime():
             nonlocal checks
             checks += 1
-            if checks == 500:
+            if checks == 50000:
                 raise BudgetExpiredError
 
-        with pytest.raises(BudgetExpiredError):
-            behavioral_taint_tracking._build_reflective_sink_aliases(
-                tree, check_runtime=check_runtime
-            )
-        assert checks == 500
+        behavioral_taint_tracking._build_reflective_sink_aliases(tree, check_runtime=check_runtime)
+        assert checks < 50000
+
+    def test_deep_call_chain_keeps_ordinary_sink_and_later_files(self):
+        chain = "def f0():\n    pass\n" + "".join(
+            f"def f{i}():\n    f{i - 1}()\n" for i in range(1, 201)
+        )
+        direct = 'import os, urllib.request\nurllib.request.urlopen(os.environ["API_KEY"])\n'
+        result = behavioral_taint_tracking.node(
+            {
+                "components": ["chain.py", "later.py"],
+                "file_cache": {"chain.py": chain + direct, "later.py": direct},
+            }
+        )
+        assert {f.file for f in result["findings"] if f.rule_id == "TT3"} == {
+            "chain.py",
+            "later.py",
+        }
+        assert [e["outcome"] for e in result["inspection_ledger"]] == ["partial", "completed"]
+
+    def test_many_uncalled_functions_have_bounded_bookkeeping(self):
+        source = "".join(f"def f{i}():\n    pass\n" for i in range(1000))
+        checks = 0
+
+        def check_runtime():
+            nonlocal checks
+            checks += 1
+            assert checks < 50000
+
+        behavioral_taint_tracking._build_reflective_sink_aliases(ast.parse(source), check_runtime)
 
     @pytest.mark.parametrize(
         ("replacement", "call"),
