@@ -369,9 +369,12 @@ class TestOpenAIProvider:
         assert llm.default_headers == {"OpenAI-Project": "proj_123"}
 
     def test_default_model(self) -> None:
-        assert OpenAIProvider().resolve_model() == "gpt-5.4"
-        # All slots inherit DEFAULT_MODEL — gpt-5.4 everywhere.
-        assert OpenAIProvider().resolve_model("meta_analyzer") == "gpt-5.4"
+        provider = OpenAIProvider()
+        assert provider.resolve_model() == "gpt-6.1-sol"
+        # All slots inherit DEFAULT_MODEL — gpt-6.1-sol everywhere.
+        assert provider.resolve_model("meta_analyzer") == "gpt-6.1-sol"
+        assert provider.get_context_length(provider.DEFAULT_MODEL) == 1_050_000
+        assert provider.get_max_output_tokens(provider.DEFAULT_MODEL) == 128_000
 
     def test_metadata_known_model(self) -> None:
         provider = OpenAIProvider()
