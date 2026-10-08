@@ -15,6 +15,7 @@ from skillspector import references as references_module
 from skillspector.cli import app
 from skillspector.mcp_server import run_scan
 from skillspector.references import resolve_bundle_references_with_metadata
+from skillspector.sarif_models import validate_sarif_report
 
 
 @pytest.mark.parametrize(
@@ -124,20 +125,59 @@ async def test_cli_and_mcp_reference_completeness_agree(
         result = CliRunner().invoke(
             app, ["scan", str(tmp_path), "--no-llm", "--format", "json", "--fail-on-incomplete"]
         )
-        assert result.exit_code == (0 if present else 1), result.output
+        assert result.exit_code == 0, result.output
         report = json.loads(result.stdout)
     else:
         result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
-        # MCP keeps missing-reference-only caveats install-eligible while the
-        # rendered report still exposes the incomplete analysis.
         assert result["safe_to_install"] is True
         report = json.loads(result["report"])
     assert report["execution_successful"] is True
-    assert report["analysis_completeness"]["is_complete"] is present
-    assert report["risk_assessment"]["recommendation"] == ("SAFE" if present else "CAUTION")
+    completeness = report["analysis_completeness"]
+    assert completeness["is_complete"] is True
+    assert completeness["status"] == ("complete" if present else "complete_with_caveats")
+    assert report["risk_assessment"]["recommendation"] == "SAFE"
     assert {r["status"] for r in report["analysis_completeness"]["references"]} == {
         "resolved" if present else "missing"
     }
+
+
+@pytest.mark.parametrize("output_format", ["json", "terminal", "sarif"])
+def test_cli_missing_reference_caveat_does_not_fail_incomplete_gate(
+    tmp_path: Path, output_format: str
+) -> None:
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: workspace-helper\ndescription: Explain a workspace.\n---\n"
+        "Read `helm/environment/values.yml` in the user's repository.\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "--no-llm",
+            "--format",
+            output_format,
+            "--fail-on-incomplete",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    if output_format == "json":
+        completeness = json.loads(result.stdout)["analysis_completeness"]
+        assert completeness["references"][0]["status"] == "missing"
+        assert completeness["ledger_exceptions"][0]["reason_code"] == "reference_missing"
+        assert completeness["status"] == "complete_with_caveats"
+        assert completeness["is_complete"] is True
+    elif output_format == "sarif":
+        report = json.loads(result.stdout)
+        validate_sarif_report(report)
+        completeness = report["runs"][0]["invocations"][0]["properties"]["analysisCompleteness"]
+        assert completeness["status"] == "complete_with_caveats"
+        assert completeness["isComplete"] is True
+    else:
+        assert "complete_with_caveats" in result.stdout
 
 
 @pytest.mark.parametrize(
