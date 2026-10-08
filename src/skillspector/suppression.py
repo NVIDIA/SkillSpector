@@ -738,10 +738,14 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
             .encode("utf-8", errors="backslashreplace")
             .decode("utf-8")
         )
-        # JSON permits these raw characters, but YAML rejects most of them and
-        # folds NEL into a space. The loader reads both formats through PyYAML.
+        # JSON permits these raw characters, but YAML rejects most of them,
+        # folds NEL into a space, and treats LS/PS as line breaks that strip
+        # adjacent spaces or start a "---" document marker. The loader reads
+        # both formats through PyYAML.
         content = re.sub(
-            r"[\x7f-\x9f\ufffe\uffff]", lambda match: f"\\u{ord(match[0]):04x}", content
+            r"[\x7f-\x9f\u2028\u2029\ufffe\uffff]",
+            lambda match: f"\\u{ord(match[0]):04x}",
+            content,
         )
     else:
         header = (

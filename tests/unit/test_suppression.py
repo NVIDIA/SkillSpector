@@ -1095,6 +1095,8 @@ def test_dump_baseline_rejects_unloadable_output_without_overwriting(
         "Accepted 🚀 𐐷\twith\nnotes",
         "Accepted \ud800 lone surrogate",
         "Accepted \x7f\x80\x85\x9f\ufffe\uffff controls",
+        "Accepted \u2028 line and \u2029 paragraph separators",
+        "Accepted\u2028--- not a document marker",
     ],
 )
 def test_dump_baseline_preserves_unicode_reason(tmp_path: Path, suffix: str, reason: str) -> None:

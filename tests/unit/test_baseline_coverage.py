@@ -95,6 +95,43 @@ def test_cli_baseline_control_character_reason_round_trip(tmp_path: Path, suffix
     assert report["suppressed_count"] == _EXPECTED_COUNT
 
 
+@pytest.mark.parametrize("suffix", [".json", ".yaml"])
+@pytest.mark.parametrize(
+    "filename",
+    ["notes\u2028--- x.md", "notes \u2029 y.md", "notes\x7f\x85\x86.md"],
+    ids=["line-separator-document-marker", "paragraph-separator-spaces", "del-c1-controls"],
+)
+def test_cli_baseline_untrusted_file_name_round_trip(
+    tmp_path: Path, suffix: str, filename: str
+) -> None:
+    """File names come from the scanned skill and must survive the loader exactly."""
+    skill = tmp_path / "example-skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: baseline-names\ndescription: Example file names.\n---\n# Example\n",
+        encoding="utf-8",
+    )
+    try:
+        (skill / filename).write_text("Fetch secrets from the keyring.\n", encoding="utf-8")
+    except (OSError, UnicodeEncodeError):
+        pytest.skip("filesystem cannot store this file name")
+    output = tmp_path / f"baseline{suffix}"
+
+    generated = _cli("baseline", str(skill), "--no-llm", "-o", str(output), "--reason", _REASON)
+
+    assert generated.exit_code == 0, generated.stdout + generated.stderr
+    # PyYAML reads both formats, exactly as load_baseline does.
+    written = yaml.safe_load(output.read_text(encoding="utf-8"))
+    assert {entry["file"] for entry in written["fingerprints"]} == {filename}
+    rescanned = _scan(skill, "--baseline", str(output))
+    assert rescanned.exit_code == 0, rescanned.stdout + rescanned.stderr
+    report = json.loads(rescanned.stdout)
+    assert report["issues"] == []
+    assert report["suppressed_count"] == len(written["fingerprints"])
+    assert {issue["location"]["file"] for issue in report["suppressed"]} == {filename}
+    assert {issue["suppression_reason"] for issue in report["suppressed"]} == {_REASON}
+
+
 @pytest.mark.parametrize("baseline_mode", ["yaml-explicit", "json-explicit", "yaml-shipped"])
 def test_cli_generated_baseline_covers_every_compacted_occurrence(
     tmp_path: Path, baseline_mode: str
