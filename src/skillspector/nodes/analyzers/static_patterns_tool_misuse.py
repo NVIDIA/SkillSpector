@@ -31,6 +31,8 @@ from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
+from skillspector.javascript_tokens import JavaScriptTemplateSpans
+from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
@@ -1945,6 +1947,7 @@ def _has_shell_command_word_exhaustion(
     structural_quote_closers: set[int] | None = None,
     structural_quote_openers: set[int] | None = None,
     python_source: _PythonSourceOwnership | None = None,
+    javascript_source: _JavaScriptTemplateOwnership | None = None,
     perl_eval_blocks: bool = False,
     _command_string_depth: int = 0,
 ) -> bool:
@@ -1969,6 +1972,8 @@ def _has_shell_command_word_exhaustion(
         check_runtime()
         start = candidate.start()
         if start in owned_word_positions:
+            continue
+        if javascript_source is not None and javascript_source.owns(start):
             continue
         if structural_quote_closers is not None and start in structural_quote_closers:
             continue
@@ -2034,6 +2039,12 @@ def _has_shell_command_word_exhaustion(
                 # Likewise, a host string or comment token owns its bytes: a
                 # shell quote it opens cannot continue into later host code.
                 unresolved_end = min(unresolved_end, python_source.word_end(start))
+            elif (
+                unresolved_end - start > _SHELL_COMMAND_WORD_CHARS and javascript_source is not None
+            ):
+                # Template literal delimiters and their host-language
+                # expressions cannot continue a shell word into later code.
+                unresolved_end = min(unresolved_end, javascript_source.word_end(start))
             if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS:
                 return True
             continue
@@ -2611,6 +2622,51 @@ class _PythonSourceOwnership:
             cursor = segment_end
         self._cached_word_start, self._cached_word_end = start, result
         return result
+
+
+class _JavaScriptTemplateOwnership:
+    """Lazily proven ownership of template literal bytes in complete JavaScript."""
+
+    def __init__(self, content: str, check_runtime: Callable[[], None]) -> None:
+        self._content = content
+        self._check_runtime = check_runtime
+        self._spans: JavaScriptTemplateSpans | None = None
+        self._spans_computed = False
+
+    def _owned_spans(self) -> JavaScriptTemplateSpans | None:
+        if not self._spans_computed:
+            self._spans = _javascript_template_spans(self._content, self._check_runtime)
+            self._spans_computed = True
+        return self._spans
+
+    def owns(self, position: int) -> bool:
+        spans = self._owned_spans()
+        if spans is None:
+            return False
+        starts, ends = spans
+        index = bisect_right(starts, position) - 1
+        return index >= 0 and position < ends[index]
+
+    def word_end(self, start: int) -> int:
+        """Return the end of a shell word while skipping proven template bytes."""
+        spans = self._owned_spans()
+        content = self._content
+        if spans is None:
+            return len(content)
+        starts, ends = spans
+        cursor = start
+        while True:
+            self._check_runtime()
+            index = bisect_right(starts, cursor) - 1
+            if index >= 0 and cursor < ends[index]:
+                cursor = ends[index]
+            segment_end = starts[index + 1] if index + 1 < len(starts) else len(content)
+            match = _PYTHON_SHELL_WORD_BREAK_RE.search(content, cursor, segment_end)
+            if match is not None:
+                return match.start()
+            if segment_end == len(content):
+                return segment_end
+            cursor = segment_end
 
 
 def _skip_command_substitution(
@@ -4617,12 +4673,18 @@ def has_bounded_parse_exhaustion(
     structural_quote_openers = None
     json_strings: list[tuple[int, int]] = []
     python_source = None
+    javascript_source = None
     if file_type == "perl" and complete_context:
         content = _perl_literal_print_shell_text(content, check_runtime)
     if file_type == "python" and complete_context:
         # Only a complete module can prove Python token ownership. A fragment
         # may begin inside a string and would invert code and literal bytes.
         python_source = _PythonSourceOwnership(content, check_runtime)
+    if file_type == "javascript" and complete_context:
+        # A complete parse proves which backticks own host template bytes.
+        # Interpolated templates in files with shell calls retain conservative
+        # bounds because this analyzer does not prove their data flow.
+        javascript_source = _JavaScriptTemplateOwnership(content, check_runtime)
     if file_type == "markdown":
         if complete_context:
             json_strings = validated_json_string_spans(content, check_runtime)
@@ -4637,6 +4699,7 @@ def has_bounded_parse_exhaustion(
         structural_quote_closers=structural_quote_closers,
         structural_quote_openers=structural_quote_openers,
         python_source=python_source,
+        javascript_source=javascript_source,
         perl_eval_blocks=file_type == "perl",
     ):
         return True
