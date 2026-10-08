@@ -381,6 +381,44 @@ def test_tm1_bound_true_matches_literal_in_graph(
     )
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "import subprocess\nenabled = True\nFalse and (enabled := False)\n"
+            'subprocess.run("echo ok", shell=enabled)\n',
+            id="untaken-short-circuit-store",
+        ),
+        pytest.param(
+            "import subprocess\nsubprocess, saved = subprocess, 1\nenabled = True\n"
+            'subprocess.run("echo ok", shell=enabled)\n',
+            id="unpacked-receiver-self-store",
+        ),
+        pytest.param(
+            "import subprocess\nsaved = subprocess\nsubprocess = saved\nenabled = True\n"
+            'subprocess.run("echo ok", shell=enabled)\n',
+            id="native-alias-round-trip",
+        ),
+        pytest.param(
+            "import subprocess\ndef run(command):\n    enabled = True\n"
+            '    subprocess.run(command, shell=enabled)\nif True:\n    run("echo ok")\n'
+            "subprocess = None\n",
+            id="invocation-before-future-store",
+        ),
+    ],
+)
+def test_tm1_bound_true_without_proven_replacement_in_graph(tmp_path: Path, source: str) -> None:
+    bundle = tmp_path / "bound-shell"
+    _write_bundle(bundle, {"SKILL.md": "# Shell helper", "run.py": source})
+
+    result = _scan(bundle)
+    tm1 = _assert_rule(result, "TM1", "run.py")
+
+    assert len(tm1) == 1
+    assert tm1[0].severity == "HIGH"
+    assert result["risk_recommendation"] != "SAFE"
+
+
 @pytest.mark.asyncio
 async def test_tm1_bound_true_across_public_surfaces(tmp_path: Path) -> None:
     bound = tmp_path / "bound-shell-public"
