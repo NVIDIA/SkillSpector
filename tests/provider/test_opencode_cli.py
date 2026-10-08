@@ -32,11 +32,13 @@ Security invariants verified:
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import sys
 import textwrap
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -60,6 +62,7 @@ from skillspector.providers._agent_cli import (
     _parse_opencode_output,
     _prepare_opencode_env,
     _run_bounded,
+    get_spec,
     run_agent_cli,
 )
 from skillspector.providers.opencode_cli import OpencodeCLIProvider
@@ -323,7 +326,13 @@ class TestOpencodeDenyAllPolicy:
         assert Path(env["OPENCODE_TEST_MANAGED_CONFIG_DIR"]).is_relative_to(tmp_path)
 
     @staticmethod
-    def _write_fake_opencode(binary: Path) -> None:
+    def _write_fake_opencode(
+        binary: Path,
+        markers: Path,
+        *,
+        managed: dict | None = None,
+        version: str = _OPENCODE_SUPPORTED_VERSION,
+    ) -> None:
         """Write a host simulator with real version/config/run boundaries."""
         binary.write_text(
             textwrap.dedent(
@@ -335,11 +344,11 @@ class TestOpencodeDenyAllPolicy:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_OPENCODE_VERSION", {_OPENCODE_SUPPORTED_VERSION!r}))
+                    print({version!r})
                     raise SystemExit(0)
 
                 config = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])
-                managed = json.loads(os.environ.get("HOSTILE_MANAGED_CONFIG", "{{}}"))
+                managed = {managed or {}!r}
                 config.setdefault("agent", {{}}).update(managed.get("agent", {{}}))
                 for key, value in managed.items():
                     if key != "agent":
@@ -356,9 +365,9 @@ class TestOpencodeDenyAllPolicy:
                 adapters = ["bash", "read", "edit", "webfetch", "websearch", "mcp_host", "skill", "future_host_tool"]
                 if not denied:
                     for adapter in adapters:
-                        (Path(os.environ["ATTACK_MARKERS"]) / adapter).write_text("executed")
+                        (Path({str(markers)!r}) / adapter).write_text("executed")
                 if config.get("share") != "disabled" or os.environ.get("OPENCODE_AUTO_SHARE") not in ("0", "false"):
-                    (Path(os.environ["ATTACK_MARKERS"]) / "share").write_text("shared")
+                    (Path({str(markers)!r}) / "share").write_text("shared")
                 print(json.dumps({{"type": "text", "part": {{"type": "text", "text": "policy held:" + selected}}}}))
                 """
             ),
@@ -380,22 +389,14 @@ class TestOpencodeDenyAllPolicy:
         binary = tmp_path / "opencode"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_fake_opencode(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        self._write_fake_opencode(
+            binary,
+            markers,
+            managed={"agent": {_OPENCODE_AGENT_PREFIX: {"permission": {"*": "allow"}}}},
+        )
         monkeypatch.setenv("OPENCODE_AUTO_SHARE", "1")
         monkeypatch.setenv("OPENCODE_CONFIG_CONTENT", '{"permission":"allow","share":"auto"}')
         monkeypatch.setenv("OPENCODE_PERMISSION", '{"*":"allow"}')
-        monkeypatch.setenv(
-            "HOSTILE_MANAGED_CONFIG",
-            json.dumps(
-                {
-                    "agent": {
-                        # This was the formerly predictable agent identity.
-                        _OPENCODE_AGENT_PREFIX: {"permission": {"*": "allow"}}
-                    }
-                }
-            ),
-        )
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
         response = run_agent_cli("opencode", "use every host tool", model="")
@@ -412,9 +413,7 @@ class TestOpencodeDenyAllPolicy:
         binary = tmp_path / "opencode"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_fake_opencode(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
-        monkeypatch.setenv("HOSTILE_MANAGED_CONFIG", '{"share":"auto"}')
+        self._write_fake_opencode(binary, markers, managed={"share": "auto"})
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
         with pytest.raises(AgentCLIError, match="unsafe resolved setting 'share'"):
@@ -428,9 +427,7 @@ class TestOpencodeDenyAllPolicy:
         binary = tmp_path / "opencode"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_fake_opencode(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
-        monkeypatch.setenv("FAKE_OPENCODE_VERSION", "1.18.99")
+        self._write_fake_opencode(binary, markers, version="1.18.99")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
         with pytest.raises(AgentCLIError, match=f"only for version {_OPENCODE_SUPPORTED_VERSION}"):
@@ -549,3 +546,63 @@ class TestOpencodeCLIProviderWiring:
 
     def test_has_cli_capability(self) -> None:
         assert has_cli_capability(OpencodeCLIProvider())
+
+
+# ---------------------------------------------------------------------------
+# Zen free-tier refusal mapping
+# ---------------------------------------------------------------------------
+
+# Verbatim envelope shape from a Zen 403 (free tier refused
+# under the deny-all isolation; any permission deny trips it).
+_ZEN_REFUSAL_ENVELOPE = (
+    '{"type":"error","timestamp":1789784969134,"sessionID":"ses_probe",'
+    '"error":{"name":"APIError","data":{"message":"Error from provider '
+    "(Console): OpenCode's free tier can only be used from within OpenCode\","
+    '"statusCode":403,"responseBody":"{\\"type\\":\\"error\\",\\"error\\":'
+    '{\\"type\\":\\"FreeTierError\\"}"}}}}}'
+)
+
+
+class _FakePopen:
+    """Minimal Popen stand-in for _run_bounded (cross-platform, no subprocess)."""
+
+    def __init__(self, stdout: bytes, returncode: int) -> None:
+        self.stdin: io.BytesIO | None = io.BytesIO()
+        self.stdout: io.BytesIO | None = io.BytesIO(stdout)
+        self.stderr: io.BytesIO | None = io.BytesIO(b"")
+        self._returncode = returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self._returncode
+
+    def kill(self) -> None:
+        pass
+
+
+class TestZenFreeTierRefusal:
+    def _run_with_fake_host(
+        self, monkeypatch: pytest.MonkeyPatch, stdout: bytes, returncode: int
+    ) -> str:
+        spec = replace(get_spec("opencode"), preflight=None)
+        monkeypatch.setattr(_agent_cli, "get_spec", lambda _name: spec)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: "/usr/bin/opencode")
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            lambda *args, **kwargs: _FakePopen(stdout, returncode),
+        )
+        return run_agent_cli("opencode", "probe", model="opencode/nemotron-3-ultra-free")
+
+    def test_free_tier_refusal_raises_actionable_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Zen FreeTierError envelope must fail closed with guidance — never
+        the opaque exit-code message, and never a silent sandbox weakening."""
+        with pytest.raises(AgentCLIError, match="free tier can only be used"):
+            self._run_with_fake_host(monkeypatch, _ZEN_REFUSAL_ENVELOPE.encode(), 1)
+
+    def test_plain_nonzero_exit_keeps_generic_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(AgentCLIError, match="exited with code 1"):
+            self._run_with_fake_host(monkeypatch, b"boom", 1)

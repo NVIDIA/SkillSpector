@@ -17,6 +17,7 @@
 
 import ctypes
 import os
+import subprocess
 import sys
 from errno import ENOENT
 from pathlib import Path, PurePosixPath
@@ -374,12 +375,13 @@ def test_windows_no_follow_open_rejects_canonical_path_mismatch(
         _open_regular_file_from_windows_handle(source)
 
 
-def test_resolve_zip_file(tmp_path: Path) -> None:
-    """Resolving a .zip file extracts and returns the extract dir."""
+@pytest.mark.parametrize("extension", [".zip", ".ZIP", ".ZiP"])
+def test_resolve_zip_file(tmp_path: Path, extension: str) -> None:
+    """ZIP extensions are recognized regardless of case for local inputs."""
     import zipfile
 
     (tmp_path / "SKILL.md").write_text("# Skill", encoding="utf-8")
-    zip_path = tmp_path / "skill.zip"
+    zip_path = tmp_path / f"skill{extension}"
     with zipfile.ZipFile(zip_path, "w") as zf:
         zf.write(tmp_path / "SKILL.md", "SKILL.md")
     handler = InputHandler()
@@ -387,6 +389,7 @@ def test_resolve_zip_file(tmp_path: Path) -> None:
         resolved, source_type = handler.resolve(str(zip_path))
         assert resolved.is_dir()
         assert source_type == "zip"
+        assert (resolved / "SKILL.md").read_text(encoding="utf-8") == "# Skill"
     finally:
         handler.cleanup()
 
@@ -601,6 +604,45 @@ def test_file_page_url_downloads_the_raw_file(
         handler.cleanup()
 
 
+@pytest.mark.parametrize("budgeted", [False, True], ids=["direct", "workflow-budget"])
+@pytest.mark.parametrize("extension", [".zip", ".ZIP", ".ZiP"])
+def test_file_url_download_extracts_zip_regardless_of_extension_case(
+    monkeypatch: pytest.MonkeyPatch, extension: str, budgeted: bool
+) -> None:
+    """ZIP filenames trigger extraction even without a ZIP content type."""
+    import io
+    import zipfile
+
+    skill = b"---\nname: demo\ndescription: demo\n---\n# Demo\n"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("SKILL.md", skill)
+    url = f"https://raw.githubusercontent.com/org/repo/main/skill{extension}"
+    requested: list[str] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(
+            200, content=archive.getvalue(), headers={"content-type": "application/octet-stream"}
+        )
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        "skillspector.input_handler.httpx.Client",
+        lambda *args, **kwargs: real_client(*args, transport=httpx.MockTransport(serve), **kwargs),
+    )
+    monkeypatch.setattr("skillspector.input_handler._is_private_ip", lambda _host: False)
+    handler = InputHandler(transitive_budget=WorkflowResourceBudget() if budgeted else None)
+    try:
+        resolved, source_type = handler.resolve(url)
+
+        assert source_type == "url"
+        assert requested == [url]
+        assert (resolved / "SKILL.md").read_bytes() == skill
+    finally:
+        handler.cleanup()
+
+
 def test_validate_url_host_scp_extracts_github() -> None:
     """_validate_url_host extracts 'github.com' from an scp-style URL."""
     with patch("skillspector.input_handler._is_private_ip", return_value=False):
@@ -660,3 +702,171 @@ def test_scp_ssrf_gate_fires() -> None:
     with patch("skillspector.input_handler._is_private_ip", return_value=True):
         with pytest.raises(ValueError, match="private/internal IP"):
             InputHandler()._validate_url_host("git@github.com:org/repo.git", ALLOWED_GIT_HOSTS)
+
+
+@pytest.mark.parametrize("operation", ["_clone_git", "_list_remote_refs"])
+def test_anonymous_git_drops_ambient_auth_and_config(
+    operation: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    hostile = {
+        "HOME": str(tmp_path),
+        "SSH_AUTH_SOCK": "/synthetic/agent",
+        "GIT_ASKPASS": "/synthetic/askpass",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.extraHeader",
+        "GIT_CONFIG_VALUE_0": "Authorization: synthetic-secret",
+        "GIT_CONFIG_GLOBAL": str(tmp_path / "credentials.config"),
+        "GITHUB_TOKEN": "synthetic-token",
+        "CURL_HOME": str(tmp_path),
+        "SSLKEYLOGFILE": str(tmp_path / "tls-keys"),
+        "GIT_SSL_CERT": "/synthetic/client.pem",
+        "GIT_SSL_KEY": "/synthetic/client.key",
+        "GIT_CEILING_DIRECTORIES": "/synthetic/ceiling",
+    }
+    transport = {
+        key: "/synthetic/ca"
+        if "CA" in key or key.startswith("SSL_")
+        else "http://proxy.example:8080"
+        for key in (
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "GIT_SSL_CAINFO",
+            "GIT_SSL_CAPATH",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "CURL_CA_BUNDLE",
+        )
+    }
+    for key, value in (hostile | transport).items():
+        monkeypatch.setenv(key, value)
+    handler = InputHandler(allow_git_credentials=False)
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_git(command: list[str], **kwargs: object) -> MagicMock:
+        calls.append((command, kwargs))
+        if "clone" in command:
+            Path(command[-1]).mkdir(parents=True)
+        process = MagicMock()
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        process.returncode = 0
+        process.stdout = b"abc\trefs/heads/main\n"
+        return process
+
+    try:
+        with (
+            patch.object(handler, "_validate_url_host", return_value="github.com"),
+            patch("skillspector.input_handler.subprocess.Popen", side_effect=fake_git),
+            patch("skillspector.input_handler.subprocess.run", side_effect=fake_git),
+        ):
+            getattr(handler, operation)("https://github.com/org/public.git")
+        assert len(calls) == 1
+        command, kwargs = calls[0]
+        env = kwargs["env"]
+        isolated_home = handler.temp_dir_for_cleanup() / "git-home"
+        assert command[:3] == ["git", "-C", str(isolated_home)]
+        assert "credential.helper=" in command
+        assert "core.askPass=" in command
+        assert "http.extraHeader=" in command
+        assert "http.followRedirects=false" in command
+        assert env["HOME"] == env["USERPROFILE"] == str(isolated_home)
+        assert env["GIT_CONFIG_GLOBAL"] == env["GIT_CONFIG_SYSTEM"] == os.devnull
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert env["GIT_ALLOW_PROTOCOL"] == "https"
+        assert env["GIT_CEILING_DIRECTORIES"] == str(isolated_home.parent)
+        assert {key: env[key] for key in transport} == transport
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+        assert list(isolated_home.iterdir()) == []
+        for key in hostile.keys() - {"HOME", "GIT_CONFIG_GLOBAL", "GIT_CEILING_DIRECTORIES"}:
+            assert key not in env
+        assert os.environ["HOME"] == str(tmp_path)
+    finally:
+        handler.cleanup()
+
+
+@pytest.mark.parametrize("operation", ["_clone_git", "_list_remote_refs"])
+@pytest.mark.parametrize(
+    "target",
+    [
+        "git@github.com:org/private.git",
+        "ssh://git@github.com/org/private.git",
+        "https://user:password@github.com/org/private.git",
+    ],
+)
+def test_anonymous_git_rejects_auth_targets_before_start(operation: str, target: str) -> None:
+    handler = InputHandler(allow_git_credentials=False)
+    with (
+        patch("skillspector.input_handler.subprocess.Popen") as popen,
+        patch("skillspector.input_handler.subprocess.run") as run,
+    ):
+        with pytest.raises(ValueError, match="unauthenticated HTTPS"):
+            getattr(handler, operation)(target)
+    popen.assert_not_called()
+    run.assert_not_called()
+    assert handler.temp_dir_for_cleanup() is None
+
+
+@pytest.mark.parametrize("operation", ["_clone_git", "_list_remote_refs"])
+@pytest.mark.parametrize(
+    "target, expected",
+    [
+        ("https://gitlab.com/group/subgroup/repo", "https://gitlab.com/group/subgroup/repo.git"),
+        ("https://gitlab.com/group/repo.git/", "https://gitlab.com/group/repo.git"),
+        ("https://bitbucket.org/team/repo/", "https://bitbucket.org/team/repo.git"),
+        ("https://github.com/org/repo", "https://github.com/org/repo"),
+    ],
+)
+def test_anonymous_git_normalizes_repository_urls_without_redirects(operation, target, expected):
+    handler = InputHandler(allow_git_credentials=False)
+    calls = []
+
+    def fake_git(command, **kwargs):
+        calls.append(command)
+        if "clone" in command:
+            Path(command[-1]).mkdir(parents=True)
+        return SimpleNamespace(poll=lambda: 0, returncode=0, stdout=b"abc\trefs/heads/main\n")
+
+    try:
+        with (
+            patch.object(handler, "_validate_url_host"),
+            patch("skillspector.input_handler.subprocess.Popen", side_effect=fake_git),
+            patch("skillspector.input_handler.subprocess.run", side_effect=fake_git),
+        ):
+            getattr(handler, operation)(target)
+        assert expected in calls[0]
+        assert "http.followRedirects=false" in calls[0]
+    finally:
+        handler.cleanup()
+
+
+def test_anonymous_git_cannot_read_enclosing_repository_config(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "config",
+            "http.https://github.com/.extraheader",
+            "synthetic-header",
+        ],
+        check=True,
+    )
+    handler = InputHandler(allow_git_credentials=False)
+    with patch.object(handler, "_get_temp_dir", return_value=tmp_path / "scan"):
+        (tmp_path / "scan").mkdir()
+        argv, env, _ = handler._git_invocation("https://github.com/org/repo")
+    result = subprocess.run(
+        [*argv, "config", "--get-urlmatch", "http.extraheader", "https://github.com/org/repo"],
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+    assert b"synthetic-header" not in result.stdout
+    assert result.stdout.strip() == b""

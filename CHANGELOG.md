@@ -1,5 +1,6 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
+* fix(static): stop code comparisons after removal verbs from reading as unterminated tag-marker directives (#777)
 * fix(baseline): fingerprint every occurrence of a deduplicated finding so the next scan suppresses all of them (#633)
 * fix(security): retain incomplete coverage for runtime-selected commands and remeasure active Git clones strictly (#514)
 * fix(scan): preserve required-input failures and multiline prompt uncertainty (#563)

@@ -17,9 +17,13 @@
 
 import ast
 import json
+import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
+import zipfile
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from importlib import import_module
@@ -32,6 +36,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import typer
 import yaml
+from markdown_it import MarkdownIt
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -92,6 +97,13 @@ def test_cli_version() -> None:
     assert result.exit_code == 0
     assert "SkillSpector" in result.output
     assert "v" in result.output
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "example.com"])
+def test_mcp_cli_rejects_exposed_http_binding(host: str) -> None:
+    result = runner.invoke(app, ["mcp", "--transport", "http", "--host", host])
+    assert result.exit_code == 2
+    assert "must bind to a loopback IP" in result.output
 
 
 def test_discovered_files_tree_renders_untrusted_names_literally() -> None:
@@ -171,6 +183,118 @@ def test_stream_progress_returns_complete_values_state(
     assert result == final_state
 
 
+def _stop_scan_after_input_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: type[BaseException]
+) -> tuple[Path, list[Path]]:
+    """Build a zipped skill, record scan temp dirs, and make the report step raise."""
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("SKILL.md", "---\nname: demo\ndescription: d\n---\n# Demo\n")
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def recording_mkdtemp(*args: Any, **kwargs: Any) -> str:
+        """Create scan temp dirs under tmp_path and remember them."""
+        if kwargs.get("prefix") != "skillspector_":
+            return real_mkdtemp(*args, **kwargs)
+        path = real_mkdtemp(*args, **{**kwargs, "dir": tmp_path})
+        created.append(Path(path))
+        return path
+
+    def stop(*args: Any, **kwargs: Any) -> str:
+        """Stand in for an interrupt or a failure after the input is materialized."""
+        raise error("scan stopped")
+
+    monkeypatch.setattr("skillspector.input_handler.tempfile.mkdtemp", recording_mkdtemp)
+    monkeypatch.setattr("skillspector.nodes.report._format_json", stop)
+    return archive, created
+
+
+@pytest.mark.parametrize("stream_progress", [False, True])
+@pytest.mark.parametrize("error", [KeyboardInterrupt, RuntimeError])
+def test_scan_that_stops_early_removes_its_temp_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stream_progress: bool,
+    error: type[BaseException],
+) -> None:
+    """A scan interrupted or failing after input resolution removes its temp dir."""
+    archive, created = _stop_scan_after_input_resolution(monkeypatch, tmp_path, error)
+
+    with pytest.raises(error):
+        cli._run_graph_scan(
+            input_path=str(archive),
+            format=FormatChoice.json,
+            no_llm=True,
+            stream_progress=stream_progress,
+        )
+
+    assert created
+    assert not any(path.exists() for path in created)
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, RuntimeError])
+def test_transitive_scan_stopped_in_a_child_removes_the_root_temp_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: type[BaseException]
+) -> None:
+    """A --transitive scan of a zipped root that stops while a child is scanning removes the root's temp dir."""
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(
+            "SKILL.md",
+            "---\nname: demo\ndescription: d\n---\n# Demo\n\n"
+            "Install the helper skill from https://github.com/org/dep.git first.\n",
+        )
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def recording_mkdtemp(*args: Any, **kwargs: Any) -> str:
+        """Create scan temp dirs under tmp_path and remember them."""
+        if kwargs.get("prefix") != "skillspector_":
+            return real_mkdtemp(*args, **kwargs)
+        path = real_mkdtemp(*args, **{**kwargs, "dir": tmp_path})
+        created.append(Path(path))
+        return path
+
+    real_scan_for_source = cli._run_graph_scan_for_source
+    child_inputs: list[str] = []
+
+    def scan_for_source(**kwargs: Any) -> dict[str, object]:
+        """Run the root scan for real and stop the first transitive child."""
+        if kwargs["input_path"] == str(archive):
+            return real_scan_for_source(**kwargs)
+        child_inputs.append(kwargs["input_path"])
+        raise error("child scan stopped")
+
+    monkeypatch.setattr("skillspector.input_handler.tempfile.mkdtemp", recording_mkdtemp)
+    monkeypatch.setattr(cli, "_run_graph_scan_for_source", scan_for_source)
+    if error is RuntimeError:
+        # A child failure is recorded as a warning; make the merge step raise instead.
+        def stop_merge(*args: Any, **kwargs: Any) -> None:
+            raise error("merge stopped")
+
+        monkeypatch.setattr(cli, "_ensure_required_failure_events", stop_merge)
+
+    with pytest.raises(error):
+        cli._scan_skill(
+            input_path=str(archive),
+            format=FormatChoice.json,
+            no_llm=True,
+            baseline=None,
+            yara_rules_dir=None,
+            verbose=False,
+            show_suppressed=False,
+            transitive_enabled=True,
+            transitive_depth=1,
+            transitive_allow_prefix=None,
+            transitive_deny_prefix=None,
+        )
+
+    assert child_inputs, "the root should have reached a transitive child scan"
+    assert created
+    assert not any(path.exists() for path in created)
+
+
 @pytest.mark.parametrize(
     ("terminal", "verbose", "expected"),
     [(True, False, True), (False, False, False), (True, True, False)],
@@ -222,6 +346,7 @@ def test_cli_scan_help_lists_every_available_provider() -> None:
         "ollama",
         "azure_openai",
         "openai_compatible",
+        "gemini",
         "claude_cli",
         "codex_cli",
         "gemini_cli",
@@ -235,6 +360,44 @@ def test_scan_state_records_explicit_llm_request_intent(no_llm: bool, expected: 
     state = cli._scan_state("skill", FormatChoice.json, no_llm)
 
     assert state["llm_requested"] is expected
+
+
+def test_cli_help_does_not_initialize_analyzers() -> None:
+    """Help should not compile the scan graph or warn about missing credentials."""
+    env = os.environ.copy()
+    env["SKILLSPECTOR_PROVIDER"] = "nv_build"
+    for name in ("ANTHROPIC_API_KEY", "NVIDIA_INFERENCE_KEY", "OPENAI_API_KEY"):
+        env.pop(name, None)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from skillspector.cli import app; app()",
+            "--help",
+        ],
+        capture_output=True,
+        check=False,
+        env=env,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode == 0
+    assert "Usage:" in completed.stdout
+    assert "Skipping analyzer" not in completed.stderr
+
+
+def test_package_graph_export_stays_lazy_after_first_load() -> None:
+    """The package export must not be replaced by the graph submodule."""
+    from skillspector import graph as first
+
+    assert first._get_compiled() is not None
+
+    from skillspector import graph as later
+
+    assert later is first
+    assert callable(later.invoke)
 
 
 def test_cli_scan_local_directory(tmp_path: Path) -> None:
@@ -284,6 +447,85 @@ def test_cli_scan_output_to_file(tmp_path: Path) -> None:
     assert out_file.exists()
     content = out_file.read_text()
     assert "out-test" in content or "risk_assessment" in content
+
+
+@pytest.mark.parametrize("format", list(FormatChoice))
+@pytest.mark.parametrize(
+    "alias", ["same-path", "relative-path", "parent-path", "symlink", "symlink-parent", "hard-link"]
+)
+def test_cli_scan_rejects_output_alias_of_input_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, format: FormatChoice, alias: str
+) -> None:
+    """An output alias must not replace the original skill with its report."""
+    source = tmp_path / "SKILL.md"
+    original = b"---\nname: protected\ndescription: Say hello.\n---\n# Hello\n"
+    source.write_bytes(original)
+    output = source
+    monkeypatch.chdir(tmp_path)
+    if alias == "relative-path":
+        output = Path("SKILL.md")
+    elif alias == "parent-path":
+        nested = tmp_path / "nested"
+        nested.mkdir()
+        output = nested / ".." / source.name
+    elif alias == "symlink":
+        output = tmp_path / "report.txt"
+        try:
+            output.symlink_to(source)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+    elif alias == "symlink-parent":
+        linked = tmp_path / "linked"
+        try:
+            linked.symlink_to(tmp_path, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+        output = linked / source.name
+    elif alias == "hard-link":
+        output = tmp_path / "report.txt"
+        try:
+            os.link(source, output)
+        except OSError:
+            pytest.skip("hard links are not supported on this filesystem")
+    scan_skill = MagicMock(return_value={"report_body": "Scan report", "risk_score": 0})
+    monkeypatch.setattr(cli, "_scan_skill", scan_skill)
+
+    result = runner.invoke(
+        app, ["scan", str(source), "--no-llm", "--format", format.value, "--output", str(output)]
+    )
+
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert source.read_bytes() == original
+    assert output.read_bytes() == original
+    scan_skill.assert_not_called()
+
+
+@pytest.mark.parametrize("format", list(FormatChoice))
+@pytest.mark.parametrize("destination", ["new", "existing", "same-name"])
+def test_cli_scan_preserves_input_when_writing_a_separate_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, format: FormatChoice, destination: str
+) -> None:
+    """Separate reports still work, including existing files and matching names."""
+    source = tmp_path / "SKILL.md"
+    original = b"# Original skill\n"
+    source.write_bytes(original)
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    output = reports / (source.name if destination == "same-name" else "report.txt")
+    if destination == "existing":
+        output.write_text("Previous report", encoding="utf-8")
+    scan_skill = MagicMock(return_value={"report_body": "Scan report", "risk_score": 0})
+    monkeypatch.setattr(cli, "_scan_skill", scan_skill)
+
+    result = runner.invoke(
+        app, ["scan", str(source), "--no-llm", "--format", format.value, "--output", str(output)]
+    )
+
+    assert result.exit_code == 0
+    assert source.read_bytes() == original
+    assert output.read_text(encoding="utf-8") == "Scan report"
+    scan_skill.assert_called_once()
 
 
 def test_cli_scan_no_llm(tmp_path: Path) -> None:
@@ -346,6 +588,185 @@ def test_cli_fail_on_incomplete_exits_one_after_writing_report(
     )
 
     assert result.exit_code == 1
+    assert output.exists()
+
+
+@pytest.mark.parametrize(
+    ("coverage", "threshold", "exit_code"),
+    [(86.9, 87.0, 1), (87.0, 87.0, 0)],
+)
+def test_cli_min_coverage_uses_strict_boundary_and_writes_report(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    coverage: float,
+    threshold: float,
+    exit_code: int,
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(
+        "skillspector.cli.graph.invoke",
+        lambda state, config: {
+            "report_body": json.dumps({"analysis_completeness": {"coverage_percent": coverage}}),
+            "execution_successful": True,
+            "analysis_completeness": {"coverage_percent": coverage},
+            "risk_score": 0,
+        },
+    )
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "-f",
+            "json",
+            "-o",
+            str(output),
+            "--min-coverage",
+            str(threshold),
+        ],
+    )
+    assert result.exit_code == exit_code
+    assert json.loads(output.read_text())["analysis_completeness"]["coverage_percent"] == coverage
+
+
+@pytest.mark.parametrize(
+    ("analysis_completeness", "threshold"),
+    [
+        (None, 87),
+        ({"coverage_percent": None}, 87),
+        ({"coverage_percent": "unknown"}, 87),
+        ({"coverage_percent": True}, 0),
+        ({"coverage_percent": float("nan")}, 0),
+        ({"coverage_percent": float("inf")}, 0),
+    ],
+    ids=["missing", "null", "non-numeric", "boolean", "nan", "infinity"],
+)
+def test_cli_min_coverage_fails_closed_for_malformed_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    analysis_completeness: dict[str, object] | None,
+    threshold: float,
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
+    output = tmp_path / "report.json"
+    graph_result: dict[str, object] = {
+        "report_body": json.dumps(
+            {"analysis_completeness": analysis_completeness}
+            if analysis_completeness is not None
+            else {}
+        ),
+        "execution_successful": True,
+        "risk_score": 0,
+    }
+    if analysis_completeness is not None:
+        graph_result["analysis_completeness"] = analysis_completeness
+    monkeypatch.setattr("skillspector.cli.graph.invoke", lambda state, config: graph_result)
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "-f",
+            "json",
+            "-o",
+            str(output),
+            "--min-coverage",
+            str(threshold),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert output.exists()
+
+
+@pytest.mark.parametrize("value", ["-1", "101", "nan", "inf"])
+def test_cli_min_coverage_rejects_invalid_values(tmp_path: Path, value: str) -> None:
+    (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
+    result = runner.invoke(app, ["scan", str(tmp_path), "--min-coverage", value])
+    assert result.exit_code == 2
+    plain_output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.output)
+    assert "must be a finite number between 0 and 100" in " ".join(
+        re.sub(r"[│╭╮╰╯─]", " ", plain_output).split()
+    )
+
+
+def test_cli_mcp_registry_rejects_min_coverage(tmp_path: Path) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text('{"servers": []}', encoding="utf-8")
+    result = runner.invoke(
+        app,
+        ["scan", str(payload), "--mcp-registry", "--format", "json", "--min-coverage", "87"],
+    )
+    assert result.exit_code == 2
+    assert "cannot be combined with" in result.output
+    assert "--min-coverage" in result.output
+
+
+@pytest.mark.parametrize(("threshold", "exit_code"), [("90", 1), ("0", 0)])
+def test_recursive_min_coverage_fails_when_only_symlinked_skills_were_found(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, threshold: str, exit_code: int
+) -> None:
+    (tmp_path / "README.md").write_text("# Skills", encoding="utf-8")
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(
+        cli_module,
+        "detect_skills",
+        lambda _path: MultiSkillDetectionResult(is_multi_skill=False, omitted_symlink_entries=1),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_scan_skill",
+        lambda **_kwargs: {
+            "report_body": "{}",
+            "execution_successful": True,
+            "analysis_completeness": {"is_complete": True, "coverage_percent": 100},
+            "risk_score": 0,
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        ["scan", str(tmp_path), "--recursive", "--no-llm", "-f", "json", "-o", str(output)]
+        + ["--min-coverage", threshold],
+    )
+
+    assert result.exit_code == exit_code
+    assert output.exists()
+
+
+def test_recursive_min_coverage_checks_each_child_and_writes_report(tmp_path: Path) -> None:
+    s1 = SkillDirectory(path=tmp_path / "one", name="one", relative_path="one")
+    s2 = SkillDirectory(path=tmp_path / "two", name="two", relative_path="two")
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True, skills=[s1, s2], has_root_skill=False
+    )
+    output = tmp_path / "combined.json"
+    with patch(
+        "skillspector.cli.graph.invoke",
+        side_effect=[
+            {
+                "report_body": json.dumps({"analysis_completeness": {"coverage_percent": 100}}),
+                "analysis_completeness": {"coverage_percent": 100},
+                "risk_score": 0,
+            },
+            {
+                "report_body": json.dumps({"analysis_completeness": {"coverage_percent": 80}}),
+                "analysis_completeness": {"coverage_percent": 80},
+                "risk_score": 0,
+            },
+        ],
+    ):
+        with pytest.raises(typer.Exit) as exit_info:
+            _scan_multi_skill(
+                detection,
+                FormatChoice.json,
+                output,
+                no_llm=True,
+                min_coverage=87,
+            )
+    assert exit_info.value.exit_code == 1
     assert output.exists()
 
 
@@ -424,6 +845,223 @@ def test_cli_fail_on_findings_exits_one_below_risk_threshold(
     )
 
     assert result.exit_code == 1
+    assert output.exists()
+
+
+def test_recursive_min_coverage_passes_when_all_children_meet_threshold(
+    tmp_path: Path,
+) -> None:
+    skills = [
+        SkillDirectory(path=tmp_path / "one", name="one", relative_path="one"),
+        SkillDirectory(path=tmp_path / "two", name="two", relative_path="two"),
+    ]
+    output = tmp_path / "combined.json"
+    child = {
+        "report_body": json.dumps({"analysis_completeness": {"coverage_percent": 100}}),
+        "analysis_completeness": {"coverage_percent": 100},
+        "risk_score": 0,
+    }
+    with patch("skillspector.cli.graph.invoke", side_effect=[child.copy(), child.copy()]):
+        _scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=skills, has_root_skill=False),
+            FormatChoice.json,
+            output,
+            no_llm=True,
+            min_coverage=90,
+        )
+    assert output.exists()
+    assert (
+        json.loads(output.read_text(encoding="utf-8"))["analysis_completeness"]["coverage_percent"]
+        == 100.0
+    )
+
+
+def test_recursive_min_coverage_fails_when_skills_are_omitted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    skills = [SkillDirectory(tmp_path / name, name, name) for name in ("one", "two", "three")]
+    output = tmp_path / "combined.json"
+    monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_PUBLIC_RECORDS", 1)
+    monkeypatch.setattr(
+        cli.graph, "invoke", lambda *_args, **_kwargs: _bounded_recursive_result("one")
+    )
+
+    with pytest.raises(typer.Exit) as exit_info:
+        _scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=skills),
+            FormatChoice.json,
+            output,
+            no_llm=True,
+            min_coverage=30,
+        )
+
+    assert exit_info.value.exit_code == 1
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["analysis_completeness"]["coverage_percent"] == pytest.approx(33.33)
+    assert payload["skills_omitted"] == 2
+    assert payload["skills"][-1]["omitted_count"] == 2
+
+
+def test_recursive_min_coverage_allows_omitted_skills_at_threshold_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    skills = [SkillDirectory(tmp_path / name, name, name) for name in ("one", "two", "three")]
+    output = tmp_path / "combined.json"
+    monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_PUBLIC_RECORDS", 1)
+    monkeypatch.setattr(
+        cli.graph, "invoke", lambda *_args, **_kwargs: _bounded_recursive_result("one")
+    )
+
+    _scan_multi_skill(
+        MultiSkillDetectionResult(is_multi_skill=True, skills=skills),
+        FormatChoice.json,
+        output,
+        no_llm=True,
+        min_coverage=0,
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["skills_omitted"] == 2
+    assert payload["skills"][-1]["omitted_count"] == 2
+
+
+@pytest.mark.parametrize(("threshold", "exit_code"), [(90, 1), (0, None)])
+def test_recursive_min_coverage_counts_symlinked_skills_as_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    threshold: float,
+    exit_code: int | None,
+) -> None:
+    skills = [SkillDirectory(tmp_path / name, name, name) for name in ("one", "two")]
+    output = tmp_path / "combined.json"
+    monkeypatch.setattr(
+        cli.graph,
+        "invoke",
+        lambda *_args, **_kwargs: _bounded_recursive_result("one", finding_count=0),
+    )
+
+    expectation = pytest.raises(typer.Exit) if exit_code else nullcontext()
+    with expectation as exit_info:
+        _scan_multi_skill(
+            MultiSkillDetectionResult(
+                is_multi_skill=True, skills=skills, omitted_symlink_entries=1
+            ),
+            FormatChoice.json,
+            output,
+            no_llm=True,
+            min_coverage=threshold,
+        )
+
+    if exit_info is not None:
+        assert exit_info.value.exit_code == exit_code
+    assert json.loads(output.read_text(encoding="utf-8"))["skills_omitted"] == 1
+
+
+def test_recursive_min_coverage_keeps_execution_failure_exit_two(tmp_path: Path) -> None:
+    skills = [SkillDirectory(tmp_path / name, name, name) for name in ("one", "two")]
+    output = tmp_path / "combined.json"
+    with patch(
+        "skillspector.cli.graph.invoke",
+        side_effect=[
+            _bounded_recursive_result("one", finding_count=0),
+            {"report_body": "{}", "risk_score": 0, "execution_successful": False},
+        ],
+    ):
+        with pytest.raises(typer.Exit) as exit_info:
+            _scan_multi_skill(
+                MultiSkillDetectionResult(is_multi_skill=True, skills=skills),
+                FormatChoice.json,
+                output,
+                no_llm=True,
+                min_coverage=90,
+            )
+
+    assert exit_info.value.exit_code == 2
+    assert output.exists()
+
+
+def test_recursive_min_coverage_ignores_aggregate_completeness_for_partial_children(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    skills = [SkillDirectory(tmp_path / name, name, name) for name in ("one", "two", "three")]
+    output = tmp_path / "combined.json"
+
+    def partial_result(label: str) -> dict[str, object]:
+        result = _bounded_recursive_result(label, finding_count=0)
+        result["analysis_completeness"] = {"is_complete": False, "coverage_percent": 95}
+        result["report_body"] = json.dumps(
+            {"analysis_completeness": result["analysis_completeness"]}
+        )
+        return result
+
+    results = iter(partial_result(name) for name in ("one", "two", "three"))
+    monkeypatch.setattr(cli.graph, "invoke", lambda *_args, **_kwargs: next(results))
+
+    _scan_multi_skill(
+        MultiSkillDetectionResult(is_multi_skill=True, skills=skills),
+        FormatChoice.json,
+        output,
+        no_llm=True,
+        min_coverage=90,
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["skills_omitted"] == 0
+    assert payload["analysis_completeness"]["coverage_percent"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("analysis_completeness", "threshold"),
+    [
+        (None, 87),
+        ({"coverage_percent": None}, 87),
+        ({"coverage_percent": "unknown"}, 87),
+        ({"coverage_percent": True}, 0),
+        ({"coverage_percent": float("nan")}, 0),
+        ({"coverage_percent": float("inf")}, 0),
+    ],
+    ids=["missing", "null", "non-numeric", "boolean", "nan", "infinity"],
+)
+def test_recursive_min_coverage_fails_closed_for_malformed_child_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    analysis_completeness: dict[str, object] | None,
+    threshold: float,
+) -> None:
+    skills = [
+        SkillDirectory(tmp_path / "one", "one", "one"),
+        SkillDirectory(tmp_path / "two", "two", "two"),
+    ]
+    output = tmp_path / "combined.json"
+    malformed_child: dict[str, object] = {
+        "report_body": json.dumps(
+            {"analysis_completeness": analysis_completeness}
+            if analysis_completeness is not None
+            else {}
+        ),
+        "execution_successful": True,
+        "risk_score": 0,
+    }
+    if analysis_completeness is not None:
+        malformed_child["analysis_completeness"] = analysis_completeness
+    valid_child = _bounded_recursive_result("two", finding_count=0)
+    results = iter([malformed_child, valid_child])
+
+    def invoke(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return next(results)
+
+    monkeypatch.setattr(cli.graph, "invoke", invoke)
+
+    with pytest.raises(typer.Exit) as exit_info:
+        _scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=skills),
+            FormatChoice.json,
+            output,
+            no_llm=True,
+            min_coverage=threshold,
+        )
+
+    assert exit_info.value.exit_code == 1
     assert output.exists()
 
 
@@ -653,7 +1291,7 @@ def test_recursive_dot_child_static_finding_never_reaches_a_provider(
     get_chat_model = MagicMock(return_value=model)
     monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
     monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", get_chat_model)
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     monkeypatch.setattr(cli_module, "graph", import_module("skillspector.graph").create_graph())
     monkeypatch.setattr(cli_module, "RISK_THRESHOLD", 100)
     output = tmp_path / "recursive.json"
@@ -1583,7 +2221,7 @@ def _bounded_recursive_result(label: str, *, finding_count: int = 1) -> dict[str
         "risk_severity": "LOW",
         "risk_recommendation": "SAFE",
         "execution_successful": True,
-        "analysis_completeness": {"is_complete": True},
+        "analysis_completeness": {"is_complete": True, "coverage_percent": 100},
         "findings": findings,
         "filtered_findings": findings,
         "suppressed_findings": [],
@@ -2156,6 +2794,94 @@ def test_recursive_sarif_preserves_intrinsic_child_state_without_output_limit(
         for item in aggregate_notifications
     )
     assert "aggregate safety limit" not in json.dumps(aggregate_notifications)
+
+
+def _recursive_child_with_results(label: str) -> dict[str, object]:
+    """Build a child recursive result whose SARIF run has two located results."""
+    child = _bounded_recursive_result(label)
+    sarif = cast(dict[str, object], child["sarif_report"])
+    run = cast(list[dict[str, object]], sarif["runs"])[0]
+    run["results"] = [
+        {
+            "ruleId": "P5",
+            "message": {"text": "Malicious instruction"},
+            "level": "error",
+            "locations": [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": "SKILL.md"},
+                        "region": {"startLine": 1},
+                    }
+                },
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": "scripts/helper.py"},
+                        "region": {"startLine": 3},
+                    }
+                },
+            ],
+        }
+    ]
+    return child
+
+
+def test_recursive_sarif_scopes_result_uris_to_skill_directory(tmp_path: Path) -> None:
+    """Recursive child results carry uriBaseId and the run maps it to the skill path."""
+    skill = SkillDirectory(tmp_path / "malicious_skill", "malicious_skill", "malicious_skill")
+    child = _recursive_child_with_results("one")
+    completeness = cli._multi_skill_analysis_completeness(
+        total_skills=1,
+        complete_skills=1,
+        partial_skills=0,
+        failed_skills=0,
+        omitted_skills=0,
+        limitations=[],
+    )
+
+    payload = cli._multi_skill_sarif_report([skill], [child], completeness)
+
+    validate_sarif_report(payload)
+    run = payload["runs"][0]
+    assert run["properties"]["recursiveSkill"] == {
+        "name": "malicious_skill",
+        "path": "malicious_skill",
+    }
+    assert run["originalUriBaseIds"] == {
+        "SCANROOT": {"uri": tmp_path.as_uri() + "/"},
+        "SKILLROOT": {"uri": "malicious_skill/", "uriBaseId": "SCANROOT"},
+    }
+    locations = run["results"][0]["locations"]
+    assert [loc["physicalLocation"]["artifactLocation"]["uri"] for loc in locations] == [
+        "SKILL.md",
+        "scripts/helper.py",
+    ]
+    assert {loc["physicalLocation"]["artifactLocation"]["uriBaseId"] for loc in locations} == {
+        "SKILLROOT"
+    }
+
+
+def test_recursive_sarif_child_without_results_still_maps_base_id(tmp_path: Path) -> None:
+    """A child run with no results still publishes the skill base URI mapping."""
+    skill = SkillDirectory(tmp_path / "one", "one", "one")
+    child = _bounded_recursive_result("one")
+    completeness = cli._multi_skill_analysis_completeness(
+        total_skills=1,
+        complete_skills=1,
+        partial_skills=0,
+        failed_skills=0,
+        omitted_skills=0,
+        limitations=[],
+    )
+
+    payload = cli._multi_skill_sarif_report([skill], [child], completeness)
+
+    validate_sarif_report(payload)
+    run = payload["runs"][0]
+    assert run["originalUriBaseIds"] == {
+        "SCANROOT": {"uri": tmp_path.as_uri() + "/"},
+        "SKILLROOT": {"uri": "one/", "uriBaseId": "SCANROOT"},
+    }
+    assert run["results"] == []
 
 
 def test_recursive_sarif_labels_actual_serialized_output_cap() -> None:
@@ -4402,6 +5128,7 @@ def test_scan_transitive_merges_current_effective_finding_ids(monkeypatch) -> No
         "findings": [direct],
         "filtered_findings": [direct],
         "effective_finding_ids": [direct.finding_id],
+        "meta_review_required": False,
         "components": ["SKILL.md"],
         "component_metadata": [
             {
@@ -4431,6 +5158,7 @@ def test_scan_transitive_merges_current_effective_finding_ids(monkeypatch) -> No
             "findings": [child],
             "filtered_findings": [child],
             "effective_finding_ids": [child.finding_id],
+            "meta_review_required": True,
             "components": ["dep.py"],
             "component_metadata": [
                 {
@@ -4471,6 +5199,7 @@ def test_scan_transitive_merges_current_effective_finding_ids(monkeypatch) -> No
     ]
     assert child_output.finding_id != child.finding_id
     assert merged["transitive_finding_count"] == 1
+    assert merged["meta_review_required"] is True
 
 
 @pytest.mark.parametrize("output_format", list(cli.FormatChoice))
@@ -4552,6 +5281,8 @@ def test_scan_transitive_intrinsic_child_partial_is_not_traversal_truncation(
     exceptions = cast(list[dict[str, object]], completeness["ledger_exceptions"])
     assert {item["reason_code"] for item in exceptions} == {"static_parse_limit"}
     report_body = cast(str, merged["report_body"])
+    if output_format is cli.FormatChoice.markdown:
+        report_body = MarkdownIt().enable("table").render(report_body)
     assert "Inspection reached its configured output limit." not in report_body
     assert "Transitive traversal truncated" not in report_body
     if output_format is cli.FormatChoice.json:
@@ -6290,3 +7021,42 @@ def test_cli_baseline_uses_local_cache_for_provider_excluded_findings(tmp_path: 
     written = yaml.safe_load(out.read_text(encoding="utf-8"))
     assert [entry["file"] for entry in written["fingerprints"]] == [".hidden.md"]
     assert len(written["fingerprints"][0]["hash"]) == len("sha256:") + 64
+
+
+def test_recursive_sarif_uses_real_encoded_directory_and_preserves_external_sources(
+    tmp_path: Path,
+) -> None:
+    from urllib.parse import unquote, urljoin, urlsplit
+
+    skill = SkillDirectory(tmp_path / "my+skill café", "safe display", "my_skill_café")
+    child = _recursive_child_with_results("one")
+    artifact = child["sarif_report"]["runs"][0]["results"][0]["locations"][0]["physicalLocation"][
+        "artifactLocation"
+    ]
+    artifact.update(
+        {
+            "uri": "external/abc/SKILL.md",
+            "properties": {
+                "sourceIdentity": "external/abc",
+                "sourceUrl": "https://example.test/skill",
+            },
+        }
+    )
+    completeness = cli._multi_skill_analysis_completeness(
+        total_skills=1,
+        complete_skills=1,
+        partial_skills=0,
+        failed_skills=0,
+        omitted_skills=0,
+        limitations=[],
+    )
+    payload = cli._multi_skill_sarif_report([skill], [child], completeness)
+    validate_sarif_report(payload)
+    run = payload["runs"][0]
+    bases = run["originalUriBaseIds"]
+    assert bases["SKILLROOT"] == {"uri": "my%2Bskill%20caf%C3%A9/", "uriBaseId": "SCANROOT"}
+    locations = run["results"][0]["locations"]
+    assert "uriBaseId" not in locations[0]["physicalLocation"]["artifactLocation"]
+    local = locations[1]["physicalLocation"]["artifactLocation"]
+    resolved = urljoin(urljoin(bases["SCANROOT"]["uri"], bases["SKILLROOT"]["uri"]), local["uri"])
+    assert Path(unquote(urlsplit(resolved).path)) == skill.path / "scripts/helper.py"

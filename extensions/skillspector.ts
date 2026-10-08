@@ -16,7 +16,7 @@ const scanSchema = Type.Object({
   output: Type.Optional(Type.String({ description: "Optional report output path within the current workspace." })),
   noLlm: Type.Optional(Type.Boolean({ description: "Skip LLM analysis. Defaults to true." })),
   provider: Type.Optional(
-    StringEnum(["openai", "anthropic", "anthropic_proxy", "nv_build", "nv_inference"] as const, {
+    StringEnum(["openai", "anthropic", "anthropic_proxy", "nv_build", "nv_inference", "gemini"] as const, {
       description: "Optional SkillSpector LLM provider when noLlm is false.",
     }),
   ),
@@ -41,8 +41,8 @@ function redactSecrets(value: string): string {
   return value
     .replace(/(sk-ant-[A-Za-z0-9_-]{12,})/g, "[REDACTED_ANTHROPIC_KEY]")
     .replace(/(sk-[A-Za-z0-9_-]{20,})/g, "[REDACTED_OPENAI_KEY]")
-    .replace(/([A-Za-z0-9_]*API_KEY[=:]\s*)[^\s]+/gi, "$1[REDACTED]")
-    .replace(/([A-Za-z0-9_]*TOKEN[=:]\s*)[^\s]+/gi, "$1[REDACTED]");
+    // Start only at a word boundary; retrying at every character is quadratic.
+    .replace(/\b([A-Za-z0-9_]*(?:API_KEY|TOKEN)[=:]\s*)[^\s]+/gi, "$1[REDACTED]");
 }
 
 function truncateText(value: string, maxChars = 12000): { text: string; truncated: boolean } {
@@ -147,7 +147,8 @@ export default function (pi: ExtensionAPI) {
           cwd: ctx.cwd,
           env,
           signal,
-          timeout: 120000,
+          // Match the CLI's 600s workflow budget plus startup/report headroom.
+          timeout: (params.noLlm ?? true) ? 120000 : 630000,
         });
 
         const stdout = truncateText(redactSecrets(result.stdout ?? ""));

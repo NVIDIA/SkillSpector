@@ -43,7 +43,7 @@ Equivalent CLI:
 - `format`: `terminal`, `json`, `markdown`, or `sarif`. Default: `terminal`.
 - `output`: optional report path.
 - `noLlm`: default `true`.
-- `provider`: optional `openai`, `anthropic`, `anthropic_proxy`, or `nv_build`.
+- `provider`: optional `openai`, `anthropic`, `anthropic_proxy`, `nv_build`, `nv_inference`, or `gemini`.
 - `model`: optional model override.
 - `yaraRulesDir`: optional directory of extra YARA rules.
 - `verbose`: optional detailed progress.
@@ -51,6 +51,11 @@ Equivalent CLI:
 ## LLM-backed analysis
 
 Static scan is default. To use semantic LLM analysis, configure provider credentials in your shell before launching Pi, then call the tool with `noLlm=false` and a provider.
+
+Static scans have a 120-second process limit. Explicit LLM scans have a
+630-second limit, allowing the CLI's default 600-second workflow budget plus
+startup and report writing. This tool limit stays fixed even if
+`SKILLSPECTOR_MAX_WORKFLOW_SECONDS` is configured above 600.
 
 Example:
 

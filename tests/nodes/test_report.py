@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import json
 import logging
+from unittest.mock import MagicMock
 
 import pytest
+from markdown_it import MarkdownIt
 
 from skillspector.models import Finding
 from skillspector.nodes.report import (
@@ -674,7 +676,7 @@ class TestReportNode:
 
         assert "| Execution | successful |" in body
         assert "### Ledger Exceptions" in body
-        assert "llm_structured_response_invalid" in body
+        assert "llm_structured_response_invalid" in MarkdownIt().render(body)
         assert "`SKILL.md`" in body
         assert "### Analyzer Statuses" in body
         assert "### Limitations" in body
@@ -761,8 +763,8 @@ class TestReportNode:
         body = report(state)["report_body"]
 
         if output_format == "markdown":
-            assert "| read_error | rule set `yara_rules` | Rule dropped. |" in body
-            assert "| read_error | `yara_rules` | File unreadable. |" in body
+            assert r"| read\_error | rule set `yara_rules` | Rule dropped\. |" in body
+            assert r"| read\_error | `yara_rules` | File unreadable\. |" in body
         else:
             assert "read_error rule set yara_rules: Rule dropped." in body
             assert "read_error yara_rules: File unreadable." in body
@@ -895,7 +897,12 @@ class TestReportNode:
             row = json.loads(result["report_body"])["runs"][0]["results"][0]
             assert row["properties"]["evidence"] == finding.evidence
         else:
-            assert "outer_path" in result["report_body"]
+            rendered = (
+                MarkdownIt().render(result["report_body"])
+                if output_format == "markdown"
+                else result["report_body"]
+            )
+            assert "outer_path" in rendered
             assert "archive.docx" in result["report_body"]
 
     @pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
@@ -934,7 +941,8 @@ class TestReportNode:
 
         body = report(state)["report_body"]
 
-        assert "archive_member_limit" in body
+        rendered = MarkdownIt().render(body) if output_format == "markdown" else body
+        assert "archive_member_limit" in rendered
         assert "outer.zip!/nested.zip" in body
 
     def test_report_default_output_format_is_sarif(self) -> None:
@@ -1340,6 +1348,8 @@ def test_report_shares_record_budget_with_suppressed_occurrences(
     elif output_format == "sarif":
         assert len(json.loads(body)["runs"][0]["results"]) <= 4
     else:
+        if output_format == "markdown":
+            body = MarkdownIt().render(body)
         assert body.count("ACTIVE_BOUND") == 2
         assert body.count("SUPPRESSED_BOUND") == 1
 
@@ -1388,6 +1398,99 @@ def test_report_markdown_show_suppressed_lists_rows() -> None:
     assert "fp" in shown
 
 
+@pytest.mark.parametrize(
+    "file,expected",
+    [
+        ("notes.md", "notes.md"),
+        ("notes|draft.md", "notes\\|draft.md"),
+        ("notes||draft.md", "notes\\|\\|draft.md"),
+        ("notes\ndraft.md", "notes draft.md"),
+        ("notes\rdraft.md", "notes draft.md"),
+        ("notes\r\ndraft.md", "notes draft.md"),
+        ("資料|draft\nreview.md", "資料\\|draft review.md"),
+    ],
+)
+def test_report_markdown_table_paths_stay_in_one_cell(file: str, expected: str) -> None:
+    """Component and suppressed finding paths cannot split table rows or cells."""
+    state: SkillspectorState = {
+        "filtered_findings": [_finding("P5", file=file)],
+        "component_metadata": [{"path": file, "type": "markdown", "lines": 1, "executable": False}],
+        "baseline": Baseline(rules=[SuppressionRule(rule_id="P5", reason="Reviewed")]),
+        "show_suppressed": True,
+        "use_llm": False,
+        "output_format": "markdown",
+    }
+
+    rows = report(state)["report_body"].splitlines()
+
+    assert f"| `{expected}` | markdown | 1 | No |" in rows
+    assert f"| P5 | `{expected}:1` | Reviewed |" in rows
+    data = json.loads(report({**state, "output_format": "json"})["report_body"])
+    assert data["components"][0]["path"] == file
+    assert data["suppressed"][0]["location"]["file"] == file
+
+
+@pytest.mark.parametrize(
+    "file",
+    [
+        "x` [Verify this scan](https:&#47;&#47;evil.example) `y.md",
+        "a`<img src=x>`b.md",
+        "`leading.md",
+        "trailing.md`",
+        " leading.md",
+        "trailing.md ",
+        "a``b`c.md",
+    ],
+)
+def test_report_markdown_table_paths_keep_backticks_inside_code_spans(file: str) -> None:
+    """Backticks in paths stay literal and cannot inject Markdown or HTML."""
+    state: SkillspectorState = {
+        "filtered_findings": [_finding("P5", file=file)],
+        "component_metadata": [{"path": file, "type": "markdown", "lines": 1, "executable": False}],
+        "baseline": Baseline(rules=[SuppressionRule(rule_id="P5", reason="Reviewed")]),
+        "show_suppressed": True,
+        "use_llm": False,
+        "output_format": "markdown",
+    }
+
+    body = report(state)["report_body"]
+    tokens = MarkdownIt("commonmark", {"html": True}).enable("table").parse(body)
+    children = [child for token in tokens for child in token.children or []]
+    code = [child.content for child in children if child.type == "code_inline"]
+
+    assert file in code
+    assert f"{file}:1" in code
+    assert not any(child.type in {"link_open", "html_inline", "image"} for child in children)
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        ("Reviewed", "Reviewed"),
+        ("Reviewed | approved", "Reviewed \\| approved"),
+        ("Reviewed\nby the team", "Reviewed by the team"),
+        ("Reviewed\rby the team", "Reviewed by the team"),
+        ("Reviewed\r\nby the team", "Reviewed by the team"),
+        ("承認済み | read\nonly", "承認済み \\| read only"),
+    ],
+)
+def test_report_markdown_suppression_reason_stays_in_one_cell(reason: str, expected: str) -> None:
+    """Multiline baseline reasons stay in one Markdown row and remain intact in JSON."""
+    state: SkillspectorState = {
+        "filtered_findings": [_finding("P5")],
+        "baseline": Baseline(rules=[SuppressionRule(rule_id="P5", reason=reason)]),
+        "show_suppressed": True,
+        "use_llm": False,
+        "output_format": "markdown",
+    }
+
+    rows = report(state)["report_body"].splitlines()
+
+    assert f"| P5 | `SKILL.md:1` | {expected} |" in rows
+    data = json.loads(report({**state, "output_format": "json"})["report_body"])
+    assert data["suppressed"][0]["suppression_reason"] == reason
+
+
 def test_report_no_baseline_unchanged() -> None:
     """Without a baseline, scoring is unchanged and nothing is suppressed."""
     state: SkillspectorState = {
@@ -1413,6 +1516,45 @@ def _meta_from_json_report(state: SkillspectorState) -> dict:
     return json.loads(report(state)["report_body"])["metadata"]
 
 
+def test_json_report_probes_availability_once_and_reuses_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[float | None] = []
+    monkeypatch.setattr(
+        "skillspector.nodes.report.is_llm_available",
+        lambda *, timeout=120: calls.append(timeout) or (True, None),
+    )
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+    }
+
+    assert _meta_from_json_report(state)["llm_available"] is True
+    assert calls == [120]
+
+
+def test_json_report_does_not_probe_after_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "skillspector.nodes.report.transitive_remaining_seconds", lambda _state: 0.0
+    )
+    probe = MagicMock(return_value=(True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", probe)
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "llm_call_log": [llm_call_record("semantic_security_discovery", ok=True)],
+    }
+
+    assert _meta_from_json_report(state)["llm_available"] is True
+    probe.assert_not_called()
+
+
 def test_report_llm_degraded_when_all_calls_failed(monkeypatch: pytest.MonkeyPatch) -> None:
     """use_llm requested + every semantic-analyzer call failed -> llm_degraded True.
 
@@ -1423,7 +1565,7 @@ def test_report_llm_degraded_when_all_calls_failed(monkeypatch: pytest.MonkeyPat
     llm_degraded / llm_calls_attempted / llm_calls_succeeded / llm_error.
     """
     # Pre-flight reports available (binary/creds present); the failure is at runtime.
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1459,7 +1601,7 @@ def test_report_degraded_when_some_calls_fail(monkeypatch: pytest.MonkeyPatch) -
     analyzer) while the rest of the fan-out succeeds; that is still a coverage
     gap and must not read as a clean, fully-analyzed scan.
     """
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1494,7 +1636,7 @@ def test_report_meta_analysis_applied_survives_other_analyzer_partial_failure(
     one boolean. Matches the reported 3/4 scenario: 3 calls succeed
     (including meta_analyzer), 1 semantic-analyzer batch is dropped.
     """
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1527,7 +1669,7 @@ def test_report_meta_analysis_not_applied_when_meta_analyzer_itself_fails(
     This is the other half of the independent-contracts fix: the two fields
     are not blind to meta_analyzer - they just ignore everyone ELSE.
     """
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1559,7 +1701,7 @@ def test_report_meta_analysis_not_applied_when_no_meta_analyzer_record(
     llm_available stays True: provider availability is a separate contract
     from whether meta_analyzer had anything to do.
     """
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1577,7 +1719,7 @@ def test_report_meta_analysis_not_applied_when_no_meta_analyzer_record(
 
 def test_report_static_only_without_calls_is_not_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
     """Explicit static-only intent needs no LLM telemetry and is not degraded."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1597,7 +1739,7 @@ def test_report_static_only_without_calls_is_not_degraded(monkeypatch: pytest.Mo
 def test_json_report_exposes_only_sanitized_provider_usage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1642,7 +1784,7 @@ def test_json_report_exposes_only_sanitized_provider_usage(
 def test_json_report_exposes_captured_llm_provenance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1741,7 +1883,7 @@ def test_json_report_preserves_counterless_cli_provider_observation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """CLI success remains provenance evidence even without token counters."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1796,7 +1938,7 @@ def test_json_report_preserves_counterless_cli_provider_observation(
 
 def test_report_no_llm_failures_not_counted_as_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
     """use_llm False -> failures (if any) never mark the scan degraded."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1812,7 +1954,7 @@ def test_report_no_llm_failures_not_counted_as_degraded(monkeypatch: pytest.Monk
 
 def test_report_terminal_shows_degraded_warning(monkeypatch: pytest.MonkeyPatch) -> None:
     """Terminal output surfaces a visible degraded-scan warning."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1829,7 +1971,7 @@ def test_report_terminal_shows_degraded_warning(monkeypatch: pytest.MonkeyPatch)
 
 def test_report_markdown_shows_degraded_warning(monkeypatch: pytest.MonkeyPatch) -> None:
     """Markdown output surfaces a visible degraded-scan warning."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -2061,7 +2203,7 @@ def test_explicit_requested_llm_with_missing_telemetry_degrades_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A requested semantic pass needs verified runtime evidence before JSON can say SAFE."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -2087,7 +2229,7 @@ def test_use_llm_fallback_with_missing_telemetry_degrades_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Omitted request metadata inherits enabled LLM intent and cannot report SAFE."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -2114,7 +2256,7 @@ def test_malformed_llm_request_intent_falls_back_to_enabled_llm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Non-boolean request metadata cannot override enabled semantic analysis."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -2139,7 +2281,7 @@ def test_truthy_malformed_request_intent_cannot_override_static_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A non-boolean request value inherits an explicit static-only execution mode."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -2163,7 +2305,7 @@ def test_malformed_use_llm_value_cannot_opt_out_of_semantic_accounting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Only the literal boolean False selects static-only execution."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -2187,7 +2329,7 @@ def test_explicit_requested_llm_with_invalid_call_telemetry_degrades_without_cra
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Malformed runtime evidence cannot bypass the floor or break report rendering."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -2214,7 +2356,7 @@ def test_explicit_requested_llm_with_missing_telemetry_warns_every_report_surfac
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Human-readable and SARIF reports expose the shared semantic coverage gap."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -2242,7 +2384,7 @@ def test_explicit_all_not_applicable_semantic_pass_stays_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verified no-work statuses are complete without claiming any LLM calls."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -2280,7 +2422,7 @@ def test_unavailable_provider_floors_recommendation_even_with_success_records(
     """Provider truth wins when swallowed batch failures produced false success records."""
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (False, "codex binary not found"),
+        lambda *, timeout=120: (False, "codex binary not found"),
     )
     state: SkillspectorState = {
         "filtered_findings": [],
@@ -2353,7 +2495,7 @@ def test_analyzer_partial_batch_failure_flows_through_to_report_degraded(
     )
     from skillspector.nodes.analyzers.semantic_developer_intent import node as di_node
 
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
 
     def _mock_get_chat_model(*_args: object, **_kwargs: object) -> MagicMock:
         mock_llm = MagicMock()
@@ -2403,7 +2545,7 @@ def test_preflight_unavailable_log_does_not_claim_runtime_calls_failed(
     """Preflight failure is logged without inventing zero attempted runtime calls."""
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (False, "not configured"),
+        lambda **_: (False, "not configured"),
     )
     state: SkillspectorState = {
         "filtered_findings": [],
