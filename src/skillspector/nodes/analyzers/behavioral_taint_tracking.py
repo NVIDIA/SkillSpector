@@ -414,10 +414,11 @@ def _find_nested_sources(
 # * ``f(...)`` where ``f`` resolves lexically to functions (or a lambda
 #   assigned to the name) defined in this file; every definition bound to the
 #   name is one callee, so redefinitions cost nothing per call;
-# * ``self.m(...)`` / ``cls.m(...)`` in a method, ``Class.m(...)`` and
-#   ``super().m(...)``, through the class's own methods or those of its
-#   nearest in-file base (a bounded, precomputed lookup);
-# * ``Class(...)`` / ``cls(...)``, which bind to ``__init__``.
+# * ``self.m(...)`` / ``cls.m(...)`` in a method, ``Class.m(...)``,
+#   ``super().m(...)`` and ``Class().m(...)`` / ``cls().m(...)``, through the
+#   class's own methods or those of its nearest in-file base (a bounded,
+#   precomputed lookup in C3 order);
+# * ``Class(...)`` / ``cls(...)``, which bind to ``__init__`` and ``__new__``.
 #
 # Receivers of any other shape (``obj.m(...)``) are not resolved and bind
 # nothing, exactly as before. ``self.x`` / ``cls.x`` attributes are per class:
@@ -432,12 +433,14 @@ _CLASS = 4
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
 _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
 
-# Call-site positional arguments at or beyond this parameter index (and any
-# after a ``*args`` unpacking) share one wildcard slot, so binding work per
+# Call-site positional arguments at or beyond this parameter index share one
+# wildcard slot, and an ``*args`` unpacking fills a wildcard slot keyed by the
+# parameter index it starts at (at most this one), so binding work per
 # definition is bounded by a constant.
 _MAX_POSITIONAL_SLOTS = 16
-# The in-file base lookup visits at most this many classes, scanning at most
-# this many bases of each, so it is a constant per class.
+# The in-file base lookup visits at most this many classes (the class itself
+# included), merging at most this many bases of each, so it is a constant per
+# class.
 _MAX_ANCESTORS = 8
 _MAX_BASES = 8
 
@@ -447,24 +450,36 @@ _PASS = 1  # keeps the line of the fact it forwards
 _RETURN = 2  # into a function's return summary: never carries bound facts
 _BIND = 3  # from a call-site argument into a callee's parameter slot
 
-# One source per key, the most severe one. Which source is most severe
-# depends on the sink, so a key keeps it for two sink lanes; when the lanes
-# agree (almost always) they share one fact, which propagates once:
+# A key keeps one fact per lane; when the lanes agree (almost always) they
+# share one fact, which propagates once:
 #
-# * lane 0, network output: credential (TT3) > file read (TT4) > external
-#   input (TT2), so a helper's network or file source never hides a credential;
-# * lane 1, code execution and deserialization: external input (TT5/TT6) >
-#   file read (TT6) > credential (TT2), so a helper's credential never hides
-#   user or network input reaching ``exec`` or ``pickle.loads``.
+# * lane 0, the most severe source for network output: credential (TT3) >
+#   file read (TT4) > external input (TT2), so a helper's network or file
+#   source never hides a credential;
+# * lane 1, the most severe source for code execution and deserialization:
+#   external input (TT5/TT6) > file read (TT6) > credential (TT2), so a
+#   helper's credential never hides user or network input reaching ``exec``
+#   or ``pickle.loads``;
+# * lane 2, the first source to arrive, unranked, in the order earlier
+#   releases propagated (the source a ``main`` message cites).
 #
-# A sink reads its own lane; file writes (TT2 for every source) read lane 0.
+# Lanes 0 and 1 decide the rule at a sink (file writes, TT2 for every
+# source, read lane 0). The message cites the lane 2 fact whenever it gives
+# that same rule, so a more severe source replaces the cited one only when it
+# changes the rule (see ``_TaintGraph.cited``).
 _SOURCE_NAMES: tuple[str, ...] = tuple(sorted(_ALL_SOURCES))
 _SOURCE_INDEX: dict[str, int] = {name: index for index, name in enumerate(_SOURCE_NAMES)}
-_LANE_RANKS: tuple[tuple[int, int], ...] = tuple(
-    (2, 0) if name in _CREDENTIAL_SOURCES else (0, 2) if name in _EXTERNAL_INPUT_SOURCES else (1, 1)
+_LANE_RANKS: tuple[tuple[int, int, int], ...] = tuple(
+    (2, 0, 0)
+    if name in _CREDENTIAL_SOURCES
+    else (0, 2, 0)
+    if name in _EXTERNAL_INPUT_SOURCES
+    else (1, 1, 0)
     for name in _SOURCE_NAMES
 )
-_BOTH_LANES = 3
+_LANES = (0, 1, 2)
+_FIRST_LANE = 2
+_ALL_LANES = 7
 
 # A fact is (source index, line).
 _Fact = tuple[int, int]
@@ -530,16 +545,16 @@ class _Scope:
 
 
 class _Function:
-    """A ``def``/``async def`` or lambda, with the callee groups it belongs to."""
+    """A ``def``/``async def`` or lambda, with the callee group it belongs to."""
 
-    __slots__ = ("node", "scope", "kind", "key", "groups")
+    __slots__ = ("node", "scope", "kind", "key", "group")
 
     def __init__(self, node: _FunctionNode | ast.Lambda, scope: _Scope) -> None:
         self.node = node
         self.scope = scope
         self.kind = "function"  # function | instance | class | static
         self.key = -1  # key of the name the definition binds
-        self.groups: list[_Group] = []
+        self.group: _Group | None = None
 
 
 class _ClassDef:
@@ -568,25 +583,79 @@ class _Class:
 class _Group:
     """One callee: every function bound to a name, or every same-kind method
     of a class with one name. Call sites bind into its argument slots, which
-    flow into each definition's parameters once."""
+    flow into each definition's parameters once.
 
-    __slots__ = ("id", "kind", "functions", "keyword_params", "has_kwarg", "slots")
+    Each function belongs to exactly one group. A lambda bound to several
+    names (``a = b = lambda ...``) is one group that every such name shares,
+    so its parameters are linked once however many names it has.
+    """
+
+    __slots__ = (
+        "id",
+        "kind",
+        "functions",
+        "merged",
+        "slots",
+        "named",
+        "kwarg_named",
+        "kw_names",
+        "kw_open",
+    )
 
     def __init__(self, group_id: int, kind: str) -> None:
         self.id = group_id
         self.kind = kind
         self.functions: list[_Function] = []
-        self.keyword_params: set[str] = set()
-        self.has_kwarg = False
+        # The group this one was merged into, if any (union-find parent).
+        self.merged: _Group | None = None
         self.slots: dict[object, int] = {}
+        # Computed once, on the first call bound into the group (see
+        # ``signature``): names a keyword argument can bind to, and the names
+        # every ``**kwargs`` definition of the group binds by name instead.
+        self.named: set[str] | None = None
+        self.kwarg_named: set[str] | None = None
+        # Keyword names call sites pass into the group's ``**kwargs``, so a
+        # forwarded ``**kwargs`` binds only those (see ``forwarded_names``);
+        # ``kw_open`` once a call passes ``**mapping`` or too many names.
+        self.kw_names: set[str] = set()
+        self.kw_open = False
 
     def add(self, function: _Function) -> None:
         self.functions.append(function)
-        function.groups.append(self)
-        args = function.node.args
-        self.keyword_params.update(arg.arg for arg in args.args)
-        self.keyword_params.update(arg.arg for arg in args.kwonlyargs)
-        self.has_kwarg = self.has_kwarg or args.kwarg is not None
+        function.group = self
+
+    def root(self) -> _Group:
+        group = self
+        while group.merged is not None:
+            group = group.merged
+        node = self
+        while node.merged is not None and node.merged is not group:
+            following = node.merged
+            node.merged = group  # path compression
+            node = following
+        return group
+
+    def signature(self) -> tuple[set[str], set[str] | None]:
+        """(names a keyword can bind, names every ``**kwargs`` definition takes
+        by name or ``None`` when no definition has ``**kwargs``).
+
+        A keyword naming a parameter binds only that parameter; it reaches a
+        ``**kwargs`` only when some definition with ``**kwargs`` lacks it
+        (positional-only names do reach ``**kwargs``).
+        """
+        if self.named is None:
+            named: set[str] = set()
+            kwarg_named: set[str] | None = None
+            for function in self.functions:
+                args = function.node.args
+                names = {arg.arg for arg in args.args}
+                names.update(arg.arg for arg in args.kwonlyargs)
+                named |= names
+                if args.kwarg is not None:
+                    kwarg_named = names if kwarg_named is None else kwarg_named & names
+            self.named = named
+            self.kwarg_named = kwarg_named
+        return self.named, self.kwarg_named
 
 
 class _CallTargets(NamedTuple):
@@ -642,12 +711,62 @@ def _receiver_offset(kind: str, class_object: bool) -> int:
     return 0
 
 
+def _c3(cls: _Class, bases: list[_Class]) -> list[_Class]:
+    """C3 linearization of *cls* from its bases' linearizations, cut at ``_MAX_ANCESTORS``.
+
+    Bases are already linearized (and cut). A base still being linearized
+    (a cycle) stands for itself. An inconsistent hierarchy, which Python
+    rejects, continues with the leftmost remaining head.
+    """
+    result = [cls]
+    if not bases:
+        return result
+    sequences = [
+        [c for c in (base.ancestors if base.ancestors is not None else [base]) if c is not cls]
+        for base in bases
+    ]
+    if len(sequences) == 1:  # single inheritance: the base's order
+        result.extend(sequences[0][: _MAX_ANCESTORS - 1])
+        return result
+    sequences.append([base for base in bases if base is not cls])
+    # How many sequences hold each class after their head.
+    tails: dict[int, int] = {}
+    for sequence in sequences:
+        for c in sequence[1:]:
+            tails[c.id] = tails.get(c.id, 0) + 1
+    positions = [0] * len(sequences)
+    placed = {cls.id}
+    while len(result) < _MAX_ANCESTORS:
+        candidate: _Class | None = None
+        leftmost: _Class | None = None
+        for sequence, position in zip(sequences, positions, strict=True):
+            if position < len(sequence):
+                head = sequence[position]
+                if leftmost is None:
+                    leftmost = head
+                if not tails.get(head.id):
+                    candidate = head
+                    break
+        candidate = candidate or leftmost
+        if candidate is None:
+            break
+        if candidate.id not in placed:
+            placed.add(candidate.id)
+            result.append(candidate)
+        for i, sequence in enumerate(sequences):
+            position = positions[i]
+            if position < len(sequence) and sequence[position] is candidate:
+                position += 1
+                positions[i] = position
+                if position < len(sequence):
+                    tails[sequence[position].id] -= 1
+    return result
+
+
 class _ScopeIndex:
     """Lexical scopes of one module plus the in-file callees calls can bind to."""
 
-    def __init__(self, aliases: dict[str, str], type_map: dict[str, str]) -> None:
-        self.aliases = aliases
-        self.type_map = type_map
+    def __init__(self) -> None:
         self.scopes: list[_Scope] = []
         # Statements and expressions that create flows, with their scope, in
         # ``ast.walk`` (breadth-first) order: Assign, Return and Call.
@@ -668,6 +787,14 @@ class _ScopeIndex:
         # an ordinary fact.
         self.local = bytearray()
         self.name_key: dict[ast.Name, int] = {}
+        # (class key, module key) for each name a class body reads and also
+        # binds: such a read sees the class's value or, before the class
+        # binds it, the module global (Python's LOAD_NAME).
+        self.class_reads: dict[tuple[int, int], None] = {}
+        # Keys some statement assigns, and each ``**kwargs`` parameter's
+        # key -> its function.
+        self.stored: set[int] = set()
+        self.kwarg_params: dict[int, _Function] = {}
         self.class_of_key: dict[int, _Class] = {}
         self.function_groups: dict[int, _Group] = {}
         self.groups: list[_Group] = []
@@ -751,21 +878,72 @@ class _ScopeIndex:
             kinds[kind] = group
         return group
 
+    def lambda_group(self, node: ast.Lambda, function: _Function) -> _Group:
+        """The one callee of a lambda, shared by every name it is bound to."""
+        group = self._lambda_groups.get(node)
+        if group is None:
+            group = self._new_group("function")
+            group.add(function)
+            self._lambda_groups[node] = group
+        return group.root()
+
+    def bind_name(self, key: int, group: _Group) -> None:
+        """Make *group* (a lambda's) a callee of the name *key*.
+
+        The first binding shares the group; a name with another definition
+        merges the two groups (redefinitions are one callee), so a lambda
+        bound to many names is never copied per name.
+        """
+        current = self.function_groups.get(key)
+        if current is None:
+            self.function_groups[key] = group
+            return
+        current, group = current.root(), group.root()
+        if current is group:
+            return
+        if len(current.functions) < len(group.functions):
+            current, group = group, current
+        group.merged = current
+        for function in group.functions:
+            function.group = current
+        current.functions.extend(group.functions)
+        group.functions = []
+
+    def finish_groups(self) -> None:
+        for key, group in self.function_groups.items():
+            if group.merged is not None:
+                self.function_groups[key] = group.root()
+
     def ancestors(self, cls: _Class, tick: Callable[[], None]) -> list[_Class]:
-        """*cls* then its in-file bases, depth-first left to right, bounded."""
-        if cls.ancestors is None:
+        """*cls* then its in-file bases in C3 (method resolution) order, bounded.
+
+        Each class merges the (bounded) linearizations of at most
+        ``_MAX_BASES`` bases and keeps the first ``_MAX_ANCESTORS`` classes,
+        so the work per class is a constant. Classes are linearized bases
+        first, iteratively, so a long inheritance chain cannot exhaust the
+        stack; a cycle (possible when redefinitions merge) is cut.
+        """
+        if cls.ancestors is not None:
+            return cls.ancestors
+        visiting: set[int] = set()
+        stack = [cls]
+        while stack:
             tick()
-            order: list[_Class] = []
-            seen: set[int] = set()
-            stack = [cls]
-            while stack and len(order) < _MAX_ANCESTORS:
-                current = stack.pop()
-                if current.id in seen:
+            current = stack[-1]
+            if current.ancestors is not None:
+                stack.pop()
+                continue
+            bases = current.bases[:_MAX_BASES]
+            if current.id not in visiting:
+                visiting.add(current.id)
+                pending = [
+                    base for base in bases if base.ancestors is None and base.id not in visiting
+                ]
+                if pending:
+                    stack.extend(reversed(pending))
                     continue
-                seen.add(current.id)
-                order.append(current)
-                stack.extend(reversed(current.bases[:_MAX_BASES]))
-            cls.ancestors = order
+            stack.pop()
+            current.ancestors = _c3(current, bases)
         return cls.ancestors
 
     def lookup(
@@ -812,6 +990,13 @@ class _ScopeIndex:
             return None
         return parent.class_def.cls
 
+    def constructed_class(self, key: int) -> _Class | None:
+        """The class ``Name(...)`` constructs: an in-file class name, or ``cls``."""
+        receiver = self.receivers.get(key)
+        if receiver is not None:
+            return receiver[0] if receiver[1] else None  # cls(...) in a classmethod
+        return self.class_of_key.get(key)
+
     def call_targets(self, call: ast.Call, tick: Callable[[], None]) -> _CallTargets:
         """The in-file callees a call reaches, resolved from syntax alone."""
         cached = self._calls.get(call)
@@ -826,22 +1011,17 @@ class _ScopeIndex:
             if group is not None:
                 members.append((group, 0))
                 results.append(group)
-            constructed = self.class_of_key.get(key)
-            receiver = self.receivers.get(key)
-            if receiver is not None and receiver[1]:
-                constructed = receiver[0]  # cls(...) in a classmethod
+            constructed = self.constructed_class(key)
             if constructed is not None:
                 for group in self.lookup(constructed, "__init__", 0, tick):
                     members.append((group, 0 if group.kind == "static" else 1))
+                # ``C(x)`` also calls ``C.__new__(C, x)``: ``cls`` is implicit.
+                for group in self.lookup(constructed, "__new__", 0, tick):
+                    members.append((group, 1))
         elif isinstance(func, ast.Lambda):
             function = self.lambdas.get(func)
             if function is not None:
-                group = self._lambda_groups.get(func)
-                if group is None:
-                    group = self._new_group("function")
-                    group.add(function)
-                    self._lambda_groups[func] = group
-                members.append((group, 0))
+                members.append((self.lambda_group(func, function), 0))
         elif isinstance(func, ast.Attribute):
             value = func.value
             cls: _Class | None = None
@@ -857,7 +1037,11 @@ class _ScopeIndex:
                     class_object = True
             elif isinstance(value, ast.Call):
                 cls = self.super_class(value)
-                skip = 1
+                if cls is not None:
+                    skip = 1
+                elif isinstance(value.func, ast.Name):
+                    # ``C().m(...)`` / ``cls().m(...)``: an instance of an in-file class.
+                    cls = self.constructed_class(self.name_key.get(value.func, -1))
             if cls is not None:
                 for group in self.lookup(cls, func.attr, skip, tick):
                     members.append((group, _receiver_offset(group.kind, class_object)))
@@ -880,6 +1064,14 @@ class _ScopeIndex:
         if cls is None:
             return None
         return self.synthetic(("store", cls.id, node.attr), False)
+
+    def class_body_store(self, cls: _Class, name: str) -> int:
+        """Key of a name a class body assigns, read as ``self.name`` / ``cls.name``.
+
+        Kept apart from ``self.x`` stores: a subclass that rebinds the name in
+        its own body shadows a base's class-body value.
+        """
+        return self.synthetic(("class", cls.id, name), False)
 
     def attribute_view(self, node: ast.Attribute) -> int | None:
         """Key read by ``self.x`` / ``cls.x``: stores in the class and its bases."""
@@ -916,8 +1108,6 @@ class _ScopeIndex:
 
 def _build_scope_index(
     tree: ast.AST,
-    aliases: dict[str, str],
-    type_map: dict[str, str],
     check_runtime: Callable[[], None] | None = None,
 ) -> _ScopeIndex:
     """Assign every name to its lexical scope and index in-file callees.
@@ -929,7 +1119,7 @@ def _build_scope_index(
     indexing pass over class and function definitions.
     """
     tick = check_runtime or _noop
-    index = _ScopeIndex(aliases, type_map)
+    index = _ScopeIndex()
     module = index.new_scope(_MODULE, None, "")
     # Nodes evaluated in a different scope than their parent (bodies of
     # functions, classes and lambdas; comprehension elements).
@@ -1053,6 +1243,9 @@ def _resolve_names(index: _ScopeIndex, tick: Callable[[], None]) -> None:
     there unless declared ``global``/``nonlocal``, and otherwise resolves to
     the nearest enclosing binder, then the module. Class bodies see their own
     names but are invisible to the functions and comprehensions inside them.
+    A class-body read of a name the class binds sees the class's value or,
+    before the class binds it, the module global (CPython's LOAD_NAME; an
+    enclosing function's local is not consulted), so it reads both.
     """
     module = index.module
     stacks: dict[str, list[_Scope]] = {}
@@ -1094,7 +1287,13 @@ def _resolve_names(index: _ScopeIndex, tick: Callable[[], None]) -> None:
                     names.append(name)
         for node in scope.names or ():
             tick()
-            index.name_key[node] = index.key(binding_scope(scope, node.id), node.id)
+            binder = binding_scope(scope, node.id)
+            key = index.key(binder, node.id)
+            index.name_key[node] = key
+            if not isinstance(node.ctx, ast.Load):
+                index.stored.add(key)
+            elif binder is scope and scope.kind == _CLASS:
+                index.class_reads[(key, index.key(module, node.id))] = None
         for name, definition in scope.definitions or ():
             tick()
             definition.key = index.key(binding_scope(scope, name), name)
@@ -1130,6 +1329,8 @@ def _index_definitions(index: _ScopeIndex, tick: Callable[[], None]) -> None:
     for function in index.functions:
         tick()
         node = function.node
+        if node.args.kwarg is not None:
+            index.kwarg_params[index.key(function.scope, node.args.kwarg.arg)] = function
         if isinstance(node, ast.Lambda):
             continue
         parent = function.scope.parent
@@ -1150,7 +1351,8 @@ def _index_definitions(index: _ScopeIndex, tick: Callable[[], None]) -> None:
         function = index.lambdas.get(lambda_node)
         key = index.name_key.get(target)
         if function is not None and key is not None:
-            index.function_group(key).add(function)
+            index.bind_name(key, index.lambda_group(lambda_node, function))
+    index.finish_groups()
 
 
 def _mark_targets(
@@ -1160,17 +1362,18 @@ def _mark_targets(
     line: int,
     fact: _Fact,
     bound: int,
-    lanes: int = _BOTH_LANES,
+    lanes: int = _ALL_LANES,
 ) -> list[tuple[int, int, int]]:
     """Give each target *fact*, in each of *lanes*, where it outranks what it holds.
 
     Monotone: a target's fact in a lane is only ever replaced by a strictly
-    more severe source for that lane, so each key changes at most twice per
-    lane and slot, and the worklist terminates. A key has two slots: ordinary
-    facts, and facts bound from a call site into a function's parameters
-    (``bound``). A bound fact stays bound in function locals; module, class
-    and attribute state turns it into an ordinary fact. Returns the
-    (key, slot, changed lanes) triples to propagate from.
+    more severe source for that lane (never in lane 2, where every source
+    ranks the same and the first to arrive stays), so each key changes at
+    most three times per lane and slot, and the worklist terminates. A key
+    has two slots: ordinary facts, and facts bound from a call site into a
+    function's parameters (``bound``). A bound fact stays bound in function
+    locals; module, class and attribute state turns it into an ordinary
+    fact. Returns the (key, slot, changed lanes) triples to propagate from.
     """
     source, fact_line = fact
     if kind != _PASS:
@@ -1190,7 +1393,7 @@ def _mark_targets(
         slot = 1 if bound and local[target] else 0
         held = facts[slot]
         mask = 0
-        for lane in (0, 1):
+        for lane in _LANES:
             if not lanes >> lane & 1:
                 continue
             rank = ranks[lane]
@@ -1212,17 +1415,28 @@ class _TaintGraph:
     """Scope-aware taint, independent of AST visit order.
 
     Taint is reachability in a flow graph over keys, computed with a monotone
-    worklist that fires each flow at most once per (lane, source rank, slot),
-    so at most 12 times whatever the number of sources:
+    worklist that fires each flow at most once per (lane, source rank, slot):
+    at most 14 times whatever the number of sources (three ranks in lanes 0
+    and 1, one in lane 2, two slots each).
 
-    * phase A replays exactly the assignment flows earlier releases used
-      (``x = <expr>`` reads every name in ``<expr>``), in the same order, so a
-      flow both versions report cites the same variable, source and line;
-    * phase B adds what scoping makes precise: arguments of direct in-file
+    * Phase A replays exactly the assignment flows earlier releases used
+      (``x = <expr>`` reads every name in ``<expr>``), in the same order, plus
+      a class body's read of the module global under a name the class also
+      binds (earlier releases had one name for both). In lane 2, which keeps
+      the first source to arrive, a key that earlier releases tainted the
+      same way holds the source and line they cite. Their fact differs only
+      where it came from a same-named variable in another scope, a name clash
+      this scoping removes.
+    * Phase B adds what scoping makes precise: arguments of direct in-file
       calls bind into parameters (as bound facts), parameter defaults,
       return summaries read by callers, and ``self.x`` / ``cls.x`` attributes.
       Phase B never replaces a fact by one of equal rank, so it only fills
-      keys phase A left clean or upgrades them to a more severe source.
+      keys phase A left clean or upgrades lane 0 or 1 to a more severe
+      source; lane 2 is never replaced.
+
+    At a sink, the sink's ranked lane decides the rule, and the message cites
+    the lane 2 fact whenever that gives the same rule (``cited``). A more
+    severe source therefore changes a message only where it changes the rule.
 
     A callee's return summary carries only facts that do not depend on its
     parameters: bound facts never enter it. What a call returns from its
@@ -1243,9 +1457,9 @@ class _TaintGraph:
         self.aliases = aliases
         self.tick = check_runtime or _noop
         # facts[slot][lane]: key -> fact; slot 1 holds facts bound from a call site.
-        self.facts: tuple[tuple[dict[int, _Fact], dict[int, _Fact]], ...] = (
-            ({}, {}),
-            ({}, {}),
+        self.facts: tuple[tuple[dict[int, _Fact], ...], ...] = (
+            ({}, {}, {}),
+            ({}, {}, {}),
         )
         # Each flow's (targets, kind, line), keyed by its index (a stable id).
         # ``prop_a`` / ``prop_b`` map a key read by a phase A / B flow to its ids.
@@ -1307,24 +1521,28 @@ class _TaintGraph:
         return key
 
     def scan(
-        self, node: ast.AST, root: _Scope, nested_values: bool
+        self, node: ast.AST, root: _Scope, nested_values: bool, opaque_lambdas: bool = False
     ) -> tuple[list[int], list[int], list[tuple[str, int]]]:
         """Walk an expression once: (names read, other keys read, sources).
 
         Names are the reads earlier releases used. Other keys are the return
         summaries of in-file calls and ``self.x`` attributes. With
         *nested_values*, an in-file call is read through its value key and not
-        walked. Sources are the most severe source call per lane (first in walk
-        order among equals), with the lanes each one is for, or an
-        ``os.environ[...]`` subscript as the whole expression.
+        walked. With *opaque_lambdas* a lambda is not walked: a default holds
+        the function object, and each lambda's own defaults are scanned once,
+        for that lambda. Sources, each with the lanes it is for: in lanes 0
+        and 1 the most severe source call (the first in walk order among
+        equals), in lane 2 the first source call in walk order (the one
+        earlier releases took); or an ``os.environ[...]`` subscript as the
+        whole expression.
         """
         index = self.index
         name_key = index.name_key
         tick = self.tick
         names: dict[int, None] = {}
         others: dict[int, None] = {}
-        best: list[str | None] = [None, None]
-        best_rank = [-1, -1]
+        best: list[str | None] = [None, None, None]
+        best_rank = [-1, -1, -1]
         queue: deque[ast.AST] = deque([node])
         while queue:
             tick()
@@ -1343,7 +1561,7 @@ class _TaintGraph:
                 source = _call_source(child, self.type_map, self.aliases)
                 if source is not None:
                     ranks = _LANE_RANKS[_SOURCE_INDEX[source]]
-                    for lane in (0, 1):
+                    for lane in _LANES:
                         if ranks[lane] > best_rank[lane]:
                             best[lane], best_rank[lane] = source, ranks[lane]
                 for group in index.call_targets(child, tick).results:
@@ -1352,17 +1570,18 @@ class _TaintGraph:
                 view = index.attribute_view(child)
                 if view is not None:
                     others[view] = None
+            elif opaque_lambdas and isinstance(child, ast.Lambda):
+                continue
             for grandchild in ast.iter_child_nodes(child):
                 if not isinstance(grandchild, ast.expr_context):
                     queue.append(grandchild)
         if best[0] is None:
-            best[0] = best[1] = _credential_subscript(node, self.aliases)
-        sources: list[tuple[str, int]] = []
-        if best[0] is not None and best[0] == best[1]:
-            sources.append((best[0], _BOTH_LANES))
-        else:
-            sources.extend((source, 1 << lane) for lane, source in enumerate(best) if source)
-        return list(names), list(others), sources
+            best = [_credential_subscript(node, self.aliases)] * len(_LANES)
+        lanes_of: dict[str, int] = {}
+        for lane, source in enumerate(best):
+            if source is not None:
+                lanes_of[source] = lanes_of.get(source, 0) | 1 << lane
+        return list(names), list(others), list(lanes_of.items())
 
     def assign(self, node: ast.Assign, scope: _Scope) -> None:
         index = self.index
@@ -1405,14 +1624,14 @@ class _TaintGraph:
         if link in self._class_links:
             return
         self._class_links.add(link)
-        store = self.index.synthetic(("store", class_def.cls.id, name), False)
+        store = self.index.class_body_store(class_def.cls, name)
         self.add_flow((key,), (store,), _PASS, 0, False)
 
     def returned(self, value: ast.expr, scope: _Scope, line: int) -> None:
         function = scope.function
-        if function is None or not function.groups:
+        if function is None or function.group is None:
             return
-        targets = [self.ret_key(group) for group in function.groups]
+        targets = (self.ret_key(function.group),)
         names, others, sources = self.scan(value, scope, False)
         self.seed(targets, _RETURN, line, sources)
         self.add_flow([*names, *others], targets, _RETURN, line, False)
@@ -1444,32 +1663,88 @@ class _TaintGraph:
         scans: list[tuple[list[int], list[int], list[tuple[str, int]]]],
         line: int,
     ) -> None:
+        """Bind a call's arguments into each callee's slots.
+
+        Positional arguments bind by parameter index (the receiver *offset*
+        added); from the first ``*args`` on they share a wildcard slot keyed
+        by the parameter index it starts at, and arguments at index
+        ``_MAX_POSITIONAL_SLOTS`` or beyond share the last one. ``**mapping``
+        binds a wildcard keyed by the offset, except a forwarded ``**kwargs``
+        whose keyword names are known, which binds as those keywords. So an
+        implicit ``self`` / ``cls`` is never filled by an unpacking.
+        """
         slots: list[list[int]] = []
-        unpacked = False
+        starred_at = -1
         for position, arg in enumerate(node.args):
-            if isinstance(arg, ast.Starred):
-                unpacked = True
+            if starred_at < 0 and isinstance(arg, ast.Starred):
+                starred_at = position
             keys: list[int] = []
             for group, offset in members:
-                slot: object = position + offset
-                if unpacked or position + offset >= _MAX_POSITIONAL_SLOTS:
-                    slot = "*"
+                slot: object
+                if starred_at >= 0:
+                    slot = ("*", min(starred_at + offset, _MAX_POSITIONAL_SLOTS))
+                elif position + offset >= _MAX_POSITIONAL_SLOTS:
+                    slot = ("*", _MAX_POSITIONAL_SLOTS)
+                else:
+                    slot = position + offset
                 keys.append(self.slot(group, slot))
             slots.append(keys)
         for keyword in node.keywords:
+            names = (
+                [keyword.arg] if keyword.arg is not None else self.forwarded_names(keyword.value)
+            )
             keys = []
-            for group, _offset in members:
-                if keyword.arg is None:
-                    keys.append(self.slot(group, "**"))
+            for group, offset in members:
+                if names is None:
+                    keys.append(self.slot(group, ("**", offset)))
                     continue
-                if keyword.arg in group.keyword_params:
-                    keys.append(self.slot(group, ("kw", keyword.arg)))
-                if group.has_kwarg:
-                    keys.append(self.slot(group, "kw*"))
-            slots.append(keys)
+                named, kwarg_named = group.signature()
+                for name in names:
+                    if name in named:
+                        keys.append(self.slot(group, ("kw", name)))
+                    if kwarg_named is not None and name not in kwarg_named:
+                        keys.append(self.slot(group, "kw*"))
+            slots.append(list(dict.fromkeys(keys)))
         for keys, (names, others, sources) in zip(slots, scans, strict=True):
             self.seed(keys, _BIND, line, sources)
             self.add_flow([*names, *others], keys, _BIND, line, False)
+
+    def forwarded_names(self, value: ast.expr) -> list[str] | None:
+        """The keywords a forwarded ``**kwargs`` can hold, or ``None`` if unknown.
+
+        ``**kwargs`` of an in-file function holds only the keyword names its
+        call sites pass into it (``collect_keywords``), unless some call site
+        passes a ``**mapping`` or the parameter is reassigned.
+        """
+        if not isinstance(value, ast.Name):
+            return None
+        index = self.index
+        key = index.name_key.get(value, -1)
+        function = index.kwarg_params.get(key)
+        if function is None or function.group is None or key in index.stored:
+            return None
+        group = function.group
+        return None if group.kw_open else sorted(group.kw_names)
+
+    def collect_keywords(self) -> None:
+        """Record the keyword names each callee's ``**kwargs`` receives."""
+        index = self.index
+        for node, _scope in index.statements:
+            if not isinstance(node, ast.Call) or not node.keywords:
+                continue
+            self.tick()
+            for group, _offset in index.call_targets(node, self.tick).members:
+                _named, kwarg_named = group.signature()
+                if kwarg_named is None or group.kw_open:
+                    continue
+                for keyword in node.keywords:
+                    if keyword.arg is None:
+                        group.kw_open = True
+                        break
+                    if keyword.arg not in kwarg_named:
+                        group.kw_names.add(keyword.arg)
+                if len(group.kw_names) > _MAX_POSITIONAL_SLOTS:
+                    group.kw_open = True
 
     def slot(self, group: _Group, slot: object) -> int:
         key = group.slots.get(slot)
@@ -1490,61 +1765,93 @@ class _TaintGraph:
         for arg, default in pairs:
             self.tick()
             target = (self.index.key(function.scope, arg.arg),)
-            names, others, sources = self.scan(default, defining, False)
+            names, others, sources = self.scan(default, defining, False, opaque_lambdas=True)
             self.seed(target, _ASSIGN, default.lineno, sources)
             self.add_flow([*names, *others], target, _ASSIGN, default.lineno, False)
 
     def link_callees(self) -> None:
-        """Flow each callee's argument slots into the parameters they bind."""
+        """Flow each callee's argument slots into the parameters they bind.
+
+        Parameter *i* reads positional slot *i*, the ``*args`` wildcards that
+        start at or before *i*, its keyword slot and the ``**mapping``
+        wildcards whose receiver offset is at most *i* (keywords and mappings
+        never reach positional-only parameters).
+        """
         index = self.index
         for group in index.groups:
             if not group.slots:
                 continue
             slots = group.slots
+            stars = [
+                (start, slots[("*", start)])
+                for start in range(_MAX_POSITIONAL_SLOTS + 1)
+                if ("*", start) in slots
+            ]
+            mappings = [
+                (offset, slots[("**", offset)]) for offset in (0, 1) if ("**", offset) in slots
+            ]
+            rest = slots.get("kw*")
             for function in group.functions:
                 self.tick()
                 args = function.node.args
                 scope = function.scope
                 positional = [*args.posonlyargs, *args.args]
+                posonly = len(args.posonlyargs)
                 for position, arg in enumerate(positional):
-                    reads = [
-                        slots.get(position if position < _MAX_POSITIONAL_SLOTS else "*"),
-                        slots.get("*"),
-                        None if position < len(args.posonlyargs) else slots.get(("kw", arg.arg)),
-                        slots.get("**"),
-                    ]
+                    reads = [slots.get(position)]
+                    reads.extend(key for start, key in stars if start <= position)
+                    if position >= posonly:
+                        reads.append(slots.get(("kw", arg.arg)))
+                        reads.extend(key for offset, key in mappings if offset <= position)
                     self.bind_parameter(reads, index.key(scope, arg.arg))
                 for arg in args.kwonlyargs:
-                    reads = [slots.get(("kw", arg.arg)), slots.get("**")]
+                    reads = [slots.get(("kw", arg.arg)), *(key for _, key in mappings)]
                     self.bind_parameter(reads, index.key(scope, arg.arg))
                 if args.vararg is not None:
-                    extra = range(len(positional), _MAX_POSITIONAL_SLOTS)
-                    reads = [slots.get("*"), *(slots.get(position) for position in extra)]
+                    reads = [key for _, key in stars]
+                    reads.extend(
+                        slots.get(i) for i in range(len(positional), _MAX_POSITIONAL_SLOTS)
+                    )
                     self.bind_parameter(reads, index.key(scope, args.vararg.arg))
                 if args.kwarg is not None:
-                    reads = [slots.get("kw*"), slots.get("**")]
+                    reads = [rest, *(key for _, key in mappings)]
                     self.bind_parameter(reads, index.key(scope, args.kwarg.arg))
 
     def bind_parameter(self, reads: list[int | None], target: int) -> None:
         self.add_flow([key for key in reads if key is not None], (target,), _PASS, 0, False)
 
     def link_attributes(self) -> None:
-        """A ``self.x`` read sees stores of ``x`` in its class and in-file bases."""
+        """A ``self.x`` read sees ``self.x`` stores in its class and in-file
+        bases, and the class-body ``x`` of the nearest of them that binds it."""
         index = self.index
+        ids = index._ids
         for node in index.attributes:
             self.tick()
             index.attribute_view(node)
         for cls, attr, view in index.view_list:
             self.tick()
             reads = []
+            shadowed = False
             for owner in index.ancestors(cls, self.tick):
-                store = index._ids.get(("store", owner.id, attr))
+                store = ids.get(("store", owner.id, attr))
                 if store is not None:
                     reads.append(store)
+                if not shadowed:
+                    body = ids.get(("class", owner.id, attr))
+                    if body is not None:
+                        reads.append(body)
+                        shadowed = True
+                    elif attr in owner.methods:
+                        shadowed = True
             self.add_flow(reads, (view,), _PASS, 0, False)
 
     def build(self) -> None:
-        for node, scope in self.index.statements:
+        index = self.index
+        for class_key, module_key in index.class_reads:
+            self.tick()
+            self.add_flow((module_key,), (class_key,), _PASS, 0, True)
+        self.collect_keywords()
+        for node, scope in index.statements:
             self.tick()
             if isinstance(node, ast.Assign):
                 self.assign(node, scope)
@@ -1553,7 +1860,7 @@ class _TaintGraph:
                     self.returned(node.value, scope, node.lineno)
             elif isinstance(node, ast.Call):
                 self.call(node, scope)
-        for function in self.index.functions:
+        for function in index.functions:
             self.tick()
             self.defaults(function)
         self.link_attributes()
@@ -1571,7 +1878,7 @@ class _TaintGraph:
         # Phase B: every flow. Phase A facts are read again through the new
         # flows (each phase A flow already fired for them and is skipped).
         worklist: deque[tuple[int, int, int]] = deque(
-            (key, 0, _BOTH_LANES) for key in self.facts[0][0]
+            (key, 0, _ALL_LANES) for key in self.facts[0][_FIRST_LANE]
         )
         for targets, kind, line, fact, lanes in self.seeds:
             self.tick()
@@ -1590,34 +1897,43 @@ class _TaintGraph:
             self.tick()
             key, slot, lanes = worklist.popleft()
             held = facts[slot]
-            first = held[0].get(key) if lanes & 1 else None
-            second = held[1].get(key) if lanes & 2 else None
-            if first is not None and first is second:
-                carried = [(first, _BOTH_LANES)]
-            else:
-                carried = [(fact, 1 << lane) for lane, fact in enumerate((first, second)) if fact]
+            # Lanes holding the same fact propagate it together.
+            carried: list[list] = []
+            for lane in _LANES:
+                if lanes >> lane & 1:
+                    fact = held[lane].get(key)
+                    if fact is None:
+                        continue
+                    for entry in carried:
+                        if entry[0] is fact:
+                            entry[1] |= 1 << lane
+                            break
+                    else:
+                        carried.append([fact, 1 << lane])
             for fact, fact_lanes in carried:
                 ranks = _LANE_RANKS[fact[0]]
-                # One bit per (lane, rank, slot): 12 bits per flow.
-                bits = [1 << (6 * lane + 2 * ranks[lane] + slot) for lane in (0, 1)]
+                # One bit per (lane, rank, slot): 14 bits per flow.
+                want = 0
+                for lane in _LANES:
+                    if fact_lanes >> lane & 1:
+                        want |= 1 << (6 * lane + 2 * ranks[lane] + slot)
                 for table in tables:
                     for flow_id in table.get(key, ()):
                         mark = fired[flow_id]
-                        todo = 0
-                        for lane in (0, 1):
-                            if fact_lanes >> lane & 1 and not mark & bits[lane]:
-                                todo |= 1 << lane
-                        if not todo:
+                        todo_bits = want & ~mark
+                        if not todo_bits:
                             # Already propagated a source of this rank: its targets
                             # hold one at least as severe. Skip to stay linear.
                             continue
                         targets, kind, line = flows[flow_id]
                         if slot and kind == _RETURN:
                             continue
-                        for lane in (0, 1):
-                            if todo >> lane & 1:
-                                mark |= bits[lane]
-                        fired[flow_id] = mark
+                        fired[flow_id] = mark | todo_bits
+                        todo = (
+                            (1 if todo_bits & 0x3F else 0)
+                            | (2 if todo_bits & 0xFC0 else 0)
+                            | (4 if todo_bits & 0x3000 else 0)
+                        )
                         worklist.extend(_mark_targets(self, targets, kind, line, fact, slot, todo))
 
     # ── results ──
@@ -1631,6 +1947,24 @@ class _TaintGraph:
         ):
             return bound
         return ordinary
+
+    def cited(self, key: int, sink_name: str, lane: int) -> _Fact | None:
+        """The fact a sink of *lane* reports for *key*.
+
+        The ranked lane gives the most severe rule. The first source to
+        arrive (lane 2, what earlier releases cite) is reported instead
+        whenever it gives that same rule, so a more severe source replaces
+        the cited one only when it changes the rule.
+        """
+        ranked = self.fact(key, lane)
+        if ranked is None:
+            return None
+        first = self.fact(key, _FIRST_LANE)
+        if first is not None and first is not ranked:
+            rule = _pick_rule(_SOURCE_NAMES[ranked[0]], sink_name, is_direct=False)
+            if _pick_rule(_SOURCE_NAMES[first[0]], sink_name, is_direct=False) == rule:
+                return first
+        return ranked
 
     def tainted_names(self) -> dict[str, _TaintedVar]:
         """Tainted variables by readable name (module globals keep their bare name)."""
@@ -1663,7 +1997,7 @@ def _collect_tainted(
     Module globals keep their bare name; function locals read
     ``qualname.<locals>.name``. See ``_TaintGraph`` for the propagation rules.
     """
-    index = _build_scope_index(tree, aliases, type_map, check_runtime)
+    index = _build_scope_index(tree, check_runtime)
     graph = _TaintGraph(index, type_map, aliases, check_runtime)
     graph.run()
     return graph.tainted_names()
@@ -1742,7 +2076,7 @@ def _find_tainted_names_in_args(
         for key, spelled, out in reads:
             if key is None or key in seen:
                 continue
-            fact = graph.fact(key, lane)
+            fact = graph.cited(key, sink_name, lane)
             if fact is None:
                 continue
             seen.add(key)
@@ -1764,7 +2098,7 @@ def _analyze_python(
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
     check_runtime = budget.check_runtime if budget is not None else None
-    index = _build_scope_index(tree, aliases, type_map, check_runtime)
+    index = _build_scope_index(tree, check_runtime)
     graph = _TaintGraph(index, type_map, aliases, check_runtime)
     graph.run()
     seen: set[tuple[str, ast.Call]] = set()
