@@ -31,17 +31,55 @@ this model``).  What replaces it depends on the platform:
 
 from __future__ import annotations
 
+import re
+
 # Bare model names documented to answer a forced tool call with HTTP 400.
-FORCED_TOOL_CALL_REJECTED_MODELS = ("claude-fable-5-1", "claude-mythos-5-1")
+FORCED_TOOL_CALL_REJECTED_MODELS = (
+    "claude-fable-5-1",
+    "claude-mythos-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+)
+
+# Bare model names documented to reject sampling controls (``temperature``) with HTTP 400.
+SAMPLING_REJECTED_MODELS = ("claude-opus-5-5", "claude-sonnet-5-5")
 
 _BEDROCK_VENDOR_PREFIX = "anthropic."
 
+# A Claude model name ending an identifier, at its start or after a ``-``/``.``
+# routing prefix (``bedrock-claude-...``, ``us.anthropic.claude-...``).
+_CLAUDE_MODEL_NAME = re.compile(r"(?:^|[-.])(claude-[a-z0-9][a-z0-9.-]*)$")
+_DOTTED_VERSION = re.compile(r"(?<=\d)\.(?=\d)")
 
-def rejects_forced_tool_call(model: str) -> bool:
-    """Return ``True`` when the bare *model* name (optionally version-suffixed) rejects forced tool calls."""
-    return any(
-        model == name or model.startswith(name + "-") for name in FORCED_TOOL_CALL_REJECTED_MODELS
+
+def _names_model(model: str | None, names: tuple[str, ...]) -> bool:
+    return model is not None and any(
+        model == name or model.startswith(name + "-") for name in names
     )
+
+
+def rejects_forced_tool_call(model: str | None) -> bool:
+    """Return ``True`` when the bare *model* name (optionally version-suffixed) rejects forced tool calls."""
+    return _names_model(model, FORCED_TOOL_CALL_REJECTED_MODELS)
+
+
+def rejects_sampling_controls(model: str | None) -> bool:
+    """Return ``True`` when the bare *model* name (optionally version-suffixed) rejects ``temperature``."""
+    return _names_model(model, SAMPLING_REJECTED_MODELS)
+
+
+def claude_model_name(model: str) -> str | None:
+    """Return the bare Claude model name carried by *model*, or ``None``.
+
+    Reads the identifier's last path segment, case-insensitively and up to any
+    ``@`` or ``:`` suffix (``@20260922``, ``:latest``, Bedrock's ``:0``), so
+    gateway IDs (``azure/anthropic/claude-opus-5-5``), routing prefixes
+    (``bedrock-claude-opus-5-5``, ``us.anthropic.claude-opus-5-5``) and dotted
+    versions (``claude-opus-5.5``) all resolve to ``claude-opus-5-5``.
+    """
+    name = re.split(r"[@:]", model.rpartition("/")[2].lower(), maxsplit=1)[0]
+    match = _CLAUDE_MODEL_NAME.search(name)
+    return _DOTTED_VERSION.sub("-", match.group(1)) if match else None
 
 
 def claude_model_from_bedrock_id(model: str) -> str | None:

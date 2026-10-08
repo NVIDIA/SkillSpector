@@ -309,8 +309,9 @@ Structured output is requested through LangChain's `with_structured_output`,
 whose default forces a tool call. Some models reject a forced tool call with
 HTTP 400 (`tool_choice: type "tool" and "any" are not supported for this
 model`). The `anthropic` and `anthropic_proxy` providers route those models
-(`claude-fable-5-1`, `claude-mythos-5-1`, or any registry entry with
-`structured_output: json_schema`) to the native JSON-schema response format.
+(`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-1`, `claude-mythos-5-1`,
+or any registry entry with `structured_output: json_schema`) to the native
+JSON-schema response format.
 Bedrock has no JSON-schema output for them, so the `bedrock` provider leaves
 `toolChoice` at `auto`, asks for the tool call in the prompt, and retries a
 prose answer; it recognises the model from the model ID, a geo/global
@@ -349,8 +350,9 @@ export SKILLSPECTOR_PROVIDER=bedrock
 export AWS_REGION=us-west-2  # default if unset
 # Default model: us.anthropic.claude-sonnet-4-6-20250915-v1:0
 # Override with any Bedrock model ID, cross-region inference-profile
-# ID, or your own application-inference-profile ARN:
-# export SKILLSPECTOR_MODEL=us.anthropic.claude-opus-4-6-20250915-v1:0
+# ID, or your own application-inference-profile ARN. Claude 5.5 is opt-in:
+# us./eu. profiles keep requests in that geography, global. routes worldwide.
+# export SKILLSPECTOR_MODEL=us.anthropic.claude-sonnet-5-5
 skillspector scan ./my-skill/
 
 # NVIDIA build.nvidia.com
@@ -721,7 +723,7 @@ Issues (2)
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
 | `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3`; other provider/model combinations keep their endpoint defaults. | Optional |
 | `SKILLSPECTOR_OUTPUT_LANGUAGE` | Short, single-line language label (letters, numbers, spaces, `_`, or `-`; maximum 64 characters) for human-readable LLM finding text such as messages, explanations, and remediation. Rule IDs, severity values, paths, code, and other machine-readable values remain unchanged. Unset, blank, or invalid values preserve the default output language. | Optional |
-| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves the provider default. Lower values can reduce run-to-run variation but do not guarantee identical output. | Optional |
+| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves the provider default. Lower values can reduce run-to-run variation but do not guarantee identical output. `claude-opus-5-5` and `claude-sonnet-5-5` reject sampling controls, so with any explicit value (`1` included) the `anthropic`, `anthropic_proxy`, and `bedrock` providers fail before sending a request. | Optional |
 | `SKILLSPECTOR_SEED` | Optional integer sampling seed for OpenAI-compatible and Azure OpenAI providers. Other hosted providers and CLI providers do not receive it. Provider support remains model-dependent. | Optional |
 | `SKILLSPECTOR_COMPACT_PROMPTS` | Opt-in compact line numbering in LLM prompts: numbered lines render as `L1:`, `L2:` instead of zero-padded `L01:`, `L02:`. Accepted truthy values are `1`, `true`, and `yes` (case-insensitive; surrounding whitespace is trimmed). Unset or any other value keeps the default zero-padded format. | Optional |
 | `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |

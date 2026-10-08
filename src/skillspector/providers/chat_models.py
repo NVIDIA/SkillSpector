@@ -29,6 +29,10 @@ from skillspector.inference_usage import (
     register_chat_model_controls,
     retained_chat_model_controls,
 )
+from skillspector.providers.structured_output import (
+    claude_model_name,
+    rejects_sampling_controls,
+)
 
 logger = logging.getLogger(__name__)
 MIN_SAMPLING_SEED = -(1 << 63)
@@ -80,6 +84,18 @@ def resolve_sampling_parameters(*, include_seed: bool = False) -> dict[str, floa
     if seed is not None:
         parameters["seed"] = seed
     return parameters
+
+
+def reject_unsupported_controls(model: str, sampling_parameters: dict[str, float | int]) -> None:
+    """Raise ``ValueError`` before any request when *model* rejects a requested control.
+
+    Any explicit ``temperature``, ``1.0`` included, fails for the Claude models
+    in ``SAMPLING_REJECTED_MODELS``, which reject sampling controls.
+    """
+    if "temperature" in sampling_parameters and rejects_sampling_controls(claude_model_name(model)):
+        raise ValueError(
+            f"SKILLSPECTOR_TEMPERATURE is not supported by {model}; unset it to use this model"
+        )
 
 
 def validate_base_url(url: str | None) -> None:

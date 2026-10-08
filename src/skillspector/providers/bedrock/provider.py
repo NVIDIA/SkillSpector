@@ -49,7 +49,10 @@ from skillspector.inference_usage import (
     retained_chat_model_controls,
 )
 from skillspector.providers import registry
-from skillspector.providers.chat_models import resolve_sampling_parameters
+from skillspector.providers.chat_models import (
+    reject_unsupported_controls,
+    resolve_sampling_parameters,
+)
 from skillspector.providers.structured_output import (
     claude_model_from_bedrock_id,
     rejects_forced_tool_call,
@@ -155,6 +158,7 @@ class BedrockProvider:
             # and let bind_structured_output ask for the call in the prompt.
             kwargs["supports_tool_choice_values"] = ("auto",)
         sampling_parameters = resolve_sampling_parameters()
+        reject_unsupported_controls(model, sampling_parameters)
         kwargs.update(sampling_parameters)
 
         chat_model = ChatBedrockConverse(**kwargs)

@@ -500,7 +500,9 @@ class TestModelRegistryFiles:
 class TestAnthropicProvider:
     """Anthropic provider — Claude credentials + bundled YAML metadata."""
 
-    @pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-mythos-5-1"])
+    @pytest.mark.parametrize(
+        "model", ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-mythos-5-1"]
+    )
     def test_structured_output_method_is_json_schema_for_registry_models(self, model: str) -> None:
         assert AnthropicProvider().structured_output_method(model) == "json_schema"
 
@@ -524,7 +526,15 @@ class TestAnthropicProvider:
         assert AnthropicProvider().structured_output_method(model) is None
 
     @pytest.mark.parametrize(
-        "model", ["claude-opus-5", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-4-8"]
+        "model",
+        [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5-1",
+            "claude-opus-4-8",
+        ],
     )
     def test_current_generation_models_carry_token_limits(self, model: str) -> None:
         provider = AnthropicProvider()

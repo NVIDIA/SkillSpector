@@ -44,7 +44,11 @@ from skillspector.inference_usage import (
     retained_chat_model_controls,
 )
 from skillspector.providers import registry
-from skillspector.providers.chat_models import resolve_reasoning_effort, resolve_sampling_parameters
+from skillspector.providers.chat_models import (
+    reject_unsupported_controls,
+    resolve_reasoning_effort,
+    resolve_sampling_parameters,
+)
 from skillspector.providers.structured_output import rejects_forced_tool_call
 
 # Default endpoint; overridden by ``ANTHROPIC_BASE_URL`` when set.
@@ -108,6 +112,7 @@ class AnthropicProvider:
         if effort is not None:
             kwargs["effort"] = effort
         sampling_parameters = resolve_sampling_parameters()
+        reject_unsupported_controls(model, sampling_parameters)
         kwargs.update(sampling_parameters)
         chat_model_cls = _ChatAnthropicBearer if _use_bearer_auth() else ChatAnthropic
         chat_model = chat_model_cls(**kwargs)

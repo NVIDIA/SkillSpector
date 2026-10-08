@@ -275,6 +275,28 @@ class TestBedrockProviderCreateChatModel:
         assert kwargs["temperature"] == 0.3
         assert "seed" not in kwargs
 
+    @pytest.mark.parametrize("temperature", ["0", "1.0"])
+    @pytest.mark.parametrize(
+        "model", ["us.anthropic.claude-opus-5-5", "global.anthropic.claude-sonnet-5-5"]
+    )
+    @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
+    @patch("skillspector.providers.bedrock.provider.boto3.Session")
+    def test_claude_5_5_temperature_is_rejected_before_construction(
+        self,
+        mock_session: MagicMock,
+        mock_chat: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        model: str,
+        temperature: str,
+    ) -> None:
+        mock_session.return_value.get_credentials.return_value = MagicMock()
+        mock_session.return_value.client.return_value = MagicMock()
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", temperature)
+
+        with pytest.raises(ValueError, match="SKILLSPECTOR_TEMPERATURE is not supported"):
+            BedrockProvider().create_chat_model(model, max_tokens=1024)
+        mock_chat.assert_not_called()
+
 
 class TestBedrockProviderSelection:
     """SKILLSPECTOR_PROVIDER=bedrock activates BedrockProvider."""
@@ -286,7 +308,18 @@ class TestBedrockProviderSelection:
         assert isinstance(get_metadata_provider(), BedrockProvider)
 
 
+_CLAUDE_5_5_PROFILES = [
+    "us.anthropic.claude-opus-5-5",
+    "eu.anthropic.claude-opus-5-5",
+    "au.anthropic.claude-opus-5-5",
+    "jp.anthropic.claude-opus-5-5",
+    "global.anthropic.claude-opus-5-5",
+    "us.anthropic.claude-sonnet-5-5",
+    "eu.anthropic.claude-sonnet-5-5",
+    "global.anthropic.claude-sonnet-5-5",
+]
 _REJECTING_MODELS = [
+    *_CLAUDE_5_5_PROFILES,
     "anthropic.claude-fable-5-1",
     "us.anthropic.claude-fable-5-1",
     "global.anthropic.claude-fable-5-1",
@@ -294,6 +327,7 @@ _REJECTING_MODELS = [
     "anthropic.claude-fable-5-1-20260901-v1:0",
     "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-fable-5-1",
     "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-mythos-5-1",
+    "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-sonnet-5-5",
 ]
 _FORCING_MODELS = [
     BEDROCK_DEFAULT_MODEL,
@@ -318,7 +352,8 @@ class TestBedrockProviderToolChoice:
         assert BedrockProvider().forced_tool_choice_supported(model) is True
 
     @pytest.mark.parametrize(
-        "model", ["anthropic.claude-fable-5-1", "us.anthropic.claude-mythos-5-1"]
+        "model",
+        ["anthropic.claude-fable-5-1", "us.anthropic.claude-mythos-5-1", *_CLAUDE_5_5_PROFILES],
     )
     def test_registry_models_carry_token_limits(self, model: str) -> None:
         provider = BedrockProvider()
