@@ -41,8 +41,8 @@ function redactSecrets(value: string): string {
   return value
     .replace(/(sk-ant-[A-Za-z0-9_-]{12,})/g, "[REDACTED_ANTHROPIC_KEY]")
     .replace(/(sk-[A-Za-z0-9_-]{20,})/g, "[REDACTED_OPENAI_KEY]")
-    .replace(/([A-Za-z0-9_]*API_KEY[=:]\s*)[^\s]+/gi, "$1[REDACTED]")
-    .replace(/([A-Za-z0-9_]*TOKEN[=:]\s*)[^\s]+/gi, "$1[REDACTED]");
+    // Start only at a word boundary; retrying at every character is quadratic.
+    .replace(/\b([A-Za-z0-9_]*(?:API_KEY|TOKEN)[=:]\s*)[^\s]+/gi, "$1[REDACTED]");
 }
 
 function truncateText(value: string, maxChars = 12000): { text: string; truncated: boolean } {

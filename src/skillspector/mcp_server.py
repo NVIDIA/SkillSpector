@@ -31,6 +31,7 @@ from collections.abc import Mapping
 from ipaddress import ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from skillspector import __version__
 from skillspector.cleanup import TempDirTracker, cleanup_result
@@ -116,7 +117,7 @@ async def run_scan(
             :data:`VALID_FORMATS`.
         allow_local_targets: Whether local filesystem targets are allowed.
             HTTP MCP calls set this to ``False`` so routable servers do not
-            accept caller-controlled local paths.
+            accept caller-controlled local paths or use ambient Git credentials.
         yara_rules_dir: Optional directory of additional YARA rules.
 
     Returns:
@@ -133,12 +134,20 @@ async def run_scan(
         local_yara_rules = yara_rules_dir is not None and _is_local_target(yara_rules_dir)
         if local_target or local_yara_rules:
             raise ValueError("local targets are disabled for this MCP transport")
+        parsed_target = urlparse(target.strip())
+        if (
+            parsed_target.scheme != "https"
+            or parsed_target.username is not None
+            or parsed_target.password is not None
+        ):
+            raise ValueError("this MCP transport requires an unauthenticated HTTPS target")
 
     llm_preflight_available, _ = is_llm_available()
     llm_enabled = use_llm and llm_preflight_available
 
     state: dict[str, Any] = {
         "input_path": target,
+        "allow_git_credentials": allow_local_targets,
         "output_format": output_format,
         "use_llm": llm_enabled,
         "llm_requested": use_llm,

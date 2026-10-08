@@ -65,6 +65,7 @@ from skillspector.python_ast import (
     may_be_python_source,
     resolve_python_source_classification,
 )
+from skillspector.python_tokens import PythonStringClosers
 from skillspector.security_reconstruction import (
     MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
     MAX_MARKER_LOOKAHEAD_CHARS,
@@ -2044,6 +2045,17 @@ def _restore_source_lines(
                 )
 
 
+def _window_string_closer(
+    python_strings: PythonStringClosers, window_start: int
+) -> Callable[[int], bool]:
+    """Answer string-closer queries in one window's source coordinates."""
+
+    def closes_string(offset: int) -> bool:
+        return python_strings.closes_string(window_start + offset)
+
+    return closes_string
+
+
 def _scan_declared_marker_views(
     path: str,
     content: str,
@@ -2106,6 +2118,13 @@ def _scan_declared_marker_views(
             )
         return True
 
+    # A complete Python module proves which quotes close its string literals.
+    # The proof covers the whole artifact, so it holds in every window. It is
+    # computed only when a loose quoted directive header reaches a quote.
+    python_strings = (
+        PythonStringClosers(content, check_runtime) if _infer_file_type(path) == "python" else None
+    )
+
     for owned_start, raw_start in zip(owned_starts, raw_starts, strict=True):
         check_runtime()
         owned_end = min(len(content), owned_start + DECLARED_MARKER_OWNED_CHARS)
@@ -2131,6 +2150,13 @@ def _scan_declared_marker_views(
         )
         across_security_views = len(full_views) > 1
         check_runtime()
+        # View offsets are window-relative. Synthetic Markdown fence context
+        # never occurs for Python, but it would not map onto module offsets.
+        string_closer = (
+            None
+            if python_strings is None or context_prefix
+            else _window_string_closer(python_strings, raw_start)
+        )
         for full_view in full_views:
             full_view_limited = False
             reconstruction = build_declared_marker_views(
@@ -2139,6 +2165,7 @@ def _scan_declared_marker_views(
                 owned_source_start=owned_source_start,
                 owned_source_end=owned_source_end,
                 source_end_is_truncated=raw_end < len(content),
+                validated_string_closer=string_closer,
             )
             projection_limited = projection_limited or reconstruction.limited
             for marker_view in reconstruction.views:
