@@ -25,6 +25,9 @@ def _occurrences(finding: Finding) -> list[dict[str, object]]:
             "file": finding.file,
             "start_line": finding.start_line,
             "end_line": finding.end_line,
+            "finding": finding.finding,
+            "context": finding.context,
+            "code_snippet": finding.code_snippet,
             **({"start_column": finding.start_column} if finding.start_column is not None else {}),
             **({"end_column": finding.end_column} if finding.end_column is not None else {}),
             "source_url": finding.source_url,
@@ -177,26 +180,35 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
         _classification_metadata,
     ), group in groups.items():
         representative = min(group, key=_representative_key)
-        occurrences = {
-            (
-                str(occurrence.get("file", "")),
-                _line(occurrence.get("start_line"), 1),
-                occurrence.get("end_line"),
-                occurrence.get("start_column"),
-                occurrence.get("end_column"),
-                str(occurrence.get("source_identity") or finding.source_identity or ""),
-                str(occurrence.get("source_digest") or finding.source_digest or ""),
-                str(occurrence.get("source_url") or finding.source_url or ""),
-                _line(occurrence.get("transitive_depth"), finding.transitive_depth),
-            )
-            for finding in group
-            for occurrence in _occurrences(finding)
-        }
+        occurrences: dict[tuple[object, ...], dict[str, object]] = {}
+        for finding in sorted(
+            group, key=lambda item: (_representative_key(item), _output_key(item))
+        ):
+            for occurrence in _occurrences(finding):
+                location = (
+                    str(occurrence.get("file", "")),
+                    _line(occurrence.get("start_line"), 1),
+                    occurrence.get("end_line"),
+                    occurrence.get("start_column"),
+                    occurrence.get("end_column"),
+                    str(occurrence.get("source_identity") or finding.source_identity or ""),
+                    str(occurrence.get("source_digest") or finding.source_digest or ""),
+                    str(occurrence.get("source_url") or finding.source_url or ""),
+                    _line(occurrence.get("transitive_depth"), finding.transitive_depth),
+                )
+                occurrences.setdefault(
+                    location,
+                    {
+                        field: occurrence.get(field, getattr(finding, field))
+                        for field in ("finding", "context", "code_snippet")
+                    },
+                )
         ordered_occurrences = [
             {
                 "file": file,
                 "start_line": start,
                 "end_line": end,
+                **source_text,
                 **({"start_column": start_column} if start_column is not None else {}),
                 **({"end_column": end_column} if end_column is not None else {}),
                 **({"source_identity": source_identity} if source_identity else {}),
@@ -205,27 +217,30 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
                 **({"transitive_depth": transitive_depth} if transitive_depth else {}),
             }
             for (
-                file,
-                start,
-                end,
-                start_column,
-                end_column,
-                source_identity,
-                source_digest,
-                source_url,
-                transitive_depth,
+                (
+                    file,
+                    start,
+                    end,
+                    start_column,
+                    end_column,
+                    source_identity,
+                    source_digest,
+                    source_url,
+                    transitive_depth,
+                ),
+                source_text,
             ) in sorted(
-                occurrences,
+                occurrences.items(),
                 key=lambda item: (
-                    item[5],
-                    item[6],
-                    item[7],
-                    item[8],
-                    item[0],
-                    item[1],
-                    _line(item[2], item[1]),
-                    _line(item[3], -1),
-                    _line(item[4], -1),
+                    item[0][5],
+                    item[0][6],
+                    item[0][7],
+                    item[0][8],
+                    item[0][0],
+                    item[0][1],
+                    _line(item[0][2], item[0][1]),
+                    _line(item[0][3], -1),
+                    _line(item[0][4], -1),
                 ),
             )
         ]

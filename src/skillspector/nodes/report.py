@@ -155,6 +155,13 @@ def _sanitize_finding(finding: Finding) -> Finding:
         matched_text=clean(finding.matched_text),
         code_snippet=clean(finding.code_snippet),
         evidence=evidence,
+        occurrences=[
+            {
+                key: clean(value) if key in {"finding", "context", "code_snippet"} else value
+                for key, value in occurrence.items()
+            }
+            for occurrence in finding.occurrences
+        ],
     )
 
 
@@ -275,6 +282,10 @@ def _expand_occurrences(findings: list[Finding]) -> list[Finding]:
                         str(provenance["source_url"]) if "source_url" in provenance else None
                     ),
                     transitive_depth=depth_value if isinstance(depth_value, int) else 0,
+                    **{
+                        field: occurrence.get(field, getattr(finding, field))
+                        for field in ("finding", "context", "code_snippet")
+                    },
                     occurrences=[],
                 )
             )
@@ -344,7 +355,14 @@ def _build_sarif_properties(
     finding: Finding, occurrence: Mapping[str, object] | None = None
 ) -> dict[str, object] | None:
     """Project selected finding metadata into a SARIF properties dictionary."""
-    finding_dict = finding.to_dict()
+    occurrence = occurrence or {}
+    finding_dict = replace(
+        finding,
+        **{
+            field: occurrence.get(field, getattr(finding, field))
+            for field in ("finding", "context", "code_snippet")
+        },
+    ).to_dict()
     metadata: dict[str, object] = {
         "findingId": finding.finding_id,
         "severity": finding_dict["severity"],
