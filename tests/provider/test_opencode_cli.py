@@ -302,6 +302,8 @@ class TestOpencodeDenyAllPolicy:
             "OPENCODE_CONFIG_CONTENT": '{"permission":"allow","share":"auto"}',
             "OPENCODE_PERMISSION": '{"*":"allow"}',
             "OPENCODE_EXPERIMENTAL": "1",
+            # An ambient value must not switch the OAuth login plugins back off (#809).
+            "OPENCODE_DISABLE_DEFAULT_PLUGINS": "1",
         }
 
         argv = _build_opencode_argv(OPENCODE_BINARY, "", 0)

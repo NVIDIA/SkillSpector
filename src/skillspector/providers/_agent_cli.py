@@ -676,7 +676,9 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
         SKILLSPECTOR_MODEL is set).
 
     The shared runner also isolates every OpenCode config/state path, disables
-    ambient instructions, skills, plugins, auto-sharing, snapshots and updates,
+    ambient instructions, skills, external plugins (the internal OAuth/provider
+    plugins stay enabled, see ``_prepare_opencode_env``), auto-sharing,
+    snapshots and updates,
     scrubs secret-bearing environment variables, delivers untrusted content
     via stdin only, and never passes ``--auto``.
 
