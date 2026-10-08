@@ -23,9 +23,10 @@ categories that have no semantic-analyzer equivalent.
 Concurrency model
 -----------------
 Each skill runs the full ``graph.invoke(state)`` pipeline in a dedicated
-thread via :class:`~concurrent.futures.ThreadPoolExecutor`.  The number of
+process supervised by a :class:`~concurrent.futures.ThreadPoolExecutor`. The number of
 parallel workers is controlled by ``--workers`` (default 4).  A 90-second
-per-skill timeout prevents stalled workers from blocking the batch.  This
+per-skill work timeout prevents stalled workers from blocking the batch. Worker
+startup has a separate 90-second bound. Failed skills remain in reports. This
 sits on top of two built-in parallelism layers:
 
 * **Layer 1** — 20 analyzers fan-out inside the LangGraph (per-skill)
@@ -57,10 +58,26 @@ else:
     _dotenv.load_dotenv(_dotenv.find_dotenv(usecwd=True), override=True)
 
 import argparse
+import json
+import multiprocessing
+import os
+import shutil
+import signal
+import subprocess
 import sys
+import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
+from contextlib import ExitStack
+from functools import partial
+from multiprocessing.connection import wait
+from multiprocessing.managers import BaseManager
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from uuid import uuid4
+
 from skillspector.logging_config import set_level
 
 from .api_pool import create_api_key_pool_from_env
@@ -68,11 +85,21 @@ from .discovery import discover_skills
 from .reports import _format_json as format_json
 from .reports import _format_markdown as format_markdown
 from .reports import _format_terminal as format_terminal
-from .runner import run_one
+from .reports import _terminal_text
+from .runner import entry_from_error, run_one
 
 # Progress-print lock — Rich consoles are not thread-safe; serialize output
 # from the main thread via this lock.
 _print_lock = threading.Lock()
+# Process.start() reaps finished siblings; serialize it with live-worker cleanup.
+_process_lock = threading.Lock()
+
+
+class _PoolManager(BaseManager):
+    """Keep rate limits shared across independently killable scan processes."""
+
+
+_PoolManager.register("create_pool", create_api_key_pool_from_env)
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +115,7 @@ def _scan_skill(
     lang: str,
     require_llm: bool,
     api_pool=None,
+    verbose: bool = False,
 ) -> tuple[dict[str, object], str | None, str]:
     """Scan a single skill through the full pipeline.
 
@@ -100,6 +128,9 @@ def _scan_skill(
     except ValueError:
         rel_name = skill_dir.name
 
+    if verbose:
+        set_level("DEBUG")
+
     # Core scan and optional gap-fill share the graph's validated file cache.
     entry, error_msg = run_one(
         skill_dir,
@@ -111,6 +142,113 @@ def _scan_skill(
     )
 
     return entry, error_msg, rel_name
+
+
+def _kill_worker_group(pid: int) -> None:
+    """Stop a worker and any descendants that share its process group."""
+    if os.name == "posix":
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    else:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=5, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _watch_parent(scratch: Path | None = None) -> None:
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        return
+    wait([parent.sentinel])
+    if scratch is not None:
+        # A dead supervisor cannot clean its scratch or stop the worker group.
+        shutil.rmtree(scratch, ignore_errors=True)
+        _kill_worker_group(os.getpid())
+    # The pool manager has no worker group, but must not retain API keys after
+    # its supervisor disappears.
+    os._exit(0)
+
+
+def _start_parent_watch(scratch: Path | None = None) -> None:
+    threading.Thread(target=_watch_parent, args=(scratch,), daemon=True).start()
+
+
+def _scan_skill_process(
+    skill_dir: Path, root: Path, result_path: Path, options: dict, started
+) -> None:
+    if os.name == "posix":
+        os.setsid()
+    _start_parent_watch(result_path.parent)
+    # A killed worker cannot run finally blocks. Its supervisor owns all scratch.
+    tempfile.tempdir = str(result_path.parent)
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        os.environ[name] = str(result_path.parent)
+    from .runner import deepseek_compat, set_api_pool
+
+    if options.get("api_pool") is not None:
+        set_api_pool(options["api_pool"])
+    with deepseek_compat():
+        started.set()
+        result = _scan_skill(skill_dir, root, **options)
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+
+
+def _scan_skill_bounded(
+    skill_dir: Path, root: Path, *, api_pool=None, timeout: float = 90,
+    startup_timeout: float = 90, **options
+) -> tuple[dict[str, object], str | None, str]:
+    """Enforce the wall-clock limit on actual work, including local analysis."""
+    owner = uuid4().hex
+    if api_pool is not None:
+        options["api_pool"] = SimpleNamespace(
+            acquire=partial(api_pool.acquire, owner=owner),
+            try_acquire=partial(api_pool.try_acquire, owner=owner),
+            release=partial(api_pool.release, owner=owner),
+            record_retry_success=api_pool.record_retry_success,
+        )
+    with TemporaryDirectory(prefix="skillspector-batch-") as scratch:
+        result_path = Path(scratch) / "result.json"
+        context = multiprocessing.get_context("spawn")
+        started = context.Event()
+        process = context.Process(
+            target=_scan_skill_process, args=(skill_dir, root, result_path, options, started)
+        )
+        try:
+            with _process_lock:
+                process.start()
+            startup_deadline = time.monotonic() + startup_timeout
+            while not started.is_set() and process.is_alive():
+                remaining = startup_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"scan worker startup timed out after {startup_timeout:g}s")
+                started.wait(min(0.1, remaining))
+            process.join(timeout if started.is_set() else 0)
+            if process.is_alive():
+                raise TimeoutError(f"scan timed out after {timeout:g}s")
+            if process.exitcode != 0:
+                raise RuntimeError(f"Skill scan worker exited with code {process.exitcode}")
+            entry, error, name = json.loads(result_path.read_text(encoding="utf-8"))
+            return entry, error, name
+        finally:
+            with _process_lock:
+                if process.pid is not None:
+                    # Only signal a live, unreaped worker while sibling starts
+                    # cannot recycle its PID. Providers own normal-exit cleanup.
+                    if process.exitcode is None:
+                        _kill_worker_group(process.pid)
+                        if process.is_alive():
+                            process.kill()
+                    process.join()
+                    process.close()
+            if api_pool is not None:
+                api_pool.release_owner(owner)
 
 
 # ---------------------------------------------------------------------------
@@ -138,10 +276,16 @@ def _main_impl() -> None:
     # -- Rich detection -------------------------------------------------------
     try:
         from rich.console import Console
+        from rich.markup import escape
+        from rich.text import Text
     except ImportError:
         Console = None  # type: ignore[assignment]  # noqa: N806
 
-    c = Console() if Console is not None else None
+    c = Console(emoji=False) if Console is not None else None
+
+    def display(value: object) -> str:
+        text = _terminal_text(value)
+        return escape(text) if c else text
 
     def _print(*args: object, **kwargs: object) -> None:
         """Print through Rich when available, falling back to plain text."""
@@ -191,7 +335,8 @@ def _main_impl() -> None:
         metavar="N",
         help="Number of parallel scan workers (default: 4).  "
         "Reduce to 1 for free-tier API keys, increase for enterprise tiers.  "
-        "Skills that time out (90s) are skipped; other workers continue.",
+        "Skills that time out (90s of scanning, plus up to 90s for startup) "
+        "are reported as errors; other workers continue.",
     )
     parser.add_argument(
         "-V",
@@ -226,7 +371,7 @@ def _main_impl() -> None:
     # -- Validation ----------------------------------------------------------
     root = args.input_dir.resolve()
     if not root.is_dir():
-        _print(f"[red]Error:[/red] {root} is not a directory", file=sys.stderr)
+        _print(f"[red]Error:[/red] {display(root)} is not a directory", file=sys.stderr)
         sys.exit(2)
 
     skill_dirs = discover_skills(root)
@@ -240,9 +385,6 @@ def _main_impl() -> None:
 
     # -- API Pool (optional — returns None if single-key) --------------------
     api_pool = create_api_key_pool_from_env()
-    if api_pool:
-        from .runner import set_api_pool
-        set_api_pool(api_pool)
     use_llm = not args.no_llm
 
     # -- Header --------------------------------------------------------------
@@ -254,7 +396,7 @@ def _main_impl() -> None:
     )
     _print(
         f"\n[bold]SkillSpector Batch Scan[/bold] — "
-        f"{len(skill_dirs)} skill(s) in [dim]{root}[/dim]"
+        f"{len(skill_dirs)} skill(s) in [dim]{display(root)}[/dim]"
         f"  ([cyan]{args.workers} workers[/cyan]{pool_note})\n"
     )
 
@@ -273,16 +415,23 @@ def _main_impl() -> None:
 
     total = len(skill_dirs)
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+    pool_snapshot = None
+    with ExitStack() as cleanup, ThreadPoolExecutor(max_workers=args.workers) as executor:
+        if api_pool is not None:
+            pool_manager = _PoolManager(ctx=multiprocessing.get_context("spawn"))
+            pool_manager.start(_start_parent_watch)
+            cleanup.callback(pool_manager.shutdown)
+            api_pool = pool_manager.create_pool()
         future_map = {
             executor.submit(
-                _scan_skill,
+                _scan_skill_bounded,
                 skill_dir,
                 root,
                 use_llm=use_llm,
                 lang=args.lang,
                 require_llm=args.require_llm,
                 api_pool=api_pool,
+                verbose=args.verbose,
             ): idx
             for idx, skill_dir in enumerate(skill_dirs, 1)
         }
@@ -291,49 +440,36 @@ def _main_impl() -> None:
             idx = future_map[future]
             rel_name = str(skill_dirs[idx - 1].relative_to(root)) if idx <= len(skill_dirs) else "?"
             try:
-                entry, error_msg, rel_name = future.result(timeout=90)
-            except TimeoutError:
-                errors += 1
-                with _print_lock:
-                    _print(
-                        f"  [{idx}/{total}] [cyan]{rel_name}[/cyan] → "
-                        f"[red]TIMEOUT (90s)[/red]"
-                    )
-                # Don't retry — the worker thread is still stuck and a
-                # retry would consume another slot.  HTTP-level timeouts
-                # (runner.py Patch 6) prevent most hangs from happening.
-                continue
-            except Exception:
-                # Unexpected crash (e.g. asyncio event-loop failure).
-                # Don't retry — log and continue.
-                errors += 1
-                with _print_lock:
-                    _print(
-                        f"  [{idx}/{total}] [cyan]{rel_name}[/cyan] → "
-                        f"[red]CRASH[/red]"
-                    )
-                continue
+                entry, error_msg, rel_name = future.result()
+            except Exception as exc:
+                error_msg = str(exc) or type(exc).__name__
+                entry = entry_from_error(skill_dirs[idx - 1], root, error_msg, args.lang)
             lang = entry["skill"]["language"]
             results.append(entry)
 
             # -- Progress (main thread via lock — safe for Rich) ---------
             with _print_lock:
                 # Non-English LLM guard warning
-                if lang != "en" and not use_llm and args.require_llm:
+                if not error_msg and lang != "en" and not use_llm and args.require_llm:
+                    warning = (
+                        f"non-English skill '{_terminal_text(rel_name)}' "
+                        f"({_terminal_text(lang)}) scanned with --no-llm. "
+                        "Static pattern recall is reduced for this language. "
+                        "Re-run without --no-llm for full coverage, or use "
+                        "--no-require-llm to suppress this warning."
+                    )
                     _print(
-                        f"[yellow]WARNING:[/yellow] non-English skill "
-                        f"'{rel_name}' ({lang}) scanned with --no-llm. "
-                        f"Static pattern recall is reduced for this language. "
-                        f"Re-run without --no-llm for full coverage, or use "
-                        f"--no-require-llm to suppress this warning.",
+                        Text.assemble(("WARNING:", "yellow"), " ", warning)
+                        if c
+                        else f"WARNING: {warning}",
                         file=sys.stderr,
                     )
 
                 if error_msg:
                     errors += 1
                     _print(
-                        f"  [{idx}/{total}] [cyan]{rel_name}[/cyan] → "
-                        f"[red]ERROR: {error_msg}[/red]"
+                        f"  [{idx}/{total}] [cyan]{display(rel_name)}[/cyan] → "
+                        f"[red]ERROR: {display(error_msg)}[/red]"
                     )
                 else:
                     risk = entry.get("risk_assessment", {})
@@ -344,10 +480,13 @@ def _main_impl() -> None:
                         has_high_risk = True
                     color = _sev_colors.get(severity, "")
                     _print(
-                        f"  [{idx}/{total}] [cyan]{rel_name}[/cyan] → "
-                        f"[{color}]{score}/100 {severity}[/{color}] "
+                        f"  [{idx}/{total}] [cyan]{display(rel_name)}[/cyan] → "
+                        f"[{color}]{score}/100 {display(severity)}[/{color}] "
                         f"({n_issues} issue(s))"
                     )
+
+        if api_pool is not None:
+            pool_snapshot = api_pool.snapshot()
 
     # -- Sort results by risk score descending -------------------------------
     results.sort(
@@ -356,8 +495,8 @@ def _main_impl() -> None:
     )
 
     # -- API Pool summary (if active) ----------------------------------------
-    if api_pool:
-        snap = api_pool.snapshot()
+    if pool_snapshot:
+        snap = pool_snapshot
         _parts = [
             f"{snap['total_requests_served']} requests served",
         ]
@@ -384,10 +523,10 @@ def _main_impl() -> None:
 
     if args.output:
         args.output.write_text(report_body, encoding="utf-8")
-        _print(f"\n[green]Batch report saved to:[/green] {args.output}")
+        _print(f"\n[green]Batch report saved to:[/green] {display(args.output)}")
     else:
         if fmt == "terminal":
-            _print(report_body)
+            _print(report_body, markup=False, highlight=False)
         else:
             sys.stdout.write(report_body + "\n")
 

@@ -36,6 +36,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import typer
 import yaml
+from markdown_it import MarkdownIt
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -5280,6 +5281,8 @@ def test_scan_transitive_intrinsic_child_partial_is_not_traversal_truncation(
     exceptions = cast(list[dict[str, object]], completeness["ledger_exceptions"])
     assert {item["reason_code"] for item in exceptions} == {"static_parse_limit"}
     report_body = cast(str, merged["report_body"])
+    if output_format is cli.FormatChoice.markdown:
+        report_body = MarkdownIt().enable("table").render(report_body)
     assert "Inspection reached its configured output limit." not in report_body
     assert "Transitive traversal truncated" not in report_body
     if output_format is cli.FormatChoice.json:
