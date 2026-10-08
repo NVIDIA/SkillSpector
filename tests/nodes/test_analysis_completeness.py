@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from markdown_it import MarkdownIt
 
 from skillspector.models import Finding
 from skillspector.nodes.report import report
@@ -88,10 +89,13 @@ def test_every_format_preserves_exceptions_but_omits_completed_rows(
 ) -> None:
     state = _state_with_two_ledger_exceptions(output_format)
     result = report(state)
+    body = result["report_body"]
+    if output_format == "markdown":
+        body = MarkdownIt().enable("table").render(body)
 
     assert result["execution_successful"] is False
     if output_format == "json":
-        payload = json.loads(result["report_body"])
+        payload = json.loads(body)
         assert payload["execution_successful"] is False
         assert len(payload["analysis_completeness"]["ledger_exceptions"]) == 2
         assert payload["issues"][0]["finding_id"] == state["findings"][0].finding_id
@@ -103,10 +107,10 @@ def test_every_format_preserves_exceptions_but_omits_completed_rows(
         assert run["results"][0]["properties"]["findingId"] == state["findings"][0].finding_id
         assert run["invocations"][0]["executionSuccessful"] is False
     else:
-        assert "read_error" in result["report_body"]
-        assert "syntax_error" in result["report_body"]
+        assert "read_error" in body
+        assert "syntax_error" in body
 
-    assert "work-completed" not in result["report_body"]
+    assert "work-completed" not in body
 
 
 def test_fatal_omission_floors_safe_recommendation_without_changing_score() -> None:

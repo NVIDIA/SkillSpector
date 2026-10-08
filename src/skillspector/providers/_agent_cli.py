@@ -26,8 +26,8 @@ which enforces:
   adversarial skill content) is written to the process stdin, never
   injected into argv.
 - **Capability stripping** (per-binary): tools disabled, MCP disabled,
-  no extra directories, deny permission mode (claude); read-only sandbox
-  (codex).  ``--dangerously-skip-permissions`` is NEVER used.
+  no extra directories, deny permission mode (claude). Codex is disabled
+  until a complete no-tools policy is verified.  ``--dangerously-skip-permissions`` is NEVER used.
 - **Environment scrubbing**: API keys, SSH keys, cloud credentials, and
   other secrets are stripped from the child environment.
 - **Timeout enforcement**: the call raises ``TimeoutError`` rather than
@@ -41,8 +41,8 @@ which enforces:
   of capability removal).
 
 The JSON output envelope (``claude -p --output-format json``) is parsed
-and the assistant text is returned.  ``codex exec --json`` produces
-JSONL events; the last assistant message is extracted.
+and the assistant text is returned. The Codex JSONL parser is retained for
+compatibility, but Codex inference is disabled before a subprocess is started.
 """
 
 from __future__ import annotations
@@ -75,35 +75,46 @@ MAX_OUTPUT_BYTES = 10_000_000  # 10 MB safety cap on stdout
 MAX_STDERR_BYTES = 64_000  # stderr is only used for error snippets
 CLI_TIMEOUT_SECONDS = 300  # 5-minute per-call hard limit
 
-# Environment variables that must NOT be forwarded to child processes.
-# Includes API keys, cloud creds, SSH agent, and SkillSpector's own keys.
-_SECRET_ENV_PREFIXES: tuple[str, ...] = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_PROXY_API_KEY",
-    "OPENAI_API_KEY",
-    "SKILLSPECTOR_API_KEYS",
-    "SKILLSPECTOR_COMPAT_API_KEY",
-    "NVIDIA_INFERENCE_KEY",
-    "NVIDIA_INFERENCE_METADATA_KEY",
-    "AWS_",
-    "AZURE_",
-    "GOOGLE_",
-    "GCLOUD_",
-    "GCP_",
-    "SSH_",
-    "GPG_",
-    "GITHUB_TOKEN",
-    "GITLAB_TOKEN",
-    "HUGGINGFACE_TOKEN",
-    "HF_TOKEN",
-    "COHERE_API_KEY",
-    "REPLICATE_API_TOKEN",
-    "MISTRAL_API_KEY",
-    "TOGETHER_API_KEY",
-    "GROQ_API_KEY",
-    "FIREWORKS_API_KEY",
-    "LANGCHAIN_API_KEY",
-    "LANGSMITH_API_KEY",
+# Only runtime, network transport, and local-login discovery variables cross into agent processes.
+# Do not inherit provider keys, arbitrary application variables, loader hooks,
+# or CLI configuration overrides from the operator's environment.
+_RUNTIME_ENV_NAMES = frozenset(
+    {
+        "PATH",
+        "PATHEXT",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "USERNAME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "XDG_DATA_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "NODE_EXTRA_CA_CERTS",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "TERM",
+        "NO_COLOR",
+    }
 )
 
 
@@ -117,18 +128,13 @@ class AgentCLIError(RuntimeError):
 
 
 def _scrub_env() -> dict[str, str]:
-    """Return a copy of ``os.environ`` with secret variables removed.
+    """Keep only runtime variables needed by the CLIs and their local logins.
 
-    Any variable whose name starts with a prefix in ``_SECRET_ENV_PREFIXES``
-    is stripped.  The resulting environment is passed to the subprocess.
+    Exact names (case-insensitive for Windows) fail closed for new secret names
+    and configuration overrides. Provider API keys are deliberately excluded:
+    agent CLI providers authenticate through the user's existing local login.
     """
-    clean: dict[str, str] = {}
-    for key, val in os.environ.items():
-        upper = key.upper()
-        if any(upper.startswith(p.upper()) for p in _SECRET_ENV_PREFIXES):
-            continue
-        clean[key] = val
-    return clean
+    return {key: val for key, val in os.environ.items() if key.upper() in _RUNTIME_ENV_NAMES}
 
 
 # ---------------------------------------------------------------------------
@@ -276,60 +282,23 @@ def _parse_claude_output(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Registered but disabled. Re-enabling requires a pinned CLI version and a
+# verified policy preflight that denies every model-driven tool and host-file read.
+_CODEX_DISABLED_REASON = (
+    "codex_cli is disabled: its read-only sandbox still permits commands to read "
+    "host files, and SkillSpector has no verified deny-all-tools policy for Codex. "
+    "Use an HTTP API provider or another supported CLI provider instead."
+)
+
+
 def _build_codex_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
-    """Build the argv list for a capability-stripped ``codex exec`` call.
+    """Refuse inference until all model tool execution can be disabled.
 
-    Flags chosen (verified end-to-end against codex 0.139.0):
-
-    ``exec``
-        Non-interactive subcommand. With NO positional prompt, codex reads the
-        instructions from stdin — which is exactly where the runner pipes the
-        prompt. (Passing ``-`` makes the prompt literally ``"-"`` and demotes
-        the real content to a ``<stdin>`` block, so we do not pass it.)
-
-    ``--json``
-        Emit JSONL events to stdout, enabling structured parsing.
-
-    ``--sandbox read-only``
-        Most restrictive sandbox mode. Model-generated shell commands are
-        restricted to read-only filesystem access; no code execution. Unlike
-        claude/gemini (which block model tool use entirely), codex's strictest
-        mode still permits read-only filesystem *reads* by model-generated
-        commands. This is informational, not an exfil channel: the call runs in
-        an isolated empty temp CWD, output returns only to the operator's own
-        report, and there is no network egress path.
-
-    ``--ephemeral``
-        Do not persist session files to disk (no residue from the scan).
-
-    ``--ignore-user-config``
-        Ignore ``$CODEX_HOME/config.toml``; use only our explicit flags.
-
-    ``--ignore-rules``
-        Do not load user/project ``.rules`` files.
-
-    ``--model <label>``
-        Use the requested model.
-
-    ``-m`` / ``--model`` label is validated via ``_validate_model_label``.
+    Read-only access is insufficient for untrusted prompts: host file contents
+    can leave through the model response. Disabling one shell feature does not
+    establish a deny-all policy for other or future tools.
     """
-    return [
-        binary,
-        "exec",
-        "--json",
-        "--sandbox",
-        "read-only",
-        # We run in an isolated empty temp dir (not a git repo); codex refuses
-        # an "untrusted" dir without this. Safe: --sandbox read-only still bars
-        # code execution, and the temp dir holds no project files.
-        "--skip-git-repo-check",
-        "--ephemeral",
-        "--ignore-user-config",
-        "--ignore-rules",
-        # --model omitted by default -> codex uses the account's default model
-        # (forwarded only when SKILLSPECTOR_MODEL is set).
-        *(["--model", _validate_model_label(model)] if model else []),
-    ]
+    raise AgentCLIError(_CODEX_DISABLED_REASON)
 
 
 def _parse_codex_output(raw: str) -> str:
@@ -784,7 +753,11 @@ def _claude_auth_check(binary: str) -> tuple[bool, str | None]:
     """Check claude is authenticated via ``claude auth status`` (no inference)."""
     try:
         result = subprocess.run(
-            [binary, "auth", "status"], capture_output=True, shell=False, timeout=15
+            [binary, "auth", "status"],
+            capture_output=True,
+            shell=False,
+            timeout=15,
+            env=_scrub_env(),
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
         return False, f"claude auth status check failed: {exc}"
@@ -799,17 +772,8 @@ def _claude_auth_check(binary: str) -> tuple[bool, str | None]:
 
 
 def _codex_auth_check(binary: str) -> tuple[bool, str | None]:
-    """Check codex is authenticated via ``codex login status`` (no inference)."""
-    try:
-        result = subprocess.run(
-            [binary, "login", "status"], capture_output=True, shell=False, timeout=15
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
-        return False, f"codex login status check failed: {exc}"
-    out = (result.stdout or b"").decode("utf-8", errors="replace").lower()
-    if result.returncode != 0 or "not logged in" in out:
-        return False, "codex is not authenticated (run `codex login`)"
-    return True, None
+    """Report Codex unavailable without starting a process (fail closed)."""
+    return False, _CODEX_DISABLED_REASON
 
 
 def _gemini_auth_check(binary: str) -> tuple[bool, str | None]:

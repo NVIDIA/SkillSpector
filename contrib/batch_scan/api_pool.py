@@ -159,10 +159,12 @@ class ApiKeyPool:
         self._retry_successes: int = 0
         self._total_requests_served: int = 0
         self._peak_active_requests: int = 0
+        self._leases: dict[str, list[ApiKey]] = {}
+        self._cancelled_owners: set[str] = set()
 
     # -- Public API -----------------------------------------------------------
 
-    def acquire(self, timeout: float | None = None) -> ApiKey:
+    def acquire(self, timeout: float | None = None, *, owner: str | None = None) -> ApiKey:
         """Acquire a slot on the least-loaded available key.
 
         Scheduling priority:
@@ -193,6 +195,8 @@ class ApiKeyPool:
 
         with self._condition:
             while True:
+                if owner in self._cancelled_owners:
+                    raise RuntimeError("Scan worker has stopped")
                 now = time.monotonic()
 
                 # Step 1: recover rate-limited keys whose backoff has expired
@@ -208,6 +212,8 @@ class ApiKeyPool:
                     _now_active = sum(k.active_requests for k in self._keys)
                     if _now_active > self._peak_active_requests:
                         self._peak_active_requests = _now_active
+                    if owner is not None:
+                        self._leases.setdefault(owner, []).append(key)
                     logger.debug(
                         "Pool: slot on key …%s (%d/%d active)",
                         key.key[-8:],
@@ -236,7 +242,7 @@ class ApiKeyPool:
                     )
                     self._condition.wait(timeout=wait)
 
-    def try_acquire(self) -> ApiKey | None:
+    def try_acquire(self, *, owner: str | None = None) -> ApiKey | None:
         """Non-blocking acquire — returns a key immediately or ``None``.
 
         Unlike :meth:`acquire`, this never blocks.  If a slot is available
@@ -244,6 +250,8 @@ class ApiKeyPool:
         Useful in async contexts where blocking would stall the event loop.
         """
         with self._lock:
+            if owner in self._cancelled_owners:
+                raise RuntimeError("Scan worker has stopped")
             self._recover_expired_keys(time.monotonic())
             available = [k for k in self._keys if k.available]
             if not available:
@@ -255,9 +263,11 @@ class ApiKeyPool:
             _now_active = sum(k.active_requests for k in self._keys)
             if _now_active > self._peak_active_requests:
                 self._peak_active_requests = _now_active
+            if owner is not None:
+                self._leases.setdefault(owner, []).append(key)
             return key
 
-    def release(self, key: ApiKey, *, success: bool = True) -> None:
+    def release(self, key: ApiKey, *, success: bool = True, owner: str | None = None) -> None:
         """Release a slot on *key* back to the pool.
 
         Parameters
@@ -270,6 +280,15 @@ class ApiKeyPool:
             rate-limited with exponential backoff.
         """
         with self._condition:
+            if owner is not None:
+                # Manager RPC returns a copy: release the server's original lease.
+                leases = self._leases.get(owner, [])
+                for index, leased in enumerate(leases):
+                    if (leased.key, leased.base_url, leased.model) == (key.key, key.base_url, key.model):
+                        key = leases.pop(index)
+                        break
+                else:
+                    return
             key.active_requests = max(0, key.active_requests - 1)
 
             if success:
@@ -297,6 +316,14 @@ class ApiKeyPool:
                     key.consecutive_429,
                 )
 
+            self._condition.notify_all()
+
+    def release_owner(self, owner: str) -> None:
+        """Reclaim slots and wake waiters after a scan process exits or is killed."""
+        with self._condition:
+            self._cancelled_owners.add(owner)
+            for key in self._leases.pop(owner, []):
+                key.active_requests = max(0, key.active_requests - 1)
             self._condition.notify_all()
 
     def record_retry_success(self) -> None:

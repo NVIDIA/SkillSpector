@@ -24,7 +24,7 @@ python -m contrib.batch_scan.batch_scan ./tests/fixtures/ -f terminal --workers 
 
 ```
 contrib/batch_scan/
-├── batch_scan.py          # CLI entry + ThreadPoolExecutor (start here)
+├── batch_scan.py          # CLI entry + bounded process supervision (start here)
 ├── runner.py              # graph.invoke() wrapper + 7 patches + pool wiring (core)
 ├── gap_fill.py            # GapFillAnalyzer — LLM pass for 8 uncovered rules
 ├── api_pool.py            # ApiKeyPool — multi-key scheduler + 429 backoff
