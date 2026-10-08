@@ -1842,6 +1842,103 @@ def test_unrelated_fatal_does_not_reclassify_a_format_only_reference() -> None:
     )
 
 
+def test_rule_set_row_is_excluded_from_path_keyed_accounting_by_type() -> None:
+    """A rule-set label equal to a real file's path must not touch that file.
+
+    ``components`` holds a fully read file whose path equals the rule-set label,
+    and SKILL.md links to it. The rule-set row must keep the scan partial without
+    lowering that file's coverage, synthesizing AE1, or merging with the file's
+    own public exception row.
+    """
+    file_event = ledger_event(
+        analyzer_id="static_runner",
+        outcome=LedgerOutcome.COMPLETED,
+        phase="static",
+        path="yara_rules",
+    )
+    rule_set_event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        record_type=LedgerRecordType.RULE_SET,
+        phase="static",
+        path="yara_rules/",
+        reason=LedgerReason.READ_ERROR,
+        observed_artifacts=1,
+        limit_artifacts=0,
+    )
+    # A real, same-path, same-reason row from the file itself must stay separate.
+    real_file_row = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        record_type=LedgerRecordType.SYSTEM,
+        phase="static",
+        path="yara_rules",
+        reason=LedgerReason.READ_ERROR,
+    )
+    assert rule_set_event["path"] == file_event["path"] == "yara_rules"
+    state: SkillspectorState = {
+        "components": ["SKILL.md", "yara_rules"],
+        "findings": [],
+        "effective_finding_ids": [],
+        "artifact_references": [
+            {
+                "source_path": "SKILL.md",
+                "line": 3,
+                "column": 5,
+                "evidence": "See [the notes](yara_rules).",
+                "target_path": "yara_rules",
+                "status": "resolved",
+                "disposition": "complete",
+            }
+        ],
+        "inspection_ledger": [
+            ledger_event(
+                analyzer_id="static_runner",
+                outcome=LedgerOutcome.COMPLETED,
+                phase="static",
+                path="SKILL.md",
+            ),
+            file_event,
+            rule_set_event,
+        ],
+        "analyzer_status_events": [
+            analyzer_status_event(
+                analyzer_id="static_runner",
+                status="completed",
+                planned_work=[
+                    _target(
+                        inspection_work_id("static_runner", "SKILL.md", None, None), "SKILL.md"
+                    ),
+                    _target(file_event["work_id"], "yara_rules"),
+                ],
+            ),
+            analyzer_status_event(
+                analyzer_id="static_yara",
+                status="degraded",
+                planned_work=[_target(rule_set_event["work_id"], "yara_rules")],
+            ),
+        ],
+    }
+
+    result = finalize_inspection_ledger(state)
+
+    assert [finding.rule_id for finding in result["findings"]] == []
+    completeness = result["analysis_completeness"]
+    assert completeness["coverage_percent"] == 100.0
+    assert completeness["fully_inspected_files"] == 2
+    assert completeness["partially_inspected_files"] == 0
+    assert completeness["is_complete"] is False
+    assert completeness["execution_successful"] is True
+    assert [row.get("scope") for row in completeness["ledger_exceptions"]] == ["rule_set"]
+
+    # Control: the same label on a SYSTEM row is real artifact evidence and must
+    # still drive both AE1 and coverage, and must not merge with the rule-set row.
+    control_state = dict(state)
+    control_state["inspection_ledger"] = [*state["inspection_ledger"], real_file_row]
+    control = finalize_inspection_ledger(control_state)
+    assert [finding.rule_id for finding in control["findings"]] == ["AE1"]
+    rows = control["analysis_completeness"]["ledger_exceptions"]
+    assert sorted(str(row.get("scope")) for row in rows) == ["None", "rule_set"]
+
+
 @pytest.mark.parametrize(
     ("disposition", "reason", "expected_ae7"),
     [

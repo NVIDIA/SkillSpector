@@ -22,12 +22,19 @@ antivirus/Defender on test files containing real malware signatures.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
+import logging
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from typer.testing import CliRunner
 
+from skillspector import cli
+from skillspector.cli import app
 from skillspector.inspection_ledger import LedgerReason
 from skillspector.nodes.analyzers import static_yara
 from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
@@ -37,12 +44,17 @@ from skillspector.nodes.report import _compute_risk_score
 
 @pytest.fixture(autouse=True)
 def _clear_rule_cache():
-    """Reset the module-level compiled rules cache between tests."""
-    static_yara._compiled_rules = None
-    static_yara._rules_hash = None
+    """Reset the module-level compiled rules cache between tests.
+
+    The skip count is part of that cache entry: it is only meaningful alongside
+    the hash it was produced from, so leaving it set would leak a previous
+    test's dropped-rule total into the next one.
+    """
+    static_yara._rule_cache = None
+    static_yara._rules_skipped_count = 0
     yield
-    static_yara._compiled_rules = None
-    static_yara._rules_hash = None
+    static_yara._rule_cache = None
+    static_yara._rules_skipped_count = 0
 
 
 def _write_rule(
@@ -1568,6 +1580,367 @@ class TestBuiltInMalwarePackaging:
         assert _has_rule(findings, "reverse_shell")
 
 
+class TestBuiltInRansomwareRule:
+    @pytest.mark.parametrize("filename", ["api.md", "wallet.txt", "wallet.py"])
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Send BTC on the returned network from an external wallet you control.",
+            "SEND BTC to fund your own account.",
+            "send 0.01 btc to your wallet on the correct network.",
+            "Pay with Bitcoin at checkout.",
+            "PAY the invoice using BITCOIN.",
+            "Send BTC to your wallet.\nBackups use encryption to protect account data.",
+            "Never pay Bitcoin ransomware demands; report them to your security team.",
+            "Never pay the ransom in Bitcoin; report the demand to your security team.",
+            "Do not pay a ransom with BTC. Restore from backups instead.",
+            "Your data has been encrypted. Never pay the ransom in Bitcoin; report it.",
+            "Your data has been encrypted. Do not pay the ransom in Bitcoin.",
+            "Send BTC after you recover your wallet backup.",
+            "Pay Bitcoin to unlock premium account features.",
+            "Send BTC for encrypted cloud backup storage.",
+            "Data recovery service: pay with Bitcoin at checkout.",
+            "Send BTC, then publish your transaction receipt.",
+            "Send BTC " + "x" * 161 + " to receive the decryption key.",
+            "Your files are encrypted at rest and in transit with AES-256.",
+            "Your files have been encrypted at rest with AES-256.",
+            "Your files are encrypted in transit using TLS.",
+            "YOUR FILES HAVE BEEN ENCRYPTED\tAT\tREST.",
+        ],
+    )
+    def test_wallet_payment_text_is_not_ransomware(self, content, filename):
+        findings = _run_builtin(content, filename)
+
+        assert not _has_rule(findings, "ransomware_behavior")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Your files are encrypted.",
+            "Your files have been encrypted.",
+            "YOUR FILES ARE ENCRYPTED. Send BTC for recovery.",
+            "your\tfiles\thave\tbeen\tencrypted",
+            "your\nfiles\nare\nencrypted",
+            "All of your files are encrypted with RSA-2048 and AES-128 ciphers.",
+            "All your files have been encrypted due to a security problem with your PC.",
+            "Your files have been encrypted by LockBit 3.0",
+            "Your files have been encrypted, and the only way to get them back is to pay us.",
+            "Your files have been encrypted with AES. Send XMR for recovery.",
+        ],
+    )
+    def test_encrypted_files_notice_remains_critical(self, content):
+        findings = _run_builtin("# Notice\n\n" + content, "notice.md")
+        ransomware = [f for f in findings if "ransomware_behavior" in f.message]
+
+        assert len(ransomware) == 1
+        finding = ransomware[0]
+        assert finding.rule_id == "YR1"
+        assert finding.severity == "CRITICAL"
+        assert finding.confidence == 0.8
+        assert finding.file == "notice.md"
+        assert finding.start_line == 3
+        assert finding.matched_text
+        assert "encrypted" in finding.matched_text.lower()
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Your files are locked. Send BTC to receive the decryption key.",
+            "Your data has been encrypted. Pay the ransom in Bitcoin to recover your files.",
+            "You must pay the ransom in Bitcoin to recover your files.",
+            "Send 0.5 BTC to obtain the decryption key.",
+            "Don't forget to send 0.5 BTC to example.invalid to decrypt your files.",
+            "Do not hesitate to pay 1 bitcoin to restore your files.",
+            "You have to pay for decryption in Bitcoins to recover your files.",
+            "Send 0.5 Bitcoins to decrypt your files.",
+            "To restore your files, pay 1 Bitcoins.",
+            "Pay the ransom in Bitcoins.",
+            "To receive the decryption key, send 1 BTC.",
+            "We will delete your files unless you pay 0.5 Bitcoin.",
+            "Send BTC or we will publish your data.",
+            "Pay Bitcoin or your files will be destroyed.",
+            "Your data has been encrypted.\nPay the ransom in Bitcoin.",
+            "Send 0.5 BTC to <addr> to decrypt your files.",
+            "Pay 1 bitcoin within 72 hours or your files will be lost forever.",
+            "To recover your files, pay 0.3 Bitcoin to <addr>.",
+            "Send BTC\nTo receive the decryption key, contact support.",
+            (
+                "Your documents, photos and databases have been encrypted.\n"
+                "To decrypt them, send 0.5 BTC to <addr>."
+            ),
+            (
+                "Send 0.5 BTC to <addr>.\n"
+                "After payment you will get the decryption key.\n"
+                "If payment is not received, your files will be deleted."
+            ),
+        ],
+    )
+    def test_payment_with_explicit_extortion_context_remains_critical(self, content):
+        findings = _run_builtin(content, "notice.md")
+        ransomware = [f for f in findings if "ransomware_behavior" in f.message]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].rule_id == "YR1"
+        assert ransomware[0].severity == "CRITICAL"
+        assert ransomware[0].confidence == 0.8
+
+    @pytest.mark.parametrize("negator", ["Never", "Do not", "Don't", "Must not", "Should not"])
+    @pytest.mark.parametrize("modifier", ["", " ever"])
+    @pytest.mark.parametrize("payment", ["pay", "send"])
+    @pytest.mark.parametrize("context_first", [False, True])
+    def test_only_directly_negated_payments_are_filtered(
+        self, negator, modifier, payment, context_first
+    ):
+        demand = f"{negator}{modifier} {payment} 0.5 Bitcoins"
+        content = (
+            f"To recover your files, {demand}."
+            if context_first
+            else f"{demand} to decrypt your files."
+        )
+
+        assert not _has_rule(_run_builtin(content), "ransomware_behavior")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "If you don't pay 0.5 bitcoin within 48 hours, your files will be deleted.",
+            "If you don’t pay 0.5 bitcoin within 48 hours, your files will be deleted.",
+            "If you do not pay 1 Bitcoin within 72 hours, all your files will be lost forever.",
+            "If you do not send 1 BTC to the address below, we will publish your stolen data.",
+            "Never pay less than 1 bitcoin or your files will be deleted.",
+            "Never send less than 0.5 BTC to decrypt your files.",
+            "Do not pay less than 1 BTC or your files will be destroyed.",
+            "Don't send anything less than 0.5 BTC to decrypt your files.",
+            (
+                "We have downloaded your confidential data.\n"
+                "If you do not send 5 BTC to the address below within 72 hours, "
+                "we will publish your stolen data."
+            ),
+            (
+                "All your important files are encrypted!\n"
+                "If you don't pay 0.5 bitcoin within 48 hours, your files will be deleted."
+            ),
+        ],
+    )
+    def test_conditional_and_minimum_amount_demands_remain_critical(self, content):
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.md")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].rule_id == "YR1"
+        assert ransomware[0].severity == "CRITICAL"
+        assert ransomware[0].start_line == content.count("\n") + 1
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Never send BTC to strangers.",
+            "Never send BTC to anyone who promises to decrypt your files.",
+            "Never pay the ransom in Bitcoin; report it to your security team.",
+            "Do not pay the ransom in Bitcoin.",
+            "If you are attacked, do not pay the ransom in Bitcoin.",
+            "You should never pay the ransom in Bitcoin.",
+            "You must not send BTC to anyone who offers to decrypt your files.",
+            "- Never pay the ransom in Bitcoin.",
+            "> **Never** pay the ransom in Bitcoin.",
+            "1. Do not send BTC to anyone who offers to decrypt your files.",
+            "Don’t send BTC to anyone promising to decrypt your files.",
+        ],
+    )
+    def test_clause_opening_payment_advice_is_not_ransomware(self, content):
+        assert not _has_rule(_run_builtin(content, "advice.md"), "ransomware_behavior")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "To decrypt your files you must send\n0.5 BTC to the address below.",
+            "To decrypt your files you must send\r\n0.5 BTC to the address below.",
+            "Send 1 BTC to the wallet below\nto decrypt\nyour files.",
+            (
+                "Your network has been breached and your documents are locked. To decrypt\n"
+                "your files you must send 0.5 BTC to the address below."
+            ),
+            (
+                "Your network has been breached and your documents are locked. To decrypt your\n"
+                "files you must pay 0.5 bitcoin to the address below."
+            ),
+            "Pay the\nransom in Bitcoin.",
+            "Pay the ransom\nin Bitcoin.",
+            "Send 0.5BTC to example.invalid to decrypt your files.",
+            "To restore your files, pay 1bitcoin.",
+        ],
+    )
+    def test_hard_wrapped_and_glued_amount_demands_remain_critical(self, content):
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.txt")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].rule_id == "YR1"
+        assert ransomware[0].severity == "CRITICAL"
+        assert ransomware[0].start_line == 1
+
+    @pytest.mark.parametrize("filler, expected", [(79, True), (80, False)])
+    def test_wrapped_payment_currency_window_remains_bounded(self, filler, expected):
+        content = "To decrypt your files you must send\n" + "x" * filler + " BTC."
+
+        assert _has_rule(_run_builtin(content, "notice.txt"), "ransomware_behavior") is expected
+
+    def test_payment_currency_allows_only_one_line_break(self):
+        content = "To decrypt your files you must send\n\n0.5 BTC to the address below."
+
+        assert not _has_rule(_run_builtin(content, "notice.txt"), "ransomware_behavior")
+
+    def test_negated_advice_does_not_own_a_later_wrapped_demand(self):
+        content = "Never send BTC to strangers.\nSend 1 BTC to decrypt your files.\n"
+
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.md")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].start_line == 2
+        assert ransomware[0].matched_text.startswith("Send 1 BTC")
+
+    @pytest.mark.parametrize("separator", ["\n", "\r\n"])
+    def test_storage_notice_does_not_hide_later_encryption_notice(self, separator):
+        content = (
+            "Your files are encrypted at rest with AES-256."
+            + separator
+            + "Your files have been encrypted by a ransomware operator."
+        )
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.md")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].start_line == 2
+        assert ransomware[0].matched_text == "Your files have been encrypted"
+        assert ransomware[0].match_fingerprint
+
+    def test_storage_notice_does_not_hide_independent_payment_demand(self):
+        content = (
+            "Your files are encrypted at rest with AES-256." + " " * 161 + "\n"
+            "Don't forget to send 0.5 BTC to decrypt your files."
+        )
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.md")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].start_line == 2
+        assert ransomware[0].matched_text.startswith("send 0.5 BTC")
+
+    def test_clipped_prefix_cannot_manufacture_a_negator_word(self):
+        content = "xnever" + " " * 75 + "send BTC to decrypt your files."
+
+        assert _has_rule(_run_builtin(content), "ransomware_behavior")
+
+    def test_storage_filter_does_not_change_custom_rule_evidence(self, tmp_path):
+        _write_rule(
+            tmp_path,
+            "ransomware_behavior",
+            category="malware",
+            severity="CRITICAL",
+            strings={"ransom_note": "Your files are encrypted at rest"},
+        )
+
+        findings = _run("Your files are encrypted at rest.", "storage.md", str(tmp_path))
+
+        assert len(findings) == 1
+        assert findings[0].matched_text == "Your files are encrypted at rest"
+        assert "[malware]" not in findings[0].message
+
+    @pytest.mark.parametrize("spacing, expected", [(160, True), (161, False)])
+    @pytest.mark.parametrize("context_first", [False, True])
+    def test_cross_line_extortion_window_remains_bounded(self, spacing, expected, context_first):
+        gap = "\n" + "x" * (spacing - 2) + " "
+        content = (
+            "to decrypt your files" + gap + "send BTC"
+            if context_first
+            else "send BTC" + gap + "to decrypt your files"
+        )
+
+        assert _has_rule(_run_builtin(content), "ransomware_behavior") is expected
+
+    def test_real_demand_after_negated_advice_supplies_evidence_and_location(self):
+        content = (
+            "Never pay the ransom in Bitcoin; report the demand.\nPay the ransom in Bitcoin.\n"
+        )
+
+        findings = _run_builtin(content, "notice.md")
+        ransomware = [finding for finding in findings if "ransomware_behavior" in finding.message]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].start_line == 2
+        assert ransomware[0].matched_text == "Pay the ransom in Bitcoin"
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "os.walk(root) ... .encrypt(data)",
+            "os.walk(root) ... .cipher(data)",
+            "os.rename(path, path + '.locked')",
+            "os.rename(path, path + '.encrypted')",
+            "os.rename(path, path + '.crypt')",
+            "os.rename(path, path + '.enc')",
+            "os.walk(root) ... open(path, 'wb')",
+        ],
+    )
+    def test_behavior_indicators_remain_detected(self, content):
+        # Inert source fragments are scanned as text, never executed.
+        findings = _run_builtin(content, "sample.txt")
+
+        assert _has_rule(findings, "ransomware_behavior")
+
+    def test_multiline_encrypt_and_drop_note_script_is_detected(self):
+        content = """\
+from cryptography.fernet import Fernet
+import os
+
+for root, _dirs, files in os.walk(os.path.expanduser("~")):
+    for filename in files:
+        path = os.path.join(root, filename)
+        with open(path, "rb") as source:
+            encrypted = Fernet(key).encrypt(source.read())
+        with open(path, "wb") as destination:
+            destination.write(encrypted)
+
+with open("README_RESTORE_FILES.txt", "w") as note:
+    note.write("Your documents have been encrypted.\\n")
+    note.write("Send 0.5 BTC to <addr> to decrypt your files.\\n")
+"""
+
+        findings = _run_builtin(content, "encrypt.py")
+
+        assert _has_rule(findings, "ransomware_behavior")
+
+    def test_wallet_text_still_reaches_custom_rules(self, tmp_path):
+        _write_rule(
+            tmp_path,
+            "wallet_policy",
+            category="hack_tool",
+            severity="MEDIUM",
+            strings={"payment": "Send BTC"},
+        )
+
+        findings = _run("Send BTC to your own wallet.", "api.md", str(tmp_path))
+
+        assert _has_rule(findings, "wallet_policy")
+        assert not _has_rule(findings, "ransomware_behavior")
+
+
 # ── Built-in cryptominer rules ───────────────────────────────────────
 
 
@@ -1871,22 +2244,22 @@ class TestRuleCaching:
             tmp_path, "rule_cache", category="malware", severity="HIGH", strings={"a": "CACHETEST"}
         )
         _run("CACHETEST", "f.txt", str(tmp_path))
-        first_rules = static_yara._compiled_rules
+        first_rules = static_yara._rule_cache.rules
         _run("CACHETEST", "f.txt", str(tmp_path))
-        assert static_yara._compiled_rules is first_rules
+        assert static_yara._rule_cache.rules is first_rules
 
     def test_cache_invalidated_on_new_rule(self, tmp_path):
         _write_rule(
             tmp_path, "rule_v1", category="malware", severity="HIGH", strings={"a": "V1MARKER"}
         )
         _run("V1MARKER", "f.txt", str(tmp_path))
-        first_hash = static_yara._rules_hash
+        first_hash = static_yara._rule_cache.rules_hash
 
         _write_rule(
             tmp_path, "rule_v2", category="malware", severity="HIGH", strings={"a": "V2MARKER"}
         )
         _run("V2MARKER", "f.txt", str(tmp_path))
-        assert static_yara._rules_hash != first_hash
+        assert static_yara._rule_cache.rules_hash != first_hash
 
 
 # ── Internal helpers ──────────────────────────────────────────────────
@@ -2035,6 +2408,48 @@ class TestHelpers:
         assert "valid" in ns_map
         assert "invalid" not in ns_map
         assert skipped == 1
+
+    def test_malformed_rule_is_reported_not_silently_dropped(self, tmp_path, monkeypatch):
+        """A custom rule that can't compile must not report a clean, SAFE scan (#554).
+
+        Reproduces the issue's own scenario: a valid rule plus a rule with a
+        YARA syntax error in the same --yara-rules-dir. The good rule must
+        still fire, but the analyzer status must not be "completed" -- that
+        claim would be false, since the broken rule never ran against
+        anything.
+        """
+        static_yara._rule_cache = None
+        static_yara._rules_skipped_count = 0
+        monkeypatch.setattr(static_yara, "_BUILTIN_RULES_DIR", tmp_path / "empty_builtin")
+        (tmp_path / "empty_builtin").mkdir()
+
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "good.yar").write_text(
+            'rule good_rule { meta: category = "malware" '
+            'strings: $a = "ACME_CANARY" condition: $a }'
+        )
+        # Missing closing brace: a real YARA syntax error, not a decode failure.
+        (rules_dir / "bad.yar").write_text('rule bad_rule { strings: $a = "x" condition: $a')
+
+        result = static_yara.node(
+            {
+                "components": ["skill.md"],
+                "file_cache": {"skill.md": "contains ACME_CANARY"},
+                "yara_rules_dir": str(rules_dir),
+            }
+        )
+
+        assert any("good_rule" in f.message for f in result["findings"]), (
+            "the valid rule must still fire"
+        )
+        status = result["analyzer_status_events"][0]
+        assert status["status"] != "completed", "a dropped custom rule must not report a clean scan"
+        assert any(
+            event.get("reason_code") == LedgerReason.READ_ERROR
+            and event.get("observed_artifacts") == 1
+            for event in result["inspection_ledger"]
+        )
 
     @pytest.mark.parametrize("payload", ["not base64", "not base64 é"])
     def test_malformed_extra_encoded_rule_does_not_block_builtin_rules(self, tmp_path, payload):
@@ -2405,3 +2820,664 @@ class TestInspectionLedgerResponse:
         match.assert_not_called()
         assert matched.reason == "runtime_limit"
         assert matched.metrics == {"observed_seconds": 0.0, "limit_seconds": 0.5}
+
+
+class TestRuleSkipAccounting:
+    """Regressions for the three review findings on the #554 skip-count surface.
+
+    All three share one root shape: the dropped-rule total was reported through
+    channels not tied to the scan that produced it -- a module global read after
+    the fact, a ledger work ID shared with component work, and a DEBUG log the
+    operator never sees at default verbosity.
+    """
+
+    @staticmethod
+    def _isolated_builtin(tmp_path: Path, monkeypatch) -> None:
+        """Point the built-in rule dir at an empty dir so counts are only ours."""
+        builtin = tmp_path / "empty_builtin"
+        builtin.mkdir(exist_ok=True)
+        monkeypatch.setattr(static_yara, "_BUILTIN_RULES_DIR", builtin)
+
+    @staticmethod
+    def _rule_dir(tmp_path: Path, name: str, *, broken: int, good: bool = True) -> Path:
+        """Build a rule dir with ``broken`` uncompilable rules, optionally one valid one.
+
+        ``good=False`` with ``broken=0`` yields an existing but empty directory,
+        which is how the "no rule files at all" load path is reached.
+        """
+        rules_dir = tmp_path / name
+        rules_dir.mkdir(parents=True, exist_ok=True)
+        marker = f"MARKER_{name.upper()}"
+        if good:
+            (rules_dir / "good.yar").write_text(
+                f'rule good_{name} {{ strings: $a = "{marker}" condition: $a }}'
+            )
+        for index in range(broken):
+            # Missing closing brace: a real YARA syntax error, not a decode failure.
+            (rules_dir / f"bad{index}.yar").write_text(
+                f'rule bad_{name}_{index} {{ strings: $a = "x" condition: $a'
+            )
+        return rules_dir
+
+    def test_skip_count_travels_with_the_rules_it_describes(self, tmp_path, monkeypatch):
+        """Two loads in sequence must each report their own skip total.
+
+        Deterministic form of the concurrency finding: reading the count as a
+        separate step after the load is what lets a later load answer for an
+        earlier one. ``load_rules_with_skips`` returns both halves together, so
+        the pairing cannot be broken by anything that happens afterwards.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        dir_a = self._rule_dir(tmp_path, "a", broken=1)
+        dir_b = self._rule_dir(tmp_path, "b", broken=0)
+
+        rules_a, skipped_a = static_yara.load_rules_with_skips(dir_a)
+        rules_b, skipped_b = static_yara.load_rules_with_skips(dir_b)
+
+        assert rules_a is not None
+        assert rules_b is not None
+        assert skipped_a == 1, "rule set A dropped one rule and must say so"
+        assert skipped_b == 0, "rule set B dropped nothing and must not inherit A's count"
+
+        # The separate-read path is what made this unsafe: after B's load the
+        # module global describes B, so anyone still holding A's rules and
+        # reading the global now would report a clean scan for A.
+        assert static_yara.rules_skipped_count() == 0
+
+    @pytest.mark.parametrize(
+        ("label", "b_broken", "a_broken"),
+        [
+            # B finds no rule files at all. This path forced the count to zero,
+            # so A's cache hit reported zero dropped rules: a false-complete scan.
+            ("no_rule_files", 0, 1),
+            # B compiles nothing because every one of its rules is rejected.
+            # Counts are deliberately asymmetric (A drops 2, B drops 1) so an
+            # inherited count is visible rather than coincidentally equal.
+            ("all_rejected", 1, 2),
+        ],
+    )
+    def test_cached_rules_never_report_a_later_loads_skip_count(
+        self, tmp_path, monkeypatch, label, b_broken, a_broken
+    ):
+        """load A -> load a non-populating B -> load A again must still report A's count.
+
+        ``_load_rules`` used to set the skip count and return on both
+        non-populating paths without replacing *or* clearing the cached rules
+        and hash. The entry left behind still matched A's hash, so the third
+        load hit the cache and paired A's rules with B's count -- zero for the
+        empty/no-files case -- and a rule set that had dropped a detector went
+        back to reporting a complete scan.
+
+        Deterministic and single-threaded: this is a cache-integrity defect, not
+        a race, so it reproduces purely from the order of the three loads.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        dir_a = self._rule_dir(tmp_path, f"a_{label}", broken=a_broken)
+        dir_b = self._rule_dir(tmp_path, f"b_{label}", broken=b_broken, good=False)
+
+        rules_a, skipped_a = static_yara.load_rules_with_skips(dir_a)
+        assert rules_a is not None
+        assert skipped_a == a_broken
+
+        rules_b, skipped_b = static_yara.load_rules_with_skips(dir_b)
+        assert rules_b is None, "B must not produce usable rules in this scenario"
+
+        rules_a_again, skipped_a_again = static_yara.load_rules_with_skips(dir_a)
+
+        assert rules_a_again is not None, "A's rules must still be available"
+        assert skipped_a_again == a_broken, (
+            f"rule set A dropped {a_broken} rule(s) but the reload reported "
+            f"{skipped_a_again}, which is B's count ({skipped_b})"
+        )
+
+    @pytest.mark.parametrize(
+        ("label", "broken", "good"),
+        [
+            ("no_rule_files", 0, False),
+            ("all_rejected", 1, False),
+        ],
+    )
+    def test_non_populating_load_leaves_no_cache_entry(
+        self, tmp_path, monkeypatch, label, broken, good
+    ):
+        """A load that yields no usable rules must not leave a populated cache entry.
+
+        Covers the invalidation half directly, so a future change that starts
+        writing one part of the entry on these paths fails here rather than
+        only showing up as a wrong skip count three loads later.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        dir_a = self._rule_dir(tmp_path, f"seed_{label}", broken=1)
+        assert static_yara._load_rules(dir_a) is not None
+        assert static_yara._rule_cache is not None, "the seed load must populate the cache"
+
+        dir_b = self._rule_dir(tmp_path, f"empty_{label}", broken=broken, good=good)
+
+        assert static_yara._load_rules(dir_b) is None
+        assert static_yara._rule_cache is None, (
+            "the previous rules and hash are still cached after a load that "
+            "produced nothing, so a later request for that hash can be served "
+            "rules paired with this load's count"
+        )
+
+    def test_cache_entry_cannot_be_mutated_in_place(self, tmp_path, monkeypatch):
+        """The three halves are one immutable value, not three fields to edit.
+
+        Reassigning ``_rule_cache`` wholesale is the only supported way to
+        publish a change, which is what makes a cache hit unable to mix one
+        load's rules with another's count.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        static_yara._load_rules(self._rule_dir(tmp_path, "frozen", broken=1))
+        entry = static_yara._rule_cache
+        assert entry is not None
+        assert entry.skipped_count == 1
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            entry.skipped_count = 0
+
+    def test_rescan_after_a_non_populating_load_still_reports_the_dropped_rule(
+        self, tmp_path, monkeypatch
+    ):
+        """End to end: the A -> B -> A sequence must not resurrect a clean scan.
+
+        The load-level assertions above pin the count; this pins the user-visible
+        consequence the issue is actually about. Before the fix the second scan
+        of A reported ``completed`` with no rule-skip event at all, even though
+        one of A's own rules had never run.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        rules_dir = self._rule_dir(tmp_path, "scan", broken=1)
+        empty_dir = self._rule_dir(tmp_path, "empty_scan", broken=0, good=False)
+        state = {
+            "components": ["skill.md"],
+            "file_cache": {"skill.md": "contains MARKER_SCAN"},
+            "yara_rules_dir": str(rules_dir),
+        }
+
+        first = static_yara.node(state)
+        assert first["analyzer_status_events"][0]["status"] != "completed"
+
+        static_yara.node(
+            {
+                "components": ["skill.md"],
+                "file_cache": {"skill.md": "nothing to match"},
+                "yara_rules_dir": str(empty_dir),
+            }
+        )
+
+        second = static_yara.node(state)
+
+        assert any("good_scan" in finding.message for finding in second["findings"]), (
+            "the valid rule must still fire on the rescan"
+        )
+        assert second["analyzer_status_events"][0]["status"] != "completed", (
+            "a rescan served from cache must not claim a complete scan while one "
+            "of its own rules is still dropped"
+        )
+        assert any(
+            event.get("reason_code") is LedgerReason.READ_ERROR
+            and event.get("observed_artifacts") == 1
+            for event in second["inspection_ledger"]
+        ), "the dropped rule must still be surfaced in the ledger on the rescan"
+
+    def test_load_and_read_is_serialized_against_other_scans(self, tmp_path, monkeypatch):
+        """The load-and-read pair must be atomic, not merely adjacent.
+
+        Proves the lock is genuinely held across the whole transaction rather
+        than racing threads and hoping, so the test cannot pass by luck of
+        timing: mid-transaction, another thread must not be able to acquire the
+        rules lock at all.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        dir_a = self._rule_dir(tmp_path, "a", broken=2)
+
+        lock_was_held: list[bool] = []
+        real_load = static_yara._load_rules
+
+        def probing_load(extra_dir=None):
+            rules = real_load(extra_dir)
+            acquired_elsewhere: list[bool] = []
+
+            def try_acquire() -> None:
+                got = static_yara._RULES_LOCK.acquire(blocking=False)
+                acquired_elsewhere.append(got)
+                if got:
+                    static_yara._RULES_LOCK.release()
+
+            probe = threading.Thread(target=try_acquire)
+            probe.start()
+            probe.join()
+            lock_was_held.append(not acquired_elsewhere[0])
+            return rules
+
+        monkeypatch.setattr(static_yara, "_load_rules", probing_load)
+        _, skipped = static_yara.load_rules_with_skips(dir_a)
+
+        assert skipped == 2
+        assert lock_was_held == [True], (
+            "another scan could enter the load-and-read transaction, so the rules "
+            "and their skip count are not obtained atomically"
+        )
+
+    def test_concurrent_scans_never_report_another_rule_sets_count(self, tmp_path, monkeypatch):
+        """Under real contention every scan must still see its own total."""
+        self._isolated_builtin(tmp_path, monkeypatch)
+        dir_a = self._rule_dir(tmp_path, "a", broken=1)
+        dir_b = self._rule_dir(tmp_path, "b", broken=0)
+
+        mismatches: list[tuple[str, int, int]] = []
+        failures: list[BaseException] = []
+        observations = 0
+
+        def scan(label: str, rules_dir: Path, expected: int) -> None:
+            nonlocal observations
+            try:
+                for _ in range(25):
+                    _, skipped = static_yara.load_rules_with_skips(rules_dir)
+                    observations += 1
+                    if skipped != expected:
+                        mismatches.append((label, expected, skipped))
+            except BaseException as exc:  # noqa: BLE001 - re-raised in the main thread
+                failures.append(exc)
+
+        threads = [
+            threading.Thread(target=scan, args=("A", dir_a, 1)),
+            threading.Thread(target=scan, args=("B", dir_b, 0)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        # An exception inside a worker thread does not fail the test on its own,
+        # so it is surfaced explicitly -- otherwise this test passes vacuously
+        # when the scans never actually ran.
+        assert failures == [], f"a scan thread raised: {failures!r}"
+        assert observations == 50, f"expected 50 observations, made {observations}"
+        assert mismatches == [], f"scans observed another rule set's skip count: {mismatches}"
+
+    def test_rule_load_event_does_not_collide_with_a_component_of_the_same_name(
+        self, tmp_path, monkeypatch
+    ):
+        """A skill file named ``yara_rules`` must not collide with the rule-load event.
+
+        The ledger derives a work ID from ``analyzer_id`` plus the normalized
+        path. The synthetic rule-set scope normalizes to ``yara_rules``, so
+        attributing the event to ``static_yara`` gave it the same work ID as a
+        scanned component of that name: both planned targets then resolved to two
+        matching events and reconciliation raised a fatal ``unaccounted_work``
+        instead of recording a nonfatal partial scan. Renaming the synthetic path
+        alone would only move the collision to the next unlucky filename.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        rules_dir = self._rule_dir(tmp_path, "r", broken=1)
+
+        result = static_yara.node(
+            {
+                "components": ["yara_rules"],
+                "file_cache": {"yara_rules": "contains MARKER_R"},
+                "yara_rules_dir": str(rules_dir),
+            }
+        )
+
+        events = result["inspection_ledger"]
+        work_ids = [event["work_id"] for event in events]
+        assert len(work_ids) == len(set(work_ids)), (
+            "the rule-load event shares a work ID with the scanned component"
+        )
+
+        # The planned work the status advertises must be equally distinct, since
+        # reconciliation requires exactly one event per planned target.
+        planned = result["analyzer_status_events"][0]["planned_work"]
+        planned_ids = [target["work_id"] for target in planned]
+        assert len(planned_ids) == len(set(planned_ids))
+
+        # The dropped rule is still surfaced, and the scan is partial not clean.
+        assert result["analyzer_status_events"][0]["status"] != "completed"
+        assert any(
+            event.get("reason_code") == LedgerReason.READ_ERROR
+            and event.get("observed_artifacts") == 1
+            for event in events
+        )
+
+    @pytest.mark.parametrize("referenced_name", ["yara_rules", "normal.txt"])
+    def test_referenced_file_named_like_the_rule_set_is_not_charged_with_its_dropped_rule(
+        self, tmp_path, referenced_name
+    ):
+        """A real file sharing the rule-set label must be scored like any other file.
+
+        The rule-load event is labelled ``yara_rules``. Finalization groups
+        reference outcomes and per-component coverage by path, so a benign,
+        fully read file of that name, linked from ``SKILL.md``, was charged with
+        the rule set's partial outcome: a false HIGH AE1, risk score 25 and 50%
+        coverage, all of which vanished when only the filename changed. The scan
+        must stay partial (a rule really was dropped), but nothing file-specific
+        may be inferred from the label. Driven through the real CLI so the
+        finalizer and report generation are both exercised.
+        """
+        skill = tmp_path / "skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: A harmless demo skill.\n---\n\n"
+            f"# Demo\n\nSee [the notes]({referenced_name}) for details.\n",
+            encoding="utf-8",
+        )
+        (skill / referenced_name).write_text("Plain harmless notes.\n", encoding="utf-8")
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "valid.yar").write_text("rule never_fires { condition: false }\n")
+        (rules_dir / "broken.yar").write_text('rule broken { strings: $a = "x" condition: $a\n')
+
+        def scan(output_format: str, *extra: str) -> tuple[int, dict]:
+            out = tmp_path / f"report-{output_format}-{len(extra)}.json"
+            result = CliRunner().invoke(
+                app,
+                [
+                    "scan",
+                    str(skill),
+                    "--no-llm",
+                    "--yara-rules-dir",
+                    str(rules_dir),
+                    "--format",
+                    output_format,
+                    "--output",
+                    str(out),
+                    *extra,
+                ],
+            )
+            return result.exit_code, json.loads(out.read_text(encoding="utf-8"))
+
+        exit_code, report = scan("json")
+        assert exit_code == 0
+        assert [issue["id"] for issue in report["issues"]] == [], (
+            "a rule-set failure must not invent a finding against a file of the same name"
+        )
+        assert report["risk_assessment"]["score"] == 0
+        completeness = report["analysis_completeness"]
+        assert completeness["coverage_percent"] == 100.0
+        assert completeness["partially_inspected_files"] == 0
+        assert completeness["entirely_uninspected_files"] == 0
+
+        # The dropped rule itself is still reported, as a nonfatal partial scan
+        # explicitly scoped to the rule set rather than to an artifact.
+        assert completeness["is_complete"] is False
+        assert completeness["execution_successful"] is True
+        rule_set_rows = [
+            row for row in completeness["ledger_exceptions"] if row.get("scope") == "rule_set"
+        ]
+        assert len(rule_set_rows) == 1
+        assert rule_set_rows[0]["reason_code"] == LedgerReason.READ_ERROR
+        assert rule_set_rows[0]["fatal"] is False
+        assert all(
+            row.get("scope") == "rule_set"
+            for row in completeness["ledger_exceptions"]
+            if row["reason_code"] == LedgerReason.READ_ERROR
+        )
+
+        strict_exit, _ = scan("json", "--fail-on-incomplete")
+        assert strict_exit == 1
+
+        # SARIF must not point the rule-set notification at an artifact either.
+        _, sarif = scan("sarif")
+        notifications = sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+        rule_set_notifications = [
+            item for item in notifications if item.get("properties", {}).get("scope") == "rule_set"
+        ]
+        assert len(rule_set_notifications) == 1
+        assert not rule_set_notifications[0].get("locations")
+
+    @pytest.mark.parametrize(
+        ("filename", "content", "expected_fragment"),
+        [
+            ("acme.yar", b'rule broken { strings: $a = "x" condition: $a', "could not compile"),
+            (
+                "bom.yar",
+                b'\xef\xbb\xbfrule bomrule { strings: $a = "y" condition: $a }',
+                "could not compile",
+            ),
+            (
+                "bad_utf8.yar",
+                b'rule u { strings: $a = "\xff\xfe" condition: $a }',
+                "could not decode",
+            ),
+        ],
+    )
+    def test_rejected_rule_is_named_at_default_log_level(
+        self, tmp_path, monkeypatch, caplog, filename, content, expected_fragment
+    ):
+        """Each rejected rule must be reported at WARNING, naming the file (#554).
+
+        A dropped rule removes a detector. At DEBUG the operator gets no signal
+        at default verbosity, and the ledger event is scoped to the rule set
+        rather than to one file, so without this the specific file that needs
+        repairing cannot be identified.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        rules_dir = tmp_path / "rejected"
+        rules_dir.mkdir()
+        (rules_dir / filename).write_bytes(content)
+
+        with caplog.at_level(logging.WARNING, logger=static_yara.logger.name):
+            static_yara._load_rules(rules_dir)
+
+        rejections = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING and "rejected rule file" in record.getMessage()
+        ]
+        assert len(rejections) == 1, f"expected one rejection warning, got {rejections}"
+        assert filename in rejections[0], f"the warning must name {filename}: {rejections[0]}"
+        assert expected_fragment in rejections[0]
+
+    def test_rejection_reason_is_length_bounded(self):
+        """Rule sources can be untrusted, so the echoed reason must be capped."""
+        reason = static_yara._bounded_rejection_reason(ValueError("x" * 5_000))
+
+        assert len(reason) <= static_yara.MAX_RULE_REJECTION_REASON_CHARS + 3
+        assert reason.endswith("...")
+
+    def test_rejection_reason_collapses_newlines(self):
+        """A multi-line YARA error must stay one log line."""
+        reason = static_yara._bounded_rejection_reason(ValueError("line one\nline two\r\nthree"))
+
+        assert "\n" not in reason
+        assert reason == "line one line two three"
+
+    def test_rule_lock_wait_honours_the_callers_deadline(self, tmp_path, monkeypatch):
+        """A scan queued behind another scan's slow rule load must still stop on time.
+
+        Scan A is held inside the real rule-read path, so it owns the rules lock.
+        Scan B has its own short workflow budget; an unconditional lock wait kept
+        it blocked until A finished, long after B's deadline. B must instead
+        return the existing ``runtime_limit`` result within its own budget, and
+        A must still get its own rules and skip count once it resumes.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        rules_dir = self._rule_dir(tmp_path, "a", broken=1)
+
+        a_reading = threading.Event()
+        release_a = threading.Event()
+        real_read = static_yara._read_rule_bytes_cache
+
+        def paused_read(rule_files):
+            if threading.current_thread().name == "scan-a":
+                a_reading.set()
+                # Bounded so a regression fails the timing assertion below
+                # instead of hanging the suite.
+                release_a.wait(timeout=5.0)
+            return real_read(rule_files)
+
+        monkeypatch.setattr(static_yara, "_read_rule_bytes_cache", paused_read)
+
+        a_result: list[tuple[object, int]] = []
+        a_failures: list[BaseException] = []
+
+        def scan_a() -> None:
+            try:
+                a_result.append(static_yara.load_rules_with_skips(rules_dir))
+            except BaseException as exc:  # noqa: BLE001 - re-raised in the main thread
+                a_failures.append(exc)
+
+        budget_seconds = 1.2
+
+        class Budget:
+            def __init__(self) -> None:
+                self.deadline = time.monotonic() + budget_seconds
+
+            def remaining_seconds(self) -> float:
+                return self.deadline - time.monotonic()
+
+        thread_a = threading.Thread(target=scan_a, name="scan-a")
+        thread_a.start()
+        try:
+            assert a_reading.wait(timeout=5.0), "scan A never reached the rule-read path"
+            started = time.monotonic()
+            b = static_yara.node(
+                {
+                    "components": ["a.py", "b.py"],
+                    "file_cache": {"a.py": "a", "b.py": "b"},
+                    "yara_rules_dir": str(rules_dir),
+                    "transitive_traversal_state": Budget(),
+                }
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            release_a.set()
+            thread_a.join(timeout=10.0)
+
+        assert elapsed < budget_seconds + 0.5, (
+            f"scan B waited {elapsed:.3f}s for another scan's rule load, "
+            f"past its own {budget_seconds}s budget"
+        )
+        assert [event["path"] for event in b["inspection_ledger"]] == ["a.py", "b.py"]
+        assert all(
+            event["reason_code"] == LedgerReason.RUNTIME_LIMIT for event in b["inspection_ledger"]
+        )
+        assert b["analyzer_status_events"][0]["status"] == "degraded"
+
+        # A's transaction is untouched by B giving up: same rules, own count.
+        assert a_failures == [], f"scan A raised: {a_failures!r}"
+        assert len(a_result) == 1
+        rules, skipped = a_result[0]
+        assert rules is not None
+        assert skipped == 1
+
+    def test_rule_lock_reentry_does_not_wait_on_an_expired_deadline(self):
+        """The nested acquire inside ``load_rules_with_skips`` must not time out.
+
+        The thread already owns the reentrant lock, so re-acquiring it is
+        immediate even with no time left, and releasing it leaves the outer
+        hold intact.
+        """
+        expired = static_yara._new_rule_load_budget(
+            1.0,
+            workflow_limit_seconds=0.0,
+            workflow_started_at=time.monotonic() - 1.0,
+        )
+        token = static_yara._RULE_LOAD_DEADLINE.set(expired)
+        try:
+            with static_yara._RULES_LOCK:
+                with static_yara._RulesLockWithinDeadline():
+                    pass
+                held_elsewhere: list[bool] = []
+
+                def probe() -> None:
+                    got = static_yara._RULES_LOCK.acquire(blocking=False)
+                    held_elsewhere.append(not got)
+                    if got:
+                        static_yara._RULES_LOCK.release()
+
+                prober = threading.Thread(target=probe)
+                prober.start()
+                prober.join()
+                assert held_elsewhere == [True], "the inner release dropped the outer hold"
+        finally:
+            static_yara._RULE_LOAD_DEADLINE.reset(token)
+
+    def test_rule_set_work_survives_transitive_status_scoping(self, tmp_path, monkeypatch):
+        """Every scope's rule-set work must be counted, not just the root's.
+
+        ``_source_aware_ledger`` re-scopes the rule-set row with its own
+        ``rule_set:static`` identity, but the status path rebuilt the matching
+        planned target with ``static_yara``, so in each child the target no
+        longer matched any retained row and was dropped. The exceptions survived
+        while the per-analyzer counts silently lost each child's rejected rule:
+        4 planned / 1 partial instead of 6 / 3 for a root plus two children.
+        Driven through the real CLI and the real graph for all three scopes.
+        """
+        children = {
+            "https://github.com/org/child-one": tmp_path / "child-one",
+            "https://github.com/org/child-two": tmp_path / "child-two",
+        }
+        root = tmp_path / "root"
+        for directory in (root, *children.values()):
+            directory.mkdir()
+        (root / "SKILL.md").write_text(
+            "---\nname: root\ndescription: A harmless root skill.\n---\n\n"
+            "# Root\n\nUses https://github.com/org/child-one.git and "
+            "https://github.com/org/child-two.git.\n",
+            encoding="utf-8",
+        )
+        for url, directory in children.items():
+            name = url.rsplit("/", 1)[-1]
+            (directory / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: A harmless child skill.\n---\n\n# Child\n",
+                encoding="utf-8",
+            )
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "valid.yar").write_text("rule never_fires { condition: false }\n")
+        (rules_dir / "broken.yar").write_text('rule broken { strings: $a = "x" condition: $a\n')
+
+        real_run_graph_scan = cli._run_graph_scan
+        scanned: list[str] = []
+
+        def run_graph_scan(input_path: str, *args, **kwargs):
+            scanned.append(input_path)
+            for url, directory in children.items():
+                if input_path.rstrip("/").removesuffix(".git") == url:
+                    input_path = str(directory)
+                    break
+            return real_run_graph_scan(input_path, *args, **kwargs)
+
+        monkeypatch.setattr(cli, "_run_graph_scan", run_graph_scan)
+        out = tmp_path / "report.json"
+        result = CliRunner().invoke(
+            app,
+            [
+                "scan",
+                str(root),
+                "--no-llm",
+                "--yara-rules-dir",
+                str(rules_dir),
+                "--transitive",
+                "--transitive-depth",
+                "1",
+                "--format",
+                "json",
+                "--output",
+                str(out),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert len(scanned) == 3, f"expected root plus two children, scanned {scanned}"
+        completeness = json.loads(out.read_text(encoding="utf-8"))["analysis_completeness"]
+
+        rule_set_rows = [
+            row for row in completeness["ledger_exceptions"] if row.get("scope") == "rule_set"
+        ]
+        assert len(rule_set_rows) == 3, "one rule-set exception per scope"
+
+        yara_statuses = [
+            row for row in completeness["analyzer_statuses"] if row["analyzer_id"] == "static_yara"
+        ]
+        assert yara_statuses
+        planned = sum(row["planned_work"] for row in yara_statuses)
+        partial = sum(row["partial"] for row in yara_statuses)
+        assert (planned, partial) == (6, 3), (
+            "each scope plans its SKILL.md plus its rule set, and each rule set "
+            f"is partial; got {planned} planned / {partial} partial"
+        )
+        assert all(row["unaccounted"] == 0 for row in yara_statuses)
+        assert all(row["status"] == "degraded" for row in yara_statuses)
