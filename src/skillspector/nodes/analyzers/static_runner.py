@@ -453,7 +453,9 @@ def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> rege
                     or following[literal_word.end()] not in "?*{"
                 )
                 previous_word = bool(
-                    parts and len(parts[-1]) == 1 and re.fullmatch(r"\w", parts[-1], flags & re.ASCII)
+                    parts
+                    and len(parts[-1]) == 1
+                    and re.fullmatch(r"\w", parts[-1], flags & re.ASCII)
                 )
                 if required_word:
                     parts.append(rf"(?<!{word})")
