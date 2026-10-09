@@ -64,6 +64,7 @@ class ArtifactRecord(TypedDict):
     contains_nul: bool
     misleading_extension: bool
     referenced: bool
+    readable_binary: NotRequired[bool]
     reason: NotRequired[str]
     inherited_exclusion_reason: NotRequired[str]
 
@@ -367,6 +368,11 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
         decoded = data.decode("utf-8", errors="replace")
         decodable = False
 
+    # These printable prefixes are also valid instruction text. Keep the
+    # claimed binary format's coverage limits, but inspect the readable bytes.
+    # Lossy decoding must not let one invalid byte or a binary comment hide text.
+    readable_binary = data.startswith((b"MZ", b"GIF87a", b"GIF89a", b"%PDF-"))
+
     if has_binary_magic:
         kind = ContentKind.BINARY
     elif decodable:
@@ -388,6 +394,8 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
     disposition = (
         ArtifactDisposition.PARTIAL
         if referenced and kind is not ContentKind.TEXT
+        else ArtifactDisposition.ANALYZED
+        if readable_binary
         else ArtifactDisposition.OUT_OF_SCOPE
         if kind is ContentKind.BINARY
         else ArtifactDisposition.ANALYZED
@@ -401,7 +409,37 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
         "contains_nul": contains_nul,
         "misleading_extension": misleading,
         "referenced": referenced,
+        "readable_binary": readable_binary,
     }
+
+
+def pdf_xmp_format_spans(content: str) -> tuple[int, int, int]:
+    """Recognize one standard XMP packet's BOM and trailing ASCII padding only."""
+    header = '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+    if not content.startswith("%PDF-"):
+        return -1, -1, -1
+    start = content.find(header)
+    if start < 0:
+        # Unicode normalization removes the format-only BOM in derived views.
+        header = header.replace("\ufeff", "")
+        start = content.find(header)
+    if start < 0 or content.find(header, start + len(header)) >= 0:
+        return -1, -1, -1
+    metadata = content.find("<x:xmpmeta", start + len(header))
+    close = content.find("</x:xmpmeta>", metadata) if metadata >= 0 else -1
+    if close < 0:
+        return -1, -1, -1
+    padding_start = close + len("</x:xmpmeta>")
+    padding_end = padding_start
+    while padding_end < len(content) and content[padding_end] in " \t\r\n":
+        padding_end += 1
+    if not content.startswith(('<?xpacket end="w"?>', '<?xpacket end="r"?>'), padding_end):
+        return -1, -1, -1
+    return (
+        (start + header.index("\ufeff") if "\ufeff" in header else -1),
+        padding_start,
+        padding_end,
+    )
 
 
 def promote_artifact_to_decoded_text(artifact: ArtifactRecord) -> None:

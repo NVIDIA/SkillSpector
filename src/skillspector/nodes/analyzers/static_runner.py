@@ -3066,6 +3066,16 @@ def _cleanup_expired_path_findings(
     return [] if has_postprocessor else findings
 
 
+def _binary_text_findings(findings: list[Finding], content: str) -> list[Finding]:
+    """Binary NUL bytes alone do not establish concealed instructions."""
+    del content
+    return [
+        finding
+        for finding in findings
+        if not (finding.rule_id == "P2" and finding.matched_text == "\x00")
+    ]
+
+
 def run_static_patterns(
     state: Mapping[str, object],
     pattern_modules: list,
@@ -3104,7 +3114,18 @@ def run_static_patterns(
         {
             str(item.get("path", ""))
             for item in raw_inventory
-            if isinstance(item, dict) and item.get("content_kind") == ContentKind.BINARY
+            if isinstance(item, dict)
+            and item.get("content_kind") == ContentKind.BINARY
+            and not item.get("readable_binary")
+        }
+        if isinstance(raw_inventory, list)
+        else set()
+    )
+    readable_binary_paths = (
+        {
+            str(item.get("path", ""))
+            for item in raw_inventory
+            if isinstance(item, dict) and item.get("readable_binary")
         }
         if isinstance(raw_inventory, list)
         else set()
@@ -3120,7 +3141,11 @@ def run_static_patterns(
             continue
         if needs_python_source and path in source_classification_limitations:
             continue
-        if path in binary_paths or (not binary_paths and _is_binary_file(path, content)):
+        if path in binary_paths or (
+            not raw_inventory
+            and path not in readable_binary_paths
+            and _is_binary_file(path, content)
+        ):
             continue
         remaining = MAX_FINDINGS_PER_ANALYZER - len(findings)
         if remaining <= 0:
@@ -3183,6 +3208,8 @@ def run_static_patterns(
                     pattern_modules,
                     path_findings,
                 )
+        if path in readable_binary_paths:
+            path_findings = _binary_text_findings(path_findings, content)
         findings.extend(path_findings[:path_limit])
 
     return findings
@@ -3266,7 +3293,11 @@ def run_static_patterns_with_ledger(
                 path=path,
                 reason=LedgerReason.OPAQUE_CONTENT,
             )
-        elif path not in container_paths and artifact.get("content_kind") == ContentKind.BINARY:
+        elif (
+            path not in container_paths
+            and artifact.get("content_kind") == ContentKind.BINARY
+            and not artifact.get("readable_binary")
+        ):
             referenced = bool(artifact.get("referenced"))
             event = ledger_event(
                 outcome=LedgerOutcome.PARTIAL if referenced else LedgerOutcome.OUT_OF_SCOPE,
@@ -3470,6 +3501,8 @@ def run_static_patterns_with_ledger(
                     }
                     path_findings = path_findings[:remaining]
                     resource_limit = LedgerReason.OUTPUT_LIMIT
+                if artifact.get("readable_binary"):
+                    path_findings = _binary_text_findings(path_findings, content)
                 findings.extend(path_findings)
                 oversized_python = (
                     source_classification is not None

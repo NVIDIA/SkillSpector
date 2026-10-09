@@ -22,7 +22,11 @@ import re
 import sys
 from collections.abc import Callable, Iterator
 
-from skillspector.artifacts import _is_emoji_base, prompt_injection_letter_spacing_view
+from skillspector.artifacts import (
+    _is_emoji_base,
+    pdf_xmp_format_spans,
+    prompt_injection_letter_spacing_view,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -362,10 +366,13 @@ def analyze(
                     complete_match=match.group(0),
                 )
             )
+    xmp_bom, xmp_padding_start, xmp_padding_end = pdf_xmp_format_spans(content)
     if file_type in ("markdown", "perl", "other"):
         for pattern_source, confidence in P2_PATTERNS:
             for match in _p2_pattern_matches(content, pattern_source, check_runtime):
                 runtime_check()
+                if match.start() == xmp_bom and match.group(0) == "\ufeff":
+                    continue
                 findings.append(
                     AnalyzerFinding(
                         rule_id="P2",
@@ -492,6 +499,8 @@ def analyze(
         runtime_check()
         for run in detect_whitespace_padding(content, file_type=file_type):
             runtime_check()
+            if xmp_padding_start <= run.start_offset < run.end_offset <= xmp_padding_end:
+                continue
             if run.kind == "vertical":
                 confidence = 0.8 if run.followed_by_content else 0.6
                 severity = (

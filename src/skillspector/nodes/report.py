@@ -529,7 +529,10 @@ def _risk_score_floor(finding: Finding) -> int:
     configured_floor = _RISK_SCORE_FLOORS_BY_RULE_ID.get(finding.rule_id, 0)
     if configured_floor:
         return configured_floor
-    if finding.rule_id == "SC9" and finding.evidence.get("excluded_from_analysis") is True:
+    if finding.rule_id == "SC9" and (
+        finding.evidence.get("excluded_from_analysis") is True
+        or finding.evidence.get("partially_analyzed_executable") is True
+    ):
         return 51
     if (finding.severity or "").upper() != "CRITICAL":
         return 0
@@ -629,7 +632,10 @@ def _compute_risk_score(
         default=0,
     )
     if component_metadata and any(
-        component.get("excluded_from_analysis") is True
+        (
+            component.get("excluded_from_analysis") is True
+            or component.get("partially_analyzed_executable") is True
+        )
         and component.get("allowed_exclusion") is not True
         and (
             component.get("executable") is True
