@@ -314,7 +314,7 @@ python -m contrib.batch_scan.batch_scan ./tests/fixtures/ --no-require-llm --no-
 |------|---------|
 | 0 | All safe (no HIGH/CRITICAL) |
 | 1 | ≥1 skill has HIGH or CRITICAL risk |
-| 2 | Scan errors or incomplete gap-fill occurred; `skills[].error` explains the failure |
+| 2 | Scan errors or incomplete gap-fill occurred; `skills[].error` or `enhancements.gap_fill_error` explains the failure |
 
 CI usage:
 
@@ -439,5 +439,5 @@ reporting before the worker's 90-second hard limit. Invalid responses can take
 up to four attempts while that budget remains. Failed setup and failed batches
 retain core findings and completed gap-fill findings. An incomplete pass records
 `enhancements.gap_fill_status: "incomplete"`, `gap_fill_error_reasons`, and
-`skills[].error`, and exits 2 even when its ledger outcome is nonfatal.
+`enhancements.gap_fill_error`, and exits 2 even when its ledger outcome is nonfatal.
 The worker hard limit still applies if a provider ignores its request timeout.

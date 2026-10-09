@@ -814,7 +814,7 @@ def run_one(
                 entry["execution_successful"] = completeness["execution_successful"]
                 if entry["risk_assessment"]["recommendation"] == "SAFE":
                     entry["risk_assessment"]["recommendation"] = "CAUTION"
-                entry["error"] = str(gap_error)
+                entry["enhancements"]["gap_fill_error"] = str(gap_error)
                 entry["enhancements"]["gap_fill_status"] = "incomplete"
                 entry["enhancements"]["gap_fill_error_reasons"] = sorted({
                     failure.reason.value for failure in gap_error.outcome.failures

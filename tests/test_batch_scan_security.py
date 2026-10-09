@@ -206,7 +206,7 @@ def test_gap_fill_failure_is_incomplete_and_preserves_findings(
     assert entry["analysis_completeness"]["is_complete"] is False
     assert entry["risk_assessment"]["recommendation"] == "CAUTION"
     assert entry["execution_successful"] is (failure_mode != "provider")
-    assert entry["error"] == error
+    assert entry["enhancements"]["gap_fill_error"] == error
     assert entry["enhancements"]["gap_fill_status"] == "incomplete"
     assert any(issue["id"] == "TM1" for issue in entry["issues"])
     assert any(issue["id"] == "P5" for issue in entry["issues"]) is partial_success
@@ -689,7 +689,7 @@ def test_gap_fill_setup_failure_retains_core_findings(batch_skill, monkeypatch, 
     entry, error = runner.run_one(
         skill, skill.parent, use_llm=True, detected_language="zh", apply_gap_fill=True
     )
-    assert error is not None and entry["error"] == error
+    assert error is not None and entry["enhancements"]["gap_fill_error"] == error
     assert any(issue["id"] == "TM1" for issue in entry["issues"])
     assert entry["risk_assessment"]["recommendation"] != "SAFE"
     assert entry["analysis_completeness"]["is_complete"] is False
