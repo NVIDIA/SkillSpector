@@ -45,6 +45,13 @@ prevents sensitive rule text from creating a finding against itself or entering
 regenerated fingerprints. Other baseline files and sibling YAML/JSON files
 remain in normal scan scope unless they are selected with `--baseline` or `-o`.
 
+Use `skillspector baseline ./my-skill/ -o -` to emit JSON on stdout. This is
+available on Windows too; redirect only to a trusted destination. File output
+requires POSIX no-follow directory operations and fails before analysis when
+unsupported. Baselines are replaced atomically with mode 0600, including existing
+files. The parent must be writable, symlinked parents and non-regular files are
+refused, and macOS also requires readable ancestor directories.
+
 ## Baseline file format
 
 YAML or JSON (the `.json` extension selects JSON output when generating). Two

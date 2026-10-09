@@ -46,7 +46,7 @@ from rich.tree import Tree
 from skillspector import __version__, transitive
 from skillspector.cleanup import TempDirTracker, cleanup_result
 from skillspector.constants import RISK_THRESHOLD
-from skillspector.file_output import write_text_no_follow
+from skillspector.file_output import require_secure_file_output, write_text_no_follow
 from skillspector.graph_proxy import graph
 from skillspector.input_handler import validate_local_input_path
 from skillspector.inspection_ledger import (
@@ -666,6 +666,13 @@ def scan(
             "and cannot be combined with --recursive, --transitive, or --mcp-registry"
         )
         raise typer.Exit(code=2)
+
+    if output is not None:
+        try:
+            require_secure_file_output()
+        except ValueError as exc:
+            err_console.print(f"[red]Error:[/red] {exc}")
+            raise typer.Exit(code=2) from exc
 
     if mcp_registry:
         if (
@@ -3401,7 +3408,7 @@ def baseline(
         typer.Option(
             "--output",
             "-o",
-            help="Where to write the baseline file (YAML; .json extension writes JSON).",
+            help="Baseline file (YAML; .json writes JSON), or - for JSON on stdout.",
         ),
     ] = Path(".skillspector-baseline.yaml"),
     no_llm: Annotated[
@@ -3437,12 +3444,16 @@ def baseline(
     """
     result = None
     try:
+        to_stdout = str(output) == "-"
+        if not to_stdout:
+            require_secure_file_output()
         if verbose:
             set_level("DEBUG")
-            console.print("[dim]Scanning to build baseline...[/dim]")
+            err_console.print("[dim]Scanning to build baseline...[/dim]")
         # output_format is irrelevant here; we consume findings, not report_body.
         state = _scan_state(input_path, FormatChoice.json, no_llm)
-        state["baseline_path"] = os.path.abspath(output.expanduser())
+        if not to_stdout:
+            state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
         # Fingerprint every occurrence the next scan checks. The reported
         # findings are deduplicated and keep only one occurrence's evidence.
@@ -3456,10 +3467,13 @@ def baseline(
             file_cache=result.get("local_file_cache") or result.get("file_cache") or {},
             scanner_version=__version__,
         )
-        dump_baseline(data, output)
-        console.print(
-            f"[green]Wrote baseline with {len(findings)} suppressed finding(s) to:[/green] {output}"
-        )
+        if to_stdout:
+            sys.stdout.write(json.dumps(data, indent=2) + "\n")
+        else:
+            dump_baseline(data, output)
+            console.print(
+                f"[green]Wrote baseline with {len(findings)} suppressed finding(s) to:[/green] {output}"
+            )
     except typer.Exit:
         raise
     except (FileNotFoundError, ValueError) as e:

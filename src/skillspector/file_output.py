@@ -17,10 +17,11 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 from secrets import token_hex
-from stat import S_ISREG
+from stat import S_ISREG, filemode
 
 from skillspector.input_handler import _normalize_root_owned_alias
 
@@ -32,6 +33,16 @@ _SECURE_OUTPUT_SUPPORTED = (
 )
 
 
+def require_secure_file_output() -> None:
+    """Reject unsupported file writes before starting potentially costly scans."""
+    if not _SECURE_OUTPUT_SUPPORTED:
+        raise ValueError(
+            "Safe file output is unsupported on this platform. "
+            "For scan or batch reports, omit --output; for baselines, use --output -. "
+            "Redirect stdout only to a destination you trust."
+        )
+
+
 def write_text_no_follow(path: str | Path, text: str) -> None:
     """Atomically replace a regular output through an anchored parent descriptor.
 
@@ -39,15 +50,13 @@ def write_text_no_follow(path: str | Path, text: str) -> None:
     cannot redirect the write; a parent swap cannot change the opened directory.
     Platforms without these guarantees must use explicitly managed stdout.
     """
-    if not _SECURE_OUTPUT_SUPPORTED:
-        raise ValueError(
-            "Safe file output is unsupported on this platform; use stdout redirection."
-        )
+    require_secure_file_output()
     absolute = _normalize_root_owned_alias(Path(path))
     flags = os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_PATH", os.O_RDONLY)
-    directory_fd = os.open(absolute.anchor, flags)
+    directory_fd = None
     temporary_name = None
     try:
+        directory_fd = os.open(absolute.anchor, flags)
         for part in absolute.parts[1:-1]:
             next_fd = os.open(part, flags, dir_fd=directory_fd)
             os.close(directory_fd)
@@ -58,7 +67,10 @@ def write_text_no_follow(path: str | Path, text: str) -> None:
             pass
         else:
             if not S_ISREG(existing.st_mode):
-                raise ValueError("Refusing to overwrite a non-regular output file.")
+                raise ValueError(
+                    f"Refusing to overwrite non-regular output {str(path)!r} "
+                    f"(type {filemode(existing.st_mode)[0]!r})."
+                )
         candidate = f".skillspector-output-{token_hex(16)}"
         fd = os.open(
             candidate,
@@ -76,10 +88,19 @@ def write_text_no_follow(path: str | Path, text: str) -> None:
             dst_dir_fd=directory_fd,
         )
         temporary_name = None
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            detail = "an output directory is a symlink or is not a directory"
+        elif isinstance(exc, FileNotFoundError):
+            detail = "the output directory does not exist"
+        else:
+            detail = exc.strerror or str(exc)
+        raise ValueError(f"Could not write output {str(path)!r}: {detail}.") from exc
     finally:
         if temporary_name is not None:
             try:
                 os.unlink(temporary_name, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
-        os.close(directory_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)

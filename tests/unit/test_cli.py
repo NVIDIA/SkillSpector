@@ -7100,7 +7100,7 @@ def test_report_output_cannot_redirect_to_external_file(tmp_path, monkeypatch, r
 
         monkeypatch.setattr(file_output.os, "open", open_after_swap)
     if race == "parent-before-open":
-        with pytest.raises(OSError):
+        with pytest.raises(ValueError, match="symlink or is not a directory"):
             file_output.write_text_no_follow(output, "report")
     else:
         file_output.write_text_no_follow(output, "report")
@@ -7128,7 +7128,7 @@ def test_report_output_rejects_symlinks_and_cleans_failed_replace(tmp_path, monk
         raise PermissionError("synthetic replacement failure")
 
     monkeypatch.setattr(file_output.os, "replace", fail_replace)
-    with pytest.raises(PermissionError):
+    with pytest.raises(ValueError, match="synthetic replacement failure"):
         file_output.write_text_no_follow(output, "report")
     assert output.read_text(encoding="utf-8") == "previous"
     assert protected.read_text(encoding="utf-8") == "original"
@@ -7148,8 +7148,125 @@ def test_report_output_unsupported_platform_keeps_stdout(tmp_path, monkeypatch):
         app, ["scan", str(skill), "--no-llm", "--output", str(tmp_path / "report")]
     )
     assert result.exit_code == 2
-    assert "use stdout redirection" in result.output
+    assert "unsupported on this platform" in " ".join(result.output.split())
     assert not (tmp_path / "report").exists()
     result = runner.invoke(app, ["scan", str(skill), "--no-llm", "--format", "json"])
     assert result.exit_code == 0
     assert result.stdout.strip() == "report"
+
+
+@pytest.mark.parametrize(
+    "mode", ["single", "recursive", "registry", "baseline-default", "baseline-json"]
+)
+def test_unsupported_output_stops_before_analysis(tmp_path, monkeypatch, mode):
+    from skillspector import file_output
+
+    monkeypatch.setattr(file_output, "_SECURE_OUTPUT_SUPPORTED", False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COLUMNS", "79")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("analysis must not run for unsupported output")
+
+    monkeypatch.setattr(cli, "_scan_skill", forbidden)
+    monkeypatch.setattr(cli, "detect_skills", forbidden)
+    monkeypatch.setattr(cli, "scan_registry", forbidden)
+    monkeypatch.setattr(cli.graph, "invoke", forbidden)
+    args = ["baseline" if mode.startswith("baseline") else "scan", str(tmp_path), "--no-llm"]
+    if mode == "recursive":
+        args += ["--recursive"]
+    if mode == "registry":
+        args += ["--mcp-registry", "--format", "json"]
+    if mode != "baseline-default":
+        args += ["--output", "out.json"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 2
+    assert "unsupported on this platform" in " ".join(result.output.split())
+    assert not list(tmp_path.iterdir())
+
+
+def test_baseline_stdout_works_without_secure_file_output(tmp_path, monkeypatch):
+    from skillspector import file_output
+
+    monkeypatch.setattr(file_output, "_SECURE_OUTPUT_SUPPORTED", False)
+    monkeypatch.chdir(tmp_path)
+    states = []
+
+    def invoke(state):
+        states.append(state)
+        return {"active_findings": [], "file_cache": {}, "risk_score": 0}
+
+    monkeypatch.setattr(cli.graph, "invoke", invoke)
+    result = runner.invoke(app, ["baseline", str(tmp_path), "--no-llm", "-o", "-", "--verbose"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["fingerprints"] == []
+    assert "baseline_path" not in states[0]
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative output requires POSIX")
+@pytest.mark.parametrize(
+    "mode", ["baseline-default", "baseline-json", "registry", "json", "sarif", "markdown"]
+)
+def test_all_cli_writers_reject_symlink_destinations(tmp_path, monkeypatch, mode):
+    monkeypatch.chdir(tmp_path)
+    protected = tmp_path / "protected"
+    protected.write_text("preserve", encoding="utf-8")
+    output = tmp_path / (
+        ".skillspector-baseline.yaml" if mode == "baseline-default" else "out.json"
+    )
+    output.symlink_to(protected.name)
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("# Safe skill", encoding="utf-8")
+    if mode.startswith("baseline"):
+        monkeypatch.setattr(
+            cli.graph,
+            "invoke",
+            lambda state: {"active_findings": [], "file_cache": {}, "risk_score": 0},
+        )
+        args = ["baseline", str(skill), "--no-llm"]
+    elif mode == "registry":
+        monkeypatch.setattr(
+            cli, "scan_registry", lambda *args, **kwargs: {"findings": [], "risk_score": 0}
+        )
+        args = ["scan", "registry.json", "--mcp-registry", "--format", "json"]
+    else:
+        monkeypatch.setattr(
+            cli,
+            "detect_skills",
+            lambda root: MultiSkillDetectionResult(
+                is_multi_skill=True,
+                has_root_skill=False,
+                skills=[SkillDirectory(path=skill, name="skill", relative_path="skill")],
+            ),
+        )
+        monkeypatch.setattr(
+            cli, "_scan_skill", lambda *args, **kwargs: _bounded_recursive_result("safe")
+        )
+        args = ["scan", str(tmp_path), "--recursive", "--no-llm", "--format", mode]
+    if mode != "baseline-default":
+        args += ["--output", str(output)]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 2, result.output
+    assert "non-regular" in result.output
+    assert protected.read_text(encoding="utf-8") == "preserve"
+    assert output.is_symlink()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative output requires POSIX")
+@pytest.mark.parametrize("kind", ["missing", "symlink", "file", "device"])
+def test_output_errors_name_the_requested_path(tmp_path, kind):
+    from skillspector.file_output import write_text_no_follow
+
+    output = tmp_path / "parent" / "report.json"
+    if kind == "symlink":
+        (tmp_path / "parent").symlink_to(tmp_path, target_is_directory=True)
+    elif kind == "file":
+        (tmp_path / "parent").write_text("not a directory", encoding="utf-8")
+    elif kind == "device":
+        output = Path(os.devnull)
+    with pytest.raises(ValueError) as error:
+        write_text_no_follow(output, "report")
+    assert str(output) in str(error.value)
+    assert not list(tmp_path.glob(".skillspector-output-*"))

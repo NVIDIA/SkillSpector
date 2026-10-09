@@ -541,3 +541,61 @@ def test_scan_forwards_verbose_logging(batch_skill, monkeypatch):
         skill, skill.parent, use_llm=False, lang="en", require_llm=False, verbose=True
     )
     assert levels == ["DEBUG"]
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hard-link", "unsupported"])
+def test_batch_report_uses_safe_output(tmp_path, monkeypatch, kind):
+    from skillspector import file_output
+
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("# Safe skill", encoding="utf-8")
+    protected = tmp_path / "protected"
+    protected.write_text("preserve", encoding="utf-8")
+    output = tmp_path / "report.json"
+    if kind == "unsupported":
+        monkeypatch.setattr(file_output, "_SECURE_OUTPUT_SUPPORTED", False)
+    elif kind == "symlink":
+        output.symlink_to(protected)
+    else:
+        os.link(protected, output)
+    calls = []
+
+    def scan(*args, **kwargs):
+        calls.append(True)
+        return (
+            {
+                "skill": {"name": "safe"},
+                "risk_assessment": {"score": 0, "severity": "LOW"},
+                "issues": [],
+            },
+            None,
+            "safe",
+        )
+
+    monkeypatch.setattr(batch_scan, "_scan_skill_bounded", scan)
+    monkeypatch.setattr(batch_scan, "create_api_key_pool_from_env", lambda: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "batch_scan",
+            str(tmp_path),
+            "--no-llm",
+            "--workers",
+            "1",
+            "-f",
+            "json",
+            "-o",
+            str(output),
+        ],
+    )
+    if kind == "hard-link":
+        batch_scan.main()
+        assert output.read_text(encoding="utf-8") != "preserve"
+    else:
+        with pytest.raises(SystemExit) as error:
+            batch_scan.main()
+        assert error.value.code == 2
+    assert protected.read_text(encoding="utf-8") == "preserve"
+    assert bool(calls) == (kind != "unsupported")
