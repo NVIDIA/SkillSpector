@@ -554,7 +554,6 @@ _LINEAR_COMMAND_PATTERNS = frozenset(
         r"curl\s+[^|]*\|\s*(?:sudo\s+)?(?:python|python3|node|ruby|perl)",
         r"wget\s+[^|]*\|\s*(?:sudo\s+)?(?:python|python3|node|ruby|perl)",
         r"(?:&&|;)\s*(?:curl|wget)\s+[^|]*\|\s*(?:ba)?sh",
-        r"(?:create|write|mkdir)\s+[^|]*(?:~/|/home/|/tmp/)\.(?!git|ssh|aws)[a-z_-]+",
         r"curl\s+[^&]*-o\s+\S+\s*&&\s*(?:sudo\s+)?(?:ba)?sh",
         r"wget\s+[^&]*-O\s+\S+\s*&&\s*(?:sudo\s+)?(?:ba)?sh",
     }
