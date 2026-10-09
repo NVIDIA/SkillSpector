@@ -16,7 +16,7 @@ from skillspector.artifacts import SecurityTextView
 
 _MAX_CHARS = 1_000_000
 _MAX_NODES = 10_000
-_PRINTABLE = re.compile(rb"[\x20-\x7e]{4,}")
+_PRINTABLE = re.compile(r"[^\x00-\x1f\x7f-\x9f\ufffd]{4,}")
 
 
 @dataclass(frozen=True)
@@ -57,7 +57,10 @@ def _decode(value: object) -> bytes:
 
 
 def _printable(data: bytes) -> list[str]:
-    return [match.group().decode("ascii") for match in _PRINTABLE.finditer(data)]
+    # Preserve readable Unicode and format characters for semantic/obfuscation
+    # analysis. Invalid bytes and control bytes separate runs rather than
+    # silently joining attacker-controlled fragments.
+    return _PRINTABLE.findall(data.decode("utf-8", errors="replace"))
 
 
 def project_oms_content(content: str) -> OMSProjection | None:
