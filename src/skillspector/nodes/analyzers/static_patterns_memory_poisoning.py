@@ -27,6 +27,7 @@ from __future__ import annotations
 import re
 import sys
 
+from skillspector.artifacts import pdf_xmp_format_spans
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -540,6 +541,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     complete_match=match.group(0),
                 )
             )
+    _, xmp_padding_start, xmp_padding_end = pdf_xmp_format_spans(content)
     for pattern, confidence in MP2_PATTERNS:
         matches = (
             static_runner.iter_paragraph_matches
@@ -548,6 +550,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             span = match.group(0)
+            if xmp_padding_start <= match.start() < match.end() <= xmp_padding_end:
+                continue
             if _is_layout_only_span(span):
                 continue
             non_ws_chars = set(span) - {" ", "\t", "\n", "\r"}

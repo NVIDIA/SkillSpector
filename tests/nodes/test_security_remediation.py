@@ -1018,9 +1018,14 @@ def test_git_hook_sample_policy_near_misses_fail_closed(
     assert metadata["executable"] is True
     assert metadata.get("allowed_exclusion") is not True
     assert metadata["concealed_executable"] is True
+    expected_reason = (
+        LedgerReason.BINARY_EXECUTABLE_TEXT
+        if metadata.get("partially_analyzed_executable")
+        else LedgerReason.EXCLUDED_EXECUTABLE_CONTENT
+    )
     assert any(
         event["path"] == relative_path
-        and event.get("reason_code") == LedgerReason.EXCLUDED_EXECUTABLE_CONTENT
+        and event.get("reason_code") == expected_reason
         for event in result["inspection_ledger"]
     )
     assert _compute_risk_score([], False, result["component_metadata"])[0] == 51

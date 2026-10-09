@@ -410,6 +410,31 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
     }
 
 
+def pdf_xmp_format_spans(content: str) -> tuple[int, int, int]:
+    """Recognize one standard XMP packet's BOM and trailing ASCII padding only."""
+    header = '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+    if not content.startswith("%PDF-"):
+        return -1, -1, -1
+    start = content.find(header)
+    if start < 0:
+        # Unicode normalization removes the format-only BOM in derived views.
+        header = header.replace("\ufeff", "")
+        start = content.find(header)
+    if start < 0 or content.find(header, start + len(header)) >= 0:
+        return -1, -1, -1
+    metadata = content.find("<x:xmpmeta", start + len(header))
+    close = content.find("</x:xmpmeta>", metadata) if metadata >= 0 else -1
+    if close < 0:
+        return -1, -1, -1
+    padding_start = close + len("</x:xmpmeta>")
+    padding_end = padding_start
+    while padding_end < len(content) and content[padding_end] in " \t\r\n":
+        padding_end += 1
+    if not content.startswith(('<?xpacket end="w"?>', '<?xpacket end="r"?>'), padding_end):
+        return -1, -1, -1
+    return (start + header.index("\ufeff") if "\ufeff" in header else -1), padding_start, padding_end
+
+
 def decode_text(data: bytes) -> str:
     """Return the loss-tolerant local text projection for static analyzers."""
     return data.decode("utf-8", errors="replace")

@@ -22,7 +22,7 @@ import re
 import sys
 from collections.abc import Callable, Iterator
 
-from skillspector.artifacts import _is_emoji_base, prompt_injection_letter_spacing_view
+from skillspector.artifacts import _is_emoji_base, pdf_xmp_format_spans, prompt_injection_letter_spacing_view
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -321,26 +321,6 @@ def _tag_run_from(content: str, offset: int) -> str:
     return content[offset:end]
 
 
-def _pdf_xmp_format_spans(content: str) -> tuple[int, int, int]:
-    """Recognize one standard XMP packet's BOM and trailing ASCII padding only."""
-    header = '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>'
-    if not content.startswith("%PDF-"):
-        return -1, -1, -1
-    start = content.find(header)
-    if start < 0 or content.find(header, start + len(header)) >= 0:
-        return -1, -1, -1
-    metadata = content.find("<x:xmpmeta", start + len(header))
-    close = content.find("</x:xmpmeta>", metadata) if metadata >= 0 else -1
-    if close < 0:
-        return -1, -1, -1
-    padding_start = close + len("</x:xmpmeta>")
-    padding_end = padding_start
-    while padding_end < len(content) and content[padding_end] in " \t\r\n":
-        padding_end += 1
-    if not content.startswith(('<?xpacket end="w"?>', '<?xpacket end="r"?>'), padding_end):
-        return -1, -1, -1
-    return start + header.index("\ufeff"), padding_start, padding_end
-
 
 def analyze(
     content: str,
@@ -383,7 +363,7 @@ def analyze(
                     complete_match=match.group(0),
                 )
             )
-    xmp_bom, xmp_padding_start, xmp_padding_end = _pdf_xmp_format_spans(content)
+    xmp_bom, xmp_padding_start, xmp_padding_end = pdf_xmp_format_spans(content)
     if file_type in ("markdown", "perl", "other"):
         for pattern_source, confidence in P2_PATTERNS:
             for match in _p2_pattern_matches(content, pattern_source, check_runtime):
