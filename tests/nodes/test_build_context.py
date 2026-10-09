@@ -750,18 +750,22 @@ def test_build_context_model_config_matches_openai_fallback(
     assert result["model_config"]["default"] == OpenAIProvider.DEFAULT_MODEL
 
 
-def test_build_context_inventories_but_excludes_valid_root_oms_signature(
+def test_build_context_inspects_unverified_root_oms_signature(
     tmp_path: Path,
 ) -> None:
-    """A real OMS signature is reported as metadata but withheld from analyzers."""
+    """Recognized structure is metadata, never permission to exclude content."""
     (tmp_path / "SKILL.md").write_text("---\nname: signed\n---\n# Signed\n", encoding="utf-8")
     signature_path = _write_real_oms_signature(tmp_path)
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert "skill.oms.sig" not in result["components"]
-    assert "skill.oms.sig" not in result["file_cache"]
-    assert any(
+    assert "skill.oms.sig" in result["components"]
+    assert result["local_file_cache"]["skill.oms.sig"] == signature_path.read_bytes().decode(
+        "utf-8"
+    )
+    assert "https://in-toto.io/Statement/v1" in result["file_cache"]["skill.oms.sig"]
+    assert "skill.oms.sig" in result["llm_components"]
+    assert not any(
         event["path"] == "skill.oms.sig" and event["reason_code"] == "oms_signature"
         for event in result["inspection_ledger"]
     )
@@ -777,8 +781,8 @@ def test_build_context_inventories_but_excludes_valid_root_oms_signature(
     }
 
 
-def test_build_context_excludes_future_oms_predicate_version(tmp_path: Path) -> None:
-    """OMS predicate revisions remain excluded without relaxing the namespace check."""
+def test_build_context_inspects_future_oms_predicate_version(tmp_path: Path) -> None:
+    """Future predicate versions cannot opt content out of inspection."""
     bundle = json.loads(_OMS_FIXTURE.read_text(encoding="utf-8"))
     payload = json.loads(base64.b64decode(bundle["dsseEnvelope"]["payload"]))
     payload["predicateType"] = "https://model_signing/signature/v1.1"
@@ -789,8 +793,9 @@ def test_build_context_excludes_future_oms_predicate_version(tmp_path: Path) -> 
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert "skill.oms.sig" not in result["components"]
-    assert any(
+    assert "skill.oms.sig" in result["components"]
+    assert "skill.oms.sig" in result["llm_components"]
+    assert not any(
         event["path"] == "skill.oms.sig" and event["reason_code"] == "oms_signature"
         for event in result["inspection_ledger"]
     )
@@ -819,7 +824,11 @@ def test_build_context_scans_unrecognized_root_oms_signature(
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert result["file_cache"]["skill.oms.sig"] == content
+    assert result["local_file_cache"]["skill.oms.sig"] == content
+    if invalid_case == "wrong_media_type":
+        assert "https://in-toto.io/Statement/v1" in result["file_cache"]["skill.oms.sig"]
+    else:
+        assert result["file_cache"]["skill.oms.sig"] == content
     signature_meta = next(
         item for item in result["component_metadata"] if item["path"] == "skill.oms.sig"
     )
@@ -832,11 +841,75 @@ def test_build_context_scans_nested_oms_signature(tmp_path: Path) -> None:
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert result["file_cache"]["nested/skill.oms.sig"] == nested.read_bytes().decode("utf-8")
+    assert result["local_file_cache"]["nested/skill.oms.sig"] == nested.read_bytes().decode("utf-8")
+    assert "https://in-toto.io/Statement/v1" in result["file_cache"]["nested/skill.oms.sig"]
     signature_meta = next(
         item for item in result["component_metadata"] if item["path"] == "nested/skill.oms.sig"
     )
     assert signature_meta["type"] == "other"
+
+
+@pytest.mark.parametrize(
+    "failure", ["certificate", "signature", "oversized_signature", "payload", "dependency", "limit"]
+)
+def test_oms_projection_keeps_unsupported_fields_and_reports_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import sys
+
+    import skillspector.oms as oms
+
+    bundle = json.loads(_OMS_FIXTURE.read_bytes())
+    if failure == "certificate":
+        bundle["verificationMaterial"]["x509CertificateChain"]["certificates"][0]["rawBytes"] = (
+            "YWJj"
+        )
+    elif failure == "signature":
+        sig = bundle["dsseEnvelope"]["signatures"][0]["sig"]
+        bundle["dsseEnvelope"]["signatures"][0]["sig"] = base64.b64encode(
+            base64.b64decode(sig) + b"trailing"
+        ).decode()
+    elif failure == "oversized_signature":
+        from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+
+        bundle["dsseEnvelope"]["signatures"][0]["sig"] = base64.b64encode(
+            encode_dss_signature(1 << 600, 1)
+        ).decode()
+    elif failure == "payload":
+        bundle["dsseEnvelope"]["payload"] = "not-base64"
+    elif failure == "dependency":
+        monkeypatch.setitem(sys.modules, "cryptography", None)
+    else:
+        monkeypatch.setattr(oms, "_MAX_NODES", 3)
+    content = json.dumps(bundle)
+    (tmp_path / "bundle.json").write_text(content)
+    result = build_context({"skill_path": str(tmp_path)})
+    assert result["local_file_cache"]["bundle.json"] == content
+    assert any(event.get("reason_code") == "oms_signature" for event in result["inspection_ledger"])
+    if failure == "certificate":
+        assert "YWJj" in result["file_cache"]["bundle.json"]
+    if failure in {"certificate", "signature", "dependency"}:
+        assert "https://in-toto.io/Statement/v1" in result["file_cache"]["bundle.json"]
+
+
+@pytest.mark.parametrize("escaped_key", [False, True])
+def test_oms_projection_preserves_crlf_and_rejects_duplicate_fields(
+    tmp_path: Path, escaped_key: bool
+) -> None:
+    bundle = json.loads(_OMS_FIXTURE.read_bytes())
+    content = json.dumps(bundle, indent=2).replace("\n", "\r\n")
+    path = tmp_path / "bundle.json"
+    path.write_bytes(content.encode())
+    result = build_context({"skill_path": str(tmp_path)})
+    assert result["local_file_cache"]["bundle.json"] == content
+    assert "https://in-toto.io/Statement/v1" in result["file_cache"]["bundle.json"]
+    duplicate = content[:-1] + ', "dsseEnvelope": {}}'
+    if escaped_key:
+        duplicate = duplicate.replace('"dsseEnvelope"', r'"dss\u0065Envelope"')
+    path.write_bytes(duplicate.encode())
+    result = build_context({"skill_path": str(tmp_path)})
+    assert result["file_cache"]["bundle.json"] == duplicate
+    assert any(event.get("reason_code") == "oms_signature" for event in result["inspection_ledger"])
 
 
 def test_build_context_skips_skip_dirs(tmp_path: Path) -> None:

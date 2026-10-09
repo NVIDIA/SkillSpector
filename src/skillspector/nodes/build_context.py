@@ -73,6 +73,7 @@ from skillspector.nested_artifacts import (
     is_executable_content,
     is_zip_content,
 )
+from skillspector.oms import project_oms_content
 from skillspector.python_ast import (
     PythonSourceClassification,
     classify_python_source,
@@ -833,7 +834,7 @@ def _decode_base64_json(value: object) -> dict[str, object] | None:
 
 
 def _is_valid_oms_signature_bytes(data: bytes) -> bool:
-    """Recognize the minimal OMS DSSE/in-toto structure from bounded bytes."""
+    """Recognize OMS structure only; this does not verify or trust its contents."""
     try:
         if len(data) > MAX_FILE_BYTES:
             return False
@@ -2806,16 +2807,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             elif signature_valid:
                 recognized_oms_signature_paths.add(_OMS_SIGNATURE_PATH)
     recognized_oms_signatures = frozenset(recognized_oms_signature_paths)
-    signature_events = [
-        ledger_event(
-            outcome=LedgerOutcome.OUT_OF_SCOPE,
-            record_type=LedgerRecordType.SCOPE_BOUNDARY,
-            phase="discovery",
-            path=path,
-            reason=LedgerReason.OMS_SIGNATURE,
-        )
-        for path in sorted(recognized_oms_signatures)
-    ]
+    signature_events: list[InspectionLedgerEvent] = []
     baseline_events = [
         ledger_event(
             outcome=LedgerOutcome.OUT_OF_SCOPE,
@@ -2826,12 +2818,6 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         )
         for path in sorted(selected_baselines)
     ]
-    for artifact in artifact_inventory:
-        if artifact["path"] in recognized_oms_signatures:
-            artifact["disposition"] = ArtifactDisposition.OUT_OF_SCOPE
-            artifact["reason"] = LedgerReason.OMS_SIGNATURE.value
-            llm_file_cache.pop(artifact["path"], None)
-
     primary_path = next(
         (path for path in ("SKILL.md", "skill.md") if path in inventoried_components), None
     )
@@ -2999,8 +2985,6 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     ordinary_components: list[str] = []
     for path in cache_candidates:
         ordinary_artifact = inventory_by_path.get(path)
-        if path in recognized_oms_signatures:
-            continue
         if path in raw_file_cache or (
             ordinary_artifact is not None
             and ordinary_artifact.get("disposition")
@@ -3321,7 +3305,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             ]
         )
     )
-    for path in [*recognized_containers, *recognized_oms_signatures]:
+    for path in recognized_containers:
         llm_file_cache.pop(path, None)
 
     postprocessing_events: list[InspectionLedgerEvent] = []
@@ -3493,6 +3477,41 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 limit_seconds=runtime_limit,
             )
         )
+
+    for path, content in local_file_cache.items():
+        if not content.lstrip().startswith("{"):
+            continue
+        projection_started = monotonic()
+        if projection_started >= processing_deadline:
+            _record_processing_runtime(
+                phase="signature_projection", path=path, now=projection_started
+            )
+            continue
+        projection = project_oms_content(content)
+        if projection is None:
+            continue
+        projection_finished = monotonic()
+        if projection_finished >= processing_deadline:
+            _record_processing_runtime(
+                phase="signature_projection", path=path, now=projection_finished
+            )
+            continue
+        if path in llm_file_cache:
+            llm_file_cache[path] = projection.view.text
+        if not projection.complete:
+            signature_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="discovery",
+                    path=path,
+                    reason=LedgerReason.OMS_SIGNATURE,
+                )
+            )
+            artifact = inventory_by_path.get(path)
+            if artifact is not None and artifact["disposition"] == ArtifactDisposition.ANALYZED:
+                artifact["disposition"] = ArtifactDisposition.PARTIAL
+                artifact["reason"] = LedgerReason.OMS_SIGNATURE.value
 
     llm_components = sorted(llm_file_cache)
     file_cache = dict(llm_file_cache)
