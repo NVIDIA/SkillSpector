@@ -776,8 +776,10 @@ Options:
 skillspector baseline <path> [-o FILE] [--no-llm] [--reason TEXT]
 ```
 
-Report and baseline files are replaced atomically with private permissions (0600),
-including existing files. Their parent directory must be writable; symlinked
+Report files and new baselines use private permissions (0600). Existing baselines
+retain their access metadata when safely replaced; updates requiring in-place
+writes are refused. All file output uses atomic replacement. The parent directory
+must be writable; symlinked
 parents and non-regular destinations such as devices are refused. On macOS,
 ancestor directories must also be readable. File output requires POSIX no-follow
 directory operations and is unavailable on Windows. Unsupported file output fails
