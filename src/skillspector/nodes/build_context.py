@@ -1035,6 +1035,8 @@ def _mark_unanalyzed_executables(
             }
         )
         artifact.setdefault("reason", reason.value)
+        if readable_executable and artifact["disposition"] == ArtifactDisposition.ANALYZED:
+            artifact["disposition"] = ArtifactDisposition.PARTIAL
         events.append(
             ledger_event(
                 outcome=LedgerOutcome.PARTIAL,
@@ -3223,6 +3225,8 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             and artifact.get("referenced")
             and path not in excluded_nested_components
         ):
+            if artifact["disposition"] == ArtifactDisposition.ANALYZED:
+                artifact["disposition"] = ArtifactDisposition.PARTIAL
             content_interpretation_events.append(
                 ledger_event(
                     outcome=LedgerOutcome.PARTIAL,
