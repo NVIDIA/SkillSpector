@@ -26,8 +26,6 @@ import types
 
 import pytest
 
-import pytest
-
 from skillspector.nodes.analyzers import behavioral_taint_tracking
 from skillspector.nodes.analyzers.common import build_type_map
 from skillspector.nodes.deduplicate import deduplicate
