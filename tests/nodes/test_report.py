@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
@@ -2695,3 +2696,59 @@ def test_report_sarif_preserves_high_vs_critical_severity() -> None:
     assert by_rule["R2"]["level"] == "error"
     assert by_rule["R1"]["properties"]["severity"] == "HIGH"
     assert by_rule["R2"]["properties"]["severity"] == "CRITICAL"
+
+
+def test_report_retains_exact_active_findings_before_compaction_and_output_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = Finding(
+        rule_id="TM1",
+        message="destructive command",
+        file="SKILL.md",
+        start_line=1,
+        matched_text="rm -rf /",
+        confidence=0.8,
+        context="first context",
+        code_snippet="first snippet",
+    )
+    repeated = replace(
+        first,
+        finding_id="repeated",
+        start_line=4,
+        confidence=0.7,
+        context="second context",
+        code_snippet="second snippet",
+    )
+    other_file = replace(
+        first,
+        finding_id="other-file",
+        file="scripts/check.sh",
+        confidence=0.9,
+        context="third context",
+        code_snippet="third snippet",
+    )
+    findings = [first, repeated, other_file]
+    monkeypatch.setattr("skillspector.nodes.report.MAX_FINDING_OUTPUT_RECORDS", 1)
+    result = report({"findings": findings, "use_llm": False, "output_format": "json"})
+
+    assert len(result["filtered_findings"]) == 1
+    assert len(result["filtered_findings"][0].occurrences) == 1
+    assert result["active_findings"] == findings
+
+
+def test_report_active_findings_are_sanitized_and_exclude_suppressed() -> None:
+    kept = _finding("TM1", message="destructive\x1b[31m command")
+    suppressed = _finding("PE3")
+    result = report(
+        {
+            "findings": [kept, suppressed],
+            "use_llm": False,
+            "output_format": "json",
+            "baseline": Baseline(rules=[SuppressionRule(rule_id="PE3", reason="accepted")]),
+        }
+    )
+
+    assert len(result["active_findings"]) == 1
+    assert result["active_findings"][0].finding_id == kept.finding_id
+    assert result["active_findings"][0].message == "destructive command"
+    assert kept.message == "destructive\x1b[31m command"
