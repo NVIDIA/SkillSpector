@@ -410,6 +410,8 @@ def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> rege
     while cursor < len(source):
         # Group names are syntax, never case-insensitive literals.
         if source.startswith(("(?P<", "(?P="), cursor):
+            if source.startswith("(?P=", cursor) and flags & re.IGNORECASE and not ascii_content:
+                raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
             end = source.index(">" if source.startswith("(?P<", cursor) else ")", cursor) + 1
             parts.append(source[cursor:end])
             cursor = end
@@ -424,6 +426,8 @@ def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> rege
         char = source[cursor]
         if char == "\\" and cursor + 1 < len(source):
             code = source[cursor + 1]
+            if code in "123456789" and flags & re.IGNORECASE and not ascii_content:
+                raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
             if code in "xuU":
                 end = cursor + {"x": 4, "u": 6, "U": 10}[code]
                 value = chr(int(source[cursor + 2 : end], 16))

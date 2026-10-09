@@ -2840,3 +2840,11 @@ def test_variable_shell_backreference_routing_covers_all_callers(monkeypatch):
         {"components": ["tool.py"], "file_cache": {"tool.py": content}}, [module]
     )
     assert len(calls) >= 3
+
+
+@pytest.mark.parametrize("pattern", [r"(.)\1", r"(?P<value>.)(?P=value)"])
+@pytest.mark.parametrize("content", ["ıI", "İI", "ſs", "µμ"])
+def test_unreviewed_unicode_backreferences_fail_closed(pattern, content):
+    with pytest.raises(static_runner._StaticResourceLimitError) as caught:
+        list(static_runner.iter_pattern_matches(pattern, content, re.IGNORECASE))
+    assert caught.value.reason.value == "rules_unavailable"
