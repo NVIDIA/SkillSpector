@@ -191,6 +191,78 @@ class TestLP2WildcardPermission:
 
 
 class TestLP1UnderdeclaredCapability:
+    def test_url_parsing_does_not_require_network_permission(self):
+        """urllib.parse only transforms local strings and does not make network calls."""
+        state: dict = {
+            "manifest": {"name": "url-parser", "permissions": ["read"], "triggers": []},
+            "file_cache": {
+                "scripts/parser.py": "from urllib.parse import urlparse\nurlparse('https://example.com')\n"
+            },
+            "component_metadata": [
+                {
+                    "path": "scripts/parser.py",
+                    "type": "python",
+                    "executable": True,
+                    "lines": 2,
+                    "size_bytes": 80,
+                }
+            ],
+            "has_executable_scripts": True,
+            "components": ["scripts/parser.py"],
+        }
+
+        findings = mcp_least_privilege.node(state)["findings"]
+
+        assert not [finding for finding in findings if finding.rule_id == "LP1"]
+
+    def test_urllib_request_requires_network_permission(self):
+        """urllib.request can perform network I/O and remains covered by LP1."""
+        state: dict = {
+            "manifest": {"name": "url-fetcher", "permissions": ["read"], "triggers": []},
+            "file_cache": {
+                "scripts/fetch.py": "from urllib.request import urlopen\nurlopen('https://example.com')\n"
+            },
+            "component_metadata": [
+                {
+                    "path": "scripts/fetch.py",
+                    "type": "python",
+                    "executable": True,
+                    "lines": 2,
+                    "size_bytes": 80,
+                }
+            ],
+            "has_executable_scripts": True,
+            "components": ["scripts/fetch.py"],
+        }
+
+        findings = mcp_least_privilege.node(state)["findings"]
+
+        assert [finding for finding in findings if finding.rule_id == "LP1"]
+
+    def test_urllib_request_alias_requires_network_permission(self):
+        """from urllib import request can perform network I/O."""
+        state: dict = {
+            "manifest": {"name": "url-fetcher", "permissions": ["read"], "triggers": []},
+            "file_cache": {
+                "scripts/fetch.py": "from urllib import request\nrequest.urlopen('https://example.com')\n"
+            },
+            "component_metadata": [
+                {
+                    "path": "scripts/fetch.py",
+                    "type": "python",
+                    "executable": True,
+                    "lines": 2,
+                    "size_bytes": 80,
+                }
+            ],
+            "has_executable_scripts": True,
+            "components": ["scripts/fetch.py"],
+        }
+
+        findings = mcp_least_privilege.node(state)["findings"]
+
+        assert [finding for finding in findings if finding.rule_id == "LP1"]
+
     def test_underdeclared_detected(self):
         """mcp_underdeclared_skill uses network, shell, env but declares no permissions → LP3 (no LP1 since permissions is empty)."""
         state = _make_state("mcp_underdeclared_skill")

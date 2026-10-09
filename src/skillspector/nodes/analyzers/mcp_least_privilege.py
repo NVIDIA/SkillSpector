@@ -74,7 +74,8 @@ _CAPABILITY_PATTERNS: dict[str, list[str]] = {
     "network": [
         r"\bhttpx\b",
         r"\brequests\b",
-        r"\burllib\b",
+        r"\burllib\.request\b",
+        r"\bfrom\s+urllib\s+import\s+request\b",
         r"\baiohttp\b",
         r"socket\.connect",
         r"fetch\(",
