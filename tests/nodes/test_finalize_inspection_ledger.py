@@ -22,6 +22,7 @@ from skillspector.inspection_ledger import (
     LedgerReason,
     LedgerRecordType,
     analyzer_status_event,
+    analyzer_status_for_events,
     finalize_ledger,
     guard_analyzer_node,
     inspection_work_id,
@@ -123,6 +124,55 @@ def test_completed_work_is_covered_and_resolves_emitted_finding_ids() -> None:
     assert completeness["coverage_percent"] == 100.0
     assert completeness["ledger_exceptions"] == []
     assert effective_ids == [finding.finding_id]
+
+
+def test_out_of_scope_boundaries_do_not_count_as_analyzer_failures() -> None:
+    """Non-fatal scope boundaries are not planned work for an analyzer."""
+    analyzer_id = "static_patterns_prompt_injection"
+    inspected = ledger_event(
+        outcome=LedgerOutcome.COMPLETED,
+        phase="static",
+        analyzer_id=analyzer_id,
+        path="scripts/run.py",
+    )
+    excluded = ledger_event(
+        outcome=LedgerOutcome.OUT_OF_SCOPE,
+        record_type=LedgerRecordType.SCOPE_BOUNDARY,
+        phase="static",
+        analyzer_id=analyzer_id,
+        path="assets/font.ttf",
+        reason=LedgerReason.BINARY_CONTENT,
+    )
+
+    completeness, _ = finalize_ledger(
+        {
+            "components": ["scripts/run.py", "assets/font.ttf"],
+            "findings": [],
+            "inspection_ledger": [inspected, excluded],
+            "analyzer_status_events": [
+                analyzer_status_for_events(analyzer_id, [inspected, excluded])
+            ],
+            "artifact_inventory": [
+                {"path": "scripts/run.py", "disposition": "complete"},
+                {
+                    "path": "assets/font.ttf",
+                    "disposition": "out_of_scope",
+                    "content_kind": "binary",
+                },
+            ],
+        }
+    )
+
+    status = next(
+        row for row in completeness["analyzer_statuses"] if row["analyzer_id"] == analyzer_id
+    )
+    assert status["status"] == "completed"
+    assert status["planned_work"] == 1
+    assert status["completed"] == 1
+    assert status["failed"] == 0
+    assert completeness["scope_exclusions"][0]["path"] == "assets/font.ttf"
+    assert completeness["status"] == "complete"
+    assert completeness["coverage_percent"] == 100.0
 
 
 def test_missing_terminal_row_becomes_fatal_unaccounted_work() -> None:
