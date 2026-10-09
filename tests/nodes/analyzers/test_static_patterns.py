@@ -2906,4 +2906,5 @@ def test_variable_shell_argument_limit_reaches_incomplete_ledger():
 def test_word_boundary_shortcut_respects_ascii_word_membership(pattern, flags):
     content = "α αa αé é éa é_ a aα"
     expected = [match.span() for match in re.finditer(pattern, content, flags)]
-    assert [match.span() for match in static_runner.iter_pattern_matches(pattern, content, flags)] == expected
+    actual = [match.span() for match in static_runner.iter_pattern_matches(pattern, content, flags)]
+    assert actual == expected
