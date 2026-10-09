@@ -3498,6 +3498,47 @@ idna==3.7\\
         lines = {p[0]: p[2] for p in sc_mod._extract_packages_from_package_json(content)}
         assert lines["express"] == 4
 
+    def test_package_json_reads_optional_dependencies(self) -> None:
+        content = json.dumps({"optionalDependencies": {"chalk": "4.1.2", "@scope/pkg": "1.0.0"}})
+        assert sc_mod._extract_packages_from_package_json(content) == [
+            ("chalk", "4.1.2", 1),
+            ("@scope/pkg", "1.0.0", 1),
+        ]
+
+    def test_package_json_optional_dependency_overrides_same_name(self) -> None:
+        content = json.dumps(
+            {
+                "dependencies": {"chalk": "4.1.2", "lodash": "4.17.21"},
+                "optionalDependencies": {"chalk": "5.6.2"},
+            }
+        )
+        versions = {p[0]: p[1] for p in sc_mod._extract_packages_from_package_json(content)}
+        assert versions == {"chalk": "5.6.2", "lodash": "4.17.21"}
+        assert len(sc_mod._extract_packages_from_package_json(content)) == 2
+
+    def test_package_json_optional_dependencies_keep_limit_and_lines(self) -> None:
+        content = (
+            "{\n"
+            '  "dependencies": {\n'
+            '    "a": "1.0.0"\n'
+            "  },\n"
+            '  "optionalDependencies": {\n'
+            '    "b": "2.0.0",\n'
+            '    "c": "3.0.0"\n'
+            "  }\n"
+            "}\n"
+        )
+        assert sc_mod._extract_packages_from_package_json(content) == [
+            ("a", "1.0.0", 3),
+            ("b", "2.0.0", 6),
+            ("c", "3.0.0", 7),
+        ]
+        assert len(sc_mod._extract_packages_from_package_json(content, limit=2)) == 2
+
+    def test_package_json_scan_fallback_reads_optional_dependencies(self) -> None:
+        content = '{\n  "optionalDependencies": {\n    "chalk": "4.1.2"\n  },\n  not json\n'
+        assert sc_mod._extract_packages_from_package_json(content) == [("chalk", "4.1.2", 3)]
+
     def test_package_json_line_prefers_the_dependency_over_a_script(self) -> None:
         # A name that also appears in "scripts" must not steal the line number.
         content = (
