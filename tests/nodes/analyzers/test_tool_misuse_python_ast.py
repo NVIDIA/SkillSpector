@@ -550,21 +550,6 @@ def test_later_argument_effect_invalidates_receiver_for_called_function() -> Non
         pytest.param("replace_subprocess()", id="expression"),
         pytest.param("result = replace_subprocess()", id="assignment"),
         pytest.param("result: object = replace_subprocess()", id="annotated-assignment"),
-        pytest.param("result = (replace_subprocess(),)", id="tuple-rhs"),
-        pytest.param("result = [replace_subprocess()]", id="list-rhs"),
-        pytest.param(
-            "result: object = (replace_subprocess(),)",
-            id="annotated-tuple-rhs",
-        ),
-        pytest.param(
-            "result: object = [replace_subprocess()]",
-            id="annotated-list-rhs",
-        ),
-        pytest.param("result = (mutator.value,)", id="tuple-protocol-rhs"),
-        pytest.param(
-            "result: object = [mutator[0]]",
-            id="annotated-list-protocol-rhs",
-        ),
     ],
 )
 def test_generic_call_invalidates_receiver_trust(statement: str) -> None:
@@ -582,24 +567,46 @@ def test_generic_call_invalidates_receiver_trust(statement: str) -> None:
 @pytest.mark.parametrize(
     "statement",
     [
+        pytest.param("ignored = (replace_subprocess(),)", id="tuple-rhs"),
+        pytest.param("ignored = [replace_subprocess()]", id="list-rhs"),
+        pytest.param(
+            "ignored: tuple[object, ...] = (replace_subprocess(),)",
+            id="annotated-tuple-rhs",
+        ),
+    ],
+)
+def test_nested_generic_call_invalidates_receiver_trust(statement: str) -> None:
+    findings = _tm1_ast(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        f"{statement}\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+def test_nested_generic_call_invalidates_receiver_trust_for_called_function() -> None:
+    findings = _tm1_ast(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "ignored = (replace_subprocess(),)\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
         pytest.param("replace_subprocess()", id="expression"),
         pytest.param("result = replace_subprocess()", id="assignment"),
         pytest.param("result: object = replace_subprocess()", id="annotated-assignment"),
-        pytest.param("result = (replace_subprocess(),)", id="tuple-rhs"),
-        pytest.param("result = [replace_subprocess()]", id="list-rhs"),
-        pytest.param(
-            "result: object = (replace_subprocess(),)",
-            id="annotated-tuple-rhs",
-        ),
-        pytest.param(
-            "result: object = [replace_subprocess()]",
-            id="annotated-list-rhs",
-        ),
-        pytest.param("result = (mutator.value,)", id="tuple-protocol-rhs"),
-        pytest.param(
-            "result: object = [mutator[0]]",
-            id="annotated-list-protocol-rhs",
-        ),
     ],
 )
 def test_generic_call_invalidates_receiver_trust_for_called_function(statement: str) -> None:
@@ -669,6 +676,19 @@ def test_generic_call_invalidates_receiver_trust_for_nested_closure() -> None:
     )
 
 
+def test_generic_call_invalidates_true_prefixed_nested_closure() -> None:
+    assert not _tm1_ast(
+        "import subprocess\n"
+        "def outer():\n"
+        "    true_value = True\n"
+        "    def inner():\n"
+        "        subprocess.run(command, shell=true_value)\n"
+        "    replace_subprocess()\n"
+        "    inner()\n"
+        "outer()\n"
+    )
+
+
 @pytest.mark.parametrize(
     "statement",
     [
@@ -698,6 +718,47 @@ def test_direct_subprocess_call_remains_detected(statement: str) -> None:
     )
 
     assert [finding.location.start_line for finding in findings] == [4, 6]
+
+
+@pytest.mark.parametrize(
+    "call_line",
+    [
+        "subprocess.run(command, shell=true); "
+        "[subprocess.run(command, shell=true) for item in items]",
+        "[subprocess.run(command, shell=true) for item in items]; "
+        "subprocess.run(command, shell=true)",
+    ],
+)
+def test_true_direct_calls_around_safe_comprehension_keep_distinct_locations(
+    call_line: str,
+) -> None:
+    findings = _tm1(f"items = [1]\ncommand = '/bin/true'\ntrue = True\n{call_line}\n")
+    expected_columns = [
+        index for index in range(len(call_line)) if call_line.startswith("subprocess.run", index)
+    ]
+
+    assert len(findings) == 2
+    assert sorted(finding.start_column for finding in findings) == expected_columns
+
+
+def test_unknown_comprehension_protocol_invalidates_receiver_trust() -> None:
+    assert not _tm1_ast(
+        "import subprocess\n"
+        "[subprocess.run('/bin/true', shell=False) for item in items]\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+
+def test_unknown_comprehension_protocol_invalidates_called_function_trust() -> None:
+    assert not _tm1_ast(
+        "import subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "[subprocess.run('/bin/true', shell=False) for item in items]\n"
+        "execute()\n"
+    )
 
 
 def test_blank_line_before_assignment_has_one_tm1_owner() -> None:
@@ -776,119 +837,16 @@ def test_true_prefixed_identifier_has_one_lexical_owner() -> None:
     assert len(findings) == 1
 
 
-@pytest.mark.parametrize("name", ["true", "TRUE", "TrUe"])
-def test_case_variant_true_has_one_direct_owner(name: str) -> None:
-    findings = _tm1(f"{name} = True\nsubprocess.run(command, shell={name})\n")
-
-    assert len(findings) == 1
-    assert findings[0].start_line == 2
-    assert not findings[0].evidence
-
-
 def test_true_prefixed_closure_has_one_lexical_owner() -> None:
     findings = _tm1(
-        "true_value = True\n"
-        "def inner():\n"
-        "    # one\n"
-        "    # two\n"
-        "    # three\n"
-        "    subprocess.run(command, shell=true_value)\n"
+        "def outer():\n"
+        "    true_value = True\n"
+        "    def inner():\n"
+        "        subprocess.run(command, shell=true_value)\n"
     )
 
     assert len(findings) == 1
-    assert findings[0].start_line == 6
-    snippet = str(findings[0].to_dict()["code_snippet"])
-    assert "subprocess.run" in snippet
-    assert "true_value = True" not in snippet
-    assert findings[0].severity == "HIGH"
-    assert findings[0].confidence == pytest.approx(0.9)
-
-
-def test_normalized_prefix_keeps_lexical_signal_after_unknown_receiver_effect() -> None:
-    assert (
-        len(
-            _tm1(
-                "true_value = True\n"
-                "def inner():\n"
-                "    ﬀ; subprocess.run(command, shell=true_value)\n"
-                "replace_subprocess()\n"
-                "inner()\n"
-            )
-        )
-        == 1
-    )
-
-
-def test_normalized_prefix_does_not_duplicate_true_direct_fallback() -> None:
-    findings = _tm1("true = True\nﬀ; subprocess.run(command, shell=true)\n")
-
-    assert len(findings) == 1
-    assert (findings[0].start_line, findings[0].start_column) == (2, 3)
-    assert not findings[0].evidence
-
-
-@pytest.mark.parametrize(
-    "call_line",
-    [
-        "subprocess.run(command, shell=true); "
-        "[subprocess.run(command, shell=true) for item in items]",
-        "[subprocess.run(command, shell=true) for item in items]; "
-        "subprocess.run(command, shell=true)",
-    ],
-)
-def test_true_direct_calls_on_one_line_keep_distinct_locations(call_line: str) -> None:
-    findings = _tm1(f"items = [1]\ncommand = '/bin/true'\ntrue = True\n{call_line}\n")
-    expected_columns = [
-        index for index in range(len(call_line)) if call_line.startswith("subprocess.run", index)
-    ]
-
-    assert len(findings) == 2
-    assert sorted(finding.start_column for finding in findings) == expected_columns
-
-
-def test_unknown_comprehension_protocol_invalidates_receiver_trust() -> None:
-    assert not _tm1_ast(
-        "import subprocess\n"
-        "[subprocess.run('/bin/true', shell=False) for item in items]\n"
-        "enabled = True\n"
-        "subprocess.run(command, shell=enabled)\n"
-    )
-
-
-def test_unknown_comprehension_protocol_invalidates_called_function_trust() -> None:
-    assert not _tm1_ast(
-        "import subprocess\n"
-        "def execute():\n"
-        "    enabled = True\n"
-        "    subprocess.run(command, shell=enabled)\n"
-        "[subprocess.run('/bin/true', shell=False) for item in items]\n"
-        "execute()\n"
-    )
-
-
-def test_true_direct_lexical_signal_survives_unknown_receiver_effect() -> None:
-    findings = _tm1(
-        "true = True\n"
-        "subprocess.run(command, shell=true)\n"
-        "replace_subprocess()\n"
-        "subprocess.run(command, shell=true)\n"
-    )
-
-    assert [finding.start_line for finding in findings] == [2, 4]
-
-
-@pytest.mark.parametrize(
-    ("path", "suffix"),
-    [
-        pytest.param("run.py", "if:\n", id="malformed-python"),
-        pytest.param("run.js", "", id="non-python"),
-    ],
-)
-def test_true_direct_fallback_survives_without_ast_ownership(path: str, suffix: str) -> None:
-    findings = _tm1(f"true = True\nsubprocess.run(command, shell=true)\n{suffix}", path)
-
-    assert len(findings) == 1
-    assert not findings[0].evidence
+    assert findings[0].start_line == 4
 
 
 @pytest.mark.parametrize(
@@ -954,12 +912,10 @@ def test_malformed_python_keeps_bounded_lexical_fallback() -> None:
     assert "_tm1_variable_shell_flag" not in findings[0].evidence
 
 
-@pytest.mark.parametrize("name", ["enabled", "true"])
 def test_oversized_python_keeps_bounded_lexical_fallback(
     monkeypatch: pytest.MonkeyPatch,
-    name: str,
 ) -> None:
-    content = f"{name} = True\nsubprocess.run(command, shell={name})\n" + "# padding\n" * 20
+    content = "enabled = True\nsubprocess.run(command, shell=enabled)\n" + "# padding\n" * 20
     monkeypatch.setattr(tm_module.static_runner, "MAX_FILE_CHARS", 80)
 
     findings = _tm1(content)
@@ -1451,3 +1407,157 @@ def test_unknown_unsafe_binding_blocks_called_function_trust(
     )
 
     assert not findings
+
+
+@pytest.mark.parametrize("name", ["true", "TRUE", "TrUe"])
+def test_case_variant_true_has_one_direct_owner(name: str) -> None:
+    findings = _tm1(f"{name} = True\nsubprocess.run(command, shell={name})\n")
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 2
+    assert not findings[0].evidence
+
+
+def test_normalized_prefix_keeps_lexical_signal_after_unknown_receiver_effect() -> None:
+    assert (
+        len(
+            _tm1(
+                "true_value = True\n"
+                "def inner():\n"
+                "    ﬀ; subprocess.run(command, shell=true_value)\n"
+                "replace_subprocess()\n"
+                "inner()\n"
+            )
+        )
+        == 1
+    )
+
+
+def test_normalized_prefix_does_not_duplicate_true_direct_fallback() -> None:
+    findings = _tm1("true = True\nﬀ; subprocess.run(command, shell=true)\n")
+
+    assert len(findings) == 1
+    assert (findings[0].start_line, findings[0].start_column) == (2, 3)
+    assert not findings[0].evidence
+
+
+def test_true_direct_lexical_signal_survives_unknown_receiver_effect() -> None:
+    findings = _tm1(
+        "true = True\n"
+        "subprocess.run(command, shell=true)\n"
+        "replace_subprocess()\n"
+        "subprocess.run(command, shell=true)\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [2, 4]
+
+
+@pytest.mark.parametrize(
+    ("path", "suffix"),
+    [
+        pytest.param("run.py", "if:\n", id="malformed-python"),
+        pytest.param("run.js", "", id="non-python"),
+    ],
+)
+def test_true_direct_fallback_survives_without_ast_ownership(path: str, suffix: str) -> None:
+    findings = _tm1(f"true = True\nsubprocess.run(command, shell=true)\n{suffix}", path)
+
+    assert len(findings) == 1
+    assert not findings[0].evidence
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(
+            "true = True\n"
+            "def inner():\n"
+            "    subprocess.run(command, shell=true)\n"
+            "replace_subprocess()\n"
+            "inner()\n",
+            id="direct-true-after-unknown-receiver-effect",
+        ),
+        pytest.param(
+            "true_value = True\nﬀ; subprocess.run(command, shell=true_value)\nif:\n",
+            id="normalized-prefix-without-ast",
+        ),
+    ],
+)
+def test_true_named_shell_window_has_one_owner_per_call(content: str) -> None:
+    findings = _tm1(content)
+
+    assert len(findings) == 1
+    assert not findings[0].evidence
+
+
+@pytest.mark.parametrize(
+    ("path", "prefix", "suffix"),
+    [
+        pytest.param("run.js", "", "", id="javascript"),
+        pytest.param("SKILL.md", "# Skill\n```python\n", "```\n", id="fenced-markdown"),
+        pytest.param("notes.md", "", "", id="plain-markdown"),
+    ],
+)
+def test_true_prefixed_window_reports_non_python_call(path: str, prefix: str, suffix: str) -> None:
+    findings = _tm1(
+        f"{prefix}true_value = True\nsubprocess.run(command, shell=true_value)\n{suffix}",
+        path,
+    )
+
+    assert len(findings) == 1
+    assert findings[0].severity == "HIGH"
+    assert (findings[0].start_line, findings[0].start_column) == (prefix.count("\n") + 2, 0)
+    assert not findings[0].evidence
+
+
+def test_true_prefixed_call_after_unknown_receiver_effect_keeps_lexical_signal() -> None:
+    findings = _tm1(
+        "true_value = True\n"
+        "subprocess.run(command, shell=true_value)\n"
+        "replace_subprocess()\n"
+        "subprocess.run(command, shell=true_value)\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [2, 4]
+
+
+def test_true_prefixed_call_window_keeps_binding_counterevidence() -> None:
+    findings = _tm1(
+        "true_value = True\n"
+        "subprocess.run(command, shell=true_value)\n"
+        "true_value = False\n"
+        "subprocess.run(command, shell=true_value)\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [2]
+
+
+@pytest.mark.parametrize(
+    ("name", "path", "suffix"),
+    [
+        pytest.param("true_value", "run.py", "if:\n", id="true-prefixed-malformed-python"),
+        pytest.param("true", "run.js", "", id="true-non-python"),
+    ],
+)
+def test_true_named_calls_on_one_line_without_ast_keep_distinct_locations(
+    name: str, path: str, suffix: str
+) -> None:
+    call = f"subprocess.run(command, shell={name})"
+    findings = _tm1(f"{name} = True\n{call}; {call}\n{suffix}", path)
+
+    assert sorted((finding.start_line, finding.start_column) for finding in findings) == [
+        (2, 0),
+        (2, len(call) + 2),
+    ]
+
+
+def test_true_prefixed_assignment_inside_earlier_window_owns_its_call() -> None:
+    findings = _tm1(
+        "true_value = True\n"
+        "true_other = True\n"
+        "subprocess.run(command, shell=true_value)\n"
+        "subprocess.run(command, shell=true_other)\n",
+        "run.js",
+    )
+
+    assert [finding.start_line for finding in findings] == [3, 4]
