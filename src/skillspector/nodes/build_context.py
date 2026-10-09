@@ -72,6 +72,7 @@ from skillspector.nested_artifacts import (
     is_executable_content,
     is_zip_content,
 )
+from skillspector.oms import project_oms_content
 from skillspector.python_ast import prewarm_python_ast_cache
 from skillspector.references import (
     MAX_ACCEPTED_REFERENCES,
@@ -2738,16 +2739,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             elif signature_valid:
                 recognized_oms_signature_paths.add(_OMS_SIGNATURE_PATH)
     recognized_oms_signatures = frozenset(recognized_oms_signature_paths)
-    signature_events = [
-        ledger_event(
-            outcome=LedgerOutcome.PARTIAL,
-            record_type=LedgerRecordType.SYSTEM,
-            phase="discovery",
-            path=path,
-            reason=LedgerReason.OMS_SIGNATURE,
-        )
-        for path in sorted(recognized_oms_signatures)
-    ]
+    signature_events: list[InspectionLedgerEvent] = []
     baseline_events = [
         ledger_event(
             outcome=LedgerOutcome.OUT_OF_SCOPE,
@@ -2758,13 +2750,6 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         )
         for path in sorted(selected_baselines)
     ]
-    for artifact in artifact_inventory:
-        if artifact["path"] in recognized_oms_signatures:
-            # Structure is attacker-controlled, not a trust decision. Inspect
-            # the wrapper normally and report the encoded payload limitation.
-            artifact["disposition"] = ArtifactDisposition.PARTIAL
-            artifact["reason"] = LedgerReason.OMS_SIGNATURE.value
-
     primary_path = next(
         (path for path in ("SKILL.md", "skill.md") if path in inventoried_components), None
     )
@@ -3249,6 +3234,40 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     )
     for path in recognized_containers:
         llm_file_cache.pop(path, None)
+    for path, content in local_file_cache.items():
+        if not content.lstrip().startswith("{"):
+            continue
+        projection_started = monotonic()
+        if projection_started >= processing_deadline:
+            _record_processing_runtime(
+                phase="signature_projection", path=path, now=projection_started
+            )
+            continue
+        projection = project_oms_content(content)
+        if projection is None:
+            continue
+        projection_finished = monotonic()
+        if projection_finished >= processing_deadline:
+            _record_processing_runtime(
+                phase="signature_projection", path=path, now=projection_finished
+            )
+            continue
+        if path in llm_file_cache:
+            llm_file_cache[path] = projection.view.text
+        if not projection.complete:
+            signature_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="discovery",
+                    path=path,
+                    reason=LedgerReason.OMS_SIGNATURE,
+                )
+            )
+            artifact = inventory_by_path.get(path)
+            if artifact is not None and artifact["disposition"] == ArtifactDisposition.ANALYZED:
+                artifact["disposition"] = ArtifactDisposition.PARTIAL
+                artifact["reason"] = LedgerReason.OMS_SIGNATURE.value
     llm_components = sorted(llm_file_cache)
     file_cache = dict(llm_file_cache)
 

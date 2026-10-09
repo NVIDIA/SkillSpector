@@ -915,13 +915,15 @@ SkillSpector uses a two-stage detection pipeline:
 - High recall (catches most issues)
 - Moderate precision (some false positives)
 
-A valid, root-level OpenSSF Model Signing signature (`skill.oms.sig`) is retained in the
-component inventory as type `oms_signature`, but excluded from static and LLM content analysis.
-OMS bundles necessarily contain long base64-encoded payload, signature, and certificate fields;
-generic obfuscated-code checks can otherwise misclassify those fields as hidden executable content.
-The recognizer checks the minimal OMS DSSE/in-toto structure; it does not verify the signature,
-certificate chain, transparency-log entry, or signer identity. Invalid or unrecognized signature
-files are scanned normally.
+OpenSSF Model Signing / DSSE bundles remain in content analysis, regardless of
+filename. Static and LLM analyzers inspect decoded JSON payloads, readable DER
+certificate/signature content, and all unknown wrapper fields. Strictly parsed
+binary fields are projected rather than treated as executable base64; canonical
+bytes remain available to YARA and fingerprints. Unsupported encodings (including
+environments without the optional `cryptography` dependency) retain raw fields
+and produce an explicit incomplete-analysis warning. Findings in decoded content
+point to the original bundle and label their projection in evidence. None of this
+verifies signatures, certificate chains, transparency logs, or signer identity.
 
 ### Stage 2: LLM Semantic Analysis (Optional)
 - Evaluates context and intent
@@ -950,7 +952,7 @@ The tool requires outbound HTTPS access to `api.osv.dev` for live vulnerability 
 SkillSpector is defense-in-depth, not a sandbox. Know what it does and does not do before relying on it:
 
 - **It never executes the scanned skill.** All analysis is static (regex, Python AST, YARA) plus optional LLM evaluation of file *contents* — the skill's code is never run.
-- **LLM analysis sends analyzer-eligible file contents to the configured provider.** When LLM analysis is enabled (the default), file contents are sent to the active `SKILLSPECTOR_PROVIDER` endpoint. Recognized OMS signature files are excluded. Use `--no-llm` to keep contents local (static analysis only).
+- **LLM analysis sends analyzer-eligible file contents to the configured provider.** When LLM analysis is enabled (the default), file contents are sent to the active `SKILLSPECTOR_PROVIDER` endpoint. DSSE payloads and readable signing metadata are included. Use `--no-llm` to keep contents local (static analysis only).
 - **SC4 sends dependency names to OSV.dev.** The supply-chain check queries [OSV.dev](https://osv.dev) with the package names and versions the skill declares, to look up known CVEs. This is fundamental to the check and runs even with `--no-llm`. It sends dependency coordinates (not file contents), requires no API key, and falls back to a bundled list when OSV.dev is unreachable.
 - **It does not sandbox the host.** SkillSpector flags risky patterns *before* you install a skill; it does not contain or isolate a skill you choose to install anyway.
 
