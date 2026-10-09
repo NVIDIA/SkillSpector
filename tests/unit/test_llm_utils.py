@@ -274,6 +274,16 @@ class TestChatCompletion:
 
 
 class TestIsLlmAvailable:
+    def test_unbound_gemini_uses_bounded_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "gemini")
+        resolve = MagicMock(return_value=("token", "https://example.invalid"))
+        monkeypatch.setattr(
+            "skillspector.providers.gemini.provider.GeminiProvider.resolve_credentials", resolve
+        )
+
+        assert is_llm_available(timeout=7) == (True, None)
+        resolve.assert_called_once_with(timeout=7)
+
     def test_returns_true_when_credentials_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "k")
         ok, msg = is_llm_available()
@@ -820,6 +830,73 @@ class TestStructuredOutputMethod:
             "method": "json_schema"
         }
         assert structured_output_kwargs("other", provider=_HintingProvider()) == {}
+
+    def test_analyzer_preference_applies_only_without_explicit_configuration(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        assert structured_output_kwargs(
+            "other", provider=_PlainProvider(), preferred_method="function_calling"
+        ) == {"method": "function_calling"}
+        assert structured_output_kwargs(
+            "needs-json-1", provider=_HintingProvider(), preferred_method="function_calling"
+        ) == {"method": "json_schema"}
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "json_schema")
+        assert structured_output_kwargs(
+            "other", provider=_PlainProvider(), preferred_method="function_calling"
+        ) == {"method": "json_schema"}
+
+    @pytest.mark.parametrize("override", [None, "json_schema", "function_calling"])
+    @pytest.mark.parametrize("provider", [_PlainProvider(), _HintingProvider()])
+    def test_unknown_analyzer_preference_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, override, provider
+    ) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        if override is not None:
+            monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", override)
+        with pytest.raises(ValueError, match="preferred structured output method"):
+            structured_output_kwargs("needs-json-1", provider=provider, preferred_method="xml")
+
+    def test_selected_function_calling_rejects_none_without_changing_prompt(self, monkeypatch):
+        from langchain_core.runnables import RunnableLambda
+
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "function_calling")
+        prompts = []
+
+        class Model:
+            def with_structured_output(self, schema, **kwargs):
+                assert kwargs == {"method": "function_calling"}
+
+                def answer(prompt):
+                    prompts.append(prompt)
+                    return None
+
+                return RunnableLambda(answer)
+
+        chain = bind_structured_output(Model(), dict, "m", provider=_PlainProvider())
+        with pytest.raises(StructuredOutputParseError):
+            chain.invoke("unchanged prompt")
+        assert prompts == ["unchanged prompt"]
+
+    def test_function_calling_preserves_cli_adapter_usage_hooks(self, monkeypatch):
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "function_calling")
+
+        class Schema(BaseModel):
+            verdict: str
+
+        provider = MagicMock()
+        provider.complete.return_value = '{"verdict": "safe"}'
+        adapter = AgentCLIChatModel(provider, "m", 1024)
+        structured = bind_structured_output(adapter, Schema, "m", provider=_PlainProvider())
+        collector = InferenceUsageCollector(
+            node="test",
+            request_kind="structured_output",
+            provider="claude_cli",
+            requested_model="m",
+        )
+        result = structured.invoke_with_usage("test", collector)
+        assert result == Schema(verdict="safe")
+        assert collector.response_received
 
     def test_env_override_wins_over_the_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "function_calling")

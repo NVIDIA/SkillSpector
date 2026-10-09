@@ -71,6 +71,8 @@ from skillspector.llm_utils import (
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
+from skillspector.providers import get_active_provider
+from skillspector.providers.gemini import GeminiProvider
 
 logger = get_logger(__name__)
 
@@ -932,7 +934,14 @@ class LLMAnalyzerBase:
         self._timeout = timeout
         self._dynamic_timeout = callable(timeout)
         self._input_budget = get_max_input_tokens(model)
-        self._llm = get_chat_model(model=model, timeout=self._require_time_remaining())
+        try:
+            self._llm = get_chat_model(model=model, timeout=self._require_time_remaining())
+        except ValueError:
+            raise
+        except Exception:
+            self._require_time_remaining()
+            raise
+        self._require_time_remaining()
         # Native SDK retries cannot re-read a workflow-wide deadline between
         # attempts.  A dynamic deadline therefore uses our explicit retry loop,
         # which checks and caps every retry/backoff against remaining time.
@@ -942,7 +951,7 @@ class LLMAnalyzerBase:
             max_retries=native_retries,
         )
         self._structured_llm = (
-            bind_structured_output(self._llm, self.response_schema, model)
+            self._bind_structured_output(self._llm, self.response_schema)
             if self.response_schema
             else None
         )
@@ -951,6 +960,18 @@ class LLMAnalyzerBase:
             request_kind="structured_output" if self.response_schema else "chat_completion",
             model=model,
             chat_model=self._llm,
+        )
+
+    def _structured_output_preference(self, llm: object) -> str | None:
+        """Return an analyzer-specific binding preference, if any."""
+        return None
+
+    def _bind_structured_output(self, llm: object, schema: type) -> object:
+        return bind_structured_output(
+            llm,
+            schema,
+            self.model,
+            preferred_method=self._structured_output_preference(llm),
         )
 
     def _remaining_timeout(self) -> float | None:
@@ -983,11 +1004,27 @@ class LLMAnalyzerBase:
         remaining = self._require_time_remaining()
         if not self._dynamic_timeout:
             return self._llm, self._structured_llm
-        if _retarget_request_timeout(self._llm, remaining):
+        provider = get_active_provider()
+        token_changed = False
+        if isinstance(provider, GeminiProvider) and isinstance(self._llm, BaseChatOpenAI):
+            credentials = provider.resolve_credentials(timeout=remaining)
+            if credentials is None:
+                raise ValueError("Gemini credentials unavailable.")
+            token = self._llm.openai_api_key
+            token_changed = token is None or token.get_secret_value() != credentials[0]
+            remaining = self._require_time_remaining()
+        if not token_changed and _retarget_request_timeout(self._llm, remaining):
             # Native retries were already disabled for the dynamic-deadline case in
             # ``__init__``, and the structured runnable wraps this same model instance.
             return self._llm, self._structured_llm
-        llm = get_chat_model(model=self.model, timeout=remaining)
+        try:
+            llm = get_chat_model(model=self.model, timeout=remaining)
+        except ValueError:
+            raise
+        except Exception:
+            self._require_time_remaining()
+            raise
+        self._require_time_remaining()
         _uses_native_connection_retries(llm, max_retries=0)
         effective_provider = chat_model_provider_name(llm)
         if effective_provider is not None:
@@ -997,10 +1034,12 @@ class LLMAnalyzerBase:
             chat_model_controls(llm),
         )
         structured = (
-            bind_structured_output(llm, self.response_schema, self.model)
+            self._bind_structured_output(llm, self.response_schema)
             if self.response_schema
             else None
         )
+        if token_changed:
+            self._llm, self._structured_llm = llm, structured
         return llm, structured
 
     @property
