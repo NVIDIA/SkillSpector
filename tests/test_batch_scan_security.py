@@ -565,7 +565,7 @@ def test_batch_report_uses_safe_output(tmp_path, monkeypatch, kind):
         calls.append(True)
         return (
             {
-                "skill": {"name": "safe"},
+                "skill": {"name": "safe", "language": "en"},
                 "risk_assessment": {"score": 0, "severity": "LOW"},
                 "issues": [],
             },
