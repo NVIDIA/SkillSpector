@@ -341,6 +341,8 @@ class SkillspectorState(TypedDict, total=False):
     # Output: report node writes formatted string here
     output_format: str
     report_body: str
+    # Auxiliary output; never participates in inspection completeness or scoring.
+    structured_role_coverage: dict[str, object]
 
     # LLM: when False, LLM-based nodes (meta_analyzer, mcp_tool_poisoning's TP4,
     # and the semantic_* analyzers) return immediately without calling the LLM.

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -83,6 +84,7 @@ from skillspector.semantic_runtime import (
     successful_llm_record,
 )
 from skillspector.state import SkillspectorState, transitive_remaining_seconds
+from skillspector.structured_role_report import annotate_structured_report_findings
 from skillspector.suppression import Baseline, SuppressedFinding, partition_findings
 
 logger = get_logger(__name__)
@@ -1394,6 +1396,7 @@ def _format_json(
     semantic_runtime_incomplete: bool = False,
     runtime_available: bool | None = None,
     provider_availability: tuple[bool, str | None] | None = None,
+    structured_role_coverage: Mapping[str, object] | None = None,
 ) -> str:
     """Generate JSON report string."""
     suppressed = suppressed or []
@@ -1444,6 +1447,8 @@ def _format_json(
         "execution_successful": execution_successful,
     }
     data["analysis_completeness"] = dict(analysis_completeness or {})
+    if structured_role_coverage and structured_role_coverage.get("eligible_occurrences"):
+        data["structured_role_coverage"] = dict(structured_role_coverage)
     return json.dumps(data, indent=2)
 
 
@@ -1882,14 +1887,32 @@ def report(state: SkillspectorState) -> dict[str, object]:
     ) and risk_recommendation == "SAFE":
         risk_recommendation = "CAUTION"
 
+    # Auxiliary roles belong only to disposable report copies, AFTER baseline
+    # selection, scoring and compaction. Never return them as canonical findings:
+    # transitive aggregation and a later report may deduplicate those again.
+    remaining = transitive_remaining_seconds(state)
+    role_deadline = time.monotonic() + max(0.0, remaining) if remaining is not None else None
+    role_input_findings = display_findings
+    display_findings, structured_role_coverage = annotate_structured_report_findings(
+        role_input_findings, state, deadline=role_deadline
+    )
+    display_findings = [
+        _sanitize_finding(rendered) if rendered is not original else original
+        for original, rendered in zip(role_input_findings, display_findings, strict=True)
+    ]
+
     sarif_report = _build_sarif(
-        reported_findings,
+        display_findings,
         suppressed,
         degraded_notice=degraded_notice,
         analysis_completeness=analysis_completeness,
         execution_successful=execution_successful,
         structured_summaries=structured_summaries,
     )
+    if structured_role_coverage["eligible_occurrences"]:
+        sarif_report["runs"][0]["invocations"][0]["properties"]["structuredRoleCoverage"] = (
+            structured_role_coverage
+        )
     if output_format == "terminal":
         report_body = _format_terminal(
             display_findings,
@@ -1940,6 +1963,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             semantic_runtime_incomplete=semantic_runtime_incomplete,
             runtime_available=runtime_available,
             provider_availability=(provider_available, provider_error),
+            structured_role_coverage=structured_role_coverage,
         )
     elif output_format == "markdown":
         report_body = _format_markdown(
@@ -1963,6 +1987,18 @@ def report(state: SkillspectorState) -> dict[str, object]:
     else:
         report_body = json.dumps(sarif_report, indent=2)
 
+    if (
+        output_format in {"terminal", "markdown"}
+        and structured_role_coverage["eligible_occurrences"]
+    ):
+        report_body += (
+            "\n\nStructured source roles (report-only): "
+            f"{structured_role_coverage['exact_occurrences']} exact; "
+            f"{structured_role_coverage['unknown_or_unavailable_occurrences']} unknown/unavailable; "
+            f"{structured_role_coverage['omitted_occurrences']} omitted. "
+            "No detection or risk-score adjustment.\n"
+        )
+
     logger.debug(
         "Report generated: format=%s, findings_count=%d, suppressed_count=%d",
         output_format,
@@ -1971,6 +2007,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     )
     return {
         "sarif_report": sarif_report,
+        "structured_role_coverage": structured_role_coverage,
         "risk_score": risk_score,
         "risk_severity": risk_severity,
         "risk_recommendation": risk_recommendation,
