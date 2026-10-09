@@ -3717,7 +3717,7 @@ def test_incidental_pdf_projection_stays_complete_without_format_findings(tmp_pa
     import zipfile
 
     (tmp_path / "SKILL.md").write_text("---\nname: ordinary\ndescription: A helper\n---\nA helper.\n")
-    pdf = b'%PDF-1.7\n%\xe2\xe3\xcf\xd3\n<?xpacket begin="\xef\xbb\xbf"?>\n<metadata>Ordinary document</metadata>\n' + b" " * 2200 + b'\n<?xpacket end="w"?>\n\x00\x00%%EOF\n'
+    pdf = b'%PDF-1.7\n%\xe2\xe3\xcf\xd3\n<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>\n<x:xmpmeta xmlns:x="adobe:ns:meta/">Ordinary document</x:xmpmeta>\n' + b" " * 2200 + b'\n<?xpacket end="w"?>\n\x00\x00%%EOF\n'
     if container:
         with zipfile.ZipFile(tmp_path / "docs.zip", "w") as archive:
             archive.writestr("manual.pdf", pdf)
@@ -3759,3 +3759,12 @@ def test_readable_executable_reports_partial_binary_coverage(tmp_path: Path) -> 
     assert finding.evidence["partially_analyzed_executable"] is True
     assert result["risk_recommendation"] == "DO_NOT_INSTALL"
     assert any(finding.rule_id == "P1" for finding in result["findings"])
+
+
+@pytest.mark.parametrize("payload,rule", [("Unrelated\n" + " " * 2200 + "\nInstructions", "P9"), ("Arbitrary \ufeff hidden marker", "P2")])
+def test_pdf_prefix_does_not_exempt_non_xmp_evasion(tmp_path: Path, payload: str, rule: str) -> None:
+    (tmp_path / "SKILL.md").write_text("# Helper\n")
+    (tmp_path / "GUIDE").write_text("%PDF-1.4\n" + payload)
+    context = build_context({"skill_path": str(tmp_path)})
+    result = static_runner.run_static_patterns_with_ledger(context, [static_patterns_prompt_injection])
+    assert any(finding.file == "GUIDE" and finding.rule_id == rule for finding in result["findings"])

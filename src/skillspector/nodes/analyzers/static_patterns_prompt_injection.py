@@ -321,6 +321,27 @@ def _tag_run_from(content: str, offset: int) -> str:
     return content[offset:end]
 
 
+def _pdf_xmp_format_spans(content: str) -> tuple[int, int, int]:
+    """Recognize one standard XMP packet's BOM and trailing ASCII padding only."""
+    header = '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+    if not content.startswith("%PDF-"):
+        return -1, -1, -1
+    start = content.find(header)
+    if start < 0 or content.find(header, start + len(header)) >= 0:
+        return -1, -1, -1
+    metadata = content.find("<x:xmpmeta", start + len(header))
+    close = content.find("</x:xmpmeta>", metadata) if metadata >= 0 else -1
+    if close < 0:
+        return -1, -1, -1
+    padding_start = close + len("</x:xmpmeta>")
+    padding_end = padding_start
+    while padding_end < len(content) and content[padding_end] in " \t\r\n":
+        padding_end += 1
+    if not content.startswith(('<?xpacket end="w"?>', '<?xpacket end="r"?>'), padding_end):
+        return -1, -1, -1
+    return start + header.index("\ufeff"), padding_start, padding_end
+
+
 def analyze(
     content: str,
     file_path: str,
@@ -362,10 +383,13 @@ def analyze(
                     complete_match=match.group(0),
                 )
             )
+    xmp_bom, xmp_padding_start, xmp_padding_end = _pdf_xmp_format_spans(content)
     if file_type in ("markdown", "perl", "other"):
         for pattern_source, confidence in P2_PATTERNS:
             for match in _p2_pattern_matches(content, pattern_source, check_runtime):
                 runtime_check()
+                if match.start() == xmp_bom and match.group(0) == "\ufeff":
+                    continue
                 findings.append(
                     AnalyzerFinding(
                         rule_id="P2",
@@ -492,6 +516,8 @@ def analyze(
         runtime_check()
         for run in detect_whitespace_padding(content, file_type=file_type):
             runtime_check()
+            if xmp_padding_start <= run.start_offset < run.end_offset <= xmp_padding_end:
+                continue
             if run.kind == "vertical":
                 confidence = 0.8 if run.followed_by_content else 0.6
                 severity = (

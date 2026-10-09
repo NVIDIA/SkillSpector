@@ -2386,16 +2386,10 @@ def _cleanup_expired_path_findings(
 
 
 def _binary_text_findings(findings: list[Finding], content: str) -> list[Finding]:
-    """Do not treat format padding or binary NULs as concealed instructions."""
-    return [
-        finding for finding in findings
-        if not (
-            (finding.rule_id == "P9" and content.startswith("%PDF-"))
-            or (finding.rule_id == "P2" and finding.matched_text == "\x00")
-            or (finding.rule_id == "P2" and content.startswith("%PDF-")
-                and finding.matched_text == "\ufeff")
-        )
-    ]
+    """Binary NUL bytes alone do not establish concealed instructions."""
+    del content
+    return [finding for finding in findings
+            if not (finding.rule_id == "P2" and finding.matched_text == "\x00")]
 
 
 def run_static_patterns(
