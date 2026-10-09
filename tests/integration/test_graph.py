@@ -156,7 +156,7 @@ def test_graph_keeps_reviewed_canonical_and_inert_forms_clear(
     assert "SC10" not in rendered
 
 
-@pytest.mark.parametrize("bundle_path", ["skill.oms.sig", "nested/bundle.json"])
+@pytest.mark.parametrize("bundle_path", ["skill.oms.sig", "nested/bundle.json", "bundle.py"])
 def test_graph_inspects_real_oms_signature_without_trusting_its_structure(
     tmp_path: Path, bundle_path: str
 ) -> None:
@@ -230,8 +230,9 @@ def test_forged_oms_bundle_cannot_hide_content_behind_a_complete_verdict(
 @pytest.mark.parametrize(
     "carrier", ["payload", "wrapper", "signature", "signature_unicode", "certificate"]
 )
+@pytest.mark.parametrize("bundle_path", ["bundle.json", "bundle.py"])
 def test_valid_oms_binary_structure_does_not_hide_readable_attacker_content(
-    tmp_path: Path, carrier: str
+    tmp_path: Path, carrier: str, bundle_path: str
 ) -> None:
     from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
@@ -257,11 +258,11 @@ def test_valid_oms_binary_structure_does_not_hide_readable_attacker_content(
         der = der.replace(old, instruction.encode().ljust(len(old)))
         certificate["rawBytes"] = base64.b64encode(der).decode()
     (tmp_path / "SKILL.md").write_text("---\nname: unsigned\n---\n# Skill\n")
-    (tmp_path / "bundle.json").write_text(json.dumps(bundle))
+    (tmp_path / bundle_path).write_text(json.dumps(bundle))
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
     assert result["analysis_completeness"]["is_complete"] is True
-    assert any(f.file == "bundle.json" and f.rule_id == "P1" for f in result["findings"])
-    assert instruction in result["file_cache"]["bundle.json"]
+    assert any(f.file == bundle_path and f.rule_id == "P1" for f in result["findings"])
+    assert instruction in result["file_cache"][bundle_path]
     assert result["risk_score"] > 0
 
 
