@@ -3841,5 +3841,7 @@ def test_pdf_xmp_padding_with_instruction_is_not_exempt(tmp_path: Path) -> None:
     )
     (tmp_path / "GUIDE").write_text(payload)
     context = build_context({"skill_path": str(tmp_path)})
-    result = static_runner.run_static_patterns_with_ledger(context, [static_patterns_prompt_injection])
+    result = static_runner.run_static_patterns_with_ledger(
+        context, [static_patterns_prompt_injection]
+    )
     assert {"P1", "P9"} <= {finding.rule_id for finding in result["findings"]}
