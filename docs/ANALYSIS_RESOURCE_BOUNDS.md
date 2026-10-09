@@ -255,6 +255,7 @@ removes the rejected partial checkout.
 | Static findings | 10,000 | One artifact |
 | Static findings | 10,000 | One analyzer |
 | Static-analysis time | 300 seconds | One artifact, within the workflow deadline |
+| Timed static-pattern matching CPU | 0.25 seconds | One rule per content window, shared across paragraphs, within the artifact and workflow deadlines |
 | YARA rule-directory entries | 10,000 | Built-in and optional directories combined |
 | YARA rule files | 1,024 | One rule load |
 | YARA rule source bytes | 1 MiB | One rule file |
@@ -332,6 +333,36 @@ Static pattern analysis and YARA matching allow up to 300 seconds per artifact b
 default. Set `SKILLSPECTOR_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT` to a positive
 finite number of seconds to change that allowance. Invalid, zero, negative,
 infinite, or NaN values log a warning and retain the 300-second default.
+
+The shared matcher has a fixed 0.25-second matching CPU limit per rule and content window.
+Paragraph-matched rules share this allowance across all their paragraphs.
+Raising the artifact allowance does not raise this limit. It covers routed rules
+in prompt injection, tool misuse, data exfiltration, supply chain, agent snooping,
+excessive agency, memory poisoning, and rogue agents. Through paragraph matching,
+it also covers prose rules in harmful content, system prompt leakage, output
+handling, anti-refusal, privilege escalation, and SSRF. Output-handling and
+privilege-escalation code patterns also use the timed matcher. Other code rules (SSRF endpoint/request patterns,
+harmful-content substance names, and deserialization DS1–DS4) and helper-specific
+searches remain outside it. The anti-refusal schema-field helper uses a linear
+whitespace prefix so its benign-context check cannot backtrack quadratically.
+
+Audited command/option patterns use a linear, command-segment search that preserves
+unbounded command spans and the original greedy matches. Memory poisoning's
+2–20-character repetition rule uses Python's native engine: failed candidates
+examine at most 20 copies, and successful candidates consume the repeated run.
+The variable shell-flag rule also retains Python’s native backreference semantics.
+It checks assignment headers separately and bounds each candidate call-argument
+tail to 4,096 characters, with the same accumulated matching CPU allowance. A
+potential match extending beyond that span reports `static_parse_limit`.
+The repetition rule is bounded by the 256,000-character inspection window and the
+artifact deadline, rather than the slower engine's per-search timer.
+
+Matching CPU accounting excludes caller work and other threads. The interruptible
+engine itself measures process CPU, however, so native work in competing threads
+can interrupt a search early. Retrying discards progress and can still exhaust the
+matching allowance under sustained contention. If a search expires, its ledger
+event keeps the observed time and limit, and that analyzer records partial coverage
+for the artifact while retaining findings already produced.
 
 ## Configuring the dependency-source deadline
 

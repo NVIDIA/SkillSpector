@@ -273,7 +273,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in RA1_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = bisect_right(line_starts, match.start())
@@ -323,7 +323,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     for pattern, confidence in RA2_PATTERNS:
         is_prose = (pattern, confidence) in RA2_PROSE_PATTERNS
-        matches = static_runner.iter_paragraph_matches if is_prose else re.finditer
+        matches = (
+            static_runner.iter_paragraph_matches if is_prose else static_runner.iter_pattern_matches
+        )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             if is_prose and is_directly_prohibited(content, match.start(), match.end()):
                 continue

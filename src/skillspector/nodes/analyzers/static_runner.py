@@ -17,11 +17,14 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
 import json
 import math
 import os
 import re
+import sys
+import threading
 import time
 import unicodedata
 from array import array
@@ -32,6 +35,8 @@ from dataclasses import dataclass, field
 from inspect import getattr_static
 from itertools import chain
 from typing import cast
+
+import regex  # type: ignore[import-untyped]
 
 from skillspector.artifacts import (
     ContentKind,
@@ -321,17 +326,449 @@ def _paragraph_ranges(content: str) -> tuple[tuple[int, int], ...]:
     return result
 
 
+_STATIC_PATTERN_SECONDS = 0.25
+_ACTIVE_FINDING_BUDGET: ContextVar[_FindingBudget | None] = ContextVar(
+    "static_pattern_finding_budget", default=None
+)
+
+
+_CATEGORY_LOCK = threading.Lock()
+
+
+def _python_categories(ascii_only: bool, ascii_content: bool) -> dict[str, str]:
+    # lru_cache alone permits duplicate builds when analyzer threads miss together.
+    with _CATEGORY_LOCK:
+        return _cached_python_categories(ascii_only, ascii_content)
+
+
+@functools.lru_cache(maxsize=4)
+def _cached_python_categories(ascii_only: bool, ascii_content: bool) -> dict[str, str]:
+    """Use native properties with small corrections for Python's Unicode version."""
+    ascii_alphabet = ascii_only or ascii_content
+    alphabet = "".join(map(chr, range(128 if ascii_alphabet else sys.maxunicode + 1)))
+    native_classes = {"w": r"\p{L}\p{N}_", "s": r"\p{White_Space}", "d": r"\p{Nd}"}
+    result: dict[str, str] = {}
+    budget = _ACTIVE_FINDING_BUDGET.get()
+
+    def ranges_text(ranges: list[tuple[int, int]]) -> str:
+        return "".join(
+            rf"\U{start:08x}" if start == end else rf"\U{start:08x}-\U{end:08x}"
+            for start, end in ranges
+        )
+
+    for category, native_class in native_classes.items():
+        # These single-character classes scan the finite Unicode alphabet once,
+        # never attacker input. Preserve Python's membership, including its
+        # Unicode version and the extra ASCII whitespace separators.
+        native_members = bytearray(len(alphabet))
+        if not ascii_alphabet:
+            for match in regex.finditer(f"[{native_class}]+", alphabet):
+                native_members[match.start() : match.end()] = b"\1" * len(match.group())
+        additions: list[tuple[int, int]] = []
+        removals: list[tuple[int, int]] = []
+        for value, character in enumerate(alphabet):
+            if budget is not None and value % 4096 == 0:
+                budget.check_runtime()
+            expected = (
+                character.isalnum() or character == "_"
+                if category == "w"
+                else character.isspace()
+                if category == "s"
+                else character.isdecimal()
+            )
+            if ascii_only and category == "s":
+                expected = character in " \t\n\r\f\v"
+            if expected == bool(native_members[value]):
+                continue
+            ranges = additions if expected else removals
+            if ranges and ranges[-1][1] == value - 1:
+                ranges[-1] = (ranges[-1][0], value)
+            else:
+                ranges.append((value, value))
+        added, removed = ranges_text(additions), ranges_text(removals)
+        if ascii_alphabet:
+            result[category] = f"(?-i:[{added}])"
+            result[category.upper()] = f"(?-i:[^{added}])"
+            continue
+        for key, negation, include, exclude in (
+            (category, "", added, removed),
+            (category.upper(), "^", removed, added),
+        ):
+            atom = f"[{negation}{native_class}]"
+            if include:
+                atom = f"(?:{atom}|[{include}])"
+            if exclude:
+                atom = f"(?![{exclude}]){atom}"
+            result[key] = f"(?-i:{atom})"
+    return result
+
+
+@functools.lru_cache(maxsize=1024)
+def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> regex.Pattern[str]:
+    """Translate the static-rule grammar while retaining original match offsets.
+
+    Scoped flags and verbose rules need their own grammar support. Reject them
+    as unavailable coverage rather than silently changing detection semantics.
+    """
+    if flags & re.VERBOSE:
+        raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+    timed_flags = regex.VERSION0
+    for name in ("ASCII", "IGNORECASE", "MULTILINE", "DOTALL", "VERBOSE"):
+        if flags & getattr(re, name):
+            timed_flags |= getattr(regex, name)
+
+    def literal_class(token: str) -> str:
+        if flags & re.IGNORECASE and not flags & re.ASCII:
+            for alias in ("ı", "İ"):
+                if bool(re.fullmatch(token, alias, flags)) != bool(
+                    regex.fullmatch(token, alias, timed_flags)
+                ):
+                    insert = 2 if token.startswith("[^") else 1
+                    token = token[:insert] + alias + token[insert:]
+        return token
+
+    # ASCII input needs only ASCII category members. Keep the original flags:
+    # Unicode \s includes ASCII control separators, and Unicode literals can
+    # still fold to ASCII letters under IGNORECASE.
+    categories = _python_categories(bool(flags & re.ASCII), ascii_content)
+    word = categories["w"]
+    parts: list[str] = []
+    cursor = 0
+    while cursor < len(source):
+        # Group names are syntax, never case-insensitive literals.
+        if source.startswith(("(?P<", "(?P="), cursor):
+            if source.startswith("(?P=", cursor) and flags & re.IGNORECASE and not ascii_content:
+                raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+            end = source.index(">" if source.startswith("(?P<", cursor) else ")", cursor) + 1
+            parts.append(source[cursor:end])
+            cursor = end
+            continue
+        flag_group = re.match(r"\(\?[aiLmsux-]+([:)])", source[cursor:])
+        if flag_group is not None:
+            if flag_group.group(1) == ":":
+                raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+            parts.append(flag_group.group(0))
+            cursor += len(flag_group.group(0))
+            continue
+        char = source[cursor]
+        if char == "\\" and cursor + 1 < len(source):
+            code = source[cursor + 1]
+            if code in "123456789" and flags & re.IGNORECASE and not ascii_content:
+                raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+            if code in "xuU":
+                end = cursor + {"x": 4, "u": 6, "U": 10}[code]
+                value = chr(int(source[cursor + 2 : end], 16))
+                parts.append(
+                    "[iIİı]"
+                    if value in "iI" and flags & re.IGNORECASE and not flags & re.ASCII
+                    else source[cursor:end]
+                )
+                cursor = end
+                continue
+            if code in "NB":
+                raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+            if code in categories:
+                parts.append(categories[code])
+            elif code == "b":
+                following = source[cursor + 2 :]
+                literal_word = re.match(
+                    r"[A-Za-z0-9_]+|\(\?:[A-Za-z0-9_]+(?:\|[A-Za-z0-9_]+)*\)", following
+                )
+                required_word = literal_word is not None and (
+                    literal_word.end() == len(following)
+                    or following[literal_word.end()] not in "?*{"
+                )
+                previous_word = bool(
+                    parts
+                    and len(parts[-1]) == 1
+                    and re.fullmatch(r"\w", parts[-1], flags & re.ASCII)
+                )
+                if required_word:
+                    parts.append(rf"(?<!{word})")
+                elif previous_word:
+                    parts.append(rf"(?!{word})")
+                else:
+                    parts.append(rf"(?:(?<!{word})(?={word})|(?<={word})(?!{word}))")
+            else:
+                parts.append(source[cursor : cursor + 2])
+            cursor += 2
+            continue
+        if char == "[":
+            end = cursor + 1
+            if end < len(source) and source[end] == "^":
+                end += 1
+            if end < len(source) and source[end] == "]":
+                end += 1
+            while end < len(source) and source[end] != "]":
+                end += 2 if source[end] == "\\" else 1
+            token = source[cursor : end + 1]
+            negated = token.startswith("[^")
+            inner = token[2 if negated else 1 : -1]
+            atoms: list[str] = []
+            literals: list[str] = []
+            for part in re.findall(r"\\.|.", inner, re.DOTALL):
+                if len(part) == 2 and part.startswith("\\") and part[1] in categories:
+                    # Word/space membership never inherits IGNORECASE. The
+                    # regex package may know case pairs newer than this Python.
+                    atoms.append(categories[part[1]])
+                else:
+                    literals.append(part)
+            if not atoms:
+                # Keep native character-class scanning for ordinary wildcards.
+                parts.append(literal_class(token))
+                cursor = end + 1
+                continue
+            if literals:
+                literal_text = "".join(literals)
+                if literal_text.startswith("^"):
+                    literal_text = "\\" + literal_text
+                atoms.append(literal_class("[" + literal_text + "]"))
+            union = "(?:" + "|".join(atoms) + ")"
+            rewritten = "(?:(?!" + union + r")[\s\S])" if negated else union
+            parts.append(rewritten)
+            cursor = end + 1
+            continue
+        if char in "iI" and flags & re.IGNORECASE and not flags & re.ASCII:
+            parts.append("[iIİı]")
+        else:
+            parts.append(char)
+        cursor += 1
+    return regex.compile("".join(parts), timed_flags)
+
+
+# Only these audited shapes use the linear command path. Prefixes and suffixes
+# have no overlapping unbounded repeats. Keep
+# this registry explicit so a new catalog shape gets reviewed before bypassing
+# the interruptible engine.
+_LINEAR_COMMAND_PATTERNS = frozenset(
+    {
+        r"curl\s+[^|]*-k\b",
+        r"curl\s+[^|]*--insecure\b",
+        r"wget\s+[^|]*--no-check-certificate",
+        r"(?:chmod|chown)\s+[^|]*a\+rwx",
+        r"git\s+push\s+[^|]*--force",
+        r"curl\s+[^|]*(?:-d|--data|--data-raw|--data-binary)\s+",
+        r"wget\s+[^|]*--post-(?:data|file)",
+        r"curl\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh",
+        r"wget\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh",
+        r"curl\s+[^|]*\|\s*(?:sudo\s+)?(?:python|python3|node|ruby|perl)",
+        r"wget\s+[^|]*\|\s*(?:sudo\s+)?(?:python|python3|node|ruby|perl)",
+        r"(?:&&|;)\s*(?:curl|wget)\s+[^|]*\|\s*(?:ba)?sh",
+        r"curl\s+[^&]*-o\s+\S+\s*&&\s*(?:sudo\s+)?(?:ba)?sh",
+        r"wget\s+[^&]*-O\s+\S+\s*&&\s*(?:sudo\s+)?(?:ba)?sh",
+    }
+)
+
+
+@functools.lru_cache(maxsize=128)
+def _linear_command_parts(source: str, flags: int) -> tuple[re.Pattern[str], re.Pattern[str], str]:
+    separator = "|" if "[^|]*" in source else "&"
+    prefix, suffix = source.split(f"[^{separator}]*", 1)
+    # Lookahead retains overlapping suffix starts. The original anchored match
+    # below chooses the same greedy span as the complete Python pattern.
+    return re.compile(prefix, flags), re.compile(f"(?={suffix})", flags), separator
+
+
+def _linear_command_matches(
+    original: re.Pattern[str], content: str, start: int, end: int
+) -> Iterator[re.Match[str]]:
+    """Preserve greedy matches while visiting each delimiter-free segment once.
+
+    The wildcard chooses the rightmost possible suffix. If an earlier command
+    precedes it, the original pattern can match at that command in one anchored
+    pass. Without such a pair, skip the segment without retrying every command.
+    Audited suffixes may consume delimiters, as in a download followed by && sh.
+    Each successful match consumes its segment's last suffix; the total prefix,
+    suffix and anchored scanning is linear in the window length.
+    """
+    start, end = max(0, start), min(len(content), max(0, end))
+    prefix, suffix, separator = _linear_command_parts(original.pattern, original.flags)
+    suffixes = suffix.finditer(content, start, end)
+    candidate = next(suffixes, None)
+    budget = _ACTIVE_FINDING_BUDGET.get()
+    while start < end:
+        if budget is not None:
+            budget.check_runtime()
+        delimiter = content.find(separator, start, end)
+        stop = end if delimiter < 0 else delimiter
+        last_suffix = None
+        while candidate is not None and candidate.start() <= stop:
+            if candidate.start() >= start:
+                last_suffix = candidate
+            candidate = next(suffixes, None)
+        if last_suffix is not None:
+            command = prefix.search(content, start, last_suffix.start())
+            if command is not None:
+                match = original.match(content, command.start(), end)
+                if match is None:
+                    raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+                start = max(stop + 1, match.end())
+                yield match
+                continue
+        start = stop + 1
+
+
+@dataclass
+class _PatternAllowance:
+    seconds: float = 0.0
+    limit: float = field(default_factory=lambda: _STATIC_PATTERN_SECONDS)
+
+    def check(self) -> None:
+        if self.seconds >= self.limit:
+            raise _StaticResourceLimitError(
+                LedgerReason.RUNTIME_LIMIT,
+                {"observed_seconds": self.seconds, "limit_seconds": self.limit},
+            )
+
+
+def _iter_pattern_matches(
+    original: re.Pattern[str],
+    compiled: regex.Pattern[str] | None,
+    content: str,
+    start: int,
+    end: int,
+    allowance: _PatternAllowance,
+    budget: _FindingBudget | None,
+) -> Iterator[re.Match[str]]:
+    linear_matches = (
+        _linear_command_matches(original, content, start, end) if compiled is None else None
+    )
+    skip_empty = False
+    try:
+        while True:
+            if budget is not None:
+                budget.check_runtime()
+                allowance.limit = min(
+                    allowance.limit,
+                    allowance.seconds + max(0.0, budget.deadline - budget.clock()),
+                )
+            timeout = allowance.limit - allowance.seconds
+            if timeout <= 0:
+                raise TimeoutError
+            # regex's iterator timer includes CPU used by the caller between
+            # yields. Restart it while retaining one cumulative matching budget;
+            # the artifact deadline separately bounds caller work.
+            started_at = time.thread_time()
+            expired = False
+            try:
+                if linear_matches is not None:
+                    match = next(linear_matches, None)
+                else:
+                    assert compiled is not None
+                    matches = compiled.finditer(
+                        content,
+                        start,
+                        len(content) if end is None else end,
+                        timeout=timeout,
+                        concurrent=False,
+                    )
+                    if skip_empty:
+                        # Replay the previous empty match so the native iterator
+                        # can still return a nonempty match at the same position.
+                        next(matches, None)
+                    match = next(matches, None)
+            except TimeoutError:
+                expired = True
+            finally:
+                allowance.seconds += max(0.0, time.thread_time() - started_at)
+            if budget is not None:
+                budget.check_runtime()
+            if linear_matches is not None and allowance.seconds >= allowance.limit:
+                raise TimeoutError
+            if expired:
+                # The engine counts all process CPU. Retry within this thread's
+                # allowance; sustained contention can still exhaust it through
+                # repeated searches that make no retained progress.
+                continue
+            if match is None:
+                return
+            start = match.end()
+            skip_empty = match.start() == start
+            yield cast(re.Match[str], match)
+    except TimeoutError as exc:
+        raise _StaticResourceLimitError(
+            LedgerReason.RUNTIME_LIMIT,
+            {
+                "observed_seconds": allowance.seconds,
+                "limit_seconds": allowance.limit,
+            },
+        ) from exc
+
+
+def iter_pattern_matches(
+    pattern: str | re.Pattern[str],
+    content: str,
+    flags: int = 0,
+    *,
+    start: int = 0,
+    end: int | None = None,
+) -> Iterator[re.Match[str]]:
+    """Interrupt a single pattern search and retain the runner's partial evidence."""
+    budget = _ACTIVE_FINDING_BUDGET.get()
+    if budget is not None:
+        budget.check_runtime()
+    original = re.compile(pattern, flags)
+    compiled = (
+        None
+        if original.pattern in _LINEAR_COMMAND_PATTERNS and not original.flags & re.VERBOSE
+        else _timed_pattern(original.pattern, original.flags, content.isascii())
+    )
+    yield from _iter_pattern_matches(
+        original,
+        compiled,
+        content,
+        start,
+        len(content) if end is None else end,
+        _PatternAllowance(),
+        budget,
+    )
+
+
 def iter_paragraph_matches(
     pattern: str | re.Pattern[str], content: str, flags: int = 0
 ) -> Iterator[re.Match[str]]:
-    """Match prose within paragraphs; executable and structured rules use finditer."""
-    regex = re.compile(pattern, flags)
+    """Match prose ranges with one matching allowance per rule and content window."""
     ranges = _paragraph_ranges(content)
     if not ranges:
-        yield from regex.finditer(content)
+        yield from iter_pattern_matches(pattern, content, flags)
         return
-    for start, end in ranges:
-        yield from regex.finditer(content, start, end)
+    budget = _ACTIVE_FINDING_BUDGET.get()
+    if budget is not None:
+        budget.check_runtime()
+    original = re.compile(pattern, flags)
+    compiled = _timed_pattern(original.pattern, original.flags, content.isascii())
+    allowance = _PatternAllowance()
+    cursor = 0
+    while cursor < len(ranges):
+        if budget is not None:
+            budget.check_runtime()
+        allowance.check()
+        start, end = ranges[cursor]
+        if end - start > 8:
+            yield from _iter_pattern_matches(
+                original, compiled, content, start, end, allowance, budget
+            )
+            cursor += 1
+            continue
+        # At most eight characters per native search bounds backtracking in the
+        # trusted rule catalog. Batch these tiny ranges to avoid a timer/engine
+        # setup for each paragraph; collect before yielding to exclude caller CPU.
+        started_at = time.thread_time()
+        matches = []
+        for _ in range(128):
+            start, end = ranges[cursor]
+            if end - start > 8:
+                break
+            matches.extend(original.finditer(content, start, end))
+            cursor += 1
+            if cursor == len(ranges):
+                break
+        allowance.seconds += max(0.0, time.thread_time() - started_at)
+        allowance.check()
+        for match in matches:
+            if budget is not None:
+                budget.check_runtime()
+            yield match
 
 
 def security_view_match_is_literal(content: str, start: int, end: int) -> bool:
@@ -997,6 +1434,7 @@ def _scan_path(
         module_finding_start = len(findings)
         occurrence_columns = _OccurrenceColumnResolver(content, line_starts)
         finding_budget.begin_module()
+        budget_token = _ACTIVE_FINDING_BUDGET.set(finding_budget)
         try:
             with observe_analyzer_findings(finding_budget.observe_creation):
                 prepared = (prepared_analyses or {}).get(id(module))
@@ -1055,6 +1493,8 @@ def _scan_path(
                     if converted is not None:
                         findings.append(converted)
             return findings, exc
+        finally:
+            _ACTIVE_FINDING_BUDGET.reset(budget_token)
     return findings, None
 
 
@@ -3390,11 +3830,12 @@ def run_static_patterns_with_ledger(
                             or observed_seconds >= runtime_limit
                         )
                         if expired:
+                            if resource_limit is not LedgerReason.RUNTIME_LIMIT:
+                                resource_metrics = {
+                                    "observed_seconds": observed_seconds,
+                                    "limit_seconds": runtime_limit,
+                                }
                             resource_limit = LedgerReason.RUNTIME_LIMIT
-                            resource_metrics = {
-                                "observed_seconds": observed_seconds,
-                                "limit_seconds": runtime_limit,
-                            }
                             path_findings = _cleanup_expired_path_findings(
                                 pattern_modules,
                                 path_findings,
@@ -3495,10 +3936,18 @@ def run_static_patterns_with_ledger(
                     reason=partial_reason if partial else None,
                     emitted_finding_ids=[finding.finding_id for finding in path_findings],
                     observed_characters=(
-                        len(content) if partial_reason is LedgerReason.SIZE_LIMIT else None
+                        int(resource_metrics["observed_characters"])
+                        if "observed_characters" in resource_metrics
+                        else len(content)
+                        if partial_reason is LedgerReason.SIZE_LIMIT
+                        else None
                     ),
                     limit_characters=(
-                        MAX_FILE_CHARS if partial_reason is LedgerReason.SIZE_LIMIT else None
+                        int(resource_metrics["limit_characters"])
+                        if "limit_characters" in resource_metrics
+                        else MAX_FILE_CHARS
+                        if partial_reason is LedgerReason.SIZE_LIMIT
+                        else None
                     ),
                     observed_findings=(
                         int(resource_metrics.get("observed_findings", len(path_findings)))
