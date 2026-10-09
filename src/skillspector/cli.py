@@ -83,6 +83,7 @@ from skillspector.suppression import (
     dump_baseline,
     effective_findings,
     load_baseline,
+    source_content_key,
 )
 
 logger = get_logger(__name__)
@@ -1191,7 +1192,7 @@ def _source_aware_file_cache(
     file_cache: dict[str, str], source_identity: str | None
 ) -> dict[str, str]:
     return {
-        _transitive_component_key(source_identity, path): content
+        (source_content_key(source_identity, path) if source_identity else path): content
         for path, content in file_cache.items()
     }
 
@@ -1789,7 +1790,8 @@ def _bounded_cache_update(
 ) -> None:
     for path in sorted(values):
         if path in destination:
-            destination[path] = values[path]
+            # Source-scoped keys are disjoint from root paths. A repeated key
+            # refers to the same cached result within this traversal.
             continue
         if len(destination) >= limit:
             traversal.note_truncation(f"{resource} budget {limit} reached")
