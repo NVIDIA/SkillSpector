@@ -197,9 +197,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     for pattern, confidence in AS3_PATTERNS:
         is_prose = (pattern, confidence) in AS3_PROSE_PATTERNS
         matches = (
-            static_runner.iter_paragraph_matches
-            if is_prose
-            else static_runner.iter_pattern_matches
+            static_runner.iter_paragraph_matches if is_prose else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             if is_prose and is_directly_prohibited(content, match.start(), match.end()):

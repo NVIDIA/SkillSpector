@@ -57,8 +57,8 @@ from .common import (
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
     SourceLocationIndex,
-    get_context_from_lines,
     get_context,
+    get_context_from_lines,
     is_reference_material,
 )
 from .pattern_defaults import PatternCategory
@@ -285,6 +285,7 @@ def _iter_variable_shell_flag_matches(content: str) -> Iterator[re.Match[str]]:
         if match is not None:
             consumed = match.end()
             yield match
+
 
 _VARIABLE_SHELL_ASSIGNMENT_RE = re.compile(
     _VARIABLE_SHELL_ASSIGNMENT_PATTERN, re.IGNORECASE | re.MULTILINE
@@ -4454,7 +4455,9 @@ def _tm1_candidates(
         pattern: str,
         confidence: float,
     ) -> Iterator[tuple[int, int, re.Match[str], float]]:
-        for match in static_runner.iter_pattern_matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             yield match.start(), pattern_index, match, confidence
 
     def direct_candidates() -> Iterator[
@@ -5385,7 +5388,9 @@ def analyze(
     reference_material = is_reference_material(file_path, file_type)
     tm4_tags = [*tag, "contextual-triage", "likely-benign-context"] if reference_material else tag
     for pattern, confidence in TM4_PATTERNS:
-        for match in static_runner.iter_pattern_matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = line_number(match.start())
             findings.append(
                 AnalyzerFinding(

@@ -2842,11 +2842,14 @@ def test_variable_shell_windows_preserve_upstream_call_ownership(name, prefix):
                 end = len(content)
                 break
         for argument in module._SHELL_NAME_ARGUMENT_RE.finditer(content, assignment.end(), end):
-            window = module._VARIABLE_SHELL_FLAG_RE.fullmatch(content, assignment.start(), argument.end())
+            window = module._VARIABLE_SHELL_FLAG_RE.fullmatch(
+                content, assignment.start(), argument.end()
+            )
             if window is not None:
                 keep(window)
     assert [(m.span(), m.groups()) for m in module._variable_shell_matches(content)] == [
-        (m.span(), m.groups()) for m in sorted(expected.values(), key=lambda m: (m.start(), m.end()))
+        (m.span(), m.groups())
+        for m in sorted(expected.values(), key=lambda m: (m.start(), m.end()))
     ]
 
 
