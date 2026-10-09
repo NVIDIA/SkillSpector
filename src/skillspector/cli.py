@@ -3443,6 +3443,23 @@ def baseline(
         state = _scan_state(input_path, FormatChoice.json, no_llm)
         state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
+        completeness_value = result.get("analysis_completeness")
+        completeness = completeness_value if isinstance(completeness_value, dict) else {}
+        if (
+            result.get("execution_successful") is False
+            or completeness.get("execution_successful") is False
+            or completeness.get("status") == "failed"
+        ):
+            raise ValueError(
+                "Cannot generate baseline because scan execution failed. "
+                "Run 'skillspector scan' to inspect analysis completeness, "
+                "resolve the failures, and retry."
+            )
+        if completeness.get("is_complete") is False or completeness.get("status") == "partial":
+            err_console.print(
+                "[yellow]Warning:[/yellow] Scan analysis is incomplete; the baseline "
+                "accepts only observed findings and coverage gaps remain."
+            )
         # Fingerprint every occurrence the next scan checks. The reported
         # findings are deduplicated and keep only one occurrence's evidence.
         findings = result["active_findings"]
