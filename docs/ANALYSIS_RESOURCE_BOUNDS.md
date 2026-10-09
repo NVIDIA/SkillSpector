@@ -255,7 +255,7 @@ removes the rejected partial checkout.
 | Static findings | 10,000 | One artifact |
 | Static findings | 10,000 | One analyzer |
 | Static-analysis time | 300 seconds | One artifact, within the workflow deadline |
-| Timed static-pattern matching CPU | 0.25 seconds | One pattern search, within the artifact and workflow deadlines |
+| Timed static-pattern matching CPU | 0.25 seconds | One rule per content window, shared across paragraphs, within the artifact and workflow deadlines |
 | YARA rule-directory entries | 10,000 | Built-in and optional directories combined |
 | YARA rule files | 1,024 | One rule load |
 | YARA rule source bytes | 1 MiB | One rule file |
@@ -334,14 +334,17 @@ default. Set `SKILLSPECTOR_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT` to a positi
 finite number of seconds to change that allowance. Invalid, zero, negative,
 infinite, or NaN values log a warning and retain the 300-second default.
 
-The shared matcher has a fixed 0.25-second matching CPU limit per search.
+The shared matcher has a fixed 0.25-second matching CPU limit per rule and content window.
+Paragraph-matched rules share this allowance across all their paragraphs.
 Raising the artifact allowance does not raise this limit. It covers routed rules
 in prompt injection, tool misuse, data exfiltration, supply chain, agent snooping,
 excessive agency, memory poisoning, and rogue agents. Through paragraph matching,
 it also covers prose rules in harmful content, system prompt leakage, output
 handling, anti-refusal, privilege escalation, and SSRF. Output-handling and
 privilege-escalation code patterns and the variable shell-flag scope precheck
-also use the timed matcher. Other helper-specific searches remain outside it.
+also use the timed matcher. Other code rules (SSRF endpoint/request patterns,
+harmful-content substance names, and deserialization DS1–DS4) and helper-specific
+searches remain outside it.
 
 Audited command/option patterns use a linear, command-segment search that preserves
 unbounded command spans and the original greedy matches. Memory poisoning's

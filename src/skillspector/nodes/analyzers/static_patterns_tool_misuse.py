@@ -45,7 +45,8 @@ from .common import (
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
     get_context,
-    get_line_number,
+    get_context_from_lines,
+    SourceLocationIndex,
     is_reference_material,
 )
 from .pattern_defaults import PatternCategory
@@ -4719,12 +4720,15 @@ def analyze(
 ) -> list[AnalyzerFinding]:
     """Analyze content for tool misuse patterns (TM1–TM3)."""
     findings: list[AnalyzerFinding] = []
+    locations = SourceLocationIndex(content, file_path)
+    lines = content.splitlines()
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
 
     def ctx(start: int) -> str:
-        return get_context(content, start)
+        line, column = locations.line_and_column(start)
+        return get_context_from_lines(lines, line, column=column)
 
     tag = [PatternCategory.TOOL_MISUSE.value]
     tm1_findings_by_key: dict[tuple[int, str, int], AnalyzerFinding] = {}
@@ -4762,7 +4766,7 @@ def analyze(
             continue
         if variable_match is not None and (match_start, match_end) in invisible_variable_matches:
             continue
-        line_num = get_line_number(content, match_start)
+        line_num = locations.line_and_column(match_start)[0]
         context_text = ctx(match_start)
         matched = matched_text[:200]
         matched_line = _line_containing(content, match_start, match_end)
@@ -4807,7 +4811,7 @@ def analyze(
             else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+            line_num = locations.line_and_column(match.start())[0]
             context_text = ctx(match.start())
             matched = match.group(0)[:200]
 
@@ -4837,7 +4841,7 @@ def analyze(
             else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+            line_num = locations.line_and_column(match.start())[0]
             findings.append(
                 AnalyzerFinding(
                     rule_id="TM3",
@@ -4861,7 +4865,7 @@ def analyze(
         for match in static_runner.iter_pattern_matches(
             pattern, content, re.IGNORECASE | re.MULTILINE
         ):
-            line_num = get_line_number(content, match.start())
+            line_num = locations.line_and_column(match.start())[0]
             findings.append(
                 AnalyzerFinding(
                     rule_id="TM4",
@@ -4931,7 +4935,7 @@ def postprocess_path_findings(
     if ast_index is None:
         return cleanup_path_findings(findings)
     resolved: dict[tuple[int, str], list[_VariableShellCandidate]] = {}
-    for match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
+    for match in static_runner.iter_pattern_matches(_VARIABLE_SHELL_FLAG_RE, content):
         finding_line = bisect_right(ast_index.line_character_starts, match.start())
         assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
         candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)

@@ -440,7 +440,19 @@ def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> rege
             if code in categories:
                 parts.append(categories[code])
             elif code == "b":
-                parts.append(rf"(?:(?<!{word})(?={word})|(?<={word})(?!{word}))")
+                following = source[cursor + 2 :]
+                literal_word = re.match(r"[A-Za-z0-9_]+|\(\?:[A-Za-z0-9_]+(?:\|[A-Za-z0-9_]+)*\)", following)
+                required_word = literal_word is not None and (
+                    literal_word.end() == len(following)
+                    or following[literal_word.end()] not in "?*{"
+                )
+                previous_word = bool(parts and len(parts[-1]) == 1 and re.fullmatch(r"\w", parts[-1]))
+                if required_word:
+                    parts.append(rf"(?<!{word})")
+                elif previous_word:
+                    parts.append(rf"(?!{word})")
+                else:
+                    parts.append(rf"(?:(?<!{word})(?={word})|(?<={word})(?!{word}))")
             else:
                 parts.append(source[cursor : cursor + 2])
             cursor += 2
@@ -561,41 +573,41 @@ def _linear_command_matches(
         start = stop + 1
 
 
-def iter_pattern_matches(
-    pattern: str | re.Pattern[str],
+@dataclass
+class _PatternAllowance:
+    seconds: float = 0.0
+    limit: float = field(default_factory=lambda: _STATIC_PATTERN_SECONDS)
+
+    def check(self) -> None:
+        if self.seconds >= self.limit:
+            raise _StaticResourceLimitError(
+                LedgerReason.RUNTIME_LIMIT,
+                {"observed_seconds": self.seconds, "limit_seconds": self.limit},
+            )
+
+
+def _iter_pattern_matches(
+    original: re.Pattern[str],
+    compiled: regex.Pattern[str] | None,
     content: str,
-    flags: int = 0,
-    *,
-    start: int = 0,
-    end: int | None = None,
+    start: int,
+    end: int,
+    allowance: _PatternAllowance,
+    budget: _FindingBudget | None,
 ) -> Iterator[re.Match[str]]:
-    """Interrupt a single pattern search and retain the runner's partial evidence."""
-    budget = _ACTIVE_FINDING_BUDGET.get()
-    if budget is not None:
-        budget.check_runtime()
-    original = re.compile(pattern, flags)
     linear_matches = (
-        _linear_command_matches(original, content, start, len(content) if end is None else end)
-        if original.pattern in _LINEAR_COMMAND_PATTERNS and not original.flags & re.VERBOSE
-        else None
+        _linear_command_matches(original, content, start, end) if compiled is None else None
     )
-    compiled = (
-        None
-        if linear_matches is not None
-        else _timed_pattern(original.pattern, original.flags, content.isascii())
-    )
-    matching_seconds = 0.0
-    matching_limit = _STATIC_PATTERN_SECONDS
     skip_empty = False
     try:
         while True:
             if budget is not None:
                 budget.check_runtime()
-                matching_limit = min(
-                    matching_limit,
-                    matching_seconds + max(0.0, budget.deadline - budget.clock()),
+                allowance.limit = min(
+                    allowance.limit,
+                    allowance.seconds + max(0.0, budget.deadline - budget.clock()),
                 )
-            timeout = matching_limit - matching_seconds
+            timeout = allowance.limit - allowance.seconds
             if timeout <= 0:
                 raise TimeoutError
             # regex's iterator timer includes CPU used by the caller between
@@ -623,10 +635,10 @@ def iter_pattern_matches(
             except TimeoutError:
                 expired = True
             finally:
-                matching_seconds += max(0.0, time.thread_time() - started_at)
+                allowance.seconds += max(0.0, time.thread_time() - started_at)
             if budget is not None:
                 budget.check_runtime()
-            if linear_matches is not None and matching_seconds >= matching_limit:
+            if linear_matches is not None and allowance.seconds >= allowance.limit:
                 raise TimeoutError
             if expired:
                 # The engine counts all process CPU. Retry within this thread's
@@ -642,22 +654,82 @@ def iter_pattern_matches(
         raise _StaticResourceLimitError(
             LedgerReason.RUNTIME_LIMIT,
             {
-                "observed_seconds": matching_seconds,
-                "limit_seconds": matching_limit,
+                "observed_seconds": allowance.seconds,
+                "limit_seconds": allowance.limit,
             },
         ) from exc
+
+
+
+def iter_pattern_matches(
+    pattern: str | re.Pattern[str],
+    content: str,
+    flags: int = 0,
+    *,
+    start: int = 0,
+    end: int | None = None,
+) -> Iterator[re.Match[str]]:
+    """Interrupt a single pattern search and retain the runner's partial evidence."""
+    budget = _ACTIVE_FINDING_BUDGET.get()
+    if budget is not None:
+        budget.check_runtime()
+    original = re.compile(pattern, flags)
+    compiled = (
+        None
+        if original.pattern in _LINEAR_COMMAND_PATTERNS and not original.flags & re.VERBOSE
+        else _timed_pattern(original.pattern, original.flags, content.isascii())
+    )
+    yield from _iter_pattern_matches(
+        original, compiled, content, start, len(content) if end is None else end,
+        _PatternAllowance(), budget,
+    )
 
 
 def iter_paragraph_matches(
     pattern: str | re.Pattern[str], content: str, flags: int = 0
 ) -> Iterator[re.Match[str]]:
-    """Match prose within paragraphs; executable and structured rules use finditer."""
+    """Match prose ranges with one matching allowance per rule and content window."""
     ranges = _paragraph_ranges(content)
     if not ranges:
         yield from iter_pattern_matches(pattern, content, flags)
         return
-    for start, end in ranges:
-        yield from iter_pattern_matches(pattern, content, flags, start=start, end=end)
+    budget = _ACTIVE_FINDING_BUDGET.get()
+    if budget is not None:
+        budget.check_runtime()
+    original = re.compile(pattern, flags)
+    compiled = _timed_pattern(original.pattern, original.flags, content.isascii())
+    allowance = _PatternAllowance()
+    cursor = 0
+    while cursor < len(ranges):
+        if budget is not None:
+            budget.check_runtime()
+        allowance.check()
+        start, end = ranges[cursor]
+        if end - start > 8:
+            yield from _iter_pattern_matches(
+                original, compiled, content, start, end, allowance, budget
+            )
+            cursor += 1
+            continue
+        # At most eight characters per native search bounds backtracking in the
+        # trusted rule catalog. Batch these tiny ranges to avoid a timer/engine
+        # setup for each paragraph; collect before yielding to exclude caller CPU.
+        started_at = time.thread_time()
+        matches = []
+        for _ in range(128):
+            start, end = ranges[cursor]
+            if end - start > 8:
+                break
+            matches.extend(original.finditer(content, start, end))
+            cursor += 1
+            if cursor == len(ranges):
+                break
+        allowance.seconds += max(0.0, time.thread_time() - started_at)
+        allowance.check()
+        for match in matches:
+            if budget is not None:
+                budget.check_runtime()
+            yield match
 
 
 def security_view_match_is_literal(content: str, start: int, end: int) -> bool:

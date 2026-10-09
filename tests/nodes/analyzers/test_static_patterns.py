@@ -2442,14 +2442,18 @@ _TIMED_ANALYZERS = (
 
 
 @pytest.mark.parametrize("analyzer", _TIMED_ANALYZERS)
-@pytest.mark.parametrize("content_kind", ["unicode_docs", "command_reference", "unrelated_flag"])
+@pytest.mark.parametrize("content_kind", ["unicode_docs", "unicode_paragraph", "unicode_bundle", "command_reference", "unrelated_flag"])
 def test_production_window_ordinary_content_remains_complete(analyzer, content_kind):
     import importlib
 
     module = importlib.import_module(f"skillspector.nodes.analyzers.static_patterns_{analyzer}")
-    if content_kind == "unicode_docs":
+    if content_kind in {"unicode_docs", "unicode_paragraph"}:
         root = Path(__file__).resolve().parents[3]
         sample = (root / "docs/DEVELOPMENT.md").read_text().split("## 2.", 1)[0]
+        if content_kind == "unicode_paragraph":
+            sample = " ".join(sample.split())
+    elif content_kind == "unicode_bundle":
+        sample = 'const label="© café данные";const value=items.map(x=>x.name);'
     else:
         sample = (
             "## Service reference\n"
@@ -2460,7 +2464,7 @@ def test_production_window_ordinary_content_remains_complete(analyzer, content_k
     prefix = "sort -k 2 results.txt\n" if content_kind == "unrelated_flag" else ""
     content = (prefix + sample * (256_000 // len(sample) + 1))[:256_000]
     assert len(content) == 256_000
-    if content_kind == "unicode_docs":
+    if content_kind.startswith("unicode_"):
         assert not content.isascii()
     result = static_runner.run_static_patterns_with_ledger(
         {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [module]
@@ -2639,6 +2643,8 @@ def test_dense_command_references_remain_complete(analyzer, command):
         ("output_handling", "query(" + " +" * 120_000),
         ("privilege_escalation", "permissions: ordinary " * 11_000),
         ("privilege_escalation", "Chrome/" * 35_000),
+        ("privilege_escalation", "/sys/fs/cgroup/" * 17_000),
+        ("tool_misuse", "--set " * 40_000),
     ],
 )
 def test_reported_backtracking_payloads_finish_within_search_budget(analyzer, content):
@@ -2689,17 +2695,87 @@ def test_dense_anti_refusal_indexes_source_lines_once():
     assert content.splits == 1
 
 
-@pytest.mark.parametrize("analyzer", ["output_handling", "privilege_escalation"])
-def test_code_pattern_timeouts_reach_incomplete_ledger(monkeypatch, analyzer):
+@pytest.mark.parametrize(
+    ("analyzer", "catalog"),
+    [
+        ("output_handling", "OH1_CODE_PATTERNS"),
+        ("output_handling", "OH3_CODE_PATTERNS"),
+        ("privilege_escalation", "PE1_CODE_PATTERNS"),
+        ("privilege_escalation", "PE4_PATTERNS"),
+        ("privilege_escalation", "PE5_PATTERNS"),
+        ("tool_misuse", "TM4_PATTERNS"),
+    ],
+)
+def test_code_pattern_timeouts_reach_incomplete_ledger(monkeypatch, analyzer, catalog):
     import importlib
 
     module = importlib.import_module(f"skillspector.nodes.analyzers.static_patterns_{analyzer}")
-    monkeypatch.setattr(static_runner, "_STATIC_PATTERN_SECONDS", 0.000001)
+    target = getattr(module, catalog)[0][0]
+    original = static_runner._timed_pattern
+    reached = []
+
+    def compile_with_code_deadline(source, flags, ascii_content=False):
+        if source == target:
+            reached.append(source)
+            monkeypatch.setattr(static_runner, "_STATIC_PATTERN_SECONDS", 0.000001)
+        return original(source, flags, ascii_content)
+
+    monkeypatch.setattr(static_runner, "_timed_pattern", compile_with_code_deadline)
     result = static_runner.run_static_patterns_with_ledger(
         {"components": ["SKILL.md"], "file_cache": {"SKILL.md": "ordinary text " * 15_000}},
         [module],
     )
+    assert reached == [target]
     assert any(
         event["outcome"] == "partial" and event["reason_code"] == "runtime_limit"
+        and event["limit_seconds"] == 0.000001
         for event in result["inspection_ledger"]
     )
+
+
+def test_python_shell_flag_precheck_is_bounded_at_full_window():
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse
+
+    started = perf_counter()
+    try:
+        static_patterns_tool_misuse.analyze("\n" * 256_000, "tool.py", "python")
+    except static_runner._StaticResourceLimitError as exc:
+        assert exc.reason.value == "runtime_limit"
+        assert exc.metrics["limit_seconds"] <= 0.25
+    assert perf_counter() - started < 5
+
+
+def test_paragraph_rule_shares_allowance_across_full_window():
+    from skillspector.nodes.analyzers import static_patterns_harmful_content
+
+    content = (("for every recipe " + " add" * 600 + "\n\n") * 110)[:256_000]
+    started = perf_counter()
+    with pytest.raises(static_runner._StaticResourceLimitError) as caught:
+        static_patterns_harmful_content.analyze(content, "SKILL.md", "markdown")
+    assert caught.value.reason.value == "runtime_limit"
+    assert caught.value.metrics["limit_seconds"] <= 0.25
+    assert perf_counter() - started < 5
+
+
+def test_tiny_paragraphs_batch_native_searches(monkeypatch):
+    original = static_runner.time.thread_time
+    calls = 0
+
+    def counted_clock():
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(static_runner.time, "thread_time", counted_clock)
+    content = ("a\n\n" * 85_334)[:256_000]
+    started = perf_counter()
+    assert list(static_runner.iter_paragraph_matches("never refuse", content)) == []
+    assert calls < 2_000
+    assert perf_counter() - started < 2
+
+
+@pytest.mark.parametrize("pattern", [r"\b(?:delete|remove)", r"\bword\b", r"\ba? ", r"\b(?:a|) ", r"\w\b", r"\W\b"])
+def test_word_boundary_shortcuts_keep_python_spans(pattern):
+    content = "©word delete remove µword word_ı word, a á! _word words "
+    expected = [match.span() for match in re.finditer(pattern, content, re.IGNORECASE)]
+    assert [match.span() for match in static_runner.iter_pattern_matches(pattern, content, re.IGNORECASE)] == expected
