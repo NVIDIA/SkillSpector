@@ -38,7 +38,7 @@ from skillspector.cleanup import TempDirTracker, cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.graph_proxy import restore_package_graph_export
-from skillspector.inspection_ledger import LedgerReason
+from skillspector.inspection_ledger import only_missing_reference_exceptions
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.nodes.analyzers import ANALYZER_MODULES
@@ -202,14 +202,9 @@ async def run_scan(
         # must keep blocking safe_to_install like any other exceptional
         # reason.
         ledger_exceptions = analysis_completeness.get("ledger_exceptions") or []
-        reference_caveat_only = (
-            bool(ledger_exceptions)
-            and not analysis_completeness.get("limitations")
-            and all(
-                exception.get("reason_code") == LedgerReason.REFERENCE_MISSING
-                for exception in ledger_exceptions
-            )
-        )
+        reference_caveat_only = only_missing_reference_exceptions(
+            ledger_exceptions
+        ) and not analysis_completeness.get("limitations")
         analysis_requirement_met = not use_llm or llm_runtime_complete
         safe_to_install = (
             risk_score <= RISK_THRESHOLD

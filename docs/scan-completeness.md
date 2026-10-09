@@ -129,6 +129,8 @@ Fatal execution failure takes precedence and exits 2 regardless of strict flags.
 
 JSON and MCP expose `analysis_completeness.status`, `is_complete`, `ledger_exceptions`, `scope_exclusions`, `analyzer_statuses`, and `limitations`, as well as `execution_successful`. Exceptions include reason, message, path, fatality, available source lines, and applicable limit metrics. Terminal and Markdown reports show these projections; SARIF uses invocation completeness and notifications. The report raises an otherwise `SAFE` recommendation to `CAUTION` for incomplete analysis while retaining the actual score and severity.
 
+If every ledger exception is `reference_missing` and no files, analyzers, or other scan work are incomplete, the report uses `complete_with_caveats` with `is_complete=true`. Missing references remain visible in the reference and exception details, but do not make `--fail-on-incomplete` fail or change an otherwise `SAFE` recommendation. Ambiguous references and any actual coverage gap remain incomplete.
+
 A subtlety is that component coverage can still read **100%** for AE6: analyzer work completed on each file, while a separate system event records unresolved interpretation. Consumers must use `is_complete` and the ledger, not the coverage percentage alone. No new telemetry platform is needed to explain these decisions; the existing public fields distinguish the causes.
 
 ## Review critique and remaining limits

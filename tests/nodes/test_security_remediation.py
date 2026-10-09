@@ -1769,7 +1769,9 @@ def test_reported_self_and_existing_file_references_remain_complete(tmp_path: Pa
 
 
 @pytest.mark.parametrize("case", ["missing", "ambiguous"])
-def test_unresolved_primary_reference_blocks_complete_verdict(tmp_path: Path, case: str) -> None:
+def test_missing_reference_is_caveat_but_ambiguous_reference_blocks_completeness(
+    tmp_path: Path, case: str
+) -> None:
     reference = "references/windows-host-setup.md" if case == "missing" else "guide.md"
     if case == "ambiguous":
         for subdirectory in ("first", "second"):
@@ -1798,13 +1800,15 @@ def test_unresolved_primary_reference_blocks_complete_verdict(tmp_path: Path, ca
     assert unresolved[0]["status"] == case
     assert unresolved[0]["target_path"] is None
     assert not any(finding.rule_id == "AE1" for finding in result["filtered_findings"])
-    assert result["analysis_completeness"]["is_complete"] is False
+    completeness = result["analysis_completeness"]
+    assert completeness["is_complete"] is (case == "missing")
+    assert completeness["status"] == ("complete_with_caveats" if case == "missing" else "partial")
     expected_reason = "reference_missing" if case == "missing" else "reference_unresolved"
     assert any(
         row["reason_code"] == expected_reason
         for row in result["analysis_completeness"]["ledger_exceptions"]
     )
-    assert result["risk_recommendation"] != "SAFE"
+    assert (result["risk_recommendation"] == "SAFE") is (case == "missing")
 
 
 @pytest.mark.parametrize(
@@ -1881,22 +1885,24 @@ def test_reference_caveat_does_not_turn_self_reference_into_ae1(
     assert statuses[("resolved", primary)] == 1
     assert statuses[(status, None)] == 1
     assert not any(finding.rule_id == "AE1" for finding in result["filtered_findings"])
-    # The unresolved mention is still reported as a completeness caveat.
+    # The unresolved mention remains visible even when it is non-blocking.
     assert [
         (row["path"], row["reason_code"])
         for row in result["analysis_completeness"]["ledger_exceptions"]
     ] == [(primary, reason)]
-    assert result["analysis_completeness"]["is_complete"] is False
-    assert result["risk_recommendation"] == "CAUTION"
+    assert result["analysis_completeness"]["is_complete"] is (status == "missing")
+    assert result["analysis_completeness"]["status"] == (
+        "complete_with_caveats" if status == "missing" else "partial"
+    )
+    assert result["risk_recommendation"] == ("SAFE" if status == "missing" else "CAUTION")
 
 
 @pytest.mark.asyncio
 async def test_unresolved_reference_caveat_does_not_block_mcp_install(tmp_path: Path) -> None:
     """A reference caveat hides no bytes, so it must not fail safe_to_install.
 
-    Same fixture as test_missing_primary_reference_blocks_complete_verdict:
-    is_complete stays False and the recommendation stays non-SAFE, but every
-    discovered file was fully inspected and nothing was hidden from analysis.
+    Every discovered file was fully inspected and nothing was hidden from
+    analysis; the report retains the caveat while treating coverage as complete.
     """
     (tmp_path / "SKILL.md").write_text(
         "# Skill\n\nContinue with [the local guide](missing-guide.md).\n",
@@ -1905,8 +1911,9 @@ async def test_unresolved_reference_caveat_does_not_block_mcp_install(tmp_path: 
 
     verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
 
-    assert verdict["analysis_completeness"]["is_complete"] is False
-    assert verdict["recommendation"] != "SAFE"
+    assert verdict["analysis_completeness"]["is_complete"] is True
+    assert verdict["analysis_completeness"]["status"] == "complete_with_caveats"
+    assert verdict["recommendation"] == "SAFE"
     assert verdict["safe_to_install"] is True
 
 
