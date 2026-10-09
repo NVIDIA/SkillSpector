@@ -25,12 +25,22 @@ Framework: ASI02.
 from __future__ import annotations
 
 import ast
+import heapq
 import re
 import sys
+import time
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from hashlib import sha256
 
+from skillspector.artifacts import (
+    SecurityTextView,
+    _has_derived_security_view,
+    normalized_security_prefix,
+    normalized_security_view,
+    security_text_views,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
@@ -42,10 +52,10 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 from . import static_runner
 from .common import (
     LINE_BREAK_CHARS,
+    LOGICAL_LINE_BREAK,
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
     get_context,
-    get_line_number,
     is_reference_material,
 )
 from .pattern_defaults import PatternCategory
@@ -55,9 +65,17 @@ logger = get_logger(__name__)
 ANALYZER_ID = "static_patterns_tool_misuse"
 ANALYZE_USES_POSTPROCESS = True
 POSTPROCESS_USES_PYTHON_AST = True
+POSTPROCESS_USES_RUNTIME_BUDGET = True
 _VARIABLE_SHELL_FLAG_EVIDENCE = "_tm1_variable_shell_flag"
-_TRUE_SHELL_DIRECT_EVIDENCE = "_tm1_true_shell_direct"
-_TRUE_SHELL_ARGUMENT_RE = re.compile(r"\bshell\s*=\s*true", re.IGNORECASE)
+LEXICAL_DIRECT_SHELL_EVIDENCE = "_tm1_lexical_direct_shell"
+LEXICAL_RAW_OWNER_EVIDENCE = "_tm1_lexical_raw_owner"
+LEXICAL_NORMALIZED_MATCH_EVIDENCE = "_tm1_lexical_normalized_match"
+LEXICAL_BOUND_IDENTITY_EVIDENCE = "_tm1_lexical_bound_identity"
+LEXICAL_BOUND_IDENTITY_SOURCE_EVIDENCE = "_tm1_lexical_bound_identity_source"
+LEXICAL_BOUND_CLASSIFICATION_EVIDENCE = "_tm1_lexical_bound_classification"
+LEXICAL_REACH_TERMINATED_EVIDENCE = "_tm1_lexical_reach_terminated"
+LEXICAL_BOUND_REACHABLE_EVIDENCE = "_tm1_lexical_bound_reachable"
+_MAX_DIRECT_SHELL_CONTEXT_CHARS = 1024
 
 _SHELL_COMMAND_WORD_START_RE = re.compile(r"[rRdDeE$'\"`\\]")
 _SHELL_COMMAND_WORD_CHARS = 4096
@@ -197,21 +215,27 @@ _ROOT_GLOB_AFFIRMATIVE_NEGATION_PREFIX_RE = re.compile(
 # shell=<name> to a subprocess invocation.  The bounded newline gap and the
 # AST binding-evidence guard keep this a local data-flow fact; Python scope
 # visibility is enforced separately in analyze() via _VARIABLE_SHELL_FLAG_RE.
+_VARIABLE_SHELL_ASSIGNMENT_PATTERN = r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*True\s*$\n"
 _VARIABLE_SHELL_FLAG_PATTERN = (
-    r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*True\s*$\n"
-    r"(?:[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
+    _VARIABLE_SHELL_ASSIGNMENT_PATTERN + r"(?:[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
     r"(?:subprocess\.\w+|Popen)\s*\([^)]*\bshell\s*=\s*\1\b"
 )
 _VARIABLE_SHELL_FLAG_RE = re.compile(_VARIABLE_SHELL_FLAG_PATTERN, re.IGNORECASE | re.MULTILINE)
+_VARIABLE_SHELL_ASSIGNMENT_RE = re.compile(
+    _VARIABLE_SHELL_ASSIGNMENT_PATTERN, re.IGNORECASE | re.MULTILINE
+)
+_SHELL_NAME_ARGUMENT_RE = re.compile(r"\bshell\s*=\s*\w+", re.IGNORECASE)
 
 # TM1: Tool Parameter Abuse — dangerous parameter values
-TM1_CODE_PATTERNS = [
+DIRECT_SHELL_TRUE_PATTERNS: tuple[tuple[str, float], ...] = (
     # shell=True is a classic command injection vector
-    (r"subprocess\.\w+\s*\([^)]*shell\s*=\s*True", 0.8),
-    (r"Popen\s*\([^)]*shell\s*=\s*True", 0.8),
-    # Preserve the direct-call signal when a Python boolean is assigned to a
-    # local name immediately before the invocation. The bounded newline gap
-    # avoids treating an arbitrary distant assignment as a data-flow fact.
+    (r"subprocess\.\w+\s*\([^)]*shell\s*=\s*True\b", 0.8),
+    (r"Popen\s*\([^)]*shell\s*=\s*True\b", 0.8),
+)
+_DIRECT_SHELL_TRUE_VALUE = re.compile(r"shell\s*=\s*True\b", re.IGNORECASE)
+TM1_CODE_PATTERNS = [
+    *DIRECT_SHELL_TRUE_PATTERNS,
+    # Preserve the current-main fallback when the Python AST is unavailable.
     (_VARIABLE_SHELL_FLAG_PATTERN, 0.8),
     # Bound command names on both sides so prefixes such as rmm/ (RAPIDS
     # Memory Manager headers) are not interpreted as destructive commands.
@@ -3250,6 +3274,118 @@ def _has_unsupported_brace_expansion(tokens: tuple[_ShellToken, ...]) -> bool:
     )
 
 
+def _projected_subprocess_qualifier(
+    content: str,
+    popen_start: int,
+    maximum_lookbehind: int,
+) -> tuple[int, int, str, bool] | None:
+    """Return a security-view ``subprocess.`` suffix and its raw source span."""
+    qualifier = "subprocess."
+    if popen_start <= 0:
+        return None
+    maximum = min(popen_start, max(0, maximum_lookbehind))
+    lookbehind = min(maximum, 64)
+    while lookbehind:
+        prefix_start = popen_start - lookbehind
+        # Include the first method character so contextual default-ignorable
+        # handling sees the same right boundary as the full security view.
+        needs_more_source = False
+        source = content[prefix_start : popen_start + 1]
+        for view in security_text_views(source):
+            derived_popen_start = (
+                popen_start - prefix_start
+                if view.source_offsets is None
+                else bisect_left(view.source_offsets, popen_start - prefix_start)
+            )
+            prefix = view.text[:derived_popen_start]
+            if len(prefix) < len(qualifier):
+                needs_more_source = True
+                continue
+            suffix_start = len(prefix) - len(qualifier)
+            suffix = prefix[suffix_start:]
+            if suffix.casefold() == qualifier:
+                return (
+                    prefix_start + view.source_offset(suffix_start),
+                    prefix_start + view.source_offset(derived_popen_start - 1) + 1,
+                    suffix,
+                    view.name != "raw",
+                )
+        if not needs_more_source:
+            return None
+        if lookbehind == maximum:
+            return None
+        lookbehind = min(maximum, lookbehind * 2)
+    return None
+
+
+def _subprocess_qualifier_start(content: str, popen_start: int) -> int | None:
+    """Find a bounded security-view ``subprocess.`` suffix before bare Popen."""
+    qualifier = _projected_subprocess_qualifier(
+        content,
+        popen_start,
+        static_runner._WINDOW_OVERLAP_CHARS + len("subprocess."),
+    )
+    return qualifier[0] if qualifier is not None else None
+
+
+def _outer_shell_true_anchor(matched_text: str) -> int | None:
+    """Locate the first outer-call shell literal, ignoring quoted lookalikes."""
+    stack: list[str] = []
+    quote: str | None = None
+    triple = False
+    in_comment = False
+    cursor = 0
+    pairs = {")": "(", "]": "[", "}": "{"}
+    while cursor < len(matched_text):
+        character = matched_text[cursor]
+        if in_comment:
+            if character in LINE_BREAK_CHARS:
+                in_comment = False
+            cursor += 1
+            continue
+        if quote is not None:
+            if character == "\\":
+                cursor = min(len(matched_text), cursor + 2)
+                continue
+            marker = quote * (3 if triple else 1)
+            if matched_text.startswith(marker, cursor):
+                cursor += len(marker)
+                quote = None
+                triple = False
+            else:
+                cursor += 1
+            continue
+        if character in "'\"":
+            quote = character
+            triple = matched_text.startswith(character * 3, cursor)
+            cursor += 3 if triple else 1
+            continue
+        if character == "#":
+            in_comment = True
+            cursor += 1
+            continue
+        if character in "([{":
+            stack.append(character)
+            cursor += 1
+            continue
+        if character in pairs:
+            if stack and stack[-1] == pairs[character]:
+                stack.pop()
+            cursor += 1
+            continue
+        if (
+            stack == ["("]
+            and (
+                cursor == 0
+                or not (matched_text[cursor - 1].isalnum() or matched_text[cursor - 1] == "_")
+            )
+            and _DIRECT_SHELL_TRUE_VALUE.match(matched_text, cursor) is not None
+        ):
+            return cursor
+        cursor += 1
+    return None
+
+
 _SCOPE_NODE_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
 _COMPREHENSION_SCOPE_TYPES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 _NATIVE_SHELL_RECEIVERS = frozenset({"subprocess", "Popen"})
@@ -3947,6 +4083,52 @@ def _assignment_name_scope(
     return scope
 
 
+def _variable_shell_call_start(match: re.Match[str]) -> int | None:
+    """Return the final call selected by one bounded variable-shell match."""
+    callees = tuple(re.finditer(r"(?:subprocess\.\w+|Popen)\s*\(", match.group(0), re.IGNORECASE))
+    return match.start() + callees[-1].start() if callees else None
+
+
+def _is_true_prefixed_name(name: str) -> bool:
+    """Return whether a variable window keeps a call-anchored fallback for a name."""
+    return name.casefold().startswith("true")
+
+
+def _variable_shell_matches(content: str) -> list[re.Match[str]]:
+    """Return bounded variable-shell windows, one per call for true-prefixed names.
+
+    The non-overlapping scan pairs an assignment with one call and skips an
+    assignment inside an earlier window. The ``\\b``-bounded direct pattern
+    does not report ``shell=true_value`` and folds identical same-line
+    ``shell=true`` calls into one candidate, so every assignment of a
+    true-prefixed name is also paired with each call its bounded window
+    reaches. The nearest assignment owns each call.
+    """
+    windows: dict[int, re.Match[str]] = {}
+
+    def keep(window: re.Match[str]) -> None:
+        previous = windows.get(window.end())
+        if previous is None or window.start() > previous.start():
+            windows[window.end()] = window
+
+    for match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
+        keep(match)
+    for assignment in _VARIABLE_SHELL_ASSIGNMENT_RE.finditer(content):
+        if not _is_true_prefixed_name(assignment.group(1)):
+            continue
+        search_end = assignment.end() - 1
+        for _ in range(5):
+            search_end = content.find("\n", search_end + 1)
+            if search_end == -1:
+                search_end = len(content)
+                break
+        for argument in _SHELL_NAME_ARGUMENT_RE.finditer(content, assignment.end(), search_end):
+            window = _VARIABLE_SHELL_FLAG_RE.fullmatch(content, assignment.start(), argument.end())
+            if window is not None:
+                keep(window)
+    return sorted(windows.values(), key=lambda window: (window.start(), window.end()))
+
+
 def _resolve_variable_shell_candidate(
     index: _VariableShellAstIndex,
     match: re.Match[str],
@@ -3961,8 +4143,15 @@ def _resolve_variable_shell_candidate(
     ]
     call_nodes = index.calls.get(name, ())
     starts = index.call_starts.get(name, ())
-    call_index = bisect_left(starts, match.start())
-    if len(assignment_nodes) != 1 or call_index >= len(call_nodes):
+    expected_call_start = _variable_shell_call_start(match)
+    if expected_call_start is None:
+        return None
+    call_index = bisect_left(starts, expected_call_start)
+    if (
+        len(assignment_nodes) != 1
+        or call_index >= len(call_nodes)
+        or call_nodes[call_index].start != expected_call_start
+    ):
         return None
     assignment = assignment_nodes[0]
     call = call_nodes[call_index]
@@ -4167,46 +4356,145 @@ def _lexical_shell_has_counterevidence(
 def _tm1_candidates(
     content: str,
     *,
+    direct_shell_only: bool = False,
     shell_content: str | None = None,
-) -> Iterator[tuple[int, int, str, float]]:
-    for pattern, confidence in TM1_PATTERNS:
+) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
+    def direct_matches(
+        pattern_index: int,
+        pattern: str,
+        confidence: float,
+    ) -> Iterator[tuple[int, int, re.Match[str], float]]:
+        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            yield match.start(), pattern_index, match, confidence
+
+    def direct_candidates() -> Iterator[
+        tuple[int, int, str, float, bool, int | None, int | None, str | None]
+    ]:
+        direct_iterators = (
+            direct_matches(pattern_index, pattern, confidence)
+            for pattern_index, (pattern, confidence) in enumerate(DIRECT_SHELL_TRUE_PATTERNS)
+        )
+        qualified_popen_starts: set[int] = set()
+        for _, pattern_index, match, confidence in heapq.merge(
+            *direct_iterators,
+            key=lambda candidate: (candidate[0], candidate[1]),
+        ):
+            alternate_start: int | None = None
+            alternate_matched_text: str | None = None
+            if pattern_index == 0:
+                method = re.match(r"subprocess\.(?P<method>\w+)", match.group(0), re.IGNORECASE)
+                if method is not None and method.group("method").casefold() == "popen":
+                    alternate_start = match.start() + method.start("method")
+                    alternate_matched_text = content[alternate_start : match.end()]
+                    qualified_popen_starts.add(alternate_start)
+            elif match.start() in qualified_popen_starts:
+                # Emit one candidate for a qualified ``subprocess.Popen`` call,
+                # but retain the bare-method coordinate as an ownership fallback
+                # when the qualifier belongs to an adjacent scan window.
+                qualified_popen_starts.remove(match.start())
+                continue
+            elif (
+                qualifier_start := _subprocess_qualifier_start(content, match.start())
+            ) is not None:
+                alternate_start = qualifier_start
+                alternate_matched_text = content[qualifier_start : match.end()]
+            relative_anchor = _outer_shell_true_anchor(match.group(0))
+            if relative_anchor is None:
+                for shell_value in _DIRECT_SHELL_TRUE_VALUE.finditer(match.group(0)):
+                    relative_anchor = shell_value.start()
+            anchor = match.start() + relative_anchor if relative_anchor is not None else None
+            yield (
+                match.start(),
+                match.end(),
+                match.group(0),
+                confidence,
+                True,
+                anchor,
+                alternate_start,
+                alternate_matched_text,
+            )
+
+    if direct_shell_only:
+        yield from direct_candidates()
+        return
+
+    def ordinary_matches(
+        pattern_index: int,
+        pattern: str,
+        confidence: float,
+    ) -> Iterator[tuple[int, int, re.Match[str], float]]:
+        if pattern == _VARIABLE_SHELL_FLAG_PATTERN:
+            for match in _variable_shell_matches(content):
+                yield match.start(), pattern_index, match, confidence
+            return
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in TM1_PROSE_PATTERNS
             else re.finditer
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
-            yield match.start(), match.end(), match.group(0), confidence
+            yield match.start(), pattern_index, match, confidence
 
-    yield from _tm1_shell_candidates(content)
-    if shell_content is not None and shell_content != content:
-        yield from _tm1_shell_candidates(shell_content)
-
-
-def _tm1_shell_candidates(content: str) -> Iterator[tuple[int, int, str, float]]:
-    seen_commands: set[tuple[int, int]] = set()
-    covered_until = 0
-    for command_start, body_start in _destructive_command_words(content):
-        if command_start < covered_until:
-            continue
-        command_key = (command_start, body_start)
-        if command_key in seen_commands:
-            continue
-        seen_commands.add(command_key)
-        # Documentation is excluded regardless of the shell parse result.  Apply
-        # that existing semantic gate first so large manuals do not pay for a
-        # character-by-character shell parse for every explanatory ``rm`` noun.
-        if _is_root_glob_documentation(content, command_start, body_start):
-            continue
-        tokens, command_end, _ = _bounded_shell_tokens(
-            content,
-            command_start,
-            body_start,
+    def ordinary_candidates() -> Iterator[
+        tuple[int, int, str, float, bool, int | None, int | None, str | None]
+    ]:
+        ordinary_iterators = (
+            ordinary_matches(pattern_index, pattern, confidence)
+            for pattern_index, (pattern, confidence) in enumerate(
+                TM1_PATTERNS[len(DIRECT_SHELL_TRUE_PATTERNS) :]
+            )
         )
-        covered_until = max(covered_until, command_end)
-        command = content[command_start:command_end]
-        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
-            yield command_start, command_end, command, 0.9
+        for _, _, match, confidence in heapq.merge(
+            *ordinary_iterators,
+            key=lambda candidate: (candidate[0], candidate[1]),
+        ):
+            yield (
+                match.start(),
+                match.end(),
+                match.group(0),
+                confidence,
+                False,
+                None,
+                None,
+                None,
+            )
+
+    def destructive_candidates(
+        candidate_content: str,
+    ) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
+        seen_commands: set[tuple[int, int]] = set()
+        covered_until = 0
+        for command_start, body_start in _destructive_command_words(candidate_content):
+            if command_start < covered_until:
+                continue
+            command_key = (command_start, body_start)
+            if command_key in seen_commands:
+                continue
+            seen_commands.add(command_key)
+            # Documentation is excluded regardless of the shell parse result. Apply
+            # that existing semantic gate first so large manuals do not pay for a
+            # character-by-character shell parse for every explanatory ``rm`` noun.
+            if _is_root_glob_documentation(candidate_content, command_start, body_start):
+                continue
+            tokens, command_end, _ = _bounded_shell_tokens(
+                candidate_content,
+                command_start,
+                body_start,
+            )
+            covered_until = max(covered_until, command_end)
+            command = candidate_content[command_start:command_end]
+            if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
+                yield command_start, command_end, command, 0.9, False, None, None, None
+
+    destructive_iterators = [destructive_candidates(content)]
+    if shell_content is not None and shell_content != content:
+        destructive_iterators.append(destructive_candidates(shell_content))
+    yield from heapq.merge(
+        direct_candidates(),
+        ordinary_candidates(),
+        *destructive_iterators,
+        key=lambda candidate: candidate[0],
+    )
 
 
 def _markdown_block_separator(line: str, check_runtime: Callable[[], None]) -> bool:
@@ -4690,19 +4978,45 @@ def _line_containing(content: str, start: int, end: int) -> str:
     return content[line_start:line_end]
 
 
+def _bounded_context(content: str, match_start: int) -> str:
+    """Return a fixed-size context centered on one direct shell call."""
+    left = max(0, match_start - _MAX_DIRECT_SHELL_CONTEXT_CHARS // 2)
+    right = min(len(content), left + _MAX_DIRECT_SHELL_CONTEXT_CHARS)
+    left = max(0, right - _MAX_DIRECT_SHELL_CONTEXT_CHARS)
+    return content[left:right].rstrip(LINE_BREAK_CHARS)
+
+
+def _raw_classification_bounds(content: str, source_start: int) -> tuple[int, int]:
+    """Return the raw scanner-window bounds that own *source_start*."""
+    if len(content) <= static_runner.SECURITY_VIEW_WINDOW_CHARS:
+        return 0, len(content)
+    owned_start = (
+        source_start // static_runner._RAW_WINDOW_OWNED_CHARS
+    ) * static_runner._RAW_WINDOW_OWNED_CHARS
+    owned_end = min(len(content), owned_start + static_runner._RAW_WINDOW_OWNED_CHARS)
+    raw_start = max(0, owned_start - static_runner._WINDOW_OVERLAP_CHARS)
+    raw_end = min(len(content), owned_end + static_runner._WINDOW_OVERLAP_CHARS)
+    return raw_start, raw_end
+
+
 def _classify_tm1(
     context: str,
     matched_text: str,
     matched_line: str,
     confidence: float,
     file_type: str,
+    *,
+    safe_context: bool | None = None,
+    safe_matched_line: bool | None = None,
 ) -> tuple[Severity, float]:
     """Apply the existing TM1 contextual classification to one candidate."""
-    if (
-        _is_safe_container_command(context)
-        or _is_safe_dockerfile_idiom(context, matched_text)
-        or _is_safe_cache_cleanup(matched_line)
-    ):
+    if safe_context is None:
+        safe_context = _is_safe_container_command(context) or _is_safe_dockerfile_idiom(
+            context, matched_text
+        )
+    if safe_matched_line is None:
+        safe_matched_line = _is_safe_cache_cleanup(matched_line)
+    if safe_context or safe_matched_line:
         return Severity.LOW, min(confidence, 0.15)
     adjusted = (
         min(1.0, confidence + 0.1) if file_type in ("python", "shell", "javascript") else confidence
@@ -4715,6 +5029,7 @@ def analyze(
     file_path: str,
     file_type: str,
     *,
+    _direct_shell_only: bool = False,
     defer_variable_reconciliation: bool = False,
 ) -> list[AnalyzerFinding]:
     """Analyze content for tool misuse patterns (TM1–TM3)."""
@@ -4723,16 +5038,33 @@ def analyze(
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
 
+    line_starts = (0, *(match.end() for match in LOGICAL_LINE_BREAK.finditer(content)))
+
+    def line_number(start: int) -> int:
+        return bisect_right(line_starts, start)
+
+    context_by_line: dict[int, str] = {}
+
     def ctx(start: int) -> str:
-        return get_context(content, start)
+        line = line_number(start)
+        context = context_by_line.get(line)
+        if context is None:
+            context = get_context(content, start)
+            context_by_line[line] = context
+        return context
 
     tag = [PatternCategory.TOOL_MISUSE.value]
-    tm1_findings_by_key: dict[tuple[int, str, int], AnalyzerFinding] = {}
+    tm1_findings_by_key: dict[tuple[int, str], AnalyzerFinding] = {}
+    direct_safety_by_line: dict[int, tuple[bool, bool]] = {}
 
-    variable_matches = {
-        (match.start(), match.end()): (match.group(1), match)
-        for match in _VARIABLE_SHELL_FLAG_RE.finditer(content)
-    }
+    variable_matches = (
+        {}
+        if _direct_shell_only
+        else {
+            (match.start(), match.end()): (match.group(1), match)
+            for match in _variable_shell_matches(content)
+        }
+    )
     invisible_variable_matches: set[tuple[int, int]] = set()
     if file_type == "python" and variable_matches and not defer_variable_reconciliation:
         parsed = parse_python_source(content, file_path)
@@ -4752,29 +5084,67 @@ def analyze(
     shell_content = (
         _perl_literal_print_shell_text(content, lambda: None) if file_type == "perl" else None
     )
-    for match_start, match_end, matched_text, confidence in _tm1_candidates(
-        content, shell_content=shell_content
+    for (
+        match_start,
+        match_end,
+        matched_text,
+        confidence,
+        is_direct_shell_true,
+        direct_shell_anchor,
+        alternate_start,
+        alternate_matched_text,
+    ) in _tm1_candidates(
+        content,
+        direct_shell_only=_direct_shell_only,
+        shell_content=shell_content,
     ):
         variable_match = variable_matches.get((match_start, match_end))
-        if variable_match is not None and variable_match[0].casefold().startswith("true"):
-            # The case-insensitive direct ``shell=True`` pattern already owns
-            # true-prefixed names at the exact call location.
-            continue
         if variable_match is not None and (match_start, match_end) in invisible_variable_matches:
             continue
-        line_num = get_line_number(content, match_start)
-        context_text = ctx(match_start)
+        line_num = line_number(match_start)
+        classification_context = ctx(match_start)
+        context_text = (
+            _bounded_context(content, match_start)
+            if is_direct_shell_true
+            else classification_context
+        )
         matched = matched_text[:200]
         matched_line = _line_containing(content, match_start, match_end)
 
-        sev, adj = _classify_tm1(
-            context_text,
-            matched,
-            matched_line,
-            confidence,
-            file_type,
+        if is_direct_shell_true:
+            safety = direct_safety_by_line.get(line_num)
+            if safety is None:
+                safety = (
+                    _is_safe_container_command(classification_context)
+                    or _is_safe_dockerfile_idiom(classification_context, matched),
+                    _is_safe_cache_cleanup(matched_line),
+                )
+                direct_safety_by_line[line_num] = safety
+            sev, adj = _classify_tm1(
+                classification_context,
+                matched,
+                matched_line,
+                confidence,
+                file_type,
+                safe_context=safety[0],
+                safe_matched_line=safety[1],
+            )
+        else:
+            sev, adj = _classify_tm1(
+                classification_context,
+                matched,
+                matched_line,
+                confidence,
+                file_type,
+            )
+        candidate_identity = (
+            matched_text if is_direct_shell_true or variable_match is not None else matched
         )
-        candidate_key = (line_num, " ".join(matched.strip().split()), match_start)
+        complete_identity_match = matched_text
+        candidate_key = (
+            line_num,
+            sha256(" ".join(candidate_identity.strip().split()).encode()).hexdigest(),
+        )
         existing = tm1_findings_by_key.get(candidate_key)
         if existing is not None:
             if adj > existing.confidence:
@@ -4782,10 +5152,68 @@ def analyze(
                 existing.severity = sev
             continue
         evidence: dict[str, object] = {static_runner._VIEW_START_EVIDENCE: match_start}
+        if is_direct_shell_true:
+            canonical_start = (
+                alternate_start
+                if alternate_start is not None and alternate_start < match_start
+                else match_start
+            )
+            shell_match = (
+                _DIRECT_SHELL_TRUE_VALUE.match(content, direct_shell_anchor)
+                if direct_shell_anchor is not None
+                else None
+            )
+            canonical_match = (
+                content[canonical_start : shell_match.end()]
+                if shell_match is not None
+                else (
+                    alternate_matched_text
+                    if alternate_start is not None
+                    and alternate_start < match_start
+                    and alternate_matched_text is not None
+                    else matched_text
+                )
+            )
+            complete_identity_match = normalized_security_view(canonical_match).text
+            reach_end = content.find(")", match_start)
+            reach_terminated = reach_end != -1
+            if not reach_terminated:
+                reach_end = len(content)
+            evidence.update(
+                {
+                    static_runner._PRESERVE_SOURCE_START_EVIDENCE: True,
+                    static_runner._VIEW_REACH_END_EVIDENCE: reach_end,
+                    static_runner._VIEW_REPLACEMENT_START_LIMIT_EVIDENCE: max(
+                        0,
+                        len(content) - len("True"),
+                    ),
+                    LEXICAL_REACH_TERMINATED_EVIDENCE: reach_terminated,
+                    LEXICAL_DIRECT_SHELL_EVIDENCE: True,
+                    LEXICAL_NORMALIZED_MATCH_EVIDENCE: normalized_security_prefix(
+                        canonical_match,
+                        200,
+                    ),
+                }
+            )
+            if direct_shell_anchor is not None:
+                evidence[static_runner._VIEW_ANCHOR_EVIDENCE] = direct_shell_anchor
+            if alternate_start is not None:
+                evidence[static_runner._VIEW_ALTERNATE_START_EVIDENCE] = alternate_start
+            if alternate_matched_text is not None:
+                evidence[static_runner._ALTERNATE_MATCHED_TEXT_EVIDENCE] = alternate_matched_text[
+                    :200
+                ]
         if variable_match is not None and defer_variable_reconciliation:
             evidence[_VARIABLE_SHELL_FLAG_EVIDENCE] = variable_match[0]
-        elif defer_variable_reconciliation and _TRUE_SHELL_ARGUMENT_RE.search(matched_text):
-            evidence[_TRUE_SHELL_DIRECT_EVIDENCE] = True
+            evidence[static_runner._PRESERVE_SOURCE_START_EVIDENCE] = True
+            call_start = _variable_shell_call_start(variable_match[1])
+            if call_start is not None:
+                if variable_match[0].casefold().startswith("true"):
+                    evidence[static_runner._VIEW_START_EVIDENCE] = call_start
+                    # Like a direct owner, a call-anchored window keeps one
+                    # identity across raw and normalized security views.
+                    complete_identity_match = normalized_security_view(matched_text).text
+                evidence[static_runner._VIEW_ANCHOR_EVIDENCE] = call_start
         finding = AnalyzerFinding(
             rule_id="TM1",
             message="Tool Parameter Abuse",
@@ -4795,11 +5223,15 @@ def analyze(
             tags=tag,
             context=context_text,
             matched_text=matched,
-            complete_match=matched_text,
+            complete_match=complete_identity_match,
             evidence=evidence,
         )
         tm1_findings_by_key[candidate_key] = finding
         findings.append(finding)
+
+    if _direct_shell_only:
+        return findings
+
     for pattern, confidence in TM2_PATTERNS:
         matches = (
             static_runner.iter_paragraph_matches
@@ -4807,7 +5239,7 @@ def analyze(
             else re.finditer
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+            line_num = line_number(match.start())
             context_text = ctx(match.start())
             matched = match.group(0)[:200]
 
@@ -4837,7 +5269,7 @@ def analyze(
             else re.finditer
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+            line_num = line_number(match.start())
             findings.append(
                 AnalyzerFinding(
                     rule_id="TM3",
@@ -4859,7 +5291,7 @@ def analyze(
     tm4_tags = [*tag, "contextual-triage", "likely-benign-context"] if reference_material else tag
     for pattern, confidence in TM4_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+            line_num = line_number(match.start())
             findings.append(
                 AnalyzerFinding(
                     rule_id="TM4",
@@ -4876,6 +5308,1236 @@ def analyze(
     return findings
 
 
+def coalesce_path_findings(content: str, findings: list[Finding]) -> list[Finding]:
+    """Select one owner per direct call without discarding private coordinates."""
+    from . import static_python_shell_truthiness
+
+    full_match_identities = {
+        finding.finding_id: finding.match_fingerprint
+        for finding in findings
+        if finding.match_fingerprint is not None
+    }
+    bound_call_starts = {
+        call_start
+        for finding in findings
+        if finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is True
+        and type(
+            call_start := finding.evidence.get(
+                static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE
+            )
+        )
+        is int
+    }
+    # The case-insensitive direct ``shell=True`` pattern also matches a name
+    # spelled ``true``, so its lexical owner already reports that exact call
+    # even when no Python AST can reconcile the variable window.
+    true_name_call_starts = bound_call_starts | {
+        coordinate
+        for finding in findings
+        if finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is True
+        for key in (
+            static_runner._ABSOLUTE_START_EVIDENCE,
+            static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+        )
+        if type(coordinate := finding.evidence.get(key)) is int
+    }
+    findings = [
+        finding
+        for finding in findings
+        if not (
+            isinstance(variable_name := finding.evidence.get(_VARIABLE_SHELL_FLAG_EVIDENCE), str)
+            and finding.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE)
+            in (true_name_call_starts if variable_name.casefold() == "true" else bound_call_starts)
+        )
+    ]
+    canonical_bound_calls: dict[tuple[str, int, str], set[int]] = {}
+    for finding in findings:
+        canonical = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_CANONICAL_FINGERPRINT_EVIDENCE
+        )
+        call_start = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE)
+        if isinstance(canonical, str) and type(call_start) is int:
+            canonical_bound_calls.setdefault(
+                (finding.file, finding.start_line, canonical),
+                set(),
+            ).add(call_start)
+    colliding_bound_identities = {
+        key for key, call_starts in canonical_bound_calls.items() if len(call_starts) > 1
+    }
+
+    lexical_records: list[tuple[Finding, int]] = []
+    parents: dict[int, int] = {}
+
+    def find(coordinate: int) -> int:
+        parent = parents.setdefault(coordinate, coordinate)
+        while parent != coordinate:
+            grandparent = parents[parent]
+            parents[coordinate] = grandparent
+            coordinate = parent
+            parent = grandparent
+        return coordinate
+
+    def union(first: int, second: int) -> None:
+        first_root = find(first)
+        second_root = find(second)
+        if first_root == second_root:
+            return
+        canonical = min(first_root, second_root)
+        parents[max(first_root, second_root)] = canonical
+
+    for finding in findings:
+        if finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is not True:
+            continue
+        start = finding.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE)
+        if type(start) is int:
+            find(start)
+            alternate_start = finding.evidence.get(static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE)
+            if type(alternate_start) is int:
+                union(start, alternate_start)
+            lexical_records.append((finding, start))
+
+    lexical_groups: dict[int, list[Finding]] = {}
+    for finding, start in lexical_records:
+        lexical_groups.setdefault(find(start), []).append(finding)
+
+    severity_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+
+    def lexical_owner_rank(
+        finding: Finding,
+        call_start: int,
+    ) -> tuple[bool, bool, bool, int, float]:
+        """Rank public classification donors independently of scan order."""
+        return (
+            finding.evidence.get(LEXICAL_RAW_OWNER_EVIDENCE) is True,
+            "normalized-view" not in finding.tags,
+            finding.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE) == call_start,
+            severity_rank.get(finding.severity, -1),
+            finding.confidence,
+        )
+
+    def select_lexical_owner(group: list[Finding], call_start: int) -> Finding:
+        return max(
+            enumerate(group),
+            key=lambda item: (*lexical_owner_rank(item[1], call_start), -item[0]),
+        )[1]
+
+    def fingerprint_source_rank(
+        finding: Finding,
+        call_start: int,
+    ) -> tuple[bool, bool, int, bool, int]:
+        """Rank immutable identity donors independently of scan order."""
+        anchor = finding.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE)
+        reach_end = finding.evidence.get(static_runner._ABSOLUTE_REACH_END_EVIDENCE)
+        return (
+            finding.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE) == call_start,
+            "normalized-view" in finding.tags,
+            anchor if type(anchor) is int else -1,
+            finding.evidence.get(LEXICAL_REACH_TERMINATED_EVIDENCE) is True,
+            reach_end if type(reach_end) is int else -1,
+        )
+
+    def fingerprint_record_rank(
+        record: dict[str, object],
+        call_start: int,
+    ) -> tuple[bool, bool, int, bool, int]:
+        """Re-rank a retained identity donor at the current group coordinate."""
+        anchor = record.get("anchor")
+        reach_end = record.get("reach_end")
+        return (
+            record.get("start") == call_start,
+            record.get("normalized") is True,
+            anchor if type(anchor) is int else -1,
+            record.get("reach_terminated") is True,
+            reach_end if type(reach_end) is int else -1,
+        )
+
+    def classification_record(
+        finding: Finding,
+    ) -> dict[str, object]:
+        """Snapshot the bounded public fields needed across cap finalizers."""
+        return {
+            "severity": finding.severity,
+            "confidence": finding.confidence,
+            "base_tags": tuple(finding.tags),
+            "tags": tuple(finding.tags),
+            "raw_owner": finding.evidence.get(LEXICAL_RAW_OWNER_EVIDENCE) is True,
+            "raw_view": "normalized-view" not in finding.tags,
+            "start": finding.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE),
+        }
+
+    def classification_record_rank(
+        record: dict[str, object],
+        call_start: int,
+    ) -> tuple[bool, bool, bool, int, float]:
+        """Re-rank a retained public donor at the current group coordinate."""
+        severity = record.get("severity")
+        confidence = record.get("confidence")
+        return (
+            record.get("raw_owner") is True,
+            record.get("raw_view") is True,
+            record.get("start") == call_start,
+            severity_rank.get(severity, -1) if isinstance(severity, str) else -1,
+            (
+                float(confidence)
+                if isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
+                else -1.0
+            ),
+        )
+
+    def select_fingerprint_source(group: list[Finding], call_start: int) -> Finding:
+        """Prefer the canonical-coordinate normalized match, independent of scan order."""
+        return max(
+            enumerate(group),
+            key=lambda item: (*fingerprint_source_rank(item[1], call_start), -item[0]),
+        )[1]
+
+    def lexical_fingerprint(finding: Finding) -> str | None:
+        """Hash immutable lexical text instead of a prior coalescing override."""
+        canonical_match = finding.evidence.get(LEXICAL_NORMALIZED_MATCH_EVIDENCE)
+        if not isinstance(canonical_match, str) and finding.matched_text is None:
+            return finding.fingerprint()
+        if not isinstance(canonical_match, str):
+            canonical_match = normalized_security_prefix(finding.matched_text or "", 200)
+        normalized = " ".join(canonical_match.strip().split())
+        return sha256(f"{finding.rule_id}\x1f{normalized}".encode()).hexdigest()
+
+    def actual_shell_is_reachable(
+        candidate: Finding,
+        shell_value_start: int,
+        direct_match_end: int,
+    ) -> bool | None:
+        """Compare an AST shell value with this candidate's exact regex reach."""
+        reach_end = candidate.evidence.get(static_runner._ABSOLUTE_REACH_END_EVIDENCE)
+        reach_terminated = candidate.evidence.get(LEXICAL_REACH_TERMINATED_EVIDENCE)
+        if type(reach_end) is not int or type(reach_terminated) is not bool:
+            return None
+        replacement_start_limit = candidate.evidence.get(
+            static_runner._ABSOLUTE_REPLACEMENT_START_LIMIT_EVIDENCE
+        )
+        if type(replacement_start_limit) is int and shell_value_start > replacement_start_limit:
+            replacement_recovery_start = candidate.evidence.get(
+                static_runner._ABSOLUTE_REPLACEMENT_RECOVERY_START_EVIDENCE
+            )
+            if type(replacement_recovery_start) is not int or not any(
+                type(candidate_start) is int and candidate_start >= replacement_recovery_start
+                for candidate_start in (
+                    candidate.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE),
+                    candidate.evidence.get(static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE),
+                )
+            ):
+                return False
+        if reach_terminated:
+            return reach_end > shell_value_start
+        return reach_end >= direct_match_end
+
+    lexical_owners: dict[int, Finding] = {}
+    lexical_member_starts: dict[str, int] = {}
+    for call_start, group in lexical_groups.items():
+        owner = select_lexical_owner(group, call_start)
+        canonical = select_fingerprint_source(group, call_start)
+        if "normalized-view" not in owner.tags:
+            owner.evidence[LEXICAL_RAW_OWNER_EVIDENCE] = True
+        owner_start = owner.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE)
+        if owner is not canonical:
+            # Coalescing can run repeatedly while a finding cap is being
+            # finalized. Persist the canonical identity coordinates on the
+            # retained public owner even when both candidates start together,
+            # otherwise a later pass re-hashes the earlier lexical lookalike.
+            canonical_match = canonical.evidence.get(LEXICAL_NORMALIZED_MATCH_EVIDENCE)
+            if isinstance(canonical_match, str):
+                owner.evidence[LEXICAL_NORMALIZED_MATCH_EVIDENCE] = canonical_match
+            for evidence_key in (
+                static_runner._ABSOLUTE_ANCHOR_EVIDENCE,
+                static_runner._ABSOLUTE_REACH_END_EVIDENCE,
+                static_runner._ABSOLUTE_REPLACEMENT_START_LIMIT_EVIDENCE,
+                static_runner._ABSOLUTE_REPLACEMENT_RECOVERY_START_EVIDENCE,
+                LEXICAL_REACH_TERMINATED_EVIDENCE,
+            ):
+                if evidence_key in canonical.evidence:
+                    owner.evidence[evidence_key] = canonical.evidence[evidence_key]
+                else:
+                    owner.evidence.pop(evidence_key, None)
+        if (
+            owner is not canonical
+            and type(owner_start) is int
+            and owner_start != call_start
+            and canonical.matched_text is not None
+        ):
+            # A raw bare-Popen owner can be the only classification context
+            # that existed before a cross-window normalized qualifier was
+            # reconstructed. Preserve that public owner while borrowing only
+            # the canonical call identity from the derived candidate.
+            owner.matched_text = canonical.matched_text
+            owner.finding = canonical.finding
+            owner.evidence[static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE] = call_start
+            if "normalized-view" in canonical.tags and "normalized-view" not in owner.tags:
+                owner.tags.append("normalized-view")
+        lexical_canonical_fingerprint = lexical_fingerprint(canonical)
+        complete_identity = full_match_identities.get(canonical.finding_id)
+        owner.match_fingerprint = (
+            complete_identity
+            if isinstance(complete_identity, str)
+            else lexical_canonical_fingerprint
+        )
+        lexical_owners[call_start] = owner
+        lexical_member_starts.update((candidate.finding_id, call_start) for candidate in group)
+
+    ast_call_starts: set[int] = set()
+    ast_owners: dict[str, Finding] = {}
+    for finding in findings:
+        if finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is not True:
+            continue
+        canonical_fingerprint = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_CANONICAL_FINGERPRINT_EVIDENCE
+        )
+        lexical_identity = finding.evidence.get(LEXICAL_BOUND_IDENTITY_EVIDENCE)
+        previously_reachable = finding.evidence.get(LEXICAL_BOUND_REACHABLE_EVIDENCE) is True
+        complete_identity = full_match_identities.get(finding.finding_id)
+        canonical_collision = (
+            isinstance(canonical_fingerprint, str)
+            and (
+                finding.file,
+                finding.start_line,
+                canonical_fingerprint,
+            )
+            in colliding_bound_identities
+        )
+        fingerprint = (
+            lexical_identity
+            if isinstance(lexical_identity, str)
+            else complete_identity
+            if canonical_collision and isinstance(complete_identity, str)
+            else canonical_fingerprint
+        )
+        if canonical_collision and isinstance(fingerprint, str):
+            finding.evidence[LEXICAL_BOUND_IDENTITY_EVIDENCE] = fingerprint
+        if isinstance(fingerprint, str):
+            finding.match_fingerprint = fingerprint
+        ast_call_start = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE
+        )
+        ast_call_end = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_END_EVIDENCE)
+        direct_match_end = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_DIRECT_MATCH_END_EVIDENCE
+        )
+        popen_start = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_POPEN_START_EVIDENCE
+        )
+        shell_anchor = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_SHELL_ANCHOR_EVIDENCE
+        )
+        ast_owner: Finding | None = None
+        if type(ast_call_start) is int:
+            ast_call_starts.add(ast_call_start)
+            lexical_coordinates = [ast_call_start]
+            if type(popen_start) is int:
+                # Parenthesized, spaced, and explicitly continued receivers
+                # can only be recognized lexically from the method token. That
+                # token still belongs to this parsed call even when a quoted
+                # trailing ``shell=True`` produces a different shell anchor.
+                ast_call_starts.add(popen_start)
+                lexical_coordinates.append(popen_start)
+            coordinate_groups = [
+                (coordinate, lexical_groups[coordinate])
+                for coordinate in lexical_coordinates
+                if coordinate in lexical_groups
+            ]
+            exact_group = [
+                candidate
+                for _, group in coordinate_groups
+                for candidate in group
+                if type(shell_anchor) is int
+                and candidate.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE) == shell_anchor
+            ]
+            if exact_group:
+                ast_owner = select_lexical_owner(exact_group, ast_call_start)
+                ast_owners[finding.finding_id] = ast_owner
+                finding.evidence.pop(LEXICAL_BOUND_IDENTITY_EVIDENCE, None)
+                finding.evidence.pop(LEXICAL_BOUND_IDENTITY_SOURCE_EVIDENCE, None)
+                finding.evidence.pop(LEXICAL_BOUND_CLASSIFICATION_EVIDENCE, None)
+            elif type(shell_anchor) is int and type(direct_match_end) is int:
+                # The legacy regex stops at the first nested ``)``. If an
+                # earlier parenthesized argument contains ``shell=True``, a
+                # direct literal is therefore fingerprinted from that retained
+                # same-call prefix in every file type. Keep a bound-name call
+                # on that established identity without borrowing its public
+                # text, tags, or classification. Exact coordinates exclude a
+                # separate nested call that happens to appear in the arguments.
+                same_call_candidates = [
+                    candidate for _, group in coordinate_groups for candidate in group
+                ]
+                shell_value_start = direct_match_end - len("True")
+                reachability = [
+                    actual_shell_is_reachable(
+                        candidate,
+                        shell_value_start,
+                        direct_match_end,
+                    )
+                    for candidate in same_call_candidates
+                ]
+                actual_shell_is_unreachable = bool(same_call_candidates) and all(
+                    type(
+                        candidate_anchor := candidate.evidence.get(
+                            static_runner._ABSOLUTE_ANCHOR_EVIDENCE
+                        )
+                    )
+                    is int
+                    and ast_call_start <= candidate_anchor < shell_anchor
+                    and (type(ast_call_end) is not int or candidate_anchor < ast_call_end)
+                    and reachable is False
+                    for candidate, reachable in zip(
+                        same_call_candidates,
+                        reachability,
+                        strict=True,
+                    )
+                )
+                if previously_reachable or any(reachable is True for reachable in reachability):
+                    finding.evidence[LEXICAL_BOUND_REACHABLE_EVIDENCE] = True
+                    finding.evidence.pop(LEXICAL_BOUND_IDENTITY_EVIDENCE, None)
+                    finding.evidence.pop(LEXICAL_BOUND_IDENTITY_SOURCE_EVIDENCE, None)
+                    finding.evidence.pop(LEXICAL_BOUND_CLASSIFICATION_EVIDENCE, None)
+                    if isinstance(canonical_fingerprint, str):
+                        finding.match_fingerprint = canonical_fingerprint
+                elif actual_shell_is_unreachable:
+                    identity_coordinate = min(coordinate for coordinate, _ in coordinate_groups)
+                    identity_source = select_fingerprint_source(
+                        same_call_candidates,
+                        identity_coordinate,
+                    )
+                    public_owner = select_lexical_owner(
+                        same_call_candidates,
+                        identity_coordinate,
+                    )
+                    legacy_fingerprint = lexical_fingerprint(identity_source)
+                    if isinstance(legacy_fingerprint, str):
+                        identity_record: dict[str, object] = {
+                            "start": identity_source.evidence.get(
+                                static_runner._ABSOLUTE_START_EVIDENCE
+                            ),
+                            "normalized": "normalized-view" in identity_source.tags,
+                            "anchor": identity_source.evidence.get(
+                                static_runner._ABSOLUTE_ANCHOR_EVIDENCE
+                            ),
+                            "reach_terminated": identity_source.evidence.get(
+                                LEXICAL_REACH_TERMINATED_EVIDENCE
+                            ),
+                            "reach_end": identity_source.evidence.get(
+                                static_runner._ABSOLUTE_REACH_END_EVIDENCE
+                            ),
+                        }
+                        prior_identity_record = finding.evidence.get(
+                            LEXICAL_BOUND_IDENTITY_SOURCE_EVIDENCE
+                        )
+                        if not isinstance(prior_identity_record, dict) or (
+                            fingerprint_record_rank(identity_record, identity_coordinate)
+                            > fingerprint_record_rank(
+                                prior_identity_record,
+                                identity_coordinate,
+                            )
+                        ):
+                            finding.evidence[LEXICAL_BOUND_IDENTITY_EVIDENCE] = legacy_fingerprint
+                            finding.evidence[LEXICAL_BOUND_IDENTITY_SOURCE_EVIDENCE] = (
+                                identity_record
+                            )
+                        persisted_identity = finding.evidence.get(LEXICAL_BOUND_IDENTITY_EVIDENCE)
+                        if isinstance(persisted_identity, str):
+                            finding.match_fingerprint = persisted_identity
+
+                        prior_classification = finding.evidence.get(
+                            LEXICAL_BOUND_CLASSIFICATION_EVIDENCE
+                        )
+                        current_classification = classification_record(public_owner)
+                        if not isinstance(prior_classification, dict) or (
+                            classification_record_rank(
+                                current_classification,
+                                identity_coordinate,
+                            )
+                            > classification_record_rank(
+                                prior_classification,
+                                identity_coordinate,
+                            )
+                        ):
+                            prior_classification = current_classification
+
+                        base_tags = prior_classification.get("base_tags")
+                        projected_tags = (
+                            list(base_tags)
+                            if isinstance(base_tags, (list, tuple))
+                            and all(isinstance(tag, str) for tag in base_tags)
+                            else []
+                        )
+                        persisted_identity_record = finding.evidence.get(
+                            LEXICAL_BOUND_IDENTITY_SOURCE_EVIDENCE
+                        )
+                        if (
+                            isinstance(persisted_identity_record, dict)
+                            and persisted_identity_record.get("normalized") is True
+                            and persisted_identity_record.get("start") == identity_coordinate
+                            and prior_classification.get("start") != identity_coordinate
+                            and "normalized-view" not in projected_tags
+                        ):
+                            # This is the same projection performed above when
+                            # a raw bare-Popen owner and its normalized qualified
+                            # identity coexist in one pass. Re-derive it when
+                            # those bounded donors arrive in separate cap passes.
+                            projected_tags.append("normalized-view")
+                        prior_classification["tags"] = tuple(projected_tags)
+                        finding.evidence[LEXICAL_BOUND_CLASSIFICATION_EVIDENCE] = (
+                            prior_classification
+                        )
+        if ast_owner is not None and isinstance(canonical_fingerprint, str):
+            ast_owner.match_fingerprint = canonical_fingerprint
+
+    reconciled: list[Finding] = []
+    emitted_call_starts: set[int] = set()
+    for finding in findings:
+        is_ast = finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is True
+        ast_call_start = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE
+        )
+        ast_owner = ast_owners.get(finding.finding_id)
+        if is_ast:
+            if type(ast_call_start) is int and ast_call_start in emitted_call_starts:
+                continue
+            if ast_owner is not None:
+                reconciled.append(ast_owner)
+            else:
+                reconciled.append(finding)
+            if type(ast_call_start) is int:
+                emitted_call_starts.add(ast_call_start)
+            continue
+        lexical_start = lexical_member_starts.get(finding.finding_id)
+        if lexical_start is not None:
+            if lexical_start not in ast_call_starts and lexical_start not in emitted_call_starts:
+                reconciled.append(lexical_owners[lexical_start])
+                emitted_call_starts.add(lexical_start)
+            continue
+        reconciled.append(finding)
+
+    source_line_starts = (0, *(match.end() for match in LOGICAL_LINE_BREAK.finditer(content)))
+    tm1_slots: list[int] = []
+    tm1_by_source: list[tuple[int, int, Finding]] = []
+    for index, finding in enumerate(reconciled):
+        if finding.rule_id != "TM1":
+            continue
+        bound_start = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE)
+        lexical_coordinate = finding.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE)
+        source_start = (
+            bound_start
+            if type(bound_start) is int
+            else lexical_coordinate
+            if type(lexical_coordinate) is int
+            else None
+        )
+        if source_start is None:
+            line_index = min(max(finding.start_line - 1, 0), len(source_line_starts) - 1)
+            source_start = source_line_starts[line_index]
+            if type(finding.start_column) is int and finding.start_column > 0:
+                source_start += finding.start_column
+        tm1_slots.append(index)
+        tm1_by_source.append((source_start, index, finding))
+    for slot, (_, _, finding) in zip(
+        tm1_slots,
+        sorted(tm1_by_source, key=lambda item: (item[0], item[1])),
+        strict=True,
+    ):
+        reconciled[slot] = finding
+    public: list[Finding] = []
+    seen_direct_calls: set[tuple[str, int, str | None]] = set()
+    for finding in reconciled:
+        is_direct_shell = (
+            finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is True
+            or finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is True
+        )
+        if finding.rule_id != "TM1" or not is_direct_shell:
+            public.append(finding)
+            continue
+        key = (finding.file, finding.start_line, finding.fingerprint())
+        if key in seen_direct_calls:
+            continue
+        seen_direct_calls.add(key)
+        public.append(finding)
+    return public
+
+
+def _owning_raw_window(
+    content: str,
+    source_start: int,
+) -> tuple[int, int, int, int]:
+    """Return the raw and owned bounds used by the ordinary window scanner."""
+    if len(content) <= static_runner.SECURITY_VIEW_WINDOW_CHARS:
+        return 0, len(content), 0, len(content)
+    owned_start = (
+        source_start // static_runner._RAW_WINDOW_OWNED_CHARS
+    ) * static_runner._RAW_WINDOW_OWNED_CHARS
+    owned_end = min(len(content), owned_start + static_runner._RAW_WINDOW_OWNED_CHARS)
+    raw_start = max(0, owned_start - static_runner._WINDOW_OVERLAP_CHARS)
+    raw_end = min(len(content), owned_end + static_runner._WINDOW_OVERLAP_CHARS)
+    return raw_start, raw_end, owned_start, owned_end
+
+
+def _window_popen_qualifiers(
+    content: str,
+    popen_starts: set[int],
+    check_runtime: Callable[[], None],
+    source_context: static_runner._WindowSourceContext,
+) -> dict[int, tuple[int, int, str, str, bool, bool]]:
+    """Replay each owning bounded window once for retained Popen anchors."""
+    targets_by_window: dict[tuple[int, int, int, int], set[int]] = {}
+    for popen_start in popen_starts:
+        bounds = _owning_raw_window(content, popen_start)
+        targets_by_window.setdefault(bounds, set()).add(popen_start)
+
+    qualifiers: dict[int, tuple[int, int, str, str, bool, bool]] = {}
+    qualified_pattern = DIRECT_SHELL_TRUE_PATTERNS[0][0]
+    for (raw_start, raw_end, owned_start, owned_end), targets in targets_by_window.items():
+        check_runtime()
+        raw_window = content[raw_start:raw_end]
+        context_prefix = static_runner._markdown_context_prefix(
+            content,
+            raw_start,
+            raw_end,
+            source_context.fence_states,
+            source_context.fence_transitions,
+        )
+        for raw_view in security_text_views(context_prefix + raw_window):
+            full_view = static_runner._window_view_with_markdown_context(
+                raw_view,
+                len(context_prefix),
+            )
+            check_runtime()
+            for view in static_runner._bounded_view_slices(full_view):
+                check_runtime()
+                for match in re.finditer(
+                    qualified_pattern, view.text, re.IGNORECASE | re.MULTILINE
+                ):
+                    method = re.match(
+                        r"subprocess\.(?P<method>\w+)",
+                        match.group(0),
+                        re.IGNORECASE,
+                    )
+                    if method is None or method.group("method").casefold() != "popen":
+                        continue
+                    derived_popen_start = match.start() + method.start("method")
+                    popen_start = raw_start + view.source_offset(derived_popen_start)
+                    if popen_start not in targets:
+                        continue
+                    qualifier_start = raw_start + view.source_offset(match.start())
+                    qualifier_end = raw_start + view.source_offset(derived_popen_start - 1) + 1
+                    qualifier_text = view.text[match.start() : derived_popen_start]
+                    raw_match_end = raw_start + view.source_offset(match.end() - 1) + 1
+                    requires_derived_match = (
+                        view.name != "raw"
+                        and match.group(0) != content[qualifier_start:raw_match_end]
+                    )
+                    candidate = (
+                        qualifier_start,
+                        qualifier_end,
+                        qualifier_text,
+                        match.group(0),
+                        requires_derived_match,
+                        owned_start <= qualifier_start < owned_end,
+                    )
+                    previous = qualifiers.get(popen_start)
+                    if previous is None or (candidate[4], candidate[5]) > (
+                        previous[4],
+                        previous[5],
+                    ):
+                        qualifiers[popen_start] = candidate
+    return qualifiers
+
+
+def _cross_window_subprocess_qualifiers(
+    content: str,
+    popen_anchors: dict[int, int],
+    check_runtime: Callable[[], None],
+) -> dict[int, tuple[int, int, str, str, bool]]:
+    """Recover retained qualifiers while replaying each shared projection once."""
+    qualifiers: dict[int, tuple[int, int, str, str, bool]] = {}
+    qualified_pattern = DIRECT_SHELL_TRUE_PATTERNS[0][0]
+    targets_by_run: dict[tuple[int, int], dict[int, int]] = {}
+    runs_by_anchor = static_runner._continuity_runs_for_anchors(
+        content,
+        set(popen_anchors.values()),
+        check_runtime,
+    )
+    for popen_start, anchor in popen_anchors.items():
+        run = runs_by_anchor.get(anchor)
+        if run is not None:
+            targets_by_run.setdefault(run, {})[popen_start] = anchor
+
+    for _, projection_target_anchors in sorted(targets_by_run.items()):
+        projection_targets = set(projection_target_anchors)
+        projection = static_runner._anchored_continuity_view(
+            content,
+            min(projection_target_anchors.values()),
+            check_runtime,
+        )
+        if projection is None or not projection.text or projection.source_offsets is None:
+            continue
+
+        for full_view in security_text_views(projection.text):
+            for view in static_runner._bounded_view_slices(full_view):
+                check_runtime()
+                for match in re.finditer(
+                    qualified_pattern,
+                    view.text,
+                    re.IGNORECASE | re.MULTILINE,
+                ):
+                    method = re.match(
+                        r"subprocess\.(?P<method>\w+)",
+                        match.group(0),
+                        re.IGNORECASE,
+                    )
+                    if method is None or method.group("method").casefold() != "popen":
+                        continue
+                    derived_popen_start = match.start() + method.start("method")
+                    projected_popen_start = view.source_offset(derived_popen_start)
+                    raw_popen_start = projection.source_offset(projected_popen_start)
+                    if raw_popen_start not in projection_targets or raw_popen_start in qualifiers:
+                        continue
+                    projected_start = view.source_offset(match.start())
+                    projected_end = view.source_offset(derived_popen_start - 1)
+                    qualifiers[raw_popen_start] = (
+                        projection.source_offset(projected_start),
+                        projection.source_offset(projected_end) + 1,
+                        view.text[match.start() : derived_popen_start],
+                        match.group(0),
+                        True,
+                    )
+    return qualifiers
+
+
+def reconcile_retained_findings(
+    content: str,
+    findings: list[Finding],
+    check_runtime: Callable[[], None],
+    source_context: static_runner._WindowSourceContext,
+) -> None:
+    """Finalize retained bare-Popen identity without discovering new findings."""
+    retained: list[tuple[Finding, int, int]] = []
+    for finding in findings:
+        if (
+            finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is not True
+            or re.match(r"Popen\b", finding.matched_text or "", re.IGNORECASE) is None
+        ):
+            continue
+        coordinates = [
+            coordinate
+            for key in (
+                static_runner._ABSOLUTE_START_EVIDENCE,
+                static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+            )
+            if type(coordinate := finding.evidence.get(key)) is int
+        ]
+        if coordinates:
+            popen_start = max(coordinates)
+            shell_anchor = finding.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE)
+            retained.append(
+                (
+                    finding,
+                    popen_start,
+                    shell_anchor if type(shell_anchor) is int else popen_start,
+                )
+            )
+
+    window_qualifiers = _window_popen_qualifiers(
+        content,
+        {popen_start for _, popen_start, _ in retained},
+        check_runtime,
+        source_context,
+    )
+    cross_window_qualifiers = _cross_window_subprocess_qualifiers(
+        content,
+        {popen_start: continuity_anchor for _, popen_start, continuity_anchor in retained},
+        check_runtime,
+    )
+    for finding, popen_start, _ in retained:
+        check_runtime()
+        window_qualifier = window_qualifiers.get(popen_start)
+        cross_window_qualifier = cross_window_qualifiers.get(popen_start)
+        if cross_window_qualifier is not None:
+            qualifier = cross_window_qualifier
+            update_public_match = True
+        elif window_qualifier is not None:
+            (
+                qualifier_start,
+                qualifier_end,
+                qualifier_text,
+                canonical_match,
+                normalized_view,
+                qualifier_owned,
+            ) = window_qualifier
+            update_public_match = normalized_view or qualifier_owned
+            qualifier = (
+                qualifier_start,
+                qualifier_end,
+                qualifier_text,
+                canonical_match,
+                normalized_view,
+            )
+        else:
+            qualifier = None
+            update_public_match = False
+        if qualifier is None:
+            continue
+        qualifier_start, _, _, canonical_match, normalized_view = qualifier
+        canonical_projection = normalized_security_view(canonical_match).text
+        canonical_preview = canonical_projection[:200]
+        finding.evidence[LEXICAL_NORMALIZED_MATCH_EVIDENCE] = canonical_preview
+        if update_public_match:
+            finding.matched_text = canonical_preview
+            finding.finding = canonical_preview
+        finding.evidence[static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE] = qualifier_start
+        finding.match_fingerprint = sha256(
+            f"{finding.rule_id}\x1f{' '.join(canonical_projection.strip().split())}".encode()
+        ).hexdigest()
+        if normalized_view and "normalized-view" not in finding.tags:
+            finding.tags.append("normalized-view")
+
+
+def _lexical_call_start(finding: Finding) -> int | None:
+    """Return a lexical owner's canonical call coordinate."""
+    coordinates = (
+        coordinate
+        for key in (
+            static_runner._ABSOLUTE_START_EVIDENCE,
+            static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+        )
+        if type(coordinate := finding.evidence.get(key)) is int
+    )
+    return min(coordinates, default=None)
+
+
+def _internal_evidence_keys() -> tuple[str, ...]:
+    """Return private reconciliation keys that must not escape public findings."""
+    from . import static_python_shell_truthiness
+
+    return (
+        _VARIABLE_SHELL_FLAG_EVIDENCE,
+        LEXICAL_DIRECT_SHELL_EVIDENCE,
+        LEXICAL_RAW_OWNER_EVIDENCE,
+        LEXICAL_NORMALIZED_MATCH_EVIDENCE,
+        LEXICAL_BOUND_IDENTITY_EVIDENCE,
+        LEXICAL_BOUND_IDENTITY_SOURCE_EVIDENCE,
+        LEXICAL_BOUND_CLASSIFICATION_EVIDENCE,
+        LEXICAL_REACH_TERMINATED_EVIDENCE,
+        LEXICAL_BOUND_REACHABLE_EVIDENCE,
+        static_python_shell_truthiness.BOUND_SHELL_EVIDENCE,
+        static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE,
+        static_python_shell_truthiness.BOUND_CALL_END_EVIDENCE,
+        static_python_shell_truthiness.BOUND_SHELL_ANCHOR_EVIDENCE,
+        static_python_shell_truthiness.BOUND_CANONICAL_FINGERPRINT_EVIDENCE,
+        static_python_shell_truthiness.BOUND_NORMALIZED_VIEW_EVIDENCE,
+        static_python_shell_truthiness.BOUND_CLASSIFICATION_MATCH_EVIDENCE,
+        static_python_shell_truthiness.BOUND_DIRECT_MATCH_END_EVIDENCE,
+        static_python_shell_truthiness.BOUND_POPEN_START_EVIDENCE,
+        static_python_shell_truthiness.BOUND_DIRECT_OWNER_START_EVIDENCE,
+        static_python_shell_truthiness.BOUND_SHELL_VALUE_START_EVIDENCE,
+        static_python_shell_truthiness.BOUND_SHELL_VALUE_END_EVIDENCE,
+        static_python_shell_truthiness.DIRECT_LITERAL_METADATA_EVIDENCE,
+        static_runner._VIEW_START_EVIDENCE,
+        static_runner._VIEW_ANCHOR_EVIDENCE,
+        static_runner._VIEW_ALTERNATE_START_EVIDENCE,
+        static_runner._VIEW_REACH_END_EVIDENCE,
+        static_runner._VIEW_REPLACEMENT_START_LIMIT_EVIDENCE,
+        static_runner._SOURCE_START_EVIDENCE,
+        static_runner._SOURCE_ANCHOR_EVIDENCE,
+        static_runner._SOURCE_ALTERNATE_START_EVIDENCE,
+        static_runner._SOURCE_REACH_END_EVIDENCE,
+        static_runner._SOURCE_REPLACEMENT_START_LIMIT_EVIDENCE,
+        static_runner._SOURCE_REPLACEMENT_RECOVERY_START_EVIDENCE,
+        static_runner._PRESERVE_SOURCE_START_EVIDENCE,
+        static_runner._ABSOLUTE_START_EVIDENCE,
+        static_runner._ABSOLUTE_ANCHOR_EVIDENCE,
+        static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+        static_runner._ABSOLUTE_REACH_END_EVIDENCE,
+        static_runner._ABSOLUTE_REPLACEMENT_START_LIMIT_EVIDENCE,
+        static_runner._ABSOLUTE_REPLACEMENT_RECOVERY_START_EVIDENCE,
+        static_runner._ALTERNATE_MATCHED_TEXT_EVIDENCE,
+    )
+
+
+def cleanup_path_findings(findings: list[Finding]) -> list[Finding]:
+    """Strip private reconciliation state when the analysis deadline has expired."""
+    internal_keys = _internal_evidence_keys()
+    for finding in findings:
+        for key in internal_keys:
+            finding.evidence.pop(key, None)
+    return findings
+
+
+class _DirectShellReplayLexical:
+    """Lexical-only facade used for direct-equivalent bounded windows."""
+
+    @staticmethod
+    def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+        return analyze(
+            content,
+            file_path,
+            file_type,
+            _direct_shell_only=True,
+        )
+
+
+def _bound_direct_replays(
+    content: str,
+    findings: list[Finding],
+    python_ast: ParsedPythonFile | None,
+    *,
+    started_at: float | None = None,
+    timeout_seconds: float | None = None,
+) -> dict[int, Finding]:
+    """Replay only retained owners in one cap-independent virtual artifact."""
+    from . import static_python_shell_truthiness
+
+    if python_ast is None or python_ast.tree is None:
+        return {}
+    retained_call_starts: set[int] = set()
+    file_path = "<unknown>"
+    for finding in findings:
+        if (
+            finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is not True
+            or finding.evidence.get(static_python_shell_truthiness.DIRECT_LITERAL_METADATA_EVIDENCE)
+            is True
+        ):
+            continue
+        call_start = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE)
+        if type(call_start) is int:
+            retained_call_starts.add(call_start)
+            file_path = finding.file
+    if not retained_call_starts:
+        return {}
+
+    budget_started_at = time.monotonic() if started_at is None else started_at
+    runtime_limit = static_runner.MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
+    if timeout_seconds is not None:
+        runtime_limit = min(runtime_limit, max(0.0, timeout_seconds))
+    replay_budget = static_runner._FindingBudget(
+        max_findings=static_runner.MAX_FILE_CHARS,
+        started_at=budget_started_at,
+        deadline=budget_started_at + runtime_limit,
+        clock=time.monotonic,
+    )
+    try:
+        specs = static_python_shell_truthiness.bound_shell_metadata(
+            python_ast,
+            file_path,
+            check_runtime=replay_budget.check_runtime,
+        )
+    except static_runner._StaticResourceLimitError:
+        return {}
+    if not specs:
+        return {}
+
+    cursor = 0
+    shift = 0
+    virtual_parts: list[str] = []
+    virtual_coordinates_by_call: dict[int, tuple[int, int | None, int]] = {}
+    try:
+        for spec in specs:
+            if spec.value_start < cursor:
+                # The supported straight-line grammar cannot overlap shell-name
+                # spans. Stay conservative if malformed coordinates ever do.
+                return {}
+            replay_budget.check_runtime()
+            virtual_parts.append(content[cursor : spec.value_start])
+            virtual_call_start = spec.call_start + shift
+            virtual_coordinates_by_call[spec.call_start] = (
+                virtual_call_start,
+                spec.popen_start + shift if spec.popen_start is not None else None,
+                spec.shell_anchor + shift,
+            )
+            virtual_parts.append("True")
+            cursor = spec.value_end
+            shift += len("True") - (spec.value_end - spec.value_start)
+        virtual_parts.append(content[cursor:])
+        virtual_content = "".join(virtual_parts)
+        replay_budget.check_runtime()
+    except static_runner._StaticResourceLimitError:
+        return {}
+    replacement_starts = [spec.value_start for spec in specs]
+    replacement_ends: list[int] = []
+    cumulative_deltas: list[int] = [0]
+    for spec in specs:
+        replacement_ends.append(spec.value_end)
+        cumulative_deltas.append(
+            cumulative_deltas[-1] + len("True") - (spec.value_end - spec.value_start)
+        )
+
+    def source_to_virtual_boundary(source_offset: int) -> int:
+        replacement_count = bisect_right(replacement_ends, source_offset)
+        return source_offset + cumulative_deltas[replacement_count]
+
+    def boundary_is_preserved(source_offset: int, virtual_offset: int) -> bool:
+        """Return whether a raw-window edge has one unambiguous virtual edge."""
+        replacement_index = bisect_right(replacement_starts, source_offset) - 1
+        if (
+            replacement_index >= 0
+            and replacement_starts[replacement_index]
+            < source_offset
+            < replacement_ends[replacement_index]
+        ):
+            return False
+        return source_to_virtual_boundary(source_offset) == virtual_offset
+
+    metadata_by_call = {spec.call_start: spec for spec in specs}
+    fixed_coordinates = {
+        coordinate
+        for finding in findings
+        if finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is True
+        and type(finding.evidence.get(static_runner._ABSOLUTE_REPLACEMENT_START_LIMIT_EVIDENCE))
+        is int
+        for key in (
+            static_runner._ABSOLUTE_START_EVIDENCE,
+            static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+        )
+        if type(coordinate := finding.evidence.get(key)) is int
+    }
+    retained_shell_anchors = {
+        spec.shell_anchor for spec in specs if spec.call_start in retained_call_starts
+    }
+    try:
+        continuity_runs = static_runner._continuity_runs_for_anchors(
+            content,
+            retained_shell_anchors,
+            replay_budget.check_runtime,
+        )
+    except static_runner._StaticResourceLimitError:
+        return {}
+    continuity_calls = {
+        spec.call_start
+        for spec in specs
+        if spec.call_start in retained_call_starts and spec.shell_anchor in continuity_runs
+    }
+    replay_targets: dict[int, int] = {}
+    target_calls: set[int] = set()
+    for call_start in retained_call_starts:
+        target_spec = metadata_by_call.get(call_start)
+        target_coordinates = virtual_coordinates_by_call.get(call_start)
+        if target_spec is None or target_coordinates is None:
+            continue
+        virtual_call_start, virtual_popen_start, _ = target_coordinates
+        related_fixed_boundary = bool(
+            {call_start, target_spec.popen_start}.difference({None}).intersection(fixed_coordinates)
+        )
+        source_coordinates = (call_start, target_spec.popen_start)
+        virtual_coordinates = (virtual_call_start, virtual_popen_start)
+        changes_outer_window = any(
+            not all(
+                boundary_is_preserved(source_boundary, virtual_boundary)
+                for source_boundary, virtual_boundary in zip(
+                    _owning_raw_window(content, source_coordinate),
+                    _owning_raw_window(virtual_content, virtual_coordinate),
+                    strict=True,
+                )
+            )
+            for source_coordinate, virtual_coordinate in zip(
+                source_coordinates,
+                virtual_coordinates,
+                strict=True,
+            )
+            if source_coordinate is not None and virtual_coordinate is not None
+        ) or (len(content) <= static_runner.SECURITY_VIEW_WINDOW_CHARS) != (
+            len(virtual_content) <= static_runner.SECURITY_VIEW_WINDOW_CHARS
+        )
+        call_end = (
+            target_spec.call_end if target_spec.call_end is not None else target_spec.value_end
+        )
+        try:
+            replay_budget.check_runtime()
+            call_text = content[target_spec.call_start : call_end]
+            call_has_derived_view = _has_derived_security_view(call_text)
+            call_has_direct_lookalike = _DIRECT_SHELL_TRUE_VALUE.search(call_text) is not None
+            replay_budget.check_runtime()
+        except static_runner._StaticResourceLimitError:
+            return {}
+        if not (
+            target_spec.normalized_view
+            or call_has_derived_view
+            or call_has_direct_lookalike
+            or related_fixed_boundary
+            or changes_outer_window
+            or call_start in continuity_calls
+        ):
+            continue
+        target_calls.add(call_start)
+        replay_targets[virtual_call_start] = call_start
+        if virtual_popen_start is not None:
+            replay_targets[virtual_popen_start] = call_start
+    if not target_calls:
+        return {}
+
+    source_line_starts = (
+        0,
+        *(match.end() for match in LOGICAL_LINE_BREAK.finditer(virtual_content)),
+    )
+    window_targets: dict[tuple[int, int, int, int], set[int]] = {}
+    for coordinate in replay_targets:
+        bounds = _owning_raw_window(virtual_content, coordinate)
+        window_targets.setdefault(bounds, set()).add(coordinate)
+
+    replay_candidates: list[Finding] = []
+    seen_candidates: set[static_runner._ViewFindingKey] = set()
+    whole_artifact_window = len(virtual_content) <= static_runner.SECURITY_VIEW_WINDOW_CHARS
+    try:
+        for (raw_start, raw_end, owned_start, owned_end), _ in window_targets.items():
+            replay_budget.check_runtime()
+            raw_window = virtual_content[raw_start:raw_end]
+            owned_source_start = owned_start - raw_start
+            owned_source_end = owned_end - raw_start
+            outer_right_boundary_is_fixed = raw_end < len(virtual_content) or (
+                whole_artifact_window
+                and len(virtual_content) == static_runner.SECURITY_VIEW_WINDOW_CHARS
+            )
+            right_boundary_recovery_start = (
+                owned_start + static_runner._RAW_WINDOW_OWNED_CHARS - raw_start
+                if raw_end < len(virtual_content)
+                else static_runner._RAW_WINDOW_OWNED_CHARS
+                if whole_artifact_window
+                and len(virtual_content) > static_runner.SECURITY_VIEW_WINDOW_CHARS - len("True")
+                else None
+            )
+            for full_view in security_text_views(raw_window):
+                full_view = static_runner._with_fixed_right_boundary(
+                    full_view,
+                    outer_right_boundary_is_fixed,
+                    right_boundary_recovery_start,
+                )
+                for view in static_runner._bounded_view_slices(full_view):
+                    replay_budget.check_runtime()
+                    view_findings, _ = static_runner._scan_view_windows(
+                        file_path,
+                        view,
+                        [_DirectShellReplayLexical],
+                        replay_budget,
+                        None,
+                        source_text=raw_window,
+                    )
+                    owned_findings: list[Finding] = []
+                    for replay in view_findings:
+                        source_start = replay.evidence.get(static_runner._SOURCE_START_EVIDENCE)
+                        if isinstance(source_start, int) and not (
+                            owned_source_start <= source_start < owned_source_end
+                        ):
+                            alternate_start = replay.evidence.get(
+                                static_runner._SOURCE_ALTERNATE_START_EVIDENCE
+                            )
+                            if not (
+                                isinstance(alternate_start, int)
+                                and owned_source_start <= alternate_start < owned_source_end
+                            ):
+                                continue
+                            replay.evidence[static_runner._SOURCE_START_EVIDENCE] = alternate_start
+                            replay.evidence[static_runner._SOURCE_ALTERNATE_START_EVIDENCE] = (
+                                source_start
+                            )
+                        owned_findings.append(replay)
+                    static_runner._restore_source_lines(
+                        owned_findings,
+                        raw_window=raw_window,
+                        window_line=1,
+                        view=view,
+                        window_start=raw_start,
+                        source_line_starts=source_line_starts,
+                    )
+                    for replay in owned_findings:
+                        candidate_coordinates = {
+                            coordinate
+                            for key in (
+                                static_runner._ABSOLUTE_START_EVIDENCE,
+                                static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+                            )
+                            if type(coordinate := replay.evidence.get(key)) is int
+                        }
+                        if not candidate_coordinates.intersection(replay_targets):
+                            continue
+                        key = static_runner._view_finding_key(replay)
+                        if key not in seen_candidates:
+                            seen_candidates.add(key)
+                            replay_candidates.append(replay)
+
+        for call_start in continuity_calls.intersection(target_calls):
+            replay_budget.check_runtime()
+            _, _, virtual_shell_anchor = virtual_coordinates_by_call[call_start]
+            projection = static_runner._anchored_continuity_view(
+                virtual_content,
+                virtual_shell_anchor,
+                replay_budget.check_runtime,
+            )
+            if projection is None or not projection.text or projection.source_offsets is None:
+                continue
+            projection_is_fixed = projection.source_offsets[-1] + 1 < len(virtual_content)
+            for full_view in security_text_views(projection.text):
+                full_view = SecurityTextView(
+                    name=f"continuity-{full_view.name}",
+                    text=full_view.text,
+                    source_offsets=full_view.source_offsets,
+                    right_boundary_is_fixed=projection_is_fixed,
+                )
+                for view in static_runner._bounded_view_slices(full_view):
+                    replay_budget.check_runtime()
+                    view_findings, _ = static_runner._scan_view_windows(
+                        file_path,
+                        view,
+                        [_DirectShellReplayLexical],
+                        replay_budget,
+                        None,
+                        source_text=projection.text,
+                    )
+                    static_runner._restore_source_lines(
+                        view_findings,
+                        raw_window=projection.text,
+                        window_line=1,
+                        view=view,
+                        start_source_offsets=projection.source_offsets,
+                    )
+                    for replay in view_findings:
+                        candidate_coordinates = {
+                            coordinate
+                            for key in (
+                                static_runner._ABSOLUTE_START_EVIDENCE,
+                                static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+                            )
+                            if type(coordinate := replay.evidence.get(key)) is int
+                        }
+                        if not candidate_coordinates.intersection(replay_targets):
+                            continue
+                        key = static_runner._view_finding_key(replay)
+                        if key not in seen_candidates:
+                            seen_candidates.add(key)
+                            replay_candidates.append(replay)
+    except static_runner._StaticResourceLimitError:
+        return {}
+
+    replay_findings = static_runner._deduplicate_view_findings(
+        coalesce_path_findings(virtual_content, replay_candidates)
+    )
+    replay_by_call: dict[int, Finding] = {}
+    for replay in replay_findings:
+        replay_coordinates = {
+            coordinate
+            for key in (
+                static_runner._ABSOLUTE_START_EVIDENCE,
+                static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+            )
+            if type(coordinate := replay.evidence.get(key)) is int
+        }
+        for coordinate in sorted(replay_coordinates):
+            call_start = replay_targets.get(coordinate)
+            if call_start is not None:
+                spec = metadata_by_call[call_start]
+                _, _, virtual_shell_anchor = virtual_coordinates_by_call[call_start]
+                lexical_anchor = replay.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE)
+                if lexical_anchor == virtual_shell_anchor:
+                    replay.match_fingerprint = spec.canonical_fingerprint
+                    if spec.normalized_view and "normalized-view" not in replay.tags:
+                        replay.tags.append("normalized-view")
+                replay_by_call.setdefault(call_start, replay)
+                break
+    return replay_by_call
+
+
 def _bound_shell_call_key(call: ast.Call) -> tuple[int, int, int, int]:
     """Return the call key shared with the flow-sensitive companion."""
     return (
@@ -4886,117 +6548,97 @@ def _bound_shell_call_key(call: ast.Call) -> tuple[int, int, int, int]:
     )
 
 
-def cleanup_path_findings(findings: list[Finding]) -> list[Finding]:
-    """Remove private reconciliation evidence when postprocessing times out."""
-    for finding in findings:
-        finding.evidence.pop(_VARIABLE_SHELL_FLAG_EVIDENCE, None)
-        finding.evidence.pop(_TRUE_SHELL_DIRECT_EVIDENCE, None)
-    return findings
-
-
-def postprocess_path_findings(
+def _reconcile_variable_shell_findings(
     content: str,
     findings: list[Finding],
-    *,
     python_ast: ParsedPythonFile | None,
 ) -> list[Finding]:
-    """Reconcile the legacy variable regex with the Python AST companion."""
+    """Reconcile the bounded variable regex with the shared Python AST."""
     marked = [
         finding
         for finding in findings
         if isinstance(finding.evidence.get(_VARIABLE_SHELL_FLAG_EVIDENCE), str)
-        or finding.evidence.get(_TRUE_SHELL_DIRECT_EVIDENCE) is True
     ]
     if not marked:
         return findings
 
     file_path = marked[0].file
-    file_type = static_runner._infer_file_type(file_path)
-    if file_type != "python":
-        reconciled: list[Finding] = []
-        for finding in findings:
-            variable_name = finding.evidence.pop(_VARIABLE_SHELL_FLAG_EVIDENCE, None)
-            finding.evidence.pop(_TRUE_SHELL_DIRECT_EVIDENCE, None)
-            if not isinstance(variable_name, str):
-                reconciled.append(finding)
-        return reconciled
+    if static_runner._infer_file_type(file_path) != "python":
+        # Without Python bindings, keep only call-anchored windows for
+        # true-prefixed names; coalescing drops one a direct owner reports.
+        marked_ids = {
+            id(finding)
+            for finding in marked
+            if not (
+                isinstance(name := finding.evidence.get(_VARIABLE_SHELL_FLAG_EVIDENCE), str)
+                and _is_true_prefixed_name(name)
+            )
+        }
+        return [finding for finding in findings if id(finding) not in marked_ids]
     if python_ast is None or python_ast.tree is None:
-        return cleanup_path_findings(findings)
+        return findings
 
     from . import static_python_shell_truthiness
 
     ast_index = _build_variable_shell_ast_index(python_ast)
     if ast_index is None:
-        return cleanup_path_findings(findings)
+        return findings
     resolved: dict[tuple[int, str], list[_VariableShellCandidate]] = {}
-    for match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
-        finding_line = bisect_right(ast_index.line_character_starts, match.start())
+    for match in _variable_shell_matches(content):
         assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
         candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)
-        if candidate is None:
-            continue
-        key = (finding_line, candidate.name)
-        resolved.setdefault(key, []).append(candidate)
+        if candidate is not None:
+            call_span = _node_character_span(python_ast, candidate.call)
+            if call_span is not None:
+                resolved.setdefault((call_span[0], candidate.name), []).append(candidate)
     ownership, emitted, cached_replacements = (
         static_python_shell_truthiness.bound_shell_call_analysis(file_path, python_ast)
     )
-    retained_companion_locations = {
-        (finding.start_line, finding.start_column)
-        for finding in findings
-        if finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is True
-    }
-    emitted = {
-        key
-        for key in emitted
-        if (key[0], python_ast.character_column(key[0], key[1])) in retained_companion_locations
-    }
-    cached_replacements_by_start = {
-        (line, column)
-        for line, byte_column, _, _ in cached_replacements
-        if (column := python_ast.character_column(line, byte_column)) is not None
-    }
-    ownership_by_start = {
-        (line, column): trusted
-        for (line, byte_column, _, _), trusted in ownership.items()
-        if (column := python_ast.character_column(line, byte_column)) is not None
-    }
-
-    candidates_by_location: dict[tuple[int, int | None], list[_VariableShellCandidate]] = {}
-    for candidates in resolved.values():
-        for candidate in candidates:
-            location = (
-                candidate.call.lineno,
-                python_ast.character_column(candidate.call.lineno, candidate.call.col_offset),
+    supported_calls = set(emitted)
+    retained_companion_starts: set[int] = set()
+    retained_companion_sources: set[tuple[int, str]] = set()
+    for finding in findings:
+        if finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is not True:
+            continue
+        start = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE)
+        end = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_END_EVIDENCE)
+        if type(start) is int and type(end) is int and 0 <= start < end <= len(content):
+            retained_companion_starts.add(start)
+            retained_companion_sources.add(
+                (bisect_right(python_ast.line_character_starts, start), content[start:end])
             )
-            candidates_by_location.setdefault(location, []).append(candidate)
+    retained_emitted: set[tuple[int, int, int, int]] = set()
+    for key in emitted:
+        start = python_ast.line_character_starts[key[0] - 1] + (
+            python_ast.character_column(key[0], key[1]) or 0
+        )
+        end = python_ast.line_character_starts[key[2] - 1] + (
+            python_ast.character_column(key[2], key[3]) or 0
+        )
+        # The companion shares one report owner for identical same-line calls.
+        # Compare the complete raw source, since displayed previews can collide.
+        if (
+            start in retained_companion_starts
+            or (key[0], content[start:end]) in retained_companion_sources
+        ):
+            retained_emitted.add(key)
+    emitted = retained_emitted
 
     reconciled: list[Finding] = []
     for finding in findings:
-        variable_name = finding.evidence.pop(_VARIABLE_SHELL_FLAG_EVIDENCE, None)
-        direct_true = finding.evidence.pop(_TRUE_SHELL_DIRECT_EVIDENCE, None)
-        if direct_true is True:
-            location = (finding.start_line, finding.start_column)
-            if location in cached_replacements_by_start:
-                continue
-            if finding.start_column is not None and ownership_by_start.get(location) is False:
-                matching = candidates_by_location.get(location, [])
-                if len(matching) == 1 and _lexical_shell_has_counterevidence(
-                    ast_index, python_ast, matching[0], receiver_trusted=False
-                ):
-                    continue
-            reconciled.append(finding)
-            continue
+        variable_name = finding.evidence.get(_VARIABLE_SHELL_FLAG_EVIDENCE)
         if not isinstance(variable_name, str):
             reconciled.append(finding)
             continue
-        candidates = resolved.get((finding.start_line, variable_name), [])
+        call_start = finding.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE)
+        candidates = (
+            resolved.get((call_start, variable_name), []) if type(call_start) is int else []
+        )
         if len(candidates) != 1:
-            # Derived views and ambiguous recovery candidates retain the
-            # conservative lexical signal.
             reconciled.append(finding)
             continue
         candidate = candidates[0]
-        if variable_name.casefold().startswith("true") or not candidate.visible:
+        if not candidate.visible:
             continue
         call_key = _bound_shell_call_key(candidate.call)
         if (
@@ -5007,8 +6649,281 @@ def postprocess_path_findings(
             )
         ):
             continue
+        if call_key in supported_calls:
+            retained_owner = static_python_shell_truthiness.bound_shell_finding_for_call(
+                file_path, python_ast, candidate.call
+            )
+            if retained_owner is not None:
+                replacement = static_runner.analyzer_finding_to_finding(retained_owner)
+                replacement.finding_id = finding.finding_id
+                reconciled.append(replacement)
+                continue
+        if variable_name.casefold().startswith("true"):
+            call = candidate.call
+            finding.start_line = getattr(call, "lineno", finding.start_line)
+            finding.end_line = getattr(call, "end_lineno", finding.end_line)
+            finding.start_column = python_ast.character_column(
+                finding.start_line, getattr(call, "col_offset", 0)
+            )
+            if finding.end_line is not None:
+                finding.end_column = python_ast.character_column(
+                    finding.end_line, getattr(call, "end_col_offset", 0)
+                )
+            call_source = python_ast.source_segment(call)
+            if call_source is not None:
+                finding.matched_text = call_source[:200]
+                finding.finding = call_source[:200]
+            if type(call_start) is int:
+                call_context = get_context(content, call_start)
+                finding.context = call_context
+                finding.code_snippet = call_context
         reconciled.append(finding)
     return reconciled
+
+
+def postprocess_path_findings(
+    content: str,
+    findings: list[Finding],
+    *,
+    python_ast: ParsedPythonFile | None = None,
+    started_at: float | None = None,
+    timeout_seconds: float | None = None,
+) -> list[Finding]:
+    """Finalize ownership, classification, and private TM1 coordinates."""
+    from . import static_python_shell_truthiness
+
+    findings = _reconcile_variable_shell_findings(content, findings, python_ast)
+    direct_replays = _bound_direct_replays(
+        content,
+        findings,
+        python_ast,
+        started_at=started_at,
+        timeout_seconds=timeout_seconds,
+    )
+    reconciled = coalesce_path_findings(content, findings)
+    if python_ast is not None:
+        direct_starts = {
+            start
+            for finding in reconciled
+            if finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is True
+            and type(start := _lexical_call_start(finding)) is int
+        }
+        direct_metadata = static_python_shell_truthiness.direct_literal_metadata(
+            python_ast,
+            next((finding.file for finding in reconciled), "<unknown>"),
+            direct_starts,
+        )
+        canonical_direct_calls: dict[tuple[str, int, str], set[int]] = {}
+        for finding in reconciled:
+            direct_call_start = _lexical_call_start(finding)
+            metadata = (
+                direct_metadata.get(direct_call_start) if type(direct_call_start) is int else None
+            )
+            if metadata is not None:
+                canonical_direct_calls.setdefault(
+                    (finding.file, finding.start_line, metadata.match_fingerprint),
+                    set(),
+                ).add(metadata.call_start)
+        colliding_direct_identities = {
+            key for key, call_starts in canonical_direct_calls.items() if len(call_starts) > 1
+        }
+        for finding in reconciled:
+            direct_call_start = _lexical_call_start(finding)
+            metadata = (
+                direct_metadata.get(direct_call_start) if type(direct_call_start) is int else None
+            )
+            lexical_anchor = finding.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE)
+            if metadata is None or lexical_anchor != metadata.shell_anchor:
+                continue
+            if (
+                finding.file,
+                finding.start_line,
+                metadata.match_fingerprint,
+            ) not in colliding_direct_identities:
+                finding.match_fingerprint = metadata.match_fingerprint
+            finding.evidence.update(
+                {
+                    static_python_shell_truthiness.BOUND_SHELL_EVIDENCE: True,
+                    static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE: metadata.call_start,
+                    static_python_shell_truthiness.DIRECT_LITERAL_METADATA_EVIDENCE: True,
+                }
+            )
+            if metadata.call_end is not None:
+                finding.evidence[static_python_shell_truthiness.BOUND_CALL_END_EVIDENCE] = (
+                    metadata.call_end
+                )
+            if metadata.normalized_view and "normalized-view" not in finding.tags:
+                finding.tags.append("normalized-view")
+            if metadata.normalized_view:
+                finding.evidence[static_python_shell_truthiness.BOUND_NORMALIZED_VIEW_EVIDENCE] = (
+                    True
+                )
+    safety_by_scope: dict[tuple[int, int, bool], tuple[bool, bool]] = {}
+    raw_lines_by_start: dict[int, tuple[str, ...]] = {}
+    source_line_starts = (0, *(match.end() for match in LOGICAL_LINE_BREAK.finditer(content)))
+
+    for finding in reconciled:
+        is_bound = finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is True
+        if (
+            finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is True
+            and "normalized-view" in finding.tags
+            and isinstance(
+                canonical_match := finding.evidence.get(LEXICAL_NORMALIZED_MATCH_EVIDENCE),
+                str,
+            )
+        ):
+            finding.matched_text = canonical_match
+            finding.finding = canonical_match
+        is_direct_literal = (
+            finding.evidence.get(static_python_shell_truthiness.DIRECT_LITERAL_METADATA_EVIDENCE)
+            is True
+        )
+        if is_bound and not is_direct_literal:
+            if (
+                finding.evidence.get(static_python_shell_truthiness.BOUND_NORMALIZED_VIEW_EVIDENCE)
+                is True
+                and "normalized-view" not in finding.tags
+            ):
+                finding.tags.append("normalized-view")
+            matched = (finding.matched_text or "")[:200]
+            classification_match = finding.evidence.get(
+                static_python_shell_truthiness.BOUND_CLASSIFICATION_MATCH_EVIDENCE,
+                matched,
+            )
+            if not isinstance(classification_match, str):
+                classification_match = matched
+            call_start = finding.evidence.get(
+                static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE
+            )
+            call_end = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_END_EVIDENCE)
+            classification_context = finding.context or ""
+            matched_line = matched
+            safe_context: bool | None = None
+            safe_matched_line: bool | None = None
+            if type(call_start) is int:
+                preserves_lexical_location = (
+                    finding.evidence.get(
+                        static_python_shell_truthiness.DIRECT_LITERAL_METADATA_EVIDENCE
+                    )
+                    is True
+                )
+                if not preserves_lexical_location:
+                    finding.start_line = bisect_right(source_line_starts, call_start)
+                    if type(call_end) is int and call_end > call_start:
+                        finding.end_line = bisect_right(source_line_starts, call_end - 1)
+                retained_start = finding.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE)
+                direct_owner_start = finding.evidence.get(
+                    static_python_shell_truthiness.BOUND_DIRECT_OWNER_START_EVIDENCE
+                )
+                classification_start = (
+                    retained_start
+                    if preserves_lexical_location and type(retained_start) is int
+                    else direct_owner_start
+                    if type(direct_owner_start) is int
+                    else call_start
+                )
+                direct_match_end = finding.evidence.get(
+                    static_python_shell_truthiness.BOUND_DIRECT_MATCH_END_EVIDENCE
+                )
+                popen_start = finding.evidence.get(
+                    static_python_shell_truthiness.BOUND_POPEN_START_EVIDENCE
+                )
+                _, qualifier_window_end = _raw_classification_bounds(content, call_start)
+                if (
+                    not preserves_lexical_location
+                    and classification_start == call_start
+                    and type(direct_match_end) is int
+                    and direct_match_end > qualifier_window_end
+                    and type(popen_start) is int
+                ):
+                    classification_start = popen_start
+                raw_start, raw_end = _raw_classification_bounds(content, classification_start)
+                classification_line = bisect_right(
+                    source_line_starts,
+                    classification_start,
+                )
+                normalized_view = (
+                    finding.evidence.get(
+                        static_python_shell_truthiness.BOUND_NORMALIZED_VIEW_EVIDENCE
+                    )
+                    is True
+                )
+                scope_key = (raw_start, classification_line, normalized_view)
+                safety = safety_by_scope.get(scope_key)
+                if safety is None:
+                    raw_lines = raw_lines_by_start.get(raw_start)
+                    if raw_lines is None:
+                        raw_lines = tuple(content[raw_start:raw_end].splitlines())
+                        raw_lines_by_start[raw_start] = raw_lines
+                    raw_start_line = bisect_right(source_line_starts, raw_start)
+                    local_line = classification_line - raw_start_line
+                    if 0 <= local_line < len(raw_lines):
+                        context_start = max(0, local_line - 3)
+                        context_end = min(len(raw_lines), local_line + 4)
+                        classification_context = "\n".join(raw_lines[context_start:context_end])
+                        matched_line = raw_lines[local_line]
+                    if normalized_view:
+                        classification_context = normalized_security_view(
+                            classification_context
+                        ).text
+                        matched_line = normalized_security_view(matched_line).text
+                        classification_match = normalized_security_view(classification_match).text
+                    safety = (
+                        _is_safe_container_command(classification_context)
+                        or _is_safe_dockerfile_idiom(
+                            classification_context,
+                            classification_match,
+                        ),
+                        _is_safe_cache_cleanup(matched_line),
+                    )
+                    safety_by_scope[scope_key] = safety
+                safe_context, safe_matched_line = safety
+            severity, finding.confidence = _classify_tm1(
+                classification_context,
+                classification_match,
+                matched_line,
+                (
+                    0.8
+                    if finding.evidence.get(
+                        static_python_shell_truthiness.DIRECT_LITERAL_METADATA_EVIDENCE
+                    )
+                    is True
+                    else finding.confidence
+                ),
+                "python",
+                safe_context=safe_context,
+                safe_matched_line=safe_matched_line,
+            )
+            finding.severity = severity.value
+        borrowed_classification = finding.evidence.get(LEXICAL_BOUND_CLASSIFICATION_EVIDENCE)
+        if isinstance(borrowed_classification, dict):
+            borrowed_severity = borrowed_classification.get("severity")
+            borrowed_confidence = borrowed_classification.get("confidence")
+            borrowed_tags = borrowed_classification.get("tags")
+            if isinstance(borrowed_severity, str):
+                finding.severity = borrowed_severity
+            if isinstance(borrowed_confidence, (int, float)) and not isinstance(
+                borrowed_confidence, bool
+            ):
+                finding.confidence = float(borrowed_confidence)
+            if isinstance(borrowed_tags, (list, tuple)) and all(
+                isinstance(tag, str) for tag in borrowed_tags
+            ):
+                finding.tags = list(borrowed_tags)
+        replay_call_start = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE
+        )
+        replay = (
+            direct_replays.get(replay_call_start)
+            if type(replay_call_start) is int and not is_direct_literal
+            else None
+        )
+        if replay is not None:
+            finding.match_fingerprint = replay.fingerprint()
+            finding.severity = replay.severity
+            finding.confidence = replay.confidence
+            finding.tags = list(replay.tags)
+    return cleanup_path_findings(reconciled)
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
@@ -5019,28 +6934,5 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         state,
         [sys.modules[__name__], static_python_shell_truthiness],
     )
-    file_cache = state.get("file_cache", {})
-    for finding in response["findings"]:
-        if (
-            finding.evidence.pop(
-                static_python_shell_truthiness.BOUND_SHELL_EVIDENCE,
-                None,
-            )
-            is not True
-        ):
-            continue
-        content = file_cache.get(finding.file, "")
-        content_lines = content.splitlines()
-        line_index = max(0, finding.start_line - 1)
-        matched = (finding.matched_text or "")[:200]
-        matched_line = content_lines[line_index] if line_index < len(content_lines) else matched
-        severity, finding.confidence = _classify_tm1(
-            finding.context or "",
-            matched,
-            matched_line,
-            finding.confidence,
-            "python",
-        )
-        finding.severity = severity.value
     logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
     return response
