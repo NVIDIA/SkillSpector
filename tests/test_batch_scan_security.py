@@ -128,7 +128,7 @@ def test_gap_fill_provider_prompt_excludes_symlink_target(
     assert entry["issues"] == []
 
 
-@pytest.mark.parametrize("failure_mode", ["json", "schema", "provider", "timeout"])
+@pytest.mark.parametrize("failure_mode", ["json", "schema", "provider", "runtime_signal", "missing_findings"])
 @pytest.mark.parametrize("partial_success", [False, True])
 def test_gap_fill_failure_is_incomplete_and_preserves_findings(
     batch_skill, monkeypatch: pytest.MonkeyPatch, failure_mode, partial_success
@@ -184,8 +184,10 @@ def test_gap_fill_failure_is_incomplete_and_preserves_findings(
             )
         if failure_mode == "provider":
             raise RuntimeError("synthetic provider failure")
-        if failure_mode == "timeout":
+        if failure_mode == "runtime_signal":
             raise llm_analyzer_base.LLMRuntimeLimitError("deadline")
+        if failure_mode == "missing_findings":
+            return AIMessage(content='{"refusal": "No analysis returned"}')
         return AIMessage(content="not JSON" if failure_mode == "json" else '{"findings": 1}')
 
     monkeypatch.setattr(
@@ -202,13 +204,18 @@ def test_gap_fill_failure_is_incomplete_and_preserves_findings(
     assert entry["enhancements"]["gap_fill_applied"] is False
     assert entry["enhancements"]["gap_fill_findings"] == int(partial_success)
     assert entry["analysis_completeness"]["is_complete"] is False
+    assert entry["risk_assessment"]["recommendation"] == "CAUTION"
+    assert entry["execution_successful"] is (failure_mode != "provider")
+    assert entry["error"] == error
+    assert entry["enhancements"]["gap_fill_status"] == "incomplete"
     assert any(issue["id"] == "TM1" for issue in entry["issues"])
     assert any(issue["id"] == "P5" for issue in entry["issues"]) is partial_success
     expected_reason = {
         "json": "llm_structured_response_invalid",
         "schema": "llm_structured_response_invalid",
         "provider": "llm_batch_failed",
-        "timeout": "runtime_limit",
+        "runtime_signal": "runtime_limit",
+        "missing_findings": "llm_structured_response_invalid",
     }[failure_mode]
     assert any(
         row["reason_code"] == expected_reason
@@ -219,7 +226,7 @@ def test_gap_fill_failure_is_incomplete_and_preserves_findings(
     assert payload["batch"]["inspection_completeness"]["incomplete_skills"] == 1
     assert expected_reason in reports._format_terminal([entry])
     assert expected_reason.replace("_", "\\_") in reports._format_markdown([entry])
-    expected_failed_calls = 4 if failure_mode in {"json", "schema"} else 1
+    expected_failed_calls = 4 if failure_mode in {"json", "schema", "missing_findings"} else 1
     assert len(calls) == expected_failed_calls + int(partial_success)
     monkeypatch.setattr(
         batch_scan, "_scan_skill_bounded", lambda *args, **kw: (entry, error, skill.name)
@@ -648,3 +655,71 @@ def test_scan_forwards_verbose_logging(batch_skill, monkeypatch):
         skill, skill.parent, use_llm=False, lang="en", require_llm=False, verbose=True
     )
     assert levels == ["DEBUG"]
+
+
+@pytest.mark.parametrize("requested", [2, 60, None])
+def test_compat_http_timeout_preserves_shorter_deadline(monkeypatch, requested):
+    observed = {}
+    monkeypatch.setattr(runner, "_original_chatopenai_init", lambda self, **kw: observed.update(kw))
+    runner._patched_chatopenai_init(object(), timeout=requested)
+    assert observed["timeout"] is observed["request_timeout"]
+    assert observed["timeout"].read == (2 if requested == 2 else 30)
+    assert observed["timeout"].connect == (2 if requested == 2 else 8)
+
+
+@pytest.mark.parametrize("stage", ["construction", "batching"])
+def test_gap_fill_setup_failure_retains_core_findings(batch_skill, monkeypatch, stage):
+    import contrib.batch_scan.gap_fill as gap_fill
+    from skillspector.models import Finding
+
+    skill, _ = batch_skill
+    core = Finding(rule_id="TM1", message="Core evidence", severity="HIGH", file="SKILL.md")
+    _mock_scan(monkeypatch, lambda context: context.update(findings=[core]))
+    monkeypatch.setattr(runner, "run_gap_fill", run_gap_fill)
+
+    def fail(*args, **kwargs):
+        raise TypeError("synthetic setup failure")
+
+    if stage == "construction":
+        monkeypatch.setattr(gap_fill, "GapFillAnalyzer", fail)
+    else:
+        monkeypatch.setattr(llm_analyzer_base, "get_chat_model", lambda **kw: SimpleNamespace())
+        monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda model: 100_000)
+        monkeypatch.setattr(gap_fill.GapFillAnalyzer, "get_batches", fail)
+    entry, error = runner.run_one(
+        skill, skill.parent, use_llm=True, detected_language="zh", apply_gap_fill=True
+    )
+    assert error is not None and entry["error"] == error
+    assert any(issue["id"] == "TM1" for issue in entry["issues"])
+    assert entry["risk_assessment"]["recommendation"] != "SAFE"
+    assert entry["analysis_completeness"]["is_complete"] is False
+    assert entry["execution_successful"] is False
+    assert entry["enhancements"]["gap_fill_error_reasons"] == ["llm_batch_failed"]
+    assert any(row["path"] == "SKILL.md" for row in entry["analysis_completeness"]["ledger_exceptions"])
+
+
+def test_gap_fill_real_deadline_stops_retries_and_keeps_core(batch_skill, monkeypatch):
+    from skillspector.models import Finding
+
+    skill, _ = batch_skill
+    core = Finding(rule_id="TM1", message="Core evidence", severity="HIGH", file="SKILL.md")
+    _mock_scan(monkeypatch, lambda context: context.update(findings=[core]))
+    monkeypatch.setattr(runner, "run_gap_fill", run_gap_fill)
+    calls = []
+    def invoke(prompt):
+        calls.append(prompt)
+        return AIMessage(content="not JSON")
+    monkeypatch.setattr(llm_analyzer_base, "get_chat_model", lambda **kw: SimpleNamespace(invoke=invoke))
+    monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda model: 100_000)
+    started = time.monotonic()
+    with runner.deepseek_compat():
+        entry, error = runner.run_one(
+            skill, skill.parent, use_llm=True, detected_language="zh", apply_gap_fill=True,
+            timeout=0.3,
+        )
+    assert time.monotonic() - started < 2
+    assert len(calls) <= 1
+    assert error is not None
+    assert any(issue["id"] == "TM1" for issue in entry["issues"])
+    assert entry["enhancements"]["gap_fill_error_reasons"] == ["runtime_limit"]
+    assert entry["analysis_completeness"]["is_complete"] is False

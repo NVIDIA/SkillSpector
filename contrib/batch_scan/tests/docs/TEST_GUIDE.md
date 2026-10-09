@@ -119,7 +119,7 @@ Answers reviewer: *"Several patches depend on internal details that can break on
 | Class | Tests | Covers |
 |-------|-------|--------|
 | `TestParseResponseValidJSON` | 4 | Single finding; multiple findings; empty findings; default values |
-| `TestParseResponseInvalidInput` | 9 | Non-JSON; integer; list; missing `rule_id`; null bytes; BOM prefix; missing `findings` key; illegal severity → defaults |
+| `TestParseResponseInvalidInput` | 3 | Non-JSON; integer; list; missing `rule_id`; null bytes; BOM prefix; missing `findings` key; illegal severity → defaults |
 | `TestParseResponseMarkdownFences` | 4 | Fenced with language tag; no tag; trailing whitespace; unclosed fence |
 | `TestParseResponseFiltering` | 5 | Confidence below threshold; unknown rule_id; mixed valid/invalid; all below threshold; all unknown |
 | `TestParseResponsePydanticModel` | 1 | Delegate to Pydantic model path |

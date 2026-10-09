@@ -215,7 +215,6 @@ class TestParseResponseInvalidInput(unittest.TestCase):
             "This is not JSON at all.", "", 42, "[1, 2, 3]",
             json.dumps({"findings": "not a list"}),
             json.dumps({"findings": [_valid_finding(severity="CATASTROPHIC")]}),
-            "\ufeff" + json.dumps({"findings": [_valid_finding()]}),
             '{"findings": [\x00]}',
         ]
         for response in responses:
@@ -223,8 +222,15 @@ class TestParseResponseInvalidInput(unittest.TestCase):
                 with self.assertRaises(_StructuredResponseValidationError):
                     self.analyzer.parse_response(response, _batch())
 
-    def test_missing_findings_key_keeps_schema_default(self):
-        self.assertEqual(self.analyzer.parse_response('{"other": "value"}', _batch()), [])
+    def test_missing_findings_key_is_not_a_completed_analysis(self):
+        for response in ('{}', '{"error": "no analysis"}', '{"refusal": "no"}'):
+            with self.subTest(response=response):
+                with self.assertRaises(_StructuredResponseValidationError):
+                    self.analyzer.parse_response(response, _batch())
+
+    def test_bom_prefixed_valid_findings_are_preserved(self):
+        findings = self.analyzer.parse_response("\ufeff" + json.dumps({"findings": [_valid_finding()]}), _batch())
+        self.assertEqual([finding.rule_id for finding in findings], ["P5"])
 
 
 # ---------------------------------------------------------------------------
@@ -272,8 +278,7 @@ class TestParseResponsePydanticModel(unittest.TestCase):
         results = self.analyzer.parse_response(result, _batch())
         # Should return findings (delegates to parent class behavior)
         self.assertIsInstance(results, list)
-        # At minimum, must not crash
-        self.assertGreaterEqual(len(results), 0)
+        self.assertEqual([finding.rule_id for finding in results], ["P5"])
 
 
 # ---------------------------------------------------------------------------
