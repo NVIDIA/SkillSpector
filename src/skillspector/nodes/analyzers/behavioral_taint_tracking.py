@@ -128,6 +128,7 @@ _NETWORK_OUTPUT_SINKS = frozenset(
         "httpx.patch",
         "httpx.get",
         "urllib.request.urlopen",
+        "urllib.request.build_opener.open",
         "socket.socket.send",
         "socket.socket.sendall",
         "socket.socket.sendto",
@@ -303,6 +304,14 @@ def _resolve_sink_name(
     ``importlib.import_module('subprocess').run(...)`` resolves to ``'subprocess.run'``
     and re-enters ``_EXEC_SINKS`` like the statically-imported form would.
     """
+    if (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "open"
+        and isinstance(node.func.value, ast.Call)
+        and resolve_call_name_typed(node.func.value, type_map, aliases)
+        == "urllib.request.build_opener"
+    ):
+        return "urllib.request.build_opener.open"
     name = resolve_call_name_typed(node, type_map, aliases)
     if name is None:
         name = resolve_dynamic_import_call(node, aliases)
