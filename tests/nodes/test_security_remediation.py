@@ -3723,8 +3723,9 @@ def test_report_does_not_allow_meta_selection_to_remove_deterministic_finding() 
 def test_incidental_pdf_projection_stays_complete_without_format_findings(
     tmp_path: Path, container: bool
 ) -> None:
-    from skillspector.graph import graph
     import zipfile
+
+    from skillspector.graph import graph
 
     (tmp_path / "SKILL.md").write_text(
         "---\nname: ordinary\ndescription: A helper\n---\nA helper.\n"
@@ -3746,8 +3747,9 @@ def test_incidental_pdf_projection_stays_complete_without_format_findings(
 
 
 def test_readable_member_of_excluded_archive_does_not_create_sc9(tmp_path: Path) -> None:
-    from skillspector.graph import graph
     import zipfile
+
+    from skillspector.graph import graph
 
     (tmp_path / "SKILL.md").write_text(
         "---\nname: ordinary\ndescription: A helper\n---\nA helper.\n"
