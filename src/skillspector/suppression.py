@@ -85,7 +85,8 @@ MAX_BASELINE_DEPTH = 64
 MAX_BASELINE_RECORDS = 10_000
 MAX_BASELINE_SCALAR_CHARS = 64 * 1024
 # Validation passes for an output path that concurrent writers replace.
-_BASELINE_DESTINATION_ATTEMPTS = 2
+# Allow a small burst of cooperating atomic writers while bounding hostile swaps.
+_BASELINE_DESTINATION_ATTEMPTS = 8
 _FINGERPRINT_SCHEMA = "skillspector-finding-fingerprint-v2"
 _FINGERPRINT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SOURCE_IDENTITY_RE = re.compile(r"external/[0-9a-f]{64}\Z")
