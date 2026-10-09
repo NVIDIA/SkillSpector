@@ -99,6 +99,7 @@ class LedgerReason(StrEnum):
     REFERENCE_MISSING = "reference_missing"
     REFERENCE_UNRESOLVED = "reference_unresolved"
     MANIFEST_PARSE_ERROR = "manifest_parse_error"
+    DEPENDENCY_PARSE_ERROR = "dependency_parse_error"
     MANIFEST_PARSE_LIMIT = "manifest_parse_limit"
     ARTIFACT_COUNT_LIMIT = "artifact_count_limit"
     TRAVERSAL_DEPTH_LIMIT = "traversal_depth_limit"
@@ -205,6 +206,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     ),
     LedgerReason.MANIFEST_PARSE_ERROR: (
         "Manifest frontmatter is malformed or uses an unsupported value shape."
+    ),
+    LedgerReason.DEPENDENCY_PARSE_ERROR: (
+        "Dependency metadata could not be parsed into supported registry coordinates."
     ),
     LedgerReason.MANIFEST_PARSE_LIMIT: (
         "Manifest frontmatter could not be completely examined within its resource limits."

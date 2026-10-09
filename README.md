@@ -942,6 +942,10 @@ SC4 uses the [OSV.dev](https://osv.dev) API to check dependencies against the fu
 - **Batch queries** — all dependencies are checked in a single HTTP call.
 - **Automatic fallback** — if OSV.dev is unreachable (air-gapped/offline), a small built-in fallback list is used.
 - **Caching** — results are cached in-memory for 1 hour to avoid redundant API calls during a session.
+- **Pipenv** — reads `Pipfile` package tables and the direct/transitive packages in
+  `Pipfile.lock`, including development and custom categories. Exact lock versions
+  can resolve unpinned manifest dependencies. Malformed entries and unsupported
+  VCS/local sources are reported as incomplete dependency checks.
 
 The tool requires outbound HTTPS access to `api.osv.dev` for live vulnerability data. When that is not available, findings are limited to the static fallback list.
 
