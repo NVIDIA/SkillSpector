@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_supply_chain as supply_chain
 from skillspector.nodes.analyzers.osv_client import OsvQueryLimitation, QueryBatchResults
@@ -104,6 +106,54 @@ def test_toml_lock_parser_returns_empty_for_malformed_toml():
 name = "broken"
 """
     assert supply_chain._extract_packages_from_toml_lock(content) == []
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("pyproject.toml", "[project]\ndependencies = ["),
+        ("package.json", '{"dependencies": {'),
+        ("uv.lock", '[[package]\nname = "broken"'),
+    ],
+)
+def test_malformed_dependency_manifests_are_reported_as_partial(path, content):
+    _findings, limitations, _packages_seen = supply_chain._analyze_dependencies_detailed(
+        content,
+        path,
+    )
+
+    assert any(item.reason is LedgerReason.STATIC_PARSE_LIMIT for item in limitations)
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("pyproject.toml", "[project]\nname = 'example'\n"),
+        ("package.json", '{"name": "example"}'),
+        ("uv.lock", "version = 1\n"),
+    ],
+)
+def test_valid_dependency_free_manifests_remain_complete(path, content):
+    _findings, limitations, _packages_seen = supply_chain._analyze_dependencies_detailed(
+        content,
+        path,
+    )
+
+    assert not any(item.reason is LedgerReason.STATIC_PARSE_LIMIT for item in limitations)
+
+
+def test_malformed_package_json_keeps_line_scan_fallback(monkeypatch):
+    seen = _capture_osv_packages(monkeypatch)
+    content = '{"dependencies": {\n  "demo-package": "1.2.3"\n'
+
+    _findings, limitations, packages_seen = supply_chain._analyze_dependencies_detailed(
+        content,
+        "package.json",
+    )
+
+    assert packages_seen == 1
+    assert ("demo-package", "1.2.3") in seen["packages"]
+    assert any(item.reason is LedgerReason.STATIC_PARSE_LIMIT for item in limitations)
 
 
 def test_toml_lock_parser_keeps_package_without_version():

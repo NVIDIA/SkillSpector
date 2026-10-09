@@ -534,6 +534,50 @@ def test_cli_scan_local_directory(tmp_path: Path) -> None:
     assert "scan-test" in result.output or "skill" in result.output
 
 
+@pytest.mark.parametrize(
+    ("manifest_path", "manifest", "incomplete"),
+    [
+        ("pyproject.toml", "[project]\ndependencies = [", True),
+        ("package.json", '{"dependencies": {', True),
+        ("uv.lock", '[[package]\nname = "broken"', True),
+        ("pyproject.toml", "[project]\nname = 'example'\n", False),
+        ("package.json", '{"name": "example"}', False),
+        ("uv.lock", "version = 1\n", False),
+    ],
+)
+def test_cli_reports_malformed_dependency_manifest_completeness(
+    tmp_path: Path, manifest_path: str, manifest: str, incomplete: bool
+) -> None:
+    """Malformed dependency metadata must affect the strict completeness gate."""
+    (tmp_path / "SKILL.md").write_text("---\nname: manifest-test\n---\n# Safe", encoding="utf-8")
+    (tmp_path / manifest_path).write_text(manifest, encoding="utf-8")
+    output = tmp_path / "report.json"
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "--format",
+            "json",
+            "--no-llm",
+            "--output",
+            str(output),
+            "--fail-on-incomplete",
+        ],
+    )
+
+    assert result.exit_code == (1 if incomplete else 0)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["analysis_completeness"]["is_complete"] is not incomplete
+    if incomplete:
+        assert any(
+            event["reason_code"] == LedgerReason.STATIC_PARSE_LIMIT.value
+            and event["path"] == manifest_path
+            for event in payload["analysis_completeness"]["ledger_exceptions"]
+        )
+
+
 def test_cli_rejects_symlinked_parent_before_preflight(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
