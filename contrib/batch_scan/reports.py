@@ -69,7 +69,9 @@ def _inspection_summary(results: list[dict[str, object]]) -> dict[str, int]:
     }
 
 
-def _exception_groups(results: list[dict[str, object]]) -> list[tuple[str, list[dict[str, object]]]]:
+def _exception_groups(
+    results: list[dict[str, object]],
+) -> list[tuple[str, list[dict[str, object]]]]:
     """Collect every public exception by child skill, without sampling rows."""
     groups: list[tuple[str, list[dict[str, object]]]] = []
     for result in sorted_results(results):
@@ -131,10 +133,7 @@ def _format_terminal(results: list[dict[str, object]]) -> str:
     capture.print(
         Panel(
             "[bold]SkillSpector Batch Scan Report[/bold]",
-            subtitle=(
-                f"v{_skillspector_version}  |  "
-                "[green]Multilingual Enhanced[/green]"
-            ),
+            subtitle=(f"v{_skillspector_version}  |  [green]Multilingual Enhanced[/green]"),
         )
     )
     capture.print()
@@ -155,10 +154,7 @@ def _format_terminal(results: list[dict[str, object]]) -> str:
             f"({gap_fill_skills} gap-fill applied, "
             f"{gap_fill_total} gap-fill finding(s))"
         )
-    capture.print(
-        "[dim]Compare with standard scan: "
-        "skillspector scan <skill> -f json[/dim]"
-    )
+    capture.print("[dim]Compare with standard scan: skillspector scan <skill> -f json[/dim]")
     capture.print()
 
     # ── Source breakdown ─────────────────────────────────────────
@@ -214,13 +210,10 @@ def _format_terminal(results: list[dict[str, object]]) -> str:
         )
     if medium > 0:
         capture.print(
-            f"[yellow]{medium} skill(s)[/yellow] "
-            "with MEDIUM risk — review before installing"
+            f"[yellow]{medium} skill(s)[/yellow] with MEDIUM risk — review before installing"
         )
     if low_count > 0:
-        capture.print(
-            f"[green]{low_count} skill(s)[/green] with LOW risk — likely safe"
-        )
+        capture.print(f"[green]{low_count} skill(s)[/green] with LOW risk — likely safe")
     for skill_name, exceptions in _exception_groups(results):
         capture.print(f"[bold]Ledger exceptions — {escape(_terminal_text(skill_name))}[/bold]")
         for exception in exceptions:
@@ -236,11 +229,7 @@ def _format_terminal(results: list[dict[str, object]]) -> str:
 
 
 def _count_sev(results: list[dict[str, object]], severity: str) -> int:
-    return sum(
-        1
-        for r in results
-        if r.get("risk_assessment", {}).get("severity") == severity
-    )
+    return sum(1 for r in results if r.get("risk_assessment", {}).get("severity") == severity)
 
 
 def _lr_icon(severity: str, language: str) -> str:
@@ -404,8 +393,7 @@ def _format_markdown(results: list[dict[str, object]]) -> str:
 
     lines.append("# SkillSpector Batch Scan Report\n")
     lines.append(
-        f"**Scan mode:** Multilingual Enhanced  \n"
-        f"**Version:** v{_skillspector_version}  \n"
+        f"**Scan mode:** Multilingual Enhanced  \n**Version:** v{_skillspector_version}  \n"
     )
     if non_en:
         lines.append(
@@ -414,13 +402,10 @@ def _format_markdown(results: list[dict[str, object]]) -> str:
             f"{gap_fill_total} gap-fill finding(s)  \n"
         )
     lines.append(
-        "**Compare with:** `skillspector scan <skill> -f json` "
-        "for standard single-skill output  \n"
+        "**Compare with:** `skillspector scan <skill> -f json` for standard single-skill output  \n"
     )
     lines.append(f"**Skills scanned:** {total}  ")
-    lines.append(
-        f"**Scanned at:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}  \n"
-    )
+    lines.append(f"**Scanned at:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}  \n")
 
     critical = _count_sev(results, "CRITICAL")
     high = _count_sev(results, "HIGH")

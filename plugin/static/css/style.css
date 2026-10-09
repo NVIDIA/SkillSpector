@@ -1,0 +1,56 @@
+:root{--nvidia:#76B900;--bg:#0a0e14;--card:#111821;--border:#1f2a37;--text:#e6edf3;--muted:#8b949e;--critical:#ff3b30;--high:#ff9500;--medium:#ffcc02;--low:#34c759;--info:#5ac8fa}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text)}
+.topbar{padding:16px 24px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:#0f141c}
+.brand{font-weight:700;font-size:18px}.brand .logo{color:var(--nvidia)}.brand small{color:var(--muted);font-weight:400;margin-left:8px}
+.meta{color:var(--muted);font-size:12px}
+.tabs{display:flex;gap:8px;padding:12px 24px;border-bottom:1px solid var(--border);background:#0f141c;position:sticky;top:0;z-index:10}
+.tab{background:transparent;border:1px solid var(--border);color:var(--text);padding:8px 14px;border-radius:999px;cursor:pointer}
+.tab.active{background:var(--nvidia);color:#000;border-color:var(--nvidia);font-weight:600}
+main{padding:24px;max-width:1300px;margin:0 auto}
+.panel{display:none}.panel.active{display:block}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;text-align:center}
+.card h3{margin:0;font-size:28px;color:var(--nvidia)}.card p{margin:4px 0 0;color:var(--muted);font-size:12px}
+.severity-bar{display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+.sev{padding:6px 10px;border-radius:999px;font-size:12px;border:1px solid var(--border)}
+.sev.critical{background:#ff3b3022;color:var(--critical);border-color:var(--critical)}
+.sev.high{background:#ff950022;color:var(--high);border-color:var(--high)}
+.sev.medium{background:#ffcc0222;color:var(--medium);border-color:var(--medium)}
+.sev.low{background:#34c75922;color:var(--low)}
+.sev.info{background:#5ac8fa22;color:var(--info)}
+.graph-metrics pre{background:var(--card);border:1px solid var(--border);padding:12px;border-radius:8px;overflow:auto}
+.offline-badge{background:#76B9001a;border:1px solid var(--nvidia);color:var(--nvidia);padding:8px 12px;border-radius:8px;display:inline-block;margin-top:12px}
+#cy{width:100%;height:520px;background:var(--card);border:1px solid var(--border);border-radius:12px}
+.legend{margin-top:8px;color:var(--muted);font-size:12px}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.dot.external{background:var(--high)}.dot.internal{background:var(--nvidia)}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--border);font-size:13px}th{background:#0f141c;color:var(--muted);font-weight:600}
+.badge{padding:2px 8px;border-radius:999px;font-size:11px;border:1px solid var(--border);text-transform:uppercase}
+.badge.critical{background:var(--critical);color:#fff}.badge.high{background:var(--high);color:#000}.badge.medium{background:var(--medium);color:#000}.badge.low{background:var(--low);color:#000}.badge.info{background:var(--info);color:#000}
+.evidence{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.filters{display:flex;gap:8px;margin-bottom:12px} .filters input, .filters select{background:var(--card);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px}
+.scorecards{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}
+.scorecard{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px}
+.score-header{display:flex;justify-content:space-between;align-items:center}
+.score{font-size:20px;font-weight:700;padding:6px 10px;border-radius:8px}.score.grade-a{background:#34c759;color:#000}.score.grade-b{background:#76B900;color:#000}.score.grade-c{background:var(--medium);color:#000}.score.grade-d{background:var(--high);color:#000}.score.grade-f{background:var(--critical);color:#fff}
+.explanation{color:var(--muted);font-size:13px}
+details{margin-top:8px;background:#0f141c;border:1px solid var(--border);border-radius:8px;padding:8px}
+pre{white-space:pre-wrap;word-break:break-all;font-size:12px}
+footer{padding:16px;text-align:center;color:var(--muted);border-top:1px solid var(--border);margin-top:24px}
+.muted{color:var(--muted)}
+.kv{display:flex; justify-content:space-between; gap:12px; padding:6px 0; border-bottom:1px dashed var(--border); font-size:13px}
+.kv span{color:var(--muted)} .kv b{color:var(--text)}
+table.compact th, table.compact td{padding:6px 8px; font-size:12px}
+.tablewrap{overflow:auto; border:1px solid var(--border); border-radius:8px}
+.panel-head{display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px}
+.panel-head .actions button, .btn, .sbom-grid button{background:var(--card); border:1px solid var(--border); color:var(--text); padding:6px 10px; border-radius:8px; cursor:pointer}
+.panel-head .actions button:hover, .btn:hover{border-color:var(--nvidia); color:var(--nvidia)}
+.sbom-grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:16px}
+.alert{padding:10px 12px; border-radius:8px; border:1px solid; font-size:13px}
+.alert.high{background:#ff950022; border-color:var(--high); color:var(--high)}
+.skill-overview{margin-top:12px}
+.msg{font-size:13px} .fix{font-size:12px; color:var(--muted); margin-top:4px}
+.ev{font-size:12px; white-space:pre-wrap; word-break:break-all; max-width:340px}
+.badge.grade-a{background:#34c759; color:#000} .badge.grade-b{background:#76B900; color:#000} .badge.grade-c{background:var(--medium); color:#000} .badge.grade-d{background:var(--high); color:#000} .badge.grade-f{background:var(--critical); color:#fff}
+.grade-a{color:#34c759} .grade-b{color:#76B900} .grade-c{color:var(--medium)} .grade-d{color:var(--high)} .grade-f{color:var(--critical)}
+.progress{background:var(--border); border-radius:999px; overflow:hidden}
+h3 small, h2 small{color:var(--muted); font-weight:400; font-size:13px}
