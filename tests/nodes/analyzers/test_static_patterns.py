@@ -2720,7 +2720,9 @@ def test_code_pattern_timeouts_reach_incomplete_ledger(monkeypatch, analyzer, ca
     def compile_with_code_deadline(source, flags, ascii_content=False):
         if source == target:
             reached.append(source)
-            monkeypatch.setattr(static_runner, "_STATIC_PATTERN_SECONDS", 0.000001)
+            # Exhaust this rule's allowance deterministically; a no-match can
+            # finish inside a one-microsecond deadline on a warm CPU cache.
+            monkeypatch.setattr(static_runner, "_STATIC_PATTERN_SECONDS", 0.0)
         return original(source, flags, ascii_content)
 
     monkeypatch.setattr(static_runner, "_timed_pattern", compile_with_code_deadline)
@@ -2732,7 +2734,7 @@ def test_code_pattern_timeouts_reach_incomplete_ledger(monkeypatch, analyzer, ca
     assert any(
         event["outcome"] == "partial"
         and event["reason_code"] == "runtime_limit"
-        and event["limit_seconds"] == 0.000001
+        and event["limit_seconds"] == 0.0
         for event in result["inspection_ledger"]
     )
 
