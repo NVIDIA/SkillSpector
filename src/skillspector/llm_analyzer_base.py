@@ -71,12 +71,15 @@ from skillspector.llm_utils import (
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
-from skillspector.providers import get_active_provider
+from skillspector.providers import UnknownProviderError, get_active_provider, has_cli_capability
 from skillspector.providers.gemini import GeminiProvider
 
 logger = get_logger(__name__)
 
 DEFAULT_MAX_LLM_CONCURRENCY = 10
+# A CLI-provider call is a whole agent session on the user's own plan, so the
+# default fan-out is much smaller than for an HTTP API.
+DEFAULT_CLI_MAX_LLM_CONCURRENCY = 2
 API_CONNECTION_MAX_RETRIES = 3
 API_CONNECTION_RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
 RATE_LIMIT_RETRY_DELAYS_SECONDS = (5.0, 15.0, 30.0)
@@ -536,10 +539,28 @@ def _shared_limiter(limit: int) -> _GlobalLLMLimiter:
         return limiter
 
 
+def _default_max_concurrency() -> int:
+    """Return the fan-out default for the active provider.
+
+    CLI providers get :data:`DEFAULT_CLI_MAX_LLM_CONCURRENCY` because every
+    request starts a separate agent session that counts against the user's
+    plan. An unknown provider keeps the HTTP default; provider selection
+    reports that error itself.
+    """
+    try:
+        provider = get_active_provider()
+    except UnknownProviderError:
+        return DEFAULT_MAX_LLM_CONCURRENCY
+    if has_cli_capability(provider):
+        return DEFAULT_CLI_MAX_LLM_CONCURRENCY
+    return DEFAULT_MAX_LLM_CONCURRENCY
+
+
 def resolve_max_concurrency() -> int:
     """Resolve the LLM fan-out concurrency from ``SKILLSPECTOR_MAX_LLM_CONCURRENCY``.
 
-    Defaults to :data:`DEFAULT_MAX_LLM_CONCURRENCY`. Users on rate-limited
+    Defaults to :data:`DEFAULT_MAX_LLM_CONCURRENCY`, or to
+    :data:`DEFAULT_CLI_MAX_LLM_CONCURRENCY` for CLI providers. Users on rate-limited
     providers (free tiers with a low RPM) can set it to ``1`` to serialize
     requests across every analyzer instead of bursting up to 10 in parallel — a burst that otherwise
     guarantees 429s, and 429'd batches are dropped from the result (see the
@@ -548,16 +569,17 @@ def resolve_max_concurrency() -> int:
     """
     raw = os.environ.get("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "").strip()
     if not raw:
-        return DEFAULT_MAX_LLM_CONCURRENCY
+        return _default_max_concurrency()
     try:
         value = int(raw)
     except ValueError:
+        default = _default_max_concurrency()
         logger.warning(
             "Invalid SKILLSPECTOR_MAX_LLM_CONCURRENCY=%r (not an int); using %d",
             raw,
-            DEFAULT_MAX_LLM_CONCURRENCY,
+            default,
         )
-        return DEFAULT_MAX_LLM_CONCURRENCY
+        return default
     if value < 1:
         logger.warning("SKILLSPECTOR_MAX_LLM_CONCURRENCY=%d < 1; clamping to 1", value)
         return 1

@@ -32,6 +32,8 @@ from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 import skillspector.providers as providers_module
+import skillspector.providers._agent_cli as agent_cli_module
+import skillspector.providers._agent_cli_base as agent_cli_base_module
 import skillspector.providers.anthropic.provider as anthropic_provider_module
 from skillspector.inference_usage import chat_model_controls, chat_model_requested_controls
 from skillspector.providers import (
@@ -1066,6 +1068,34 @@ class TestAntigravityCLIProvider:
         available, reason = AntigravityCLIProvider().is_available()
         assert available is False
         assert reason
+
+
+class TestAgentCLISessionCostWarning:
+    """A usable CLI provider warns once that every LLM call is a full session."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_warned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(agent_cli_base_module, "_cost_warned", set())
+
+    def test_warns_once_when_available(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(agent_cli_module, "is_available", lambda name: (True, None))
+        provider = ClaudeCLIProvider()
+        with caplog.at_level("WARNING", logger=agent_cli_base_module.logger.name):
+            assert provider.is_available() == (True, None)
+            assert provider.is_available() == (True, None)
+        warnings = [r for r in caplog.records if "separate claude session" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "--no-llm" in warnings[0].getMessage()
+
+    def test_silent_when_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(agent_cli_module, "is_available", lambda name: (False, "not logged in"))
+        with caplog.at_level("WARNING", logger=agent_cli_base_module.logger.name):
+            assert ClaudeCLIProvider().is_available() == (False, "not logged in")
+        assert not [r for r in caplog.records if "separate claude session" in r.getMessage()]
 
 
 class TestAgentCLIProviderMetadata:

@@ -42,6 +42,7 @@ import pytest
 
 from skillspector.providers import _agent_cli
 from skillspector.providers._agent_cli import (
+    _CLAUDE_SYSTEM_PROMPT,
     MAX_INPUT_BYTES,
     AgentCLIError,
     _build_claude_argv,
@@ -209,6 +210,23 @@ class TestBuildClaudeArgv:
     def test_disable_slash_commands_present(self) -> None:
         argv = _build_claude_argv(CLAUDE_BINARY, MODEL, 4096)
         assert "--disable-slash-commands" in argv
+
+    def test_tools_flag_removes_all_builtin_tools(self) -> None:
+        argv = _build_claude_argv(CLAUDE_BINARY, MODEL, 4096)
+        # --allowed-tools "" only denies use; --tools "" also drops the schemas
+        # from context, which every call would otherwise pay for.
+        assert argv[argv.index("--tools") + 1] == ""
+
+    def test_system_prompt_replaced_with_fixed_text(self) -> None:
+        argv = _build_claude_argv(CLAUDE_BINARY, MODEL, 4096)
+        assert argv[argv.index("--system-prompt") + 1] == _CLAUDE_SYSTEM_PROMPT
+        assert "--append-system-prompt" not in argv
+
+    def test_no_session_persistence(self) -> None:
+        argv = _build_claude_argv(CLAUDE_BINARY, MODEL, 4096)
+        # Each call runs in a fresh temp cwd; persisting would leave one
+        # ~/.claude/projects folder per call.
+        assert "--no-session-persistence" in argv
 
     def test_dangerously_skip_permissions_never_in_argv(self) -> None:
         argv = _build_claude_argv(CLAUDE_BINARY, MODEL, 4096)
