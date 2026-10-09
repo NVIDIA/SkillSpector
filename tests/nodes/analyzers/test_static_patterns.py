@@ -2812,6 +2812,62 @@ def test_variable_shell_backreferences_keep_python_spans(name, reference, gap, p
     ] == expected
 
 
+@pytest.mark.parametrize("name", ["true_value", "true_İ", "true_µ", "flag"])
+@pytest.mark.parametrize("prefix", ["", "\n\n", "# Unicode ©\n\n"])
+def test_variable_shell_windows_preserve_upstream_call_ownership(name, prefix):
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
+
+    content = (
+        prefix
+        + f"{name} = True\ntrue_other = True\n"
+        + f"subprocess.run(cmd, shell={name}); subprocess.run(cmd, shell={name})\n"
+        + "subprocess.run(cmd, shell=true_other)\n"
+    )
+    expected = {}
+
+    def keep(window):
+        previous = expected.get(window.end())
+        if previous is None or window.start() > previous.start():
+            expected[window.end()] = window
+
+    for window in module._VARIABLE_SHELL_FLAG_RE.finditer(content):
+        keep(window)
+    for assignment in module._VARIABLE_SHELL_ASSIGNMENT_RE.finditer(content):
+        if not assignment.group(1).casefold().startswith("true"):
+            continue
+        end = assignment.end() - 1
+        for _ in range(5):
+            end = content.find("\n", end + 1)
+            if end < 0:
+                end = len(content)
+                break
+        for argument in module._SHELL_NAME_ARGUMENT_RE.finditer(content, assignment.end(), end):
+            window = module._VARIABLE_SHELL_FLAG_RE.fullmatch(content, assignment.start(), argument.end())
+            if window is not None:
+                keep(window)
+    assert [(m.span(), m.groups()) for m in module._variable_shell_matches(content)] == [
+        (m.span(), m.groups()) for m in sorted(expected.values(), key=lambda m: (m.start(), m.end()))
+    ]
+
+
+def test_variable_shell_true_prefixed_long_tail_stays_incomplete():
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
+
+    content = "true_value = True\nsubprocess.run(" + "x" * 4097 + ", shell=true_value)"
+    with pytest.raises(static_runner._StaticResourceLimitError) as caught:
+        module._variable_shell_matches(content)
+    assert caught.value.reason.value == "static_parse_limit"
+
+
+def test_variable_shell_assignment_index_handles_blank_line_prefix():
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
+
+    content = "\n" * 256_000 + "true_value = True\nsubprocess.run(cmd, shell=true_value)\n"
+    matches = module._variable_shell_matches(content)
+    assert len(matches) == 1
+    assert matches[0].start() == 0
+
+
 @pytest.mark.parametrize("tail_length", [4095, 4096, 4097])
 def test_variable_shell_argument_tail_boundary(tail_length):
     from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
