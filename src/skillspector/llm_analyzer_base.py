@@ -610,7 +610,10 @@ class LLMFinding(BaseModel):
     @classmethod
     def _normalize_confidence(cls, v: object) -> float:
         # Accept 0-100 scale values from some models, then clamp into [0, 1].
-        value = float(cast(Any, v))
+        try:
+            value = float(cast(Any, v))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("confidence must be numeric") from exc
         if value > 2.0:
             value = value / 100.0
         return min(1.0, max(0.0, value))

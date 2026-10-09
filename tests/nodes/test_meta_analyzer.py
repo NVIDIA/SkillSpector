@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import Batch, BatchExecutionResult, BatchFailure
 from skillspector.models import Finding
@@ -31,6 +33,7 @@ from skillspector.nodes.analyzers import static_patterns_anti_refusal
 from skillspector.nodes.analyzers.static_runner import analyzer_finding_to_finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
+    MetaAnalyzerResult,
     _meta_ledger_response,
     meta_analyzer,
 )
@@ -1092,7 +1095,46 @@ def test_use_llm_false_records_nothing() -> None:
     assert "filtered_findings" not in result
 
 
+@pytest.mark.parametrize("value", ["invalid JSON", "", "{not json", "null", "42", '"wrong type"'])
+def test_invalid_stringified_meta_findings_fail_validation(value) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        MetaAnalyzerResult.model_validate({"findings": value})
+
+
+def test_valid_stringified_meta_fields_are_supported() -> None:
+    result = MetaAnalyzerResult.model_validate(
+        {
+            "findings": "[]",
+            "overall_assessment": '{"risk_level": "LOW", "summary": "No issues found"}',
+        }
+    )
+    assert result.findings == []
+    assert result.overall_assessment.summary == "No issues found"
+
+
 def test_no_findings_records_nothing() -> None:
     result = meta_analyzer(_degr_state(findings=[]))
     assert "llm_call_log" not in result
     assert "filtered_findings" not in result
+
+
+@pytest.mark.parametrize("assessment", ["HIGH risk: exfiltrates credentials", "LOW", ""])
+def test_optional_prose_assessment_keeps_finding_verdict(assessment):
+    verdict = {
+        "pattern_id": "P1",
+        "is_vulnerability": True,
+        "confidence": 0.9,
+        "intent": "malicious",
+        "impact": "high",
+        "explanation": "Unsafe instruction",
+        "remediation": "Remove instruction",
+    }
+    result = MetaAnalyzerResult.model_validate(
+        {"findings": [verdict], "overall_assessment": assessment}
+    )
+    assert len(result.findings) == 1
+    assert result.findings[0].pattern_id == "P1"
+    assert result.findings[0].is_vulnerability is True
+    assert result.overall_assessment is None

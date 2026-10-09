@@ -284,22 +284,22 @@ raw LLM string → _strip_markdown_fences() → json.loads() → model_validate(
 The two-step parse (stdlib `json.loads` then Pydantic `model_validate`) exists
 because:
 
-1. `json.loads` is fast, deterministic, and raises clear `JSONDecodeError` on
-   malformed output — we catch this and return `[]` (empty findings).
-2. `model_validate` enforces the schema: required fields, literal enums,
-   confidence range, string length.  Schema violations are caught and returned
-   as `[]` with a warning log.
+1. `json.loads` parses the response. Invalid JSON raises the core structured-response
+   validation error rather than producing an empty findings list.
+2. `model_validate` checks the required fields and value types. Schema failures
+   use the same retry and reporting path.
 
-**Error propagation:** If the LLM returns invalid JSON or schema-mismatched
-output, the analyzer returns `[]` (no findings for that file).  The scan
-continues — a single malformed LLM response never blocks the pipeline.
-The warning is logged at `WARNING` level so operators can monitor parse-failure
-rates without sifting through debug logs.
+**Error propagation:** Invalid JSON and schema failures are retried up to four
+attempts. If they persist, the ledger records `skipped` with reason
+`llm_structured_response_invalid`; the analyzer is degraded and the skill counts
+as incomplete. The scan continues and keeps findings from completed work.
+Core logs `LLM structured response validation failed for ... retrying` and,
+on exhaustion, `... after 4 attempts`, without logging the raw response.
 
-Patch 3 adds a `_sanitize_meta_finding()` pass after validation to handle
-known LLM quirks: `null` string fields → `""`, unrecognized enum values
-(e.g., `"none"`) → `"low"`.  These are applied post-validation because they
-represent recoverable soft errors, not hard schema violations.
+Patch 3 sanitizes known soft quirks before validation: null explanation and
+remediation become empty strings, impact labels are case-folded, and unknown
+impact labels use `low`. Invalid findings still fail validation. Optional prose
+in `overall_assessment` is ignored so valid finding verdicts are retained.
 
 ## Gap-Fill Rule Selection Criteria
 
