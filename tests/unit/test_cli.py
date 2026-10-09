@@ -7155,6 +7155,246 @@ def test_recursive_sarif_uses_real_encoded_directory_and_preserves_external_sour
     assert Path(unquote(urlsplit(resolved).path)) == skill.path / "scripts/helper.py"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative output requires POSIX")
+@pytest.mark.parametrize("race", ["leaf", "parent-before-open", "parent-after-open", "hard-link"])
+@pytest.mark.parametrize("writer", ["report", "baseline"])
+def test_report_output_cannot_redirect_to_external_file(tmp_path, monkeypatch, race, writer):
+    from skillspector import file_output
+    from skillspector.suppression import dump_baseline
+
+    def write_output(path):
+        if writer == "baseline":
+            dump_baseline({"version": 2}, path)
+        else:
+            file_output.write_text_no_follow(path, "report")
+
+    parent = tmp_path / "reports"
+    parent.mkdir()
+    moved = tmp_path / "original-reports"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    protected = outside / "report.json"
+    protected.write_text("protected", encoding="utf-8")
+    output = parent / protected.name
+    original_open = os.open
+    original_replace = os.replace
+    if race == "hard-link":
+        os.link(protected, output)
+    elif race == "leaf":
+
+        def replace_after_swap(src, dst, **kwargs):
+            output.symlink_to(protected)
+            return original_replace(src, dst, **kwargs)
+
+        monkeypatch.setattr(file_output.os, "replace", replace_after_swap)
+    else:
+
+        def open_after_swap(path, flags, *args, **kwargs):
+            if path == parent.name:
+                if race == "parent-after-open":
+                    fd = original_open(path, flags, *args, **kwargs)
+                parent.rename(moved)
+                parent.symlink_to(outside, target_is_directory=True)
+                if race == "parent-after-open":
+                    return fd
+            return original_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(file_output.os, "open", open_after_swap)
+    if race == "parent-before-open":
+        with pytest.raises(ValueError, match="symlink or is not a directory"):
+            write_output(output)
+    else:
+        write_output(output)
+        written = (moved if race == "parent-after-open" else parent) / output.name
+        if writer == "baseline":
+            assert json.loads(written.read_text(encoding="utf-8")) == {"version": 2}
+        else:
+            assert written.read_text(encoding="utf-8") == "report"
+        expected_mode = (
+            protected.stat().st_mode & 0o777
+            if writer == "baseline" and race == "hard-link"
+            else 0o600
+        )
+        assert written.stat().st_mode & 0o777 == expected_mode
+        assert not written.is_symlink()
+    assert protected.read_text(encoding="utf-8") == "protected"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative output requires POSIX")
+def test_report_output_rejects_symlinks_and_cleans_failed_replace(tmp_path, monkeypatch):
+    from skillspector import file_output
+
+    protected = tmp_path / "protected"
+    protected.write_text("original", encoding="utf-8")
+    output = tmp_path / "report"
+    output.symlink_to(protected)
+    with pytest.raises(ValueError, match="non-regular"):
+        file_output.write_text_no_follow(output, "report")
+    output.unlink()
+    output.write_text("previous", encoding="utf-8")
+
+    def fail_replace(*args, **kwargs):
+        raise PermissionError("synthetic replacement failure")
+
+    monkeypatch.setattr(file_output.os, "replace", fail_replace)
+    with pytest.raises(ValueError, match="synthetic replacement failure"):
+        file_output.write_text_no_follow(output, "report")
+    assert output.read_text(encoding="utf-8") == "previous"
+    assert protected.read_text(encoding="utf-8") == "original"
+    assert not list(tmp_path.glob(".skillspector-output-*"))
+
+
+def test_report_output_unsupported_platform_keeps_stdout(tmp_path, monkeypatch):
+    from skillspector import file_output
+
+    monkeypatch.setattr(file_output, "_SECURE_OUTPUT_SUPPORTED", False)
+    skill = tmp_path / "SKILL.md"
+    skill.write_text("---\nname: safe\n---\nHello", encoding="utf-8")
+    monkeypatch.setattr(
+        cli, "_scan_skill", lambda **kwargs: {"report_body": "report", "risk_score": 0}
+    )
+    result = runner.invoke(
+        app, ["scan", str(skill), "--no-llm", "--output", str(tmp_path / "report")]
+    )
+    assert result.exit_code == 2
+    assert "unsupported on this platform" in " ".join(result.output.split())
+    assert not (tmp_path / "report").exists()
+    result = runner.invoke(app, ["scan", str(skill), "--no-llm", "--format", "json"])
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "report"
+
+
+@pytest.mark.parametrize(
+    "mode", ["single", "recursive", "registry", "baseline-default", "baseline-json"]
+)
+def test_unsupported_output_stops_before_analysis(tmp_path, monkeypatch, mode):
+    from skillspector import file_output
+
+    monkeypatch.setattr(file_output, "_SECURE_OUTPUT_SUPPORTED", False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COLUMNS", "79")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("analysis must not run for unsupported output")
+
+    monkeypatch.setattr(cli, "_scan_skill", forbidden)
+    monkeypatch.setattr(cli, "detect_skills", forbidden)
+    monkeypatch.setattr(cli, "scan_registry", forbidden)
+    monkeypatch.setattr(cli.graph, "invoke", forbidden)
+    args = ["baseline" if mode.startswith("baseline") else "scan", str(tmp_path), "--no-llm"]
+    if mode == "recursive":
+        args += ["--recursive"]
+    if mode == "registry":
+        args += ["--mcp-registry", "--format", "json"]
+    if mode != "baseline-default":
+        args += ["--output", "out.json"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 2
+    assert "unsupported on this platform" in " ".join(result.output.split())
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("reason", ["Accepted", "Accepted 🚀 𐐷\u2028--- with notes"])
+def test_baseline_stdout_works_without_secure_file_output(tmp_path, monkeypatch, reason):
+    from skillspector import file_output
+
+    monkeypatch.setattr(file_output, "_SECURE_OUTPUT_SUPPORTED", False)
+    monkeypatch.chdir(tmp_path)
+    states = []
+
+    def invoke(state):
+        states.append(state)
+        return {
+            "active_findings": [_finding("P1", "instruction")],
+            "file_cache": {"SKILL.md": "instruction"},
+            "risk_score": 0,
+        }
+
+    monkeypatch.setattr(cli.graph, "invoke", invoke)
+    result = runner.invoke(
+        app, ["baseline", str(tmp_path), "--no-llm", "-o", "-", "--verbose", "--reason", reason]
+    )
+    assert result.exit_code == 0, result.output
+    import yaml
+
+    from skillspector.suppression import baseline_from_dict
+
+    parsed = baseline_from_dict(yaml.safe_load(result.stdout))
+    assert list(parsed.fingerprints.values()) == [reason]
+    assert json.loads(result.stdout)["fingerprints"][0]["reason"] == reason
+    assert "baseline_path" not in states[0]
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative output requires POSIX")
+@pytest.mark.parametrize(
+    "mode", ["baseline-default", "baseline-json", "registry", "json", "sarif", "markdown"]
+)
+def test_all_cli_writers_reject_symlink_destinations(tmp_path, monkeypatch, mode):
+    monkeypatch.chdir(tmp_path)
+    protected = tmp_path / "protected"
+    protected.write_text("preserve", encoding="utf-8")
+    output = tmp_path / (
+        ".skillspector-baseline.yaml" if mode == "baseline-default" else "out.json"
+    )
+    output.symlink_to(protected.name)
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("# Safe skill", encoding="utf-8")
+    if mode.startswith("baseline"):
+        monkeypatch.setattr(
+            cli.graph,
+            "invoke",
+            lambda state: {"active_findings": [], "file_cache": {}, "risk_score": 0},
+        )
+        args = ["baseline", str(skill), "--no-llm"]
+    elif mode == "registry":
+        monkeypatch.setattr(
+            cli, "scan_registry", lambda *args, **kwargs: {"findings": [], "risk_score": 0}
+        )
+        args = ["scan", "registry.json", "--mcp-registry", "--format", "json"]
+    else:
+        monkeypatch.setattr(
+            cli,
+            "detect_skills",
+            lambda root: MultiSkillDetectionResult(
+                is_multi_skill=True,
+                has_root_skill=False,
+                skills=[SkillDirectory(path=skill, name="skill", relative_path="skill")],
+            ),
+        )
+        monkeypatch.setattr(
+            cli, "_scan_skill", lambda *args, **kwargs: _bounded_recursive_result("safe")
+        )
+        args = ["scan", str(tmp_path), "--recursive", "--no-llm", "--format", mode]
+    if mode != "baseline-default":
+        args += ["--output", str(output)]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 2, result.output
+    expected_error = "must be a regular file" if mode.startswith("baseline") else "non-regular"
+    assert expected_error in result.output
+    assert protected.read_text(encoding="utf-8") == "preserve"
+    assert output.is_symlink()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative output requires POSIX")
+@pytest.mark.parametrize("kind", ["missing", "symlink", "file", "device"])
+def test_output_errors_name_the_requested_path(tmp_path, kind):
+    from skillspector.file_output import write_text_no_follow
+
+    output = tmp_path / "parent" / "report.json"
+    if kind == "symlink":
+        (tmp_path / "parent").symlink_to(tmp_path, target_is_directory=True)
+    elif kind == "file":
+        (tmp_path / "parent").write_text("not a directory", encoding="utf-8")
+    elif kind == "device":
+        output = Path(os.devnull)
+    with pytest.raises(ValueError) as error:
+        write_text_no_follow(output, "report")
+    assert str(output) in str(error.value)
+    assert not list(tmp_path.glob(".skillspector-output-*"))
+
+
 @pytest.mark.parametrize(
     "failure_status",
     [
