@@ -3731,6 +3731,54 @@ def test_cli_shipped_baseline_recursive_path_untouched(
     assert "Applying author-shipped baseline" not in result.stderr
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[/INST]",
+        "[bold]x[/bold]",
+        r"\[bold]x[/bold]",
+        ":white_check_mark:",
+        "2001:db8:a:b:c",
+        "C:\\Users\\",
+    ],
+)
+@pytest.mark.parametrize("write_to_file", [False, True])
+def test_cli_scan_recursive_terminal_preserves_literal_report_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str, write_to_file: bool
+) -> None:
+    """Combining rendered reports must preserve their literal text on either output path."""
+    skills_root = tmp_path / "multi-terminal"
+    skills = []
+    for name in ("alpha", "beta"):
+        child = skills_root / name
+        child.mkdir(parents=True)
+        skills.append(SkillDirectory(path=child, name=name, relative_path=name))
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=skills, has_root_skill=False)
+
+    def fake_invoke(state: dict[str, Any], config: Any = None) -> dict[str, Any]:
+        name = Path(state["input_path"]).name
+        return {
+            "risk_score": 0,
+            "risk_severity": "LOW",
+            "report_body": f"{name}: {text}",
+        }
+
+    monkeypatch.setattr("skillspector.cli.detect_skills", lambda _: detection)
+    monkeypatch.setattr("skillspector.cli.graph", SimpleNamespace(invoke=fake_invoke))
+    output = tmp_path / "report.txt"
+    args = ["scan", str(skills_root), "--recursive", "--no-llm"]
+    if write_to_file:
+        args += ["--output", str(output)]
+
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    report_text = output.read_text(encoding="utf-8") if write_to_file else result.output
+    for skill in skills:
+        assert f"--- {skill.relative_path} ---" in report_text
+        assert f"{skill.name}: {text}" in report_text
+
+
 def test_cli_scan_recursive_terminal_output_to_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -32,9 +32,9 @@ from io import StringIO
 from typing import Literal, cast
 
 from rich.console import Console
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from skillspector import __version__ as skillspector_version
 from skillspector.dependency_sources import redact_text
@@ -84,6 +84,7 @@ from skillspector.semantic_runtime import (
 )
 from skillspector.state import SkillspectorState, transitive_remaining_seconds
 from skillspector.suppression import Baseline, SuppressedFinding, partition_findings
+from skillspector.terminal_text import visible_terminal_text
 
 logger = get_logger(__name__)
 
@@ -1001,6 +1002,11 @@ def _build_sarif(
     return rendered
 
 
+def _terminal_text(value: object, style: str = "") -> Text:
+    """Keep dynamic text literal and render its non-printable characters visibly."""
+    return Text(visible_terminal_text(str(value)), style=style)
+
+
 def _render_terminal_completeness(
     console: Console,
     completeness: Mapping[str, object],
@@ -1012,24 +1018,30 @@ def _render_terminal_completeness(
     table.add_column("Metric", style="bold")
     table.add_column("Value")
     table.add_row("Execution", "successful" if execution_successful else "failed")
-    table.add_row("Status", str(completeness.get("status", "complete")))
-    table.add_row("Coverage", f"{completeness.get('coverage_percent', 100.0)}%")
-    table.add_row("Fully inspected", str(completeness.get("fully_inspected_files", 0)))
-    table.add_row("Partially inspected", str(completeness.get("partially_inspected_files", 0)))
-    table.add_row("Entirely uninspected", str(completeness.get("entirely_uninspected_files", 0)))
+    table.add_row("Status", _terminal_text(completeness.get("status", "complete")))
+    table.add_row("Coverage", _terminal_text(f"{completeness.get('coverage_percent', 100.0)}%"))
+    table.add_row("Fully inspected", _terminal_text(completeness.get("fully_inspected_files", 0)))
+    table.add_row(
+        "Partially inspected", _terminal_text(completeness.get("partially_inspected_files", 0))
+    )
+    table.add_row(
+        "Entirely uninspected", _terminal_text(completeness.get("entirely_uninspected_files", 0))
+    )
     if completeness.get("exclude_patterns"):
         table.add_row(
-            "Explicit exclusion patterns", escape(", ".join(completeness["exclude_patterns"]))
+            "Explicit exclusion patterns",
+            _terminal_text(", ".join(completeness["exclude_patterns"])),
         )
         table.add_row(
-            "Excluded files (not inspected)", str(completeness.get("excluded_file_count", 0))
+            "Excluded files (not inspected)",
+            _terminal_text(completeness.get("excluded_file_count", 0)),
         )
     console.print(table)
 
     def render_rows(title: str, rows: object) -> None:
         if not isinstance(rows, list) or not rows:
             return
-        console.print(f"[bold]{escape(title)}[/bold]")
+        console.print(_terminal_text(title, "bold"))
         for row in rows:
             if not isinstance(row, Mapping):
                 continue
@@ -1044,7 +1056,7 @@ def _render_terminal_completeness(
                 location = f"rule set {location}"
             reason = str(row.get("reason_code", row.get("status", "status")))
             message = str(row.get("message", ""))
-            console.print(f"  - {escape(reason)} {escape(location)}: {escape(message)}")
+            console.print(_terminal_text(f"  - {reason} {location}: {message}"))
 
     render_rows("Scope exclusions", completeness.get("scope_exclusions"))
     render_rows("Ledger exceptions", completeness.get("ledger_exceptions"))
@@ -1053,7 +1065,7 @@ def _render_terminal_completeness(
     if isinstance(limitations, list) and limitations:
         console.print("[bold]Limitations[/bold]")
         for limitation in limitations:
-            console.print(f"  - {escape(str(limitation))}")
+            console.print(_terminal_text(f"  - {limitation}"))
 
 
 def _format_terminal(
@@ -1074,9 +1086,9 @@ def _format_terminal(
     analysis_completeness: Mapping[str, object] | None = None,
     execution_successful: bool = True,
 ) -> str:
-    """Generate Rich terminal output and export as string."""
+    """Generate styled Rich output with literal, control-safe dynamic text."""
     suppressed = suppressed or []
-    console = Console(record=True, force_terminal=True, width=80, file=StringIO())
+    console = Console(record=True, force_terminal=True, width=80, file=StringIO(), emoji=False)
     skill_name = (manifest.get("name") or "unknown") if manifest else "unknown"
     source = skill_path or ""
 
@@ -1087,8 +1099,8 @@ def _format_terminal(
             subtitle=f"v{skillspector_version}",
         )
     )
-    console.print(f"\n[bold]Skill:[/bold] {skill_name}")
-    console.print(f"[bold]Source:[/bold] {source}")
+    console.print(Text.assemble("\n", ("Skill: ", "bold"), _terminal_text(skill_name)))
+    console.print(Text.assemble(("Source: ", "bold"), _terminal_text(source)))
     console.print(f"[bold]Scanned:[/bold] {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
     severity_colors = {
@@ -1121,7 +1133,9 @@ def _format_terminal(
         lines = comp.get("lines", 0)
         exec_flag = comp.get("executable", False)
         exec_marker = "[yellow]Yes[/yellow]" if exec_flag else "No"
-        comp_table.add_row(path, typ, str(lines), exec_marker)
+        comp_table.add_row(
+            _terminal_text(path), _terminal_text(typ), _terminal_text(lines), exec_marker
+        )
     if len(component_metadata) > 15:
         comp_table.add_row(f"... and {len(component_metadata) - 15} more", "", "", "")
     console.print(comp_table)
@@ -1133,7 +1147,9 @@ def _format_terminal(
         console.print()
         console.print(
             Panel(
-                f"[bold]Degraded scan[/bold]\n{effective_degraded_notice}",
+                Text.assemble(
+                    ("Degraded scan\n", "bold"), _terminal_text(effective_degraded_notice)
+                ),
                 title="[bold red]WARNING[/bold red]",
                 border_style="red",
             )
@@ -1143,24 +1159,50 @@ def _format_terminal(
         console.print("\n")
         console.print(f"[bold]Issues ({len(findings)})[/bold]\n")
         severity_icons = {
-            "LOW": "[green]LOW[/green]",
-            "MEDIUM": "[yellow]MEDIUM[/yellow]",
-            "HIGH": "[red]HIGH[/red]",
-            "CRITICAL": "[bold red]CRITICAL[/bold red]",
+            "LOW": Text("LOW", style="green"),
+            "MEDIUM": Text("MEDIUM", style="yellow"),
+            "HIGH": Text("HIGH", style="red"),
+            "CRITICAL": Text("CRITICAL", style="bold red"),
         }
         for f in findings:
-            icon = severity_icons.get((f.severity or "LOW").upper(), f.severity)
-            console.print(f"  {icon}: {f.rule_id} - {f.message[:60]}...")
+            icon = severity_icons.get(
+                (f.severity or "LOW").upper(), _terminal_text(f.severity or "")
+            )
+            console.print(
+                Text.assemble(
+                    "  ",
+                    icon,
+                    ": ",
+                    _terminal_text(f.rule_id),
+                    " - ",
+                    _terminal_text(f.message[:60]),
+                    "...",
+                )
+            )
             end = f"–{f.end_line}" if f.end_line and f.end_line != f.start_line else ""
-            console.print(f"    [dim]Location:[/dim] {f.file}:{f.start_line}{end}")
+            console.print(
+                Text.assemble(
+                    ("    Location: ", "dim"), _terminal_text(f.file), f":{f.start_line}{end}"
+                )
+            )
             if f.source_url:
-                console.print(f"    [dim]Source:[/dim] {f.source_url} (depth {f.transitive_depth})")
+                console.print(
+                    Text.assemble(
+                        ("    Source: ", "dim"),
+                        _terminal_text(f.source_url),
+                        f" (depth {f.transitive_depth})",
+                    )
+                )
             console.print(f"    [dim]Confidence:[/dim] {f.confidence:.0%}")
             if f.remediation:
-                console.print(f"    [dim]Remediation:[/dim] {(f.remediation or '')[:150]}...")
+                console.print(
+                    Text.assemble(
+                        ("    Remediation: ", "dim"), _terminal_text(f.remediation[:150]), "..."
+                    )
+                )
             if f.evidence:
                 rendered = ", ".join(f"{key}={value}" for key, value in sorted(f.evidence.items()))
-                console.print(f"    [dim]Evidence:[/dim] {rendered}")
+                console.print(Text.assemble(("    Evidence: ", "dim"), _terminal_text(rendered)))
             console.print()
     else:
         console.print("\n[green]No security issues detected.[/green]\n")
@@ -1170,11 +1212,16 @@ def _format_terminal(
         console.print(f"[bold]Structured Skill Summary ({len(structured_summaries)})[/bold]\n")
         for summary in structured_summaries:
             console.print(
-                f"  [cyan]{summary.get('id', 'SSR-1')}[/cyan]: {summary.get('message', '')}"
+                Text.assemble(
+                    "  ",
+                    _terminal_text(summary.get("id", "SSR-1"), "cyan"),
+                    ": ",
+                    _terminal_text(summary.get("message", "")),
+                )
             )
             file = _summary_display_value(summary.get("file"))
             if file:
-                console.print(f"    [dim]File:[/dim] {file}")
+                console.print(Text.assemble(("    File: ", "dim"), _terminal_text(file)))
             for key, label in (
                 ("protocol", "Protocol"),
                 ("layout_kind", "Layout"),
@@ -1186,7 +1233,7 @@ def _format_terminal(
             ):
                 value = _summary_display_value(summary.get(key))
                 if value:
-                    console.print(f"    [dim]{label}:[/dim] {value}")
+                    console.print(Text.assemble((f"    {label}: ", "dim"), _terminal_text(value)))
             console.print()
 
     if suppressed:
@@ -1197,7 +1244,16 @@ def _format_terminal(
             for sf in suppressed:
                 f = sf.finding
                 console.print(
-                    f"  [dim]- {f.rule_id} {f.file}:{f.start_line} (reason: {sf.reason})[/dim]"
+                    Text.assemble(
+                        "  - ",
+                        _terminal_text(f.rule_id),
+                        " ",
+                        _terminal_text(f.file),
+                        f":{f.start_line} (reason: ",
+                        _terminal_text(sf.reason),
+                        ")",
+                        style="dim",
+                    )
                 )
         else:
             console.print("[dim]Use --show-suppressed to list them.[/dim]")
