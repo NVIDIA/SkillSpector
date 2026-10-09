@@ -31,7 +31,10 @@ _SAFE_TEXT = "# 安全助手\n这是一个帮助用户整理资料的安全技�
 
 @pytest.mark.parametrize("analyzer_kind", ["discovery", "meta"])
 @pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("invalid_response", ["not JSON", '{"findings": "invalid"}', "null-confidence", "list-confidence"])
+@pytest.mark.parametrize(
+    "invalid_response",
+    ["not JSON", '{"findings": "invalid"}', "null-confidence", "list-confidence"],
+)
 @pytest.mark.parametrize("recovers", [False, True])
 async def test_compat_parse_failures_retry_and_remain_visible(
     monkeypatch: pytest.MonkeyPatch,
@@ -43,11 +46,23 @@ async def test_compat_parse_failures_retry_and_remain_visible(
     if invalid_response in {"null-confidence", "list-confidence"}:
         confidence = None if invalid_response == "null-confidence" else [1]
         item = (
-            {"rule_id": "P1", "message": "Unsafe instruction", "severity": "HIGH",
-             "start_line": 1, "explanation": "Unsafe", "remediation": "Remove"}
+            {
+                "rule_id": "P1",
+                "message": "Unsafe instruction",
+                "severity": "HIGH",
+                "start_line": 1,
+                "explanation": "Unsafe",
+                "remediation": "Remove",
+            }
             if analyzer_kind == "discovery"
-            else {"pattern_id": "P1", "is_vulnerability": True, "intent": "malicious",
-                  "impact": "high", "explanation": "Unsafe", "remediation": "Remove"}
+            else {
+                "pattern_id": "P1",
+                "is_vulnerability": True,
+                "intent": "malicious",
+                "impact": "high",
+                "explanation": "Unsafe",
+                "remediation": "Remove",
+            }
         )
         invalid_response = json.dumps({"findings": [dict(item, confidence=confidence)]})
     calls = []
@@ -618,9 +633,21 @@ def test_compat_meta_repairs_soft_fields_before_validation(impact):
     batch = llm_analyzer_base.Batch(file_path="SKILL.md", content=_SAFE_TEXT)
     result = runner._patched_meta_parse(
         None,
-        json.dumps({"findings": [{"pattern_id": "P1", "is_vulnerability": True,
-            "confidence": 0.9, "intent": "malicious", "impact": impact,
-            "explanation": None, "remediation": None}]}),
+        json.dumps(
+            {
+                "findings": [
+                    {
+                        "pattern_id": "P1",
+                        "is_vulnerability": True,
+                        "confidence": 0.9,
+                        "intent": "malicious",
+                        "impact": impact,
+                        "explanation": None,
+                        "remediation": None,
+                    }
+                ]
+            }
+        ),
         batch,
     )
     assert len(result) == 1
@@ -684,8 +711,10 @@ async def test_pooled_request_releases_slot_when_client_build_fails(monkeypatch,
 
     key = ApiKey("synthetic", None, "test", max_concurrent=1)
     model = PooledChatModel(ApiKeyPool([key]), timeout=1)
+
     def fail(*args, **kwargs):
         raise ValueError("synthetic constructor failure")
+
     monkeypatch.setattr(model, "_build_llm", fail)
     with pytest.raises(ValueError, match="synthetic constructor failure"):
         if asynchronous:
@@ -704,18 +733,23 @@ async def test_pooled_key_retries_share_one_deadline(monkeypatch, asynchronous):
     limits, releases = [], []
     key = object()
     pool = SimpleNamespace(
-        acquire=lambda **kwargs: key, try_acquire=lambda: key,
+        acquire=lambda **kwargs: key,
+        try_acquire=lambda: key,
         release=lambda key, **kwargs: releases.append(kwargs),
     )
     model = api_pool.PooledChatModel(pool, timeout=2, max_retries=5)
+
     def invoke(prompt):
         clock[0] += 1
         raise RuntimeError("429 rate limit")
+
     async def ainvoke(prompt):
         return invoke(prompt)
+
     def build(key, *, timeout):
         limits.append(timeout)
         return SimpleNamespace(invoke=invoke, ainvoke=ainvoke)
+
     monkeypatch.setattr(model, "_build_llm", build)
     with pytest.raises(llm_analyzer_base.LLMRuntimeLimitError):
         if asynchronous:
@@ -727,8 +761,9 @@ async def test_pooled_key_retries_share_one_deadline(monkeypatch, asynchronous):
 
 
 def test_pooled_client_bounds_connect_and_disables_sdk_retries(monkeypatch):
-    from contrib.batch_scan.api_pool import ApiKey, ApiKeyPool, PooledChatModel
     import langchain_openai
+
+    from contrib.batch_scan.api_pool import ApiKey, ApiKeyPool, PooledChatModel
 
     key = ApiKey("synthetic", None, "test")
     observed = {}

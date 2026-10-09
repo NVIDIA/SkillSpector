@@ -1123,8 +1123,12 @@ def test_no_findings_records_nothing() -> None:
 @pytest.mark.parametrize("assessment", ["HIGH risk: exfiltrates credentials", "LOW", ""])
 def test_optional_prose_assessment_keeps_finding_verdict(assessment):
     verdict = {
-        "pattern_id": "P1", "is_vulnerability": True, "confidence": 0.9,
-        "intent": "malicious", "impact": "high", "explanation": "Unsafe instruction",
+        "pattern_id": "P1",
+        "is_vulnerability": True,
+        "confidence": 0.9,
+        "intent": "malicious",
+        "impact": "high",
+        "explanation": "Unsafe instruction",
         "remediation": "Remove instruction",
     }
     result = MetaAnalyzerResult.model_validate(
