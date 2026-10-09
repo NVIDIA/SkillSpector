@@ -26,6 +26,40 @@ from skillspector.state import WorkflowResourceBudget
 class TestMcpRugPullNode:
     """Tests for the MCP rug-pull comparison logic."""
 
+    def test_rp1_unpinned_npx_in_mcp_server_config(self) -> None:
+        """RP1 inspects executable MCP command and args in JSON configs."""
+        result = node(
+            {
+                "file_cache": {
+                    "mcp.json": (
+                        '{\n  "mcpServers": {\n    "context7": {\n'
+                        '      "command": "npx",\n'
+                        '      "args": ["-y", "@upstash/context7-mcp@latest"]\n'
+                        "    }\n  }\n}"
+                    )
+                }
+            }
+        )
+
+        findings = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+        assert len(findings) == 1
+        assert findings[0].file == "mcp.json"
+        assert findings[0].start_line == 4
+        assert findings[0].matched_text == "npx -y @upstash/context7-mcp"
+
+    def test_rp1_pinned_npx_in_mcp_server_config(self) -> None:
+        """RP1 accepts an MCP command whose package operand is version-pinned."""
+        result = node(
+            {
+                "file_cache": {
+                    "mcp.json": '{"mcpServers":{"context7":{"command":"npx",'
+                    '"args":["-y","@upstash/context7-mcp@1.2.3"]}}}'
+                }
+            }
+        )
+
+        assert not [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
     def test_no_previous_manifest_skips(self) -> None:
         """Returns empty findings when previous_manifest is absent."""
         state = {
