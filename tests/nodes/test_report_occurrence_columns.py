@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ import pytest
 from skillspector.mcp_server import run_scan
 from skillspector.models import Finding
 from skillspector.nodes.analyzers import static_patterns_prompt_injection, static_runner
+from skillspector.nodes.deduplicate import deduplicate
 from skillspector.nodes.report import _build_sarif, _expand_occurrences, report
 from skillspector.suppression import SuppressedFinding
 
@@ -162,6 +164,73 @@ def test_reports_preserve_original_source_columns(
         for row in regions
     ] == expected
     assert sarif_run["columnKind"] == "unicodeCodePoints"
+
+
+def test_cross_file_occurrences_keep_their_report_identity_and_snippet() -> None:
+    findings = [
+        Finding(
+            rule_id="AST4",
+            message="subprocess module call",
+            finding_id="finding-first",
+            file="first.py",
+            start_line=3,
+            severity="MEDIUM",
+            matched_text="subprocess.run(command)",
+            code_snippet="first_context\nsubprocess.run(command)",
+        ),
+        Finding(
+            rule_id="AST4",
+            message="subprocess module call",
+            finding_id="finding-second",
+            file="second.py",
+            start_line=7,
+            severity="MEDIUM",
+            matched_text="subprocess.run(command)",
+            code_snippet="second_context\nsubprocess.run(command)",
+        ),
+    ]
+
+    compacted = deduplicate([*findings, replace(findings[0], finding_id="finding-first-duplicate")])
+
+    assert len(compacted) == 1
+    assert len(compacted[0].occurrences) == 2
+    assert deduplicate(compacted)[0].to_dict() == compacted[0].to_dict()
+    assert all(
+        set(occurrence)
+        <= {
+            "file",
+            "start_line",
+            "end_line",
+            "start_column",
+            "end_column",
+            "source_identity",
+            "source_digest",
+            "source_url",
+            "transitive_depth",
+        }
+        for occurrence in compacted[0].to_dict()["occurrences"]
+    )
+    result = report({"findings": compacted, "output_format": "json"})
+    issues = json.loads(result["report_body"])["issues"]
+    assert [
+        (issue["location"]["file"], issue["finding_id"], issue["code_snippet"]) for issue in issues
+    ] == [
+        ("first.py", "finding-first", "first_context\nsubprocess.run(command)"),
+        ("second.py", "finding-second", "second_context\nsubprocess.run(command)"),
+    ]
+    assert "_skillspector_report_" not in result["report_body"]
+    assert "_skillspector_report_" not in json.dumps(result["sarif_report"])
+    assert [
+        (
+            item["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            item["properties"]["findingId"],
+            item["properties"]["code_snippet"],
+        )
+        for item in result["sarif_report"]["runs"][0]["results"]
+    ] == [
+        ("first.py", "finding-first", "first_context\nsubprocess.run(command)"),
+        ("second.py", "finding-second", "second_context\nsubprocess.run(command)"),
+    ]
 
 
 async def test_mcp_embedded_report_preserves_same_line_and_multifile_spans(tmp_path: Path) -> None:
