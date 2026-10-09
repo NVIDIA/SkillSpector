@@ -17,9 +17,14 @@
 
 from __future__ import annotations
 
+import errno
 import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from stat import S_IMODE
+from threading import Barrier
 
 import pytest
 import yaml
@@ -1051,3 +1056,507 @@ def test_effective_findings_skips_a_suppressed_entry_with_no_finding() -> None:
     }
 
     assert effective_findings(result) == [kept]
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+@pytest.mark.parametrize(
+    ("limit_name", "limit", "message"),
+    [
+        ("MAX_BASELINE_RECORDS", 1, "record limit"),
+        ("MAX_BASELINE_BYTES", 32, "byte limit"),
+        ("MAX_BASELINE_NODES", 3, "node limit"),
+    ],
+)
+def test_dump_baseline_rejects_unloadable_output_without_overwriting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+    limit_name: str,
+    limit: int,
+    message: str,
+) -> None:
+    findings = [_finding(start_line=3), _finding(start_line=7)]
+    data = build_baseline_dict(
+        findings, file_cache={findings[0].file: SKILL_CONTENT}, scanner_version=SCANNER_VERSION
+    )
+    output = tmp_path / f"baseline{suffix}"
+    output.write_text("existing baseline", encoding="utf-8")
+    monkeypatch.setattr(suppression_module, limit_name, limit)
+
+    with pytest.raises(ValueError, match=message):
+        dump_baseline(data, output)
+    assert output.read_text(encoding="utf-8") == "existing baseline"
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "Accepted 🚀 𐐷\twith\nnotes",
+        "Accepted \ud800 lone surrogate",
+        "Accepted \x7f\x80\x85\x9f\ufffe\uffff controls",
+        "Accepted \u2028 line and \u2029 paragraph separators",
+        "Accepted\u2028--- not a document marker",
+    ],
+)
+def test_dump_baseline_preserves_unicode_reason(tmp_path: Path, suffix: str, reason: str) -> None:
+    output = tmp_path / f"baseline{suffix}"
+    data = build_baseline_dict(
+        [_finding()],
+        reason=reason,
+        file_cache={"skill-a/SKILL.md": SKILL_CONTENT},
+        scanner_version=SCANNER_VERSION,
+    )
+
+    dump_baseline(data, output)
+
+    assert list(load_baseline(output).fingerprints.values()) == [reason]
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+@pytest.mark.parametrize("failure", ["write", "sync", "replace", "interrupt"])
+@pytest.mark.parametrize("existing", [True, False])
+def test_dump_baseline_keeps_destination_on_io_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+    failure: str,
+    existing: bool,
+) -> None:
+    output = tmp_path / f"baseline{suffix}"
+    if existing:
+        output.write_text("existing baseline", encoding="utf-8")
+    data: dict[str, object] = {"version": 2, "rules": [{"id": "TM1", "reason": "accepted"}]}
+    error = KeyboardInterrupt if failure == "interrupt" else OSError
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise error("injected I/O failure")
+
+    if failure in {"write", "interrupt"}:
+        import tempfile
+
+        original = tempfile.NamedTemporaryFile
+
+        def failing_temporary_file(*args: object, **kwargs: object):
+            temporary = original(*args, **kwargs)
+            original_write = temporary.write
+
+            def partial_write(content: bytes) -> None:
+                original_write(content[: len(content) // 2])
+                temporary.flush()
+                fail()
+
+            temporary.write = partial_write
+            return temporary
+
+        monkeypatch.setattr(tempfile, "NamedTemporaryFile", failing_temporary_file)
+    elif failure == "sync":
+        monkeypatch.setattr(os, "fsync", fail)
+    else:
+        monkeypatch.setattr(os, "replace", fail)
+
+    with pytest.raises(error, match="injected I/O failure"):
+        dump_baseline(data, output)
+
+    if existing:
+        assert output.read_text(encoding="utf-8") == "existing baseline"
+        assert list(tmp_path.iterdir()) == [output]
+    else:
+        assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX file modes")
+@pytest.mark.parametrize("mode", [0o600, 0o640, 0o644, 0o664])
+def test_dump_baseline_preserves_existing_permissions(tmp_path: Path, mode: int) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.write_text("existing baseline", encoding="utf-8")
+    output.chmod(mode)
+
+    dump_baseline({"version": 2}, output)
+
+    assert S_IMODE(output.stat().st_mode) == mode
+    assert load_baseline(output).is_empty()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_dump_baseline_shared_writer_preserves_inode_and_group_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "baseline.json"
+    output.write_text("old baseline" * 200, encoding="utf-8")
+    output.chmod(0o664)
+    old = output.stat()
+    # Force the non-owner branch without privileged OS ownership changes.
+    monkeypatch.setattr(os, "geteuid", lambda: old.st_uid + 1)
+
+    def no_chown(*args: object) -> None:
+        pytest.fail("a shared writer must not require chown")
+
+    monkeypatch.setattr(os, "fchown", no_chown)
+    dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "shared"}]}, output)
+
+    assert load_baseline(output).rules[0].reason == "shared"
+    assert (output.stat().st_uid, output.stat().st_gid, output.stat().st_ino) == (
+        old.st_uid,
+        old.st_gid,
+        old.st_ino,
+    )
+    assert S_IMODE(output.stat().st_mode) == 0o664
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_dump_baseline_owner_outside_destination_group_rewrites_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.write_text("old baseline", encoding="utf-8")
+    output.chmod(0o664)
+    groups = [gid for gid in os.getgroups() if gid != tmp_path.stat().st_gid]
+    if not groups:
+        pytest.skip("requires a supplementary group distinct from the directory group")
+    os.chown(output, -1, groups[0])
+    old = output.stat()
+
+    def denied_chown(*args: object) -> None:
+        # A non-root owner cannot assign a group it is not a member of.
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "fchown", denied_chown)
+    dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "owner"}]}, output)
+
+    assert load_baseline(output).rules[0].reason == "owner"
+    assert (output.stat().st_gid, output.stat().st_ino) == (old.st_gid, old.st_ino)
+    assert S_IMODE(output.stat().st_mode) == 0o664
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_dump_baseline_revalidates_destination_replaced_while_opening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.write_text("original", encoding="utf-8")
+    output.chmod(0o600)
+    replacement = tmp_path / "other.yaml"
+    replacement.write_text("replacement", encoding="utf-8")
+    replacement.chmod(0o640)
+    original_open = os.open
+
+    def swapped_open(path, flags, *args, **kwargs):
+        # A cooperating writer atomically publishes once, between lstat and open.
+        if Path(path) == output and replacement.exists():
+            os.replace(replacement, output)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapped_open)
+    dump_baseline({"version": 2}, output)
+
+    assert load_baseline(output).is_empty()
+    # The replacement, not the stale first observation, supplies access metadata.
+    assert S_IMODE(output.stat().st_mode) == 0o640
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_dump_baseline_rejects_destination_that_keeps_changing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.write_text("original", encoding="utf-8")
+    original_open = os.open
+    swaps = 0
+
+    def swapped_open(path, flags, *args, **kwargs):
+        nonlocal swaps
+        if Path(path) == output:
+            swaps += 1
+            replacement = tmp_path / f"replacement-{swaps}.yaml"
+            replacement.write_text(f"replacement {swaps}", encoding="utf-8")
+            os.replace(replacement, output)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapped_open)
+    with pytest.raises(ValueError, match="changed while opening"):
+        dump_baseline({"version": 2}, output)
+
+    assert swaps == suppression_module._BASELINE_DESTINATION_ATTEMPTS
+    assert output.read_text(encoding="utf-8") == f"replacement {swaps}"
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+@pytest.mark.parametrize("persistent", [False, True])
+def test_dump_baseline_shared_writer_revalidates_destination_replaced_before_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, persistent: bool
+) -> None:
+    import fcntl
+
+    output = tmp_path / "baseline.yaml"
+    output.write_text("original", encoding="utf-8")
+    output.chmod(0o664)
+    monkeypatch.setattr(os, "geteuid", lambda: output.stat().st_uid + 1)
+    original_flock = fcntl.flock
+    replaced: list[int] = []
+
+    def replacing_flock(descriptor: int, operation: int) -> None:
+        # Another writer publishes after this one opened the path, before the lock.
+        if persistent or not replaced:
+            replacement = tmp_path / f"replacement-{len(replaced)}.yaml"
+            replacement.write_text("replacement", encoding="utf-8")
+            replacement.chmod(0o664)
+            os.replace(replacement, output)
+            replaced.append(output.stat().st_ino)
+        original_flock(descriptor, operation)
+
+    monkeypatch.setattr(fcntl, "flock", replacing_flock)
+    data = {"version": 2, "rules": [{"id": "TM1", "reason": "shared"}]}
+    if persistent:
+        with pytest.raises(ValueError, match="changed before writing"):
+            dump_baseline(data, output)
+        assert len(replaced) == suppression_module._BASELINE_DESTINATION_ATTEMPTS
+        # Every validated inode was replaced before anything was written.
+        assert output.read_text(encoding="utf-8") == "replacement"
+    else:
+        dump_baseline(data, output)
+        assert load_baseline(output).rules[0].reason == "shared"
+        assert output.stat().st_ino == replaced[0]
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+@pytest.mark.parametrize("error", [errno.ENOTSUP, errno.EOPNOTSUPP])
+def test_dump_baseline_accepts_filesystem_without_extended_acls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: int
+) -> None:
+    import ctypes
+    from types import SimpleNamespace
+
+    def unsupported_acl(descriptor: int, acl: int, acl_type: int) -> int:
+        ctypes.set_errno(error)
+        return -1
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda *args, **kwargs: SimpleNamespace(
+            acl_init=lambda count: 1, acl_set_fd_np=unsupported_acl, acl_free=lambda acl: 0
+        ),
+    )
+    output = tmp_path / "baseline.yaml"
+    dump_baseline({"version": 2}, output)
+    assert load_baseline(output).is_empty()
+    assert S_IMODE(output.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX file modes")
+def test_dump_baseline_creates_private_file(tmp_path: Path) -> None:
+    output = tmp_path / "baseline.yaml"
+
+    dump_baseline({"version": 2}, output)
+
+    assert S_IMODE(output.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX file modes")
+def test_dump_baseline_preserves_read_only_destination(tmp_path: Path) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.write_text("existing baseline", encoding="utf-8")
+    output.chmod(0o444)
+
+    with pytest.raises(PermissionError):
+        dump_baseline({"version": 2}, output)
+
+    assert output.read_text(encoding="utf-8") == "existing baseline"
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.parametrize("target_exists", [True, False])
+def test_dump_baseline_rejects_symlink_destination(tmp_path: Path, target_exists: bool) -> None:
+    target = tmp_path / "target.yaml"
+    if target_exists:
+        target.write_text("existing baseline", encoding="utf-8")
+    output = tmp_path / "baseline.yaml"
+    output.symlink_to(target)
+
+    with pytest.raises(ValueError, match="regular file"):
+        dump_baseline({"version": 2}, output)
+
+    assert output.is_symlink()
+    if target_exists:
+        assert target.read_text(encoding="utf-8") == "existing baseline"
+    else:
+        assert not target.exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFO support")
+def test_dump_baseline_rejects_fifo_without_writing(tmp_path: Path) -> None:
+    output = tmp_path / "baseline.yaml"
+    os.mkfifo(output)
+
+    with pytest.raises(ValueError, match="regular file"):
+        dump_baseline({"version": 2}, output)
+
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_dump_baseline_rejects_directory_destination(tmp_path: Path) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.mkdir()
+
+    with pytest.raises(ValueError, match="regular file"):
+        dump_baseline({"version": 2}, output)
+
+    assert output.is_dir()
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_dump_baseline_accepts_long_destination_name(tmp_path: Path) -> None:
+    output = tmp_path / ("b" * 245 + ".yaml")
+
+    dump_baseline({"version": 2}, output)
+
+    assert load_baseline(output).is_empty()
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_dump_baseline_keeps_destination_when_acl_removal_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ctypes
+    from types import SimpleNamespace
+
+    output = tmp_path / "baseline.yaml"
+    output.write_text("existing baseline", encoding="utf-8")
+
+    def fail_set_acl(descriptor: int, acl: int, acl_type: int) -> int:
+        ctypes.set_errno(errno.EACCES)
+        return -1
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda *args, **kwargs: SimpleNamespace(
+            acl_init=lambda count: 1, acl_set_fd_np=fail_set_acl, acl_free=lambda acl: 0
+        ),
+    )
+
+    with pytest.raises(PermissionError, match="clear inherited baseline ACLs"):
+        dump_baseline({"version": 2}, output)
+
+    assert output.read_text(encoding="utf-8") == "existing baseline"
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS inherited ACLs")
+@pytest.mark.parametrize("mode", [None, 0o600, 0o200])
+def test_dump_baseline_clears_inherited_macos_acl(tmp_path: Path, mode: int | None) -> None:
+    import subprocess
+
+    output = tmp_path / "baseline.yaml"
+    if mode is not None:
+        output.write_text("existing baseline", encoding="utf-8")
+        output.chmod(mode)
+    subprocess.run(
+        ["/bin/chmod", "+a", "everyone allow read,file_inherit", str(tmp_path)],
+        check=True,
+        capture_output=True,
+    )
+
+    dump_baseline({"version": 2}, output)
+
+    acl_listing = subprocess.run(
+        ["/bin/ls", "-le", str(output)], check=True, capture_output=True, text=True
+    ).stdout
+    assert "everyone" not in acl_listing
+    assert S_IMODE(output.stat().st_mode) == (0o600 if mode is None else mode)
+    if mode == 0o200 and os.geteuid() != 0:
+        with pytest.raises(PermissionError):
+            output.read_bytes()
+    else:
+        assert load_baseline(output).is_empty()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS access ACLs")
+def test_dump_baseline_installs_destination_acl_before_writing_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_preserve_acl = suppression_module._preserve_baseline_acl
+    target_sizes: list[int] = []
+
+    def assert_empty_acl_target(source: int, destination: int) -> None:
+        target_sizes.append(os.fstat(destination).st_size)
+        original_preserve_acl(source, destination)
+
+    monkeypatch.setattr(suppression_module, "_preserve_baseline_acl", assert_empty_acl_target)
+    import subprocess
+
+    output = tmp_path / "baseline.yaml"
+    output.write_text("existing", encoding="utf-8")
+    output.chmod(0o664)
+    subprocess.run(
+        ["/bin/chmod", "+a", "everyone deny read", str(output)],
+        check=True,
+        capture_output=True,
+    )
+    old_listing = subprocess.run(
+        ["/bin/ls", "-le", str(output)], check=True, capture_output=True, text=True
+    ).stdout.splitlines()[1:]
+
+    dump_baseline({"version": 2}, output)
+
+    listing = subprocess.run(
+        ["/bin/ls", "-le", str(output)], check=True, capture_output=True, text=True
+    ).stdout.splitlines()[1:]
+    assert listing == old_listing
+    assert target_sizes == [0]
+    assert S_IMODE(output.stat().st_mode) == 0o664
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or os.geteuid() == 0,
+    reason="requires non-root macOS ACL permission evaluation",
+)
+def test_dump_baseline_accepts_acl_write_grant_without_mode_write_bits(tmp_path: Path) -> None:
+    import pwd
+    import subprocess
+
+    output = tmp_path / "baseline.yaml"
+    output.write_text("existing", encoding="utf-8")
+    output.chmod(0o444)
+    username = pwd.getpwuid(os.geteuid()).pw_name
+    subprocess.run(
+        ["/bin/chmod", "+a", f"user:{username} allow write", str(output)],
+        check=True,
+        capture_output=True,
+    )
+
+    dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "shared"}]}, output)
+
+    assert S_IMODE(output.stat().st_mode) == 0o444
+    assert load_baseline(output).rules[0].reason == "shared"
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+def test_dump_baseline_concurrent_writers_publish_complete_documents(
+    tmp_path: Path, suffix: str
+) -> None:
+    output = tmp_path / f"baseline{suffix}"
+    workers = 8
+    barrier = Barrier(workers)
+    reasons = {f"accepted writer {index} " + "x" * 1000 for index in range(workers)}
+    dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "initial"}]}, output)
+
+    def write(reason: str) -> None:
+        barrier.wait(timeout=10)
+        dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": reason}]}, output)
+        assert load_baseline(output).rules[0].reason in reasons
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for result in executor.map(write, reasons):
+            assert result is None
+
+    assert load_baseline(output).rules[0].reason in reasons
+    assert list(tmp_path.iterdir()) == [output]
