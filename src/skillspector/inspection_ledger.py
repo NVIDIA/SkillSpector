@@ -174,7 +174,8 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "Archive member name has an ambiguous or duplicate provenance identity."
     ),
     LedgerReason.ARTIFACT_PATH_COLLISION: (
-        "A filesystem path uses the reserved archive delimiter and cannot be attributed safely."
+        "A disk path containing '!/' collides with an archive member. Rename the directory "
+        "ending in '!'; the colliding archive member was not analyzed."
     ),
     LedgerReason.ARCHIVE_LINK_MEMBER: "Archive link member was not followed or read.",
     LedgerReason.ARCHIVE_DEPTH_LIMIT: "Nested archive depth limit was reached.",

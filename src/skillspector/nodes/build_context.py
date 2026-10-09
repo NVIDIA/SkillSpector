@@ -61,6 +61,7 @@ from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
+    inspection_work_id,
     ledger_event,
 )
 from skillspector.llm_provenance import capture_llm_provenance, capture_static_llm_provenance
@@ -2963,10 +2964,14 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     nested_input_cache = {**raw_file_cache, **excluded_archive_cache}
     nested = inspect_nested_artifacts(
         skill_dir,
-        [
-            *(path for path in ordinary_components if path in raw_file_cache),
-            *excluded_archive_cache,
-        ],
+        sorted(
+            [
+                *(path for path in ordinary_components if path in raw_file_cache),
+                *excluded_archive_cache,
+            ],
+            # Expand real containers before another archive can claim their children.
+            key=lambda path: -path.count("!/"),
+        ),
         raw_file_cache=nested_input_cache,
         max_members=remaining_artifacts,
         max_uncompressed_bytes=remaining_bytes,
@@ -3176,9 +3181,38 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             limitation_reason=limitation_reason,
         )
 
-    # The !/ delimiter belongs to virtual archive paths. Real paths using it
-    # must never let a nested member replace the bytes read from disk.
-    reserved_paths = {item["path"] for item in artifact_inventory if "!/" in item["path"]}
+    # Only an actual collision is fatal: ordinary directories may end in "!".
+    nested_paths = (
+        {item["path"] for item in nested.artifact_inventory}
+        | set(nested.components)
+        | set(nested.file_cache)
+        | set(nested.raw_file_cache)
+    )
+    reserved_paths = {item["path"] for item in artifact_inventory} & nested_paths
+    member_containers = {
+        str(item["path"]): str(item["outer_path"])
+        for item in nested.metadata
+        if item["path"] in reserved_paths and item.get("outer_path")
+    }
+    for path in sorted(reserved_paths):
+        container = member_containers.get(path, path.rsplit("!/", 1)[0])
+        event = ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="nested_artifact_inspection",
+            path=container,
+            reason=LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH,
+        )
+        event["message"] += f" Archive member {path!r} was not analyzed because it collides with a disk file."
+        prework_events.append(event)
+    for event in nested.ledger_events:
+        path = event["path"]
+        if path in reserved_paths:
+            event["path"] = member_containers.get(path, path.rsplit("!/", 1)[0])
+            event["work_id"] = inspection_work_id(
+                f"{event['record_type'].value}:{event['phase']}", event["path"], None, None
+            )
+            event["message"] += f" This applies to withheld archive member {path!r}, not the disk file."
     for artifact in artifact_inventory:
         if artifact["path"] in reserved_paths:
             artifact["disposition"] = ArtifactDisposition.FAILED
