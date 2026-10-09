@@ -1296,6 +1296,127 @@ class TestInspectionLedgerResponse:
         assert event["observed_seconds"] == 31.0
         assert event["limit_seconds"] == 30.0
 
+    def test_postprocessor_cannot_clear_interrupted_producer_output_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+
+        class PostprocessingFacade:
+            ANALYZER_ID = "interrupted_postprocessed_static"
+
+            @staticmethod
+            def analyze(*, content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+                del content, file_path, file_type
+                return []
+
+            @staticmethod
+            def coalesce_path_findings(content: str, findings: list[Finding]) -> list[Finding]:
+                del content
+                return findings
+
+            @staticmethod
+            def postprocess_path_findings(content: str, findings: list[Finding]) -> list[Finding]:
+                del content, findings
+                return []
+
+        class AstBurstModule:
+            USES_PYTHON_AST = True
+
+            @staticmethod
+            def analyze(
+                *,
+                content: str,
+                file_path: str,
+                file_type: str,
+                python_ast: object,
+            ) -> list[AnalyzerFinding]:
+                del content, file_type, python_ast
+                return [
+                    AnalyzerFinding(
+                        rule_id="T1",
+                        message="candidate",
+                        severity=Severity.HIGH,
+                        location=Location(file=file_path, start_line=line),
+                    )
+                    for line in (1, 2)
+                ]
+
+        response = static_runner.run_static_patterns_with_ledger(
+            {"components": ["input.py"], "file_cache": {"input.py": "value = 1\n"}},
+            [PostprocessingFacade, AstBurstModule],
+        )
+        event = response["inspection_ledger"][0]
+
+        assert response["findings"] == []
+        assert event["outcome"] == "partial"
+        assert event["reason_code"] == "output_limit"
+        assert event["observed_findings"] == 2
+        assert event["limit_findings"] == 1
+
+    def test_postprocessor_reconciles_full_aggregate_before_output_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+
+        class PostprocessingFacade:
+            ANALYZER_ID = "aggregate_postprocessed_static"
+
+            @staticmethod
+            def analyze(*, content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+                del content, file_type
+                active_view = static_runner._ACTIVE_SECURITY_VIEW.get()
+                if active_view is None or active_view[0].name != "raw":
+                    return []
+                return [
+                    AnalyzerFinding(
+                        rule_id="KEEP",
+                        message="lexical suffix",
+                        severity=Severity.HIGH,
+                        location=Location(file=file_path, start_line=1),
+                    )
+                ]
+
+            @staticmethod
+            def coalesce_path_findings(content: str, findings: list[Finding]) -> list[Finding]:
+                del content
+                return findings
+
+            @staticmethod
+            def postprocess_path_findings(content: str, findings: list[Finding]) -> list[Finding]:
+                del content
+                return [finding for finding in findings if finding.rule_id == "KEEP"]
+
+        class AstPrefixModule:
+            USES_PYTHON_AST = True
+
+            @staticmethod
+            def analyze(
+                *,
+                content: str,
+                file_path: str,
+                file_type: str,
+                python_ast: object,
+            ) -> list[AnalyzerFinding]:
+                del content, file_type, python_ast
+                return [
+                    AnalyzerFinding(
+                        rule_id="DROP",
+                        message="AST prefix",
+                        severity=Severity.HIGH,
+                        location=Location(file=file_path, start_line=1),
+                    )
+                ]
+
+        response = static_runner.run_static_patterns_with_ledger(
+            {"components": ["input.py"], "file_cache": {"input.py": "value = 1\n"}},
+            [PostprocessingFacade, AstPrefixModule],
+        )
+        event = response["inspection_ledger"][0]
+
+        assert [finding.rule_id for finding in response["findings"]] == ["KEEP"]
+        assert event["outcome"] == "completed"
+        assert event.get("reason_code") is None
+
     def test_postprocessor_is_skipped_after_scan_runtime_limit(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
