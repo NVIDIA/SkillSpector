@@ -533,7 +533,7 @@ def _compile_rules(
     """
     _enforce_rule_load_deadline()
     try:
-        compiled = yara.compile(sources=sources)
+        compiled = yara.compile(sources=sources, includes=False)
         _enforce_rule_load_deadline()
         return compiled, 0
     except yara.SyntaxError:
@@ -545,7 +545,7 @@ def _compile_rules(
     for ns, source in sources.items():
         _enforce_rule_load_deadline()
         try:
-            yara.compile(source=source)
+            yara.compile(source=source, includes=False)
             good[ns] = source
         except (yara.SyntaxError, yara.Error) as exc:
             skipped += 1
@@ -559,7 +559,7 @@ def _compile_rules(
             )
 
     _enforce_rule_load_deadline()
-    compiled = yara.compile(sources=good) if good else None
+    compiled = yara.compile(sources=good, includes=False) if good else None
     _enforce_rule_load_deadline()
     return compiled, skipped
 
