@@ -2899,3 +2899,11 @@ def test_variable_shell_argument_limit_reaches_incomplete_ledger():
         and event["limit_characters"] == 4096
         for event in result["inspection_ledger"]
     )
+
+
+@pytest.mark.parametrize("flags", [re.ASCII, re.ASCII | re.IGNORECASE])
+@pytest.mark.parametrize("pattern", [r"α\b", r"é\b", r"a\b"])
+def test_word_boundary_shortcut_respects_ascii_word_membership(pattern, flags):
+    content = "α αa αé é éa é_ a aα"
+    expected = [match.span() for match in re.finditer(pattern, content, flags)]
+    assert [match.span() for match in static_runner.iter_pattern_matches(pattern, content, flags)] == expected
