@@ -34,17 +34,19 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 from skillspector.graph import graph
-from skillspector.llm_analyzer_base import LLMAnalyzerBase, LLMAnalysisResult
+from skillspector.inspection_ledger import finalize_ledger
+from skillspector.llm_analyzer_base import LLMAnalyzerBase, LLMAnalysisResult, ledger_events_for_batches
 from skillspector.logging_config import get_logger
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, MetaAnalyzerResult
 
 from .annotation import annotate_findings
 from .detection import detect_skill_language
-from .gap_fill import run_gap_fill
+from .gap_fill import GapFillError, run_gap_fill
 
 logger = get_logger(__name__)
 
@@ -85,13 +87,16 @@ def set_api_pool(pool: "ApiKeyPool | None") -> None:
     if _original_get_chat_model is None:
         _original_get_chat_model = _llm_utils.get_chat_model
 
-    def _pooled_get_chat_model(model=None):
+    def _pooled_get_chat_model(model=None, *, timeout=None):
         if _api_pool:
             from .api_pool import PooledChatModel
-            pooled_model = PooledChatModel(_api_pool)
+            pooled_model = PooledChatModel(
+                _api_pool,
+                timeout=_DEFAULT_REQUEST_TIMEOUT if timeout is None else timeout,
+            )
             _llm_utils.register_chat_model_provider(pooled_model, "openai")
             return pooled_model
-        return _original_get_chat_model(model)
+        return _original_get_chat_model(model=model, timeout=timeout)
 
     _llm_utils.get_chat_model = _pooled_get_chat_model
     _llm_analyzer_base.get_chat_model = _pooled_get_chat_model
@@ -124,7 +129,7 @@ _patches_depth: int = 0  # nesting counter — safe for re-entrant context manag
 _original_base_init = LLMAnalyzerBase.__init__
 
 
-def _patched_base_init(self, base_prompt, model, *, node="llm_analyzer"):
+def _patched_base_init(self, base_prompt, model, *, node="llm_analyzer", timeout=None):
     """Set response_schema=None on the instance dict BEFORE original init.
 
     Relies on Python MRO guarantee: instance.__dict__ is always checked
@@ -132,7 +137,7 @@ def _patched_base_init(self, base_prompt, model, *, node="llm_analyzer"):
     a library internal.
     """
     self.response_schema = None
-    _original_base_init(self, base_prompt, model, node=node)
+    _original_base_init(self, base_prompt, model, node=node, timeout=timeout)
 
 
 # -- Patch 2: LLMAnalyzerBase.parse_response handles raw JSON --------------
@@ -264,10 +269,14 @@ except ImportError:
 def _patched_chatopenai_init(self, **kwargs):
     import httpx
 
-    _to = httpx.Timeout(
-        _DEFAULT_REQUEST_TIMEOUT,
-        connect=_DEFAULT_CONNECT_TIMEOUT,
-    )
+    requested = kwargs.get("request_timeout", kwargs.get("timeout"))
+    _to = httpx.Timeout(_DEFAULT_REQUEST_TIMEOUT, connect=_DEFAULT_CONNECT_TIMEOUT)
+    if requested is not None:
+        requested = httpx.Timeout(requested).as_dict()
+        _to = httpx.Timeout(**{
+            key: min(cap, requested[key]) if requested[key] is not None else cap
+            for key, cap in _to.as_dict().items()
+        })
     # Set both the Pydantic alias AND the canonical field name so we don't
     # depend on alias-precedence behaviour (which is a Pydantic v2 internal).
     kwargs["timeout"] = _to
@@ -729,6 +738,7 @@ def run_one(
     gap_fill_findings: int = 0,
     apply_gap_fill: bool = False,
     api_pool=None,
+    timeout: float = 90,
 ) -> tuple[dict[str, object], str | None]:
     """Scan a single skill through the full graph pipeline.
 
@@ -755,9 +765,12 @@ def run_one(
     Returns
     -------
     ``(entry, error_message_or_None)`` — on success *error_message*
-    is ``None``; on failure *entry* is a stub error entry and
-    *error_message* carries the exception text.
+    is ``None``. Gap-fill failure retains the core entry and adds incomplete
+    coverage and a machine-readable error. A failure before the core result
+    returns a stub error entry.
     """
+    # Leave time to serialize partial findings before the worker hard limit.
+    deadline = time.monotonic() + max(0, timeout - min(5.0, timeout / 10))
     result = None
     try:
         state = scan_state(skill_dir, use_llm=use_llm)
@@ -775,12 +788,38 @@ def run_one(
             gap_fill_findings=gap_fill_findings,
         )
         if apply_gap_fill and use_llm and detected_language != "en":
-            gap_findings = run_gap_fill(file_cache, detected_language, api_pool=api_pool)
+            gap_error = None
+            try:
+                gap_findings = run_gap_fill(
+                    file_cache, detected_language, api_pool=api_pool,
+                    timeout=lambda: deadline - time.monotonic(),
+                )
+            except GapFillError as exc:
+                gap_error = exc
+                gap_findings = exc.findings
             entry["issues"] = list(entry.get("issues", [])) + annotate_findings(
                 [finding.to_dict() for finding in gap_findings], detected_language
             )
-            entry["enhancements"]["gap_fill_applied"] = True
+            entry["enhancements"]["gap_fill_applied"] = bool(file_cache) and gap_error is None
             entry["enhancements"]["gap_fill_findings"] = len(gap_findings)
+            if gap_error is not None:
+                events, status = ledger_events_for_batches("gap_fill", gap_error.outcome)
+                completeness, _ = finalize_ledger({
+                    **result,
+                    "findings": [*(result.get("findings") or []), *gap_findings],
+                    "inspection_ledger": [*(result.get("inspection_ledger") or []), *events],
+                    "analyzer_status_events": [*(result.get("analyzer_status_events") or []), status],
+                })
+                entry["analysis_completeness"] = completeness
+                entry["execution_successful"] = completeness["execution_successful"]
+                if entry["risk_assessment"]["recommendation"] == "SAFE":
+                    entry["risk_assessment"]["recommendation"] = "CAUTION"
+                entry["enhancements"]["gap_fill_error"] = str(gap_error)
+                entry["enhancements"]["gap_fill_status"] = "incomplete"
+                entry["enhancements"]["gap_fill_error_reasons"] = sorted({
+                    failure.reason.value for failure in gap_error.outcome.failures
+                })
+                return entry, str(gap_error)
         return entry, None
     except Exception as exc:
         return entry_from_error(skill_dir, root, str(exc), detected_language), str(exc)

@@ -128,6 +128,121 @@ def test_gap_fill_provider_prompt_excludes_symlink_target(
     assert entry["issues"] == []
 
 
+@pytest.mark.parametrize(
+    "failure_mode", ["json", "schema", "provider", "runtime_signal", "missing_findings"]
+)
+@pytest.mark.parametrize("partial_success", [False, True])
+def test_gap_fill_failure_is_incomplete_and_preserves_findings(
+    batch_skill, monkeypatch: pytest.MonkeyPatch, failure_mode, partial_success
+) -> None:
+    from contrib.batch_scan import reports
+    from skillspector.inspection_ledger import (
+        LedgerOutcome,
+        analyzer_status_for_events,
+        ledger_event,
+    )
+    from skillspector.models import Finding
+
+    skill, _ = batch_skill
+    core_finding = Finding(
+        rule_id="TM1", message="Existing evidence", severity="HIGH", file="SKILL.md"
+    )
+    if partial_success:
+        (skill / "partial.md").write_text(_SAFE_TEXT, encoding="utf-8")
+
+    def keep_core_evidence(context):
+        events = [
+            ledger_event(
+                analyzer_id="core-test",
+                phase="static",
+                path="SKILL.md",
+                outcome=LedgerOutcome.COMPLETED,
+                emitted_finding_ids=[core_finding.finding_id],
+            )
+        ]
+        context["findings"] = [core_finding]
+        context["inspection_ledger"] = [*context.get("inspection_ledger", []), *events]
+        context["analyzer_status_events"] = [analyzer_status_for_events("core-test", events)]
+
+    _mock_scan(monkeypatch, keep_core_evidence)
+    monkeypatch.setattr(runner, "run_gap_fill", run_gap_fill)
+    calls = []
+
+    def invoke(prompt):
+        calls.append(prompt)
+        if "File: partial.md" in prompt:
+            return AIMessage(
+                content=json.dumps(
+                    {
+                        "findings": [
+                            {
+                                "rule_id": "P5",
+                                "message": "Retained gap evidence",
+                                "severity": "HIGH",
+                            }
+                        ]
+                    }
+                )
+            )
+        if failure_mode == "provider":
+            raise RuntimeError("synthetic provider failure")
+        if failure_mode == "runtime_signal":
+            raise llm_analyzer_base.LLMRuntimeLimitError("deadline")
+        if failure_mode == "missing_findings":
+            return AIMessage(content='{"refusal": "No analysis returned"}')
+        return AIMessage(content="not JSON" if failure_mode == "json" else '{"findings": 1}')
+
+    monkeypatch.setattr(
+        llm_analyzer_base, "get_chat_model", lambda **kw: SimpleNamespace(invoke=invoke)
+    )
+    monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda model: 100_000)
+    monkeypatch.setattr(llm_analyzer_base, "STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS", (0, 0, 0))
+
+    entry, error = runner.run_one(
+        skill, skill.parent, use_llm=True, detected_language="zh", apply_gap_fill=True
+    )
+
+    assert error == "Gap-fill analysis did not complete for 1 batch(es)."
+    assert entry["enhancements"]["gap_fill_applied"] is False
+    assert entry["enhancements"]["gap_fill_findings"] == int(partial_success)
+    assert entry["analysis_completeness"]["is_complete"] is False
+    assert entry["risk_assessment"]["recommendation"] == "CAUTION"
+    assert entry["execution_successful"] is (failure_mode != "provider")
+    assert entry["enhancements"]["gap_fill_error"] == error
+    assert entry["enhancements"]["gap_fill_status"] == "incomplete"
+    assert any(issue["id"] == "TM1" for issue in entry["issues"])
+    assert any(issue["id"] == "P5" for issue in entry["issues"]) is partial_success
+    expected_reason = {
+        "json": "llm_structured_response_invalid",
+        "schema": "llm_structured_response_invalid",
+        "provider": "llm_batch_failed",
+        "runtime_signal": "runtime_limit",
+        "missing_findings": "llm_structured_response_invalid",
+    }[failure_mode]
+    assert any(
+        row["reason_code"] == expected_reason
+        for row in entry["analysis_completeness"]["ledger_exceptions"]
+    )
+    payload = json.loads(reports._format_json([entry]))
+    assert payload["batch"]["enhancements"]["gap_fill_applied"] == 0
+    assert payload["batch"]["inspection_completeness"]["incomplete_skills"] == 1
+    assert expected_reason in reports._format_terminal([entry])
+    assert expected_reason.replace("_", "\\_") in reports._format_markdown([entry])
+    expected_failed_calls = 4 if failure_mode in {"json", "schema", "missing_findings"} else 1
+    assert len(calls) == expected_failed_calls + int(partial_success)
+    monkeypatch.setattr(
+        batch_scan, "_scan_skill_bounded", lambda *args, **kw: (entry, error, skill.name)
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["batch_scan", str(skill.parent), "--no-llm", "--format", "json", "--workers", "1"],
+    )
+    with pytest.raises(SystemExit) as stopped:
+        batch_scan._main_impl()
+    assert stopped.value.code == 2
+
+
 @pytest.mark.parametrize("cache_state", ["empty", "missing"])
 def test_gap_fill_never_falls_back_to_local_content(
     batch_skill, monkeypatch: pytest.MonkeyPatch, cache_state
@@ -149,6 +264,7 @@ def test_gap_fill_never_falls_back_to_local_content(
     assert error is None, error
     assert observed["calls"] == [({}, "zh")]
     assert entry["skill"]["language"] == "zh"
+    assert entry["enhancements"]["gap_fill_applied"] is False
 
 
 @pytest.mark.parametrize(
@@ -541,3 +657,170 @@ def test_scan_forwards_verbose_logging(batch_skill, monkeypatch):
         skill, skill.parent, use_llm=False, lang="en", require_llm=False, verbose=True
     )
     assert levels == ["DEBUG"]
+
+
+@pytest.mark.parametrize("requested", [2, 60, None])
+def test_compat_http_timeout_preserves_shorter_deadline(monkeypatch, requested):
+    observed = {}
+    monkeypatch.setattr(runner, "_original_chatopenai_init", lambda self, **kw: observed.update(kw))
+    runner._patched_chatopenai_init(object(), timeout=requested)
+    assert observed["timeout"] is observed["request_timeout"]
+    assert observed["timeout"].read == (2 if requested == 2 else 30)
+    assert observed["timeout"].connect == (2 if requested == 2 else 8)
+
+
+@pytest.mark.parametrize("stage", ["construction", "batching"])
+def test_gap_fill_setup_failure_retains_core_findings(batch_skill, monkeypatch, stage):
+    import contrib.batch_scan.gap_fill as gap_fill
+    from skillspector.models import Finding
+
+    skill, _ = batch_skill
+    core = Finding(rule_id="TM1", message="Core evidence", severity="HIGH", file="SKILL.md")
+    _mock_scan(monkeypatch, lambda context: context.update(findings=[core]))
+    monkeypatch.setattr(runner, "run_gap_fill", run_gap_fill)
+
+    def fail(*args, **kwargs):
+        raise TypeError("synthetic setup failure")
+
+    if stage == "construction":
+        monkeypatch.setattr(gap_fill, "GapFillAnalyzer", fail)
+    else:
+        monkeypatch.setattr(llm_analyzer_base, "get_chat_model", lambda **kw: SimpleNamespace())
+        monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda model: 100_000)
+        monkeypatch.setattr(gap_fill.GapFillAnalyzer, "get_batches", fail)
+    entry, error = runner.run_one(
+        skill, skill.parent, use_llm=True, detected_language="zh", apply_gap_fill=True
+    )
+    assert error is not None and entry["enhancements"]["gap_fill_error"] == error
+    assert any(issue["id"] == "TM1" for issue in entry["issues"])
+    assert entry["risk_assessment"]["recommendation"] != "SAFE"
+    assert entry["analysis_completeness"]["is_complete"] is False
+    assert entry["execution_successful"] is False
+    assert entry["enhancements"]["gap_fill_error_reasons"] == ["llm_batch_failed"]
+    assert any(
+        row["path"] == "SKILL.md" for row in entry["analysis_completeness"]["ledger_exceptions"]
+    )
+
+
+def test_gap_fill_real_deadline_stops_retries_and_keeps_core(batch_skill, monkeypatch):
+    from skillspector.models import Finding
+
+    skill, _ = batch_skill
+    core = Finding(rule_id="TM1", message="Core evidence", severity="HIGH", file="SKILL.md")
+    _mock_scan(monkeypatch, lambda context: context.update(findings=[core]))
+    monkeypatch.setattr(runner, "run_gap_fill", run_gap_fill)
+    calls = []
+
+    def invoke(prompt):
+        calls.append(prompt)
+        return AIMessage(content="not JSON")
+
+    monkeypatch.setattr(
+        llm_analyzer_base, "get_chat_model", lambda **kw: SimpleNamespace(invoke=invoke)
+    )
+    monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda model: 100_000)
+    started = time.monotonic()
+    with runner.deepseek_compat():
+        entry, error = runner.run_one(
+            skill,
+            skill.parent,
+            use_llm=True,
+            detected_language="zh",
+            apply_gap_fill=True,
+            timeout=0.3,
+        )
+    assert time.monotonic() - started < 2
+    assert len(calls) <= 1
+    assert error is not None
+    assert any(issue["id"] == "TM1" for issue in entry["issues"])
+    assert entry["enhancements"]["gap_fill_error_reasons"] == ["runtime_limit"]
+    assert entry["analysis_completeness"]["is_complete"] is False
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_pooled_request_slot_wait_obeys_deadline(asynchronous):
+    from contrib.batch_scan.api_pool import ApiKey, ApiKeyPool, PooledChatModel
+
+    pool = ApiKeyPool([ApiKey("synthetic", None, "test", max_concurrent=1)])
+    occupied = pool.acquire()
+    model = PooledChatModel(pool, timeout=0.02)
+    started = time.monotonic()
+    try:
+        with pytest.raises(llm_analyzer_base.LLMRuntimeLimitError):
+            if asynchronous:
+                await model.ainvoke("unused")
+            else:
+                model.invoke("unused")
+        assert time.monotonic() - started < 1
+        assert occupied.active_requests == 1
+    finally:
+        pool.release(occupied)
+    assert occupied.active_requests == 0
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_pooled_request_releases_slot_when_client_build_fails(monkeypatch, asynchronous):
+    from contrib.batch_scan.api_pool import ApiKey, ApiKeyPool, PooledChatModel
+
+    key = ApiKey("synthetic", None, "test", max_concurrent=1)
+    model = PooledChatModel(ApiKeyPool([key]), timeout=1)
+
+    def fail(*args, **kwargs):
+        raise ValueError("synthetic constructor failure")
+
+    monkeypatch.setattr(model, "_build_llm", fail)
+    with pytest.raises(ValueError, match="synthetic constructor failure"):
+        if asynchronous:
+            await model.ainvoke("unused")
+        else:
+            model.invoke("unused")
+    assert key.active_requests == 0
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_pooled_key_retries_share_one_deadline(monkeypatch, asynchronous):
+    import contrib.batch_scan.api_pool as api_pool
+
+    clock = [0.0]
+    monkeypatch.setattr(api_pool, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    limits, releases = [], []
+    key = object()
+    pool = SimpleNamespace(
+        acquire=lambda **kwargs: key,
+        try_acquire=lambda: key,
+        release=lambda key, **kwargs: releases.append(kwargs),
+    )
+    model = api_pool.PooledChatModel(pool, timeout=2, max_retries=5)
+
+    def invoke(prompt):
+        clock[0] += 1
+        raise RuntimeError("429 rate limit")
+
+    async def ainvoke(prompt):
+        return invoke(prompt)
+
+    def build(key, *, timeout):
+        limits.append(timeout)
+        return SimpleNamespace(invoke=invoke, ainvoke=ainvoke)
+
+    monkeypatch.setattr(model, "_build_llm", build)
+    with pytest.raises(llm_analyzer_base.LLMRuntimeLimitError):
+        if asynchronous:
+            await model.ainvoke("unused")
+        else:
+            model.invoke("unused")
+    assert limits == [2, 1]
+    assert releases == [{"success": False}, {"success": False}]
+
+
+def test_pooled_client_bounds_connect_and_disables_sdk_retries(monkeypatch):
+    import langchain_openai
+
+    from contrib.batch_scan.api_pool import ApiKey, ApiKeyPool, PooledChatModel
+
+    key = ApiKey("synthetic", None, "test")
+    observed = {}
+    monkeypatch.setattr(langchain_openai, "ChatOpenAI", lambda **kw: observed.update(kw))
+    PooledChatModel(ApiKeyPool([key]))._build_llm(key, timeout=0.1)
+    assert observed["timeout"].connect == observed["timeout"].read == 0.1
+    assert observed["max_retries"] == 0

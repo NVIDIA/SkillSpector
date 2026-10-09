@@ -28,12 +28,21 @@ execution via :meth:`arun_batches`.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from skillspector.constants import MODEL_CONFIG
-from skillspector.llm_analyzer_base import LLMAnalyzerBase
+from skillspector.inspection_ledger import LedgerReason
+from skillspector.llm_analyzer_base import (
+    Batch,
+    BatchExecutionResult,
+    BatchFailure,
+    LLMRuntimeLimitError,
+    LLMAnalyzerBase,
+    _StructuredResponseValidationError,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 
@@ -87,7 +96,16 @@ class GapFillFinding(BaseModel):
 class GapFillResult(BaseModel):
     """Structured LLM response for the gap-fill analyzer."""
 
-    findings: list[GapFillFinding] = Field(default_factory=list)
+    findings: list[GapFillFinding]
+
+
+class GapFillError(RuntimeError):
+    """An incomplete pass, retaining successful batches for the report."""
+
+    def __init__(self, outcome: BatchExecutionResult):
+        self.outcome = outcome
+        self.findings = [finding for _, findings in outcome.successful for finding in findings]
+        super().__init__(f"Gap-fill analysis did not complete for {len(outcome.failures)} batch(es).")
 
 
 # ---------------------------------------------------------------------------
@@ -179,12 +197,12 @@ class GapFillAnalyzer(LLMAnalyzerBase):
     # response_format.  JSON is parsed manually in parse_response().
     response_schema: type | None = None
 
-    def __init__(self, language: str, model: str | None = None, api_pool: "ApiKeyPool | None" = None):
+    def __init__(self, language: str, model: str | None = None, api_pool: "ApiKeyPool | None" = None, *, timeout: float | None | Callable[[], float | None] = None):
         self.language = language
         resolved_model = model or MODEL_CONFIG.get("default", "gpt-5.4")
         # Inject language into the base prompt before passing to parent
         prompt = GAP_FILL_ANALYZER_PROMPT.format(language=language)
-        super().__init__(base_prompt=prompt, model=resolved_model)
+        super().__init__(base_prompt=prompt, model=resolved_model, timeout=timeout)
         # Wire multi-key pool into gap-fill LLM calls
         if api_pool:
             from .api_pool import PooledChatModel
@@ -209,38 +227,12 @@ class GapFillAnalyzer(LLMAnalyzerBase):
         Because ``response_schema`` is ``None``, *response* is a raw string
         (not a Pydantic model).  We strip markdown code fences, parse JSON,
         validate with :class:`GapFillResult`, and filter to ``confidence >= 0.7``.
+        Invalid JSON or schema raises ``_StructuredResponseValidationError`` for retry.
         """
-        text = str(response).strip()
-
-        # Strip markdown code fences if present
-        if text.startswith("```"):
-            first_nl = text.find("\n")
-            if first_nl != -1:
-                text = text[first_nl + 1:]
-            if text.rstrip().endswith("```"):
-                text = text.rstrip()[:-3].rstrip()
-
-        # Parse JSON → Pydantic for validation
-        import json
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError as exc:
-            logger.warning(
-                "GapFillAnalyzer: invalid JSON for %s: %s",
-                batch.file_label,
-                exc,
-            )
-            return []
-
-        try:
-            result = GapFillResult.model_validate(data)
-        except Exception as exc:
-            logger.warning(
-                "GapFillAnalyzer: schema validation failed for %s: %s",
-                batch.file_label,
-                exc,
-            )
-            return []
+        if isinstance(response, GapFillResult):
+            result = response
+        else:
+            result = self._parse_json_response(response)
 
         findings: list[Finding] = []
         for item in result.findings:
@@ -256,9 +248,29 @@ class GapFillAnalyzer(LLMAnalyzerBase):
             findings.append(item.to_finding(batch.file_path))
         return findings
 
+    @staticmethod
+    def _parse_json_response(response):
+        text = str(response).lstrip("\ufeff").strip()
+
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            first_nl = text.find("\n")
+            if first_nl != -1:
+                text = text[first_nl + 1:]
+            if text.rstrip().endswith("```"):
+                text = text.rstrip()[:-3].rstrip()
+
+        # Parse JSON → Pydantic for validation
+        import json
+        try:
+            data = json.loads(text)
+            return GapFillResult.model_validate(data)
+        except (json.JSONDecodeError, ValidationError) as exc:
+            raise _StructuredResponseValidationError from exc
+
 
 # ---------------------------------------------------------------------------
-# Backward-compatible entry point
+# Entry point preserving partial results
 # ---------------------------------------------------------------------------
 
 
@@ -267,6 +279,8 @@ def run_gap_fill(
     language: str,
     model: str | None = None,
     api_pool: "ApiKeyPool | None" = None,
+    *,
+    timeout: float | None | Callable[[], float | None] = None,
 ) -> list[Finding]:
     """Run a single targeted LLM pass covering the 8 gap-fill rules.
 
@@ -289,17 +303,27 @@ def run_gap_fill(
     list[Finding]
         A (possibly empty) list of gap-fill findings.  Only findings with
         ``confidence >= 0.7`` are included.
+
+    Raises
+    ------
+    GapFillError
+        Any setup or batch failure. ``outcome`` contains per-batch evidence and
+        ``findings`` retains results from completed batches.
     """
     if not file_cache:
         return []
 
     try:
-        analyzer = GapFillAnalyzer(language=language, model=model, api_pool=api_pool)
+        analyzer = GapFillAnalyzer(language=language, model=model, api_pool=api_pool, timeout=timeout)
         batches = analyzer.get_batches(list(file_cache.keys()), file_cache)
-        results = analyzer.run_batches(batches, language=language)
-        return analyzer.collect_findings(results)
-    except ValueError:
-        raise
     except Exception as exc:
-        logger.warning("Gap-fill analysis failed: %s", exc)
-        return []
+        reason = LedgerReason.RUNTIME_LIMIT if isinstance(exc, LLMRuntimeLimitError) else LedgerReason.LLM_BATCH_FAILED
+        outcome = BatchExecutionResult(failures=[
+            BatchFailure(Batch(file_path=path, content=content), error_class=type(exc).__name__, reason=reason)
+            for path, content in file_cache.items()
+        ])
+        raise GapFillError(outcome) from exc
+    outcome = analyzer.run_batches_detailed(batches, language=language)
+    if outcome.failures:
+        raise GapFillError(outcome)
+    return analyzer.collect_findings(outcome.successful)

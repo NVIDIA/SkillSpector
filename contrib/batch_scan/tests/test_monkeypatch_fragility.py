@@ -277,6 +277,7 @@ class TestGuardPatch1Init(unittest.TestCase):
             "prompt",
             "model",
             node="semantic_security_discovery",
+            timeout=None,
         )
         self.assertIsNone(instance.response_schema)
 

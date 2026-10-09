@@ -202,7 +202,8 @@ python -m contrib.batch_scan.batch_scan ./tests/fixtures/ -f json -o batch.json
 
 Key differences in batch output:
 - `scan_mode: "multilingual-enhanced"` — provenance marker
-- `enhancements.gap_fill_applied` — true if LLM gap-fill was used
+- `enhancements.gap_fill_applied` — true only if every gap-fill batch completed;
+  partial passes can still have `gap_fill_findings > 0`
 - `enhancements.english_keyword_rules_skipped` — count of static rules bypassed
 - `skill.language` — detected language tag
 
@@ -313,7 +314,7 @@ python -m contrib.batch_scan.batch_scan ./tests/fixtures/ --no-require-llm --no-
 |------|---------|
 | 0 | All safe (no HIGH/CRITICAL) |
 | 1 | ≥1 skill has HIGH or CRITICAL risk |
-| 2 | Scan errors occurred |
+| 2 | Scan errors or incomplete gap-fill occurred; `skills[].error` or `enhancements.gap_fill_error` explains the failure |
 
 CI usage:
 
@@ -431,3 +432,12 @@ tests/
 ---
 
 **Next:** [DESIGN.md](DESIGN.md) — architecture & concurrency model · [REVIEW_RESPONSE.md](REVIEW_RESPONSE.md) — PR #100 review response · [CONTRIBUTING.md](../CONTRIBUTING.md) — dev setup & code conventions
+
+
+Gap-fill uses the remaining per-skill budget, leaving up to five seconds for
+reporting before the worker's 90-second hard limit. Invalid responses can take
+up to four attempts while that budget remains. Failed setup and failed batches
+retain core findings and completed gap-fill findings. An incomplete pass records
+`enhancements.gap_fill_status: "incomplete"`, `gap_fill_error_reasons`, and
+`enhancements.gap_fill_error`, and exits 2 even when its ledger outcome is nonfatal.
+The worker hard limit still applies if a provider ignores its request timeout.
