@@ -7371,7 +7371,8 @@ def test_all_cli_writers_reject_symlink_destinations(tmp_path, monkeypatch, mode
         args += ["--output", str(output)]
     result = runner.invoke(app, args)
     assert result.exit_code == 2, result.output
-    assert "non-regular" in result.output
+    expected_error = "must be a regular file" if mode.startswith("baseline") else "non-regular"
+    assert expected_error in result.output
     assert protected.read_text(encoding="utf-8") == "preserve"
     assert output.is_symlink()
 
