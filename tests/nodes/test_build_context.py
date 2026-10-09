@@ -1124,6 +1124,65 @@ def test_build_context_parses_allowed_tools_single_space_string(tmp_path: Path) 
     assert result["manifest"]["allowed-tools"] == ["Bash"]
 
 
+@pytest.mark.parametrize(
+    ("declaration", "expected"),
+    [
+        pytest.param(
+            "Bash(git status:*) Read",
+            ["Bash(git status:*)", "Read"],
+            id="space_inside_scope",
+        ),
+        pytest.param(
+            "Bash(git status:*), Read",
+            ["Bash(git status:*)", "Read"],
+            id="comma_string",
+        ),
+        pytest.param(
+            "Read(./docs Bash(notes).md)",
+            ["Read(./docs Bash(notes).md)"],
+            id="nested_parens_inside_scope",
+        ),
+        pytest.param(
+            "Read(./docs, Bash(notes).md)",
+            ["Read(./docs, Bash(notes).md)"],
+            id="comma_inside_scope",
+        ),
+        pytest.param(
+            "Bash(git status:*) Read(./a, b)",
+            ["Bash(git status:*)", "Read(./a, b)"],
+            id="comma_only_inside_scope_keeps_space_form",
+        ),
+        pytest.param(
+            "Bash(echo '(') Read", ["Bash(echo '(')", "Read"], id="literal_open_paren_in_scope"
+        ),
+        pytest.param(
+            "Bash(echo ')') Read", ["Bash(echo ')')", "Read"], id="literal_close_paren_in_scope"
+        ),
+        pytest.param(
+            "Bash(echo '('), Read",
+            ["Bash(echo '(')", "Read"],
+            id="comma_string_literal_open_paren_in_scope",
+        ),
+        pytest.param(
+            "Bash(echo ')'), Read",
+            ["Bash(echo ')')", "Read"],
+            id="comma_string_literal_close_paren_in_scope",
+        ),
+    ],
+)
+def test_build_context_keeps_scoped_allowed_tools_whole(
+    tmp_path: Path, declaration: str, expected: list[str]
+) -> None:
+    """Separators inside a `Tool(specifier)` scope belong to the scope."""
+    (tmp_path / "SKILL.md").write_text(
+        f"---\nname: deployer\ndescription: deploys services\nallowed-tools: {declaration}\n---\n",
+        encoding="utf-8",
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+    assert result["manifest"]["allowed-tools"] == expected
+
+
 def test_build_context_inventories_excluded_executable_descendants(tmp_path: Path) -> None:
     """Excluded trees retain bounded inventory and executable coverage evidence."""
     (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
