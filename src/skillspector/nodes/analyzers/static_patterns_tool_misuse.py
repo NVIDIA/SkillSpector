@@ -5204,6 +5204,10 @@ def analyze(
                     :200
                 ]
         if variable_match is not None and defer_variable_reconciliation:
+            # Without Python bindings, keep only call-anchored windows for
+            # true-prefixed names; coalescing drops one a direct owner reports.
+            if file_type != "python" and not _is_true_prefixed_name(variable_match[0]):
+                continue
             evidence[_VARIABLE_SHELL_FLAG_EVIDENCE] = variable_match[0]
             evidence[static_runner._PRESERVE_SOURCE_START_EVIDENCE] = True
             call_start = _variable_shell_call_start(variable_match[1])
@@ -6170,6 +6174,8 @@ def cleanup_path_findings(findings: list[Finding]) -> list[Finding]:
 class _DirectShellReplayLexical:
     """Lexical-only facade used for direct-equivalent bounded windows."""
 
+    USES_PYTHON_SOURCE_TYPE = True
+
     @staticmethod
     def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
         return analyze(
@@ -6412,6 +6418,7 @@ def _bound_direct_replays(
                         [_DirectShellReplayLexical],
                         replay_budget,
                         None,
+                        python_source=True,
                         source_text=raw_window,
                     )
                     owned_findings: list[Finding] = []
@@ -6483,6 +6490,7 @@ def _bound_direct_replays(
                         [_DirectShellReplayLexical],
                         replay_budget,
                         None,
+                        python_source=True,
                         source_text=projection.text,
                     )
                     static_runner._restore_source_lines(
@@ -6563,18 +6571,6 @@ def _reconcile_variable_shell_findings(
         return findings
 
     file_path = marked[0].file
-    if static_runner._infer_file_type(file_path) != "python":
-        # Without Python bindings, keep only call-anchored windows for
-        # true-prefixed names; coalescing drops one a direct owner reports.
-        marked_ids = {
-            id(finding)
-            for finding in marked
-            if not (
-                isinstance(name := finding.evidence.get(_VARIABLE_SHELL_FLAG_EVIDENCE), str)
-                and _is_true_prefixed_name(name)
-            )
-        }
-        return [finding for finding in findings if id(finding) not in marked_ids]
     if python_ast is None or python_ast.tree is None:
         return findings
 
