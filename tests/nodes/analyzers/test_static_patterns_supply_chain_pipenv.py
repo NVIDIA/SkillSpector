@@ -366,6 +366,86 @@ def test_project_scoping_keeps_the_aggregate_lock_package_budget():
     )
 
 
+@pytest.mark.parametrize("reverse_order", [False, True])
+@pytest.mark.parametrize("limitation_kind", ["git", "syntax", "size", "entry_limit"])
+def test_file_local_lock_limitations_preserve_other_projects(limitation_kind, reverse_order):
+    git_entry = {"git": "https://example.invalid/dependency.git"}
+    contents = {
+        "git": _lock_content(default={"custom": git_entry}),
+        "syntax": "{",
+        "size": _lock_content(
+            default={"x" * (supply_chain.MAX_DEPENDENCY_NAME_CHARS + 1): {"version": "==1.0"}}
+        ),
+        "entry_limit": _lock_content(default={f"custom{i}": git_entry for i in range(4)}),
+    }
+    files = {
+        "Pipfile.lock": contents[limitation_kind],
+        "docs/Pipfile.lock": _lock_content(default={"pyyaml": {"version": "==5.3.1"}}),
+    }
+    components = list(files)
+    if reverse_order:
+        components.reverse()
+    locked, limitations = supply_chain._collect_locked_versions_detailed(files, components, limit=2)
+
+    assert locked[supply_chain._python_lock_scope("docs/Pipfile")] == {"pyyaml": "5.3.1"}
+    expected_reason = {
+        "git": LedgerReason.DEPENDENCY_PARSE_ERROR,
+        "syntax": LedgerReason.DEPENDENCY_PARSE_ERROR,
+        "size": LedgerReason.SIZE_LIMIT,
+        "entry_limit": LedgerReason.OUTPUT_LIMIT,
+    }[limitation_kind]
+    assert any(
+        path == "Pipfile.lock" and limitation.reason is expected_reason
+        for path, limitation in limitations
+    )
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_node_unsupported_lock_source_preserves_other_manifest_findings(
+    monkeypatch, osv_packages, reverse_order
+):
+    monkeypatch.setattr(
+        supply_chain.static_runner,
+        "run_static_patterns_with_ledger",
+        lambda _state, _modules: {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+        },
+    )
+    files = {
+        "Pipfile.lock": _lock_content(
+            default={"custom": {"git": "https://example.invalid/dependency.git"}}
+        ),
+        "docs/Pipfile.lock": _lock_content(default={"pyyaml": {"version": "==5.3.1"}}),
+        "docs/Pipfile": '[packages]\npyyaml = "*"\n',
+    }
+    components = list(files)
+    if reverse_order:
+        components.reverse()
+    response = supply_chain.node(
+        {
+            "skill_path": "",
+            "components": components,
+            "file_cache": files,
+            "local_file_cache": files,
+            "manifest": {},
+            "component_metadata": [],
+        }
+    )
+
+    sc4_paths = {item.file for item in response["findings"] if item.rule_id == "SC4"}
+    assert sc4_paths == {"docs/Pipfile", "docs/Pipfile.lock"}
+    assert ("pyyaml", None) not in osv_packages
+    assert any(
+        event["path"] == "Pipfile.lock"
+        and event["outcome"] is LedgerOutcome.PARTIAL
+        and event["reason_code"] is LedgerReason.DEPENDENCY_PARSE_ERROR
+        and event["error_class"] == "UnsupportedDependencySource"
+        for event in response["inspection_ledger"]
+    )
+
+
 @pytest.mark.parametrize("spec", ["*", ">=5.3", "~=5.3", "==5.3.*"])
 def test_manifest_ranges_are_not_treated_as_installed_versions(spec, osv_packages):
     findings = supply_chain._analyze_dependencies(f'[packages]\npyyaml = "{spec}"\n', "Pipfile")
