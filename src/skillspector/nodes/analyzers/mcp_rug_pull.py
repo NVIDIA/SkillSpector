@@ -124,9 +124,27 @@ class _RugPullBudget:
 
 # RP1: Unpinned MCP server references in code or manifest
 _RP1_NPX_CMD = re.compile(
-    r"npx\s+(?:-+\w+\s+)*((?:@?[a-zA-Z][\w.-]*/)?[a-zA-Z][\w.-]*)",
+    r"\bp?npx[ \t]+(?:-+\w+[ \t]+)*((?:@?[a-zA-Z][\w.-]*/)?[a-zA-Z][\w.-]*)",
     re.IGNORECASE,
 )
+_RP1_CONFIG_RUNNER = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<item>-[ \t]+)?(?:command|cmd)[ \t]*:[ \t]*"
+    r"(?P<quote>[\"']?)(?P<runner>(?:[^\s\"'#]*/)?p?npx)(?P=quote)[ \t]*(?:#.*)?$",
+    re.IGNORECASE,
+)
+_RP1_CONFIG_ARGS = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<item>-[ \t]+)?args[ \t]*:[ \t]*(?P<value>.*)$",
+    re.IGNORECASE,
+)
+_RP1_CONFIG_KEY = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<item>-[ \t]+)?(?:[\w-]+|\"[^\"]+\"|'[^']+')[ \t]*:"
+)
+_RP1_CONFIG_ARG_TOKEN = re.compile(r"[\"']([^\"']*)[\"']|([^\s,\[\]#]+)")
+_RP1_CONFIG_MAX_LINES = 8
+# Structural windows count sibling keys, not the physical lines in their values.
+# Independently bound physical traversal and argument collection per command.
+_RP1_CONFIG_MAX_PHYSICAL_LINES = 256
+_RP1_CONFIG_MAX_ARG_LINES = 128
 _RP1_UVX_CMD = re.compile(
     r"(?:uvx|uv\s+tool\s+run)\s+(?:-+\w+\s+)*([a-zA-Z][\w.-]*)",
     re.IGNORECASE,
@@ -159,6 +177,147 @@ def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
 def _find_line(content: str, pos: int) -> int:
     """Return 1-based line number for character position *pos*."""
     return content.count("\n", 0, pos) + 1
+
+
+def _strip_yaml_comment(line: str) -> str:
+    """Remove an unquoted YAML comment without treating quoted hashes as comments."""
+    quote = ""
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if quote == '"' and char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                if quote == "'" and index + 1 < len(line) and line[index + 1] == "'":
+                    index += 2
+                    continue
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+        index += 1
+    return line
+
+
+def _iter_config_npx_commands(
+    content: str, budget: _RugPullBudget, file_path: str
+) -> list[tuple[int, str, str]]:
+    """Find bounded YAML MCP command/args pairs that run an npx-style runner."""
+    lines = content.splitlines(keepends=True)
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+
+    matches: list[tuple[int, str, str]] = []
+    for command_index, command_line in enumerate(lines):
+        budget.check_runtime(file_path)
+        command = _RP1_CONFIG_RUNNER.fullmatch(command_line.rstrip("\r\n"))
+        if command is None:
+            continue
+
+        # The key in "- command:" starts after the sequence marker. Sibling
+        # keys align with that column, not with the marker's indentation.
+        command_indent = len(command.group("indent")) + len(command.group("item") or "")
+        args_index: int | None = None
+        args_match: re.Match[str] | None = None
+        for direction in (-1, 1):
+            if direction == -1 and command.group("item"):
+                continue  # This command is already the first key in its list item.
+            sibling_count = 0
+            for distance in range(1, _RP1_CONFIG_MAX_PHYSICAL_LINES + 1):
+                index = command_index + direction * distance
+                if not 0 <= index < len(lines):
+                    break
+                budget.check_runtime(file_path)
+                candidate_line = lines[index].rstrip("\r\n")
+                stripped = candidate_line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                indent = len(candidate_line) - len(candidate_line.lstrip(" \t"))
+                key = _RP1_CONFIG_KEY.match(candidate_line)
+                key_indent = (
+                    len(key.group("indent")) + len(key.group("item") or "")
+                    if key is not None
+                    else indent
+                )
+                # Backward traversal may reach the first key of this list item.
+                # Forward traversal must never enter the next item, even when
+                # its key has the same effective column.
+                first_item_key = key is not None and key.group("item") is not None
+                if indent < command_indent and not (
+                    direction == -1 and first_item_key and key_indent == command_indent
+                ):
+                    break
+                if key_indent == command_indent:
+                    if key is None:
+                        # An indentless sequence belongs to a sibling value,
+                        # not a new server mapping. Other scalar lines end it.
+                        if not stripped.startswith("- ") and stripped != "-":
+                            break
+                    else:
+                        sibling_count += 1
+                        if sibling_count > _RP1_CONFIG_MAX_LINES:
+                            break
+                        candidate_args = _RP1_CONFIG_ARGS.fullmatch(candidate_line)
+                        if candidate_args is not None:
+                            args_index = index
+                            args_match = candidate_args
+                            break
+                if direction == -1 and first_item_key and key_indent == command_indent:
+                    break
+            if args_match is not None:
+                break
+
+        if args_index is None or args_match is None:
+            continue
+
+        args_indent = len(args_match.group("indent")) + len(args_match.group("item") or "")
+        args_lines = [_strip_yaml_comment(args_match.group("value"))]
+        args_end_index = args_index
+        for index in range(
+            args_index + 1, min(len(lines), args_index + _RP1_CONFIG_MAX_ARG_LINES + 1)
+        ):
+            budget.check_runtime(file_path)
+            candidate_line = lines[index].rstrip("\r\n")
+            stripped = candidate_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(candidate_line) - len(candidate_line.lstrip(" \t"))
+            indentless_item = indent == args_indent and (
+                stripped.startswith("- ") or stripped == "-"
+            )
+            if indent < args_indent or (indent == args_indent and not indentless_item):
+                break
+            # A mapping item is not a scalar package argument and may start
+            # another server; never consume its keys as command arguments.
+            if indentless_item and _RP1_CONFIG_KEY.match(candidate_line):
+                break
+            args_lines.append(_strip_yaml_comment(candidate_line.lstrip(" \t")))
+            args_end_index = index
+
+        args_text = " ".join(args_lines)
+        for token_match in _RP1_CONFIG_ARG_TOKEN.finditer(args_text):
+            quoted_token = token_match.group(1)
+            token = quoted_token if quoted_token is not None else token_match.group(2)
+            if token.startswith("-"):
+                continue
+            if not token:
+                # The first positional argument is empty, not a package name.
+                # Do not shift a later argument into its position or invent RP1.
+                break
+            start = offsets[command_index]
+            full_match = "".join(
+                lines[min(command_index, args_index) : max(command_index, args_end_index) + 1]
+            ).strip()
+            matches.append((start, full_match, token))
+            break
+
+    return matches
 
 
 def _normalize_string_list(
@@ -257,6 +416,35 @@ def _check_rp1(
                         "compromised and publishes a malicious update."
                     ),
                     remediation="Pin the version: npx @scope/server@1.2.3",
+                )
+            )
+
+        # YAML MCP configs often place the runner and package in separate fields.
+        for start, full_match, package in _iter_config_npx_commands(content, budget, file_path):
+            budget.check_runtime(file_path)
+            if _VERSION_PIN_RE.search(package):
+                continue
+            line_num = _find_line(content, start)
+            budget.emit(
+                Finding(
+                    rule_id="RP1",
+                    message=(
+                        f"MCP server referenced without pinned version: '{full_match[:200]}'."
+                    ),
+                    severity="MEDIUM",
+                    confidence=0.70,
+                    file=file_path,
+                    start_line=line_num,
+                    category=_CATEGORY,
+                    tags=list(_TAGS),
+                    matched_text=full_match[:200],
+                    match_fingerprint=compute_match_fingerprint("RP1", full_match),
+                    explanation=(
+                        "npx-style MCP commands without a version suffix "
+                        "create a rug-pull risk if the upstream server is "
+                        "compromised and publishes a malicious update."
+                    ),
+                    remediation="Pin the version in the args list: @scope/server@1.2.3",
                 )
             )
 

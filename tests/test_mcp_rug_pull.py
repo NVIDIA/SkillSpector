@@ -19,7 +19,17 @@ from __future__ import annotations
 
 import json
 
-from skillspector.nodes.analyzers.mcp_rug_pull import node
+import pytest
+import yaml
+
+from skillspector.nodes.analyzers.mcp_rug_pull import (
+    _RP1_CONFIG_MAX_ARG_LINES,
+    _RP1_CONFIG_MAX_PHYSICAL_LINES,
+    _iter_config_npx_commands,
+    _RugPullBudget,
+    _strip_yaml_comment,
+    node,
+)
 from skillspector.nodes.build_context import build_context
 from skillspector.nodes.deduplicate import deduplicate
 from skillspector.nodes.report import report
@@ -53,6 +63,321 @@ def test_rp1_npx_unpinned():
     ][0]
     assert issue["pattern"] == rp1[0].message
     assert issue["finding"] == "npx @scope/mcp-server"
+
+
+def test_rp1_npx_match_does_not_cross_lines():
+    """A trailing ``npx`` must not combine with the next line as a command."""
+    for content in (
+        "---\nname: npx\ndescription: repro\n---\n",
+        "Install it with npx\nthe package manager.\n",
+    ):
+        result = node(_state(file_cache={"SKILL.md": content}))
+        assert not [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+
+def test_rp1_pnpx_unpinned():
+    """RP1 also detects pnpm's npx-style runner without a version pin."""
+    result = node(_state(file_cache={"setup.sh": "pnpx @scope/mcp-server\n"}))
+    rp1 = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+    assert len(rp1) == 1
+    assert rp1[0].matched_text == "pnpx @scope/mcp-server"
+
+
+def test_rp1_npx_requires_a_word_boundary():
+    """An unrelated identifier ending in ``npx`` is not a command."""
+    result = node(_state(file_cache={"setup.sh": "foonpx @scope/mcp-server\n"}))
+
+    assert not [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+
+def test_rp1_yaml_mcp_config_unpinned():
+    """RP1 detects unpinned npx-style commands in YAML MCP config args."""
+    configs = (
+        """mcpServers:\n  fs:\n    command: npx\n    args: ["-y", "@scope/mcp-server"]\n""",
+        """servers:\n  goose:\n    cmd: pnpx\n    args:\n      - "-y"\n      - "@scope/mcp-server"\n""",
+    )
+
+    for config in configs:
+        result = node(_state(file_cache={"mcp.yaml": config}))
+        rp1 = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+        assert len(rp1) == 1
+        assert "@scope/mcp-server" in rp1[0].matched_text
+
+
+def test_rp1_yaml_mcp_config_pinned_no_finding():
+    """RP1 skips YAML MCP args whose package token pins a version."""
+    configs = (
+        """mcpServers:\n  fs:\n    command: npx\n    args: ["-y", "@scope/mcp-server@1.2.3"]\n""",
+        """servers:\n  goose:\n    cmd: pnpx\n    args:\n      - "-y"\n      - "@scope/mcp-server@1.2.3"\n""",
+    )
+
+    for config in configs:
+        result = node(_state(file_cache={"mcp.yaml": config}))
+
+        assert not [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+
+@pytest.mark.parametrize("style", ["flow", "block"])
+@pytest.mark.parametrize("quote", ['"', "'"])
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (["-y", "@scope/server", ""], 1),
+        (["-y", "@scope/server@1.2.3", ""], 0),
+        (["", "@scope/server"], 0),
+        (["-y", "", "@scope/server"], 0),
+        (["-y", "", "@scope/server@1.2.3"], 0),
+        ([""], 0),
+        (["-y", ""], 0),
+    ],
+)
+def test_rp1_yaml_empty_arguments_do_not_crash_or_shift_package(style, quote, arguments, expected):
+    quoted = [quote + argument + quote for argument in arguments]
+    args = (
+        "    args: [" + ", ".join(quoted) + "]\n"
+        if style == "flow"
+        else "    args:\n" + "".join("      - " + argument + "\n" for argument in quoted)
+    )
+    result = node(_state(file_cache={"mcp.yaml": "mcpServers:\n  fs:\n    command: npx\n" + args}))
+    rp1 = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+    assert len(rp1) == expected
+    if rp1:
+        assert rp1[0].start_line == 3
+        assert "@scope/server" in rp1[0].matched_text
+
+
+def test_rp1_yaml_empty_package_does_not_abort_other_configs_or_files():
+    content = (
+        'mcpServers:\n  empty:\n    command: npx\n    args: ["-y", ""]\n'
+        '  real:\n    command: pnpx\n    args: ["@scope/server"]\n'
+    )
+    result = node(_state(file_cache={"mcp.yaml": content, "setup.sh": "npx another-server\n"}))
+    rp1 = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+    assert [(finding.file, finding.start_line) for finding in rp1] == [
+        ("mcp.yaml", 6),
+        ("setup.sh", 1),
+    ]
+    assert all(event["outcome"] == "completed" for event in result["inspection_ledger"])
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        'mcpServers:\n  fs:\n    command: npx\n    env:\n      FOO: bar\n    args: ["-y", "PACKAGE"]\n',
+        'mcpServers:\n  fs:\n    command: npx\n    type: stdio\n    cwd: /tmp\n    description: server\n    args: ["-y", "PACKAGE"]\n',
+        'servers:\n  - command: npx\n    args: ["-y", "PACKAGE"]\n',
+        'servers:\n  - command: pnpx\n    type: stdio\n    args:\n      - "-y"\n      - "PACKAGE"\n',
+        'mcpServers:\n  fs:\n    args: ["-y", "PACKAGE"]\n    env: {}\n    command: npx\n',
+        'mcpServers:\n  fs:\n    args:\n      - "-y"\n      - "PACKAGE"\n    command: npx\n',
+        'servers:\n  - args: ["-y", "PACKAGE"]\n    command: npx\n',
+        'servers:\n  - name: fs\n    args:\n      - "-y"\n      - "PACKAGE"\n    command: npx\n',
+        'mcpServers:\n  fs:\n    command: /usr/local/bin/npx\n    args: ["-y", "PACKAGE"]\n',
+        'mcpServers:\n  fs:\n    args: ["-y", "PACKAGE"]\n    command: "./node_modules/.bin/pnpx"\n',
+    ],
+)
+@pytest.mark.parametrize("pinned", [False, True])
+def test_rp1_yaml_sibling_layouts_preserve_pin_behavior(layout, pinned):
+    package = "@scope/server@1.2.3" if pinned else "@scope/server"
+    content = layout.replace("PACKAGE", package)
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == (0 if pinned else 1)
+    if rp1:
+        assert "@scope/server" in rp1[0].matched_text
+        assert rp1[0].start_line == next(
+            index for index, line in enumerate(content.splitlines(), 1) if "command:" in line
+        )
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    ("header", "command", "middle", "args"),
+    [
+        (
+            "mcpServers:\n  fs:\n",
+            "    command: npx\n",
+            "",
+            '    args:\n    - -y\n    - "PACKAGE"\n',
+        ),
+        ("servers:\n- name: fs\n", "  command: pnpx\n", "", '  args:\n  - -y\n  - "PACKAGE"\n'),
+        (
+            "mcpServers:\n  fs:\n",
+            "    command: npx\n",
+            "    autoApprove:\n    - read_file\n",
+            '    args: ["PACKAGE"]\n',
+        ),
+        (
+            "mcpServers:\n  fs:\n",
+            "    command: npx\n",
+            "    env:\n" + "".join(f"      KEY{i}: value\n" for i in range(12)),
+            '    args: ["PACKAGE"]\n',
+        ),
+        (
+            "mcpServers:\n  fs:\n",
+            "    command: npx\n",
+            "    description: |\n" + "      description text\n" * 12,
+            '    args: ["PACKAGE"]\n',
+        ),
+        (
+            "mcpServers:\n  fs:\n",
+            "    command: npx\n",
+            "",
+            "    args:\n" + "      - -y\n" * 12 + '      - "PACKAGE"\n',
+        ),
+    ],
+)
+def test_rp1_yaml_indentless_and_long_values(
+    header, command, middle, args, pinned, reverse, newline
+):
+    package = "@scope/server@1.2.3" if pinned else "@scope/server"
+    pair = args + middle + command if reverse else command + middle + args
+    content = (header + pair).replace("PACKAGE", package).replace("\n", newline)
+    parsed = yaml.safe_load(content)
+    server = parsed["servers"][0] if "servers" in parsed else parsed["mcpServers"]["fs"]
+    assert server["args"][-1] == package
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == (0 if pinned else 1)
+    if rp1:
+        assert rp1[0].start_line == next(
+            i for i, line in enumerate(content.splitlines(), 1) if "command:" in line
+        )
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_rp1_yaml_indentless_args_in_first_key_list_item(pinned):
+    package = "@scope/server@1.2.3" if pinned else "@scope/server"
+    content = f'servers:\n- command: npx\n  args:\n  - -y\n  - "{package}"\n'
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == (0 if pinned else 1)
+
+
+@pytest.mark.parametrize("direction", ["before", "after"])
+@pytest.mark.parametrize("at_limit", [True, False])
+def test_rp1_yaml_physical_search_hard_limit(direction, at_limit):
+    distance = _RP1_CONFIG_MAX_PHYSICAL_LINES + (0 if at_limit else 1)
+    filler = "    # padding\n" * (distance - 1)
+    command = "    command: npx\n"
+    args = '    args: ["@scope/server"]\n'
+    pair = args + filler + command if direction == "before" else command + filler + args
+    matches = _iter_config_npx_commands(
+        "mcpServers:\n  fs:\n" + pair, _RugPullBudget({}), "mcp.yaml"
+    )
+    assert len(matches) == (1 if at_limit else 0)
+
+
+@pytest.mark.parametrize("indent", ["    ", "      "])
+@pytest.mark.parametrize("at_limit", [True, False])
+def test_rp1_yaml_argument_collection_hard_limit(indent, at_limit):
+    distance = _RP1_CONFIG_MAX_ARG_LINES + (0 if at_limit else 1)
+    content = "mcpServers:\n  fs:\n    command: npx\n    args:\n"
+    content += f"{indent}- -y\n" * (distance - 1) + f'{indent}- "@scope/server"\n'
+    matches = _iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml")
+    assert len(matches) == (1 if at_limit else 0)
+
+
+def test_rp1_yaml_long_value_traversal_checks_runtime(monkeypatch):
+    calls = 0
+
+    def check_runtime(self, path=None):
+        nonlocal calls
+        calls += 1
+        if calls == 20:
+            raise RuntimeError("test deadline")
+
+    monkeypatch.setattr(_RugPullBudget, "check_runtime", check_runtime)
+    content = "    command: npx\n    env:\n" + "      KEY: value\n" * 100
+    with pytest.raises(RuntimeError, match="test deadline"):
+        _iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml")
+    assert calls == 20
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        'args: # "@scope/server@1.2.3"\n      - "@scope/server"',
+        'args:\n      - "-y" # "decoy@1.2.3"\n      - "@scope/server"',
+        'args: ["@scope/server"] # "decoy@1.2.3"',
+    ],
+)
+def test_rp1_yaml_comments_cannot_supply_a_fake_package_pin(args):
+    content = "mcpServers:\n  fs:\n    command: npx\n    " + args + "\n"
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'servers:\n  - command: npx\n  - args: ["@scope/server"]\n',
+        'servers:\n  - args: ["@scope/server"]\n  - command: npx\n',
+        'mcpServers:\n  first:\n    command: npx\n  second:\n    args: ["@scope/server"]\n',
+        'mcpServers:\n  first:\n    args: ["@scope/server"]\n  second:\n    command: npx\n',
+        'mcpServers:\n  fs:\n    command: npx\n    env:\n      args: ["@scope/server"]\n',
+    ],
+)
+def test_rp1_yaml_does_not_bind_args_from_another_mapping(content):
+    assert not [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+
+
+@pytest.mark.parametrize("direction", ["before", "after"])
+@pytest.mark.parametrize("distance", [8, 9])
+def test_rp1_yaml_sibling_search_remains_bounded(direction, distance):
+    command = "    command: npx\n"
+    args = '    args: ["@scope/server"]\n'
+    intervening = "".join(f"    field{i}: value\n" for i in range(distance - 1))
+    pair = args + intervening + command if direction == "before" else command + intervening + args
+    content = "mcpServers:\n  fs:\n" + pair
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == (1 if distance == 8 else 0)
+
+
+def test_rp1_yaml_nested_pinned_args_do_not_hide_sibling_package():
+    content = (
+        "servers:\r\n  - command: npx\r\n    env:\r\n"
+        '      args: ["decoy@1.2.3"]\r\n    args: ["@scope/server"]\r\n'
+    )
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == 1
+    assert rp1[0].start_line == 2
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ('"pkg#fragment" # "decoy@1.2.3"', '"pkg#fragment" '),
+        ("'it''s # quoted' # tail", "'it''s # quoted' "),
+        ('"escaped\\" # quoted" # tail', '"escaped\\" # quoted" '),
+        ("pkg#fragment", "pkg#fragment"),
+    ],
+)
+def test_yaml_comment_stripping_preserves_quoted_content(line, expected):
+    assert _strip_yaml_comment(line) == expected
+
+
+def test_rp1_npx_still_matches_flags_on_the_same_line():
+    """Common npx flags remain supported after restricting whitespace."""
+    result = node(_state(file_cache={"setup.sh": "npx -y @scope/mcp-server\n"}))
+    rp1 = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+    assert len(rp1) == 1
+    assert rp1[0].matched_text == "npx -y @scope/mcp-server"
 
 
 def test_rp1_scans_cached_files_without_a_manifest():
