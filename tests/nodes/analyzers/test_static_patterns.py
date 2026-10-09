@@ -2857,3 +2857,28 @@ def test_variable_shell_oversized_tail_is_incomplete_even_after_early_match():
     with pytest.raises(static_runner._StaticResourceLimitError) as caught:
         list(module._iter_variable_shell_flag_matches(content))
     assert caught.value.reason.value == "static_parse_limit"
+
+
+def test_variable_shell_scope_parses_once_after_main_reconciliation(monkeypatch):
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
+
+    original_parse = module.parse_python_source
+    original_index = module._build_variable_shell_ast_index
+    calls = {"parse": 0, "index": 0}
+
+    def parse(*args, **kwargs):
+        calls["parse"] += 1
+        return original_parse(*args, **kwargs)
+
+    def index(*args, **kwargs):
+        calls["index"] += 1
+        return original_index(*args, **kwargs)
+
+    monkeypatch.setattr(module, "parse_python_source", parse)
+    monkeypatch.setattr(module, "_build_variable_shell_ast_index", index)
+    content = "import subprocess\n" + "".join(
+        f"flag_{i} = True\nsubprocess.run(cmd, shell=flag_{i})\n" for i in range(100)
+    )
+    findings = module.analyze(content, "tool.py", "python")
+    assert sum(finding.rule_id == "TM1" for finding in findings) >= 100
+    assert calls == {"parse": 1, "index": 1}
