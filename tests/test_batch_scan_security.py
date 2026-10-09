@@ -723,3 +723,84 @@ def test_gap_fill_real_deadline_stops_retries_and_keeps_core(batch_skill, monkey
     assert any(issue["id"] == "TM1" for issue in entry["issues"])
     assert entry["enhancements"]["gap_fill_error_reasons"] == ["runtime_limit"]
     assert entry["analysis_completeness"]["is_complete"] is False
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_pooled_request_slot_wait_obeys_deadline(asynchronous):
+    from contrib.batch_scan.api_pool import ApiKey, ApiKeyPool, PooledChatModel
+
+    pool = ApiKeyPool([ApiKey("synthetic", None, "test", max_concurrent=1)])
+    occupied = pool.acquire()
+    model = PooledChatModel(pool, timeout=0.02)
+    started = time.monotonic()
+    try:
+        with pytest.raises(llm_analyzer_base.LLMRuntimeLimitError):
+            if asynchronous:
+                await model.ainvoke("unused")
+            else:
+                model.invoke("unused")
+        assert time.monotonic() - started < 1
+        assert occupied.active_requests == 1
+    finally:
+        pool.release(occupied)
+    assert occupied.active_requests == 0
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_pooled_request_releases_slot_when_client_build_fails(monkeypatch, asynchronous):
+    from contrib.batch_scan.api_pool import ApiKey, ApiKeyPool, PooledChatModel
+
+    key = ApiKey("synthetic", None, "test", max_concurrent=1)
+    model = PooledChatModel(ApiKeyPool([key]), timeout=1)
+    def fail(*args, **kwargs):
+        raise ValueError("synthetic constructor failure")
+    monkeypatch.setattr(model, "_build_llm", fail)
+    with pytest.raises(ValueError, match="synthetic constructor failure"):
+        if asynchronous:
+            await model.ainvoke("unused")
+        else:
+            model.invoke("unused")
+    assert key.active_requests == 0
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_pooled_key_retries_share_one_deadline(monkeypatch, asynchronous):
+    import contrib.batch_scan.api_pool as api_pool
+
+    clock = [0.0]
+    monkeypatch.setattr(api_pool, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    limits, releases = [], []
+    key = object()
+    pool = SimpleNamespace(
+        acquire=lambda **kwargs: key, try_acquire=lambda: key,
+        release=lambda key, **kwargs: releases.append(kwargs),
+    )
+    model = api_pool.PooledChatModel(pool, timeout=2, max_retries=5)
+    def invoke(prompt):
+        clock[0] += 1
+        raise RuntimeError("429 rate limit")
+    async def ainvoke(prompt):
+        return invoke(prompt)
+    def build(key, *, timeout):
+        limits.append(timeout)
+        return SimpleNamespace(invoke=invoke, ainvoke=ainvoke)
+    monkeypatch.setattr(model, "_build_llm", build)
+    with pytest.raises(llm_analyzer_base.LLMRuntimeLimitError):
+        if asynchronous:
+            await model.ainvoke("unused")
+        else:
+            model.invoke("unused")
+    assert limits == [2, 1]
+    assert releases == [{"success": False}, {"success": False}]
+
+
+def test_pooled_client_bounds_connect_and_disables_sdk_retries(monkeypatch):
+    from contrib.batch_scan.api_pool import ApiKey, ApiKeyPool, PooledChatModel
+    import langchain_openai
+
+    key = ApiKey("synthetic", None, "test")
+    observed = {}
+    monkeypatch.setattr(langchain_openai, "ChatOpenAI", lambda **kw: observed.update(kw))
+    PooledChatModel(ApiKeyPool([key]))._build_llm(key, timeout=0.1)
+    assert observed["timeout"].connect == observed["timeout"].read == 0.1
+    assert observed["max_retries"] == 0
