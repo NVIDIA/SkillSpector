@@ -18,7 +18,7 @@
 Reads ``ANTHROPIC_API_KEY`` for credentials and honors ``ANTHROPIC_BASE_URL``
 as an explicit endpoint override (e.g. a local proxy); when unset, requests
 go to api.anthropic.com. Constructs ``langchain_anthropic.ChatAnthropic``
-directly. It defaults to Opus 4.6 for analyzers and Sonnet 4.6 for
+directly. It defaults to Opus 5.5 for analyzers and Sonnet 5.5 for
 ``meta_analyzer`` (cheaper for the high-volume filter pass).
 
 Set ``ANTHROPIC_AUTH_SCHEME=bearer`` when the endpoint expects
@@ -44,7 +44,10 @@ from skillspector.inference_usage import (
     retained_chat_model_controls,
 )
 from skillspector.providers import registry
-from skillspector.providers.chat_models import resolve_reasoning_effort, resolve_sampling_parameters
+from skillspector.providers.chat_models import (
+    resolve_reasoning_effort,
+    resolve_sampling_parameters,
+)
 from skillspector.providers.structured_output import rejects_forced_tool_call
 
 # Default endpoint; overridden by ``ANTHROPIC_BASE_URL`` when set.
@@ -70,9 +73,9 @@ class _ChatAnthropicBearer(ChatAnthropic):
 class AnthropicProvider:
     """Anthropic credentials + bundled-YAML metadata provider."""
 
-    DEFAULT_MODEL = "claude-opus-4-6"
+    DEFAULT_MODEL = "claude-opus-5-5"
     SLOT_DEFAULTS: dict[str, str] = {
-        "meta_analyzer": "claude-sonnet-4-6",
+        "meta_analyzer": "claude-sonnet-5-5",
     }
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
@@ -107,7 +110,7 @@ class AnthropicProvider:
         effort = resolve_reasoning_effort()
         if effort is not None:
             kwargs["effort"] = effort
-        sampling_parameters = resolve_sampling_parameters()
+        sampling_parameters = resolve_sampling_parameters(model)
         kwargs.update(sampling_parameters)
         chat_model_cls = _ChatAnthropicBearer if _use_bearer_auth() else ChatAnthropic
         chat_model = chat_model_cls(**kwargs)
@@ -136,7 +139,7 @@ class AnthropicProvider:
         return user_input or self.SLOT_DEFAULTS.get(slot, "") or self.DEFAULT_MODEL
 
     def structured_output_method(self, model: str) -> str | None:
-        """``with_structured_output`` method for *model*: registry entry, then family prefix, else ``None``."""
+        """``with_structured_output`` method for *model*: registry entry, then Claude name, else ``None``."""
         declared = registry.lookup_structured_output_method(REGISTRY_PATH, model)
         if declared:
             return declared

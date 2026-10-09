@@ -29,10 +29,18 @@ from skillspector.inference_usage import (
     register_chat_model_controls,
     retained_chat_model_controls,
 )
+from skillspector.providers.structured_output import is_gpt_6_1_sol, rejects_sampling_controls
 
 logger = logging.getLogger(__name__)
 MIN_SAMPLING_SEED = -(1 << 63)
 MAX_SAMPLING_SEED = (1 << 63) - 1
+
+# Reasoning efforts GPT-6.1 Sol accepts; it rejects ``none`` and ``minimal``.
+GPT_6_1_SOL_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+class UnsupportedControlError(ValueError):
+    """A requested sampling or reasoning control the model rejects, raised before any request."""
 
 
 def resolve_reasoning_effort() -> str | None:
@@ -69,8 +77,19 @@ def resolve_seed() -> int | None:
     return seed
 
 
-def resolve_sampling_parameters(*, include_seed: bool = False) -> dict[str, float | int]:
-    """Resolve optional, validated sampling controls for hosted providers."""
+def resolve_sampling_parameters(
+    model: str,
+    *,
+    include_seed: bool = False,
+    reasoning_effort: str | None = None,
+    registry_path: str | None = None,
+) -> dict[str, float | int]:
+    """Resolve optional, validated sampling controls for a request to *model*.
+
+    Raises :class:`UnsupportedControlError` when *model* rejects the requested
+    temperature or *reasoning_effort* (see :func:`reject_unsupported_controls`),
+    so every hosted provider applies the same guard before any request.
+    """
     parameters: dict[str, float | int] = {}
     temperature = resolve_temperature()
     if temperature is not None:
@@ -79,7 +98,40 @@ def resolve_sampling_parameters(*, include_seed: bool = False) -> dict[str, floa
     seed = resolve_seed() if include_seed else None
     if seed is not None:
         parameters["seed"] = seed
+    reject_unsupported_controls(model, parameters, reasoning_effort, registry_path=registry_path)
     return parameters
+
+
+def reject_unsupported_controls(
+    model: str,
+    sampling_parameters: dict[str, float | int],
+    reasoning_effort: str | None = None,
+    *,
+    registry_path: str | None = None,
+) -> None:
+    """Raise :class:`UnsupportedControlError` when *model* rejects a requested control.
+
+    Any explicit ``temperature``, ``1.0`` included, fails for GPT-6.1 Sol, the
+    Claude models in ``SAMPLING_REJECTED_MODELS``, and registry entries at
+    *registry_path* declaring ``sampling: rejected``.  GPT-6.1 Sol also accepts
+    only ``GPT_6_1_SOL_REASONING_EFFORTS``.
+    """
+    sol = is_gpt_6_1_sol(model)
+    if "temperature" in sampling_parameters and (
+        sol or rejects_sampling_controls(model, registry_path)
+    ):
+        raise UnsupportedControlError(
+            f"SKILLSPECTOR_TEMPERATURE is not supported by {model}; unset it to use this model"
+        )
+    if (
+        sol
+        and reasoning_effort is not None
+        and reasoning_effort not in GPT_6_1_SOL_REASONING_EFFORTS
+    ):
+        raise UnsupportedControlError(
+            f"SKILLSPECTOR_REASONING_EFFORT={reasoning_effort!r} is not supported by {model}; "
+            f"use one of {', '.join(GPT_6_1_SOL_REASONING_EFFORTS)} or unset it"
+        )
 
 
 def validate_base_url(url: str | None) -> None:
@@ -112,13 +164,14 @@ def create_openai_compatible_chat_model(
     max_tokens: int,
     timeout: float | None = 120,
     default_headers: dict[str, str] | None = None,
-    disabled_params: dict[str, object] | None = None,
+    forced_tool_choice: bool = True,
     default_reasoning_effort: str | None = None,
 ) -> BaseChatModel | None:
     """Create ``ChatOpenAI`` for providers serving OpenAI-compatible endpoints.
 
-    *disabled_params* is passed to ``ChatOpenAI``; ``{"tool_choice": None}``
-    keeps ``with_structured_output`` from forcing a tool call.
+    ``forced_tool_choice=False`` sets ``disabled_params={"tool_choice": None}``
+    so ``with_structured_output`` never forces a tool call; this is the shape
+    ``llm_utils._binds_unforced_tool_call`` looks for.
     """
     if credentials is None:
         return None
@@ -133,12 +186,14 @@ def create_openai_compatible_chat_model(
         "timeout": timeout,
         "default_headers": default_headers,
     }
-    if disabled_params:
-        kwargs["disabled_params"] = disabled_params
+    if not forced_tool_choice:
+        kwargs["disabled_params"] = {"tool_choice": None}
     reasoning_effort = resolve_reasoning_effort()
     if reasoning_effort or default_reasoning_effort:
         kwargs["reasoning_effort"] = reasoning_effort or default_reasoning_effort
-    sampling_parameters = resolve_sampling_parameters(include_seed=True)
+    sampling_parameters = resolve_sampling_parameters(
+        model, include_seed=True, reasoning_effort=reasoning_effort
+    )
     kwargs.update(sampling_parameters)
     chat_model = ChatOpenAI(**kwargs)
     register_chat_model_controls(

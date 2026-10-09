@@ -57,6 +57,7 @@ from skillspector.inspection_ledger import (
     inspection_work_id,
     ledger_event,
 )
+from skillspector.llm_utils import unsupported_control_error
 from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
 from skillspector.models import OCCURRENCE_FINDING_ID_KEY, Finding
@@ -370,6 +371,16 @@ def _write_result(
             console.print(report_body, markup=False)
         else:
             print(report_body)
+
+
+def _exit_on_unsupported_llm_controls(no_llm: bool) -> None:
+    """Exit 2 before any analysis when a configured model rejects a requested control."""
+    if no_llm:
+        return
+    error = unsupported_control_error()
+    if error is not None:
+        err_console.print(f"[red]Error:[/red] {error}")
+        raise typer.Exit(code=2)
 
 
 def _validate_min_coverage(value: float | None) -> float | None:
@@ -735,6 +746,7 @@ def scan(
     except ValueError as exc:
         err_console.print(f"[red]Error:[/red] invalid transitive prefix: {exc}")
         raise typer.Exit(code=2) from exc
+    _exit_on_unsupported_llm_controls(no_llm)
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     pre_scan_ledger_events: list[dict[str, object]] = []
     discovery_console = (
@@ -3450,6 +3462,7 @@ def baseline(
         skillspector baseline ./my-skill/ -o team-baseline.yaml --no-llm
         skillspector scan ./my-skill/ --baseline .skillspector-baseline.yaml
     """
+    _exit_on_unsupported_llm_controls(no_llm)
     result = None
     try:
         if verbose:
