@@ -577,6 +577,63 @@ def test_build_context_path_is_file_not_dir(tmp_path: Path) -> None:
         build_context(state)
 
 
+_PEP263_LATIN1_SOURCE = b"# coding: latin-1\n# caf\xe9\nvalue = 1\n"
+
+
+@pytest.mark.parametrize(
+    ("filename", "source"),
+    [
+        pytest.param("runner.py", _PEP263_LATIN1_SOURCE, id="python-suffix"),
+        pytest.param("runner.pyw", _PEP263_LATIN1_SOURCE, id="python-window"),
+        pytest.param(
+            "runner",
+            b"#!/usr/bin/env python3\n" + _PEP263_LATIN1_SOURCE,
+            id="extensionless-shebang",
+        ),
+    ],
+)
+def test_selected_pep263_python_primary_is_decoded_not_rejected(
+    tmp_path: Path, filename: str, source: bytes
+) -> None:
+    """A supported PEP 263 encoding is the primary's text format, not opaque bytes."""
+    (tmp_path / filename).write_bytes(source)
+
+    result = build_context({"skill_path": str(tmp_path), "primary_file_path": filename})
+
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == filename)
+    assert artifact["disposition"] == ArtifactDisposition.ANALYZED
+    assert "reason" not in artifact
+    assert "café" in result["local_file_cache"][filename]
+    assert not any(
+        event.get("reason_code") == LedgerReason.UNSUPPORTED_PRIMARY_CONTENT
+        for event in result["inspection_ledger"]
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(b"# coding: no-such-codec\n# caf\xe9\nvalue = 1\n", id="unknown-codec"),
+        pytest.param(b"# coding: ascii\n# caf\xe9\nvalue = 1\n", id="invalid-for-codec"),
+    ],
+)
+def test_selected_undecodable_python_primary_remains_fatal(tmp_path: Path, source: bytes) -> None:
+    """Only a successful declared decode lifts the generic UTF-8 primary rejection."""
+    (tmp_path / "runner.py").write_bytes(source)
+
+    result = build_context({"skill_path": str(tmp_path), "primary_file_path": "runner.py"})
+
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == "runner.py")
+    assert artifact["disposition"] == ArtifactDisposition.FAILED
+    assert artifact["reason"] == LedgerReason.UNSUPPORTED_PRIMARY_CONTENT.value
+    assert "runner.py" not in result["local_file_cache"]
+    assert any(
+        event.get("reason_code") == LedgerReason.UNSUPPORTED_PRIMARY_CONTENT
+        and event["outcome"] == LedgerOutcome.FAILED
+        for event in result["inspection_ledger"]
+    )
+
+
 def test_build_context_empty_directory_is_valid_empty_scan(tmp_path: Path) -> None:
     """An existing empty directory is a valid scan target with no components."""
     state: SkillspectorState = {"skill_path": str(tmp_path)}
