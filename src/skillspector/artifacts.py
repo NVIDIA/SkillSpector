@@ -367,9 +367,8 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
 
     # These printable prefixes are also valid instruction text. Keep the
     # claimed binary format's coverage limits, but inspect the readable bytes.
-    readable_binary = (
-        decodable and not contains_nul and data.startswith((b"MZ", b"GIF87a", b"GIF89a", b"%PDF-"))
-    )
+    # Lossy decoding must not let one invalid byte or a binary comment hide text.
+    readable_binary = data.startswith((b"MZ", b"GIF87a", b"GIF89a", b"%PDF-"))
 
     if has_binary_magic:
         kind = ContentKind.BINARY
@@ -391,7 +390,9 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
     )
     disposition = (
         ArtifactDisposition.PARTIAL
-        if readable_binary or (referenced and kind is not ContentKind.TEXT)
+        if referenced and kind is not ContentKind.TEXT
+        else ArtifactDisposition.ANALYZED
+        if readable_binary
         else ArtifactDisposition.OUT_OF_SCOPE
         if kind is ContentKind.BINARY
         else ArtifactDisposition.ANALYZED

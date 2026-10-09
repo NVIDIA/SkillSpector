@@ -3487,6 +3487,7 @@ def _analyze_concealed_executables(
                 concealment_reasons.append("disguised_container")
         concealment = concealment_reasons[0]
         excluded_from_analysis = metadata.get("excluded_from_analysis") is True
+        partially_analyzed_executable = metadata.get("partially_analyzed_executable") is True
         referenced_uninspected = (
             metadata.get("inspection_limitation_reason")
             == LedgerReason.REFERENCED_UNINSPECTED.value
@@ -3499,6 +3500,8 @@ def _analyze_concealed_executables(
                     if referenced_uninspected
                     else "An excluded artifact could not be completely inspected."
                     if inspection_incomplete
+                    else "Readable text was inspected, but binary executable behavior was not analyzed."
+                    if partially_analyzed_executable
                     else "Executable content is excluded from analysis."
                     if excluded_from_analysis
                     else "Executable content is concealed inside a document, hidden, "
@@ -3524,6 +3527,9 @@ def _analyze_concealed_executables(
                     else "A resource, read, or archive-safety limit left excluded content "
                     "outside deterministic inspection coverage."
                     if inspection_incomplete
+                    else "Text-based checks covered the readable projection, but they cannot "
+                    "establish the behavior of the binary executable."
+                    if partially_analyzed_executable
                     else "An executable artifact remains available under the skill install path "
                     "but its content is outside analyzer coverage."
                     if excluded_from_analysis
@@ -3556,6 +3562,7 @@ def _analyze_concealed_executables(
                     "local_only": True,
                     "referenced": metadata.get("referenced") is True,
                     "excluded_from_analysis": excluded_from_analysis,
+                    "partially_analyzed_executable": partially_analyzed_executable,
                     "excluded_inspection_incomplete": inspection_incomplete,
                     "inherited_exclusion_reason": metadata.get("inherited_exclusion_reason"),
                     "inspection_limitation_reason": metadata.get("inspection_limitation_reason"),

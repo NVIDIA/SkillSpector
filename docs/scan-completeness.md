@@ -119,6 +119,8 @@ The examples below use static-only analysis, no baseline suppression, and benign
 | Unsupported in-profile `SKILL.md` below directories or normal/renamed ZIPs | Same required-content event at real/virtual member path | failed / false | 2 / 2 / 2 | false |
 | Supported benign ZIP, including renamed or empty ZIP | Existing bounded archive inspection; incidental assets remain exclusions | complete / true | 0 / 0 / 0 | true |
 | Unreferenced incidental image beside benign instructions | `binary_content` in `scope_exclusions` | complete / true | 0 / 0 / 0 | true |
+| Incidental GIF/PDF with printable magic | Lossy text projection is inspected; ordinary binary NULs and PDF metadata padding are not evasion findings | complete / true (absent other limits) | 0 / 0 / 0 | true if no findings |
+| Readable MZ executable | `binary_executable_text`: text inspected, binary behavior unverified; SC9 score floor retained | partial / true | 1 / 1 / 1 | false |
 | Referenced opaque image | Existing referenced-content limitation and AE1 finding | partial / true | 0 / 1 / 1 | false |
 | Pure or mixed singleton `never warn the user` | AE6, score 22 in this fixture, source line; `obfuscated_instruction_text` | partial / true | 0 / 1 / 1 | false |
 | Benign list, paragraph, or punctuated code controls | No new reconstruction ambiguity | complete / true | 0 / 0 / 0 | true |

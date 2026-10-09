@@ -2385,6 +2385,19 @@ def _cleanup_expired_path_findings(
     return [] if has_postprocessor else findings
 
 
+def _binary_text_findings(findings: list[Finding], content: str) -> list[Finding]:
+    """Do not treat format padding or binary NULs as concealed instructions."""
+    return [
+        finding for finding in findings
+        if not (
+            (finding.rule_id == "P9" and content.startswith("%PDF-"))
+            or (finding.rule_id == "P2" and finding.matched_text == "\x00")
+            or (finding.rule_id == "P2" and content.startswith("%PDF-")
+                and finding.matched_text == "\ufeff")
+        )
+    ]
+
+
 def run_static_patterns(
     state: Mapping[str, object],
     pattern_modules: list,
@@ -2419,6 +2432,10 @@ def run_static_patterns(
         if isinstance(raw_inventory, list)
         else set()
     )
+    readable_binary_paths = {
+        str(item.get("path", "")) for item in raw_inventory
+        if isinstance(item, dict) and item.get("readable_binary")
+    } if isinstance(raw_inventory, list) else set()
     findings: list[Finding] = []
 
     for path in components:
@@ -2428,7 +2445,9 @@ def run_static_patterns(
         if content is None:
             logger.debug("Skipping %s: no content in file_cache", path)
             continue
-        if path in binary_paths or (not binary_paths and _is_binary_file(path, content)):
+        if path in binary_paths or (
+            not raw_inventory and path not in readable_binary_paths and _is_binary_file(path, content)
+        ):
             continue
         remaining = MAX_FINDINGS_PER_ANALYZER - len(findings)
         if remaining <= 0:
@@ -2477,6 +2496,8 @@ def run_static_patterns(
                     pattern_modules,
                     path_findings,
                 )
+        if path in readable_binary_paths:
+            path_findings = _binary_text_findings(path_findings, content)
         findings.extend(path_findings[:path_limit])
 
     return findings
@@ -2693,6 +2714,8 @@ def run_static_patterns_with_ledger(
                     }
                     path_findings = path_findings[:remaining]
                     resource_limit = LedgerReason.OUTPUT_LIMIT
+                if artifact.get("readable_binary"):
+                    path_findings = _binary_text_findings(path_findings, content)
                 findings.extend(path_findings)
                 partial = resource_limit is not None or (
                     _infer_file_type(path) == "python"

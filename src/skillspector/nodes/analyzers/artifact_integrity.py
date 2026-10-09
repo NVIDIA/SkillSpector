@@ -1061,7 +1061,11 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                     format_density, mixed_script, first_nul_line, first_obfuscation_line = (
                         _text_signals(content, budget)
                     )
-                    if artifact.get("contains_nul") and first_nul_line is not None:
+                    if (
+                        artifact.get("contains_nul")
+                        and not artifact.get("readable_binary")
+                        and first_nul_line is not None
+                    ):
                         budget.emit(
                             _finding(
                                 "AE3",

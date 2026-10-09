@@ -993,8 +993,13 @@ def _mark_unanalyzed_executables(
             disposition is ArtifactDisposition.PARTIAL
             and len(raw) < max(0, int(artifact.get("size_bytes", 0)))
         )
+        readable_executable = bool(artifact.get("readable_binary"))
         if content_kind is ContentKind.BINARY:
-            reason = LedgerReason.BINARY_CONTENT
+            reason = (
+                LedgerReason.BINARY_EXECUTABLE_TEXT
+                if readable_executable
+                else LedgerReason.BINARY_CONTENT
+            )
         elif disposition is ArtifactDisposition.OUT_OF_SCOPE:
             reason = LedgerReason.OPAQUE_CONTENT
         elif disposition is ArtifactDisposition.FAILED or incomplete_bytes:
@@ -1023,7 +1028,8 @@ def _mark_unanalyzed_executables(
                 "container_depth": component.get("container_depth", path.count("!/")),
                 "outer_hidden": component.get("outer_hidden", hidden),
                 "concealed_executable": True,
-                "excluded_from_analysis": True,
+                "excluded_from_analysis": not readable_executable,
+                "partially_analyzed_executable": readable_executable,
                 "inherited_exclusion_reason": reason.value,
                 "concealment_reasons": list(dict.fromkeys([*reason_list, reason.value])),
             }
@@ -1035,7 +1041,11 @@ def _mark_unanalyzed_executables(
                 record_type=LedgerRecordType.SYSTEM,
                 phase="coverage_policy",
                 path=path,
-                reason=LedgerReason.EXCLUDED_EXECUTABLE_CONTENT,
+                reason=(
+                    LedgerReason.BINARY_EXECUTABLE_TEXT
+                    if readable_executable
+                    else LedgerReason.EXCLUDED_EXECUTABLE_CONTENT
+                ),
             )
         )
     return events
@@ -3081,7 +3091,9 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             continue
         nested_exclusion_reason = excluded_archive_reasons[outer_path]
         nested_artifact["inherited_exclusion_reason"] = nested_exclusion_reason.value
-        if nested_artifact["disposition"] is ArtifactDisposition.ANALYZED:
+        if nested_artifact["disposition"] is ArtifactDisposition.ANALYZED or (
+            nested_artifact.get("readable_binary") and not nested_artifact.get("reason")
+        ):
             nested_artifact["disposition"] = ArtifactDisposition.OUT_OF_SCOPE
             nested_artifact["reason"] = nested_exclusion_reason.value
         elif nested_artifact["disposition"] is ArtifactDisposition.OUT_OF_SCOPE:
@@ -3206,7 +3218,11 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     selected_primary = state.get("primary_file_path")
     for artifact in artifact_inventory:
         path = artifact["path"]
-        if artifact.get("readable_binary"):
+        if (
+            artifact.get("readable_binary")
+            and artifact.get("referenced")
+            and path not in excluded_nested_components
+        ):
             content_interpretation_events.append(
                 ledger_event(
                     outcome=LedgerOutcome.PARTIAL,
