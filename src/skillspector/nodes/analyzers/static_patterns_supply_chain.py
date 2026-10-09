@@ -1868,7 +1868,8 @@ def _collect_locked_versions_detailed(
             limitations.extend((path, limitation) for limitation in parse_limitations)
         else:
             packages = _extract_packages_from_toml_lock(content, limit=remaining + 1)
-        if len(packages) > remaining:
+        package_limit_exceeded = len(packages) > remaining
+        if package_limit_exceeded:
             limitations.append(
                 (
                     path,
@@ -1897,7 +1898,8 @@ def _collect_locked_versions_detailed(
                     ambiguous_versions.add(key)
                 else:
                     project_versions[normalized_name] = version
-        if limitations:
+        # File-local parse gaps must not prevent resolution in other projects.
+        if package_limit_exceeded:
             break
     return locked_versions, limitations
 
