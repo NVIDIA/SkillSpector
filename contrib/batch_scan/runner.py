@@ -91,13 +91,16 @@ def set_api_pool(pool: "ApiKeyPool | None") -> None:
     if _original_get_chat_model is None:
         _original_get_chat_model = _llm_utils.get_chat_model
 
-    def _pooled_get_chat_model(model=None):
+    def _pooled_get_chat_model(model=None, *, timeout=None):
         if _api_pool:
             from .api_pool import PooledChatModel
-            pooled_model = PooledChatModel(_api_pool)
+            pooled_model = PooledChatModel(
+                _api_pool,
+                timeout=_DEFAULT_REQUEST_TIMEOUT if timeout is None else timeout,
+            )
             _llm_utils.register_chat_model_provider(pooled_model, "openai")
             return pooled_model
-        return _original_get_chat_model(model)
+        return _original_get_chat_model(model=model, timeout=timeout)
 
     _llm_utils.get_chat_model = _pooled_get_chat_model
     _llm_analyzer_base.get_chat_model = _pooled_get_chat_model
@@ -168,7 +171,9 @@ def _sanitize_meta_finding(d: dict) -> dict:
     for key in ("remediation", "explanation"):
         if d.get(key) is None:
             d[key] = ""
-    if d.get("impact") not in ("critical", "high", "medium", "low"):
+    impact = d.get("impact")
+    d["impact"] = impact.casefold() if isinstance(impact, str) else "low"
+    if d["impact"] not in ("critical", "high", "medium", "low"):
         d["impact"] = "low"
     return d
 
@@ -180,12 +185,17 @@ def _patched_meta_parse(self, response, batch):
     text = _strip_markdown_fences(str(response))
     try:
         data = json.loads(text)
+        if isinstance(data, dict) and isinstance(data.get("findings"), list):
+            data["findings"] = [
+                _sanitize_meta_finding(dict(item)) if isinstance(item, dict) else item
+                for item in data["findings"]
+            ]
         result = MetaAnalyzerResult.model_validate(data)
     except (json.JSONDecodeError, ValidationError) as exc:
         raise _StructuredResponseValidationError from exc
     items = []
     for f in result.findings:
-        d = _sanitize_meta_finding(f.model_dump())
+        d = f.model_dump()
         d["_file"] = batch.file_path
         items.append(d)
     return items
@@ -308,12 +318,13 @@ def _verify_patch_targets() -> None:
         "LLMAnalyzerBase.__init__",
         1,
     )
-    _node_param = inspect.signature(LLMAnalyzerBase.__init__).parameters.get("node")
-    if _node_param is None or _node_param.kind != inspect.Parameter.KEYWORD_ONLY:
-        raise RuntimeError(
-            "Patch 1 target changed: LLMAnalyzerBase.__init__ must retain its "
-            "keyword-only 'node' parameter."
-        )
+    for name in ("node", "timeout"):
+        parameter = inspect.signature(LLMAnalyzerBase.__init__).parameters.get(name)
+        if parameter is None or parameter.kind != inspect.Parameter.KEYWORD_ONLY:
+            raise RuntimeError(
+                "Patch 1 target changed: LLMAnalyzerBase.__init__ must retain its "
+                f"keyword-only '{name}' parameter."
+            )
     if not hasattr(LLMAnalyzerBase, "response_schema"):
         raise RuntimeError(
             "Patch 1 target lost: LLMAnalyzerBase no longer has "
@@ -328,7 +339,7 @@ def _verify_patch_targets() -> None:
         "LLMAnalyzerBase.parse_response",
         2,
     )
-    # Deep deps (called inside try/except — silent degradation if broken):
+    # Validate dependencies before patching rather than failing during a scan:
     if not hasattr(LLMAnalysisResult, "model_validate"):
         raise RuntimeError(
             "Patch 2 deep dependency lost: LLMAnalysisResult.model_validate "

@@ -1095,13 +1095,12 @@ def test_use_llm_false_records_nothing() -> None:
     assert "filtered_findings" not in result
 
 
-@pytest.mark.parametrize("field", ["findings", "overall_assessment"])
-@pytest.mark.parametrize("value", ["invalid JSON", "42", '"wrong type"'])
-def test_invalid_stringified_meta_fields_fail_validation(field, value) -> None:
+@pytest.mark.parametrize("value", ["invalid JSON", "", "{not json", "null", "42", '"wrong type"'])
+def test_invalid_stringified_meta_findings_fail_validation(value) -> None:
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
-        MetaAnalyzerResult.model_validate({field: value})
+        MetaAnalyzerResult.model_validate({"findings": value})
 
 
 def test_valid_stringified_meta_fields_are_supported() -> None:
@@ -1119,3 +1118,19 @@ def test_no_findings_records_nothing() -> None:
     result = meta_analyzer(_degr_state(findings=[]))
     assert "llm_call_log" not in result
     assert "filtered_findings" not in result
+
+
+@pytest.mark.parametrize("assessment", ["HIGH risk: exfiltrates credentials", "LOW", ""])
+def test_optional_prose_assessment_keeps_finding_verdict(assessment):
+    verdict = {
+        "pattern_id": "P1", "is_vulnerability": True, "confidence": 0.9,
+        "intent": "malicious", "impact": "high", "explanation": "Unsafe instruction",
+        "remediation": "Remove instruction",
+    }
+    result = MetaAnalyzerResult.model_validate(
+        {"findings": [verdict], "overall_assessment": assessment}
+    )
+    assert len(result.findings) == 1
+    assert result.findings[0].pattern_id == "P1"
+    assert result.findings[0].is_vulnerability is True
+    assert result.overall_assessment is None

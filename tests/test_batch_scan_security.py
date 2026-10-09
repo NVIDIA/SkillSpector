@@ -31,7 +31,7 @@ _SAFE_TEXT = "# 安全助手\n这是一个帮助用户整理资料的安全技�
 
 @pytest.mark.parametrize("analyzer_kind", ["discovery", "meta"])
 @pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("invalid_response", ["not JSON", '{"findings": "invalid"}'])
+@pytest.mark.parametrize("invalid_response", ["not JSON", '{"findings": "invalid"}', "null-confidence", "list-confidence"])
 @pytest.mark.parametrize("recovers", [False, True])
 async def test_compat_parse_failures_retry_and_remain_visible(
     monkeypatch: pytest.MonkeyPatch,
@@ -40,6 +40,16 @@ async def test_compat_parse_failures_retry_and_remain_visible(
     invalid_response: str,
     recovers: bool,
 ) -> None:
+    if invalid_response in {"null-confidence", "list-confidence"}:
+        confidence = None if invalid_response == "null-confidence" else [1]
+        item = (
+            {"rule_id": "P1", "message": "Unsafe instruction", "severity": "HIGH",
+             "start_line": 1, "explanation": "Unsafe", "remediation": "Remove"}
+            if analyzer_kind == "discovery"
+            else {"pattern_id": "P1", "is_vulnerability": True, "intent": "malicious",
+                  "impact": "high", "explanation": "Unsafe", "remediation": "Remove"}
+        )
+        invalid_response = json.dumps({"findings": [dict(item, confidence=confidence)]})
     calls = []
 
     def invoke(prompt):
@@ -601,3 +611,37 @@ def test_scan_forwards_verbose_logging(batch_skill, monkeypatch):
         skill, skill.parent, use_llm=False, lang="en", require_llm=False, verbose=True
     )
     assert levels == ["DEBUG"]
+
+
+@pytest.mark.parametrize("impact", ["High", "none", None, "catastrophic"])
+def test_compat_meta_repairs_soft_fields_before_validation(impact):
+    batch = llm_analyzer_base.Batch(file_path="SKILL.md", content=_SAFE_TEXT)
+    result = runner._patched_meta_parse(
+        None,
+        json.dumps({"findings": [{"pattern_id": "P1", "is_vulnerability": True,
+            "confidence": 0.9, "intent": "malicious", "impact": impact,
+            "explanation": None, "remediation": None}]}),
+        batch,
+    )
+    assert len(result) == 1
+    assert result[0]["impact"] == ("high" if impact == "High" else "low")
+    assert result[0]["explanation"] == result[0]["remediation"] == ""
+    assert result[0]["_file"] == "SKILL.md"
+
+
+@pytest.mark.parametrize("timeout", [None, 7, lambda: 7])
+def test_compat_pooled_constructor_forwards_timeout(monkeypatch, timeout):
+    from contrib.batch_scan.api_pool import PooledChatModel
+
+    pool = object()
+    monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda model: 100_000)
+    # Register and construct the real adapter; invoking it would require a real pool.
+    try:
+        runner.set_api_pool(pool)
+        with runner.deepseek_compat():
+            analyzer = runner.LLMAnalyzerBase("Review", "test", timeout=timeout)
+        assert isinstance(analyzer._llm, PooledChatModel)
+        assert analyzer._llm._pool is pool
+        assert analyzer._llm._timeout == (30 if timeout is None else 7)
+    finally:
+        runner.set_api_pool(None)
