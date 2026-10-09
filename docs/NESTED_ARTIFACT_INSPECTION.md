@@ -63,6 +63,12 @@ makes the analysis incomplete. A result that would otherwise be `SAFE` is report
 a failing gate with `--fail-on-incomplete`. Inspection exceptions and their affected outer or nested
 paths are surfaced in terminal, JSON, Markdown, and SARIF output.
 
+If a real disk path containing `!/` has the same identity as an archive member, the scan
+records `artifact_path_collision`, retains the disk bytes, and withholds the archive member.
+This fails the scan (CLI exit 2 and MCP `safe_to_install=false`). Rename the disk directory
+ending in `!` to remove the ambiguity. Non-colliding directory names ending in `!` remain valid.
+Archive exceptions for a withheld member are reported against its container.
+
 ## SC9: Concealed Executable Artifact
 
 SC9 is a deterministic HIGH finding when executable content is concealed inside an Office document

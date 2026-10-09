@@ -84,6 +84,7 @@ class LedgerReason(StrEnum):
     ARCHIVE_TRUNCATED = "archive_truncated"
     ARCHIVE_UNSAFE_MEMBER_PATH = "archive_unsafe_member_path"
     ARCHIVE_AMBIGUOUS_MEMBER_PATH = "archive_ambiguous_member_path"
+    ARTIFACT_PATH_COLLISION = "artifact_path_collision"
     ARCHIVE_LINK_MEMBER = "archive_link_member"
     ARCHIVE_DEPTH_LIMIT = "archive_depth_limit"
     ARCHIVE_MEMBER_LIMIT = "archive_member_limit"
@@ -173,6 +174,10 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     ),
     LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH: (
         "Archive member name has an ambiguous or duplicate provenance identity."
+    ),
+    LedgerReason.ARTIFACT_PATH_COLLISION: (
+        "A disk path containing '!/' collides with an archive member. Rename the directory "
+        "ending in '!'; the colliding archive member was not analyzed."
     ),
     LedgerReason.ARCHIVE_LINK_MEMBER: "Archive link member was not followed or read.",
     LedgerReason.ARCHIVE_DEPTH_LIMIT: "Nested archive depth limit was reached.",

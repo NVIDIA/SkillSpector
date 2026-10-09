@@ -62,6 +62,7 @@ from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
+    inspection_work_id,
     ledger_event,
 )
 from skillspector.llm_provenance import capture_llm_provenance, capture_static_llm_provenance
@@ -3031,10 +3032,14 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     nested_input_cache = {**raw_file_cache, **excluded_archive_cache}
     nested = inspect_nested_artifacts(
         skill_dir,
-        [
-            *(path for path in ordinary_components if path in raw_file_cache),
-            *excluded_archive_cache,
-        ],
+        sorted(
+            [
+                *(path for path in ordinary_components if path in raw_file_cache),
+                *excluded_archive_cache,
+            ],
+            # Expand real containers before another archive can claim their children.
+            key=lambda path: -path.count("!/"),
+        ),
         raw_file_cache=nested_input_cache,
         max_members=remaining_artifacts,
         max_uncompressed_bytes=remaining_bytes,
@@ -3244,28 +3249,82 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             limitation_reason=limitation_reason,
         )
 
+    # Only an actual collision is fatal: ordinary directories may end in "!".
+    nested_paths = (
+        {item["path"] for item in nested.artifact_inventory}
+        | set(nested.components)
+        | set(nested.file_cache)
+        | set(nested.raw_file_cache)
+    )
+    reserved_paths = {item["path"] for item in artifact_inventory} & nested_paths
+    member_containers = {
+        str(item["path"]): str(item["outer_path"])
+        for item in nested.metadata
+        if item["path"] in reserved_paths and item.get("outer_path")
+    }
+    for path in sorted(reserved_paths):
+        container = member_containers.get(path, path.rsplit("!/", 1)[0])
+        event = ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="nested_artifact_inspection",
+            path=container,
+            reason=LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH,
+        )
+        event["message"] += (
+            f" Archive member {path!r} was not analyzed because it collides with a disk file."
+        )
+        prework_events.append(event)
+    for event in nested.ledger_events:
+        path = event["path"]
+        if path in reserved_paths:
+            event["path"] = member_containers.get(path, path.rsplit("!/", 1)[0])
+            event["work_id"] = inspection_work_id(
+                f"{event['record_type'].value}:{event['phase']}", event["path"], None, None
+            )
+            event["message"] += (
+                f" This applies to withheld archive member {path!r}, not the disk file."
+            )
+    for artifact in artifact_inventory:
+        if artifact["path"] in reserved_paths:
+            artifact["disposition"] = ArtifactDisposition.FAILED
+            artifact["reason"] = LedgerReason.ARTIFACT_PATH_COLLISION.value
+            prework_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="discovery",
+                    path=artifact["path"],
+                    reason=LedgerReason.ARTIFACT_PATH_COLLISION,
+                )
+            )
+    blocked_nested_paths = excluded_nested_components | reserved_paths
+    nested.metadata = [item for item in nested.metadata if item["path"] not in reserved_paths]
+    nested.python_source_classifications = {
+        path: classification
+        for path, classification in nested.python_source_classifications.items()
+        if path not in blocked_nested_paths
+    }
     ordinary_nested_components = [
-        path for path in nested.components if path not in excluded_nested_components
+        path for path in nested.components if path not in blocked_nested_paths
     ]
     local_file_cache = dict(ordinary_file_cache)
     local_file_cache.update(
-        {
-            path: data
-            for path, data in nested.file_cache.items()
-            if path not in excluded_nested_components
-        }
+        {path: data for path, data in nested.file_cache.items() if path not in blocked_nested_paths}
     )
     raw_file_cache.update(
         {
             path: data
             for path, data in nested.raw_file_cache.items()
-            if path not in excluded_nested_components
+            if path not in blocked_nested_paths
         }
     )
-    artifact_inventory.extend(nested.artifact_inventory)
+    artifact_inventory.extend(
+        item for item in nested.artifact_inventory if item["path"] not in reserved_paths
+    )
     for artifact in artifact_inventory:
         override = nested.inventory_overrides.get(artifact["path"])
-        if override is not None:
+        if override is not None and artifact["disposition"] != ArtifactDisposition.FAILED:
             artifact["disposition"], artifact["reason"] = override
     inventory_by_path = {item["path"]: item for item in artifact_inventory}
 
