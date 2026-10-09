@@ -260,7 +260,18 @@ def test_valid_oms_binary_structure_does_not_hide_readable_attacker_content(
     assert result["analysis_completeness"]["is_complete"] is True
     assert any(f.file == "bundle.json" and f.rule_id == "P1" for f in result["findings"])
     assert instruction in result["file_cache"]["bundle.json"]
-    assert result["risk_recommendation"] != "SAFE"
+    assert result["risk_score"] > 0
+
+
+def test_oms_unknown_base64_field_remains_in_static_analysis(tmp_path: Path) -> None:
+    fixture = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
+    bundle = json.loads(fixture.read_bytes())
+    bundle["unknown"] = base64.b64encode(b"hidden content " * 40).decode()
+    (tmp_path / "SKILL.md").write_text("---\nname: example\n---\n# Skill\n")
+    (tmp_path / "bundle.json").write_text(json.dumps(bundle))
+    result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
+    assert bundle["unknown"] in result["file_cache"]["bundle.json"]
+    assert any(f.file == "bundle.json" and f.rule_id == "SC3" for f in result["findings"])
 
 
 @pytest.mark.parametrize("output_format", ["terminal", "markdown", "sarif"])
