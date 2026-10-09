@@ -779,6 +779,35 @@ def run_one(
             entry["issues"] = list(entry.get("issues", [])) + annotate_findings(
                 [finding.to_dict() for finding in gap_findings], detected_language
             )
+            if gap_findings:
+                from skillspector.nodes.report import _compute_risk_score
+
+                findings = result.get(
+                    "active_findings",
+                    result.get("filtered_findings", result.get("findings", [])),
+                )
+                if not isinstance(findings, list):
+                    findings = []
+                component_metadata = result.get("component_metadata")
+                if not isinstance(component_metadata, list):
+                    component_metadata = []
+                score, severity, recommendation = _compute_risk_score(
+                    findings + gap_findings,
+                    bool(result.get("has_executable_scripts", False)),
+                    component_metadata,
+                )
+                risk_assessment = entry.get("risk_assessment")
+                if (
+                    recommendation == "SAFE"
+                    and isinstance(risk_assessment, dict)
+                    and risk_assessment.get("recommendation") == "CAUTION"
+                ):
+                    recommendation = "CAUTION"
+                entry["risk_assessment"] = {
+                    "score": score,
+                    "severity": severity,
+                    "recommendation": recommendation.replace("_", " "),
+                }
             entry["enhancements"]["gap_fill_applied"] = True
             entry["enhancements"]["gap_fill_findings"] = len(gap_findings)
         return entry, None
