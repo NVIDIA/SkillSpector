@@ -227,7 +227,9 @@ def test_forged_oms_bundle_cannot_hide_content_behind_a_complete_verdict(
     )
 
 
-@pytest.mark.parametrize("carrier", ["payload", "wrapper", "signature", "signature_unicode", "certificate"])
+@pytest.mark.parametrize(
+    "carrier", ["payload", "wrapper", "signature", "signature_unicode", "certificate"]
+)
 def test_valid_oms_binary_structure_does_not_hide_readable_attacker_content(
     tmp_path: Path, carrier: str
 ) -> None:
