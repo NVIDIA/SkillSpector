@@ -25,6 +25,7 @@ Framework: ASI10.
 from __future__ import annotations
 
 import re
+import shlex
 import sys
 from bisect import bisect_right
 
@@ -33,8 +34,9 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import LOGICAL_LINE_BREAK, get_context_from_lines
+from .common import LINE_BREAK_CHARS, LOGICAL_LINE_BREAK, get_context_from_lines
 from .pattern_defaults import PatternCategory
+from .prohibition_context import is_directly_prohibited
 
 logger = get_logger(__name__)
 
@@ -154,6 +156,36 @@ _PROTECTED_UPDATE_SUBJECT_PARTS = frozenset(
     {"agent", "assistant", "self", "skill", "skillspector", "tool"}
 )
 _MAX_COMPANION_UPDATE_LINE_CHARS = 4_096
+_HIDDEN_DIRECTORY_WRITE_PATTERN = (
+    rf"(?:create|write|mkdir)(?:[ \t]|\\\r?\n)+(?:[^|&;{LINE_BREAK_CHARS}]|\\\r?\n)*"
+    r"(?:~/|/home/|/tmp/)\.(?!git|ssh|aws)[a-z_-]+"
+)
+_STANDARD_SKILL_MKDIR = re.compile(
+    r"[ \t]*mkdir[ \t]+(?:(?:-p|--parents)[ \t]+)?(?:--[ \t]+)?"
+    r"(?P<quote>['\"]?)(?P<target>~/\.(?:claude|codex|gemini)/skills"
+    r"(?:/[a-zA-Z0-9][a-zA-Z0-9_.-]*)?)/?(?P=quote)[ \t]*"
+)
+# Anything that may address a skills root: any agent configuration directory,
+# a "skills" path segment, or a shell parameter expansion or command
+# substitution. Quoting, duplicate or dot path segments, other home spellings,
+# globs, cd plus relative paths and variables must not make a nearby writer
+# look unrelated to the created directory. Prose such as "skills directory" or
+# "$0" is not a path or an expansion.
+_SKILLS_ROOT = re.compile(
+    r"\.(?:claude|codex|gemini)\b|/skills\b|\bskills/|\$(?:\{|\(|[A-Za-z_@*])",
+    re.IGNORECASE,
+)
+_SKILL_INSTALL_PATH = re.compile(
+    r"(?:~/|\$(?:HOME|\{HOME\})/|/home/[^/\s]+/)"
+    r"(?P<relative>\.(?:claude|codex|gemini)/skills(?:/[a-zA-Z0-9][a-zA-Z0-9_.-]*)*)/?"
+)
+_CLONE_URL = re.compile(
+    r"(?:(?:https?|git|ssh)://[a-zA-Z0-9._~:/%@+-]+"
+    r"|[a-zA-Z0-9_.-]+@[a-zA-Z0-9_.-]+:[a-zA-Z0-9._~/-]+)"
+)
+_SKILL_CONTEXT_LINE = re.compile(rf"[^{LINE_BREAK_CHARS}]+")
+_NON_WHITESPACE = re.compile(r"\S")
+_MAX_SKILL_INSTALL_CONTEXT_CHARS = 4_096
 
 # RA2: Session Persistence — unauthorized persistence across boundaries
 RA2_CODE_PATTERNS = [
@@ -164,7 +196,7 @@ RA2_CODE_PATTERNS = [
         0.8,
     ),
     # Hidden files and directories for persistence
-    (r"(?:create|write|mkdir)\s+[^|]*(?:~/|/home/|/tmp/)\.(?!git|ssh|aws)[a-z_-]+", 0.6),
+    (_HIDDEN_DIRECTORY_WRITE_PATTERN, 0.6),
     # Background processes
     (r"(?:nohup|disown|setsid)\s+", 0.65),
     # Registry / plist for Windows/macOS persistence
@@ -290,12 +322,33 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in RA2_PATTERNS:
-        matches = (
-            static_runner.iter_paragraph_matches
-            if (pattern, confidence) in RA2_PROSE_PATTERNS
-            else re.finditer
-        )
+        is_prose = (pattern, confidence) in RA2_PROSE_PATTERNS
+        matches = static_runner.iter_paragraph_matches if is_prose else re.finditer
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            if is_prose and is_directly_prohibited(content, match.start(), match.end()):
+                continue
+            if pattern == _HIDDEN_DIRECTORY_WRITE_PATTERN:
+                line_start, line_end = _logical_line_bounds(
+                    content, match.start(), line_starts, line_ends
+                )
+                # Creating a conventional installation directory alone does not
+                # establish persistence. Only exempt a complete simple command;
+                # extra targets, shell composition, writes, and traversal stay
+                # findings even when they mention the same skills directory.
+                standard_mkdir = _STANDARD_SKILL_MKDIR.fullmatch(content[line_start:line_end])
+                if standard_mkdir:
+                    unsafe_context = _unsafe_skill_install_context(
+                        content,
+                        line_start,
+                        standard_mkdir.group("target"),
+                        line_starts,
+                        line_ends,
+                    )
+                    if unsafe_context is None:
+                        continue
+                    # Preserve evidence for the nearby skills-root operation.
+                    # Unknown or clipped syntax keeps the mkdir's own evidence.
+                    match = unsafe_context
             line_num = bisect_right(line_starts, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -311,6 +364,74 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     return findings
+
+
+def _unsafe_skill_install_context(
+    content: str,
+    mkdir_line_start: int,
+    target: str,
+    line_starts: tuple[int, ...],
+    line_ends: tuple[int, ...],
+) -> re.Match[str] | None:
+    """Retain persistence when nearby skills-root use is not a simple install.
+
+    Inspect every neighboring logical line within a 4 KiB window.
+    Blank lines do not prove independence. Any possible skills-root reference
+    (however spelled) retains detection unless the complete line is a simple
+    clone into the target.
+    Composition, parse errors, alternate writers and destinations are unsafe.
+    """
+    mkdir_line_index = bisect_right(line_starts, mkdir_line_start) - 1
+    radius = _MAX_SKILL_INSTALL_CONTEXT_CHARS // 2
+    context_start = max(0, mkdir_line_start - radius)
+    context_end = min(len(content), mkdir_line_start + radius)
+    mkdir_evidence = _SKILL_CONTEXT_LINE.match(
+        content, mkdir_line_start, line_ends[mkdir_line_index]
+    )
+
+    for direction in (1, -1):
+        line_index = mkdir_line_index + direction
+        while 0 <= line_index < len(line_starts):
+            start, end = line_starts[line_index], line_ends[line_index]
+            if start >= context_end or end <= context_start:
+                # A line can end exactly at the window edge. Uninspected
+                # content beyond the window cannot prove independence.
+                beyond = (
+                    _NON_WHITESPACE.search(content, context_end)
+                    if direction > 0
+                    else _NON_WHITESPACE.search(content, 0, context_start)
+                )
+                if beyond is not None:
+                    return mkdir_evidence
+                break
+            if start < context_start or end > context_end:
+                return mkdir_evidence
+            line = content[start:end]
+            if _SKILLS_ROOT.search(line) and not _is_simple_skill_clone(line, target):
+                return _SKILL_CONTEXT_LINE.match(content, start, end)
+            line_index += direction
+    return None
+
+
+def _is_simple_skill_clone(line: str, target: str) -> bool:
+    """Recognize only git clone <literal URL> <target or child directory>."""
+    if _SHELL_COMMAND_COMPOSITION.search(line) or "`" in line:
+        return False
+    try:
+        tokens = shlex.split(line, posix=True)
+    except ValueError:
+        return False
+    if len(tokens) != 4 or tokens[:2] != ["git", "clone"]:
+        return False
+    if _CLONE_URL.fullmatch(tokens[2]) is None:
+        return False
+    destination = _SKILL_INSTALL_PATH.fullmatch(tokens[3])
+    created = _SKILL_INSTALL_PATH.fullmatch(target)
+    if destination is None or created is None:
+        return False
+    relative = destination.group("relative")
+    created_relative = created.group("relative")
+    return relative == created_relative or relative.startswith(f"{created_relative}/")
 
 
 def _is_signed_companion_cli_update(
