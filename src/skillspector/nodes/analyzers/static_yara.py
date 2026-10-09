@@ -61,6 +61,7 @@ from skillspector.state import (
 )
 
 from .pattern_defaults import PatternCategory
+from .prohibition_context import PROMPT_REVEAL_TAIL, is_directly_prohibited
 from .static_runner import (
     MAX_FINDINGS_PER_ANALYZER,
     MAX_FINDINGS_PER_ARTIFACT,
@@ -120,6 +121,16 @@ _RANSOMWARE_MINIMUM_PAYMENT = re.compile(
 _RANSOMWARE_STORAGE_CONTINUATION = re.compile(
     rb"[ \t]+(?:at[ \t]+rest|in[ \t]+transit)\b", re.IGNORECASE
 )
+_PROMPT_INJECTION_NAMESPACE = "agent_skills"
+_PROMPT_INJECTION_RULE = "agent_skill_prompt_injection_hidden_instructions"
+_PROMPT_REVEAL_IDENTIFIER = "$inj_reveal_prompt"
+# Mirror only this built-in YARA string. A bounded byte rescan is necessary:
+# fast=True can omit a later affirmative instance after the first prohibition.
+_PROMPT_REVEAL_PATTERN = re.compile(
+    rb"(reveal|print|dump|expose|show)\s+(the\s+)?(system|developer)\s+(prompt|message|instructions)",
+    re.IGNORECASE,
+)
+_PROMPT_CONTEXT_BYTES = 2_052  # More than 512 complete UTF-8 characters per side.
 MAX_YARA_MATCH_INSTANCES_PER_RULE = 4_096
 MAX_YARA_RULE_FILES = 1_024
 MAX_YARA_RULE_DIRECTORY_ENTRIES = 10_000
@@ -954,6 +965,82 @@ def _accepted_builtin_ransomware_instances(
     return accepted
 
 
+@dataclass(frozen=True, slots=True)
+class _PromptRevealInstance:
+    """A full raw-byte instance rediscovered after YARA's fast scan."""
+
+    offset: int
+    matched_data: bytes
+    matched_length: int
+
+
+def _is_prohibited_prompt_reveal(data: bytes, start: int, end: int) -> bool:
+    """Preserve UTF-8 offsets and clipped-context safeguards for one instance."""
+    left = max(0, start - _PROMPT_CONTEXT_BYTES)
+    right = min(len(data), end + _PROMPT_CONTEXT_BYTES)
+    prefix = data[left:start].decode("utf-8", errors="replace")
+    action = data[start:end].decode("utf-8", errors="replace")
+    suffix = data[end:right].decode("utf-8", errors="replace")
+    # Sentinels prevent the helper from mistaking a clipped window for the
+    # complete source document, even at a multibyte decoding boundary.
+    if left:
+        prefix = "x" + prefix
+    if right < len(data):
+        suffix += "x"
+    return is_directly_prohibited(
+        prefix + action + suffix,
+        len(prefix),
+        len(prefix) + len(action),
+        allowed_tail=PROMPT_REVEAL_TAIL,
+        allow_yara_continuation=True,
+    )
+
+
+def _filter_prohibited_prompt_reveals(
+    instances: list[tuple[str, object]], data: bytes
+) -> tuple[list[tuple[str, object]], bool]:
+    """Filter only direct prohibitions of the built-in prompt-reveal string.
+
+    Other injection strings retain their ordinary meaning. Reconstruct all
+    reveal instances within the existing record limit; an incomplete rescan
+    cannot justify suppression and retains the original finding as partial.
+    """
+    if not any(identifier == _PROMPT_REVEAL_IDENTIFIER for identifier, _ in instances):
+        return instances, False
+    retained = [item for item in instances if item[0] != _PROMPT_REVEAL_IDENTIFIER]
+    removed = False
+    scanned = len(retained)
+    for occurrence in _PROMPT_REVEAL_PATTERN.finditer(data):
+        scanned += 1
+        if scanned > MAX_YARA_MATCH_INSTANCES_PER_RULE:
+            return instances, True
+        if _is_prohibited_prompt_reveal(data, occurrence.start(), occurrence.end()):
+            removed = True
+            continue
+        retained.append(
+            (
+                _PROMPT_REVEAL_IDENTIFIER,
+                _PromptRevealInstance(
+                    occurrence.start(), occurrence.group(), occurrence.end() - occurrence.start()
+                ),
+            )
+        )
+    if not removed:
+        return instances, False
+
+    identifiers = {identifier for identifier, _ in retained}
+    hidden = {identifier for identifier in identifiers if identifier.startswith("$hidden_")}
+    injections = {identifier for identifier in identifiers if identifier.startswith("$inj_")}
+    # Match the built-in condition after filtering: hidden evidence, or agent
+    # context plus an injection, or two distinct injection string identifiers.
+    if not (hidden or ("$agent_context" in identifiers and injections) or len(injections) >= 2):
+        return [], False
+    # Incidental context such as an opening "LLM" must not locate a remaining
+    # malicious instruction at the earlier defensive sentence. Keep all actual
+    # injection/hidden evidence for the report and its full-match fingerprint.
+    return [item for item in retained if item[0] != "$agent_context"], False
+
+
 def _parse_meta(match: yara.Match) -> tuple[str, Severity, float, str | None]:
     """Extract rule_id, severity, confidence, and description from a YARA match's meta."""
     meta: dict[str, object] = match.meta or {}
@@ -1060,6 +1147,15 @@ def _match_file(
             break
         instances, limited = _bounded_match_instances(match)
         instance_limited = instance_limited or limited
+        if (
+            match.namespace == _PROMPT_INJECTION_NAMESPACE
+            and match.rule == _PROMPT_INJECTION_RULE
+            and not limited
+        ):
+            instances, prompt_limited = _filter_prohibited_prompt_reveals(instances, data)
+            instance_limited = instance_limited or prompt_limited
+            if not instances:
+                continue
         if (
             match.namespace == _DESTRUCTIVE_AUTONOMY_NAMESPACE
             and match.rule == _DESTRUCTIVE_AUTONOMY_RULE
