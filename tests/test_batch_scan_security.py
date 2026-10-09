@@ -128,7 +128,9 @@ def test_gap_fill_provider_prompt_excludes_symlink_target(
     assert entry["issues"] == []
 
 
-@pytest.mark.parametrize("failure_mode", ["json", "schema", "provider", "runtime_signal", "missing_findings"])
+@pytest.mark.parametrize(
+    "failure_mode", ["json", "schema", "provider", "runtime_signal", "missing_findings"]
+)
 @pytest.mark.parametrize("partial_success", [False, True])
 def test_gap_fill_failure_is_incomplete_and_preserves_findings(
     batch_skill, monkeypatch: pytest.MonkeyPatch, failure_mode, partial_success
@@ -695,7 +697,9 @@ def test_gap_fill_setup_failure_retains_core_findings(batch_skill, monkeypatch, 
     assert entry["analysis_completeness"]["is_complete"] is False
     assert entry["execution_successful"] is False
     assert entry["enhancements"]["gap_fill_error_reasons"] == ["llm_batch_failed"]
-    assert any(row["path"] == "SKILL.md" for row in entry["analysis_completeness"]["ledger_exceptions"])
+    assert any(
+        row["path"] == "SKILL.md" for row in entry["analysis_completeness"]["ledger_exceptions"]
+    )
 
 
 def test_gap_fill_real_deadline_stops_retries_and_keeps_core(batch_skill, monkeypatch):
@@ -706,15 +710,23 @@ def test_gap_fill_real_deadline_stops_retries_and_keeps_core(batch_skill, monkey
     _mock_scan(monkeypatch, lambda context: context.update(findings=[core]))
     monkeypatch.setattr(runner, "run_gap_fill", run_gap_fill)
     calls = []
+
     def invoke(prompt):
         calls.append(prompt)
         return AIMessage(content="not JSON")
-    monkeypatch.setattr(llm_analyzer_base, "get_chat_model", lambda **kw: SimpleNamespace(invoke=invoke))
+
+    monkeypatch.setattr(
+        llm_analyzer_base, "get_chat_model", lambda **kw: SimpleNamespace(invoke=invoke)
+    )
     monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda model: 100_000)
     started = time.monotonic()
     with runner.deepseek_compat():
         entry, error = runner.run_one(
-            skill, skill.parent, use_llm=True, detected_language="zh", apply_gap_fill=True,
+            skill,
+            skill.parent,
+            use_llm=True,
+            detected_language="zh",
+            apply_gap_fill=True,
             timeout=0.3,
         )
     assert time.monotonic() - started < 2
@@ -752,8 +764,10 @@ async def test_pooled_request_releases_slot_when_client_build_fails(monkeypatch,
 
     key = ApiKey("synthetic", None, "test", max_concurrent=1)
     model = PooledChatModel(ApiKeyPool([key]), timeout=1)
+
     def fail(*args, **kwargs):
         raise ValueError("synthetic constructor failure")
+
     monkeypatch.setattr(model, "_build_llm", fail)
     with pytest.raises(ValueError, match="synthetic constructor failure"):
         if asynchronous:
@@ -772,18 +786,23 @@ async def test_pooled_key_retries_share_one_deadline(monkeypatch, asynchronous):
     limits, releases = [], []
     key = object()
     pool = SimpleNamespace(
-        acquire=lambda **kwargs: key, try_acquire=lambda: key,
+        acquire=lambda **kwargs: key,
+        try_acquire=lambda: key,
         release=lambda key, **kwargs: releases.append(kwargs),
     )
     model = api_pool.PooledChatModel(pool, timeout=2, max_retries=5)
+
     def invoke(prompt):
         clock[0] += 1
         raise RuntimeError("429 rate limit")
+
     async def ainvoke(prompt):
         return invoke(prompt)
+
     def build(key, *, timeout):
         limits.append(timeout)
         return SimpleNamespace(invoke=invoke, ainvoke=ainvoke)
+
     monkeypatch.setattr(model, "_build_llm", build)
     with pytest.raises(llm_analyzer_base.LLMRuntimeLimitError):
         if asynchronous:
@@ -795,8 +814,9 @@ async def test_pooled_key_retries_share_one_deadline(monkeypatch, asynchronous):
 
 
 def test_pooled_client_bounds_connect_and_disables_sdk_retries(monkeypatch):
-    from contrib.batch_scan.api_pool import ApiKey, ApiKeyPool, PooledChatModel
     import langchain_openai
+
+    from contrib.batch_scan.api_pool import ApiKey, ApiKeyPool, PooledChatModel
 
     key = ApiKey("synthetic", None, "test")
     observed = {}
