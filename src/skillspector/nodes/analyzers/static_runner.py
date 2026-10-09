@@ -3142,10 +3142,18 @@ def run_static_patterns_with_ledger(
                     reason=partial_reason if partial else None,
                     emitted_finding_ids=[finding.finding_id for finding in path_findings],
                     observed_characters=(
-                        len(content) if partial_reason is LedgerReason.SIZE_LIMIT else None
+                        int(resource_metrics["observed_characters"])
+                        if "observed_characters" in resource_metrics
+                        else len(content)
+                        if partial_reason is LedgerReason.SIZE_LIMIT
+                        else None
                     ),
                     limit_characters=(
-                        MAX_FILE_CHARS if partial_reason is LedgerReason.SIZE_LIMIT else None
+                        int(resource_metrics["limit_characters"])
+                        if "limit_characters" in resource_metrics
+                        else MAX_FILE_CHARS
+                        if partial_reason is LedgerReason.SIZE_LIMIT
+                        else None
                     ),
                     observed_findings=(
                         int(resource_metrics.get("observed_findings", len(path_findings)))
