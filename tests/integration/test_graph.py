@@ -268,10 +268,10 @@ def test_oms_unknown_base64_field_remains_in_static_analysis(tmp_path: Path) -> 
     bundle = json.loads(fixture.read_bytes())
     bundle["unknown"] = base64.b64encode(b"hidden content " * 40).decode()
     (tmp_path / "SKILL.md").write_text("---\nname: example\n---\n# Skill\n")
-    (tmp_path / "bundle.json").write_text(json.dumps(bundle))
+    (tmp_path / "skill.oms.sig").write_text(json.dumps(bundle))
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
-    assert bundle["unknown"] in result["file_cache"]["bundle.json"]
-    assert any(f.file == "bundle.json" and f.rule_id == "SC3" for f in result["findings"])
+    assert bundle["unknown"] in result["file_cache"]["skill.oms.sig"]
+    assert any(f.file == "skill.oms.sig" and f.rule_id == "SC3" for f in result["findings"])
 
 
 @pytest.mark.parametrize("output_format", ["terminal", "markdown", "sarif"])
