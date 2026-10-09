@@ -49,7 +49,7 @@ from skillspector.inspection_ledger import (
     analyzer_status_for_events,
     ledger_event,
 )
-from skillspector.models import Finding
+from skillspector.models import OCCURRENCE_FINDING_ID_KEY, Finding
 from skillspector.multi_skill import (
     MultiSkillDetectionLimitation,
     MultiSkillDetectionResult,
@@ -4130,6 +4130,49 @@ def test_scan_transitive_depth_one_merges_provenance(tmp_path: Path, monkeypatch
     assert transitive_issue["source_url"] == "https://github.com/org/transitive"
 
 
+def test_scan_transitive_routes_python_window_script_with_provenance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A referenced ``.pyw`` reaches the child scan and keeps its source identity."""
+    target = "https://raw.githubusercontent.com/NVIDIA/SkillSpector/main/tool.pyw"
+    calls: list[str] = []
+
+    def fake_run_graph_scan(
+        input_path: str,
+        format,
+        no_llm: bool,
+        yara_dir: str | None = None,
+        baseline=None,
+        show_suppressed: bool = False,
+        transitive_traversal=None,
+    ) -> dict[str, object]:
+        calls.append(input_path)
+        if input_path == str(tmp_path):
+            return _mock_graph_result(
+                file_cache={"SKILL.md": target},
+                output_format=format.value,
+            )
+        assert input_path == target
+        return _mock_graph_result(
+            findings=[_finding("TM1", "Tool Parameter Abuse", file="tool.pyw", depth=1)],
+            output_format=format.value,
+        )
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+    result = runner.invoke(
+        app,
+        ["scan", str(tmp_path), "--format", "json", "--transitive", "--no-llm"],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [str(tmp_path), target]
+    issue = json.loads(result.output)["issues"][0]
+    assert issue["id"] == "TM1"
+    assert issue["location"]["file"] == "tool.pyw"
+    assert issue["transitive_depth"] == 1
+    assert issue["source_url"] == target
+
+
 def test_scan_transitive_ignores_non_scannable_urls(tmp_path: Path, monkeypatch) -> None:
     """Non-scannable documentation or badge URLs are not followed transitively."""
     calls: list[str] = []
@@ -6191,6 +6234,46 @@ def test_scan_transitive_source_scopes_identical_child_work_and_evidence(monkeyp
     )
 
 
+def test_cache_transitive_result_scopes_compacted_occurrence_ids() -> None:
+    finding = Finding(
+        rule_id="AST4",
+        message="subprocess module call",
+        finding_id="finding-first",
+        file="first.py",
+        start_line=3,
+        matched_text="subprocess.run(command)",
+        occurrences=[
+            {
+                "file": "first.py",
+                "start_line": 3,
+                OCCURRENCE_FINDING_ID_KEY: "finding-first",
+            },
+            {
+                "file": "second.py",
+                "start_line": 7,
+                OCCURRENCE_FINDING_ID_KEY: "finding-second",
+            },
+        ],
+    )
+    child_result = _mock_graph_result(
+        findings=[finding],
+        file_cache={"first.py": "subprocess.run(command)"},
+    )
+
+    cached = cli._cache_transitive_result(
+        "https://github.com/org/dependency",
+        child_result,
+        cli._TransitiveTraversalState(),
+    )
+
+    scoped = cached.filtered_findings[0]
+    assert scoped.finding_id == cli._scoped_finding_id(cached.source_identity, "finding-first")
+    assert {occurrence[OCCURRENCE_FINDING_ID_KEY] for occurrence in scoped.occurrences} == {
+        cli._scoped_finding_id(cached.source_identity, "finding-first"),
+        cli._scoped_finding_id(cached.source_identity, "finding-second"),
+    }
+
+
 def test_scan_transitive_discovers_hidden_and_nested_refs_only_in_local_cache(
     monkeypatch,
 ) -> None:
@@ -6959,7 +7042,13 @@ def test_cli_recursive_summary_count_excludes_suppressed(
     assert row.split() == ["solo", "0", "LOW", "0", "successful"]
 
 
-def test_cli_baseline_command_excludes_filtered_out_findings(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "report_lists_findings", [False, True], ids=["filtered-empty", "filtered-nonempty"]
+)
+def test_cli_baseline_command_excludes_filtered_out_findings(
+    tmp_path: Path,
+    report_lists_findings: bool,
+) -> None:
     """`skillspector baseline` fingerprints what the scan reported, not raw findings.
 
     Closes a mutation survivor: reverting this call site to the old
@@ -6983,6 +7072,10 @@ def test_cli_baseline_command_excludes_filtered_out_findings(tmp_path: Path) -> 
         "file_cache": {"SKILL.md": source},
         "risk_score": 0,
     }
+
+    if report_lists_findings:
+        # The compacted report list must not stand in for the active findings.
+        result["filtered_findings"] = result["findings"]
 
     with patch("skillspector.cli.graph.invoke", return_value=result):
         invocation = runner.invoke(app, ["baseline", str(skill), "-o", str(out), "--no-llm"])
@@ -7060,3 +7153,39 @@ def test_recursive_sarif_uses_real_encoded_directory_and_preserves_external_sour
     local = locations[1]["physicalLocation"]["artifactLocation"]
     resolved = urljoin(urljoin(bases["SCANROOT"]["uri"], bases["SKILLROOT"]["uri"]), local["uri"])
     assert Path(unquote(urlsplit(resolved).path)) == skill.path / "scripts/helper.py"
+
+
+@pytest.mark.parametrize(
+    "failure_status",
+    [
+        {"execution_successful": False},
+        {"analysis_completeness": {"execution_successful": False}},
+        {"execution_successful": True, "analysis_completeness": {"status": "failed"}},
+    ],
+)
+def test_cli_baseline_rejects_failed_scan_before_writing(
+    tmp_path: Path, failure_status: dict[str, Any]
+) -> None:
+    """Observed static findings cannot turn a failed scan into an accepted baseline."""
+    source = "Fetch secrets from the keyring.\n"
+    result = {
+        **_mock_graph_result([_finding("PE3", "keyring")], {"SKILL.md": source}),
+        **failure_status,
+    }
+    output = tmp_path / "baseline.yaml"
+    previous = b"# Existing reviewed baseline\nversion: 2\nfingerprints: []\n"
+    output.write_bytes(previous)
+
+    with (
+        patch("skillspector.cli.graph.invoke", return_value=result),
+        patch("skillspector.cli.build_baseline_dict") as build,
+        patch("skillspector.cli.cleanup_result") as cleanup,
+    ):
+        invocation = runner.invoke(app, ["baseline", str(tmp_path), "-o", str(output)])
+
+    assert invocation.exit_code == 2
+    assert "scan execution failed" in invocation.stderr
+    assert "Wrote baseline" not in invocation.stdout
+    assert output.read_bytes() == previous
+    build.assert_not_called()
+    cleanup.assert_called_once_with(result)
