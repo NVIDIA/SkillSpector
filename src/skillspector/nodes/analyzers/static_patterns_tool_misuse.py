@@ -238,7 +238,7 @@ def _iter_variable_shell_flag_matches(content: str) -> Iterator[re.Match[str]]:
             while whitespace_start > consumed and content[whitespace_start - 1].isspace():
                 whitespace_start -= 1
             newline = content.find("\n", whitespace_start, header.start())
-            start = newline + 1 if newline >= 0 else header.start()
+            start = 0 if whitespace_start == 0 else newline + 1 if newline >= 0 else header.start()
             prefix = _VARIABLE_SHELL_PREFIX_RE.match(content, start)
             if prefix is None:
                 continue

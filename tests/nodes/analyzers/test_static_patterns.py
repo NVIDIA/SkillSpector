@@ -2794,11 +2794,12 @@ def test_word_boundary_shortcuts_keep_python_spans(pattern):
     "name,reference", [("ıx", "IX"), ("İx", "IX"), ("ſx", "sx"), ("µx", "μx"), ("flag", "flag")]
 )
 @pytest.mark.parametrize("gap", ["", "\n\n", " " * 100 + "\n\n"])
-def test_variable_shell_backreferences_keep_python_spans(name, reference, gap):
+@pytest.mark.parametrize("prefix", ["", "# Unicode context ©\n", "\n", "\n\n"])
+def test_variable_shell_backreferences_keep_python_spans(name, reference, gap, prefix):
     from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
 
     content = (
-        "# Unicode context ©\n"
+        prefix
         + gap
         + f"{name} = True\nflag = True\n"
         + f"subprocess.run((cmd), shell={name}); subprocess.run(cmd, shell={reference}); subprocess.run(cmd, shell=flag)\n"
@@ -2883,3 +2884,18 @@ def test_variable_shell_scope_parses_once_after_main_reconciliation(monkeypatch)
     findings = module.analyze(content, "tool.py", "python")
     assert sum(finding.rule_id == "TM1" for finding in findings) >= 100
     assert calls == {"parse": 1, "index": 1}
+
+
+def test_variable_shell_argument_limit_reaches_incomplete_ledger():
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
+
+    content = "flag = True\nsubprocess.run(cmd, shell=flag, " + "x" * 4096 + ", shell=flag)"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["tool.py"], "file_cache": {"tool.py": content}}, [module]
+    )
+    assert any(
+        event["outcome"] == "partial"
+        and event["reason_code"] == "static_parse_limit"
+        and event["limit_characters"] == 4096
+        for event in result["inspection_ledger"]
+    )
