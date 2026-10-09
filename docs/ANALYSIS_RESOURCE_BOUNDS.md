@@ -341,8 +341,7 @@ in prompt injection, tool misuse, data exfiltration, supply chain, agent snoopin
 excessive agency, memory poisoning, and rogue agents. Through paragraph matching,
 it also covers prose rules in harmful content, system prompt leakage, output
 handling, anti-refusal, privilege escalation, and SSRF. Output-handling and
-privilege-escalation code patterns and the variable shell-flag scope precheck
-also use the timed matcher. Other code rules (SSRF endpoint/request patterns,
+privilege-escalation code patterns also use the timed matcher. Other code rules (SSRF endpoint/request patterns,
 harmful-content substance names, and deserialization DS1–DS4) and helper-specific
 searches remain outside it.
 
@@ -350,7 +349,11 @@ Audited command/option patterns use a linear, command-segment search that preser
 unbounded command spans and the original greedy matches. Memory poisoning's
 2–20-character repetition rule uses Python's native engine: failed candidates
 examine at most 20 copies, and successful candidates consume the repeated run.
-This linear rule is bounded by the 256,000-character inspection window and the
+The variable shell-flag rule also retains Python’s native backreference semantics.
+It checks assignment headers separately and bounds each candidate call-argument
+tail to 4,096 characters, with the same accumulated matching CPU allowance. A
+potential match extending beyond that span reports `static_parse_limit`.
+The repetition rule is bounded by the 256,000-character inspection window and the
 artifact deadline, rather than the slower engine's per-search timer.
 
 Matching CPU accounting excludes caller work and other threads. The interruptible

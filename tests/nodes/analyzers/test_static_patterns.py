@@ -23,7 +23,6 @@ from time import perf_counter
 from unittest.mock import MagicMock
 
 import pytest
-
 from skillspector.models import (
     AnalyzerFinding,
     Location,
@@ -2442,7 +2441,10 @@ _TIMED_ANALYZERS = (
 
 
 @pytest.mark.parametrize("analyzer", _TIMED_ANALYZERS)
-@pytest.mark.parametrize("content_kind", ["unicode_docs", "unicode_paragraph", "unicode_bundle", "command_reference", "unrelated_flag"])
+@pytest.mark.parametrize(
+    "content_kind",
+    ["unicode_docs", "unicode_paragraph", "unicode_bundle", "command_reference", "unrelated_flag"],
+)
 def test_production_window_ordinary_content_remains_complete(analyzer, content_kind):
     import importlib
 
@@ -2727,7 +2729,8 @@ def test_code_pattern_timeouts_reach_incomplete_ledger(monkeypatch, analyzer, ca
     )
     assert reached == [target]
     assert any(
-        event["outcome"] == "partial" and event["reason_code"] == "runtime_limit"
+        event["outcome"] == "partial"
+        and event["reason_code"] == "runtime_limit"
         and event["limit_seconds"] == 0.000001
         for event in result["inspection_ledger"]
     )
@@ -2774,8 +2777,66 @@ def test_tiny_paragraphs_batch_native_searches(monkeypatch):
     assert perf_counter() - started < 2
 
 
-@pytest.mark.parametrize("pattern", [r"\b(?:delete|remove)", r"\bword\b", r"\ba? ", r"\b(?:a|) ", r"\w\b", r"\W\b"])
+@pytest.mark.parametrize(
+    "pattern", [r"\b(?:delete|remove)", r"\bword\b", r"\ba? ", r"\b(?:a|) ", r"\w\b", r"\W\b"]
+)
 def test_word_boundary_shortcuts_keep_python_spans(pattern):
     content = "©word delete remove µword word_ı word, a á! _word words "
     expected = [match.span() for match in re.finditer(pattern, content, re.IGNORECASE)]
-    assert [match.span() for match in static_runner.iter_pattern_matches(pattern, content, re.IGNORECASE)] == expected
+    assert [
+        match.span()
+        for match in static_runner.iter_pattern_matches(pattern, content, re.IGNORECASE)
+    ] == expected
+
+
+@pytest.mark.parametrize(
+    "name,reference", [("ıx", "IX"), ("İx", "IX"), ("ſx", "sx"), ("µx", "μx"), ("flag", "flag")]
+)
+@pytest.mark.parametrize("gap", ["", "\n\n", " " * 100 + "\n\n"])
+def test_variable_shell_backreferences_keep_python_spans(name, reference, gap):
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
+
+    content = (
+        "# Unicode context ©\n"
+        + gap
+        + f"{name} = True\nflag = True\n"
+        + f"subprocess.run((cmd), shell={name}); subprocess.run(cmd, shell={reference}); subprocess.run(cmd, shell=flag)\n"
+    )
+    expected = [
+        (m.span(), m.groups(), m.group()) for m in module._VARIABLE_SHELL_FLAG_RE.finditer(content)
+    ]
+    assert [
+        (m.span(), m.groups(), m.group()) for m in module._iter_variable_shell_flag_matches(content)
+    ] == expected
+
+
+@pytest.mark.parametrize("tail_length", [4095, 4096, 4097])
+def test_variable_shell_argument_tail_boundary(tail_length):
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
+
+    content = "flag = True\nsubprocess.run(" + "x" * tail_length
+    if tail_length <= 4096:
+        assert list(module._iter_variable_shell_flag_matches(content)) == []
+    else:
+        with pytest.raises(static_runner._StaticResourceLimitError) as caught:
+            list(module._iter_variable_shell_flag_matches(content))
+        assert caught.value.reason.value == "static_parse_limit"
+        assert caught.value.metrics["limit_characters"] == 4096
+
+
+def test_variable_shell_backreference_routing_covers_all_callers(monkeypatch):
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
+
+    calls = []
+    original = module._iter_variable_shell_flag_matches
+
+    def capture(content):
+        calls.append(content)
+        yield from original(content)
+
+    monkeypatch.setattr(module, "_iter_variable_shell_flag_matches", capture)
+    content = "import subprocess\nflag = True\nsubprocess.run(cmd, shell=flag)\n"
+    static_runner.run_static_patterns_with_ledger(
+        {"components": ["tool.py"], "file_cache": {"tool.py": content}}, [module]
+    )
+    assert len(calls) >= 3

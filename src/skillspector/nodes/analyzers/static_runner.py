@@ -37,7 +37,6 @@ from itertools import chain
 from typing import cast
 
 import regex  # type: ignore[import-untyped]
-
 from skillspector.artifacts import (
     ContentKind,
     SecurityTextView,
@@ -441,12 +440,16 @@ def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> rege
                 parts.append(categories[code])
             elif code == "b":
                 following = source[cursor + 2 :]
-                literal_word = re.match(r"[A-Za-z0-9_]+|\(\?:[A-Za-z0-9_]+(?:\|[A-Za-z0-9_]+)*\)", following)
+                literal_word = re.match(
+                    r"[A-Za-z0-9_]+|\(\?:[A-Za-z0-9_]+(?:\|[A-Za-z0-9_]+)*\)", following
+                )
                 required_word = literal_word is not None and (
                     literal_word.end() == len(following)
                     or following[literal_word.end()] not in "?*{"
                 )
-                previous_word = bool(parts and len(parts[-1]) == 1 and re.fullmatch(r"\w", parts[-1]))
+                previous_word = bool(
+                    parts and len(parts[-1]) == 1 and re.fullmatch(r"\w", parts[-1])
+                )
                 if required_word:
                     parts.append(rf"(?<!{word})")
                 elif previous_word:
@@ -660,7 +663,6 @@ def _iter_pattern_matches(
         ) from exc
 
 
-
 def iter_pattern_matches(
     pattern: str | re.Pattern[str],
     content: str,
@@ -680,8 +682,13 @@ def iter_pattern_matches(
         else _timed_pattern(original.pattern, original.flags, content.isascii())
     )
     yield from _iter_pattern_matches(
-        original, compiled, content, start, len(content) if end is None else end,
-        _PatternAllowance(), budget,
+        original,
+        compiled,
+        content,
+        start,
+        len(content) if end is None else end,
+        _PatternAllowance(),
+        budget,
     )
 
 

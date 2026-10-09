@@ -27,10 +27,12 @@ from __future__ import annotations
 import ast
 import re
 import sys
+import time
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
+from skillspector.inspection_ledger import LedgerReason
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
@@ -44,9 +46,8 @@ from .common import (
     LINE_BREAK_CHARS,
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
-    get_context,
-    get_context_from_lines,
     SourceLocationIndex,
+    get_context_from_lines,
     is_reference_material,
 )
 from .pattern_defaults import PatternCategory
@@ -204,6 +205,64 @@ _VARIABLE_SHELL_FLAG_PATTERN = (
     r"(?:subprocess\.\w+|Popen)\s*\([^)]*\bshell\s*=\s*\1\b"
 )
 _VARIABLE_SHELL_FLAG_RE = re.compile(_VARIABLE_SHELL_FLAG_PATTERN, re.IGNORECASE | re.MULTILINE)
+_VARIABLE_SHELL_HEADER_RE = re.compile(
+    r"(?m)^[^\S\n]*[A-Za-z_]\w*\s*=\s*True(?=\s*$)", re.IGNORECASE
+)
+_VARIABLE_SHELL_PREFIX_RE = re.compile(
+    _VARIABLE_SHELL_FLAG_PATTERN.split(r"[^)]*", 1)[0], re.IGNORECASE | re.MULTILINE
+)
+_VARIABLE_SHELL_ARGUMENT_CHARS = 4096
+
+
+def _iter_variable_shell_flag_matches(content: str) -> Iterator[re.Match[str]]:
+    """Keep Python's case-folded backreferences within bounded native searches."""
+    headers = _VARIABLE_SHELL_HEADER_RE.finditer(content)
+    allowance = static_runner._PatternAllowance()
+    budget = static_runner._ACTIVE_FINDING_BUDGET.get()
+    consumed = 0
+    while True:
+        if budget is not None:
+            budget.check_runtime()
+        allowance.check()
+        started_at = time.thread_time()
+        match = None
+        try:
+            header = next(headers, None)
+            if header is None:
+                return
+            if header.start() < consumed:
+                continue
+            # Preserve the original leading-whitespace span without retrying
+            # ^\s* at every blank line. Distinct headers cannot share this run.
+            whitespace_start = header.start()
+            while whitespace_start > consumed and content[whitespace_start - 1].isspace():
+                whitespace_start -= 1
+            newline = content.find("\n", whitespace_start, header.start())
+            start = newline + 1 if newline >= 0 else header.start()
+            prefix = _VARIABLE_SHELL_PREFIX_RE.match(content, start)
+            if prefix is None:
+                continue
+            end = min(len(content), prefix.end() + _VARIABLE_SHELL_ARGUMENT_CHARS)
+            match = _VARIABLE_SHELL_FLAG_RE.match(content, start, end)
+            truncated = end < len(content) and (
+                (match is None and ")" not in content[prefix.end() : end])
+                or (match is not None and match.end() == end and re.match(r"\w", content[end]))
+            )
+            if truncated:
+                raise static_runner._StaticResourceLimitError(
+                    LedgerReason.STATIC_PARSE_LIMIT,
+                    {
+                        "observed_characters": _VARIABLE_SHELL_ARGUMENT_CHARS + 1,
+                        "limit_characters": _VARIABLE_SHELL_ARGUMENT_CHARS,
+                    },
+                )
+        finally:
+            allowance.seconds += max(0.0, time.thread_time() - started_at)
+            allowance.check()
+        if match is not None:
+            consumed = match.end()
+            yield match
+
 
 # TM1: Tool Parameter Abuse — dangerous parameter values
 TM1_CODE_PATTERNS = [
@@ -4171,12 +4230,16 @@ def _tm1_candidates(
     shell_content: str | None = None,
 ) -> Iterator[tuple[int, int, str, float]]:
     for pattern, confidence in TM1_PATTERNS:
-        matches = (
-            static_runner.iter_paragraph_matches
-            if (pattern, confidence) in TM1_PROSE_PATTERNS
-            else static_runner.iter_pattern_matches
-        )
-        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+        if pattern == _VARIABLE_SHELL_FLAG_PATTERN:
+            matches = _iter_variable_shell_flag_matches(content)
+        else:
+            matcher = (
+                static_runner.iter_paragraph_matches
+                if (pattern, confidence) in TM1_PROSE_PATTERNS
+                else static_runner.iter_pattern_matches
+            )
+            matches = matcher(pattern, content, re.IGNORECASE | re.MULTILINE)
+        for match in matches:
             yield match.start(), match.end(), match.group(0), confidence
 
     yield from _tm1_shell_candidates(content)
@@ -4735,7 +4798,7 @@ def analyze(
 
     variable_matches = {
         (match.start(), match.end()): (match.group(1), match)
-        for match in static_runner.iter_pattern_matches(_VARIABLE_SHELL_FLAG_RE, content)
+        for match in _iter_variable_shell_flag_matches(content)
     }
     invisible_variable_matches: set[tuple[int, int]] = set()
     if file_type == "python" and variable_matches and not defer_variable_reconciliation:
@@ -4935,7 +4998,7 @@ def postprocess_path_findings(
     if ast_index is None:
         return cleanup_path_findings(findings)
     resolved: dict[tuple[int, str], list[_VariableShellCandidate]] = {}
-    for match in static_runner.iter_pattern_matches(_VARIABLE_SHELL_FLAG_RE, content):
+    for match in _iter_variable_shell_flag_matches(content):
         finding_line = bisect_right(ast_index.line_character_starts, match.start())
         assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
         candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)
