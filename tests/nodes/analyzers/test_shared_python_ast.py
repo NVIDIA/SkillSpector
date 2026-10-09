@@ -60,12 +60,12 @@ def test_long_output_flow_uses_complete_ast_source_identity() -> None:
 def test_preparsed_python_is_reused_by_all_ast_analyzers(tmp_path, monkeypatch) -> None:
     """One scan parses each eligible Python file once before analyzer fan-out."""
     (tmp_path / "script.py").write_text(
-        "import subprocess\n"
-        "enabled = True\n"
-        "subprocess.run(output, shell=enabled)\n"
         "import os\n"
         "payload = input()\n"
         "environment = os.environ.copy()\n"
+        "import subprocess\n"
+        "enabled = True\n"
+        "subprocess.run(output, shell=enabled)\n"
         "exec(payload)\n",
         encoding="utf-8",
     )
