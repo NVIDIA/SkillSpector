@@ -486,19 +486,19 @@ class PooledChatModel:
 
         for attempt in range(self._max_retries + 1):
             key = self._pool.acquire()
-            llm = self._build_llm(key)
+            release_success = True
             try:
+                llm = self._build_llm(key)
                 if callbacks is None:
                     result = llm.invoke(prompt)
                 else:
                     result = llm.invoke(prompt, config={"callbacks": callbacks})
-                self._pool.release(key, success=True)
                 if attempt > 0:
                     self._pool.record_retry_success()
                 return result
             except Exception as exc:
                 if self._is_rate_limit(exc) and attempt < self._max_retries:
-                    self._pool.release(key, success=False)
+                    release_success = False
                     logger.debug(
                         "PooledChatModel: rate-limited, retrying "
                         "(attempt %d/%d)",
@@ -506,9 +506,10 @@ class PooledChatModel:
                         self._max_retries,
                     )
                     continue
-                self._pool.release(key, success=True)
                 last_exception = exc
                 raise
+            finally:
+                self._pool.release(key, success=release_success)
 
         raise RuntimeError(
             f"PooledChatModel: exhausted {self._max_retries} retries "
@@ -521,27 +522,31 @@ class PooledChatModel:
         *,
         callbacks: list[object] | None = None,
     ) -> object:
-        """Async retry loop — non-blocking acquire first, block only if full."""
+        """Async retry loop with cancellation-safe slot acquisition and release."""
         import asyncio
         last_exception: Exception | None = None
 
         for attempt in range(self._max_retries + 1):
             key = self._pool.try_acquire()
-            if key is None:
-                key = await asyncio.to_thread(self._pool.acquire)
-            llm = self._build_llm(key)
+            while key is None:
+                # A blocking acquire in a worker thread can reserve a slot
+                # after its awaiting task has been cancelled. Keep waiting in
+                # the task so cancellation leaves no orphaned pool waiter.
+                await asyncio.sleep(0.05)
+                key = self._pool.try_acquire()
+            release_success = True
             try:
+                llm = self._build_llm(key)
                 if callbacks is None:
                     result = await llm.ainvoke(prompt)
                 else:
                     result = await llm.ainvoke(prompt, config={"callbacks": callbacks})
-                self._pool.release(key, success=True)
                 if attempt > 0:
                     self._pool.record_retry_success()
                 return result
             except Exception as exc:
                 if self._is_rate_limit(exc) and attempt < self._max_retries:
-                    self._pool.release(key, success=False)
+                    release_success = False
                     logger.debug(
                         "PooledChatModel: rate-limited, retrying "
                         "(attempt %d/%d)",
@@ -549,9 +554,10 @@ class PooledChatModel:
                         self._max_retries,
                     )
                     continue
-                self._pool.release(key, success=True)
                 last_exception = exc
                 raise
+            finally:
+                self._pool.release(key, success=release_success)
 
         raise RuntimeError(
             f"PooledChatModel: exhausted {self._max_retries} retries "
