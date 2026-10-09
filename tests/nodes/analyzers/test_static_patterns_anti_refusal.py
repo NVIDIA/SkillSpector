@@ -581,7 +581,16 @@ class TestAntiRefusalDescriptivePythonComments:
         assert findings
 
 
-@pytest.mark.parametrize("suffix", [" field", "[] field", "  []  in the response schema", " in warnings[] list", " in errors[] array"])
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        " field",
+        "[] field",
+        "  []  in the response schema",
+        " in warnings[] list",
+        " in errors[] array",
+    ],
+)
 def test_schema_field_whitespace_rewrite_keeps_benign_suffixes(suffix):
     assert anti_refusal_module._BENIGN_AR_SCHEMA_FIELD_PATTERN.search(suffix)
 
