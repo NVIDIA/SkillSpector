@@ -55,16 +55,19 @@ a keyword in ``*`` (e.g. ``"*telemetry*"``) for substring matching.
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import hashlib
 import json
 import os
 import posixpath
 import re
+import sys
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from stat import S_ISREG
+from stat import S_IMODE, S_ISREG
 from typing import Any
 
 import yaml
@@ -80,6 +83,8 @@ MAX_BASELINE_NODES = 100_000
 MAX_BASELINE_DEPTH = 64
 MAX_BASELINE_RECORDS = 10_000
 MAX_BASELINE_SCALAR_CHARS = 64 * 1024
+# Validation passes for an output path that concurrent writers replace.
+_BASELINE_DESTINATION_ATTEMPTS = 2
 _FINGERPRINT_SCHEMA = "skillspector-finding-fingerprint-v2"
 _FINGERPRINT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SOURCE_IDENTITY_RE = re.compile(r"external/[0-9a-f]{64}\Z")
@@ -642,14 +647,231 @@ def build_baseline_dict(
     }
 
 
+def _restrict_baseline_temporary(descriptor: int) -> None:
+    """Remove inherited access before a temporary file receives baseline data."""
+    if os.name == "posix":
+        # Also masks named-user/group ACL grants on POSIX ACL implementations.
+        os.fchmod(descriptor, 0o600)
+    if sys.platform != "darwin":
+        return
+
+    # macOS extended ACL grants are independent of permission bits. Use the
+    # already-open descriptor so clearing them cannot follow a swapped path.
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        init_acl = libc.acl_init
+        set_acl = libc.acl_set_fd_np
+        free_acl = libc.acl_free
+    except AttributeError:
+        # Filesystems/platforms without extended ACL support need only mode bits.
+        return
+    init_acl.argtypes = [ctypes.c_int]
+    init_acl.restype = ctypes.c_void_p
+    set_acl.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    set_acl.restype = ctypes.c_int
+    free_acl.argtypes = [ctypes.c_void_p]
+    free_acl.restype = ctypes.c_int
+    empty_acl = init_acl(0)
+    if not empty_acl:
+        raise OSError(ctypes.get_errno(), "Could not initialize baseline ACL")
+    try:
+        if set_acl(descriptor, empty_acl, 0x100) != 0:  # ACL_TYPE_EXTENDED
+            error = ctypes.get_errno()
+            if error not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+                raise OSError(error, "Could not clear inherited baseline ACLs")
+    finally:
+        free_acl(empty_acl)
+
+
+def _preserve_baseline_acl(source: int, destination: int) -> None:
+    """Copy an existing access ACL through descriptors before publication."""
+    if sys.platform == "darwin":
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        get_acl = libc.acl_get_fd_np
+        set_acl = libc.acl_set_fd_np
+        free_acl = libc.acl_free
+        get_acl.argtypes = [ctypes.c_int, ctypes.c_int]
+        get_acl.restype = ctypes.c_void_p
+        set_acl.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        set_acl.restype = ctypes.c_int
+        free_acl.argtypes = [ctypes.c_void_p]
+        free_acl.restype = ctypes.c_int
+        acl = get_acl(source, 0x100)
+        if not acl:
+            error = ctypes.get_errno()
+            if error in {errno.ENOENT, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                return
+            raise OSError(error, "Could not read existing baseline ACL")
+        try:
+            if set_acl(destination, acl, 0x100) != 0:
+                raise OSError(ctypes.get_errno(), "Could not preserve existing baseline ACL")
+        finally:
+            free_acl(acl)
+    elif sys.platform.startswith("linux"):
+        try:
+            acl = os.getxattr(source, "system.posix_acl_access")
+        except OSError as error:
+            if error.errno in {errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                return
+            raise
+        os.setxattr(destination, "system.posix_acl_access", acl)
+
+
+def _write_baseline_in_place(
+    descriptor: int, encoded: bytes, p: Path, opened: os.stat_result
+) -> bool:
+    """Rewrite a validated inode in place, keeping its owner, group, mode and ACLs.
+
+    Returns False, without writing, when *p* no longer names *opened*.
+    """
+    import fcntl
+
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    current = p.lstat()
+    if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+        return False
+    remaining = memoryview(encoded)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError(errno.EIO, "Could not write shared baseline", str(p))
+        remaining = remaining[written:]
+    os.ftruncate(descriptor, len(encoded))
+    os.fsync(descriptor)
+    return True
+
+
 def dump_baseline(data: dict[str, object], path: str | Path) -> None:
-    """Write a baseline mapping to *path* as YAML (``.json`` extension -> JSON)."""
+    """Validate and write a regular baseline (``.json`` -> JSON).
+
+    On POSIX, new files have owner-only permissions. Replacements preserve
+    ownership and ordinary permission bits; the old file must be writable.
+    Non-owner writers, and owners that cannot assign the destination's group,
+    update the validated descriptor in place, preserving its permissions and
+    ACLs without requiring chown. That shared-file path is not atomic for
+    readers or crash-safe. Symlinks and special files are rejected.
+    """
+    baseline_from_dict(data)
     p = Path(path)
     if p.suffix.lower() == ".json":
-        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        # PyYAML does not combine JSON's escaped UTF-16 surrogate pairs. Emit
+        # astral characters directly, escaping only genuine lone surrogates.
+        content = (
+            json.dumps(data, indent=2, ensure_ascii=False)
+            .encode("utf-8", errors="backslashreplace")
+            .decode("utf-8")
+        )
+        # JSON permits these raw characters, but YAML rejects most of them,
+        # folds NEL into a space, and treats LS/PS as line breaks that strip
+        # adjacent spaces or start a "---" document marker. The loader reads
+        # both formats through PyYAML.
+        content = re.sub(
+            r"[\x7f-\x9f\u2028\u2029\ufffe\uffff]",
+            lambda match: f"\\u{ord(match[0]):04x}",
+            content,
+        )
     else:
         header = (
             "# SkillSpector baseline — findings listed here are suppressed on future scans.\n"
             "# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.\n"
         )
-        p.write_text(header + yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        content = header + yaml.safe_dump(data, sort_keys=False)
+    # A complete population can exceed the loader's limits even when a compact
+    # report fits. Reject it before overwriting an existing, usable baseline.
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_BASELINE_BYTES:
+        raise ValueError(f"Baseline file exceeds byte limit ({MAX_BASELINE_BYTES}): {p}")
+    yaml.load(content, Loader=_BoundedBaselineLoader)
+
+    destination = None
+    access_descriptor = None
+    # A cooperating writer can atomically replace the path between validating
+    # and opening or locking it. Validate the replacement from the start, but
+    # only a bounded number of times; a path that keeps changing fails closed.
+    for attempt in range(1, _BASELINE_DESTINATION_ATTEMPTS + 1):
+        final_attempt = attempt == _BASELINE_DESTINATION_ATTEMPTS
+        try:
+            destination = p.lstat()
+        except FileNotFoundError:
+            destination = None
+            break
+        if not S_ISREG(destination.st_mode):
+            raise ValueError(f"Baseline output must be a regular file: {p}")
+        if os.name == "posix" and os.geteuid() == 0 and not destination.st_mode & 0o222:
+            raise PermissionError(errno.EACCES, "Baseline output is not writable", str(p))
+        # The descriptor check handles ACL grants that mode bits omit. Root
+        # still observes the explicit read-only mode guard above.
+        flags = os.O_WRONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(p, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not S_ISREG(opened.st_mode):
+                raise ValueError(f"Baseline output must be a regular file: {p}")
+            if (opened.st_dev, opened.st_ino) != (destination.st_dev, destination.st_ino):
+                if final_attempt:
+                    raise ValueError(f"Baseline output changed while opening: {p}")
+                continue
+            destination = opened
+            if os.name == "posix" and os.geteuid() not in {0, destination.st_uid}:
+                # Replacing somebody else's writable file would require chown
+                # and would discard its ACLs. Serialize cooperating shared-file
+                # writers and keep this already validated inode instead.
+                if _write_baseline_in_place(descriptor, encoded, p, opened):
+                    return
+                if final_attempt:
+                    raise ValueError(f"Baseline output changed before writing: {p}")
+                continue
+            # Retain the validated inode's access metadata while competing
+            # atomic writers replace the path. There is no need to reopen it.
+            access_descriptor = os.dup(descriptor)
+            break
+        finally:
+            os.close(descriptor)
+
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=p.parent, prefix=".skillspector-baseline.", suffix=".tmp", delete=False
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            _restrict_baseline_temporary(temporary.fileno())
+            if destination is not None:
+                current = os.fstat(temporary.fileno())
+                if (current.st_uid, current.st_gid) != (destination.st_uid, destination.st_gid):
+                    try:
+                        os.fchown(temporary.fileno(), destination.st_uid, destination.st_gid)
+                    except PermissionError:
+                        if access_descriptor is None:
+                            raise
+                        # A non-root owner cannot assign a group it is not a
+                        # member of. Rewrite the validated inode, keeping its group.
+                        if not _write_baseline_in_place(access_descriptor, encoded, p, destination):
+                            raise ValueError(
+                                f"Baseline output changed before writing: {p}"
+                            ) from None
+                        return
+                # Keep existing group writers/readers. Newly generated files
+                # remain private; replacing one does not revoke shared access.
+                mode = S_IMODE(destination.st_mode) & 0o777
+                if os.name == "posix":
+                    os.fchmod(temporary.fileno(), mode)
+                    # Clearing inherited ACLs must not remove a restrictive or
+                    # shared access ACL from the existing destination.
+                    assert access_descriptor is not None
+                    _preserve_baseline_acl(access_descriptor, temporary.fileno())
+                else:
+                    os.chmod(temporary_path, mode)
+            # Configure all destination access metadata while the file is empty.
+            temporary.write(encoded)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, p)
+    finally:
+        if access_descriptor is not None:
+            os.close(access_descriptor)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
