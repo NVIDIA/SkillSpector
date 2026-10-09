@@ -57,15 +57,15 @@ def create_openai_compatible_chat_model(*, model, credentials, max_tokens, timeo
 ```python
 class LLMAnalyzerBase:
     def __init__(self, base_prompt, model):
-        self._llm = get_chat_model(model=model)     # fresh instance
-        self._structured_llm = ...                   # fresh instance
+        self._llm = get_chat_model(model=model)  # fresh instance
+        self._structured_llm = ...  # fresh instance
 ```
 - Constructor takes only prompt + model — no external state
 - `_llm` is instance-local, not shared
 
 ### Graph layer
 ```python
-graph = create_graph()   # compiled once at module load
+graph = create_graph()  # compiled once at module load
 # Each invoke creates a new state; graph is a read-only execution plan
 ```
 - `graph` = topology blueprint (read-only, stateless)
@@ -106,10 +106,12 @@ LangGraph semantics: when one node has multiple outgoing edges, target nodes run
 # llm_analyzer_base.py:387
 sem = asyncio.Semaphore(max_concurrency=10)
 
+
 async def _process(batch):
     async with sem:
         response = await self._structured_llm.ainvoke(prompt)
         return self.parse_response(response, batch)
+
 
 return list(await asyncio.gather(*[_process(b) for b in batches]))
 ```
@@ -121,8 +123,9 @@ Token-budget-aware chunking: files exceeding the model's context window are spli
 ```python
 # batch_scan.py
 with ThreadPoolExecutor(max_workers=args.workers) as executor:
-    futures = {executor.submit(_scan_skill, dir, root, ...): idx
-               for idx, dir in enumerate(skill_dirs)}
+    futures = {
+        executor.submit(_scan_skill, dir, root, ...): idx for idx, dir in enumerate(skill_dirs)
+    }
     for future in as_completed(futures):
         entry, error, name = future.result(timeout=90)
 ```

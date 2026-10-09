@@ -17,7 +17,11 @@
 
 from __future__ import annotations
 
-import unittest, sys, time, random, os
+import os
+import random
+import sys
+import time
+import unittest
 from pathlib import Path
 
 _project_root = Path(__file__).resolve().parents[4]
@@ -41,11 +45,7 @@ for mod in [
     "test_runner_patches",
     "test_annotation",
 ]:
-    flatten(
-        loader.loadTestsFromName(
-            f"contrib.batch_scan.tests.tests-pro.{mod}"
-        )
-    )
+    flatten(loader.loadTestsFromName(f"contrib.batch_scan.tests.tests-pro.{mod}"))
 
 random.seed(42)
 random.shuffle(all_tests)
@@ -70,4 +70,7 @@ r = unittest.TextTestRunner(verbosity=0, resultclass=_NumberedResult).run(
     unittest.TestSuite(all_tests)
 )
 dt = time.perf_counter() - t0
-print(f"Time: {dt:.0f}s | {r.testsRun} run | {len(r.failures)} fail |", "PASS" if r.wasSuccessful() else "FAIL")
+print(
+    f"Time: {dt:.0f}s | {r.testsRun} run | {len(r.failures)} fail |",
+    "PASS" if r.wasSuccessful() else "FAIL",
+)

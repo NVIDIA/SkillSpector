@@ -30,17 +30,15 @@ _project_root = Path(__file__).resolve().parents[3]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from skillspector.llm_analyzer_base import Batch
-from skillspector.models import Finding
-
 from contrib.batch_scan.gap_fill import (
+    _GAP_FILL_RULE_IDS,
     GapFillAnalyzer,
     GapFillFinding,
     GapFillResult,
-    _GAP_FILL_RULE_IDS,
     run_gap_fill,
 )
-
+from skillspector.llm_analyzer_base import Batch
+from skillspector.models import Finding
 
 # ---------------------------------------------------------------------------
 # Factory (#4: replaces mutable module-level dict)
@@ -184,10 +182,10 @@ class TestParseResponseFiltering(unittest.TestCase):
     def test_mixed_valid_and_invalid_only_keeps_valid(self):
         data = {
             "findings": [
-                _valid_finding(),                                       # ✅
-                _valid_finding(rule_id="P6", confidence=0.8),           # ✅
-                _valid_finding(confidence=0.3),                         # ❌ low conf
-                _valid_finding(rule_id="UNKNOWN_X"),                    # ❌ unknown rule
+                _valid_finding(),  # ✅
+                _valid_finding(rule_id="P6", confidence=0.8),  # ✅
+                _valid_finding(confidence=0.3),  # ❌ low conf
+                _valid_finding(rule_id="UNKNOWN_X"),  # ❌ unknown rule
             ]
         }
         results = self.analyzer.parse_response(json.dumps(data), _batch())
@@ -309,8 +307,12 @@ class TestParseResponsePydanticModel(unittest.TestCase):
 class TestGapFillFindingConversion(unittest.TestCase):
     def test_to_finding_preserves_all_nine_fields(self):
         gf = GapFillFinding(
-            rule_id="P5", message="Test", severity="HIGH", confidence=0.85,
-            explanation="Test explanation", remediation="Test remediation",
+            rule_id="P5",
+            message="Test",
+            severity="HIGH",
+            confidence=0.85,
+            explanation="Test explanation",
+            remediation="Test remediation",
         )
         f = gf.to_finding("some/file.py")
         self.assertEqual(f.rule_id, "P5")
@@ -392,10 +394,12 @@ class TestGetBatchesAndCollectFindings(unittest.TestCase):
         batch2 = _batch("b.md")
         finding1 = Finding(rule_id="P5", message="m1", severity="LOW", confidence=0.8, file="a.md")
         finding2 = Finding(rule_id="P6", message="m2", severity="LOW", confidence=0.8, file="b.md")
-        results = self.analyzer.collect_findings([
-            (batch1, [finding1]),
-            (batch2, [finding2]),
-        ])
+        results = self.analyzer.collect_findings(
+            [
+                (batch1, [finding1]),
+                (batch2, [finding2]),
+            ]
+        )
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0].rule_id, "P5")
         self.assertEqual(results[1].rule_id, "P6")

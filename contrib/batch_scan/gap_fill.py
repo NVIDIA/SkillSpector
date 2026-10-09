@@ -57,18 +57,10 @@ class GapFillFinding(BaseModel):
 
     rule_id: str = Field(description="Identifier matching one of the gap-fill rule IDs")
     message: str = Field(description="Short description of the finding")
-    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"] = Field(
-        description="Severity level"
-    )
-    confidence: float = Field(
-        ge=0.0, le=1.0, default=0.7, description="Confidence score (0.0-1.0)"
-    )
-    explanation: str = Field(
-        default="", description="Why this is dangerous (2-3 sentences)"
-    )
-    remediation: str = Field(
-        default="", description="Actionable steps to fix the issue"
-    )
+    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"] = Field(description="Severity level")
+    confidence: float = Field(ge=0.0, le=1.0, default=0.7, description="Confidence score (0.0-1.0)")
+    explanation: str = Field(default="", description="Why this is dangerous (2-3 sentences)")
+    remediation: str = Field(default="", description="Actionable steps to fix the issue")
 
     def to_finding(self, file: str) -> Finding:
         """Convert to a :class:`~skillspector.models.Finding` for the report."""
@@ -179,7 +171,7 @@ class GapFillAnalyzer(LLMAnalyzerBase):
     # response_format.  JSON is parsed manually in parse_response().
     response_schema: type | None = None
 
-    def __init__(self, language: str, model: str | None = None, api_pool: "ApiKeyPool | None" = None):
+    def __init__(self, language: str, model: str | None = None, api_pool: ApiKeyPool | None = None):
         self.language = language
         resolved_model = model or MODEL_CONFIG.get("default", "gpt-5.4")
         # Inject language into the base prompt before passing to parent
@@ -188,6 +180,7 @@ class GapFillAnalyzer(LLMAnalyzerBase):
         # Wire multi-key pool into gap-fill LLM calls
         if api_pool:
             from .api_pool import PooledChatModel
+
             self.chat_model = PooledChatModel(api_pool)
 
     # -- Prompt ---------------------------------------------------------------
@@ -216,12 +209,13 @@ class GapFillAnalyzer(LLMAnalyzerBase):
         if text.startswith("```"):
             first_nl = text.find("\n")
             if first_nl != -1:
-                text = text[first_nl + 1:]
+                text = text[first_nl + 1 :]
             if text.rstrip().endswith("```"):
                 text = text.rstrip()[:-3].rstrip()
 
         # Parse JSON → Pydantic for validation
         import json
+
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
@@ -266,7 +260,7 @@ def run_gap_fill(
     file_cache: dict[str, str],
     language: str,
     model: str | None = None,
-    api_pool: "ApiKeyPool | None" = None,
+    api_pool: ApiKeyPool | None = None,
 ) -> list[Finding]:
     """Run a single targeted LLM pass covering the 8 gap-fill rules.
 

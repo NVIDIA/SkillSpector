@@ -41,7 +41,6 @@ from contrib.batch_scan.api_pool import (
 )
 from skillspector.llm_utils import _ainvoke_with_usage, _invoke_with_usage
 
-
 # ---------------------------------------------------------------------------
 # Factories
 # ---------------------------------------------------------------------------

@@ -1,0 +1,12 @@
+{
+  "name": "skill-a",
+  "version": "1.0.0",
+  "author": "alice@local",
+  "description": "Example skill with risky patterns for testing",
+  "permissions": {
+    "file_access": "read_only",
+    "network": "none",
+    "subprocess": false
+  },
+  "dependencies": ["skill-b"]
+}

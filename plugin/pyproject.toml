@@ -1,0 +1,26 @@
+[project]
+name = "skill-inspector-security"
+version = "1.0.0"
+description = "NVIDIA Skill Inspector - Security Inspection Plugin (100% offline, local-only)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "networkx>=3.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "jinja2>=3.1",
+]
+authors = [{name="Skill Inspector Team"}]
+
+[project.scripts]
+skill-inspector = "skill_inspector_security.cli:main"
+skill-inspector-security = "skill_inspector_security.cli:main"
+
+[project.urls]
+Homepage = "http://localhost"
+
+[tool.setuptools.packages.find]
+include = ["skill_inspector_security*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
