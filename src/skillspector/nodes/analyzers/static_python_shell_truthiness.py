@@ -12,20 +12,44 @@ guessing about Python execution.
 from __future__ import annotations
 
 import ast
+import re
+from collections.abc import Callable
+from dataclasses import dataclass
 
-from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.artifacts import (
+    normalized_security_prefix,
+    normalized_security_view,
+    security_text_views,
+)
+from skillspector.models import AnalyzerFinding, Location, Severity, compute_match_fingerprint
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
 
-from .common import get_complete_source_segment, get_context_from_lines
+from .common import LINE_BREAK_CHARS, get_complete_source_segment, get_context_from_lines
 from .pattern_defaults import PatternCategory
 
 ANALYZER_ID = "static_patterns_tool_misuse"
 USES_PYTHON_AST = True
 BOUND_SHELL_EVIDENCE = "_tm1_bound_shell_value"
+BOUND_CALL_START_EVIDENCE = "_tm1_bound_call_start"
+BOUND_CALL_END_EVIDENCE = "_tm1_bound_call_end"
+BOUND_SHELL_ANCHOR_EVIDENCE = "_tm1_bound_shell_anchor"
+BOUND_CANONICAL_FINGERPRINT_EVIDENCE = "_tm1_bound_canonical_fingerprint"
+BOUND_NORMALIZED_VIEW_EVIDENCE = "_tm1_bound_normalized_view"
+BOUND_CLASSIFICATION_MATCH_EVIDENCE = "_tm1_bound_classification_match"
+BOUND_DIRECT_MATCH_END_EVIDENCE = "_tm1_bound_direct_match_end"
+BOUND_POPEN_START_EVIDENCE = "_tm1_bound_popen_start"
+BOUND_DIRECT_OWNER_START_EVIDENCE = "_tm1_bound_direct_owner_start"
+BOUND_SHELL_VALUE_START_EVIDENCE = "_tm1_bound_shell_value_start"
+BOUND_SHELL_VALUE_END_EVIDENCE = "_tm1_bound_shell_value_end"
+DIRECT_LITERAL_METADATA_EVIDENCE = "_tm1_direct_literal_metadata"
 _DIRECT_CALL_NAMES = frozenset({"subprocess", "Popen"})
 _CACHED_SUBPROCESS_API_SLOTS = frozenset(
     {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
 )
+_DIRECT_CALLEE = re.compile(r"(?:subprocess\.\w+|Popen)", re.IGNORECASE)
+_SHELL_KEYWORD_PREFIX = re.compile(r"shell\s*=\s*", re.IGNORECASE)
+_MAX_CONTEXT_CHARS = 1024
+_MAX_DIRECT_NAME_CHARS = len("subprocess") + 1
 BoundShellCallKey = tuple[int, int, int, int]
 
 
@@ -37,6 +61,31 @@ def _bound_shell_call_key(call: ast.Call) -> BoundShellCallKey:
         getattr(call, "end_lineno", getattr(call, "lineno", 1)),
         getattr(call, "end_col_offset", getattr(call, "col_offset", 0)),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class DirectLiteralMetadata:
+    """AST metadata attached only to an already-confirmed lexical finding."""
+
+    call_start: int
+    call_end: int | None
+    shell_anchor: int
+    match_fingerprint: str
+    normalized_view: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BoundShellMetadata:
+    """Cap-independent source coordinates for one supported bound shell call."""
+
+    call_start: int
+    call_end: int | None
+    shell_anchor: int
+    value_start: int
+    value_end: int
+    popen_start: int | None
+    canonical_fingerprint: str
+    normalized_view: bool
 
 
 def _truth_value(
@@ -627,15 +676,21 @@ def _class_deferred_receiver_trust(
     return deferred, trusted_at_call_by_definition
 
 
+def _normalized_direct_name(name: str) -> str | None:
+    """Return the bounded canonical spelling of a direct subprocess receiver."""
+    normalized = normalized_security_prefix(name, _MAX_DIRECT_NAME_CHARS).casefold()
+    return normalized if normalized in {"subprocess", "popen"} else None
+
+
 def _is_direct_subprocess_syntax(call: ast.Call) -> bool:
-    """Return whether a call uses one of the direct subprocess spellings."""
+    """Return whether a call uses one of the normalized direct subprocess spellings."""
     function = call.func
     if isinstance(function, ast.Name):
-        return function.id == "Popen"
+        return _normalized_direct_name(function.id) == "popen"
     return (
         isinstance(function, ast.Attribute)
         and isinstance(function.value, ast.Name)
-        and function.value.id == "subprocess"
+        and _normalized_direct_name(function.value.id) == "subprocess"
     )
 
 
@@ -725,7 +780,7 @@ def _call_arguments_are_passive(call: ast.Call) -> bool:
     )
 
 
-def _value_preserves_receiver_trust(
+def _expression_preserves_receiver_trust(
     expression: ast.expr,
     trusted_names: set[str],
     protocol_safe_names: set[str] | None = None,
@@ -745,7 +800,7 @@ def _value_preserves_receiver_trust(
     if isinstance(expression, (ast.Tuple, ast.List)):
         return all(
             not isinstance(item, ast.Starred)
-            and _value_preserves_receiver_trust(
+            and _expression_preserves_receiver_trust(
                 item,
                 trusted_names,
                 protocol_safe_names,
@@ -774,7 +829,7 @@ def _value_preserves_receiver_trust(
     # subprocess calls. Preserve that behavior while still rejecting generic
     # nested calls and receiver stores.
     return all(
-        _value_preserves_receiver_trust(
+        _expression_preserves_receiver_trust(
             value,
             trusted_names,
             protocol_safe_names,
@@ -939,7 +994,7 @@ def _advance_trusted_names(
             statement.value,
             finalizer_safe_names,
         )
-        preserves_receiver_trust = simple_targets and _value_preserves_receiver_trust(
+        preserves_receiver_trust = simple_targets and _expression_preserves_receiver_trust(
             statement.value,
             trusted_names,
             finalizer_safe_names,
@@ -988,7 +1043,7 @@ def _advance_trusted_names(
             and _annotation_is_passive(statement.annotation)
             and (
                 value is None
-                or _value_preserves_receiver_trust(
+                or _expression_preserves_receiver_trust(
                     value,
                     trusted_names,
                     finalizer_safe_names,
@@ -1044,7 +1099,7 @@ def _advance_trusted_names(
         return
     if isinstance(statement, ast.Expr):
         value = statement.value
-        preserves_receiver_trust = _value_preserves_receiver_trust(
+        preserves_receiver_trust = _expression_preserves_receiver_trust(
             value,
             trusted_names,
             finalizer_safe_names,
@@ -1064,7 +1119,7 @@ def _advance_trusted_names(
         if not (
             _is_finalizer_safe_value(statement.test, finalizer_safe_names)
             and all(
-                _value_preserves_receiver_trust(
+                _expression_preserves_receiver_trust(
                     item,
                     trusted_names,
                     finalizer_safe_names,
@@ -1378,11 +1433,25 @@ class _CachedSubprocessState:
 
 
 class _Analyzer:
-    def __init__(self, file_path: str, python_ast: ParsedPythonFile) -> None:
+    def __init__(
+        self,
+        file_path: str,
+        parsed: ParsedPythonFile,
+        *,
+        emit_findings: bool = True,
+        check_runtime: Callable[[], None] | None = None,
+    ) -> None:
         self.file_path = file_path
-        self.python_ast = python_ast
-        self.lines = python_ast.lines
+        self.parsed = parsed
+        self.python_ast = parsed
+        self.content = parsed.content
+        self.lines = parsed.lines
+        self._emit_findings = emit_findings
+        self._check_runtime = check_runtime
         self.findings: list[AnalyzerFinding] = []
+        self._finding_keys: set[tuple[int, str]] = set()
+        self.bound_shell_metadata: list[BoundShellMetadata] = []
+
         self.bound_shell_call_ownership: dict[BoundShellCallKey, bool] = {}
         self.emitted_shell_calls: set[BoundShellCallKey] = set()
         self.cached_replacement_by_call: dict[BoundShellCallKey, bool] = {}
@@ -1446,25 +1515,168 @@ class _Analyzer:
             and _shell_argument_is_captured_before_effects(call)
         )
 
-    def _inspect_call(self, call: ast.Call, facts: dict[str, bool]) -> None:
-        shell = next((item.value for item in call.keywords if item.arg == "shell"), None)
+    def _source_position(self, node: ast.AST, *, end: bool = False) -> int | None:
+        """Map one AST UTF-8 byte coordinate through the shared parsed source."""
+        line_name = "end_lineno" if end else "lineno"
+        column_name = "end_col_offset" if end else "col_offset"
+        line = getattr(node, line_name, None)
+        byte_column = getattr(node, column_name, None)
+        if not isinstance(line, int) or not isinstance(byte_column, int):
+            return None
+        character_column = self.parsed.character_column(line, byte_column)
+        line_index = line - 1
+        if character_column is None or not 0 <= line_index < len(self.parsed.line_character_starts):
+            return None
+        return self.parsed.line_character_starts[line_index] + character_column
+
+    def _source_start(self, node: ast.AST) -> int | None:
+        return self._source_position(node)
+
+    def _source_end(self, node: ast.AST) -> int | None:
+        return self._source_position(node, end=True)
+
+    def _source_segment(self, node: ast.AST) -> str:
+        source = self.parsed.source_segment(node)
+        if source is not None:
+            return source
+        line = getattr(node, "lineno", 1)
+        end_line = getattr(node, "end_lineno", None)
+        return get_complete_source_segment(self.lines, line, end_line)
+
+    def _canonical_fingerprint(
+        self,
+        call: ast.Call,
+        shell_keyword: ast.keyword,
+        shell: ast.expr,
+    ) -> tuple[str, bool, int] | None:
+        """Mirror the direct lexical match through ``shell=True``."""
+        call_start = self._source_start(call)
+        shell_start = self._source_start(shell)
+        if call_start is None or shell_start is None or shell_start < call_start:
+            return None
+        raw_callee = self._source_segment(call.func)
+        canonical_start = call_start
         if (
-            not isinstance(shell, ast.Name)
-            or self.cached_subprocess.blocks(call)
-            or shell.id.casefold().startswith("true")
-            or facts.get(shell.id) is not True
+            isinstance(call.func, ast.Attribute)
+            and _normalized_direct_name(call.func.attr) == "popen"
+            and not any(
+                view.text.casefold() == "subprocess.popen"
+                for view in security_text_views(raw_callee)
+            )
         ):
-            return
-        self.emitted_shell_calls.add(_bound_shell_call_key(call))
+            function_end = self._source_end(call.func)
+            raw_method = re.search(r"(?P<method>\w+)\s*$", raw_callee)
+            if function_end is not None and raw_method is not None:
+                canonical_start = function_end - len(raw_method.group("method"))
+        raw_canonical = self.content[canonical_start:shell_start] + "True"
+        canonical = normalized_security_view(raw_canonical).text
+        normalized_callee = normalized_security_view(raw_callee).text
+        keyword_start = self._source_start(shell_keyword)
+        raw_keyword = self.content[keyword_start:shell_start] if keyword_start is not None else ""
+        normalized_keyword = normalized_security_view(raw_keyword).text
+        normalization_exposed_direct_spelling = (
+            _DIRECT_CALLEE.fullmatch(raw_callee) is None
+            and _DIRECT_CALLEE.fullmatch(normalized_callee) is not None
+            or _SHELL_KEYWORD_PREFIX.fullmatch(raw_keyword) is None
+            and _SHELL_KEYWORD_PREFIX.fullmatch(normalized_keyword) is not None
+        )
+        return (
+            compute_match_fingerprint("TM1", canonical),
+            normalization_exposed_direct_spelling,
+            canonical_start,
+        )
+
+    def _bounded_context(self, call: ast.Call) -> str:
+        call_start = self._source_start(call)
+        if call_start is None:
+            line = getattr(call, "lineno", 1)
+            return get_context_from_lines(self.lines, line)[:_MAX_CONTEXT_CHARS]
+        left = max(0, call_start - _MAX_CONTEXT_CHARS // 2)
+        right = min(len(self.content), left + _MAX_CONTEXT_CHARS)
+        left = max(0, right - _MAX_CONTEXT_CHARS)
+        return self.content[left:right].rstrip(LINE_BREAK_CHARS)
+
+    def _append_finding(
+        self,
+        call: ast.Call,
+        shell_keyword: ast.keyword,
+        shell: ast.expr,
+    ) -> None:
         line = getattr(call, "lineno", 1)
         end_line = getattr(call, "end_lineno", None)
-        start_byte_column = getattr(call, "col_offset", 0)
-        end_byte_column = getattr(call, "end_col_offset", start_byte_column)
-        start_column = self.python_ast.character_column(line, start_byte_column)
-        end_column = self.python_ast.character_column(end_line or line, end_byte_column)
-        complete_match = self.python_ast.source_segment(call)
-        if complete_match is None:
-            complete_match = get_complete_source_segment(self.lines, line, end_line)
+        start_column = self.parsed.character_column(line, getattr(call, "col_offset", 0))
+        end_column = (
+            self.parsed.character_column(end_line, getattr(call, "end_col_offset", 0))
+            if isinstance(end_line, int)
+            else None
+        )
+        source_start = self._source_start(call)
+        source_end = self._source_end(call)
+        shell_anchor = self._source_start(shell_keyword)
+        shell_start = self._source_start(shell)
+        shell_end = self._source_end(shell)
+        popen_start: int | None = None
+        if (
+            isinstance(call.func, ast.Attribute)
+            and _normalized_direct_name(call.func.attr) == "popen"
+        ):
+            function_end = self._source_end(call.func)
+            raw_function = self._source_segment(call.func)
+            raw_method = re.search(r"(?P<method>\w+)\s*$", raw_function)
+            if function_end is not None and raw_method is not None:
+                popen_start = function_end - len(raw_method.group("method"))
+        canonical = self._canonical_fingerprint(call, shell_keyword, shell)
+        if (
+            source_start is not None
+            and shell_anchor is not None
+            and shell_start is not None
+            and shell_end is not None
+            and canonical is not None
+        ):
+            self.bound_shell_metadata.append(
+                BoundShellMetadata(
+                    call_start=source_start,
+                    call_end=source_end,
+                    shell_anchor=shell_anchor,
+                    value_start=shell_start,
+                    value_end=shell_end,
+                    popen_start=popen_start,
+                    canonical_fingerprint=canonical[0],
+                    normalized_view=canonical[1],
+                )
+            )
+        if not self._emit_findings:
+            return
+
+        source = self._source_segment(call)
+        evidence: dict[str, object] = {BOUND_SHELL_EVIDENCE: True}
+        if source_start is not None:
+            evidence[BOUND_CALL_START_EVIDENCE] = source_start
+        if source_end is not None:
+            evidence[BOUND_CALL_END_EVIDENCE] = source_end
+        if shell_anchor is not None:
+            evidence[BOUND_SHELL_ANCHOR_EVIDENCE] = shell_anchor
+        if shell_start is not None:
+            evidence[BOUND_SHELL_VALUE_START_EVIDENCE] = shell_start
+        if shell_end is not None:
+            evidence[BOUND_SHELL_VALUE_END_EVIDENCE] = shell_end
+        if source_start is not None and shell_start is not None:
+            evidence[BOUND_CLASSIFICATION_MATCH_EVIDENCE] = (
+                self.content[source_start:shell_start] + "True"
+            )[:200]
+            evidence[BOUND_DIRECT_MATCH_END_EVIDENCE] = shell_start + len("True")
+        if popen_start is not None:
+            evidence[BOUND_POPEN_START_EVIDENCE] = popen_start
+        finding_key = (line, compute_match_fingerprint("TM1", source))
+        if finding_key in self._finding_keys:
+            return
+        self._finding_keys.add(finding_key)
+        if canonical is not None:
+            fingerprint, is_normalized, direct_owner_start = canonical
+            evidence[BOUND_CANONICAL_FINGERPRINT_EVIDENCE] = fingerprint
+            evidence[BOUND_DIRECT_OWNER_START_EVIDENCE] = direct_owner_start
+            if is_normalized:
+                evidence[BOUND_NORMALIZED_VIEW_EVIDENCE] = True
         self.findings.append(
             AnalyzerFinding(
                 rule_id="TM1",
@@ -1479,16 +1691,26 @@ class _Analyzer:
                 ),
                 confidence=0.8,
                 tags=[PatternCategory.TOOL_MISUSE.value],
-                context=get_context_from_lines(
-                    self.lines,
-                    line,
-                    column=start_column if start_column is not None else 0,
-                ),
-                matched_text=complete_match[:200],
-                complete_match=complete_match,
-                evidence={BOUND_SHELL_EVIDENCE: True},
+                context=self._bounded_context(call),
+                matched_text=source[:200],
+                complete_match=source,
+                evidence=evidence,
             )
         )
+
+    def _inspect_call(self, call: ast.Call, facts: dict[str, bool]) -> None:
+        shell_keyword = next((item for item in call.keywords if item.arg == "shell"), None)
+        if shell_keyword is None:
+            return
+        shell = shell_keyword.value
+        if (
+            not isinstance(shell, ast.Name)
+            or self.cached_subprocess.blocks(call)
+            or facts.get(shell.id) is not True
+        ):
+            return
+        self.emitted_shell_calls.add(_bound_shell_call_key(call))
+        self._append_finding(call, shell_keyword, shell)
 
     def _scan_assignment(
         self,
@@ -1510,7 +1732,7 @@ class _Analyzer:
         )
         result_is_finalizer_safe = _is_finalizer_safe_value(value, finalizer_safe_names)
         call_has_protocol_effects = False
-        preserves_receiver_trust = simple_targets and _value_preserves_receiver_trust(
+        preserves_receiver_trust = simple_targets and _expression_preserves_receiver_trust(
             value,
             trusted_names,
             finalizer_safe_names,
@@ -1654,6 +1876,8 @@ class _Analyzer:
             deferred_cached.advance(candidate)
 
         for index, statement in enumerate(statements):
+            if self._check_runtime is not None:
+                self._check_runtime()
             if isinstance(statement, (ast.Expr, ast.Return, ast.Assign, ast.AnnAssign)):
                 if statement.value is not None:
                     self._record_eager_cached_replacements(statement.value)
@@ -1754,7 +1978,7 @@ class _Analyzer:
                     and _annotation_is_passive(statement.annotation)
                     and (
                         value is None
-                        or _value_preserves_receiver_trust(
+                        or _expression_preserves_receiver_trust(
                             value,
                             trusted_names,
                             finalizer_safe_names,
@@ -1816,7 +2040,7 @@ class _Analyzer:
             ):
                 continue
             elif isinstance(statement, ast.Expr):
-                preserves_receiver_trust = _value_preserves_receiver_trust(
+                preserves_receiver_trust = _expression_preserves_receiver_trust(
                     statement.value,
                     trusted_names,
                     finalizer_safe_names,
@@ -1836,7 +2060,7 @@ class _Analyzer:
                 if statement.msg is not None:
                     expressions.append(statement.msg)
                 preserves_receiver_trust = all(
-                    _value_preserves_receiver_trust(
+                    _expression_preserves_receiver_trust(
                         item,
                         trusted_names,
                         finalizer_safe_names,
@@ -1905,6 +2129,7 @@ class _Analyzer:
                 bound_names.update(_direct_bound_names(statement))
                 trusted_names.clear()
                 unknown_unsafe_bindings[0] = True
+
             self.cached_subprocess.advance(statement)
 
         self.cached_subprocess = previous_cached
@@ -1914,20 +2139,94 @@ class _Analyzer:
         return sorted(self.findings, key=lambda finding: finding.location.start_line)
 
 
-def analyze(
-    content: str,
+def bound_shell_metadata(
+    parsed: ParsedPythonFile,
     file_path: str,
-    file_type: str,
     *,
-    python_ast: ParsedPythonFile | None = None,
-) -> list[AnalyzerFinding]:
-    """Find straight-line truthy names passed to direct subprocess calls."""
-    if file_type != "python":
-        return []
-    parsed = python_ast or parse_python_source(content, file_path)
+    check_runtime: Callable[[], None] | None = None,
+) -> tuple[BoundShellMetadata, ...]:
+    """Return every supported bound call independently of the finding cap."""
     if parsed.tree is None:
-        return []
-    return _Analyzer(file_path, parsed).run(parsed.tree)
+        return ()
+    analyzer = _Analyzer(
+        file_path,
+        parsed,
+        emit_findings=False,
+        check_runtime=check_runtime,
+    )
+    analyzer.run(parsed.tree)
+    return tuple(sorted(analyzer.bound_shell_metadata, key=lambda item: item.call_start))
+
+
+def direct_literal_metadata(
+    parsed: ParsedPythonFile,
+    file_path: str,
+    call_starts: set[int],
+) -> dict[int, DirectLiteralMetadata]:
+    """Enrich only retained lexical owners without creating budgeted findings."""
+    if parsed.tree is None or not call_starts:
+        return {}
+    locator = _Analyzer(file_path, parsed)
+    metadata: dict[int, DirectLiteralMetadata] = {}
+    for node in ast.walk(parsed.tree):
+        if not isinstance(node, ast.Call):
+            continue
+        call_start = locator._source_start(node)
+        if call_start is None:
+            continue
+        lookup_coordinates = {call_start}
+        function = node.func
+        if (
+            isinstance(function, ast.Attribute)
+            and isinstance(function.value, ast.Name)
+            and _normalized_direct_name(function.value.id) == "subprocess"
+            and _normalized_direct_name(function.attr) == "popen"
+        ):
+            function_end = locator._source_end(function)
+            raw_function = locator._source_segment(function)
+            raw_method = re.search(r"(?P<method>\w+)\s*$", raw_function)
+            if function_end is not None and raw_method is not None:
+                lookup_coordinates.add(function_end - len(raw_method.group("method")))
+        retained_coordinates = lookup_coordinates.intersection(call_starts)
+        if not retained_coordinates:
+            continue
+        shell_keyword = next((item for item in node.keywords if item.arg == "shell"), None)
+        if shell_keyword is None:
+            continue
+        shell = shell_keyword.value
+        if not (
+            isinstance(shell, ast.Constant) and type(shell.value) is bool and shell.value is True
+        ):
+            continue
+        canonical = locator._canonical_fingerprint(node, shell_keyword, shell)
+        shell_anchor = locator._source_start(shell_keyword)
+        if canonical is None or shell_anchor is None:
+            continue
+        fingerprint, normalized_view, _ = canonical
+        direct_metadata = DirectLiteralMetadata(
+            call_start=call_start,
+            call_end=locator._source_end(node),
+            shell_anchor=shell_anchor,
+            match_fingerprint=fingerprint,
+            normalized_view=normalized_view,
+        )
+        for coordinate in retained_coordinates:
+            metadata[coordinate] = direct_metadata
+    return metadata
+
+
+def bound_shell_finding_for_call(
+    file_path: str,
+    python_ast: ParsedPythonFile,
+    call: ast.Call,
+) -> AnalyzerFinding | None:
+    """Build metadata for a retained owner after positive dataflow confirmation."""
+    shell_keyword = next((item for item in call.keywords if item.arg == "shell"), None)
+    if shell_keyword is None or not isinstance(shell_keyword.value, ast.Name):
+        return None
+    analyzer = _Analyzer(file_path, python_ast)
+    analyzer._append_finding(call, shell_keyword, shell_keyword.value)
+    return analyzer.findings[0] if analyzer.findings else None
 
 
 def bound_shell_call_analysis(
@@ -1937,7 +2236,7 @@ def bound_shell_call_analysis(
     """Separate trust, detections, and affirmative cached-slot replacements."""
     if python_ast.tree is None:
         return {}, set(), set()
-    analyzer = _Analyzer(file_path, python_ast)
+    analyzer = _Analyzer(file_path, python_ast, emit_findings=False)
     analyzer.run(python_ast.tree)
     return (
         dict(analyzer.bound_shell_call_ownership),
@@ -1962,6 +2261,22 @@ def bound_shell_call_ownership(
     """Return supported bound-shell calls and whether their receiver is trusted."""
     if python_ast.tree is None:
         return {}
-    analyzer = _Analyzer(file_path, python_ast)
+    analyzer = _Analyzer(file_path, python_ast, emit_findings=False)
     analyzer.run(python_ast.tree)
     return dict(analyzer.bound_shell_call_ownership)
+
+
+def analyze(
+    content: str,
+    file_path: str,
+    file_type: str,
+    *,
+    python_ast: ParsedPythonFile | None = None,
+) -> list[AnalyzerFinding]:
+    """Find straight-line truthy names passed to direct subprocess calls."""
+    if file_type != "python":
+        return []
+    parsed = python_ast or parse_python_source(content, file_path)
+    if parsed.tree is None:
+        return []
+    return _Analyzer(file_path, parsed).run(parsed.tree)
