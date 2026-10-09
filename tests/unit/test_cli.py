@@ -575,21 +575,32 @@ def test_cli_scan_output_to_file(tmp_path: Path) -> None:
     assert "out-test" in content or "risk_assessment" in content
 
 
-@pytest.mark.parametrize("format", list(FormatChoice))
+@pytest.mark.parametrize(
+    "format,registry_mode",
+    [(format, False) for format in FormatChoice] + [(FormatChoice.json, True)],
+)
 @pytest.mark.parametrize(
     "alias", ["same-path", "relative-path", "parent-path", "symlink", "symlink-parent", "hard-link"]
 )
 def test_cli_scan_rejects_output_alias_of_input_file(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, format: FormatChoice, alias: str
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    format: FormatChoice,
+    registry_mode: bool,
+    alias: str,
 ) -> None:
-    """An output alias must not replace the original skill with its report."""
-    source = tmp_path / "SKILL.md"
-    original = b"---\nname: protected\ndescription: Say hello.\n---\n# Hello\n"
+    """An output alias must not replace the original input with its report."""
+    source = tmp_path / ("registry.json" if registry_mode else "SKILL.md")
+    original = (
+        b'{"servers": []}'
+        if registry_mode
+        else b"---\nname: protected\ndescription: Say hello.\n---\n# Hello\n"
+    )
     source.write_bytes(original)
     output = source
     monkeypatch.chdir(tmp_path)
     if alias == "relative-path":
-        output = Path("SKILL.md")
+        output = Path(source.name)
     elif alias == "parent-path":
         nested = tmp_path / "nested"
         nested.mkdir()
@@ -613,18 +624,21 @@ def test_cli_scan_rejects_output_alias_of_input_file(
             os.link(source, output)
         except OSError:
             pytest.skip("hard links are not supported on this filesystem")
-    scan_skill = MagicMock(return_value={"report_body": "Scan report", "risk_score": 0})
-    monkeypatch.setattr(cli, "_scan_skill", scan_skill)
-
-    result = runner.invoke(
-        app, ["scan", str(source), "--no-llm", "--format", format.value, "--output", str(output)]
+    scan_input = MagicMock(
+        return_value={"report_body": "Scan report", "risk_score": 0, "findings": []}
     )
+    monkeypatch.setattr(cli, "scan_registry" if registry_mode else "_scan_skill", scan_input)
+
+    args = ["scan", str(source), "--no-llm", "--format", format.value, "--output", str(output)]
+    if registry_mode:
+        args.append("--mcp-registry")
+    result = runner.invoke(app, args)
 
     assert result.exit_code == 2
     assert "--output points to the input file" in result.output
     assert source.read_bytes() == original
     assert output.read_bytes() == original
-    scan_skill.assert_not_called()
+    scan_input.assert_not_called()
 
 
 @pytest.mark.parametrize("format", list(FormatChoice))
@@ -1583,6 +1597,48 @@ def test_cli_mcp_registry_routes_and_writes_json(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0
     assert json.loads(output.read_text(encoding="utf-8"))["mcp_registry"] is True
+    assert payload.read_text(encoding="utf-8") == '{"servers": []}'
+
+
+@pytest.mark.parametrize("alias", ["same-path", "hard-link"])
+def test_cli_mcp_registry_preserves_comparison_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alias: str
+) -> None:
+    source = tmp_path / "registry.json"
+    source.write_text('{"servers": []}', encoding="utf-8")
+    previous = tmp_path / "previous-report.json"
+    original = b'{"snapshots": []}'
+    previous.write_bytes(original)
+    output = previous
+    if alias == "hard-link":
+        output = tmp_path / "report.json"
+        try:
+            os.link(previous, output)
+        except OSError:
+            pytest.skip("hard links are not supported on this filesystem")
+    scan_registry = MagicMock(return_value={"findings": [], "risk_score": 0})
+    monkeypatch.setattr(cli, "scan_registry", scan_registry)
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(source),
+            "--mcp-registry",
+            "--format",
+            "json",
+            "--mcp-registry-compare",
+            str(previous),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert previous.read_bytes() == original
+    assert source.read_text(encoding="utf-8") == '{"servers": []}'
+    scan_registry.assert_not_called()
 
 
 def test_cli_mcp_registry_exits_1_when_aggregate_risk_crosses_threshold(tmp_path: Path) -> None:
