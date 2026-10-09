@@ -255,10 +255,14 @@ except ImportError:
 def _patched_chatopenai_init(self, **kwargs):
     import httpx
 
-    _to = httpx.Timeout(
-        _DEFAULT_REQUEST_TIMEOUT,
-        connect=_DEFAULT_CONNECT_TIMEOUT,
-    )
+    requested = kwargs.get("request_timeout", kwargs.get("timeout"))
+    _to = httpx.Timeout(_DEFAULT_REQUEST_TIMEOUT, connect=_DEFAULT_CONNECT_TIMEOUT)
+    if requested is not None:
+        requested = httpx.Timeout(requested).as_dict()
+        _to = httpx.Timeout(**{
+            key: min(cap, requested[key]) if requested[key] is not None else cap
+            for key, cap in _to.as_dict().items()
+        })
     # Set both the Pydantic alias AND the canonical field name so we don't
     # depend on alias-precedence behaviour (which is a Pydantic v2 internal).
     kwargs["timeout"] = _to

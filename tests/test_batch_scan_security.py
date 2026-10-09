@@ -645,3 +645,13 @@ def test_compat_pooled_constructor_forwards_timeout(monkeypatch, timeout):
         assert analyzer._llm._timeout == (30 if timeout is None else 7)
     finally:
         runner.set_api_pool(None)
+
+
+@pytest.mark.parametrize("requested", [2, 60, None])
+def test_compat_http_timeout_preserves_shorter_deadline(monkeypatch, requested):
+    observed = {}
+    monkeypatch.setattr(runner, "_original_chatopenai_init", lambda self, **kw: observed.update(kw))
+    runner._patched_chatopenai_init(object(), timeout=requested)
+    assert observed["timeout"] is observed["request_timeout"]
+    assert observed["timeout"].read == (2 if requested == 2 else 30)
+    assert observed["timeout"].connect == (2 if requested == 2 else 8)
