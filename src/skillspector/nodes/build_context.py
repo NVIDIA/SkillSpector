@@ -3203,7 +3203,9 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             path=container,
             reason=LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH,
         )
-        event["message"] += f" Archive member {path!r} was not analyzed because it collides with a disk file."
+        event["message"] += (
+            f" Archive member {path!r} was not analyzed because it collides with a disk file."
+        )
         prework_events.append(event)
     for event in nested.ledger_events:
         path = event["path"]
@@ -3212,7 +3214,9 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             event["work_id"] = inspection_work_id(
                 f"{event['record_type'].value}:{event['phase']}", event["path"], None, None
             )
-            event["message"] += f" This applies to withheld archive member {path!r}, not the disk file."
+            event["message"] += (
+                f" This applies to withheld archive member {path!r}, not the disk file."
+            )
     for artifact in artifact_inventory:
         if artifact["path"] in reserved_paths:
             artifact["disposition"] = ArtifactDisposition.FAILED
