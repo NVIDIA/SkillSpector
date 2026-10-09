@@ -51,6 +51,7 @@ from .pattern_defaults import PatternCategory
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_privilege_escalation"
+USES_PYTHON_SOURCE_TYPE = True
 
 # Scan-scoped handle on the runner's shared Python AST cache, published by
 # node() for the analyze() calls the runner makes on its behalf.  This module
