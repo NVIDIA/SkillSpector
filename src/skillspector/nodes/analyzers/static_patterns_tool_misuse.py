@@ -244,10 +244,7 @@ def _iter_variable_shell_flag_matches(content: str) -> Iterator[re.Match[str]]:
                 continue
             end = min(len(content), prefix.end() + _VARIABLE_SHELL_ARGUMENT_CHARS)
             match = _VARIABLE_SHELL_FLAG_RE.match(content, start, end)
-            truncated = end < len(content) and (
-                (match is None and ")" not in content[prefix.end() : end])
-                or (match is not None and match.end() == end and re.match(r"\w", content[end]))
-            )
+            truncated = end < len(content) and ")" not in content[prefix.end() : end]
             if truncated:
                 raise static_runner._StaticResourceLimitError(
                     LedgerReason.STATIC_PARSE_LIMIT,

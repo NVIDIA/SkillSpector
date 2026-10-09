@@ -343,7 +343,8 @@ it also covers prose rules in harmful content, system prompt leakage, output
 handling, anti-refusal, privilege escalation, and SSRF. Output-handling and
 privilege-escalation code patterns also use the timed matcher. Other code rules (SSRF endpoint/request patterns,
 harmful-content substance names, and deserialization DS1–DS4) and helper-specific
-searches remain outside it.
+searches remain outside it. The anti-refusal schema-field helper uses a linear
+whitespace prefix so its benign-context check cannot backtrack quadratically.
 
 Audited command/option patterns use a linear, command-segment search that preserves
 unbounded command spans and the original greedy matches. Memory poisoning's

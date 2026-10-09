@@ -2848,3 +2848,12 @@ def test_unreviewed_unicode_backreferences_fail_closed(pattern, content):
     with pytest.raises(static_runner._StaticResourceLimitError) as caught:
         list(static_runner.iter_pattern_matches(pattern, content, re.IGNORECASE))
     assert caught.value.reason.value == "rules_unavailable"
+
+
+def test_variable_shell_oversized_tail_is_incomplete_even_after_early_match():
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
+
+    content = "flag = True\nsubprocess.run(cmd, shell=flag, " + "x" * 4096 + ", shell=flag)"
+    with pytest.raises(static_runner._StaticResourceLimitError) as caught:
+        list(module._iter_variable_shell_flag_matches(content))
+    assert caught.value.reason.value == "static_parse_limit"

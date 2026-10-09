@@ -188,14 +188,14 @@ _AR2_DIRECT_INTENT_PATTERNS = (
 )
 _BENIGN_AR_SCHEMA_FIELD_PATTERN = re.compile(
     r"""
-    ^\s*(?:\[\])?\s+(?:field|key|property|array|list|entry)\b
+    ^(?:\s*\[\])?\s+(?:field|key|property|array|list|entry)\b
     |
-    ^\s*(?:\[\])?\s+(?:in|of)\s+(?:the\s+)?(?:json(?:\s+output)?|output|response)\s+schema\b
+    ^(?:\s*\[\])?\s+(?:in|of)\s+(?:the\s+)?(?:json(?:\s+output)?|output|response)\s+schema\b
     |
-    ^\s*(?:\[\])?\s+(?:in|of)\s+(?:the\s+)?(?:warnings?|disclaimers?|caveats?)\b(?:\[\])?\s+
+    ^(?:\s*\[\])?\s+(?:in|of)\s+(?:the\s+)?(?:warnings?|disclaimers?|caveats?)\b(?:\[\])?\s+
     (?:field|key|property|array|list|entry)\b
     |
-    ^\s*(?:\[\])?\s+in\s+(?:the\s+)?errors\[\]\s+array\b
+    ^(?:\s*\[\])?\s+in\s+(?:the\s+)?errors\[\]\s+array\b
     """,
     re.IGNORECASE | re.VERBOSE,
 )
