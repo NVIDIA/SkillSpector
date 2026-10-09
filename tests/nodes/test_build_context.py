@@ -835,7 +835,10 @@ def test_oms_projection_keeps_unsupported_fields_and_reports_partial(
         assert "https://in-toto.io/Statement/v1" in result["file_cache"]["bundle.json"]
 
 
-def test_oms_projection_preserves_crlf_and_rejects_duplicate_fields(tmp_path: Path) -> None:
+@pytest.mark.parametrize("escaped_key", [False, True])
+def test_oms_projection_preserves_crlf_and_rejects_duplicate_fields(
+    tmp_path: Path, escaped_key: bool
+) -> None:
     bundle = json.loads(_OMS_FIXTURE.read_bytes())
     content = json.dumps(bundle, indent=2).replace("\n", "\r\n")
     path = tmp_path / "bundle.json"
@@ -844,6 +847,8 @@ def test_oms_projection_preserves_crlf_and_rejects_duplicate_fields(tmp_path: Pa
     assert result["local_file_cache"]["bundle.json"] == content
     assert "https://in-toto.io/Statement/v1" in result["file_cache"]["bundle.json"]
     duplicate = content[:-1] + ', "dsseEnvelope": {}}'
+    if escaped_key:
+        duplicate = duplicate.replace('"dsseEnvelope"', r'"dss\u0065Envelope"')
     path.write_bytes(duplicate.encode())
     result = build_context({"skill_path": str(tmp_path)})
     assert result["file_cache"]["bundle.json"] == duplicate

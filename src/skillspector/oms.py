@@ -76,11 +76,16 @@ def project_oms_content(content: str) -> OMSProjection | None:
     try:
         bundle = _load(content)
     except (ValueError, RecursionError):
-        return (
-            OMSProjection(SecurityTextView("raw", content), False)
-            if "dsseEnvelope" in content
-            else None
-        )
+        recognized = "dsseEnvelope" in content
+        if not recognized:
+            # Recognition only: a duplicate-key bundle may escape its field
+            # names. Never use this permissive parse as analysis content.
+            try:
+                untrusted = json.loads(content)
+                recognized = isinstance(untrusted, dict) and "dsseEnvelope" in untrusted
+            except (ValueError, RecursionError):
+                pass
+        return OMSProjection(SecurityTextView("raw", content), False) if recognized else None
     if not isinstance(bundle, dict) or "dsseEnvelope" not in bundle:
         return None
     envelope = bundle["dsseEnvelope"]
