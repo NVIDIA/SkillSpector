@@ -23,6 +23,7 @@ from time import perf_counter
 from unittest.mock import MagicMock
 
 import pytest
+
 from skillspector.models import (
     AnalyzerFinding,
     Location,

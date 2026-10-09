@@ -37,6 +37,7 @@ from itertools import chain
 from typing import cast
 
 import regex  # type: ignore[import-untyped]
+
 from skillspector.artifacts import (
     ContentKind,
     SecurityTextView,
