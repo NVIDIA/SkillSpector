@@ -101,6 +101,9 @@ from .static_runner import analyzer_finding_to_finding
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_supply_chain"
+# SC2 literal-XOR decoding and SC3 key on file_type, so Python executed via a
+# shebang (extensionless, .md, ...) must receive "python" rather than its suffix.
+USES_PYTHON_SOURCE_TYPE = True
 
 # Dependency work is supplemental to the canonical text scan and therefore
 # needs its own aggregate ceilings.  These apply across every manifest in a
