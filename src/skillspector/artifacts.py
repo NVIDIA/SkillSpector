@@ -432,7 +432,11 @@ def pdf_xmp_format_spans(content: str) -> tuple[int, int, int]:
         padding_end += 1
     if not content.startswith(('<?xpacket end="w"?>', '<?xpacket end="r"?>'), padding_end):
         return -1, -1, -1
-    return (start + header.index("\ufeff") if "\ufeff" in header else -1), padding_start, padding_end
+    return (
+        (start + header.index("\ufeff") if "\ufeff" in header else -1),
+        padding_start,
+        padding_end,
+    )
 
 
 def decode_text(data: bytes) -> str:

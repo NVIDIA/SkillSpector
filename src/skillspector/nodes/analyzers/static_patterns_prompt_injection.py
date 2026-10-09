@@ -22,7 +22,11 @@ import re
 import sys
 from collections.abc import Callable, Iterator
 
-from skillspector.artifacts import _is_emoji_base, pdf_xmp_format_spans, prompt_injection_letter_spacing_view
+from skillspector.artifacts import (
+    _is_emoji_base,
+    pdf_xmp_format_spans,
+    prompt_injection_letter_spacing_view,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -319,7 +323,6 @@ def _tag_run_from(content: str, offset: int) -> str:
     while end < len(content) and _TAG_BLOCK[0] <= ord(content[end]) <= _TAG_BLOCK[1]:
         end += 1
     return content[offset:end]
-
 
 
 def analyze(
