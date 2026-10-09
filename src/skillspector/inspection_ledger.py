@@ -105,6 +105,7 @@ class LedgerReason(StrEnum):
     TOTAL_BYTES_LIMIT = "total_bytes_limit"
     RUNTIME_LIMIT = "runtime_limit"
     EXCLUDED_EXECUTABLE_CONTENT = "excluded_executable_content"
+    HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY = "hidden_skill_executable_local_only"
     OUTPUT_LIMIT = "output_limit"
     TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
@@ -215,6 +216,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.RUNTIME_LIMIT: "Inspection reached its configured runtime limit.",
     LedgerReason.EXCLUDED_EXECUTABLE_CONTENT: (
         "Executable content was inventoried but excluded from content analysis."
+    ),
+    LedgerReason.HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY: (
+        "Conventional hidden-skill helper script was kept local and not sent to an external LLM."
     ),
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
     LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED: (
