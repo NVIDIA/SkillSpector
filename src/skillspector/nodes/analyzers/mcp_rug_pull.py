@@ -191,11 +191,15 @@ _SHELL_WORD_RE = re.compile(
 )
 _SHELL_WORD_GAP_RE = re.compile(r"(?:[ \t]+|\\\r?\n)+")
 _SHELL_QUOTING_RE = re.compile(r"""\\(.)|["']""", re.DOTALL)
-# A redirection operator with its optional file descriptor (2>, &>>, 2>&, <<<, {fd}>).
-# The shell removes it and its target word wherever it appears in the command.
+# A redirection operator with its optional file descriptor (2>, >>, 2>&, <<<, {fd}>).
+# `&>` and `&>>` take none: in `2&>log` the shell passes `2` as an argument. The
+# shell removes a redirection and its target word wherever they appear in the command.
 _SHELL_REDIRECTION_RE = re.compile(
-    r"(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:&>>?|<<<|<<-?|<>|<&|>&|>>|>\||[<>])"
+    r"&>>?|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<|<<-?|<>|<&|>&|>>|>\||[<>])"
 )
+# A command substitution of plain words. Unless it runs `case`, its closing `)` or
+# backquote is the one matched here; quotes, escapes, nesting or a comment could move it.
+_SHELL_PLAIN_SUBSTITUTION_RE = re.compile(r"\$\(([\w \t.,:=+%/-]*)\)|`([\w \t.,:=+%/-]*)`")
 # A parameter name or a special parameter after `$` ($HOME, $1, $?). `$@` is not
 # one of them here: it expands to several words even in double quotes.
 _SHELL_PARAMETER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9*#?$!-]")
@@ -363,6 +367,56 @@ def _docker_image_known_text(word: str) -> str | None:
     return known
 
 
+def _shell_word_is_one_argument(word: str) -> bool:
+    """Return whether the shell word *word* is certain to stay one argument.
+
+    Outside quotes, an expansion (``$X``, ``$(pwd)``), brace expansion
+    (``{a,b}``, ``{1..3}``) or a pattern (``*``, ``?``, ``[``) can produce
+    several arguments or none, and so can ``"$@"`` or ``"${arr[@]}"`` in double
+    quotes (see ``_expansion_end``). A command substitution in double quotes
+    counts only when it is plain words: a quote inside it ends the double-quoted
+    string early here, so the shell's word may be longer than *word*.
+    """
+    in_double_quotes = False
+    brace_depth = 0
+    index = 0
+    while index < len(word):
+        char = word[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "'" and not in_double_quotes:
+            close = word.find("'", index + 1)
+            if close < 0:
+                return False
+            index = close + 1
+            continue
+        if char in "$`":
+            if not in_double_quotes:
+                return False
+            plain = _SHELL_PLAIN_SUBSTITUTION_RE.match(word, index)
+            if plain is not None and "case" not in plain[plain.lastindex].split():
+                index = plain.end()
+                continue
+            end = _expansion_end(word, index)
+            if end is None:
+                return False
+            index = end
+            continue
+        if char == '"':
+            in_double_quotes = not in_double_quotes
+        elif not in_double_quotes and char in "*?[":
+            return False
+        elif not in_double_quotes and char == "{":
+            brace_depth += 1
+        elif not in_double_quotes and char == "}" and brace_depth:
+            brace_depth -= 1
+        elif not in_double_quotes and brace_depth and (char == "," or word.startswith("..", index)):
+            return False
+        index += 1
+    return True
+
+
 def _docker_image_operand(subcommand: str, text: str, truncated: bool) -> tuple[str | None, int]:
     """Return the image operand of a docker command and where reading stopped.
 
@@ -370,9 +424,10 @@ def _docker_image_operand(subcommand: str, text: str, truncated: bool) -> tuple[
     and their values are skipped using docker's option table, and redirections
     (``2>log``, ``<<<x``) are skipped with their targets. The image is None when
     it cannot be identified (an unknown option, a missing value or redirection
-    target, the end of the command, a word cut off by the read bound) or when its
-    tag depends on an expansion, so the caller still reports the command. For an
-    image whose value is partly known, only the known part is returned.
+    target, a word before the image that may not be one argument, the end of the
+    command, a word cut off by the read bound) or when its tag depends on an
+    expansion, so the caller still reports the command. For an image whose value
+    is partly known, only the known part is returned.
     """
     value_options, flag_options = _DOCKER_OPTIONS[subcommand.lower()]
     pos = 0
@@ -383,8 +438,10 @@ def _docker_image_operand(subcommand: str, text: str, truncated: bool) -> tuple[
         redirection = _SHELL_REDIRECTION_RE.match(text, gap.end() if gap else pos)
         if redirection is not None:
             target = _next_shell_word(text, redirection.end(), truncated)
-            if target is None:
-                return None, redirection.end()
+            # A target that may not be one argument can also end later than the
+            # word read here (2>${LOG:-a b}).
+            if target is None or not _shell_word_is_one_argument(target.group(0)):
+                return None, target.end() if target else redirection.end()
             pos = target.end()
             continue
         word_match = _next_shell_word(text, pos, truncated)
@@ -392,10 +449,14 @@ def _docker_image_operand(subcommand: str, text: str, truncated: bool) -> tuple[
             return None, pos
         pos = word_match.end()
         word = _SHELL_QUOTING_RE.sub(r"\1", word_match.group(0))
+        if not expect_value and (end_of_options or not word.startswith("-") or word == "-"):
+            return _docker_image_known_text(word_match.group(0)), pos
+        # An option or value that splits into several arguments, or none, moves the
+        # image to another word (-e $ENV with ENV='A=1 ubuntu').
+        if not _shell_word_is_one_argument(word_match.group(0)):
+            return None, pos
         if expect_value:
             expect_value = False
-        elif end_of_options or not word.startswith("-") or word == "-":
-            return _docker_image_known_text(word_match.group(0)), pos
         elif word == "--":
             end_of_options = True
         elif word.startswith("--"):

@@ -278,8 +278,11 @@ def test_rp1_docker_redirections_before_pinned_image_no_finding():
         "docker run -i <input.txt alpine:3.20 cat\n",
         "docker run -i <<<'hello' alpine:3.20 cat\n",
         "docker run --rm &>>run.log alpine:3.20\n",
+        "docker run --rm &>run.log alpine:3.20\n",
+        "docker run -e 2&>run.log alpine:3.20\n",
         "docker run -e 2>err.log MODE=fast alpine:3.20\n",
         "docker run --rm alpine:3.20>out.log\n",
+        'docker run --rm 2>"$LOG" >"$(pwd)/out.log" alpine:3.20\n',
     ):
         assert _rp1_matches(content) == [], content
 
@@ -306,6 +309,63 @@ def test_rp1_docker_unclear_redirection_is_still_reported():
         ("docker run --rm 2>\n", "docker run --rm 2>"),
         ("docker run --rm 2>|\n", "docker run --rm 2>|"),
         ("docker run --env-file <(env) alpine:3.20\n", "docker run --env-file <"),
+        # With LOG=err.log the shell redirects to err.log and runs ubuntu.
+        ("docker run --rm 2>${LOG:-err x:1} ubuntu\n", "docker run --rm 2>${LOG:-err"),
+        ('docker run --rm 2>"$(echo " x:1 ")" ubuntu\n', 'docker run --rm 2>"$(echo "'),
+    ):
+        assert _rp1_matches(content) == [expected], content
+
+
+def test_rp1_docker_number_before_ampersand_redirection_is_an_argument():
+    """`&>` takes no file descriptor, so in `2&>log` the `2` is the image."""
+    for content, expected in (
+        ("docker run --rm 2&>log alpine:3.20\n", "docker run --rm 2"),
+        ("docker run --rm 2&>>log alpine:3.20\n", "docker run --rm 2"),
+        ("docker run --rm {fd}&>log alpine:3.20\n", "docker run --rm {fd}"),
+    ):
+        assert _rp1_matches(content) == [expected], content
+
+
+def test_rp1_docker_option_value_that_is_one_argument_no_finding():
+    """Quoted expansions and substitutions stay one argument before the image."""
+    for content in (
+        'docker run --rm -e "$DOCKER_ENV" alpine:3.20\n',
+        'docker run --rm -e"$DOCKER_ENV" --env="${MODE:-dev}" alpine:3.20\n',
+        'docker run --rm -e "$*" alpine:3.20\n',
+        "docker run --rm -e 'MODE=$X' -e MODE=\\$X alpine:3.20\n",
+        "docker run --rm -e \"A={x,y}\" -e 'GLOB=*.py' -e A={} alpine:3.20\n",
+        "docker run --rm -v ~/.cache:/root/.cache alpine:3.20\n",
+        'docker run --rm -v "$(git rev-parse --show-toplevel)":/src alpine:3.20\n',
+        'docker run --rm --user "$(id -u):$(id -g)" alpine:3.20\n',
+        'docker run --rm -v "`pwd`":/app alpine:3.20\n',
+    ):
+        assert _rp1_matches(content) == [], content
+
+
+def test_rp1_docker_option_value_that_can_split_is_reported():
+    """An option value that can become several arguments, or none, can move the image."""
+    for content, expected in (
+        # With DOCKER_ENV='MODE=dev ubuntu' the image is ubuntu.
+        ("docker run --rm -e $DOCKER_ENV alpine:3.20\n", "docker run --rm -e $DOCKER_ENV"),
+        ("docker run --rm -e$DOCKER_ENV alpine:3.20\n", "docker run --rm -e$DOCKER_ENV"),
+        ("docker run --rm --env=$DOCKER_ENV alpine:3.20\n", "docker run --rm --env=$DOCKER_ENV"),
+        ("docker run --rm -e ${DOCKER_ENV} alpine:3.20\n", "docker run --rm -e ${DOCKER_ENV}"),
+        ("docker run --rm=$RM alpine:3.20\n", "docker run --rm=$RM"),
+        ('docker run --rm -e "${ARGS[@]}" alpine:3.20\n', 'docker run --rm -e "${ARGS[@]}"'),
+        ('docker run --rm --env="${ARGS[@]}" alpine:3.20\n', 'docker run --rm --env="${ARGS[@]}"'),
+        ('docker run --rm -e "$@" alpine:3.20\n', 'docker run --rm -e "$@"'),
+        ("docker run --rm -e $* alpine:3.20\n", "docker run --rm -e $*"),
+        ("docker run --rm -v $(pwd):/app node:20\n", "docker run --rm -v $(pwd):/app"),
+        ("docker run --rm -e {A,B}=1 alpine:3.20\n", "docker run --rm -e {A,B}=1"),
+        ("docker run --rm -e X{1..2}=a alpine:3.20\n", "docker run --rm -e X{1..2}=a"),
+        ("docker run --rm -v * alpine:3.20\n", "docker run --rm -v *"),
+        # A quote inside the substitution ends the double-quoted string early here.
+        ('docker run --rm -e "$(echo " x:1 ")" ubuntu\n', 'docker run --rm -e "$(echo "'),
+        ('docker run --rm -e "`echo " x:1 "`" ubuntu\n', 'docker run --rm -e "`echo "'),
+        (
+            'docker run --rm --name "$(case a in a) echo " x:1 ";; esac)" ubuntu\n',
+            'docker run --rm --name "$(case a in a) echo "',
+        ),
     ):
         assert _rp1_matches(content) == [expected], content
 
@@ -322,8 +382,15 @@ def test_rp1_docker_operand_scan_is_linear():
         'docker pull -q "' * 3_125,
         "docker run " + "2>x " * 10_000,
         "docker run " + "1" * 50_000 + ">x",
+        "docker run " + "1" * 50_000 + "&>x",
+        "docker run " + "2&>x " * 10_000,
         'docker run "' + "${a" * 10_000 + '"',
         'docker run "' + "$(" * 10_000 + '"',
+        'docker run -e "' + "$(a" * 10_000 + '"',
+        'docker run -e "$(' + "a " * 25_000 + ')" x',
+        'docker run -e "x" ' * 5_000,
+        "docker run -e " + "{a," * 10_000,
+        "docker run -e " + "{a.." * 10_000,
     ):
         started = time.perf_counter()
         _rp1_matches(content)
