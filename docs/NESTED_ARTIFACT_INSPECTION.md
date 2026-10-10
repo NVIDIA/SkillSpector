@@ -11,6 +11,37 @@ Nested members use a stable virtual path that retains their full provenance:
 outer-file!/nested.zip!/scripts/setup.sh
 ```
 
+## JSON component locations
+
+JSON component rows preserve this virtual path in `path`, matching finding locations and
+inspection-ledger entries. Archive members also expose their existing inventory provenance:
+
+```json
+{
+  "path": "bundle.whl!/package/module.py",
+  "type": "python",
+  "executable": true,
+  "outer_path": "bundle.whl",
+  "nested_path": "package/module.py",
+  "container_type": "zip",
+  "container_ancestry": ["zip"],
+  "container_depth": 1
+}
+```
+
+`outer_path` names the physical container relative to that component's source root. `nested_path`
+retains the full member chain inside it, including any nested `!/` boundaries. Each member keeps
+its own component row, executable flag, type, line count, and byte size. Ordinary files do not gain
+archive fields merely because their names contain `!/`.
+
+Consumers must distinguish a virtual member from an on-disk file: `executable: true` describes
+the member's content, not the existence of its virtual path on disk. Use the source identity and
+full `path` to join components with findings; do not collapse members by `outer_path`. When
+validating a report, check archive provenance and containment within the corresponding source
+root, and retain incomplete-inspection failures. These additive fields do not change existing
+consumer validators automatically, prove that every member was inspected, or justify extracting
+or executing archive content.
+
 ## Security invariants
 
 - Members are read in memory. SkillSpector never extracts, renders, imports, installs, or executes

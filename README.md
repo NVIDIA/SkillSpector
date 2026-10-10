@@ -835,6 +835,9 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
 - `risk_assessment.severity` ∈ `LOW | MEDIUM | HIGH | CRITICAL`.
 - `risk_assessment.recommendation` ∈ `SAFE | CAUTION | DO_NOT_INSTALL`, mapped from severity: `LOW → SAFE`, `MEDIUM → CAUTION`, `HIGH`/`CRITICAL → DO_NOT_INSTALL`.
 - `metadata.llm_error` appears only when LLM analysis was requested but unavailable.
+- Archive-member components retain their virtual `path` and include `outer_path`, `nested_path`,
+  and container provenance. Virtual paths identify in-memory members, not on-disk files; see
+  [JSON component locations](docs/NESTED_ARTIFACT_INSPECTION.md#json-component-locations).
 - AE1 findings use **Incomplete referenced artifact analysis**. Their source
   location identifies the reference; `evidence` identifies the affected target,
   analyzer reasons, and available bounds. Review the target's completeness
