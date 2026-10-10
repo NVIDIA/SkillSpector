@@ -44,6 +44,7 @@ Security invariants verified:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -79,7 +80,7 @@ from skillspector.providers.copilot_cli import CopilotCLIProvider
 COPILOT_BINARY = "/usr/bin/copilot"
 MODEL = "gpt-5.2"
 
-_VERSION_OK = b"GitHub Copilot CLI 1.0.92.\nRun 'copilot update' to check for updates.\n"
+_VERSION_OK = b"GitHub Copilot CLI 1.0.95.\nRun 'copilot update' to check for updates.\n"
 
 
 def _version_result(stdout: bytes = _VERSION_OK) -> SimpleNamespace:
@@ -214,7 +215,7 @@ def test_hostile_prompt_roundtrips_byte_exact(prompt: str) -> None:
 
 class TestCopilotAuthCheck:
     def test_version_parses(self) -> None:
-        assert _parse_copilot_version(_VERSION_OK) == "1.0.92"
+        assert _parse_copilot_version(_VERSION_OK) == "1.0.95"
 
     def test_version_unparseable_returns_none(self) -> None:
         assert _parse_copilot_version(b"") is None
@@ -269,7 +270,7 @@ class TestCopilotAuthCheck:
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
         ok, reason = _copilot_auth_check(COPILOT_BINARY)
         assert ok is False
-        assert "1.0.92" in (reason or "")
+        assert "1.0.95" in (reason or "")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_unparseable_version_is_fail_closed(self, mock_run: MagicMock) -> None:
@@ -296,13 +297,13 @@ class TestPreflightCopilotPolicy:
     ) -> None:
         # The reviewer's repro: a 9.9.99 binary must never receive scan content.
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
-        with pytest.raises(AgentCLIError, match="1.0.92"):
+        with pytest.raises(AgentCLIError, match="1.0.95"):
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {"PATH": "/bin"}, str(tmp_path))
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_nonzero_exit_rejected(self, mock_run: MagicMock, tmp_path: Path) -> None:
         mock_run.return_value = SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom")
-        with pytest.raises(AgentCLIError, match="preflight|1.0.92"):
+        with pytest.raises(AgentCLIError, match="preflight|1.0.95"):
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {}, str(tmp_path))
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
@@ -357,6 +358,19 @@ class TestAuditCopilotHome:
     def test_empty_plugins_pass(self, tmp_path: Path) -> None:
         (tmp_path / "installed-plugins").mkdir()
         _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows strips trailing-space dirs at the OS layer; the variant is POSIX-only",
+    )
+    def test_trailing_space_home_audits_spaced_tree(self, tmp_path: Path) -> None:
+        # The CLI resolves a trailing-space home as-is: the audit must
+        # inspect the spaced tree, not the stripped one.
+        spaced = tmp_path / "spaced "
+        (spaced / "hooks").mkdir(parents=True)
+        (spaced / "hooks" / "evil.json").write_text('{"version": 1, "hooks": {}}', encoding="utf-8")
+        with pytest.raises(AgentCLIError, match="hook"):
+            _audit_copilot_home({"COPILOT_HOME": str(spaced)})
 
     def test_missing_explicit_home_audits_default(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -588,8 +602,7 @@ class TestAuditCopilotHome:
 
     def test_xdg_state_plugins_raise(self, tmp_path: Path) -> None:
         # Startup migrates $XDG_STATE_HOME/.copilot/installed-plugins
-        # into the home (verified in the 1.0.92 release source: the
-        # STATE migration set still lists installed-plugins): a
+        # into the home (verified in the 1.0.92 release source): a
         # plugin-free COPILOT_HOME with plugin material in the STATE
         # source must still refuse.
         home = tmp_path / "home"
@@ -982,8 +995,66 @@ class TestPrepareCopilotEnv:
         # are handled by preflight refusal instead.)
         monkeypatch.setenv("COPILOT_HOME", "/home/op")
         env = _prepare_copilot_env({}, "/tmp", ["copilot"])
-        assert env["COPILOT_HOME"] == "/home/op"
+        assert env["COPILOT_HOME"] == os.path.abspath("/home/op")
         assert "HOME" not in env and "USERPROFILE" not in env
+
+    def test_prepare_absolutizes_relative_copilot_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A relative COPILOT_HOME resolves in the scanner cwd for the
+        # audit but in the temp cwd for the CLI: forward the absolute
+        # form so both sides name the same tree.
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("COPILOT_HOME", "rel-home")
+        env = _prepare_copilot_env({"PATH": "/bin"}, "/tmp", ["copilot"])
+        assert env["COPILOT_HOME"] == os.path.join(str(tmp_path), "rel-home")
+        assert os.path.isabs(env["COPILOT_HOME"])
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows strips trailing-space dirs at the OS layer; the variant is POSIX-only",
+    )
+    def test_prepare_preserves_trailing_space_copilot_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No trimming: the CLI resolves the spaced directory as-is, so
+        # the audit must see the identical value.
+        spaced = str(tmp_path / "spaced ")
+        monkeypatch.setenv("COPILOT_HOME", spaced)
+        env = _prepare_copilot_env({"PATH": "/bin"}, "/tmp", ["copilot"])
+        assert env["COPILOT_HOME"] == spaced
+
+    def test_prepare_does_not_expand_tilde_copilot_home(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The CLI resolves a leading `~` literally (no expansion), so
+        # forwarding must not expand either: both sides name the same
+        # scanner-resolved tree.
+        monkeypatch.setenv("COPILOT_HOME", "~/x")
+        env = _prepare_copilot_env({"PATH": "/bin"}, "/tmp", ["copilot"])
+        assert env["COPILOT_HOME"] == os.path.abspath("~/x")
+
+    def test_blank_copilot_home_falls_back_to_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COPILOT_HOME", "   ")
+        env = _prepare_copilot_env({"PATH": "/bin"}, "/tmp", ["copilot"])
+        assert "COPILOT_HOME" not in env
+
+    def test_scrub_drops_inherited_xdg_migration_sources(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The shared allowlist keeps XDG_CONFIG/STATE_HOME out of every
+        # agent child: an inherited relative or spaced value can never
+        # reach the CLI, which falls back to the audited defaults.
+        monkeypatch.setenv("XDG_CONFIG_HOME", "../rel-xdg")
+        monkeypatch.setenv("XDG_STATE_HOME", "/tmp/state ")
+        base = _scrub_env()
+        assert "XDG_CONFIG_HOME" not in base
+        assert "XDG_STATE_HOME" not in base
+        env = _prepare_copilot_env(base, "/tmp", ["copilot"])
+        assert "XDG_CONFIG_HOME" not in env
+        assert "XDG_STATE_HOME" not in env
 
 
 # ---------------------------------------------------------------------------
@@ -1020,7 +1091,7 @@ class TestHookHomeEndToEnd:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.92"))
+                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.95"))
                     raise SystemExit(0)
 
                 markers = Path(os.environ["ATTACK_MARKERS"])
@@ -1060,20 +1131,49 @@ class TestHookHomeEndToEnd:
             run_agent_cli("copilot", "use every host tool", model="")
         assert list(markers.iterdir()) == []
 
+    @staticmethod
+    def _write_env_recording_copilot(binary: Path) -> None:
+        """Fake host: answers --version, otherwise records its env."""
+        binary.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import os
+                import sys
+                from pathlib import Path
+
+                if sys.argv[1:] == ["--version"]:
+                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.95"))
+                    raise SystemExit(0)
+
+                markers = Path(os.environ["ATTACK_MARKERS"])
+                markers.mkdir(parents=True, exist_ok=True)
+                for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "COPILOT_HOME"):
+                    (markers / name).write_text(os.environ.get(name, "ABSENT"))
+                sys.stdin.read()
+                print("ok")
+                """
+            ),
+            encoding="utf-8",
+        )
+        binary.chmod(0o700)
+
     @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
-    def test_xdg_hook_source_rejects_before_prompt_delivery(
+    def test_inherited_relative_xdg_never_reaches_child(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Migration source hooks reject even with a hook-free home.
+        """A relative inherited XDG source cannot smuggle hook material.
 
-        COPILOT_HOME is clean; the hook lives only in the inherited
-        XDG source tree that startup would migrate into the home.
+        The shared allowlist strips XDG_CONFIG/STATE_HOME before the
+        child spawns, so the CLI falls back to the audited defaults:
+        scanner-side dirt in the relative tree is inert, and the
+        stand-in records the variables as absent.
         """
         home = tmp_path / "copilot-home"
         home.mkdir()
-        xdg = tmp_path / "xdg" / ".copilot" / "hooks"
-        xdg.mkdir(parents=True)
-        (xdg / "evil.json").write_text(
+        dirt = tmp_path / "evil-xdg" / ".copilot" / "hooks"
+        dirt.mkdir(parents=True)
+        (dirt / "evil.json").write_text(
             '{"version": 1, "hooks": {"userPromptSubmitted": '
             '[{"type": "prompt", "prompt": "hi"}]}}',
             encoding="utf-8",
@@ -1081,43 +1181,62 @@ class TestHookHomeEndToEnd:
         binary = tmp_path / "copilot"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_recording_copilot(binary)
+        self._write_env_recording_copilot(binary)
         monkeypatch.setenv("ATTACK_MARKERS", str(markers))
         monkeypatch.setenv("COPILOT_HOME", str(home))
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        monkeypatch.setenv("XDG_CONFIG_HOME", "../evil-xdg")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
-        with pytest.raises(AgentCLIError, match="hook"):
-            run_agent_cli("copilot", "use every host tool", model="")
-        assert list(markers.iterdir()) == []
+        assert run_agent_cli("copilot", "use every host tool", model="") == "ok"
+        assert (markers / "XDG_CONFIG_HOME").read_text(encoding="utf-8") == "ABSENT"
 
     @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
-    def test_xdg_state_source_rejects_before_prompt_delivery(
+    def test_inherited_spaced_xdg_state_never_reaches_child(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """STATE migration source plugins reject even with a clean home.
+        """A trailing-space inherited STATE source cannot smuggle plugins.
 
-        COPILOT_HOME and the CONFIG source are clean; plugin material
-        lives only in the inherited STATE tree that startup would
-        migrate into the home (verified in the 1.0.92 release source).
-        Rejection must precede prompt delivery.
+        Same mitigation as the CONFIG source: stripping happens for
+        the child, so the spaced tree is never resolved by the CLI.
         """
         home = tmp_path / "copilot-home"
         home.mkdir()
-        plugins = tmp_path / "xdg-state" / ".copilot" / "installed-plugins" / "evil"
+        plugins = tmp_path / "spaced " / ".copilot" / "installed-plugins" / "evil"
         plugins.mkdir(parents=True)
         binary = tmp_path / "copilot"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_recording_copilot(binary)
+        self._write_env_recording_copilot(binary)
         monkeypatch.setenv("ATTACK_MARKERS", str(markers))
         monkeypatch.setenv("COPILOT_HOME", str(home))
-        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "spaced "))
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
-        with pytest.raises(AgentCLIError, match="installed plugins"):
-            run_agent_cli("copilot", "use every host tool", model="")
-        assert list(markers.iterdir()) == []
+        assert run_agent_cli("copilot", "use every host tool", model="") == "ok"
+        assert (markers / "XDG_STATE_HOME").read_text(encoding="utf-8") == "ABSENT"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_relative_copilot_home_forwarded_absolute(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The child must receive the scanner-resolved absolute home.
+
+        A relative COPILOT_HOME resolves in the temp cwd for the CLI
+        but in the scanner cwd for the audit: forwarding the absolute
+        form keeps both sides on the same tree.
+        """
+        home = tmp_path / "rel-home"
+        home.mkdir()
+        binary = tmp_path / "copilot"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_env_recording_copilot(binary)
+        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        monkeypatch.setenv("COPILOT_HOME", "rel-home")
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        assert run_agent_cli("copilot", "use every host tool", model="") == "ok"
+        assert (markers / "COPILOT_HOME").read_text(encoding="utf-8") == str(home)
 
     @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
     def test_extensions_reject_before_prompt_delivery(
@@ -1195,7 +1314,7 @@ class TestAdversarialTransport:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.92"))
+                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.95"))
                     raise SystemExit(0)
 
                 markers = Path(os.environ["ATTACK_MARKERS"])
@@ -1293,6 +1412,6 @@ class TestAdversarialTransport:
         monkeypatch.setenv("FAKE_COPILOT_VERSION", "9.9.99")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
-        with pytest.raises(AgentCLIError, match="1.0.92"):
+        with pytest.raises(AgentCLIError, match="1.0.95"):
             run_agent_cli("copilot", "use every host tool", model="")
         assert list(markers.iterdir()) == []
