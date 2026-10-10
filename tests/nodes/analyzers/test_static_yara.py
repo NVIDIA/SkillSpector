@@ -2409,6 +2409,37 @@ class TestHelpers:
         assert "invalid" not in ns_map
         assert skipped == 1
 
+    @pytest.mark.parametrize("relative", [False, True])
+    def test_external_includes_are_rejected_without_dropping_valid_rules(
+        self, tmp_path, monkeypatch, relative
+    ):
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        outside = tmp_path / "private.yar"
+        outside.write_text('rule external_private_rule { strings: $a = "Local" condition: $a }')
+        include = "../private.yar" if relative else str(outside)
+        (rules_dir / "include.yar").write_text(f'include "{include}"')
+        (rules_dir / "good.yar").write_text(
+            'rule approved_local_rule { strings: $a = "Local" condition: $a }'
+        )
+        monkeypatch.chdir(rules_dir)
+        monkeypatch.setattr(static_yara, "_rule_cache", None)
+        monkeypatch.setattr(static_yara, "_BUILTIN_RULES_DIR", tmp_path / "empty_builtin")
+        result = static_yara.node(
+            {
+                "components": ["SKILL.md"],
+                "file_cache": {"SKILL.md": "Local sample skill."},
+                "yara_rules_dir": str(rules_dir),
+            }
+        )
+        assert any("approved_local_rule" in f.message for f in result["findings"])
+        assert not any("external_private_rule" in f.message for f in result["findings"])
+        assert result["analyzer_status_events"][0]["status"] != "completed"
+        assert any(
+            event.get("reason_code") == LedgerReason.READ_ERROR
+            for event in result["inspection_ledger"]
+        )
+
     def test_malformed_rule_is_reported_not_silently_dropped(self, tmp_path, monkeypatch):
         """A custom rule that can't compile must not report a clean, SAFE scan (#554).
 
