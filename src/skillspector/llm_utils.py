@@ -45,8 +45,10 @@ from collections.abc import Coroutine
 from typing import Any, NoReturn
 
 from google.auth.exceptions import RefreshError
+from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.runnables import Runnable, RunnableLambda
+from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
+from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from skillspector.inference_usage import (
     InferenceUsageCollector,
@@ -381,15 +383,26 @@ class AgentCLIChatModel:
 STRUCTURED_OUTPUT_METHODS = ("function_calling", "json_schema")
 
 
-def structured_output_kwargs(model: str, provider: object | None = None) -> dict[str, str]:
+def structured_output_kwargs(
+    model: str,
+    provider: object | None = None,
+    *,
+    preferred_method: str | None = None,
+) -> dict[str, str]:
     """Keyword arguments for ``with_structured_output`` when binding a schema for *model*.
 
     ``SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD`` wins, then the active provider's
-    ``structured_output_method(model)`` hint, else LangChain's default (no kwargs).
+    ``structured_output_method(model)`` hint, then an analyzer preference, else
+    LangChain's default (no kwargs).
 
     Raises:
-        ValueError: when the environment override is not a known method.
+        ValueError: when the environment override or preference is not a known method.
     """
+    if preferred_method is not None and preferred_method not in STRUCTURED_OUTPUT_METHODS:
+        raise ValueError(
+            "preferred structured output method must be one of "
+            f"{', '.join(STRUCTURED_OUTPUT_METHODS)}; got {preferred_method!r}"
+        )
     override = os.environ.get("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "").strip().lower()
     if override:
         if override not in STRUCTURED_OUTPUT_METHODS:
@@ -402,11 +415,19 @@ def structured_output_kwargs(model: str, provider: object | None = None) -> dict
         provider = get_active_provider()
     hint = getattr(provider, "structured_output_method", None)
     method = hint(model) if callable(hint) else None
+    if method:
+        return {"method": method}
+    method = preferred_method
     return {"method": method} if method else {}
 
 
 def bind_structured_output(
-    llm: object, schema: type, model: str, provider: object | None = None
+    llm: object,
+    schema: type,
+    model: str,
+    provider: object | None = None,
+    *,
+    preferred_method: str | None = None,
 ) -> object:
     """``llm.with_structured_output(schema)`` with the method *model* needs.
 
@@ -416,11 +437,24 @@ def bind_structured_output(
     the prompt, and a prose answer raises :class:`StructuredOutputParseError`,
     which the analyzers retry like any other malformed structured response.
     """
-    kwargs = structured_output_kwargs(model, provider)
-    structured = llm.with_structured_output(schema, **kwargs)  # type: ignore[attr-defined]
-    if not _binds_unforced_tool_call(llm, kwargs.get("method")):
-        return structured
-    return _require_tool_call(structured, schema)
+    kwargs = structured_output_kwargs(model, provider, preferred_method=preferred_method)
+    unforced = _binds_unforced_tool_call(llm, kwargs.get("method"))
+    include_raw = isinstance(llm, BaseChatModel) and (
+        unforced or kwargs.get("method") == "function_calling"
+    )
+    binding_kwargs: dict[str, Any] = dict(kwargs)
+    if include_raw:
+        # Native parsers may silently keep only the first tool call. Retain the
+        # raw message so validation can reject extra or invalid calls instead.
+        binding_kwargs["include_raw"] = True
+    structured = llm.with_structured_output(schema, **binding_kwargs)  # type: ignore[attr-defined]
+    if unforced:
+        return _require_tool_call(structured, schema, include_raw=include_raw)
+    if kwargs.get("method") == "function_calling" and not isinstance(
+        structured, _StructuredAgentCLIModel
+    ):
+        return _validate_tool_call_result(structured, schema, include_raw=include_raw)
+    return structured
 
 
 def _binds_unforced_tool_call(llm: object, method: str | None) -> bool:
@@ -446,21 +480,82 @@ _TOOL_CALL_INSTRUCTION = (
 )
 
 
-def _require_tool_call(structured: Runnable, schema: type) -> Runnable:
+def _require_tool_call(
+    structured: Runnable, schema: type, *, include_raw: bool = False
+) -> Runnable:
     """Ask for the tool call in the prompt and fail closed when it does not happen."""
-    tool = schema.__name__ if isinstance(schema, type) else "response"
+    tool = (
+        convert_to_openai_tool(schema)["function"]["name"]
+        if include_raw
+        else schema.__name__
+        if isinstance(schema, type)
+        else "response"
+    )
 
     def _ask(prompt: str) -> str:
         return f"{prompt}\n\n{_TOOL_CALL_INSTRUCTION.format(tool=tool)}"
 
+    return RunnableLambda(_ask) | _validate_tool_call_result(
+        structured, schema, include_raw=include_raw
+    )
+
+
+def _validate_tool_call_result(
+    structured: Runnable, schema: type, *, include_raw: bool = False
+) -> Runnable:
+    """Validate forced/auto tool results without changing the bound model prompt."""
+    tool = (
+        convert_to_openai_tool(schema)["function"]["name"]
+        if include_raw
+        else schema.__name__
+        if isinstance(schema, type)
+        else "response"
+    )
+
     def _check(result: object) -> object:
+        if include_raw:
+            if not isinstance(result, dict):
+                raise StructuredOutputParseError(f"model returned invalid {tool} tool output")
+            raw = result.get("raw")
+            calls = getattr(raw, "tool_calls", None)
+            if (
+                not isinstance(calls, list)
+                or len(calls) != 1
+                or calls[0].get("name") != tool
+                or getattr(raw, "invalid_tool_calls", None)
+            ):
+                raise StructuredOutputParseError(
+                    f"model must return exactly one valid {tool} tool call"
+                )
+            error = result.get("parsing_error")
+            if error is not None:
+                raise StructuredOutputParseError(
+                    f"model returned invalid {tool} tool arguments"
+                ) from error
+            result = result.get("parsed")
         if result is None:
             raise StructuredOutputParseError(
                 f"model answered in prose instead of calling the {tool} tool"
             )
         return result
 
-    return RunnableLambda(_ask) | structured | RunnableLambda(_check)
+    def _invoke(prompt: Any, config: RunnableConfig) -> object:
+        try:
+            return _check(structured.invoke(prompt, config=config))
+        except OutputParserException as exc:
+            raise StructuredOutputParseError(
+                f"model returned invalid {tool} tool arguments"
+            ) from exc
+
+    async def _ainvoke(prompt: Any, config: RunnableConfig) -> object:
+        try:
+            return _check(await structured.ainvoke(prompt, config=config))
+        except OutputParserException as exc:
+            raise StructuredOutputParseError(
+                f"model returned invalid {tool} tool arguments"
+            ) from exc
+
+    return RunnableLambda(_invoke, _ainvoke)
 
 
 def get_chat_model(

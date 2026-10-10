@@ -36,6 +36,15 @@ class LedgerRecordType(StrEnum):
     WORK_ITEM = "work_item"
     SYSTEM = "system"
     SCOPE_BOUNDARY = "scope_boundary"
+    # An analyzer's own configuration (e.g. its YARA rule set), not a skill
+    # artifact. Its ``path`` is only a report-safe label, and every relative
+    # path is also a legal file name, so path-keyed accounting must exclude
+    # these records by type -- no choice of label can be collision-free.
+    RULE_SET = "rule_set"
+
+
+RULE_SET_SCOPE: Final = "rule_set"
+"""Public ``scope`` of exception rows describing a rule set rather than a file."""
 
 
 class LedgerReason(StrEnum):
@@ -99,6 +108,8 @@ class LedgerReason(StrEnum):
     OUTPUT_LIMIT = "output_limit"
     TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
+    PYTHON_SOURCE_AMBIGUOUS = "python_source_ambiguous"
+    PYTHON_SOURCE_DECODE_ERROR = "python_source_decode_error"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
 
 
@@ -212,6 +223,12 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.STATIC_PARSE_LIMIT: (
         "A security-relevant expression exceeded a bounded static parser's span limit."
     ),
+    LedgerReason.PYTHON_SOURCE_AMBIGUOUS: (
+        "Python execution intent depends on runtime or platform-specific shebang semantics."
+    ),
+    LedgerReason.PYTHON_SOURCE_DECODE_ERROR: (
+        "Python source bytes could not be decoded under their declared encoding."
+    ),
     LedgerReason.OBFUSCATED_INSTRUCTION_TEXT: (
         "Obfuscated instruction text could not be fully evaluated by the deterministic layer."
     ),
@@ -295,6 +312,7 @@ class InspectionLedgerException(TypedDict):
     error_class: NotRequired[str]
     analyzers: NotRequired[list[str]]
     fatal: NotRequired[bool]
+    scope: NotRequired[str]
 
 
 class AnalysisCompleteness(TypedDict):
@@ -589,6 +607,7 @@ def _exception(
     error_class: str | None = None,
     analyzers: Iterable[str] = (),
     fatal: bool,
+    scope: str | None = None,
 ) -> InspectionLedgerException:
     """Build the public, safe projection of one exceptional ledger fact."""
     exception: InspectionLedgerException = {
@@ -606,7 +625,14 @@ def _exception(
         exception["analyzers"] = analyzer_ids
     if error_class:
         exception["error_class"] = error_class
+    if scope:
+        exception["scope"] = scope
     return exception
+
+
+def _is_rule_set_record(event: Mapping[str, object]) -> bool:
+    """Return whether a ledger row describes a rule set rather than an artifact."""
+    return event.get("record_type") == LedgerRecordType.RULE_SET
 
 
 def _exception_from_event(
@@ -629,6 +655,7 @@ def _exception_from_event(
         error_class=event.get("error_class"),
         analyzers=[str(event.get("analyzer_id", ""))],
         fatal=fatal,
+        scope=RULE_SET_SCOPE if _is_rule_set_record(event) else None,
     )
 
 
@@ -647,6 +674,9 @@ def _merge_exception_projection(
             exception["start_line"],
             exception["end_line"],
             exception.get("error_class"),
+            # A rule-set row and a real file's row can share a path label;
+            # they must never merge into one public row.
+            exception.get("scope"),
         )
         existing = grouped.get(key)
         if existing is None:
@@ -926,9 +956,17 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
     ledger_exceptions = _merge_exception_projection(exceptional_rows)
     scope_exclusions = _merge_exception_projection(scope_rows)
 
+    # Rule-set rows describe an analyzer's configuration, not an artifact. Their
+    # path is only a label, so folding them into per-component coverage would
+    # charge the rule set's incompleteness to any real file with that name.
+    rule_set_work_ids = {
+        str(event.get("work_id", "")) for event in events if _is_rule_set_record(event)
+    }
     per_component: dict[str, list[LedgerOutcome]] = {component: [] for component in components}
     if primary_targets:
         for _analyzer_id, target, matches in primary_targets:
+            if str(target.get("work_id", "")) in rule_set_work_ids:
+                continue
             path = _safe_path(target.get("path"), components)
             outcomes = per_component.setdefault(path, [])
             if len(matches) == 1:

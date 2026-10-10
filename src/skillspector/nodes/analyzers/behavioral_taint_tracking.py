@@ -39,7 +39,12 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
-from skillspector.python_ast import ParsedPythonFile, get_python_ast
+from skillspector.python_ast import (
+    ParsedPythonFile,
+    PythonSourceClassification,
+    get_python_ast,
+    resolve_python_source_classification,
+)
 from skillspector.state import (
     AnalyzerNodeResponse,
     SkillspectorState,
@@ -123,6 +128,7 @@ _NETWORK_OUTPUT_SINKS = frozenset(
         "httpx.patch",
         "httpx.get",
         "urllib.request.urlopen",
+        "urllib.request.build_opener.open",
         "socket.socket.send",
         "socket.socket.sendall",
         "socket.socket.sendto",
@@ -298,6 +304,14 @@ def _resolve_sink_name(
     ``importlib.import_module('subprocess').run(...)`` resolves to ``'subprocess.run'``
     and re-enters ``_EXEC_SINKS`` like the statically-imported form would.
     """
+    if (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "open"
+        and isinstance(node.func.value, ast.Call)
+        and resolve_call_name_typed(node.func.value, type_map, aliases)
+        == "urllib.request.build_opener"
+    ):
+        return "urllib.request.build_opener.open"
     name = resolve_call_name_typed(node, type_map, aliases)
     if name is None:
         name = resolve_dynamic_import_call(node, aliases)
@@ -723,6 +737,14 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Parse Python files and detect source\u2192sink data flows."""
     components: list[str] = state.get("components") or []
     file_cache: dict[str, str] = state.get("local_file_cache") or state.get("file_cache") or {}
+    raw_file_cache = state.get("raw_file_cache")
+    source_classifications = (
+        state.get("python_source_classifications")
+        if "python_source_classifications" in state
+        else None
+    )
+    source_classification_limitations = state.get("python_source_classification_limitations") or {}
+    source_decode_failures = state.get("python_source_decode_failures") or {}
     python_ast_cache_key = state.get("python_ast_cache_key")
     all_findings: list[Finding] = []
     ledger_events: list[InspectionLedgerEvent] = []
@@ -730,7 +752,27 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     terminal_limit: _BehavioralResourceLimitError | None = None
 
     for path in components:
-        if not path.endswith(".py"):
+        content = file_cache.get(path)
+        source_classification: PythonSourceClassification | None = None
+        if source_classifications is not None and path in source_classifications:
+            source_classification = resolve_python_source_classification(
+                path,
+                content,
+                source_classifications=source_classifications,
+                raw_file_cache=raw_file_cache,
+            )
+            if source_classification is PythonSourceClassification.NON_PYTHON:
+                continue
+        if path in source_classification_limitations:
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="behavioral",
+                    analyzer_id=ANALYZER_ID,
+                    path=path,
+                    reason=LedgerReason.RUNTIME_LIMIT,
+                )
+            )
             continue
         if terminal_limit is None and budget.analyzer_exhausted():
             terminal_limit = _BehavioralResourceLimitError(
@@ -740,11 +782,41 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                     "limit_findings": MAX_FINDINGS_PER_ANALYZER,
                 },
             )
+        if terminal_limit is None:
+            try:
+                budget.check_runtime()
+            except _BehavioralResourceLimitError as exc:
+                terminal_limit = exc
         if terminal_limit is not None:
             event = _partial_limit_event(path, terminal_limit)
             ledger_events.append(event)
             continue
-        content = file_cache.get(path)
+        if path in source_decode_failures:
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="behavioral",
+                    analyzer_id=ANALYZER_ID,
+                    path=path,
+                    reason=LedgerReason.PYTHON_SOURCE_DECODE_ERROR,
+                )
+            )
+            continue
+        if source_classification is None:
+            source_classification = resolve_python_source_classification(
+                path,
+                content,
+                source_classifications=source_classifications,
+                raw_file_cache=raw_file_cache,
+            )
+            try:
+                budget.check_runtime()
+            except _BehavioralResourceLimitError as exc:
+                terminal_limit = exc
+                ledger_events.append(_partial_limit_event(path, exc))
+                continue
+        if source_classification is PythonSourceClassification.NON_PYTHON:
+            continue
         if content is None:
             event = ledger_event(
                 outcome=LedgerOutcome.FAILED,
@@ -800,10 +872,19 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 )
             else:
                 event = ledger_event(
-                    outcome=LedgerOutcome.COMPLETED,
+                    outcome=(
+                        LedgerOutcome.PARTIAL
+                        if source_classification is PythonSourceClassification.AMBIGUOUS
+                        else LedgerOutcome.COMPLETED
+                    ),
                     phase="behavioral",
                     analyzer_id=ANALYZER_ID,
                     path=path,
+                    reason=(
+                        LedgerReason.PYTHON_SOURCE_AMBIGUOUS
+                        if source_classification is PythonSourceClassification.AMBIGUOUS
+                        else None
+                    ),
                     emitted_finding_ids=[finding.finding_id for finding in path_findings],
                 )
         ledger_events.append(event)

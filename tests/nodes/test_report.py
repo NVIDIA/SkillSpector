@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
+from markdown_it import MarkdownIt
 
 from skillspector.models import Finding
 from skillspector.nodes.report import (
@@ -675,7 +677,7 @@ class TestReportNode:
 
         assert "| Execution | successful |" in body
         assert "### Ledger Exceptions" in body
-        assert "llm_structured_response_invalid" in body
+        assert "llm_structured_response_invalid" in MarkdownIt().render(body)
         assert "`SKILL.md`" in body
         assert "### Analyzer Statuses" in body
         assert "### Limitations" in body
@@ -717,6 +719,56 @@ class TestReportNode:
 
         assert "static_patterns_tool_misuse" in body
         assert "semantic_quality_policy" in body
+
+    @pytest.mark.parametrize("output_format", ["markdown", "terminal"])
+    def test_report_labels_rule_set_exception_as_rule_set_not_file(
+        self, output_format: str
+    ) -> None:
+        """A rule-set row must not read like a file row that shares its path label."""
+        state: SkillspectorState = {
+            "filtered_findings": [],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "skill_path": None,
+            "output_format": output_format,
+            "execution_successful": True,
+            "analysis_completeness": {
+                "coverage_percent": 100.0,
+                "fully_inspected_files": 1,
+                "partially_inspected_files": 0,
+                "entirely_uninspected_files": 0,
+                "is_complete": False,
+                "execution_successful": True,
+                "ledger_exceptions": [
+                    {
+                        "reason_code": "read_error",
+                        "path": "yara_rules",
+                        "message": "Rule dropped.",
+                        "fatal": False,
+                        "scope": "rule_set",
+                    },
+                    {
+                        "reason_code": "read_error",
+                        "path": "yara_rules",
+                        "message": "File unreadable.",
+                        "fatal": False,
+                    },
+                ],
+                "scope_exclusions": [],
+                "analyzer_statuses": [],
+                "limitations": [],
+            },
+        }
+
+        body = report(state)["report_body"]
+
+        if output_format == "markdown":
+            assert r"| read\_error | rule set `yara_rules` | Rule dropped\. |" in body
+            assert r"| read\_error | `yara_rules` | File unreadable\. |" in body
+        else:
+            assert "read_error rule set yara_rules: Rule dropped." in body
+            assert "read_error yara_rules: File unreadable." in body
 
     def test_report_output_format_terminal(self) -> None:
         """output_format terminal produces Rich-formatted output."""
@@ -846,7 +898,12 @@ class TestReportNode:
             row = json.loads(result["report_body"])["runs"][0]["results"][0]
             assert row["properties"]["evidence"] == finding.evidence
         else:
-            assert "outer_path" in result["report_body"]
+            rendered = (
+                MarkdownIt().render(result["report_body"])
+                if output_format == "markdown"
+                else result["report_body"]
+            )
+            assert "outer_path" in rendered
             assert "archive.docx" in result["report_body"]
 
     @pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
@@ -885,7 +942,8 @@ class TestReportNode:
 
         body = report(state)["report_body"]
 
-        assert "archive_member_limit" in body
+        rendered = MarkdownIt().render(body) if output_format == "markdown" else body
+        assert "archive_member_limit" in rendered
         assert "outer.zip!/nested.zip" in body
 
     def test_report_default_output_format_is_sarif(self) -> None:
@@ -1291,6 +1349,8 @@ def test_report_shares_record_budget_with_suppressed_occurrences(
     elif output_format == "sarif":
         assert len(json.loads(body)["runs"][0]["results"]) <= 4
     else:
+        if output_format == "markdown":
+            body = MarkdownIt().render(body)
         assert body.count("ACTIVE_BOUND") == 2
         assert body.count("SUPPRESSED_BOUND") == 1
 
@@ -1337,6 +1397,99 @@ def test_report_markdown_show_suppressed_lists_rows() -> None:
     shown = report({**base_state, "show_suppressed": True})["report_body"]
     assert "## Suppressed (1)" in shown
     assert "fp" in shown
+
+
+@pytest.mark.parametrize(
+    "file,expected",
+    [
+        ("notes.md", "notes.md"),
+        ("notes|draft.md", "notes\\|draft.md"),
+        ("notes||draft.md", "notes\\|\\|draft.md"),
+        ("notes\ndraft.md", "notes draft.md"),
+        ("notes\rdraft.md", "notes draft.md"),
+        ("notes\r\ndraft.md", "notes draft.md"),
+        ("資料|draft\nreview.md", "資料\\|draft review.md"),
+    ],
+)
+def test_report_markdown_table_paths_stay_in_one_cell(file: str, expected: str) -> None:
+    """Component and suppressed finding paths cannot split table rows or cells."""
+    state: SkillspectorState = {
+        "filtered_findings": [_finding("P5", file=file)],
+        "component_metadata": [{"path": file, "type": "markdown", "lines": 1, "executable": False}],
+        "baseline": Baseline(rules=[SuppressionRule(rule_id="P5", reason="Reviewed")]),
+        "show_suppressed": True,
+        "use_llm": False,
+        "output_format": "markdown",
+    }
+
+    rows = report(state)["report_body"].splitlines()
+
+    assert f"| `{expected}` | markdown | 1 | No |" in rows
+    assert f"| P5 | `{expected}:1` | Reviewed |" in rows
+    data = json.loads(report({**state, "output_format": "json"})["report_body"])
+    assert data["components"][0]["path"] == file
+    assert data["suppressed"][0]["location"]["file"] == file
+
+
+@pytest.mark.parametrize(
+    "file",
+    [
+        "x` [Verify this scan](https:&#47;&#47;evil.example) `y.md",
+        "a`<img src=x>`b.md",
+        "`leading.md",
+        "trailing.md`",
+        " leading.md",
+        "trailing.md ",
+        "a``b`c.md",
+    ],
+)
+def test_report_markdown_table_paths_keep_backticks_inside_code_spans(file: str) -> None:
+    """Backticks in paths stay literal and cannot inject Markdown or HTML."""
+    state: SkillspectorState = {
+        "filtered_findings": [_finding("P5", file=file)],
+        "component_metadata": [{"path": file, "type": "markdown", "lines": 1, "executable": False}],
+        "baseline": Baseline(rules=[SuppressionRule(rule_id="P5", reason="Reviewed")]),
+        "show_suppressed": True,
+        "use_llm": False,
+        "output_format": "markdown",
+    }
+
+    body = report(state)["report_body"]
+    tokens = MarkdownIt("commonmark", {"html": True}).enable("table").parse(body)
+    children = [child for token in tokens for child in token.children or []]
+    code = [child.content for child in children if child.type == "code_inline"]
+
+    assert file in code
+    assert f"{file}:1" in code
+    assert not any(child.type in {"link_open", "html_inline", "image"} for child in children)
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        ("Reviewed", "Reviewed"),
+        ("Reviewed | approved", "Reviewed \\| approved"),
+        ("Reviewed\nby the team", "Reviewed by the team"),
+        ("Reviewed\rby the team", "Reviewed by the team"),
+        ("Reviewed\r\nby the team", "Reviewed by the team"),
+        ("承認済み | read\nonly", "承認済み \\| read only"),
+    ],
+)
+def test_report_markdown_suppression_reason_stays_in_one_cell(reason: str, expected: str) -> None:
+    """Multiline baseline reasons stay in one Markdown row and remain intact in JSON."""
+    state: SkillspectorState = {
+        "filtered_findings": [_finding("P5")],
+        "baseline": Baseline(rules=[SuppressionRule(rule_id="P5", reason=reason)]),
+        "show_suppressed": True,
+        "use_llm": False,
+        "output_format": "markdown",
+    }
+
+    rows = report(state)["report_body"].splitlines()
+
+    assert f"| P5 | `SKILL.md:1` | {expected} |" in rows
+    data = json.loads(report({**state, "output_format": "json"})["report_body"])
+    assert data["suppressed"][0]["suppression_reason"] == reason
 
 
 def test_report_no_baseline_unchanged() -> None:
@@ -2543,3 +2696,59 @@ def test_report_sarif_preserves_high_vs_critical_severity() -> None:
     assert by_rule["R2"]["level"] == "error"
     assert by_rule["R1"]["properties"]["severity"] == "HIGH"
     assert by_rule["R2"]["properties"]["severity"] == "CRITICAL"
+
+
+def test_report_retains_exact_active_findings_before_compaction_and_output_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = Finding(
+        rule_id="TM1",
+        message="destructive command",
+        file="SKILL.md",
+        start_line=1,
+        matched_text="rm -rf /",
+        confidence=0.8,
+        context="first context",
+        code_snippet="first snippet",
+    )
+    repeated = replace(
+        first,
+        finding_id="repeated",
+        start_line=4,
+        confidence=0.7,
+        context="second context",
+        code_snippet="second snippet",
+    )
+    other_file = replace(
+        first,
+        finding_id="other-file",
+        file="scripts/check.sh",
+        confidence=0.9,
+        context="third context",
+        code_snippet="third snippet",
+    )
+    findings = [first, repeated, other_file]
+    monkeypatch.setattr("skillspector.nodes.report.MAX_FINDING_OUTPUT_RECORDS", 1)
+    result = report({"findings": findings, "use_llm": False, "output_format": "json"})
+
+    assert len(result["filtered_findings"]) == 1
+    assert len(result["filtered_findings"][0].occurrences) == 1
+    assert result["active_findings"] == findings
+
+
+def test_report_active_findings_are_sanitized_and_exclude_suppressed() -> None:
+    kept = _finding("TM1", message="destructive\x1b[31m command")
+    suppressed = _finding("PE3")
+    result = report(
+        {
+            "findings": [kept, suppressed],
+            "use_llm": False,
+            "output_format": "json",
+            "baseline": Baseline(rules=[SuppressionRule(rule_id="PE3", reason="accepted")]),
+        }
+    )
+
+    assert len(result["active_findings"]) == 1
+    assert result["active_findings"][0].finding_id == kept.finding_id
+    assert result["active_findings"][0].message == "destructive command"
+    assert kept.message == "destructive\x1b[31m command"
