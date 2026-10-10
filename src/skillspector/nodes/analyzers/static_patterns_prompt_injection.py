@@ -244,19 +244,28 @@ _VARIATION_SELECTORS = {0xFE0E, 0xFE0F}
 # Shared grammar cores: the year-range + holder cap and the SPDX
 # expression each appear in both a license-line form and a metadata
 # value form. One core per shape so the next cap change edits one place.
-# Name-like tokens carry letters, digits, and header punctuation only
-# (no colon, slash, or tilde) with at most one inner hyphen, so a
-# hyphen-, colon-, or slash-joined sentence never counts as tokens.
-_P2_NAME_TOKEN = r"[A-Za-z0-9&.,'()+]+(?:-[A-Za-z0-9&.,'()+]+)?"
+# Name-like tokens carry letters, digits, underscore, and header
+# punctuation only (no colon, slash, tilde, or inner dot — the path
+# grammar needs the dot for the file extension) with at most one
+# inner separator ([-,_]) and an optional trailing dot or comma
+# (Corp., Acme,), so a dot-, comma-, hyphen-, colon-, or
+# slash-joined sentence never counts as tokens.
+_P2_NAME_TOKEN = r"[A-Za-z0-9&'()+_]+(?:[-,_][A-Za-z0-9&'()+_]+)?[.,]?"
 _P2_COPYRIGHT_CORE = (
     r"(?=.{1,60}\Z)(?:\(c\)\s+|©\s+)?\d{1,4}(?:\s*-\s*\d{1,4})?"
     r"\s+(?:" + _P2_NAME_TOKEN + r"\s+){0,5}" + _P2_NAME_TOKEN + r"\.?"
 )
-# SPDX ids allow at most two hyphens (length is scoped to the id run so
-# chains and trailing periods never shrink it); chains cap at three ids.
+# SPDX ids allow at most two hyphens, plus a third only in a
+# digit-bearing id (versioned compounds such as GPL-3.0-or-later and
+# CC-BY-SA-4.0; all-alpha 3-hyphen runs stay refused). Dots sit only
+# between digits, so dot-joined prose never fits. Length is scoped to
+# the id run so chains and trailing periods never shrink it; chains
+# cap at three ids.
 _P2_SPDX_ID = (
     r"(?=[A-Za-z0-9.+\-]{1,24}(?![A-Za-z0-9.+\-]))"
-    r"[A-Za-z0-9.+]+(?:-[A-Za-z0-9.+]+){0,2}"
+    r"(?:[A-Za-z0-9+]+(?:\.[0-9]+)?(?:-[A-Za-z0-9+]+(?:\.[0-9]+)?){0,2}"
+    r"|(?=[A-Za-z0-9.+\-]*[0-9])[A-Za-z0-9+]+(?:\.[0-9]+)?"
+    r"(?:-[A-Za-z0-9+]+(?:\.[0-9]+)?){0,3})"
 )
 _P2_SPDX_ATOM = _P2_SPDX_ID + r"(?:\s+(?:OR|AND|WITH)\s+" + _P2_SPDX_ID + r"){0,2}"
 _P2_LICENSE_LINE_RES = (
@@ -270,17 +279,15 @@ _P2_LICENSE_LINE_RES = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"\ALicensed under the\s+(?:"
-        + _P2_NAME_TOKEN
-        + r"\s+){0,2}"
-        + _P2_NAME_TOKEN
-        + r"\s+License"
+        r"\ALicensed under the\s+(?=.{1,40}\s+License)"
+        r"(?:" + _P2_NAME_TOKEN + r"\s+){0,2}" + _P2_NAME_TOKEN + r"\s+License"
         r"(?:, Version \d+\.\d+)?\.?\Z",
         re.IGNORECASE,
     ),
 )
 _P2_COPYRIGHT_LINE_INDEX = 0
 _P2_SPDX_LINE_INDEX = 2
+_P2_LICENSED_LINE_INDEX = 3
 _P2_OVERRIDE_EXTRA = re.compile(
     r"system\s+prompt|respond\s+as|override\s+instructions?|you\s+must",
     re.IGNORECASE,
@@ -294,23 +301,27 @@ _P2_EXTERNAL_DEST = re.compile(
     re.IGNORECASE,
 )
 _P2_EXFIL_STANDALONE = re.compile(r"\bexfiltrat\w*\b", re.IGNORECASE)
-# Standalone instruction-ish words refuse the benign exemption when they
-# appear in a value or license fragment. Keys are never scanned (system
-# requirements, get started). Load-bearing for Title-Case prose, which
-# no name grammar can stop. Fail-closed FP shapes: send feedback, blog
-# post, operating system in values.
-_P2_TRIGGER_STANDALONE = re.compile(
-    r"\b(system|instructions?|ignore|post|get|send|transmit)\b", re.IGNORECASE
+# Instruction-ish words refuse the benign exemption when they appear
+# anywhere in a value or license fragment, even inside a longer word —
+# that is how main's P2 regex matches. Keys are never scanned (system
+# requirements, get started). "get" is deliberately excluded: as a
+# substring it fires on ordinary prose (getting_started, target,
+# forget), while GET-plus-URL exfiltration still trips the danger
+# scans. This costs one plain-prose shape (PostgreSQL carries "post"):
+# it reports P2, as it does on main, as does Systems ("system").
+# Applied to values and license fragments only, never keys.
+_P2_TRIGGER_SUBSTRING = re.compile(
+    r"(system|instructions?|ignore|post|send|transmit)", re.IGNORECASE
 )
 
 
 def _p2_trigger_scan_text(text: str) -> str:
-    """Return a de-obfuscated copy of ``text`` for trigger/danger scans.
+    """Return a de-obfuscated copy of ``text`` for the danger scans.
 
     camelCase joints, underscores, and digits become spaces, so
     IgnorePriorInstructions scans as Ignore Prior Instructions.
-    Grammars always match the raw text; only the scans use the copy.
-    Single benign words (PostgreSQL, Systems) stay whole-word clean.
+    Only the danger scans use the copy; the exemption trigger check
+    is a raw substring, which needs no de-obfuscation.
     """
     text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", text)
     text = re.sub(r"[0-9_]+", " ", text)
@@ -348,20 +359,24 @@ _P2_METADATA_LINE = re.compile(r"\A([A-Za-z][\w\- ]{0,40}):\s+(\S.*)\Z")
 # are 1-4 capitalized tokens or an email, requires entries each carry
 # a version unless the value is one bare name (operators may follow
 # the name directly: "python>=3.10"), free-text keys take one short
-# hyphen-free word, and get-started paths need a dotted final segment
-# so slash-joined prose no longer fits. A standalone trigger word
-# (system, instruction(s), ignore, post, get, send, transmit) in any
-# value refuses exemption; keys are excluded since "system
-# requirements" and "get started" are keys. Known residuals: a bare
-# triggerless package name ("requires: numpy") parses as a package;
-# short triggerless SPDX OR-chains fit the atom cap.
-# Requirement names take a package-name shape: optional @scope/, at most
-# 40 characters, at most two -/_/. separators — a hyphen-joined sentence
-# never counts as one bare name. Length is scoped to the name run so
-# comma-separated lists never shrink it.
+# token with at most two inner dots, and get-started paths need a
+# dotted final segment so slash-joined prose no longer fits. A
+# trigger word anywhere inside a value (system, instruction(s),
+# ignore, post, send, transmit — never "get", see above) refuses
+# exemption; keys are excluded since "system requirements" and "get
+# started" are keys. Known residuals: a bare triggerless package name
+# ("requires: numpy") parses as a package; short triggerless SPDX
+# OR-chains fit the atom cap; a trigger broken inside itself
+# ("ig_nore") carries no contiguous trigger run, so neither this
+# check nor main's regex sees it.
+# Requirement names take a package-name shape: optional @scope/
+# (hyphens allowed in the scope), at most 40 characters, at most two
+# -/_/. separators — a separator-joined sentence never counts as one
+# bare name. Length is scoped to the name run so comma-separated
+# lists never shrink it.
 _P2_REQ_NAME = (
     r"(?=[A-Za-z0-9_.@/\-]{1,40}(?![A-Za-z0-9_.@/\-]))"
-    r"(?:@[A-Za-z0-9_.]+/)?[A-Za-z0-9_.]+(?:[-/.][A-Za-z0-9_.]+){0,2}"
+    r"(?:@[A-Za-z0-9_.\-]+/)?[A-Za-z0-9]+(?:[-_./][A-Za-z0-9]+){0,2}"
 )
 _P2_REQ_VER = r"v?\d+(?:\.\d+){0,3}(?:[-+][0-9A-Za-z.]{1,20})?[+*]?"
 _P2_REQ_OP = r"(?:>=|<=|==|!=|~=|\^|>|<|=|~)"
@@ -384,7 +399,7 @@ _P2_PATH_VALUE_RE = re.compile(
     r"\A(?=[\w\-./#:?]{1,80}\Z)(?:https?://[\w\-.~]+(?::\d+)?/)?"
     r"(?:" + _P2_NAME_TOKEN + r"/){0,3}" + _P2_NAME_TOKEN + r"\.[\w]{1,10}(?:[#?]\S*)?\Z"
 )
-_P2_SINGLE_TOKEN_RE = re.compile(r"\A[A-Za-z0-9.]{1,24}\Z")
+_P2_SINGLE_TOKEN_RE = re.compile(r"\A(?=[A-Za-z0-9.]{1,24}\Z)[A-Za-z0-9]+(?:\.[A-Za-z0-9]+){0,2}\Z")
 _P2_COPYRIGHT_VALUE_RE = re.compile(
     r"\A" + _P2_COPYRIGHT_CORE + r"\Z",
     re.IGNORECASE,
@@ -470,7 +485,7 @@ def _is_frontmatter_adjacent(content: str, match_start: int) -> bool:
 
 def _is_license_only_fragment(fragment: str) -> bool:
     """Return True when the fragment fully matches an anchored license-line form."""
-    if _P2_TRIGGER_STANDALONE.search(_p2_trigger_scan_text(fragment)) is not None:
+    if _P2_TRIGGER_SUBSTRING.search(fragment) is not None:
         return False
     return any(pattern.match(fragment) is not None for pattern in _P2_LICENSE_LINE_RES)
 
@@ -491,7 +506,7 @@ def _is_allowlisted_metadata_fragment(fragment: str) -> bool:
     value = match.group(2).strip()
     if len(value) > 1 and value.endswith("."):
         value = value[:-1]
-    if _P2_TRIGGER_STANDALONE.search(_p2_trigger_scan_text(value)) is not None:
+    if _P2_TRIGGER_SUBSTRING.search(value) is not None:
         return False
     if key in _P2_FREE_TEXT_KEYS:
         return _P2_SINGLE_TOKEN_RE.match(value) is not None
@@ -516,6 +531,7 @@ def _is_benign_license_or_metadata_body(inner: str) -> bool:
     seen_keys: set[str] = set()
     copyright_lines = 0
     spdx_lines = 0
+    licensed_lines = 0
     for fragment in re.split(r"[.!?]+\s+|\n|;", body):
         fragment = fragment.strip()
         if not fragment:
@@ -529,6 +545,10 @@ def _is_benign_license_or_metadata_body(inner: str) -> bool:
                 spdx_lines += 1
                 if spdx_lines > 1:
                     return False
+            elif _P2_LICENSE_LINE_RES[_P2_LICENSED_LINE_INDEX].match(fragment) is not None:
+                licensed_lines += 1
+                if licensed_lines > 1:
+                    return False
             continue
         key_match = _P2_METADATA_LINE.match(fragment)
         if key_match is not None:
@@ -537,6 +557,10 @@ def _is_benign_license_or_metadata_body(inner: str) -> bool:
                 if key in seen_keys:
                     return False
                 seen_keys.add(key)
+                if key == "copyright":
+                    copyright_lines += 1
+                    if copyright_lines > 2:
+                        return False
         if _is_allowlisted_metadata_fragment(fragment):
             continue
         return False
