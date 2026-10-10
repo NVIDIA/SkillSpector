@@ -131,6 +131,19 @@ class TestPerSlotModelOverrides:
 
         assert config["default"] == NvBuildProvider.DEFAULT_MODEL
 
+    def test_nv_build_slot_override_does_not_inherit_glm_reasoning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "nv_build")
+        monkeypatch.setenv("NVIDIA_INFERENCE_KEY", "nvapi-test")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_META_ANALYZER", "openai/gpt-oss-120b")
+        config = _reload_constants().build_model_config()
+        provider = NvBuildProvider()
+        default_model = provider.create_chat_model(config["default"], max_tokens=123)
+        meta_model = provider.create_chat_model(config["meta_analyzer"], max_tokens=123)
+        assert default_model._get_request_payload("hello")["reasoning_effort"] == "high"
+        assert "reasoning_effort" not in meta_model._get_request_payload("hello")
+
     def test_cli_provider_precedes_openai_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "codex_cli")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")

@@ -37,6 +37,7 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 from . import static_runner
 from .common import SourceLocationIndex, get_context, get_line_number
 from .pattern_defaults import PatternCategory
+from .prohibition_context import is_directly_prohibited
 
 logger = get_logger(__name__)
 
@@ -102,6 +103,43 @@ EA2_PROSE_PATTERNS = [
     ),
 ]
 EA2_PATTERNS = EA2_CODE_PATTERNS + EA2_PROSE_PATTERNS
+
+# Approval qualifiers are risky only when attached to an affirmative action.
+# Keep this grammar deliberately small: arbitrary words between a prohibition
+# and "without approval" could contain a separate, operative instruction.
+_APPROVAL_OBJECT = (
+    r"(?:(?:new|additional|external)\s+)?"
+    r"(?:dependencies|changes|files|commands|deployments|purchases|requests|actions)"
+)
+_APPROVAL_ACTION = re.compile(
+    rf"\b(?P<action>(?:add|install|introduce|make|delete|remove|modify|run|execute|send)"
+    rf"\s+{_APPROVAL_OBJECT}|deploy)\s+$",
+    re.IGNORECASE,
+)
+_NO_UNAPPROVED_ACTION = re.compile(rf"\bno\s+(?P<object>{_APPROVAL_OBJECT})\s+$", re.IGNORECASE)
+_PROHIBITED_ACTION_OBJECT = re.compile(
+    r"(?:(?:all|any|new)\s+)?(?:files|commands|changes|requests|messages|dependencies)",
+    re.IGNORECASE,
+)
+
+
+def _requires_approval(content: str, start: int, end: int) -> bool:
+    """Recognize a local requirement for approval, without negating other actions."""
+    if not content[start:end].lower().startswith("without"):
+        return False
+    prefix_start = max(0, start - 160)
+    prefix = content[prefix_start:start]
+    action = _APPROVAL_ACTION.search(prefix)
+    if action is not None:
+        return is_directly_prohibited(content, prefix_start + action.start(), end)
+    constraint = _NO_UNAPPROVED_ACTION.search(prefix)
+    if constraint is None:
+        return False
+    # Reuse the prohibition helper's clause/override checks by treating "no"
+    # as the directly governing prohibition of the constrained object.
+    object_start = prefix_start + constraint.start("object")
+    return is_directly_prohibited(content, object_start, end)
+
 
 # EA3: Scope Creep
 EA3_PATTERNS = [
@@ -410,6 +448,16 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             else re.finditer
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            if (pattern, confidence) in EA2_PROSE_PATTERNS and (
+                is_directly_prohibited(
+                    content,
+                    match.start(),
+                    match.end(),
+                    allowed_tail=_PROHIBITED_ACTION_OBJECT,
+                )
+                or _requires_approval(content, match.start(), match.end())
+            ):
+                continue
             line_num = get_line_number(content, match.start())
             context_text = ctx(match.start())
             findings.append(
