@@ -87,6 +87,32 @@ def test_rp1_npx_pinned_no_finding():
     assert len(rp1) == 0
 
 
+def test_rp1_unrelated_version_pin_does_not_suppress():
+    """A pin on another argument or command on the same line does not pin the package."""
+    for content, expected in (
+        ("npx evil-package --label helper@1.2.3\n", "npx evil-package"),
+        ("npx @scope/mcp-server http://localhost:3000/sse\n", "npx @scope/mcp-server"),
+        ("npx @scope/server-a && npx @scope/server-b@1.2.3\n", "npx @scope/server-a"),
+        ("uvx my-mcp-server --with helper==1.2.3\n", "uvx my-mcp-server"),
+        ("pip install my-mcp-server other-package==1.2.3\n", "pip install my-mcp-server"),
+    ):
+        result = node(_state(file_cache={"setup.sh": content}))
+        rp1 = [f for f in result["findings"] if f.rule_id == "RP1"]
+        assert [f.matched_text for f in rp1] == [expected], content
+
+
+def test_rp1_version_pin_attached_to_package_no_finding():
+    """A pin attached to the package operand still counts when other arguments follow."""
+    for content in (
+        "npx -y @scope/mcp-server@1.2.3 --label helper\n",
+        "npx -p @scope/mcp-server@1.2.3 mcp-server\n",
+        "uvx my-mcp-server==1.2.3 --host 127.0.0.1:8000\n",
+        "pip install my-mcp-server[cli]==1.2.3\n",
+    ):
+        result = node(_state(file_cache={"setup.sh": content}))
+        assert not [f for f in result["findings"] if f.rule_id == "RP1"], content
+
+
 def test_rp1_uvx_unpinned():
     """RP1 detects uvx without ==version."""
     result = node(

@@ -204,14 +204,9 @@ async def test_encoded_destination_reporting_preserves_opaque_coverage(
         assert completeness["entirely_uninspected_files"] == 1
         assert any(item["path"] == target for item in completeness["ledger_exceptions"])
     if use_llm:
-        # AE1 concerns bytes excluded from the LLM cache. Its locally retained
-        # meta finding keeps the existing conservative runtime caveat, even
-        # though all three semantic analyzers below completed successfully.
-        if marker:
-            assert report["metadata"].get("llm_degraded", False) is False
-        else:
-            assert report["metadata"]["llm_degraded"] is True
-            assert "semantic runtime telemetry was incomplete" in report["metadata"]["llm_error"]
+        # AE1 is a coverage finding added after meta-review; it is not evidence
+        # that the requested LLM review call failed.
+        assert report["metadata"].get("llm_degraded", False) is False
         assert report["metadata"]["llm_calls_succeeded"] >= 3
         assert (
             report["metadata"]["llm_calls_succeeded"] == report["metadata"]["llm_calls_attempted"]

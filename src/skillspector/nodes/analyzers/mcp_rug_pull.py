@@ -207,6 +207,16 @@ def _get_parameters_map(
 # ---------------------------------------------------------------------------
 
 
+def _operand_has_version_pin(line_remainder: str) -> bool:
+    """Return whether a version pin is attached to the matched package operand.
+
+    Only the operand's own token counts, so a version on a later argument or on a
+    neighboring command on the same line does not pin this package.
+    """
+    operand_suffix = re.split(r"\s", line_remainder, maxsplit=1)[0]
+    return _VERSION_PIN_RE.search(operand_suffix) is not None
+
+
 def _check_rp1(
     manifest: dict,
     file_cache: dict[str, str],
@@ -223,7 +233,7 @@ def _check_rp1(
             if line_end == -1:
                 line_end = len(content)
             line_remainder = content[m.end() : min(line_end, m.end() + 256)]
-            if _VERSION_PIN_RE.search(full_match) or _VERSION_PIN_RE.search(line_remainder):
+            if _VERSION_PIN_RE.search(full_match) or _operand_has_version_pin(line_remainder):
                 continue
             line_num = _find_line(content, m.start())
             budget.emit(
@@ -258,7 +268,7 @@ def _check_rp1(
             if line_end == -1:
                 line_end = len(content)
             line_remainder = content[m.end() : min(line_end, m.end() + 256)]
-            if _VERSION_PIN_RE.search(full_match) or _VERSION_PIN_RE.search(line_remainder):
+            if _VERSION_PIN_RE.search(full_match) or _operand_has_version_pin(line_remainder):
                 continue
             line_num = _find_line(content, m.start())
             budget.emit(
@@ -291,7 +301,7 @@ def _check_rp1(
             if line_end == -1:
                 line_end = len(content)
             line_remainder = content[m.end() : min(line_end, m.end() + 256)]
-            if _VERSION_PIN_RE.search(full_match) or _VERSION_PIN_RE.search(line_remainder):
+            if _VERSION_PIN_RE.search(full_match) or _operand_has_version_pin(line_remainder):
                 continue
             pkg = m.group(1)
             if "mcp" not in pkg.lower():

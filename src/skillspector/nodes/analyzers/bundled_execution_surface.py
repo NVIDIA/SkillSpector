@@ -11,7 +11,7 @@ import math
 import posixpath
 import re
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Final
 from urllib.parse import urlsplit
@@ -42,6 +42,10 @@ _APPLICABLE_PATHS: Final = frozenset(
         ".claude/settings.local.json",
     }
 )
+# Claude Code also loads plugin hooks from the `hooks` field of
+# `.claude-plugin/plugin.json` (a path, a list of paths, or an inline object).
+_PLUGIN_MANIFEST_PATH: Final = ".claude-plugin/plugin.json"
+_MAX_PLUGIN_HOOK_PATHS: Final = 16
 _MAX_DECLARATIONS: Final = 2_048
 _MAX_DECLARATION_CHARS: Final = 16_384
 _VALID_DEFAULT_MODES: Final = frozenset(
@@ -237,8 +241,11 @@ _ENV_COMMAND_INJECTION_NAMES: Final = frozenset(
     }
 )
 # NODE_OPTIONS flags that load attacker-chosen modules into the Node runtime.
+# "-r" is Node's own short alias for "--require" and is honored identically
+# when set via NODE_OPTIONS (confirmed via `process.allowedNodeEnvironmentFlags`
+# on Node 22, which lists both). It has no long-form spelling to fall back on.
 _NODE_OPTIONS_CODE_FLAGS: Final = frozenset(
-    {"--require", "--import", "--loader", "--experimental-loader"}
+    {"-r", "--require", "--import", "--loader", "--experimental-loader"}
 )
 _ANTHROPIC_DEFAULT_BASE_URL: Final = "https://api.anthropic.com"
 _HookIdentity = tuple[str, str, str]
@@ -1930,6 +1937,92 @@ def _analyze_document(
     )
 
 
+def _plugin_hook_documents(
+    file_cache: Mapping[str, str],
+) -> tuple[dict[str, str], dict[str, InspectionLedgerEvent]]:
+    """Resolve bounded plugin hooks and retain every uninspected declaration."""
+    documents: dict[str, str] = {}
+    partial: dict[str, InspectionLedgerEvent] = {}
+
+    def incomplete(path: str, reason: LedgerReason, **bounds: int) -> None:
+        partial[path] = ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            analyzer_id=ANALYZER_ID,
+            path=path,
+            reason=reason,
+            **bounds,
+        )
+
+    content = file_cache.get(_PLUGIN_MANIFEST_PATH)
+    if content is None:
+        return documents, partial
+    if len(content) > MAX_FILE_CHARS:
+        incomplete(
+            _PLUGIN_MANIFEST_PATH,
+            LedgerReason.SIZE_LIMIT,
+            observed_characters=len(content),
+            limit_characters=MAX_FILE_CHARS,
+        )
+        return documents, partial
+    try:
+        manifest = _parse_document(content)
+    except (RecursionError, ValueError):
+        incomplete(_PLUGIN_MANIFEST_PATH, LedgerReason.OPAQUE_CONTENT)
+        return documents, partial
+    if not isinstance(manifest, dict):
+        incomplete(_PLUGIN_MANIFEST_PATH, LedgerReason.OPAQUE_CONTENT)
+        return documents, partial
+    raw_hooks = manifest.get("hooks")
+    if raw_hooks is None:
+        return documents, partial
+    candidates = raw_hooks if isinstance(raw_hooks, list) else [raw_hooks]
+    inline: dict[str, list] = {}
+    for candidate in candidates[:_MAX_PLUGIN_HOOK_PATHS]:
+        if isinstance(candidate, dict):
+            for event, groups in candidate.items():
+                if isinstance(groups, list):
+                    inline.setdefault(event, []).extend(groups)
+                else:
+                    incomplete(_PLUGIN_MANIFEST_PATH, LedgerReason.OPAQUE_CONTENT)
+            continue
+        if not isinstance(candidate, str):
+            incomplete(_PLUGIN_MANIFEST_PATH, LedgerReason.OPAQUE_CONTENT)
+            continue
+        try:
+            candidate.encode("utf-8")
+        except UnicodeEncodeError:
+            incomplete(_PLUGIN_MANIFEST_PATH, LedgerReason.REFERENCED_UNINSPECTED)
+            continue
+        resolved = posixpath.normpath(candidate)
+        if (
+            not resolved
+            or resolved in {".", ".."}
+            or resolved.startswith("../")
+            or posixpath.isabs(candidate)
+            or "\\" in candidate
+            or (len(candidate) > 1 and candidate[1] == ":")
+            or (len(resolved) > 1 and resolved[1] == ":")
+        ):
+            incomplete(_PLUGIN_MANIFEST_PATH, LedgerReason.REFERENCED_UNINSPECTED)
+            continue
+        hook_content = file_cache.get(resolved)
+        if hook_content is None:
+            incomplete(resolved, LedgerReason.REFERENCED_UNINSPECTED)
+            continue
+        documents[resolved] = hook_content
+    if inline:
+        documents[_PLUGIN_MANIFEST_PATH] = json.dumps({"hooks": inline}, ensure_ascii=False)
+    if len(candidates) > _MAX_PLUGIN_HOOK_PATHS:
+        incomplete(
+            _PLUGIN_MANIFEST_PATH,
+            LedgerReason.OUTPUT_LIMIT,
+            observed_records=len(candidates),
+            limit_records=_MAX_PLUGIN_HOOK_PATHS,
+        )
+    return documents, partial
+
+
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Inspect exact bundled hook/settings paths using bounded literal classifiers."""
     components = state.get("components") or []
@@ -1942,9 +2035,20 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     ledger_events: list[InspectionLedgerEvent] = []
     previous_settings_hook_ids: set[_HookIdentity] = set()
     applicable_paths = set(components).intersection(_APPLICABLE_PATHS)
+    plugin_documents, plugin_partial = _plugin_hook_documents(file_cache)
+    if decodable.get(_PLUGIN_MANIFEST_PATH) is False:
+        plugin_partial[_PLUGIN_MANIFEST_PATH] = ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            analyzer_id=ANALYZER_ID,
+            path=_PLUGIN_MANIFEST_PATH,
+            reason=LedgerReason.OPAQUE_CONTENT,
+        )
+    applicable_paths |= set(plugin_documents)
     hooks_disabled = _bundled_hooks_are_disabled(applicable_paths, file_cache, decodable)
 
     for path in sorted(applicable_paths):
+        partial_event = plugin_partial.pop(path, None)
         if decodable.get(path) is False:
             ledger_events.append(
                 ledger_event(
@@ -1956,7 +2060,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 )
             )
             continue
-        content = file_cache.get(path)
+        content = plugin_documents.get(path, file_cache.get(path))
         if content is None:
             ledger_events.append(
                 ledger_event(
@@ -1991,8 +2095,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             )
             continue
         findings.extend(path_findings)
+        if partial_event is not None:
+            event.update(partial_event)
+            event["emitted_finding_ids"] = [finding.finding_id for finding in path_findings]
         ledger_events.append(event)
 
+    ledger_events.extend(plugin_partial.values())
     status = analyzer_status_for_events(ANALYZER_ID, ledger_events)
     return {
         "findings": findings,

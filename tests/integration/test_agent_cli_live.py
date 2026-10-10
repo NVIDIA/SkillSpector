@@ -17,7 +17,7 @@
 
 WHY THESE ARE OPTIONAL
 ----------------------
-These tests invoke the REAL local agent CLIs (``claude`` / ``codex`` /
+These tests invoke the REAL local agent CLIs (``claude`` /
 ``gemini``), so they are marked ``integration`` and are therefore EXCLUDED from
 the default test run — ``pyproject.toml`` sets ``addopts = -m 'not
 integration'``. A developer (at NVIDIA or anywhere) who does **not** have any of
@@ -28,7 +28,7 @@ provider logic is fully covered by the mocked unit tests in
 
 When you DO opt in with ``-m integration``, each case additionally SKIPS
 per-CLI when that binary is absent or unauthenticated. So if you only have
-``codex`` installed, the codex cases run and the claude/gemini cases skip
+``claude`` installed, the claude cases run and the gemini cases skip
 cleanly — a missing tool never fails the suite.
 
     # exercise whichever agent CLIs you happen to have installed + logged in:
@@ -40,6 +40,9 @@ Each case verifies, against the real binary:
   2. A prompt containing a prompt-injection is returned as analysis *text*, not
      executed (the capability-stripped, fail-closed invocation; the flags that
      guarantee this are unit-tested in ``tests/unit/test_agent_cli.py``).
+
+``codex`` is excluded because its read-only sandbox permits host-file reads;
+its fail-closed behaviour is covered by unit tests.
 
 ``agy`` (Antigravity) is intentionally NOT covered: it is registered but
 DISABLED — its print mode renders to a TTY and returns nothing on a pipe, so it
@@ -58,7 +61,7 @@ pytestmark = pytest.mark.integration
 
 #: Real ``stdin -> stdout`` agent CLIs this harness can drive. Add a new CLI here
 #: once it is wired into the ``_agent_cli`` registry and verified end-to-end.
-LIVE_CLIS = ["claude", "codex", "gemini"]
+LIVE_CLIS = ["claude", "gemini"]
 
 
 def _require(cli: str) -> None:

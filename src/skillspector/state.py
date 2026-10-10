@@ -235,6 +235,8 @@ class SkillspectorState(TypedDict, total=False):
 
     # Input: resolve_input node consumes input_path or skill_path, sets skill_path
     input_path: str | None
+    # Only trusted local transports may use the operator's Git credentials.
+    allow_git_credentials: bool
     skill_path: str | None
     # Relative identity of a wrapped/downloaded explicit file, distinct from passive assets.
     primary_file_path: str | None
@@ -256,6 +258,12 @@ class SkillspectorState(TypedDict, total=False):
     local_file_cache: dict[str, str]
     # Raw bytes remain the canonical source for YARA and content classification.
     raw_file_cache: dict[str, bytes]
+    # Byte-derived Python execution identity shared by every analyzer branch.
+    python_source_classifications: dict[str, str]
+    # Paths whose Python applicability could not be resolved before the shared deadline.
+    python_source_classification_limitations: dict[str, str]
+    # Paths withheld from text/AST consumers after strict PEP 263 decode failure.
+    python_source_decode_failures: dict[str, str]
     # External-model consumers use the redacted projection for sensitive local files.
     llm_file_cache: dict[str, str]
     artifact_inventory: list[ArtifactRecord]
@@ -277,6 +285,10 @@ class SkillspectorState(TypedDict, total=False):
     inspection_ledger: Annotated[list[InspectionLedgerEvent], merge_inspection_ledger]
     analyzer_status_events: Annotated[list[AnalyzerStatusEvent], operator.add]
     effective_finding_ids: list[str]
+    # Whether meta-analysis had provider-eligible findings when it ran.  This
+    # snapshot prevents later coverage findings from being mistaken for work
+    # that an earlier meta-analysis phase was required to review.
+    meta_review_required: bool
     analysis_completeness: AnalysisCompleteness
     execution_successful: bool
 
@@ -310,6 +322,10 @@ class SkillspectorState(TypedDict, total=False):
     baseline_path: str | None
     show_suppressed: bool
     suppressed_findings: list[object]
+    # Kept findings as baseline suppression saw them: one per occurrence, before
+    # deduplication compacts them. `skillspector baseline` fingerprints these so
+    # every occurrence the next scan checks has its own entry.
+    active_findings: list[Finding]
 
     # Model IDs per LLM-using node: e.g. {"default": "...", "meta_analyzer": "..."}
     model_config: dict[str, str]
@@ -337,6 +353,8 @@ class SkillspectorState(TypedDict, total=False):
     # Report generation uses this to distinguish unavailable requested analysis from an
     # explicit static-only scan while analyzers continue to honor use_llm.
     llm_requested: bool
+    # Explicit caller scope, recorded in public coverage accounting.
+    exclude_patterns: list[str]
     # Monotonic provenance flag: content rooted beneath a hidden/local-only
     # source remains in deterministic analysis but never enters provider input.
     source_local_only: bool
@@ -465,6 +483,7 @@ class MetaAnalyzerResponse(TypedDict):
 
     findings: NotRequired[list[Finding]]
     effective_finding_ids: NotRequired[list[str]]
+    meta_review_required: NotRequired[bool]
     inspection_ledger: NotRequired[list[InspectionLedgerEvent]]
     analyzer_status_events: NotRequired[list[AnalyzerStatusEvent]]
     llm_call_log: NotRequired[list[LLMCallRecord]]

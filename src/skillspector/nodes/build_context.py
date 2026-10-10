@@ -28,6 +28,7 @@ import os
 import re
 import tarfile
 from collections.abc import Callable, Mapping
+from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from stat import S_ISREG
 from time import monotonic
@@ -41,6 +42,7 @@ from skillspector.artifacts import (
     ContentKind,
     classify_artifact,
     decode_text,
+    promote_artifact_to_decoded_text,
 )
 from skillspector.constants import (
     MAX_ANALYZABLE_FILE_BYTES,
@@ -72,7 +74,13 @@ from skillspector.nested_artifacts import (
     is_executable_content,
     is_zip_content,
 )
-from skillspector.python_ast import prewarm_python_ast_cache
+from skillspector.python_ast import (
+    PythonSourceClassification,
+    classify_python_source,
+    decode_python_source,
+    is_python_source,
+    prewarm_python_ast_cache,
+)
 from skillspector.references import (
     MAX_ACCEPTED_REFERENCES,
     MAX_RAW_REFERENCE_CANDIDATES,
@@ -140,6 +148,7 @@ _FILE_TYPES: dict[str, str] = {
     ".md": "markdown",
     ".markdown": "markdown",
     ".py": "python",
+    ".pyw": "python",
     ".sh": "shell",
     ".bash": "shell",
     ".zsh": "shell",
@@ -791,8 +800,19 @@ def _walk_skill_files(
     )
 
 
-def _infer_file_type(path: str) -> str:
-    """Infer file type from path (extension)."""
+def _infer_file_type(
+    path: str,
+    content: str | bytes | None = None,
+    *,
+    source_classification: PythonSourceClassification | None = None,
+) -> str:
+    """Infer file type from path and bounded execution metadata."""
+    if (
+        source_classification is PythonSourceClassification.PYTHON
+        if source_classification is not None
+        else is_python_source(path, content)
+    ):
+        return "python"
     idx = path.rfind(".")
     suffix = path[idx:].lower() if idx >= 0 else ""
     return _FILE_TYPES.get(suffix, "other")
@@ -889,6 +909,7 @@ def _build_component_metadata(
     raw_file_cache: Mapping[str, bytes],
     recognized_oms_signatures: frozenset[str] = frozenset(),
     *,
+    source_classifications: Mapping[str, PythonSourceClassification] | None = None,
     clock: Callable[[], float] = monotonic,
     started_at: float | None = None,
     deadline: float | None = None,
@@ -914,8 +935,21 @@ def _build_component_metadata(
         if _expired(path):
             break
         full = skill_dir / path
-        file_type = "oms_signature" if path in recognized_oms_signatures else _infer_file_type(path)
         content = file_cache.get(path)
+        raw_content = raw_file_cache.get(path) if raw_file_cache is not None else None
+        source_content = raw_content if raw_content is not None else content
+        source_classification = (
+            source_classifications.get(path) if source_classifications is not None else None
+        )
+        file_type = (
+            "oms_signature"
+            if path in recognized_oms_signatures
+            else _infer_file_type(
+                path,
+                source_content,
+                source_classification=source_classification,
+            )
+        )
         lines = (
             len(content.splitlines())
             if content is not None
@@ -932,7 +966,9 @@ def _build_component_metadata(
             size_bytes = 0
             mode = 0
         data = raw_file_cache.get(path, b"")
-        executable = is_executable_content(path, data, mode)
+        executable = is_executable_content(
+            path, data, mode, complete_content=len(data) == size_bytes
+        )
         if executable:
             has_executable = True
         component: dict[str, object] = {
@@ -1357,7 +1393,12 @@ def _inspect_excluded_artifacts(
                             executable=executable,
                         )
                         continue
-                    executable = is_executable_content(path, probe, file_stat.st_mode)
+                    executable = is_executable_content(
+                        path,
+                        probe,
+                        file_stat.st_mode,
+                        complete_content=len(probe) == size_bytes,
+                    )
                 archive_candidate = is_zip_content(probe)
                 expected_archive = expected_container_type(path) is not None
                 if expected_archive and not archive_candidate:
@@ -2522,12 +2563,37 @@ def _parse_manifest(
     return {}
 
 
-def _unsupported_primary_bytes(artifact: ArtifactRecord, data: bytes) -> bool:
+def _decodes_as_declared_python(
+    path: str,
+    data: bytes,
+    classification: PythonSourceClassification | None,
+) -> bool:
+    """Return whether Python bytes decode under their declared PEP 263 encoding."""
+    if classification is None:
+        classification = classify_python_source(path, data)
+    if classification is PythonSourceClassification.NON_PYTHON:
+        return False
+    try:
+        decode_python_source(data)
+    except Exception:
+        return False
+    return True
+
+
+def _unsupported_primary_bytes(
+    artifact: ArtifactRecord,
+    data: bytes,
+    *,
+    python_classification: PythonSourceClassification | None,
+    deadline: float,
+) -> bool:
     """Recognize opaque primary content without opening or expanding containers.
 
     ZIPs are handled separately by bounded nested inspection. Other archive
     headers and UTF-16/32 instructions must not count as decoded source text,
     even when their bytes happen to be valid UTF-8 (for example an ASCII TAR).
+    Python source is decoded by its PEP 263 declaration rather than as UTF-8,
+    so only a failed declared decode leaves non-UTF-8 Python unsupported.
     """
     split_utf8 = False
     if not artifact["decodable"] and artifact["size_bytes"] > len(data):
@@ -2551,12 +2617,22 @@ def _unsupported_primary_bytes(artifact: ArtifactRecord, data: bytes) -> bool:
         and sample[3:4] in b"123456789"
         and sample[4:10] in (b"1AY&SY", b"\x17rE8P\x90")
     )
-    return (
+    utf8_unsupported = (
         (artifact["content_kind"] != ContentKind.TEXT and not split_utf8)
         # A bounded prefix can split a valid UTF-8 code point. Existing size
         # accounting already marks that scan partial; it is not proof that the
         # complete source uses an unsupported encoding.
         or (not artifact["decodable"] and not split_utf8)
+    )
+    if (
+        utf8_unsupported
+        # Post-cache Python decoding must not begin after the shared deadline.
+        and monotonic() < deadline
+        and _decodes_as_declared_python(artifact["path"], data, python_classification)
+    ):
+        utf8_unsupported = False
+    return (
+        utf8_unsupported
         or sample.startswith((b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff"))
         or sample.startswith((b"\x1f\x8b", b"\xfd7zXZ\x00", b"7z\xbc\xaf\x27\x1c", b"Rar!\x1a\x07"))
         or is_tar
@@ -2589,6 +2665,43 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         excluded_artifacts,
         excluded_inspection_gaps,
     ) = _walk_skill_files(skill_dir, state)
+    patterns = state.get("exclude_patterns", [])
+    if len(patterns) > 128 or any(
+        not isinstance(pattern, str)
+        or not pattern
+        or len(pattern) > 1024
+        or pattern.startswith("/")
+        or "\\" in pattern
+        or ".." in pattern.split("/")
+        or any(ord(char) < 32 for char in pattern)
+        for pattern in patterns
+    ):
+        raise ValueError("Exclusions require at most 128 relative POSIX globs (1-1024 characters)")
+    if any(
+        fnmatchcase(manifest, pattern)
+        for manifest in ("SKILL.md", "skill.md")
+        for pattern in patterns
+    ):
+        raise ValueError("--exclude must not match the required SKILL.md manifest")
+    user_excluded = sorted(
+        path
+        for path in inventoried_components
+        if any(fnmatchcase(path, pattern) for pattern in patterns)
+    )
+    user_excluded_set = set(user_excluded)
+    inventoried_components = [
+        path for path in inventoried_components if path not in user_excluded_set
+    ]
+    user_exclusion_events = [
+        ledger_event(
+            outcome=LedgerOutcome.SKIPPED,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="explicit_exclusion",
+            path=path,
+            reason=LedgerReason.USER_EXCLUSION,
+        )
+        for path in user_excluded
+    ]
     selected_baseline = _selected_baseline_component(state, skill_dir, inventoried_components)
     selected_baselines = frozenset({selected_baseline} if selected_baseline else set())
     for path in selected_baselines:
@@ -2632,6 +2745,20 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             MAX_TOTAL_CACHED_BYTES - sum(len(data) for data in raw_file_cache.values()),
         ),
         incomplete_exclusions=excluded_inspection_gaps,
+    )
+    artifact_inventory.extend(
+        {
+            "path": path,
+            "content_kind": ContentKind.OPAQUE,
+            "disposition": ArtifactDisposition.PARTIAL,
+            "size_bytes": 0,
+            "decodable": False,
+            "contains_nul": False,
+            "misleading_extension": False,
+            "referenced": False,
+            "reason": LedgerReason.USER_EXCLUSION.value,
+        }
+        for path in user_excluded
     )
     artifact_inventory = sorted(
         [*artifact_inventory, *excluded_inventory], key=lambda item: item["path"]
@@ -2750,12 +2877,17 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                     source_path=primary_path,
                     source_text=primary_text,
                     known_paths=sorted(
-                        dict.fromkeys([*inventoried_components, *excluded_artifacts])
+                        dict.fromkeys(
+                            [*inventoried_components, *excluded_artifacts, *user_excluded]
+                        )
                     ),
                     clock=monotonic,
                     deadline=processing_deadline,
                 )
         references = resolution.records
+        for reference in references:
+            if reference.get("target_path") in user_excluded_set:
+                reference["disposition"] = ArtifactDisposition.PARTIAL
         primary_artifact = inventory_by_path.get(primary_path)
         primary_partial = (
             primary_artifact is not None
@@ -3243,7 +3375,12 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         if not required or path in nested.recognized_zip_paths:
             continue
         data = raw_file_cache.get(path)
-        if data is None or not _unsupported_primary_bytes(artifact, data):
+        if data is None or not _unsupported_primary_bytes(
+            artifact,
+            data,
+            python_classification=nested.python_source_classifications.get(path),
+            deadline=processing_deadline,
+        ):
             continue
         # Explicit input and primary instructions cannot be passive exclusions.
         # Keep canonical bytes for byte-based analysis and source attribution,
@@ -3277,9 +3414,179 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     )
     for path in [*recognized_containers, *recognized_oms_signatures]:
         llm_file_cache.pop(path, None)
+
+    postprocessing_events: list[InspectionLedgerEvent] = []
+    runtime_limit = max(0.0, processing_deadline - processing_started)
+
+    def _mark_runtime_partial(affected_paths: list[str], first_limited_path: str) -> None:
+        limited = False
+        for affected_path in affected_paths:
+            if affected_path == first_limited_path:
+                limited = True
+            if not limited:
+                continue
+            affected_artifact = inventory_by_path.get(affected_path)
+            if (
+                affected_artifact is None
+                or affected_artifact.get("disposition") == ArtifactDisposition.FAILED
+            ):
+                continue
+            if affected_artifact.get("disposition") != ArtifactDisposition.PARTIAL:
+                affected_artifact["reason"] = LedgerReason.RUNTIME_LIMIT.value
+            affected_artifact["disposition"] = ArtifactDisposition.PARTIAL
+
+    classification_events: list[InspectionLedgerEvent] = []
+    source_classifications = dict(nested.python_source_classifications)
+    completed_source_classifications: set[str] = set()
+    source_decode_failures: dict[str, str] = {}
+    nested_metadata_by_path = {
+        str(metadata.get("path", "")): metadata for metadata in nested.metadata
+    }
+    classification_runtime_limitation: tuple[str, float] | None = None
+    for path in components:
+        now = monotonic()
+        if now >= processing_deadline:
+            classification_runtime_limitation = (
+                path,
+                max(0.0, now - processing_started),
+            )
+            break
+        content = local_file_cache.get(path)
+        raw_content = raw_file_cache.get(path)
+        source_classification = source_classifications.get(path)
+        if source_classification is None:
+            source_classification = classify_python_source(
+                path,
+                raw_content if raw_content is not None else content,
+            )
+            source_classifications[path] = source_classification
+        if (
+            source_classification is not PythonSourceClassification.NON_PYTHON
+            and raw_content is not None
+        ):
+            try:
+                decoded_python = decode_python_source(raw_content)
+            except Exception as exc:
+                source_decode_failures[path] = LedgerReason.PYTHON_SOURCE_DECODE_ERROR.value
+                classified_artifact = inventory_by_path.get(path)
+                if (
+                    classified_artifact is not None
+                    and classified_artifact.get("disposition") != ArtifactDisposition.FAILED
+                ):
+                    if (
+                        classified_artifact.get("disposition") != ArtifactDisposition.PARTIAL
+                        or "reason" not in classified_artifact
+                    ):
+                        classified_artifact["reason"] = (
+                            LedgerReason.PYTHON_SOURCE_DECODE_ERROR.value
+                        )
+                    classified_artifact["disposition"] = ArtifactDisposition.PARTIAL
+                local_file_cache.pop(path, None)
+                llm_file_cache.pop(path, None)
+                classification_events.append(
+                    ledger_event(
+                        outcome=LedgerOutcome.PARTIAL,
+                        record_type=LedgerRecordType.SYSTEM,
+                        phase="python_source_decoding",
+                        path=path,
+                        reason=LedgerReason.PYTHON_SOURCE_DECODE_ERROR,
+                        error_class=type(exc).__name__,
+                    )
+                )
+            else:
+                local_file_cache[path] = decoded_python
+                nested_metadata = nested_metadata_by_path.get(path)
+                if nested_metadata is not None:
+                    nested_metadata["lines"] = len(decoded_python.splitlines())
+                classified_artifact = inventory_by_path.get(path)
+                if classified_artifact is not None:
+                    promote_artifact_to_decoded_text(classified_artifact)
+                    disposition = classified_artifact.get("disposition")
+                    artifact_reason = classified_artifact.get("reason")
+                    bounded_provider_view = (
+                        disposition == ArtifactDisposition.PARTIAL
+                        and artifact_reason
+                        in {
+                            LedgerReason.SIZE_LIMIT.value,
+                            LedgerReason.TOTAL_BYTES_LIMIT.value,
+                        }
+                    )
+                    if not source_local_only and (
+                        path in llm_file_cache
+                        or (
+                            path not in nested.file_cache
+                            and path not in recognized_containers
+                            and not _is_hidden_path(path)
+                            and (
+                                disposition == ArtifactDisposition.ANALYZED or bounded_provider_view
+                            )
+                        )
+                    ):
+                        provider_content = decoded_python
+                        if bounded_provider_view:
+                            provider_content = _llm_view_of_truncated_file(
+                                decoded_python,
+                                total_size=max(
+                                    len(raw_content),
+                                    int(classified_artifact.get("size_bytes", 0)),
+                                ),
+                                read_bytes=len(raw_content),
+                            )
+                        llm_file_cache[path] = _redact_for_external_model(
+                            path,
+                            provider_content,
+                        )
+        completed_source_classifications.add(path)
+        now = monotonic()
+        if now >= processing_deadline:
+            classification_runtime_limitation = (
+                path,
+                max(0.0, now - processing_started),
+            )
+            break
+        if source_classification is PythonSourceClassification.AMBIGUOUS:
+            classified_artifact = inventory_by_path.get(path)
+            if classified_artifact is not None and classified_artifact.get("disposition") not in {
+                ArtifactDisposition.FAILED,
+                ArtifactDisposition.OUT_OF_SCOPE,
+            }:
+                if classified_artifact.get("disposition") != ArtifactDisposition.PARTIAL:
+                    classified_artifact["reason"] = LedgerReason.PYTHON_SOURCE_AMBIGUOUS.value
+                classified_artifact["disposition"] = ArtifactDisposition.PARTIAL
+            classification_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="python_source_classification",
+                    path=path,
+                    reason=LedgerReason.PYTHON_SOURCE_AMBIGUOUS,
+                )
+            )
+    source_classification_limitations = {
+        path: LedgerReason.RUNTIME_LIMIT.value
+        for path in components
+        if path not in completed_source_classifications
+    }
+    for path in source_classification_limitations:
+        local_file_cache.pop(path, None)
+        llm_file_cache.pop(path, None)
+    if classification_runtime_limitation is not None:
+        path, elapsed = classification_runtime_limitation
+        _mark_runtime_partial(components, path)
+        classification_events.append(
+            ledger_event(
+                outcome=LedgerOutcome.PARTIAL,
+                record_type=LedgerRecordType.SYSTEM,
+                phase="python_source_classification",
+                path=path,
+                reason=LedgerReason.RUNTIME_LIMIT,
+                observed_seconds=elapsed,
+                limit_seconds=runtime_limit,
+            )
+        )
+
     llm_components = sorted(llm_file_cache)
     file_cache = dict(llm_file_cache)
-
     manifest_events: list[InspectionLedgerEvent] = []
     manifest = _parse_manifest(
         skill_dir,
@@ -3362,49 +3669,39 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             )
         )
 
-    disposition_by_path = {item["path"]: item["disposition"] for item in artifact_inventory}
-    for reference in references:
-        target = reference["target_path"]
-        if target and target in disposition_by_path:
-            reference["disposition"] = disposition_by_path[target]
-
-    postprocessing_events: list[InspectionLedgerEvent] = []
-    runtime_limit = max(0.0, processing_deadline - processing_started)
-
-    def _mark_runtime_partial(affected_paths: list[str], first_limited_path: str) -> None:
-        limited = False
-        for affected_path in affected_paths:
-            if affected_path == first_limited_path:
-                limited = True
-            if not limited:
-                continue
-            affected_artifact = inventory_by_path.get(affected_path)
-            if (
-                affected_artifact is None
-                or affected_artifact.get("disposition") == ArtifactDisposition.FAILED
-            ):
-                continue
-            if affected_artifact.get("disposition") != ArtifactDisposition.PARTIAL:
-                affected_artifact["reason"] = LedgerReason.RUNTIME_LIMIT.value
-            affected_artifact["disposition"] = ArtifactDisposition.PARTIAL
-
+    python_components = [
+        component
+        for component in components
+        if component in local_file_cache
+        and source_classifications.get(component, PythonSourceClassification.AMBIGUOUS)
+        is not PythonSourceClassification.NON_PYTHON
+    ]
+    python_component_set = set(python_components)
     ast_runtime_limitations: list[tuple[str, float]] = []
-    python_ast_cache_key = prewarm_python_ast_cache(
-        components,
-        local_file_cache,
-        clock=monotonic,
-        started_at=processing_started,
-        deadline=processing_deadline,
-        runtime_limitations=ast_runtime_limitations,
-    )
+    if classification_runtime_limitation is not None:
+        python_ast_cache_key = None
+        ast_runtime_limitations.append(classification_runtime_limitation)
+    else:
+        python_ast_cache_key = prewarm_python_ast_cache(
+            python_components,
+            local_file_cache,
+            raw_file_cache=raw_file_cache,
+            source_classifications=source_classifications,
+            clock=monotonic,
+            started_at=processing_started,
+            deadline=processing_deadline,
+            runtime_limitations=ast_runtime_limitations,
+        )
     if ast_runtime_limitations:
         path, elapsed = ast_runtime_limitations[0]
-        python_components = [
+        limited_index = components.index(path)
+        affected_python_components = [
             component
-            for component in components
-            if component.lower().endswith(".py") and component in local_file_cache
+            for component in components[limited_index:]
+            if component in python_component_set
         ]
-        _mark_runtime_partial(python_components, path)
+        if affected_python_components:
+            _mark_runtime_partial(affected_python_components, affected_python_components[0])
         postprocessing_events.append(
             ledger_event(
                 outcome=LedgerOutcome.PARTIAL,
@@ -3426,6 +3723,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         local_file_cache,
         raw_file_cache,
         recognized_oms_signatures,
+        source_classifications=source_classifications,
         clock=monotonic,
         started_at=processing_started,
         deadline=processing_deadline,
@@ -3469,6 +3767,15 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         or any(bool(metadata.get("executable")) for metadata in excluded_component_metadata)
     )
 
+    # Post-cache classification, AST prewarm, and metadata work can still
+    # downgrade inventory rows.  Project those final dispositions only after
+    # every mutation so reference coverage cannot remain falsely complete.
+    disposition_by_path = {item["path"]: item["disposition"] for item in artifact_inventory}
+    for reference in references:
+        target = reference["target_path"]
+        if target and target in disposition_by_path:
+            reference["disposition"] = disposition_by_path[target]
+
     use_llm = state.get("use_llm", True)
     model_config = build_model_config() if use_llm else {}
     llm_provenance = (
@@ -3482,6 +3789,11 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "file_cache": file_cache,
         "local_file_cache": local_file_cache,
         "raw_file_cache": raw_file_cache,
+        "python_source_classifications": {
+            path: classification.value for path, classification in source_classifications.items()
+        },
+        "python_source_classification_limitations": source_classification_limitations,
+        "python_source_decode_failures": source_decode_failures,
         "llm_file_cache": llm_file_cache,
         "source_local_only": source_local_only,
         "artifact_inventory": artifact_inventory,
@@ -3493,6 +3805,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "inspection_ledger": _bounded_ledger_output(
             [
                 *discovery_events,
+                *user_exclusion_events,
                 *prework_events,
                 *signature_events,
                 *baseline_events,
@@ -3502,6 +3815,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 *nested.ledger_events,
                 *primary_content_events,
                 *excluded_nested_events,
+                *classification_events,
                 *manifest_events,
                 *structured_events,
                 *postprocessing_events,

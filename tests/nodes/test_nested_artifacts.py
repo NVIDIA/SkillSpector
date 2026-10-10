@@ -33,8 +33,10 @@ from skillspector.nested_artifacts import (
 from skillspector.nodes.analyzers.static_patterns_supply_chain import (
     _analyze_concealed_executables,
 )
+from skillspector.nodes.analyzers.static_patterns_tool_misuse import node as analyze_tool_misuse
 from skillspector.nodes.build_context import build_context
 from skillspector.nodes.report import _compute_risk_score
+from skillspector.python_ast import ParsedPythonFile, get_python_ast
 
 
 def _zip_bytes(
@@ -66,6 +68,129 @@ def _document_members(**extra: bytes) -> dict[str, bytes]:
         "word/document.xml": b"<document>ordinary text</document>",
         **extra,
     }
+
+
+def test_typescript_declaration_files_are_not_executable_by_name_alone() -> None:
+    declaration = b"export interface Options { retries?: number; }\nexport type Result = string;\n"
+
+    assert not is_executable_content("types.d.cts", declaration, complete_content=True)
+    assert not is_executable_content("types.d.mts", declaration, complete_content=True)
+
+
+def test_runtime_code_in_typescript_declaration_named_file_stays_executable() -> None:
+    runtime = b'declare const marker: string;\nrequire("child_process").execSync(marker);\n'
+
+    assert is_executable_content("evil.d.cts", runtime)
+
+
+def test_declaration_exemption_requires_complete_content() -> None:
+    declaration = b"export {}"
+
+    assert is_executable_content("types.d.mts", declaration)
+    assert not is_executable_content("types.d.mts", declaration, complete_content=True)
+
+
+def test_runtime_default_import_named_type_is_not_a_type_only_import() -> None:
+    runtime = b'import type from "./payload.mjs";\n'
+
+    assert is_executable_content("evil.d.mts", runtime, complete_content=True)
+
+
+def test_typescript_declaration_span_cannot_cross_asi_line_break() -> None:
+    runtime = b'export type Config = string\nconsole.log("RUNTIME")\n;'
+
+    assert is_executable_content("evil.d.cts", runtime, complete_content=True)
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        b'type A = "/*";\nconsole.log("RUNTIME");\ntype B = "*/";\n',
+        b'type A = "//"; console.log("RUNTIME")\ntype B = string;\n',
+        b'type A = `unterminated;\nconsole.log("RUNTIME");',
+    ],
+)
+def test_comment_markers_inside_literals_cannot_hide_runtime(runtime: bytes) -> None:
+    assert is_executable_content("evil.d.ts", runtime, complete_content=True)
+
+
+def test_typical_typescript_emitted_declaration_file_is_inert() -> None:
+    declaration = (
+        b"export interface Options { retries?: number; }\n"
+        b"export declare function load(options: Options): Promise<void>;\n"
+        b"export type Result = string;\n"
+    )
+
+    assert not is_executable_content("types.d.ts", declaration, complete_content=True)
+
+
+def test_typescript_side_effect_import_in_declaration_named_file_stays_executable() -> None:
+    runtime = b"import './payload.js';\nexport type Result = string;\n"
+
+    assert is_executable_content("evil.d.mts", runtime)
+
+
+def test_mixed_typescript_declaration_and_runtime_stays_executable() -> None:
+    runtime = b"export type Result = string;\nconsole.log('runtime');\n"
+
+    assert is_executable_content("evil.d.ts", runtime)
+
+
+@pytest.mark.parametrize("path", ["types.d.ts", "types.d.cts", "types.d.mts"])
+def test_ambient_typescript_namespaces_and_modules_are_declarations(path: str) -> None:
+    declaration = (
+        b"declare namespace Payload { interface Value { name: string; } }\n"
+        b'declare module "payload" { export function load(): string; }\n'
+    )
+
+    assert not is_executable_content(path, declaration, complete_content=True)
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        b'namespace Payload { console.log("runtime"); }\n',
+        b'export namespace Payload { console.log("runtime"); }\n',
+        b'declare namespace Payload { console.log("runtime"); }\n',
+    ],
+)
+def test_typescript_namespace_bodies_must_be_proven_ambient(runtime: bytes) -> None:
+    assert is_executable_content("evil.d.ts", runtime)
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        b'type = console.log("runtime");\n',
+        b"namespace: { console.log('runtime'); }\n",
+    ],
+)
+def test_ambiguous_typescript_keywords_stay_executable(runtime: bytes) -> None:
+    """Assignments and labels must not be mistaken for declarations."""
+    assert is_executable_content("evil.d.mts", runtime)
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        b'type = console.log("runtime");\n',
+        b"namespace: { console.log('runtime'); }\n",
+    ],
+)
+def test_ambiguous_typescript_keywords_in_hidden_documents_raise_sc9(
+    tmp_path: Path, runtime: bytes
+) -> None:
+    archive_path = tmp_path / ".types.docx.txt"
+    _write_archive(archive_path, _document_members(**{"word/payload.d.mts": runtime}))
+    (tmp_path / "SKILL.md").write_text("# Declaration container\n", encoding="utf-8")
+
+    context = build_context({"skill_path": str(tmp_path)})
+    virtual_path = ".types.docx.txt!/word/payload.d.mts"
+    metadata = next(item for item in context["component_metadata"] if item["path"] == virtual_path)
+    assert metadata["executable"] is True
+    assert metadata["concealed_executable"] is True
+    findings = _analyze_concealed_executables(context["component_metadata"])
+    assert any(finding.rule_id == "SC9" and finding.file == virtual_path for finding in findings)
 
 
 @pytest.mark.parametrize(
@@ -386,6 +511,138 @@ def test_build_context_accounts_nested_bytes_to_transitive_budget(tmp_path: Path
         len(content) for content in context["raw_file_cache"].values()
     )
     assert traversal.reasons == []
+
+
+@pytest.mark.parametrize(
+    ("member_name", "content"),
+    [
+        pytest.param("run.pyw", b"value = 1\n", id="pyw"),
+        pytest.param(
+            "runner",
+            b"#!/usr/bin/env python3\nvalue = 2\n",
+            id="env-shebang",
+        ),
+    ],
+)
+def test_nested_python_execution_surfaces_are_typed_and_prewarmed(
+    tmp_path: Path, member_name: str, content: bytes
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Nested Python\n", encoding="utf-8")
+    _write_archive(tmp_path / "bundle.zip", {member_name: content})
+
+    context = build_context({"skill_path": str(tmp_path)})
+    virtual_path = f"bundle.zip!/{member_name}"
+    metadata = next(item for item in context["component_metadata"] if item["path"] == virtual_path)
+
+    assert metadata["type"] == "python"
+    assert metadata["executable"] is True
+    assert context["python_source_classifications"][virtual_path] == "python"
+    cache_key = context["python_ast_cache_key"]
+    assert isinstance(cache_key, str)
+    parsed = get_python_ast(cache_key, context["local_file_cache"][virtual_path], virtual_path)
+    assert isinstance(parsed, ParsedPythonFile)
+    assert parsed.is_parseable
+
+
+def test_nested_relative_selected_script_remains_partial(tmp_path: Path) -> None:
+    """Archive provenance cannot establish the invocation working directory."""
+    (tmp_path / "SKILL.md").write_text("# Nested Python\n", encoding="utf-8")
+    _write_archive(
+        tmp_path / "bundle.zip",
+        {"runner": b"#!/usr/bin/python3 runner\nvalue = 1\n"},
+    )
+
+    context = build_context({"skill_path": str(tmp_path)})
+    virtual_path = "bundle.zip!/runner"
+    artifact = next(item for item in context["artifact_inventory"] if item["path"] == virtual_path)
+
+    assert context["python_source_classifications"][virtual_path] == "ambiguous"
+    assert artifact["disposition"] == ArtifactDisposition.PARTIAL
+    assert artifact["reason"] == LedgerReason.PYTHON_SOURCE_AMBIGUOUS
+    assert any(
+        event.get("path") == virtual_path
+        and event.get("reason_code") == LedgerReason.PYTHON_SOURCE_AMBIGUOUS
+        for event in context["inspection_ledger"]
+    )
+
+
+def test_nested_pep263_python_is_decoded_and_analyzed_locally(tmp_path: Path) -> None:
+    (tmp_path / "SKILL.md").write_text("# Nested encoded Python\n", encoding="utf-8")
+    raw = (
+        b"#!/usr/bin/env python3\n"
+        b"# coding: latin-1\n"
+        b"# " + b"\xff" * 1_000 + b"\nimport subprocess\n"
+        b"enabled = True\n"
+        b"subprocess.run(command, shell=enabled)\n"
+    )
+    _write_archive(tmp_path / "bundle.zip", {"runner": raw})
+
+    context = build_context({"skill_path": str(tmp_path)})
+    virtual_path = "bundle.zip!/runner"
+    artifact = next(item for item in context["artifact_inventory"] if item["path"] == virtual_path)
+
+    assert context["raw_file_cache"][virtual_path] == raw
+    assert "ÿ" * 1_000 in context["local_file_cache"][virtual_path]
+    assert virtual_path not in context["file_cache"]
+    assert artifact["content_kind"] is ContentKind.TEXT
+    assert artifact["disposition"] is ArtifactDisposition.ANALYZED
+    assert any(finding.rule_id == "TM1" for finding in analyze_tool_misuse(context)["findings"])
+
+
+def test_nested_python_metadata_uses_exact_decoded_line_count(tmp_path: Path) -> None:
+    (tmp_path / "SKILL.md").write_text("# Nested encoded Python\n", encoding="utf-8")
+    raw = (
+        b"# coding: unicode_escape\nimport subprocess\n# hidden\\nsubprocess.run('x', shell=True)\n"
+    )
+    _write_archive(tmp_path / "bundle.zip", {"run.py": raw})
+
+    context = build_context({"skill_path": str(tmp_path)})
+    virtual_path = "bundle.zip!/run.py"
+    metadata = next(item for item in context["component_metadata"] if item["path"] == virtual_path)
+    tm1 = next(
+        finding
+        for finding in analyze_tool_misuse(context)["findings"]
+        if finding.rule_id == "TM1" and finding.file == virtual_path
+    )
+
+    assert len(context["local_file_cache"][virtual_path].splitlines()) == 4
+    assert metadata["lines"] == 4
+    assert tm1.start_line == 4
+
+
+def test_nested_python_member_filesystem_alias_remains_partial(tmp_path: Path) -> None:
+    (tmp_path / "SKILL.md").write_text("# Nested Python\n", encoding="utf-8")
+    _write_archive(
+        tmp_path / "bundle.zip",
+        {"Runner": b"#!/usr/bin/python3 runner\nvalue = 1\n"},
+    )
+
+    context = build_context({"skill_path": str(tmp_path)})
+    virtual_path = "bundle.zip!/Runner"
+    artifact = next(item for item in context["artifact_inventory"] if item["path"] == virtual_path)
+
+    assert context["python_source_classifications"][virtual_path] == "ambiguous"
+    assert artifact["disposition"] == ArtifactDisposition.PARTIAL
+    assert artifact["reason"] == LedgerReason.PYTHON_SOURCE_AMBIGUOUS
+    assert any(
+        event.get("path") == virtual_path
+        and event.get("reason_code") == LedgerReason.PYTHON_SOURCE_AMBIGUOUS
+        for event in context["inspection_ledger"]
+    )
+
+
+def test_nested_deceptive_python_shebang_remains_non_python(tmp_path: Path) -> None:
+    (tmp_path / "SKILL.md").write_text("# Nested non-Python\n", encoding="utf-8")
+    _write_archive(
+        tmp_path / "bundle.zip",
+        {"runner": b"#!/usr/bin/env node python3\nvalue = 1\n"},
+    )
+
+    context = build_context({"skill_path": str(tmp_path)})
+    virtual_path = "bundle.zip!/runner"
+    metadata = next(item for item in context["component_metadata"] if item["path"] == virtual_path)
+
+    assert metadata["type"] != "python"
 
 
 def test_hidden_disguised_document_inventories_nested_executable_locally(tmp_path: Path) -> None:

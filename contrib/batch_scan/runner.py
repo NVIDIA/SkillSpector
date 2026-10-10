@@ -783,34 +783,40 @@ def run_one(
             entry["enhancements"]["gap_fill_findings"] = len(gap_findings)
         return entry, None
     except Exception as exc:
-        rel_name = _rel_name(skill_dir, root)
-        error_entry: dict[str, object] = {
-            "skill": {
-                "name": rel_name,
-                "source": str(skill_dir),
-                "source_group": rel_name.split("/")[0] if "/" in rel_name else ".",
-                "language": detected_language,
-                "scanned_at": datetime.now(UTC).isoformat(),
-            },
-            "risk_assessment": {
-                "score": 0,
-                "severity": "ERROR",
-                "recommendation": "ERROR",
-            },
-            "components": [],
-            "issues": [],
-            "scan_mode": "multilingual-enhanced",
-            "enhancements": {
-                "gap_fill_applied": False,
-                "gap_fill_findings": 0,
-                "english_keyword_rules_skipped": 0,
-            },
-            "error": str(exc),
-        }
-        return error_entry, str(exc)
+        return entry_from_error(skill_dir, root, str(exc), detected_language), str(exc)
     finally:
         if result is not None:
             cleanup_result(result)
+
+
+def entry_from_error(
+    skill_dir: Path, root: Path, error: str, detected_language: str
+) -> dict[str, object]:
+    """Keep failed and interrupted scans visible in every batch report."""
+    rel_name = _rel_name(skill_dir, root)
+    return {
+        "skill": {
+            "name": rel_name,
+            "source": str(skill_dir),
+            "source_group": rel_name.split("/")[0] if "/" in rel_name else ".",
+            "language": "unknown" if detected_language == "auto" else detected_language,
+            "scanned_at": datetime.now(UTC).isoformat(),
+        },
+        "risk_assessment": {
+            "score": 0,
+            "severity": "ERROR",
+            "recommendation": "ERROR",
+        },
+        "components": [],
+        "issues": [],
+        "scan_mode": "multilingual-enhanced",
+        "enhancements": {
+            "gap_fill_applied": False,
+            "gap_fill_findings": 0,
+            "english_keyword_rules_skipped": 0,
+        },
+        "error": error,
+    }
 
 
 def _rel_name(skill_dir: Path, root: Path) -> str:
