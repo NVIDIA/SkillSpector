@@ -348,6 +348,29 @@ TM2_PROSE_PATTERNS = [
 TM2_PATTERNS = TM2_CODE_PATTERNS + TM2_PROSE_PATTERNS
 
 # TM3: Unsafe Defaults — overly permissive default settings
+#
+# A umask leaves new files world-writable when its world-write bit (0o002) is unset.
+# In octal digits that is a last digit of 0, 1, 4 or 5.
+_UMASK_OCTAL_WORLD_WRITE = r"[0-7]*[0145]\b"
+# Python, JavaScript and C read a number as octal only with a 0o prefix or a leading
+# 0, so a bare 14 is 0o016 (world-write masked) and a bare 8 is 0o010 (unmasked). A
+# decimal N leaves the bit unset when N % 4 is 0 or 1, which its last two digits decide.
+_UMASK_NUMBER_WORLD_WRITE = (
+    rf"(?:0(?:o?{_UMASK_OCTAL_WORLD_WRITE})?\b"
+    r"|[1-9]\d*+(?<=[02468][014589]|[13579][2367]|\D[14589])\b)"
+)
+# umask 000, or an assigned value such as umask = 0o000 or umask = 8.
+_TM3_UMASK = (
+    rf"umask(?:[ \t]+(?:0o)?{_UMASK_OCTAL_WORLD_WRITE}|\s*=\s*{_UMASK_NUMBER_WORLD_WRITE})",
+    0.8,
+)
+# Shell reads every umask value as octal, including a variable such as UMASK=14 that
+# is later passed to the umask command.
+_TM3_SHELL_UMASK = (rf"umask(?:\s*=\s*|[ \t]+)(?:0o)?{_UMASK_OCTAL_WORLD_WRITE}", 0.8)
+# umask(0) as a statement or inside an expression. `old = os.umask(0)` is how Python
+# reads the umask before restoring it, so analyze() skips a call whose result is
+# assigned (see _is_assigned_value).
+_TM3_UMASK_CALL = (rf"(?<![\w.])(?:\w+\.)*umask\(\s*{_UMASK_NUMBER_WORLD_WRITE}\s*\)", 0.8)
 TM3_CODE_PATTERNS = [
     # TLS/SSL verification disabled
     (r"verify\s*=\s*False", 0.75),
@@ -362,8 +385,21 @@ TM3_CODE_PATTERNS = [
     # Overly permissive CORS / access
     (r"(?:CORS|cors)[^=]*=\s*['\"]?\*['\"]?", 0.65),
     (r"(?:allow|access)[_-]?(?:origin|hosts?)\s*=\s*['\"]?\*['\"]?", 0.7),
-    # Unsafe permissions
-    (r"(?:mode|permission|umask)\s*=\s*(?:0?o?777|0?o?666)", 0.8),
+    # Unsafe permissions. A mode masked with the umask (0o666 & ~umask) respects it,
+    # like a plain open(), when the mask ends the expression: a closing bracket, a
+    # separator, or the end of a line (LF or CRLF, after an optional # comment) whose
+    # next line does not continue it with an operator, `and` or `or`. Any other
+    # operator, such as | 0o777 or the floor division // 512, can change the result
+    # and is still reported. The comment is bounded so the check stays linear.
+    (
+        r"(?:mode|permission)\s*=\s*(?:0?o?777|0?o?666)"
+        r"(?![ \t]*&[ \t]*~[ \t]*[\w.]*umask\b(?:\([^()\n]*\))?[ \t]*"
+        r"(?:[),;\]}]|(?:#[^\n]{0,240}|\r)?$"
+        r"(?!\n[ \t]*(?:[-+*/%|&^<>=?:.]|(?:and|or)\b))))",
+        0.8,
+    ),
+    _TM3_UMASK,
+    _TM3_UMASK_CALL,
     (r"world[_-]?(?:readable|writable|executable)", 0.7),
     # Debug/dev mode in production
     (r"(?:debug|dev|development)[_-]?mode\s*=\s*(?:True|true|1|on|yes|enable)", 0.6),
@@ -388,6 +424,7 @@ TM3_PROSE_PATTERNS = [
     ),
 ]
 TM3_PATTERNS = TM3_CODE_PATTERNS + TM3_PROSE_PATTERNS
+_TM3_SHELL_PATTERNS = [_TM3_SHELL_UMASK if entry == _TM3_UMASK else entry for entry in TM3_PATTERNS]
 
 # TM4: Privileged Kubernetes Workload — manifest/CLI primitives that grant
 # node/host takeover (the cluster-scale counterpart of a privileged container).
@@ -4978,6 +5015,21 @@ def _line_containing(content: str, start: int, end: int) -> str:
     return content[line_start:line_end]
 
 
+def _is_assigned_value(content: str, start: int) -> bool:
+    """Return whether the expression at *start* is the value of an assignment.
+
+    Whitespace, line continuations and opening parentheses after the ``=`` are
+    skipped, so ``old =  (os.umask(0))`` reads like ``old = os.umask(0)``.
+    ``==``, ``!=``, ``<=`` and ``>=`` compare rather than assign.
+    """
+    index = start
+    while index and content[index - 1] in " \t\r\n\\(":
+        index -= 1
+    if not index or content[index - 1] != "=":
+        return False
+    return index < 2 or content[index - 2] not in "=!<>"
+
+
 def _bounded_context(content: str, match_start: int) -> str:
     """Return a fixed-size context centered on one direct shell call."""
     left = max(0, match_start - _MAX_DIRECT_SHELL_CONTEXT_CHARS // 2)
@@ -5266,13 +5318,16 @@ def analyze(
                     complete_match=match.group(0),
                 )
             )
-    for pattern, confidence in TM3_PATTERNS:
+    for pattern, confidence in _TM3_SHELL_PATTERNS if file_type == "shell" else TM3_PATTERNS:
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in TM3_PROSE_PATTERNS
             else re.finditer
         )
+        skip_assigned = (pattern, confidence) == _TM3_UMASK_CALL
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            if skip_assigned and _is_assigned_value(content, match.start()):
+                continue
             line_num = line_number(match.start())
             findings.append(
                 AnalyzerFinding(
