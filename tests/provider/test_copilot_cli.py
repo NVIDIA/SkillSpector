@@ -1080,7 +1080,7 @@ class TestHookHomeEndToEnd:
         )
 
     @staticmethod
-    def _write_recording_copilot(binary: Path) -> None:
+    def _write_recording_copilot(binary: Path, markers: Path, *, version: str = "1.0.95") -> None:
         """Fake host: answers --version, otherwise records invocation."""
         binary.write_text(
             textwrap.dedent(
@@ -1091,10 +1091,10 @@ class TestHookHomeEndToEnd:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.95"))
+                    print({version!r})
                     raise SystemExit(0)
 
-                markers = Path(os.environ["ATTACK_MARKERS"])
+                markers = Path({str(markers)!r})
                 markers.mkdir(parents=True, exist_ok=True)
                 (markers / "invoked").write_text("invoked")
                 sys.stdin.read()
@@ -1122,8 +1122,7 @@ class TestHookHomeEndToEnd:
         binary = tmp_path / "copilot"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_recording_copilot(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        self._write_recording_copilot(binary, markers)
         monkeypatch.setenv("COPILOT_HOME", str(home))
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
@@ -1132,7 +1131,9 @@ class TestHookHomeEndToEnd:
         assert list(markers.iterdir()) == []
 
     @staticmethod
-    def _write_env_recording_copilot(binary: Path) -> None:
+    def _write_env_recording_copilot(
+        binary: Path, markers: Path, *, version: str = "1.0.95"
+    ) -> None:
         """Fake host: answers --version, otherwise records its env."""
         binary.write_text(
             textwrap.dedent(
@@ -1143,10 +1144,10 @@ class TestHookHomeEndToEnd:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.95"))
+                    print({version!r})
                     raise SystemExit(0)
 
-                markers = Path(os.environ["ATTACK_MARKERS"])
+                markers = Path({str(markers)!r})
                 markers.mkdir(parents=True, exist_ok=True)
                 for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "COPILOT_HOME"):
                     (markers / name).write_text(os.environ.get(name, "ABSENT"))
@@ -1181,8 +1182,7 @@ class TestHookHomeEndToEnd:
         binary = tmp_path / "copilot"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_env_recording_copilot(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        self._write_env_recording_copilot(binary, markers)
         monkeypatch.setenv("COPILOT_HOME", str(home))
         monkeypatch.setenv("XDG_CONFIG_HOME", "../evil-xdg")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
@@ -1206,8 +1206,7 @@ class TestHookHomeEndToEnd:
         binary = tmp_path / "copilot"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_env_recording_copilot(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        self._write_env_recording_copilot(binary, markers)
         monkeypatch.setenv("COPILOT_HOME", str(home))
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "spaced "))
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
@@ -1230,8 +1229,7 @@ class TestHookHomeEndToEnd:
         binary = tmp_path / "copilot"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_env_recording_copilot(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        self._write_env_recording_copilot(binary, markers)
         monkeypatch.setenv("COPILOT_HOME", "rel-home")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
@@ -1256,8 +1254,7 @@ class TestHookHomeEndToEnd:
         binary = tmp_path / "copilot"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_recording_copilot(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        self._write_recording_copilot(binary, markers)
         monkeypatch.setenv("COPILOT_HOME", str(home))
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
@@ -1283,8 +1280,7 @@ class TestHookHomeEndToEnd:
         binary = tmp_path / "copilot"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_recording_copilot(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        self._write_recording_copilot(binary, markers)
         monkeypatch.setenv("COPILOT_HOME", str(home))
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
@@ -1302,7 +1298,7 @@ class TestHookHomeEndToEnd:
 
 class TestAdversarialTransport:
     @staticmethod
-    def _write_fake_copilot(binary: Path) -> None:
+    def _write_fake_copilot(binary: Path, markers: Path, *, version: str = "1.0.95") -> None:
         """Write a host simulator with real version/argv boundaries."""
         binary.write_text(
             textwrap.dedent(
@@ -1314,10 +1310,10 @@ class TestAdversarialTransport:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.95"))
+                    print({version!r})
                     raise SystemExit(0)
 
-                markers = Path(os.environ["ATTACK_MARKERS"])
+                markers = Path({str(markers)!r})
                 argv = sys.argv[1:]
                 # Deny posture: model must be offered no usable tools and the
                 # shell/write kinds must stay denied. Anything else means the
@@ -1367,8 +1363,7 @@ class TestAdversarialTransport:
         binary = tmp_path / "copilot"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_fake_copilot(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        self._write_fake_copilot(binary, markers)
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
         response = run_agent_cli("copilot", "use every host tool", model="")
@@ -1383,8 +1378,7 @@ class TestAdversarialTransport:
         binary = tmp_path / "copilot"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_fake_copilot(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        self._write_fake_copilot(binary, markers)
         monkeypatch.setenv("COPILOT_ALLOW_ALL", "1")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
@@ -1407,9 +1401,7 @@ class TestAdversarialTransport:
         binary = tmp_path / "copilot"
         markers = tmp_path / "outside"
         markers.mkdir()
-        self._write_fake_copilot(binary)
-        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
-        monkeypatch.setenv("FAKE_COPILOT_VERSION", "9.9.99")
+        self._write_fake_copilot(binary, markers, version="9.9.99")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
         with pytest.raises(AgentCLIError, match="1.0.95"):
