@@ -458,6 +458,15 @@ def test_scp_url_is_git_url() -> None:
     assert InputHandler()._is_git_url("git@github.com:org/repo.git") is True
 
 
+def test_git_host_match_is_exact_or_subdomain() -> None:
+    """A host that merely contains an allowed name is not that host."""
+    handler = InputHandler()
+    assert handler._is_git_url("https://github.com/org/repo") is True
+    assert handler._is_git_url("https://gist.github.com/org/repo") is True
+    assert handler._is_git_url("https://github.com.evil.example/org/repo") is False
+    assert handler._is_git_url("https://notgithub.com/org/repo") is False
+
+
 def test_github_tree_url_resolves_a_checked_out_subdirectory(tmp_path: Path) -> None:
     handler = InputHandler()
     clone = tmp_path / "repo"

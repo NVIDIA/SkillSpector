@@ -1078,7 +1078,8 @@ class InputHandler:
             return False
         parsed = urlparse(path)
         host = parsed.hostname or ""
-        if any(allowed in host for allowed in ALLOWED_GIT_HOSTS):
+        # Same suffix rule as _validate_url_host: "github.com.evil.tld" is not GitHub.
+        if any(host == allowed or host.endswith("." + allowed) for allowed in ALLOWED_GIT_HOSTS):
             lower_path = parsed.path.lower()
             if (
                 "/raw/" in lower_path
