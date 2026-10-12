@@ -22,6 +22,7 @@ No business logic; workflow lives in the graph.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import warnings
@@ -33,6 +34,7 @@ from hashlib import sha256
 from pathlib import Path
 from time import monotonic
 from typing import Annotated, cast
+from urllib.parse import quote
 
 import typer
 from langchain_core.runnables import RunnableConfig
@@ -42,9 +44,9 @@ from rich.text import Text
 from rich.tree import Tree
 
 from skillspector import __version__, transitive
-from skillspector.cleanup import cleanup_result
+from skillspector.cleanup import TempDirTracker, cleanup_result
 from skillspector.constants import RISK_THRESHOLD
-from skillspector.graph import graph
+from skillspector.graph_proxy import graph
 from skillspector.input_handler import validate_local_input_path
 from skillspector.inspection_ledger import (
     MAX_INSPECTION_LEDGER_EVENTS,
@@ -57,8 +59,13 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
-from skillspector.models import Finding
-from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
+from skillspector.models import OCCURRENCE_FINDING_ID_KEY, Finding
+from skillspector.multi_skill import (
+    MultiSkillDetectionResult,
+    SkillDirectory,
+    _manifest_file,
+    detect_skills,
+)
 from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
 from skillspector.nodes.report import report
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
@@ -75,6 +82,7 @@ from skillspector.suppression import (
     dump_baseline,
     effective_findings,
     load_baseline,
+    source_content_key,
 )
 
 logger = get_logger(__name__)
@@ -177,6 +185,7 @@ class _CachedTransitiveResult:
     artifact_references: list[dict[str, object]]
     has_executable_scripts: bool
     execution_successful: bool
+    meta_review_required: bool
     refs: list[str]
 
 
@@ -314,6 +323,7 @@ def _scan_state(
     baseline: Path | None = None,
     show_suppressed: bool = False,
     source_local_only: bool = False,
+    exclude_patterns: list[str] | None = None,
 ) -> dict[str, object]:
     """Build initial graph state from scan CLI args."""
     state: dict[str, object] = {
@@ -323,6 +333,8 @@ def _scan_state(
         "llm_requested": not no_llm,
         "source_local_only": source_local_only,
     }
+    if exclude_patterns:
+        state["exclude_patterns"] = list(exclude_patterns)
     if yara_rules_dir is not None:
         state["yara_rules_dir"] = yara_rules_dir
     if baseline is not None:
@@ -355,9 +367,34 @@ def _write_result(
             console.print(f"Report saved to: {output}")
     else:
         if format == FormatChoice.terminal:
-            console.print(report_body)
+            console.print(report_body, markup=False)
         else:
             print(report_body)
+
+
+def _validate_min_coverage(value: float | None) -> float | None:
+    """Accept only finite percentage thresholds in the CLI's supported range."""
+    if value is not None and (not math.isfinite(value) or not 0 <= value <= 100):
+        raise typer.BadParameter("must be a finite number between 0 and 100")
+    return value
+
+
+def _coverage_below_threshold(result: dict[str, object], threshold: float | None) -> bool:
+    """Compare finalized canonical coverage with the requested threshold."""
+    if threshold is None:
+        return False
+    completeness = result.get("analysis_completeness")
+    coverage = completeness.get("coverage_percent") if isinstance(completeness, dict) else None
+    if isinstance(coverage, bool) or not isinstance(coverage, (int, float)):
+        return True
+    if not math.isfinite(coverage):
+        return True
+    return coverage < threshold
+
+
+def _omissions_fail_threshold(omitted_skills: int, threshold: float | None) -> bool:
+    """Known omitted skills leave coverage below any positive threshold."""
+    return bool(omitted_skills) and threshold is not None and threshold > 0
 
 
 def _recursive_json_payload(result: dict[str, object]) -> dict[str, object] | None:
@@ -433,6 +470,14 @@ def scan(
             "--output",
             "-o",
             help="Output file path. If not specified, prints to stdout.",
+        ),
+    ] = None,
+    exclude: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude",
+            help="Exclude a relative POSIX path glob (repeatable). Local single-skill directories "
+            "only; exclusions are reported as uninspected, partial coverage. SKILL.md is required.",
         ),
     ] = None,
     no_llm: Annotated[
@@ -522,6 +567,14 @@ def scan(
             help="Exit 1 when relevant analysis is partial or incomplete.",
         ),
     ] = False,
+    min_coverage: Annotated[
+        float | None,
+        typer.Option(
+            "--min-coverage",
+            help="Exit 1 when canonical analysis coverage is below this percentage (0-100).",
+            callback=_validate_min_coverage,
+        ),
+    ] = None,
     fail_on_findings: Annotated[
         bool,
         typer.Option(
@@ -544,6 +597,13 @@ def scan(
             help="Scan an MCP Registry payload or URL instead of a skill.",
         ),
     ] = False,
+    mcp_registry_compare: Annotated[
+        Path | None,
+        typer.Option(
+            "--mcp-registry-compare",
+            help="Compare registry snapshots with a previous local JSON report; requires --mcp-registry.",
+        ),
+    ] = None,
 ) -> None:
     """
     Scan a skill for security vulnerabilities.
@@ -560,7 +620,7 @@ def scan(
         SKILLSPECTOR_PROVIDER  Active LLM provider: openai | anthropic |
                                anthropic_proxy | bedrock | nv_build |
                                nv_inference | ollama | azure_openai |
-                               openai_compatible | claude_cli | codex_cli |
+                               openai_compatible | gemini | claude_cli |
                                gemini_cli | opencode_cli. Defaults to the NVIDIA path
                                (nv_inference, falling back to nv_build in
                                OSS builds).
@@ -582,16 +642,43 @@ def scan(
           AZURE_OPENAI_ENDPOINT              for azure_openai
         SKILLSPECTOR_COMPAT_API_KEY +
           SKILLSPECTOR_COMPAT_BASE_URL       for openai_compatible
+        GOOGLE_CLOUD_PROJECT [+ GOOGLE_CLOUD_LOCATION]
+                                             for gemini (uses Application
+                                             Default Credentials / Workload Identity)
 
-        ollama uses the local Ollama service. claude_cli, codex_cli,
+        ollama uses the local Ollama service. claude_cli,
         gemini_cli, and opencode_cli use their CLI's existing local
-        authentication session.
+        authentication session. codex_cli is registered but disabled because
+        its read-only sandbox permits host-file reads; use another provider.
     """
+    if mcp_registry_compare is not None and not mcp_registry:
+        err_console.print("[red]Error:[/red] --mcp-registry-compare requires --mcp-registry")
+        raise typer.Exit(code=2)
+    if exclude and (
+        recursive
+        or transitive_enabled
+        or mcp_registry
+        or not Path(input_path).is_dir()
+        or _manifest_file(Path(input_path)) is None
+    ):
+        err_console.print(
+            "[red]Error:[/red] --exclude requires a local single-skill directory with SKILL.md or skill.md "
+            "and cannot be combined with --recursive, --transitive, or --mcp-registry"
+        )
+        raise typer.Exit(code=2)
+
     if mcp_registry:
-        if recursive or baseline is not None or show_suppressed or yara_rules_dir is not None:
+        if (
+            recursive
+            or baseline is not None
+            or show_suppressed
+            or yara_rules_dir is not None
+            or min_coverage is not None
+        ):
             err_console.print(
                 "[red]Error:[/red] --mcp-registry cannot be combined with "
-                "--recursive, --baseline, --show-suppressed, or --yara-rules-dir"
+                "--recursive, --baseline, --show-suppressed, --yara-rules-dir, "
+                "or --min-coverage"
             )
             raise typer.Exit(code=2)
         if format != FormatChoice.json:
@@ -600,7 +687,11 @@ def scan(
             )
             raise typer.Exit(code=2)
         try:
-            result = scan_registry(input_path)
+            result = (
+                scan_registry(input_path, compare_path=mcp_registry_compare)
+                if mcp_registry_compare is not None
+                else scan_registry(input_path)
+            )
             report = json.dumps(result, indent=2)
             if output:
                 output.write_text(report, encoding="utf-8")
@@ -625,7 +716,16 @@ def scan(
     if not input_path.startswith(("http://", "https://", "git@")):
         try:
             resolved_path = validate_local_input_path(resolved_path)
-        except ValueError as e:
+            if (
+                output is not None
+                and resolved_path.is_file()
+                and output.exists()
+                and output.samefile(resolved_path)
+            ):
+                raise ValueError(
+                    "--output points to the input file. Choose a different output path."
+                )
+        except (OSError, ValueError) as e:
             err_console.print(f"[red]Error:[/red] {e}")
             raise typer.Exit(code=2) from e
     try:
@@ -640,8 +740,10 @@ def scan(
     discovery_console = (
         err_console if output is None and format is not FormatChoice.terminal else console
     )
+    recursive_omitted_skills = 0
     if recursive and resolved_path.is_dir():
         detection = detect_skills(resolved_path)
+        recursive_omitted_skills = detection.omitted_symlink_entries
         if not detection.complete:
             pre_scan_ledger_events = _multi_skill_limitation_events(detection)
             err_console.print(
@@ -674,6 +776,7 @@ def scan(
                     verbose=verbose,
                     fail_on_incomplete=fail_on_incomplete,
                     fail_on_findings=fail_on_findings,
+                    min_coverage=min_coverage,
                 )
             except typer.Exit:
                 raise
@@ -700,6 +803,9 @@ def scan(
                 "[yellow]Warning:[/yellow] Skill discovery was incomplete; continuing "
                 "with a bounded scan and reporting partial coverage."
             )
+        if exclude and detection.is_multi_skill:
+            err_console.print("[red]Error:[/red] --exclude is not supported for multi-skill scans")
+            raise typer.Exit(code=2)
         if detection.is_multi_skill:
             discovery_console.print(
                 f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
@@ -733,7 +839,8 @@ def scan(
 
     result = None
     try:
-        result = _scan_skill(
+        scan_skill = partial(_scan_skill, exclude_patterns=exclude) if exclude else _scan_skill
+        result = scan_skill(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -760,6 +867,10 @@ def scan(
         if fail_on_incomplete and not is_complete:
             raise typer.Exit(code=1)
         if fail_on_findings and effective_findings(result):
+            raise typer.Exit(code=1)
+        if _coverage_below_threshold(result, min_coverage) or _omissions_fail_threshold(
+            recursive_omitted_skills, min_coverage
+        ):
             raise typer.Exit(code=1)
         if (result.get("risk_score") or 0) > RISK_THRESHOLD:
             raise typer.Exit(code=1)
@@ -891,6 +1002,40 @@ def _ledger_work_identity(entry: dict[str, object]) -> str:
     return f"{record_value}:{entry.get('phase', '')}"
 
 
+def _ledger_work_identities(value: object) -> dict[str, str]:
+    """Map each child ledger row's own work ID to the identity it was built from.
+
+    A status ``planned_work`` target carries only the child's work ID, path and
+    range, not the identity behind it. Rows whose identity is not the
+    analyzer's own -- the static_yara rule-set row is ``rule_set:static``, not
+    ``static_yara`` -- must be re-scoped with that same identity in the status
+    path, or the status target and its ledger row get different scoped IDs
+    and the target is dropped as unretained.
+    """
+    identities: dict[str, str] = {}
+    for event in _coerce_dict_list(value):
+        work_id = event.get("work_id")
+        if isinstance(work_id, str) and work_id:
+            identities[work_id] = _ledger_work_identity(event)
+    return identities
+
+
+def _source_scoped_work_id(identity: str, item: dict[str, object]) -> str:
+    """Build the scoped work ID for an already re-pathed ledger row or status target.
+
+    Shared by :func:`_source_aware_ledger` and :func:`_source_aware_status_events`
+    so the two scoping paths cannot derive different IDs for the same work.
+    """
+    start_line = item.get("start_line")
+    end_line = item.get("end_line")
+    return inspection_work_id(
+        identity,
+        str(item.get("path", "SKILL.md")),
+        start_line if isinstance(start_line, int) else None,
+        end_line if isinstance(end_line, int) else None,
+    )
+
+
 def _source_aware_ledger(
     value: object,
     *,
@@ -916,15 +1061,7 @@ def _source_aware_ledger(
                     for item in ids
                     if isinstance(item, str)
                 ]
-        scoped_path = str(entry.get("path", "SKILL.md"))
-        start_line = entry.get("start_line")
-        end_line = entry.get("end_line")
-        entry["work_id"] = inspection_work_id(
-            _ledger_work_identity(entry),
-            scoped_path,
-            start_line if isinstance(start_line, int) else None,
-            end_line if isinstance(end_line, int) else None,
-        )
+        entry["work_id"] = _source_scoped_work_id(_ledger_work_identity(entry), entry)
         events.append(entry)
     return events
 
@@ -937,8 +1074,10 @@ def _source_aware_status_events(
     source_digest: str,
     retained_work_ids: set[str],
     max_planned_work: int,
+    work_identities: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
     statuses: list[dict[str, object]] = []
+    identities = work_identities or {}
     planned_retained = 0
     for status in _coerce_dict_list(value):
         if len(statuses) >= _TRANSITIVE_MAX_STATUS_EVENTS:
@@ -960,14 +1099,11 @@ def _source_aware_status_events(
                 path = scoped_target.get("path")
                 if isinstance(path, str) and path:
                     scoped_target["path"] = _transitive_component_key(source_identity, path)
-                start_line = scoped_target.get("start_line")
-                end_line = scoped_target.get("end_line")
-                scoped_target["work_id"] = inspection_work_id(
-                    analyzer_id,
-                    str(scoped_target.get("path", "SKILL.md")),
-                    start_line if isinstance(start_line, int) else None,
-                    end_line if isinstance(end_line, int) else None,
-                )
+                # Re-scope with the identity the matching ledger row used, so
+                # both paths agree on the scoped ID; the analyzer ID is only the
+                # fallback for targets with no child ledger row.
+                identity = identities.get(str(target.get("work_id", "")), analyzer_id)
+                scoped_target["work_id"] = _source_scoped_work_id(identity, scoped_target)
                 if scoped_target["work_id"] not in retained_work_ids:
                     continue
                 scoped_work.append(scoped_target)
@@ -1044,7 +1180,7 @@ def _source_aware_file_cache(
     file_cache: dict[str, str], source_identity: str | None
 ) -> dict[str, str]:
     return {
-        _transitive_component_key(source_identity, path): content
+        (source_content_key(source_identity, path) if source_identity else path): content
         for path, content in file_cache.items()
     }
 
@@ -1179,18 +1315,32 @@ def _cache_transitive_result(
     child_filtered = _coerce_findings_list(child_result.get("filtered_findings"))
     child_findings = _coerce_findings_list(child_result.get("findings"))
     all_ids = {finding.finding_id for finding in [*child_filtered, *child_findings]}
+    all_ids.update(
+        occurrence_id
+        for finding in [*child_filtered, *child_findings]
+        for occurrence in finding.occurrences
+        if isinstance((occurrence_id := occurrence.get(OCCURRENCE_FINDING_ID_KEY)), str)
+    )
     all_ids.update(_effective_finding_ids(child_result))
     finding_id_map = {
         finding_id: _scoped_finding_id(source_identity, finding_id) for finding_id in all_ids
     }
 
     def _scope_finding(finding: Finding) -> Finding:
+        occurrences = []
+        for raw in finding.occurrences:
+            occurrence = dict(raw)
+            occurrence_id = occurrence.get(OCCURRENCE_FINDING_ID_KEY)
+            if isinstance(occurrence_id, str):
+                occurrence[OCCURRENCE_FINDING_ID_KEY] = finding_id_map[occurrence_id]
+            occurrences.append(occurrence)
         return replace(
             finding,
             finding_id=finding_id_map[finding.finding_id],
             source_url=target,
             source_identity=source_identity,
             source_digest=source_digest,
+            occurrences=occurrences,
         )
 
     scoped_filtered = [_scope_finding(item) for item in child_filtered[:_TRANSITIVE_MAX_FINDINGS]]
@@ -1265,6 +1415,7 @@ def _cache_transitive_result(
         source_digest=source_digest,
         retained_work_ids=retained_work_ids,
         max_planned_work=len(retained_work_ids),
+        work_identities=_ledger_work_identities(child_result.get("inspection_ledger")),
     )
     child_metadata = _decorate_component_metadata(
         _coerce_component_metadata(child_result.get("component_metadata")),
@@ -1316,6 +1467,7 @@ def _cache_transitive_result(
         has_executable_scripts=bool(child_result.get("has_executable_scripts", False))
         or any(bool(entry.get("executable", False)) for entry in child_metadata),
         execution_successful=child_result.get("execution_successful") is not False,
+        meta_review_required=child_result.get("meta_review_required") is True,
         refs=extraction.references,
     )
 
@@ -1397,6 +1549,7 @@ def _run_graph_scan(
     initial_inspection_ledger: list[dict[str, object]] | None = None,
     source_local_only: bool = False,
     stream_progress: bool = False,
+    exclude_patterns: list[str] | None = None,
 ) -> dict[str, object]:
     state = _scan_state(
         input_path=input_path,
@@ -1406,14 +1559,20 @@ def _run_graph_scan(
         baseline=baseline,
         show_suppressed=show_suppressed,
         source_local_only=source_local_only,
+        exclude_patterns=exclude_patterns,
     )
     if transitive_traversal is not None:
         state["transitive_traversal_state"] = transitive_traversal
     if initial_inspection_ledger:
         state["inspection_ledger"] = initial_inspection_ledger
     trace_config = _build_trace_config(input_path, format, no_llm)
+    # A scan that raises or is interrupted returns no result for the caller to
+    # clean up, so remove the temp directory resolve_input made here instead.
+    temp_dir_tracker = TempDirTracker()
+    trace_config["callbacks"] = [temp_dir_tracker]
     if not stream_progress:
-        return cast(dict[str, object], graph.invoke(state, config=trace_config))
+        with temp_dir_tracker.removing_on_error():
+            return cast(dict[str, object], graph.invoke(state, config=trace_config))
 
     analyzer_node_ids = _wired_analyzer_node_ids()
     total_analyzers = len(analyzer_node_ids)
@@ -1431,6 +1590,7 @@ def _run_graph_scan(
             console=err_console,
             transient=True,
         ) as progress,
+        temp_dir_tracker.removing_on_error(),
     ):
         warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
         task_id = progress.add_task("Resolving input...", total=total_steps)
@@ -1501,11 +1661,14 @@ def _run_graph_scan_for_source(
     initial_inspection_ledger: list[dict[str, object]] | None = None,
     source_local_only: bool = False,
     stream_progress: bool = False,
+    exclude_patterns: list[str] | None = None,
 ) -> dict[str, object]:
     """Invoke a scan without widening the legacy call contract for public sources."""
     run_graph_scan = (
         partial(_run_graph_scan, stream_progress=True) if stream_progress else _run_graph_scan
     )
+    if exclude_patterns:
+        run_graph_scan = partial(run_graph_scan, exclude_patterns=exclude_patterns)
     if initial_inspection_ledger is not None:
         if source_local_only:
             return run_graph_scan(
@@ -1615,7 +1778,8 @@ def _bounded_cache_update(
 ) -> None:
     for path in sorted(values):
         if path in destination:
-            destination[path] = values[path]
+            # Source-scoped keys are disjoint from root paths. A repeated key
+            # refers to the same cached result within this traversal.
             continue
         if len(destination) >= limit:
             traversal.note_truncation(f"{resource} budget {limit} reached")
@@ -1927,6 +2091,7 @@ def _scan_transitive(
         _coerce_component_metadata(initial_result.get("component_metadata")), None
     )[: traversal.budget.max_components]
     has_executable_scripts = bool(initial_result.get("has_executable_scripts", False))
+    merged_meta_review_required = initial_result.get("meta_review_required") is True
 
     root_extraction = transitive.extract_external_refs_with_metadata(
         local_file_cache,
@@ -2141,6 +2306,8 @@ def _scan_transitive(
                 )
                 if cached.has_executable_scripts:
                     has_executable_scripts = True
+                if cached.meta_review_required:
+                    merged_meta_review_required = True
                 _bounded_extend(
                     merged_components,
                     cached.components,
@@ -2275,6 +2442,7 @@ def _scan_transitive(
         "artifact_inventory": merged_artifact_inventory,
         "artifact_references": merged_artifact_references,
         "has_executable_scripts": has_executable_scripts,
+        "meta_review_required": merged_meta_review_required,
         "use_llm": initial_result.get("use_llm", not no_llm),
         "llm_requested": initial_result.get("llm_requested", not no_llm),
         "llm_call_log": merged_llm_call_log,
@@ -2325,6 +2493,7 @@ def _scan_transitive(
         merged_result["effective_finding_ids"] = effective_ids
     report_result = cast(dict[str, object], report(merged_result))
     report_result["analysis_completeness"] = merged_result.get("analysis_completeness", {})
+    report_result["meta_review_required"] = merged_meta_review_required
     report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
     active_findings = _coerce_findings_list(report_result.get("filtered_findings"))
     report_result["transitive_finding_count"] = sum(
@@ -2363,6 +2532,7 @@ def _scan_skill(
     transitive_traversal: _TransitiveTraversalState | None = None,
     pre_scan_ledger_events: list[dict[str, object]] | None = None,
     source_local_only: bool = False,
+    exclude_patterns: list[str] | None = None,
 ) -> dict[str, object]:
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     active_visited: set[str] = set()
@@ -2379,8 +2549,11 @@ def _scan_skill(
     if transitive_enabled and transitive_traversal is None:
         transitive_traversal = _TransitiveTraversalState(cache=transitive_cache or {})
     stream_progress = not verbose and err_console.is_terminal
+    run_for_source = _run_graph_scan_for_source
+    if exclude_patterns:
+        run_for_source = partial(run_for_source, exclude_patterns=exclude_patterns)
     if pre_scan_ledger_events:
-        result = _run_graph_scan_for_source(
+        result = run_for_source(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -2393,7 +2566,7 @@ def _scan_skill(
             stream_progress=stream_progress,
         )
     else:
-        result = _run_graph_scan_for_source(
+        result = run_for_source(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -2415,21 +2588,29 @@ def _scan_skill(
         active_visited.add(transitive.canonicalize_source_identity(input_path))
     except ValueError:
         pass
-    return _scan_transitive(
-        initial_result=result,
-        format=format,
-        no_llm=no_llm,
-        max_depth=transitive_depth,
-        transitive_allow_prefix=transitive_allow_prefix,
-        transitive_deny_prefix=transitive_deny_prefix,
-        baseline=baseline,
-        show_suppressed=show_suppressed,
-        visited=active_visited,
-        scan_cache=transitive_cache,
-        yara_dir=yara_dir,
-        traversal=transitive_traversal,
-        source_local_only=source_local_only,
-    )
+    # The root graph has returned, so its tracker no longer guards the root's
+    # temp dir. If the transitive phase is interrupted or raises, nothing is
+    # returned for the caller's cleanup_result, so remove it here. On success
+    # the merged result carries the same temp_dir_for_cleanup for the caller.
+    try:
+        return _scan_transitive(
+            initial_result=result,
+            format=format,
+            no_llm=no_llm,
+            max_depth=transitive_depth,
+            transitive_allow_prefix=transitive_allow_prefix,
+            transitive_deny_prefix=transitive_deny_prefix,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+            visited=active_visited,
+            scan_cache=transitive_cache,
+            yara_dir=yara_dir,
+            traversal=transitive_traversal,
+            source_local_only=source_local_only,
+        )
+    except BaseException:
+        cleanup_result(result)
+        raise
 
 
 def _multi_skill_public_record_count(result: dict[str, object]) -> int:
@@ -2592,6 +2773,11 @@ def _multi_skill_text_summary(
     return f"{risk}\n\n{_multi_skill_text_completeness(completeness)}"
 
 
+# uriBaseId key used to scope recursive child-run result URIs to their own
+# skill directory (SARIF 2.1.0 section 3.14.14).
+_RECURSIVE_SARIF_URI_BASE_ID = "SKILLROOT"
+
+
 def _multi_skill_sarif_report(
     processed_skills: list[SkillDirectory],
     results: list[dict[str, object]],
@@ -2621,6 +2807,43 @@ def _multi_skill_sarif_report(
                 "path": skill.relative_path,
             }
             run["properties"] = run_properties
+            # SARIF 2.1.0 sections 3.4.4 and 3.14.14: scope each child run's
+            # skill-relative URIs to its own skill directory so results from
+            # different skills stop collapsing onto one repo-root-relative
+            # path. Single-skill output is untouched: only recursive merges
+            # set uriBaseId.
+            relative = quote(skill.path.name, safe="")
+            if relative:
+                for result in run.get("results", []):
+                    if not isinstance(result, dict):
+                        continue
+                    for location in result.get("locations", []):
+                        physical = (
+                            location.get("physicalLocation") if isinstance(location, dict) else None
+                        )
+                        artifact = (
+                            physical.get("artifactLocation") if isinstance(physical, dict) else None
+                        )
+                        if isinstance(artifact, dict):
+                            provenance = artifact.get("properties")
+                            if isinstance(provenance, dict) and any(
+                                key in provenance
+                                for key in (
+                                    "sourceIdentity",
+                                    "sourceUrl",
+                                    "sourceDigest",
+                                    "transitiveDepth",
+                                )
+                            ):
+                                continue
+                            artifact["uriBaseId"] = _RECURSIVE_SARIF_URI_BASE_ID
+                run["originalUriBaseIds"] = {
+                    "SCANROOT": {"uri": skill.path.parent.resolve().as_uri() + "/"},
+                    _RECURSIVE_SARIF_URI_BASE_ID: {
+                        "uri": f"{relative}/",
+                        "uriBaseId": "SCANROOT",
+                    },
+                }
             runs.append(run)
 
     invocation_properties: dict[str, object] = {"analysisCompleteness": completeness}
@@ -2693,6 +2916,7 @@ def _scan_multi_skill(
     yara_dir: str | None = None,
     verbose: bool = False,
     fail_on_incomplete: bool = False,
+    min_coverage: float | None = None,
     fail_on_findings: bool = False,
     **legacy_kwargs: object,
 ) -> None:
@@ -2735,6 +2959,7 @@ def _scan_multi_skill(
     complete_skill_count = 0
     partial_skill_count = 0
     failed_skill_count = 0
+    coverage_failed = False
 
     for i, skill in enumerate(skills, 1):
         if i > _MULTI_SKILL_MAX_SKILLS:
@@ -2781,6 +3006,8 @@ def _scan_multi_skill(
                 source_local_only=skill.local_only,
             )
             child_failed = result.get("execution_successful") is False
+            if not child_failed and _coverage_below_threshold(result, min_coverage):
+                coverage_failed = True
             completeness_value = result.get("analysis_completeness")
             child_partial = (
                 not child_failed
@@ -2886,6 +3113,8 @@ def _scan_multi_skill(
         aggregate_limitations.append(
             f"{unscanned_skill_count} recursive skill(s) unscanned after an aggregate limit"
         )
+    if _omissions_fail_threshold(skills_omitted_total, min_coverage):
+        coverage_failed = True
     aggregate_limitations = list(dict.fromkeys(aggregate_limitations))[:256]
     aggregate_completeness = _multi_skill_analysis_completeness(
         total_skills=len(skills) + omitted_symlink_entry_count,
@@ -3122,6 +3351,8 @@ def _scan_multi_skill(
         raise typer.Exit(code=1)
     if fail_on_findings and has_findings:
         raise typer.Exit(code=1)
+    if coverage_failed:
+        raise typer.Exit(code=1)
     if max_score > RISK_THRESHOLD:
         raise typer.Exit(code=1)
 
@@ -3133,13 +3364,15 @@ def mcp(
         typer.Option(
             "--transport",
             "-t",
-            help="Transport: FastMCP stdio for local CLI agents, http for remote/A2A callers.",
+            help="Transport: FastMCP stdio for local CLI agents, http for loopback HTTP clients.",
             case_sensitive=False,
         ),
     ] = TransportChoice.stdio,
     host: Annotated[
         str,
-        typer.Option("--host", help="Host to bind (http transport only)."),
+        typer.Option(
+            "--host", help="Loopback IP to bind (http transport only; localhost is accepted)."
+        ),
     ] = "127.0.0.1",
     port: Annotated[
         int,
@@ -3150,7 +3383,7 @@ def mcp(
     Run SkillSpector as an MCP server.
 
     Exposes a single tool, ``scan_skill``, so any MCP-capable agent (Claude Code,
-    Codex CLI, Gemini CLI) or remote runtime can scan a skill and gate installs
+    Codex CLI, Gemini CLI) can scan a skill locally and gate installs
     on the verdict.
 
     Requires the optional mcp extra. Reinstall the GitHub tool package with
@@ -3165,7 +3398,7 @@ def mcp(
         from skillspector.mcp_server import run as run_mcp
 
         run_mcp(transport=transport.value, host=host, port=port)
-    except ModuleNotFoundError as e:
+    except (ModuleNotFoundError, ValueError) as e:
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
 
@@ -3226,6 +3459,23 @@ def baseline(
         state = _scan_state(input_path, FormatChoice.json, no_llm)
         state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
+        completeness_value = result.get("analysis_completeness")
+        completeness = completeness_value if isinstance(completeness_value, dict) else {}
+        if (
+            result.get("execution_successful") is False
+            or completeness.get("execution_successful") is False
+            or completeness.get("status") == "failed"
+        ):
+            raise ValueError(
+                "Cannot generate baseline because scan execution failed. "
+                "Run 'skillspector scan' to inspect analysis completeness, "
+                "resolve the failures, and retry."
+            )
+        if completeness.get("is_complete") is False or completeness.get("status") == "partial":
+            err_console.print(
+                "[yellow]Warning:[/yellow] Scan analysis is incomplete; the baseline "
+                "accepts only observed findings and coverage gaps remain."
+            )
         # Fingerprint every occurrence the next scan checks. The reported
         # findings are deduplicated and keep only one occurrence's evidence.
         findings = result["active_findings"]

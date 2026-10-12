@@ -219,7 +219,8 @@ def test_finding_clones_preserve_security_metadata_and_confidence() -> None:
         [returned] = _analyzer().apply_filter([original], [(batch, items)])
         assert returned.confidence == original.confidence
         assert returned.intent == original.intent
-        assert returned.evidence == original.evidence
+        assert returned.evidence.items() >= original.evidence.items()
+        assert returned.evidence["llm_review_outcome"] in {"confirmed", "disagreed"}
         assert returned.match_fingerprint == original.match_fingerprint
         assert returned.occurrences == original.occurrences
         assert (returned.start_column, returned.end_column) == (7, 19)
@@ -236,6 +237,150 @@ def test_exact_end_line_match_still_works() -> None:
 
     assert len(kept) == 1
     assert kept[0].rule_id == "AST1"
+
+
+def test_same_rule_and_line_bind_assessments_by_finding_id() -> None:
+    """A response is bound to the exact finding it names, not a shared location."""
+    first = Finding(
+        rule_id="SC4", message="first", finding_id="first", file="requirements.txt", start_line=4
+    )
+    second = Finding(
+        rule_id="SC4", message="second", finding_id="second", file="requirements.txt", start_line=4
+    )
+    batch = Batch(file_path="requirements.txt", content="", findings=[first, second])
+    items = [
+        _llm_item("SC4", 4, finding_id="first", explanation="first assessment"),
+        _llm_item("SC4", 4, finding_id="second", explanation="second assessment"),
+    ]
+
+    returned = _analyzer().apply_filter([first, second], [(batch, items)])
+    by_id = {finding.finding_id: finding for finding in returned}
+
+    assert by_id["first"].message == "first assessment"
+    assert by_id["second"].message == "second assessment"
+
+
+def test_swapped_ids_fall_back_to_location_matching() -> None:
+    """A mismatched id must not move one rule's assessment onto another rule."""
+    sc4 = Finding(
+        rule_id="SC4", message="sc4 static", finding_id="sc4", file="requirements.txt", start_line=4
+    )
+    ast1 = Finding(
+        rule_id="AST1",
+        message="ast1 static",
+        finding_id="ast1",
+        file="requirements.txt",
+        start_line=9,
+    )
+    batch = Batch(file_path="requirements.txt", content="", findings=[sc4, ast1])
+    items = [
+        _llm_item("AST1", 9, finding_id="sc4", explanation="ast1 assessment"),
+        _llm_item("SC4", 4, finding_id="ast1", explanation="sc4 assessment"),
+    ]
+
+    returned = _analyzer().apply_filter([sc4, ast1], [(batch, items)])
+    by_id = {finding.finding_id: finding for finding in returned}
+
+    assert by_id["sc4"].message == "sc4 assessment"
+    assert by_id["ast1"].message == "ast1 assessment"
+
+
+def test_unknown_id_with_correct_location_still_binds() -> None:
+    """A mistyped id should not turn a matching assessment into missing."""
+    finding = _finding("SC4", 4)
+    batch = Batch(file_path="requirements.txt", content="", findings=[finding])
+    items = [
+        _llm_item(
+            "SC4",
+            4,
+            finding_id="one-hex-digit-wrong",
+            explanation="location-bound assessment",
+        )
+    ]
+
+    returned = _analyzer().apply_filter([finding], [(batch, items)])
+
+    assert returned[0].message == "location-bound assessment"
+    assert returned[0].evidence["llm_review_outcome"] == "confirmed"
+
+
+def test_id_from_another_batch_is_rejected_and_location_is_used() -> None:
+    """An id outside the submitted batch cannot select a finding."""
+    finding = Finding(
+        rule_id="SC4", message="static", finding_id="current", file="requirements.txt", start_line=4
+    )
+    other = Finding(
+        rule_id="SC4", message="other", finding_id="other", file="requirements.txt", start_line=9
+    )
+    batch = Batch(file_path="requirements.txt", content="", findings=[finding])
+    other_batch = Batch(file_path="requirements.txt", content="", findings=[other])
+    items = [
+        _llm_item(
+            "SC4",
+            4,
+            finding_id=other.finding_id,
+            explanation="location-bound assessment",
+        )
+    ]
+
+    returned = _analyzer().apply_filter([finding], [(batch, items)])
+
+    assert returned[0].message == "location-bound assessment"
+    assert returned[0].evidence["llm_review_outcome"] == "confirmed"
+    assert other_batch.findings[0].finding_id == "other"
+
+
+def test_overlapping_chunk_assessments_prefer_confirmed() -> None:
+    """A later, less favorable chunk must not erase an earlier confirmation."""
+    finding = Finding(
+        rule_id="R1", message="static", finding_id="finding", file="a.py", start_line=10
+    )
+    first_batch = Batch(file_path="a.py", content="first", findings=[finding])
+    later_batch = Batch(file_path="a.py", content="later", findings=[finding])
+    confirmed = _llm_item(
+        "R1",
+        10,
+        is_vulnerability=True,
+        confidence=0.9,
+        explanation="confirmed assessment",
+        _file="a.py",
+    )
+    disagreed = _llm_item(
+        "R1",
+        10,
+        is_vulnerability=False,
+        confidence=0.1,
+        explanation="disagreed assessment",
+        _file="a.py",
+    )
+
+    returned = _analyzer().apply_filter(
+        [finding],
+        [(first_batch, [confirmed]), (later_batch, [disagreed])],
+    )
+
+    assert returned[0].message == "confirmed assessment"
+    assert returned[0].evidence["llm_review_outcome"] == "confirmed"
+
+
+def test_review_evidence_does_not_copy_model_reasoning() -> None:
+    """Model explanation and remediation must not be rendered as finding evidence."""
+    finding = _finding("SC4", 4)
+    batch = Batch(file_path="requirements.txt", content="", findings=[finding])
+    item = _llm_item(
+        "SC4",
+        4,
+        confidence=0.7,
+        explanation="model reasoning",
+        remediation="model remediation",
+    )
+
+    returned = _analyzer().apply_filter([finding], [(batch, [item])])
+
+    assert returned[0].evidence["llm_review_outcome"] == "confirmed"
+    assert returned[0].evidence["llm_review_confidence"] == 0.7
+    assert "llm_review_explanation" not in returned[0].evidence
+    assert "llm_review_remediation" not in returned[0].evidence
 
 
 def _confirm(pattern_id: str, file: str, start_line: int) -> dict[str, object]:
@@ -520,6 +665,42 @@ class TestMetaAnalyzerPartialBatchFailure:
 
         confirmed = next(f for f in filtered if f.file == "a.py")
         assert confirmed.explanation == "confirmed by llm"
+
+    def test_review_outcomes_distinguish_disagreement_missing_and_failed(self) -> None:
+        disagreed = _lineage_finding("disagreed", "a.py", 1)
+        omitted = _lineage_finding("omitted", "a.py", 5)
+        failed = _lineage_finding("failed", "b.py", 3)
+        batch_a = Batch(file_path="a.py", content="code a", findings=[disagreed, omitted])
+        batch_b = Batch(file_path="b.py", content="code b", findings=[failed])
+        response = [
+            {
+                "finding_id": "disagreed",
+                "pattern_id": "DISAGREED",
+                "start_line": 1,
+                "is_vulnerability": False,
+                "_file": "a.py",
+            }
+        ]
+
+        with (
+            patch.object(LLMMetaAnalyzer, "get_batches", return_value=[batch_a, batch_b]),
+            patch.object(
+                LLMMetaAnalyzer,
+                "arun_batches",
+                new_callable=AsyncMock,
+                return_value=[(batch_a, response)],
+            ),
+        ):
+            result = meta_analyzer(self._state([disagreed, omitted, failed]))
+
+        by_id = {finding.finding_id: finding for finding in result["findings"]}
+        assert by_id["disagreed"].evidence["llm_review_outcome"] == "disagreed"
+        assert by_id["omitted"].evidence["llm_review_outcome"] == "missing"
+        assert by_id["failed"].evidence["llm_review_outcome"] == "failed"
+        assert "llm-unconfirmed" in by_id["disagreed"].tags
+        assert "llm-unconfirmed" in by_id["omitted"].tags
+        assert "llm-unconfirmed" not in by_id["failed"].tags
+        assert result["meta_review_required"] is True
 
     def test_selection_does_not_persist_filtered_findings(self) -> None:
         finding = _lineage_finding("retained", "a.py", 1)

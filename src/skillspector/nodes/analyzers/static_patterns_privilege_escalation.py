@@ -43,6 +43,7 @@ from .common import (
     get_context,
     get_context_from_lines,
     get_line_number,
+    is_reference_material,
     resolve_call_name,
 )
 from .pattern_defaults import PatternCategory
@@ -50,6 +51,7 @@ from .pattern_defaults import PatternCategory
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_privilege_escalation"
+USES_PYTHON_SOURCE_TYPE = True
 
 # Scan-scoped handle on the runner's shared Python AST cache, published by
 # node() for the analyze() calls the runner makes on its behalf.  This module
@@ -86,7 +88,28 @@ PE2_CODE_PATTERNS = [
     (r"doas\s+", 0.7),
     (r"pkexec\s+", 0.75),
     (r"chmod\s+[ugo]*[+-=]*s", 0.85),
-    (r"chmod\s+[0-7]*[4567][0-7]{2}", 0.8),
+    # A numeric mode only grants setuid/setgid/sticky through its leading octal
+    # digit, so the full four-digit form is what has to be present.  Accepting a
+    # bare 4/5/6/7 anywhere in the mode flagged every ordinary permission whose
+    # rwx triple happened to contain one (chmod 600, chmod 644, chmod 755, ...).
+    # Leading digit 2-7 selects setgid (2, 3, 6) or setuid (4, 5, 7).  A bare 1
+    # only adds sticky, which grants nobody new access, so it stays unreported.
+    # The pieces around the mode: 0* absorbs the leading zeros GNU and BSD chmod
+    # accept, the optional [+=] accepts the operator GNU chmod allows in front of
+    # the digits (chmod +4000, chmod =4755), the option group lets
+    # `chmod -R 4755 dir` reach the mode, the optional quotes cover
+    # `chmod "6755"`, and the trailing lookahead rejects a longer digit run
+    # (chmod 47554) as well as a malformed trailing word (chmod 4755x) while still
+    # matching every non-alphanumeric terminator (space, end of line, `;`, `&`,
+    # `|`, `)`, `$`, a quote or a backtick).
+    # The option group takes a single leading dash on purpose: with `--?` a token
+    # starting `--` can be split between the two alternatives, and on a line of
+    # unmatched `-- ` tokens that made the match exponential.  `[\w=-]*` already
+    # absorbs the second dash of a long option, so `-` alone covers both.
+    (
+        r"chmod\s+(?:-[\w=-]*[ \t]+)*[\"']?[+=]?0*[2-7][0-7]{3}[\"']?(?![0-9\w])",
+        0.8,
+    ),
 ]
 PE2_PROSE_PATTERNS = [
     (r"(?:run|execute)\s+(?:as|with)\s+root", 0.8),
@@ -314,6 +337,50 @@ _PE3_TOKEN_DOCUMENTATION_DIRS = frozenset(
 _MARKDOWN_LINE_PREFIX = re.compile(r"^\s*(?:(?:[-*+>#]|\d+[.)])\s*)*")
 _MAX_CONTEXTUAL_CLASSIFICATION_LINE_CHARS = 4_096
 _MAX_BOUND_TOKEN_CONTEXT_CHARS = 4_096
+# Path-exclusion lists in gitignore syntax: one pattern per line, ``#`` starts
+# a comment, a leading ``!`` re-includes a path, and patterns resolve beneath
+# the directory holding the file.  Each keeps matching files out of a commit,
+# an image build context, a published package, or a tool's or agent's view.
+# ``.gitattributes`` is deliberately absent: its lines attach attributes,
+# including filter, diff and merge drivers, to paths instead of excluding them.
+_PE3_IGNORE_PATTERN_FILE_NAMES = frozenset(
+    {
+        ".aiderignore",
+        ".cursorignore",
+        ".cursorindexingignore",
+        ".dockerignore",
+        ".eslintignore",
+        ".fdignore",
+        ".gcloudignore",
+        ".geminiignore",
+        ".gitignore",
+        ".helmignore",
+        ".ignore",
+        ".npmignore",
+        ".prettierignore",
+        ".rgignore",
+        ".stylelintignore",
+        ".vercelignore",
+    }
+)
+# BuildKit also reads ``<Dockerfile name>.dockerignore`` beside a named Dockerfile.
+# The suffix alone is accepted on purpose, with or without a matching Dockerfile
+# in the bundle: the file name only selects the per-line rules below, and every
+# exemption still needs a line that is one pattern token, not a negation, and
+# not a host path.  Prose or commands in such a file keep their PE3 findings.
+_PE3_IGNORE_PATTERN_FILE_SUFFIX = ".dockerignore"
+# One ignore-file entry: a single pattern token, optionally padded by spaces or
+# tabs.  The token cannot open as a comment (``#``) or a negation (``!``), and
+# cannot contain whitespace, quotes, ``$`` or shell control characters.
+_PE3_IGNORE_FILE_ENTRY = re.compile(
+    r"[ \t]*(?P<pattern>[^\s#!|;&<>()`'\"$][^\s|;&<>()`'\"$]*)[ \t]*"
+)
+# An entry written as a host location instead of a path beneath the ignore
+# file: a home directory (``~``), a drive letter, the system and home roots
+# that PE3's own patterns name, or a parent directory (``..``).
+_PE3_IGNORE_HOST_PATH = re.compile(
+    r"^(?:~|[A-Za-z]:|/(?i:etc|home|users|root)(?:/|$))|(?:^|[/\\])\.\.(?:[/\\]|$)"
+)
 
 
 def _source_line_metadata(content: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -533,6 +600,60 @@ def _is_bare_credential_store_noun(
         return True
     # Any operation tied to this exact noun, including a read, dominates benign prose.
     return False
+
+
+def _is_ignore_pattern_file(file_path: str) -> bool:
+    """Return whether *file_path* names a gitignore-syntax path-exclusion list."""
+    basename = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    return basename in _PE3_IGNORE_PATTERN_FILE_NAMES or basename.endswith(
+        _PE3_IGNORE_PATTERN_FILE_SUFFIX
+    )
+
+
+def _is_ignore_file_exclusion_entry(content: str, match: re.Match[str]) -> bool:
+    """Return True when *match* is the path pattern on its own ignore-file line.
+
+    Callers check the file with :func:`_is_ignore_pattern_file` first. An entry
+    such as ``.env`` or ``config/credentials.json`` keeps that file out of
+    whatever the ignore file governs; it neither reads nor reveals the
+    credential, so it is not credential access.
+
+    The whole physical line (split on ``\\n`` as ignore-file parsers split it,
+    with a trailing ``\\r`` dropped) must be one pattern token containing the
+    match. Every other shape keeps its finding:
+
+    - comments, which are free text an agent may read as instructions;
+    - negated entries such as ``!.env``, which re-include the credential file
+      in the commit, build context, package, or agent view the file governs,
+      so they expose it instead of excluding it;
+    - lines with whitespace, quotes, ``$`` or shell control characters, which
+      are prose or commands rather than one pattern; other logical line
+      separators count as whitespace here;
+    - entries written as host locations (``~``, a drive letter, ``/etc``,
+      ``/home``, ``/Users`` or ``/root``, or a ``..`` segment): ignore files
+      only match beneath their own directory and never expand ``~``, so such
+      an entry excludes no ordinary project file and names a host credential
+      location instead;
+    - lines longer than the contextual-classification bound.
+    """
+    start = match.start()
+    limit = _MAX_CONTEXTUAL_CLASSIFICATION_LINE_CHARS
+    search_from = max(0, start - limit)
+    line_start = content.rfind("\n", search_from, start) + 1
+    if line_start == 0 and search_from > 0:
+        return False
+    line_end = content.find("\n", start, start + limit + 1)
+    if line_end < 0:
+        line_end = len(content)
+    if line_end - line_start > limit:
+        return False
+    if line_end > line_start and content[line_end - 1] == "\r":
+        line_end -= 1
+    entry = _PE3_IGNORE_FILE_ENTRY.fullmatch(content, line_start, line_end)
+    if entry is None or _PE3_IGNORE_HOST_PATH.search(entry.group("pattern")):
+        return False
+    matched_end = start + len(match.group(0).rstrip())
+    return entry.start("pattern") <= start and matched_end <= entry.end("pattern")
 
 
 def _is_access_token_documentation_noun(
@@ -856,6 +977,8 @@ def analyze(
     line_starts, line_ends = _source_line_metadata(content)
     content_lines = content.splitlines()
     fence_ranges = _markdown_fence_ranges(content) if file_type in {"markdown", "text"} else None
+    reference_material = is_reference_material(file_path, file_type)
+    ignore_pattern_file = _is_ignore_pattern_file(file_path)
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
@@ -930,6 +1053,8 @@ def analyze(
             if _is_bare_credential_store_noun(
                 content, match, file_type, fence_ranges, line_starts, line_ends
             ):
+                continue
+            if ignore_pattern_file and _is_ignore_file_exclusion_entry(content, match):
                 continue
             line_num = line_number(match.start())
             context = context_at(match.start())
@@ -1065,7 +1190,7 @@ def analyze(
             line_num = line_number(match.start())
             context = context_at(match.start())
             finding_tags = list(tag)
-            if _is_documentation_example(context, file_type):
+            if reference_material or _is_documentation_example(context, file_type):
                 finding_tags.extend(["contextual-triage", "likely-benign-context"])
             if line_num in pe5_best and pe5_best[line_num].confidence >= confidence:
                 continue

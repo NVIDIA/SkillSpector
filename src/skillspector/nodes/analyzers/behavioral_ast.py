@@ -32,7 +32,12 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
-from skillspector.python_ast import ParsedPythonFile, get_python_ast
+from skillspector.python_ast import (
+    ParsedPythonFile,
+    PythonSourceClassification,
+    get_python_ast,
+    resolve_python_source_classification,
+)
 from skillspector.state import (
     AnalyzerNodeResponse,
     SkillspectorState,
@@ -437,6 +442,7 @@ def _analyze_python(
         return context
 
     def _emit(
+        node_index: int,
         rule_id: str,
         ast_node: ast.Call,
         msg_override: str | None = None,
@@ -446,8 +452,8 @@ def _analyze_python(
         complete_match = python_ast.source_segment(ast_node)
         if complete_match is None:
             complete_match = get_complete_source_segment(lines, lineno, end_lineno)
-        start_byte_column = getattr(ast_node, "col_offset", 0)
-        end_byte_column = getattr(ast_node, "end_col_offset", start_byte_column)
+        start_byte_column = getattr(ast_node, "col_offset", None)
+        end_byte_column = getattr(ast_node, "end_col_offset", None)
         start_column = python_ast.character_column(lineno, start_byte_column)
         end_column = python_ast.character_column(end_lineno or lineno, end_byte_column)
         finding = AnalyzerFinding(
@@ -466,13 +472,20 @@ def _analyze_python(
             context=context_for(lineno, start_column if start_column is not None else 0),
             matched_text=complete_match[:200],
             complete_match=complete_match,
+            # Evidence participates in report compaction. Keep distinct syntax
+            # nodes distinguishable when their source spans are incomplete.
+            evidence=(
+                {"python_ast_node_index": node_index}
+                if start_column is None or end_column is None
+                else {}
+            ),
         )
         if budget is None:
             findings.append(finding)
         else:
             budget.emit(finding)
 
-    for ast_node in ast.walk(tree):
+    for node_index, ast_node in enumerate(ast.walk(tree)):
         if budget is not None:
             budget.check_runtime()
         if isinstance(ast_node, ast.Subscript):
@@ -482,6 +495,7 @@ def _analyze_python(
                 if isinstance(key, ast.Constant):
                     if isinstance(key.value, str) and key.value in _DANGEROUS_GETATTR_NAMES:
                         _emit(
+                            node_index,
                             "AST9",
                             ast_node,
                             f"Reflective dangerous access via {module}.__dict__ subscript "
@@ -489,6 +503,7 @@ def _analyze_python(
                         )
                 else:
                     _emit(
+                        node_index,
                         "AST7",
                         ast_node,
                         f"Dynamic attribute access via {module}.__dict__ subscript",
@@ -513,6 +528,7 @@ def _analyze_python(
                 if isinstance(key, ast.Constant):
                     if isinstance(key.value, str) and key.value in _DANGEROUS_GETATTR_NAMES:
                         _emit(
+                            node_index,
                             "AST9",
                             ast_node,
                             f"Reflective dangerous access via {module}.__dict__.{method}() "
@@ -520,6 +536,7 @@ def _analyze_python(
                         )
                 else:
                     _emit(
+                        node_index,
                         "AST7",
                         ast_node,
                         f"Dynamic attribute access via {module}.__dict__.{method}()",
@@ -542,8 +559,10 @@ def _analyze_python(
                     budget.check_runtime if budget is not None else None,
                 )
                 if source:
-                    _emit("AST8", ast_node, f"Dangerous chain: exec() wrapping {source}")
-            _emit("AST1", ast_node)
+                    _emit(
+                        node_index, "AST8", ast_node, f"Dangerous chain: exec() wrapping {source}"
+                    )
+            _emit(node_index, "AST1", ast_node)
 
         elif call_name == "eval":
             if _is_chain_sink(ast_node, aliases) and ast_node.args:
@@ -553,27 +572,29 @@ def _analyze_python(
                     budget.check_runtime if budget is not None else None,
                 )
                 if source:
-                    _emit("AST8", ast_node, f"Dangerous chain: eval() wrapping {source}")
-            _emit("AST2", ast_node)
+                    _emit(
+                        node_index, "AST8", ast_node, f"Dangerous chain: eval() wrapping {source}"
+                    )
+            _emit(node_index, "AST2", ast_node)
 
         elif call_name == "__import__":
-            _emit("AST3", ast_node)
+            _emit(node_index, "AST3", ast_node)
 
         elif call_name == "compile":
-            _emit("AST6", ast_node)
+            _emit(node_index, "AST6", ast_node)
 
         elif call_name.startswith("subprocess."):
             attr = call_name.split(".", 1)[1]
             if attr in _SUBPROCESS_CALLS:
-                _emit("AST4", ast_node)
+                _emit(node_index, "AST4", ast_node)
 
         elif call_name.startswith("os."):
             attr = call_name.split(".", 1)[1]
             if attr in _OS_EXEC_CALLS:
-                _emit("AST5", ast_node)
+                _emit(node_index, "AST5", ast_node)
 
         elif (deser_msg := _deserialization_message(call_name, ast_node)) is not None:
-            _emit("AST10", ast_node, deser_msg)
+            _emit(node_index, "AST10", ast_node, deser_msg)
 
         elif call_name == "getattr" and len(ast_node.args) >= 2:
             second_arg = ast_node.args[1]
@@ -584,9 +605,9 @@ def _analyze_python(
             if isinstance(second_arg, ast.Constant) and not isinstance(second_arg.value, str):
                 continue
             if resolved_name in _DANGEROUS_GETATTR_NAMES:
-                _emit("AST9", ast_node)
+                _emit(node_index, "AST9", ast_node)
             elif resolved_name is None or not isinstance(second_arg, ast.Constant):
-                _emit("AST7", ast_node)
+                _emit(node_index, "AST7", ast_node)
 
     return findings if budget is None else list(budget.current_findings)
 
@@ -632,6 +653,14 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Parse Python files via AST and detect dangerous execution patterns."""
     components: list[str] = state.get("components") or []
     file_cache: dict[str, str] = state.get("local_file_cache") or state.get("file_cache") or {}
+    raw_file_cache = state.get("raw_file_cache")
+    source_classifications = (
+        state.get("python_source_classifications")
+        if "python_source_classifications" in state
+        else None
+    )
+    source_classification_limitations = state.get("python_source_classification_limitations") or {}
+    source_decode_failures = state.get("python_source_decode_failures") or {}
     python_ast_cache_key = state.get("python_ast_cache_key")
     all_findings: list[Finding] = []
     ledger_events: list[InspectionLedgerEvent] = []
@@ -639,7 +668,27 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     terminal_limit: _BehavioralResourceLimitError | None = None
 
     for path in components:
-        if not path.endswith(".py"):
+        content = file_cache.get(path)
+        source_classification: PythonSourceClassification | None = None
+        if source_classifications is not None and path in source_classifications:
+            source_classification = resolve_python_source_classification(
+                path,
+                content,
+                source_classifications=source_classifications,
+                raw_file_cache=raw_file_cache,
+            )
+            if source_classification is PythonSourceClassification.NON_PYTHON:
+                continue
+        if path in source_classification_limitations:
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="behavioral",
+                    analyzer_id=ANALYZER_ID,
+                    path=path,
+                    reason=LedgerReason.RUNTIME_LIMIT,
+                )
+            )
             continue
         if terminal_limit is None and budget.analyzer_exhausted():
             terminal_limit = _BehavioralResourceLimitError(
@@ -649,11 +698,41 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                     "limit_findings": MAX_FINDINGS_PER_ANALYZER,
                 },
             )
+        if terminal_limit is None:
+            try:
+                budget.check_runtime()
+            except _BehavioralResourceLimitError as exc:
+                terminal_limit = exc
         if terminal_limit is not None:
             event = _partial_limit_event(path, terminal_limit)
             ledger_events.append(event)
             continue
-        content = file_cache.get(path)
+        if path in source_decode_failures:
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="behavioral",
+                    analyzer_id=ANALYZER_ID,
+                    path=path,
+                    reason=LedgerReason.PYTHON_SOURCE_DECODE_ERROR,
+                )
+            )
+            continue
+        if source_classification is None:
+            source_classification = resolve_python_source_classification(
+                path,
+                content,
+                source_classifications=source_classifications,
+                raw_file_cache=raw_file_cache,
+            )
+            try:
+                budget.check_runtime()
+            except _BehavioralResourceLimitError as exc:
+                terminal_limit = exc
+                ledger_events.append(_partial_limit_event(path, exc))
+                continue
+        if source_classification is PythonSourceClassification.NON_PYTHON:
+            continue
         if content is None:
             event = ledger_event(
                 outcome=LedgerOutcome.FAILED,
@@ -709,10 +788,19 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 )
             else:
                 event = ledger_event(
-                    outcome=LedgerOutcome.COMPLETED,
+                    outcome=(
+                        LedgerOutcome.PARTIAL
+                        if source_classification is PythonSourceClassification.AMBIGUOUS
+                        else LedgerOutcome.COMPLETED
+                    ),
                     phase="behavioral",
                     analyzer_id=ANALYZER_ID,
                     path=path,
+                    reason=(
+                        LedgerReason.PYTHON_SOURCE_AMBIGUOUS
+                        if source_classification is PythonSourceClassification.AMBIGUOUS
+                        else None
+                    ),
                     emitted_finding_ids=[finding.finding_id for finding in path_findings],
                 )
         ledger_events.append(event)

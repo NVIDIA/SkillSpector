@@ -33,7 +33,7 @@ def test_responses_api_effort_matches_emitted_request_in_report(
     monkeypatch.setattr("skillspector.llm_provenance.get_active_provider", lambda: provider)
     monkeypatch.setattr("skillspector.llm_provenance.get_model_config_provider", lambda: provider)
     monkeypatch.setattr("skillspector.llm_utils.get_active_provider", lambda: provider)
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", "high")
     monkeypatch.delenv("SKILLSPECTOR_TEMPERATURE", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_SEED", raising=False)
@@ -159,7 +159,7 @@ def test_report_rejects_credentials_in_raw_provenance_and_response_controls(
     monkeypatch: pytest.MonkeyPatch, use_llm: bool
 ) -> None:
     """Final serialization revalidates raw state instead of trusting capture."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],

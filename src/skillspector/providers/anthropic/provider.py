@@ -20,12 +20,20 @@ as an explicit endpoint override (e.g. a local proxy); when unset, requests
 go to api.anthropic.com. Constructs ``langchain_anthropic.ChatAnthropic``
 directly. It defaults to Opus 4.6 for analyzers and Sonnet 4.6 for
 ``meta_analyzer`` (cheaper for the high-volume filter pass).
+
+Set ``ANTHROPIC_AUTH_SCHEME=bearer`` when the endpoint expects
+``Authorization: Bearer`` (common on corporate LLM gateways) instead of
+Anthropic's default ``x-api-key`` header. The token is read from
+``ANTHROPIC_API_KEY``; request bodies and URLs stay on the standard Messages
+API (unlike ``anthropic_proxy``, which targets Vertex raw-predict).
 """
 
 from __future__ import annotations
 
 import os
+from functools import cached_property
 from pathlib import Path
+from typing import Any
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -43,6 +51,20 @@ from skillspector.providers.structured_output import rejects_forced_tool_call
 ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
+
+
+def _use_bearer_auth() -> bool:
+    return os.environ.get("ANTHROPIC_AUTH_SCHEME", "").strip().lower() == "bearer"
+
+
+class _ChatAnthropicBearer(ChatAnthropic):
+    """Sends the credential as ``Authorization: Bearer`` instead of ``x-api-key``."""
+
+    @cached_property
+    def _client_params(self) -> dict[str, Any]:
+        params = super()._client_params
+        params["auth_token"] = params.pop("api_key")
+        return params
 
 
 class AnthropicProvider:
@@ -87,7 +109,8 @@ class AnthropicProvider:
             kwargs["effort"] = effort
         sampling_parameters = resolve_sampling_parameters()
         kwargs.update(sampling_parameters)
-        chat_model = ChatAnthropic(**kwargs)
+        chat_model_cls = _ChatAnthropicBearer if _use_bearer_auth() else ChatAnthropic
+        chat_model = chat_model_cls(**kwargs)
         register_chat_model_controls(
             chat_model,
             retained_chat_model_controls(
