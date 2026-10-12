@@ -1370,6 +1370,43 @@ def _build_metadata(
     return meta
 
 
+def _json_component(component: Mapping[str, object]) -> dict[str, object]:
+    """Preserve component identity and expose structured archive provenance."""
+    result = {
+        key: component.get(key)
+        for key in (
+            "path",
+            "type",
+            "lines",
+            "executable",
+            "size_bytes",
+            "source_url",
+            "source_identity",
+            "source_digest",
+        )
+    }
+    outer_path = component.get("outer_path")
+    nested_path = component.get("nested_path")
+    if (
+        isinstance(outer_path, str)
+        and outer_path
+        and isinstance(nested_path, str)
+        and nested_path
+        and component.get("path") == f"{outer_path}!/{nested_path}"
+    ):
+        result.update(outer_path=outer_path, nested_path=nested_path)
+        container_type = component.get("container_type")
+        if isinstance(container_type, str) and container_type:
+            result["container_type"] = container_type
+        depth = component.get("container_depth")
+        if isinstance(depth, int) and not isinstance(depth, bool) and depth > 0:
+            result["container_depth"] = depth
+        ancestry = component.get("container_ancestry")
+        if isinstance(ancestry, list) and all(isinstance(item, str) and item for item in ancestry):
+            result["container_ancestry"] = list(ancestry)
+    return result
+
+
 def _format_json(
     findings: list[Finding],
     component_metadata: list[dict[str, object]],
@@ -1410,19 +1447,7 @@ def _format_json(
             "recommendation": risk_recommendation,
             "max_issue_severity": _max_issue_severity(findings),
         },
-        "components": [
-            {
-                "path": c.get("path"),
-                "type": c.get("type"),
-                "lines": c.get("lines"),
-                "executable": c.get("executable"),
-                "size_bytes": c.get("size_bytes"),
-                "source_url": c.get("source_url"),
-                "source_identity": c.get("source_identity"),
-                "source_digest": c.get("source_digest"),
-            }
-            for c in component_metadata
-        ],
+        "components": [_json_component(component) for component in component_metadata],
         "structured_summaries": structured_summaries or [],
         "issues": [f.to_dict() for f in findings],
         "suppressed_count": len(suppressed),
