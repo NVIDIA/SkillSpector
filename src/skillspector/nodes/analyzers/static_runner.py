@@ -573,7 +573,12 @@ def _image_extracted_text(state: Mapping[str, object], path: str) -> tuple[str, 
     """Return ``(text, truncated)`` for one image path from cache or raw bytes.
 
     Prefers the build-time extract-once cache; falls back to direct raw
-    extraction for states without it. Identified by magic bytes, never
+    extraction only for states without it (unit-called runners predate the
+    cache). When the cache exists but lacks the path, build ran and skipped
+    it under the shared deadline — or it is not an image — so there is no
+    fallback: per-analyzer re-extraction would pay the crafted-input walk
+    again outside the deadline. The caller records PARTIAL runtime_limit
+    for magic-byte misses. Identified by magic bytes, never
     suffix-gated, so a renamed image is still covered. Images without a text layer
     yield ``("", False)`` and keep their existing skip accounting.
     """
@@ -581,10 +586,14 @@ def _image_extracted_text(state: Mapping[str, object], path: str) -> tuple[str, 
     entry = _coerce_image_text_entry(text_cache.get(path)) if isinstance(text_cache, dict) else None
     if entry is not None:
         return entry
+    if isinstance(text_cache, dict):
+        return "", False
     raw_cache = state.get("raw_file_cache")
     raw = raw_cache.get(path) if isinstance(raw_cache, dict) else None
     if not isinstance(raw, bytes) or not raw or len(raw) > MAX_ANALYZABLE_FILE_BYTES:
-        return "", False
+        # Oversized raws are unreadable here, which is itself a possible
+        # loss: flag it rather than claiming textless-complete.
+        return "", True
     if not has_image_magic(raw):
         return "", False
     return extract_image_text_detailed(raw)
@@ -3124,6 +3133,10 @@ def run_static_patterns(
     """
     Run one or more pattern modules over state components/file_cache.
 
+    Test-only entry point: no production callers (no ledger channel, so
+    image truncation only affects the scanned prefix). Production reads
+    go through run_static_patterns_with_ledger, which records PARTIAL.
+
     For each path in state["components"], loads content from state["file_cache"],
     infers file_type, runs each module's analyze(content, path, file_type),
     converts all AnalyzerFindings to Finding via analyzer_finding_to_finding, returns combined list.
@@ -3304,10 +3317,21 @@ def run_static_patterns_with_ledger(
         # textless images keep the existing skip accounting.
         image_scan_content: str | None = None
         image_scan_truncated = False
+        image_cache_miss = False
         if path not in container_paths and artifact.get("content_kind") == ContentKind.BINARY:
             image_scan_content, image_scan_truncated = _image_extracted_text(state, path)
             if not image_scan_content:
                 image_scan_content = None
+            if image_scan_content is None and not image_scan_truncated:
+                text_cache = state.get("image_text_cache")
+                raw_cache = state.get("raw_file_cache")
+                raw = raw_cache.get(path) if isinstance(raw_cache, dict) else None
+                image_cache_miss = (
+                    isinstance(text_cache, dict)
+                    and path not in text_cache
+                    and isinstance(raw, bytes)
+                    and has_image_magic(raw)
+                )
         inline_scan_content: str | None = None
         inline_scan_truncated = False
         inline_cache = state.get("image_inline_text_cache")
@@ -3353,17 +3377,38 @@ def run_static_patterns_with_ledger(
             and artifact.get("content_kind") == ContentKind.BINARY
             and image_scan_content is None
         ):
-            referenced = bool(artifact.get("referenced"))
-            event = ledger_event(
-                outcome=LedgerOutcome.PARTIAL if referenced else LedgerOutcome.OUT_OF_SCOPE,
-                record_type=(
-                    LedgerRecordType.WORK_ITEM if referenced else LedgerRecordType.SCOPE_BOUNDARY
-                ),
-                phase="static",
-                analyzer_id=analyzer_id,
-                path=path,
-                reason=(LedgerReason.OPAQUE_CONTENT if referenced else LedgerReason.BINARY_CONTENT),
-            )
+            if image_cache_miss:
+                event = ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="static",
+                    analyzer_id=analyzer_id,
+                    path=path,
+                    reason=LedgerReason.RUNTIME_LIMIT,
+                )
+            elif image_scan_truncated:
+                event = ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="static",
+                    analyzer_id=analyzer_id,
+                    path=path,
+                    reason=LedgerReason.SIZE_LIMIT,
+                )
+            else:
+                referenced = bool(artifact.get("referenced"))
+                event = ledger_event(
+                    outcome=LedgerOutcome.PARTIAL if referenced else LedgerOutcome.OUT_OF_SCOPE,
+                    record_type=(
+                        LedgerRecordType.WORK_ITEM
+                        if referenced
+                        else LedgerRecordType.SCOPE_BOUNDARY
+                    ),
+                    phase="static",
+                    analyzer_id=analyzer_id,
+                    path=path,
+                    reason=(
+                        LedgerReason.OPAQUE_CONTENT if referenced else LedgerReason.BINARY_CONTENT
+                    ),
+                )
         elif path not in container_paths:
             content = image_scan_content if image_scan_content is not None else file_cache.get(path)
             if content is None:
@@ -3559,23 +3604,25 @@ def run_static_patterns_with_ledger(
                 findings.extend(path_findings)
                 if image_scan_content is not None:
                     _tag_image_text_findings(path_findings)
+                # Inline data:-URI text folds into this row: a second row would
+                # share the SKILL.md work id and fail ledger accounting, so
+                # the inline outcome merges here (PARTIAL if either side is
+                # partial, emitted ids from both) and no inline row is added.
+                size_content = content
+                inline_error_class: str | None = None
                 if inline_scan_content is not None:
                     inline_budget = MAX_FINDINGS_PER_ANALYZER - len(findings)
                     inline_remaining = transitive_remaining_seconds(cast(SkillspectorState, state))
+                    inline_reason: LedgerReason | None = None
+                    inline_metrics: dict[str, object] = {}
                     try:
                         if inline_budget <= 0 or (
                             inline_remaining is not None and inline_remaining <= 0
                         ):
-                            inline_event = ledger_event(
-                                outcome=LedgerOutcome.PARTIAL,
-                                phase="static",
-                                analyzer_id=analyzer_id,
-                                path=path,
-                                reason=(
-                                    LedgerReason.OUTPUT_LIMIT
-                                    if inline_budget <= 0
-                                    else LedgerReason.RUNTIME_LIMIT
-                                ),
+                            inline_reason = (
+                                LedgerReason.OUTPUT_LIMIT
+                                if inline_budget <= 0
+                                else LedgerReason.RUNTIME_LIMIT
                             )
                         else:
                             if inline_scan_content:
@@ -3595,65 +3642,9 @@ def run_static_patterns_with_ledger(
                                 inline_findings, inline_limit, inline_metrics = [], None, {}
                             _tag_image_text_findings(inline_findings)
                             findings.extend(inline_findings)
-                            inline_reason: LedgerReason | None = inline_limit or (
+                            path_findings.extend(inline_findings)
+                            inline_reason = inline_limit or (
                                 LedgerReason.SIZE_LIMIT if inline_scan_truncated else None
-                            )
-                            inline_event = ledger_event(
-                                outcome=(
-                                    LedgerOutcome.PARTIAL
-                                    if inline_reason is not None
-                                    else LedgerOutcome.COMPLETED
-                                ),
-                                phase="static",
-                                analyzer_id=analyzer_id,
-                                path=path,
-                                reason=inline_reason,
-                                emitted_finding_ids=[
-                                    finding.finding_id for finding in inline_findings
-                                ],
-                                observed_characters=(
-                                    len(inline_scan_content)
-                                    if inline_reason is LedgerReason.SIZE_LIMIT
-                                    else None
-                                ),
-                                limit_characters=(
-                                    MAX_IMAGE_TEXT_CHARS
-                                    if inline_reason is LedgerReason.SIZE_LIMIT
-                                    else None
-                                ),
-                                observed_findings=(
-                                    int(
-                                        inline_metrics.get(
-                                            "observed_findings", len(inline_findings)
-                                        )
-                                    )
-                                    if inline_reason is LedgerReason.OUTPUT_LIMIT
-                                    else None
-                                ),
-                                limit_findings=(
-                                    int(
-                                        inline_metrics.get(
-                                            "limit_findings", MAX_FINDINGS_PER_ARTIFACT
-                                        )
-                                    )
-                                    if inline_reason is LedgerReason.OUTPUT_LIMIT
-                                    else None
-                                ),
-                                observed_seconds=(
-                                    float(inline_metrics.get("observed_seconds", 0.0))
-                                    if inline_reason is LedgerReason.RUNTIME_LIMIT
-                                    else None
-                                ),
-                                limit_seconds=(
-                                    float(
-                                        inline_metrics.get(
-                                            "limit_seconds",
-                                            MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT,
-                                        )
-                                    )
-                                    if inline_reason is LedgerReason.RUNTIME_LIMIT
-                                    else None
-                                ),
                             )
                     except Exception as exc:
                         logger.warning(
@@ -3662,15 +3653,17 @@ def run_static_patterns_with_ledger(
                             path,
                             exc,
                         )
-                        inline_event = ledger_event(
-                            outcome=LedgerOutcome.FAILED,
-                            phase="static",
-                            analyzer_id=analyzer_id,
-                            path=path,
-                            reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
-                            error_class=type(exc).__name__,
-                        )
-                    events.append(inline_event)
+                        inline_error_class = type(exc).__name__
+                    if inline_reason is not None and resource_limit is None:
+                        resource_limit = inline_reason
+                        resource_metrics = inline_metrics
+                        size_content = inline_scan_content
+                # An inline-scan error folds as PARTIAL, never FAILED: a
+                # FAILED row cannot carry emitted ids (ledger_event raises),
+                # which would nuke the whole analyzer on a real finding.
+                if inline_error_class is not None:
+                    resource_limit = LedgerReason.ANALYZER_RUNTIME_ERROR
+                    resource_metrics = {}
                 oversized_python = (
                     source_classification is not None
                     and source_classification is not PythonSourceClassification.NON_PYTHON
@@ -3702,14 +3695,15 @@ def run_static_patterns_with_ledger(
                     analyzer_id=analyzer_id,
                     path=path,
                     reason=partial_reason if partial else None,
+                    error_class=inline_error_class,
                     emitted_finding_ids=[finding.finding_id for finding in path_findings],
                     observed_characters=(
-                        len(content) if partial_reason is LedgerReason.SIZE_LIMIT else None
+                        len(size_content) if partial_reason is LedgerReason.SIZE_LIMIT else None
                     ),
                     limit_characters=(
                         MAX_IMAGE_TEXT_CHARS
                         if partial_reason is LedgerReason.SIZE_LIMIT
-                        and image_scan_content is not None
+                        and (image_scan_content is not None or inline_scan_content is not None)
                         else (MAX_FILE_CHARS if partial_reason is LedgerReason.SIZE_LIMIT else None)
                     ),
                     observed_findings=(

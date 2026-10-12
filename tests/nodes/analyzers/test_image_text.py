@@ -12,14 +12,15 @@ from __future__ import annotations
 import struct
 import zlib
 
+import pytest
+
 from skillspector.artifacts import ArtifactDisposition, ContentKind
 from skillspector.image_text import (
     MAX_IMAGE_TEXT_CHARS,
     extract_image_text,
     extract_image_text_detailed,
-    is_image_path,
 )
-from skillspector.inspection_ledger import LedgerOutcome
+from skillspector.inspection_ledger import LedgerOutcome, finalize_ledger
 from skillspector.nodes.analyzers import static_patterns_prompt_injection as prompt_injection
 from skillspector.nodes.analyzers import static_runner
 
@@ -64,14 +65,6 @@ def _gif_with_comment(text: str) -> bytes:
         for piece in (payload[i : i + 255] for i in range(0, len(payload), 255))
     )
     return b"GIF89a" + struct.pack("<HHBBB", 1, 1, 0, 0, 0) + b"\x21\xfe" + blocks + b"\x00\x3b"
-
-
-def test_is_image_path_matches_supported_suffixes() -> None:
-    assert is_image_path("assets/shot.png")
-    assert is_image_path("assets/photo.JPG")
-    assert is_image_path("a/b.webp")
-    assert not is_image_path("SKILL.md")
-    assert not is_image_path("assets/shot.png.exe")
 
 
 def test_png_text_chunk_extraction_feeds_prompt_injection() -> None:
@@ -184,6 +177,23 @@ def _png_with_dummy_chunks_then_text(count: int, text: str) -> bytes:
     )
 
 
+def _png_with_ifd0_description_no_exif_pointer(text: str) -> bytes:
+    description = text.encode() + b"\x00"
+    tiff = (
+        b"II*\x00"
+        + struct.pack("<I", 8)
+        + struct.pack("<H", 1)
+        + struct.pack("<HHI", 0x010E, 2, len(description))
+        + struct.pack("<I", 26)
+        + struct.pack("<I", 0)
+        + description
+    )
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr) + _chunk(b"eXIf", tiff) + _chunk(b"IEND", b"")
+    )
+
+
 def _png_with_big_endian_exif_unicode_comment(text: str) -> bytes:
     comment = b"UNICODE\x00" + text.encode("utf-16-be")
     exif_ifd_at, comment_at = 26, 44
@@ -227,6 +237,78 @@ def _gif_with_frames_and_comment(frames: int, text: str) -> bytes:
     )
 
 
+def _gif_with_fat_frame_and_comment(text: str) -> bytes:
+    payload = text.encode()
+    blocks = b"".join(
+        bytes((len(piece),)) + piece
+        for piece in (payload[i : i + 255] for i in range(0, len(payload), 255))
+    )
+    frame = b"\x2c" + b"\x00" * 9 + b"\x02" + b"\x01A" * 16385 + b"\x00"
+    return (
+        b"GIF89a"
+        + struct.pack("<HHBBB", 1, 1, 0, 0, 0)
+        + frame
+        + b"\x21\xfe"
+        + blocks
+        + b"\x00\x3b"
+    )
+
+
+def _gif_with_comment_and_big_frame(text: str) -> bytes:
+    payload = text.encode()
+    blocks = b"".join(
+        bytes((len(piece),)) + piece
+        for piece in (payload[i : i + 255] for i in range(0, len(payload), 255))
+    )
+    frame = b"\x2c" + b"\x00" * 9 + b"\x02" + (bytes((255,)) + b"\x00" * 255) * 4200 + b"\x00"
+    return (
+        b"GIF89a"
+        + struct.pack("<HHBBB", 1, 1, 0, 0, 0)
+        + b"\x21\xfe"
+        + blocks
+        + b"\x00"
+        + frame
+        + b"\x3b"
+    )
+
+
+def _jpeg_with_junk_before_comment(text: str) -> bytes:
+    payload = text.encode()
+    return (
+        b"\xff\xd8"
+        + b"\xff\xe0"
+        + struct.pack(">H", 16)
+        + b"JFIF\x00"
+        + b"\x00" * 9
+        + b"\x00"
+        + b"\xff\xff\xfe"
+        + struct.pack(">H", len(payload) + 2)
+        + payload
+        + b"\xff\xd9"
+    )
+
+
+def _png_with_big_real_exif_comment(text: str) -> bytes:
+    field = b"ASCII\x00\x00\x00" + text.encode()
+    tiff = (
+        b"II*\x00"
+        + struct.pack("<I", 8)
+        + struct.pack("<H", 1)
+        + struct.pack("<HHI", 0x8769, 4, 1)
+        + struct.pack("<I", 26)
+        + struct.pack("<I", 0)
+        + struct.pack("<H", 1)
+        + struct.pack("<HHI", 0x9286, 7, len(field))
+        + struct.pack("<I", 44)
+        + struct.pack("<I", 0)
+        + field
+    )
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr) + _chunk(b"eXIf", tiff) + _chunk(b"IEND", b"")
+    )
+
+
 class TestImageTextAdversarial:
     """Untrusted-input cases: hidden, oversized, truncated, or endian payloads."""
 
@@ -262,11 +344,33 @@ class TestImageTextAdversarial:
         )
         assert INJECTION in extracted
 
+    def test_ifd0_description_without_exif_pointer_is_found(self) -> None:
+        # ImageDescription lives in IFD0: no ExifIFD pointer required.
+        extracted, truncated = extract_image_text_detailed(
+            _png_with_ifd0_description_no_exif_pointer(INJECTION)
+        )
+        assert INJECTION in extracted
+        assert truncated is False
+
     def test_truncated_chunk_yields_no_text_without_raising(self) -> None:
         # Cut inside the tEXt payload: the declared length overruns the
         # available bytes, so nothing parses (and nothing raises).
         png = _png_with_text("Comment", INJECTION)[:56]
         assert extract_image_text_detailed(png) == ("", False)
+
+    def test_gif_comment_cut_mid_block_is_truncated(self) -> None:
+        gif = b"GIF89a" + struct.pack("<HHBBB", 1, 1, 0, 0, 0) + b"\x21\xfe\x05AB\x3b"
+        assert extract_image_text_detailed(gif) == ("", True)
+
+    def test_absurd_ifd_entry_count_is_truncated(self) -> None:
+        tiff = b"II*\x00" + struct.pack("<I", 8) + struct.pack("<H", 300)
+        png = (
+            b"\x89PNG\r\n\x1a\n"
+            + _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + _chunk(b"eXIf", tiff)
+            + _chunk(b"IEND", b"")
+        )
+        assert extract_image_text_detailed(png) == ("", True)
 
     def test_out_of_range_ifd_offset_yields_no_text(self) -> None:
         tiff = b"II*\x00" + struct.pack("<I", 9999)
@@ -309,6 +413,41 @@ class TestImageTextAdversarial:
     def test_comment_after_many_gif_frames_is_extracted(self) -> None:
         extracted, _ = extract_image_text_detailed(_gif_with_frames_and_comment(300, INJECTION))
         assert INJECTION in extracted
+
+    def test_comment_after_fat_pixel_frame_is_not_hidden(self) -> None:
+        # One frame of 16,385 one-byte sub-blocks (~33 KB) must not hide a
+        # later comment: pixel data is skipped, never collected or capped.
+        extracted, truncated = extract_image_text_detailed(
+            _gif_with_fat_frame_and_comment(INJECTION)
+        )
+        assert INJECTION in extracted
+        assert truncated is False
+
+    def test_comment_before_big_pixel_frame_stays_complete(self) -> None:
+        # A benign frame over 1 MB of LZW data must not force PARTIAL when
+        # the comment already parsed.
+        extracted, truncated = extract_image_text_detailed(
+            _gif_with_comment_and_big_frame(INJECTION)
+        )
+        assert INJECTION in extracted
+        assert truncated is False
+
+    def test_jpeg_comment_after_junk_and_fill_is_found(self) -> None:
+        # A junk byte and a 0xFF fill byte before a marker resync like
+        # libjpeg instead of ending the walk.
+        extracted, _ = extract_image_text_detailed(_jpeg_with_junk_before_comment(INJECTION))
+        assert INJECTION in extracted
+
+    def test_jpeg_walk_stopping_early_with_bytes_left_is_truncated(self) -> None:
+        payload = b"\xff\xd8" + b"\xff\xfe" + struct.pack(">H", 500) + b"short"
+        assert extract_image_text_detailed(payload) == ("", True)
+
+    def test_oversized_exif_field_yields_bounded_prefix(self) -> None:
+        text = (INJECTION + " ") * 20000
+        extracted, truncated = extract_image_text_detailed(_png_with_big_real_exif_comment(text))
+        assert INJECTION in extracted
+        assert truncated is True
+        assert len(extracted) <= MAX_IMAGE_TEXT_CHARS
 
     def test_truncated_extraction_records_partial_row_with_finding(self) -> None:
         text = INJECTION + "\n" + "x" * MAX_IMAGE_TEXT_CHARS
@@ -402,3 +541,95 @@ class TestImageTextAdversarial:
             if finding.file == "SKILL.md" and "image-text-layer" in finding.tags
         ]
         assert any(finding.rule_id == "P1" for finding in inline_findings)
+        # The inline outcome folds into SKILL.md's own row: exactly one
+        # static row, so ledger accounting stays clean (a second inline row
+        # would share the work id and fail as fatal unaccounted_work).
+        static_rows = [
+            event for event in response["inspection_ledger"] if event.get("phase") == "static"
+        ]
+        assert len(static_rows) == 1
+        assert inline_findings[0].finding_id in static_rows[0].get("emitted_finding_ids", [])
+        completeness, _ = finalize_ledger(
+            {
+                "components": ["SKILL.md"],
+                "findings": response["findings"],
+                "effective_finding_ids": [finding.finding_id for finding in response["findings"]],
+                "inspection_ledger": response["inspection_ledger"],
+                "analyzer_status_events": response["analyzer_status_events"],
+            }
+        )
+        assert completeness["execution_successful"] is True
+        assert completeness["ledger_exceptions"] == []
+
+    def test_inline_scan_error_folds_partial_with_class(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An inline-scan error must not nuke the analyzer: it folds as
+        # PARTIAL with its class on the single SKILL.md row, keeping the
+        # main finding's emitted id (a FAILED row with ids raises).
+        real_scan = static_runner._scan_all_views_detailed
+
+        def boom(path: str, content: str, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+            if content == INJECTION:
+                raise RuntimeError("boom")
+            return real_scan(path, content, *args, **kwargs)
+
+        monkeypatch.setattr(static_runner, "_scan_all_views_detailed", boom)
+        body = "# Skill\n\n" + INJECTION + "\n"
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {"SKILL.md": body},
+            "local_file_cache": {},
+            "raw_file_cache": {},
+            "image_inline_text_cache": {"SKILL.md": (INJECTION, False)},
+            "artifact_inventory": [
+                {
+                    "path": "SKILL.md",
+                    "content_kind": ContentKind.TEXT,
+                    "disposition": ArtifactDisposition.ANALYZED,
+                    "size_bytes": len(body),
+                    "decodable": True,
+                    "contains_nul": False,
+                    "misleading_extension": False,
+                    "referenced": True,
+                }
+            ],
+        }
+        response = static_runner.run_static_patterns_with_ledger(state, [prompt_injection])
+        rows = [event for event in response["inspection_ledger"] if event.get("phase") == "static"]
+        assert len(rows) == 1
+        assert rows[0]["outcome"] is LedgerOutcome.PARTIAL
+
+    def test_truncated_textless_image_records_partial_not_out_of_scope(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Truncation with no text is still lost text: an unreferenced image
+        # records PARTIAL with a size reason, never OUT_OF_SCOPE complete.
+        monkeypatch.setattr(static_runner, "extract_image_text_detailed", lambda data: ("", True))
+        raw = _png_with_text("Comment", INJECTION)
+        state = {
+            "components": ["assets/shot.png"],
+            "file_cache": {},
+            "local_file_cache": {},
+            "raw_file_cache": {"assets/shot.png": raw},
+            "artifact_inventory": [
+                {
+                    "path": "assets/shot.png",
+                    "content_kind": ContentKind.BINARY,
+                    "disposition": ArtifactDisposition.PARTIAL,
+                    "size_bytes": len(raw),
+                    "decodable": False,
+                    "contains_nul": False,
+                    "misleading_extension": False,
+                    "referenced": False,
+                }
+            ],
+        }
+        response = static_runner.run_static_patterns_with_ledger(state, [prompt_injection])
+        rows = [
+            event
+            for event in response["inspection_ledger"]
+            if event.get("path") == "assets/shot.png" and event.get("phase") == "static"
+        ]
+        assert len(rows) == 1
+        assert rows[0]["outcome"] is LedgerOutcome.PARTIAL

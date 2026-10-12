@@ -272,6 +272,13 @@ class SkillspectorState(TypedDict, total=False):
     # Per-skill image inventory: local image files plus remote URLs
     # cited-but-unfetched. Informational only; no verdicts.
     image_inventory: dict[str, object]
+    # Extract-once image text, populated by build_context under the shared
+    # deadline: path -> (text, truncated). Declared so the compiled graph
+    # carries the caches to the static analyzers instead of each
+    # re-extracting outside the deadline. Tuples arrive as lists after a
+    # checkpoint round-trip; runners coerce both shapes.
+    image_text_cache: dict[str, tuple[str, bool]]
+    image_inline_text_cache: dict[str, tuple[str, bool]]
     # Retained for compatibility with the persisted workflow-state schema.
     ast_cache: dict[str, str]
     # Key for the process-local parsed-AST cache.  The ASTs themselves stay

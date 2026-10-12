@@ -40,15 +40,12 @@ _MAX_CHUNK_BYTES: Final = 1_000_000
 # ~2 s. A 1 MiB comment needs ~4,120 full-size blocks, so 16,384 blocks
 # keeps any legitimate comment while stopping a crafted walk in ~2 ms.
 _MAX_SUB_BLOCKS: Final = 16_384
+# GIF walks skip pixel data by offset arithmetic (cheap), so the per-file
+# bound only needs to stop pathological walks: 4 MB covers multi-megabyte
+# benign frames while a crafted 16 MiB walk trips it loudly.
+_MAX_GIF_WALK_BYTES: Final = 4_000_000
 
 _IFD_TYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 7: 1}
-
-
-def is_image_path(path: str) -> bool:
-    """Return whether *path* names a supported raster image by suffix."""
-    name = path.replace("\\", "/").rsplit("/", 1)[-1]
-    index = name.rfind(".")
-    return index >= 0 and name[index:].lower() in IMAGE_SUFFIXES
 
 
 def has_image_magic(data: bytes) -> bool:
@@ -148,6 +145,9 @@ def _png_text(data: bytes) -> tuple[str, bool]:
         chunk_type = data[offset + 4 : offset + 8]
         end = offset + 12 + length
         if end > len(data):
+            # Declared length overruns the file: corrupt container, not a
+            # parsed-then-truncated text layer (a zero-chunk file stays
+            # textless-complete; JPEG overruns are flagged in _jpeg_text).
             break
         payload = data[offset + 8 : offset + 8 + length]
         if chunk_type in (b"tEXt", b"zTXt", b"iTXt"):
@@ -170,32 +170,36 @@ def _png_text(data: bytes) -> tuple[str, bool]:
 def _ifd_field(data: bytes, order: str, ifd_offset: int, tag: int) -> tuple[bytes | None, bool]:
     """Return ``(value bytes, capped)`` for one TIFF IFD entry.
 
-    Oversized fields are refused without reading them (memory-DoS
-    guard) and reported, so a large EXIF payload cannot silently
-    vanish from the scan.
+    Oversized fields yield their bounded prefix with ``capped`` set
+    (memory-DoS guard without silent loss); unreadable offsets are
+    reported, so a large EXIF payload cannot silently vanish.
     """
     if ifd_offset < 0 or ifd_offset + 2 > len(data):
         return None, False
     count = struct.unpack(order + "H", data[ifd_offset : ifd_offset + 2])[0]
     if count > 256:
-        return None, False
+        return None, True
     for index in range(count):
         entry = ifd_offset + 2 + index * 12
         if entry + 12 > len(data):
-            return None, False
+            return None, True
         entry_tag, field_type, field_count = struct.unpack(order + "HHI", data[entry : entry + 8])
         if entry_tag != tag:
             continue
         size = _IFD_TYPE_SIZES.get(field_type, 0)
-        if not size or field_count > 65536 or field_count * size > _MAX_CHUNK_BYTES:
+        if not size:
             return None, True
         total = field_count * size
         value = data[entry + 8 : entry + 12]
         if total <= 4:
             return value[:total], False
         value_offset = struct.unpack(order + "I", value)[0]
+        if value_offset > len(data):
+            return None, True
+        if total > _MAX_CHUNK_BYTES:
+            return data[value_offset : value_offset + _MAX_CHUNK_BYTES], True
         if value_offset + total > len(data):
-            return None, False
+            return None, True
         return data[value_offset : value_offset + total], False
     return None, False
 
@@ -244,15 +248,22 @@ def _exif_user_comment(tiff: bytes) -> tuple[str, bool]:
         return "", False
     ifd_offset = struct.unpack(order + "I", tiff[4:8])[0]
     pointer, truncated = _ifd_field(tiff, order, ifd_offset, 0x8769)
-    if pointer is None or len(pointer) != 4:
-        return "", truncated
-    exif_offset = struct.unpack(order + "I", pointer)[0]
     parts: list[str] = []
-    for offset, tag in ((exif_offset, 0x9286), (ifd_offset, 0x010E), (exif_offset, 0x9C9C)):
+    # ImageDescription and XPComment live in IFD0 (exiftool EXIF table;
+    # Windows writes XPComment there), so they read without the ExifIFD
+    # pointer; only UserComment needs the sub-IFD.
+    for offset, tag in ((ifd_offset, 0x010E), (ifd_offset, 0x9C9C)):
         text, capped = _exif_text_field(tiff, order, offset, tag)
         truncated = truncated or capped
         if text:
             parts.append(text)
+    if pointer is None or len(pointer) != 4:
+        return "\n".join(parts), truncated
+    exif_offset = struct.unpack(order + "I", pointer)[0]
+    text, capped = _exif_text_field(tiff, order, exif_offset, 0x9286)
+    truncated = truncated or capped
+    if text:
+        parts.append(text)
     return "\n".join(parts), truncated
 
 
@@ -262,35 +273,57 @@ def _jpeg_text(data: bytes) -> tuple[str, bool]:
     truncated = False
     offset = 2
     while True:
-        if offset + 4 > len(data):
-            break
         if total >= MAX_IMAGE_TEXT_CHARS:
             truncated = True
             break
-        if data[offset] != 0xFF:
+        if offset + 2 > len(data):
+            # Truncated tail: bytes remain but no marker fits.
+            truncated = truncated or offset < len(data)
             break
+        if data[offset] != 0xFF:
+            # Junk between segments: resync to the next marker the way
+            # libjpeg's next_marker() does. Junk itself carries no text
+            # layer, so the skip is silent; stopping with no marker
+            # ahead is reported.
+            resync = data.find(b"\xff", offset)
+            if resync < 0:
+                truncated = True
+                break
+            offset = resync
+            continue
         marker = data[offset + 1]
         if marker == 0xD9:
             break
         if marker == 0xD8 or 0xD0 <= marker <= 0xD7:
             offset += 2
             continue
+        if marker == 0x00:
+            # Stuffed byte: not a marker, skip both bytes like Pillow.
+            offset += 2
+            continue
+        if marker == 0xFF:
+            # Fill byte before a marker: consume one and re-examine, so
+            # FF FF FE parses as fill + COM marker (libjpeg next_marker).
+            offset += 1
+            continue
         if marker == 0xDA:
             # Scan data follows without length prefix; COM segments past
             # this point (progressive scans) are a documented gap.
             break
+        if offset + 4 > len(data):
+            truncated = True
+            break
         length = int.from_bytes(data[offset + 2 : offset + 4], "big")
         if length < 2 or offset + 2 + length > len(data):
+            truncated = True
             break
         payload = data[offset + 4 : offset + 2 + length]
-        if marker == 0xFE and len(payload) <= _MAX_CHUNK_BYTES:
+        # Segment lengths are 16-bit, so payloads are structurally capped
+        # near 64 KB and always fit the text bounds below.
+        if marker == 0xFE:
             total, lost = _collect(parts, total, _decode(payload).strip("\x00").strip())
             truncated = truncated or lost
-        elif (
-            marker == 0xE1
-            and payload.startswith(b"Exif\x00\x00")
-            and len(payload) <= _MAX_CHUNK_BYTES
-        ):
+        elif marker == 0xE1 and payload.startswith(b"Exif\x00\x00") and len(payload) > 6:
             text, capped = _exif_user_comment(payload[6:])
             total, lost = _collect(parts, total, text)
             truncated = truncated or capped or lost
@@ -309,12 +342,41 @@ def _read_sub_blocks(data: bytes, offset: int) -> tuple[bytes, int, bool]:
         if size == 0:
             break
         blocks += 1
+        if offset + size > len(data):
+            # Declared block overruns the file: truncated, not clean.
+            capped = True
+            break
         if blocks > _MAX_SUB_BLOCKS or len(collected) + size > _MAX_CHUNK_BYTES:
             capped = True
             break
         collected += data[offset : offset + size]
         offset += size
     return bytes(collected), offset, capped
+
+
+def _skip_sub_blocks(data: bytes, offset: int) -> tuple[int, bool]:
+    """Advance past GIF data sub-blocks without collecting or capping.
+
+    Pixel data and non-comment extensions are skipped by offset
+    arithmetic only: collecting them would let padding-sized frames
+    hide a later comment or force a false PARTIAL. Reports whether
+    the walk tripped the per-skip byte bound or a truncated tail.
+    """
+    start = offset
+    capped = False
+    while offset < len(data):
+        if offset - start > _MAX_GIF_WALK_BYTES:
+            capped = True
+            break
+        size = data[offset]
+        offset += 1
+        if size == 0:
+            break
+        if offset + size > len(data):
+            capped = True
+            break
+        offset += size
+    return offset, capped
 
 
 def _gif_text(data: bytes) -> tuple[str, bool]:
@@ -330,6 +392,9 @@ def _gif_text(data: bytes) -> tuple[str, bool]:
     while True:
         if offset >= len(data):
             break
+        if offset > _MAX_GIF_WALK_BYTES:
+            truncated = True
+            break
         if total >= MAX_IMAGE_TEXT_CHARS:
             truncated = True
             break
@@ -341,11 +406,14 @@ def _gif_text(data: bytes) -> tuple[str, bool]:
                 break
             label = data[offset + 1]
             offset += 2
-            comment, offset, capped = _read_sub_blocks(data, offset)
-            truncated = truncated or capped
             if label == 0xFE:
+                comment, offset, capped = _read_sub_blocks(data, offset)
+                truncated = truncated or capped
                 total, lost = _collect(parts, total, _decode(comment).strip("\x00").strip())
                 truncated = truncated or lost
+            else:
+                offset, capped = _skip_sub_blocks(data, offset)
+                truncated = truncated or capped
         elif separator == 0x2C:
             if offset + 10 > len(data):
                 break
@@ -356,7 +424,7 @@ def _gif_text(data: bytes) -> tuple[str, bool]:
             if offset >= len(data):
                 break
             offset += 1
-            _, offset, capped = _read_sub_blocks(data, offset)
+            offset, capped = _skip_sub_blocks(data, offset)
             truncated = truncated or capped
         else:
             break
@@ -380,7 +448,7 @@ def extract_image_text_detailed(data: bytes) -> tuple[str, bool]:
             return _gif_text(data)
         return "", False
     except Exception:
-        return "", False
+        return "", True
 
 
 def extract_image_text(data: bytes) -> str:

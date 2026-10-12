@@ -3009,7 +3009,12 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     image_inventory_events: list[InspectionLedgerEvent] = []
     image_text_cache: dict[str, tuple[str, bool]] = {}
     image_inline_text_cache: dict[str, tuple[str, bool]] = {}
-    if primary_path is not None and primary_path in raw_file_cache:
+    # Whether the image phase ran: the runner treats a present-but-missing
+    # cache entry as a deadline skip (PARTIAL) but a wholly absent cache as
+    # a phase that never ran (legacy raw fallback). Container scans whose
+    # primary path is not a cached file skip the phase entirely.
+    image_phase_ran = primary_path is not None and primary_path in raw_file_cache
+    if image_phase_ran:
         image_inventory, inventory_truncated = collect_image_inventory(
             primary_text,
             primary_path,
@@ -3033,16 +3038,19 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 ledger_event(
                     outcome=LedgerOutcome.PARTIAL,
                     record_type=LedgerRecordType.SYSTEM,
-                    phase="image_inventory",
+                    # Own phase, not image_inventory: the inventory rows
+                    # already claim these work ids as COMPLETED.
+                    phase="image_text",
                     path=path,
                     reason=LedgerReason.RUNTIME_LIMIT,
                     observed_seconds=max(0.0, monotonic() - processing_started),
-                    limit_seconds=MAX_BUNDLE_CACHE_SECONDS,
+                    limit_seconds=processing_runtime_limit,
                 )
             )
 
         if monotonic() >= processing_deadline:
-            _image_runtime_limit_row(primary_path)
+            for image_path in sorted(image_inventory["local_images"]):
+                _image_runtime_limit_row(image_path)
         else:
             for image_path in sorted(image_inventory["local_images"]):
                 if monotonic() >= processing_deadline:
@@ -3053,7 +3061,8 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                     image_text_cache[image_path] = extract_image_text_detailed(raw)
             for path, raw in raw_file_cache.items():
                 if monotonic() >= processing_deadline:
-                    _image_runtime_limit_row(primary_path)
+                    if isinstance(raw, bytes) and has_image_magic(raw):
+                        _image_runtime_limit_row(path)
                     break
                 if (
                     path not in image_text_cache
@@ -3800,8 +3809,6 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "artifact_references": references,
         "reference_resolution": reference_resolution,
         "image_inventory": image_inventory,
-        "image_text_cache": image_text_cache,
-        "image_inline_text_cache": image_inline_text_cache,
         "inspection_ledger": _bounded_ledger_output(
             [
                 *discovery_events,
@@ -3833,6 +3840,9 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "has_executable_scripts": has_executable_scripts,
         "workflow_resource_budget": workflow_budget,
     }
+    if image_phase_ran:
+        result["image_text_cache"] = image_text_cache
+        result["image_inline_text_cache"] = image_inline_text_cache
 
     if structured.context is not None:
         result["structured_skill_context"] = structured.context
