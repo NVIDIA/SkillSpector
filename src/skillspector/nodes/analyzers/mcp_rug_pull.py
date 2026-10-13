@@ -219,24 +219,36 @@ def _operand_has_version_pin(line_remainder: str) -> bool:
     return _VERSION_PIN_RE.search(operand_suffix) is not None
 
 
-def _iter_config_commands(config: object, budget: _RugPullBudget, path: str) -> Iterator[str]:
-    """Yield command lines represented by JSON command/args objects."""
-    pending = [config]
+def _iter_config_commands(
+    config: object, budget: _RugPullBudget, path: str, content: str
+) -> Iterator[tuple[str, int]]:
+    """Yield JSON command lines with the line of each command key."""
+    command_keys = iter(re.finditer(r'(?<!\\)"command"\s*:', content))
+    pending = [(iter(((None, config),)), None)]
     while pending:
         budget.check_runtime(path)
-        item = pending.pop()
-        if isinstance(item, dict):
-            command = item.get("command")
-            args = item.get("args")
+        items, owner = pending[-1]
+        try:
+            key, item = next(items)
+        except StopIteration:
+            pending.pop()
+            continue
+
+        if key == "command" and owner is not None:
+            key_match = next(command_keys, None)
+            args = owner.get("args")
             if (
-                isinstance(command, str)
+                isinstance(item, str)
                 and isinstance(args, list)
                 and all(isinstance(argument, str) for argument in args)
             ):
-                yield " ".join([command, *args])
-            pending.extend(reversed(tuple(item.values())))
+                line = _find_line(content, key_match.start()) if key_match else 1
+                yield " ".join([item, *args]), line
+
+        if isinstance(item, dict):
+            pending.append((iter(item.items()), item))
         elif isinstance(item, list):
-            pending.extend(reversed(item))
+            pending.append((iter((None, value) for value in item), None))
 
 
 def _check_rp1_npx(
@@ -295,11 +307,9 @@ def _check_rp1(
             except (json.JSONDecodeError, RecursionError):
                 config = None
             if config is not None:
-                command_field = re.search(r'"command"\s*:', content)
-                command_line_number = (
-                    _find_line(content, command_field.start()) if command_field is not None else 1
-                )
-                for command_line in _iter_config_commands(config, budget, file_path):
+                for command_line, command_line_number in _iter_config_commands(
+                    config, budget, file_path, content
+                ):
                     _check_rp1_npx(command_line, file_path, budget, command_line_number)
 
         # uvx without ==version

@@ -60,6 +60,27 @@ class TestMcpRugPullNode:
 
         assert not [finding for finding in result["findings"] if finding.rule_id == "RP1"]
 
+    def test_rp1_json_config_attributes_finding_to_matching_server(self) -> None:
+        """RP1 points to the npx server when it is not the first configured server."""
+        result = node(
+            {
+                "file_cache": {
+                    "mcp.json": (
+                        '{\n  "mcpServers": {\n    "local": {\n'
+                        '      "command": "node",\n      "args": ["server.js"]\n'
+                        '    },\n    "context7": {\n      "command": "npx",\n'
+                        '      "args": ["-y", "@upstash/context7-mcp"]\n'
+                        "    }\n  }\n}"
+                    )
+                }
+            }
+        )
+
+        findings = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+        assert len(findings) == 1
+        assert findings[0].start_line == 8
+        assert findings[0].matched_text == "npx -y @upstash/context7-mcp"
+
     def test_no_previous_manifest_skips(self) -> None:
         """Returns empty findings when previous_manifest is absent."""
         state = {
