@@ -52,12 +52,14 @@ from langchain_openai.chat_models.base import BaseChatOpenAI
 from openai import ContentFilterFinishReasonError, LengthFinishReasonError, pydantic_function_tool
 from pydantic import BaseModel
 
+from skillspector.constants import build_model_config
 from skillspector.inference_usage import (
     InferenceUsageCollector,
     chat_model_controls,
     chat_model_requested_controls,
     provider_name,
 )
+from skillspector.llm_provenance import LLM_ANALYZER_SLOTS
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
 from skillspector.providers import (
     UnknownProviderError,
@@ -71,7 +73,7 @@ from skillspector.providers import (
     resolve_chat_model_credentials,
     resolve_provider_credentials,
 )
-from skillspector.providers.chat_models import resolve_reasoning_effort
+from skillspector.providers.chat_models import UnsupportedControlError, resolve_reasoning_effort
 from skillspector.providers.openai import OpenAIProvider
 from skillspector.structured_response import (
     MAX_RESPONSE_CHARS,
@@ -147,14 +149,16 @@ def _resolve_default_chat_model() -> str:
     raise_no_llm_api_key_configured()
 
 
-def is_llm_available() -> tuple[bool, str | None]:
+def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
     """Return ``(available, error_message)`` describing LLM availability.
 
     CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
     ``opencode_cli``) are checked through their ``is_available()`` method
     first. Other providers probe the same native chat-model path used by
     :func:`get_chat_model`; unbound HTTP providers keep the
-    credential-resolution and OpenAI fallback path.
+    credential-resolution and OpenAI fallback path.  A configured model that
+    rejects a requested control makes the LLM unavailable, with the reason
+    from :func:`unsupported_control_error`.
     """
     try:
         provider = get_active_provider()
@@ -163,22 +167,56 @@ def is_llm_available() -> tuple[bool, str | None]:
     if has_cli_capability(provider):
         return provider.is_available()  # type: ignore[attr-defined]
 
-    if has_provider_binding():
-        try:
-            model = provider.resolve_model()
+    try:
+        if has_provider_binding():
+            model = next(iter(_llm_slot_models()))
             create_chat_model(
                 model=model,
                 max_tokens=get_max_output_tokens(model),
-                timeout=120,
+                timeout=timeout,
             )
-        except ValueError as exc:
-            return False, str(exc)
-        return True, None
-    try:
-        _resolve_llm_credentials()
+        else:
+            _resolve_llm_credentials()
     except ValueError as exc:
         return False, str(exc)
-    return True, None
+    control_error = unsupported_control_error(timeout)
+    return control_error is None, control_error
+
+
+def _llm_slot_models() -> dict[str, None]:
+    """Return distinct models for slots whose analyzers can make LLM calls."""
+    model_config = build_model_config()
+    return dict.fromkeys(model_config[slot] for slot in LLM_ANALYZER_SLOTS)
+
+
+def unsupported_control_error(timeout: float | None = 120) -> str | None:
+    """Return why a configured slot model rejects a requested control, else ``None``.
+
+    Only ``SKILLSPECTOR_TEMPERATURE`` and ``SKILLSPECTOR_REASONING_EFFORT`` can
+    be rejected, so nothing runs when both are unset.  Otherwise each distinct
+    LLM slot model is built the way the analyzers build it, so the provider's own
+    guard (model name or registry entry) reports an
+    :class:`~skillspector.providers.chat_models.UnsupportedControlError`
+    before any analysis.  Other failures, such as missing credentials, are
+    left to the regular availability path.
+    """
+    if not any(
+        os.environ.get(name, "").strip()
+        for name in ("SKILLSPECTOR_TEMPERATURE", "SKILLSPECTOR_REASONING_EFFORT")
+    ):
+        return None
+    try:
+        if has_cli_capability(get_active_provider()):
+            return None
+        models = _llm_slot_models()
+        for model in models:
+            get_chat_model(model, timeout=timeout)
+    except UnsupportedControlError as exc:
+        return str(exc)
+    except Exception:
+        # Not a control rejection; availability checks report it.
+        return None
+    return None
 
 
 def fetch_model_token_limits(model_label: str) -> tuple[int, int]:

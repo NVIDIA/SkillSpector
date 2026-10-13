@@ -1410,6 +1410,49 @@ def _meta_from_json_report(state: SkillspectorState) -> dict:
     return json.loads(report(state)["report_body"])["metadata"]
 
 
+def test_json_report_probes_availability_once_and_reuses_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[float | None] = []
+    monkeypatch.setattr(
+        "skillspector.nodes.report.is_llm_available",
+        lambda *, timeout=120: calls.append(timeout) or (True, None),
+    )
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_requested": True,
+    }
+
+    assert _meta_from_json_report(state)["llm_available"] is True
+    assert calls == [120]
+
+
+def test_json_report_does_not_probe_after_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "skillspector.nodes.report.transitive_remaining_seconds", lambda _state: 0.0
+    )
+    probe = MagicMock(return_value=(True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", probe)
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_requested": True,
+        "llm_call_log": [llm_call_record("semantic_security_discovery", ok=True)],
+    }
+
+    assert _meta_from_json_report(state)["llm_available"] is True
+    probe.assert_not_called()
+
+
 def test_report_llm_degraded_when_all_calls_failed(monkeypatch: pytest.MonkeyPatch) -> None:
     """use_llm requested + every semantic-analyzer call failed -> llm_degraded True.
 
@@ -1586,7 +1629,7 @@ def test_report_static_only_without_calls_is_not_degraded(monkeypatch: pytest.Mo
         "llm_call_log": [],
     }
     meta = _meta_from_json_report(state)
-    assert meta["llm_available"] is True
+    assert meta["llm_available"] is False
     assert "llm_degraded" not in meta
     assert "llm_calls_attempted" not in meta
 

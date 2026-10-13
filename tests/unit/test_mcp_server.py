@@ -285,9 +285,9 @@ def test_static_only_graph_keeps_semantic_nodes_without_constructing_a_model(
     finally:
         reset_provider(token)
 
-    assert capability_probes > 0
+    assert capability_probes == 0
     semantic_model_factory.assert_not_called()
-    assert json.loads(result["report_body"])["metadata"]["llm_available"] is True
+    assert json.loads(result["report_body"])["metadata"]["llm_available"] is False
     semantic_statuses = {
         status["analyzer_id"]: status["status"]
         for status in result["analyzer_status_events"]
@@ -720,16 +720,16 @@ async def test_explicit_static_only_keeps_embedded_json_report_unchanged(
     assert payload["metadata"]["meta_analysis_applied"] is False
 
 
-async def test_run_scan_reports_llm_available_with_credentials(
+async def test_run_scan_static_mode_skips_availability_with_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Credentials present but use_llm=False: available, but honestly not used."""
+    """Static scans do not advertise availability without probing credentials."""
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
 
-    assert result["llm_available"] is True
+    assert result["llm_available"] is False
     assert result["llm_requested"] is False
     assert result["llm_used"] is False
     assert result["scan_mode"] == "static-only"
