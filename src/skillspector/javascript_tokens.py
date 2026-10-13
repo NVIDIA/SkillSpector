@@ -29,6 +29,7 @@ _SHELL_EXECUTION_CALLS = frozenset(
         "system",
     }
 )
+_SHELL_EXECUTION_MODULES = frozenset({"child_process", "execa", "shelljs", "zx"})
 
 
 def javascript_template_spans(
@@ -38,8 +39,8 @@ def javascript_template_spans(
     """Return template literal ranges only when a complete script parses.
 
     Unsupported or malformed JavaScript returns ``None`` so callers retain
-    their conservative parse bounds. A file with an interpolated template and
-    a shell execution call also keeps those bounds because this parser does not
+    their conservative parse bounds. A file with a template and a shell
+    execution call also keeps those bounds because this parser does not
     establish whether that template supplies the executed command.
     """
     if "`" not in content or len(content) > MAX_PYTHON_AST_SOURCE_CHARS:
@@ -80,9 +81,7 @@ def javascript_template_spans(
     if not templates:
         return None
 
-    if any(dynamic for _, _, dynamic in templates) and _has_shell_execution_call(
-        program, check_runtime
-    ):
+    if _has_shell_execution_call(program, check_runtime):
         return None
 
     # Nested template literals occur inside interpolation expressions. The
@@ -122,21 +121,42 @@ def _walk_nodes(value: Any, check_runtime: Callable[[], None]) -> Iterator[Any]:
 
 def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -> bool:
     for node in _walk_nodes(program, check_runtime):
-        if node.type == "CallExpression" and _is_shell_execution_callee(node.callee):
+        if node.type == "ImportDeclaration" and _is_shell_execution_module(
+            getattr(node.source, "value", "")
+        ):
             return True
+        if node.type in {"CallExpression", "NewExpression"}:
+            if _is_shell_execution_callee(node.callee):
+                return True
+            if (
+                node.callee.type == "Identifier"
+                and node.callee.name == "require"
+                and node.arguments
+                and _is_shell_execution_module(getattr(node.arguments[0], "value", ""))
+            ):
+                return True
+        if node.type == "TaggedTemplateExpression":
+            tag = node.tag
+            if _is_shell_execution_callee(tag) or (tag.type == "Identifier" and tag.name == "$"):
+                return True
     return False
+
+
+def _is_shell_execution_module(module: Any) -> bool:
+    if not isinstance(module, str):
+        return False
+    normalized = module.removeprefix("node:")
+    return any(
+        normalized == name or normalized.startswith(f"{name}/") for name in _SHELL_EXECUTION_MODULES
+    )
 
 
 def _is_shell_execution_callee(callee: Any) -> bool:
     if callee.type == "Identifier":
         return callee.name.casefold() in _SHELL_EXECUTION_CALLS
-    if callee.type == "MemberExpression" and not callee.computed:
-        property_name = getattr(callee.property, "name", "")
-        object_name = getattr(callee.object, "name", "")
-        return property_name.casefold() in _SHELL_EXECUTION_CALLS and object_name.casefold() in {
-            "child_process",
-            "cp",
-            "shell",
-            "execa",
-        }
+    if callee.type == "MemberExpression":
+        property_name = getattr(callee.property, "name", "") or getattr(
+            callee.property, "value", ""
+        )
+        return property_name.casefold() in _SHELL_EXECUTION_CALLS
     return False

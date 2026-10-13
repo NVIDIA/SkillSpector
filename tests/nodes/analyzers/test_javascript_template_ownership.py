@@ -53,6 +53,41 @@ def test_dynamic_template_in_file_with_exec_stays_partial(source: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "const { execSync } = require('child_process'); execSync(`$TOOL -rf /`);",
+            id="static-template-with-shell-variable",
+        ),
+        pytest.param(
+            "const child = require('child_process'); child.execSync(`${tool} -rf /`);",
+            id="required-module-alias",
+        ),
+        pytest.param(
+            "const childProcess = require('child_process'); childProcess.execSync(`${tool} -rf /`);",
+            id="child-process-alias",
+        ),
+        pytest.param(
+            "const proc = require('child_process'); proc.spawnSync(`${tool} -rf /`);",
+            id="proc-spawn-alias",
+        ),
+        pytest.param(
+            "require('child_process').execSync(`${tool} -rf /`);",
+            id="require-call-member-receiver",
+        ),
+        pytest.param("shelljs.exec(`${tool} -rf /`);", id="shelljs-member-call"),
+        pytest.param("import execa from 'execa'; execa(`${tool} -rf /`);", id="execa-import"),
+        pytest.param("import { $ } from 'zx'; $`rm -rf /`;", id="zx-tagged-template"),
+    ],
+)
+def test_shell_execution_forms_keep_template_files_partial(source: str) -> None:
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is True
+    )
+
+
+@pytest.mark.parametrize(
     "source", ["const value = `unterminated;", "const = `malformed ${value}`;"]
 )
 def test_unproven_javascript_keeps_conservative_parse_result(source: str) -> None:
