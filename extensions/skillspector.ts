@@ -172,6 +172,10 @@ function publishReport(source: string, destination: string): void {
 }
 
 function buildScanArgs(params: SkillSpectorScanParams, output?: string): string[] {
+  // The CLI would parse a dash-led target as one of its own options.
+  if (params.target.startsWith("-")) {
+    throw new Error(`Scan target must not start with "-": ${params.target} (write ./${params.target} for a path)`);
+  }
   const args = ["scan", params.target];
   args.push("--format", params.format ?? "terminal");
 

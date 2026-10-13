@@ -7,6 +7,9 @@ LOCAL_REPORT="${SKILLSPECTOR_DOCKER_LOCAL_REPORT:-.skillspector-docker-smoke.jso
 GITHUB_REPORT="${SKILLSPECTOR_DOCKER_GITHUB_REPORT:-.skillspector-docker-github-smoke.json}"
 GITHUB_URL="${SKILLSPECTOR_DOCKER_GITHUB_URL:-https://github.com/octocat/Hello-World}"
 GITHUB_EXPECTED_COMPONENT="${SKILLSPECTOR_DOCKER_GITHUB_EXPECTED_COMPONENT:-README}"
+# The image runs as a non-root user; scans that write into the bind mount run
+# as the host user so the report is writable and owned by the caller.
+HOST_USER="$(id -u):$(id -g)"
 
 run() {
   printf "\n>> %s\n" "$*"
@@ -34,11 +37,11 @@ assert_report_contains_component() {
 }
 
 scan_github_url() {
-  printf "\n>> docker run --rm -v %s:/scan %s scan %s --no-llm --format json --output /scan/%s\n" \
-    "${REPO_DIR}" "${IMAGE}" "${GITHUB_URL}" "${GITHUB_REPORT}"
+  printf "\n>> docker run --rm --user %s -v %s:/scan %s scan %s --no-llm --format json --output /scan/%s\n" \
+    "${HOST_USER}" "${REPO_DIR}" "${IMAGE}" "${GITHUB_URL}" "${GITHUB_REPORT}"
 
   set +e
-  docker run --rm -v "${REPO_DIR}:/scan" "${IMAGE}" scan "${GITHUB_URL}" \
+  docker run --rm --user "${HOST_USER}" -v "${REPO_DIR}:/scan" "${IMAGE}" scan "${GITHUB_URL}" \
     --no-llm --format json --output "/scan/${GITHUB_REPORT}"
   github_scan_status="$?"
   set -e
@@ -57,7 +60,13 @@ scan_github_url() {
 run docker run --rm "${IMAGE}" --version
 run docker run --rm --entrypoint git "${IMAGE}" --version
 
-run docker run --rm -v "${REPO_DIR}:/scan" "${IMAGE}" scan tests/fixtures/safe_skill \
+image_uid="$(docker run --rm --entrypoint id "${IMAGE}" -u)"
+if [ "${image_uid}" = "0" ]; then
+  echo "Image must not run as root by default"
+  exit 1
+fi
+
+run docker run --rm --user "${HOST_USER}" -v "${REPO_DIR}:/scan" "${IMAGE}" scan tests/fixtures/safe_skill \
   --no-llm --format json --output "/scan/${LOCAL_REPORT}"
 validate_json_report "${LOCAL_REPORT}"
 
