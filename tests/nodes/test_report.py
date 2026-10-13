@@ -1569,7 +1569,7 @@ def test_report_static_only_without_calls_is_not_degraded(monkeypatch: pytest.Mo
         "llm_call_log": [],
     }
     meta = _meta_from_json_report(state)
-    assert meta["llm_available"] is True
+    assert meta["llm_available"] is False
     assert "llm_degraded" not in meta
     assert "llm_calls_attempted" not in meta
 

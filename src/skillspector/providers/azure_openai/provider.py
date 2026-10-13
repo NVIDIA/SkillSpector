@@ -84,7 +84,7 @@ class AzureOpenAIProvider:
             "max_tokens": max_tokens,
             "timeout": timeout,
         }
-        sampling_parameters = resolve_sampling_parameters(include_seed=True)
+        sampling_parameters = resolve_sampling_parameters(model, include_seed=True)
         kwargs.update(sampling_parameters)
         chat_model = AzureChatOpenAI(**kwargs)
         register_chat_model_controls(

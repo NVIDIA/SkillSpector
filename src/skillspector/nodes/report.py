@@ -1365,7 +1365,7 @@ def _build_metadata(
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
-    provider_available, llm_error = is_llm_available()
+    provider_available, llm_error = is_llm_available() if use_llm else (False, None)
     attempted, succeeded, call_log_degraded = _llm_runtime_status(use_llm, llm_call_log)
     # meta_analyzer's own record, independent of whether a DIFFERENT
     # LLM-backed node (a semantic_* analyzer) lost coverage to a dropped
@@ -1870,7 +1870,10 @@ def report(state: SkillspectorState) -> dict[str, object]:
         if analysis_completeness.get("status", "complete") == "complete":
             analysis_completeness["status"] = "partial"
     _attempted, _succeeded, degraded = _llm_runtime_status(llm_requested, llm_call_log)
-    provider_available, provider_error = is_llm_available()
+    if llm_requested and not use_llm:
+        provider_available, provider_error = False, state.get("llm_preflight_error")
+    else:
+        provider_available, provider_error = is_llm_available() if llm_requested else (False, None)
     runtime_available = llm_runtime_available(
         preflight_available=provider_available,
         result=state,
@@ -1894,6 +1897,8 @@ def report(state: SkillspectorState) -> dict[str, object]:
             "LLM analysis was requested but unavailable during preflight; "
             "results reflect STATIC analysis only."
         )
+        if provider_error:
+            degraded_notice += f" {provider_error}"
     elif provider_unavailable and degraded_notice is None:
         degraded_notice = (
             "LLM analysis was requested but the configured provider was unavailable"
