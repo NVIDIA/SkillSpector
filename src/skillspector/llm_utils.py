@@ -57,6 +57,7 @@ from skillspector.inference_usage import (
     chat_model_requested_controls,
     provider_name,
 )
+from skillspector.llm_provenance import LLM_ANALYZER_SLOTS
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
 from skillspector.providers import (
     UnknownProviderError,
@@ -157,7 +158,7 @@ def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
 
     try:
         if has_provider_binding():
-            model = provider.resolve_model()
+            model = next(iter(_llm_slot_models()))
             create_chat_model(
                 model=model,
                 max_tokens=get_max_output_tokens(model),
@@ -173,12 +174,18 @@ def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
     return control_error is None, control_error
 
 
+def _llm_slot_models() -> dict[str, None]:
+    """Return distinct models for slots whose analyzers can make LLM calls."""
+    model_config = build_model_config()
+    return dict.fromkeys(model_config[slot] for slot in LLM_ANALYZER_SLOTS)
+
+
 def unsupported_control_error(timeout: float | None = 120) -> str | None:
     """Return why a configured slot model rejects a requested control, else ``None``.
 
     Only ``SKILLSPECTOR_TEMPERATURE`` and ``SKILLSPECTOR_REASONING_EFFORT`` can
     be rejected, so nothing runs when both are unset.  Otherwise each distinct
-    slot model is built the way the analyzers build it, so the provider's own
+    LLM slot model is built the way the analyzers build it, so the provider's own
     guard (model name or registry entry) reports an
     :class:`~skillspector.providers.chat_models.UnsupportedControlError`
     before any analysis.  Other failures, such as missing credentials, are
@@ -192,7 +199,7 @@ def unsupported_control_error(timeout: float | None = 120) -> str | None:
     try:
         if has_cli_capability(get_active_provider()):
             return None
-        models = dict.fromkeys(build_model_config().values())
+        models = _llm_slot_models()
         for model in models:
             get_chat_model(model, timeout=timeout)
     except UnsupportedControlError as exc:

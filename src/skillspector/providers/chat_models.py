@@ -83,12 +83,15 @@ def resolve_sampling_parameters(
     include_seed: bool = False,
     reasoning_effort: str | None = None,
     registry_path: str | None = None,
+    native_anthropic: bool = False,
 ) -> dict[str, float | int]:
     """Resolve optional, validated sampling controls for a request to *model*.
 
     Raises :class:`UnsupportedControlError` when *model* rejects the requested
     temperature or *reasoning_effort* (see :func:`reject_unsupported_controls`),
     so every hosted provider applies the same guard before any request.
+    Only the official Anthropic endpoint sets *native_anthropic* to allow
+    Claude's backwards-compatible ``temperature=1.0``.
     """
     parameters: dict[str, float | int] = {}
     temperature = resolve_temperature()
@@ -98,7 +101,13 @@ def resolve_sampling_parameters(
     seed = resolve_seed() if include_seed else None
     if seed is not None:
         parameters["seed"] = seed
-    reject_unsupported_controls(model, parameters, reasoning_effort, registry_path=registry_path)
+    reject_unsupported_controls(
+        model,
+        parameters,
+        reasoning_effort,
+        registry_path=registry_path,
+        native_anthropic=native_anthropic,
+    )
     return parameters
 
 
@@ -108,17 +117,25 @@ def reject_unsupported_controls(
     reasoning_effort: str | None = None,
     *,
     registry_path: str | None = None,
+    native_anthropic: bool = False,
 ) -> None:
     """Raise :class:`UnsupportedControlError` when *model* rejects a requested control.
 
     Any explicit ``temperature``, ``1.0`` included, fails for GPT-6.1 Sol, the
     Claude models in ``SAMPLING_REJECTED_MODELS``, and registry entries at
-    *registry_path* declaring ``sampling: rejected``.  GPT-6.1 Sol also accepts
-    only ``GPT_6_1_SOL_REASONING_EFFORTS``.
+    *registry_path* declaring ``sampling: rejected``. The official Anthropic
+    endpoint accepts ``1.0`` for the known Claude models when
+    *native_anthropic* is set; other routes keep the strict guard.
+    GPT-6.1 Sol also accepts only ``GPT_6_1_SOL_REASONING_EFFORTS``.
     """
     sol = is_gpt_6_1_sol(model)
+    native_default_temperature = (
+        native_anthropic
+        and sampling_parameters.get("temperature") == 1.0
+        and rejects_sampling_controls(model)
+    )
     if "temperature" in sampling_parameters and (
-        sol or rejects_sampling_controls(model, registry_path)
+        sol or (rejects_sampling_controls(model, registry_path) and not native_default_temperature)
     ):
         raise UnsupportedControlError(
             f"SKILLSPECTOR_TEMPERATURE is not supported by {model}; unset it to use this model"

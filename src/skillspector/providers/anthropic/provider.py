@@ -99,10 +99,11 @@ class AnthropicProvider:
             return None
 
         api_key, base_url = creds
+        endpoint = base_url or ANTHROPIC_BASE_URL
         kwargs = {
             "model_name": model,
             "api_key": SecretStr(api_key),
-            "base_url": base_url or ANTHROPIC_BASE_URL,
+            "base_url": endpoint,
             "max_tokens_to_sample": max_tokens,
             "timeout": timeout,
             "stop": None,
@@ -110,7 +111,11 @@ class AnthropicProvider:
         effort = resolve_reasoning_effort()
         if effort is not None:
             kwargs["effort"] = effort
-        sampling_parameters = resolve_sampling_parameters(model)
+        # The native Messages API accepts 1.0 for backwards compatibility;
+        # endpoint overrides may have different sampling rules.
+        sampling_parameters = resolve_sampling_parameters(
+            model, native_anthropic=endpoint.rstrip("/") == ANTHROPIC_BASE_URL
+        )
         kwargs.update(sampling_parameters)
         chat_model_cls = _ChatAnthropicBearer if _use_bearer_auth() else ChatAnthropic
         chat_model = chat_model_cls(**kwargs)

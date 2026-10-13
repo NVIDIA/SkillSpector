@@ -241,9 +241,11 @@ class TestAnthropicClaude55:
         with pytest.raises(OutputParserException):
             chain.invoke("analyse this")
 
-    @_ANTHROPIC_PROVIDERS
+    @pytest.mark.parametrize(
+        ("provider_cls", "temperature"),
+        [(AnthropicProvider, "0"), (AnthropicProxyProvider, "0"), (AnthropicProxyProvider, "1.0")],
+    )
     @pytest.mark.parametrize("model", _CLAUDE_5_5)
-    @pytest.mark.parametrize("temperature", ["0", "1.0"])
     def test_explicit_temperature_fails_before_any_request(
         self, monkeypatch: pytest.MonkeyPatch, provider_cls: type, model: str, temperature: str
     ) -> None:
@@ -601,6 +603,67 @@ class TestScanPreflightControls:
         error = unsupported_control_error()
 
         assert error is not None and "SKILLSPECTOR_REASONING_EFFORT='minimal'" in error
+
+    @pytest.mark.parametrize("slot", ["mcp_least_privilege", "mcp_rug_pull"])
+    def test_static_slot_models_do_not_reject_scan_controls(
+        self, monkeypatch: pytest.MonkeyPatch, slot: str
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "gpt-5.4")
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+        monkeypatch.setenv(f"SKILLSPECTOR_MODEL_{slot.upper()}", "gpt-6.1-sol")
+
+        assert unsupported_control_error() is None
+        assert is_llm_available() == (True, None)
+
+    @pytest.mark.parametrize(
+        "slot",
+        [
+            "mcp_tool_poisoning",
+            "semantic_developer_intent",
+            "semantic_quality_policy",
+            "semantic_security_discovery",
+            "meta_analyzer",
+        ],
+    )
+    def test_active_slot_models_still_reject_scan_controls(
+        self, monkeypatch: pytest.MonkeyPatch, slot: str
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "gpt-5.4")
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+        monkeypatch.setenv(f"SKILLSPECTOR_MODEL_{slot.upper()}", "gpt-6.1-sol")
+
+        error = unsupported_control_error()
+        assert error is not None and "not supported by gpt-6.1-sol" in error
+        assert is_llm_available() == (False, error)
+
+    def test_unused_base_model_does_not_reject_overridden_active_slots(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skillspector.providers import reset_provider, use_provider
+
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "gpt-6.1-sol")
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+        for slot in (
+            "mcp_tool_poisoning",
+            "semantic_developer_intent",
+            "semantic_quality_policy",
+            "semantic_security_discovery",
+            "meta_analyzer",
+        ):
+            monkeypatch.setenv(f"SKILLSPECTOR_MODEL_{slot.upper()}", "gpt-5.4")
+
+        token = use_provider(OpenAIProvider())
+        try:
+            assert unsupported_control_error() is None
+            assert is_llm_available() == (True, None)
+        finally:
+            reset_provider(token)
 
     def test_supported_controls_and_missing_credentials_pass(
         self, monkeypatch: pytest.MonkeyPatch

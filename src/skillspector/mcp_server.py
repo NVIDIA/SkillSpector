@@ -142,7 +142,7 @@ async def run_scan(
         ):
             raise ValueError("this MCP transport requires an unauthenticated HTTPS target")
 
-    llm_preflight_available, _ = is_llm_available()
+    llm_preflight_available, _ = is_llm_available() if use_llm else (False, None)
     llm_enabled = use_llm and llm_preflight_available
 
     state: dict[str, Any] = {

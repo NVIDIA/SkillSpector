@@ -1258,7 +1258,13 @@ def _build_metadata(
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
-    provider_available, llm_error = provider_availability or is_llm_available()
+    provider_available, llm_error = (
+        provider_availability
+        if provider_availability is not None
+        else is_llm_available()
+        if use_llm
+        else (False, None)
+    )
     attempted, succeeded, call_log_degraded = _llm_runtime_status(use_llm, llm_call_log)
     # meta_analyzer's own record, independent of whether a DIFFERENT
     # LLM-backed node (a semantic_* analyzer) lost coverage to a dropped
@@ -1800,7 +1806,9 @@ def report(state: SkillspectorState) -> dict[str, object]:
             analysis_completeness["status"] = "partial"
     _attempted, _succeeded, degraded = _llm_runtime_status(llm_requested, llm_call_log)
     remaining = transitive_remaining_seconds(state)
-    if remaining is not None and remaining <= 0:
+    if not llm_requested:
+        provider_available, provider_error = False, None
+    elif remaining is not None and remaining <= 0:
         provider_available = any(successful_llm_record(record) for record in llm_call_log)
         provider_error = (
             None

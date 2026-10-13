@@ -1531,6 +1531,8 @@ def test_json_report_probes_availability_once_and_reuses_it(
         "has_executable_scripts": False,
         "manifest": {},
         "output_format": "json",
+        "use_llm": True,
+        "llm_requested": True,
     }
 
     assert _meta_from_json_report(state)["llm_available"] is True
@@ -1549,6 +1551,8 @@ def test_json_report_does_not_probe_after_deadline(monkeypatch: pytest.MonkeyPat
         "has_executable_scripts": False,
         "manifest": {},
         "output_format": "json",
+        "use_llm": True,
+        "llm_requested": True,
         "llm_call_log": [llm_call_record("semantic_security_discovery", ok=True)],
     }
 
@@ -1732,7 +1736,7 @@ def test_report_static_only_without_calls_is_not_degraded(monkeypatch: pytest.Mo
         "llm_call_log": [],
     }
     meta = _meta_from_json_report(state)
-    assert meta["llm_available"] is True
+    assert meta["llm_available"] is False
     assert "llm_degraded" not in meta
     assert "llm_calls_attempted" not in meta
 
