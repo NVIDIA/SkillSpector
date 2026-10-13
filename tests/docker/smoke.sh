@@ -7,8 +7,9 @@ LOCAL_REPORT="${SKILLSPECTOR_DOCKER_LOCAL_REPORT:-.skillspector-docker-smoke.jso
 GITHUB_REPORT="${SKILLSPECTOR_DOCKER_GITHUB_REPORT:-.skillspector-docker-github-smoke.json}"
 GITHUB_URL="${SKILLSPECTOR_DOCKER_GITHUB_URL:-https://github.com/octocat/Hello-World}"
 GITHUB_EXPECTED_COMPONENT="${SKILLSPECTOR_DOCKER_GITHUB_EXPECTED_COMPONENT:-README}"
-# The image runs as a non-root user; scans that write into the bind mount run
-# as the host user so the report is writable and owned by the caller.
+# The image runs as a non-root user; every container that touches the bind
+# mount runs as the host user, so scans can write the report and the readers
+# can open it even in a private (0700) checkout owned by the caller.
 HOST_USER="$(id -u):$(id -g)"
 
 run() {
@@ -21,7 +22,7 @@ validate_json_report() {
   report_path="$1"
 
   test -s "${REPO_DIR}/${report_path}"
-  run docker run --rm --entrypoint python -v "${REPO_DIR}:/scan" "${IMAGE}" \
+  run docker run --rm --user "${HOST_USER}" --entrypoint python -v "${REPO_DIR}:/scan" "${IMAGE}" \
     -m json.tool "/scan/${report_path}" >/dev/null
   return
 }
@@ -30,7 +31,7 @@ assert_report_contains_component() {
   report_path="$1"
   expected_component="$2"
 
-  run docker run --rm --entrypoint python -v "${REPO_DIR}:/scan" "${IMAGE}" \
+  run docker run --rm --user "${HOST_USER}" --entrypoint python -v "${REPO_DIR}:/scan" "${IMAGE}" \
     -c 'import json, sys; data = json.load(open("/scan/" + sys.argv[1])); expected = sys.argv[2]; assert any(c.get("path") == expected for c in data.get("components", [])), f"missing component: {expected}"' \
     "${report_path}" "${expected_component}"
   return
