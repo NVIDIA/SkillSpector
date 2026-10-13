@@ -389,8 +389,7 @@ def _main_impl() -> None:
 
     # -- Header --------------------------------------------------------------
     pool_note = (
-        f", [green]{api_pool.keys_configured} keys "
-        f"({api_pool.total_capacity} slots)[/green]"
+        f", [green]{api_pool.keys_configured} keys ({api_pool.total_capacity} slots)[/green]"
         if api_pool
         else ""
     )
@@ -501,13 +500,10 @@ def _main_impl() -> None:
             f"{snap['total_requests_served']} requests served",
         ]
         if snap.get("peak_active_requests", 0) > 0:
-            _parts.append(
-                f"peak {snap['peak_active_requests']}/{snap['total_capacity']} slots"
-            )
+            _parts.append(f"peak {snap['peak_active_requests']}/{snap['total_capacity']} slots")
         if snap.get("rate_limits_hit", 0) > 0:
             _parts.append(
-                f"{snap['rate_limits_hit']} rate-limit(s), "
-                f"{snap['retry_successes']} retried"
+                f"{snap['rate_limits_hit']} rate-limit(s), {snap['retry_successes']} retried"
             )
         _parts.append(f"{snap['keys_configured']} keys")
         _print(f"\n[dim]API Pool: {', '.join(_parts)}[/dim]")
