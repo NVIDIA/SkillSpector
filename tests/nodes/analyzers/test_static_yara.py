@@ -622,6 +622,7 @@ _STEALER_COOKIE_PATHS = {
     "chrome_macos": "cGF0aCA9IGhvbWUgKyAiL0xpYnJhcnkvQXBwbGljYXRpb24gU3VwcG9ydC9Hb29nbGUvQ2hyb21lL0RlZmF1bHQvQ29va2llcyI=",
     "opera_windows": "JHAgPSAiJGVudjpBUFBEQVRBXE9wZXJhIFNvZnR3YXJlXE9wZXJhIFN0YWJsZVxOZXR3b3JrXENvb2tpZXMi",
     "firefox_profile": "c3JjID0gcHJvZmlsZV9kaXIgLyAnY29va2llcy5zcWxpdGUn",
+    "chrome_pathlib_spaced": "UGF0aC5ob21lKCkgLyAiQXBwRGF0YSIgLyAiTG9jYWwiIC8gIkdvb2dsZSIgLyAiQ2hyb21lIiAvICJVc2VyIERhdGEiIC8gIkRlZmF1bHQiIC8gIk5ldHdvcmsiIC8gIkNvb2tpZXMi",
 }
 
 
@@ -637,6 +638,9 @@ _STEALER_COOKIE_CODE = {
     "browser_argument": "c3RlYWwoIkNvb2tpZXMiLCAiZmlyZWZveCIp",
     "keyword_argument": "Z3JhYl9jb29raWVzKGJyb3dzZXI9ImVkZ2UiKQ==",
     "attribute_access": "Y29va2llcyA9IHJlYWQob3BlcmEucHJvZmlsZSk=",
+    "find_glob": "ZmluZCB+IC1uYW1lIENvb2tpZXMgLXBhdGggJypjaHJvbWUqJw==",
+    "quoted_path_segment": "c2h1dGlsLmNvcHkoaG9tZSArICIvQ29va2llcyIsICIvdG1wLyIgKyAiY2hyb21pdW0vIiArIG5hbWUp",
+    "dashed_path_segment": "c3JjID0gIkNvb2tpZXMiOyBkc3QgPSBwcm9maWxlX3Jvb3QgKyAiLy5jb25maWcvZ29vZ2xlLWNocm9tZS9vdXQi",
 }
 
 
@@ -650,6 +654,9 @@ _COOKIE_PROSE = [
     "Forward cookies to Chrome headless through the Playwright context.\n",
     "Clear cookies in Chrome.\n",
     "Cookies are shared with Edge, Chrome and Firefox.\n",
+    "Third-party cookies are blocked by Chrome's tracking protection.\n",
+    "Session cookies are dropped by Firefox's Enhanced Tracking Protection.\n",
+    "Cookies: Chrome/Edge supported, Safari planned.\n",
 ]
 
 
@@ -2284,6 +2291,9 @@ rule agent_skill_destructive_autonomous_actions {
             "chrome_headless",
             "clear_in_chrome",
             "shared_with_browsers",
+            "chrome_possessive",
+            "firefox_possessive",
+            "browser_list_with_slash",
         ],
     )
     def test_info_stealer_ignores_cookie_prose(self, content):
