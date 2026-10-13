@@ -522,6 +522,19 @@ def _is_shell_command_position(content: str, start: int) -> bool:
     return cursor < 0 or content[cursor] in "\n\r;|&("
 
 
+def _opens_runtime_word(content: str, start: int) -> bool:
+    """Return whether ``start`` opens a ``$`` or single-backtick word, bare or in ``"``."""
+    cursor = start + 1 if content.startswith('"', start) else start
+    if content.startswith("$", cursor):
+        return True
+    # A backtick run such as a Markdown fence never opens a substitution.
+    return (
+        content.startswith("`", cursor)
+        and not content.startswith("``", cursor)
+        and (cursor == 0 or content[cursor - 1] != "`")
+    )
+
+
 def _has_quoted_assignment_prefix(content: str, start: int) -> bool:
     """Return whether a quoted candidate starts with a shell assignment name."""
     if start >= len(content) or content[start] not in "'\"":
@@ -2022,7 +2035,15 @@ def _has_shell_command_word_exhaustion(
         if _has_quoted_assignment_prefix(content, start):
             continue
         shadowed = start < shadow_through
-        if shadowed and not _is_shell_command_position(content, start):
+        # A runtime-selected command may follow any prefix word (``sudo -u
+        # root``, ``then``, ``{``, ``env A=1``), so ``$``- and backtick-led
+        # candidates keep main's word-start check; other words must open a
+        # command position.
+        if (
+            shadowed
+            and not _opens_runtime_word(content, start)
+            and not _is_shell_command_position(content, start)
+        ):
             continue
         candidate_word_positions: set[int] = set()
         parsed = _parse_shell_command_word(
