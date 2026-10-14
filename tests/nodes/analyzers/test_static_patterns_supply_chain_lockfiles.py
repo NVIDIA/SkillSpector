@@ -113,6 +113,8 @@ name = "broken"
     [
         ("pyproject.toml", "[project]\ndependencies = ["),
         ("package.json", '{"dependencies": {'),
+        ("package-lock.json", '{"packages": '),
+        ("npm-shrinkwrap.json", '{"dependencies": '),
         ("uv.lock", '[[package]\nname = "broken"'),
     ],
 )
@@ -122,7 +124,25 @@ def test_malformed_dependency_manifests_are_reported_as_partial(path, content):
         path,
     )
 
-    assert any(item.reason is LedgerReason.STATIC_PARSE_LIMIT for item in limitations)
+    assert any(item.reason is LedgerReason.DEPENDENCY_PARSE_ERROR for item in limitations)
+
+
+@pytest.mark.parametrize(
+    ("path", "prefix"),
+    [
+        ("pyproject.toml", "[project]\nname = "),
+        ("uv.lock", "version = "),
+    ],
+)
+def test_oversized_toml_integer_is_reported_as_dependency_parse_error(path, prefix):
+    content = prefix + "9" * 5_000
+
+    _findings, limitations, _packages_seen = supply_chain._analyze_dependencies_detailed(
+        content,
+        path,
+    )
+
+    assert any(item.reason is LedgerReason.DEPENDENCY_PARSE_ERROR for item in limitations)
 
 
 @pytest.mark.parametrize(
@@ -153,7 +173,7 @@ def test_malformed_package_json_keeps_line_scan_fallback(monkeypatch):
 
     assert packages_seen == 1
     assert ("demo-package", "1.2.3") in seen["packages"]
-    assert any(item.reason is LedgerReason.STATIC_PARSE_LIMIT for item in limitations)
+    assert any(item.reason is LedgerReason.DEPENDENCY_PARSE_ERROR for item in limitations)
 
 
 def test_toml_lock_parser_keeps_package_without_version():

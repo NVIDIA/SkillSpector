@@ -413,6 +413,8 @@ def test_cli_scan_local_directory(tmp_path: Path) -> None:
     [
         ("pyproject.toml", "[project]\ndependencies = [", True),
         ("package.json", '{"dependencies": {', True),
+        ("package-lock.json", '{"packages": ', True),
+        ("npm-shrinkwrap.json", '{"dependencies": ', True),
         ("uv.lock", '[[package]\nname = "broken"', True),
         ("pyproject.toml", "[project]\nname = 'example'\n", False),
         ("package.json", '{"name": "example"}', False),
@@ -446,7 +448,7 @@ def test_cli_reports_malformed_dependency_manifest_completeness(
     assert payload["analysis_completeness"]["is_complete"] is not incomplete
     if incomplete:
         assert any(
-            event["reason_code"] == LedgerReason.STATIC_PARSE_LIMIT.value
+            event["reason_code"] == LedgerReason.DEPENDENCY_PARSE_ERROR.value
             and event["path"] == manifest_path
             for event in payload["analysis_completeness"]["ledger_exceptions"]
         )

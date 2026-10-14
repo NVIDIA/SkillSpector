@@ -1421,7 +1421,7 @@ def _extract_packages_from_pyproject(
         return []
     try:
         data = tomllib.loads(content)
-    except tomllib.TOMLDecodeError as error:
+    except (ValueError, RecursionError) as error:
         if on_parse_error is not None:
             on_parse_error(type(error).__name__)
         return []
@@ -1520,7 +1520,11 @@ def _npm_lock_line_index(content: str) -> dict[str, int]:
     return index
 
 
-def _npm_lock_entries(content: str) -> list[tuple[str, str, int, int]]:
+def _npm_lock_entries(
+    content: str,
+    *,
+    on_parse_error: Callable[[str], None] | None = None,
+) -> list[tuple[str, str, int, int]]:
     """Extract (name, version, line, depth) for every install recorded in an npm lockfile.
 
     Covers both layouts: ``lockfileVersion`` 2/3 keep every install under ``packages`` keyed by
@@ -1537,7 +1541,11 @@ def _npm_lock_entries(content: str) -> list[tuple[str, str, int, int]]:
     """
     try:
         data = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, RecursionError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
+        return []
+    except TypeError:
         return []
     if not isinstance(data, dict):
         return []
@@ -1587,12 +1595,14 @@ def _extract_packages_from_npm_lock(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract exact package versions from an npm lockfile."""
     if limit is not None and limit <= 0:
         return []
     found: list[tuple[str, str | None, int]] = [
-        (name, version, line) for name, version, line, _depth in _npm_lock_entries(content)
+        (name, version, line)
+        for name, version, line, _depth in _npm_lock_entries(content, on_parse_error=on_parse_error)
     ]
     return found if limit is None else found[:limit]
 
@@ -1608,7 +1618,7 @@ def _extract_packages_from_toml_lock(
         return []
     try:
         data = tomllib.loads(content)
-    except tomllib.TOMLDecodeError as error:
+    except (ValueError, RecursionError) as error:
         if on_parse_error is not None:
             on_parse_error(type(error).__name__)
         return []
@@ -2767,7 +2777,7 @@ def _analyze_dependencies_detailed(
     def record_parse_error(error_class: str) -> None:
         limitations.append(
             OsvQueryLimitation(
-                reason=LedgerReason.STATIC_PARSE_LIMIT,
+                reason=LedgerReason.DEPENDENCY_PARSE_ERROR,
                 error_class=error_class,
             )
         )
@@ -2806,7 +2816,11 @@ def _analyze_dependencies_detailed(
         known_legit = _KNOWN_LEGIT_PYPI
     else:
         if is_npm_lock:
-            packages = _extract_packages_from_npm_lock(content, limit=extraction_limit)
+            packages = _extract_packages_from_npm_lock(
+                content,
+                limit=extraction_limit,
+                on_parse_error=record_parse_error,
+            )
         else:
             packages = _apply_locked_versions(
                 _extract_packages_from_package_json(
