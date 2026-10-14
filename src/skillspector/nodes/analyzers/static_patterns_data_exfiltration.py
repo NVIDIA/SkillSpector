@@ -119,6 +119,7 @@ _CHILD_PROCESS_ENV_CALLS = frozenset(
         "asyncio.create_subprocess_shell",
     }
 )
+_LAUNCHER_MODULES = frozenset(name.partition(".")[0] for name in _CHILD_PROCESS_ENV_CALLS)
 E3_CODE_PATTERNS = [
     (r"glob\s*\.\s*glob\s*\([^)]*(?:\.env|\.ssh|\.aws|\.config|credentials)", 0.8),
     (r"os\s*\.\s*walk\s*\([^)]*(?:home|~|/Users|/home)", 0.6),
@@ -348,11 +349,10 @@ def _is_dynamic_copy_call(call: ast.Call, aliases: dict[str, str]) -> bool:
 
 # In-place edits of a mapping that keep the values on the host. ``update`` and
 # ``clear`` return ``None``. The extraction methods hand a value back, so they
-# only count as edits when that value is thrown away, or when it is the value of
-# one literal key: a targeted lookup, which E2 does not treat as harvesting.
+# only count as edits when that value is thrown away. A value kept from the copy,
+# even by one literal key, is invisible to taint tracking, so it keeps the finding.
 _ENVIRONMENT_MUTATION_METHODS = frozenset({"update", "clear"})
 _ENVIRONMENT_EXTRACTION_METHODS = frozenset({"pop", "popitem", "setdefault"})
-_ENVIRONMENT_SINGLE_KEY_METHODS = frozenset({"pop", "setdefault"})
 
 # Statement lists a raise, ``break`` or ``continue`` can leave before a later
 # rebinding runs, while code that still sees the older binding goes on to run:
@@ -370,8 +370,17 @@ _PROTECTED_BODIES = frozenset(
     }
 )
 
-# Builtins that read variables by a name only known at run time.
-_DYNAMIC_NAMESPACE_CALLS = frozenset({"globals", "locals", "vars", "eval", "exec"})
+# Builtins, attributes and modules that read variables by a name only known at
+# run time.
+_DYNAMIC_NAMESPACE_NAMES = frozenset({"globals", "locals", "vars", "eval", "exec", "sys.modules"})
+_DYNAMIC_NAMESPACE_ATTRIBUTES = frozenset({"f_locals", "f_globals", "__globals__"})
+
+# Calls that can replace an attribute of the object passed first, and the
+# ``sys.modules`` methods that can replace a module before it is imported.
+_ATTRIBUTE_WRITE_CALLS = frozenset({"setattr", "delattr", "vars"})
+_MODULE_TABLE_WRITE_METHODS = frozenset(
+    {"update", "setdefault", "pop", "popitem", "clear", "__setitem__", "__delitem__"}
+)
 
 # Bindings of one name that may all still be live, past which the name is
 # reported rather than followed. Keeps crafted files linear.
@@ -395,15 +404,138 @@ def _edit_receiver(node: ast.AST) -> ast.Name | None:
     receiver = _method_receiver(node, _ENVIRONMENT_MUTATION_METHODS)
     if receiver is None and isinstance(node, ast.Expr):
         receiver = _method_receiver(node.value, _ENVIRONMENT_EXTRACTION_METHODS)
-    if receiver is None and isinstance(node, ast.Call):
-        single_key = _method_receiver(node, _ENVIRONMENT_SINGLE_KEY_METHODS)
-        if single_key is not None and (
-            node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-        ):
-            receiver = single_key
     return receiver
+
+
+def _is_main_guard(test: ast.expr) -> bool:
+    """Return whether ``test`` is ``__name__ == "__main__"``, either way round."""
+    if not (
+        isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq)
+    ):
+        return False
+    sides = (test.left, test.comparators[0])
+    return any(isinstance(side, ast.Name) and side.id == "__name__" for side in sides) and any(
+        isinstance(side, ast.Constant) and side.value == "__main__" for side in sides
+    )
+
+
+def _reads_names_dynamically(node: ast.AST, aliases: dict[str, str]) -> bool:
+    """Return whether ``node`` can read a variable by a name only known at run time.
+
+    Any reference counts, not only a call, so ``namespace = locals`` is caught too.
+    """
+    if isinstance(node, ast.Attribute):
+        if node.attr in _DYNAMIC_NAMESPACE_ATTRIBUTES:
+            return True
+        # Two parts at most (``sys.modules``, ``builtins.locals``) keeps this linear.
+        if not isinstance(node.value, ast.Name):
+            return False
+        name = apply_import_aliases(f"{node.value.id}.{node.attr}", aliases)
+    elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+        name = apply_import_aliases(node.id, aliases)
+    else:
+        return False
+    return name in _DYNAMIC_NAMESPACE_NAMES
+
+
+class _FileBindings:
+    """How one file binds its names: by import or otherwise, and what it patches.
+
+    The flow pass sees one file, and call names are matched by spelling, so a
+    launcher or a ``__main__`` guard is only trusted when nothing in the file can
+    have replaced it.
+    """
+
+    def __init__(self, tree: ast.AST, aliases: dict[str, str]) -> None:
+        # Local name to the absolute import paths bound to it. ``""`` marks a
+        # relative import, which may load a file the skill ships.
+        self._imports: dict[str, set[str]] = {}
+        # Names bound other than by an import, anywhere in the file.
+        self._rebound: set[str] = set()
+        # Top-level modules with an attribute written from this file.
+        self._patched: set[str] = set()
+        # A star import or a write to ``sys.modules`` can replace any import.
+        self._imports_replaceable = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    # ``import a.b`` binds ``a``; ``import a.b as c`` binds ``c`` to ``a.b``.
+                    root = alias.name.partition(".")[0]
+                    local, path = (alias.asname, alias.name) if alias.asname else (root, root)
+                    self._imports.setdefault(local, set()).add(path)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "*":
+                        self._imports_replaceable = True
+                        continue
+                    path = f"{node.module}.{alias.name}" if node.module and not node.level else ""
+                    self._imports.setdefault(alias.asname or alias.name, set()).add(path)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                self._rebound.add(node.name)
+            elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+                self._rebound.add(node.id)
+            elif isinstance(node, ast.arg):
+                self._rebound.add(node.arg)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                self._rebound.update(node.names)
+            elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+                self._rebound.add(node.name)
+            elif isinstance(node, ast.MatchMapping) and node.rest:
+                self._rebound.add(node.rest)
+            else:
+                self._record_patch(node, aliases)
+
+    def _record_patch(self, node: ast.AST, aliases: dict[str, str]) -> None:
+        """Note a module whose attributes ``node`` may replace."""
+        written: ast.expr | None = None
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and not isinstance(node.ctx, ast.Load):
+            written = node.value if isinstance(node, ast.Subscript) else node
+        elif (
+            isinstance(node, ast.Attribute)
+            and node.attr == "__dict__"
+            and isinstance(node.value, ast.Name)
+        ):
+            written = node.value
+        elif isinstance(node, ast.Call) and node.args:
+            call_name = resolve_call_name(node, aliases)
+            if call_name in _ATTRIBUTE_WRITE_CALLS:
+                written = node.args[0]
+            elif call_name is not None and call_name.startswith("sys.modules."):
+                if call_name.rpartition(".")[2] in _MODULE_TABLE_WRITE_METHODS:
+                    written = node.func
+        if written is None:
+            return
+        name = _resolve_expression_name(written, aliases)
+        if name is None:
+            return
+        if name == "sys.modules" or name.startswith("sys.modules."):
+            self._imports_replaceable = True
+        self._patched.add(name.partition(".")[0])
+
+    def launchers(self) -> set[str]:
+        """Local names a child-process launcher can be called through.
+
+        Each one is bound only by absolute imports of one path in a launcher
+        module, and nothing in the file writes to that module.
+        """
+        if self._imports_replaceable:
+            return set()
+        trusted: set[str] = set()
+        for name, paths in self._imports.items():
+            if name in self._rebound or len(paths) != 1:
+                continue
+            module = next(iter(paths)).partition(".")[0]
+            if module in _LAUNCHER_MODULES and module not in self._patched:
+                trusted.add(name)
+        return trusted
+
+    def main_guard_holds(self) -> bool:
+        """Whether ``__name__`` keeps its import-time value in this file."""
+        return (
+            not self._imports_replaceable
+            and "__name__" not in self._rebound
+            and "__name__" not in self._imports
+        )
 
 
 @dataclass
@@ -513,6 +645,13 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
     ``env=`` argument or an in-place edit of the mapping; any other use keeps the
     finding.
 
+    The pass sees one file, so a binding only passes through by name where no
+    other file can reach it: a function local, or a module global bound in a
+    top-level ``if __name__ == "__main__":`` body, which importers never run. A
+    launcher only counts when its root name is bound solely by an absolute import
+    from ``subprocess`` or ``asyncio`` and nothing in the file writes to that
+    module, so a local ``def run`` or ``class subprocess`` gets no exemption.
+
     Control flow errs toward keeping the finding. A rebinding closes only the
     bindings made in its own block or in blocks nested inside it, so one inside an
     ``if``, ``try``, ``with``, ``match`` or loop body leaves the outer binding open
@@ -521,8 +660,9 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
     ``except``, ``with`` and loop bodies), or as a walrus, which can sit in a
     short-circuit. A loop body may run again, so a read anywhere in a loop counts
     against every binding made in that loop. A walrus result, a class attribute
-    and any name in a file that reads names dynamically (``globals()``,
-    ``eval``) keep the finding, as does a name with too many live bindings.
+    and any name in a file that can read names dynamically (``globals``,
+    ``eval``, frame locals, ``__globals__``, ``sys.modules``) keep the finding,
+    as does a name with too many live bindings.
 
     A function or lambda body runs at some later time, so its reads of an
     enclosing name count against every binding of that name that is open when the
@@ -535,18 +675,34 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
         self._env_arguments: set[int] = set()
         self._mutated_names: set[int] = set()
         self._dynamic_reads = False
+        bindings = _FileBindings(tree, aliases)
+        launchers = bindings.launchers()
+        # Importers never run a top-level ``if __name__ == "__main__":`` body.
+        self._main_guards: set[int] = set()
+        if isinstance(tree, ast.Module) and bindings.main_guard_holds():
+            self._main_guards = {
+                id(statement)
+                for statement in tree.body
+                if isinstance(statement, ast.If) and _is_main_guard(statement.test)
+            }
+        self._in_main_guard = False
         for node in ast.walk(tree):
+            if _reads_names_dynamically(node, aliases):
+                self._dynamic_reads = True
             receiver = _edit_receiver(node)
             if receiver is not None:
                 self._mutated_names.add(id(receiver))
             elif isinstance(node, ast.Call):
                 call_name = resolve_call_name(node, aliases)
-                if call_name in _CHILD_PROCESS_ENV_CALLS:
+                spelling = resolve_dotted_name(node.func)
+                if (
+                    call_name in _CHILD_PROCESS_ENV_CALLS
+                    and spelling is not None
+                    and spelling.partition(".")[0] in launchers
+                ):
                     self._env_arguments.update(
                         id(keyword.value) for keyword in node.keywords if keyword.arg == "env"
                     )
-                elif call_name in _DYNAMIC_NAMESPACE_CALLS:
-                    self._dynamic_reads = True
             elif (
                 isinstance(node, ast.Subscript)
                 and isinstance(node.ctx, (ast.Store, ast.Del))
@@ -619,9 +775,15 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
             self._close(scope, name, self._block)
         if value_id is None:
             return
-        # A walrus also hands the value to the enclosing expression, and a class
-        # attribute outlives the class body.
-        escaped = walrus or scope.is_class or name in scope.read_later
+        # A walrus also hands the value to the enclosing expression, a class
+        # attribute outlives the class body, and another file can import a module
+        # global this pass never sees.
+        escaped = (
+            walrus
+            or scope.is_class
+            or name in scope.read_later
+            or (scope is self._scopes[0] and not self._in_main_guard)
+        )
         binding = _EnvironmentBinding(value_id, self._block, escaped=escaped)
         bindings = scope.open.setdefault(name, [])
         bindings.append(binding)
@@ -775,6 +937,16 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
         self.visit_For(node)
+
+    def visit_If(self, node: ast.If) -> None:
+        if id(node) not in self._main_guards:
+            self.generic_visit(node)
+            return
+        self.visit(node.test)
+        self._in_main_guard = True
+        self._visit_block(node.body)
+        self._in_main_guard = False
+        self._visit_block(node.orelse)
 
     def visit_While(self, node: ast.While) -> None:
         # The test runs again before every pass.
