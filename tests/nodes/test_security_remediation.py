@@ -1290,8 +1290,8 @@ def test_reference_cannot_reintroduce_artifact_omitted_by_discovery(
     assert "z.txt" not in result["components"]
     assert "z.txt" not in result["raw_file_cache"]
     reference = next(item for item in result["artifact_references"] if item["status"] != "rejected")
-    assert reference["status"] == "missing"
-    assert reference["target_path"] is None
+    assert reference["status"] == "uninspected"
+    assert reference["target_path"] == "z.txt"
 
 
 def test_bundle_traversal_depth_limit_records_affected_scope(
