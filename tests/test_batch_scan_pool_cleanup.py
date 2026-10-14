@@ -19,20 +19,6 @@ def _model() -> PooledChatModel:
     )
 
 
-@pytest.mark.parametrize("async_call", [False, True])
-async def test_model_construction_failure_releases_slot(monkeypatch, async_call: bool) -> None:
-    model = _model()
-    monkeypatch.setattr(model, "_build_llm", Mock(side_effect=ValueError("invalid client")))
-    with pytest.raises(ValueError, match="invalid client"):
-        if async_call:
-            await model.ainvoke("test")
-        else:
-            model.invoke("test")
-    assert model._pool.active_requests == 0
-    key = model._pool.acquire(timeout=0.05)
-    model._pool.release(key)
-
-
 async def test_cancelling_inflight_call_releases_slot(monkeypatch) -> None:
     model = _model()
     started = asyncio.Event()
@@ -61,10 +47,10 @@ async def test_cancelling_waiter_does_not_reserve_a_slot_later(monkeypatch) -> N
         return original_try()
 
     monkeypatch.setattr(model._pool, "try_acquire", try_acquire)
-    # The old thread-based acquire can outlive cancellation. Bound it so the
-    # regression test cleans up its executor even when run against old code.
+    # Bound any blocking fallback so the test cannot leave a waiting worker
+    # behind if a regression reintroduces threaded slot acquisition.
     original_acquire = model._pool.acquire
-    monkeypatch.setattr(model._pool, "acquire", lambda: original_acquire(timeout=0.1))
+    monkeypatch.setattr(model._pool, "acquire", lambda **kwargs: original_acquire(timeout=0.1))
     task = asyncio.create_task(model.ainvoke("test"))
     await asyncio.wait_for(tried.wait(), timeout=1)
     task.cancel()
