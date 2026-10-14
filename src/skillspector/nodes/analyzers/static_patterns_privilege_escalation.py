@@ -380,6 +380,11 @@ _PE3_IGNORE_PATTERN_FILE_NAMES = frozenset(
 # exemption still needs a line that is one pattern token, not a negation, and
 # not a host path.  Prose or commands in such a file keep their PE3 findings.
 _PE3_IGNORE_PATTERN_FILE_SUFFIX = ".dockerignore"
+# Markdown fence info strings that label a code block as an ignore-file body
+# (GitHub Linguist's "Ignore List" aliases plus ``dockerignore``).  A block such
+# as ```gitignore shows the lines to put in that file, so each line gets the
+# same per-line rules as a real ignore file.
+_PE3_IGNORE_LIST_FENCE_LANGUAGES = frozenset({"gitignore", "git-ignore", "ignore", "dockerignore"})
 # One ignore-file entry: a single pattern token, optionally padded by spaces or
 # tabs.  The token cannot open as a comment (``#``) or a negation (``!``), and
 # cannot contain whitespace, quotes, ``$`` or shell control characters.
@@ -534,6 +539,38 @@ def _markdown_fence_ranges(content: str) -> list[tuple[int, int]]:
                 active = (marker[0], len(marker), offset + len(line))
         offset += len(line)
     if active is not None:
+        ranges.append((active[2], len(content)))
+    return ranges
+
+
+def _markdown_ignore_list_fence_ranges(content: str) -> list[tuple[int, int]]:
+    """Return body ranges of fenced blocks whose language is an ignore list.
+
+    Only the first word of the info string counts, case-insensitively, so
+    ```gitignore and ```GitIgnore title="x" qualify while ```bash does not.
+    An unclosed fence runs to the end of the content, as in
+    :func:`_markdown_fence_ranges`.
+    """
+    ranges: list[tuple[int, int]] = []
+    active: tuple[str, int, int, bool] | None = None
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        stripped = line.rstrip(LINE_BREAK_CHARS)
+        closing = MARKDOWN_FENCE_CLOSE.fullmatch(stripped)
+        if active is not None:
+            if closing and closing.group(1)[0] == active[0] and len(closing.group(1)) >= active[1]:
+                if active[3]:
+                    ranges.append((active[2], offset))
+                active = None
+        else:
+            opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped)
+            if opening:
+                marker = opening.group(1)
+                info = stripped[opening.end(1) :].split()
+                is_ignore_list = bool(info) and info[0].lower() in _PE3_IGNORE_LIST_FENCE_LANGUAGES
+                active = (marker[0], len(marker), offset + len(line), is_ignore_list)
+        offset += len(line)
+    if active is not None and active[3]:
         ranges.append((active[2], len(content)))
     return ranges
 
@@ -1025,6 +1062,9 @@ def analyze(
     fence_ranges = _markdown_fence_ranges(content) if file_type in {"markdown", "text"} else None
     reference_material = is_reference_material(file_path, file_type)
     ignore_pattern_file = _is_ignore_pattern_file(file_path)
+    ignore_list_fences = (
+        _markdown_ignore_list_fence_ranges(content) if file_type in {"markdown", "text"} else []
+    )
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
@@ -1100,7 +1140,10 @@ def analyze(
                 content, match, file_type, fence_ranges, line_starts, line_ends
             ):
                 continue
-            if ignore_pattern_file and _is_ignore_file_exclusion_entry(content, match):
+            in_ignore_list = ignore_pattern_file or any(
+                start <= match.start() < end for start, end in ignore_list_fences
+            )
+            if in_ignore_list and _is_ignore_file_exclusion_entry(content, match):
                 continue
             if _is_credential_type_disclosure_label(
                 content, match, file_type, line_starts, line_ends
