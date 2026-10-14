@@ -37,7 +37,7 @@ make install-dev
   - **`SKILLSPECTOR_PROVIDER`**: Selects the active LLM provider — `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `gemini_cli`, or `opencode_cli`. Defaults to `nv_build` when unset.
   - **Provider credential**: depends on the active provider. Hosted providers use the matching variables in [.env.example](../.env.example); Ollama and CLI providers do not require an API key. See [providers/](../src/skillspector/providers/).
   - **`OPENAI_BASE_URL`**: Override the OpenAI endpoint (e.g. point at Ollama).
-  - **`SKILLSPECTOR_MODEL`**: Override default model; see [constants.py](../src/skillspector/constants.py).
+  - **`SKILLSPECTOR_MODEL`**: Override default model; see [constants.py](../src/skillspector/constants.py). OpenAI retains `gpt-5.4`; Anthropic retains `claude-opus-4-6` with `claude-sonnet-4-6` for `meta_analyzer`. Sol and Claude 5.5 remain opt-in pending the [live scanner acceptance described in the README](../README.md#llm-analysis).
   - **`SKILLSPECTOR_TEMPERATURE`**: Optional hosted-provider sampling temperature from `0` to `1`. `gpt-6.1-sol` rejects every explicit value. `claude-opus-5-5` and `claude-sonnet-5-5` accept only `1.0` on the native Anthropic endpoint; other routes reject every explicit value. Unsupported settings on active LLM slots stop the scan before analysis. Static scans skip provider initialization and control validation.
   - **`SKILLSPECTOR_SEED`**: Optional integer seed for OpenAI-compatible and Azure OpenAI providers.
 

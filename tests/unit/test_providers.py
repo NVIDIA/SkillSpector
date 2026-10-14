@@ -366,9 +366,9 @@ class TestOpenAIProvider:
 
     def test_default_model(self) -> None:
         provider = OpenAIProvider()
-        assert provider.resolve_model() == "gpt-6.1-sol"
-        # All slots inherit DEFAULT_MODEL — gpt-6.1-sol everywhere.
-        assert provider.resolve_model("meta_analyzer") == "gpt-6.1-sol"
+        assert provider.resolve_model() == "gpt-5.4"
+        # All slots retain the previous default until live scanner acceptance.
+        assert provider.resolve_model("meta_analyzer") == "gpt-5.4"
         assert provider.get_context_length(provider.DEFAULT_MODEL) == 1_050_000
         assert provider.get_max_output_tokens(provider.DEFAULT_MODEL) == 128_000
 
@@ -637,8 +637,8 @@ class TestAnthropicProvider:
         assert AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123) is None
 
     def test_default_model_and_meta_downgrade(self) -> None:
-        assert AnthropicProvider().resolve_model() == "claude-opus-5-5"
-        assert AnthropicProvider().resolve_model("meta_analyzer") == "claude-sonnet-5-5"
+        assert AnthropicProvider().resolve_model() == "claude-opus-4-6"
+        assert AnthropicProvider().resolve_model("meta_analyzer") == "claude-sonnet-4-6"
 
     def test_metadata_known_models(self) -> None:
         provider = AnthropicProvider()

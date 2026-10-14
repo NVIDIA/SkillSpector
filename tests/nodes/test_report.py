@@ -2649,3 +2649,53 @@ def test_report_active_findings_are_sanitized_and_exclude_suppressed() -> None:
     assert result["active_findings"][0].finding_id == kept.finding_id
     assert result["active_findings"][0].message == "destructive command"
     assert kept.message == "destructive\x1b[31m command"
+
+
+@pytest.mark.parametrize("reason", [None, "SKILLSPECTOR_TEMPERATURE is unsupported; unset it"])
+def test_report_retains_preflight_reason_without_reprobing(
+    monkeypatch: pytest.MonkeyPatch, reason: str | None
+) -> None:
+    """A captured unavailable result remains authoritative if provider context changes."""
+
+    def unexpected_probe(**_: object) -> tuple[bool, str | None]:
+        raise AssertionError("preflight-disabled reports must not probe the provider again")
+
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", unexpected_probe)
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "output_format": "json",
+        "use_llm": False,
+        "llm_requested": True,
+        "llm_preflight_error": reason,
+    }
+
+    metadata = json.loads(report(state)["report_body"])["metadata"]
+
+    assert "unavailable during preflight" in metadata["llm_error"]
+    assert "static analysis only" in metadata["llm_error"]
+    if reason:
+        assert reason in metadata["llm_error"]
+    assert metadata["llm_available"] is False
+
+
+def test_report_active_runtime_error_takes_priority_over_stale_preflight_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An executing scan reports the current call failure rather than old configuration detail."""
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "output_format": "json",
+        "use_llm": True,
+        "llm_requested": True,
+        "llm_preflight_error": "stale preflight reason",
+        "llm_call_log": [
+            {"node": "meta_analyzer", "ok": False, "error": "active provider runtime failure"}
+        ],
+    }
+
+    metadata = json.loads(report(state)["report_body"])["metadata"]
+
+    assert "active provider runtime failure" in metadata["llm_error"]
+    assert "stale preflight reason" not in metadata["llm_error"]
+    assert metadata["llm_degraded"] is True

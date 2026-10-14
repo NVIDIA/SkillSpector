@@ -38,7 +38,7 @@ from rich.text import Text
 
 from skillspector import __version__ as skillspector_version
 from skillspector.dependency_sources import redact_text
-from skillspector.inference_usage import sanitize_inference_usage
+from skillspector.inference_usage import looks_like_credential, sanitize_inference_usage
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
     RULE_SET_SCOPE,
@@ -137,6 +137,18 @@ def _clean_text(value: str | None) -> str | None:
     if not isinstance(value, str):
         return value
     return _CONTROL_RE.sub("", _ANSI_RE.sub("", value))
+
+
+def redact_llm_error(value: object) -> str | None:
+    """Keep actionable provider error text without report-visible credentials."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    cleaned = redact_text(_clean_text(value) or "")
+    return re.sub(
+        r"(?i)(?:(?:authorization\s*:\s*)?(?:bearer|basic)\s+)?[A-Za-z0-9_+/.-]+={0,2}",
+        lambda match: "***" if looks_like_credential(match.group(0)) else match.group(0),
+        cleaned,
+    )
 
 
 def _sanitize_finding(finding: Finding) -> Finding:
@@ -1302,6 +1314,7 @@ def _build_metadata(
         if use_llm
         else (False, None)
     )
+    llm_error = redact_llm_error(llm_error)
     attempted, succeeded, call_log_degraded = _llm_runtime_status(use_llm, llm_call_log)
     # meta_analyzer's own record, independent of whether a DIFFERENT
     # LLM-backed node (a semantic_* analyzer) lost coverage to a dropped
@@ -1376,9 +1389,10 @@ def _build_metadata(
         meta["llm_calls_attempted"] = attempted
         meta["llm_calls_succeeded"] = succeeded
     if unavailable_before_execution:
+        detail = f" Reason: {llm_error}" if llm_error else ""
         meta["llm_error"] = (
             "LLM analysis was requested but unavailable during preflight; "
-            "results reflect static analysis only."
+            f"results reflect static analysis only.{detail}"
         )
     elif call_log_degraded:
         meta["llm_degraded"] = True
@@ -1814,6 +1828,9 @@ def report(state: SkillspectorState) -> dict[str, object]:
     remaining = transitive_remaining_seconds(state)
     if not llm_requested:
         provider_available, provider_error = False, None
+    elif not use_llm and "llm_preflight_error" in state:
+        provider_available = False
+        provider_error = redact_llm_error(state.get("llm_preflight_error"))
     elif remaining is not None and remaining <= 0:
         provider_available = any(successful_llm_record(record) for record in llm_call_log)
         provider_error = (

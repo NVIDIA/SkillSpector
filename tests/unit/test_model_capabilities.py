@@ -547,7 +547,7 @@ class TestAzureOpenAIControls:
         assert chat_model_requested_controls(llm)["temperature"] == 0.2
 
 
-_DEFAULT_PROVIDER_ENV = pytest.mark.parametrize(
+_OPT_IN_MODEL_ENV = pytest.mark.parametrize(
     ("provider", "credential", "model"),
     [
         ("openai", "OPENAI_API_KEY", "gpt-6.1-sol"),
@@ -559,7 +559,7 @@ _DEFAULT_PROVIDER_ENV = pytest.mark.parametrize(
 class TestScanPreflightControls:
     """A rejected control stops the scan before analysis and names the setting."""
 
-    @_DEFAULT_PROVIDER_ENV
+    @_OPT_IN_MODEL_ENV
     def test_scan_exits_before_analysis_with_the_reason(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -571,6 +571,7 @@ class TestScanPreflightControls:
         (tmp_path / "SKILL.md").write_text("---\nname: demo\n---\nHello.\n", encoding="utf-8")
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", provider)
         monkeypatch.setenv(credential, "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", model)
         monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
 
         with patch("skillspector.cli.graph.invoke") as invoke:
@@ -580,12 +581,13 @@ class TestScanPreflightControls:
         assert f"SKILLSPECTOR_TEMPERATURE is not supported by {model}" in result.output
         invoke.assert_not_called()
 
-    @_DEFAULT_PROVIDER_ENV
+    @_OPT_IN_MODEL_ENV
     def test_preflight_reports_the_reason_as_llm_error(
         self, monkeypatch: pytest.MonkeyPatch, provider: str, credential: str, model: str
     ) -> None:
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", provider)
         monkeypatch.setenv(credential, "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", model)
         monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
 
         available, error = is_llm_available()
@@ -690,6 +692,7 @@ class TestScanPreflightControls:
         (tmp_path / "SKILL.md").write_text("---\nname: demo\n---\nHello.\n", encoding="utf-8")
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "gpt-6.1-sol")
         monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
 
         with patch("skillspector.cli.unsupported_control_error") as check:
