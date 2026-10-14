@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from markdown_it import MarkdownIt
 
 from skillspector.graph import graph
 from skillspector.mcp_server import run_scan
@@ -141,6 +142,8 @@ def _assert_report(body: str, output_format: str, count: int) -> None:
             item["properties"].get("reasonCode") == "opaque_content" for item in notifications
         )
     else:
+        if output_format == "markdown":
+            body = MarkdownIt().enable("table").render(body)
         assert "CAUTION" in body
         assert "Inspection Completeness" in body
         assert "partial" in body

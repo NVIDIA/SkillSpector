@@ -330,7 +330,7 @@ fi
 |---------|-----|
 | "No LLM API key configured" | Set up `.env` or use `--no-llm` |
 | Connection errors / 429 | Reduce `--workers` |
-| Skills timing out (90s) | Check network; the scanner skips and continues |
+| Skills timing out (90s of scanning) | Check network and API-pool capacity; the saved report retains an ERROR entry and other skills continue. Worker startup has its own 90s bound. |
 | "Event loop is closed" | Harmless, suppressed |
 | model_info token limit warning | Harmless, 128K default used |
 
@@ -341,10 +341,11 @@ fi
    classified as English and lose gap-fill coverage.
 3. **No SARIF output.**  Upstream supports it; this contrib adds terminal/JSON/Markdown.
 4. **Gap-fill quality not benchmarked for non-English.**  No ground-truth comparison exists.
-5. **`parse_response` JSON recovery is best-effort.**  When the LLM returns
-   malformed JSON, the analyzer returns empty findings (no crash).  This is a
-   graceful-degradation choice: a single malformed response won't block the
-   pipeline, but the user won't know which findings were lost.
+5. **Malformed provider responses reduce coverage.** Compatibility-mode discovery
+   and meta responses are retried up to four attempts, then recorded as
+   `llm_structured_response_invalid` and counted as incomplete. Valid findings
+   from completed batches are kept. Gap-fill parsing still drops malformed
+   responses until the separate gap-fill failure fix is included.
 
 See `DESIGN.md` for architecture details and `docs/archive/FUTURE_WORK.md` for suggested directions.
 

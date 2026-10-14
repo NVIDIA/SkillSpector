@@ -38,18 +38,12 @@ REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 class NvBuildProvider:
     """build.nvidia.com credentials + bundled-YAML metadata provider."""
 
-    # General default.  The previous defaults (deepseek-v4-flash and, for the
-    # meta_analyzer slot, deepseek-v4-pro) are no longer served: the former
-    # returns 410 Gone (end of life 2026-08-07) and neither appears in
-    # GET /v1/models, so the out-of-the-box path failed every call.
-    #
-    # The replacement is chosen for DETECTION, not latency.  On a bait skill
-    # carrying prose-disguised credential exfiltration, the fast served model
-    # (deepseek-v4-flash-0731, ~1.6 s/call) completed every call, reported no
-    # degradation, and returned a clean verdict — a confident false negative,
-    # which on a security scanner is the worst possible failure.  glm-5.2 costs
-    # ~16 s/call and flags it CRITICAL.
-    DEFAULT_MODEL = "z-ai/glm-5.2"
+    # GLM-5.2 is retired on the hosted endpoint (HTTP 410).
+    # Choose defaults for detection, not latency alone: a faster replacement
+    # previously missed the credential-disclosure control. GLM-5.3 detected
+    # SSD-3 on that control; the prompt-injection control remains unverified
+    # because its hosted requests timed out. Recheck both before replacing it.
+    DEFAULT_MODEL = "z-ai/glm-5.3"
     SLOT_DEFAULTS: dict[str, str] = {}
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
@@ -72,6 +66,9 @@ class NvBuildProvider:
             credentials=self.resolve_credentials(),
             max_tokens=max_tokens,
             timeout=timeout,
+            # GLM-5.3 otherwise defaults to maximum reasoning effort.
+            # https://build.nvidia.com/z-ai/glm-5-3/modelcard
+            default_reasoning_effort="high" if model == "z-ai/glm-5.3" else None,
         )
 
     def get_context_length(self, model: str) -> int | None:

@@ -19,6 +19,7 @@ import json
 from dataclasses import replace
 
 import pytest
+from markdown_it import MarkdownIt
 
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.llm_analyzer_base import Batch
@@ -85,6 +86,8 @@ def _assert_report_guidance(finding, output_format):
         assert properties["explanation"] == finding.explanation
         assert properties["remediation"] == finding.remediation
     else:
+        if output_format == "markdown":
+            body = MarkdownIt().render(body)
         assert finding.remediation in body
 
 

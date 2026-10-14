@@ -47,25 +47,94 @@ export function truncate(text: string, max: number): string {
 export function redact(text: string, env: Env = process.env): string {
   const credentialValues = [...new Set(
     CREDENTIAL_ENV_NAMES.map((name) => env[name]?.trim()).filter(
-      (value): value is string => Boolean(value && value.length >= 4),
+      (value): value is string => Boolean(value),
     ),
   )].sort((left, right) => right.length - left.length)
-  const credentialPattern = credentialValues.length
-    ? new RegExp(
-        credentialValues
-          .map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-          .join("|"),
-        "g",
-      )
+  const valuePatterns = credentialValues.map((value) => {
+    const literal = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    // Short values are usually local-provider placeholders. Treat them as
+    // tokens so they cannot change words, JSON fields, or longer credentials.
+    return value.length < 4 ? `(?<![A-Za-z0-9_-])${literal}(?![A-Za-z0-9_-])` : literal
+  })
+  // Look ahead so overlapping configured values are all covered. Matching
+  // still advances through the original text, never through replacement markers.
+  const credentialPattern = valuePatterns.length
+    ? new RegExp(`(?=(${valuePatterns.join("|")}))`, "g")
     : undefined
-  const redacted = credentialPattern ? text.replace(credentialPattern, "[REDACTED]") : text
-  return redacted
-    .replace(/sk-ant-[A-Za-z0-9_-]+/g, "[REDACTED]")
-    .replace(/\bsk-[A-Za-z0-9_-]{6,}\b/g, "[REDACTED]")
-    .replace(
-      /\b([A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|ACCESS_KEY_ID|SECRET_ACCESS_KEY|INFERENCE_KEY))(\s*[:=]\s*["']?)[^"'\s,}]+/g,
-      "$1$2[REDACTED]",
-    )
+  // A full configured credential can act as the separator before another key.
+  // Match on the original text so overlapping values never split that key.
+  // Short values cannot end here unless their existing token boundary allows it.
+  const longValues = valuePatterns.filter((_, index) => credentialValues[index].length >= 4)
+  const keyBoundary = longValues.length ? `(?:\\b|(?<=${longValues.join("|")}))` : "\\b"
+  const keyPattern = new RegExp([
+    "sk-ant-[A-Za-z0-9_-]+",
+    `${keyBoundary}sk-[A-Za-z0-9_-]{6,}\\b`,
+    // Consume each uppercase name once, even when it is not an assignment.
+    // Otherwise a known value like AAAA permits a costly retry at every A.
+    `${keyBoundary}([A-Z][A-Z0-9_]*)`,
+  ].join("|"), "g")
+  const assignmentName = /[A-Z0-9_](?:API_KEY|TOKEN|ACCESS_KEY_ID|SECRET_ACCESS_KEY|INFERENCE_KEY)$/
+  const assignmentValue = /(\s*[:=]\s*["']?)[^"'\s,}]+/y
+  const scrub = (value: string): string => {
+    function* spans(pattern: RegExp | undefined, literal: boolean): Generator<[number, number]> {
+      if (!pattern) return
+      for (const match of value.matchAll(pattern)) {
+        if (!literal && match[1]) {
+          if (!assignmentName.test(match[1])) continue
+          assignmentValue.lastIndex = match.index + match[0].length
+          const assigned = assignmentValue.exec(value)
+          if (assigned) {
+            yield [assigned.index + assigned[1].length, assigned.index + assigned[0].length]
+          }
+        } else {
+          yield [match.index, match.index + (literal ? match[1].length : match[0].length)]
+        }
+      }
+    }
+    const known = spans(credentialPattern, true)
+    const shaped = spans(keyPattern, false)
+    let nextKnown = known.next().value
+    let nextShaped = shaped.next().value
+    let cursor = 0
+    let start = -1
+    let end = -1
+    const parts: string[] = []
+    // Merge two ordered span streams in linear time. A shorter key/assignment
+    // match cannot expose the tail of a longer configured credential.
+    while (nextKnown || nextShaped) {
+      let span: [number, number]
+      if (nextKnown && (!nextShaped || nextKnown[0] <= nextShaped[0])) {
+        span = nextKnown
+        nextKnown = known.next().value
+      } else {
+        span = nextShaped!
+        nextShaped = shaped.next().value
+      }
+      if (span[0] > end) {
+        if (start >= 0) {
+          parts.push(value.slice(cursor, start), "[REDACTED]")
+          cursor = end
+        }
+        start = span[0]
+      }
+      end = Math.max(end, span[1])
+    }
+    if (start >= 0) {
+      parts.push(value.slice(cursor, start), "[REDACTED]")
+      cursor = end
+    }
+    parts.push(value.slice(cursor))
+    return parts.join("")
+  }
+  try {
+    const report = JSON.parse(text)
+    if (report === null || typeof report !== "object") return scrub(text)
+    // Preserve JSON numbers and booleans, including a score equal to a short
+    // placeholder. Credentials inside JSON strings still receive full scrubbing.
+    return text.replace(/"(?:[^"\\]|\\.)*"/g, (token) => JSON.stringify(scrub(JSON.parse(token))))
+  } catch {
+    return scrub(text)
+  }
 }
 
 export function isScpGitTarget(target: string): boolean {

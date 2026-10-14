@@ -31,6 +31,7 @@ from collections.abc import Mapping
 from ipaddress import ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from skillspector import __version__
 from skillspector.cleanup import TempDirTracker, cleanup_result
@@ -41,6 +42,7 @@ from skillspector.inspection_ledger import LedgerReason
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.nodes.analyzers import ANALYZER_MODULES
+from skillspector.nodes.report import redact_llm_error
 from skillspector.semantic_runtime import llm_runtime_available, semantic_runtime_accounting
 from skillspector.suppression import effective_findings
 
@@ -116,7 +118,7 @@ async def run_scan(
             :data:`VALID_FORMATS`.
         allow_local_targets: Whether local filesystem targets are allowed.
             HTTP MCP calls set this to ``False`` so routable servers do not
-            accept caller-controlled local paths.
+            accept caller-controlled local paths or use ambient Git credentials.
         yara_rules_dir: Optional directory of additional YARA rules.
 
     Returns:
@@ -133,16 +135,26 @@ async def run_scan(
         local_yara_rules = yara_rules_dir is not None and _is_local_target(yara_rules_dir)
         if local_target or local_yara_rules:
             raise ValueError("local targets are disabled for this MCP transport")
+        parsed_target = urlparse(target.strip())
+        if (
+            parsed_target.scheme != "https"
+            or parsed_target.username is not None
+            or parsed_target.password is not None
+        ):
+            raise ValueError("this MCP transport requires an unauthenticated HTTPS target")
 
-    llm_preflight_available, _ = is_llm_available()
+    llm_preflight_available, llm_preflight_error = is_llm_available() if use_llm else (False, None)
     llm_enabled = use_llm and llm_preflight_available
 
     state: dict[str, Any] = {
         "input_path": target,
+        "allow_git_credentials": allow_local_targets,
         "output_format": output_format,
         "use_llm": llm_enabled,
         "llm_requested": use_llm,
     }
+    if use_llm and not llm_preflight_available:
+        state["llm_preflight_error"] = redact_llm_error(llm_preflight_error)
     if yara_rules_dir:
         state["yara_rules_dir"] = yara_rules_dir
 

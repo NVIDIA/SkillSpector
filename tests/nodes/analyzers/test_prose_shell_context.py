@@ -135,7 +135,14 @@ def test_list_prose_preserves_unicode_offsets_and_later_findings(
         assert coverage["ledger_exceptions"] == []
         assert report["risk_assessment"]["recommendation"] != "SAFE"
         assert not any(issue["id"] == "AE1" for issue in report["issues"])
-        assert len({issue["finding_id"] for issue in report["issues"] if issue["id"] == "TM1"}) == 1
+        tm1_issues = [issue for issue in report["issues"] if issue["id"] == "TM1"]
+        # Compaction retains one match identity while reports preserve each
+        # occurrence's original identifier and source-specific snippet.
+        assert len(tm1_issues) == 2
+        assert all(issue["match_fingerprint"] for issue in tm1_issues)
+        assert len({issue["match_fingerprint"] for issue in tm1_issues}) == 1
+        assert len({issue["finding_id"] for issue in tm1_issues}) == 2
+        assert len({issue["code_snippet"] for issue in tm1_issues}) == 2
         locations = {
             (location["file"], location["start_line"])
             for issue in report["issues"]

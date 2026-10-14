@@ -33,6 +33,7 @@ from pydantic import SecretStr
 
 import skillspector.providers as providers_module
 import skillspector.providers.anthropic.provider as anthropic_provider_module
+from skillspector.inference_usage import chat_model_controls, chat_model_requested_controls
 from skillspector.providers import (
     NO_LLM_API_KEY_MESSAGE,
     chat_models,
@@ -143,6 +144,7 @@ class TestNvBuildProvider:
     @pytest.mark.parametrize(
         ("model", "context_length"),
         [
+            ("z-ai/glm-5.3", 128_000),
             ("z-ai/glm-5.2", 202_749),
             ("moonshotai/kimi-k2.6", 256_000),
         ],
@@ -161,6 +163,51 @@ class TestNvBuildProvider:
         provider = NvBuildProvider()
         assert provider.get_context_length("z-ai/glm-5.2") == 202_749
         assert provider.get_max_output_tokens("z-ai/glm-5.2") == 32_768
+
+    def test_default_model_keeps_conservative_token_budgets(self) -> None:
+        provider = NvBuildProvider()
+        assert provider.DEFAULT_MODEL == "z-ai/glm-5.3"
+        assert provider.get_context_length(provider.DEFAULT_MODEL) == 128_000
+        assert provider.get_max_output_tokens(provider.DEFAULT_MODEL) == 32_000
+
+    @pytest.mark.parametrize(
+        ("model", "configured_effort", "expected_effort"),
+        [
+            ("z-ai/glm-5.3", None, "high"),
+            ("z-ai/glm-5.3", "   ", "high"),
+            ("z-ai/glm-5.3", " low ", "low"),
+            ("z-ai/glm-5.3", "high", "high"),
+            ("z-ai/glm-5.3", "max", "max"),
+            ("z-ai/glm-5.2", None, None),
+            ("z-ai/glm-5.3-flash", None, None),
+            ("another/model", None, None),
+        ],
+    )
+    def test_reasoning_default_is_model_specific_and_preserves_user_override(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        model: str,
+        configured_effort: str | None,
+        expected_effort: str | None,
+    ) -> None:
+        monkeypatch.setenv("NVIDIA_INFERENCE_KEY", "nvapi-test")
+        if configured_effort is not None:
+            monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", configured_effort)
+        llm = NvBuildProvider().create_chat_model(model, max_tokens=123)
+        assert isinstance(llm, ChatOpenAI)
+        assert llm._get_request_payload("hello").get("reasoning_effort") == expected_effort
+        assert chat_model_controls(llm)["reasoning_effort"] == expected_effort
+        assert chat_model_requested_controls(llm)["reasoning_effort"] == (
+            configured_effort.strip() or None if configured_effort else None
+        )
+
+    def test_glm_reasoning_default_does_not_apply_to_other_providers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        llm = OpenAIProvider().create_chat_model("z-ai/glm-5.3", max_tokens=123)
+        assert isinstance(llm, ChatOpenAI)
+        assert "reasoning_effort" not in llm._get_request_payload("hello")
 
     @pytest.mark.parametrize("model", ["glm-5.2", "z-ai/glm-5.2 "])
     def test_nv_build_model_near_match_stays_unresolved(self, model: str) -> None:
@@ -322,9 +369,12 @@ class TestOpenAIProvider:
         assert llm.default_headers == {"OpenAI-Project": "proj_123"}
 
     def test_default_model(self) -> None:
-        assert OpenAIProvider().resolve_model() == "gpt-5.4"
-        # All slots inherit DEFAULT_MODEL — gpt-5.4 everywhere.
-        assert OpenAIProvider().resolve_model("meta_analyzer") == "gpt-5.4"
+        provider = OpenAIProvider()
+        assert provider.resolve_model() == "gpt-5.4"
+        # All slots retain the previous default until live scanner acceptance.
+        assert provider.resolve_model("meta_analyzer") == "gpt-5.4"
+        assert provider.get_context_length(provider.DEFAULT_MODEL) == 1_050_000
+        assert provider.get_max_output_tokens(provider.DEFAULT_MODEL) == 128_000
 
     def test_metadata_known_model(self) -> None:
         provider = OpenAIProvider()
@@ -453,7 +503,9 @@ class TestModelRegistryFiles:
 class TestAnthropicProvider:
     """Anthropic provider — Claude credentials + bundled YAML metadata."""
 
-    @pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-mythos-5-1"])
+    @pytest.mark.parametrize(
+        "model", ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-mythos-5-1"]
+    )
     def test_structured_output_method_is_json_schema_for_registry_models(self, model: str) -> None:
         assert AnthropicProvider().structured_output_method(model) == "json_schema"
 
@@ -477,7 +529,15 @@ class TestAnthropicProvider:
         assert AnthropicProvider().structured_output_method(model) is None
 
     @pytest.mark.parametrize(
-        "model", ["claude-opus-5", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-4-8"]
+        "model",
+        [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5-1",
+            "claude-opus-4-8",
+        ],
     )
     def test_current_generation_models_carry_token_limits(self, model: str) -> None:
         provider = AnthropicProvider()

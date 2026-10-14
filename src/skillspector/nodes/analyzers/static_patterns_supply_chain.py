@@ -31,6 +31,7 @@ Node and analyze() in one module.
 from __future__ import annotations
 
 import ast
+import base64
 import codecs
 import functools
 import io
@@ -101,6 +102,9 @@ from .static_runner import analyzer_finding_to_finding
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_supply_chain"
+# SC2 literal-XOR decoding and SC3 key on file_type, so Python executed via a
+# shebang (extensionless, .md, ...) must receive "python" rather than its suffix.
+USES_PYTHON_SOURCE_TYPE = True
 
 # Dependency work is supplemental to the canonical text scan and therefore
 # needs its own aggregate ceilings.  These apply across every manifest in a
@@ -262,6 +266,101 @@ def _decoded_literal_xor_calls(content: str) -> list[tuple[int, str]]:
     return decoded
 
 
+_MAX_SHELL_LITERAL_CHARS = 16_384
+# Shell decoders that print a base64, base32 or hex payload. Flag runs stay
+# short and bounded, and the group is atomic, so a flag such as -dddd that
+# parses several ways cannot multiply backtracking.
+_SC3_SHELL_DECODER = (
+    r"(?>\bbase(?:64|32)(?:[ \t]{1,16}--?[A-Za-z][\w=-]{0,20}){0,3}?"
+    r"[ \t]{1,16}(?:--decode|-[A-Za-z]{0,3}d[A-Za-z]{0,3})\b"
+    r"|\bxxd(?:[ \t]{1,16}-[A-Za-z]{1,10}){0,3}?[ \t]{1,16}-(?:r|rp|pr|rps|psr|revert)\b"
+    r"|\bopenssl[ \t]{1,16}(?:base64|enc)(?:[ \t]{1,16}-[A-Za-z0-9-]{1,16}){0,4}?[ \t]{1,16}-d\b)"
+)
+# One pipeline stage. It ends at a pipe, a list operator, a newline, an
+# inline-code backtick or a backslash (so a JSON-escaped \n ends it too), but
+# keeps up to two redirections such as 2>&1 or JSON-escaped quotes. Runs are
+# possessive, so a failed match never backtracks into them.
+_SC3_PIPE_SEGMENT = r"[^|;&\n`\\]{0,256}+(?:(?:&[0-9>-]|\\['\"])[^|;&\n`\\]{0,64}+){0,2}+"
+# A shell reads its program from stdin unless -c or a script operand supplies
+# one. An interpreter counts only without a program argument:
+# `python3 -m json.tool` and `python3 "$dir/render.py"` read data. A sudo
+# option argument cannot start with "-", so each sudo word parses one way.
+_SC3_PIPE_EXECUTOR = (
+    r"\|(?!\|)&?[ \t]{0,16}"
+    r"(?:sudo(?:[ \t]{1,16}+-[A-Za-z]{1,8}+(?:[ \t]{1,16}+[\w.][\w.-]{0,31}+)?){0,4}[ \t]{1,16}+)?"
+    r"(?:(?:/[\w.-]{1,32}){0,4}/)?"
+    r"(?:(?:ba|da|z|k|a)?sh(?![\w.-])"
+    r"(?![ \t]{1,16}(?:-[A-Za-z]{1,8}[ \t]{1,16}){0,3}-[A-Za-z]{0,3}c)"
+    r"(?![ \t]{1,16}(?!-|/dev/stdin\b|[0-9]{0,2}[<>])[^\s|;&)#])"
+    r"|(?:python(?:[23](?:\.[0-9]{1,2})?)?|perl|ruby|node)(?:[ \t]{1,16}-[A-Za-z]{0,4}){0,2}"
+    r"(?=['\"]|[ \t]{0,16}(?:$|[\r;&|)`#]|[0-9]{0,2}>)))"
+)
+# eval, -c and -e run their argument whichever substitution supplies it. A bare
+# shell, interpreter or source runs only content it reads from <(...),
+# < <(...) or a here-string; given "$(...)" it runs a file path. Executor words
+# must start a word, so `deploy.sh "$(...)"` and `--source "$(...)"` do not
+# count. `.` counts only in command position, at a line start or after an
+# operator, a bracket, a backtick or a quote, so `jq . <<< ...` and
+# `tar -C . < <(...)` do not count. A backslash admits JSON-escaped quotes in
+# hook configs.
+_SC3_SUBSTITUTION_EXECUTOR = (
+    r"(?:(?<![\w.-])(?:eval|(?:ba|da|z|k|a)?sh[ \t]{1,16}-[A-Za-z]{0,3}c"
+    r"|python(?:[23](?:\.[0-9]{1,2})?)?[ \t]{1,16}-c|(?:perl|ruby|node)[ \t]{1,16}-e)"
+    r"[ \t]{1,16}\\?[\"']?(?:\$\(|`)"
+    r"|(?:(?<![\w.-])(?:source|(?:ba|da|z|k|a)?sh|python(?:[23](?:\.[0-9]{1,2})?)?|perl|ruby|node)"
+    r"|(?:^|(?<=[;&|(`'\"{]))[ \t]{0,16}\.)"
+    r"(?:[ \t]{1,16}-{1,2}[A-Za-z]{0,16}){0,2}(?:[ \t]{1,16}/dev/stdin)?"
+    r"[ \t]{1,16}(?:<<<[ \t]{0,16}\\?[\"']?(?:\$\(|`)|<(?:[ \t]{0,16}<)?\())"
+)
+# Options and the here-string operator between a decoder and an inline literal.
+_SC3_HERE_STRING = r"(?:[ \t]{1,16}-[A-Za-z0-9-]{1,16}){0,4}[ \t]{0,16}<<<[ \t]{0,16}"
+_SC3_SHELL_LITERAL = (
+    rf"(?P<quote>(?:\\?['\"])?)(?P<literal>[A-Za-z0-9+/=]{{8,{_MAX_SHELL_LITERAL_CHARS}}})"
+)
+_SC3_PIPED_LITERAL = re.compile(
+    r"\b(?:echo(?:[ \t]{1,16}-[neE]{1,3})?"
+    r"|printf(?:[ \t]{1,16}(?P<format_quote>['\"]?)%s(?:\\n)?(?P=format_quote))?)"
+    rf"[ \t]{{1,16}}{_SC3_SHELL_LITERAL}(?P=quote)"
+    rf"[ \t]{{0,16}}\|(?!\|)[ \t]{{0,16}}(?P<decoder>{_SC3_SHELL_DECODER})",
+    re.IGNORECASE,
+)
+_SC3_HERE_STRING_LITERAL = re.compile(
+    rf"(?P<decoder>{_SC3_SHELL_DECODER}){_SC3_HERE_STRING}{_SC3_SHELL_LITERAL}"
+    rf"(?![A-Za-z0-9+/=])(?P=quote)",
+    re.IGNORECASE,
+)
+_SC3_SHELL_DECODE_COMMAND = re.compile(_SC3_SHELL_DECODER, re.IGNORECASE)
+
+
+def _decoded_shell_literal_payloads(content: str) -> list[tuple[int, str]]:
+    """Decode literal payloads fed to a shell decoder.
+
+    Only an inline echo/printf argument or a here-string is decoded, as base64,
+    base32 or (for xxd) hex; an ``openssl enc`` cipher is not applied.
+    Variables, files and downloads stay opaque. Invalid UTF-8 becomes U+FFFD,
+    so a stray byte cannot hide the command. Returns ``(offset, text)`` pairs
+    in source order.
+    """
+    decoded: list[tuple[int, str]] = []
+    for pattern in (_SC3_PIPED_LITERAL, _SC3_HERE_STRING_LITERAL):
+        for match in pattern.finditer(content):
+            literal = match.group("literal")
+            decoder = match.group("decoder").lower()
+            try:
+                if decoder.startswith("xxd"):
+                    # Like xxd -r -p, ignore a trailing odd nibble.
+                    payload = bytes.fromhex(literal[: len(literal) // 2 * 2])
+                elif decoder.startswith("base32"):
+                    payload = base64.b32decode(literal + "=" * (-len(literal) % 8))
+                else:
+                    payload = base64.b64decode(literal + "=" * (-len(literal) % 4), validate=True)
+            except ValueError:
+                continue
+            decoded.append((match.start("literal"), payload.decode("utf-8", errors="replace")))
+    decoded.sort()
+    return decoded
+
+
 SC3_CODE_PATTERNS = [
     (r"exec\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
     (r"eval\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
@@ -284,6 +383,23 @@ SC3_PROSE_PATTERNS = [
     (r"decode\s+(?:this|the)\s+(?:base64|hex)\s+(?:and\s+)?(?:run|execute)", 0.8),
 ]
 SC3_PATTERNS = SC3_CODE_PATTERNS + SC3_PROSE_PATTERNS
+# Shell decode-to-execute chains run on every file type, like SC2, because
+# SKILL.md instructions and hook configs carry shell commands too.
+SC3_SHELL_PATTERNS = [
+    (
+        # A here-string literal can outgrow a pipeline stage, so it is consumed
+        # whole, and possessively, before the first stage.
+        rf"{_SC3_SHELL_DECODER}(?:{_SC3_HERE_STRING}\\?['\"]?"
+        rf"[A-Za-z0-9+/=]{{0,{_MAX_SHELL_LITERAL_CHARS}}}+)?+{_SC3_PIPE_SEGMENT}"
+        rf"(?:\|(?!\|)&?{_SC3_PIPE_SEGMENT}){{0,3}}?{_SC3_PIPE_EXECUTOR}",
+        0.9,
+    ),
+    (
+        rf"{_SC3_SUBSTITUTION_EXECUTOR}[^()`\n]{{0,{_MAX_SHELL_LITERAL_CHARS}}}?"
+        rf"{_SC3_SHELL_DECODER}",
+        0.9,
+    ),
+]
 
 # SC7: Untrusted Container Image — pulling images with signature/registry
 # verification turned off. These flags disable image trust regardless of the
@@ -861,13 +977,34 @@ _DESCRIPTION_ACTIVATION_CONDITION_RE = re.compile(
 )
 
 # Universal-scope signals for description clauses. The scope must be
-# unconditional: a subject qualifier such as "about PostgreSQL" keeps the
-# clause describing a capability, not a catch-all trigger.
+# unconditional: a subject or domain qualifier such as "about PostgreSQL",
+# "with PDF files" or "related to Kubernetes" keeps the clause describing a
+# capability, not a catch-all trigger. Up to three leading determiners,
+# quantifiers or "of" are transparent ("about this codebase", "about any AWS
+# service", "about all the services", "about all of the services" are still
+# bounded by the noun after them). A qualifier whose object is only a pronoun
+# or a generic noun ("anything with it", "anything with anyone", "anything
+# with any of them", "anything related to any topic", "any messages with any
+# content") bounds nothing and stays universal. Broad prepositions ("in",
+# "for", "on") are deliberately not qualifiers: "any message in the chat" is
+# still every message.
+_DESCRIPTION_SCOPE_DETERMINER = (
+    r"(?:the|a|an|this|that|these|those|any|all|every|each|some|"
+    r"my|your|our|their|its|his|her)"
+)
+_DESCRIPTION_UNBOUNDED_OBJECT = (
+    r"(?:it|them|you|me|us|him|her|anything|everything|whatever|something|"
+    r"nothing|anyone|anybody|someone|somebody|everyone|everybody|nobody|"
+    r"topics?|subjects?|things?|content)"
+)
 _DESCRIPTION_UNIVERSAL_SCOPE_RE = re.compile(
     r"\b(?:"
     r"anything|everything|whatever|"
     r"(?:all|any|every)\s+(?:messages?|requests?|questions?|queries?|inputs?|tasks?)"
-    r")\b(?!\s+about\b)",
+    r")\b"
+    r"(?!\s+(?:about|with|involving|regarding|concerning|(?:related|relating)\s+to)\s+"
+    rf"(?:(?:{_DESCRIPTION_SCOPE_DETERMINER}|of)\s+){{0,3}}"
+    rf"(?!(?:{_DESCRIPTION_UNBOUNDED_OBJECT}|{_DESCRIPTION_SCOPE_DETERMINER}|of)\b)[a-z0-9])",
     re.IGNORECASE,
 )
 
@@ -878,21 +1015,44 @@ _DESCRIPTION_UNIVERSAL_SCOPE_RE = re.compile(
 # "CI/CD" must not read as invocation intent for "build".
 _DESCRIPTION_INVOCATION_RE = re.compile(
     r"\b(?:commands?|slash|invoke[sd]?|invoking|intercept(?:s|ed|ing)?|"
-    r"override[sd]?|overriding|shadow(?:s|ed|ing)?)\b|(?<![\w/])/[a-z]",
+    r"override[sd]?|overriding|overridden|shadow(?:s|ed|ing)?)\b|(?<![\w/])/[a-z]",
     re.IGNORECASE,
 )
 
-# Command-interception signals for the TR2 shadow-command rule. Unlike the
+# Command-interception evidence for the TR2 shadow-command rule. Unlike the
 # broader extraction gate above, this requires an actual
 # invocation/interception/override claim (or a literal slash-command token):
 # merely discussing commands as a noun ("Show available build commands",
 # "documents the build and test commands") describes documentation or help
 # prose, not shadowing intent, so it must not establish TR2 on its own.
-_DESCRIPTION_COMMAND_INTERCEPTION_RE = re.compile(
+# The shadowed command must also be the object of that evidence, not any
+# built-in word that happens to share the clause: a slash-command token names
+# a command by its whole name ("/ask-matt" is "ask-matt", not the built-in
+# "ask"), and an interception verb governs the built-ins that follow it in
+# the clause ("Intercepts and replaces the built-in deploy command"). A
+# slash-command token that is not a built-in ("/ask-matt") stays one name, and
+# a home-relative path ("~/build") is not a slash command.
+_DESCRIPTION_SLASH_COMMAND_RE = re.compile(r"(?<![\w/.~])/([a-z][\w-]*)", re.IGNORECASE)
+_DESCRIPTION_INTERCEPTION_VERB_RE = re.compile(
     r"\b(?:invoke[sd]?|invoking|intercept(?:s|ed|ing)?|"
-    r"override[sd]?|overriding|shadow(?:s|ed|ing)?)\b|(?<![\w/])/[a-z]",
+    r"override[sd]?|overriding|overridden|shadow(?:s|ed|ing)?)\b",
     re.IGNORECASE,
 )
+# Passive interception claims name the command before the verb: "the built-in
+# deploy command is intercepted", "types deploy it is intercepted", "the deploy
+# command will be intercepted", "deploy commands are now shadowed". The
+# auxiliary may be "is"/"are" (optionally "being"), "gets", "will be" or
+# "has/have been", and one adverb may precede the participle. The adverb slot
+# takes a short list plus "-ly" words, so a negation ("is not intercepted",
+# "is never shadowed") does not count.
+_DESCRIPTION_PASSIVE_INTERCEPTION_RE = re.compile(
+    r"(?<![\w/.~-])/?([a-z][\w-]*)\s+(?:commands?\s+|it\s+)?"
+    r"(?:(?:is|are)(?:\s+being)?|gets?|will\s+be|ha(?:s|ve)\s+been)\s+"
+    r"(?:(?:always|now|also|still|already|[a-z]+ly)\s+)?"
+    r"(?:intercepted|overridden|shadowed|invoked)\b",
+    re.IGNORECASE,
+)
+_DESCRIPTION_COMMAND_TOKEN_RE = re.compile(r"(?<![\w/.~-])/?([a-z][\w-]*)", re.IGNORECASE)
 
 # Trigger-phrase extraction for the TR1 broad/short-trigger rule on
 # descriptions: the word or phrase the skill claims to activate on, as in
@@ -1007,6 +1167,33 @@ def _description_condition_has_universal_scope(clause: str) -> bool:
     span = rest[: boundary.start()] if boundary else rest
     span = span[:_MAX_DESCRIPTION_CONDITION_SPAN]
     return _DESCRIPTION_UNIVERSAL_SCOPE_RE.search(span) is not None
+
+
+def _description_shadowed_commands(clause: str) -> list[str]:
+    """Built-in commands a description clause claims to invoke or intercept.
+
+    Only commands tied to interception evidence count: a slash-command token
+    whose whole name is a built-in, a built-in named anywhere after an
+    invocation/interception/override verb in the clause, or a built-in that a
+    passive claim names right before its auxiliary ("deploy is intercepted",
+    "deploy command has been overridden").
+    Returns the sorted set of shadowed built-in commands.
+    """
+    shadowed = {
+        match.group(1).lower()
+        for match in _DESCRIPTION_SLASH_COMMAND_RE.finditer(clause)
+        if match.group(1).lower() in _BUILTIN_COMMANDS
+    }
+    verb = _DESCRIPTION_INTERCEPTION_VERB_RE.search(clause)
+    if verb is not None:
+        tokens = _DESCRIPTION_COMMAND_TOKEN_RE.findall(clause[verb.end() :])
+        shadowed.update(t.lower() for t in tokens if t.lower() in _BUILTIN_COMMANDS)
+    shadowed.update(
+        match.group(1).lower()
+        for match in _DESCRIPTION_PASSIVE_INTERCEPTION_RE.finditer(clause)
+        if match.group(1).lower() in _BUILTIN_COMMANDS
+    )
+    return sorted(shadowed)
 
 
 def _extract_description_trigger_clauses(description: str) -> tuple[list[str], int]:
@@ -1187,7 +1374,12 @@ def _extract_packages_from_requirements_detailed(
     return results, largest_omitted
 
 
-_NPM_DEPENDENCY_SECTIONS = ("dependencies", "devDependencies", "peerDependencies")
+_NPM_DEPENDENCY_SECTIONS = (
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+)
 
 
 def _package_json_line(content: str, section: str, name: str) -> int:
@@ -1264,7 +1456,9 @@ def _extract_packages_from_package_json_scan(
     in_deps = False
     for i, line in enumerate(content.splitlines(), 1):
         stripped = line.strip()
-        if re.search(r'"(?:dependencies|devDependencies|peerDependencies)"', stripped):
+        if re.search(
+            r'"(?:dependencies|devDependencies|peerDependencies|optionalDependencies)"', stripped
+        ):
             in_deps = True
             continue
         if in_deps and stripped.startswith("}"):
@@ -1299,6 +1493,9 @@ def _extract_packages_from_package_json(
         return _extract_packages_from_package_json_scan(content, limit=limit)
     if not isinstance(data, dict):
         return []
+    # npm installs an optionalDependencies entry in place of a same-name "dependencies" entry.
+    optional = data.get("optionalDependencies")
+    overridden = set(optional) if isinstance(optional, dict) else set()
     dependencies: list[tuple[str, str, str]] = []
     for section in _NPM_DEPENDENCY_SECTIONS:
         deps = data.get(section)
@@ -1306,6 +1503,8 @@ def _extract_packages_from_package_json(
             continue
         for name, spec in deps.items():
             if not isinstance(name, str) or not isinstance(spec, str):
+                continue
+            if section == "dependencies" and name in overridden:
                 continue
             dependencies.append((section, name, spec))
             if limit is not None and len(dependencies) >= max(0, limit):
@@ -2053,28 +2252,52 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     )
                 )
                 break
-    if file_type in ("python", "javascript", "shell", "perl", "other"):
-        for pattern, confidence in SC3_PATTERNS:
-            matches = (
-                static_runner.iter_paragraph_matches
-                if (pattern, confidence) in SC3_PROSE_PATTERNS
-                else re.finditer
-            )
-            for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
-                line_num = line_number(match.start())
+    # Every shell decode check needs a decoder command, which most files lack.
+    has_shell_decoder = _SC3_SHELL_DECODE_COMMAND.search(content) is not None
+    if has_shell_decoder:
+        for start, command in _decoded_shell_literal_payloads(content):
+            for pattern, confidence in SC2_PATTERNS:
+                if not re.search(pattern, command, re.IGNORECASE | re.MULTILINE):
+                    continue
                 findings.append(
                     AnalyzerFinding(
-                        rule_id="SC3",
-                        message="Obfuscated Code",
+                        rule_id="SC2",
+                        message="External Script Fetching",
                         severity=Severity.HIGH,
-                        location=loc(line_num),
+                        location=loc(line_number(start)),
                         confidence=confidence,
-                        tags=tag,
-                        context=ctx(match.start()),
-                        matched_text=match.group(0)[:200],
-                        complete_match=match.group(0),
+                        tags=list(tag),
+                        context=ctx(start),
+                        matched_text=command[:200],
                     )
                 )
+                break
+    sc3_patterns = (
+        SC3_PATTERNS if file_type in ("python", "javascript", "shell", "perl", "other") else []
+    )
+    if has_shell_decoder:
+        sc3_patterns = sc3_patterns + SC3_SHELL_PATTERNS
+    for pattern, confidence in sc3_patterns:
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in SC3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = line_number(match.start())
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="SC3",
+                    message="Obfuscated Code",
+                    severity=Severity.HIGH,
+                    location=loc(line_num),
+                    confidence=confidence,
+                    tags=tag,
+                    context=ctx(match.start()),
+                    matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
+                )
+            )
     # SC7: untrusted container image. Example filtering is delegated to the runner.
     for pattern, confidence in SC7_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
@@ -3010,7 +3233,6 @@ def _analyze_triggers(
 
     for i, clause in enumerate(description_clauses, 1):
         clause_lower = clause.lower().strip()
-        words = clause_lower.split()
 
         # TR1 (description-calibrated): extract the trigger phrase the skill
         # claims to activate on ("whenever the user says hello") and apply
@@ -3071,11 +3293,11 @@ def _analyze_triggers(
         # capability or documentation prose such as "Show available build
         # commands" merely discusses commands and stays out of the trigger
         # path. Invocation clauses pass the extraction gate on their own, so
-        # no broad-activation wording is required.
-        shadowed = sorted(
-            {cmd for cmd in _BUILTIN_COMMANDS if cmd in {w.lstrip("/") for w in words}}
-        )
-        if shadowed and _DESCRIPTION_COMMAND_INTERCEPTION_RE.search(clause):
+        # no broad-activation wording is required. The shadowed command must
+        # be the object of that claim: "/ask-matt" does not shadow "ask", and
+        # the noun "ask" elsewhere in the clause is not an invocation.
+        shadowed = _description_shadowed_commands(clause)
+        if shadowed:
             findings.append(
                 Finding(
                     rule_id="TR2",

@@ -532,6 +532,10 @@ def _reference_coverage_findings(
         else []
     )
     for event in ledger_events:
+        if event.get("record_type") == LedgerRecordType.RULE_SET:
+            # A rule set's path is a label, not an artifact: a real file that
+            # happens to share it was not inspected any less completely.
+            continue
         # Reference resolution records a mention of a path that the bundle does
         # not carry, or that matches more than one bundled file, as a partial
         # event on the file that contains the mention. Neither leaves bytes of
