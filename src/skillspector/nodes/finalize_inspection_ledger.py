@@ -818,7 +818,7 @@ def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
         *reference_statuses,
     ]
     completeness, effective_finding_ids = finalize_ledger(merged_state)
-    if coverage_findings and completeness["status"] == "complete":
+    if coverage_findings and completeness["status"] in {"complete", "complete_with_caveats"}:
         completeness["status"] = "partial"
         completeness["is_complete"] = False
         limitations = completeness.setdefault("limitations", [])
