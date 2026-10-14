@@ -55,7 +55,9 @@ from .common import (
     LOGICAL_LINE_BREAK,
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
+    SourceLocationIndex,
     get_context,
+    get_context_from_lines,
     is_reference_material,
 )
 from .pattern_defaults import PatternCategory
@@ -63,6 +65,7 @@ from .pattern_defaults import PatternCategory
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_tool_misuse"
+USES_RUNTIME_CHECK = True
 ANALYZE_USES_POSTPROCESS = True
 POSTPROCESS_USES_PYTHON_AST = True
 POSTPROCESS_USES_RUNTIME_BUDGET = True
@@ -5051,27 +5054,30 @@ def analyze(
     file_path: str,
     file_type: str,
     *,
+    check_runtime: Callable[[], None] | None = None,
     _direct_shell_only: bool = False,
     defer_variable_reconciliation: bool = False,
 ) -> list[AnalyzerFinding]:
     """Analyze content for tool misuse patterns (TM1–TM3)."""
+    runtime_check = check_runtime or (lambda: None)
+    runtime_check()
     findings: list[AnalyzerFinding] = []
+    locations = SourceLocationIndex(content, file_path)
+    lines = content.splitlines()
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
 
-    line_starts = (0, *(match.end() for match in LOGICAL_LINE_BREAK.finditer(content)))
-
     def line_number(start: int) -> int:
-        return bisect_right(line_starts, start)
+        return locations.line_and_column(start)[0]
 
     context_by_line: dict[int, str] = {}
 
     def ctx(start: int) -> str:
-        line = line_number(start)
+        line, column = locations.line_and_column(start)
         context = context_by_line.get(line)
         if context is None:
-            context = get_context(content, start)
+            context = get_context_from_lines(lines, line, column=column)
             context_by_line[line] = context
         return context
 
@@ -5089,10 +5095,14 @@ def analyze(
     )
     invisible_variable_matches: set[tuple[int, int]] = set()
     if file_type == "python" and variable_matches and not defer_variable_reconciliation:
+        runtime_check()
         parsed = parse_python_source(content, file_path)
+        runtime_check()
         ast_index = _build_variable_shell_ast_index(parsed)
+        runtime_check()
         if ast_index is not None:
             for span, (_, match) in variable_matches.items():
+                runtime_check()
                 assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
                 candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)
                 if candidate is not None and (
@@ -5104,7 +5114,7 @@ def analyze(
                     invisible_variable_matches.add(span)
 
     shell_content = (
-        _perl_literal_print_shell_text(content, lambda: None) if file_type == "perl" else None
+        _perl_literal_print_shell_text(content, runtime_check) if file_type == "perl" else None
     )
     for (
         match_start,
@@ -5120,6 +5130,7 @@ def analyze(
         direct_shell_only=_direct_shell_only,
         shell_content=shell_content,
     ):
+        runtime_check()
         variable_match = variable_matches.get((match_start, match_end))
         if variable_match is not None and (match_start, match_end) in invisible_variable_matches:
             continue
@@ -5265,6 +5276,7 @@ def analyze(
             else re.finditer
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            runtime_check()
             line_num = line_number(match.start())
             context_text = ctx(match.start())
             matched = match.group(0)[:200]
@@ -5295,6 +5307,7 @@ def analyze(
             else re.finditer
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            runtime_check()
             line_num = line_number(match.start())
             findings.append(
                 AnalyzerFinding(
@@ -5317,6 +5330,7 @@ def analyze(
     tm4_tags = [*tag, "contextual-triage", "likely-benign-context"] if reference_material else tag
     for pattern, confidence in TM4_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            runtime_check()
             line_num = line_number(match.start())
             findings.append(
                 AnalyzerFinding(
