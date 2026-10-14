@@ -237,6 +237,45 @@ def test_empty_gap_fill_preserves_core_risk_assessment(
     assert entry["enhancements"]["gap_fill_findings"] == 0
 
 
+def test_gap_fill_preserves_caution_for_incomplete_scan(
+    batch_skill, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    skill, _ = batch_skill
+    original_result = {
+        "active_findings": [],
+        "filtered_findings": [],
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "risk_recommendation": "CAUTION",
+        "component_metadata": [],
+        "has_executable_scripts": False,
+    }
+    _mock_scan(monkeypatch, lambda context: context.update(original_result))
+    finding = Finding(
+        rule_id="P5",
+        message="Low-severity gap-fill finding",
+        severity="LOW",
+        confidence=1.0,
+        file="SKILL.md",
+        category="Security",
+    )
+    monkeypatch.setattr(runner, "run_gap_fill", lambda *args, **kwargs: [finding])
+
+    entry, error = runner.run_one(
+        skill,
+        skill.parent,
+        use_llm=True,
+        detected_language="zh",
+        apply_gap_fill=True,
+    )
+
+    assert error is None
+    assert entry["risk_assessment"]["score"] > 0
+    assert entry["risk_assessment"]["severity"] == "LOW"
+    assert entry["risk_assessment"]["recommendation"] == "CAUTION"
+    assert entry["enhancements"]["gap_fill_findings"] == 1
+
+
 @pytest.mark.parametrize("cache_state", ["empty", "missing"])
 def test_gap_fill_never_falls_back_to_local_content(
     batch_skill, monkeypatch: pytest.MonkeyPatch, cache_state
