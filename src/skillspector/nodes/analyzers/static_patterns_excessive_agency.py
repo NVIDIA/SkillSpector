@@ -72,6 +72,31 @@ EA1_PROSE_PATTERNS = [
     ),
 ]
 EA1_PATTERNS = EA1_CODE_PATTERNS + EA1_PROSE_PATTERNS
+_EA1_SAFE_READ_PURPOSE = re.compile(
+    r"to\s+(?:open|read|view|inspect|access)\s+(?:the\s+)?"
+    r"(?:file|document|artifact)(?:\s+yet)?\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_EA1_WRAPPED_OPENING_PROHIBITION = re.compile(
+    r"(?:\A|(?<=[.!?\n]))[ \t]*(?:\d+[.)][ \t]+)?do[ \t]*(?:\r?\n[ \t]*)?not[ \t]+\Z",
+    re.IGNORECASE,
+)
+_EA1_WRAPPED_OPENING_TAIL = re.compile(
+    r"\A[ \t]+to[ \t]+open[ \t]+the[ \t]+file[ \t]+yet\."
+    r"(?:\r?\n)[ \t]*(?:\d+[.)][ \t]+)?ask[ \t]+for[ \t]+explicit[ \t]+user[ \t]+"
+    r"approval[ \t]+in[ \t]+the[ \t]+current[ \t]+conversation[ \t]+before[ \t]+opening"
+    r"(?:[ \t]*\r?\n[ \t]*|[ \t]+)the[ \t]+local[ \t]+file\.[ \t]+open[ \t]+it[ \t]+only[ \t]+after[ \t]+"
+    r"that[ \t]+approval\.(?=\r?\n|\Z)",
+    re.IGNORECASE,
+)
+
+
+def _is_wrapped_opening_prohibition(content: str, start: int, end: int) -> bool:
+    """Recognize the numbered split-line prohibition plus its approval safeguard."""
+    prefix = content[max(0, start - 160) : start]
+    return _EA1_WRAPPED_OPENING_PROHIBITION.search(prefix) is not None and (
+        _EA1_WRAPPED_OPENING_TAIL.match(content[end:]) is not None
+    )
 
 # EA2: Autonomous Decision Making
 EA2_CODE_PATTERNS = [
@@ -173,6 +198,19 @@ EA3_PATTERNS = [
         0.7,
     ),
 ]
+_MIT_WARRANTY_CLAUSE = re.compile(
+    r"\s*IMPLIED,\s+INCLUDING\s+BUT\s+NOT\s+LIMITED\s+TO\s+"
+    r"THE\s+WARRANTIES\s+OF\s+MERCHANTABILITY,\s*",
+    re.IGNORECASE,
+)
+
+
+def _is_mit_warranty_clause(content: str, start: int, end: int) -> bool:
+    """Return whether an EA3 match is the exact MIT warranty clause."""
+    line_start = content.rfind("\n", 0, start) + 1
+    line_end = content.find("\n", end)
+    line_end = len(content) if line_end == -1 else line_end
+    return _MIT_WARRANTY_CLAUSE.fullmatch(content[line_start:line_end]) is not None
 
 # EA4: Unbounded Resource Access
 EA4_CODE_PATTERNS = [
@@ -427,6 +465,10 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             else re.finditer
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            if (pattern, confidence) in EA1_PROSE_PATTERNS and is_directly_prohibited(
+                content, match.start(), match.end(), allowed_tail=_EA1_SAFE_READ_PURPOSE
+            ) or _is_wrapped_opening_prohibition(content, match.start(), match.end()):
+                continue
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -477,6 +519,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in static_runner.iter_paragraph_matches(
             pattern, content, re.IGNORECASE | re.MULTILINE
         ):
+            if _is_mit_warranty_clause(content, match.start(), match.end()):
+                continue
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
