@@ -29,7 +29,11 @@ import pytest
 
 from skillspector.graph import graph
 from skillspector.nodes.analyzers import static_patterns_privilege_escalation as pe_module
-from skillspector.nodes.analyzers.static_runner import _infer_file_type, run_static_patterns
+from skillspector.nodes.analyzers.static_runner import (
+    SECURITY_VIEW_WINDOW_CHARS,
+    _infer_file_type,
+    run_static_patterns,
+)
 
 _SECRETS_SECTION = (
     "# Environment & secrets\n.env\n.env.*\n!.env.example\n\n# Caches\n__pycache__/\n"
@@ -316,3 +320,29 @@ class TestIgnoreListCodeFencesInMarkdown:
     def test_ignore_list_fence_in_a_script_is_not_special(self) -> None:
         content = '"""\n```gitignore\n.env\n```\n"""\nprint(open(".env").read())\n'
         assert _pe3_lines(content, "scripts/show.py") == [3, 6]
+
+
+def _long_fenced(language: str) -> str:
+    """One fence longer than a scan window, with ``.env`` in a later window."""
+    filler = "build/\n" * (SECURITY_VIEW_WINDOW_CHARS // len("build/\n") + 1)
+    return f"```{language}\n{filler}.env\n```\n"
+
+
+class TestIgnoreListFenceAcrossScanWindows:
+    """The runner splits long files into windows; the fence language must survive."""
+
+    def _runner_pe3_lines(self, content: str) -> list[int]:
+        findings = run_static_patterns(
+            {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
+            [pe_module],
+        )
+        return sorted(finding.start_line for finding in findings if finding.rule_id == "PE3")
+
+    def test_entry_in_a_later_window_is_not_flagged(self) -> None:
+        content = _long_fenced("gitignore")
+        assert len(content) > SECURITY_VIEW_WINDOW_CHARS
+        assert self._runner_pe3_lines(content) == []
+
+    def test_other_fence_in_a_later_window_keeps_pe3(self) -> None:
+        content = _long_fenced("bash")
+        assert self._runner_pe3_lines(content) == [content.count("\n") - 1]

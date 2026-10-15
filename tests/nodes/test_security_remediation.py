@@ -1539,8 +1539,8 @@ def test_marker_and_raw_windows_share_source_context(
         content: str,
         offsets: tuple[int, ...],
     ) -> tuple[
-        dict[int, tuple[str, int] | None],
-        dict[int, tuple[str, int, str, int, int]],
+        dict[int, tuple[str, int, str] | None],
+        dict[int, tuple[str, int, str, int, int, str]],
     ]:
         nonlocal calls, observed_offsets
         calls += 1
