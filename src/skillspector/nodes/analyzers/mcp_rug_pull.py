@@ -137,7 +137,7 @@ _RP1_CONFIG_ARGS = re.compile(
     re.IGNORECASE,
 )
 _RP1_CONFIG_KEY = re.compile(
-    r"^(?P<indent>[ \t]*)(?P<item>-[ \t]+)?(?:[\w-]+|\"[^\"]+\"|'[^']+')[ \t]*:"
+    r"^(?P<indent>[ \t]*)(?P<item>-[ \t]+)?(?:[\w-]+|\"[^\"]+\"|'[^']+')[ \t]*:(?=[ \t]|$)"
 )
 _RP1_CONFIG_ARG_TOKEN = re.compile(r"[\"']([^\"']*)[\"']|([^\s,\[\]#]+)")
 _RP1_CONFIG_MAX_LINES = 8

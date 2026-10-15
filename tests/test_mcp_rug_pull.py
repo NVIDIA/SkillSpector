@@ -23,6 +23,7 @@ import pytest
 import yaml
 
 from skillspector.nodes.analyzers.mcp_rug_pull import (
+    _RP1_CONFIG_KEY,
     _RP1_CONFIG_MAX_ARG_LINES,
     _RP1_CONFIG_MAX_PHYSICAL_LINES,
     _iter_config_npx_commands,
@@ -258,6 +259,63 @@ def test_rp1_yaml_indentless_args_in_first_key_list_item(pinned):
         f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
     ]
     assert len(rp1) == (0 if pinned else 1)
+
+
+@pytest.mark.parametrize("layout", ["mapping", "list"])
+@pytest.mark.parametrize("indentless", [False, True])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("shape", ["github", "url", "flag"])
+@pytest.mark.parametrize("args_first", [False, True])
+def test_rp1_yaml_colon_scalar_arguments(layout, indentless, newline, pinned, shape, args_first):
+    package = "@scope/server@1.2.3" if pinned else "@scope/server"
+    if shape == "github":
+        # This pins only an explicit numeric version, not arbitrary Git refs.
+        package = "github:owner/mcp-server" + ("@1.2.3" if pinned else "")
+    elif shape == "url":
+        package = "https://host/pkg.tgz" + ("@1.2.3" if pinned else "")
+    args = ["-y", "--flag:value", package] if shape == "flag" else ["-y", package]
+    server = {"args": args, "command": "npx"} if args_first else {"command": "npx", "args": args}
+    config = {"mcpServers": {"fs": server}} if layout == "mapping" else {"servers": [server]}
+    content = yaml.safe_dump(config, sort_keys=False, indent=2)
+    if not indentless:
+        lines = content.splitlines()
+        args_index = next(
+            i for i, line in enumerate(lines) if line.strip().removeprefix("- ") == "args:"
+        )
+        for i in range(args_index + 1, len(lines)):
+            if not lines[i].lstrip().startswith("- "):
+                break
+            lines[i] = "  " + lines[i]
+        content = "\n".join(lines) + "\n"
+    content = content.replace("\n", newline)
+    assert yaml.safe_load(content) == config
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == (0 if pinned else 1)
+    if rp1:
+        assert rp1[0].start_line == next(
+            i for i, line in enumerate(content.splitlines(), 1) if "command:" in line
+        )
+
+
+@pytest.mark.parametrize(
+    ("line", "is_key"),
+    [
+        ("- github:owner/repo", False),
+        ("- https://host/pkg.tgz", False),
+        ("- --flag:value", False),
+        ("- name: x", True),
+        ("env:", True),
+        ("args: []", True),
+        ("args:\t[]", True),
+        ('"args": []', True),
+        ("'args': []", True),
+    ],
+)
+def test_rp1_yaml_mapping_indicator_requires_separator(line, is_key):
+    assert bool(_RP1_CONFIG_KEY.match(line)) is is_key
 
 
 @pytest.mark.parametrize("direction", ["before", "after"])
