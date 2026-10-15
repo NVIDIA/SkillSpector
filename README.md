@@ -782,7 +782,7 @@ Options:
   -f, --format [terminal|json|markdown|sarif]  Output format [default: terminal]
   -o, --output PATH                            Output file path
   --no-llm                                     Skip LLM analysis (static only)
-  --yara-rules-dir PATH                        Extra YARA rules directory
+  --yara-rules-dir PATH                        Extra YARA rules directory (includes disabled)
   -b, --baseline PATH                          Suppress findings listed in a baseline
   --show-suppressed                            List baseline-suppressed findings
   -V, --verbose                                Show detailed progress
