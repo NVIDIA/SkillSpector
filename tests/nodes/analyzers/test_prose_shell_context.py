@@ -331,3 +331,57 @@ def test_prose_ownership_checks_cancellation_after_word_jumps(
     content += "\n\n" + prefix + "The interface doesn't match the spec.\n"
     with pytest.raises(TimeoutError, match="cancelled"):
         tm._markdown_shell_text(content, cancel)
+
+
+def test_inline_json_quotes_cannot_consume_following_documentation():
+    """A complete inline JSON value owns its closing quotes, even in long docs."""
+    from skillspector.nodes.analyzers.static_patterns_tool_misuse import (
+        has_bounded_parse_exhaustion,
+    )
+
+    content = (
+        '`{"settings":{"enabled":true},"temperature":0.6}`.\n' + "Ordinary documentation.\n" * 250
+    )
+    assert not has_bounded_parse_exhaustion(content, lambda: None, file_type="markdown")
+
+
+def test_nested_list_inline_code_does_not_borrow_operands_from_later_blocks():
+    from skillspector.nodes.analyzers.static_patterns_tool_misuse import (
+        has_bounded_parse_exhaustion,
+    )
+
+    content = (
+        "- Deployment modes:\n"
+        "  - Co-located workers:\n"
+        "    each registering via `worker-$JOBID/<hostname>`; server waits for\n"
+        "    `EXPECTED` registrations.\n"
+        "    The count is `min(extra + 1, total - 1)`, bounded by available workers.\n"
+        "  - Three-role workers:\n"
+        "    with `role: frontend`; the client uses frontend-first routing.\n\n"
+        "| Setting | Description |\n| --- | --- |\n"
+        '| `hash: <sha>` | compiler with `FLAGS="-C target=native --cfg value"`, '
+        "cached behind `flock` so exactly one worker builds |\n"
+    )
+    content += "Ordinary documentation.\n" * 500
+    assert not has_bounded_parse_exhaustion(content, lambda: None, file_type="markdown")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '`{"command":"rm -rf /*"}`\n',
+        "- Modes:\n  - Commands:\n    `` `printf rm` -rf /* ``\n",
+        "- Modes:\n  - Commands:\n    ```sh\n    rm -rf /*\n    ```\n",
+        "- Modes:\n  - Commands:\n\n        `printf rm` -rf /*\n",
+    ],
+)
+def test_markdown_ownership_preserves_destructive_shell_evidence(content):
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+    assert result["findings"]
+
+
+def test_overlong_shell_word_in_nested_list_fence_stays_incomplete():
+    content = "- Modes:\n  - Commands:\n    ```sh\n    rm -rf " + "x" * 10000 + " /*\n    ```\n"
+    assert tm.has_bounded_parse_exhaustion(content, lambda: None, file_type="markdown")

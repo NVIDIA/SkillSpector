@@ -4663,7 +4663,11 @@ def _markdown_table_delimiter_columns(
 
 
 def _markdown_shell_text(
-    content: str, check_runtime: Callable[[], None], *, complete_context: bool = True
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    complete_context: bool = True,
+    json_strings: list[tuple[int, int]] | None = None,
 ) -> str:
     """Mask Markdown delimiters while retaining code and exact source offsets.
 
@@ -4702,6 +4706,13 @@ def _markdown_shell_text(
                 index += 1
                 continue
             close_start, close_end = runs[close_index]
+            if json_strings is not None:
+                # A proven inline span may contain a complete JSON value. Its
+                # quotes belong to that value, not to following documentation.
+                json_strings.extend(
+                    (end + a, end + b)
+                    for a, b in validated_json_string_spans(content[end:close_start], check_runtime)
+                )
             output[start:end] = " " * (end - start)
             output[close_start:close_end] = " " * (close_end - close_start)
             index = close_index + 1
@@ -4725,6 +4736,9 @@ def _markdown_shell_text(
         stripped = line.rstrip(LINE_BREAK_CHARS)
         leading = stripped.lstrip(" \t")
         indentation = len(stripped[: len(stripped) - len(leading)].expandtabs(4))
+        # List continuation indentation belongs to its container. Only four
+        # additional columns introduce literal indented code in that paragraph.
+        code_indent = (paragraph_list_indent if paragraph_in_list else 0) + 4
         # Interpret list padding in columns, preserving the original offsets.
         # More than four columns after a marker can introduce indented code.
         prefix = len(stripped) - len(leading)
@@ -4732,7 +4746,7 @@ def _markdown_shell_text(
         list_indented = False
         has_list_marker = False
         list_markers = 0
-        if indentation < 4:
+        if indentation < code_indent:
             while marker := list_marker.match(stripped, prefix):
                 check_runtime()
                 if (
@@ -4758,9 +4772,9 @@ def _markdown_shell_text(
                     list_indented = True
                     break
             leading = stripped[prefix:]
-        quote_start = indentation < 4 and leading.startswith(">")
-        heading = indentation < 4 and re.match(r"#{1,6}(?:[ \t]|$)", leading) is not None
-        separator = indentation < 4 and _markdown_block_separator(stripped, check_runtime)
+        quote_start = indentation < code_indent and leading.startswith(">")
+        heading = indentation < code_indent and re.match(r"#{1,6}(?:[ \t]|$)", leading) is not None
+        separator = indentation < code_indent and _markdown_block_separator(stripped, check_runtime)
         setext_only = separator and (leading.startswith("=") or leading.rstrip(" \t") == "--")
         empty_list_item = (
             not paragraph_open and re.fullmatch(r"(?:[-+*]|[0-9]{1,9}[.)])", leading) is not None
@@ -4778,7 +4792,7 @@ def _markdown_shell_text(
             or quoted_block
             or html_open
             or not leading
-            or indentation >= 4
+            or indentation >= code_indent
             or indentation < table_minimum_indent
             or list_indented
             or has_list_marker
@@ -4824,7 +4838,7 @@ def _markdown_shell_text(
                 else ""
             )
             html_end = None if terminator and terminator in leading.lower() else terminator
-        elif not leading or indentation >= 4 or list_indented:
+        elif not leading or indentation >= code_indent or list_indented:
             mask_inline_delimiters()
         else:
             # Inline code may continue within a paragraph/list item, but cannot
@@ -4835,7 +4849,15 @@ def _markdown_shell_text(
             opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped[prefix:])
             if opening:
                 mask_inline_delimiters()
-                fence = (opening[1][0], len(opening[1]), column if has_list_marker else 0)
+                fence = (
+                    opening[1][0],
+                    len(opening[1]),
+                    column
+                    if has_list_marker
+                    else paragraph_list_indent
+                    if paragraph_in_list
+                    else 0,
+                )
                 begin, end = opening.span(1)
                 output[offset + prefix + begin : offset + prefix + end] = " " * (end - begin)
             else:
@@ -4906,7 +4928,10 @@ def _markdown_shell_text(
                         continuing_paragraph = True
                         paragraph_in_list = has_list_marker or paragraph_in_list
                         if has_list_marker:
-                            paragraph_list_indent = column
+                            # Multiple markers on one line have unproven container
+                            # continuation ownership; retain the literal indentation
+                            # boundary used before list-relative prose handling.
+                            paragraph_list_indent = column if list_markers == 1 else 0
         paragraph_open = continuing_paragraph
         if not paragraph_open:
             paragraph_in_list = False
@@ -4973,9 +4998,15 @@ def has_bounded_parse_exhaustion(
     if file_type == "markdown":
         if complete_context:
             json_strings = validated_json_string_spans(content, check_runtime)
+        content = _markdown_shell_text(
+            content,
+            check_runtime,
+            complete_context=complete_context,
+            json_strings=json_strings,
+        )
+        if complete_context:
             structural_quote_closers = {end - 1 for _, end in json_strings}
             structural_quote_openers = {start for start, _ in json_strings}
-        content = _markdown_shell_text(content, check_runtime, complete_context=complete_context)
     # Perl ``eval BLOCK`` is recognized from its clause-initial ``eval`` and the
     # adjacent brace alone, so unlike quote ownership it needs no full context.
     if _has_shell_command_word_exhaustion(
