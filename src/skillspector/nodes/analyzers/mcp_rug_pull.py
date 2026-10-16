@@ -136,11 +136,75 @@ _RP1_PIP_INSTALL = re.compile(
     re.IGNORECASE,
 )
 _RP1_DOCKER_CMD = re.compile(
-    r"docker\s+(?:pull|run|create)\s+\S+",
+    r"docker\s+(pull|run|create)\s+(\S+)",
     re.IGNORECASE,
 )
 
 _VERSION_PIN_RE = re.compile(r"@[\d.]+\b|==[\d.]+|:[\d.]+|@sha256:")
+
+# Options that take a separate value and boolean options, from docker/cli
+# (cli/command/container/opts.go, run.go and create.go; cli/command/image/pull.go),
+# including hidden and deprecated ones. `docker create` accepts the `docker run`
+# options except -d, --detach-keys and --sig-proxy; sharing one table only changes
+# how commands that docker itself rejects are read.
+_DOCKER_RUN_VALUE_OPTIONS = frozenset(
+    """
+    -a -c -e -h -l -m -p -u -v -w
+    --add-host --annotation --attach --blkio-weight --blkio-weight-device --cap-add
+    --cap-drop --cgroup-parent --cgroupns --cidfile --cpu-count --cpu-percent --cpu-period
+    --cpu-quota --cpu-rt-period --cpu-rt-runtime --cpu-shares --cpus --cpuset-cpus
+    --cpuset-mems --detach-keys --device --device-cgroup-rule --device-read-bps
+    --device-read-iops --device-write-bps --device-write-iops --dns --dns-opt --dns-option
+    --dns-search --domainname --entrypoint --env --env-file --expose --gpus --group-add
+    --health-cmd --health-interval --health-retries --health-start-interval
+    --health-start-period --health-timeout --hostname --io-maxbandwidth --io-maxiops --ip
+    --ip6 --ipc --isolation --kernel-memory --label --label-file --link --link-local-ip
+    --log-driver --log-opt --mac-address --memory --memory-reservation --memory-swap
+    --memory-swappiness --mount --name --net --net-alias --network --network-alias
+    --oom-score-adj --pid --pids-limit --platform --publish --pull --restart --runtime
+    --security-opt --shm-size --stop-signal --stop-timeout --storage-opt --sysctl --tmpfs
+    --ulimit --umask --user --userns --uts --volume --volume-driver --volumes-from --workdir
+    """.split()
+)
+_DOCKER_RUN_FLAG_OPTIONS = frozenset(
+    """
+    -P -d -i -q -t
+    --detach --disable-content-trust --help --init --interactive --no-healthcheck
+    --oom-kill-disable --privileged --publish-all --quiet --read-only --rm --sig-proxy --tty
+    --use-api-socket
+    """.split()
+)
+_DOCKER_OPTIONS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "run": (_DOCKER_RUN_VALUE_OPTIONS, _DOCKER_RUN_FLAG_OPTIONS),
+    "create": (_DOCKER_RUN_VALUE_OPTIONS, _DOCKER_RUN_FLAG_OPTIONS),
+    "pull": (
+        frozenset({"--platform"}),
+        frozenset({"-a", "-q", "--all-tags", "--disable-content-trust", "--help", "--quiet"}),
+    ),
+}
+# One shell word: unquoted text, $(...), backslash escapes (including a line
+# continuation) and complete quoted strings. The alternatives start with distinct
+# characters, so matching is linear; an unterminated quote ends the word, and so
+# does a redirection operator (alpine>log).
+_SHELL_WORD_RE = re.compile(
+    r"""(?:[^\s"'\\|&;()<>`$]+|\$(?:\([^()\n]*\))?|\\(?:\r?\n|.)|"(?:[^"\\\n]|\\.)*"|'[^'\n]*')+"""
+)
+_SHELL_WORD_GAP_RE = re.compile(r"(?:[ \t]+|\\\r?\n)+")
+_SHELL_QUOTING_RE = re.compile(r"""\\(.)|["']""", re.DOTALL)
+# A redirection operator with its optional file descriptor (2>, >>, 2>&, <<<, {fd}>).
+# `&>` and `&>>` take none: in `2&>log` the shell passes `2` as an argument. The
+# shell removes a redirection and its target word wherever they appear in the command.
+_SHELL_REDIRECTION_RE = re.compile(
+    r"&>>?|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<|<<-?|<>|<&|>&|>>|>\||[<>])"
+)
+# A command substitution of plain words. Unless it runs `case`, its closing `)` or
+# backquote is the one matched here; quotes, escapes, nesting or a comment could move it.
+_SHELL_PLAIN_SUBSTITUTION_RE = re.compile(r"\$\(([\w \t.,:=+%/-]*)\)|`([\w \t.,:=+%/-]*)`")
+# A parameter name or a special parameter after `$` ($HOME, $1, $?). `$@` is not
+# one of them here: it expands to several words even in double quotes.
+_SHELL_PARAMETER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9*#?$!-]")
+# Bound on the text read after `docker <subcommand>` to find the image operand.
+_DOCKER_OPERAND_MAX_CHARS = 1024
 
 # RP2: Manifest-permission pre-staging
 _PERMISSION_EXPANSION_PATTERNS = [
@@ -205,6 +269,220 @@ def _get_parameters_map(
 # ---------------------------------------------------------------------------
 # RP1: Unpinned MCP server references
 # ---------------------------------------------------------------------------
+
+
+def _next_shell_word(text: str, pos: int, truncated: bool) -> re.Match[str] | None:
+    """Return the shell word after *pos*.
+
+    None at the end of the command or when the word may be cut off by the read
+    bound.
+    """
+    gap = _SHELL_WORD_GAP_RE.match(text, pos)
+    word_match = _SHELL_WORD_RE.match(text, gap.end() if gap else pos)
+    if word_match is None or (truncated and word_match.end() == len(text)):
+        return None
+    return word_match
+
+
+def _expansion_end(word: str, start: int) -> int | None:
+    """Return where the parameter expansion at ``word[start]`` ends.
+
+    None when the expansion cannot be read safely:
+
+    - a command substitution or arithmetic (a backquote, ``$(...)``, ``$[...]``),
+      whose closing character can sit in a ``case`` pattern or a comment;
+    - ``$@`` or a ``${...}`` with ``@`` or ``[``, since ``"$@"`` and
+      ``"${arr[@]}"`` expand to several words even in double quotes;
+    - a ``${...}`` that is unclosed or holds quoting, escapes or a nested
+      substitution, any of which can hide its closing brace.
+    """
+    if word[start] == "`" or word[start + 1 : start + 2] in ("(", "[", "@"):
+        return None
+    if word.startswith("${", start):
+        depth = 0
+        for index in range(start + 1, len(word)):
+            char = word[index]
+            if char in "\\'\"`()[]@":
+                return None
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+        return None
+    # A `$` that starts no expansion ("$" at the end of a string) is literal.
+    parameter = _SHELL_PARAMETER_RE.match(word, start + 1)
+    return parameter.end() if parameter else start + 1
+
+
+def _docker_image_known_text(word: str) -> str | None:
+    """Return the part of an image word whose value is known, without quoting.
+
+    An expansion (``$IMAGE``, ``${IMAGE:-alpine:3.20}``) has a value the scan
+    does not know. The tag or digest is still known when every expansion is
+    double-quoted and the literal text after the last one holds it: that text
+    contains a ``/``, so the last path component is literal
+    (``"${REGISTRY}/tool:1.4"``), or it starts with ``:`` or ``@``
+    (``"${IMAGE}:1.4"``), which with no ``/`` after it can only begin a tag or
+    digest. That literal text is returned. Otherwise None is returned and the
+    command is reported. An unquoted expansion or brace expansion
+    (``{alpine,alpine:3.20}``) is never resolved, because it can change which
+    word is the image, and neither is a command substitution (see
+    ``_expansion_end``).
+    """
+    known_from = 0
+    in_double_quotes = False
+    brace_depth = 0
+    index = 0
+    while index < len(word):
+        char = word[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "'" and not in_double_quotes:
+            close = word.find("'", index + 1)
+            if close < 0:
+                return None
+            index = close + 1
+            continue
+        if char in "$`":
+            end = _expansion_end(word, index) if in_double_quotes else None
+            if end is None:
+                return None
+            index = known_from = end
+            continue
+        if char == '"':
+            in_double_quotes = not in_double_quotes
+        elif not in_double_quotes and char == "{":
+            brace_depth += 1
+        elif not in_double_quotes and char == "}" and brace_depth:
+            brace_depth -= 1
+        elif not in_double_quotes and char == "," and brace_depth:
+            return None
+        index += 1
+    known = _SHELL_QUOTING_RE.sub(r"\1", word[known_from:])
+    if known_from and "/" not in known and not known.startswith((":", "@")):
+        return None
+    return known
+
+
+def _shell_word_is_one_argument(word: str) -> bool:
+    """Return whether the shell word *word* is certain to stay one argument.
+
+    Outside quotes, an expansion (``$X``, ``$(pwd)``), brace expansion
+    (``{a,b}``, ``{1..3}``) or a pattern (``*``, ``?``, ``[``) can produce
+    several arguments or none, and so can ``"$@"`` or ``"${arr[@]}"`` in double
+    quotes (see ``_expansion_end``). A command substitution in double quotes
+    counts only when it is plain words: a quote inside it ends the double-quoted
+    string early here, so the shell's word may be longer than *word*.
+    """
+    in_double_quotes = False
+    brace_depth = 0
+    index = 0
+    while index < len(word):
+        char = word[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "'" and not in_double_quotes:
+            close = word.find("'", index + 1)
+            if close < 0:
+                return False
+            index = close + 1
+            continue
+        if char in "$`":
+            if not in_double_quotes:
+                return False
+            plain = _SHELL_PLAIN_SUBSTITUTION_RE.match(word, index)
+            if plain is not None and "case" not in plain[plain.lastindex].split():
+                index = plain.end()
+                continue
+            end = _expansion_end(word, index)
+            if end is None:
+                return False
+            index = end
+            continue
+        if char == '"':
+            in_double_quotes = not in_double_quotes
+        elif not in_double_quotes and char in "*?[":
+            return False
+        elif not in_double_quotes and char == "{":
+            brace_depth += 1
+        elif not in_double_quotes and char == "}" and brace_depth:
+            brace_depth -= 1
+        elif not in_double_quotes and brace_depth and (char == "," or word.startswith("..", index)):
+            return False
+        index += 1
+    return True
+
+
+def _docker_image_operand(subcommand: str, text: str, truncated: bool) -> tuple[str | None, int]:
+    """Return the image operand of a docker command and where reading stopped.
+
+    *text* starts at the first argument after ``docker run|create|pull``. Options
+    and their values are skipped using docker's option table, and redirections
+    (``2>log``, ``<<<x``) are skipped with their targets. The image is None when
+    it cannot be identified (an unknown option, a missing value or redirection
+    target, a word before the image that may not be one argument, the end of the
+    command, a word cut off by the read bound) or when its tag depends on an
+    expansion, so the caller still reports the command. For an image whose value
+    is partly known, only the known part is returned.
+    """
+    value_options, flag_options = _DOCKER_OPTIONS[subcommand.lower()]
+    pos = 0
+    expect_value = False
+    end_of_options = False
+    while True:
+        gap = _SHELL_WORD_GAP_RE.match(text, pos)
+        redirection = _SHELL_REDIRECTION_RE.match(text, gap.end() if gap else pos)
+        if redirection is not None:
+            target = _next_shell_word(text, redirection.end(), truncated)
+            # A target that may not be one argument can also end later than the
+            # word read here (2>${LOG:-a b}).
+            if target is None or not _shell_word_is_one_argument(target.group(0)):
+                return None, target.end() if target else redirection.end()
+            pos = target.end()
+            continue
+        word_match = _next_shell_word(text, pos, truncated)
+        if word_match is None:
+            return None, pos
+        pos = word_match.end()
+        word = _SHELL_QUOTING_RE.sub(r"\1", word_match.group(0))
+        if not expect_value and (end_of_options or not word.startswith("-") or word == "-"):
+            return _docker_image_known_text(word_match.group(0)), pos
+        # An option or value that splits into several arguments, or none, moves the
+        # image to another word (-e $ENV with ENV='A=1 ubuntu').
+        if not _shell_word_is_one_argument(word_match.group(0)):
+            return None, pos
+        if expect_value:
+            expect_value = False
+        elif word == "--":
+            end_of_options = True
+        elif word.startswith("--"):
+            name, has_value, _ = word.partition("=")
+            if name in value_options and not has_value:
+                expect_value = True
+            elif name not in flag_options and not has_value:
+                return None, pos
+        else:
+            # Short options combine (-it). The first one that takes a value uses
+            # the rest of the word (-p8080:80) or, if nothing is left, the next word.
+            for index, letter in enumerate(word[1:], start=1):
+                if "-" + letter in value_options:
+                    expect_value = index == len(word) - 1
+                    break
+                if "-" + letter not in flag_options:
+                    return None, pos
+
+
+def _docker_image_has_pin(image: str) -> bool:
+    """Return whether *image* has a tag or digest.
+
+    Only the last path component is checked, because a registry port
+    (``localhost:5000/team/tool``) is not a tag.
+    """
+    return _VERSION_PIN_RE.search(image.rsplit("/", 1)[-1]) is not None
 
 
 def _operand_has_version_pin(line_remainder: str) -> bool:
@@ -333,14 +611,21 @@ def _check_rp1(
         # docker without tag or digest
         for m in _RP1_DOCKER_CMD.finditer(content):
             budget.check_runtime(file_path)
-            full_match = m.group(0)
-            if _VERSION_PIN_RE.search(full_match):
+            operand_start = m.start(2)
+            operand_text = content[operand_start : operand_start + _DOCKER_OPERAND_MAX_CHARS]
+            truncated = operand_start + _DOCKER_OPERAND_MAX_CHARS < len(content)
+            image, operand_end = _docker_image_operand(m.group(1), operand_text, truncated)
+            if image is not None and _docker_image_has_pin(image):
                 continue
+            # Report through the image, or through the last word read when the image
+            # could not be identified.
+            span_end = operand_start + operand_end if operand_end else m.end(1)
+            full_match = content[m.start() : span_end]
             line_num = _find_line(content, m.start())
             budget.emit(
                 Finding(
                     rule_id="RP1",
-                    message=f"Docker image referenced without tag or digest: '{full_match[:80]}'.",
+                    message=f"Docker image referenced without tag or digest: '{full_match[:200]}'.",
                     severity="MEDIUM",
                     confidence=0.75,
                     file=file_path,
