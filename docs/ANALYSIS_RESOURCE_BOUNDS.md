@@ -114,6 +114,7 @@ malicious evasion. Keep required references and use the reason to choose the fix
 
 | Reason | Next step |
 |---|---|
+| `dependency_parse_error` | Correct the malformed dependency manifest or lockfile, then rerun the scan. |
 | `static_parse_limit` | Inspect the expression and analyzer. If valid source is misinterpreted, correct or update the scanner and rerun. |
 | `read_error`, `stat_error`, `file_disappeared`, `missing_file_cache` | Ensure the resolved target remains readable throughout the scan. |
 | `size_limit`, `runtime_limit` | Review the reported bounds and input size; distinguish a scanner performance problem from a legitimate resource ceiling. |
