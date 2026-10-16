@@ -550,7 +550,8 @@ def scan(
             "directory (.skillspector-baseline.yaml). Off by default: a skill "
             "author's baseline can suppress findings in your scan, so a discovered "
             "baseline is only reported until you opt in. Ignored when --baseline "
-            "is given.",
+            "is given. Not supported for recursive multi-skill scans; scan each "
+            "sub-skill separately.",
         ),
     ] = False,
     transitive_enabled: Annotated[
@@ -774,6 +775,12 @@ def scan(
                 err_console.print(
                     "[red]Error:[/red] --baseline is not supported for recursive "
                     "multi-skill scans; scan each sub-skill with its own baseline"
+                )
+                raise typer.Exit(code=2)
+            if use_shipped_baseline:
+                err_console.print(
+                    "[red]Error:[/red] --use-shipped-baseline is not supported for recursive "
+                    "multi-skill scans; scan each sub-skill separately with --use-shipped-baseline"
                 )
                 raise typer.Exit(code=2)
             # Same error contract as the single-skill scan below: an error that

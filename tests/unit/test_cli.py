@@ -2035,7 +2035,10 @@ def test_cli_scan_excludes_only_the_selected_baseline(tmp_path: Path) -> None:
     assert data["suppressed_count"] == 0
 
 
-def test_recursive_multi_skill_scan_rejects_shared_baseline(tmp_path: Path) -> None:
+@pytest.mark.parametrize("extra", [[], ["--use-shipped-baseline"]])
+def test_recursive_multi_skill_scan_rejects_shared_baseline(
+    tmp_path: Path, extra: list[str]
+) -> None:
     """Exact baselines are per-skill and cannot be silently reused recursively."""
     root = tmp_path / "skills"
     for name in ("one", "two"):
@@ -2050,11 +2053,53 @@ def test_recursive_multi_skill_scan_rejects_shared_baseline(tmp_path: Path) -> N
 
     result = runner.invoke(
         app,
-        ["scan", str(root), "--recursive", "--no-llm", "--baseline", str(baseline)],
+        ["scan", str(root), "--recursive", "--no-llm", "--baseline", str(baseline), *extra],
     )
 
     assert result.exit_code == 2
-    assert "not supported for recursive multi-skill scans" in result.output
+    assert "--baseline is not supported for recursive multi-skill scans" in " ".join(
+        result.stderr.split()
+    )
+
+
+@pytest.mark.parametrize("child_count", [1, 2])
+@pytest.mark.parametrize("fmt", ["terminal", "json", "sarif", "markdown"])
+def test_recursive_multi_skill_scan_rejects_shipped_baseline(
+    tmp_path: Path, child_count: int, fmt: str
+) -> None:
+    """Do not silently ignore opt-in or overwrite a report with unsuppressed results."""
+    root = tmp_path / "skills"
+    for i in range(child_count):
+        skill = root / f"skill-{i}"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(f"---\nname: skill-{i}\n---\n# Safe\n")
+        (skill / ".skillspector-baseline.yaml").write_text(
+            "version: 2\nrules:\n  - id: P1\n    reason: reviewed policy\n"
+        )
+    output = tmp_path / "report.txt"
+    output.write_text("previous report")
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(root),
+            "--recursive",
+            "--no-llm",
+            "--use-shipped-baseline",
+            "--format",
+            fmt,
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    error = " ".join(result.stderr.split())
+    assert "--use-shipped-baseline is not supported for recursive multi-skill scans" in error
+    assert "scan each sub-skill separately with --use-shipped-baseline" in error
+    assert result.stdout == ""
+    assert output.read_text() == "previous report"
 
 
 def test_recursive_single_skill_scan_still_accepts_baseline(tmp_path: Path) -> None:
@@ -3622,12 +3667,13 @@ def test_cli_shipped_baseline_without_opt_in(tmp_path: Path) -> None:
     assert "baseline" in result2.output.lower()
 
 
-def test_cli_shipped_baseline_opt_in(tmp_path: Path) -> None:
+@pytest.mark.parametrize("extra", [[], ["--recursive"]])
+def test_cli_shipped_baseline_opt_in(tmp_path: Path, extra: list[str]) -> None:
     """Opt-in applies the shipped baseline and reports provenance on stderr (R1 head/R6)."""
     skill_dir = _make_skill_dir(tmp_path)
     result = runner.invoke(
         app,
-        ["scan", str(skill_dir), "--no-llm", "--format", "json", "--use-shipped-baseline"],
+        ["scan", str(skill_dir), "--no-llm", "--format", "json", "--use-shipped-baseline", *extra],
     )
     assert result.exit_code == 0
     data = json.loads(result.stdout)
