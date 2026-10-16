@@ -29,7 +29,7 @@ import pytest
 import yaml
 from pydantic import BaseModel
 
-from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import LLMAnalyzerBase
 from skillspector.llm_utils import AgentCLIChatModel
 from skillspector.nodes.analyzers import mcp_tool_poisoning
@@ -1836,14 +1836,98 @@ class TestTP4Fallbacks:
         )
 
     def test_tool_refusal_stays_incomplete(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A structured call that keeps returning None ends degraded, not fatal (#843)."""
         state = _make_state("mcp_mismatched_skill", use_llm=True)
-        structured_llm = _mock_tp4_structured_llm(monkeypatch, [None])
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", AsyncMock())
+        structured_llm = _mock_tp4_structured_llm(monkeypatch, [None, None, None, None])
 
         result = node(state)
 
-        assert structured_llm.calls == 1
-        assert result["analyzer_status_events"][0]["status"] == "failed"
+        assert structured_llm.calls == 4
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        assert [
+            (event["outcome"], event["reason_code"], event["error_class"]) for event in semantic
+        ] == [
+            (
+                LedgerOutcome.SKIPPED,
+                LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+                "ValidationError",
+            )
+        ]
+        assert result["llm_call_log"][0]["ok"] is False
+        completeness, _ = finalize_ledger(
+            {
+                "components": state["components"],
+                "findings": result["findings"],
+                "inspection_ledger": result["inspection_ledger"],
+                "analyzer_status_events": result["analyzer_status_events"],
+            }
+        )
+        assert completeness["execution_successful"] is True
+        assert completeness["is_complete"] is False
+
+    def test_missing_structured_response_is_retried(self, monkeypatch: pytest.MonkeyPatch):
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        sleep = AsyncMock()
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", sleep)
+        structured_llm = _mock_tp4_structured_llm(monkeypatch, [None, {"is_mismatch": False}])
+
+        result = node(state)
+
+        assert structured_llm.calls == 2
+        sleep.assert_called_once_with(0.5)
+        assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
+        assert result["analyzer_status_events"][0]["status"] == "completed"
+
+    def test_bedrock_forced_tool_call_answered_in_prose_is_retried(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bedrock's tool parser returns None for a reply with no tool call (#843)."""
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        from langchain_aws import ChatBedrockConverse
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        from skillspector import llm_utils
+        from skillspector.providers.bedrock import (
+            BEDROCK_DEFAULT_MODEL,
+            BEDROCK_DEFAULT_REGION,
+            BedrockProvider,
+        )
+
+        assert BedrockProvider().forced_tool_choice_supported(BEDROCK_DEFAULT_MODEL)
+        calls = []
+
+        async def answer_in_prose(*_args, **_kwargs):
+            calls.append(1)
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="refused"))])
+
+        monkeypatch.setattr(ChatBedrockConverse, "_agenerate", answer_in_prose)
+        monkeypatch.setattr(llm_utils, "get_active_provider", BedrockProvider)
+        monkeypatch.setattr(
+            "skillspector.llm_analyzer_base.get_chat_model",
+            lambda **kwargs: ChatBedrockConverse(
+                model=kwargs["model"],
+                client=MagicMock(),
+                bedrock_client=MagicMock(),
+                region_name=BEDROCK_DEFAULT_REGION,
+            ),
+        )
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", AsyncMock())
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        state["model_config"] = {"default": BEDROCK_DEFAULT_MODEL}
+
+        result = node(state)
+
+        assert len(calls) == 4
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
         assert any(
+            event.get("reason_code") is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+            and event.get("error_class") == "ValidationError"
+            for event in result["inspection_ledger"]
+        )
+        assert not any(
             event["outcome"] is LedgerOutcome.FAILED for event in result["inspection_ledger"]
         )
 
