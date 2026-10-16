@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import re
 import sys
+from collections.abc import Iterator
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
@@ -36,6 +37,7 @@ from .common import (
     resolve_dotted_name,
 )
 from .pattern_defaults import PatternCategory
+from .static_patterns_tool_misuse import _bounded_shell_tokens
 
 logger = get_logger(__name__)
 
@@ -59,6 +61,10 @@ E1_PROSE_PATTERNS = [
     ),
 ]
 E1_PATTERNS = E1_CODE_PATTERNS + E1_PROSE_PATTERNS
+_E1_SHELL_PATTERNS = frozenset(E1_CODE_PATTERNS[5:7])
+_E1_FETCH_COMMAND = re.compile(r"(?:curl|wget)(?=\s)", re.IGNORECASE)
+_E1_UNPROVED_SHELL_SPACE = re.compile(r"(?!\r\n)[^\S \t\n]")
+_E1_UNPROVED_SHELL_SYNTAX = re.compile(r"(?<!\S)--%(?=\s|$)|[{}]|<#")
 E2_PYTHON_FALLBACK_PATTERNS = [
     # Python: for k, v in os.environ.items() — whitespace-tolerant
     (r"for\s+\w+\s*,\s*\w+\s+in\s+os\s*\.\s*environ\s*\.\s*items\s*\(\s*\)", 0.7),
@@ -150,6 +156,67 @@ E5_PATTERNS = [
     (r"\baz\s+storage\s+blob\s+upload\b", 0.6),  # Azure CLI
     (r"\.upload_blob\s*\(", 0.55),  # Azure SDK
 ]
+
+
+def _e1_shell_command_ranges(content: str) -> tuple[tuple[int, int | None], ...]:
+    """Locate proved command boundaries without changing source evidence.
+
+    Upload flags belong to the curl/wget invocation, not a later command or
+    Markdown example. Reuse the bounded shell tokenizer so quoted newlines and
+    backslash continuations remain part of the same invocation. Uncertain syntax
+    retains the existing conservative matcher instead of suppressing evidence.
+    """
+    ranges: list[tuple[int, int | None]] = []
+    previous_end = 0
+    for fetch in _E1_FETCH_COMMAND.finditer(content):
+        if fetch.start() < previous_end:
+            # An embedded fetch may be an argument or a real nested invocation.
+            # Keep legacy evidence instead of reparsing overlapping suffixes
+            # quadratically when a command contains many curl/wget words.
+            ranges.append((fetch.start(), None))
+            break
+        _, end, limited = _bounded_shell_tokens(content, fetch.start(), fetch.end())
+        if (
+            limited
+            # Wrappers and PowerShell expressions can assemble more arguments;
+            # semicolons and hashes can be literal arguments in CMD commands.
+            or content[end : end + 1] in {"'", '"', "`", "(", ")", ";", "#"}
+            # The shared parser's security view treats Unicode/control spaces
+            # as separators. Native shells can keep them inside an argument,
+            # including before a '#' that would otherwise look like a comment.
+            or _E1_UNPROVED_SHELL_SPACE.search(content, fetch.start(), end + 1) is not None
+            # PowerShell stop-parsing, script blocks, hashtables and block
+            # comments can contain separators that do not end the invocation.
+            or _E1_UNPROVED_SHELL_SYNTAX.search(content, fetch.start(), end + 1) is not None
+            # CMD caret continuation is outside the Bourne parser's proof.
+            or re.search(r"\^[ \t]*\r?$", content[fetch.start() : end]) is not None
+        ):
+            # Keep legacy nonoverlapping matching on unproved syntax instead of
+            # repeatedly parsing overlapping suffixes after a parser limit.
+            ranges.append((fetch.start(), None))
+            break
+        ranges.append((fetch.start(), end))
+        previous_end = end
+    return tuple(ranges)
+
+
+def _iter_e1_shell_matches(
+    pattern: str,
+    content: str,
+    command_ranges: tuple[tuple[int, int | None], ...],
+) -> Iterator[re.Match[str]]:
+    compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    covered = 0
+    for start, end in command_ranges:
+        if end is None:
+            yield from compiled.finditer(content, max(start, covered))
+            return
+        if start < covered:
+            continue
+        match = compiled.match(content, start, end)
+        if match is not None:
+            yield match
+            covered = match.end()
 
 
 def _resolve_expression_name(node: ast.expr, aliases: dict[str, str]) -> str | None:
@@ -298,13 +365,17 @@ def analyze(
 
     tag = [PatternCategory.DATA_EXFILTRATION.value]
 
+    shell_command_ranges = _e1_shell_command_ranges(content)
     for pattern, confidence in E1_PATTERNS:
-        matches = (
-            static_runner.iter_paragraph_matches
-            if (pattern, confidence) in E1_PROSE_PATTERNS
-            else re.finditer
-        )
-        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+        if (pattern, confidence) in _E1_SHELL_PATTERNS:
+            e1_matches = _iter_e1_shell_matches(pattern, content, shell_command_ranges)
+        elif (pattern, confidence) in E1_PROSE_PATTERNS:
+            e1_matches = static_runner.iter_paragraph_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            )
+        else:
+            e1_matches = re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE)
+        for match in e1_matches:
             line_num = get_line_number(content, match.start())
             adj = (
                 min(1.0, confidence + 0.1)
