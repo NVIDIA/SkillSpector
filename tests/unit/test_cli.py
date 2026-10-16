@@ -1754,6 +1754,69 @@ def test_cli_mcp_registry_rejects_skill_only_flags(tmp_path: Path, flag: str) ->
     assert "cannot be combined" in result.output
 
 
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--use-shipped-baseline"],
+        ["--transitive"],
+        ["--transitive-depth", "1"],
+        ["--transitive-depth", "0"],
+        ["--transitive-depth", "-1"],
+        ["--transitive-depth", "2"],
+        ["--transitive-allow-prefix", "https://example.com/"],
+        ["--transitive-deny-prefix", "https://example.com/"],
+        ["--transitive-allow-prefix", ""],
+        ["--transitive-deny-prefix", "not-a-prefix"],
+        ["--transitive", "--transitive-depth", "2", "--use-shipped-baseline"],
+    ],
+)
+def test_cli_mcp_registry_rejects_ignored_options_before_scanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flags: list[str]
+) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text('{"servers": []}', encoding="utf-8")
+    output = tmp_path / "report.json"
+    output.write_text("previous report", encoding="utf-8")
+    scan_registry = MagicMock(return_value={"findings": [], "risk_score": 0})
+    monkeypatch.setattr(cli, "scan_registry", scan_registry)
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(payload),
+            "--mcp-registry",
+            "--format",
+            "json",
+            "--output",
+            str(output),
+            *flags,
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "cannot be combined" in result.stderr
+    assert flags[0] in result.stderr
+    assert result.stdout == ""
+    assert output.read_text(encoding="utf-8") == "previous report"
+    scan_registry.assert_not_called()
+
+
+def test_cli_mcp_registry_rejects_configured_transitive_depth(tmp_path: Path) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text('{"servers": []}', encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["scan", str(payload), "--mcp-registry", "--format", "json"],
+        default_map={"scan": {"transitive_depth": 1}},
+    )
+
+    assert result.exit_code == 2
+    assert "--transitive-depth" in result.stderr
+    assert result.stdout == ""
+
+
 def test_cli_scan_missing_baseline_exits_2(tmp_path: Path) -> None:
     """scan with a --baseline pointing at a missing file exits with code 2."""
     (tmp_path / "SKILL.md").write_text("# Hi", encoding="utf-8")

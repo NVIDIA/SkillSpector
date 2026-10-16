@@ -37,6 +37,7 @@ from typing import Annotated, cast
 from urllib.parse import quote
 
 import typer
+from click.core import ParameterSource
 from langchain_core.runnables import RunnableConfig
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
@@ -472,6 +473,7 @@ def _multi_skill_limitation_events(
 
 @app.command()
 def scan(
+    ctx: typer.Context,
     input_path: Annotated[
         str,
         typer.Argument(
@@ -697,11 +699,18 @@ def scan(
             or show_suppressed
             or yara_rules_dir is not None
             or min_coverage is not None
+            or use_shipped_baseline
+            or transitive_enabled
+            or transitive_allow_prefix
+            or transitive_deny_prefix
+            # Even an explicitly supplied default depth requests an unsupported option.
+            or ctx.get_parameter_source("transitive_depth") not in (None, ParameterSource.DEFAULT)
         ):
             err_console.print(
                 "[red]Error:[/red] --mcp-registry cannot be combined with "
                 "--recursive, --baseline, --show-suppressed, --yara-rules-dir, "
-                "or --min-coverage"
+                "--min-coverage, --use-shipped-baseline, --transitive, "
+                "--transitive-depth, --transitive-allow-prefix, or --transitive-deny-prefix"
             )
             raise typer.Exit(code=2)
         if format != FormatChoice.json:

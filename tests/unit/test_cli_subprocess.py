@@ -63,6 +63,100 @@ def _write_skill(path: Path, body: str = "# Helper\n\nFormat a table.\n") -> Pat
     return path
 
 
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--use-shipped-baseline"],
+        ["--transitive"],
+        ["--transitive-depth", "1"],
+        ["--transitive-depth", "2"],
+        ["--transitive-allow-prefix", "https://example.com/"],
+        ["--transitive-deny-prefix", "https://example.com/"],
+    ],
+)
+def test_registry_unsupported_options_stop_before_input_or_output_access(
+    tmp_path: Path, flags: list[str]
+) -> None:
+    output = tmp_path / "report.json"
+    output.write_text("previous report", encoding="utf-8")
+
+    result = _run_cli(
+        "scan",
+        str(tmp_path / "missing-registry.json"),
+        "--mcp-registry",
+        "--format",
+        "json",
+        "--output",
+        str(output),
+        *flags,
+    )
+
+    assert result.returncode == 2
+    assert "cannot be combined" in result.stderr
+    assert flags[0] in result.stderr
+    assert result.stdout == ""
+    assert output.read_text(encoding="utf-8") == "previous report"
+
+
+def test_registry_default_options_still_allow_snapshot_comparison(tmp_path: Path) -> None:
+    source = tmp_path / "registry.json"
+    source.write_text(
+        json.dumps(
+            {
+                "servers": [
+                    {
+                        "server": {
+                            "name": "example/notes",
+                            "version": "1.0.0",
+                            "repository": {
+                                "url": "https://github.com/example/notes",
+                                "source": "github",
+                            },
+                            "packages": [
+                                {
+                                    "registryType": "npm",
+                                    "identifier": "example-notes",
+                                    "version": "1.0.0",
+                                    "fileSha256": "a" * 64,
+                                    "transport": {"type": "stdio"},
+                                }
+                            ],
+                        },
+                        "_meta": {
+                            "io.modelcontextprotocol.registry/official": {"status": "active"}
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    previous = tmp_path / "previous.json"
+    initial = _run_cli(
+        "scan", str(source), "--mcp-registry", "--format", "json", "--output", str(previous)
+    )
+    assert initial.returncode == 0, initial.stderr
+    previous_bytes = previous.read_bytes()
+
+    compared = _run_cli(
+        "scan",
+        str(source),
+        "--mcp-registry",
+        "--format",
+        "json",
+        "--mcp-registry-compare",
+        str(previous),
+    )
+
+    assert compared.returncode == 0, compared.stderr
+    payload = json.loads(compared.stdout)
+    assert payload["mcp_registry"] is True
+    assert payload["server_count"] == 1
+    assert payload["risk_score"] == 0
+    assert payload["comparison"]["unchanged_count"] == 1
+    assert previous.read_bytes() == previous_bytes
+
+
 @pytest.mark.parametrize("verbose", [False, True])
 def test_recursive_json_stdout_is_one_complete_report(tmp_path: Path, verbose: bool) -> None:
     collection = tmp_path / "collection"
