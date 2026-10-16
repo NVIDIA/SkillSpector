@@ -86,6 +86,27 @@ def test_all_parsed_json_string_positions_own_their_exact_closing_quote(
         + json.dumps([_PLACEHOLDER, "x" * reconstruction._MAX_JSON_QUOTE_CONTAINER_CHARS])
         + "\n```",
     ],
+    ids=[
+        "plain-text",
+        "incomplete-object",
+        "mismatched-array",
+        "invalid-escape",
+        "nan",
+        "newline",
+        "unclosed-fence",
+        "mismatched-fence",
+        "mismatched-backtick-length",
+        "invalid-fence-info",
+        "quoted-fence",
+        "quoted-unclosed-fence",
+        "listed-fence",
+        "listed-unclosed-fence",
+        "python-fence",
+        "nested-fence",
+        "truncated-json",
+        "oversized-json",
+        "oversized-json-fence",
+    ],
 )
 def test_unproven_json_or_fence_structure_grants_no_quote_ownership(content: str) -> None:
     assert reconstruction.validated_json_string_closers(content, None) == set()
