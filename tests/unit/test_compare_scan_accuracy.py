@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -31,6 +32,11 @@ ZERO_TOLERANCE_POLICY = {
 }
 BASELINE_REVISION = "a" * 40
 CANDIDATE_REVISION = "b" * 40
+
+
+def _assert_owned_by_current_user(path: Path) -> None:
+    if hasattr(os, "geteuid"):
+        assert path.lstat().st_uid == os.geteuid()
 
 
 def _complete_report(issues: list[dict[str, object]]) -> dict[str, object]:
@@ -1201,7 +1207,7 @@ def test_accuracy_snapshots_execute_against_private_immutable_inputs(
         candidate_identity=candidate_identity,
     ) as snapshots:
         snapshot_parent = snapshots["corpus_root"].parent
-        assert snapshot_parent.lstat().st_uid == compare_scan_accuracy.os.geteuid()
+        _assert_owned_by_current_user(snapshot_parent)
         assert snapshots["corpus_root"] != corpus
         original_snapshot = (snapshots["corpus_root"] / "benign" / "SKILL.md").read_bytes()
         (corpus / "benign" / "SKILL.md").write_text("# attacker swap\n", encoding="utf-8")
@@ -1219,7 +1225,7 @@ def test_fresh_home_is_owned_empty_worktree_independent_and_cleaned(tmp_path: Pa
     with compare_scan_accuracy._fresh_owned_home() as home:
         home_path = home
         assert home.is_dir()
-        assert home.lstat().st_uid == compare_scan_accuracy.os.geteuid()
+        _assert_owned_by_current_user(home)
         assert not any(home.iterdir())
         assert not home.is_relative_to(tmp_path)
         (home / "scanner-created-state").write_text("state", encoding="utf-8")
