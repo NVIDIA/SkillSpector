@@ -3811,6 +3811,78 @@ def _direct_shell_name(call: ast.Call) -> str | None:
     return None
 
 
+def _passive_assignment_name_snapshots(tree: ast.AST) -> dict[ast.AST, frozenset[str]]:
+    """Prove prior simple-name bindings in supported straight-line scopes."""
+    from . import static_python_shell_truthiness
+
+    snapshots: dict[ast.AST, frozenset[str]] = {}
+    for scope in ast.walk(tree):
+        if not isinstance(scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        bound_names = (
+            set(_parameter_names(scope.args)) if not isinstance(scope, ast.Module) else set()
+        )
+        declarations = static_python_shell_truthiness._DirectBindingCollector(frozenset())
+        for statement in scope.body:
+            declarations.visit(statement)
+        bound_names.update(declarations.nonlocal_names)
+        safe_names: set[str] = set()
+        trusted_names = set(static_python_shell_truthiness._DIRECT_CALL_NAMES).difference(
+            bound_names
+        )
+        unknown_effects = [False]
+        for statement in scope.body:
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)) and not unknown_effects[0]:
+                targets = (
+                    statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                )
+                value = statement.value
+                if value is not None:
+                    pairs = [
+                        pair for target in targets for pair in _paired_store_values(target, value)
+                    ]
+                    if pairs and all(
+                        isinstance(target, ast.Name)
+                        and (target.id not in bound_names or target.id in safe_names)
+                        for target, _ in pairs
+                    ):
+                        snapshots[statement] = frozenset(
+                            item.id
+                            for item in ast.walk(value)
+                            if isinstance(item, ast.Name) and item.id in safe_names
+                        )
+            if isinstance(statement, (ast.Import, ast.ImportFrom)):
+                native_import = (
+                    isinstance(statement, ast.Import)
+                    and all(
+                        alias.name == "subprocess" and alias.asname in (None, "subprocess")
+                        for alias in statement.names
+                    )
+                    or isinstance(statement, ast.ImportFrom)
+                    and statement.level == 0
+                    and statement.module == "subprocess"
+                    and all(
+                        alias.name == "Popen" and alias.asname in (None, "Popen")
+                        for alias in statement.names
+                    )
+                )
+                if not native_import:
+                    # Arbitrary module initialization can change existing names.
+                    unknown_effects[0] = True
+                    safe_names.clear()
+            static_python_shell_truthiness._advance_trusted_names(
+                statement, trusted_names, bound_names, safe_names, unknown_effects
+            )
+            if isinstance(statement, (ast.Import, ast.ImportFrom)) and not unknown_effects[0]:
+                # Only a fresh, proven native import adds release-safe names.
+                safe_names.update(
+                    trusted_names.intersection(
+                        static_python_shell_truthiness._direct_bound_names(statement)
+                    )
+                )
+    return snapshots
+
+
 def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellAstIndex | None:
     """Index relevant nodes, bindings, and declarations in one AST traversal."""
     tree = parsed.tree
@@ -3830,6 +3902,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
     # self-stores. They neither replace nor restore a binding.
     identity_name_stores: set[ast.Name] = set()
     native_aliases = _native_receiver_aliases(tree)
+    passive_assignment_snapshots = _passive_assignment_name_snapshots(tree)
 
     def mark_attribute_identity_stores(target: ast.AST, value: ast.AST) -> None:
         for destination, source in _paired_store_values(target, value):
@@ -3843,16 +3916,49 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
             ):
                 attribute_identity_stores.add(destination)
 
-    def record_name_store_values(scope: ast.AST, target: ast.AST, value: ast.AST, end: int) -> None:
+    def record_name_store_values(
+        scope: ast.AST, targets: list[ast.AST], value: ast.AST, end: int
+    ) -> None:
+        from . import static_python_shell_truthiness
+
         # Pair unpacked targets with their RHS elements so a native alias, a
         # truthy flag, or a self-store is not mistaken for a replacement.
-        for destination, source in _paired_store_values(target, value):
-            if not isinstance(destination, ast.Name):
-                continue
+        pairs = [
+            (destination, source)
+            for target in targets
+            for destination, source in reversed(list(_paired_store_values(target, value)))
+        ]
+        stores = [
+            (destination, source)
+            for destination, source in pairs
+            if isinstance(destination, ast.Name)
+        ]
+        # The paired iterator is stack-based. Restore Python's left-to-right
+        # target order before deciding which occurrence owns the final value.
+        final_values = {destination.id: source for destination, source in stores}
+        safe_names = passive_assignment_snapshots.get(node)
+        safe_stores = safe_names is not None
+        safe_value = (
+            safe_names is not None
+            and static_python_shell_truthiness._is_finalizer_safe_value(value, set(safe_names))
+        )
+        # Unsupported RHS effects or target protocols cannot prove the final
+        # flag. Preserve the existing conservative event policy for those shapes.
+        false_values = (
+            {
+                source
+                for source in set(final_values.values())
+                if static_python_shell_truthiness._truth_value(source, {}) is False
+            }
+            if safe_stores and safe_value
+            else set()
+        )
+        definitely_false = {name for name, source in final_values.items() if source in false_values}
+        for destination, source in stores:
             keeps_signal = _store_keeps_shell_signal(destination.id, source, native_aliases)
             if keeps_signal is None:
                 identity_name_stores.add(destination)
-            elif keeps_signal:
+            elif keeps_signal and destination.id not in definitely_false:
                 record_binding(scope, destination.id, end, True)
 
     def record_binding(scope: ast.AST, name: str, start: int, restores: bool = False) -> None:
@@ -4123,8 +4229,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
         if isinstance(node, ast.Assign):
             stack.append((node.value, scope_chain, None))
             stack.extend((target, scope_chain, end) for target in node.targets)
-            for target in node.targets:
-                record_name_store_values(scope, target, node.value, end)
+            record_name_store_values(scope, list(node.targets), node.value, end)
         elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
             if node.value is not None:
                 stack.append((node.value, scope_chain, None))
@@ -4132,7 +4237,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
             if isinstance(node, ast.AnnAssign):
                 stack.append((node.annotation, scope_chain, None))
                 if node.value is not None:
-                    record_name_store_values(scope, node.target, node.value, end)
+                    record_name_store_values(scope, [node.target], node.value, end)
         elif isinstance(node, ast.NamedExpr):
             stack.append((node.value, scope_chain, None))
             # PEP 572 makes a walrus target inside one or more
@@ -4145,7 +4250,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
             ):
                 target_chain = target_chain[:-1]
             stack.append((node.target, target_chain, end))
-            record_name_store_values(target_chain[-1], node.target, node.value, end)
+            record_name_store_values(target_chain[-1], [node.target], node.value, end)
         elif isinstance(node, (ast.For, ast.AsyncFor)):
             iteration_span = _node_character_span(parsed, node.iter)
             iteration_end = iteration_span[1] if iteration_span is not None else end
