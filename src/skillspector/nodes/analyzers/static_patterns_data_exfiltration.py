@@ -18,8 +18,11 @@
 from __future__ import annotations
 
 import ast
+import itertools
 import re
 import sys
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
@@ -92,6 +95,21 @@ _ENVIRONMENT_MAPPING_METHOD_CONFIDENCE = {
 }
 _ENVIRONMENT_COLLECTION_CALLS = frozenset({"dict", "list", "tuple", "set", "frozenset"})
 _ENVIRONMENT_COPY_CALLS = frozenset({"copy.copy", "copy.deepcopy"})
+# Calls that hand an environment mapping to a child process. Materializing
+# ``os.environ`` for one of these is process launching, not harvesting: the child
+# receives the environment the skill already runs in, and no value leaves the host.
+_CHILD_PROCESS_ENV_CALLS = frozenset(
+    {
+        "subprocess.run",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.Popen",
+        "asyncio.create_subprocess_exec",
+        "asyncio.create_subprocess_shell",
+    }
+)
+_LAUNCHER_MODULES = frozenset(name.partition(".")[0] for name in _CHILD_PROCESS_ENV_CALLS)
 E3_CODE_PATTERNS = [
     (r"glob\s*\.\s*glob\s*\([^)]*(?:\.env|\.ssh|\.aws|\.config|credentials)", 0.8),
     (r"os\s*\.\s*walk\s*\([^)]*(?:home|~|/Users|/home)", 0.6),
@@ -188,6 +206,634 @@ def _is_dynamic_copy_call(call: ast.Call, aliases: dict[str, str]) -> bool:
     )
 
 
+# In-place edits of a mapping that keep the values on the host. ``update`` and
+# ``clear`` return ``None``. The extraction methods hand a value back, so they
+# only count as edits when that value is thrown away. A value kept from the copy,
+# even by one literal key, is invisible to taint tracking, so it keeps the finding.
+_ENVIRONMENT_MUTATION_METHODS = frozenset({"update", "clear"})
+_ENVIRONMENT_EXTRACTION_METHODS = frozenset({"pop", "popitem", "setdefault"})
+
+# Statement lists a raise, ``break`` or ``continue`` can leave before a later
+# rebinding runs, while code that still sees the older binding goes on to run:
+# a handler, a ``finally``, a context manager that swallows the error, or the
+# code after the loop. Loop bodies are handled in ``_visit_loop``.
+_PROTECTED_BODIES = frozenset(
+    {
+        (ast.Try, "body"),
+        (ast.Try, "orelse"),
+        (ast.TryStar, "body"),
+        (ast.TryStar, "orelse"),
+        (ast.ExceptHandler, "body"),
+        (ast.With, "body"),
+        (ast.AsyncWith, "body"),
+    }
+)
+
+# Builtins, attributes and modules that read variables by a name only known at
+# run time.
+_DYNAMIC_NAMESPACE_NAMES = frozenset({"globals", "locals", "vars", "eval", "exec", "sys.modules"})
+_DYNAMIC_NAMESPACE_ATTRIBUTES = frozenset({"f_locals", "f_globals", "__globals__"})
+
+# Calls that can replace an attribute of the object passed first, and the
+# ``sys.modules`` methods that can replace a module before it is imported.
+_ATTRIBUTE_WRITE_CALLS = frozenset({"setattr", "delattr", "vars"})
+_MODULE_TABLE_WRITE_METHODS = frozenset(
+    {"update", "setdefault", "pop", "popitem", "clear", "__setitem__", "__delitem__"}
+)
+
+# Bindings of one name that may all still be live, past which the name is
+# reported rather than followed. Keeps crafted files linear.
+_MAX_OPEN_BINDINGS = 32
+
+
+def _method_receiver(node: ast.AST, methods: frozenset[str]) -> ast.Name | None:
+    """Return the bare name a ``name.method(...)`` call is made on, for *methods*."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in methods
+        and isinstance(node.func.value, ast.Name)
+    ):
+        return node.func.value
+    return None
+
+
+def _edit_receiver(node: ast.AST) -> ast.Name | None:
+    """Return the name a call edits in place without taking values off the mapping."""
+    receiver = _method_receiver(node, _ENVIRONMENT_MUTATION_METHODS)
+    if receiver is None and isinstance(node, ast.Expr):
+        receiver = _method_receiver(node.value, _ENVIRONMENT_EXTRACTION_METHODS)
+    return receiver
+
+
+def _is_main_guard(test: ast.expr) -> bool:
+    """Return whether ``test`` is ``__name__ == "__main__"``, either way round."""
+    if not (
+        isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq)
+    ):
+        return False
+    sides = (test.left, test.comparators[0])
+    return any(isinstance(side, ast.Name) and side.id == "__name__" for side in sides) and any(
+        isinstance(side, ast.Constant) and side.value == "__main__" for side in sides
+    )
+
+
+def _reads_names_dynamically(node: ast.AST, aliases: dict[str, str]) -> bool:
+    """Return whether ``node`` can read a variable by a name only known at run time.
+
+    Any reference counts, not only a call, so ``namespace = locals`` is caught too.
+    """
+    if isinstance(node, ast.Attribute):
+        if node.attr in _DYNAMIC_NAMESPACE_ATTRIBUTES:
+            return True
+        # Two parts at most (``sys.modules``, ``builtins.locals``) keeps this linear.
+        if not isinstance(node.value, ast.Name):
+            return False
+        name = apply_import_aliases(f"{node.value.id}.{node.attr}", aliases)
+    elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+        name = apply_import_aliases(node.id, aliases)
+    else:
+        return False
+    return name in _DYNAMIC_NAMESPACE_NAMES
+
+
+class _FileBindings:
+    """How one file binds its names: by import or otherwise, and what it patches.
+
+    The flow pass sees one file, and call names are matched by spelling, so a
+    launcher or a ``__main__`` guard is only trusted when nothing in the file can
+    have replaced it.
+    """
+
+    def __init__(self, tree: ast.AST, aliases: dict[str, str]) -> None:
+        # Local name to the absolute import paths bound to it. ``""`` marks a
+        # relative import, which may load a file the skill ships.
+        self._imports: dict[str, set[str]] = {}
+        # Names bound other than by an import, anywhere in the file.
+        self._rebound: set[str] = set()
+        # Top-level modules with an attribute written from this file.
+        self._patched: set[str] = set()
+        # A star import or a write to ``sys.modules`` can replace any import.
+        self._imports_replaceable = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    # ``import a.b`` binds ``a``; ``import a.b as c`` binds ``c`` to ``a.b``.
+                    root = alias.name.partition(".")[0]
+                    local, path = (alias.asname, alias.name) if alias.asname else (root, root)
+                    self._imports.setdefault(local, set()).add(path)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "*":
+                        self._imports_replaceable = True
+                        continue
+                    path = f"{node.module}.{alias.name}" if node.module and not node.level else ""
+                    self._imports.setdefault(alias.asname or alias.name, set()).add(path)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                self._rebound.add(node.name)
+            elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+                self._rebound.add(node.id)
+            elif isinstance(node, ast.arg):
+                self._rebound.add(node.arg)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                self._rebound.update(node.names)
+            elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+                self._rebound.add(node.name)
+            elif isinstance(node, ast.MatchMapping) and node.rest:
+                self._rebound.add(node.rest)
+            else:
+                self._record_patch(node, aliases)
+
+    def _record_patch(self, node: ast.AST, aliases: dict[str, str]) -> None:
+        """Note a module whose attributes ``node`` may replace."""
+        written: ast.expr | None = None
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and not isinstance(node.ctx, ast.Load):
+            written = node.value if isinstance(node, ast.Subscript) else node
+        elif (
+            isinstance(node, ast.Attribute)
+            and node.attr == "__dict__"
+            and isinstance(node.value, ast.Name)
+        ):
+            written = node.value
+        elif isinstance(node, ast.Call) and node.args:
+            call_name = resolve_call_name(node, aliases)
+            if call_name in _ATTRIBUTE_WRITE_CALLS:
+                written = node.args[0]
+            elif call_name is not None and call_name.startswith("sys.modules."):
+                if call_name.rpartition(".")[2] in _MODULE_TABLE_WRITE_METHODS:
+                    written = node.func
+        if written is None:
+            return
+        name = _resolve_expression_name(written, aliases)
+        if name is None:
+            return
+        if name == "sys.modules" or name.startswith("sys.modules."):
+            self._imports_replaceable = True
+        self._patched.add(name.partition(".")[0])
+
+    def launchers(self) -> set[str]:
+        """Local names a child-process launcher can be called through.
+
+        Each one is bound only by absolute imports of one path in a launcher
+        module, and nothing in the file writes to that module.
+        """
+        if self._imports_replaceable:
+            return set()
+        trusted: set[str] = set()
+        for name, paths in self._imports.items():
+            if name in self._rebound or len(paths) != 1:
+                continue
+            module = next(iter(paths)).partition(".")[0]
+            if module in _LAUNCHER_MODULES and module not in self._patched:
+                trusted.add(name)
+        return trusted
+
+    def main_guard_holds(self) -> bool:
+        """Whether ``__name__`` keeps its import-time value in this file."""
+        return (
+            not self._imports_replaceable
+            and "__name__" not in self._rebound
+            and "__name__" not in self._imports
+        )
+
+
+@dataclass
+class _EnvironmentBinding:
+    """One name bound to a candidate expression, tracked until a rebinding that surely runs."""
+
+    value_id: int
+    # The statement block the binding was made in, as a path of block numbers.
+    block: tuple[int, ...]
+    reached_child_process: bool = False
+    escaped: bool = False
+
+
+@dataclass
+class _Loop:
+    """Names read and bindings made in one loop, whose body may run again."""
+
+    reads: set[tuple[_Scope, str]] = field(default_factory=set)
+    bindings: list[tuple[_Scope, str, _EnvironmentBinding]] = field(default_factory=list)
+
+
+# Compared by identity, so a scope can key the per-loop read set.
+@dataclass(eq=False)
+class _Scope:
+    """Open bindings of one lexical scope: module, function, lambda, class or comprehension."""
+
+    # ``None`` for the module, which owns every name no inner scope binds.
+    local_names: set[str] | None
+    declared_global: set[str] = field(default_factory=set)
+    # The body runs when it is called or iterated, not where it is defined.
+    deferred: bool = False
+    is_class: bool = False
+    is_comprehension: bool = False
+    # Several bindings of one name stay open when a rebinding may not have run.
+    open: dict[str, list[_EnvironmentBinding]] = field(default_factory=dict)
+    read_later: set[str] = field(default_factory=set)
+
+    def owns(self, name: str) -> bool:
+        return self.local_names is None or name in self.local_names
+
+
+def _scope_declarations(body: Sequence[ast.AST]) -> tuple[set[str], set[str]]:
+    """Return the names a scope binds itself and the names it declares ``global``.
+
+    Nested functions, lambdas and classes are scopes of their own, so only their
+    names count here. Comprehension targets stay inside the comprehension, but a
+    walrus inside one binds in this scope. ``nonlocal`` names belong to an
+    enclosing function.
+    """
+    bound: set[str] = set()
+    declared_global: set[str] = set()
+    declared_nonlocal: set[str] = set()
+    pending: list[ast.AST] = list(body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.comprehension):
+            pending.append(node.iter)
+            pending.extend(node.ifs)
+            continue
+        if isinstance(node, ast.Global):
+            declared_global.update(node.names)
+        elif isinstance(node, ast.Nonlocal):
+            declared_nonlocal.update(node.names)
+        elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            bound.add(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            bound.update(
+                (alias.asname or alias.name).split(".")[0]
+                for alias in node.names
+                if alias.name != "*"
+            )
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
+        pending.extend(ast.iter_child_nodes(node))
+    return bound - declared_global - declared_nonlocal, declared_global
+
+
+def _argument_names(arguments: ast.arguments) -> set[str]:
+    return {
+        argument.arg
+        for argument in (
+            *arguments.posonlyargs,
+            *arguments.args,
+            *arguments.kwonlyargs,
+            arguments.vararg,
+            arguments.kwarg,
+        )
+        if argument is not None
+    }
+
+
+class _EnvironmentFlowVisitor(ast.NodeVisitor):
+    """Decide which environment mappings only ever reach a child-process ``env=``.
+
+    Names are followed per lexical scope, in evaluation order (assignment values
+    before their targets), until a rebinding that surely runs. A later ``env = {}``
+    handed to a launcher therefore cannot vouch for an earlier
+    ``env = os.environ.copy()``, and a nested scope's own ``env`` cannot close the
+    outer one. A binding passes through only if every use is a child-process
+    ``env=`` argument or an in-place edit of the mapping; any other use keeps the
+    finding.
+
+    The pass sees one file, so a binding only passes through by name where no
+    other file can reach it: a function local, or a module global bound in a
+    top-level ``if __name__ == "__main__":`` body, which importers never run. A
+    launcher only counts when its root name is bound solely by an absolute import
+    from ``subprocess`` or ``asyncio`` and nothing in the file writes to that
+    module, so a local ``def run`` or ``class subprocess`` gets no exemption.
+
+    Control flow errs toward keeping the finding. A rebinding closes only the
+    bindings made in its own block or in blocks nested inside it, so one inside an
+    ``if``, ``try``, ``with``, ``match`` or loop body leaves the outer binding open
+    next to the new one, and later uses count against both. A rebinding never
+    closes anything where a raise, ``break`` or ``continue`` can skip it (``try``,
+    ``except``, ``with`` and loop bodies), or as a walrus, which can sit in a
+    short-circuit. A loop body may run again, so a read anywhere in a loop counts
+    against every binding made in that loop. A walrus result, a class attribute
+    and any name in a file that can read names dynamically (``globals``,
+    ``eval``, frame locals, ``__globals__``, ``sys.modules``) keep the finding,
+    as does a name with too many live bindings.
+
+    A function or lambda body runs at some later time, so its reads of an
+    enclosing name count against every binding of that name that is open when the
+    body is defined or made after it. Its writes to an enclosing name through
+    ``global`` or ``nonlocal`` cannot be ordered against the enclosing uses and
+    leave those bindings as they are.
+    """
+
+    def __init__(self, tree: ast.AST, aliases: dict[str, str]) -> None:
+        self._env_arguments: set[int] = set()
+        self._mutated_names: set[int] = set()
+        self._dynamic_reads = False
+        bindings = _FileBindings(tree, aliases)
+        launchers = bindings.launchers()
+        # Importers never run a top-level ``if __name__ == "__main__":`` body.
+        self._main_guards: set[int] = set()
+        if isinstance(tree, ast.Module) and bindings.main_guard_holds():
+            self._main_guards = {
+                id(statement)
+                for statement in tree.body
+                if isinstance(statement, ast.If) and _is_main_guard(statement.test)
+            }
+        self._in_main_guard = False
+        for node in ast.walk(tree):
+            if _reads_names_dynamically(node, aliases):
+                self._dynamic_reads = True
+            receiver = _edit_receiver(node)
+            if receiver is not None:
+                self._mutated_names.add(id(receiver))
+            elif isinstance(node, ast.Call):
+                call_name = resolve_call_name(node, aliases)
+                spelling = resolve_dotted_name(node.func)
+                if (
+                    call_name in _CHILD_PROCESS_ENV_CALLS
+                    and spelling is not None
+                    and spelling.partition(".")[0] in launchers
+                ):
+                    self._env_arguments.update(
+                        id(keyword.value) for keyword in node.keywords if keyword.arg == "env"
+                    )
+            elif (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and isinstance(node.value, ast.Name)
+            ):
+                self._mutated_names.add(id(node.value))
+            elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+                self._mutated_names.add(id(node.target))
+        self._scopes: list[_Scope] = [_Scope(local_names=None)]
+        self._passed_through: set[int] = set()
+        self._escaped: set[int] = set()
+        self._block_numbers = itertools.count()
+        self._block: tuple[int, ...] = ()
+        # How many protected bodies of the current scope enclose this point.
+        self._protected = 0
+        self._loops: list[_Loop] = []
+
+    def passthrough_ids(self) -> set[int]:
+        """Ids of expressions whose only destination is a child-process ``env=``."""
+        self._close_scope(self._scopes[0])
+        if self._dynamic_reads:
+            # Any name may be read back by a string, so only inline arguments are safe.
+            return set(self._env_arguments)
+        return (self._passed_through - self._escaped) | self._env_arguments
+
+    def _close(self, scope: _Scope, name: str, block: tuple[int, ...] | None = None) -> None:
+        """Close the bindings of ``name`` made in ``block`` or in blocks nested inside it.
+
+        Those are the bindings a rebinding in ``block`` surely replaces; ``None``
+        closes them all.
+        """
+        still_open: list[_EnvironmentBinding] = []
+        for binding in scope.open.pop(name, []):
+            if block is not None and binding.block[: len(block)] != block:
+                still_open.append(binding)
+            elif binding.escaped:
+                self._escaped.add(binding.value_id)
+            elif binding.reached_child_process:
+                self._passed_through.add(binding.value_id)
+        if still_open:
+            scope.open[name] = still_open
+
+    def _close_scope(self, scope: _Scope) -> None:
+        for name in list(scope.open):
+            self._close(scope, name)
+
+    def _resolve(self, name: str, *, walrus: bool = False) -> tuple[_Scope, bool]:
+        """Return the scope that owns ``name`` here, and whether this access runs later."""
+        deferred = False
+        innermost = True
+        for scope in reversed(self._scopes):
+            if walrus and scope.is_comprehension:
+                deferred = deferred or scope.deferred
+                continue
+            # A class body does not enclose the scopes nested inside it.
+            if innermost or not scope.is_class:
+                if scope.owns(name):
+                    return scope, deferred
+                if name in scope.declared_global:
+                    return self._scopes[0], deferred or scope.deferred
+            deferred = deferred or scope.deferred
+            innermost = False
+        return self._scopes[0], deferred
+
+    def _store(self, name: str, value_id: int | None, *, walrus: bool = False) -> None:
+        scope, deferred = self._resolve(name, walrus=walrus)
+        if deferred:
+            return
+        if not walrus and not self._protected:
+            self._close(scope, name, self._block)
+        if value_id is None:
+            return
+        # A walrus also hands the value to the enclosing expression, a class
+        # attribute outlives the class body, and another file can import a module
+        # global this pass never sees.
+        escaped = (
+            walrus
+            or scope.is_class
+            or name in scope.read_later
+            or (scope is self._scopes[0] and not self._in_main_guard)
+        )
+        binding = _EnvironmentBinding(value_id, self._block, escaped=escaped)
+        bindings = scope.open.setdefault(name, [])
+        bindings.append(binding)
+        for loop in self._loops:
+            loop.bindings.append((scope, name, binding))
+        if len(bindings) > _MAX_OPEN_BINDINGS:
+            self._escaped.update(open_binding.value_id for open_binding in bindings)
+            del scope.open[name]
+
+    def _bind(self, target: ast.expr, value_id: int, *, walrus: bool = False) -> None:
+        if isinstance(target, ast.Name):
+            self._store(target.id, value_id, walrus=walrus)
+        else:
+            self.visit(target)
+
+    def _visit_block(self, nodes: Sequence[ast.AST], *, protected: bool = False) -> None:
+        """Visit statements that may run zero, one or several times as one block."""
+        outer = self._block
+        self._block = (*outer, next(self._block_numbers))
+        self._protected += protected
+        for node in nodes:
+            self.visit(node)
+        self._protected -= protected
+        self._block = outer
+
+    def _visit_loop(self, header: Sequence[ast.AST], body: list[ast.stmt]) -> None:
+        """Visit a loop's repeated part, then count its reads against its bindings."""
+        loop = _Loop()
+        self._loops.append(loop)
+        # ``break`` and ``continue`` can skip any rebinding in the body.
+        self._visit_block([*header, *body], protected=True)
+        self._loops.pop()
+        # The next pass reads what this pass bound, whatever the source order.
+        for scope, name, binding in loop.bindings:
+            if (scope, name) in loop.reads:
+                self._escaped.add(binding.value_id)
+
+    def generic_visit(self, node: ast.AST) -> None:
+        """Visit children in order, giving every nested statement list its own block."""
+        for field_name, value in ast.iter_fields(node):
+            if isinstance(value, list) and value and isinstance(value[0], ast.stmt):
+                protected = (type(node), field_name) in _PROTECTED_BODIES
+                self._visit_block(value, protected=protected)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, ast.AST):
+                        self.visit(item)
+            elif isinstance(value, ast.AST):
+                self.visit(value)
+
+    def _visit_scope(self, scope: _Scope, body: list[ast.stmt] | list[ast.expr]) -> None:
+        # A ``try`` around a definition cannot see the locals of its body.
+        outer_protected, self._protected = self._protected, 0
+        self._scopes.append(scope)
+        self._visit_block(body)
+        self._close_scope(self._scopes.pop())
+        self._protected = outer_protected
+
+    def _visit_defaults(self, arguments: ast.arguments) -> None:
+        for default in (*arguments.defaults, *arguments.kw_defaults):
+            if default is not None:
+                self.visit(default)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self._visit_defaults(node.args)
+        bound, declared_global = _scope_declarations(node.body)
+        scope = _Scope(bound | _argument_names(node.args), declared_global, deferred=True)
+        self._visit_scope(scope, node.body)
+        self._store(node.name, None)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._visit_defaults(node.args)
+        bound, _ = _scope_declarations([node.body])
+        scope = _Scope(bound | _argument_names(node.args), deferred=True)
+        self._visit_scope(scope, [node.body])
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for expression in (*node.decorator_list, *node.bases):
+            self.visit(expression)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+        bound, declared_global = _scope_declarations(node.body)
+        self._visit_scope(_Scope(bound, declared_global, is_class=True), node.body)
+        self._store(node.name, None)
+
+    def _visit_comprehension(
+        self,
+        node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp,
+        results: list[ast.expr],
+    ) -> None:
+        # The first iterable is evaluated in the enclosing scope.
+        self.visit(node.generators[0].iter)
+        targets = {
+            name.id
+            for generator in node.generators
+            for name in ast.walk(generator.target)
+            if isinstance(name, ast.Name)
+        }
+        deferred = isinstance(node, ast.GeneratorExp)
+        self._scopes.append(_Scope(targets, deferred=deferred, is_comprehension=True))
+        repeated: list[ast.AST] = []
+        for index, generator in enumerate(node.generators):
+            if index:
+                repeated.append(generator.iter)
+            repeated.append(generator.target)
+            repeated.extend(generator.ifs)
+        self._visit_loop([*repeated, *results], [])
+        self._close_scope(self._scopes.pop())
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node, [node.key, node.value])
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for target in node.targets:
+            self._bind(target, id(node.value))
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is None:
+            return
+        self.visit(node.value)
+        self._bind(node.target, id(node.value))
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+        self._bind(node.target, id(node.value), walrus=True)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self.visit(node.value)
+        self.visit(node.target)
+
+    def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
+        self.visit(node.iter)
+        # The target is rebound on every pass, and not at all for an empty iterable.
+        self._visit_loop([node.target], node.body)
+        self._visit_block(node.orelse)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self.visit_For(node)
+
+    def visit_If(self, node: ast.If) -> None:
+        if id(node) not in self._main_guards:
+            self.generic_visit(node)
+            return
+        self.visit(node.test)
+        self._in_main_guard = True
+        self._visit_block(node.body)
+        self._in_main_guard = False
+        self._visit_block(node.orelse)
+
+    def visit_While(self, node: ast.While) -> None:
+        # The test runs again before every pass.
+        self._visit_loop([node.test], node.body)
+        self._visit_block(node.orelse)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        node_id = id(node)
+        if not isinstance(node.ctx, ast.Load) and node_id not in self._mutated_names:
+            self._store(node.id, None)
+            return
+        scope, deferred = self._resolve(node.id)
+        bindings = scope.open.get(node.id, [])
+        if node_id in self._env_arguments:
+            for binding in bindings:
+                binding.reached_child_process = True
+        elif node_id not in self._mutated_names:
+            if deferred:
+                scope.read_later.add(node.id)
+            if scope.is_class:
+                # Before the class body binds the name, the read falls through to globals.
+                bindings = [*bindings, *self._scopes[0].open.get(node.id, [])]
+            for binding in bindings:
+                binding.escaped = True
+            for loop in self._loops:
+                loop.reads.add((scope, node.id))
+
+
 def _analyze_python_environment_reads(
     content: str,
     file_path: str,
@@ -213,6 +859,14 @@ def _analyze_python_environment_reads(
 
     aliases = python_ast.import_aliases
     lines = python_ast.lines
+    try:
+        flow = _EnvironmentFlowVisitor(tree, aliases)
+        flow.visit(tree)
+        child_process_passthroughs = flow.passthrough_ids()
+    except RecursionError:
+        # Too deep for the recursive flow pass: report every full read, as before
+        # the child-process exemption existed, instead of losing the whole file.
+        child_process_passthroughs = set()
     findings: list[AnalyzerFinding] = []
     emitted: set[int] = set()
     tag = [PatternCategory.DATA_EXFILTRATION.value]
@@ -220,6 +874,8 @@ def _analyze_python_environment_reads(
     def emit(node: ast.AST, confidence: float) -> None:
         node_id = id(node)
         if node_id in emitted:
+            return
+        if node_id in child_process_passthroughs:
             return
         emitted.add(node_id)
         lineno = getattr(node, "lineno", 1)
