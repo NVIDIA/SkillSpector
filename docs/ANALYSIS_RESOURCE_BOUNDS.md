@@ -263,7 +263,7 @@ removes the rejected partial checkout.
 | Retained YARA string instances | 4,096 | One matched rule |
 | Shipped-bytecode discovery entries | 10,000 | One analyzer execution |
 | Shipped-bytecode traversal depth | 64 | One analyzer execution |
-| Shipped-bytecode analysis time | 5 seconds | One analyzer execution, within the workflow deadline |
+| Shipped-bytecode active processing time | 5 seconds | One analyzer execution, within the workflow wall-clock deadline |
 | Dependency manifests | 64 | One analyzer execution |
 | Dependency packages | 256 | One manifest |
 | Dependency packages | 1,024 | One analyzer execution |
