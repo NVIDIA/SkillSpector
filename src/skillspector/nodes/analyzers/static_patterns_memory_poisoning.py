@@ -80,8 +80,9 @@ MP1_PATTERNS = [
 ]
 
 # MP2: Context Window Stuffing — filling context to displace content
+_BOUNDED_REPETITION_PATTERN = r"(.{2,20}?)\1{20,}"
 MP2_CONTENT_PATTERNS = [
-    (r"(.{2,20}?)\1{20,}", 0.8),
+    (_BOUNDED_REPETITION_PATTERN, 0.8),
 ]
 MP2_PROSE_PATTERNS = [
     (
@@ -541,10 +542,16 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in MP2_PATTERNS:
+        # For each start there are only 19 candidate lengths. A failed candidate
+        # checks at most 20 copies; a success consumes its entire repeated run.
+        # There is no trailing condition to force it to backtrack over that run.
+        # Keep this linear, window-bounded rule on Python's faster native engine.
         matches = (
-            static_runner.iter_paragraph_matches
+            re.finditer
+            if pattern == _BOUNDED_REPETITION_PATTERN
+            else static_runner.iter_paragraph_matches
             if (pattern, confidence) in MP2_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             span = match.group(0)

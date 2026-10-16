@@ -406,21 +406,22 @@ SC3_PROSE_PATTERNS = [
 SC3_PATTERNS = SC3_CODE_PATTERNS + SC3_PROSE_PATTERNS
 # Shell decode-to-execute chains run on every file type, like SC2, because
 # SKILL.md instructions and hook configs carry shell commands too.
+# These two exact rules retain the audited bounded native path. Additional
+# shell rules default to the interruptible matcher until separately reviewed.
+_SC3_BOUNDED_PIPE_PATTERN = (
+    rf"{_SC3_SHELL_DECODER}(?:{_SC3_HERE_STRING}\\?['\"]?"
+    rf"[A-Za-z0-9+/=]{{0,{_MAX_SHELL_LITERAL_CHARS}}}+)?+{_SC3_PIPE_SEGMENT}"
+    rf"(?:\|(?!\|)&?{_SC3_PIPE_SEGMENT}){{0,3}}?{_SC3_PIPE_EXECUTOR}"
+)
+_SC3_BOUNDED_SUBSTITUTION_PATTERN = (
+    rf"{_SC3_SUBSTITUTION_EXECUTOR}[^()`\n]{{0,{_MAX_SHELL_LITERAL_CHARS}}}?"
+    rf"{_SC3_SHELL_DECODER}"
+)
 SC3_SHELL_PATTERNS = [
-    (
-        # A here-string literal can outgrow a pipeline stage, so it is consumed
-        # whole, and possessively, before the first stage.
-        rf"{_SC3_SHELL_DECODER}(?:{_SC3_HERE_STRING}\\?['\"]?"
-        rf"[A-Za-z0-9+/=]{{0,{_MAX_SHELL_LITERAL_CHARS}}}+)?+{_SC3_PIPE_SEGMENT}"
-        rf"(?:\|(?!\|)&?{_SC3_PIPE_SEGMENT}){{0,3}}?{_SC3_PIPE_EXECUTOR}",
-        0.9,
-    ),
-    (
-        rf"{_SC3_SUBSTITUTION_EXECUTOR}[^()`\n]{{0,{_MAX_SHELL_LITERAL_CHARS}}}?"
-        rf"{_SC3_SHELL_DECODER}",
-        0.9,
-    ),
+    (_SC3_BOUNDED_PIPE_PATTERN, 0.9),
+    (_SC3_BOUNDED_SUBSTITUTION_PATTERN, 0.9),
 ]
+
 
 # SC7: Untrusted Container Image — pulling images with signature/registry
 # verification turned off. These flags disable image trust regardless of the
@@ -2121,7 +2122,9 @@ def _iter_sc2_shell_matches(
     covered = 0
     for start, end in command_ranges:
         if end is None:
-            yield from compiled.finditer(content, max(start, covered))
+            yield from static_runner.iter_pattern_matches(
+                compiled, content, start=max(start, covered)
+            )
             return
         if start < covered:
             continue
@@ -2163,7 +2166,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             matches = (
                 static_runner.iter_paragraph_matches
                 if (pattern, confidence) in SC1_PROSE_PATTERNS
-                else re.finditer
+                else static_runner.iter_pattern_matches
             )
             for match in matches(pattern, content, re.MULTILINE):
                 line_num = line_number(match.start())
@@ -2188,7 +2191,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 pattern, content, re.IGNORECASE | re.MULTILINE
             )
         else:
-            matches = re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE)
+            matches = static_runner.iter_pattern_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            )
         for match in matches:
             line_num = line_number(match.start())
             mt = match.group(0)
@@ -2299,10 +2304,15 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     if has_shell_decoder:
         sc3_patterns = sc3_patterns + SC3_SHELL_PATTERNS
     for pattern, confidence in sc3_patterns:
+        # Shell-decoder rules already bound every stage/literal and use atomic
+        # or possessive ambiguous groups. Keep their audited native matcher;
+        # the interruptible engine adds enough cost to reject dense input.
         matches = (
-            static_runner.iter_paragraph_matches
+            re.finditer
+            if pattern in (_SC3_BOUNDED_PIPE_PATTERN, _SC3_BOUNDED_SUBSTITUTION_PATTERN)
+            else static_runner.iter_paragraph_matches
             if (pattern, confidence) in SC3_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = line_number(match.start())
@@ -2321,7 +2331,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     # SC7: untrusted container image. Example filtering is delegated to the runner.
     for pattern, confidence in SC7_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = line_number(match.start())
             findings.append(
                 AnalyzerFinding(
