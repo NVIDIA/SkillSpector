@@ -2410,6 +2410,46 @@ def _bounded_recursive_result(label: str, *, finding_count: int = 1) -> dict[str
     }
 
 
+@pytest.mark.parametrize(
+    ("score", "severity", "recommendation"),
+    [
+        (0, "LOW", "SAFE"),
+        (20, "LOW", "SAFE"),
+        (21, "MEDIUM", "CAUTION"),
+        (50, "MEDIUM", "CAUTION"),
+        (51, "HIGH", "DO_NOT_INSTALL"),
+        (80, "HIGH", "DO_NOT_INSTALL"),
+        (81, "CRITICAL", "DO_NOT_INSTALL"),
+        (100, "CRITICAL", "DO_NOT_INSTALL"),
+    ],
+)
+@pytest.mark.parametrize("execution_failed", [False, True])
+@pytest.mark.parametrize("analysis_incomplete", [False, True])
+def test_recursive_risk_recommendation_bands_and_overrides(
+    score: int,
+    severity: str,
+    recommendation: str,
+    execution_failed: bool,
+    analysis_incomplete: bool,
+) -> None:
+    """Completeness can increase caution, but cannot erase known risk."""
+    expected = recommendation
+    if execution_failed:
+        expected = "DO_NOT_INSTALL"
+    elif analysis_incomplete and expected == "SAFE":
+        expected = "CAUTION"
+
+    assert cli._multi_skill_risk_assessment(
+        score,
+        execution_failed=execution_failed,
+        analysis_incomplete=analysis_incomplete,
+    ) == {
+        "max_risk_score": score,
+        "severity": severity,
+        "recommendation": expected,
+    }
+
+
 def test_recursive_fail_on_findings_exits_one_below_risk_threshold(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2584,19 +2624,26 @@ def test_recursive_over_record_budget_child_preserves_risk_and_exit(
     list(FormatChoice),
 )
 @pytest.mark.parametrize("cap_kind", ["child-retention", "serialized-output"])
+@pytest.mark.parametrize(
+    ("score", "severity", "recommendation"),
+    [(25, "MEDIUM", "CAUTION"), (100, "CRITICAL", "DO_NOT_INSTALL")],
+)
 def test_recursive_non_json_caps_preserve_aggregate_risk(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     output_format: FormatChoice,
     cap_kind: str,
+    score: int,
+    severity: str,
+    recommendation: str,
 ) -> None:
-    """Omitted child details never erase known high aggregate risk."""
+    """Omitted child details never erase known aggregate risk."""
     relative_path = "critical"
     child = {
         **_bounded_recursive_result("critical", finding_count=2),
-        "risk_score": 100,
-        "risk_severity": "CRITICAL",
-        "risk_recommendation": "DO_NOT_INSTALL",
+        "risk_score": score,
+        "risk_severity": severity,
+        "risk_recommendation": recommendation,
     }
     if cap_kind == "child-retention":
         monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_PUBLIC_RECORDS", 1)
@@ -2617,7 +2664,8 @@ def test_recursive_non_json_caps_preserve_aggregate_risk(
     output = tmp_path / f"combined.{output_format.value}"
     monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: child)
 
-    with pytest.raises(typer.Exit) as exit_info:
+    exit_context = pytest.raises(typer.Exit) if score > 50 else nullcontext()
+    with exit_context as exit_info:
         cli._scan_multi_skill(
             MultiSkillDetectionResult(is_multi_skill=True, skills=[skill]),
             output_format,
@@ -2625,28 +2673,29 @@ def test_recursive_non_json_caps_preserve_aggregate_risk(
             no_llm=True,
         )
 
-    assert exit_info.value.exit_code == 1
+    if score > 50:
+        assert exit_info.value.exit_code == 1
     body = output.read_text(encoding="utf-8")
     if output_format is FormatChoice.json:
         payload = json.loads(body)
-        assert payload["max_risk_score"] == 100
-        assert payload["risk_severity"] == "CRITICAL"
-        assert payload["risk_recommendation"] == "DO_NOT_INSTALL"
+        assert payload["max_risk_score"] == score
+        assert payload["risk_severity"] == severity
+        assert payload["risk_recommendation"] == recommendation
     elif output_format is FormatChoice.sarif:
         payload = json.loads(body)
         validate_sarif_report(payload)
         aggregate = payload["runs"][-1]["invocations"][0]["properties"]
         risk = aggregate["riskAssessment"]
         assert risk == {
-            "maxRiskScore": 100,
-            "severity": "CRITICAL",
-            "recommendation": "DO_NOT_INSTALL",
+            "maxRiskScore": score,
+            "severity": severity,
+            "recommendation": recommendation,
         }
     else:
-        assert "Maximum score: 100/100" in body
-        assert "Severity: CRITICAL" in body
+        assert f"Maximum score: {score}/100" in body
+        assert f"Severity: {severity}" in body
         # Human-readable report formats follow the single-skill convention.
-        assert "Recommendation: DO NOT INSTALL" in body
+        assert f"Recommendation: {recommendation.replace('_', ' ')}" in body
 
 
 @pytest.mark.parametrize(

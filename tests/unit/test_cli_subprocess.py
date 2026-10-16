@@ -92,6 +92,65 @@ def test_recursive_json_stdout_is_one_complete_report(tmp_path: Path, verbose: b
     assert "Multi-Skill Summary" in result.stderr
 
 
+@pytest.mark.parametrize("output_format", ["json", "sarif", "markdown", "terminal"])
+def test_recursive_medium_recommendation_matches_direct_scan(
+    tmp_path: Path, output_format: str
+) -> None:
+    """A complete MEDIUM scan stays CAUTION when reported as a collection."""
+    collection = tmp_path / "collection"
+    marked = _write_skill(collection / "marked", "# Notes\n\nordinary project notes\n")
+    _write_skill(collection / "clean")
+    rules = tmp_path / "rules"
+    rules.mkdir()
+    (rules / "marker.yar").write_text(
+        "rule ordinary_notes_marker {\n"
+        " meta:\n"
+        '  severity = "HIGH"\n'
+        '  confidence = "1.0"\n'
+        '  description = "Harmless marker for report parity"\n'
+        " strings:\n"
+        '  $marker = "ordinary project notes"\n'
+        " condition:\n"
+        "  $marker\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    options = ["--no-llm", "--yara-rules-dir", str(rules)]
+    direct = _run_cli("scan", str(marked), *options, "--format", "json")
+    assert direct.returncode == 0, direct.stderr
+    direct_risk = json.loads(direct.stdout)["risk_assessment"]
+    assert direct_risk["score"] == 25
+    assert direct_risk["severity"] == "MEDIUM"
+    assert direct_risk["recommendation"] == "CAUTION"
+
+    result = _run_cli("scan", str(collection), "--recursive", *options, "--format", output_format)
+    assert result.returncode == 0, result.stderr
+    if output_format == "json":
+        payload = json.loads(result.stdout)
+        assert payload["analysis_completeness"]["is_complete"] is True
+        assert payload["execution_successful"] is True
+        assert payload["max_risk_score"] == 25
+        assert payload["risk_severity"] == "MEDIUM"
+        assert payload["risk_recommendation"] == "CAUTION"
+        children = {child["path"]: child for child in payload["skills"]}
+        assert children["marked"]["risk_assessment"]["recommendation"] == "CAUTION"
+        assert children["clean"]["risk_assessment"]["recommendation"] == "SAFE"
+    elif output_format == "sarif":
+        payload = json.loads(result.stdout)
+        aggregate = payload["runs"][-1]["invocations"][0]
+        assert aggregate["executionSuccessful"] is True
+        assert aggregate["properties"]["analysisCompleteness"]["is_complete"] is True
+        assert aggregate["properties"]["riskAssessment"] == {
+            "maxRiskScore": 25,
+            "severity": "MEDIUM",
+            "recommendation": "CAUTION",
+        }
+    else:
+        # Complete human-readable collections preserve their child reports.
+        assert "MEDIUM" in result.stdout
+        assert "CAUTION" in result.stdout
+
+
 @pytest.mark.parametrize(
     ("body", "expect_p6"),
     [
