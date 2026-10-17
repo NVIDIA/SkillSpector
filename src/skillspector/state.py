@@ -350,6 +350,9 @@ class SkillspectorState(TypedDict, total=False):
     # Report generation uses this to distinguish unavailable requested analysis from an
     # explicit static-only scan while analyzers continue to honor use_llm.
     llm_requested: bool
+    # Sanitized reason captured when caller preflight disables requested execution.
+    # Presence (including None) preserves that result without probing a new provider context.
+    llm_preflight_error: str | None
     # Explicit caller scope, recorded in public coverage accounting.
     exclude_patterns: list[str]
     # Monotonic provenance flag: content rooted beneath a hidden/local-only

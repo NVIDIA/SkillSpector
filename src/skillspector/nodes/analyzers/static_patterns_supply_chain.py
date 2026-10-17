@@ -31,6 +31,7 @@ Node and analyze() in one module.
 from __future__ import annotations
 
 import ast
+import base64
 import codecs
 import functools
 import io
@@ -65,6 +66,7 @@ from skillspector.inspection_ledger import (
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import (
+    MAX_WORKFLOW_SECONDS,
     AnalyzerNodeResponse,
     SkillspectorState,
     transitive_note_truncation,
@@ -265,6 +267,121 @@ def _decoded_literal_xor_calls(content: str) -> list[tuple[int, str]]:
     return decoded
 
 
+_MAX_SHELL_LITERAL_CHARS = 16_384
+# Shell decoders that print a base64, base32 or hex payload. Flag runs stay
+# short and bounded, and the group is atomic, so a flag such as -dddd that
+# parses several ways cannot multiply backtracking.
+_SC3_SHELL_DECODER = (
+    r"(?>\bbase(?:64|32)(?:[ \t]{1,16}--?[A-Za-z][\w=-]{0,20}){0,3}?"
+    r"[ \t]{1,16}(?:--decode|-[A-Za-z]{0,3}d[A-Za-z]{0,3})\b"
+    r"|\bxxd(?:[ \t]{1,16}-[A-Za-z]{1,10}){0,3}?[ \t]{1,16}-(?:r|rp|pr|rps|psr|revert)\b"
+    r"|\bopenssl[ \t]{1,16}(?:base64|enc)(?:[ \t]{1,16}-[A-Za-z0-9-]{1,16}){0,4}?[ \t]{1,16}-d\b)"
+)
+# One pipeline stage. It ends at a pipe, a list operator, a newline, an
+# inline-code backtick or a backslash (so a JSON-escaped \n ends it too), but
+# keeps up to two redirections such as 2>&1 or JSON-escaped quotes. Runs are
+# possessive, so a failed match never backtracks into them.
+_SC3_PIPE_SEGMENT = r"[^|;&\n`\\]{0,256}+(?:(?:&[0-9>-]|\\['\"])[^|;&\n`\\]{0,64}+){0,2}+"
+# A shell reads its program from stdin unless -c or a script operand supplies
+# one. An interpreter counts only without a program argument:
+# `python3 -m json.tool` and `python3 "$dir/render.py"` read data. A sudo
+# option argument cannot start with "-", so each sudo word parses one way.
+_SC3_PIPE_EXECUTOR = (
+    r"\|(?!\|)&?[ \t]{0,16}"
+    r"(?:sudo(?:[ \t]{1,16}+-[A-Za-z]{1,8}+(?:[ \t]{1,16}+[\w.][\w.-]{0,31}+)?){0,4}[ \t]{1,16}+)?"
+    r"(?:(?:/[\w.-]{1,32}){0,4}/)?"
+    r"(?:(?:ba|da|z|k|a)?sh(?![\w.-])"
+    r"(?![ \t]{1,16}(?:-[A-Za-z]{1,8}[ \t]{1,16}){0,3}-[A-Za-z]{0,3}c)"
+    r"(?![ \t]{1,16}(?!-|/dev/stdin\b|[0-9]{0,2}[<>])[^\s|;&)#])"
+    r"|(?:python(?:[23](?:\.[0-9]{1,2})?)?|perl|ruby|node)(?:[ \t]{1,16}-[A-Za-z]{0,4}){0,2}"
+    r"(?=['\"]|[ \t]{0,16}(?:$|[\r;&|)`#]|[0-9]{0,2}>)))"
+)
+# eval, -c and -e run their argument whichever substitution supplies it. A bare
+# shell, interpreter or source runs only content it reads from <(...),
+# < <(...) or a here-string; given "$(...)" it runs a file path. Executor words
+# must start a word, so `deploy.sh "$(...)"` and `--source "$(...)"` do not
+# count. `.` counts only in command position, at a line start or after an
+# operator, a bracket, a backtick or a quote, so `jq . <<< ...` and
+# `tar -C . < <(...)` do not count. A backslash admits JSON-escaped quotes in
+# hook configs.
+_SC3_SUBSTITUTION_EXECUTOR = (
+    r"(?:(?<![\w.-])(?:eval|(?:ba|da|z|k|a)?sh[ \t]{1,16}-[A-Za-z]{0,3}c"
+    r"|python(?:[23](?:\.[0-9]{1,2})?)?[ \t]{1,16}-c|(?:perl|ruby|node)[ \t]{1,16}-e)"
+    r"[ \t]{1,16}\\?[\"']?(?:\$\(|`)"
+    r"|(?:(?<![\w.-])(?:source|(?:ba|da|z|k|a)?sh|python(?:[23](?:\.[0-9]{1,2})?)?|perl|ruby|node)"
+    r"|(?:^|(?<=[;&|(`'\"{]))[ \t]{0,16}\.)"
+    r"(?:[ \t]{1,16}-{1,2}[A-Za-z]{0,16}){0,2}(?:[ \t]{1,16}/dev/stdin)?"
+    r"[ \t]{1,16}(?:<<<[ \t]{0,16}\\?[\"']?(?:\$\(|`)|<(?:[ \t]{0,16}<)?\())"
+)
+# Options and the here-string operator between a decoder and an inline literal.
+_SC3_HERE_STRING = r"(?:[ \t]{1,16}-[A-Za-z0-9-]{1,16}){0,4}[ \t]{0,16}<<<[ \t]{0,16}"
+_SC3_SHELL_LITERAL = (
+    rf"(?P<quote>(?:\\?['\"])?)(?P<literal>[A-Za-z0-9+/=]{{8,{_MAX_SHELL_LITERAL_CHARS}}})"
+)
+_SC3_PIPED_LITERAL = re.compile(
+    r"\b(?:echo(?:[ \t]{1,16}-[neE]{1,3})?"
+    r"|printf(?:[ \t]{1,16}(?P<format_quote>['\"]?)%s(?:\\n)?(?P=format_quote))?)"
+    rf"[ \t]{{1,16}}{_SC3_SHELL_LITERAL}(?P=quote)"
+    rf"[ \t]{{0,16}}\|(?!\|)[ \t]{{0,16}}(?P<decoder>{_SC3_SHELL_DECODER})",
+    re.IGNORECASE,
+)
+_SC3_HERE_STRING_LITERAL = re.compile(
+    rf"(?P<decoder>{_SC3_SHELL_DECODER}){_SC3_HERE_STRING}{_SC3_SHELL_LITERAL}"
+    rf"(?![A-Za-z0-9+/=])(?P=quote)",
+    re.IGNORECASE,
+)
+_SC3_SHELL_DECODE_COMMAND = re.compile(_SC3_SHELL_DECODER, re.IGNORECASE)
+_SC3_DECODED_DATA_SINK = re.compile(
+    r"(?:[ \t]{1,16}-[A-Za-z0-9-]{1,16}){0,4}[ \t]{0,16}"
+    r"\|(?!\|)&?[ \t]{0,16}sha256sum(?=$|[\s;&|)`])"
+)
+
+
+def _decoded_shell_literal_payloads(content: str) -> list[tuple[int, str]]:
+    """Decode literal payloads fed to a shell decoder.
+
+    Only an inline echo/printf argument or a here-string is decoded, as base64,
+    base32 or (for xxd) hex; an ``openssl enc`` cipher is not applied.
+    Direct checksum consumers are exempt only in a simple shell context without
+    alias, function or dynamic-command syntax. Other flows remain conservative
+    because a saved payload can be executed later.
+    Variables, files and downloads stay opaque. Invalid UTF-8 becomes U+FFFD,
+    so a stray byte cannot hide the command. Returns ``(offset, text)`` pairs
+    in source order.
+    """
+    checksum_exemption_allowed: bool | None = None
+    decoded: list[tuple[int, str]] = []
+    for pattern in (_SC3_PIPED_LITERAL, _SC3_HERE_STRING_LITERAL):
+        for match in pattern.finditer(content):
+            if _SC3_DECODED_DATA_SINK.match(content, match.end()) is not None:
+                if checksum_exemption_allowed is None:
+                    # Normalize once: escaped or quoted words can still configure aliases.
+                    tokens = _shell_tokens(content)
+                    checksum_exemption_allowed = tokens is not None and not any(
+                        token in {"alias", "function", "eval", "source", "."}
+                        or token.startswith("sha256sum=")
+                        or any(character.isspace() or character in "()" for character in token)
+                        for token in tokens
+                    )
+                if checksum_exemption_allowed:
+                    continue
+            literal = match.group("literal")
+            decoder = match.group("decoder").lower()
+            try:
+                if decoder.startswith("xxd"):
+                    # Like xxd -r -p, ignore a trailing odd nibble.
+                    payload = bytes.fromhex(literal[: len(literal) // 2 * 2])
+                elif decoder.startswith("base32"):
+                    payload = base64.b32decode(literal + "=" * (-len(literal) % 8))
+                else:
+                    payload = base64.b64decode(literal + "=" * (-len(literal) % 4), validate=True)
+            except ValueError:
+                continue
+            decoded.append((match.start("literal"), payload.decode("utf-8", errors="replace")))
+    decoded.sort()
+    return decoded
+
+
 SC3_CODE_PATTERNS = [
     (r"exec\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
     (r"eval\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
@@ -287,6 +404,23 @@ SC3_PROSE_PATTERNS = [
     (r"decode\s+(?:this|the)\s+(?:base64|hex)\s+(?:and\s+)?(?:run|execute)", 0.8),
 ]
 SC3_PATTERNS = SC3_CODE_PATTERNS + SC3_PROSE_PATTERNS
+# Shell decode-to-execute chains run on every file type, like SC2, because
+# SKILL.md instructions and hook configs carry shell commands too.
+SC3_SHELL_PATTERNS = [
+    (
+        # A here-string literal can outgrow a pipeline stage, so it is consumed
+        # whole, and possessively, before the first stage.
+        rf"{_SC3_SHELL_DECODER}(?:{_SC3_HERE_STRING}\\?['\"]?"
+        rf"[A-Za-z0-9+/=]{{0,{_MAX_SHELL_LITERAL_CHARS}}}+)?+{_SC3_PIPE_SEGMENT}"
+        rf"(?:\|(?!\|)&?{_SC3_PIPE_SEGMENT}){{0,3}}?{_SC3_PIPE_EXECUTOR}",
+        0.9,
+    ),
+    (
+        rf"{_SC3_SUBSTITUTION_EXECUTOR}[^()`\n]{{0,{_MAX_SHELL_LITERAL_CHARS}}}?"
+        rf"{_SC3_SHELL_DECODER}",
+        0.9,
+    ),
+]
 
 # SC7: Untrusted Container Image — pulling images with signature/registry
 # verification turned off. These flags disable image trust regardless of the
@@ -1261,7 +1395,12 @@ def _extract_packages_from_requirements_detailed(
     return results, largest_omitted
 
 
-_NPM_DEPENDENCY_SECTIONS = ("dependencies", "devDependencies", "peerDependencies")
+_NPM_DEPENDENCY_SECTIONS = (
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+)
 
 
 def _package_json_line(content: str, section: str, name: str) -> int:
@@ -1338,7 +1477,9 @@ def _extract_packages_from_package_json_scan(
     in_deps = False
     for i, line in enumerate(content.splitlines(), 1):
         stripped = line.strip()
-        if re.search(r'"(?:dependencies|devDependencies|peerDependencies)"', stripped):
+        if re.search(
+            r'"(?:dependencies|devDependencies|peerDependencies|optionalDependencies)"', stripped
+        ):
             in_deps = True
             continue
         if in_deps and stripped.startswith("}"):
@@ -1373,6 +1514,9 @@ def _extract_packages_from_package_json(
         return _extract_packages_from_package_json_scan(content, limit=limit)
     if not isinstance(data, dict):
         return []
+    # npm installs an optionalDependencies entry in place of a same-name "dependencies" entry.
+    optional = data.get("optionalDependencies")
+    overridden = set(optional) if isinstance(optional, dict) else set()
     dependencies: list[tuple[str, str, str]] = []
     for section in _NPM_DEPENDENCY_SECTIONS:
         deps = data.get(section)
@@ -1380,6 +1524,8 @@ def _extract_packages_from_package_json(
             continue
         for name, spec in deps.items():
             if not isinstance(name, str) or not isinstance(spec, str):
+                continue
+            if section == "dependencies" and name in overridden:
                 continue
             dependencies.append((section, name, spec))
             if limit is not None and len(dependencies) >= max(0, limit):
@@ -2127,28 +2273,52 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     )
                 )
                 break
-    if file_type in ("python", "javascript", "shell", "perl", "other"):
-        for pattern, confidence in SC3_PATTERNS:
-            matches = (
-                static_runner.iter_paragraph_matches
-                if (pattern, confidence) in SC3_PROSE_PATTERNS
-                else re.finditer
-            )
-            for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
-                line_num = line_number(match.start())
+    # Every shell decode check needs a decoder command, which most files lack.
+    has_shell_decoder = _SC3_SHELL_DECODE_COMMAND.search(content) is not None
+    if has_shell_decoder:
+        for start, command in _decoded_shell_literal_payloads(content):
+            for pattern, confidence in SC2_PATTERNS:
+                if not re.search(pattern, command, re.IGNORECASE | re.MULTILINE):
+                    continue
                 findings.append(
                     AnalyzerFinding(
-                        rule_id="SC3",
-                        message="Obfuscated Code",
+                        rule_id="SC2",
+                        message="External Script Fetching",
                         severity=Severity.HIGH,
-                        location=loc(line_num),
+                        location=loc(line_number(start)),
                         confidence=confidence,
-                        tags=tag,
-                        context=ctx(match.start()),
-                        matched_text=match.group(0)[:200],
-                        complete_match=match.group(0),
+                        tags=list(tag),
+                        context=ctx(start),
+                        matched_text=command[:200],
                     )
                 )
+                break
+    sc3_patterns = (
+        SC3_PATTERNS if file_type in ("python", "javascript", "shell", "perl", "other") else []
+    )
+    if has_shell_decoder:
+        sc3_patterns = sc3_patterns + SC3_SHELL_PATTERNS
+    for pattern, confidence in sc3_patterns:
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in SC3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = line_number(match.start())
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="SC3",
+                    message="Obfuscated Code",
+                    severity=Severity.HIGH,
+                    location=loc(line_num),
+                    confidence=confidence,
+                    tags=tag,
+                    context=ctx(match.start()),
+                    matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
+                )
+            )
     # SC7: untrusted container image. Example filtering is delegated to the runner.
     for pattern, confidence in SC7_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
@@ -3212,6 +3382,8 @@ _SC8_BYTECODE_SUFFIXES = (".pyc", ".pyo")
 MAX_SC8_DISCOVERED_ENTRIES = 10_000
 MAX_SC8_DIRECTORY_ENTRIES = 10_000
 MAX_SC8_TRAVERSAL_DEPTH = 64
+# Processing budget, measured with ``time.thread_time()`` so that time spent
+# waiting for the GIL behind concurrently running analyzers does not count.
 MAX_SC8_ANALYSIS_SECONDS = 5.0
 MAX_SC8_FINDINGS = 10_000
 MAX_SC8_LIMITATIONS = 256
@@ -3246,7 +3418,14 @@ def _scan_shipped_bytecode(
     timeout_seconds: float | None = None,
     max_findings: int | None = None,
 ) -> _ShippedBytecodeScanResult:
-    """Discover shipped bytecode with deterministic aggregate resource bounds."""
+    """Discover shipped bytecode with deterministic aggregate resource bounds.
+
+    Analyzers run concurrently in one process, so the walk can spend most of
+    its wall-clock time waiting for the GIL. The processing budget therefore
+    counts only this thread's CPU time. Wall-clock time is bounded by the
+    remaining workflow deadline (``timeout_seconds``), or by the full workflow
+    limit for callers outside a workflow.
+    """
     findings: list[Finding] = []
     limitations: list[_SupplementalLimitation] = []
     if not skill_path or not isinstance(skill_path, str):
@@ -3256,10 +3435,11 @@ def _scan_shipped_bytecode(
         return _ShippedBytecodeScanResult(findings, limitations)
 
     started_at = time.monotonic()
-    runtime_limit = max(0.0, MAX_SC8_ANALYSIS_SECONDS)
-    if timeout_seconds is not None:
-        runtime_limit = min(runtime_limit, max(0.0, timeout_seconds))
-    deadline = started_at + runtime_limit
+    active_started_at = time.thread_time()
+    active_limit = max(0.0, MAX_SC8_ANALYSIS_SECONDS)
+    wall_clock_limit = max(
+        0.0, MAX_WORKFLOW_SECONDS if timeout_seconds is None else timeout_seconds
+    )
     requested_finding_limit = MAX_SC8_FINDINGS if max_findings is None else max_findings
     finding_limit = max(0, min(requested_finding_limit, MAX_SC8_FINDINGS))
     discovered_entries = 0
@@ -3283,15 +3463,20 @@ def _scan_shipped_bytecode(
         )
 
     def runtime_exhausted(relative_directory: str) -> bool:
-        now = time.monotonic()
-        if now < deadline:
+        wall_clock_elapsed = max(0.0, time.monotonic() - started_at)
+        active_elapsed = max(0.0, time.thread_time() - active_started_at)
+        if wall_clock_elapsed >= wall_clock_limit:
+            observed_seconds, limit_seconds = wall_clock_elapsed, wall_clock_limit
+        elif active_elapsed >= active_limit:
+            observed_seconds, limit_seconds = active_elapsed, active_limit
+        else:
             return False
         add_limitation(
             _SupplementalLimitation(
                 path=scope_path(relative_directory),
                 reason=LedgerReason.RUNTIME_LIMIT,
-                observed_seconds=max(0.0, now - started_at),
-                limit_seconds=runtime_limit,
+                observed_seconds=observed_seconds,
+                limit_seconds=limit_seconds,
             )
         )
         return True
@@ -3490,6 +3675,7 @@ def _analyze_concealed_executables(
                 concealment_reasons.append("disguised_container")
         concealment = concealment_reasons[0]
         excluded_from_analysis = metadata.get("excluded_from_analysis") is True
+        partially_analyzed_executable = metadata.get("partially_analyzed_executable") is True
         referenced_uninspected = (
             metadata.get("inspection_limitation_reason")
             == LedgerReason.REFERENCED_UNINSPECTED.value
@@ -3502,6 +3688,8 @@ def _analyze_concealed_executables(
                     if referenced_uninspected
                     else "An excluded artifact could not be completely inspected."
                     if inspection_incomplete
+                    else "Readable text was inspected, but binary executable behavior was not analyzed."
+                    if partially_analyzed_executable
                     else "Executable content is excluded from analysis."
                     if excluded_from_analysis
                     else "Executable content is concealed inside a document, hidden, "
@@ -3527,6 +3715,9 @@ def _analyze_concealed_executables(
                     else "A resource, read, or archive-safety limit left excluded content "
                     "outside deterministic inspection coverage."
                     if inspection_incomplete
+                    else "Text-based checks covered the readable projection, but they cannot "
+                    "establish the behavior of the binary executable."
+                    if partially_analyzed_executable
                     else "An executable artifact remains available under the skill install path "
                     "but its content is outside analyzer coverage."
                     if excluded_from_analysis
@@ -3559,6 +3750,7 @@ def _analyze_concealed_executables(
                     "local_only": True,
                     "referenced": metadata.get("referenced") is True,
                     "excluded_from_analysis": excluded_from_analysis,
+                    "partially_analyzed_executable": partially_analyzed_executable,
                     "excluded_inspection_incomplete": inspection_incomplete,
                     "inherited_exclusion_reason": metadata.get("inherited_exclusion_reason"),
                     "inspection_limitation_reason": metadata.get("inspection_limitation_reason"),
