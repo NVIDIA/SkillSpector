@@ -28,9 +28,8 @@ _project_root = Path(__file__).resolve().parents[3]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from skillspector.models import Finding
-
 from contrib.batch_scan.annotation import annotate_findings, is_language_compatible
+from skillspector.models import Finding
 
 
 def _make_finding(rule_id: str = "P1", file: str = "test.md") -> dict:
@@ -92,10 +91,10 @@ class TestAnnotateFindings(unittest.TestCase):
     def test_mixed_rules_partial_compatibility(self):
         """Mix of English-keyword and LLM rules."""
         findings = [
-            _make_finding(rule_id="P1"),     # English keyword — incompatible with zh
-            _make_finding(rule_id="SSD1"),   # LLM — compatible
-            _make_finding(rule_id="E2"),     # English keyword — incompatible
-            _make_finding(rule_id="AST1"),   # Code — compatible
+            _make_finding(rule_id="P1"),  # English keyword — incompatible with zh
+            _make_finding(rule_id="SSD1"),  # LLM — compatible
+            _make_finding(rule_id="E2"),  # English keyword — incompatible
+            _make_finding(rule_id="AST1"),  # Code — compatible
         ]
         annotated = annotate_findings(findings, "zh")
         compatible = [f for f in annotated if f["language_compatible"]]

@@ -69,8 +69,6 @@ try:
 except ImportError:
     pass
 
-from skillspector.llm_analyzer_base import LLMAnalyzerBase
-
 from contrib.batch_scan.runner import (
     _apply_patches,
     _original_asyncio_run,
@@ -84,11 +82,12 @@ from contrib.batch_scan.runner import (
     deepseek_compat,
     setup_deepseek_compat,
 )
-
+from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 def _assert_all_patched(self: unittest.TestCase) -> None:
     """Assert all 5 method references are patched (≠ originals)."""
@@ -96,6 +95,7 @@ def _assert_all_patched(self: unittest.TestCase) -> None:
     self.assertIsNot(LLMAnalyzerBase.parse_response, _original_base_parse)
     self.assertIsNot(LLMAnalyzerBase.build_prompt, _original_base_build_prompt)
     from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer
+
     self.assertIsNot(LLMMetaAnalyzer.parse_response, _original_meta_parse)
     self.assertIsNot(LLMMetaAnalyzer.build_prompt, _original_meta_build_prompt)
 
@@ -106,6 +106,7 @@ def _assert_all_restored(self: unittest.TestCase) -> None:
     self.assertIs(LLMAnalyzerBase.parse_response, _original_base_parse)
     self.assertIs(LLMAnalyzerBase.build_prompt, _original_base_build_prompt)
     from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer
+
     self.assertIs(LLMMetaAnalyzer.parse_response, _original_meta_parse)
     self.assertIs(LLMMetaAnalyzer.build_prompt, _original_meta_build_prompt)
 
@@ -117,6 +118,7 @@ def _force_restore() -> None:
     random-order runners (random_numbered.py) shuffle test classes.
     """
     import contrib.batch_scan.runner as _runner
+
     while _runner._patches_depth > 0:
         _runner._restore_patches()
 
@@ -144,17 +146,23 @@ class TestImportNoSideEffect(unittest.TestCase):
         env = {**os.environ, "PYTHONPATH": repo_root}
         result = subprocess.run(
             [
-                sys.executable, "-X", "utf8", "-c",
+                sys.executable,
+                "-X",
+                "utf8",
+                "-c",
                 "from skillspector.llm_analyzer_base import LLMAnalyzerBase; "
                 "orig = LLMAnalyzerBase.__init__; "
                 "import contrib.batch_scan.runner; "
                 "assert LLMAnalyzerBase.__init__ is orig, 'Import applied patches!'",
             ],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
             env=env,
         )
         self.assertEqual(
-            result.returncode, 0,
+            result.returncode,
+            0,
             f"Import should not apply patches. stderr:\n{result.stderr}",
         )
 
@@ -186,14 +194,10 @@ class TestThreadIsolation(unittest.TestCase):
 
         def _outside_thread():
             """Run while main thread is inside deepseek_compat()."""
-            result_holder["init_is_original"] = (
-                LLMAnalyzerBase.__init__ is _original_base_init
-            )
+            result_holder["init_is_original"] = LLMAnalyzerBase.__init__ is _original_base_init
             # Create instance outside context → should use original init path
             instance = LLMAnalyzerBase(base_prompt="test", model="test")
-            result_holder["response_schema_not_none"] = (
-                instance.response_schema is not None
-            )
+            result_holder["response_schema_not_none"] = instance.response_schema is not None
 
         with deepseek_compat():
             # Main thread is patched — verify
@@ -211,8 +215,9 @@ class TestThreadIsolation(unittest.TestCase):
         # After context exit, everything is restored
         self.assertIs(LLMAnalyzerBase.__init__, _original_base_init)
         instance = LLMAnalyzerBase(base_prompt="test", model="test")
-        self.assertIsNotNone(instance.response_schema,
-                             "Class response_schema should be intact after context exit")
+        self.assertIsNotNone(
+            instance.response_schema, "Class response_schema should be intact after context exit"
+        )
 
     def test_two_threads_concurrent_contexts_are_independent(self) -> None:
         """Thread A and B each open deepseek_compat(); exit one, other stays patched."""
@@ -223,9 +228,7 @@ class TestThreadIsolation(unittest.TestCase):
             with deepseek_compat():
                 barrier.wait()  # both threads now inside their own context
                 barrier.wait()  # sync — both verified patched
-                results["a_before_exit"] = (
-                    LLMAnalyzerBase.__init__ is not _original_base_init
-                )
+                results["a_before_exit"] = LLMAnalyzerBase.__init__ is not _original_base_init
             # Thread A exited — Thread B should STILL be patched
             barrier.wait()  # signal B to check
 
@@ -233,16 +236,12 @@ class TestThreadIsolation(unittest.TestCase):
             with deepseek_compat():
                 barrier.wait()  # both inside
                 barrier.wait()  # sync
-                results["b_before_a_exit"] = (
-                    LLMAnalyzerBase.__init__ is not _original_base_init
-                )
+                results["b_before_a_exit"] = LLMAnalyzerBase.__init__ is not _original_base_init
                 barrier.wait()  # wait for A to exit
                 results["b_still_patched_after_a_exit"] = (
                     LLMAnalyzerBase.__init__ is not _original_base_init
                 )
-            results["b_restored_after_own_exit"] = (
-                LLMAnalyzerBase.__init__ is _original_base_init
-            )
+            results["b_restored_after_own_exit"] = LLMAnalyzerBase.__init__ is _original_base_init
 
         t_a = threading.Thread(target=_thread_a, name="A")
         t_b = threading.Thread(target=_thread_b, name="B")
@@ -253,10 +252,14 @@ class TestThreadIsolation(unittest.TestCase):
 
         self.assertTrue(results.get("a_before_exit"), "Thread A should be patched")
         self.assertTrue(results.get("b_before_a_exit"), "Thread B should be patched")
-        self.assertTrue(results.get("b_still_patched_after_a_exit"),
-                        "Thread B should stay patched after A exits (nesting counter)")
-        self.assertTrue(results.get("b_restored_after_own_exit"),
-                        "Thread B should be restored after its own exit")
+        self.assertTrue(
+            results.get("b_still_patched_after_a_exit"),
+            "Thread B should stay patched after A exits (nesting counter)",
+        )
+        self.assertTrue(
+            results.get("b_restored_after_own_exit"),
+            "Thread B should be restored after its own exit",
+        )
 
     def test_concurrent_instance_creation_no_race(self) -> None:
         """50 instances created concurrently inside one context — all get response_schema=None.
@@ -303,10 +306,10 @@ class TestThreadIsolation(unittest.TestCase):
                 t.join(timeout=30)
 
         # Assert — all instances created successfully
-        self.assertEqual(len(errors), 0,
-                         f"Instance creation errors: {errors}")
-        self.assertEqual(len(instances), num_threads,
-                         f"Expected {num_threads} instances, got {len(instances)}")
+        self.assertEqual(len(errors), 0, f"Instance creation errors: {errors}")
+        self.assertEqual(
+            len(instances), num_threads, f"Expected {num_threads} instances, got {len(instances)}"
+        )
 
         # Assert — every instance has response_schema=None (Patch 1)
         for i, inst in enumerate(instances):
@@ -347,8 +350,11 @@ class TestThreadIsolation(unittest.TestCase):
         # After context exit, new instances get class attribute back
         inst_c = LLMAnalyzerBase(base_prompt="c", model="test")
         self.assertIsNotNone(inst_c.response_schema)
-        self.assertNotIn("response_schema", inst_c.__dict__,
-                         "New instance outside context should not have instance attr")
+        self.assertNotIn(
+            "response_schema",
+            inst_c.__dict__,
+            "New instance outside context should not have instance attr",
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -147,7 +147,8 @@ AAA pattern keeps tests readable and debuggable:
 def test_slots_exhausted_try_acquire_returns_none(self):
     # Arrange — create pool with known state
     pool = _make_pool(n=1, max_concurrent=2)
-    pool.acquire(); pool.acquire()
+    pool.acquire()
+    pool.acquire()
     # Act — the operation under test
     result = pool.try_acquire()
     # Assert — single clear expectation

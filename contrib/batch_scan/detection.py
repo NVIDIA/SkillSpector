@@ -31,10 +31,10 @@ import unicodedata
 
 # Unicode range constants — (start, end) inclusive.
 _CJK_UNIFIED = (0x4E00, 0x9FFF)  # CJK Unified Ideographs
-_CJK_EXT_A = (0x3400, 0x4DBF)    # CJK Unified Ideographs Extension A
+_CJK_EXT_A = (0x3400, 0x4DBF)  # CJK Unified Ideographs Extension A
 _HIRAGANA = (0x3040, 0x309F)
 _KATAKANA = (0x30A0, 0x30FF)
-_HANGUL = (0xAC00, 0xD7AF)       # Hangul Syllables
+_HANGUL = (0xAC00, 0xD7AF)  # Hangul Syllables
 
 # Thresholds — a skill file is classified as non-English when the ratio of
 # CJK / kana / Hangul characters exceeds this proportion of total alpha chars.

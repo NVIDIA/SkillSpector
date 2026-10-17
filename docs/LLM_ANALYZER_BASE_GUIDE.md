@@ -70,9 +70,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
 
     model_config = state.get("model_config") or {}
     model = (
-        model_config.get(ANALYZER_ID)
-        or model_config.get("default")
-        or SKILLSPECTOR_DEFAULT_MODEL
+        model_config.get(ANALYZER_ID) or model_config.get("default") or SKILLSPECTOR_DEFAULT_MODEL
     )
 
     try:
@@ -154,14 +152,15 @@ The default `response_schema` is `LLMAnalysisResult`, which the LLM fills via
 
 ```python
 class LLMFinding(BaseModel):
-    rule_id: str          # e.g. "SSD-001"
-    message: str          # "Hardcoded API key"
+    rule_id: str  # e.g. "SSD-001"
+    message: str  # "Hardcoded API key"
     severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
-    start_line: int       # references L-prefixed line numbers
+    start_line: int  # references L-prefixed line numbers
     end_line: int | None  # optional range
-    confidence: float     # 0.0–1.0
-    explanation: str      # why this is a finding
-    remediation: str      # how to fix it
+    confidence: float  # 0.0–1.0
+    explanation: str  # why this is a finding
+    remediation: str  # how to fix it
+
 
 class LLMAnalysisResult(BaseModel):
     findings: list[LLMFinding]
@@ -274,14 +273,17 @@ Override `response_schema` with a different Pydantic model and implement
 from pydantic import BaseModel, Field
 from typing import Literal
 
+
 class MyFinding(BaseModel):
     pattern: str
     severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
     line: int
     reason: str
 
+
 class MyResult(BaseModel):
     findings: list[MyFinding]
+
 
 class MyAnalyzer(LLMAnalyzerBase):
     response_schema = MyResult
@@ -370,10 +372,12 @@ from skillspector.llm_analyzer_base import LLMAnalyzerBase, LLMAnalysisResult, L
 
 MOCK_TARGET = "skillspector.llm_analyzer_base.get_chat_model"
 
+
 def _mock_get_chat_model(*args, **kwargs):
     mock_llm = MagicMock()
     mock_llm.with_structured_output.return_value = MagicMock()
     return mock_llm
+
 
 @patch(MOCK_TARGET, _mock_get_chat_model)
 async def test_my_analyzer():
