@@ -92,7 +92,12 @@ from skillspector.llm_analyzer_base import (
     resolve_max_concurrency,
     resolve_output_language,
 )
-from skillspector.llm_utils import AgentCLIChatModel, StructuredOutputParseError, run_async
+from skillspector.llm_utils import (
+    AgentCLIChatModel,
+    StructuredOutputParseError,
+    _StructuredAgentCLIModel,
+    run_async,
+)
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
@@ -1143,6 +1148,29 @@ class TestCliPromptByteBudget:
         expected = [(s, e) for _t, s, e in chunk_file_by_lines(content, budget)]
         batches = analyzer.get_batches(["big.js"], {"big.js": content})
         assert [(b.start_line, b.end_line) for b in batches] == expected
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_payload_with_schema_instructions_fits_without_margin(
+        self, cli_provider: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The CLI transport appends the JSON schema after build_prompt; the budget must
+        # measure it rather than rely on the safety margin to absorb it.
+        monkeypatch.setattr("skillspector.llm_analyzer_base.PROMPT_BYTE_SAFETY_MARGIN", 0)
+        analyzer = self._analyzer()
+        structured = _StructuredAgentCLIModel(MagicMock(), LLMAnalysisResult)
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        for batch in analyzer.get_batches(["big.js"], {"big.js": content}):
+            payload = structured._augment(analyzer.build_prompt(batch))
+            assert len(payload.encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_path_with_unencodable_characters_does_not_raise(self, cli_provider: None) -> None:
+        # A non-UTF-8 file name decoded with surrogateescape; the provider encodes
+        # with errors="replace", so batching must not be stricter than the transport.
+        analyzer = self._analyzer()
+        path = "skill/\udcff.md"
+        batches = analyzer.get_batches([path], {path: "line \udcfe\n"})
+        assert [b.file_path for b in batches] == [path]
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_oversized_single_line_warns_and_is_not_truncated(
@@ -3116,6 +3144,41 @@ class TestLLMMetaAnalyzerGetBatches:
         assert all("u:p@" not in batch.content for batch in batches)
         for batch in batches:
             assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_sc10_redaction_keeps_lines_and_finding_aligned(self) -> None:
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        lines = [f"line {i}\n" for i in range(1, 11)]
+        lines[4] = "x=http://u:p@h?token=s3cret more\n"
+        content = "".join(lines)
+        cache = {"creds.py": content, "plain.py": "y=http://u:p@h\n"}
+        finding = self._make_finding("creds.py", line=5, rule_id="SC10")
+        batches = analyzer.get_batches(["creds.py", "plain.py"], cache, [finding])
+        creds = next(b for b in batches if b.file_path == "creds.py")
+        redacted = creds.content.splitlines()
+        assert len(redacted) == 10
+        assert redacted[3] == "line 4" and redacted[5] == "line 6"
+        assert "u:p@" not in redacted[4] and "s3cret" not in redacted[4]
+        assert creds.findings == [finding]
+        assert cache["creds.py"] == content  # the caller's cache is not mutated
+        plain = next(b for b in batches if b.file_path == "plain.py")
+        assert plain.content == "y=http://u:p@h\n"  # files without SC10 stay as they are
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_fixed_prompt_over_cap_warns_and_keeps_content(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        content = "".join(f"line {i}\n" for i in range(1, 101))
+        findings = [self._make_finding("a.py", line=1)]
+        metadata = "d" * (MAX_INPUT_BYTES + 10)
+        with caplog.at_level("WARNING"):
+            batches = analyzer.get_batches(
+                ["a.py"], {"a.py": content}, findings, metadata_text=metadata
+            )
+        assert "".join(b.content for b in batches) == content
+        assert "exceeds the provider input limit" in caplog.text
 
 
 # ---------------------------------------------------------------------------

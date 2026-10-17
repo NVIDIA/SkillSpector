@@ -67,6 +67,7 @@ from skillspector.llm_utils import (
     chat_model_provider_name,
     get_chat_model,
     new_inference_usage_collector,
+    structured_output_instructions,
 )
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
@@ -844,13 +845,15 @@ def numbered_line_overhead_bytes(last_line: int) -> int:
     The widest prefix belongs to the highest line number (``L19239: ``); both the
     zero-padded and the compact form are at most that wide.
     """
-    return len(f"L{last_line}: ".encode())
+    return len(f"L{last_line}: ".encode("utf-8", errors="replace"))
 
 
 def _numbered_size_bound(content: str, last_line: int) -> int:
     """Upper bound on ``len(number_lines(content, ...).encode())`` for a file of *last_line* lines."""
     line_count = len(content.splitlines())
-    return len(content.encode("utf-8")) + line_count * numbered_line_overhead_bytes(last_line)
+    return len(
+        content.encode("utf-8", errors="replace")
+    ) + line_count * numbered_line_overhead_bytes(last_line)
 
 
 def chunk_file_by_lines(
@@ -890,7 +893,9 @@ def chunk_file_by_lines(
         while end_idx < len(lines):
             line_tokens = estimate_tokens(lines[end_idx])
             line_bytes = (
-                len(lines[end_idx].encode("utf-8")) + prefix_bytes if max_bytes is not None else 0
+                len(lines[end_idx].encode("utf-8", errors="replace")) + prefix_bytes
+                if max_bytes is not None
+                else 0
             )
             over_tokens = token_count + line_tokens > max_tokens
             over_bytes = max_bytes is not None and byte_count + line_bytes > max_bytes
@@ -1232,19 +1237,24 @@ class LLMAnalyzerBase:
         last_line: int,
         **prompt_kwargs: object,
     ) -> int:
-        """Bytes :meth:`build_prompt` produces for *path* around empty content.
+        """Bytes the prompt for *path* takes around empty content.
 
-        The probe uses the widest label (``lines 1–last_line``) and all of the
-        file's findings, so it bounds the fixed part of every batch for *path*.
+        Includes the structured-output instructions a CLI transport appends
+        after :meth:`build_prompt`.  The probe uses the widest possible label
+        (``lines last_line–last_line``) and all of the file's findings, so it
+        bounds the fixed part of every batch for *path*.
         """
         probe = Batch(
             file_path=path,
             content="",
-            start_line=1,
+            start_line=last_line,
             end_line=last_line,
             findings=findings,
         )
-        return len(self.build_prompt(probe, **prompt_kwargs).encode("utf-8"))
+        prompt = self.build_prompt(probe, **prompt_kwargs)
+        if self.response_schema is not None:
+            prompt += structured_output_instructions(self.response_schema)
+        return len(prompt.encode("utf-8", errors="replace"))
 
     # -- Prompt / parse -----------------------------------------------------
 
