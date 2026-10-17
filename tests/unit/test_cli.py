@@ -36,6 +36,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import typer
 import yaml
+from click import unstyle
 from markdown_it import MarkdownIt
 from rich.console import Console
 from typer.testing import CliRunner
@@ -2522,11 +2523,19 @@ def test_cli_max_skills_reaches_recursive_scan(tmp_path, monkeypatch):
     assert payload["skills_omitted"] == 0
 
 
-def test_cli_max_skills_is_documented_in_help():
-    result = runner.invoke(app, ["scan", "--help"])
+@pytest.mark.parametrize("color", [False, True])
+def test_cli_max_skills_is_documented_in_help(monkeypatch, color):
+    # Typer initializes its terminal mode at import time, so environment-only
+    # changes here do not reliably exercise the GitHub Actions rendering path.
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr("typer.rich_utils.FORCE_TERMINAL", color)
+    monkeypatch.setattr("typer.rich_utils.COLOR_SYSTEM", "standard" if color else None)
+    result = runner.invoke(app, ["scan", "--help"], color=True)
     assert result.exit_code == 0
-    assert "--max-skills" in result.stdout
-    assert "32" in result.stdout
+    assert ("\x1b[" in result.stdout) is color
+    help_text = unstyle(result.stdout)
+    assert "--max-skills" in help_text
+    assert "32" in help_text
 
 
 @pytest.mark.parametrize("limit", [0, -1, True, 1.5])
