@@ -423,14 +423,26 @@ def _parse_gemini_output(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# OpenCode CLI invocation  (verified against opencode 1.18.33)
+# OpenCode CLI invocation (verified against opencode 1.18.31-1.18.34;
+# per-version evidence beside _OPENCODE_SUPPORTED_VERSIONS)
 # ---------------------------------------------------------------------------
 
 
 _OPENCODE_AGENT_PREFIX = "skillspector-deny-all"
 _OPENCODE_DENY_ALL = json.dumps({"*": "deny"}, separators=(",", ":"))
-_OPENCODE_MIN_VERSION = (1, 18, 31)
-_OPENCODE_MAX_VERSION = (1, 18, 34)
+# Explicit set of individually verified CLI versions (exact triples,
+# never a range): raising a MAX would silently admit an unverified
+# patch, so each widening adds one triple with its own evidence.
+# Evidence per member: 1.18.31 (#575), 1.18.32 (#613), 1.18.33 (#665),
+# 1.18.34 (PR #713: live matrix auth + preflight + isolated run +
+# --help diff, all green), 1.18.35 + 1.19.0 (this round: same matrix;
+# run --help byte-identical across .34/.35/1.19.0). The gate stays
+# load-bearing, not belt-and-suspenders: the debug-config check cannot
+# tell whether the TEST_HOME / TEST_MANAGED_CONFIG_DIR hooks below
+# still apply, so each widening needs the same per-version review.
+_OPENCODE_SUPPORTED_VERSIONS = frozenset(
+    {(1, 18, 31), (1, 18, 32), (1, 18, 33), (1, 18, 34), (1, 18, 35), (1, 19, 0)}
+)
 # Markers of a Zen free-tier refusal. Zen answers 403 to
 # any call carrying the deny-all isolation (OPENCODE_CONFIG_CONTENT or
 # OPENCODE_PERMISSION alone suffices; verified by env bisect), so free-tier
@@ -498,9 +510,14 @@ def _format_opencode_version(version: tuple[int, int, int]) -> str:
     return f"{version[0]}.{version[1]}.{version[2]}"
 
 
+_OPENCODE_SUPPORTED_VERSIONS_TEXT = ", ".join(
+    _format_opencode_version(version) for version in sorted(_OPENCODE_SUPPORTED_VERSIONS)
+)
+
+
 def _is_supported_opencode_version(version: tuple[int, int, int] | None) -> bool:
-    """Return whether a parsed version is inside the verified range."""
-    return version is not None and _OPENCODE_MIN_VERSION <= version <= _OPENCODE_MAX_VERSION
+    """Return whether a parsed version is a verified member of the set."""
+    return version is not None and version in _OPENCODE_SUPPORTED_VERSIONS
 
 
 def _prepare_opencode_env(
@@ -568,11 +585,12 @@ def _prepare_opencode_env(
             "OPENCODE_EXPERIMENTAL_PLAN_MODE": "0",
             "OPENCODE_PERMISSION": _OPENCODE_DENY_ALL,
             "OPENCODE_PURE": "1",
-            # OpenCode 1.18.33 uses this internal override for the home paths
-            # searched for AGENTS.md, .opencode, .claude, and .agents content.
+            # Internal override for the home paths searched for
+            # AGENTS.md, .opencode, .claude, and .agents content,
+            # confirmed for every version in the window.
             "OPENCODE_TEST_HOME": isolated_home,
-            # The same pinned version uses this override instead of the
-            # platform's /etc, ProgramData, or /Library managed-config path.
+            # Same override family for the platform managed-config path
+            # (/etc, ProgramData, /Library), confirmed likewise.
             "OPENCODE_TEST_MANAGED_CONFIG_DIR": managed_config,
             "TEMP": child_tmp,
             "TMP": child_tmp,
@@ -591,7 +609,7 @@ def _preflight_opencode_policy(
     """Fail closed unless OpenCode's fully resolved sensitive config is exact.
 
     macOS MDM preferences are loaded after ``OPENCODE_CONFIG_CONTENT`` and do
-    not have a supported disable flag in OpenCode 1.18.33. Querying the final
+    not have a supported disable flag in any window version. Querying the final
     config with the exact environment and directory prevents a managed
     ``share: auto`` (or another late source) from silently reopening ambient
     capabilities before the inference process is allowed to start.
@@ -626,8 +644,7 @@ def _preflight_opencode_policy(
         version_text = version_raw.decode("utf-8", errors="replace").strip()
         raise AgentCLIError(
             "OpenCode security policy is verified only for versions "
-            f"{_format_opencode_version(_OPENCODE_MIN_VERSION)} through "
-            f"{_format_opencode_version(_OPENCODE_MAX_VERSION)}; found "
+            f"{_OPENCODE_SUPPORTED_VERSIONS_TEXT}; found "
             f"{version_text[:80]!r}"
         )
 
@@ -666,7 +683,8 @@ def _preflight_opencode_policy(
 def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
     """Build argv for a text-only, deny-all ``opencode run`` call.
 
-    Flags chosen (verified against ``opencode`` 1.18.33 ``run --help``):
+    Flags chosen (verified against ``opencode`` 1.18.31-1.19.0 ``run --help``,
+    byte-identical across .34/.35/1.19.0):
 
     ``run``
         Non-interactive single-shot mode. With no positional message, the
@@ -720,7 +738,9 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
 def _parse_opencode_output(raw: str) -> str:
     """Extract assistant text from ``opencode run --format json`` JSONL events.
 
-    Verified against opencode 1.18.33, whose events look like::
+    Recorded against opencode 1.18.33 (``--help`` byte-identical across
+    the window, so the envelope claim holds for every member), whose
+    events look like::
 
         {"type": "step_start", ..., "part": {"type": "step-start", ...}}
         {"type": "text", ..., "part": {"type": "text", "text": "hi", ...}}
@@ -832,8 +852,7 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
                 return (
                     False,
                     "opencode_cli requires OpenCode "
-                    f"{_format_opencode_version(_OPENCODE_MIN_VERSION)} through "
-                    f"{_format_opencode_version(_OPENCODE_MAX_VERSION)} "
+                    f"{_OPENCODE_SUPPORTED_VERSIONS_TEXT} "
                     "for its verified deny-all policy",
                 )
             result = subprocess.run(
