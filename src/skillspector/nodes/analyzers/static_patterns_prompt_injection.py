@@ -302,16 +302,14 @@ _P2_EXTERNAL_DEST = re.compile(
 )
 _P2_EXFIL_STANDALONE = re.compile(r"\bexfiltrat\w*\b", re.IGNORECASE)
 # Instruction-ish words refuse the benign exemption when they appear
-# anywhere in a value or license fragment, even inside a longer word —
-# that is how main's P2 regex matches. Keys are never scanned (system
-# requirements, get started). "get" is deliberately excluded: as a
-# substring it fires on ordinary prose (getting_started, target,
-# forget), while GET-plus-URL exfiltration still trips the danger
-# scans. This costs one plain-prose shape (PostgreSQL carries "post"):
-# it reports P2, as it does on main, as does Systems ("system").
-# Applied to values and license fragments only, never keys.
+# anywhere in a value or license fragment, even inside a longer word:
+# all seven of main's P2 comment triggers, matched as raw substrings.
+# Keys are never scanned (system requirements, get started). The cost
+# is ordinary prose that carries a trigger (PostgreSQL carries "post",
+# target and getting_started carry "get"): it reports P2, as it does
+# on main, as does Systems ("system").
 _P2_TRIGGER_SUBSTRING = re.compile(
-    r"(system|instructions?|ignore|post|send|transmit)", re.IGNORECASE
+    r"(system|instructions?|ignore|post|send|transmit|get)", re.IGNORECASE
 )
 
 
@@ -362,9 +360,9 @@ _P2_METADATA_LINE = re.compile(r"\A([A-Za-z][\w\- ]{0,40}):\s+(\S.*)\Z")
 # token with at most two inner dots, and get-started paths need a
 # dotted final segment so slash-joined prose no longer fits. A
 # trigger word anywhere inside a value (system, instruction(s),
-# ignore, post, send, transmit — never "get", see above) refuses
-# exemption; keys are excluded since "system requirements" and "get
-# started" are keys. Known residuals: a bare triggerless package name
+# ignore, post, send, transmit, get) refuses exemption; keys are
+# excluded since "system requirements" and "get started" are keys.
+# Known residuals: a bare triggerless package name
 # ("requires: numpy") parses as a package; short triggerless SPDX
 # OR-chains fit the atom cap; a trigger broken inside itself
 # ("ig_nore") carries no contiguous trigger run, so neither this
