@@ -454,7 +454,7 @@ def _parse_gemini_output(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# OpenCode CLI invocation (verified against opencode 1.18.31-1.18.34;
+# OpenCode CLI invocation (verified against opencode 1.18.31-1.18.35 and 1.19.0-1.19.3;
 # per-version evidence beside _OPENCODE_SUPPORTED_VERSIONS)
 # ---------------------------------------------------------------------------
 
@@ -466,13 +466,29 @@ _OPENCODE_DENY_ALL = json.dumps({"*": "deny"}, separators=(",", ":"))
 # patch, so each widening adds one triple with its own evidence.
 # Evidence per member: 1.18.31 (#575), 1.18.32 (#613), 1.18.33 (#665),
 # 1.18.34 (PR #713: live matrix auth + preflight + isolated run +
-# --help diff, all green), 1.18.35 + 1.19.0 (this round: same matrix;
-# run --help byte-identical across .34/.35/1.19.0). The gate stays
+# --help diff, all green), 1.18.35 + 1.19.0 (same matrix; run --help
+# byte-identical across .34/.35/1.19.0), 1.19.1-1.19.3 (same live
+# matrix with exact nonce replies; auth-list shape identical; run
+# --help byte-identical across the three, its only delta vs 1.19.0
+# being the hidden --share flag; plugin packages unchanged across
+# 1.19.0-1.19.3 in bun.lock (opencode-gitlab-auth 2.1.0,
+# opencode-poe-auth 0.0.1, @gitlab/opencode-gitlab-auth 1.3.3, same
+# integrity hashes) and no in-tree plugin source changed). The gate stays
 # load-bearing, not belt-and-suspenders: the debug-config check cannot
 # tell whether the TEST_HOME / TEST_MANAGED_CONFIG_DIR hooks below
 # still apply, so each widening needs the same per-version review.
 _OPENCODE_SUPPORTED_VERSIONS = frozenset(
-    {(1, 18, 31), (1, 18, 32), (1, 18, 33), (1, 18, 34), (1, 18, 35), (1, 19, 0)}
+    {
+        (1, 18, 31),
+        (1, 18, 32),
+        (1, 18, 33),
+        (1, 18, 34),
+        (1, 18, 35),
+        (1, 19, 0),
+        (1, 19, 1),
+        (1, 19, 2),
+        (1, 19, 3),
+    }
 )
 # Markers of a Zen free-tier refusal. Zen answers 403 to
 # any call carrying the deny-all isolation (OPENCODE_CONFIG_CONTENT or
@@ -716,8 +732,9 @@ def _preflight_opencode_policy(
 def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
     """Build argv for a text-only, deny-all ``opencode run`` call.
 
-    Flags chosen (verified against ``opencode`` 1.18.31-1.19.0 ``run --help``,
-    byte-identical across .34/.35/1.19.0):
+    Flags chosen (verified against ``opencode`` 1.18.31-1.19.3 ``run --help``,
+    byte-identical across .34/.35/1.19.0 and across 1.19.1-1.19.3, whose
+    only change is the hidden ``--share`` flag):
 
     ``run``
         Non-interactive single-shot mode. With no positional message, the
@@ -773,8 +790,9 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
 def _parse_opencode_output(raw: str) -> str:
     """Extract assistant text from ``opencode run --format json`` JSONL events.
 
-    Recorded against opencode 1.18.33 (``--help`` byte-identical across
-    the window, so the envelope claim holds for every member), whose
+    Recorded against opencode 1.18.33 (``run --help`` is byte-identical
+    across 1.18.31-1.18.35/1.19.0 and across 1.19.1-1.19.3, and every
+    member carries the live nonce run recorded above), whose
     events look like::
 
         {"type": "step_start", ..., "part": {"type": "step-start", ...}}
