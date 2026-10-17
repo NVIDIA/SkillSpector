@@ -36,6 +36,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import typer
 import yaml
+from click import unstyle
 from markdown_it import MarkdownIt
 from rich.console import Console
 from typer.testing import CliRunner
@@ -2432,8 +2433,121 @@ def test_recursive_fail_on_findings_exits_one_below_risk_threshold(
     assert exit_info.value.exit_code == 1
 
 
+@pytest.mark.parametrize(("limit", "scanned"), [(None, 32), (1, 1), (33, 33), (40, 33)])
+@pytest.mark.parametrize("strict", [False, True])
+def test_recursive_configurable_skill_count_budget(
+    monkeypatch, tmp_path, capsys, limit, scanned, strict
+):
+    skills = [SkillDirectory(tmp_path / str(i), str(i), str(i)) for i in range(33)]
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=skills)
+    calls = []
+
+    def fake_scan(**kwargs):
+        calls.append(kwargs)
+        return _bounded_recursive_result("safe", finding_count=0)
+
+    monkeypatch.setattr(cli, "_scan_skill", fake_scan)
+    output = tmp_path / "report.json"
+    context = pytest.raises(typer.Exit) if strict and scanned < 33 else nullcontext()
+    with context as error:
+        _scan_multi_skill(
+            detection,
+            FormatChoice.json,
+            output,
+            no_llm=True,
+            max_skills=limit,
+            fail_on_incomplete=strict,
+        )
+    if strict and scanned < 33:
+        assert error.value.exit_code == 1
+    payload = json.loads(output.read_text())
+    assert len(calls) == payload["skills_scanned"] == scanned
+    assert payload["skills_omitted"] == 33 - scanned
+    assert payload["analysis_completeness"]["is_complete"] is (scanned == 33)
+    assert payload["risk_recommendation"] == ("SAFE" if scanned == 33 else "CAUTION")
+    if scanned < 33:
+        effective = 32 if limit is None else limit
+        assert (
+            f"recursive skill count budget {effective} reached"
+            in payload["analysis_completeness"]["limitations"]
+        )
+        assert "--max-skills" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc"])
+def test_cli_max_skills_rejects_invalid_count(tmp_path, monkeypatch, value):
+    monkeypatch.setattr(cli, "_scan_skill", lambda **_: pytest.fail("must not scan"))
+    result = runner.invoke(app, ["scan", str(tmp_path), "--recursive", "--max-skills", value])
+    assert result.exit_code == 2
+
+
+@pytest.mark.parametrize("recursive", [False, True])
+def test_cli_max_skills_rejects_non_collection(tmp_path, monkeypatch, recursive):
+    monkeypatch.setattr(cli, "_scan_skill", lambda **_: pytest.fail("must not scan"))
+    args = ["scan", str(tmp_path), "--max-skills", "100"]
+    if recursive:
+        args.append("--recursive")
+    result = runner.invoke(app, args)
+    assert result.exit_code == 2
+    assert "--max-skills" in result.stderr
+
+
+def test_cli_max_skills_reaches_recursive_scan(tmp_path, monkeypatch):
+    for i in range(33):
+        skill = tmp_path / f"s{i:03}"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: safe\n---\nHello\n")
+    calls = []
+
+    def fake_scan(**kwargs):
+        calls.append(kwargs)
+        return _bounded_recursive_result("safe", finding_count=0)
+
+    monkeypatch.setattr(cli, "_scan_skill", fake_scan)
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "--recursive",
+            "--max-skills",
+            "33",
+            "--no-llm",
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert len(calls) == payload["skills_scanned"] == 33
+    assert payload["skills_omitted"] == 0
+
+
+@pytest.mark.parametrize("color", [False, True])
+def test_cli_max_skills_is_documented_in_help(monkeypatch, color):
+    # Typer initializes its terminal mode at import time, so environment-only
+    # changes here do not reliably exercise the GitHub Actions rendering path.
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr("typer.rich_utils.FORCE_TERMINAL", color)
+    monkeypatch.setattr("typer.rich_utils.COLOR_SYSTEM", "standard" if color else None)
+    result = runner.invoke(app, ["scan", "--help"], color=True)
+    assert result.exit_code == 0
+    assert ("\x1b[" in result.stdout) is color
+    help_text = unstyle(result.stdout)
+    assert "--max-skills" in help_text
+    assert "32" in help_text
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_recursive_max_skills_helper_rejects_invalid_limit(tmp_path, limit):
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=[])
+    with pytest.raises(ValueError, match="positive integer"):
+        _scan_multi_skill(detection, FormatChoice.json, None, no_llm=True, max_skills=limit)
+
+
+@pytest.mark.parametrize("max_skills", [None, 100])
 def test_recursive_json_uses_one_global_public_record_budget(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, max_skills
 ) -> None:
     """Per-child report caps cannot multiply in the combined JSON document."""
     skills = [SkillDirectory(tmp_path / name, name, name) for name in ("one", "two", "three")]
@@ -2452,7 +2566,7 @@ def test_recursive_json_uses_one_global_public_record_budget(
         fake_invoke,
     )
 
-    _scan_multi_skill(detection, FormatChoice.json, output, no_llm=True)
+    _scan_multi_skill(detection, FormatChoice.json, output, no_llm=True, max_skills=max_skills)
 
     assert len(calls) == 1
     payload = json.loads(output.read_text(encoding="utf-8"))

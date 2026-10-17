@@ -525,6 +525,15 @@ def scan(
             help="Scan immediate subdirectories that each contain a SKILL.md as independent skills.",
         ),
     ] = False,
+    max_skills: Annotated[
+        int | None,
+        typer.Option(
+            "--max-skills",
+            min=1,
+            help="Maximum skills in a local --recursive multi-skill scan (default: 32). "
+            "Other aggregate safety limits still apply; no unlimited value.",
+        ),
+    ] = None,
     baseline: Annotated[
         Path | None,
         typer.Option(
@@ -674,6 +683,11 @@ def scan(
         authentication session. codex_cli is registered but disabled because
         its read-only sandbox permits host-file reads; use another provider.
     """
+    if max_skills is not None and (not recursive or mcp_registry or not Path(input_path).is_dir()):
+        err_console.print(
+            "[red]Error:[/red] --max-skills requires a local --recursive multi-skill directory"
+        )
+        raise typer.Exit(code=2)
     if mcp_registry_compare is not None and not mcp_registry:
         err_console.print("[red]Error:[/red] --mcp-registry-compare requires --mcp-registry")
         raise typer.Exit(code=2)
@@ -795,6 +809,7 @@ def scan(
                     verbose=verbose,
                     fail_on_incomplete=fail_on_incomplete,
                     fail_on_findings=fail_on_findings,
+                    max_skills=max_skills,
                     min_coverage=min_coverage,
                 )
             except typer.Exit:
@@ -809,6 +824,12 @@ def scan(
                     err_console.print(f"[red]Error:[/red] {e}")
                 raise typer.Exit(code=2) from e
             return
+        if max_skills is not None:
+            err_console.print(
+                "[red]Error:[/red] --max-skills requires detected sub-skills; "
+                "scan this input without --max-skills"
+            )
+            raise typer.Exit(code=2)
         if detection.complete and not detection.has_root_skill and len(detection.skills) == 0:
             discovery_console.print(
                 "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
@@ -2920,9 +2941,13 @@ def _scan_multi_skill(
     fail_on_incomplete: bool = False,
     min_coverage: float | None = None,
     fail_on_findings: bool = False,
+    max_skills: int | None = None,
     **legacy_kwargs: object,
 ) -> None:
     """Scan each detected sub-skill independently and produce a combined report."""
+    skill_limit = _MULTI_SKILL_MAX_SKILLS if max_skills is None else max_skills
+    if isinstance(skill_limit, bool) or not isinstance(skill_limit, int) or skill_limit < 1:
+        raise ValueError("max_skills must be a positive integer")
     if yara_dir is None and isinstance(legacy_kwargs.get("yara_rules_dir"), Path):
         yara_dir = str(legacy_kwargs["yara_rules_dir"])
     skills = detection.skills
@@ -2964,10 +2989,13 @@ def _scan_multi_skill(
     coverage_failed = False
 
     for i, skill in enumerate(skills, 1):
-        if i > _MULTI_SKILL_MAX_SKILLS:
+        if i > skill_limit:
             analysis_incomplete = True
-            aggregate_limitations.append(
-                f"recursive skill count budget {_MULTI_SKILL_MAX_SKILLS} reached"
+            aggregate_limitations.append(f"recursive skill count budget {skill_limit} reached")
+            progress_console.print(
+                f"[yellow]Recursive skill count budget {skill_limit} reached.[/yellow] "
+                "Use --recursive --max-skills N with a larger positive N, or scan "
+                "sub-skills separately. Other aggregate safety limits still apply."
             )
             break
         if retained_public_records >= _MULTI_SKILL_MAX_PUBLIC_RECORDS:
