@@ -72,6 +72,7 @@ from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
 from skillspector.providers import UnknownProviderError, get_active_provider, has_cli_capability
+from skillspector.providers._agent_cli import MAX_INPUT_BYTES
 from skillspector.providers.gemini import GeminiProvider
 
 logger = get_logger(__name__)
@@ -589,6 +590,24 @@ def resolve_max_concurrency() -> int:
 # OpenAI suggests ~4 chars per token for English text with BPE tokenizers.
 CHARS_PER_TOKEN = 4
 CHUNK_OVERLAP_LINES = 50
+# Headroom kept below a CLI provider's input cap after the fixed prompt is measured.
+PROMPT_BYTE_SAFETY_MARGIN = 4_096
+
+
+def _cli_max_input_bytes() -> int | None:
+    """Return the prompt byte cap of the active provider, or ``None`` when it has none.
+
+    CLI providers pass the prompt through :func:`run_agent_cli`, which rejects
+    anything over ``MAX_INPUT_BYTES`` before the CLI starts.  HTTP providers have
+    no such cap here; an unknown provider is reported by provider selection itself.
+    """
+    try:
+        provider = get_active_provider()
+    except UnknownProviderError:
+        return None
+    if has_cli_capability(provider):
+        return MAX_INPUT_BYTES
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -826,6 +845,12 @@ def numbered_line_overhead_bytes(last_line: int) -> int:
     zero-padded and the compact form are at most that wide.
     """
     return len(f"L{last_line}: ".encode())
+
+
+def _numbered_size_bound(content: str, last_line: int) -> int:
+    """Upper bound on ``len(number_lines(content, ...).encode())`` for a file of *last_line* lines."""
+    line_count = len(content.splitlines())
+    return len(content.encode("utf-8")) + line_count * numbered_line_overhead_bytes(last_line)
 
 
 def chunk_file_by_lines(
@@ -1118,9 +1143,18 @@ class LLMAnalyzerBase:
         file_paths: list[str],
         file_cache: dict[str, str],
         findings: list[Finding] | None = None,
+        **prompt_kwargs: object,
     ) -> list[Batch]:
-        """Create one :class:`Batch` per file, splitting oversized files into chunks."""
+        """Create one :class:`Batch` per file, splitting oversized files into chunks.
+
+        For CLI providers every batch must also keep the built prompt under the
+        provider's byte cap (see :func:`_cli_max_input_bytes`).  The fixed part of
+        the prompt is measured with :meth:`build_prompt` itself, called with
+        *prompt_kwargs* (the same keyword arguments later passed to the run), so
+        subclass prompt layouts are accounted for rather than estimated.
+        """
         base_overhead = estimate_tokens(self.base_prompt)
+        max_input_bytes = _cli_max_input_bytes()
 
         findings_by_file: dict[str, list[Finding]] = defaultdict(list)
         if findings:
@@ -1135,8 +1169,21 @@ class LLMAnalyzerBase:
             extra = self._estimate_extra_overhead(file_findings)
             content_budget = max(self._input_budget - base_overhead - extra, 1024)
 
+            last_line = max(len(content.splitlines()), 1)
+            fixed_bytes = 0
+            byte_budget: int | None = None
+            if max_input_bytes is not None:
+                fixed_bytes = self._fixed_prompt_bytes(
+                    path, file_findings, last_line, **prompt_kwargs
+                )
+                byte_budget = max_input_bytes - fixed_bytes - PROMPT_BYTE_SAFETY_MARGIN
+
+            first_batch = len(batches)
             content_tokens = estimate_tokens(content)
-            if content_tokens <= content_budget:
+            fits_bytes = byte_budget is None or (
+                _numbered_size_bound(content, last_line) <= byte_budget
+            )
+            if content_tokens <= content_budget and fits_bytes:
                 batches.append(
                     Batch(
                         file_path=path,
@@ -1146,7 +1193,13 @@ class LLMAnalyzerBase:
                 )
             else:
                 chunk_budget = max(int(content_budget), 1024)
-                for chunk_text, s_line, e_line in chunk_file_by_lines(content, chunk_budget):
+                # A non-positive byte budget means the fixed prompt alone is over the
+                # cap; splitting the content further cannot help, and every batch is
+                # reported below and fails closed at the provider.
+                chunk_bytes = byte_budget if byte_budget is not None and byte_budget > 0 else None
+                for chunk_text, s_line, e_line in chunk_file_by_lines(
+                    content, chunk_budget, max_bytes=chunk_bytes
+                ):
                     chunk_findings = findings_in_range(file_findings, s_line, e_line)
                     batches.append(
                         Batch(
@@ -1158,7 +1211,40 @@ class LLMAnalyzerBase:
                         )
                     )
 
+            if max_input_bytes is not None:
+                for batch in batches[first_batch:]:
+                    size = fixed_bytes + _numbered_size_bound(batch.content, last_line)
+                    if size > max_input_bytes:
+                        logger.warning(
+                            "LLM prompt for %s exceeds the provider input limit "
+                            "(%d > %d bytes); the batch will fail closed",
+                            batch.file_label,
+                            size,
+                            max_input_bytes,
+                        )
+
         return batches
+
+    def _fixed_prompt_bytes(
+        self,
+        path: str,
+        findings: list[Finding],
+        last_line: int,
+        **prompt_kwargs: object,
+    ) -> int:
+        """Bytes :meth:`build_prompt` produces for *path* around empty content.
+
+        The probe uses the widest label (``lines 1–last_line``) and all of the
+        file's findings, so it bounds the fixed part of every batch for *path*.
+        """
+        probe = Batch(
+            file_path=path,
+            content="",
+            start_line=1,
+            end_line=last_line,
+            findings=findings,
+        )
+        return len(self.build_prompt(probe, **prompt_kwargs).encode("utf-8"))
 
     # -- Prompt / parse -----------------------------------------------------
 

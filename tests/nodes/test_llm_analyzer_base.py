@@ -100,6 +100,7 @@ from skillspector.nodes.meta_analyzer import (
     MetaAnalyzerResult,
     _format_findings_for_prompt,
 )
+from skillspector.providers._agent_cli import MAX_INPUT_BYTES
 
 # ---------------------------------------------------------------------------
 # estimate_tokens
@@ -1070,6 +1071,90 @@ class TestMetaAnalyzerResultFindingsValidator:
     def test_findings_non_list_json_rejected(self) -> None:
         with pytest.raises(ValidationError):
             MetaAnalyzerResult.model_validate({"findings": json.dumps({"a": 1})})
+
+
+# ---------------------------------------------------------------------------
+# LLMAnalyzerBase.get_batches — CLI provider input byte cap
+# ---------------------------------------------------------------------------
+
+
+class TestCliPromptByteBudget:
+    """CLI providers reject prompts over ``MAX_INPUT_BYTES`` before the CLI starts.
+
+    The token budget alone does not keep a numbered prompt under that cap: with a
+    272k-token context window (input budget 204k tokens), short lines carry a
+    line-number prefix the token estimate ignores, and multi-byte text is larger in
+    bytes than in estimated tokens.
+    """
+
+    MODEL = "nvidia/openai/gpt-oss-120b"
+    LARGE_CONTEXT_INPUT_BUDGET = int(272_000 * 0.75)
+
+    @pytest.fixture
+    def cli_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+
+    @pytest.fixture
+    def http_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+
+    def _analyzer(self) -> LLMAnalyzerBase:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._input_budget = self.LARGE_CONTEXT_INPUT_BUDGET
+        return analyzer
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_provider_batches_fit_max_input_bytes(self, cli_provider: None) -> None:
+        analyzer = self._analyzer()
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        batches = analyzer.get_batches(["big.js"], {"big.js": content})
+        assert len(batches) > 1
+        for batch in batches:
+            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_provider_batches_cover_every_line(self, cli_provider: None) -> None:
+        analyzer = self._analyzer()
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        covered: set[int] = set()
+        for batch in analyzer.get_batches(["big.js"], {"big.js": content}):
+            assert batch.end_line is not None
+            covered.update(range(batch.start_line, batch.end_line + 1))
+        assert covered == set(range(1, 150_001))
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_provider_splits_multibyte_file_under_token_budget(
+        self, cli_provider: None
+    ) -> None:
+        analyzer = self._analyzer()
+        # ~1.2 MB of UTF-8 but only ~100k estimated tokens: fits the token budget whole.
+        content = "".join("漢" * 200 + "\n" for _ in range(2_000))
+        assert estimate_tokens(content) <= self.LARGE_CONTEXT_INPUT_BUDGET
+        batches = analyzer.get_batches(["cjk.md"], {"cjk.md": content})
+        assert len(batches) > 1
+        for batch in batches:
+            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_http_provider_batching_unchanged(self, http_provider: None) -> None:
+        analyzer = self._analyzer()
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        budget = max(analyzer._input_budget - estimate_tokens("test"), 1024)
+        expected = [(s, e) for _t, s, e in chunk_file_by_lines(content, budget)]
+        batches = analyzer.get_batches(["big.js"], {"big.js": content})
+        assert [(b.start_line, b.end_line) for b in batches] == expected
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_oversized_single_line_warns_and_is_not_truncated(
+        self, cli_provider: None, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        analyzer = self._analyzer()
+        # Fewer estimated tokens than the budget, more bytes than the cap.
+        line = "漢" * (MAX_INPUT_BYTES // 3 + 10)
+        with caplog.at_level("WARNING"):
+            batches = analyzer.get_batches(["min.js"], {"min.js": line + "\n"})
+        assert any(line in batch.content for batch in batches)
+        assert "exceeds the provider input limit" in caplog.text
 
 
 # ---------------------------------------------------------------------------
