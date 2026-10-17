@@ -819,33 +819,60 @@ def ledger_events_for_batches(
 # ---------------------------------------------------------------------------
 
 
+def numbered_line_overhead_bytes(last_line: int) -> int:
+    """Upper bound on the bytes :func:`number_lines` adds in front of each line.
+
+    The widest prefix belongs to the highest line number (``L19239: ``); both the
+    zero-padded and the compact form are at most that wide.
+    """
+    return len(f"L{last_line}: ".encode())
+
+
 def chunk_file_by_lines(
     content: str,
     max_tokens: int,
     overlap_lines: int = CHUNK_OVERLAP_LINES,
+    *,
+    max_bytes: int | None = None,
 ) -> list[tuple[str, int, int]]:
     """Split *content* into line-range chunks that each fit within *max_tokens*.
 
     Returns a list of ``(chunk_text, start_line, end_line)`` tuples where lines
     are 1-indexed.  Consecutive chunks share *overlap_lines* lines of context so
     findings near chunk boundaries still have surrounding code.
+
+    When *max_bytes* is set, each chunk must also fit within that many UTF-8
+    bytes *after* :func:`number_lines` has prefixed it, which is what a CLI
+    provider's input cap measures.  A single line that alone exceeds the budget
+    still becomes its own chunk: content is never dropped or truncated.
     """
     lines = content.splitlines(keepends=True)
     if not lines:
         return [("", 1, 1)]
+
+    # A line's own terminator is at least as long as the "\n" number_lines joins
+    # with, so line bytes plus the widest prefix bound the numbered size.
+    prefix_bytes = numbered_line_overhead_bytes(len(lines))
 
     chunks: list[tuple[str, int, int]] = []
     start_idx = 0
 
     while start_idx < len(lines):
         token_count = 0
+        byte_count = 0
         end_idx = start_idx
 
         while end_idx < len(lines):
             line_tokens = estimate_tokens(lines[end_idx])
-            if token_count + line_tokens > max_tokens and end_idx > start_idx:
+            line_bytes = (
+                len(lines[end_idx].encode("utf-8")) + prefix_bytes if max_bytes is not None else 0
+            )
+            over_tokens = token_count + line_tokens > max_tokens
+            over_bytes = max_bytes is not None and byte_count + line_bytes > max_bytes
+            if (over_tokens or over_bytes) and end_idx > start_idx:
                 break
             token_count += line_tokens
+            byte_count += line_bytes
             end_idx += 1
 
         chunk_text = "".join(lines[start_idx:end_idx])

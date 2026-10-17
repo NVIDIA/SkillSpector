@@ -88,6 +88,7 @@ from skillspector.llm_analyzer_base import (
     findings_in_range,
     ledger_events_for_batches,
     number_lines,
+    numbered_line_overhead_bytes,
     resolve_max_concurrency,
     resolve_output_language,
 )
@@ -255,6 +256,60 @@ class TestChunkFileByLines:
         chunks = chunk_file_by_lines(content, max_tokens=100)
         assert len(chunks) == 1
         assert chunks[0][1] == 1
+
+    def test_max_bytes_none_is_unchanged(self) -> None:
+        content = "".join(f"x = {i}\n" for i in range(5000))
+        assert chunk_file_by_lines(content, 500) == chunk_file_by_lines(
+            content, 500, max_bytes=None
+        )
+
+    def test_chunks_respect_byte_budget_including_line_prefix(self) -> None:
+        # The token budget alone would fit every line; only the byte budget splits.
+        content = "".join("a" * 40 + "\n" for _ in range(20_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=100_000)
+        assert len(chunks) > 1
+        for text, start, _end in chunks:
+            assert len(number_lines(text, start).encode("utf-8")) <= 100_000
+
+    def test_byte_budget_covers_every_line(self) -> None:
+        content = "".join(f"line {i}\n" for i in range(20_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=50_000)
+        covered: set[int] = set()
+        for _text, start, end in chunks:
+            covered.update(range(start, end + 1))
+        assert covered == set(range(1, 20_001))
+
+    def test_multibyte_lines_counted_in_bytes(self) -> None:
+        # 300 UTF-8 bytes but only 25 estimated tokens per line.
+        content = "".join("漢" * 100 + "\n" for _ in range(5_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=200_000)
+        assert len(chunks) > 1
+        for text, start, _end in chunks:
+            assert len(number_lines(text, start).encode("utf-8")) <= 200_000
+
+    def test_single_oversized_line_is_kept_whole(self) -> None:
+        long_line = "y" * 300_000
+        content = "short\n" + long_line + "\nshort\n"
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=100_000)
+        assert any(long_line in text for text, _start, _end in chunks)
+        covered: set[int] = set()
+        for _text, start, end in chunks:
+            covered.update(range(start, end + 1))
+        assert covered == {1, 2, 3}
+
+    def test_compact_prompts_and_crlf_stay_under_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_COMPACT_PROMPTS", "1")
+        content = "".join("b" * 30 + "\r\n" for _ in range(20_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=60_000)
+        assert len(chunks) > 1
+        for text, start, _end in chunks:
+            assert len(number_lines(text, start).encode("utf-8")) <= 60_000
+
+    def test_numbered_line_overhead_bytes_matches_widest_prefix(self) -> None:
+        assert numbered_line_overhead_bytes(9) == len("L9: ")
+        assert numbered_line_overhead_bytes(19_239) == len("L19239: ")
 
 
 # ---------------------------------------------------------------------------
