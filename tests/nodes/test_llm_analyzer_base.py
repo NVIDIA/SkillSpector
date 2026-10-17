@@ -3085,6 +3085,38 @@ class TestLLMMetaAnalyzerGetBatches:
         assert len(batches) == 1
         assert batches[0].findings == []
 
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_batches_fit_with_large_metadata_and_findings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        analyzer._input_budget = int(272_000 * 0.75)
+        content = "".join("m" * 40 + "\n" for _ in range(30_000))
+        findings = [self._make_finding("big.js", line=i) for i in range(1, 30_000, 100)]
+        metadata = "d" * 400_000
+        batches = analyzer.get_batches(
+            ["big.js"], {"big.js": content}, findings, metadata_text=metadata
+        )
+        for batch in batches:
+            prompt = analyzer.build_prompt(batch, metadata_text=metadata)
+            assert len(prompt.encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_sc10_redaction_cannot_push_prompt_over_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        analyzer._input_budget = int(272_000 * 0.75)
+        # Each short credential URL grows when redact_text rewrites it.
+        content = "".join("x=http://u:p@h\n" for _ in range(70_000))
+        findings = [self._make_finding("creds.py", line=1, rule_id="SC10")]
+        batches = analyzer.get_batches(["creds.py"], {"creds.py": content}, findings)
+        assert all("u:p@" not in batch.content for batch in batches)
+        for batch in batches:
+            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
+
 
 # ---------------------------------------------------------------------------
 # LLMMetaAnalyzer.build_prompt
