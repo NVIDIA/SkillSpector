@@ -21,10 +21,22 @@ _MANIFEST = (
     "description: Explain the documented interface when asked about its behavior.\n"
     "---\n\nRead [the interface guide](guide.md) for the explanation.\n"
 )
-_APOSTROPHE = "The interface doesn't match the spec.\n\n" + "".join(
+_OBSERVATIONS = "".join(
     f"Observation {i:03d}: the interface accepts an ordinary numeric value, "
     "records its label, and displays a plain explanatory result for this example.\n"
     for i in range(45)
+)
+_APOSTROPHE = "The interface doesn't match the spec.\n\n" + _OBSERVATIONS
+# Possessives and contractions in a prose line with other punctuation. The
+# count is odd, so read as shell quotes the last one stays open to the end.
+_POSSESSIVE = (
+    "The router keeps no mesh/CAD/splat table; it calls each reference's probe "
+    "mode, and that reference's reader (don't skip it) lists the formats.\n\n"
+) + _OBSERVATIONS
+# Read as shell quotes, a possessive and a later plural possessive pair up.
+# Only one of them as punctuation would leave the other open to the end.
+_PLURAL_POSSESSIVE = (
+    "It reads each reference's notes.\n\nIt lists the drivers' files.\n\n" + _OBSERVATIONS
 )
 _LAYOUT = (
     "```\n```\n"
@@ -38,6 +50,12 @@ _CASES = [
     pytest.param(("- " + _APOSTROPHE).replace("\n", "\r\n"), id="list-apostrophe-crlf"),
     pytest.param("- " + _APOSTROPHE.replace("doesn't", "does not"), id="list-control"),
     pytest.param(_APOSTROPHE.replace("doesn't", "does not"), id="apostrophe-control"),
+    pytest.param(_POSSESSIVE, id="possessive-long"),
+    pytest.param("- " + _POSSESSIVE, id="list-possessive-long"),
+    pytest.param(
+        _POSSESSIVE.replace("'s", "s").replace("don't", "do not"), id="possessive-control"
+    ),
+    pytest.param(_PLURAL_POSSESSIVE, id="plural-possessive-long"),
     pytest.param(_LAYOUT, id="overview-minimal"),
     pytest.param(
         _LAYOUT.replace("row-first vs column-first", "row major vs column major"),
@@ -228,11 +246,47 @@ def test_prose_inside_unresolved_shell_content_remains_partial(content: str) -> 
     assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
-@pytest.mark.parametrize("content", [_APOSTROPHE, _LAYOUT, "- " + _APOSTROPHE])
+@pytest.mark.parametrize(
+    "line",
+    [
+        "$CMD reads each reference's probe mode.",
+        "Each reference's `probe` mode.",
+        'Each reference\'s "probe" mode.',
+        "Each reference's probe mode, as in echo 'it'.",
+        "Each reference's 'tools' mode.",
+        "Each reference's probe mode \\",
+        "Run the probe \\\nfor each reference's mode.",
+        "$CMD \u2028reads each reference's probe mode.",
+        "## Each reference's probe mode",
+    ],
+)
+def test_possessive_beside_shell_syntax_keeps_its_quote(line: str) -> None:
+    content = line + "\n\n" + _OBSERVATIONS
+    projected = tm._markdown_shell_text(content, lambda: None)
+    apostrophe = content.index("reference's") + len("reference")
+    assert projected[apostrophe] == "'"
+
+
+@pytest.mark.parametrize("separator", [" ", " \u2028"], ids=["space", "line-separator"])
+def test_possessive_cannot_hide_runtime_command_operands(separator: str) -> None:
+    # Read as shell, the apostrophe joins the next line to $CMD's operands.
+    # A Unicode line separator does not end the shell line.
+    content = f"$CMD{separator}reads each reference's\nprobe' -rf /\n\n" + _OBSERVATIONS
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "content", [_APOSTROPHE, _LAYOUT, "- " + _APOSTROPHE, _POSSESSIVE, _PLURAL_POSSESSIVE]
+)
 @pytest.mark.parametrize(
     "command,partial",
     [
         ("rm -rf /", False),
+        ("r'm' -rf /", False),
         ("$($CMD) -rf /", True),
         ("$($(resolve_tool)/printf %s rm) -rf /", True),
     ],

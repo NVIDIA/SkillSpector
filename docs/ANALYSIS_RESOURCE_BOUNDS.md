@@ -1,5 +1,21 @@
 # Analysis Resource Bounds
 
+## Python string-value and bundled-import bounds
+
+Python string delimiters alone do not prove that later code cannot extend a
+command. The optional string-value completeness proof retains the original
+whole-source operand fallback around recognized shell execution, dynamic module
+access, reflection, and ambiguous subprocess modes.
+
+For bundled helpers, the proof uses only the scanner's in-memory component
+inventory and file cache. It follows selected named functions and their local
+dependencies, and separately checks module and ancestor-package initialization.
+It checks at most 64 files, 16 import levels, 2,000,000 source characters and
+40,000 visited syntax nodes per caller proof, sharing the artifact deadline.
+Missing or ambiguous local targets, import cycles, unsupported callable shapes,
+and exhausted bounds retain the original parser fallback. Interrupted proofs
+are not cached. External imports remain outside this bounded context.
+
 SkillSpector applies deterministic resource ceilings to untrusted skill bundles. A ceiling is a
 safety boundary, not an allowlist and not evidence that the portion examined was clean. When a
 relevant ceiling is reached, the scanner records the limitation and reports partial analysis.
@@ -123,6 +139,18 @@ The finding and incomplete-analysis gates remain active until the relevant
 limitations are resolved. Evidence fields are diagnostic facts, not suppression
 instructions.
 
+### Markdown prose apostrophes
+
+In a complete Markdown file, a possessive or contraction such as `reference's`,
+`drivers'` or `don't` in a prose line is punctuation, not a shell single quote
+that stays open through the rest of the file. This applies only when every quote
+on the line is such a word apostrophe, the line has no `$`, backtick, backslash
+or double quote, and the line starts a new shell line: the previous line ends in
+a newline, not a backslash continuation or a Unicode line separator. Headings,
+block quotes, code blocks, HTML blocks, tables, lines inside a pending inline
+code span, and an apostrophe inside a quote or substitution that starts earlier
+keep the lexical reading.
+
 ### Perl literal help text
 
 For `.pl` source, the tool-misuse analyzer recognizes a narrow form of standalone
@@ -148,6 +176,49 @@ interpolation, quote operators such as `qx`, quote-like special variables,
 legacy package separators, incomplete fragments, and real parser limits remain
 on the conservative analysis path. A complex helper may therefore still need
 its particular ledger reason and expression reviewed.
+
+Perl `eval BLOCK` (for example `eval { require $module; 1 } or die $@;`) traps
+exceptions in already-compiled code and is not treated as a shell `eval` of a
+string. Its statements are still scanned. String forms such as `eval $code`
+and `eval "..."` remain on the conservative path.
+
+### Python strings and comments
+
+For a complete `.py` module that the Python parser accepts, each string literal
+(including f-strings) and comment owns its bytes. A shell quote or backtick that
+is left open inside one of them, such as a Markdown fence in a string or an
+apostrophe in a comment, is charged only up to the end of that token, never to
+the code that follows. Python code that happens to use a shell wrapper name, as
+in `signal.alarm(timeout)`, is not reparsed as a shell command string. A
+runtime-selected command named in a comment takes operands only from that
+comment. One named in a string literal takes operands only from the rest of
+that string's value: the literal's body and the bodies of literals implicitly
+or `+`-concatenated after it. A value that code can still extend or rewrite,
+with `%`, `.format` or another method call, a subscript, repetition, or a
+non-literal operand, keeps the conservative result, also after a closing
+parenthesis. An f-string replacement field among the operands may supply the
+recursive and force options, so a root target beside it also stays
+conservative.
+
+Literal payloads remain visible to every security check. A single string or
+comment that itself holds more unresolved shell text than the parser bound,
+invalid or fragmentary Python, and source with a non-Python shebang keep the
+conservative result.
+
+Declared-marker reconstruction uses the same proof, as it does for validated
+JSON strings. When a removal verb is followed later on its line by the closing
+quote of a Python string, as in `assert "please omit --hours" in out`, that
+quote is not paired with the next literal's opening quote across the code
+between them. An explicit declaration, where only a short phrase such as
+`the marker` separates the verb from the quote, keeps the lexical reading.
+Marker declarations written inside one string or comment are still
+reconstructed or reported as `obfuscated_instruction_text`. Invalid or
+fragmentary Python and other file types keep the lexical reading.
+
+Both consumers share one parse and tokenization of a module. The two most
+recent results, including a failed proof, are reused, and each reuse still
+checks the static runtime budget. A proof interrupted by that budget is not
+kept.
 
 ## Structured skill data
 
