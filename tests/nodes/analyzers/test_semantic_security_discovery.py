@@ -214,7 +214,9 @@ class TestSemanticSecurityDiscoveryConcurrency:
         assert result["llm_call_log"][0]["error"] == "shared runtime limit reached"
 
     def test_batches_run_concurrently(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "4")
+        # Four batches against a shared budget of two: fan-out reaches the limit
+        # and the limit holds, which a serial loop or an unbounded gather would not.
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "2")
         peak, live = [0], [0]
         components = [f"file{i}.md" for i in range(4)]
         state = {
@@ -225,8 +227,45 @@ class TestSemanticSecurityDiscoveryConcurrency:
         }
         with patch(MOCK_PATCH_TARGET, self._counting_chat_model(peak, live)):
             result = node(state)
-        assert peak[0] >= 2
+        assert peak[0] == 2
         assert result["findings"] == []
+
+    def test_partial_failure_in_fan_out_keeps_findings_and_reports_the_gap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "4")
+        finding = LLMFinding(
+            rule_id="SSD-1",
+            message="hidden instruction",
+            severity="HIGH",
+            confidence=0.9,
+            start_line=1,
+        )
+
+        async def _invoke(prompt, *_args, **_kwargs):
+            if "File: bad.md" in str(prompt):
+                raise RuntimeError("provider exploded")
+            return LLMAnalysisResult(findings=[finding])
+
+        def _factory(*_args, **_kwargs):
+            mock_llm = _mock_get_chat_model()
+            mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(side_effect=_invoke)
+            return mock_llm
+
+        state = {
+            "use_llm": True,
+            "model_config": {"semantic_security_discovery": "test-model"},
+            "components": ["good.md", "bad.md"],
+            "file_cache": {"good.md": "# good\n", "bad.md": "# bad\n"},
+        }
+        with patch(MOCK_PATCH_TARGET, _factory):
+            result = node(state)
+
+        assert [(f.rule_id, f.file) for f in result["findings"]] == [("SSD-1", "good.md")]
+        assert result["llm_call_log"][0]["ok"] is False
+        reasons = {event["path"]: event.get("reason_code") for event in result["inspection_ledger"]}
+        assert reasons["bad.md"] == "llm_batch_failed"
+        assert reasons["good.md"] != "llm_batch_failed"
 
 
 class TestSemanticSecurityDiscoveryPrompt:
@@ -472,8 +511,8 @@ class TestErrorHandling:
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
         mock_llm = MagicMock()
-        mock_llm.with_structured_output.return_value.invoke.side_effect = OutputParserException(
-            "Invalid json output: "
+        mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
+            side_effect=OutputParserException("Invalid json output: ")
         )
         mock_get_model.return_value = mock_llm
         with patch.object(
@@ -481,6 +520,8 @@ class TestErrorHandling:
         ):
             result = node({"file_cache": {"SKILL.md": "# Skill"}})
 
+        # The refusal itself must be what failed the batch, not a mock mismatch.
+        assert mock_llm.with_structured_output.return_value.ainvoke.await_count == 1
         assert result["findings"] == []
         assert result["analyzer_status_events"][0]["status"] == "failed"
         assert result["llm_call_log"][0]["ok"] is False
@@ -494,12 +535,13 @@ class TestErrorHandling:
         from langchain_openai.chat_models.base import OpenAIRefusalError
 
         mock_llm = MagicMock()
-        mock_llm.with_structured_output.return_value.invoke.side_effect = OpenAIRefusalError(
-            "I can't help with that."
+        mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
+            side_effect=OpenAIRefusalError("I can't help with that.")
         )
         mock_get_model.return_value = mock_llm
         result = node({"file_cache": {"SKILL.md": "# Skill"}})
 
+        assert mock_llm.with_structured_output.return_value.ainvoke.await_count >= 1
         assert result["findings"] == []
         assert result["analyzer_status_events"][0]["status"] == "failed"
         assert result["llm_call_log"][0]["ok"] is False
