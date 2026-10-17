@@ -17,8 +17,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -93,7 +94,8 @@ class TestSemanticSecurityDiscoveryNode:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
+            new_callable=AsyncMock,
             return_value=[(MagicMock(), [expected_finding])],
         ):
             result = node(base_state)
@@ -134,7 +136,7 @@ class TestSemanticSecurityDiscoveryNode:
 
         submitted_batches = []
 
-        def fake_run_batches(self, batches):
+        async def fake_arun_batches(self, batches):
             submitted_batches.extend(batches)
             results = [(batch, []) for batch in batches]
             self._last_batch_outcome = BatchExecutionResult(successful=results)
@@ -144,7 +146,7 @@ class TestSemanticSecurityDiscoveryNode:
             "components": ["cached.py", "unreadable.py"],
             "file_cache": {"cached.py": "print('ready')\n"},
         }
-        with patch.object(LLMAnalyzerBase, "run_batches", fake_run_batches):
+        with patch.object(LLMAnalyzerBase, "arun_batches", fake_arun_batches):
             result = node(state)
 
         assert [batch.file_path for batch in submitted_batches] == ["cached.py"]
@@ -161,7 +163,8 @@ class TestSemanticSecurityDiscoveryNode:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
+            new_callable=AsyncMock,
             return_value=[(MagicMock(), findings)],
         ):
             result = node(base_state)
@@ -171,8 +174,59 @@ class TestSemanticSecurityDiscoveryNode:
 
 
 # ---------------------------------------------------------------------------
-# TestSemanticSecurityDiscoveryPrompt
+# TestSemanticSecurityDiscoveryConcurrency
 # ---------------------------------------------------------------------------
+
+
+class TestSemanticSecurityDiscoveryConcurrency:
+    """Batches fan out through the shared limiter, like the sibling analyzers."""
+
+    @staticmethod
+    def _counting_chat_model(peak: list[int], live: list[int]):
+        async def _invoke(*_args, **_kwargs):
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+            # Yield so a second in-flight request can be observed; a serial loop
+            # would never have two calls live at once.
+            await asyncio.sleep(0.02)
+            live[0] -= 1
+            return LLMAnalysisResult(findings=[])
+
+        def _factory(*_args, **_kwargs):
+            mock_llm = _mock_get_chat_model()
+            mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(side_effect=_invoke)
+            return mock_llm
+
+        return _factory
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_runtime_limit_from_async_fan_out_is_recorded(self, base_state) -> None:
+        from skillspector.llm_analyzer_base import LLMAnalyzerBase, LLMRuntimeLimitError
+
+        with patch.object(
+            LLMAnalyzerBase,
+            "arun_batches",
+            new_callable=AsyncMock,
+            side_effect=LLMRuntimeLimitError("shared scan runtime limit reached"),
+        ):
+            result = node(base_state)
+        assert result["findings"] == []
+        assert result["llm_call_log"][0]["error"] == "shared runtime limit reached"
+
+    def test_batches_run_concurrently(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "4")
+        peak, live = [0], [0]
+        components = [f"file{i}.md" for i in range(4)]
+        state = {
+            "use_llm": True,
+            "model_config": {"semantic_security_discovery": "test-model"},
+            "components": components,
+            "file_cache": {path: f"# {path}\n" for path in components},
+        }
+        with patch(MOCK_PATCH_TARGET, self._counting_chat_model(peak, live)):
+            result = node(state)
+        assert peak[0] >= 2
+        assert result["findings"] == []
 
 
 class TestSemanticSecurityDiscoveryPrompt:
@@ -200,7 +254,9 @@ class TestSemanticSecurityDiscoveryBatching:
     def test_single_file_one_batch(self, base_state) -> None:
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-        with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]) as mock_run:
+        with patch.object(
+            LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, return_value=[]
+        ) as mock_run:
             node(base_state)
 
         mock_run.assert_called_once()
@@ -221,7 +277,9 @@ class TestSemanticSecurityDiscoveryBatching:
             "skillspector.llm_analyzer_base.get_max_input_tokens",
             return_value=50,
         ):
-            with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]) as mock_run:
+            with patch.object(
+                LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, return_value=[]
+            ) as mock_run:
                 node(base_state)
 
         batches_arg = mock_run.call_args[0][0]
@@ -244,7 +302,9 @@ class TestUseLlmGuard:
         with patch(MOCK_PATCH_TARGET, _mock_get_chat_model):
             from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-            with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]):
+            with patch.object(
+                LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, return_value=[]
+            ):
                 result = node(state)
         assert result["findings"] == []
 
@@ -336,7 +396,8 @@ class TestErrorHandling:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
+            new_callable=AsyncMock,
             side_effect=RuntimeError("LLM service unavailable"),
         ):
             result = node(
@@ -364,7 +425,9 @@ class TestErrorHandling:
 
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-        with patch.object(LLMAnalyzerBase, "run_batches", side_effect=validation_err):
+        with patch.object(
+            LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, side_effect=validation_err
+        ):
             result = node({"file_cache": {"SKILL.md": "# Skill"}})
         assert result["findings"] == []
 
@@ -380,7 +443,9 @@ class TestErrorHandling:
 
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-        with patch.object(LLMAnalyzerBase, "run_batches", side_effect=validation_err):
+        with patch.object(
+            LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, side_effect=validation_err
+        ):
             result = node(
                 {
                     "components": ["cached.py", "missing.py"],
@@ -454,7 +519,7 @@ class TestLLMCallTelemetry:
     def test_success_records_ok_true(self, base_state) -> None:
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-        with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]):
+        with patch.object(LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, return_value=[]):
             result = node(base_state)
         assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": True, "error": None}]
 
@@ -479,7 +544,9 @@ class TestLLMCallTelemetry:
 
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-        with patch.object(LLMAnalyzerBase, "run_batches", side_effect=validation_err):
+        with patch.object(
+            LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, side_effect=validation_err
+        ):
             result = node({"file_cache": {"SKILL.md": "# Skill"}})
         assert result["llm_call_log"][0]["ok"] is False
 
@@ -510,11 +577,11 @@ def _build_file_cache(skill_dir: Path) -> dict[str, str]:
     return cache
 
 
-def _make_file_aware_run_batches(responses: dict[str, LLMAnalysisResult]):
-    """Return a mock run_batches that dispatches based on file_path in each batch."""
+def _make_file_aware_arun_batches(responses: dict[str, LLMAnalysisResult]):
+    """Return a mock arun_batches that dispatches based on file_path in each batch."""
     from skillspector.llm_analyzer_base import Batch
 
-    def _run_batches(self_inner, batches: list[Batch], **_kwargs):
+    async def _arun_batches(self_inner, batches: list[Batch], **_kwargs):
         results = []
         for batch in batches:
             response = responses.get(batch.file_path, LLMAnalysisResult(findings=[]))
@@ -522,7 +589,7 @@ def _make_file_aware_run_batches(responses: dict[str, LLMAnalysisResult]):
             results.append((batch, findings))
         return results
 
-    return _run_batches
+    return _arun_batches
 
 
 # ---------------------------------------------------------------------------
@@ -572,8 +639,8 @@ class TestFixtureConftestMalicious:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
-            _make_file_aware_run_batches(_CONFTEST_MALICIOUS_RESPONSES),
+            "arun_batches",
+            _make_file_aware_arun_batches(_CONFTEST_MALICIOUS_RESPONSES),
         ):
             result = node(state)
 
@@ -591,8 +658,8 @@ class TestFixtureConftestMalicious:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
-            _make_file_aware_run_batches(_CONFTEST_MALICIOUS_RESPONSES),
+            "arun_batches",
+            _make_file_aware_arun_batches(_CONFTEST_MALICIOUS_RESPONSES),
         ):
             result = node(state)
 
@@ -609,8 +676,8 @@ class TestFixtureConftestMalicious:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
-            _make_file_aware_run_batches(_CONFTEST_MALICIOUS_RESPONSES),
+            "arun_batches",
+            _make_file_aware_arun_batches(_CONFTEST_MALICIOUS_RESPONSES),
         ):
             result = node(state)
 
@@ -633,7 +700,8 @@ class TestFixtureConftestSafe:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
+            new_callable=AsyncMock,
             return_value=[],
         ):
             result = node(state)
@@ -680,8 +748,8 @@ class TestFixtureSsd1SemanticInjection:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
-            _make_file_aware_run_batches(_SSD1_RESPONSES),
+            "arun_batches",
+            _make_file_aware_arun_batches(_SSD1_RESPONSES),
         ):
             result = node(state)
 
@@ -732,8 +800,8 @@ class TestFixtureSsd2NovelPhrasing:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
-            _make_file_aware_run_batches(_SSD2_RESPONSES),
+            "arun_batches",
+            _make_file_aware_arun_batches(_SSD2_RESPONSES),
         ):
             result = node(state)
 
@@ -783,8 +851,8 @@ class TestFixtureSsd3NlExfiltration:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
-            _make_file_aware_run_batches(_SSD3_RESPONSES),
+            "arun_batches",
+            _make_file_aware_arun_batches(_SSD3_RESPONSES),
         ):
             result = node(state)
 
@@ -833,8 +901,8 @@ class TestFixtureSsd4NarrativeDeception:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
-            _make_file_aware_run_batches(_SSD4_RESPONSES),
+            "arun_batches",
+            _make_file_aware_arun_batches(_SSD4_RESPONSES),
         ):
             result = node(state)
 
@@ -862,7 +930,7 @@ class TestFixtureSsdClean:
 
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-        with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]):
+        with patch.object(LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, return_value=[]):
             result = node(state)
 
         assert result["findings"] == []
