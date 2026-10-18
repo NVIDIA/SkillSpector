@@ -11,6 +11,37 @@ Nested members use a stable virtual path that retains their full provenance:
 outer-file!/nested.zip!/scripts/setup.sh
 ```
 
+## JSON component locations
+
+JSON component rows preserve this virtual path in `path`, matching finding locations and
+inspection-ledger entries. Archive members also expose their existing inventory provenance:
+
+```json
+{
+  "path": "bundle.whl!/package/module.py",
+  "type": "python",
+  "executable": true,
+  "outer_path": "bundle.whl",
+  "nested_path": "package/module.py",
+  "container_type": "zip",
+  "container_ancestry": ["zip"],
+  "container_depth": 1
+}
+```
+
+`outer_path` names the physical container relative to that component's source root. `nested_path`
+retains the full member chain inside it, including any nested `!/` boundaries. Each member keeps
+its own component row, executable flag, type, line count, and byte size. Ordinary files do not gain
+archive fields merely because their names contain `!/`.
+
+Consumers must distinguish a virtual member from an on-disk file: `executable: true` describes
+the member's content, not the existence of its virtual path on disk. Use the source identity and
+full `path` to join components with findings; do not collapse members by `outer_path`. When
+validating a report, check archive provenance and containment within the corresponding source
+root, and retain incomplete-inspection failures. These additive fields do not change existing
+consumer validators automatically, prove that every member was inspected, or justify extracting
+or executing archive content.
+
 ## Security invariants
 
 - Members are read in memory. SkillSpector never extracts, renders, imports, installs, or executes
@@ -63,6 +94,15 @@ makes the analysis incomplete. A result that would otherwise be `SAFE` is report
 a failing gate with `--fail-on-incomplete`. Inspection exceptions and their affected outer or nested
 paths are surfaced in terminal, JSON, Markdown, and SARIF output.
 
+If a real disk path containing `!/` has the same identity as an archive member, the scan
+records `artifact_path_collision`, retains the disk bytes, and withholds the archive member.
+This fails the scan (CLI exit 2 and MCP `safe_to_install=false`). Rename the disk directory
+ending in `!` to remove the ambiguity. Non-colliding directory names ending in `!` remain valid.
+The colliding member file is withheld; distinct descendant members still receive analysis.
+Exceptions for that withheld file or a skipped duplicate descendant are reported against its
+archive container. Disk format and malformed-container errors stay on the disk file, and an
+analyzed disk descendant is not marked partial merely because the archive copy was skipped.
+
 ## SC9: Concealed Executable Artifact
 
 SC9 is a deterministic HIGH finding when executable content is concealed inside an Office document
@@ -70,3 +110,13 @@ container or a hidden/disguised artifact. Executability is established from an e
 a shebang, or archive mode bits. A benign document without executable members does not produce SC9.
 
 SC9 reports evidence and risk; it does not execute the member or prescribe an installation decision.
+
+At the scan root, visible source scripts beneath `.agents/skills/<name>/` and
+`.claude/skills/<name>/` are not treated as concealed when that skill directory
+contains a regular `SKILL.md` or `skill.md` manifest. These paths remain hidden
+and local-only: their contents are not sent to an external LLM. When LLM
+analysis is enabled, the inspection ledger records that LLM review was
+withheld, so the report does not imply that those scripts received semantic
+review. This narrow exception does not cover
+hidden skill names, hidden descendants, mismatched shebangs, unsupported script
+types, or nested client directories.

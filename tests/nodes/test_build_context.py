@@ -703,6 +703,132 @@ def test_source_local_only_preserves_excluded_executable_coverage(
     )
 
 
+@pytest.mark.parametrize("client_dir", [".agents", ".claude"])
+@pytest.mark.parametrize("use_llm", [True, False])
+def test_conventional_skill_scripts_are_not_concealed(
+    tmp_path: Path, client_dir: str, use_llm: bool
+) -> None:
+    skill_root = tmp_path / client_dir / "skills" / "hello"
+    (skill_root / "scripts").mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# Hello\n", encoding="utf-8")
+    (skill_root / "scripts" / "hello.py").write_text('print("hello")\n', encoding="utf-8")
+    hidden_script = skill_root / "scripts" / ".hidden.py"
+    hidden_script.write_text('print("hidden")\n', encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path), "use_llm": use_llm})
+
+    metadata = {item["path"]: item for item in result["component_metadata"]}
+    visible_path = f"{client_dir}/skills/hello/scripts/hello.py"
+    hidden_path = f"{client_dir}/skills/hello/scripts/.hidden.py"
+    assert metadata[visible_path]["concealed_executable"] is False
+    assert metadata[visible_path]["hidden_skill_script_llm_review_withheld"] is True
+    assert metadata[hidden_path]["concealed_executable"] is True
+    findings = _analyze_concealed_executables(result["component_metadata"])
+    assert visible_path not in {finding.file for finding in findings}
+    assert hidden_path in {finding.file for finding in findings}
+    coverage = [
+        event
+        for event in result["inspection_ledger"]
+        if event["path"] == visible_path
+        and event.get("reason_code") == LedgerReason.HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY
+    ]
+    if use_llm:
+        assert len(coverage) == 1
+        assert coverage[0]["outcome"] == LedgerOutcome.SKIPPED
+        assert "not sent to an external LLM" in coverage[0]["message"]
+    else:
+        assert coverage == []
+
+
+def test_conventional_skill_script_with_compatible_env_shebang_is_not_concealed(
+    tmp_path: Path,
+) -> None:
+    skill_root = tmp_path / ".claude" / "skills" / "demo"
+    script = skill_root / "scripts" / "run.py"
+    script.parent.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    script.write_bytes(b"#!/usr/bin/env python3\nprint(1)\n")
+
+    result = build_context({"skill_path": str(tmp_path), "use_llm": False})
+
+    metadata = next(
+        item
+        for item in result["component_metadata"]
+        if item["path"] == ".claude/skills/demo/scripts/run.py"
+    )
+    assert metadata["concealed_executable"] is False
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "payload", "manifest", "source_local_only"),
+    [
+        (".claude/skills/demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", False, False),
+        (
+            ".claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env python3\nprint(1)\n",
+            "symlink",
+            False,
+        ),
+        (".claude/skills/demo/scripts/tool.py", b"\x7fELF" + b"\0" * 20, True, False),
+        (".claude/skills/demo/scripts/tool.py", b"MZ" + b"\0" * 20, True, False),
+        (".claude/skills/demo/scripts/run", b"#!/bin/sh\ntrue\n", True, False),
+        (".claude/skills/demo/scripts/run.bat", b"@echo off\r\n", True, False),
+        (
+            ".claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env -Sbash\ntrue\n",
+            True,
+            False,
+        ),
+        (
+            ".claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env --split-string=bash\ntrue\n",
+            True,
+            False,
+        ),
+        (".claude/skills/.demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", True, False),
+        (
+            ".claude/skills/demo/scripts/.cache/run.py",
+            b"#!/usr/bin/env python3\nprint(1)\n",
+            True,
+            False,
+        ),
+        (".github/skills/demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", True, False),
+        (
+            "project/.claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env python3\nprint(1)\n",
+            True,
+            False,
+        ),
+        (".claude/skills/demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", True, True),
+        (".claude/skills/demo/scripts/run.py", b"#!/bin/bash\nprint(1)\n", True, False),
+    ],
+)
+def test_skill_script_exemption_fails_closed(
+    tmp_path: Path,
+    relative_path: str,
+    payload: bytes,
+    manifest: bool | str,
+    source_local_only: bool,
+) -> None:
+    target = tmp_path / relative_path
+    target.parent.mkdir(parents=True)
+    target.write_bytes(payload)
+    skill_root = target.parents[1]
+    skill_root.mkdir(parents=True, exist_ok=True)
+    if manifest is True:
+        (skill_root / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    elif manifest == "symlink":
+        external = tmp_path / "outside.md"
+        external.write_text("# Demo\n", encoding="utf-8")
+        (skill_root / "SKILL.md").symlink_to(external)
+
+    result = build_context({"skill_path": str(tmp_path), "source_local_only": source_local_only})
+    metadata = next(item for item in result["component_metadata"] if item["path"] == relative_path)
+    assert metadata["concealed_executable"] is True
+    findings = _analyze_concealed_executables(result["component_metadata"])
+    assert relative_path in {finding.file for finding in findings}
+
+
 def test_build_context_model_config_uses_bound_provider(tmp_path: Path) -> None:
     class _BoundProvider:
         DEFAULT_MODEL = "bound-default"
@@ -750,18 +876,22 @@ def test_build_context_model_config_matches_openai_fallback(
     assert result["model_config"]["default"] == OpenAIProvider.DEFAULT_MODEL
 
 
-def test_build_context_inventories_but_excludes_valid_root_oms_signature(
+def test_build_context_inspects_unverified_root_oms_signature(
     tmp_path: Path,
 ) -> None:
-    """A real OMS signature is reported as metadata but withheld from analyzers."""
+    """Recognized structure is metadata, never permission to exclude content."""
     (tmp_path / "SKILL.md").write_text("---\nname: signed\n---\n# Signed\n", encoding="utf-8")
     signature_path = _write_real_oms_signature(tmp_path)
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert "skill.oms.sig" not in result["components"]
-    assert "skill.oms.sig" not in result["file_cache"]
-    assert any(
+    assert "skill.oms.sig" in result["components"]
+    assert result["local_file_cache"]["skill.oms.sig"] == signature_path.read_bytes().decode(
+        "utf-8"
+    )
+    assert "https://in-toto.io/Statement/v1" in result["file_cache"]["skill.oms.sig"]
+    assert "skill.oms.sig" in result["llm_components"]
+    assert not any(
         event["path"] == "skill.oms.sig" and event["reason_code"] == "oms_signature"
         for event in result["inspection_ledger"]
     )
@@ -777,8 +907,8 @@ def test_build_context_inventories_but_excludes_valid_root_oms_signature(
     }
 
 
-def test_build_context_excludes_future_oms_predicate_version(tmp_path: Path) -> None:
-    """OMS predicate revisions remain excluded without relaxing the namespace check."""
+def test_build_context_inspects_future_oms_predicate_version(tmp_path: Path) -> None:
+    """Future predicate versions cannot opt content out of inspection."""
     bundle = json.loads(_OMS_FIXTURE.read_text(encoding="utf-8"))
     payload = json.loads(base64.b64decode(bundle["dsseEnvelope"]["payload"]))
     payload["predicateType"] = "https://model_signing/signature/v1.1"
@@ -789,8 +919,9 @@ def test_build_context_excludes_future_oms_predicate_version(tmp_path: Path) -> 
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert "skill.oms.sig" not in result["components"]
-    assert any(
+    assert "skill.oms.sig" in result["components"]
+    assert "skill.oms.sig" in result["llm_components"]
+    assert not any(
         event["path"] == "skill.oms.sig" and event["reason_code"] == "oms_signature"
         for event in result["inspection_ledger"]
     )
@@ -819,7 +950,11 @@ def test_build_context_scans_unrecognized_root_oms_signature(
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert result["file_cache"]["skill.oms.sig"] == content
+    assert result["local_file_cache"]["skill.oms.sig"] == content
+    if invalid_case == "wrong_media_type":
+        assert "https://in-toto.io/Statement/v1" in result["file_cache"]["skill.oms.sig"]
+    else:
+        assert result["file_cache"]["skill.oms.sig"] == content
     signature_meta = next(
         item for item in result["component_metadata"] if item["path"] == "skill.oms.sig"
     )
@@ -832,11 +967,119 @@ def test_build_context_scans_nested_oms_signature(tmp_path: Path) -> None:
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert result["file_cache"]["nested/skill.oms.sig"] == nested.read_bytes().decode("utf-8")
+    assert result["local_file_cache"]["nested/skill.oms.sig"] == nested.read_bytes().decode("utf-8")
+    assert "https://in-toto.io/Statement/v1" in result["file_cache"]["nested/skill.oms.sig"]
     signature_meta = next(
         item for item in result["component_metadata"] if item["path"] == "nested/skill.oms.sig"
     )
     assert signature_meta["type"] == "other"
+
+
+@pytest.mark.parametrize(
+    "failure", ["certificate", "signature", "oversized_signature", "payload", "dependency", "limit"]
+)
+def test_oms_projection_keeps_unsupported_fields_and_reports_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import sys
+
+    import skillspector.oms as oms
+
+    bundle = json.loads(_OMS_FIXTURE.read_bytes())
+    if failure == "certificate":
+        bundle["verificationMaterial"]["x509CertificateChain"]["certificates"][0]["rawBytes"] = (
+            "YWJj"
+        )
+    elif failure == "signature":
+        sig = bundle["dsseEnvelope"]["signatures"][0]["sig"]
+        bundle["dsseEnvelope"]["signatures"][0]["sig"] = base64.b64encode(
+            base64.b64decode(sig) + b"trailing"
+        ).decode()
+    elif failure == "oversized_signature":
+        from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+
+        bundle["dsseEnvelope"]["signatures"][0]["sig"] = base64.b64encode(
+            encode_dss_signature(1 << 600, 1)
+        ).decode()
+    elif failure == "payload":
+        bundle["dsseEnvelope"]["payload"] = "not-base64"
+    elif failure == "dependency":
+        monkeypatch.setitem(sys.modules, "cryptography", None)
+    else:
+        monkeypatch.setattr(oms, "_MAX_NODES", 3)
+    content = json.dumps(bundle)
+    (tmp_path / "bundle.json").write_text(content)
+    result = build_context({"skill_path": str(tmp_path)})
+    assert result["local_file_cache"]["bundle.json"] == content
+    assert any(event.get("reason_code") == "oms_signature" for event in result["inspection_ledger"])
+    if failure == "certificate":
+        assert "YWJj" in result["file_cache"]["bundle.json"]
+    if failure in {"certificate", "signature", "dependency"}:
+        assert "https://in-toto.io/Statement/v1" in result["file_cache"]["bundle.json"]
+
+
+@pytest.mark.parametrize("escaped_key", [False, True])
+def test_oms_projection_preserves_crlf_and_rejects_duplicate_fields(
+    tmp_path: Path, escaped_key: bool
+) -> None:
+    bundle = json.loads(_OMS_FIXTURE.read_bytes())
+    content = json.dumps(bundle, indent=2).replace("\n", "\r\n")
+    path = tmp_path / "bundle.json"
+    path.write_bytes(content.encode())
+    result = build_context({"skill_path": str(tmp_path)})
+    assert result["local_file_cache"]["bundle.json"] == content
+    assert "https://in-toto.io/Statement/v1" in result["file_cache"]["bundle.json"]
+    duplicate = content[:-1] + ', "dsseEnvelope": {}}'
+    if escaped_key:
+        duplicate = duplicate.replace('"dsseEnvelope"', r'"dss\u0065Envelope"')
+    path.write_bytes(duplicate.encode())
+    result = build_context({"skill_path": str(tmp_path)})
+    assert result["file_cache"]["bundle.json"] == duplicate
+    assert any(event.get("reason_code") == "oms_signature" for event in result["inspection_ledger"])
+
+
+@pytest.mark.parametrize("name", ["skill.oms.sig", "bundle.json"])
+@pytest.mark.parametrize("escaped_key", [False, True])
+def test_oversized_oms_bundle_keeps_an_explicit_projection_gap(tmp_path, name, escaped_key):
+    import skillspector.oms as oms
+
+    bundle = json.loads(_OMS_FIXTURE.read_bytes())
+    bundle["notes"] = "A" * oms._MAX_CHARS
+    content = json.dumps(bundle)
+    if escaped_key:
+        content = content.replace('"dsseEnvelope"', r'"dss\u0065Envelope"')
+    (tmp_path / name).write_text(content)
+
+    result = build_context({"skill_path": str(tmp_path), "use_llm": False})
+
+    assert result["local_file_cache"][name] == content
+    assert any(event.get("reason_code") == "oms_signature" for event in result["inspection_ledger"])
+
+
+@pytest.mark.parametrize("parseable_prefix", [False, True])
+def test_oms_projection_preserves_bounded_provider_view_for_truncated_files(
+    tmp_path, monkeypatch, parseable_prefix
+):
+    from importlib import import_module
+
+    module = import_module("skillspector.nodes.build_context")
+    monkeypatch.setattr(module, "MAX_TOTAL_CACHED_BYTES", 600_000)
+    bundle = json.loads(_OMS_FIXTURE.read_bytes())
+    if parseable_prefix:
+        content = json.dumps(bundle) + " " * 800_000
+    else:
+        bundle["notes"] = "A" * 800_000
+        content = json.dumps(bundle)
+    (tmp_path / "bundle.json").write_text(content)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    view = result["llm_file_cache"]["bundle.json"]
+    assert len(view) <= module.MAX_LLM_TRUNCATED_FILE_CHARS
+    assert "not reviewed by any analyzer" in view
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == "bundle.json")
+    assert artifact["disposition"] == ArtifactDisposition.PARTIAL
+    assert artifact["reason"] == LedgerReason.TOTAL_BYTES_LIMIT.value
 
 
 def test_build_context_skips_skip_dirs(tmp_path: Path) -> None:
@@ -1122,6 +1365,65 @@ def test_build_context_parses_allowed_tools_single_space_string(tmp_path: Path) 
     state: SkillspectorState = {"skill_path": str(tmp_path)}
     result = build_context(state)
     assert result["manifest"]["allowed-tools"] == ["Bash"]
+
+
+@pytest.mark.parametrize(
+    ("declaration", "expected"),
+    [
+        pytest.param(
+            "Bash(git status:*) Read",
+            ["Bash(git status:*)", "Read"],
+            id="space_inside_scope",
+        ),
+        pytest.param(
+            "Bash(git status:*), Read",
+            ["Bash(git status:*)", "Read"],
+            id="comma_string",
+        ),
+        pytest.param(
+            "Read(./docs Bash(notes).md)",
+            ["Read(./docs Bash(notes).md)"],
+            id="nested_parens_inside_scope",
+        ),
+        pytest.param(
+            "Read(./docs, Bash(notes).md)",
+            ["Read(./docs, Bash(notes).md)"],
+            id="comma_inside_scope",
+        ),
+        pytest.param(
+            "Bash(git status:*) Read(./a, b)",
+            ["Bash(git status:*)", "Read(./a, b)"],
+            id="comma_only_inside_scope_keeps_space_form",
+        ),
+        pytest.param(
+            "Bash(echo '(') Read", ["Bash(echo '(')", "Read"], id="literal_open_paren_in_scope"
+        ),
+        pytest.param(
+            "Bash(echo ')') Read", ["Bash(echo ')')", "Read"], id="literal_close_paren_in_scope"
+        ),
+        pytest.param(
+            "Bash(echo '('), Read",
+            ["Bash(echo '(')", "Read"],
+            id="comma_string_literal_open_paren_in_scope",
+        ),
+        pytest.param(
+            "Bash(echo ')'), Read",
+            ["Bash(echo ')')", "Read"],
+            id="comma_string_literal_close_paren_in_scope",
+        ),
+    ],
+)
+def test_build_context_keeps_scoped_allowed_tools_whole(
+    tmp_path: Path, declaration: str, expected: list[str]
+) -> None:
+    """Separators inside a `Tool(specifier)` scope belong to the scope."""
+    (tmp_path / "SKILL.md").write_text(
+        f"---\nname: deployer\ndescription: deploys services\nallowed-tools: {declaration}\n---\n",
+        encoding="utf-8",
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+    assert result["manifest"]["allowed-tools"] == expected
 
 
 def test_build_context_inventories_excluded_executable_descendants(tmp_path: Path) -> None:

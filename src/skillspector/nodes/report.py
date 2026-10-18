@@ -30,15 +30,16 @@ from hashlib import sha256
 from html import escape as escape_html
 from io import StringIO
 from typing import Literal, cast
+from urllib.parse import quote
 
 from rich.console import Console
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from skillspector import __version__ as skillspector_version
 from skillspector.dependency_sources import redact_text
-from skillspector.inference_usage import sanitize_inference_usage
+from skillspector.inference_usage import looks_like_credential, sanitize_inference_usage
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
     RULE_SET_SCOPE,
@@ -84,6 +85,7 @@ from skillspector.semantic_runtime import (
 )
 from skillspector.state import SkillspectorState, transitive_remaining_seconds
 from skillspector.suppression import Baseline, SuppressedFinding, partition_findings
+from skillspector.terminal_text import visible_terminal_text
 
 logger = get_logger(__name__)
 
@@ -125,6 +127,18 @@ def _clean_text(value: str | None) -> str | None:
     if not isinstance(value, str):
         return value
     return _CONTROL_RE.sub("", _ANSI_RE.sub("", value))
+
+
+def redact_llm_error(value: object) -> str | None:
+    """Keep actionable provider error text without report-visible credentials."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    cleaned = redact_text(_clean_text(value) or "")
+    return re.sub(
+        r"(?i)(?:(?:authorization\s*:\s*)?(?:bearer|basic)\s+)?[A-Za-z0-9_+/.-]+={0,2}",
+        lambda match: "***" if looks_like_credential(match.group(0)) else match.group(0),
+        cleaned,
+    )
 
 
 def _sanitize_finding(finding: Finding) -> Finding:
@@ -247,7 +261,7 @@ def _sarif_artifact_location(
         }[key]: value
         for key, value in provenance.items()
     }
-    return SarifArtifactLocation(uri=uri, properties=properties or None)
+    return SarifArtifactLocation(uri=quote(uri, safe="/!"), properties=properties or None)
 
 
 def _occurrence_columns(
@@ -529,7 +543,10 @@ def _risk_score_floor(finding: Finding) -> int:
     configured_floor = _RISK_SCORE_FLOORS_BY_RULE_ID.get(finding.rule_id, 0)
     if configured_floor:
         return configured_floor
-    if finding.rule_id == "SC9" and finding.evidence.get("excluded_from_analysis") is True:
+    if finding.rule_id == "SC9" and (
+        finding.evidence.get("excluded_from_analysis") is True
+        or finding.evidence.get("partially_analyzed_executable") is True
+    ):
         return 51
     if (finding.severity or "").upper() != "CRITICAL":
         return 0
@@ -629,7 +646,10 @@ def _compute_risk_score(
         default=0,
     )
     if component_metadata and any(
-        component.get("excluded_from_analysis") is True
+        (
+            component.get("excluded_from_analysis") is True
+            or component.get("partially_analyzed_executable") is True
+        )
         and component.get("allowed_exclusion") is not True
         and (
             component.get("executable") is True
@@ -889,7 +909,7 @@ def _build_sarif(
             locations = [
                 SarifLocation(
                     physicalLocation=SarifPhysicalLocation(
-                        artifactLocation=SarifArtifactLocation(uri=path),
+                        artifactLocation=SarifArtifactLocation(uri=quote(path, safe="/!")),
                         region=region,
                     )
                 )
@@ -1001,6 +1021,11 @@ def _build_sarif(
     return rendered
 
 
+def _terminal_text(value: object, style: str = "") -> Text:
+    """Keep dynamic text literal and render its non-printable characters visibly."""
+    return Text(visible_terminal_text(str(value)), style=style)
+
+
 def _render_terminal_completeness(
     console: Console,
     completeness: Mapping[str, object],
@@ -1012,24 +1037,30 @@ def _render_terminal_completeness(
     table.add_column("Metric", style="bold")
     table.add_column("Value")
     table.add_row("Execution", "successful" if execution_successful else "failed")
-    table.add_row("Status", str(completeness.get("status", "complete")))
-    table.add_row("Coverage", f"{completeness.get('coverage_percent', 100.0)}%")
-    table.add_row("Fully inspected", str(completeness.get("fully_inspected_files", 0)))
-    table.add_row("Partially inspected", str(completeness.get("partially_inspected_files", 0)))
-    table.add_row("Entirely uninspected", str(completeness.get("entirely_uninspected_files", 0)))
+    table.add_row("Status", _terminal_text(completeness.get("status", "complete")))
+    table.add_row("Coverage", _terminal_text(f"{completeness.get('coverage_percent', 100.0)}%"))
+    table.add_row("Fully inspected", _terminal_text(completeness.get("fully_inspected_files", 0)))
+    table.add_row(
+        "Partially inspected", _terminal_text(completeness.get("partially_inspected_files", 0))
+    )
+    table.add_row(
+        "Entirely uninspected", _terminal_text(completeness.get("entirely_uninspected_files", 0))
+    )
     if completeness.get("exclude_patterns"):
         table.add_row(
-            "Explicit exclusion patterns", escape(", ".join(completeness["exclude_patterns"]))
+            "Explicit exclusion patterns",
+            _terminal_text(", ".join(completeness["exclude_patterns"])),
         )
         table.add_row(
-            "Excluded files (not inspected)", str(completeness.get("excluded_file_count", 0))
+            "Excluded files (not inspected)",
+            _terminal_text(completeness.get("excluded_file_count", 0)),
         )
     console.print(table)
 
     def render_rows(title: str, rows: object) -> None:
         if not isinstance(rows, list) or not rows:
             return
-        console.print(f"[bold]{escape(title)}[/bold]")
+        console.print(_terminal_text(title, "bold"))
         for row in rows:
             if not isinstance(row, Mapping):
                 continue
@@ -1044,7 +1075,7 @@ def _render_terminal_completeness(
                 location = f"rule set {location}"
             reason = str(row.get("reason_code", row.get("status", "status")))
             message = str(row.get("message", ""))
-            console.print(f"  - {escape(reason)} {escape(location)}: {escape(message)}")
+            console.print(_terminal_text(f"  - {reason} {location}: {message}"))
 
     render_rows("Scope exclusions", completeness.get("scope_exclusions"))
     render_rows("Ledger exceptions", completeness.get("ledger_exceptions"))
@@ -1053,7 +1084,7 @@ def _render_terminal_completeness(
     if isinstance(limitations, list) and limitations:
         console.print("[bold]Limitations[/bold]")
         for limitation in limitations:
-            console.print(f"  - {escape(str(limitation))}")
+            console.print(_terminal_text(f"  - {limitation}"))
 
 
 def _format_terminal(
@@ -1074,9 +1105,9 @@ def _format_terminal(
     analysis_completeness: Mapping[str, object] | None = None,
     execution_successful: bool = True,
 ) -> str:
-    """Generate Rich terminal output and export as string."""
+    """Generate styled Rich output with literal, control-safe dynamic text."""
     suppressed = suppressed or []
-    console = Console(record=True, force_terminal=True, width=80, file=StringIO())
+    console = Console(record=True, force_terminal=True, width=80, file=StringIO(), emoji=False)
     skill_name = (manifest.get("name") or "unknown") if manifest else "unknown"
     source = skill_path or ""
 
@@ -1087,8 +1118,8 @@ def _format_terminal(
             subtitle=f"v{skillspector_version}",
         )
     )
-    console.print(f"\n[bold]Skill:[/bold] {skill_name}")
-    console.print(f"[bold]Source:[/bold] {source}")
+    console.print(Text.assemble("\n", ("Skill: ", "bold"), _terminal_text(skill_name)))
+    console.print(Text.assemble(("Source: ", "bold"), _terminal_text(source)))
     console.print(f"[bold]Scanned:[/bold] {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
     severity_colors = {
@@ -1121,7 +1152,9 @@ def _format_terminal(
         lines = comp.get("lines", 0)
         exec_flag = comp.get("executable", False)
         exec_marker = "[yellow]Yes[/yellow]" if exec_flag else "No"
-        comp_table.add_row(path, typ, str(lines), exec_marker)
+        comp_table.add_row(
+            _terminal_text(path), _terminal_text(typ), _terminal_text(lines), exec_marker
+        )
     if len(component_metadata) > 15:
         comp_table.add_row(f"... and {len(component_metadata) - 15} more", "", "", "")
     console.print(comp_table)
@@ -1133,7 +1166,9 @@ def _format_terminal(
         console.print()
         console.print(
             Panel(
-                f"[bold]Degraded scan[/bold]\n{effective_degraded_notice}",
+                Text.assemble(
+                    ("Degraded scan\n", "bold"), _terminal_text(effective_degraded_notice)
+                ),
                 title="[bold red]WARNING[/bold red]",
                 border_style="red",
             )
@@ -1143,24 +1178,50 @@ def _format_terminal(
         console.print("\n")
         console.print(f"[bold]Issues ({len(findings)})[/bold]\n")
         severity_icons = {
-            "LOW": "[green]LOW[/green]",
-            "MEDIUM": "[yellow]MEDIUM[/yellow]",
-            "HIGH": "[red]HIGH[/red]",
-            "CRITICAL": "[bold red]CRITICAL[/bold red]",
+            "LOW": Text("LOW", style="green"),
+            "MEDIUM": Text("MEDIUM", style="yellow"),
+            "HIGH": Text("HIGH", style="red"),
+            "CRITICAL": Text("CRITICAL", style="bold red"),
         }
         for f in findings:
-            icon = severity_icons.get((f.severity or "LOW").upper(), f.severity)
-            console.print(f"  {icon}: {f.rule_id} - {f.message[:60]}...")
+            icon = severity_icons.get(
+                (f.severity or "LOW").upper(), _terminal_text(f.severity or "")
+            )
+            console.print(
+                Text.assemble(
+                    "  ",
+                    icon,
+                    ": ",
+                    _terminal_text(f.rule_id),
+                    " - ",
+                    _terminal_text(f.message[:60]),
+                    "...",
+                )
+            )
             end = f"–{f.end_line}" if f.end_line and f.end_line != f.start_line else ""
-            console.print(f"    [dim]Location:[/dim] {f.file}:{f.start_line}{end}")
+            console.print(
+                Text.assemble(
+                    ("    Location: ", "dim"), _terminal_text(f.file), f":{f.start_line}{end}"
+                )
+            )
             if f.source_url:
-                console.print(f"    [dim]Source:[/dim] {f.source_url} (depth {f.transitive_depth})")
+                console.print(
+                    Text.assemble(
+                        ("    Source: ", "dim"),
+                        _terminal_text(f.source_url),
+                        f" (depth {f.transitive_depth})",
+                    )
+                )
             console.print(f"    [dim]Confidence:[/dim] {f.confidence:.0%}")
             if f.remediation:
-                console.print(f"    [dim]Remediation:[/dim] {(f.remediation or '')[:150]}...")
+                console.print(
+                    Text.assemble(
+                        ("    Remediation: ", "dim"), _terminal_text(f.remediation[:150]), "..."
+                    )
+                )
             if f.evidence:
                 rendered = ", ".join(f"{key}={value}" for key, value in sorted(f.evidence.items()))
-                console.print(f"    [dim]Evidence:[/dim] {rendered}")
+                console.print(Text.assemble(("    Evidence: ", "dim"), _terminal_text(rendered)))
             console.print()
     else:
         console.print("\n[green]No security issues detected.[/green]\n")
@@ -1170,11 +1231,16 @@ def _format_terminal(
         console.print(f"[bold]Structured Skill Summary ({len(structured_summaries)})[/bold]\n")
         for summary in structured_summaries:
             console.print(
-                f"  [cyan]{summary.get('id', 'SSR-1')}[/cyan]: {summary.get('message', '')}"
+                Text.assemble(
+                    "  ",
+                    _terminal_text(summary.get("id", "SSR-1"), "cyan"),
+                    ": ",
+                    _terminal_text(summary.get("message", "")),
+                )
             )
             file = _summary_display_value(summary.get("file"))
             if file:
-                console.print(f"    [dim]File:[/dim] {file}")
+                console.print(Text.assemble(("    File: ", "dim"), _terminal_text(file)))
             for key, label in (
                 ("protocol", "Protocol"),
                 ("layout_kind", "Layout"),
@@ -1186,7 +1252,7 @@ def _format_terminal(
             ):
                 value = _summary_display_value(summary.get(key))
                 if value:
-                    console.print(f"    [dim]{label}:[/dim] {value}")
+                    console.print(Text.assemble((f"    {label}: ", "dim"), _terminal_text(value)))
             console.print()
 
     if suppressed:
@@ -1197,7 +1263,16 @@ def _format_terminal(
             for sf in suppressed:
                 f = sf.finding
                 console.print(
-                    f"  [dim]- {f.rule_id} {f.file}:{f.start_line} (reason: {sf.reason})[/dim]"
+                    Text.assemble(
+                        "  - ",
+                        _terminal_text(f.rule_id),
+                        " ",
+                        _terminal_text(f.file),
+                        f":{f.start_line} (reason: ",
+                        _terminal_text(sf.reason),
+                        ")",
+                        style="dim",
+                    )
                 )
         else:
             console.print("[dim]Use --show-suppressed to list them.[/dim]")
@@ -1258,7 +1333,14 @@ def _build_metadata(
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
-    provider_available, llm_error = provider_availability or is_llm_available()
+    provider_available, llm_error = (
+        provider_availability
+        if provider_availability is not None
+        else is_llm_available()
+        if use_llm
+        else (False, None)
+    )
+    llm_error = redact_llm_error(llm_error)
     attempted, succeeded, call_log_degraded = _llm_runtime_status(use_llm, llm_call_log)
     # meta_analyzer's own record, independent of whether a DIFFERENT
     # LLM-backed node (a semantic_* analyzer) lost coverage to a dropped
@@ -1333,9 +1415,10 @@ def _build_metadata(
         meta["llm_calls_attempted"] = attempted
         meta["llm_calls_succeeded"] = succeeded
     if unavailable_before_execution:
+        detail = f" Reason: {llm_error}" if llm_error else ""
         meta["llm_error"] = (
             "LLM analysis was requested but unavailable during preflight; "
-            "results reflect static analysis only."
+            f"results reflect static analysis only.{detail}"
         )
     elif call_log_degraded:
         meta["llm_degraded"] = True
@@ -1368,6 +1451,43 @@ def _build_metadata(
         meta["transitive_truncated"] = True
         meta["transitive_truncation_reasons"] = list(transitive_truncation_reasons)
     return meta
+
+
+def _json_component(component: Mapping[str, object]) -> dict[str, object]:
+    """Preserve component identity and expose structured archive provenance."""
+    result = {
+        key: component.get(key)
+        for key in (
+            "path",
+            "type",
+            "lines",
+            "executable",
+            "size_bytes",
+            "source_url",
+            "source_identity",
+            "source_digest",
+        )
+    }
+    outer_path = component.get("outer_path")
+    nested_path = component.get("nested_path")
+    if (
+        isinstance(outer_path, str)
+        and outer_path
+        and isinstance(nested_path, str)
+        and nested_path
+        and component.get("path") == f"{outer_path}!/{nested_path}"
+    ):
+        result.update(outer_path=outer_path, nested_path=nested_path)
+        container_type = component.get("container_type")
+        if isinstance(container_type, str) and container_type:
+            result["container_type"] = container_type
+        depth = component.get("container_depth")
+        if isinstance(depth, int) and not isinstance(depth, bool) and depth > 0:
+            result["container_depth"] = depth
+        ancestry = component.get("container_ancestry")
+        if isinstance(ancestry, list) and all(isinstance(item, str) and item for item in ancestry):
+            result["container_ancestry"] = list(ancestry)
+    return result
 
 
 def _format_json(
@@ -1410,19 +1530,7 @@ def _format_json(
             "recommendation": risk_recommendation,
             "max_issue_severity": _max_issue_severity(findings),
         },
-        "components": [
-            {
-                "path": c.get("path"),
-                "type": c.get("type"),
-                "lines": c.get("lines"),
-                "executable": c.get("executable"),
-                "size_bytes": c.get("size_bytes"),
-                "source_url": c.get("source_url"),
-                "source_identity": c.get("source_identity"),
-                "source_digest": c.get("source_digest"),
-            }
-            for c in component_metadata
-        ],
+        "components": [_json_component(component) for component in component_metadata],
         "structured_summaries": structured_summaries or [],
         "issues": [f.to_dict() for f in findings],
         "suppressed_count": len(suppressed),
@@ -1775,7 +1883,12 @@ def report(state: SkillspectorState) -> dict[str, object]:
             analysis_completeness["status"] = "partial"
     _attempted, _succeeded, degraded = _llm_runtime_status(llm_requested, llm_call_log)
     remaining = transitive_remaining_seconds(state)
-    if remaining is not None and remaining <= 0:
+    if not llm_requested:
+        provider_available, provider_error = False, None
+    elif not use_llm and "llm_preflight_error" in state:
+        provider_available = False
+        provider_error = redact_llm_error(state.get("llm_preflight_error"))
+    elif remaining is not None and remaining <= 0:
         provider_available = any(successful_llm_record(record) for record in llm_call_log)
         provider_error = (
             None

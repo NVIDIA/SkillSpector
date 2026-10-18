@@ -59,7 +59,6 @@ from skillspector.providers import (
     use_provider,
 )
 from skillspector.providers.nv_build import NvBuildProvider
-from skillspector.providers.openai import OpenAIProvider
 
 _LLM_ENV_VARS = (
     "ANTHROPIC_API_KEY",
@@ -689,7 +688,7 @@ class TestGetChatModel:
 
         llm = get_chat_model()
 
-        assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
+        assert _chat_model_name(llm) == "gpt-5.4"
 
     def test_graph_model_config_matches_openai_fallback_client(
         self, monkeypatch: pytest.MonkeyPatch
@@ -699,8 +698,8 @@ class TestGetChatModel:
         model = build_model_config()["default"]
         llm = get_chat_model(model=model)
 
-        assert model == OpenAIProvider.DEFAULT_MODEL
-        assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
+        assert model == "gpt-5.4"
+        assert _chat_model_name(llm) == "gpt-5.4"
 
     def test_explicit_model_still_overrides_openai_fallback(
         self, monkeypatch: pytest.MonkeyPatch

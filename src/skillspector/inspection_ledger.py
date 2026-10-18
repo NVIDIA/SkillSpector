@@ -60,6 +60,8 @@ class LedgerReason(StrEnum):
     MISSING_FILE_CACHE = "missing_file_cache"
     SIZE_LIMIT = "size_limit"
     BINARY_CONTENT = "binary_content"
+    BINARY_TEXT_PROJECTION = "binary_text_projection"
+    BINARY_EXECUTABLE_TEXT = "binary_executable_text"
     EVAL_DATASET = "eval_dataset"
     SYNTAX_ERROR = "syntax_error"
     LLM_BATCH_FAILED = "llm_batch_failed"
@@ -84,6 +86,7 @@ class LedgerReason(StrEnum):
     ARCHIVE_TRUNCATED = "archive_truncated"
     ARCHIVE_UNSAFE_MEMBER_PATH = "archive_unsafe_member_path"
     ARCHIVE_AMBIGUOUS_MEMBER_PATH = "archive_ambiguous_member_path"
+    ARTIFACT_PATH_COLLISION = "artifact_path_collision"
     ARCHIVE_LINK_MEMBER = "archive_link_member"
     ARCHIVE_DEPTH_LIMIT = "archive_depth_limit"
     ARCHIVE_MEMBER_LIMIT = "archive_member_limit"
@@ -105,6 +108,7 @@ class LedgerReason(StrEnum):
     TOTAL_BYTES_LIMIT = "total_bytes_limit"
     RUNTIME_LIMIT = "runtime_limit"
     EXCLUDED_EXECUTABLE_CONTENT = "excluded_executable_content"
+    HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY = "hidden_skill_executable_local_only"
     OUTPUT_LIMIT = "output_limit"
     TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
@@ -124,6 +128,12 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.MISSING_FILE_CACHE: "Applicable analyzer could not obtain file content.",
     LedgerReason.SIZE_LIMIT: "File exceeds this analyzer's character limit.",
     LedgerReason.BINARY_CONTENT: "Binary content is unsupported by this analyzer.",
+    LedgerReason.BINARY_TEXT_PROJECTION: (
+        "Only bounded printable text was inspected; binary structure and behavior are outside scope."
+    ),
+    LedgerReason.BINARY_EXECUTABLE_TEXT: (
+        "Readable text was inspected, but binary executable behavior remains outside analyzer coverage."
+    ),
     LedgerReason.EVAL_DATASET: (
         "Evaluation dataset prose is excluded from static pattern analysis."
     ),
@@ -154,7 +164,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.MANIFEST_ABSENT: ("No compatible manifest was present for this analyzer."),
     LedgerReason.NO_APPLICABLE_FILES: ("No files matched this analyzer's applicability contract."),
     LedgerReason.OMS_SIGNATURE: (
-        "Recognized OMS signature metadata is excluded from content analysis."
+        "DSSE content decoding is incomplete or unsupported; raw fields were retained for inspection. Signature authenticity was not verified."
     ),
     LedgerReason.BASELINE_FILE: (
         "The explicitly selected suppression baseline is excluded from content analysis."
@@ -173,6 +183,10 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     ),
     LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH: (
         "Archive member name has an ambiguous or duplicate provenance identity."
+    ),
+    LedgerReason.ARTIFACT_PATH_COLLISION: (
+        "A disk path containing '!/' collides with an archive member. Rename the directory "
+        "ending in '!'; the colliding archive member was not analyzed."
     ),
     LedgerReason.ARCHIVE_LINK_MEMBER: "Archive link member was not followed or read.",
     LedgerReason.ARCHIVE_DEPTH_LIMIT: "Nested archive depth limit was reached.",
@@ -215,6 +229,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.RUNTIME_LIMIT: "Inspection reached its configured runtime limit.",
     LedgerReason.EXCLUDED_EXECUTABLE_CONTENT: (
         "Executable content was inventoried but excluded from content analysis."
+    ),
+    LedgerReason.HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY: (
+        "Conventional hidden-skill helper script was kept local and not sent to an external LLM."
     ),
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
     LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED: (
@@ -544,8 +561,10 @@ def analyzer_status_event(
 def analyzer_status_for_events(
     analyzer_id: str, events: Iterable[InspectionLedgerEvent]
 ) -> AnalyzerStatusEvent:
-    """Summarize an analyzer's terminal work without exposing event payloads."""
-    terminal_events = list(events)
+    """Summarize analyzer work; scope-boundary records remain separate exclusions."""
+    terminal_events = [
+        event for event in events if event.get("record_type") != LedgerRecordType.SCOPE_BOUNDARY
+    ]
     if not terminal_events:
         return analyzer_status_event(
             analyzer_id=analyzer_id,

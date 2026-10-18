@@ -37,6 +37,7 @@ from skillspector.artifacts import (
     ContentKind,
     SecurityTextView,
     _contains_default_ignorable,
+    binary_instruction_view,
     is_default_ignorable,
     security_text_views,
 )
@@ -57,6 +58,7 @@ from skillspector.models import (
     observe_analyzer_findings,
 )
 from skillspector.nodes.deduplicate import classification_metadata_key
+from skillspector.oms import project_oms_content
 from skillspector.python_ast import (
     MAX_PYTHON_AST_SOURCE_CHARS,
     ParsedPythonFile,
@@ -2310,9 +2312,94 @@ def _scan_all_views_detailed(
     started_at: float | None = None,
     python_ast: ParsedPythonFile | None = None,
     python_source: bool | None = None,
+    readable_binary: bool = False,
+    _oms_projected: bool = False,
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Scan bounded raw windows and return any limit with observed/limit metrics."""
     started_at = time.monotonic() if started_at is None else started_at
+    if readable_binary:
+        modules = [
+            module
+            for module in pattern_modules
+            if getattr(module, "ANALYZER_ID", "")
+            in {
+                "static_patterns_prompt_injection",
+                "static_patterns_privilege_escalation",
+                "static_patterns_data_exfiltration",
+            }
+        ]
+        if not modules:
+            return [], None, {}
+        view, _ = binary_instruction_view(content)
+        findings, reason, metrics = _scan_all_views_detailed(
+            path,
+            view.text,
+            modules,
+            None,
+            max_findings=max_findings,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            python_source=False,
+        )
+        findings = [
+            finding
+            for finding in findings
+            if finding.rule_id
+            in {
+                "P1",
+                "P3",
+                "P4",
+                "PE3",
+                "E1",
+                "E2",
+                "E3",
+            }
+        ]
+        _restore_source_lines(
+            findings,
+            raw_window=content,
+            window_line=1,
+            view=view,
+            source_line_starts=logical_line_starts(content),
+        )
+        # Projection scope is recorded by build_context; actual scan limits remain partial.
+        return findings, reason, metrics
+    runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
+    if timeout_seconds is not None:
+        runtime_limit = min(runtime_limit, max(0.0, timeout_seconds))
+    now = time.monotonic()
+    if now >= started_at + runtime_limit:
+        return (
+            [],
+            LedgerReason.RUNTIME_LIMIT,
+            {
+                "observed_seconds": max(0.0, now - started_at),
+                "limit_seconds": runtime_limit,
+            },
+        )
+    projection = None if _oms_projected else project_oms_content(content)
+    if projection is not None and projection.view.name != "raw":
+        findings, reason, metrics = _scan_all_views_detailed(
+            path,
+            projection.view.text,
+            pattern_modules,
+            None,
+            max_findings=max_findings,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            # This view is derived JSON metadata, not a Python execution surface.
+            python_source=False,
+            _oms_projected=True,
+        )
+        for finding in findings:
+            finding.start_line = finding.end_line = 1
+            finding.start_column = finding.end_column = None
+            finding.evidence["oms_projection"] = (
+                "Decoded content in the original DSSE bundle; line 1 identifies the carrier."
+            )
+            finding.evidence[_SOURCE_START_EVIDENCE] = projection.view.source_offset(0)
+            finding.evidence.pop(_SOURCE_END_EVIDENCE, None)
+        return findings, reason, metrics
     ast_modules = [module for module in pattern_modules if _uses_python_ast(module)]
     lexical_modules = [module for module in pattern_modules if not _uses_python_ast(module)]
     if python_source is None:
@@ -3104,7 +3191,18 @@ def run_static_patterns(
         {
             str(item.get("path", ""))
             for item in raw_inventory
-            if isinstance(item, dict) and item.get("content_kind") == ContentKind.BINARY
+            if isinstance(item, dict)
+            and item.get("content_kind") == ContentKind.BINARY
+            and not item.get("readable_binary")
+        }
+        if isinstance(raw_inventory, list)
+        else set()
+    )
+    readable_binary_paths = (
+        {
+            str(item.get("path", ""))
+            for item in raw_inventory
+            if isinstance(item, dict) and item.get("readable_binary")
         }
         if isinstance(raw_inventory, list)
         else set()
@@ -3120,7 +3218,11 @@ def run_static_patterns(
             continue
         if needs_python_source and path in source_classification_limitations:
             continue
-        if path in binary_paths or (not binary_paths and _is_binary_file(path, content)):
+        if path in binary_paths or (
+            not raw_inventory
+            and path not in readable_binary_paths
+            and _is_binary_file(path, content)
+        ):
             continue
         remaining = MAX_FINDINGS_PER_ANALYZER - len(findings)
         if remaining <= 0:
@@ -3159,6 +3261,7 @@ def run_static_patterns(
             started_at=path_started_at,
             python_ast=python_ast,
             python_source=python_source,
+            readable_binary=path in readable_binary_paths,
         )
         runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
         if shared_remaining is not None:
@@ -3266,7 +3369,11 @@ def run_static_patterns_with_ledger(
                 path=path,
                 reason=LedgerReason.OPAQUE_CONTENT,
             )
-        elif path not in container_paths and artifact.get("content_kind") == ContentKind.BINARY:
+        elif (
+            path not in container_paths
+            and artifact.get("content_kind") == ContentKind.BINARY
+            and not artifact.get("readable_binary")
+        ):
             referenced = bool(artifact.get("referenced"))
             event = ledger_event(
                 outcome=LedgerOutcome.PARTIAL if referenced else LedgerOutcome.OUT_OF_SCOPE,
@@ -3359,6 +3466,7 @@ def run_static_patterns_with_ledger(
                             started_at=path_started_at,
                             python_ast=python_ast,
                             python_source=python_source,
+                            readable_binary=bool(artifact.get("readable_binary")),
                         )
                         fully_scanned_aggregate_overflow = bool(
                             resource_limit is LedgerReason.OUTPUT_LIMIT

@@ -97,7 +97,10 @@ class MetaAnalyzerFinding(BaseModel):
     @classmethod
     def _normalize_confidence(cls, v: object) -> float:
         # Accept 0-100 scale values from some models, then clamp into [0, 1].
-        value = float(v)  # type: ignore[arg-type]
+        try:
+            value = float(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("confidence must be numeric") from exc
         if value > 2.0:
             value = value / 100.0
         return min(1.0, max(0.0, value))
@@ -130,21 +133,17 @@ class MetaAnalyzerResult(BaseModel):
     def _parse_stringified_findings(cls, v: object) -> object:
         """LLMs sometimes return the findings array as a JSON string."""
         if isinstance(v, str):
-            try:
-                parsed = json.loads(v)
-            except (json.JSONDecodeError, TypeError):
-                return []
-            return parsed if isinstance(parsed, list) else []
+            return json.loads(v)
         return v
 
     @field_validator("overall_assessment", mode="before")
     @classmethod
     def _parse_stringified_assessment(cls, v: object) -> object:
-        """LLMs sometimes return nested objects as JSON strings."""
+        """Ignore optional prose summaries without losing valid finding verdicts."""
         if isinstance(v, str):
             try:
                 return json.loads(v)
-            except (json.JSONDecodeError, TypeError):
+            except json.JSONDecodeError:
                 return None
         return v
 

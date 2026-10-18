@@ -26,6 +26,7 @@ import binascii
 import json
 import os
 import re
+import shlex
 import tarfile
 from collections.abc import Callable, Mapping
 from fnmatch import fnmatchcase
@@ -36,10 +37,12 @@ from typing import cast
 
 import yaml
 
+from skillspector.allowed_tools import iter_allowed_tools_entries
 from skillspector.artifacts import (
     ArtifactDisposition,
     ArtifactRecord,
     ContentKind,
+    binary_instruction_view,
     classify_artifact,
     decode_text,
     promote_artifact_to_decoded_text,
@@ -62,6 +65,7 @@ from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
+    inspection_work_id,
     ledger_event,
 )
 from skillspector.llm_provenance import capture_llm_provenance, capture_static_llm_provenance
@@ -73,6 +77,7 @@ from skillspector.nested_artifacts import (
     is_executable_content,
     is_zip_content,
 )
+from skillspector.oms import project_oms_content
 from skillspector.python_ast import (
     PythonSourceClassification,
     classify_python_source,
@@ -820,6 +825,78 @@ def _is_hidden_component(path: str) -> bool:
     return any(part.startswith(".") for part in path.replace("\\", "/").split("/") if part)
 
 
+def _is_conventional_skill_script(skill_dir: Path, path: str, data: bytes) -> bool:
+    """Return whether a visible source script belongs to a standard agent skill directory."""
+    parts = path.replace("\\", "/").split("/")
+    if len(parts) < 4 or parts[0:2] not in ([".agents", "skills"], [".claude", "skills"]):
+        return False
+    skill_name = parts[2]
+    if (
+        not skill_name
+        or skill_name.startswith(".")
+        or any(part.startswith(".") for part in parts[3:])
+    ):
+        return False
+    suffix = Path(parts[-1]).suffix.lower()
+    if suffix not in {
+        ".bash",
+        ".cjs",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".php",
+        ".pl",
+        ".ps1",
+        ".py",
+        ".rb",
+        ".sh",
+        ".ts",
+        ".tsx",
+        ".zsh",
+    } or has_binary_executable_magic(data):
+        return False
+
+    first_line = data.splitlines()[0] if data.splitlines() else b""
+    if first_line.startswith(b"#!"):
+        try:
+            tokens = shlex.split(first_line[2:].decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, ValueError):
+            return False
+        if not tokens:
+            return False
+        interpreter = Path(tokens[0]).name
+        if interpreter == "env":
+            interpreter = next(
+                (token for token in tokens[1:] if not token.startswith("-") and "=" not in token),
+                "",
+            )
+        interpreter = Path(interpreter).name.removesuffix(".exe").lower()
+        compatible = {
+            ".bash": {"bash"},
+            ".cjs": {"node", "nodejs", "bun"},
+            ".js": {"node", "nodejs", "bun", "deno"},
+            ".jsx": {"node", "nodejs", "bun", "deno"},
+            ".mjs": {"node", "nodejs", "bun", "deno"},
+            ".php": {"php"},
+            ".pl": {"perl"},
+            ".ps1": {"pwsh", "powershell"},
+            ".py": {"python", "python2", "python3", "pypy", "pypy3"},
+            ".rb": {"ruby"},
+            ".sh": {"sh", "bash", "dash", "ksh", "zsh"},
+            ".ts": {"node", "nodejs", "bun", "deno", "tsx"},
+            ".tsx": {"node", "nodejs", "bun", "deno", "tsx"},
+            ".zsh": {"zsh"},
+        }
+        if not interpreter or interpreter not in compatible[suffix]:
+            return False
+
+    skill_root = skill_dir.joinpath(*parts[:3])
+    return any(
+        (manifest := skill_root / name).is_file() and not _is_symlink(manifest)
+        for name in ("SKILL.md", "skill.md")
+    )
+
+
 def _decode_base64_json(value: object) -> dict[str, object] | None:
     """Decode a strict base64 JSON object, returning ``None`` on malformed input."""
     if not isinstance(value, str) or not value:
@@ -833,7 +910,7 @@ def _decode_base64_json(value: object) -> dict[str, object] | None:
 
 
 def _is_valid_oms_signature_bytes(data: bytes) -> bool:
-    """Recognize the minimal OMS DSSE/in-toto structure from bounded bytes."""
+    """Recognize OMS structure only; this does not verify or trust its contents."""
     try:
         if len(data) > MAX_FILE_BYTES:
             return False
@@ -976,6 +1053,12 @@ def _build_component_metadata(
             "size_bytes": size_bytes,
         }
         hidden_component = _is_hidden_component(path)
+        conventional_skill_script = (
+            executable
+            and hidden_component
+            and not source_local_only
+            and _is_conventional_skill_script(skill_dir, path, data)
+        )
         if hidden_component or source_local_only:
             component["local_only"] = True
             if hidden_component:
@@ -983,7 +1066,7 @@ def _build_component_metadata(
             if source_local_only:
                 component["hidden_ancestor"] = True
                 component["source_local_only"] = True
-            if executable:
+            if executable and (source_local_only or not conventional_skill_script):
                 component.update(
                     {
                         "outer_path": path,
@@ -996,6 +1079,9 @@ def _build_component_metadata(
                         "concealment_reasons": ["hidden_artifact"],
                     }
                 )
+            elif executable:
+                component["concealed_executable"] = False
+                component["hidden_skill_script_llm_review_withheld"] = True
         metadata.append(component)
         if _expired(path):
             break
@@ -1026,8 +1112,13 @@ def _mark_unanalyzed_executables(
             disposition is ArtifactDisposition.PARTIAL
             and len(raw) < max(0, int(artifact.get("size_bytes", 0)))
         )
+        readable_executable = bool(artifact.get("readable_binary"))
         if content_kind is ContentKind.BINARY:
-            reason = LedgerReason.BINARY_CONTENT
+            reason = (
+                LedgerReason.BINARY_EXECUTABLE_TEXT
+                if readable_executable
+                else LedgerReason.BINARY_CONTENT
+            )
         elif disposition is ArtifactDisposition.OUT_OF_SCOPE:
             reason = LedgerReason.OPAQUE_CONTENT
         elif disposition is ArtifactDisposition.FAILED or incomplete_bytes:
@@ -1056,22 +1147,50 @@ def _mark_unanalyzed_executables(
                 "container_depth": component.get("container_depth", path.count("!/")),
                 "outer_hidden": component.get("outer_hidden", hidden),
                 "concealed_executable": True,
-                "excluded_from_analysis": True,
+                "excluded_from_analysis": not readable_executable,
+                "partially_analyzed_executable": readable_executable,
                 "inherited_exclusion_reason": reason.value,
                 "concealment_reasons": list(dict.fromkeys([*reason_list, reason.value])),
             }
         )
         artifact.setdefault("reason", reason.value)
+        if readable_executable and artifact["disposition"] in {
+            ArtifactDisposition.ANALYZED,
+            ArtifactDisposition.OUT_OF_SCOPE,
+        }:
+            artifact["disposition"] = ArtifactDisposition.PARTIAL
         events.append(
             ledger_event(
                 outcome=LedgerOutcome.PARTIAL,
                 record_type=LedgerRecordType.SYSTEM,
                 phase="coverage_policy",
                 path=path,
-                reason=LedgerReason.EXCLUDED_EXECUTABLE_CONTENT,
+                reason=(
+                    LedgerReason.BINARY_EXECUTABLE_TEXT
+                    if readable_executable
+                    else LedgerReason.EXCLUDED_EXECUTABLE_CONTENT
+                ),
             )
         )
     return events
+
+
+def _note_hidden_skill_scripts_not_sent_to_llm(
+    component_metadata: list[dict[str, object]],
+) -> list[InspectionLedgerEvent]:
+    """Expose the local-only boundary without turning helpers into SC9 findings."""
+    return [
+        ledger_event(
+            outcome=LedgerOutcome.SKIPPED,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="llm_eligibility",
+            path=str(component["path"]),
+            reason=LedgerReason.HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY,
+        )
+        for component in component_metadata
+        if component.get("hidden_skill_script_llm_review_withheld") is True
+        and isinstance(component.get("path"), str)
+    ]
 
 
 def _redact_for_external_model(path: str, content: str) -> str:
@@ -1949,8 +2068,10 @@ def _read_file_cache(
             if (
                 provider_submission_allowed
                 and not _is_hidden_path(path)
-                and artifact["content_kind"] == "text"
+                and (artifact["content_kind"] == "text" or artifact.get("readable_binary"))
             ):
+                if artifact.get("readable_binary"):
+                    content = binary_instruction_view(content)[0].text
                 if truncated:
                     content = _llm_view_of_truncated_file(
                         content,
@@ -2329,27 +2450,16 @@ def _project_manifest(
     manifest["triggers"] = _string_list(data.get("triggers", []))
     manifest["permissions"] = _string_list(data.get("permissions", []))
     # `allowed-tools` (Agent Skills standard) — accept list, comma string, or space-separated string.
+    # Separators inside a `Tool(specifier)` scope belong to the scope, so
+    # `Bash(git status:*) Read` stays two grants.
     allowed_tools = data.get("allowed-tools", [])
     if isinstance(allowed_tools, str):
-        if "," in allowed_tools:
-            tools: list[str] = []
-            cursor = 0
-            while cursor <= len(allowed_tools):
-                _check()
-                separator = allowed_tools.find(",", cursor)
-                if separator < 0:
-                    separator = len(allowed_tools)
-                item = allowed_tools[cursor:separator].strip()
-                if item:
-                    tools.append(_scalar_text(item))
-                if separator == len(allowed_tools):
-                    break
-                cursor = separator + 1
-            manifest["allowed-tools"] = tools
-        else:
-            manifest["allowed-tools"] = [
-                _scalar_text(t) for t in allowed_tools.split() if t.strip()
-            ]
+        tools: list[str] = []
+        for item in iter_allowed_tools_entries(allowed_tools):
+            _check()
+            if item:
+                tools.append(_scalar_text(item))
+        manifest["allowed-tools"] = tools
     elif isinstance(allowed_tools, list):
         manifest["allowed-tools"] = [
             item.strip() for item in _string_list(allowed_tools) if item.strip()
@@ -2806,16 +2916,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             elif signature_valid:
                 recognized_oms_signature_paths.add(_OMS_SIGNATURE_PATH)
     recognized_oms_signatures = frozenset(recognized_oms_signature_paths)
-    signature_events = [
-        ledger_event(
-            outcome=LedgerOutcome.OUT_OF_SCOPE,
-            record_type=LedgerRecordType.SCOPE_BOUNDARY,
-            phase="discovery",
-            path=path,
-            reason=LedgerReason.OMS_SIGNATURE,
-        )
-        for path in sorted(recognized_oms_signatures)
-    ]
+    signature_events: list[InspectionLedgerEvent] = []
     baseline_events = [
         ledger_event(
             outcome=LedgerOutcome.OUT_OF_SCOPE,
@@ -2826,12 +2927,6 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         )
         for path in sorted(selected_baselines)
     ]
-    for artifact in artifact_inventory:
-        if artifact["path"] in recognized_oms_signatures:
-            artifact["disposition"] = ArtifactDisposition.OUT_OF_SCOPE
-            artifact["reason"] = LedgerReason.OMS_SIGNATURE.value
-            llm_file_cache.pop(artifact["path"], None)
-
     primary_path = next(
         (path for path in ("SKILL.md", "skill.md") if path in inventoried_components), None
     )
@@ -2999,8 +3094,6 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     ordinary_components: list[str] = []
     for path in cache_candidates:
         ordinary_artifact = inventory_by_path.get(path)
-        if path in recognized_oms_signatures:
-            continue
         if path in raw_file_cache or (
             ordinary_artifact is not None
             and ordinary_artifact.get("disposition")
@@ -3031,10 +3124,14 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     nested_input_cache = {**raw_file_cache, **excluded_archive_cache}
     nested = inspect_nested_artifacts(
         skill_dir,
-        [
-            *(path for path in ordinary_components if path in raw_file_cache),
-            *excluded_archive_cache,
-        ],
+        sorted(
+            [
+                *(path for path in ordinary_components if path in raw_file_cache),
+                *excluded_archive_cache,
+            ],
+            # Expand real containers before another archive can claim their children.
+            key=lambda path: -path.count("!/"),
+        ),
         raw_file_cache=nested_input_cache,
         max_members=remaining_artifacts,
         max_uncompressed_bytes=remaining_bytes,
@@ -3149,7 +3246,9 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             continue
         nested_exclusion_reason = excluded_archive_reasons[outer_path]
         nested_artifact["inherited_exclusion_reason"] = nested_exclusion_reason.value
-        if nested_artifact["disposition"] is ArtifactDisposition.ANALYZED:
+        if nested_artifact["disposition"] is ArtifactDisposition.ANALYZED or (
+            nested_artifact.get("readable_binary") and not nested_artifact.get("reason")
+        ):
             nested_artifact["disposition"] = ArtifactDisposition.OUT_OF_SCOPE
             nested_artifact["reason"] = nested_exclusion_reason.value
         elif nested_artifact["disposition"] is ArtifactDisposition.OUT_OF_SCOPE:
@@ -3244,33 +3343,91 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             limitation_reason=limitation_reason,
         )
 
+    # Only an actual collision is fatal: ordinary directories may end in "!".
+    nested_paths = (
+        {item["path"] for item in nested.artifact_inventory}
+        | set(nested.components)
+        | set(nested.file_cache)
+        | set(nested.raw_file_cache)
+    )
+    reserved_paths = {item["path"] for item in artifact_inventory} & nested_paths
+    member_containers = {
+        str(item["path"]): str(item["outer_path"])
+        for item in nested.metadata
+        if item["path"] in reserved_paths and item.get("outer_path")
+    }
+    for path in sorted(reserved_paths):
+        container = member_containers.get(path, path.rsplit("!/", 1)[0])
+        event = ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="nested_artifact_inspection",
+            path=container,
+            reason=LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH,
+        )
+        event["message"] += (
+            f" Archive member file {path!r} was not analyzed because it collides with a disk file."
+            " Distinct descendant members may still be analyzed."
+        )
+        prework_events.append(event)
+    disk_container_event_ids = {id(event) for event in nested.disk_container_events}
+    for event in nested.ledger_events:
+        path = event["path"]
+        if path in reserved_paths:
+            if id(event) in disk_container_event_ids:
+                continue
+            event["path"] = member_containers.get(path, path.rsplit("!/", 1)[0])
+            event["work_id"] = inspection_work_id(
+                f"{event['record_type'].value}:{event['phase']}", event["path"], None, None
+            )
+            event["message"] += (
+                f" This applies to withheld archive member {path!r}, not the disk file."
+            )
+    for artifact in artifact_inventory:
+        if artifact["path"] in reserved_paths:
+            artifact["disposition"] = ArtifactDisposition.FAILED
+            artifact["reason"] = LedgerReason.ARTIFACT_PATH_COLLISION.value
+            prework_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="discovery",
+                    path=artifact["path"],
+                    reason=LedgerReason.ARTIFACT_PATH_COLLISION,
+                )
+            )
+    blocked_nested_paths = excluded_nested_components | reserved_paths
+    nested.metadata = [item for item in nested.metadata if item["path"] not in reserved_paths]
+    nested.python_source_classifications = {
+        path: classification
+        for path, classification in nested.python_source_classifications.items()
+        if path not in blocked_nested_paths
+    }
     ordinary_nested_components = [
-        path for path in nested.components if path not in excluded_nested_components
+        path for path in nested.components if path not in blocked_nested_paths
     ]
     local_file_cache = dict(ordinary_file_cache)
     local_file_cache.update(
-        {
-            path: data
-            for path, data in nested.file_cache.items()
-            if path not in excluded_nested_components
-        }
+        {path: data for path, data in nested.file_cache.items() if path not in blocked_nested_paths}
     )
     raw_file_cache.update(
         {
             path: data
             for path, data in nested.raw_file_cache.items()
-            if path not in excluded_nested_components
+            if path not in blocked_nested_paths
         }
     )
-    artifact_inventory.extend(nested.artifact_inventory)
+    artifact_inventory.extend(
+        item for item in nested.artifact_inventory if item["path"] not in reserved_paths
+    )
     for artifact in artifact_inventory:
         override = nested.inventory_overrides.get(artifact["path"])
-        if override is not None:
+        if override is not None and artifact["disposition"] != ArtifactDisposition.FAILED:
             artifact["disposition"], artifact["reason"] = override
     inventory_by_path = {item["path"]: item for item in artifact_inventory}
 
     recognized_containers = frozenset(nested.outer_metadata)
-    primary_content_events: list[InspectionLedgerEvent] = []
+    content_interpretation_events: list[InspectionLedgerEvent] = []
     selected_primary = state.get("primary_file_path")
     for artifact in artifact_inventory:
         path = artifact["path"]
@@ -3298,7 +3455,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         artifact["disposition"] = ArtifactDisposition.FAILED
         artifact["reason"] = LedgerReason.UNSUPPORTED_PRIMARY_CONTENT.value
         llm_file_cache.pop(path, None)
-        primary_content_events.append(
+        content_interpretation_events.append(
             ledger_event(
                 outcome=LedgerOutcome.FAILED,
                 record_type=LedgerRecordType.SYSTEM,
@@ -3321,7 +3478,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             ]
         )
     )
-    for path in [*recognized_containers, *recognized_oms_signatures]:
+    for path in recognized_containers:
         llm_file_cache.pop(path, None)
 
     postprocessing_events: list[InspectionLedgerEvent] = []
@@ -3493,6 +3650,82 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 limit_seconds=runtime_limit,
             )
         )
+
+    # Python's successful source decode takes precedence over a magic prefix.
+    for artifact in artifact_inventory:
+        path = artifact["path"]
+        if (
+            not artifact.get("readable_binary")
+            or artifact["content_kind"] != ContentKind.BINARY
+            or path in excluded_nested_components
+        ):
+            continue
+        _, projection_truncated = binary_instruction_view(local_file_cache.get(path, ""))
+        partial = bool(artifact.get("referenced"))
+        reason = LedgerReason.SIZE_LIMIT if projection_truncated else LedgerReason.OPAQUE_CONTENT
+        if artifact["disposition"] == ArtifactDisposition.ANALYZED:
+            artifact["disposition"] = (
+                ArtifactDisposition.PARTIAL if partial else ArtifactDisposition.OUT_OF_SCOPE
+            )
+        content_interpretation_events.append(
+            ledger_event(
+                outcome=LedgerOutcome.OUT_OF_SCOPE,
+                record_type=LedgerRecordType.SCOPE_BOUNDARY,
+                phase="cache",
+                path=path,
+                reason=LedgerReason.BINARY_TEXT_PROJECTION,
+            )
+        )
+        if partial:
+            content_interpretation_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path=path,
+                    reason=reason,
+                )
+            )
+
+    for path, content in local_file_cache.items():
+        if not content.lstrip().startswith("{"):
+            continue
+        projection_started = monotonic()
+        if projection_started >= processing_deadline:
+            _record_processing_runtime(
+                phase="signature_projection", path=path, now=projection_started
+            )
+            continue
+        projection = project_oms_content(content)
+        if projection is None:
+            continue
+        projection_finished = monotonic()
+        if projection_finished >= processing_deadline:
+            _record_processing_runtime(
+                phase="signature_projection", path=path, now=projection_finished
+            )
+            continue
+        artifact = inventory_by_path.get(path)
+        bounded_provider_view = artifact is not None and (
+            artifact.get("disposition") == ArtifactDisposition.PARTIAL
+            and artifact.get("reason")
+            in {LedgerReason.SIZE_LIMIT.value, LedgerReason.TOTAL_BYTES_LIMIT.value}
+        )
+        if path in llm_file_cache and projection.view.name != "raw" and not bounded_provider_view:
+            llm_file_cache[path] = projection.view.text
+        if not projection.complete:
+            signature_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="discovery",
+                    path=path,
+                    reason=LedgerReason.OMS_SIGNATURE,
+                )
+            )
+            if artifact is not None and artifact["disposition"] == ArtifactDisposition.ANALYZED:
+                artifact["disposition"] = ArtifactDisposition.PARTIAL
+                artifact["reason"] = LedgerReason.OMS_SIGNATURE.value
 
     llm_components = sorted(llm_file_cache)
     file_cache = dict(llm_file_cache)
@@ -3670,6 +3903,12 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         {item["path"]: item for item in artifact_inventory},
         raw_file_cache,
     )
+    use_llm = state.get("use_llm", True)
+    hidden_skill_llm_events = (
+        _note_hidden_skill_scripts_not_sent_to_llm(component_metadata)
+        if use_llm is not False
+        else []
+    )
     has_executable_scripts = (
         has_executable_scripts
         or any(bool(metadata.get("executable")) for metadata in nested.metadata)
@@ -3685,7 +3924,6 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         if target and target in disposition_by_path:
             reference["disposition"] = disposition_by_path[target]
 
-    use_llm = state.get("use_llm", True)
     model_config = build_model_config() if use_llm else {}
     llm_provenance = (
         capture_llm_provenance(model_config)
@@ -3719,13 +3957,14 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 *reference_events,
                 *cache_events,
                 *nested.ledger_events,
-                *primary_content_events,
+                *content_interpretation_events,
                 *excluded_nested_events,
                 *classification_events,
                 *manifest_events,
                 *structured_events,
                 *postprocessing_events,
                 *coverage_policy_events,
+                *hidden_skill_llm_events,
             ]
         ),
         "ast_cache": {},
