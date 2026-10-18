@@ -11,9 +11,12 @@ network. Never raises: unparseable input yields ``""``.
 
 Bounds are truncation-honest, never silent: every cap reports whether
 text may have been lost, so callers record ``PARTIAL`` instead of
-claiming ``COMPLETED``. Caps apply to text bytes (per-chunk and
-global), not to chunk counts, so padding with dummy chunks cannot hide
-a later payload. Oversized text yields its bounded prefix.
+claiming ``COMPLETED``. Text caps apply to text bytes (per-chunk and
+global), GIF walks to a sub-block budget, so padding cannot hide a
+later payload. Oversized text yields its bounded prefix. One
+deliberate carve-out remains: a PNG chunk length that overruns the
+file ends the walk silently (see ``_png_text``), because the chunks
+already read were complete.
 """
 
 from __future__ import annotations
@@ -40,10 +43,10 @@ _MAX_CHUNK_BYTES: Final = 1_000_000
 # ~2 s. A 1 MiB comment needs ~4,120 full-size blocks, so 16,384 blocks
 # keeps any legitimate comment while stopping a crafted walk in ~2 ms.
 _MAX_SUB_BLOCKS: Final = 16_384
-# GIF walks skip pixel data by offset arithmetic (cheap), so the per-file
-# bound only needs to stop pathological walks: 4 MB covers multi-megabyte
-# benign frames while a crafted 16 MiB walk trips it loudly.
-_MAX_GIF_WALK_BYTES: Final = 4_000_000
+# Skipped GIF data is bounded by sub-block count, not absolute bytes: a
+# benign 16 MiB frame needs ~66k full-size sub-blocks, while a crafted
+# walk of one-byte blocks stops at 2,000,000 (~0.4 s) and reports it.
+_MAX_GIF_SUB_BLOCKS: Final = 2_000_000
 
 _IFD_TYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 7: 1}
 
@@ -354,29 +357,30 @@ def _read_sub_blocks(data: bytes, offset: int) -> tuple[bytes, int, bool]:
     return bytes(collected), offset, capped
 
 
-def _skip_sub_blocks(data: bytes, offset: int) -> tuple[int, bool]:
-    """Advance past GIF data sub-blocks without collecting or capping.
+def _skip_sub_blocks(data: bytes, offset: int, budget: int) -> tuple[int, bool, int]:
+    """Advance past GIF data sub-blocks within the shared walk budget.
 
     Pixel data and non-comment extensions are skipped by offset
     arithmetic only: collecting them would let padding-sized frames
-    hide a later comment or force a false PARTIAL. Reports whether
-    the walk tripped the per-skip byte bound or a truncated tail.
+    hide a later comment or force a false PARTIAL. Reports whether the
+    walk tripped the sub-block budget or a truncated tail, plus the
+    budget left for the rest of the walk.
     """
-    start = offset
     capped = False
     while offset < len(data):
-        if offset - start > _MAX_GIF_WALK_BYTES:
+        if budget <= 0:
             capped = True
             break
         size = data[offset]
         offset += 1
+        budget -= 1
         if size == 0:
             break
         if offset + size > len(data):
             capped = True
             break
         offset += size
-    return offset, capped
+    return offset, capped, budget
 
 
 def _gif_text(data: bytes) -> tuple[str, bool]:
@@ -389,11 +393,9 @@ def _gif_text(data: bytes) -> tuple[str, bool]:
     packed = data[10]
     if packed & 0x80:
         offset += 3 * (2 ** ((packed & 0x07) + 1))
+    budget = _MAX_GIF_SUB_BLOCKS
     while True:
         if offset >= len(data):
-            break
-        if offset > _MAX_GIF_WALK_BYTES:
-            truncated = True
             break
         if total >= MAX_IMAGE_TEXT_CHARS:
             truncated = True
@@ -403,6 +405,7 @@ def _gif_text(data: bytes) -> tuple[str, bool]:
             break
         if separator == 0x21:
             if offset + 2 > len(data):
+                truncated = True
                 break
             label = data[offset + 1]
             offset += 2
@@ -412,21 +415,26 @@ def _gif_text(data: bytes) -> tuple[str, bool]:
                 total, lost = _collect(parts, total, _decode(comment).strip("\x00").strip())
                 truncated = truncated or lost
             else:
-                offset, capped = _skip_sub_blocks(data, offset)
+                offset, capped, budget = _skip_sub_blocks(data, offset, budget)
                 truncated = truncated or capped
         elif separator == 0x2C:
             if offset + 10 > len(data):
+                truncated = True
                 break
             packed = data[offset + 9]
             offset += 10
             if packed & 0x80:
                 offset += 3 * (2 ** ((packed & 0x07) + 1))
             if offset >= len(data):
+                truncated = True
                 break
             offset += 1
-            offset, capped = _skip_sub_blocks(data, offset)
+            offset, capped, budget = _skip_sub_blocks(data, offset, budget)
             truncated = truncated or capped
         else:
+            # Unknown block byte before the trailer: the rest of the
+            # container is unread, so say so rather than reporting clean.
+            truncated = True
             break
     return "\n".join(part for part in parts if part), truncated
 

@@ -637,9 +637,13 @@ def collect_image_inventory(
     Remote ``http(s)`` targets are cited as scheme-plus-host and never
     retrieved; ``data:`` image URIs are kept inline for bounded decoding
     downstream (at most 8 per skill, 1 MB each; anything beyond reports
-    truncation). Shares the caller's deadline: an expired budget stops
-    parsing and reports truncation instead of blocking the scan.
-    Returns ``(inventory, truncated)``.
+    truncation). Inline detection only sees markdown destinations of at
+    most 512 characters: the reference extractor drops longer ones
+    (``markdown_destination`` limitation), so those never reach this
+    inventory and the size caps are rarely the binding bound. Shares the
+    caller's deadline: an expired budget stops parsing and reports
+    truncation instead of blocking the scan. Returns ``(inventory,
+    truncated)``.
     """
     known = set(known_paths)
     local: set[str] = set()

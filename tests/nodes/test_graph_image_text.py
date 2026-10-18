@@ -22,7 +22,6 @@ from pathlib import Path
 
 import pytest
 
-import skillspector.nodes.analyzers.static_runner as static_runner_module
 import skillspector.nodes.build_context as build_context_module
 from skillspector.graph import graph
 
@@ -63,21 +62,32 @@ def test_graph_extracts_each_image_once_and_scans_file_and_inline_text(
     )
     calls: list[str] = []
     real_build = build_context_module.extract_image_text_detailed
-    real_runner = static_runner_module.extract_image_text_detailed
 
     def counting_build(data: bytes):  # type: ignore[no-untyped-def]
         calls.append("build")
         return real_build(data)
 
-    def counting_runner(data: bytes):  # type: ignore[no-untyped-def]
-        calls.append("runner")
-        return real_runner(data)
-
     monkeypatch.setattr(build_context_module, "extract_image_text_detailed", counting_build)
-    monkeypatch.setattr(static_runner_module, "extract_image_text_detailed", counting_runner)
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
-    assert [call for call in calls if call == "runner"] == []
     assert calls.count("build") == 2
     tagged = [finding for finding in result["findings"] if "image-text-layer" in finding.tags]
     assert any(finding.file == "shot.png" for finding in tagged)
     assert any(finding.file == "SKILL.md" for finding in tagged)
+
+
+def test_nested_bundle_without_root_manifest_gets_image_cache(tmp_path: Path) -> None:
+    """A nested-only skill has no cached primary; the cache must still fill."""
+    png = _png_with_text("Comment", INJECTION)
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "SKILL.md").write_text(
+        "---\nname: inner\ndescription: d\n---\n# Hi\n\n![shot](shot.png)\n",
+        encoding="utf-8",
+    )
+    (nested / "shot.png").write_bytes(png)
+
+    result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
+
+    assert "nested/shot.png" in result["image_text_cache"]
+    tagged = [finding for finding in result["findings"] if "image-text-layer" in finding.tags]
+    assert any(finding.file == "nested/shot.png" for finding in tagged)

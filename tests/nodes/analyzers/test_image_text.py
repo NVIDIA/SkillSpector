@@ -20,7 +20,7 @@ from skillspector.image_text import (
     extract_image_text,
     extract_image_text_detailed,
 )
-from skillspector.inspection_ledger import LedgerOutcome, finalize_ledger
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
 from skillspector.nodes.analyzers import static_patterns_prompt_injection as prompt_injection
 from skillspector.nodes.analyzers import static_runner
 
@@ -133,6 +133,7 @@ def test_static_runner_routes_image_text_through_prompt_injection() -> None:
         "file_cache": {},
         "local_file_cache": {},
         "raw_file_cache": {"assets/shot.png": png},
+        "image_text_cache": {"assets/shot.png": extract_image_text_detailed(png)},
         "artifact_inventory": [
             {
                 "path": "assets/shot.png",
@@ -432,6 +433,37 @@ class TestImageTextAdversarial:
         assert INJECTION in extracted
         assert truncated is False
 
+    def test_benign_gif_over_four_megabytes_stays_complete(self) -> None:
+        # A textless frame past 4 MB is ordinary image data, not a lost
+        # text layer: the walk budget counts sub-blocks, not bytes.
+        frame = b"\x2c" + b"\x00" * 9 + b"\x02" + (bytes((255,)) + b"A" * 255) * 16_500 + b"\x00"
+        gif = b"GIF89a" + struct.pack("<HHBBB", 1, 1, 0, 0, 0) + frame + b"\x3b"
+        assert len(gif) > 4_000_000
+        assert extract_image_text_detailed(gif) == ("", False)
+
+    def test_gif_sub_block_budget_trips_loudly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skillspector import image_text as image_text_module
+
+        monkeypatch.setattr(image_text_module, "_MAX_GIF_SUB_BLOCKS", 100)
+        frame = b"\x2c" + b"\x00" * 9 + b"\x02" + b"\x01A" * 500 + b"\x00"
+        gif = b"GIF89a" + struct.pack("<HHBBB", 1, 1, 0, 0, 0) + frame + b"\x3b"
+        assert extract_image_text_detailed(gif) == ("", True)
+
+    def test_junk_block_byte_before_comment_is_truncated(self) -> None:
+        # 0x00 is not an extension, image descriptor, or trailer: the rest
+        # of the container is unread, so the result cannot claim clean.
+        gif = b"GIF89a" + struct.pack("<HHBBB", 1, 1, 0, 0, 0) + b"\x00\x21\xfe\x02hi\x00\x3b"
+        assert extract_image_text_detailed(gif) == ("", True)
+
+    def test_gif_short_extension_header_is_truncated(self) -> None:
+        header = b"GIF89a" + struct.pack("<HHBBB", 1, 1, 0, 0, 0)
+        assert extract_image_text_detailed(header + b"\x21") == ("", True)
+
+    def test_gif_short_descriptor_tails_are_truncated(self) -> None:
+        header = b"GIF89a" + struct.pack("<HHBBB", 1, 1, 0, 0, 0)
+        assert extract_image_text_detailed(header + b"\x2c" + b"\x00" * 3) == ("", True)
+        assert extract_image_text_detailed(header + b"\x2c" + b"\x00" * 9) == ("", True)
+
     def test_jpeg_comment_after_junk_and_fill_is_found(self) -> None:
         # A junk byte and a 0xFF fill byte before a marker resync like
         # libjpeg instead of ending the walk.
@@ -463,6 +495,7 @@ class TestImageTextAdversarial:
             "file_cache": {},
             "local_file_cache": {},
             "raw_file_cache": {"assets/shot.png": png},
+            "image_text_cache": {"assets/shot.png": extract_image_text_detailed(png)},
             "artifact_inventory": [
                 {
                     "path": "assets/shot.png",
@@ -600,18 +633,16 @@ class TestImageTextAdversarial:
         assert len(rows) == 1
         assert rows[0]["outcome"] is LedgerOutcome.PARTIAL
 
-    def test_truncated_textless_image_records_partial_not_out_of_scope(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_truncated_textless_image_records_partial_not_out_of_scope(self) -> None:
         # Truncation with no text is still lost text: an unreferenced image
         # records PARTIAL with a size reason, never OUT_OF_SCOPE complete.
-        monkeypatch.setattr(static_runner, "extract_image_text_detailed", lambda data: ("", True))
         raw = _png_with_text("Comment", INJECTION)
         state = {
             "components": ["assets/shot.png"],
             "file_cache": {},
             "local_file_cache": {},
             "raw_file_cache": {"assets/shot.png": raw},
+            "image_text_cache": {"assets/shot.png": ("", True)},
             "artifact_inventory": [
                 {
                     "path": "assets/shot.png",
@@ -633,3 +664,34 @@ class TestImageTextAdversarial:
         ]
         assert len(rows) == 1
         assert rows[0]["outcome"] is LedgerOutcome.PARTIAL
+
+    def test_inline_decode_error_folds_partial_with_specific_reason(self) -> None:
+        # A malformed inline payload loses a text layer without yielding
+        # text: the SKILL.md row still records the decode failure.
+        body = "# Skill\n\nBenign instructions.\n"
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {"SKILL.md": body},
+            "local_file_cache": {},
+            "raw_file_cache": {},
+            "image_inline_text_cache": {
+                "SKILL.md": ("", True, LedgerReason.INLINE_IMAGE_DECODE_ERROR.value)
+            },
+            "artifact_inventory": [
+                {
+                    "path": "SKILL.md",
+                    "content_kind": ContentKind.TEXT,
+                    "disposition": ArtifactDisposition.ANALYZED,
+                    "size_bytes": len(body),
+                    "decodable": True,
+                    "contains_nul": False,
+                    "misleading_extension": False,
+                    "referenced": True,
+                }
+            ],
+        }
+        response = static_runner.run_static_patterns_with_ledger(state, [prompt_injection])
+        rows = [event for event in response["inspection_ledger"] if event.get("phase") == "static"]
+        assert len(rows) == 1
+        assert rows[0]["outcome"] is LedgerOutcome.PARTIAL
+        assert rows[0]["reason_code"] == LedgerReason.INLINE_IMAGE_DECODE_ERROR

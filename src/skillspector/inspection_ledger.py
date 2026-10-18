@@ -114,6 +114,7 @@ class LedgerReason(StrEnum):
     STATIC_PARSE_LIMIT = "static_parse_limit"
     PYTHON_SOURCE_AMBIGUOUS = "python_source_ambiguous"
     PYTHON_SOURCE_DECODE_ERROR = "python_source_decode_error"
+    INLINE_IMAGE_DECODE_ERROR = "inline_image_decode_error"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
 
 
@@ -245,6 +246,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     ),
     LedgerReason.PYTHON_SOURCE_DECODE_ERROR: (
         "Python source bytes could not be decoded under their declared encoding."
+    ),
+    LedgerReason.INLINE_IMAGE_DECODE_ERROR: (
+        "An inline data: image URI could not be decoded under its declared encoding."
     ),
     LedgerReason.OBFUSCATED_INSTRUCTION_TEXT: (
         "Obfuscated instruction text could not be fully evaluated by the deterministic layer."

@@ -2497,3 +2497,32 @@ def test_build_context_image_inventory_and_text_cache(tmp_path: Path) -> None:
     text, truncated = result["image_text_cache"]["shot.png"]
     assert injection in text
     assert truncated is False
+
+
+def test_inline_url_encoded_badge_does_not_force_partial(tmp_path: Path) -> None:
+    """RFC 2397 percent-escaped payloads decode; percent signs are not base64."""
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: badge\ndescription: d\n---\n\n"
+        "![badge](data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3C%2Fsvg%3E)\n",
+        encoding="utf-8",
+    )
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["image_inventory"]["inline_images"]
+    assert "SKILL.md" not in result["image_inline_text_cache"]
+
+
+def test_inline_base64_decode_failure_records_reason(tmp_path: Path) -> None:
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: badge\ndescription: d\n---\n\n![badge](data:image/png;base64,not-base64!)\n",
+        encoding="utf-8",
+    )
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["image_inline_text_cache"]["SKILL.md"] == (
+        "",
+        False,
+        LedgerReason.INLINE_IMAGE_DECODE_ERROR.value,
+    )

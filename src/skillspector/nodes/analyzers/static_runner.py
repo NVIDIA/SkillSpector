@@ -41,10 +41,8 @@ from skillspector.artifacts import (
     is_default_ignorable,
     security_text_views,
 )
-from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES
 from skillspector.image_text import (
     MAX_IMAGE_TEXT_CHARS,
-    extract_image_text_detailed,
     has_image_magic,
 )
 from skillspector.inspection_ledger import (
@@ -572,44 +570,40 @@ def _infer_file_type(path: str) -> str:
 
 
 def _image_extracted_text(state: Mapping[str, object], path: str) -> tuple[str, bool]:
-    """Return ``(text, truncated)`` for one image path from cache or raw bytes.
+    """Return ``(text, truncated)`` for one image path from the build cache.
 
-    Prefers the build-time extract-once cache; falls back to direct raw
-    extraction only for states without it (unit-called runners predate the
-    cache). When the cache exists but lacks the path, build ran and skipped
-    it under the shared deadline — or it is not an image — so there is no
-    fallback: per-analyzer re-extraction would pay the crafted-input walk
-    again outside the deadline. The caller records PARTIAL runtime_limit
-    for magic-byte misses. Identified by magic bytes, never
-    suffix-gated, so a renamed image is still covered. Images without a text layer
-    yield ``("", False)`` and keep their existing skip accounting.
+    The build fills the extract-once cache for every input shape, so a
+    missing entry means the build saw the path and skipped it (deadline) or
+    it is not an image. There is no raw fallback: per-analyzer
+    re-extraction would pay the crafted-input walk again outside the
+    deadline. The caller records PARTIAL runtime_limit for magic-byte
+    misses. Identified by magic bytes, never suffix-gated, so a renamed
+    image is still covered. Images without a text layer yield
+    ``("", False)`` and keep their existing skip accounting.
     """
     text_cache = state.get("image_text_cache")
     entry = _coerce_image_text_entry(text_cache.get(path)) if isinstance(text_cache, dict) else None
     if entry is not None:
-        return entry
-    if isinstance(text_cache, dict):
-        return "", False
-    raw_cache = state.get("raw_file_cache")
-    raw = raw_cache.get(path) if isinstance(raw_cache, dict) else None
-    if not isinstance(raw, bytes) or not raw or len(raw) > MAX_ANALYZABLE_FILE_BYTES:
-        # Oversized raws are unreadable here, which is itself a possible
-        # loss: flag it rather than claiming textless-complete.
-        return "", True
-    if not has_image_magic(raw):
-        return "", False
-    return extract_image_text_detailed(raw)
+        return entry[0], entry[1]
+    return "", False
 
 
-def _coerce_image_text_entry(value: object) -> tuple[str, bool] | None:
-    """Return a ``(text, truncated)`` pair from cache state, else None.
+def _coerce_image_text_entry(value: object) -> tuple[str, bool, LedgerReason | None] | None:
+    """Return a ``(text, truncated, reason)`` triple from cache state, else None.
 
-    Tolerates lists: checkpoints serialize stored tuples as lists.
+    Tolerates lists (checkpoints serialize stored tuples as lists) and
+    legacy two-tuples written before the reason field existed.
     """
-    if isinstance(value, (tuple, list)) and len(value) == 2:
-        text, truncated = value
+    if isinstance(value, (tuple, list)) and len(value) in (2, 3):
+        text, truncated = value[0], value[1]
+        reason: LedgerReason | None = None
+        if len(value) == 3 and isinstance(value[2], str):
+            try:
+                reason = LedgerReason(value[2])
+            except ValueError:
+                reason = None
         if isinstance(text, str) and isinstance(truncated, bool):
-            return text, truncated
+            return text, truncated, reason
     return None
 
 
@@ -3438,6 +3432,7 @@ def run_static_patterns_with_ledger(
                 )
         inline_scan_content: str | None = None
         inline_scan_truncated = False
+        inline_scan_reason: LedgerReason | None = None
         inline_cache = state.get("image_inline_text_cache")
         inline_entry = (
             _coerce_image_text_entry(inline_cache.get(path))
@@ -3445,7 +3440,7 @@ def run_static_patterns_with_ledger(
             else None
         )
         if inline_entry is not None:
-            inline_scan_content, inline_scan_truncated = inline_entry
+            inline_scan_content, inline_scan_truncated, inline_scan_reason = inline_entry
             if not inline_scan_content and not inline_scan_truncated:
                 inline_scan_content = None
         if path not in container_paths and path in source_classification_limitations:
@@ -3718,11 +3713,13 @@ def run_static_patterns_with_ledger(
                 # partial, emitted ids from both) and no inline row is added.
                 size_content = content
                 inline_error_class: str | None = None
+                # A decode failure has no text to scan but still loses a
+                # layer, so its reason must fold into this row too.
+                inline_reason: LedgerReason | None = inline_scan_reason
+                inline_metrics: dict[str, object] = {}
                 if inline_scan_content is not None:
                     inline_budget = MAX_FINDINGS_PER_ANALYZER - len(findings)
                     inline_remaining = transitive_remaining_seconds(cast(SkillspectorState, state))
-                    inline_reason: LedgerReason | None = None
-                    inline_metrics: dict[str, object] = {}
                     try:
                         if inline_budget <= 0 or (
                             inline_remaining is not None and inline_remaining <= 0
@@ -3751,8 +3748,10 @@ def run_static_patterns_with_ledger(
                             _tag_image_text_findings(inline_findings)
                             findings.extend(inline_findings)
                             path_findings.extend(inline_findings)
-                            inline_reason = inline_limit or (
-                                LedgerReason.SIZE_LIMIT if inline_scan_truncated else None
+                            inline_reason = (
+                                inline_limit
+                                or inline_scan_reason
+                                or (LedgerReason.SIZE_LIMIT if inline_scan_truncated else None)
                             )
                     except Exception as exc:
                         logger.warning(
@@ -3762,9 +3761,10 @@ def run_static_patterns_with_ledger(
                             exc,
                         )
                         inline_error_class = type(exc).__name__
-                    if inline_reason is not None and resource_limit is None:
-                        resource_limit = inline_reason
-                        resource_metrics = inline_metrics
+                if inline_reason is not None and resource_limit is None:
+                    resource_limit = inline_reason
+                    resource_metrics = inline_metrics
+                    if inline_scan_content is not None:
                         size_content = inline_scan_content
                 # An inline-scan error folds as PARTIAL, never FAILED: a
                 # FAILED row cannot carry emitted ids (ledger_event raises),
