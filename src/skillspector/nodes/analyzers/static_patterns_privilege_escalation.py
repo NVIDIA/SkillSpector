@@ -214,6 +214,17 @@ _BENIGN_ACCESS_REQUIREMENT_ROWS = frozenset(
         "| GTL access credential | Runner-gated job create/start/monitor/collect |",
     }
 )
+# The skill-card template's credential disclosure field, for example
+# ``**Credential Type(s):** [Other [Perforce access credentials]] <br>``.
+# Its bracketed value labels the credential a skill relies on.
+_PE3_CREDENTIAL_TYPE_FIELD = re.compile(
+    r"[ \t]*\*\*Credential\s+Type\(s\):\*\*[ \t]*(?P<value>\[[^\r\n]*\])"
+    r"[ \t]*(?:<br\s*/?>)?[ \t]*",
+    re.IGNORECASE,
+)
+_PE3_CREDENTIAL_TYPE_NOUN = re.compile(
+    r"access[ \t]+(?:credentials?|secrets?|tokens?)", re.IGNORECASE
+)
 _PE3_SAFE_ACCESS_TOKEN_NAVIGATION = re.compile(
     r"(?:^|>|\b(?:navigate|go)\s+to\s+)\s*settings\s*>\s*(?:ci/cd\s*>\s*)?"
     r"(?P<target>access\s+tokens?)\s*[`.)]*\s*$",
@@ -767,6 +778,41 @@ def _is_companion_cli_oauth_result_noun(
     )
 
 
+def _is_credential_type_disclosure_label(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> bool:
+    """Return True for an access-credential noun inside a skill-card credential label.
+
+    Skill cards must disclose the credential a skill needs, as in
+    ``**Credential Type(s):** [Other [Perforce access credentials]]``. In that
+    bracketed label ``access`` modifies the noun; it does not direct the agent
+    to read a credential. Only a determiner-free ``access credential``,
+    ``access secret``, or ``access token`` noun inside that one field is exempt.
+    An action verb or sensitive source anywhere in the label keeps the finding,
+    as does the same phrase elsewhere on the line or in any other field.
+    """
+    if file_type != "markdown":
+        return False
+    if _PE3_CREDENTIAL_TYPE_NOUN.fullmatch(match.group(0)) is None:
+        return False
+    line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
+    if line_end - line_start > _MAX_CONTEXTUAL_CLASSIFICATION_LINE_CHARS:
+        return False
+    field = _PE3_CREDENTIAL_TYPE_FIELD.fullmatch(content, line_start, line_end)
+    if field is None:
+        return False
+    if not field.start("value") <= match.start() < match.end() <= field.end("value"):
+        return False
+    value = field.group("value")
+    return not (
+        _PE3_TOKEN_ACTION_CONTEXT.search(value) or _PE3_TOKEN_SENSITIVE_SOURCE.search(value)
+    )
+
+
 def _is_qualified_benign_access_requirement(
     content: str,
     match: re.Match[str],
@@ -1055,6 +1101,10 @@ def analyze(
             ):
                 continue
             if ignore_pattern_file and _is_ignore_file_exclusion_entry(content, match):
+                continue
+            if _is_credential_type_disclosure_label(
+                content, match, file_type, line_starts, line_ends
+            ):
                 continue
             line_num = line_number(match.start())
             context = context_at(match.start())

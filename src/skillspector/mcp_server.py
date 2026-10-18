@@ -42,6 +42,7 @@ from skillspector.inspection_ledger import LedgerReason
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.nodes.analyzers import ANALYZER_MODULES
+from skillspector.nodes.report import redact_llm_error
 from skillspector.semantic_runtime import llm_runtime_available, semantic_runtime_accounting
 from skillspector.suppression import effective_findings
 
@@ -142,7 +143,7 @@ async def run_scan(
         ):
             raise ValueError("this MCP transport requires an unauthenticated HTTPS target")
 
-    llm_preflight_available, _ = is_llm_available()
+    llm_preflight_available, llm_preflight_error = is_llm_available() if use_llm else (False, None)
     llm_enabled = use_llm and llm_preflight_available
 
     state: dict[str, Any] = {
@@ -152,6 +153,8 @@ async def run_scan(
         "use_llm": llm_enabled,
         "llm_requested": use_llm,
     }
+    if use_llm and not llm_preflight_available:
+        state["llm_preflight_error"] = redact_llm_error(llm_preflight_error)
     if yara_rules_dir:
         state["yara_rules_dir"] = yara_rules_dir
 

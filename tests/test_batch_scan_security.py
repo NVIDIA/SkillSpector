@@ -29,6 +29,91 @@ _SECRET = "DUMMY_EXTERNAL_SECRET_NEVER_SEND"
 _SAFE_TEXT = "# 安全助手\n这是一个帮助用户整理资料的安全技能。\n"
 
 
+@pytest.mark.parametrize("analyzer_kind", ["discovery", "meta"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "invalid_response",
+    ["not JSON", '{"findings": "invalid"}', "null-confidence", "list-confidence"],
+)
+@pytest.mark.parametrize("recovers", [False, True])
+async def test_compat_parse_failures_retry_and_remain_visible(
+    monkeypatch: pytest.MonkeyPatch,
+    analyzer_kind: str,
+    asynchronous: bool,
+    invalid_response: str,
+    recovers: bool,
+) -> None:
+    if invalid_response in {"null-confidence", "list-confidence"}:
+        confidence = None if invalid_response == "null-confidence" else [1]
+        item = (
+            {
+                "rule_id": "P1",
+                "message": "Unsafe instruction",
+                "severity": "HIGH",
+                "start_line": 1,
+                "explanation": "Unsafe",
+                "remediation": "Remove",
+            }
+            if analyzer_kind == "discovery"
+            else {
+                "pattern_id": "P1",
+                "is_vulnerability": True,
+                "intent": "malicious",
+                "impact": "high",
+                "explanation": "Unsafe",
+                "remediation": "Remove",
+            }
+        )
+        invalid_response = json.dumps({"findings": [dict(item, confidence=confidence)]})
+    calls = []
+
+    def invoke(prompt):
+        calls.append(prompt)
+        response = '{"findings": []}' if recovers and len(calls) > 1 else invalid_response
+        return AIMessage(content=response)
+
+    async def ainvoke(prompt):
+        return invoke(prompt)
+
+    monkeypatch.setattr(
+        llm_analyzer_base,
+        "get_chat_model",
+        lambda **kwargs: SimpleNamespace(invoke=invoke, ainvoke=ainvoke),
+    )
+    monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda model: 100_000)
+    monkeypatch.setattr(llm_analyzer_base, "STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS", (0, 0, 0))
+    batch = llm_analyzer_base.Batch(file_path="SKILL.md", content=_SAFE_TEXT)
+
+    with runner.deepseek_compat():
+        analyzer = (
+            runner.LLMAnalyzerBase(base_prompt="Review the supplied skill", model="test", timeout=7)
+            if analyzer_kind == "discovery"
+            else runner.LLMMetaAnalyzer(model="test", timeout=7)
+        )
+        assert analyzer._timeout == 7
+        outcome = (
+            await analyzer.arun_batches_detailed([batch])
+            if asynchronous
+            else analyzer.run_batches_detailed([batch])
+        )
+
+    if recovers:
+        assert len(calls) == 2
+        assert outcome.successful == [(batch, [])]
+        assert outcome.failures == []
+    else:
+        assert len(calls) == llm_analyzer_base.STRUCTURED_RESPONSE_MAX_ATTEMPTS
+        assert outcome.successful == []
+        assert len(outcome.failures) == 1
+        assert outcome.failures[0].reason.value == "llm_structured_response_invalid"
+        events, _ = llm_analyzer_base.ledger_events_for_batches("compat-test", outcome)
+        assert len(events) == 1
+        # Core policy records malformed output as skipped, so coverage is partial.
+        assert events[0]["outcome"].value == "skipped"
+        assert events[0]["reason_code"] == "llm_structured_response_invalid"
+        assert invalid_response not in json.dumps(events)
+
+
 @pytest.fixture
 def batch_skill(tmp_path: Path) -> tuple[Path, Path]:
     skill = tmp_path / "safe-skill"
@@ -541,3 +626,148 @@ def test_scan_forwards_verbose_logging(batch_skill, monkeypatch):
         skill, skill.parent, use_llm=False, lang="en", require_llm=False, verbose=True
     )
     assert levels == ["DEBUG"]
+
+
+@pytest.mark.parametrize("impact", ["High", "none", None, "catastrophic"])
+def test_compat_meta_repairs_soft_fields_before_validation(impact):
+    batch = llm_analyzer_base.Batch(file_path="SKILL.md", content=_SAFE_TEXT)
+    result = runner._patched_meta_parse(
+        None,
+        json.dumps(
+            {
+                "findings": [
+                    {
+                        "pattern_id": "P1",
+                        "is_vulnerability": True,
+                        "confidence": 0.9,
+                        "intent": "malicious",
+                        "impact": impact,
+                        "explanation": None,
+                        "remediation": None,
+                    }
+                ]
+            }
+        ),
+        batch,
+    )
+    assert len(result) == 1
+    assert result[0]["impact"] == ("high" if impact == "High" else "low")
+    assert result[0]["explanation"] == result[0]["remediation"] == ""
+    assert result[0]["_file"] == "SKILL.md"
+
+
+@pytest.mark.parametrize("timeout", [None, 7, lambda: 7])
+def test_compat_pooled_constructor_forwards_timeout(monkeypatch, timeout):
+    from contrib.batch_scan.api_pool import PooledChatModel
+
+    pool = object()
+    monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda model: 100_000)
+    # Register and construct the real adapter; invoking it would require a real pool.
+    try:
+        runner.set_api_pool(pool)
+        with runner.deepseek_compat():
+            analyzer = runner.LLMAnalyzerBase("Review", "test", timeout=timeout)
+        assert isinstance(analyzer._llm, PooledChatModel)
+        assert analyzer._llm._pool is pool
+        assert analyzer._llm._timeout == (30 if timeout is None else 7)
+    finally:
+        runner.set_api_pool(None)
+
+
+@pytest.mark.parametrize("requested", [2, 60, None])
+def test_compat_http_timeout_preserves_shorter_deadline(monkeypatch, requested):
+    observed = {}
+    monkeypatch.setattr(runner, "_original_chatopenai_init", lambda self, **kw: observed.update(kw))
+    runner._patched_chatopenai_init(object(), timeout=requested)
+    assert observed["timeout"] is observed["request_timeout"]
+    assert observed["timeout"].read == (2 if requested == 2 else 30)
+    assert observed["timeout"].connect == (2 if requested == 2 else 8)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_pooled_request_slot_wait_obeys_deadline(asynchronous):
+    from contrib.batch_scan.api_pool import ApiKey, ApiKeyPool, PooledChatModel
+
+    pool = ApiKeyPool([ApiKey("synthetic", None, "test", max_concurrent=1)])
+    occupied = pool.acquire()
+    model = PooledChatModel(pool, timeout=0.02)
+    started = time.monotonic()
+    try:
+        with pytest.raises(llm_analyzer_base.LLMRuntimeLimitError):
+            if asynchronous:
+                await model.ainvoke("unused")
+            else:
+                model.invoke("unused")
+        assert time.monotonic() - started < 1
+        assert occupied.active_requests == 1
+    finally:
+        pool.release(occupied)
+    assert occupied.active_requests == 0
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_pooled_request_releases_slot_when_client_build_fails(monkeypatch, asynchronous):
+    from contrib.batch_scan.api_pool import ApiKey, ApiKeyPool, PooledChatModel
+
+    key = ApiKey("synthetic", None, "test", max_concurrent=1)
+    model = PooledChatModel(ApiKeyPool([key]), timeout=1)
+
+    def fail(*args, **kwargs):
+        raise ValueError("synthetic constructor failure")
+
+    monkeypatch.setattr(model, "_build_llm", fail)
+    with pytest.raises(ValueError, match="synthetic constructor failure"):
+        if asynchronous:
+            await model.ainvoke("unused")
+        else:
+            model.invoke("unused")
+    assert key.active_requests == 0
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_pooled_key_retries_share_one_deadline(monkeypatch, asynchronous):
+    import contrib.batch_scan.api_pool as api_pool
+
+    clock = [0.0]
+    monkeypatch.setattr(api_pool, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    limits, releases = [], []
+    key = object()
+    pool = SimpleNamespace(
+        acquire=lambda **kwargs: key,
+        try_acquire=lambda: key,
+        release=lambda key, **kwargs: releases.append(kwargs),
+    )
+    model = api_pool.PooledChatModel(pool, timeout=2, max_retries=5)
+
+    def invoke(prompt):
+        clock[0] += 1
+        raise RuntimeError("429 rate limit")
+
+    async def ainvoke(prompt):
+        return invoke(prompt)
+
+    def build(key, *, timeout):
+        limits.append(timeout)
+        return SimpleNamespace(invoke=invoke, ainvoke=ainvoke)
+
+    monkeypatch.setattr(model, "_build_llm", build)
+    with pytest.raises(llm_analyzer_base.LLMRuntimeLimitError):
+        if asynchronous:
+            await model.ainvoke("unused")
+        else:
+            model.invoke("unused")
+    assert limits == [2, 1]
+    assert releases == [{"success": False}, {"success": False}]
+
+
+def test_pooled_client_bounds_connect_and_disables_sdk_retries(monkeypatch):
+    import langchain_openai
+
+    from contrib.batch_scan.api_pool import ApiKey, ApiKeyPool, PooledChatModel
+
+    key = ApiKey("synthetic", None, "test")
+    observed = {}
+    monkeypatch.setattr(langchain_openai, "ChatOpenAI", lambda **kw: observed.update(kw))
+    PooledChatModel(ApiKeyPool([key]))._build_llm(key, timeout=0.1)
+    assert observed["timeout"].connect == observed["timeout"].read == 0.1
+    assert observed["max_retries"] == 0
