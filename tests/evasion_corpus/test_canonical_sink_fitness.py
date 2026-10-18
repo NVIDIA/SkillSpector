@@ -97,9 +97,9 @@ def test_corpus_has_min_spellings_per_primitive() -> None:
 # rather than silently regressing to a missed detection.
 
 # behavioral_ast rules that constitute a real dangerous-execution sink detection. A
-# spelling is "detected" if it produces any of these — the precise rule depends on which
-# complementary path fires (the canonical ladders AST1/AST4/AST5/AST6, or AST9 for a
-# literal getattr on an allowlisted name, owned by the getattr branch on `main`).
+# spelling is "detected" if it produces exactly one of these — the precise rule depends on
+# which complementary path fires (the canonical ladders AST1/AST4/AST5/AST6, or AST9 for a
+# literal getattr / module-namespace read of an allowlisted name, owned by `main`).
 _DANGEROUS_EXECUTION_RULES: frozenset[str] = frozenset(
     {"AST1", "AST2", "AST3", "AST4", "AST5", "AST6", "AST9"}
 )
@@ -138,17 +138,25 @@ def _run_taint(code: str) -> list:
 
 @pytest.mark.parametrize("row", EQUIVALENT_SPELLINGS, ids=lambda r: r.label)
 def test_spelling_reaches_ast_sink_rule(row: Spelling) -> None:
-    """Every spelling reaches a dangerous-execution rule in production at full severity.
+    """Every spelling reaches exactly one dangerous-execution rule at full severity.
 
     Proves the chokepoint is actually invoked by production (not merely importable) and
     that the spelling is not silently dropped or downgraded. The exact rule may be a
-    canonical-ladder rule or AST9 (literal getattr, owned by the getattr branch on
-    ``main``) — both are valid sink detections — so the assertion targets the
-    dangerous-execution rule set plus a minimum-severity floor.
+    canonical-ladder rule or AST9 (literal getattr / module-namespace reflection, owned
+    by the reflective branches on ``main``) — both are valid sink detections — but never
+    both: one expression must yield one sink finding, so the canonical fallback and AST9
+    stay complementary rather than double-reporting. Only the sink invocation's own line
+    is counted, so a snippet whose setup line is itself a sink (``module_from_spec`` ahead
+    of ``spec.loader.exec_module``) is not mistaken for a double report.
     """
     findings = _run_ast(row.code)
-    sink_findings = [f for f in findings if f.rule_id in _DANGEROUS_EXECUTION_RULES]
-    assert sink_findings, f"{row.label}: no sink rule, got {[f.rule_id for f in findings]}"
+    sink_line = _outermost_call(row.code).lineno
+    sink_findings = [
+        f for f in findings if f.rule_id in _DANGEROUS_EXECUTION_RULES and f.start_line == sink_line
+    ]
+    assert len(sink_findings) == 1, (
+        f"{row.label}: expected exactly one sink rule, got {[f.rule_id for f in findings]}"
+    )
     best = max(_SEVERITY_ORDER[f.severity] for f in sink_findings)
     assert best >= _SEVERITY_ORDER[_MIN_SEVERITY[row.canonical]], (
         f"{row.label}: severity downgrade, got {[(f.rule_id, f.severity) for f in sink_findings]}"
@@ -207,3 +215,26 @@ def test_direct_subprocess_stays_medium() -> None:
 def test_neighbour_produces_no_ast_findings(neighbour: Neighbour) -> None:
     """Benign look-alikes produce zero behavioral_ast findings in production."""
     assert _run_ast(neighbour.code) == []
+
+
+# Every reflective read AST9 reports on `main` (getattr incl. constant-joined names,
+# module-namespace subscript, and its .get/.setdefault/.pop reads). The canonical
+# fallback must stay silent on all of them, even for spellings it does not resolve
+# today, so the one-expression/one-finding invariant survives the layer growing.
+_AST9_OWNED_READS: tuple[str, ...] = (
+    'import os\ngetattr(os, "system")(x)',
+    'import os\ngetattr(os, "".join(["sys", "tem"]))(x)',
+    'import os\nos.__dict__["system"](x)',
+    'import os as o\nvars(o)["system"](x)',
+    'import builtins\nbuiltins.__dict__["exec"](x)',
+    'import os\nos.__dict__.get("system")(x)',
+    'import builtins\nvars(builtins).pop("exec")(x)',
+)
+
+
+@pytest.mark.parametrize("code", _AST9_OWNED_READS)
+def test_ast9_owned_read_reports_once(code: str) -> None:
+    """An AST9-owned reflective read yields AST9 alone, never a second ladder finding."""
+    findings = _run_ast(code)
+    sink_rules = [f.rule_id for f in findings if f.rule_id in _DANGEROUS_EXECUTION_RULES]
+    assert sink_rules == ["AST9"], f"expected only AST9, got {sink_rules}"
