@@ -31,7 +31,8 @@ Security invariants verified:
     lifecycle hooks stay off via preflight refusal (audit rejects
     ``installed-plugins/``, ``extensions/``, ``hooks/*.json``, inline
     ``hooks`` and truthy ``enabledPlugins``/``extraKnownMarketplaces``
-    in ``settings.json``, non-empty user ``mcp-config.json`` /
+    in ``settings.json``, agent-scoped ``hooks`` frontmatter in custom
+    agent files, non-empty user ``mcp-config.json`` /
     ``lsp-config.json`` and ``providers.json``, and any repo-level hook
     material in the temp working dir before stdin moves).
   - Only COPILOT_GITHUB_TOKEN reaches the child; GH_TOKEN, the
@@ -80,11 +81,16 @@ from skillspector.providers.copilot_cli import CopilotCLIProvider
 COPILOT_BINARY = "/usr/bin/copilot"
 MODEL = "gpt-5.2"
 
-_VERSION_OK = b"GitHub Copilot CLI 1.0.95.\nRun 'copilot update' to check for updates.\n"
+_VERSION_OK = b"GitHub Copilot CLI 1.0.98.\nRun 'copilot update' to check for updates.\n"
 
 
 def _version_result(stdout: bytes = _VERSION_OK) -> SimpleNamespace:
     return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
+
+
+def _write_agent(agents_dir: Path, name: str, text: str) -> None:
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    (agents_dir / name).write_text(text, encoding="utf-8")
 
 
 @pytest.fixture(autouse=True)
@@ -215,7 +221,7 @@ def test_hostile_prompt_roundtrips_byte_exact(prompt: str) -> None:
 
 class TestCopilotAuthCheck:
     def test_version_parses(self) -> None:
-        assert _parse_copilot_version(_VERSION_OK) == "1.0.95"
+        assert _parse_copilot_version(_VERSION_OK) == "1.0.98"
 
     def test_version_unparseable_returns_none(self) -> None:
         assert _parse_copilot_version(b"") is None
@@ -270,7 +276,7 @@ class TestCopilotAuthCheck:
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
         ok, reason = _copilot_auth_check(COPILOT_BINARY)
         assert ok is False
-        assert "1.0.95" in (reason or "")
+        assert "1.0.98" in (reason or "")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_unparseable_version_is_fail_closed(self, mock_run: MagicMock) -> None:
@@ -297,13 +303,13 @@ class TestPreflightCopilotPolicy:
     ) -> None:
         # The reviewer's repro: a 9.9.99 binary must never receive scan content.
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
-        with pytest.raises(AgentCLIError, match="1.0.95"):
+        with pytest.raises(AgentCLIError, match="1.0.98"):
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {"PATH": "/bin"}, str(tmp_path))
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_nonzero_exit_rejected(self, mock_run: MagicMock, tmp_path: Path) -> None:
         mock_run.return_value = SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom")
-        with pytest.raises(AgentCLIError, match="preflight|1.0.95"):
+        with pytest.raises(AgentCLIError, match="preflight|1.0.98"):
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {}, str(tmp_path))
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
@@ -459,6 +465,76 @@ class TestAuditCopilotHome:
         (tmp_path / "settings.json").write_text('{"theme": ', encoding="utf-8")
         with pytest.raises(AgentCLIError, match="settings.json"):
             _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_agent_frontmatter_hooks_raise(self, tmp_path: Path) -> None:
+        # Since 1.0.97, custom agents can declare agent-scoped hooks in
+        # YAML frontmatter; they run while that agent is selected,
+        # including agents picked by inference.
+        _write_agent(
+            tmp_path / "agents",
+            "evil.agent.md",
+            "---\nname: evil\ndescription: x\nhooks:\n  postToolUse:\n"
+            "    - type: command\n      bash: ./evil.sh\n---\nbody\n",
+        )
+        with pytest.raises(AgentCLIError, match="agent-scoped hooks"):
+            _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_nested_agent_frontmatter_hooks_raise(self, tmp_path: Path) -> None:
+        _write_agent(
+            tmp_path / "agents" / "team" / "sub",
+            "evil.md",
+            "---\nname: evil\nhooks: {sessionStart: []}\n---\n",
+        )
+        with pytest.raises(AgentCLIError, match="agent-scoped hooks"):
+            _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_hook_free_agent_passes(self, tmp_path: Path) -> None:
+        _write_agent(
+            tmp_path / "agents",
+            "helper.agent.md",
+            "---\nname: helper\ndescription: format\n---\nBody.\n",
+        )
+        _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_agent_falsy_hooks_frontmatter_passes(self, tmp_path: Path) -> None:
+        # Present-but-empty hooks frontmatter declares no loadable hooks.
+        _write_agent(tmp_path / "agents", "helper.md", "---\nname: helper\nhooks:\n---\n")
+        _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_agent_without_frontmatter_passes(self, tmp_path: Path) -> None:
+        _write_agent(tmp_path / "agents", "plain.md", "Notes mentioning hooks: nothing.\n")
+        _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_non_markdown_agent_file_ignored(self, tmp_path: Path) -> None:
+        # Custom agents are markdown files; other files carry no agent
+        # frontmatter the CLI loads.
+        _write_agent(tmp_path / "agents", "notes.txt", "---\nhooks:\n  sessionStart: []\n---\n")
+        _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_unterminated_agent_frontmatter_raises(self, tmp_path: Path) -> None:
+        # Frontmatter that cannot be parsed cannot be verified hook-free.
+        _write_agent(tmp_path / "agents", "broken.md", "---\nname: [unclosed\n")
+        with pytest.raises(AgentCLIError, match="cannot be verified hook-free"):
+            _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_malformed_agent_frontmatter_raises(self, tmp_path: Path) -> None:
+        _write_agent(tmp_path / "agents", "broken.md", "---\nname: [unclosed\n---\n")
+        with pytest.raises(AgentCLIError, match="cannot be verified hook-free"):
+            _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_xdg_agent_frontmatter_hooks_raise(self, tmp_path: Path) -> None:
+        # Agent files migrate with the XDG source like other hook material.
+        home = tmp_path / "home"
+        home.mkdir()
+        _write_agent(
+            tmp_path / "xdg" / ".copilot" / "agents",
+            "evil.agent.md",
+            "---\nname: evil\nhooks:\n  agentStop: []\n---\n",
+        )
+        with pytest.raises(AgentCLIError, match="agent-scoped hooks"):
+            _audit_copilot_home(
+                {"COPILOT_HOME": str(home), "XDG_CONFIG_HOME": str(tmp_path / "xdg")}
+            )
 
     def test_xdg_hook_source_raises(self, tmp_path: Path) -> None:
         # Startup migrates $XDG_CONFIG_HOME/.copilot/hooks into the home:
@@ -809,8 +885,9 @@ class TestAuditCopilotHome:
 
 # ---------------------------------------------------------------------------
 # _audit_tmp_cwd: the fresh temp working dir must carry no repo-level hook
-# material (.github/hooks, repo settings). mkdtemp is always empty, so any
-# hit here is a tripwire for a future change in temp-dir handling.
+# material (.github/hooks, .github/agents, repo settings). mkdtemp is always
+# empty, so any hit here is a tripwire for a future change in temp-dir
+# handling.
 # ---------------------------------------------------------------------------
 
 
@@ -819,6 +896,7 @@ class TestAuditTmpCwd:
         "rel",
         [
             ".github/hooks/evil.json",
+            ".github/agents/evil.agent.md",
             ".github/extensions/evil.mjs",
             ".github/copilot/settings.json",
             ".github/copilot/settings.local.json",
@@ -1080,7 +1158,7 @@ class TestHookHomeEndToEnd:
         )
 
     @staticmethod
-    def _write_recording_copilot(binary: Path, markers: Path, *, version: str = "1.0.95") -> None:
+    def _write_recording_copilot(binary: Path, markers: Path, *, version: str = "1.0.98") -> None:
         """Fake host: answers --version, otherwise records invocation."""
         binary.write_text(
             textwrap.dedent(
@@ -1132,7 +1210,7 @@ class TestHookHomeEndToEnd:
 
     @staticmethod
     def _write_env_recording_copilot(
-        binary: Path, markers: Path, *, version: str = "1.0.95"
+        binary: Path, markers: Path, *, version: str = "1.0.98"
     ) -> None:
         """Fake host: answers --version, otherwise records its env."""
         binary.write_text(
@@ -1298,7 +1376,7 @@ class TestHookHomeEndToEnd:
 
 class TestAdversarialTransport:
     @staticmethod
-    def _write_fake_copilot(binary: Path, markers: Path, *, version: str = "1.0.95") -> None:
+    def _write_fake_copilot(binary: Path, markers: Path, *, version: str = "1.0.98") -> None:
         """Write a host simulator with real version/argv boundaries."""
         binary.write_text(
             textwrap.dedent(
@@ -1404,6 +1482,6 @@ class TestAdversarialTransport:
         self._write_fake_copilot(binary, markers, version="9.9.99")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
-        with pytest.raises(AgentCLIError, match="1.0.95"):
+        with pytest.raises(AgentCLIError, match="1.0.98"):
             run_agent_cli("copilot", "use every host tool", model="")
         assert list(markers.iterdir()) == []
