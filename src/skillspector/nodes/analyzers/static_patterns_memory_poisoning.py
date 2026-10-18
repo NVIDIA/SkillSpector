@@ -300,6 +300,63 @@ def _is_layout_only_span(span: str, max_cosmetic_span: int = _MAX_LAYOUT_ONLY_SP
     return True
 
 
+_TABLE_DELIMITER_CELL = re.compile(r"^\s*:?-+:?\s*$")
+
+
+def _markdown_table_cells(line: str) -> list[str] | None:
+    """Return cells for an outer-pipe Markdown row, or ``None`` otherwise."""
+    stripped = line.strip()
+    if not (stripped.startswith("|") and stripped.endswith("|")):
+        return None
+    return stripped[1:-1].split("|")
+
+
+def _markdown_table_line_spans(content: str) -> list[tuple[int, int]]:
+    """Return (start, end) offsets of lines belonging to a proven Markdown table.
+
+    A table is proven by a header row immediately followed by a delimiter row
+    with the same number of cells; following rows belong to the table while
+    they keep that cell count. This mirrors the proven-table rule already used
+    for the P9 / whitespace-padding analyzers: aligned table rows repeat cell
+    text and padding by construction, so the MP2 repetition pattern must not
+    treat that layout repetition as context-window stuffing.
+    """
+    lines: list[tuple[int, int, str]] = []
+    pos = 0
+    for line_break in LOGICAL_LINE_BREAK.finditer(content):
+        lines.append((pos, line_break.start(), content[pos : line_break.start()]))
+        pos = line_break.end()
+    lines.append((pos, len(content), content[pos:]))
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index + 1 < len(lines):
+        header = _markdown_table_cells(lines[index][2])
+        delimiter = _markdown_table_cells(lines[index + 1][2])
+        if (
+            header
+            and delimiter
+            and len(header) == len(delimiter)
+            and all(_TABLE_DELIMITER_CELL.fullmatch(cell) for cell in delimiter)
+        ):
+            spans.append((lines[index][0], lines[index][1]))
+            spans.append((lines[index + 1][0], lines[index + 1][1]))
+            row_index = index + 2
+            while row_index < len(lines):
+                row = _markdown_table_cells(lines[row_index][2])
+                if row is None or len(row) != len(header):
+                    break
+                spans.append((lines[row_index][0], lines[row_index][1]))
+                row_index += 1
+            index = row_index
+            continue
+        index += 1
+    return spans
+
+
+def _is_markdown_table_span(spans: list[tuple[int, int]], offset: int) -> bool:
+    return any(start <= offset < end for start, end in spans)
+
+
 def _bounded_previous_nonblank_line(content: str, offset: int) -> tuple[str, bool]:
     """Return the prior nonblank logical line and whether it was complete."""
     window_start = max(0, offset - 512)
@@ -540,6 +597,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     complete_match=match.group(0),
                 )
             )
+    table_spans = _markdown_table_line_spans(content) if file_type == "markdown" else []
     for pattern, confidence in MP2_PATTERNS:
         matches = (
             static_runner.iter_paragraph_matches
@@ -549,6 +607,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             span = match.group(0)
             if _is_layout_only_span(span):
+                continue
+            if (
+                (pattern, confidence) not in MP2_PROSE_PATTERNS
+                and table_spans
+                and _is_markdown_table_span(table_spans, match.start())
+            ):
                 continue
             non_ws_chars = set(span) - {" ", "\t", "\n", "\r"}
             if len(non_ws_chars) <= 1 and not any(c in span for c in (" ", "\t")):
