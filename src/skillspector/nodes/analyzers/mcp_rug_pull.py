@@ -129,11 +129,12 @@ _RP1_NPX_CMD = re.compile(
 )
 _RP1_CONFIG_RUNNER = re.compile(
     r"^(?P<indent>[ \t]*)(?P<item>-[ \t]+)?(?:command|cmd)[ \t]*:[ \t]*"
-    r"(?P<quote>[\"']?)(?P<runner>(?:[^\s\"'#]*/)?p?npx)(?P=quote)[ \t]*(?:#.*)?$",
+    r"(?P<quote>[\"'])?(?P<runner>(?:[^\s\"'#]*/)?p?npx)"
+    r"(?(quote)(?P=quote)|(?=[ \t]|$))[ \t]*(?:#.*)?$",
     re.IGNORECASE,
 )
 _RP1_CONFIG_ARGS = re.compile(
-    r"^(?P<indent>[ \t]*)(?P<item>-[ \t]+)?args[ \t]*:[ \t]*(?P<value>.*)$",
+    r"^(?P<indent>[ \t]*)(?P<item>-[ \t]+)?(?:args|\"args\"|'args')[ \t]*:[ \t]*(?P<value>.*)$",
     re.IGNORECASE,
 )
 _RP1_CONFIG_KEY = re.compile(

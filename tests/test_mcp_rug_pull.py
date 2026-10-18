@@ -318,6 +318,102 @@ def test_rp1_yaml_mapping_indicator_requires_separator(line, is_key):
     assert bool(_RP1_CONFIG_KEY.match(line)) is is_key
 
 
+@pytest.mark.parametrize("runner", ["npx", "pnpx", "/usr/bin/npx"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("RUNNER#suffix", False),
+        ("RUNNER#", False),
+        ('"RUNNER#suffix"', False),
+        ("'RUNNER#suffix'", False),
+        ("RUNNER # comment", True),
+        ('"RUNNER"# comment', True),
+        ("'RUNNER'# comment", True),
+        ('"RUNNER" # comment', True),
+        ("RUNNER", True),
+    ],
+)
+def test_rp1_yaml_runner_hash_boundaries(runner, newline, value, expected):
+    value = value.replace("RUNNER", runner)
+    content = f'mcpServers:\n  fs:\n    command: {value}\n    args: ["@scope/server"]\n'
+    content = content.replace("\n", newline)
+    parsed = yaml.safe_load(content)["mcpServers"]["fs"]
+    assert (parsed["command"] == runner) is expected
+    matches = _iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml")
+    assert len(matches) == int(expected)
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == int(expected)
+
+
+@pytest.mark.parametrize("runner", ["npx", "pnpx", "/usr/bin/npx"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_rp1_yaml_runner_tab_comment_retains_existing_scanner_behavior(runner, newline):
+    # PyYAML rejects raw tab separators; this is a scanner compatibility control,
+    # separate from the parsed-YAML oracle above.
+    content = f'command: {runner}\t# comment\nargs: ["@scope/server"]\n'.replace("\n", newline)
+    matches = _iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml")
+    assert len(matches) == 1
+    assert matches[0][2] == "@scope/server"
+
+
+@pytest.mark.parametrize("key", ["args", '"args"', "'args'"])
+@pytest.mark.parametrize("layout", ["mapping", "list"])
+@pytest.mark.parametrize("args_first", [False, True])
+@pytest.mark.parametrize("flow", [False, True])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("pinned", [False, True])
+def test_rp1_yaml_quoted_args_keys(key, layout, args_first, flow, newline, pinned):
+    package = "@scope/server@1.2.3" if pinned else "@scope/server"
+    header, indent = (
+        ("mcpServers:\n  fs:\n", "    ") if layout == "mapping" else ("servers:\n", "  ")
+    )
+    command = "command: npx\n"
+    args = (
+        f'{key}: ["-y", "{package}"]\n'
+        if flow
+        else f'{key}:\n{indent}- -y\n{indent}- "{package}"\n'
+    )
+    first, second = (args, command) if args_first else (command, args)
+    marker = "- " if layout == "list" else indent
+    content = (header + marker + first + indent + second).replace("\n", newline)
+    parsed = yaml.safe_load(content)
+    server = parsed["mcpServers"]["fs"] if layout == "mapping" else parsed["servers"][0]
+    assert server == {"command": "npx", "args": ["-y", package]}
+    matches = _iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml")
+    assert len(matches) == 1
+    assert matches[0][2] == package
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == (0 if pinned else 1)
+    if rp1:
+        assert rp1[0].start_line == next(
+            i for i, line in enumerate(content.splitlines(), 1) if "command:" in line
+        )
+
+
+@pytest.mark.parametrize("key", ['"args"', "'args'"])
+@pytest.mark.parametrize("layout", ["mapping", "list"])
+@pytest.mark.parametrize("args_first", [False, True])
+def test_rp1_yaml_quoted_args_do_not_cross_server_boundaries(key, layout, args_first):
+    command = "command: npx\n"
+    args = f'{key}: ["@scope/server"]\n'
+    first, second = (args, command) if args_first else (command, args)
+    content = (
+        f"mcpServers:\n  first:\n    {first}  second:\n    {second}"
+        if layout == "mapping"
+        else f"servers:\n  - {first}  - {second}"
+    )
+    assert yaml.safe_load(content) is not None
+    assert not _iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml")
+    assert not [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+
+
 @pytest.mark.parametrize("direction", ["before", "after"])
 @pytest.mark.parametrize("at_limit", [True, False])
 def test_rp1_yaml_physical_search_hard_limit(direction, at_limit):
