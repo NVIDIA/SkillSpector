@@ -86,8 +86,30 @@ _ZERO_WIDTH_PATTERN = "[" + "".join(sorted(ZERO_WIDTH_CHARS)) + "]"
 # paired controls can, which is the same line GCC's -Wbidi-chars draws by
 # default. Do not add them here without revisiting that tradeoff.
 _BIDI_CONTROL_PATTERN = r"[\u202a-\u202e\u2066-\u2069]"
+# Treat separators, lower-to-upper transitions, and acronym-to-PascalCase transitions as
+# identifier boundaries without matching keyword prefixes in ordinary alphanumeric words.
+_P2_IDENTIFIER_START = (
+    r"(?:(?<![^\W_])|(?<=(?-i:[a-z0-9]))(?=(?-i:[A-Z]))|(?<=(?-i:[A-Z]))(?=(?-i:[A-Z][a-z])))"
+)
+_P2_IDENTIFIER_END = (
+    r"(?:(?![^\W_])|(?<=(?-i:[a-z0-9]))(?=(?-i:[A-Z]))|(?<=(?-i:[A-Z]))(?=(?-i:[A-Z][a-z])))"
+)
+# Keywords that are rarely part of ordinary words also match inside run-together
+# text such as PLEASEIGNOREPREVIOUSINSTRUCTIONS, which has no separator or case
+# transition to split on. Keywords that commonly start ordinary words (SYSTEMATIC,
+# POSTGRES, GETTING, target, sending) keep identifier boundaries.
+_P2_COMMENT_KEYWORD = (
+    rf"(?:{_P2_IDENTIFIER_START}(?:system|POST|GET|send){_P2_IDENTIFIER_END}"
+    r"|ignore|instructions?|transmit)"
+)
 P2_PATTERNS = [
-    (r"<!--.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?-->", 0.7),
+    (
+        # "<!-->" and "<!--->" are abrupt empty comments: the HTML tokenizer
+        # closes them immediately, so the text after them is visible. Never
+        # start a hidden-comment match there.
+        rf"<!--(?!-?>)(?:(?!--!?>).)*?{_P2_COMMENT_KEYWORD}(?:(?!--!?>).)*?--!?>",
+        0.7,
+    ),
     (r"\[//\]:\s*#\s*\(.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?\)", 0.8),
     (_ZERO_WIDTH_PATTERN, 0.6),
     (r"data:text/plain;base64,[A-Za-z0-9+/=]{50,}", 0.7),
