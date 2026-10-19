@@ -362,7 +362,7 @@ def analyze(
                     complete_match=match.group(0),
                 )
             )
-    if file_type in ("markdown", "perl", "other"):
+    if file_type in ("markdown", "perl", "powershell", "other"):
         for pattern_source, confidence in P2_PATTERNS:
             for match in _p2_pattern_matches(content, pattern_source, check_runtime):
                 runtime_check()
