@@ -115,6 +115,7 @@ class TestMiniMaxProvider:
         assert provider.get_context_length("MiniMax-M3.1-Flash") == 1_000_000
         assert provider.get_max_output_tokens("MiniMax-M3.1-Flash") == 524_288
         assert provider.get_context_length("MiniMax-M3") == 1_000_000
+        assert provider.get_context_length("MiniMax-M2.7") == 204_800
         assert provider.get_max_output_tokens("MiniMax-M3") is None
 
     def test_selector_uses_minimax_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -223,7 +224,24 @@ def test_scanner_serializes_default_and_explicit_models(
     assert request.headers["authorization"] == "Bearer test-key"
     assert body["model"] == (model or "MiniMax-M3.1-Flash")
     assert body["max_completion_tokens"] > 0
+    if model == "MiniMax-M2.7":
+        assert body["max_completion_tokens"] == 51_200
     assert not {"service_tier", "reasoning_split", "thinking", "reasoning_effort"} & body.keys()
+
+
+def test_saved_registry_budget_and_schema_remain_effective(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, requests: list[httpx.Request]
+) -> None:
+    saved_registry = tmp_path / "models.yaml"
+    saved_registry.write_text(
+        "models:\n  MiniMax-M2.7:\n    context_length: 80000\n"
+        "    max_output_tokens: 8192\n    structured_output: json_mode\n"
+    )
+    monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(saved_registry))
+    monkeypatch.setenv("SKILLSPECTOR_MODEL", "MiniMax-M2.7")
+    get_chat_model().invoke("Inspect this skill")
+    assert json.loads(requests[0].content)["max_completion_tokens"] == 8192
+    assert MiniMaxProvider().structured_output_method("MiniMax-M2.7") == "json_mode"
 
 
 @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])

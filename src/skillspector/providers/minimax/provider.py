@@ -97,7 +97,11 @@ class MiniMaxProvider:
         return registry.lookup_structured_output_method(REGISTRY_PATH, model) or "function_calling"
 
     def get_context_length(self, model: str) -> int | None:
-        return registry.lookup_context_length(REGISTRY_PATH, model)
+        context_length = registry.lookup_context_length(REGISTRY_PATH, model)
+        if context_length is None and not os.environ.get("SKILLSPECTOR_MODEL_REGISTRY", "").strip():
+            # Keep explicit legacy requests' budget without advertising them in the catalog.
+            return {"MiniMax-M2.7": 204_800}.get(model)
+        return context_length
 
     def get_max_output_tokens(self, model: str) -> int | None:
         return registry.lookup_max_output_tokens(REGISTRY_PATH, model)
