@@ -176,12 +176,9 @@ _CLOUD_DOWNLOAD_AWS_VALUE_OPTIONS = frozenset({"--region", "--profile", "--inclu
 _CLOUD_DOWNLOAD_SHELL_META = re.compile(r"[;&|<>(){}\[\]*?$\x60%!#~\x00-\x1f\x7f]")
 _CLOUD_DOWNLOAD_BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]*")
 _CLOUD_DOWNLOAD_CONTEXT_CHARS = 4_096
-_CLOUD_DOWNLOAD_PREFIX_META = re.compile(r"""[\\'"$\x60]""")
-_CLOUD_COMMAND_REDEFINITION = re.compile(
-    r"\b(?:alias|function|source|eval|trap)\b"
-    r"|(?:^|[;\r\n])[ \t]*\.[ \t]+"
-    r"|\([ \t\r\n]*\)"
-    r"|\bPATH\s*\+?="
+_CLOUD_DOWNLOAD_SETUP = re.compile(
+    r"""[\\'"$\x60]|\b(?:alias|function|source|eval|trap)\b"""
+    r"|(?:^|[;\r\n])[ \t]*\.[ \t]+|\([ \t\r\n]*\)|\bPATH\s*\+?="
 )
 
 
@@ -206,9 +203,7 @@ def _is_literal_cloud_download(
         content, offset, ()
     ):
         return False
-    if _CLOUD_DOWNLOAD_PREFIX_META.search(content, 0, offset) or _CLOUD_COMMAND_REDEFINITION.search(
-        content, 0, offset
-    ):
+    if _CLOUD_DOWNLOAD_SETUP.search(content, 0, offset):
         # Quotes, escapes or expansions can conceal alias/setup command names.
         # Without evaluating that setup, retain the existing upload evidence.
         return False
@@ -220,14 +215,14 @@ def _is_literal_cloud_download(
         return False
     if tokens[:3] in (["aws", "s3", "cp"], ["aws", "s3", "sync"]):
         scheme = "s3://"
-        arguments = tokens[3:]
+        arguments = iter(tokens[3:])
         flags = _CLOUD_DOWNLOAD_AWS_FLAGS
         if tokens[2] == "cp":
             flags = flags | {"--recursive"}
         value_options = _CLOUD_DOWNLOAD_AWS_VALUE_OPTIONS
     elif tokens[:2] in (["gsutil", "cp"], ["gsutil", "rsync"]):
         scheme = "gs://"
-        arguments = tokens[2:]
+        arguments = iter(tokens[2:])
         flags = frozenset({"-r"})
         value_options = frozenset()
     else:
@@ -235,21 +230,17 @@ def _is_literal_cloud_download(
         return False
 
     operands: list[str] = []
-    index = 0
-    while index < len(arguments):
-        argument = arguments[index]
+    for argument in arguments:
         if argument in flags:
-            index += 1
             continue
         if argument in value_options:
-            index += 1
-            if index == len(arguments) or not arguments[index] or arguments[index].startswith("-"):
+            value = next(arguments, "")
+            if not value or value.startswith("-"):
                 return False
         elif argument.startswith("-"):
             return False
         else:
             operands.append(argument)
-        index += 1
     if len(operands) != 2:
         return False
     source, destination = operands
@@ -648,7 +639,7 @@ def analyze(
                 )
             )
     # E5: retain uploads and uncertain directions; lower only proven downloads.
-    line_starts = logical_line_starts(content)
+    line_starts = logical_line_starts(content[: _CLOUD_DOWNLOAD_CONTEXT_CHARS + 1])
     for pattern, confidence in E5_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             if _is_literal_cloud_download(
