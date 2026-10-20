@@ -88,6 +88,17 @@ def test_literal_cloud_download_does_not_report_exfiltration(command: str) -> No
         "aws s3 cp s3://example-bucket/public.csv https://example.invalid/public.csv",
         "aws s3 cp s3://example-bucket/public.csv ./public.csv # trailing comment",
         "aws s3 cp s3://example-bucket/public.csv " + "x" * 4200,
+        "aws s3 cp s3://example-bucket/public.csv //server/share/public.csv",
+        r"aws s3 cp s3://example-bucket/public.csv \\server\share\public.csv",
+        "aws s3 cp s3://example-bucket/public.csv /dev/stdout",
+        "aws s3 cp s3://example-bucket/public.csv /tmp/../dev/stdout",
+        "aws s3 cp s3://example-bucket/public.csv /proc/self/fd/1",
+        "aws s3 cp s3://example-bucket/public.csv %DEST%",
+        "aws s3 cp s3://example-bucket/public.csv !DEST!",
+        "aws s3 cp s3://example-bucket/public.csv ~/public.csv",
+        "(\naws s3 cp s3://example-bucket/public.csv ./public.csv\n)",
+        "{\naws s3 cp s3://example-bucket/public.csv ./public.csv\n}",
+        'echo "$(\naws s3 cp s3://example-bucket/public.csv ./public.csv\n)"',
     ],
 )
 def test_upload_or_unproved_direction_keeps_cloud_finding(command: str) -> None:
@@ -143,6 +154,64 @@ def test_runner_keeps_upload_after_a_download_without_changing_source_offsets() 
     assert e5[0].start_line == 3
     assert e5[0].start_column == 0
     assert e5[0].matched_text == "aws s3 cp"
+
+
+@pytest.mark.parametrize(
+    "path, file_type",
+    [
+        ("download.ps1", "shell"),
+        ("download.bat", "shell"),
+        ("download.cmd", "shell"),
+        ("helper.py", "python"),
+        ("helper.js", "javascript"),
+    ],
+)
+def test_other_host_language_syntax_keeps_legacy_cloud_evidence(path: str, file_type: str) -> None:
+    findings = data_exfiltration.analyze(
+        "aws s3 cp s3://example-bucket/public.csv ./public.csv", path, file_type
+    )
+    assert any(finding.rule_id == "E5" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "alias aws=custom\n",
+        "alias 'aws=custom'\n",
+        "al\\ias aws=custom\n",
+        "al''ias aws=custom\n",
+        'aws() { custom "$@"; }\n',
+        'aws ()\n{\n custom "$@"\n}\n',
+        'function aws { custom "$@"; }\n',
+        'a\\ws() { custom "$@"; }\n',
+        "source ./plugin.sh\n",
+        ". ./plugin.sh\n",
+        "\\. ./plugin.sh\n",
+        "so''urce ./plugin.sh\n",
+        'eval "$setup"\n',
+        'trap "$setup" DEBUG\n',
+        "PATH=./tools\n",
+    ],
+)
+def test_visible_command_redefinition_keeps_cloud_finding(prefix: str) -> None:
+    findings = data_exfiltration.analyze(
+        prefix + "aws s3 cp s3://example-bucket/public.csv ./public.csv",
+        "download.sh",
+        "shell",
+    )
+    assert any(finding.rule_id == "E5" for finding in findings)
+
+
+def test_large_prefix_cannot_forget_an_earlier_alias() -> None:
+    content = (
+        "alias aws=custom\n# " + "x" * 4500 + "\n"
+        "aws s3 cp s3://example-bucket/public.csv ./public.csv\n"
+    )
+    findings = static_runner.run_static_patterns(
+        {"components": ["transfer.sh"], "file_cache": {"transfer.sh": content}},
+        [data_exfiltration],
+    )
+    assert any(finding.rule_id == "E5" for finding in findings)
 
 
 def test_real_cli_download_passes_strict_static_policy(tmp_path: Path) -> None:
