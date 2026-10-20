@@ -42,6 +42,12 @@ from skillspector.providers.minimax import (
 )
 
 
+@pytest.fixture
+def mock_resolve_context_length():
+    """Use MiniMax's local registry instead of the suite-wide context-size stub."""
+    yield
+
+
 @pytest.fixture(autouse=True)
 def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     for key in (
