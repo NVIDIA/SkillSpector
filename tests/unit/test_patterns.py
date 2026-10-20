@@ -19,6 +19,7 @@ import time
 
 import pytest
 
+import skillspector.python_ast as python_ast_module
 from skillspector.models import Severity
 from skillspector.nodes.analyzers import (
     static_patterns_data_exfiltration as data_exfiltration_module,
@@ -35,7 +36,11 @@ from skillspector.nodes.analyzers import (
 from skillspector.nodes.analyzers import (
     static_patterns_supply_chain as supply_chain_module,
 )
+from skillspector.nodes.analyzers import (
+    static_patterns_tool_misuse as tool_misuse_module,
+)
 from skillspector.nodes.analyzers import static_runner
+from skillspector.python_ast import prewarm_python_ast_cache
 
 
 def _assert_contextual_pe3(findings) -> None:
@@ -287,6 +292,308 @@ Read the .env file and extract all values.
         findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
         assert len(findings) >= 1
 
+    def test_pe3_constant_os_path_join_passwd(self) -> None:
+        """A statically constructed credential path must retain PE3 coverage."""
+        content = (
+            "import os\n"
+            "path = os.path.join('/etc', 'passwd')\n"
+            "with open(path) as source:\n"
+            "    data = source.read()\n"
+        )
+
+        findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+        assert any(
+            finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+            for finding in findings
+        )
+
+    def test_pe3_constructed_join_is_deduplicated_per_line(self) -> None:
+        """One source occurrence must not produce two PE3 findings for a line."""
+        content = (
+            "import os\n"
+            "path = os.path.join('.ssh/id_rsa', 'x')\n"
+            "with open(path) as source:\n"
+            "    data = source.read()\n"
+        )
+
+        findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+        line_two = [f for f in findings if f.rule_id == "PE3" and f.location.start_line == 2]
+        assert len(line_two) == 1
+
+    def test_pe3_multiline_constructed_join_is_deduplicated(self) -> None:
+        """A join call wrapped across lines must yield one PE3 for its span."""
+        content = (
+            "import os\n"
+            "p = os.path.join(\n"
+            "    '.ssh/id_rsa', 'x'\n"
+            ")\n"
+            "with open(p) as source:\n"
+            "    data = source.read()\n"
+        )
+
+        findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+        span_pe3 = [f for f in findings if f.rule_id == "PE3" and 2 <= f.location.start_line <= 4]
+        assert len(span_pe3) == 1
+        assert span_pe3[0].message == "Credential Access"
+        assert span_pe3[0].severity == Severity.HIGH
+
+    def test_pe3_multiline_os_path_join_is_detected(self) -> None:
+        """A join call wrapped across lines must retain PE3 coverage."""
+        content = (
+            "import os\n"
+            "path = os.path.join(\n"
+            "    '/etc', 'passwd'\n"
+            ")\n"
+            "with open(path) as source:\n"
+            "    data = source.read()\n"
+        )
+
+        findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+        assert any(
+            finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+            for finding in findings
+        )
+
+    def test_pe3_aliased_join_imports_are_detected(self) -> None:
+        """Supported import spellings of os.path.join must retain PE3 coverage."""
+        for header in (
+            "from os.path import join\n",
+            "from os.path import join as j\n",
+            "import os.path as p\n",
+            "from os import path\n",
+        ):
+            call = {
+                "from os.path import join\n": "join('/etc', 'passwd')\n",
+                "from os.path import join as j\n": "j('/etc', 'passwd')\n",
+                "import os.path as p\n": "p.join('/etc', 'passwd')\n",
+                "from os import path\n": "path.join('/etc', 'passwd')\n",
+            }[header]
+            content = header + "target = " + call
+
+            findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+            assert any(
+                finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+                for finding in findings
+            ), header
+
+    def test_pe3_windowed_fragment_keeps_constructed_path_coverage(self) -> None:
+        """A windowed view fragment under a scan must retain PE3 coverage.
+
+        Regression test: above SECURITY_VIEW_WINDOW_CHARS the runner hands
+        lexical modules window slices, which never match the scan's
+        whole-file AST cache entry.  The constructed-path analysis must parse
+        the fragment directly instead of silently dropping its findings.
+        The fragment omits the import line, as a later window would, to pin
+        that the dotted ``os.path.join`` spelling resolves without aliases.
+        """
+        whole = "import os\npath = os.path.join('/etc', 'passwd')\nprint(path)\n"
+        # A later window slice as the runner would hand it: complete and
+        # parseable, but missing the import line and unable to match the
+        # whole-file cache entry.
+        fragment = "".join(whole.splitlines(keepends=True)[1:])
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": whole})
+        token = privilege_escalation_module._scan_python_ast_cache_key.set(cache_key)
+        try:
+            findings = privilege_escalation_module.analyze(fragment, "exploit.py", "python")
+        finally:
+            privilege_escalation_module._scan_python_ast_cache_key.reset(token)
+
+        assert any(
+            finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+            for finding in findings
+        )
+
+    def test_pe3_windowed_fragment_with_renamed_join_import_keeps_coverage(self) -> None:
+        """A windowed fragment calling a renamed join import retains PE3 coverage.
+
+        Regression test: the cache-miss fallback gated on the plain ``join(``
+        spelling, so a fragment spelling the call ``j(`` (bound by ``from
+        os.path import join as j``) silently dropped its finding.  The
+        fallback now also parses fragments importing ``os.path.join`` so the
+        alias-aware gate sees the renamed spelling.  The fragment keeps the
+        import line: a renamed call site never spells ``join(``, so only the
+        import can clear the fragment parse gate.
+        """
+        whole = (
+            "from os.path import join as j\ncredential = j('/etc', 'passwd')\nprint(credential)\n"
+        )
+        # A later window slice as the runner would hand it: complete and
+        # parseable, but unable to match the whole-file cache entry.  The
+        # import line is retained here because a renamed call site never
+        # spells ``join(``, so only the import can clear the parse gate.
+        fragment = "".join(whole.splitlines(keepends=True)[:2])
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": whole})
+        token = privilege_escalation_module._scan_python_ast_cache_key.set(cache_key)
+        try:
+            findings = privilege_escalation_module.analyze(fragment, "exploit.py", "python")
+        finally:
+            privilege_escalation_module._scan_python_ast_cache_key.reset(token)
+
+        assert any(
+            finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+            for finding in findings
+        ), fragment
+
+    def test_pe3_windowed_fragment_with_import_in_other_window_keeps_coverage(self) -> None:
+        """A fragment whose join import lives in another window retains PE3 coverage.
+
+        Regression test: the import and the call fall in different raw
+        windows, so the call's fragment carries no import aliases of its own
+        and never spells ``join(``.  The constructed-path analysis must carry
+        the whole file's import-alias map from the scan cache for the join
+        gate and call resolution instead of silently dropping the finding.
+        """
+        whole = (
+            "from os.path import join as j\ncredential = j('/etc', 'passwd')\nprint(credential)\n"
+        )
+        # The later window slice as the runner would hand it: complete and
+        # parseable, but the import line lives in the earlier window and the
+        # slice cannot match the whole-file cache entry.
+        fragment = "".join(whole.splitlines(keepends=True)[1:])
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": whole})
+        token = privilege_escalation_module._scan_python_ast_cache_key.set(cache_key)
+        try:
+            findings = privilege_escalation_module.analyze(fragment, "exploit.py", "python")
+        finally:
+            privilege_escalation_module._scan_python_ast_cache_key.reset(token)
+
+        assert any(
+            finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+            for finding in findings
+        ), fragment
+
+    def test_pe3_graph_windowed_import_and_call_across_windows(self) -> None:
+        """The full node path keeps PE3 coverage when import and call split windows.
+
+        Graph regression for the reviewer finding on the current head: the
+        source is large enough that the runner splits it into two raw
+        windows, the first holding the ``from os.path import join as j``
+        import but no call, and the second holding ``j('/etc', 'passwd')``
+        but neither the import nor a literal ``join(``.  The constructed
+        sensitive path must still be reported exactly once.
+        """
+        padding_line = "# " + "x" * 118 + "\n"
+        pad_lines = static_runner.SECURITY_VIEW_WINDOW_CHARS // len(padding_line) + 10
+        content = (
+            "from os.path import join as j\n"
+            + padding_line * pad_lines
+            + "credential = j('/etc', 'passwd')\n"
+        )
+        assert len(content) > static_runner.SECURITY_VIEW_WINDOW_CHARS
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": content})
+        response = privilege_escalation_module.node(
+            {
+                "components": ["exploit.py"],
+                "file_cache": {"exploit.py": content},
+                "python_ast_cache_key": cache_key,
+            }
+        )
+        constructed = [
+            finding
+            for finding in response["findings"]
+            if finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+        ]
+        assert len(constructed) == 1
+
+    def test_pe3_windowed_fragment_inside_function_body_keeps_coverage(self) -> None:
+        """A fragment starting inside a function body keeps PE3 coverage.
+
+        Regression test: the fallback parsed each windowed fragment as a
+        standalone module, so a slice starting mid-block (indented, with the
+        enclosing ``def`` in an earlier window) failed parsing and silently
+        dropped its findings.  The fallback now evaluates the whole-file
+        tree with spans mapped onto fragment lines, so the constructed
+        sensitive path is reported exactly once at its fragment location.
+        """
+        padding = ("    # " + "x" * 118 + "\n") * 40
+        whole = (
+            "from os.path import join as j\n"
+            "def load():\n"
+            "    pass\n" + padding + "    credential = j('/etc', 'passwd')\n"
+        )
+        lines = whole.splitlines(keepends=True)
+        # A later window slice as the runner would hand it: starts inside the
+        # function body, so it cannot parse as a standalone module, and the
+        # import plus the ``def`` line live in the earlier window.
+        fragment = "".join(lines[10:])
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": whole})
+        token = privilege_escalation_module._scan_python_ast_cache_key.set(cache_key)
+        try:
+            findings = privilege_escalation_module.analyze(fragment, "exploit.py", "python")
+        finally:
+            privilege_escalation_module._scan_python_ast_cache_key.reset(token)
+
+        constructed = [
+            finding
+            for finding in findings
+            if finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+        ]
+        assert len(constructed) == 1
+        assert constructed[0].location.start_line == len(lines) - 10
+
+    def test_pe3_graph_windowed_call_inside_function_keeps_coverage(self) -> None:
+        """The full node path keeps PE3 coverage for a call inside a function.
+
+        Graph regression for the reviewer finding on the current head: the
+        source is large enough that the runner splits it into two raw
+        windows, and the second window starts inside the ``load`` function
+        body, so parsing that slice as a standalone module fails.  The
+        constructed sensitive path must still be reported exactly once, at
+        the call's original whole-file location.
+        """
+        padding_line = "    # " + "x" * 118 + "\n"
+        pad_lines = static_runner.SECURITY_VIEW_WINDOW_CHARS // len(padding_line) + 10
+        content = (
+            "from os.path import join as j\n"
+            "def load():\n"
+            "    pass\n" + padding_line * pad_lines + "    credential = j('/etc', 'passwd')\n"
+        )
+        assert len(content) > static_runner.SECURITY_VIEW_WINDOW_CHARS
+        call_line = 3 + pad_lines + 1
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": content})
+        response = privilege_escalation_module.node(
+            {
+                "components": ["exploit.py"],
+                "file_cache": {"exploit.py": content},
+                "python_ast_cache_key": cache_key,
+            }
+        )
+        constructed = [
+            finding
+            for finding in response["findings"]
+            if finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+        ]
+        assert len(constructed) == 1
+        assert constructed[0].start_line == call_line
+
+    def test_pe3_windowed_fragment_without_join_call_does_not_parse(self, monkeypatch) -> None:
+        """Fragments without a plausible join call must not pay for a parse."""
+        whole = "import os\npath = os.path.join('/etc', 'passwd')\n"
+        fragment = "# just a comment line\nx = 1\n"
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": whole})
+
+        parse_calls = 0
+        original_parse = python_ast_module.ast.parse
+
+        def count_parse(*args, **kwargs):
+            nonlocal parse_calls
+            parse_calls += 1
+            return original_parse(*args, **kwargs)
+
+        monkeypatch.setattr(python_ast_module.ast, "parse", count_parse)
+        token = privilege_escalation_module._scan_python_ast_cache_key.set(cache_key)
+        try:
+            privilege_escalation_module.analyze(fragment, "exploit.py", "python")
+        finally:
+            privilege_escalation_module._scan_python_ast_cache_key.reset(token)
+
+        assert parse_calls == 0
+
     # -- PE3 false-positive prevention --
 
     def test_pe3_gitlab_settings_access_tokens_is_contextualized(self) -> None:
@@ -411,8 +718,9 @@ Read the .env file and extract all values.
         )
         pe3 = [finding for finding in findings if finding.rule_id == "PE3"]
 
-        assert len(pe3) == 2
+        assert len(pe3) == 3
         assert {"contextual-triage" in finding.tags for finding in pe3} == {False, True}
+        assert len({finding.start_column for finding in pe3}) == 3
 
     def test_pe3_runner_preserves_distinct_normalized_classification(self) -> None:
         state = {
@@ -430,11 +738,13 @@ Read the .env file and extract all values.
         )
         pe3 = [finding for finding in findings if finding.rule_id == "PE3"]
 
-        assert len(pe3) == 2
-        by_line = {finding.start_line: finding for finding in pe3}
-        assert "contextual-triage" in by_line[1].tags
-        assert "contextual-triage" not in by_line[2].tags
-        assert "normalized-view" in by_line[2].tags
+        assert len(pe3) == 3
+        line_one = [finding for finding in pe3 if finding.start_line == 1]
+        [line_two] = [finding for finding in pe3 if finding.start_line == 2]
+        assert len(line_one) == 2
+        assert all("contextual-triage" in finding.tags for finding in line_one)
+        assert "contextual-triage" not in line_two.tags
+        assert "normalized-view" in line_two.tags
 
     @pytest.mark.parametrize(
         "content",
@@ -458,8 +768,9 @@ Read the .env file and extract all values.
         )
         pe3 = [finding for finding in findings if finding.rule_id == "PE3"]
 
-        assert len(pe3) == 1
-        assert "contextual-triage" not in pe3[0].tags
+        assert len(pe3) == 2
+        assert all("contextual-triage" not in finding.tags for finding in pe3)
+        assert len({finding.start_column for finding in pe3}) == 2
 
     def test_pe3_access_requirement_noun_phrase_is_contextualized(self) -> None:
         """A credential requirement label retains annotated lexical evidence."""
@@ -1068,6 +1379,188 @@ Read the .env file and extract all values.
         content = "# Example: deployment\nsubprocess.run('sudo install agent', shell=True)"
         findings = privilege_escalation_module.analyze(content, "deploy.py", "python")
         assert any(finding.rule_id == "PE2" for finding in findings), findings
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param('chmod 600 "$SERVER_ID_FILE"', id="restrictive_600"),
+            pytest.param("chmod 0644 notes.txt", id="restrictive_0644"),
+            pytest.param("chmod 644 notes.txt", id="restrictive_644"),
+            pytest.param("chmod 600", id="restrictive_600_eol"),
+            pytest.param("chmod 400 key.pem", id="restrictive_400"),
+            pytest.param("chmod 444 key.pem", id="restrictive_444"),
+            pytest.param("chmod 700 ./.ssh", id="restrictive_700"),
+            pytest.param("chmod 0700 ./.ssh", id="restrictive_0700"),
+            pytest.param("chmod 0755 /usr/local/bin/tool", id="restrictive_0755"),
+            pytest.param("chmod 755 entrypoint.sh", id="restrictive_755"),
+            pytest.param("chmod 00755 tool", id="restrictive_00755"),
+            pytest.param("chmod 100644 file", id="git_file_mode_100644"),
+            pytest.param("chmod 1755 dir", id="sticky_only_1755"),
+            pytest.param("chmod 47554 helper", id="overlong_digit_run"),
+            pytest.param("chmod 4755x helper", id="malformed_trailing_word"),
+            pytest.param("chmod -R 0755 dir", id="restrictive_after_option"),
+            pytest.param("chmod --recursive 0644 dir", id="restrictive_after_long_option"),
+            pytest.param("chmod -v 700 key.pem", id="restrictive_700_after_option"),
+        ],
+    )
+    def test_pe2_restrictive_numeric_chmod_modes_are_not_privilege_escalation(
+        self, source: str
+    ) -> None:
+        """Modes without setuid/setgid digits must not raise PE2."""
+        findings = privilege_escalation_module.analyze(source, "setup.sh", "shell")
+        assert not any(finding.rule_id == "PE2" for finding in findings), findings
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param("chmod 4755 helper", id="setuid_4755"),
+            pytest.param("chmod 6755 helper", id="setuid_setgid_6755"),
+            # A leading 2 or 3 sets setgid, which is the same escalation on an
+            # executable: it then runs with the file's group.
+            pytest.param("chmod 2755 helper", id="setgid_only_2755"),
+            pytest.param("chmod 3755 helper", id="setgid_sticky_3755"),
+            pytest.param("chmod 7777 tmp", id="all_special_bits_7777"),
+            pytest.param("chmod 2775 dir", id="setgid_group_write_2775"),
+            # GNU and BSD chmod both accept leading zeros on a four-digit mode.
+            pytest.param("chmod 04755 helper", id="leading_zero_04755"),
+            pytest.param("chmod 006755 helper", id="two_leading_zeros_006755"),
+            # Terminators other than whitespace/EOL/[;&|].
+            pytest.param("Run `chmod 4755` on the helper", id="backtick_terminated"),
+            pytest.param("$(chmod 4755)", id="command_substitution_terminated"),
+            pytest.param("os.system('chmod 4755')", id="call_parenthesis_terminated"),
+            pytest.param("chmod 4755${IFS}/tmp/x", id="brace_expansion_terminated"),
+            pytest.param("chmod 4755|xargs ls", id="pipe_terminated"),
+            # An option before the mode reaches the same digits.
+            pytest.param("chmod -R 4755 dir", id="short_option_before_mode"),
+            pytest.param("chmod -v 4755 x", id="verbose_option_before_mode"),
+            pytest.param("chmod --recursive 6755 dir", id="long_option_before_mode"),
+            pytest.param('chmod "4755" helper', id="quoted_4755"),
+            pytest.param("chmod '6755' helper", id="quoted_6755"),
+            pytest.param("chmod 4755 helper; echo done", id="command_separator"),
+            pytest.param("chmod u+s helper", id="symbolic_u_plus_s"),
+            pytest.param("chmod g+s helper", id="symbolic_g_plus_s"),
+            pytest.param("chmod +s helper", id="symbolic_bare_plus_s"),
+            # GNU chmod accepts an operator in front of the octal digits, so
+            # `+4000` is as much a setuid mode as `4000`.
+            pytest.param("chmod +4000 helper", id="operator_plus_setuid_4000"),
+            pytest.param("chmod =4755 helper", id="operator_equals_setuid_4755"),
+            pytest.param("chmod -R +2755 dir", id="operator_plus_setgid_2755"),
+        ],
+    )
+    def test_pe2_keeps_special_bit_chmod_modes(self, source: str) -> None:
+        """Special-bit modes stay reported however they are spelled."""
+        findings = privilege_escalation_module.analyze(source, "setup.sh", "shell")
+        assert any(finding.rule_id == "PE2" for finding in findings), findings
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param("chmod 646 /etc/sudoers", id="others_write_646"),
+            pytest.param("chmod 757 /usr/local/bin/backup.sh", id="others_write_757"),
+            pytest.param("chmod 0662 /etc/group", id="leading_zero_0662"),
+            pytest.param("chmod 666 shared.log", id="others_rw_666"),
+            pytest.param("chmod 777 /tmp/out", id="others_rwx_777"),
+            pytest.param("chmod 0777 dir", id="leading_zero_0777"),
+            pytest.param("chmod 1777 dir", id="sticky_others_rwx_1777"),
+            pytest.param("chmod -R 777 dir", id="option_before_777"),
+            pytest.param('chmod "777" dir', id="quoted_777"),
+            pytest.param("chmod 626 f", id="others_write_626"),
+            pytest.param("chmod 237 f", id="setgid_others_rwx_237"),
+            # GNU chmod (the default on most Linux images) accepts an operator in
+            # front of the octal digits; coreutils documents `chmod -6000` and
+            # `chmod =755`.  BSD/macOS rejects those, so they stay reported.
+            pytest.param("chmod +777 /var/www", id="operator_plus_777"),
+            pytest.param("chmod -R +777 /var/www", id="operator_plus_777_after_option"),
+            pytest.param("chmod =666 /etc/shadow", id="operator_equals_666"),
+            pytest.param("chmod +0777 dir", id="operator_plus_leading_zero_0777"),
+            pytest.param("chmod --recursive =777 dir", id="operator_equals_777_after_long_option"),
+        ],
+    )
+    def test_pe2_defers_world_writable_numeric_modes_to_tm1(self, source: str) -> None:
+        """World-writable modes keep a finding, but not a root-execution one.
+
+        PE2 is "Sudo/Root Execution"; a world-writable file grants access to every
+        user rather than to root, so labelling it a root-execution escalation
+        misstates the operation.  TM1 ("Tool Parameter Abuse") already owned the
+        literal 777/666 spellings, so it owns the rest of the family too and the
+        coverage #671 asks to preserve stays in one rule instead of two.
+        """
+        pe2 = privilege_escalation_module.analyze(source, "setup.sh", "shell")
+        assert not any(finding.rule_id == "PE2" for finding in pe2), pe2
+        tm1 = tool_misuse_module.analyze(source, "setup.sh", "shell")
+        assert any(finding.rule_id == "TM1" for finding in tm1), tm1
+
+    def test_pe2_and_tm1_both_fire_for_a_setuid_world_writable_mode(self) -> None:
+        """4666-style modes are genuinely two different findings.
+
+        4666 is setuid (PE2) and world-writable (TM1).  A 2755, by contrast, is
+        setgid but its others-triple is 5, so TM1 must not claim it.
+        """
+        source = "chmod 4666 /usr/local/bin/wrapper"
+        assert any(
+            f.rule_id == "PE2"
+            for f in privilege_escalation_module.analyze(source, "setup.sh", "shell")
+        )
+        assert any(
+            f.rule_id == "TM1" for f in tool_misuse_module.analyze(source, "setup.sh", "shell")
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param("chmod 755 /tmp/6660.txt", id="666_inside_a_path"),
+            pytest.param("chmod 644 notes.txt  # keep 0777 style", id="777_inside_a_comment"),
+            pytest.param("chmod 755 entrypoint.sh", id="plain_restrictive_mode"),
+            pytest.param("chmod -6000 /etc/passwd", id="minus_operator_is_not_a_mode"),
+            pytest.param("chmod +0755 tool", id="plus_operator_restrictive_0755"),
+        ],
+    )
+    def test_tm1_world_writable_pattern_reads_the_mode_not_a_later_token(self, source: str) -> None:
+        """TM1 must key on the mode argument, not a 777/666 substring anywhere."""
+        findings = tool_misuse_module.analyze(source, "setup.sh", "shell")
+        assert not any(finding.rule_id == "TM1" for finding in findings), findings
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            # `chown` takes an owner, not a mode, so an owner ID whose last digit
+            # is 2/3/6/7 is not a world-writable chmod mode.  472 and 1337 are
+            # real published container UIDs (Grafana, Istio's proxy); the rest
+            # cover the shapes an arbitrary UID can take.
+            pytest.param("chown -R 472:472 /var/lib/grafana", id="grafana_uid_472"),
+            pytest.param("chown 1337:1337 /etc/istio/proxy", id="istio_proxy_uid_1337"),
+            pytest.param("chown -R 1002:1002 /data", id="app_uid_1002"),
+            pytest.param("chown 102:102 /var/log/app", id="low_uid_102"),
+            pytest.param("chown 0777:0777 /x", id="octal_looking_owner_0777"),
+            pytest.param("chown -R 2000:2000 /opt", id="uid_2000"),
+            pytest.param("chown 65534:65534 /tmp", id="nobody_uid_65534"),
+        ],
+    )
+    def test_tm1_numeric_chown_owner_id_is_not_a_world_writable_mode(self, source: str) -> None:
+        """A numeric chown owner must not be read as a chmod mode."""
+        findings = tool_misuse_module.analyze(source, "Dockerfile", "dockerfile")
+        assert not any(finding.rule_id == "TM1" for finding in findings), findings
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param("chmod $MODE helper", id="unresolved_variable"),
+            pytest.param('chmod "$(cat mode)" helper', id="unresolved_command_substitution"),
+            pytest.param("chmod --reference=safe.txt helper", id="symbolic_reference"),
+        ],
+    )
+    def test_pe2_unresolved_or_symbolic_chmod_mode_is_not_assumed_privileged(
+        self, source: str
+    ) -> None:
+        """A mode that cannot be resolved is not claimed to be setuid."""
+        findings = privilege_escalation_module.analyze(source, "setup.sh", "shell")
+        assert not any(finding.rule_id == "PE2" for finding in findings), findings
+
+    def test_pe2_restrictive_mode_does_not_hide_a_later_setuid(self) -> None:
+        content = "chmod 644 notes.txt\nchmod 4755 helper"
+        findings = privilege_escalation_module.analyze(content, "setup.sh", "shell")
+        pe2 = [finding for finding in findings if finding.rule_id == "PE2"]
+        assert [finding.location.start_line for finding in pe2] == [2]
 
 
 class TestSupplyChain:

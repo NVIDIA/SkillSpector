@@ -25,25 +25,33 @@ Framework: ASI10.
 from __future__ import annotations
 
 import re
+import shlex
 import sys
+from bisect import bisect_right
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import LINE_BREAK_CHARS, LOGICAL_LINE_BREAK, get_context_from_lines
 from .pattern_defaults import PatternCategory
+from .prohibition_context import is_directly_prohibited
 
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_rogue_agent"
+_SECURITY_VIEW_START_EVIDENCE = "_security_view_start"
 
 # RA1: Self-Modification — skill modifies its own code, config, or behavior
-RA1_PATTERNS = [
+RA1_CODE_PATTERNS = [
     # Python: writing to own file
     (r"open\s*\(\s*__file__\s*,\s*['\"]w", 0.95),
     (r"(?:Path|pathlib)\s*\(\s*__file__\s*\)\s*\.\s*write_text", 0.95),
+    (r"(?:self[_-]?modify|self[_-]?update|self[_-]?rewrite|self[_-]?patch|self[_-]?evolve)", 0.9),
+    (r"open\s*\(\s*['\"](?:SKILL\.md|skill\.md)['\"].*?['\"]w", 0.9),
+]
+RA1_PROSE_PATTERNS = [
     (
         r"(?:write|modify|edit|update|overwrite|patch)\s+(?:this\s+)?(?:skill(?:'s)?|SKILL\.md|skill\.md)",
         0.85,
@@ -52,7 +60,6 @@ RA1_PATTERNS = [
         r"(?:modify|edit|change|rewrite|update|alter)\s+(?:your\s+own|its\s+own|this\s+skill(?:'s)?)\s+(?:code|source|file|script|config|configuration|instructions?|rules?)",
         0.9,
     ),
-    (r"(?:self[_-]?modify|self[_-]?update|self[_-]?rewrite|self[_-]?patch|self[_-]?evolve)", 0.9),
     (
         r"(?:rewrite|replace|overwrite)\s+(?:the\s+)?(?:current|existing|original)\s+(?:code|script|file|config|skill)",
         0.85,
@@ -66,7 +73,6 @@ RA1_PATTERNS = [
         r"(?:generate|create|write)\s+(?:new|updated|replacement)\s+(?:code|version)\s+(?:for|of)\s+(?:this|itself|the\s+skill)",
         0.8,
     ),
-    (r"open\s*\(\s*['\"](?:SKILL\.md|skill\.md)['\"].*?['\"]w", 0.9),
     # Modifying own config at runtime
     (
         r"(?:update|modify|change|edit)\s+(?:the\s+)?(?:config|configuration|settings|parameters)\s+(?:of\s+)?(?:this|the\s+current)\s+(?:skill|agent|tool)",
@@ -82,11 +88,124 @@ RA1_PATTERNS = [
         0.7,
     ),
 ]
+RA1_PATTERNS = RA1_CODE_PATTERNS + RA1_PROSE_PATTERNS
+
+_VERIFY_SIGNATURE_FLAG = re.compile(
+    r"--verify-signature(?:=(?P<value>1|on|true|yes))?",
+    re.IGNORECASE,
+)
+_DISABLE_SIGNATURE_VERIFICATION = re.compile(
+    r"(?<!\S)--no-verify-signature(?=\s|$)"
+    r"|(?<!\S)--verify-signature(?:=|\s+)(?:0|false|no|off)(?=\s|$)",
+    re.IGNORECASE,
+)
+_SIGNED_CLI_RELEASE = re.compile(r"\bsigned\s+(?:cli\s+)?release\b", re.IGNORECASE)
+_SIGNED_CLI_RELEASE_NEGATION = re.compile(
+    r"\b(?:not|without)\s+(?:an?\s+)?signed\s+(?:cli\s+)?release\b|"
+    r"\bexcept\s+(?:for\s+)?(?:an?\s+)?signed\s+(?:cli\s+)?release\b|"
+    r"\b(?:never|do\s+not|don't)\b[^\n]{0,40}\bsigned\s+(?:cli\s+)?release\b",
+    re.IGNORECASE,
+)
+_SHELL_COMMAND_COMPOSITION = re.compile(r"(?:&&|\|\||[;&|#<>]|\$\(|<\(|>\()")
+_COMPANION_CLI_BEFORE_SELF_UPDATE = re.compile(
+    r"(?<![\w.-])(?P<cli>[a-z0-9][\w.-]{1,63})\s+$",
+    re.IGNORECASE,
+)
+_NON_COMPANION_UPDATE_SUBJECTS = frozenset(
+    {
+        "agent",
+        "assistant",
+        "bash",
+        "cli",
+        "cmd",
+        "command",
+        "env",
+        "exec",
+        "fish",
+        "itself",
+        "node",
+        "perl",
+        "powershell",
+        "pwsh",
+        "python",
+        "ruby",
+        "self",
+        "sh",
+        "skill",
+        "skillspector",
+        "sudo",
+        "tool",
+        "zsh",
+    }
+)
+_CLI_EXECUTABLE_EXTENSIONS = (
+    ".exe",
+    ".cmd",
+    ".bat",
+    ".com",
+    ".ps1",
+    ".sh",
+    ".py",
+    ".pyw",
+    ".js",
+    ".mjs",
+    ".cjs",
+)
+_CLI_ROLE_SUFFIXES = ("-cli", "_cli", ".cli", "cli", "-ctl", "_ctl", ".ctl", "ctl")
+_PROTECTED_UPDATE_SUBJECT_PARTS = frozenset(
+    {"agent", "assistant", "self", "skill", "skillspector", "tool"}
+)
+_MAX_COMPANION_UPDATE_LINE_CHARS = 4_096
+_HIDDEN_DIRECTORY_WRITE_PATTERN = (
+    rf"(?:create|write|mkdir)(?:[ \t]|\\\r?\n)+(?:[^|&;{LINE_BREAK_CHARS}]|\\\r?\n)*"
+    r"(?:~/|/home/|/tmp/)\.(?!git|ssh|aws)[a-z_-]+"
+)
+_STANDARD_SKILL_MKDIR = re.compile(
+    r"[ \t]*mkdir[ \t]+(?:(?:-p|--parents)[ \t]+)?(?:--[ \t]+)?"
+    r"(?P<quote>['\"]?)(?P<target>~/\.(?:claude|codex|gemini)/skills"
+    r"(?:/[a-zA-Z0-9][a-zA-Z0-9_.-]*)?)/?(?P=quote)[ \t]*"
+)
+# Anything that may address a skills root: any agent configuration directory,
+# a "skills" path segment, or a shell parameter expansion or command
+# substitution. Quoting, duplicate or dot path segments, other home spellings,
+# globs, cd plus relative paths and variables must not make a nearby writer
+# look unrelated to the created directory. Prose such as "skills directory" or
+# "$0" is not a path or an expansion.
+_SKILLS_ROOT = re.compile(
+    r"\.(?:claude|codex|gemini)\b|/skills\b|\bskills/|\$(?:\{|\(|[A-Za-z_@*])",
+    re.IGNORECASE,
+)
+_SKILL_INSTALL_PATH = re.compile(
+    r"(?:~/|\$(?:HOME|\{HOME\})/|/home/[^/\s]+/)"
+    r"(?P<relative>\.(?:claude|codex|gemini)/skills(?:/[a-zA-Z0-9][a-zA-Z0-9_.-]*)*)/?"
+)
+_CLONE_URL = re.compile(
+    r"(?:(?:https?|git|ssh)://[a-zA-Z0-9._~:/%@+-]+"
+    r"|[a-zA-Z0-9_.-]+@[a-zA-Z0-9_.-]+:[a-zA-Z0-9._~/-]+)"
+)
+_SKILL_CONTEXT_LINE = re.compile(rf"[^{LINE_BREAK_CHARS}]+")
+_NON_WHITESPACE = re.compile(r"\S")
+_MAX_SKILL_INSTALL_CONTEXT_CHARS = 4_096
 
 # RA2: Session Persistence — unauthorized persistence across boundaries
-RA2_PATTERNS = [
+RA2_CODE_PATTERNS = [
     # Cron jobs and scheduled tasks
     (r"crontab\s+(?:-[el]|.*?>>?\s*/)", 0.85),
+    (
+        r"(?:systemd|systemctl|launchd|launchctl|init\.d)\s+.*?(?:enable|install|register|create)",
+        0.8,
+    ),
+    # Hidden files and directories for persistence
+    (_HIDDEN_DIRECTORY_WRITE_PATTERN, 0.6),
+    # Background processes
+    (r"(?:nohup|disown|setsid)\s+", 0.65),
+    # Registry / plist for Windows/macOS persistence
+    (r"(?:HKEY_|RegOpenKey|RegSetValue|reg\s+add)\s+", 0.8),
+    # ``plist`` must not follow a letter, so identifiers such as
+    # ``relationshipList`` or ``CT_GradientStopList`` do not match.
+    (r"(?:defaults\s+write|(?<![a-z])plist|launchctl\s+load)", 0.75),
+]
+RA2_PROSE_PATTERNS = [
     (
         r"(?:add|create|install|register)\s+(?:a\s+)?(?:cron\s+)?(?:job|task|entry)\s+(?:for|to|that)",
         0.8,
@@ -105,10 +224,6 @@ RA2_PATTERNS = [
         0.85,
     ),
     (
-        r"(?:systemd|systemctl|launchd|launchctl|init\.d)\s+.*?(?:enable|install|register|create)",
-        0.8,
-    ),
-    (
         r"(?:create|install|register|add)\s+(?:a\s+)?(?:systemd\s+)?(?:service|daemon|agent)\s+(?:file|unit)",
         0.8,
     ),
@@ -125,55 +240,116 @@ RA2_PATTERNS = [
         r"(?:persist|maintain|keep|preserve)\s+(?:state|data|context|session)\s+(?:across|between|through)\s+(?:sessions?|restarts?|reboots?|invocations?)",
         0.75,
     ),
-    # Hidden files and directories for persistence
-    (r"(?:create|write|mkdir)\s+[^|]*(?:~/|/home/|/tmp/)\.(?!git|ssh|aws)[a-z_-]+", 0.6),
     (r"(?:create|make|write)\s+(?:a\s+)?(?:hidden|dot)\s+(?:file|directory|folder)", 0.65),
-    # Background processes
-    (r"(?:nohup|disown|setsid)\s+", 0.65),
     (
         r"(?:start|launch|spawn|fork)\s+(?:a\s+)?(?:background|daemon|detached)\s+(?:process|service|worker|task)",
         0.7,
     ),
     (r"(?:run|execute)\s+(?:in\s+the\s+)?background\s+(?:and\s+)?(?:detach|persist|survive)", 0.75),
-    # Registry / plist for Windows/macOS persistence
-    (r"(?:HKEY_|RegOpenKey|RegSetValue|reg\s+add)\s+", 0.8),
-    (r"(?:defaults\s+write|plist|launchctl\s+load)", 0.75),
 ]
+RA2_PATTERNS = RA2_CODE_PATTERNS + RA2_PROSE_PATTERNS
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for rogue agent patterns (RA1–RA2)."""
     findings: list[AnalyzerFinding] = []
+    line_starts, line_ends = _logical_line_metadata(content)
+    content_lines = content.splitlines()
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
 
     def ctx(start: int) -> str:
-        return get_context(content, start)
+        line_num = bisect_right(line_starts, start)
+        return get_context_from_lines(
+            content_lines,
+            line_num,
+            column=start - line_starts[line_num - 1],
+        )
 
     tag = [PatternCategory.ROGUE_AGENT.value]
 
     for pattern, confidence in RA1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in RA1_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = bisect_right(line_starts, match.start())
             context = ctx(match.start())
-            if _is_negated_safety_constraint(content, match):
+            if _is_negated_safety_constraint(content, match, line_starts, line_ends):
                 continue
+            companion_update = _is_signed_companion_cli_update(
+                content,
+                match,
+                file_type,
+                line_starts,
+                line_ends,
+            )
+            finding_tags = list(tag)
+            if companion_update:
+                finding_tags.extend(["contextual-triage", "likely-benign-context"])
             findings.append(
                 AnalyzerFinding(
                     rule_id="RA1",
-                    message="Self-Modification",
-                    severity=Severity.HIGH,
+                    message=(
+                        "Signed Companion CLI Update" if companion_update else "Self-Modification"
+                    ),
+                    severity=Severity.LOW if companion_update else Severity.HIGH,
                     location=loc(line_num),
-                    confidence=confidence,
-                    tags=tag,
+                    confidence=min(confidence, 0.15) if companion_update else confidence,
+                    remediation=(
+                        "No skill self-modification change is indicated by this match. Keep "
+                        "signature verification mandatory and identify the companion CLI "
+                        "explicitly."
+                        if companion_update
+                        else None
+                    ),
+                    explanation=(
+                        "The matched phrase is a signed self-update subcommand for a documented "
+                        "companion CLI; it does not direct the skill or agent to rewrite itself."
+                        if companion_update
+                        else None
+                    ),
+                    tags=finding_tags,
                     context=context,
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
+                    evidence=(
+                        {_SECURITY_VIEW_START_EVIDENCE: match.start()} if companion_update else {}
+                    ),
                 )
             )
     for pattern, confidence in RA2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+        is_prose = (pattern, confidence) in RA2_PROSE_PATTERNS
+        matches = static_runner.iter_paragraph_matches if is_prose else re.finditer
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            if is_prose and is_directly_prohibited(content, match.start(), match.end()):
+                continue
+            if pattern == _HIDDEN_DIRECTORY_WRITE_PATTERN:
+                line_start, line_end = _logical_line_bounds(
+                    content, match.start(), line_starts, line_ends
+                )
+                # Creating a conventional installation directory alone does not
+                # establish persistence. Only exempt a complete simple command;
+                # extra targets, shell composition, writes, and traversal stay
+                # findings even when they mention the same skills directory.
+                standard_mkdir = _STANDARD_SKILL_MKDIR.fullmatch(content[line_start:line_end])
+                if standard_mkdir:
+                    unsafe_context = _unsafe_skill_install_context(
+                        content,
+                        line_start,
+                        standard_mkdir.group("target"),
+                        line_starts,
+                        line_ends,
+                    )
+                    if unsafe_context is None:
+                        continue
+                    # Preserve evidence for the nearby skills-root operation.
+                    # Unknown or clipped syntax keeps the mkdir's own evidence.
+                    match = unsafe_context
+            line_num = bisect_right(line_starts, match.start())
             findings.append(
                 AnalyzerFinding(
                     rule_id="RA2",
@@ -184,17 +360,232 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     return findings
 
 
-def _is_negated_safety_constraint(content: str, match: re.Match[str]) -> bool:
+def _unsafe_skill_install_context(
+    content: str,
+    mkdir_line_start: int,
+    target: str,
+    line_starts: tuple[int, ...],
+    line_ends: tuple[int, ...],
+) -> re.Match[str] | None:
+    """Retain persistence when nearby skills-root use is not a simple install.
+
+    Inspect every neighboring logical line within a 4 KiB window.
+    Blank lines do not prove independence. Any possible skills-root reference
+    (however spelled) retains detection unless the complete line is a simple
+    clone into the target.
+    Composition, parse errors, alternate writers and destinations are unsafe.
+    """
+    mkdir_line_index = bisect_right(line_starts, mkdir_line_start) - 1
+    radius = _MAX_SKILL_INSTALL_CONTEXT_CHARS // 2
+    context_start = max(0, mkdir_line_start - radius)
+    context_end = min(len(content), mkdir_line_start + radius)
+    mkdir_evidence = _SKILL_CONTEXT_LINE.match(
+        content, mkdir_line_start, line_ends[mkdir_line_index]
+    )
+
+    for direction in (1, -1):
+        line_index = mkdir_line_index + direction
+        while 0 <= line_index < len(line_starts):
+            start, end = line_starts[line_index], line_ends[line_index]
+            if start >= context_end or end <= context_start:
+                # A line can end exactly at the window edge. Uninspected
+                # content beyond the window cannot prove independence.
+                beyond = (
+                    _NON_WHITESPACE.search(content, context_end)
+                    if direction > 0
+                    else _NON_WHITESPACE.search(content, 0, context_start)
+                )
+                if beyond is not None:
+                    return mkdir_evidence
+                break
+            if start < context_start or end > context_end:
+                return mkdir_evidence
+            line = content[start:end]
+            if _SKILLS_ROOT.search(line) and not _is_simple_skill_clone(line, target):
+                return _SKILL_CONTEXT_LINE.match(content, start, end)
+            line_index += direction
+    return None
+
+
+def _is_simple_skill_clone(line: str, target: str) -> bool:
+    """Recognize only git clone <literal URL> <target or child directory>."""
+    if _SHELL_COMMAND_COMPOSITION.search(line) or "`" in line:
+        return False
+    try:
+        tokens = shlex.split(line, posix=True)
+    except ValueError:
+        return False
+    if len(tokens) != 4 or tokens[:2] != ["git", "clone"]:
+        return False
+    if _CLONE_URL.fullmatch(tokens[2]) is None:
+        return False
+    destination = _SKILL_INSTALL_PATH.fullmatch(tokens[3])
+    created = _SKILL_INSTALL_PATH.fullmatch(target)
+    if destination is None or created is None:
+        return False
+    relative = destination.group("relative")
+    created_relative = created.group("relative")
+    return relative == created_relative or relative.startswith(f"{created_relative}/")
+
+
+def _is_signed_companion_cli_update(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> bool:
+    """Identify a signed update subcommand whose subject is another CLI."""
+    if file_type not in {"markdown", "text"} or match.group(0).lower() != "self-update":
+        return False
+
+    line_start, line_end = _logical_line_bounds(
+        content,
+        match.start(),
+        line_starts,
+        line_ends,
+    )
+    if line_end - line_start > _MAX_COMPANION_UPDATE_LINE_CHARS:
+        return False
+    line = content[line_start:line_end]
+    local_start = match.start() - line_start
+    local_end = match.end() - line_start
+    code_span = _enclosing_inline_code_span(line, local_start, local_end)
+    if code_span is None:
+        return False
+    code_start, code_end = code_span
+    command = line[code_start + 1 : code_end]
+    if _SHELL_COMMAND_COMPOSITION.search(command):
+        return False
+    command_match_start = local_start - code_start - 1
+    command_match_end = local_end - code_start - 1
+    cli_match = _COMPANION_CLI_BEFORE_SELF_UPDATE.fullmatch(command[:command_match_start])
+    if cli_match is None:
+        return False
+    cli_subject = cli_match.group("cli").lower()
+    if _is_protected_update_subject(cli_subject):
+        return False
+    if _DISABLE_SIGNATURE_VERIFICATION.search(command):
+        return False
+    flag = _VERIFY_SIGNATURE_FLAG.fullmatch(command[command_match_end:].strip())
+    if flag is None:
+        return False
+    flag_value = (flag.group("value") or "true").lower()
+    clause_start = max(line.rfind(mark, 0, code_start) for mark in ".;!?") + 1
+    clause_ends = [position for mark in ".;!?" if (position := line.find(mark, code_end + 1)) >= 0]
+    clause_end = min(clause_ends, default=len(line))
+    evidence_clause = line[clause_start:clause_end]
+    next_code_start = line.find("`", code_end + 1)
+    negation_end = next_code_start if next_code_start >= 0 else len(line)
+    negation_scope = line[clause_start:negation_end]
+    return (
+        flag_value in {"1", "on", "true", "yes"}
+        and _SIGNED_CLI_RELEASE.search(evidence_clause) is not None
+        and _SIGNED_CLI_RELEASE_NEGATION.search(negation_scope) is None
+    )
+
+
+def _enclosing_inline_code_span(
+    line: str,
+    match_start: int,
+    match_end: int,
+) -> tuple[int, int] | None:
+    """Return the simple Markdown code span containing one match.
+
+    Pairing delimiters from the start of the logical line permits independent
+    commands on the same line while malformed, unpaired, and multi-backtick
+    spans remain fail-closed.
+    """
+    delimiters = [item.start() for item in re.finditer(r"`", line)]
+    if len(delimiters) % 2:
+        return None
+    for code_start, code_end in zip(delimiters[::2], delimiters[1::2], strict=True):
+        if code_start < match_start and match_end <= code_end:
+            return code_start, code_end
+    return None
+
+
+def _strip_cli_subject_affixes(subject: str) -> str:
+    """Strip stacked executable and CLI-role suffixes without losing token boundaries."""
+    stem = subject.casefold()
+    changed = True
+    while changed:
+        changed = False
+        for extension in _CLI_EXECUTABLE_EXTENSIONS:
+            if stem.endswith(extension):
+                stem = stem[: -len(extension)]
+                changed = True
+                break
+        for suffix in _CLI_ROLE_SUFFIXES:
+            if len(stem) > len(suffix) and stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                changed = True
+                break
+    return stem
+
+
+def _is_protected_update_subject(subject: str) -> bool:
+    """Fail closed when a self-update subject may denote the skill or its agent.
+
+    Companion executable names are intentionally limited to ASCII. This avoids
+    treating a confusable spelling of a protected subject as an unrelated CLI.
+    Separator-delimited protected roles are rejected without substring-denying
+    unrelated vendor names such as ``agentsope-cli`` or ``toolboxctl``.
+    """
+    if not subject.isascii():
+        return True
+    stem = _strip_cli_subject_affixes(subject)
+    collapsed = re.sub(r"[-_.]", "", stem)
+    if collapsed in _NON_COMPANION_UPDATE_SUBJECTS or collapsed.startswith("python"):
+        return True
+    return any(
+        part in _PROTECTED_UPDATE_SUBJECT_PARTS for part in re.split(r"[-_.]+", stem) if part
+    )
+
+
+def _logical_line_metadata(content: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Index the repository's complete set of logical line breaks once."""
+    starts = [0]
+    ends: list[int] = []
+    for separator in LOGICAL_LINE_BREAK.finditer(content):
+        ends.append(separator.start())
+        starts.append(separator.end())
+    ends.append(len(content))
+    return tuple(starts), tuple(ends)
+
+
+def _logical_line_bounds(
+    content: str,
+    start: int,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> tuple[int, int]:
+    """Return source-line bounds without joining evidence across separators."""
+    if line_starts is None or line_ends is None:
+        line_starts, line_ends = _logical_line_metadata(content)
+    line_index = bisect_right(line_starts, start) - 1
+    return line_starts[line_index], line_ends[line_index]
+
+
+def _is_negated_safety_constraint(
+    content: str,
+    match: re.Match[str],
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> bool:
     """Return True when an RA1 phrase is explicitly forbidden in policy prose."""
-    line_start = content.rfind("\n", 0, match.start()) + 1
-    line_end = content.find("\n", match.end())
-    if line_end == -1:
-        line_end = len(content)
+    line_start, line_end = _logical_line_bounds(
+        content,
+        match.start(),
+        line_starts,
+        line_ends,
+    )
     line = content[line_start:line_end]
     local_start = match.start() - line_start
     phrase = line[local_start : local_start + len(match.group(0))]

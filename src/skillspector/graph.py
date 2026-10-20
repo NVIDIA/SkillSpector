@@ -21,10 +21,12 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from langgraph.graph import END, START, StateGraph
 
 from skillspector.inspection_ledger import guard_analyzer_node
-from skillspector.llm_utils import is_llm_available
+from skillspector.llm_utils import is_llm_available as is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS, ANALYZER_NODES
 from skillspector.nodes.build_context import build_context
@@ -35,6 +37,10 @@ from skillspector.nodes.resolve_input import resolve_input
 from skillspector.state import SkillspectorState
 
 logger = get_logger(__name__)
+
+# ``is_llm_available`` remains a compatibility export for callers that patched
+# provider preflight here. Graph construction is deliberately credential-independent
+# so requested analyzers emit explicit statuses instead of disappearing.
 
 
 def create_graph():
@@ -60,13 +66,6 @@ def create_graph():
             logger.warning("Skipping analyzer %s: is_available() returned False", analyzer_id)
             continue
 
-        requires_api_key = getattr(mod, "requires_api_key", False)
-        if requires_api_key:
-            has_llm, _ = is_llm_available()
-            if not has_llm:
-                logger.warning("Skipping analyzer %s: required API key is missing", analyzer_id)
-                continue
-
         workflow.add_node(
             analyzer_id, guard_analyzer_node(analyzer_id, ANALYZER_NODES[analyzer_id])
         )
@@ -89,3 +88,18 @@ def create_graph():
 
 
 graph = create_graph()
+
+
+def __getattr__(name: str) -> Any:
+    """Delegate invokable graph API when this module shadows the package export.
+
+    Importing ``skillspector.graph`` directly assigns this module to the
+    parent package's ``graph`` attribute (the import system sets it after
+    module execution, so it cannot be restored from here). Delegating
+    ``invoke``/``ainvoke``/``stream`` keeps ``skillspector.graph`` invokable
+    in that import order; prefer ``from skillspector import graph`` for the
+    lazy proxy instead.
+    """
+    if name in {"invoke", "ainvoke", "stream", "astream", "batch", "abatch"}:
+        return getattr(graph, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

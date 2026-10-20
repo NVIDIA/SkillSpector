@@ -16,7 +16,7 @@ Values below are implementation defaults. MiB means 1,048,576 bytes.
 | Discovery time | 30 seconds | One skill bundle |
 | Canonical cached source bytes | 64 MiB | Ordinary files and expanded nested members combined |
 | Cached bytes from one filesystem artifact | 16 MiB | One artifact |
-| End-to-end workflow time | 60 seconds | One graph execution |
+| End-to-end workflow time | 600 seconds | One graph execution |
 | Cache and context-processing time | 60 seconds | One skill bundle, within the workflow deadline |
 
 The 64 MiB ceiling accounts for the canonical raw bytes retained for analysis. Local decoded text
@@ -86,6 +86,124 @@ Truncated extraction and missing or ambiguous local references are explicit part
 conditions. A referenced binary, opaque, or otherwise uninspected artifact is not treated as a
 successfully analyzed reference.
 
+AE1 is suppressed only for a positively identified rendered Markdown image whose complete
+bytes verify as a minimal, non-interlaced PNG and whose canonical inspection evidence has
+only unsupported-format limitations. Active, ambiguous, escaped, code, and missing-kind
+references retain AE1, as do non-PNG formats, executable or concealed content, other failures,
+unknown reasons, and mixed limitations. Suppression leaves the coverage exception, coverage
+metrics, incomplete-scan recommendation, and `--fail-on-incomplete` behavior unchanged. Such
+an image-only limitation may report LOW severity while still recommending `CAUTION` because
+the scan remains incomplete.
+
+### Diagnosing incomplete referenced artifacts
+
+AE1 uses the check name **Incomplete referenced artifact analysis**. Its location
+is the reference in the source document. The affected file appears separately in
+`evidence.target_path`, with its final `target_disposition` and up to 16 distinct
+reason records. Each reason identifies the canonical `reason_code`, message,
+phase, and analyzer; target line numbers and observed/limit values appear when
+the ledger provides them. `reasons_truncated: true` means this finding contains
+only a subset of the reasons. Review the target's entries in
+`analysis_completeness.ledger_exceptions`, including any output-limit records,
+before deciding how to resolve the failure.
+
+Two references to the same partially inspected helper can produce two AE1
+locations. They identify one affected artifact, rather than demonstrating two
+independent vulnerabilities. Incomplete analysis alone also does not establish
+malicious evasion. Keep required references and use the reason to choose the fix:
+
+| Reason | Next step |
+|---|---|
+| `static_parse_limit` | Inspect the expression and analyzer. If valid source is misinterpreted, correct or update the scanner and rerun. |
+| `read_error`, `stat_error`, `file_disappeared`, `missing_file_cache` | Ensure the resolved target remains readable throughout the scan. |
+| `size_limit`, `runtime_limit` | Review the reported bounds and input size; distinguish a scanner performance problem from a legitimate resource ceiling. |
+| `binary_content`, `opaque_content` | Provide inspectable source or analysis support for the referenced format. |
+
+The finding and incomplete-analysis gates remain active until the relevant
+limitations are resolved. Evidence fields are diagnostic facts, not suppression
+instructions.
+
+### Markdown prose apostrophes
+
+In a complete Markdown file, a possessive or contraction such as `reference's`,
+`drivers'` or `don't` in a prose line is punctuation, not a shell single quote
+that stays open through the rest of the file. This applies only when every quote
+on the line is such a word apostrophe, the line has no `$`, backtick, backslash
+or double quote, and the line starts a new shell line: the previous line ends in
+a newline, not a backslash continuation or a Unicode line separator. Headings,
+block quotes, code blocks, HTML blocks, tables, lines inside a pending inline
+code span, and an apostrophe inside a quote or substitution that starts earlier
+keep the lexical reading.
+
+### Perl literal help text
+
+For `.pl` source, the tool-misuse analyzer recognizes a narrow form of standalone
+`print`: an ordinary, single-line, non-interpolated quoted literal, optionally
+with `STDOUT`/`STDERR` or parentheses. For example:
+
+```perl
+print "Use rm to remove a project\n";
+```
+
+LF and CRLF line endings, including a trailing comment, are supported while
+source offsets are preserved. Line breaks inside the quoted literal remain
+outside this recognized form.
+
+When complete surrounding source proves those quote boundaries, the analyzer
+keeps the literal's payload visible while distinguishing Perl delimiters from
+shell delimiters. This prevents ordinary help text from creating a false shell
+parse limit. Printed dangerous commands still receive security checks, and Perl
+retains the existing prompt-injection and supply-chain checks.
+
+This is bounded recognition, not a general Perl parser. Ambiguous quoting,
+interpolation, quote operators such as `qx`, quote-like special variables,
+legacy package separators, incomplete fragments, and real parser limits remain
+on the conservative analysis path. A complex helper may therefore still need
+its particular ledger reason and expression reviewed.
+
+Perl `eval BLOCK` (for example `eval { require $module; 1 } or die $@;`) traps
+exceptions in already-compiled code and is not treated as a shell `eval` of a
+string. Its statements are still scanned. String forms such as `eval $code`
+and `eval "..."` remain on the conservative path.
+
+### Python strings and comments
+
+For a complete `.py` module that the Python parser accepts, each string literal
+(including f-strings) and comment owns its bytes. A shell quote or backtick that
+is left open inside one of them, such as a Markdown fence in a string or an
+apostrophe in a comment, is charged only up to the end of that token, never to
+the code that follows. Python code that happens to use a shell wrapper name, as
+in `signal.alarm(timeout)`, is not reparsed as a shell command string. A
+runtime-selected command named in a comment takes operands only from that
+comment. One named in a string literal takes operands only from the rest of
+that string's value: the literal's body and the bodies of literals implicitly
+or `+`-concatenated after it. A value that code can still extend or rewrite,
+with `%`, `.format` or another method call, a subscript, repetition, or a
+non-literal operand, keeps the conservative result, also after a closing
+parenthesis. An f-string replacement field among the operands may supply the
+recursive and force options, so a root target beside it also stays
+conservative.
+
+Literal payloads remain visible to every security check. A single string or
+comment that itself holds more unresolved shell text than the parser bound,
+invalid or fragmentary Python, and source with a non-Python shebang keep the
+conservative result.
+
+Declared-marker reconstruction uses the same proof, as it does for validated
+JSON strings. When a removal verb is followed later on its line by the closing
+quote of a Python string, as in `assert "please omit --hours" in out`, that
+quote is not paired with the next literal's opening quote across the code
+between them. An explicit declaration, where only a short phrase such as
+`the marker` separates the verb from the quote, keeps the lexical reading.
+Marker declarations written inside one string or comment are still
+reconstructed or reported as `obfuscated_instruction_text`. Invalid or
+fragmentary Python and other file types keep the lexical reading.
+
+Both consumers share one parse and tokenization of a module. The two most
+recent results, including a failed proof, are reused, and each reuse still
+checks the static runtime budget. A proof interrupted by that budget is not
+kept.
+
 ## Structured skill data
 
 AISOP/AISP structured extraction consumes the already-bounded cache and shares the enclosing
@@ -130,7 +248,7 @@ work consume the same allowance.
 | External targets | 32 | One traversal |
 | Downloaded and cached source bytes | 10 MiB | Root and dependencies combined |
 | Discovered and expanded artifacts | 10,000 | Root and dependencies combined |
-| Traversal time | 60 seconds | Root and dependencies combined |
+| Traversal time | 600 seconds | Root and dependencies combined |
 | Reference source records | 1,024 | One extraction |
 | Reference source bytes | 1,000,000 | One extraction |
 | Raw reference candidates | 4,096 | One extraction |
@@ -155,7 +273,7 @@ removes the rejected partial checkout.
 | Build-context ledger events | 10,000 | One bundle context |
 | Static findings | 10,000 | One artifact |
 | Static findings | 10,000 | One analyzer |
-| Static-analysis time | 30 seconds | One artifact |
+| Static-analysis time | 300 seconds | One artifact, within the workflow deadline |
 | YARA rule-directory entries | 10,000 | Built-in and optional directories combined |
 | YARA rule files | 1,024 | One rule load |
 | YARA rule source bytes | 1 MiB | One rule file |
@@ -164,7 +282,7 @@ removes the rejected partial checkout.
 | Retained YARA string instances | 4,096 | One matched rule |
 | Shipped-bytecode discovery entries | 10,000 | One analyzer execution |
 | Shipped-bytecode traversal depth | 64 | One analyzer execution |
-| Shipped-bytecode analysis time | 5 seconds | One analyzer execution, within the workflow deadline |
+| Shipped-bytecode active processing time | 5 seconds | One analyzer execution, within the workflow wall-clock deadline |
 | Dependency manifests | 64 | One analyzer execution |
 | Dependency packages | 256 | One manifest |
 | Dependency packages | 1,024 | One analyzer execution |
@@ -206,8 +324,44 @@ When relevant analysis is incomplete:
 - `skillspector scan --fail-on-incomplete` exits with status 1. Without this option, the CLI retains
   its compatibility behavior and still applies its ordinary risk-score exit policy. Execution
   failures exit with status 2.
+- `skillspector scan --min-coverage PERCENT` exits with status 1 when canonical coverage is below
+  `PERCENT`; equality passes. Recursive scans check each scanned child's own coverage, not the
+  aggregate `analysis_completeness.coverage_percent`, and any omitted or unscanned skill fails a
+  positive threshold. Skills that discovery never found because it stopped early are not counted;
+  add `--fail-on-incomplete` to catch that case.
 - MCP responses set `safe_to_install` to `false` when analysis is incomplete, any relevant file is
   entirely uninspected, execution failed, or the risk score exceeds the installation threshold.
 
 A low score or zero findings must not be interpreted as complete coverage when
 `analysis_completeness.is_complete` is false.
+
+
+## Configuring the aggregate workflow deadline
+
+The scanner limits one complete workflow to 600 seconds by default. Set
+`SKILLSPECTOR_MAX_WORKFLOW_SECONDS` to a positive finite number of seconds to
+change that aggregate deadline. The setting applies to direct,
+CLI, recursive, and multi-skill scans; byte and artifact ceilings remain in
+effect. Invalid, zero, negative, infinite, or NaN values safely keep the
+600-second default.
+
+## Configuring the static analysis deadline
+
+Static pattern analysis and YARA matching allow up to 300 seconds per artifact by
+default. Set `SKILLSPECTOR_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT` to a positive
+finite number of seconds to change that allowance. Invalid, zero, negative,
+infinite, or NaN values log a warning and retain the 300-second default.
+
+## Configuring the dependency-source deadline
+
+Dependency-source redirection analysis allows up to 5 seconds by default. Set
+`SKILLSPECTOR_MAX_DEPENDENCY_SOURCE_ANALYSIS_SECONDS` to a positive finite number of
+seconds to change that allowance. Invalid, zero, negative, infinite, or NaN
+values log a warning and retain the 5-second default.
+
+Each operation still uses the smaller of this allowance and the remaining workflow
+time. Increasing either per-operation setting does not extend the aggregate
+workflow deadline. A limit reached during analysis retains existing findings and
+reports partial work through the inspection ledger. These environment settings
+are read when their modules are imported, so restart the SkillSpector process
+after changing them.

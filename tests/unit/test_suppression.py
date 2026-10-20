@@ -17,12 +17,19 @@
 
 from __future__ import annotations
 
+import errno
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from stat import S_IMODE
+from threading import Barrier
 
 import pytest
 import yaml
 
+from skillspector import suppression as suppression_module
 from skillspector.models import Finding
 from skillspector.suppression import (
     SHIPPED_BASELINE_FILENAME,
@@ -37,6 +44,7 @@ from skillspector.suppression import (
     finding_fingerprint,
     load_baseline,
     partition_findings,
+    source_content_key,
 )
 
 SCANNER_VERSION = "test-scanner-version"
@@ -145,8 +153,8 @@ def test_transitive_fingerprint_and_baseline_are_source_aware() -> None:
     assert serialized["occurrences"][0]["source_digest"] == f"sha256:{'c' * 64}"
 
     file_cache = {
-        f"{first_identity}::skill-a/SKILL.md": SKILL_CONTENT,
-        f"{second_identity}::skill-a/SKILL.md": SKILL_CONTENT,
+        source_content_key(first_identity, "skill-a/SKILL.md"): SKILL_CONTENT,
+        source_content_key(second_identity, "skill-a/SKILL.md"): SKILL_CONTENT,
     }
     baseline = baseline_from_dict(
         build_baseline_dict([first], file_cache=file_cache, scanner_version=SCANNER_VERSION)
@@ -175,7 +183,7 @@ def test_root_glob_baseline_never_suppresses_transitive_finding() -> None:
     kept, suppressed = partition_findings(
         [child],
         baseline,
-        file_cache={f"{identity}::{child.file}": SKILL_CONTENT},
+        file_cache={source_content_key(identity, child.file): SKILL_CONTENT},
         scanner_version=SCANNER_VERSION,
     )
 
@@ -195,7 +203,7 @@ def test_transitive_exact_baseline_requires_immutable_source_provenance() -> Non
     kept, suppressed = partition_findings(
         [legacy_child],
         baseline,
-        file_cache={f"{legacy_child.source_url}::{legacy_child.file}": SKILL_CONTENT},
+        file_cache={source_content_key(legacy_child.source_url, legacy_child.file): SKILL_CONTENT},
         scanner_version=SCANNER_VERSION,
     )
 
@@ -204,7 +212,9 @@ def test_transitive_exact_baseline_requires_immutable_source_provenance() -> Non
     with pytest.raises(ValueError, match="source_identity and source_digest"):
         build_baseline_dict(
             [legacy_child],
-            file_cache={f"{legacy_child.source_url}::{legacy_child.file}": SKILL_CONTENT},
+            file_cache={
+                source_content_key(legacy_child.source_url, legacy_child.file): SKILL_CONTENT
+            },
             scanner_version=SCANNER_VERSION,
         )
 
@@ -225,6 +235,31 @@ def test_transitive_fingerprint_does_not_borrow_same_named_root_content() -> Non
             file_cache={child.file: SKILL_CONTENT},
             scanner_version=SCANNER_VERSION,
         )
+
+
+@pytest.mark.parametrize("delimiter", ["/", "::"])
+def test_transitive_fingerprint_does_not_borrow_lookalike_local_path(delimiter: str) -> None:
+    identity = f"external/{'a' * 64}"
+    child = replace(_finding(), source_identity=identity, source_digest=f"sha256:{'b' * 64}")
+    with pytest.raises(ValueError, match="source content missing"):
+        build_baseline_dict(
+            [child],
+            file_cache={f"{identity}{delimiter}{child.file}": SKILL_CONTENT},
+            scanner_version=SCANNER_VERSION,
+        )
+
+
+def test_root_lookup_does_not_normalize_a_transitive_content_key() -> None:
+    from skillspector.suppression import _component_content
+
+    key = source_content_key("scope", r"..\..\..\x")
+    assert _component_content({key: "remote content"}, './x"]') is None
+
+
+def test_source_content_key_preserves_scope_and_exact_path() -> None:
+    assert source_content_key("a/b", "c") != source_content_key("a", "b/c")
+    assert source_content_key("scope", "a\\b") != source_content_key("scope", "a/b")
+    assert source_content_key("scope", "./a") != source_content_key("scope", "a")
 
 
 def test_fingerprint_canonical_encoding_avoids_delimiter_collision() -> None:
@@ -439,6 +474,21 @@ def test_baseline_from_dict_rejects_non_mapping() -> None:
         baseline_from_dict(["not", "a", "mapping"])  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("field", ["rules", "fingerprints"])
+@pytest.mark.parametrize("value", [{}, "", 0, False])
+def test_baseline_from_dict_rejects_falsy_non_list_collections(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match="rules and fingerprints must be lists"):
+        baseline_from_dict({"version": 2, field: value})
+
+
+@pytest.mark.parametrize(
+    "collections",
+    [{}, {"rules": None}, {"fingerprints": None}, {"rules": []}, {"fingerprints": []}],
+)
+def test_baseline_from_dict_accepts_empty_collections(collections: dict[str, object]) -> None:
+    assert baseline_from_dict({"version": 2, **collections}).is_empty()
+
+
 def test_baseline_from_dict_rejects_legacy_v1_fingerprints() -> None:
     with pytest.raises(ValueError, match="Version 1 fingerprints cannot be trusted"):
         baseline_from_dict(
@@ -517,6 +567,167 @@ def test_baseline_from_dict_requires_scanner_version_for_fingerprints() -> None:
 def test_load_baseline_missing_file(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         load_baseline(tmp_path / "nope.yaml")
+
+
+def test_load_baseline_byte_limit_before_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(suppression_module, "MAX_BASELINE_BYTES", 32, raising=False)
+    out = tmp_path / "baseline.yaml"
+    out.write_bytes(b"version: 2\n".ljust(32, b" "))
+    assert load_baseline(out).is_empty()
+    out.write_bytes(out.read_bytes() + b" ")
+
+    def unexpected_parse(*args: object, **kwargs: object) -> None:
+        pytest.fail("oversized baseline reached YAML parsing")
+
+    monkeypatch.setattr(yaml, "load", unexpected_parse)
+    with pytest.raises(ValueError, match="byte limit"):
+        load_baseline(out)
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "boundary", "message"),
+    [
+        ("MAX_BASELINE_NODES", 3, "node limit"),
+        ("MAX_BASELINE_DEPTH", 2, "depth limit"),
+        ("MAX_BASELINE_SCALAR_CHARS", 7, "scalar character limit"),
+    ],
+)
+def test_load_baseline_yaml_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    boundary: int,
+    message: str,
+) -> None:
+    out = tmp_path / "baseline.yaml"
+    out.write_text("version: 2\n", encoding="utf-8")
+    monkeypatch.setattr(suppression_module, limit_name, boundary, raising=False)
+    assert load_baseline(out).is_empty()
+    monkeypatch.setattr(suppression_module, limit_name, boundary - 1, raising=False)
+    with pytest.raises(ValueError, match=message):
+        load_baseline(out)
+
+
+def test_load_baseline_counts_alias_expansion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "baseline.yaml"
+    out.write_text(
+        "version: 2\nrules:\n  - &rule {id: SQP-1, reason: accepted}\n  - *rule\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(suppression_module, "MAX_BASELINE_NODES", 15, raising=False)
+    assert len(load_baseline(out).rules) == 2
+    monkeypatch.setattr(suppression_module, "MAX_BASELINE_NODES", 14, raising=False)
+    with pytest.raises(ValueError, match="expanded YAML node limit"):
+        load_baseline(out)
+
+
+def test_load_baseline_bounds_merge_expansion_before_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "baseline.yaml"
+    out.write_text(
+        "version: 2\n"
+        "a: &a {id: SQP-1, reason: accepted}\n"
+        "b: &b {<<: [*a, *a]}\n"
+        "c: &c {<<: [*b, *b]}\n"
+        "rules: [{<<: [*c, *c]}]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(suppression_module, "MAX_BASELINE_NODES", 100, raising=False)
+
+    def unexpected_construction(*args: object, **kwargs: object) -> None:
+        pytest.fail("expanded baseline reached object construction")
+
+    monkeypatch.setattr(yaml.SafeLoader, "construct_document", unexpected_construction)
+    with pytest.raises(ValueError, match="expanded YAML node limit"):
+        load_baseline(out)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ("note: &cycle [*cycle]\n", "cyclic YAML aliases"),
+        (
+            "a: &a [value]\nb: &b [*a]\nc: [*b]\n",
+            "expanded YAML depth limit",
+        ),
+    ],
+)
+def test_load_baseline_rejects_cyclic_or_deep_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: str, message: str
+) -> None:
+    monkeypatch.setattr(suppression_module, "MAX_BASELINE_DEPTH", 4, raising=False)
+    out = tmp_path / "baseline.yaml"
+    out.write_text("version: 2\n" + payload, encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        load_baseline(out)
+
+
+def test_load_baseline_bounds_repeated_scalar_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(suppression_module, "MAX_BASELINE_BYTES", 96, raising=False)
+    out = tmp_path / "baseline.yaml"
+    content = f"version: 2\na: &text {'x' * 40}\nb: *text\nc: *text\n"
+    assert len(content.encode()) <= 96
+    out.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match="expanded YAML character limit"):
+        load_baseline(out)
+
+
+def test_load_baseline_preserves_bounded_yaml_merges(tmp_path: Path) -> None:
+    out = tmp_path / "baseline.yaml"
+    out.write_text(
+        "version: 2\n"
+        "defaults: &defaults {id: SQP-1, reason: accepted}\n"
+        "rules:\n  - <<: *defaults\n    path: SKILL.md\n"
+        "  - <<: [*defaults, {id: SSD-2, reason: second}]\n",
+        encoding="utf-8",
+    )
+    baseline = load_baseline(out)
+    assert baseline.rules == [
+        SuppressionRule(rule_id="SQP-1", reason="accepted", path="SKILL.md"),
+        SuppressionRule(rule_id="SQP-1", reason="accepted"),
+    ]
+
+
+def test_baseline_combined_record_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(suppression_module, "MAX_BASELINE_RECORDS", 2, raising=False)
+    data = {
+        "version": 2,
+        "scanner_version": SCANNER_VERSION,
+        "rules": [{"id": "SQP-1", "reason": "accepted"}],
+        "fingerprints": [{"hash": "sha256:" + "a" * 64, "reason": "accepted"}],
+    }
+    baseline = baseline_from_dict(data)
+    assert len(baseline.rules) + len(baseline.fingerprints) == 2
+    data["rules"].append({"id": "SSD-2", "reason": "accepted"})
+    with pytest.raises(ValueError, match="record limit"):
+        baseline_from_dict(data)
+    out = tmp_path / "baseline.yaml"
+    out.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="record limit"):
+        load_baseline(out)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFO support")
+def test_load_baseline_rejects_fifo_without_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "baseline.yaml"
+    os.mkfifo(out)
+
+    def unexpected_legacy_read(*args: object, **kwargs: object) -> None:
+        pytest.fail("non-regular baseline reached an unbounded read")
+
+    # Keep this regression safe on revisions that still use the blocking reader.
+    monkeypatch.setattr(Path, "read_text", unexpected_legacy_read)
+    with pytest.raises(ValueError, match="regular file"):
+        load_baseline(out)
 
 
 def test_build_dump_load_round_trip(tmp_path: Path) -> None:
@@ -873,3 +1084,496 @@ def test_effective_findings_skips_a_suppressed_entry_with_no_finding() -> None:
     }
 
     assert effective_findings(result) == [kept]
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+@pytest.mark.parametrize(
+    ("limit_name", "limit", "message"),
+    [
+        ("MAX_BASELINE_RECORDS", 1, "record limit"),
+        ("MAX_BASELINE_BYTES", 32, "byte limit"),
+        ("MAX_BASELINE_NODES", 3, "node limit"),
+    ],
+)
+def test_dump_baseline_rejects_unloadable_output_without_overwriting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+    limit_name: str,
+    limit: int,
+    message: str,
+) -> None:
+    findings = [_finding(start_line=3), _finding(start_line=7)]
+    data = build_baseline_dict(
+        findings, file_cache={findings[0].file: SKILL_CONTENT}, scanner_version=SCANNER_VERSION
+    )
+    output = tmp_path / f"baseline{suffix}"
+    output.write_text("existing baseline", encoding="utf-8")
+    monkeypatch.setattr(suppression_module, limit_name, limit)
+
+    with pytest.raises(ValueError, match=message):
+        dump_baseline(data, output)
+    assert output.read_text(encoding="utf-8") == "existing baseline"
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "Accepted 🚀 𐐷\twith\nnotes",
+        "Accepted \ud800 lone surrogate",
+        "Accepted \x7f\x80\x85\x9f\ufffe\uffff controls",
+        "Accepted \u2028 line and \u2029 paragraph separators",
+        "Accepted\u2028--- not a document marker",
+    ],
+)
+def test_dump_baseline_preserves_unicode_reason(tmp_path: Path, suffix: str, reason: str) -> None:
+    output = tmp_path / f"baseline{suffix}"
+    data = build_baseline_dict(
+        [_finding()],
+        reason=reason,
+        file_cache={"skill-a/SKILL.md": SKILL_CONTENT},
+        scanner_version=SCANNER_VERSION,
+    )
+
+    dump_baseline(data, output)
+
+    assert list(load_baseline(output).fingerprints.values()) == [reason]
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+@pytest.mark.parametrize("failure", ["write", "sync", "replace", "interrupt"])
+@pytest.mark.parametrize("existing", [True, False])
+def test_dump_baseline_keeps_destination_on_io_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+    failure: str,
+    existing: bool,
+) -> None:
+    output = tmp_path / f"baseline{suffix}"
+    if existing:
+        output.write_text("existing baseline", encoding="utf-8")
+    data: dict[str, object] = {"version": 2, "rules": [{"id": "TM1", "reason": "accepted"}]}
+    error = KeyboardInterrupt if failure == "interrupt" else OSError
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise error("injected I/O failure")
+
+    if failure in {"write", "interrupt"}:
+        original = os.fdopen
+
+        def failing_temporary_file(*args: object, **kwargs: object):
+            temporary = original(*args, **kwargs)
+            original_write = temporary.write
+
+            def partial_write(content: bytes) -> None:
+                original_write(content[: len(content) // 2])
+                temporary.flush()
+                fail()
+
+            temporary.write = partial_write
+            return temporary
+
+        monkeypatch.setattr(os, "fdopen", failing_temporary_file)
+    elif failure == "sync":
+        monkeypatch.setattr(os, "fsync", fail)
+    else:
+        monkeypatch.setattr(os, "replace", fail)
+
+    with pytest.raises(error, match="injected I/O failure"):
+        dump_baseline(data, output)
+
+    if existing:
+        assert output.read_text(encoding="utf-8") == "existing baseline"
+        assert list(tmp_path.iterdir()) == [output]
+    else:
+        assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX file modes")
+@pytest.mark.parametrize("mode", [0o600, 0o640, 0o644, 0o664])
+def test_dump_baseline_preserves_existing_permissions(tmp_path: Path, mode: int) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.write_text("existing baseline", encoding="utf-8")
+    output.chmod(mode)
+
+    dump_baseline({"version": 2}, output)
+
+    assert S_IMODE(output.stat().st_mode) == mode
+    assert load_baseline(output).is_empty()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_dump_baseline_refuses_nonowner_update_without_changing_shared_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "baseline.json"
+    output.write_text("old baseline" * 200, encoding="utf-8")
+    output.chmod(0o664)
+    old = output.stat()
+    # Force the non-owner branch without privileged OS ownership changes.
+    monkeypatch.setattr(os, "geteuid", lambda: old.st_uid + 1)
+
+    def no_chown(*args: object) -> None:
+        pytest.fail("a shared writer must not require chown")
+
+    monkeypatch.setattr(os, "fchown", no_chown)
+    with pytest.raises(PermissionError, match="owned by another user"):
+        dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "shared"}]}, output)
+
+    assert output.read_text(encoding="utf-8") == "old baseline" * 200
+    assert list(tmp_path.iterdir()) == [output]
+    assert (output.stat().st_uid, output.stat().st_gid, output.stat().st_ino) == (
+        old.st_uid,
+        old.st_gid,
+        old.st_ino,
+    )
+    assert S_IMODE(output.stat().st_mode) == 0o664
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_dump_baseline_refuses_update_when_group_cannot_be_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.write_text("old baseline", encoding="utf-8")
+    output.chmod(0o664)
+    old = output.stat()
+    original_fstat = os.fstat
+
+    def temporary_group_differs(descriptor: int):
+        current = original_fstat(descriptor)
+        if current.st_ino != old.st_ino:
+            values = list(current)
+            values[5] = old.st_gid + 1
+            return os.stat_result(values)
+        return current
+
+    monkeypatch.setattr(os, "fstat", temporary_group_differs)
+
+    def denied_chown(*args: object) -> None:
+        # A non-root owner cannot assign a group it is not a member of.
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "fchown", denied_chown)
+    with pytest.raises(PermissionError, match="Cannot safely preserve baseline ownership or group"):
+        dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "owner"}]}, output)
+
+    assert output.read_text(encoding="utf-8") == "old baseline"
+    assert (output.stat().st_gid, output.stat().st_ino) == (old.st_gid, old.st_ino)
+    assert S_IMODE(output.stat().st_mode) == 0o664
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_dump_baseline_revalidates_destination_replaced_while_opening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.write_text("original", encoding="utf-8")
+    output.chmod(0o600)
+    replacement = tmp_path / "other.yaml"
+    replacement.write_text("replacement", encoding="utf-8")
+    replacement.chmod(0o640)
+    original_open = os.open
+
+    def swapped_open(path, flags, *args, **kwargs):
+        # A cooperating writer atomically publishes once, between lstat and open.
+        if (
+            Path(path).name == output.name
+            and kwargs.get("dir_fd") is not None
+            and replacement.exists()
+        ):
+            os.replace(replacement, output)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapped_open)
+    dump_baseline({"version": 2}, output)
+
+    assert load_baseline(output).is_empty()
+    # The replacement, not the stale first observation, supplies access metadata.
+    assert S_IMODE(output.stat().st_mode) == 0o640
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_dump_baseline_rejects_destination_that_keeps_changing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.write_text("original", encoding="utf-8")
+    original_open = os.open
+    swaps = 0
+
+    def swapped_open(path, flags, *args, **kwargs):
+        nonlocal swaps
+        if Path(path).name == output.name and kwargs.get("dir_fd") is not None:
+            swaps += 1
+            replacement = tmp_path / f"replacement-{swaps}.yaml"
+            replacement.write_text(f"replacement {swaps}", encoding="utf-8")
+            os.replace(replacement, output)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapped_open)
+    with pytest.raises(ValueError, match="changed while opening"):
+        dump_baseline({"version": 2}, output)
+
+    assert swaps == suppression_module._BASELINE_DESTINATION_ATTEMPTS
+    assert output.read_text(encoding="utf-8") == f"replacement {swaps}"
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+@pytest.mark.parametrize("error", [errno.ENOTSUP, errno.EOPNOTSUPP])
+def test_dump_baseline_accepts_filesystem_without_extended_acls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: int
+) -> None:
+    import ctypes
+    from types import SimpleNamespace
+
+    def unsupported_acl(descriptor: int, acl: int, acl_type: int) -> int:
+        ctypes.set_errno(error)
+        return -1
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda *args, **kwargs: SimpleNamespace(
+            acl_init=lambda count: 1, acl_set_fd_np=unsupported_acl, acl_free=lambda acl: 0
+        ),
+    )
+    output = tmp_path / "baseline.yaml"
+    dump_baseline({"version": 2}, output)
+    assert load_baseline(output).is_empty()
+    assert S_IMODE(output.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX file modes")
+def test_dump_baseline_creates_private_file(tmp_path: Path) -> None:
+    output = tmp_path / "baseline.yaml"
+
+    dump_baseline({"version": 2}, output)
+
+    assert S_IMODE(output.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX file modes")
+def test_dump_baseline_preserves_read_only_destination(tmp_path: Path) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.write_text("existing baseline", encoding="utf-8")
+    output.chmod(0o444)
+
+    with pytest.raises(PermissionError) as error:
+        dump_baseline({"version": 2}, output)
+
+    assert str(output) in str(error.value)
+    assert output.read_text(encoding="utf-8") == "existing baseline"
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0, reason="requires unprivileged POSIX permissions"
+)
+def test_dump_baseline_parent_permission_error_names_output(tmp_path: Path) -> None:
+    output = tmp_path / "baseline.yaml"
+    tmp_path.chmod(0o555)
+    try:
+        with pytest.raises(PermissionError) as error:
+            dump_baseline({"version": 2}, output)
+        assert str(output) in str(error.value)
+        assert not output.exists()
+    finally:
+        tmp_path.chmod(0o700)
+
+
+@pytest.mark.parametrize("target_exists", [True, False])
+def test_dump_baseline_rejects_symlink_destination(tmp_path: Path, target_exists: bool) -> None:
+    target = tmp_path / "target.yaml"
+    if target_exists:
+        target.write_text("existing baseline", encoding="utf-8")
+    output = tmp_path / "baseline.yaml"
+    output.symlink_to(target)
+
+    with pytest.raises(ValueError, match="regular file"):
+        dump_baseline({"version": 2}, output)
+
+    assert output.is_symlink()
+    if target_exists:
+        assert target.read_text(encoding="utf-8") == "existing baseline"
+    else:
+        assert not target.exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFO support")
+def test_dump_baseline_rejects_fifo_without_writing(tmp_path: Path) -> None:
+    output = tmp_path / "baseline.yaml"
+    os.mkfifo(output)
+
+    with pytest.raises(ValueError, match="regular file"):
+        dump_baseline({"version": 2}, output)
+
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_dump_baseline_rejects_directory_destination(tmp_path: Path) -> None:
+    output = tmp_path / "baseline.yaml"
+    output.mkdir()
+
+    with pytest.raises(ValueError, match="regular file"):
+        dump_baseline({"version": 2}, output)
+
+    assert output.is_dir()
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_dump_baseline_accepts_long_destination_name(tmp_path: Path) -> None:
+    output = tmp_path / ("b" * 245 + ".yaml")
+
+    dump_baseline({"version": 2}, output)
+
+    assert load_baseline(output).is_empty()
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_dump_baseline_keeps_destination_when_acl_removal_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ctypes
+    from types import SimpleNamespace
+
+    output = tmp_path / "baseline.yaml"
+    output.write_text("existing baseline", encoding="utf-8")
+
+    def fail_set_acl(descriptor: int, acl: int, acl_type: int) -> int:
+        ctypes.set_errno(errno.EACCES)
+        return -1
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda *args, **kwargs: SimpleNamespace(
+            acl_init=lambda count: 1, acl_set_fd_np=fail_set_acl, acl_free=lambda acl: 0
+        ),
+    )
+
+    with pytest.raises(PermissionError, match="clear inherited baseline ACLs"):
+        dump_baseline({"version": 2}, output)
+
+    assert output.read_text(encoding="utf-8") == "existing baseline"
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS inherited ACLs")
+@pytest.mark.parametrize("mode", [None, 0o600, 0o200])
+def test_dump_baseline_clears_inherited_macos_acl(tmp_path: Path, mode: int | None) -> None:
+    import subprocess
+
+    output = tmp_path / "baseline.yaml"
+    if mode is not None:
+        output.write_text("existing baseline", encoding="utf-8")
+        output.chmod(mode)
+    subprocess.run(
+        ["/bin/chmod", "+a", "everyone allow read,file_inherit", str(tmp_path)],
+        check=True,
+        capture_output=True,
+    )
+
+    dump_baseline({"version": 2}, output)
+
+    acl_listing = subprocess.run(
+        ["/bin/ls", "-le", str(output)], check=True, capture_output=True, text=True
+    ).stdout
+    assert "everyone" not in acl_listing
+    assert S_IMODE(output.stat().st_mode) == (0o600 if mode is None else mode)
+    if mode == 0o200 and os.geteuid() != 0:
+        with pytest.raises(PermissionError):
+            output.read_bytes()
+    else:
+        assert load_baseline(output).is_empty()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS access ACLs")
+def test_dump_baseline_installs_destination_acl_before_writing_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_preserve_acl = suppression_module._preserve_baseline_acl
+    target_sizes: list[int] = []
+
+    def assert_empty_acl_target(source: int, destination: int) -> None:
+        target_sizes.append(os.fstat(destination).st_size)
+        original_preserve_acl(source, destination)
+
+    monkeypatch.setattr(suppression_module, "_preserve_baseline_acl", assert_empty_acl_target)
+    import subprocess
+
+    output = tmp_path / "baseline.yaml"
+    output.write_text("existing", encoding="utf-8")
+    output.chmod(0o664)
+    subprocess.run(
+        ["/bin/chmod", "+a", "everyone deny read", str(output)],
+        check=True,
+        capture_output=True,
+    )
+    old_listing = subprocess.run(
+        ["/bin/ls", "-le", str(output)], check=True, capture_output=True, text=True
+    ).stdout.splitlines()[1:]
+
+    dump_baseline({"version": 2}, output)
+
+    listing = subprocess.run(
+        ["/bin/ls", "-le", str(output)], check=True, capture_output=True, text=True
+    ).stdout.splitlines()[1:]
+    assert listing == old_listing
+    assert target_sizes == [0]
+    assert S_IMODE(output.stat().st_mode) == 0o664
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or os.geteuid() == 0,
+    reason="requires non-root macOS ACL permission evaluation",
+)
+def test_dump_baseline_accepts_acl_write_grant_without_mode_write_bits(tmp_path: Path) -> None:
+    import pwd
+    import subprocess
+
+    output = tmp_path / "baseline.yaml"
+    output.write_text("existing", encoding="utf-8")
+    output.chmod(0o444)
+    username = pwd.getpwuid(os.geteuid()).pw_name
+    subprocess.run(
+        ["/bin/chmod", "+a", f"user:{username} allow write", str(output)],
+        check=True,
+        capture_output=True,
+    )
+
+    dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "shared"}]}, output)
+
+    assert S_IMODE(output.stat().st_mode) == 0o444
+    assert load_baseline(output).rules[0].reason == "shared"
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+def test_dump_baseline_concurrent_writers_publish_complete_documents(
+    tmp_path: Path, suffix: str
+) -> None:
+    output = tmp_path / f"baseline{suffix}"
+    workers = 8
+    barrier = Barrier(workers)
+    reasons = {f"accepted writer {index} " + "x" * 1000 for index in range(workers)}
+    dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "initial"}]}, output)
+
+    def write(reason: str) -> None:
+        barrier.wait(timeout=10)
+        dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": reason}]}, output)
+        assert load_baseline(output).rules[0].reason in reasons
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for result in executor.map(write, reasons):
+            assert result is None
+
+    assert load_baseline(output).rules[0].reason in reasons
+    assert list(tmp_path.iterdir()) == [output]

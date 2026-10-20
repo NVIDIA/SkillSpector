@@ -13,14 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import json
+import zipfile
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from skillspector.cli import app
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_supply_chain as supply_chain
+
+
+def _zip_bytes(members: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
 
 
 def test_sc8_flags_pycache_and_pyc(tmp_path: Path) -> None:
@@ -38,6 +49,18 @@ def test_sc8_flags_pycache_and_pyc(tmp_path: Path) -> None:
     assert "scripts/__pycache__/evil.cpython-312.pyc" in paths
     assert "orphan.pyc" in paths
     assert all(f.severity == "HIGH" for f in findings)
+
+
+def test_sc8_flags_bytecode_inside_a_shipped_virtual_environment(tmp_path: Path) -> None:
+    payload = tmp_path / ".venv" / "lib" / "payload.pyc"
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"\x00")
+
+    findings = supply_chain._analyze_shipped_bytecode(str(tmp_path))
+
+    assert any(
+        finding.rule_id == "SC8" and finding.file == ".venv/lib/payload.pyc" for finding in findings
+    )
 
 
 def test_sc8_clean_tree_has_no_findings(tmp_path: Path) -> None:
@@ -58,12 +81,142 @@ def test_sc8_single_pyc_blocks_install_and_cli_exit(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 1, result.output
-    report = json.loads(result.output)
+    report = json.loads(result.stdout)
     assert report["risk_assessment"]["score"] >= 51
     assert report["risk_assessment"]["severity"] in {"HIGH", "CRITICAL"}
     assert report["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
     assert report["risk_assessment"]["max_issue_severity"] == "HIGH"
     assert any(issue["id"] == "SC8" for issue in report["issues"])
+
+
+def test_executable_in_default_exclusion_blocks_install_and_is_disclosed(tmp_path: Path) -> None:
+    """A skipped dependency tree cannot turn an executable payload into SAFE."""
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: excluded-executable\n---\n# Excluded executable\n",
+        encoding="utf-8",
+    )
+    payload = tmp_path / "node_modules" / "package" / "index.js"
+    payload.parent.mkdir(parents=True)
+    payload.write_text("process.exit(0)\n", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app,
+        ["scan", str(tmp_path), "--format", "json", "--no-llm"],
+    )
+
+    assert result.exit_code == 1, result.output
+    report = json.loads(result.output)
+    assert report["risk_assessment"]["score"] >= 51
+    assert report["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
+    issue = next(item for item in report["issues"] if item["id"] == "SC9")
+    assert issue["location"]["file"] == "node_modules/package/index.js"
+    assert issue["evidence"]["excluded_from_analysis"] is True
+    completeness = report["analysis_completeness"]
+    assert completeness["is_complete"] is False
+    assert any(
+        item["path"] == "node_modules/package/index.js"
+        and item["reason_code"] == LedgerReason.EXCLUDED_EXECUTABLE_CONTENT.value
+        for item in completeness["ledger_exceptions"]
+    )
+    assert any(
+        item["path"] == "node_modules/package/index.js"
+        and item["reason_code"] == LedgerReason.EXCLUDED_DIRECTORY.value
+        for item in completeness["scope_exclusions"]
+    )
+
+
+def test_nested_executable_in_default_exclusion_blocks_install(tmp_path: Path) -> None:
+    """An executable nested in an excluded archive cannot inherit a SAFE result."""
+    (tmp_path / "SKILL.md").write_text("# Excluded archive\n", encoding="utf-8")
+    archive = tmp_path / "node_modules" / "cache.zip"
+    archive.parent.mkdir()
+    archive.write_bytes(_zip_bytes({"payload.sh": b"#!/bin/sh\necho nested\n"}))
+
+    result = CliRunner().invoke(
+        app,
+        ["scan", str(tmp_path), "--format", "json", "--no-llm"],
+    )
+
+    assert result.exit_code == 1, result.output
+    report = json.loads(result.output)
+    virtual_path = "node_modules/cache.zip!/payload.sh"
+    issue = next(item for item in report["issues"] if item["location"]["file"] == virtual_path)
+    assert issue["id"] == "SC9"
+    assert issue["evidence"]["excluded_from_analysis"] is True
+    assert issue["evidence"]["inherited_exclusion_reason"] == "excluded_directory"
+    assert report["risk_assessment"]["score"] >= 51
+    assert report["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
+    assert report["analysis_completeness"]["is_complete"] is False
+
+
+def test_ordinary_binary_executable_cannot_remain_safe(tmp_path: Path) -> None:
+    """Inspecting a binary's text strings does not verify executable behavior."""
+    (tmp_path / "SKILL.md").write_text("# Binary executable\n", encoding="utf-8")
+    (tmp_path / "payload.exe").write_bytes(b"MZ\x00\x00binary payload")
+
+    result = CliRunner().invoke(
+        app,
+        ["scan", str(tmp_path), "--format", "json", "--no-llm"],
+    )
+
+    assert result.exit_code == 1, result.output
+    report = json.loads(result.output)
+    issue = next(item for item in report["issues"] if item["location"]["file"] == "payload.exe")
+    assert issue["id"] == "SC9"
+    assert issue["evidence"]["excluded_from_analysis"] is False
+    assert issue["evidence"]["partially_analyzed_executable"] is True
+    assert issue["evidence"]["inherited_exclusion_reason"] == "binary_executable_text"
+    assert report["risk_assessment"]["score"] >= 51
+    assert report["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
+
+
+@pytest.mark.parametrize(
+    "magic",
+    [
+        pytest.param(b"\xcf\xfa\xed\xfe", id="thin-64-little"),
+        pytest.param(b"\xca\xfe\xba\xbe", id="universal-32-big"),
+        pytest.param(b"\xbf\xba\xfe\xca", id="universal-64-little"),
+    ],
+)
+def test_hidden_extensionless_macho_uses_canonical_raw_magic(tmp_path: Path, magic: bytes) -> None:
+    """Lossy text decoding cannot erase executable magic from metadata classification."""
+    (tmp_path / "SKILL.md").write_text("# Raw executable magic\n", encoding="utf-8")
+    (tmp_path / ".payload").write_bytes(magic + b"\x00\x00\x00\x00")
+
+    result = CliRunner().invoke(
+        app,
+        ["scan", str(tmp_path), "--format", "json", "--no-llm"],
+    )
+
+    assert result.exit_code == 1, result.output
+    report = json.loads(result.output)
+    issue = next(item for item in report["issues"] if item["location"]["file"] == ".payload")
+    assert issue["id"] == "SC9"
+    assert issue["evidence"]["excluded_from_analysis"] is True
+    assert issue["evidence"]["inherited_exclusion_reason"] == "binary_content"
+    assert report["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
+
+
+def test_vcs_excluded_executable_is_audited_and_blocking(tmp_path: Path) -> None:
+    """Executable content in excluded Git object storage cannot disappear at discovery."""
+    (tmp_path / "SKILL.md").write_text("# VCS exclusion\n", encoding="utf-8")
+    payload = tmp_path / ".git" / "objects" / "aa" / "payload.sh"
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"#!/bin/sh\necho vcs payload\n")
+
+    result = CliRunner().invoke(
+        app,
+        ["scan", str(tmp_path), "--format", "json", "--no-llm"],
+    )
+
+    assert result.exit_code == 1, result.output
+    report = json.loads(result.output)
+    path = ".git/objects/aa/payload.sh"
+    issue = next(item for item in report["issues"] if item["location"]["file"] == path)
+    assert issue["id"] == "SC9"
+    assert issue["evidence"]["excluded_from_analysis"] is True
+    assert issue["evidence"]["inherited_exclusion_reason"] == "vcs_metadata"
+    assert report["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
 
 
 def test_sc8_directory_entry_overflow_discards_nondeterministic_prefix(
@@ -161,3 +314,73 @@ def test_sc8_cli_projects_truncation_into_analysis_completeness(
         item["reason_code"] == LedgerReason.ARTIFACT_COUNT_LIMIT.value
         for item in completeness["ledger_exceptions"]
     )
+
+
+class _FakeClock:
+    """Stand-in for ``time`` whose two clocks advance independently per read."""
+
+    def __init__(self, *, wall_step: float, cpu_step: float) -> None:
+        self._wall = 0.0
+        self._cpu = 0.0
+        self._wall_step = wall_step
+        self._cpu_step = cpu_step
+
+    def monotonic(self) -> float:
+        self._wall += self._wall_step
+        return self._wall
+
+    def thread_time(self) -> float:
+        self._cpu += self._cpu_step
+        return self._cpu
+
+
+def _nested_clean_tree(root: Path) -> None:
+    for name in ("features/a/references", "features/b/references", "scripts/engine"):
+        directory = root / name
+        directory.mkdir(parents=True)
+        (directory / "notes.md").write_text("x\n", encoding="utf-8")
+
+
+def test_sc8_walk_ignores_time_spent_waiting_for_other_analyzers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Concurrent analyzers hold the GIL, so each step of the walk can wait a
+    # long time while doing almost no work of its own (SKILLEVAL-17).
+    _nested_clean_tree(tmp_path)
+    monkeypatch.setattr(supply_chain, "time", _FakeClock(wall_step=1.0, cpu_step=0.0))
+
+    result = supply_chain._scan_shipped_bytecode(str(tmp_path))
+
+    assert result.findings == []
+    assert result.limitations == []
+
+
+def test_sc8_processing_budget_still_bounds_the_walk(tmp_path: Path, monkeypatch) -> None:
+    _nested_clean_tree(tmp_path)
+    monkeypatch.setattr(supply_chain, "time", _FakeClock(wall_step=0.0, cpu_step=1.0))
+
+    result = supply_chain._scan_shipped_bytecode(str(tmp_path))
+
+    assert len(result.limitations) == 1
+    limitation = result.limitations[0]
+    assert limitation.reason is LedgerReason.RUNTIME_LIMIT
+    assert limitation.limit_seconds == supply_chain.MAX_SC8_ANALYSIS_SECONDS
+
+
+@pytest.mark.parametrize(("timeout_seconds", "expected_limit"), [(None, 4.0), (3.0, 3.0)])
+def test_sc8_wall_clock_is_bounded_by_the_workflow_deadline(
+    tmp_path: Path,
+    monkeypatch,
+    timeout_seconds: float | None,
+    expected_limit: float,
+) -> None:
+    _nested_clean_tree(tmp_path)
+    monkeypatch.setattr(supply_chain, "MAX_WORKFLOW_SECONDS", 4.0)
+    monkeypatch.setattr(supply_chain, "time", _FakeClock(wall_step=1.0, cpu_step=0.0))
+
+    result = supply_chain._scan_shipped_bytecode(str(tmp_path), timeout_seconds=timeout_seconds)
+
+    assert len(result.limitations) == 1
+    limitation = result.limitations[0]
+    assert limitation.reason is LedgerReason.RUNTIME_LIMIT
+    assert limitation.limit_seconds == expected_limit

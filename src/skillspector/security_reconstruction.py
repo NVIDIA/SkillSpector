@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from array import array
 from collections import Counter
@@ -205,10 +206,13 @@ _TAG_DIRECTIVE_START_RE: Final = re.compile(
     re.IGNORECASE,
 )
 _UNSUPPORTED_TAG_DIRECTIVE_START_RE: Final = re.compile(
-    rf"\b(?:{_FALLBACK_REMOVAL_VERBS})\b[^.!?\n]{{0,{_MAX_FALLBACK_PREFIX_CHARS}}}?"
+    rf"\b(?:{_FALLBACK_REMOVAL_VERBS})\b"
+    rf"(?P<header>[^.!?\n]{{0,{_MAX_FALLBACK_PREFIX_CHARS}}}?)"
     r"(?P<open><)",
     re.IGNORECASE,
 )
+# Characters the loose fallback header above can never cross.
+_FALLBACK_HEADER_BOUNDARY_RE: Final = re.compile(r"[.!?\n]")
 _ENCODED_TAG_DIRECTIVE_START_RE: Final = re.compile(
     rf"\b(?:{_REMOVAL_VERBS})\b{_DECLARED_MARKER_PREFIX}"
     rf"(?P<open>&(?:lt|#{_ENTITY_ZERO_PADDING}60|#x{_ENTITY_ZERO_PADDING}3c);)",
@@ -235,6 +239,10 @@ _ENCODED_DOUBLE_QUOTE_RE: Final = re.compile(
     re.IGNORECASE,
 )
 _TAG_MARKER_RE: Final = re.compile(r"</?[A-Za-z][A-Za-z0-9:_-]*(?:[ \t]*/)?\>")
+# Accepts at least every prefix of a _TAG_MARKER_RE match. It also accepts
+# blanks with no ``/`` (``<br  ``), which _TAG_MARKER_RE rejects, so a marker
+# padded with blanks past the lookahead still reads as viable and fails closed.
+_TAG_MARKER_PREFIX_RE: Final = re.compile(r"</?[A-Za-z][A-Za-z0-9:_-]*[ \t]*/?")
 _UNAMBIGUOUS_ACTION_RE: Final = re.compile(
     r"\b(?:run|execute|invoke|issue|launch|perform|carry[ \t]+out)\b",
     re.IGNORECASE,
@@ -284,7 +292,7 @@ _INLINE_SHELL_WRAPPER_RE: Final = re.compile(
     re.IGNORECASE,
 )
 _DECODED_ACTIVE_TOKEN_RE: Final = re.compile(
-    r"\b(?:run|execute|invoke|issue|launch|perform|call|eval|type|submit|enter|"
+    r"\b(?:run|execute|invoke|issue|launch|perform|call|eval|type|submit|enter|curl|"
     r"rm|del|erase|sudo|bash|zsh|powershell)\b",
     re.IGNORECASE,
 )
@@ -436,17 +444,362 @@ def _compact_spaced_security_word_view(view: SecurityTextView) -> SecurityTextVi
     return SecurityTextView(f"marker-{view.name}", output.getvalue(), offsets)
 
 
+# Only bounded, complete JSON values establish quote ownership. Arbitrary
+# key/value-looking prose is not a JSON representation. Keep fence syntax
+# aligned with analyzers.common without importing its auto-discovered registry.
+_MAX_JSON_QUOTE_CONTAINER_CHARS: Final = 65_536
+_JSON_FENCE_OPEN_RE: Final = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})([^\r\n]*)$")
+_JSON_FENCE_CLOSE_RE: Final = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*$")
+_JSON_LIST_MARKER_RE: Final = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])")
+
+
+@dataclass
+class _JsonContainerCursor:
+    """Read container columns without expanding JSON or losing raw positions.
+
+    A consumed tab advances the raw index once; its remaining visual columns
+    stay in ``pending`` until another container or the validation copy uses
+    them. Tab stops therefore remain relative to the original line.
+    """
+
+    line: str
+    check_runtime: Callable[[], None] | None
+    index: int = 0
+    column: int = 0
+    pending: int = 0
+
+    def character(self) -> str:
+        if self.pending:
+            return " "
+        return self.line[self.index] if self.index < len(self.line) else ""
+
+    def advance(self) -> None:
+        if self.check_runtime is not None:
+            self.check_runtime()
+        if self.pending:
+            self.pending -= 1
+        else:
+            if self.line[self.index] == "\t":
+                self.pending = 3 - self.column % 4
+            self.index += 1
+        self.column += 1
+
+    def spaces(self, limit: int) -> int:
+        start = self.column
+        while self.column - start < limit and self.character() in (" ", "\t"):
+            self.advance()
+        return self.column - start
+
+    def quote(self) -> bool:
+        self.spaces(3)
+        if self.character() != ">":
+            return False
+        self.advance()
+        self.spaces(1)
+        return True
+
+    def remainder(self) -> str:
+        # Fence recognition needs at most four leading columns: the fourth
+        # proves overindentation. Only that bounded prefix is normalized;
+        # literal tabs after the JSON's first token remain untouched.
+        start = self.column
+        self.spaces(4)
+        return " " * (self.column - start + self.pending) + self.line[self.index :]
+
+
+def _json_fence_prefix(
+    line: str, check_runtime: Callable[[], None] | None
+) -> tuple[str, tuple[tuple[str, int], ...]]:
+    """Recognize explicit container prefixes without changing source text."""
+    context: list[tuple[str, int]] = []
+    cursor = _JsonContainerCursor(line, check_runtime)
+    while True:
+        if check_runtime is not None:
+            check_runtime()
+        start = cursor.index, cursor.column, cursor.pending
+        cursor.spaces(3)
+        if cursor.character() == ">":
+            context.append(("quote", 0))
+            cursor.advance()
+            cursor.spaces(1)
+            continue
+        item = None if cursor.pending else _JSON_LIST_MARKER_RE.match(line, cursor.index)
+        if item is not None:
+            # The marker is bounded ASCII, so raw and visual widths agree.
+            cursor.column += item.end() - cursor.index
+            cursor.index = item.end()
+            padding = cursor.spaces(5)
+            if 1 <= padding <= 4:
+                context.append(("indent", cursor.column - start[1]))
+                continue
+        cursor.index, cursor.column, cursor.pending = start
+        return cursor.remainder(), tuple(context)
+
+
+def _json_fence_body(
+    line: str,
+    context: tuple[tuple[str, int], ...],
+    check_runtime: Callable[[], None] | None,
+    *,
+    last_quote_index: int,
+) -> str | None:
+    """Remove only the opener's proven container prefixes for JSON validation."""
+    cursor = _JsonContainerCursor(line, check_runtime)
+    for index, (kind, width) in enumerate(context):
+        if check_runtime is not None:
+            check_runtime()
+        if kind == "quote":
+            if not cursor.quote():
+                return None
+        else:
+            if cursor.spaces(width) != width:
+                # Empty list-body lines may omit indentation. A missing quote
+                # prefix is different: it ends that explicit container.
+                return (
+                    "\n" if index > last_quote_index and not line[cursor.index :].strip() else None
+                )
+    return cursor.remainder()
+
+
+def _json_body_after_frontmatter(text: str, check_runtime: Callable[[], None] | None) -> int | None:
+    """Recognize a bounded, explicitly delimited metadata prefix at offset zero.
+
+    This only identifies the JSON body's boundary. Manifest parsing continues
+    to validate metadata independently; none of its quotes acquires ownership.
+    """
+    prefix = text[:_MAX_JSON_QUOTE_CONTAINER_CHARS]
+    opening = re.match(r"\A---[ \t]*\r?\n", prefix)
+    if opening is None:
+        return None
+    offset = opening.end()
+    for line in prefix[offset:].splitlines(keepends=True):
+        if check_runtime is not None:
+            check_runtime()
+        # A complete delimiter line prevents a bounded prefix ending in the
+        # middle of a longer line from manufacturing a closing delimiter.
+        if line.endswith("\n") and line.rstrip("\r\n").rstrip(" \t") in {"---", "..."}:
+            return offset + len(line)
+        offset += len(line)
+    return None
+
+
+def _validated_json_ranges(
+    text: str, check_runtime: Callable[[], None] | None
+) -> list[tuple[int, int]]:
+    """Return raw source ranges whose complete JSON syntax has been validated.
+
+    List and blockquote prefixes are removed only in a bounded validation copy.
+    They contain no string delimiters, so quote offsets in the original ranges
+    remain exact. Invalid, incomplete, oversized and deeply nested containers
+    grant no ownership. Non-JSON fences also establish block boundaries.
+    """
+
+    def check() -> None:
+        if check_runtime is not None:
+            check_runtime()
+
+    def reject_constant(value: str) -> None:
+        raise ValueError("Non-JSON numeric constant")
+
+    def valid(start: int, end: int, body: str | None = None) -> bool:
+        check()
+        if end - start > _MAX_JSON_QUOTE_CONTAINER_CHARS:
+            return False
+        try:
+            json.loads(text[start:end] if body is None else body, parse_constant=reject_constant)
+        except (ValueError, RecursionError):
+            result = False
+        else:
+            result = True
+        check()
+        return result
+
+    if valid(0, len(text)):
+        return [(0, len(text))]
+    body_start = _json_body_after_frontmatter(text, check_runtime)
+    if body_start is not None and valid(body_start, len(text)):
+        return [(body_start, len(text))]
+    ranges: list[tuple[int, int]] = []
+    fence: tuple[str, int, tuple[tuple[str, int], ...], bool] | None = None
+    body_lines: list[str] = []
+    last_quote_index = -1
+    start = 0
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        check()
+        body = None
+        if fence is not None:
+            body = _json_fence_body(
+                line, fence[2], check_runtime, last_quote_index=last_quote_index
+            )
+            if body is None:
+                # The explicit container ended. Discard its partial payload,
+                # then consider this same line once as a new fence opener.
+                # No recursion, rewind or repeated suffix scan is needed.
+                fence = None
+                body_lines = []
+        if fence is None:
+            body, context = _json_fence_prefix(line.rstrip("\r\n"), check_runtime)
+            opening = _JSON_FENCE_OPEN_RE.fullmatch(body)
+            if opening and not (opening[1][0] == "`" and "`" in opening[2]):
+                language = opening[2].strip().split(maxsplit=1)
+                last_quote_index = -1
+                for index, (kind, _) in enumerate(context):
+                    check()
+                    if kind == "quote":
+                        last_quote_index = index
+                fence = (
+                    opening[1][0],
+                    len(opening[1]),
+                    context,
+                    bool(language and language[0].lower() == "json"),
+                )
+                start = offset + len(line)
+                body_lines = []
+        else:
+            assert body is not None
+            closing = _JSON_FENCE_CLOSE_RE.fullmatch(body.rstrip("\r\n"))
+            if closing and closing[1][0] == fence[0] and len(closing[1]) >= fence[1]:
+                if fence[3] and valid(start, offset, "".join(body_lines)):
+                    ranges.append((start, offset))
+                fence = None
+                body_lines = []
+            elif offset + len(line) - start <= _MAX_JSON_QUOTE_CONTAINER_CHARS:
+                if fence[3]:
+                    body_lines.append(body)
+            else:
+                body_lines = []
+        offset += len(line)
+    return ranges
+
+
+def _json_string_spans(
+    text: str, check_runtime: Callable[[], None] | None
+) -> Iterator[tuple[int, int]]:
+    """Lex all complete JSON strings in one forward, escape-aware pass.
+
+    This intentionally includes array elements and object keys, unlike the old
+    key/string-value-pair grammar. Only the caller's validated ranges establish
+    ownership. Malformed prose still cannot grant structural quote ownership.
+    """
+    cursor = 0
+    limit = len(text)
+    start: int | None = None
+    next_check = 0
+    while cursor < limit:
+        if cursor >= next_check:
+            if check_runtime is not None:
+                check_runtime()
+            next_check = cursor + 256
+        character = text[cursor]
+        if start is None:
+            if character == '"':
+                start = cursor
+        elif character == "\\":
+            # JSON escapes consume the following character, including quotes.
+            # Unicode escape digits contain no delimiters; validation proves
+            # their syntax before these lexical spans can establish ownership.
+            cursor += 1
+        elif character == '"':
+            yield start, cursor + 1
+            start = None
+        elif character in "\r\n":
+            start = None
+        cursor += 1
+    if check_runtime is not None:
+        check_runtime()
+
+
+def validated_json_string_spans(
+    text: str, check_runtime: Callable[[], None] | None
+) -> list[tuple[int, int]]:
+    """Return exact string spans owned by complete JSON values, including both quotes."""
+    ranges = _validated_json_ranges(text, check_runtime)
+    spans: list[tuple[int, int]] = []
+    for start, end in ranges:
+        for string_start, string_end in _json_string_spans(text[start:end], check_runtime):
+            spans.append((start + string_start, start + string_end))
+    return spans
+
+
+def validated_json_string_closers(text: str, check_runtime: Callable[[], None] | None) -> set[int]:
+    """Return exact closing-quote offsets owned by complete JSON values."""
+    return {end - 1 for _, end in validated_json_string_spans(text, check_runtime)}
+
+
+def _is_quoted_mapping_key(text: str, start: int) -> bool:
+    """Return whether the exact quoted removal verb is followed by a key colon."""
+    if start == 0 or text[start - 1] not in _ALL_QUOTE_CHARACTERS:
+        return False
+    closing_quote = _QUOTE_OPEN_TO_CLOSE[text[start - 1]]
+    closing = text.find(closing_quote, start)
+    if (
+        closing < 0
+        or re.fullmatch(_FALLBACK_REMOVAL_VERBS, text[start:closing], re.IGNORECASE) is None
+    ):
+        return False
+    cursor = closing + len(closing_quote)
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    return cursor < len(text) and text[cursor] == ":"
+
+
+def _verb_is_in_cli_flag_token(text: str, start: int) -> bool:
+    """Return whether a fallback verb is part of a hyphen-prefixed token."""
+    token_start = start
+    while token_start > 0 and (text[token_start - 1].isalnum() or text[token_start - 1] in "_-"):
+        token_start -= 1
+    return token_start < start and text[token_start] == "-"
+
+
+def _view_string_closer(
+    view: SecurityTextView, validated_string_closer: Callable[[int], bool]
+) -> Callable[[int], bool]:
+    """Map a source-offset string-closer test onto ``view`` character indexes.
+
+    A derived view keeps the source offset of every character, so only an ASCII
+    quote that maps onto a proven closing delimiter is that delimiter.
+    """
+
+    def closes_owned_string(index: int) -> bool:
+        return view.text[index] in "'\"" and validated_string_closer(view.source_offset(index))
+
+    return closes_owned_string
+
+
 def _quoted_directives(
     text: str,
     check_runtime: Callable[[], None] | None,
     *,
     end_is_truncated: bool,
+    closes_owned_string: Callable[[int], bool] | None = None,
     pattern: re.Pattern[str] = _QUOTED_DIRECTIVE_START_RE,
     unsupported_header: bool = False,
 ) -> Iterator[_Directive]:
+    # A complete JSON representation owns its closing quotes; JSON-looking
+    # fragments in prose and instructions do not. Only structural closing
+    # delimiters are excluded; instruction contents remain available below.
+    # ``closes_owned_string`` extends this to proven host-language strings.
+    # Like JSON closers, it only stops the loose fallback header: an explicit
+    # declared-marker header keeps reading any quote as a marker opener.
+    json_value_closers = (
+        validated_json_string_closers(text, check_runtime) if unsupported_header else set()
+    )
     for match in pattern.finditer(text):
         if check_runtime is not None:
             check_runtime()
+        if unsupported_header and _verb_is_in_cli_flag_token(text, match.start()):
+            continue
+        if unsupported_header and _is_quoted_mapping_key(text, match.start()):
+            continue
+        if match.end() - 1 in json_value_closers:
+            continue
+        if (
+            unsupported_header
+            and closes_owned_string is not None
+            and closes_owned_string(match.start("quote"))
+        ):
+            continue
         quote = _QUOTE_OPEN_TO_CLOSE[match.group("quote")]
         marker_start = match.end()
         marker_end_limit = min(len(text), marker_start + MAX_MARKER_LOOKAHEAD_CHARS)
@@ -589,6 +942,48 @@ def _empty_replacement_directives(
         )
 
 
+def _can_open_tag_marker(text: str, start: int, limit: int) -> bool:
+    """Return whether the ``<`` at ``start`` can still begin a tag marker.
+
+    Code such as ``len(value.strip()) < 12`` or ``a<=b`` puts a comparison
+    operator after a removal verb. ``_TAG_MARKER_RE`` can never accept it, so
+    the loose fallback header must not search for a distant ``>`` and report
+    lookahead exhaustion. A tag name that is still open at ``limit`` remains
+    viable so a padded marker keeps failing closed.
+    """
+    prefix = _TAG_MARKER_PREFIX_RE.match(text, start, limit)
+    return prefix is not None and (prefix.end() == limit or text[prefix.end()] == ">")
+
+
+def _next_tag_opener(
+    text: str,
+    start: int,
+    header_end: int,
+    check_runtime: Callable[[], None] | None,
+) -> int | None:
+    """Return the first ``<`` in ``text[start:header_end]`` that can open a tag marker.
+
+    The loose fallback header stops lazily at the first ``<`` after the verb,
+    but it reaches every later ``<`` up to ``header_end`` that no sentence
+    boundary or newline separates from the verb. A comparison such as
+    ``1 < 2`` must not hide a real marker later in that span, so non-viable
+    openers are passed over rather than ending the search. Openers are
+    examined left to right and each prefix match stops at the next ``<``, so
+    the work stays linear in the bounded header span plus one lookahead.
+    """
+    boundary = _FALLBACK_HEADER_BOUNDARY_RE.search(text, start, header_end)
+    end = boundary.start() if boundary is not None else header_end
+    opener = text.find("<", start, end)
+    while opener >= 0:
+        if check_runtime is not None:
+            check_runtime()
+        limit = min(len(text), opener + MAX_MARKER_LOOKAHEAD_CHARS)
+        if _can_open_tag_marker(text, opener, limit):
+            return opener
+        opener = text.find("<", opener + 1, end)
+    return None
+
+
 def _tag_directives(
     text: str,
     check_runtime: Callable[[], None] | None,
@@ -600,7 +995,21 @@ def _tag_directives(
     for match in pattern.finditer(text):
         if check_runtime is not None:
             check_runtime()
+        if unsupported_header and _verb_is_in_cli_flag_token(text, match.start()):
+            continue
         marker_start = match.start("open")
+        if unsupported_header:
+            # The header's filler may be at most _MAX_FALLBACK_PREFIX_CHARS
+            # long, so an opener can sit at most that far past the verb.
+            opener = _next_tag_opener(
+                text,
+                marker_start,
+                match.start("header") + _MAX_FALLBACK_PREFIX_CHARS + 1,
+                check_runtime,
+            )
+            if opener is None:
+                continue
+            marker_start = opener
         marker_end_limit = min(len(text), marker_start + MAX_MARKER_LOOKAHEAD_CHARS)
         marker_end = text.find(">", marker_start + 1, marker_end_limit)
         if marker_end < 0:
@@ -629,6 +1038,8 @@ def _encoded_directives(
     for match in pattern.finditer(text):
         if check_runtime is not None:
             check_runtime()
+        if unsupported_header and _verb_is_in_cli_flag_token(text, match.start()):
+            continue
         quote = match.group("quote")
         closing_pattern = (
             _ENCODED_SINGLE_QUOTE_RE
@@ -679,6 +1090,8 @@ def _encoded_tag_directives(
     for match in pattern.finditer(text):
         if check_runtime is not None:
             check_runtime()
+        if unsupported_header and _verb_is_in_cli_flag_token(text, match.start()):
+            continue
         marker_start = match.start("open")
         marker_end_limit = min(len(text), marker_start + MAX_MARKER_LOOKAHEAD_CHARS)
         marker_end = _ENCODED_TAG_END_RE.search(text, match.end(), marker_end_limit)
@@ -723,6 +1136,7 @@ def _directives(
     check_runtime: Callable[[], None] | None,
     *,
     end_is_truncated: bool,
+    closes_owned_string: Callable[[int], bool] | None = None,
 ) -> list[_Directive]:
     candidates = [
         *_passive_quoted_directives(
@@ -745,6 +1159,7 @@ def _directives(
             text,
             check_runtime,
             end_is_truncated=end_is_truncated,
+            closes_owned_string=closes_owned_string,
             pattern=_UNSUPPORTED_QUOTED_DIRECTIVE_START_RE,
             unsupported_header=True,
         ),
@@ -1471,6 +1886,7 @@ def build_declared_marker_views(
     owned_source_start: int | None = None,
     owned_source_end: int | None = None,
     source_end_is_truncated: bool = False,
+    validated_string_closer: Callable[[int], bool] | None = None,
 ) -> DeclaredMarkerViewResult:
     """Build one-pass payload views for explicit literal-removal instructions.
 
@@ -1484,6 +1900,13 @@ def build_declared_marker_views(
     the next window. ``source_end_is_truncated`` separately records whether the
     physical view ends before the source, so ownership alone never degrades a
     complete end-of-file directive.
+
+    ``validated_string_closer`` optionally reports whether a source offset, in
+    the same coordinates, is the closing delimiter of a string literal that a
+    complete host-language parse has proven. Such a quote is syntax that ends a
+    literal, so the loose fallback header never reads it as a marker opener,
+    exactly as for a validated JSON string. Explicit declared-marker headers and
+    callers without the test keep the lexical reading.
     """
     if check_runtime is not None:
         check_runtime()
@@ -1495,6 +1918,11 @@ def build_declared_marker_views(
     ):
         return DeclaredMarkerViewResult((), False)
 
+    closes_owned_string = (
+        None
+        if validated_string_closer is None
+        else _view_string_closer(view, validated_string_closer)
+    )
     active_directives = 0
     limited = False
     projection_blocked = False
@@ -1503,6 +1931,7 @@ def build_declared_marker_views(
         view.text,
         check_runtime,
         end_is_truncated=source_end_is_truncated,
+        closes_owned_string=closes_owned_string,
     ):
         if check_runtime is not None:
             check_runtime()

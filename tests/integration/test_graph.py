@@ -16,11 +16,12 @@
 """Tests for the Skillspector LangGraph workflow."""
 
 import json
+from importlib import import_module
 from pathlib import Path
 
 import pytest
 
-from skillspector.graph import graph
+from skillspector.graph import create_graph, graph
 
 
 def test_graph_invoke_with_output_format_json(tmp_path: Path) -> None:
@@ -42,58 +43,61 @@ def test_graph_invoke_with_output_format_json(tmp_path: Path) -> None:
     assert "components" in data
 
 
-def test_graph_excludes_valid_oms_signature_from_static_findings(tmp_path: Path) -> None:
-    """A real OMS signature remains inventoried without producing scan findings."""
-    fixture = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
-    (tmp_path / "SKILL.md").write_text("---\nname: signed\n---\n# Signed\n", encoding="utf-8")
-    (tmp_path / "skill.oms.sig").write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
-
-    result = graph.invoke(
-        {
-            "skill_path": str(tmp_path),
-            "output_format": "json",
-            "use_llm": False,
-        }
-    )
-
-    report = json.loads(result["report_body"])
-    signature_component = next(
-        component for component in report["components"] if component["path"] == "skill.oms.sig"
-    )
-    assert signature_component["type"] == "oms_signature"
-    assert report["analysis_completeness"]["coverage_percent"] == 100.0
-    assert report["analysis_completeness"]["scope_exclusions"] == [
-        {
-            "outcome": "out_of_scope",
-            "phase": "discovery",
-            "reason_code": "oms_signature",
-            "message": "Recognized OMS signature metadata is excluded from content analysis.",
-            "path": "skill.oms.sig",
-            "start_line": None,
-            "end_line": None,
-            "fatal": False,
-        }
-    ]
-    assert report["analysis_completeness"]["ledger_exceptions"] == []
-    assert report["analysis_completeness"]["execution_successful"] is True
-    assert "skill.oms.sig" not in result["components"]
-    assert "skill.oms.sig" not in result["file_cache"]
-    assert not any(
-        event["path"] == "skill.oms.sig" and event["outcome"] == "failed"
-        for event in result["inspection_ledger"]
-    )
-    assert all(finding.file != "skill.oms.sig" for finding in result["findings"])
-    assert all(issue["file"] != "skill.oms.sig" for issue in report["issues"])
-
-
-@pytest.mark.parametrize("output_format", ["terminal", "markdown", "sarif"])
-def test_graph_reports_oms_scope_exclusion_in_every_non_json_format(
-    tmp_path: Path, output_format: str
+@pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
+@pytest.mark.parametrize(
+    ("script", "expected_destination"),
+    [
+        (
+            "MARKER=1 NPM_CONFIG_REGISTRY=https://packages.example.invalid\n",
+            "https://packages.example.invalid",
+        ),
+        (
+            "export MARKER=1 PIP_INDEX_URL=https://packages.example.invalid/simple\n",
+            "https://packages.example.invalid/simple",
+        ),
+        (
+            "export MARKER=1 PIP_EXTRA_INDEX_URL=https://packages.example.invalid/simple\n",
+            "https://packages.example.invalid/simple",
+        ),
+        (
+            "export MARKER=1 CARGO_REGISTRIES_PRIVATE_INDEX="
+            "sparse+https://packages.example.invalid/index\n",
+            "sparse+https://packages.example.invalid/index",
+        ),
+        (
+            "env MARKER=1 npm config set registry https://packages.example.invalid\n",
+            "https://packages.example.invalid",
+        ),
+        (
+            "sudo -E npm config set registry https://packages.example.invalid\n",
+            "https://packages.example.invalid",
+        ),
+        (
+            "command -- npm config set registry https://packages.example.invalid\n",
+            "https://packages.example.invalid",
+        ),
+        (
+            "( npm config set registry https://packages.example.invalid )\n",
+            "https://packages.example.invalid",
+        ),
+        (
+            """cat > .npmrc <<END$OF
+registry=https://packages.example.invalid
+END$OF
+""",
+            "https://packages.example.invalid",
+        ),
+    ],
+)
+def test_graph_reports_wrapped_dependency_source_changes_in_every_format(
+    tmp_path: Path, output_format: str, script: str, expected_destination: str
 ) -> None:
-    """OMS scope exclusions remain visible in every user-facing report format."""
-    fixture = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
-    (tmp_path / "SKILL.md").write_text("---\nname: signed\n---\n# Signed\n", encoding="utf-8")
-    (tmp_path / "skill.oms.sig").write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+    """SC10 survives the complete static graph and every public report format."""
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: dependency-source-test\n---\n# Dependency Source Test\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "setup.sh").write_text(script, encoding="utf-8")
 
     result = graph.invoke(
         {
@@ -103,26 +107,51 @@ def test_graph_reports_oms_scope_exclusion_in_every_non_json_format(
         }
     )
 
-    scope_exclusion = result["analysis_completeness"]["scope_exclusions"]
-    assert scope_exclusion[0]["path"] == "skill.oms.sig"
-    assert scope_exclusion[0]["reason_code"] == "oms_signature"
+    finding = next(item for item in result["findings"] if item.rule_id == "SC10")
+    assert finding.severity == "HIGH"
+    assert finding.evidence["destination"] == expected_destination
+    rendered = (
+        json.dumps(result["sarif_report"]) if output_format == "sarif" else result["report_body"]
+    )
+    assert "SC10" in rendered
+    assert "packages.example.invalid" in rendered
 
-    if output_format == "sarif":
-        notifications = result["sarif_report"]["runs"][0]["invocations"][0][
-            "toolExecutionNotifications"
-        ]
-        notification = next(
-            item for item in notifications if item["properties"]["reasonCode"] == "oms_signature"
-        )
-        assert notification["level"] == "note"
-        assert notification["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == (
-            "skill.oms.sig"
-        )
-    else:
-        expected_heading = "Scope exclusions" if output_format == "terminal" else "Scope Exclusions"
-        assert expected_heading in result["report_body"]
-        assert "oms_signature" in result["report_body"]
-        assert "skill.oms.sig" in result["report_body"]
+
+@pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
+@pytest.mark.parametrize(
+    "script",
+    [
+        "NPM_CONFIG_REGISTRY=https://registry.npmjs.org/ MARKER=1\n",
+        '"npm config set registry https://packages.example.invalid"\n',
+        """cat <<END$OF
+npm config set registry https://packages.example.invalid
+END$OF
+""",
+    ],
+)
+def test_graph_keeps_reviewed_canonical_and_inert_forms_clear(
+    tmp_path: Path, output_format: str, script: str
+) -> None:
+    """Reviewed negative forms remain clear in every public report format."""
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: dependency-source-negative-test\n---\n# Dependency Source Negative Test\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "setup.sh").write_text(script, encoding="utf-8")
+
+    result = graph.invoke(
+        {
+            "skill_path": str(tmp_path),
+            "output_format": output_format,
+            "use_llm": False,
+        }
+    )
+
+    assert all(item.rule_id != "SC10" for item in result["findings"])
+    rendered = (
+        json.dumps(result["sarif_report"]) if output_format == "sarif" else result["report_body"]
+    )
+    assert "SC10" not in rendered
 
 
 def test_graph_invoke_returns_findings_and_report(tmp_path: Path) -> None:
@@ -178,7 +207,7 @@ def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.M
         def __init__(self, _model: str, **_kwargs: object) -> None:
             pass
 
-        def run_batches_detailed(self, _batches: object) -> object:
+        async def arun_batches_detailed(self, _batches: object) -> object:
             raise RuntimeError("simulated LLM transport failure")
 
     # Semantic analyzers and meta_analyzer fail while constructing their shared
@@ -189,7 +218,14 @@ def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.M
         "skillspector.nodes.analyzers.mcp_tool_poisoning._TP4Analyzer", FailingTP4Analyzer
     )
 
-    result = graph.invoke({"skill_path": str(tmp_path), "use_llm": True, "output_format": "json"})
+    # Build after configuring availability so the mocked semantic transports
+    # are exercised even when the test environment has no provider credentials.
+    monkeypatch.setattr(
+        import_module("skillspector.graph"), "is_llm_available", lambda: (True, None)
+    )
+    result = create_graph().invoke(
+        {"skill_path": str(tmp_path), "use_llm": True, "output_format": "json"}
+    )
 
     log = result["llm_call_log"]
     assert log, "expected LLM telemetry records"

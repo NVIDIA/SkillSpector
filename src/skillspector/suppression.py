@@ -55,27 +55,97 @@ a keyword in ``*`` (e.g. ``"*telemetry*"``) for substring matching.
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import hashlib
 import json
+import os
 import posixpath
 import re
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from secrets import token_hex
+from stat import S_IMODE, S_ISREG
 from typing import Any
 
 import yaml
 
+from skillspector.file_output import open_output_parent
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 
 logger = get_logger(__name__)
 
 BASELINE_VERSION = 2
+MAX_BASELINE_BYTES = 2 * 1024 * 1024
+MAX_BASELINE_NODES = 100_000
+MAX_BASELINE_DEPTH = 64
+MAX_BASELINE_RECORDS = 10_000
+MAX_BASELINE_SCALAR_CHARS = 64 * 1024
+# Validation passes for an output path that concurrent writers replace.
+# Allow a small burst of cooperating atomic writers while bounding hostile swaps.
+_BASELINE_DESTINATION_ATTEMPTS = 8
 _FINGERPRINT_SCHEMA = "skillspector-finding-fingerprint-v2"
 _FINGERPRINT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SOURCE_IDENTITY_RE = re.compile(r"external/[0-9a-f]{64}\Z")
+
+
+class _BoundedBaselineLoader(yaml.SafeLoader):
+    """Bound composition and alias expansion before YAML object construction."""
+
+    def __init__(self, stream: str) -> None:
+        super().__init__(stream)
+        self._nodes = 0
+        self._depth = 0
+
+    def compose_node(self, parent: object, index: object) -> yaml.Node:
+        self._nodes += 1
+        if self._nodes > MAX_BASELINE_NODES:
+            raise ValueError("baseline exceeds YAML node limit")
+        if self._depth >= MAX_BASELINE_DEPTH:
+            raise ValueError("baseline exceeds YAML depth limit")
+        self._depth += 1
+        try:
+            return super().compose_node(parent, index)
+        finally:
+            self._depth -= 1
+
+    def construct_document(self, node: yaml.Node) -> Any:
+        nodes = 0
+        characters = 0
+        active: set[int] = set()
+
+        def visit(item: yaml.Node, depth: int) -> None:
+            nonlocal nodes, characters
+            nodes += 1
+            if nodes > MAX_BASELINE_NODES:
+                raise ValueError("baseline exceeds expanded YAML node limit")
+            if depth > MAX_BASELINE_DEPTH:
+                raise ValueError("baseline exceeds expanded YAML depth limit")
+            if id(item) in active:
+                raise ValueError("baseline contains cyclic YAML aliases")
+            if isinstance(item, yaml.ScalarNode):
+                if len(item.value) > MAX_BASELINE_SCALAR_CHARS:
+                    raise ValueError("baseline exceeds YAML scalar character limit")
+                characters += len(item.value)
+                if characters > MAX_BASELINE_BYTES:
+                    raise ValueError("baseline exceeds expanded YAML character limit")
+                return
+            active.add(id(item))
+            children = (
+                (child for pair in item.value for child in pair)
+                if isinstance(item, yaml.MappingNode)
+                else iter(item.value)
+            )
+            for child in children:
+                visit(child, depth + 1)
+            active.remove(id(item))
+
+        # Revisit each alias: counting only unique nodes misses merge amplification.
+        visit(node, 1)
+        return super().construct_document(node)
 
 
 def _has_exact_source_provenance(finding: Finding) -> bool:
@@ -109,6 +179,15 @@ def _normalize_component_path(path: str) -> str:
     return posixpath.normpath(normalized)
 
 
+def source_content_key(source_scope: str, file_path: str) -> str:
+    """Keep internal source content keys outside the filesystem path namespace.
+
+    NUL cannot occur in a real path. JSON binds the scope and exact path without
+    ambiguous delimiters; display/coverage paths remain ordinary strings.
+    """
+    return "\0" + json.dumps([source_scope, file_path], ensure_ascii=False, separators=(",", ":"))
+
+
 def _component_content(
     file_cache: Mapping[str, str],
     file_path: str,
@@ -119,15 +198,9 @@ def _component_content(
     """Look up *file_path* without crossing source-scope boundaries."""
     source_scope = source_identity or source_url
     if source_scope:
-        normalized_path = _normalize_component_path(file_path)
-        scoped_candidates = (
-            f"{source_scope}::{file_path}",
-            f"{source_scope}::{normalized_path}",
-            f"{source_scope.rstrip('/')}/{normalized_path}",
-        )
-        for source_key in scoped_candidates:
-            if source_key in file_cache:
-                return file_cache[source_key]
+        source_key = source_content_key(source_scope, file_path)
+        if source_key in file_cache:
+            return file_cache[source_key]
         # A transitive finding must never borrow a same-named root or sibling
         # component when its own immutable source cache entry is unavailable.
         return None
@@ -135,6 +208,8 @@ def _component_content(
         return file_cache[file_path]
     normalized = _normalize_component_path(file_path)
     for candidate, content in file_cache.items():
+        if candidate.startswith("\0"):
+            continue
         if _normalize_component_path(candidate) == normalized:
             return content
     return None
@@ -308,7 +383,16 @@ def baseline_from_dict(data: dict[str, Any]) -> Baseline:
         raise ValueError(f"baseline must be a mapping (got {type(data).__name__})")
 
     version = data.get("version")
-    raw_fingerprints = data.get("fingerprints") or []
+    raw_rules = data.get("rules")
+    raw_fingerprints = data.get("fingerprints")
+    if raw_rules is None:
+        raw_rules = []
+    if raw_fingerprints is None:
+        raw_fingerprints = []
+    if not isinstance(raw_rules, list) or not isinstance(raw_fingerprints, list):
+        raise ValueError("baseline rules and fingerprints must be lists")
+    if len(raw_rules) + len(raw_fingerprints) > MAX_BASELINE_RECORDS:
+        raise ValueError(f"baseline exceeds record limit ({MAX_BASELINE_RECORDS})")
     is_legacy_rule_only = version in (None, 1) and not raw_fingerprints
     if version != BASELINE_VERSION and not is_legacy_rule_only:
         migration = (
@@ -328,7 +412,7 @@ def baseline_from_dict(data: dict[str, Any]) -> Baseline:
         )
 
     rules: list[SuppressionRule] = []
-    for raw in data.get("rules") or []:
+    for raw in raw_rules:
         if not isinstance(raw, dict):
             raise ValueError(f"each baseline rule must be a mapping, got: {raw!r}")
         reason = raw.get("reason", "")
@@ -382,10 +466,19 @@ def load_baseline(path: str | Path) -> Baseline:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Baseline file not found: {p}")
-    text = p.read_text(encoding="utf-8")
+    with open(
+        p,
+        "rb",
+        opener=lambda path, flags: os.open(path, flags | getattr(os, "O_NONBLOCK", 0)),
+    ) as source:
+        if not S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise ValueError(f"Baseline must be a regular file: {p}")
+        content = source.read(MAX_BASELINE_BYTES + 1)
+    if len(content) > MAX_BASELINE_BYTES:
+        raise ValueError(f"Baseline file exceeds byte limit ({MAX_BASELINE_BYTES}): {p}")
     try:
-        # yaml.safe_load parses JSON too, so a single path handles both formats.
-        data = yaml.safe_load(text) or {}
+        # SafeLoader parses JSON too, so a single path handles both formats.
+        data = yaml.load(content.decode("utf-8"), Loader=_BoundedBaselineLoader) or {}
     except yaml.YAMLError as e:  # pragma: no cover - error path
         raise ValueError(f"Could not parse baseline file {p}: {e}") from e
     return baseline_from_dict(data)
@@ -561,14 +654,227 @@ def build_baseline_dict(
     }
 
 
-def dump_baseline(data: dict[str, object], path: str | Path) -> None:
-    """Write a baseline mapping to *path* as YAML (``.json`` extension -> JSON)."""
-    p = Path(path)
-    if p.suffix.lower() == ".json":
-        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+def _restrict_baseline_temporary(descriptor: int) -> None:
+    """Remove inherited access before a temporary file receives baseline data."""
+    if os.name == "posix":
+        # Also masks named-user/group ACL grants on POSIX ACL implementations.
+        os.fchmod(descriptor, 0o600)
+    if sys.platform != "darwin":
+        return
+
+    # macOS extended ACL grants are independent of permission bits. Use the
+    # already-open descriptor so clearing them cannot follow a swapped path.
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        init_acl = libc.acl_init
+        set_acl = libc.acl_set_fd_np
+        free_acl = libc.acl_free
+    except AttributeError:
+        # Filesystems/platforms without extended ACL support need only mode bits.
+        return
+    init_acl.argtypes = [ctypes.c_int]
+    init_acl.restype = ctypes.c_void_p
+    set_acl.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    set_acl.restype = ctypes.c_int
+    free_acl.argtypes = [ctypes.c_void_p]
+    free_acl.restype = ctypes.c_int
+    empty_acl = init_acl(0)
+    if not empty_acl:
+        raise OSError(ctypes.get_errno(), "Could not initialize baseline ACL")
+    try:
+        if set_acl(descriptor, empty_acl, 0x100) != 0:  # ACL_TYPE_EXTENDED
+            error = ctypes.get_errno()
+            if error not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+                raise OSError(error, "Could not clear inherited baseline ACLs")
+    finally:
+        free_acl(empty_acl)
+
+
+def _preserve_baseline_acl(source: int, destination: int) -> None:
+    """Copy an existing access ACL through descriptors before publication."""
+    if sys.platform == "darwin":
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        get_acl = libc.acl_get_fd_np
+        set_acl = libc.acl_set_fd_np
+        free_acl = libc.acl_free
+        get_acl.argtypes = [ctypes.c_int, ctypes.c_int]
+        get_acl.restype = ctypes.c_void_p
+        set_acl.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        set_acl.restype = ctypes.c_int
+        free_acl.argtypes = [ctypes.c_void_p]
+        free_acl.restype = ctypes.c_int
+        acl = get_acl(source, 0x100)
+        if not acl:
+            error = ctypes.get_errno()
+            if error in {errno.ENOENT, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                return
+            raise OSError(error, "Could not read existing baseline ACL")
+        try:
+            if set_acl(destination, acl, 0x100) != 0:
+                raise OSError(ctypes.get_errno(), "Could not preserve existing baseline ACL")
+        finally:
+            free_acl(acl)
+    elif sys.platform.startswith("linux"):
+        try:
+            acl = os.getxattr(source, "system.posix_acl_access")
+        except OSError as error:
+            if error.errno in {errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                return
+            raise
+        os.setxattr(destination, "system.posix_acl_access", acl)
+
+
+def serialize_baseline(data: dict[str, object], *, json_output: bool = False) -> str:
+    """Validate baseline output and retain Unicode round trips through its loader."""
+    baseline_from_dict(data)
+    if json_output:
+        # PyYAML does not combine JSON's escaped UTF-16 surrogate pairs. Emit
+        # astral characters directly, escaping only genuine lone surrogates.
+        content = (
+            json.dumps(data, indent=2, ensure_ascii=False)
+            .encode("utf-8", errors="backslashreplace")
+            .decode("utf-8")
+        )
+        # JSON permits these raw characters, but YAML rejects most of them,
+        # folds NEL into a space, and treats LS/PS as line breaks that strip
+        # adjacent spaces or start a "---" document marker. The loader reads
+        # both formats through PyYAML.
+        content = re.sub(
+            r"[\x7f-\x9f\u2028\u2029\ufffe\uffff]",
+            lambda match: f"\\u{ord(match[0]):04x}",
+            content,
+        )
     else:
         header = (
             "# SkillSpector baseline — findings listed here are suppressed on future scans.\n"
             "# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.\n"
         )
-        p.write_text(header + yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        content = header + yaml.safe_dump(data, sort_keys=False)
+    # A complete population can exceed the loader's limits even when a compact
+    # report fits. Reject it before overwriting an existing, usable baseline.
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_BASELINE_BYTES:
+        raise ValueError(f"Baseline file exceeds byte limit ({MAX_BASELINE_BYTES})")
+    yaml.load(content, Loader=_BoundedBaselineLoader)
+
+    return content
+
+
+def dump_baseline(data: dict[str, object], path: str | Path) -> None:
+    """Publish an anchored baseline while preserving existing access metadata.
+
+    New files are private. Existing writable files retain owner, group, mode,
+    and access ACLs when they can be atomically replaced. Shared-file updates
+    requiring in-place writes are refused, keeping the old inode untouched.
+    """
+    p = Path(path)
+    try:
+        content = serialize_baseline(data, json_output=p.suffix.lower() == ".json")
+    except ValueError as exc:
+        raise ValueError(f"{exc}: {p}") from exc
+    encoded = content.encode("utf-8")
+    try:
+        with open_output_parent(p) as (absolute, directory_fd):
+            destination = None
+            access_descriptor = None
+            # A cooperating writer can atomically replace the path between validating
+            # and opening it. Validate the replacement from the start, but
+            # only a bounded number of times; a path that keeps changing fails closed.
+            for attempt in range(1, _BASELINE_DESTINATION_ATTEMPTS + 1):
+                final_attempt = attempt == _BASELINE_DESTINATION_ATTEMPTS
+                try:
+                    destination = os.stat(absolute.name, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    destination = None
+                    break
+                if not S_ISREG(destination.st_mode):
+                    raise ValueError(f"Baseline output must be a regular file: {p}")
+                if os.name == "posix" and os.geteuid() == 0 and not destination.st_mode & 0o222:
+                    raise PermissionError(errno.EACCES, "Baseline output is not writable", str(p))
+                # The descriptor check handles ACL grants that mode bits omit. Root
+                # still observes the explicit read-only mode guard above.
+                flags = os.O_WRONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(absolute.name, flags, dir_fd=directory_fd)
+                try:
+                    opened = os.fstat(descriptor)
+                    if not S_ISREG(opened.st_mode):
+                        raise ValueError(f"Baseline output must be a regular file: {p}")
+                    if (opened.st_dev, opened.st_ino) != (destination.st_dev, destination.st_ino):
+                        if final_attempt:
+                            raise ValueError(f"Baseline output changed while opening: {p}")
+                        continue
+                    destination = opened
+                    if os.name == "posix" and os.geteuid() not in {0, destination.st_uid}:
+                        raise PermissionError(
+                            errno.EACCES,
+                            "Cannot safely replace a baseline owned by another user; "
+                            "write to a new file or use --output - redirected to a new file",
+                            str(p),
+                        )
+                    # Retain the validated inode's access metadata while competing
+                    # atomic writers replace the path. There is no need to reopen it.
+                    access_descriptor = os.dup(descriptor)
+                    break
+                finally:
+                    os.close(descriptor)
+
+            temporary_name = None
+            try:
+                candidate = f".skillspector-baseline-{token_hex(16)}.tmp"
+                descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                temporary_name = candidate
+                with os.fdopen(descriptor, "wb") as temporary:
+                    _restrict_baseline_temporary(temporary.fileno())
+                    if destination is not None:
+                        current = os.fstat(temporary.fileno())
+                        if (current.st_uid, current.st_gid) != (
+                            destination.st_uid,
+                            destination.st_gid,
+                        ):
+                            try:
+                                os.fchown(
+                                    temporary.fileno(), destination.st_uid, destination.st_gid
+                                )
+                            except PermissionError as exc:
+                                raise PermissionError(
+                                    errno.EACCES,
+                                    "Cannot safely preserve baseline ownership or group; "
+                                    "write to a new file or use --output - redirected to a new file",
+                                    str(p),
+                                ) from exc
+                        # Keep existing group writers/readers. Newly generated files
+                        # remain private; replacing one does not revoke shared access.
+                        mode = S_IMODE(destination.st_mode) & 0o777
+                        if os.name == "posix":
+                            os.fchmod(temporary.fileno(), mode)
+                            # Clearing inherited ACLs must not remove a restrictive or
+                            # shared access ACL from the existing destination.
+                            assert access_descriptor is not None
+                            _preserve_baseline_acl(access_descriptor, temporary.fileno())
+                    # Configure all destination access metadata while the file is empty.
+                    temporary.write(encoded)
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+                os.replace(
+                    temporary_name, absolute.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd
+                )
+                temporary_name = None
+            finally:
+                if access_descriptor is not None:
+                    os.close(access_descriptor)
+                if temporary_name is not None:
+                    try:
+                        os.unlink(temporary_name, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        pass
+    except OSError as exc:
+        raise OSError(exc.errno, exc.strerror or str(exc), str(p)) from exc

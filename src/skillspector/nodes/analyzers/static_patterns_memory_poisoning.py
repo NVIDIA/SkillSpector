@@ -80,8 +80,10 @@ MP1_PATTERNS = [
 ]
 
 # MP2: Context Window Stuffing — filling context to displace content
-MP2_PATTERNS = [
+MP2_CONTENT_PATTERNS = [
     (r"(.{2,20}?)\1{20,}", 0.8),
+]
+MP2_PROSE_PATTERNS = [
     (
         r"(?:repeat|duplicate|echo)\s+(?:this|the\s+following)\s+(?:\d{3,}|many|hundreds?|thousands?)\s+times?",
         0.85,
@@ -107,6 +109,7 @@ MP2_PATTERNS = [
         0.8,
     ),
 ]
+MP2_PATTERNS = MP2_CONTENT_PATTERNS + MP2_PROSE_PATTERNS
 
 # MP3: Memory Manipulation — direct modification of agent memory/state
 MP3_PATTERNS = [
@@ -152,7 +155,8 @@ MP3_PATTERNS = [
     ),
 ]
 
-_LOGICAL_BREAK = rf"(?:{LOGICAL_LINE_BREAK.pattern})"
+# CRLF is one break; backtracking must not turn it into a blank paragraph.
+_LOGICAL_BREAK = rf"(?>{LOGICAL_LINE_BREAK.pattern})"
 _BENIGN_RESET_STATE_COVERAGE = re.compile(
     rf"(?:\A|{_LOGICAL_BREAK})"
     r"[ \t]*(?:-[ \t]+\*\*Incomplete[ \t]+state[ \t]+coverage\*\*[ \t]+"
@@ -190,6 +194,83 @@ _NEXT_LINE_REFERENCE = re.compile(
     r"store|save|persist|retain|keep|internalize|set|enter|switch)[ \t]+that\b",
     re.IGNORECASE,
 )
+
+_TIMESTAMP_CONTEXT_DESCRIPTION = re.compile(
+    rf"(?:\A|{_LOGICAL_BREAK})"
+    r"[ \t]*//[ \t]*(?:✅[ \t]*)?(?:GOOD:[ \t]*)?"
+    r"(?P<target>clear[ \t]+context)[ \t]+(?:with|using)[ \t]+"
+    r"(?P<format>%[0-9]{0,3}t)[ \t]*\.?[ \t]*"
+    rf"(?=\Z|{_LOGICAL_BREAK})",
+    re.IGNORECASE,
+)
+_TIMESTAMP_DISPLAY = re.compile(
+    r'[ \t]*\$display[ \t]*\([ \t]*"'
+    r'(?P<format_string>(?:[^"\\\r\n\v\f\x85\u2028\u2029]|\\[^\r\n\v\f\x85\u2028\u2029])*)'
+    r'"[ \t]*,[ \t]*\$(?:realtime|time)[ \t]*\)[ \t]*;[ \t]*'
+    r"(?://[^\r\n\v\f\x85\u2028\u2029]*)?"
+)
+_TIMESTAMP_OWNERSHIP_PATTERN = (
+    r"\b(?:instructions?|directives?|requirements?|orders?)\b"
+    r"|\b(?:the|this|that|these|those|next|following|above|below|displayed|shown|"
+    r"described|listed|same|attached)[ \t]+"
+    r"(?:comments?|examples?|operations?|actions?|steps?|instructions?|directives?|lines?|snippets?|samples?)\b"
+    r"|\b(?:comments?|examples?|operations?|actions?|steps?|instructions?|directives?|lines?|snippets?|samples?)"
+    r"[ \t]+(?:above|below|earlier|prior|previous|preceding|following|next)\b"
+    r"|\b(?:following|next|above|below|this|that)\b[^\r\n]{0,80}"
+    r"\b(?:order|directive|instruction|command)\b"
+)
+_TIMESTAMP_OWNERSHIP_REFERENCE = re.compile(_TIMESTAMP_OWNERSHIP_PATTERN, re.IGNORECASE)
+_TIMESTAMP_AUTHORITY_HEADING = re.compile(
+    r"(?:[A-Za-z]+[ \t]+)*"
+    r"(?:commands?|instructions?|directions?|directives?|orders?|actions?|operations?|steps?|tasks?)"
+    r"(?=[ \t:]|$)[^:\r\n]{0,80}:[ \t]*",
+    re.IGNORECASE,
+)
+_TIMESTAMP_DESCRIPTION_DIRECTIVE = re.compile(
+    r"\b(?:you|agents?|assistants?|models?|llms?|bots?|must|shall|should|"
+    r"required|mandatory)\b"
+    r"|\byour[ \t]+(?:memory|context|state|history|conversation|task|objective|"
+    r"mission|instructions?)\b"
+    # Nearby memory targets can redefine what the comment's "context" means.
+    r"|\b(?:conversation|memory|history|chat|transcript|dialogue)\b"
+    r"|\b(?:follow|obey|apply|execute|perform|do|carry[ \t]+out|act[ \t]+(?:on|upon))[ \t]+"
+    r"(?:(?:the[ \t]+)?(?:following|next|above|below)[ \t]+)?"
+    r"(?:this|that|it|these|those|comments?|instructions?)\b"
+    r"|\b(?:follow|obey|apply|execute|perform|do|carry[ \t]+out|act[ \t]+(?:on|upon))\b"
+    r"[^\r\n\v\f\x85\u2028\u2029]{0,160}"
+    r"\b(?:described|displayed|documented|shown|listed|comments?|examples?|"
+    r"operations?|actions?|steps?|instructions?|directives?|lines?|snippets?|samples?)\b"
+    r"|\b(?:task|instructions?|directives?)[ \t]*:"
+    r"|\bbefore[ \t]+(?:replying|responding|answering)\b" + "|" + _TIMESTAMP_OWNERSHIP_PATTERN,
+    re.IGNORECASE,
+)
+_TIMESTAMP_BACK_REFERENCE = re.compile(
+    r"\b(?:described|displayed|documented|shown|listed|above|earlier|prior|"
+    r"previous|preceding|foregoing|same)[ \t]+"
+    r"(?:comments?|examples?|operations?|actions?|steps?|instructions?)\b"
+    r"|\b(?:comments?|examples?|operations?|actions?|steps?|instructions?)"
+    r"[ \t]+(?:above|earlier|prior|previous|preceding|foregoing)\b"
+    r"|\b(?:follow|obey|apply|execute|perform|do|carry[ \t]+out|act[ \t]+(?:on|upon)|use|run|invoke)\b"
+    r"[^\r\n\v\f\x85\u2028\u2029]{0,160}"
+    r"\b(?:this|that|it|these|those|above|earlier|prior|previous|preceding|"
+    r"foregoing|same)\b"
+    r"|\bcontext\b[^\r\n\v\f\x85\u2028\u2029]{0,160}"
+    r"\b(?:conversation|memory|history|chat|transcript|dialogue)\b"
+    r"|\b(?:conversation|memory|history|chat|transcript|dialogue)\b"
+    r"[^\r\n\v\f\x85\u2028\u2029]{0,160}\bcontext\b",
+    re.IGNORECASE,
+)
+_TIMESTAMP_REFERENCE_CUE = re.compile(
+    r"\b(?:follow|obey|apply|execute|perform|do|carry|act|use|run|invoke|context|"
+    r"described|displayed|documented|shown|listed|above|earlier|prior|previous|"
+    r"preceding|foregoing|same|commands?|instructions?|directives?|requirements?|orders?)\b",
+    re.IGNORECASE,
+)
+_CODE_FENCE_LINE = re.compile(r"[ \t]*(?:`{3,}|~{3,})[ \t]*")
+_CODE_FENCE_OPENER = re.compile(
+    r"[ \t]*(?:`{3,}|~{3,})[ \t]*(?:systemverilog|verilog)?[ \t]*", re.IGNORECASE
+)
+_CODE_FENCE_MARKER = re.compile(r"[ \t]*(?:`{3,}|~{3,})")
 
 _LAYOUT_CHAR_RANGES = (
     (0x2500, 0x257F),
@@ -279,6 +360,156 @@ def _is_benign_reset_state_coverage(content: str, match: re.Match[str]) -> bool:
     return False
 
 
+def _bounded_timestamp_following_context(content: str, offset: int) -> str | None:
+    """Inspect through a nearby fence and following paragraph, without truncation."""
+    window_end = min(len(content), offset + 512)
+    window = content[offset:window_end]
+    cursor = 0
+    closed_fence = False
+    following_paragraph = False
+    for line_break in LOGICAL_LINE_BREAK.finditer(window):
+        line = window[cursor : line_break.start()]
+        cursor = line_break.end()
+        if closed_fence:
+            # A separate code block owns its contents, not this description.
+            # Keep its opening line visible in case that line is an instruction.
+            if _CODE_FENCE_MARKER.match(line):
+                return window[:cursor]
+            if line.strip():
+                following_paragraph = True
+            elif following_paragraph and window_end != len(content):
+                return window[:cursor]
+        if _CODE_FENCE_LINE.fullmatch(line):
+            closed_fence = True
+    return window if window_end == len(content) else None
+
+
+def _normalize_timestamp_guard(content: str) -> str:
+    """Join wrapped directives for boolean guards without changing source evidence."""
+    normalized = " ".join(
+        re.sub(
+            r"^[ \t]*(?:(?:>|//)[ \t]*)*"
+            r"(?:(?:[-+*]|[0-9]{1,9}[.)])[ \t]+)?(?:#{1,6}[ \t]+)?",
+            "",
+            line,
+        )
+        for line in LOGICAL_LINE_BREAK.split(content)
+    )
+    return re.sub(r"[`*_\[\]]", "", normalized)
+
+
+def _has_timestamp_back_reference(content: str, offset: int) -> bool:
+    """Keep explicit reuse visible across paragraph and independent-block boundaries."""
+    window_end = min(len(content), offset + 512)
+    window = content[offset:window_end]
+    normalized = _normalize_timestamp_guard(window)
+    if (
+        _TIMESTAMP_BACK_REFERENCE.search(normalized)
+        or _TIMESTAMP_OWNERSHIP_REFERENCE.search(normalized)
+        or _has_timestamp_authority_heading(window)
+    ):
+        return True
+    if window_end != len(content) and LOGICAL_LINE_BREAK.match(content, window_end) is None:
+        # An unfinished reference cannot establish that the description is benign.
+        last_paragraph = re.split(rf"{_LOGICAL_BREAK}[ \t]*{_LOGICAL_BREAK}", window)[-1]
+        return (
+            _TIMESTAMP_REFERENCE_CUE.search(_normalize_timestamp_guard(last_paragraph)) is not None
+        )
+    return False
+
+
+def _has_timestamp_authority_heading(content: str) -> bool:
+    """Require a complete heading; URL or metadata colons cannot confer authority."""
+    regions = (
+        *LOGICAL_LINE_BREAK.split(content),
+        *re.split(rf"{_LOGICAL_BREAK}[ \t]*{_LOGICAL_BREAK}", content),
+    )
+    return any(
+        _TIMESTAMP_AUTHORITY_HEADING.fullmatch(_normalize_timestamp_guard(paragraph).strip())
+        for paragraph in regions
+    )
+
+
+def _is_benign_timestamp_context_description(content: str, match: re.Match[str]) -> bool:
+    """Own a descriptive comment only when its example actually prints a timestamp."""
+    window_start = max(0, match.start() - 256)
+    window_end = min(len(content), match.end() + 256)
+    for candidate in _TIMESTAMP_CONTEXT_DESCRIPTION.finditer(content, window_start, window_end):
+        if candidate.span("target") != match.span():
+            continue
+        if (
+            candidate.end() != len(content)
+            and LOGICAL_LINE_BREAK.match(content, candidate.end()) is None
+        ):
+            continue
+
+        previous_line, previous_complete = _bounded_previous_nonblank_line(
+            content, candidate.start()
+        )
+        if not previous_complete:
+            continue
+        # A fence opener cannot hide the instruction introducing its comments.
+        if _CODE_FENCE_OPENER.fullmatch(previous_line):
+            opener_start = content.rfind(
+                previous_line, max(0, candidate.start() - 512), candidate.start()
+            )
+            previous_line, previous_complete = _bounded_previous_nonblank_line(
+                content, opener_start
+            )
+            if not previous_complete:
+                continue
+        # Direct reuse of the immediately preceding text cannot grant ownership
+        # to a descriptive example, regardless of the directive's action verb.
+        if _PRECEDING_DIRECTIVE.search(_normalize_timestamp_guard(previous_line)):
+            continue
+        preceding = content[max(0, candidate.start() - 512) : candidate.start()]
+        nearest_paragraph = re.split(rf"{_LOGICAL_BREAK}[ \t]*{_LOGICAL_BREAK}", preceding)[-1]
+        if any(
+            reference.group(0).strip() != ":"
+            for reference in _PRECEDING_DIRECTIVE.finditer(
+                _normalize_timestamp_guard(nearest_paragraph)
+            )
+        ):
+            continue
+        if _TIMESTAMP_DESCRIPTION_DIRECTIVE.search(
+            _normalize_timestamp_guard(preceding)
+        ) or _has_timestamp_authority_heading(preceding):
+            continue
+
+        next_line, next_complete = _bounded_next_nonblank_line(content, candidate.end())
+        display = _TIMESTAMP_DISPLAY.fullmatch(next_line) if next_complete else None
+        if display is None:
+            continue
+        # %% is a literal percent, not timestamp formatting evidence.
+        if (
+            re.search(
+                r"(?<!%)" + re.escape(candidate.group("format")), display.group("format_string")
+            )
+            is None
+        ):
+            continue
+        if _TIMESTAMP_DESCRIPTION_DIRECTIVE.search(next_line) or _NEXT_LINE_REFERENCE.search(
+            next_line
+        ):
+            continue
+        display_start = content.find(
+            next_line, candidate.end(), min(len(content), candidate.end() + 512)
+        )
+        display_end = display_start + len(next_line)
+        if _has_timestamp_back_reference(content, display_end):
+            continue
+        following = _bounded_timestamp_following_context(content, display_end)
+        if (
+            following is None
+            or _NEXT_LINE_REFERENCE.search(_normalize_timestamp_guard(following))
+            or _TIMESTAMP_DESCRIPTION_DIRECTIVE.search(_normalize_timestamp_guard(following))
+            or _has_timestamp_authority_heading(following)
+        ):
+            continue
+        return True
+    return False
+
+
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for memory poisoning patterns (MP1–MP3)."""
     findings: list[AnalyzerFinding] = []
@@ -292,7 +523,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.MEMORY_POISONING.value]
 
     for pattern, confidence in MP1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -304,10 +537,16 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in MP2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in MP2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             span = match.group(0)
             if _is_layout_only_span(span):
                 continue
@@ -325,11 +564,16 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in MP3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            if _is_benign_reset_state_coverage(content, match):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
+            if _is_benign_reset_state_coverage(
+                content, match
+            ) or _is_benign_timestamp_context_description(content, match):
                 continue
             line_num = get_line_number(content, match.start())
             context_text = ctx(match.start())
@@ -343,6 +587,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=context_text,
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     return findings

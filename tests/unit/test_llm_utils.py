@@ -33,7 +33,7 @@ from pydantic import BaseModel
 
 from skillspector import llm_utils
 from skillspector.constants import build_model_config
-from skillspector.inference_usage import InferenceUsageCollector
+from skillspector.inference_usage import InferenceUsageCollector, sanitize_inference_usage
 from skillspector.llm_utils import (
     AgentCLIChatModel,
     StructuredOutputParseError,
@@ -41,6 +41,7 @@ from skillspector.llm_utils import (
     _extract_json_object,
     _invoke_with_usage,
     _resolve_llm_credentials,
+    bind_structured_output,
     chat_completion,
     chat_model_provider_name,
     fetch_model_token_limits,
@@ -48,6 +49,7 @@ from skillspector.llm_utils import (
     is_llm_available,
     new_inference_usage_collector,
     run_async,
+    structured_output_kwargs,
 )
 from skillspector.providers import (
     NO_LLM_API_KEY_MESSAGE,
@@ -57,7 +59,6 @@ from skillspector.providers import (
     use_provider,
 )
 from skillspector.providers.nv_build import NvBuildProvider
-from skillspector.providers.openai import OpenAIProvider
 
 _LLM_ENV_VARS = (
     "ANTHROPIC_API_KEY",
@@ -272,6 +273,16 @@ class TestChatCompletion:
 
 
 class TestIsLlmAvailable:
+    def test_unbound_gemini_uses_bounded_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "gemini")
+        resolve = MagicMock(return_value=("token", "https://example.invalid"))
+        monkeypatch.setattr(
+            "skillspector.providers.gemini.provider.GeminiProvider.resolve_credentials", resolve
+        )
+
+        assert is_llm_available(timeout=7) == (True, None)
+        resolve.assert_called_once_with(timeout=7)
+
     def test_returns_true_when_credentials_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "k")
         ok, msg = is_llm_available()
@@ -530,6 +541,23 @@ class TestGetChatModelCLIAdapter:
                     "x"
                 )
 
+    @pytest.mark.parametrize("method", [None, "json_schema", "function_calling"])
+    def test_set_timeout_reaches_structured_wrapper(self, method: str | None) -> None:
+        """A retargeted deadline applies to structured wrappers made earlier."""
+
+        class _Schema(BaseModel):
+            verdict: str
+
+        provider = MagicMock()
+        provider.complete.return_value = '{"verdict": "ok"}'
+        model = AgentCLIChatModel(provider, "claude-sonnet-4-6", 1024, timeout=30.0)
+        runnable = model.with_structured_output(_Schema, method=method)
+
+        model.set_timeout(4.5)
+        runnable.invoke("prompt")
+
+        assert provider.complete.call_args.kwargs["timeout"] == 4.5
+
     def test_structured_usage_marks_response_before_sync_parse_failure(self) -> None:
         class _Schema(BaseModel):
             verdict: str
@@ -550,7 +578,8 @@ class TestGetChatModelCLIAdapter:
             _invoke_with_usage(runnable, "prompt", collector)
 
         assert collector.response_received is True
-        assert collector.snapshot() == []
+        assert collector.snapshot()[0]["provider"] == "claude_cli"
+        assert sanitize_inference_usage(collector.snapshot()) == []
 
     async def test_concurrent_structured_usage_marks_each_async_response(self) -> None:
         class _Schema(BaseModel):
@@ -581,7 +610,8 @@ class TestGetChatModelCLIAdapter:
 
         assert all(isinstance(result, ValueError) for result in results)
         assert all(collector.response_received for collector in collectors)
-        assert all(collector.snapshot() == [] for collector in collectors)
+        assert all(collector.snapshot()[0]["provider"] == "claude_cli" for collector in collectors)
+        assert all(sanitize_inference_usage(collector.snapshot()) == [] for collector in collectors)
 
     def test_structured_usage_does_not_mark_pre_response_transport_failure(self) -> None:
         class _Schema(BaseModel):
@@ -658,7 +688,7 @@ class TestGetChatModel:
 
         llm = get_chat_model()
 
-        assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
+        assert _chat_model_name(llm) == "gpt-5.4"
 
     def test_graph_model_config_matches_openai_fallback_client(
         self, monkeypatch: pytest.MonkeyPatch
@@ -668,8 +698,8 @@ class TestGetChatModel:
         model = build_model_config()["default"]
         llm = get_chat_model(model=model)
 
-        assert model == OpenAIProvider.DEFAULT_MODEL
-        assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
+        assert model == "gpt-5.4"
+        assert _chat_model_name(llm) == "gpt-5.4"
 
     def test_explicit_model_still_overrides_openai_fallback(
         self, monkeypatch: pytest.MonkeyPatch
@@ -739,3 +769,280 @@ class TestRunAsync:
         """Test run_async correctly handles async functions with await calls."""
         result = run_async(self._test_async_function(5, delay=0.01))
         assert result == 10
+
+
+class _HintingProvider:
+    def structured_output_method(self, model: str) -> str | None:
+        return "json_schema" if model.startswith("needs-json-") else None
+
+
+class _PlainProvider:
+    pass
+
+
+class Verdict(BaseModel):
+    summary: str
+
+
+def _stub_chat_openai(
+    monkeypatch: pytest.MonkeyPatch, answers: list[AIMessage]
+) -> tuple[object, list[tuple[str, dict]]]:
+    """A ``ChatOpenAI`` with ``tool_choice`` disabled whose transport returns *answers* in order."""
+    from langchain_core.outputs import ChatResult
+    from langchain_openai import ChatOpenAI
+
+    requests: list[tuple[str, dict]] = []
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        requests.append((messages[-1].content, kwargs))
+        return ChatResult(generations=[ChatGeneration(message=answers.pop(0))])
+
+    monkeypatch.setattr(ChatOpenAI, "_generate", _generate)
+    llm = ChatOpenAI(
+        model="spark-x2.5",
+        api_key="sk-test",
+        base_url="https://maas-token-api.cn-huabei-1.xf-yun.com/v2",
+        disabled_params={"tool_choice": None},
+    )
+    return llm, requests
+
+
+class _RecordingLLM:
+    def __init__(self) -> None:
+        self.calls: list[tuple[type, dict]] = []
+
+    def with_structured_output(self, schema: type, **kwargs):
+        self.calls.append((schema, kwargs))
+        return self
+
+
+class TestStructuredOutputMethod:
+    """``with_structured_output`` binding follows env > provider hint > LangChain default."""
+
+    def test_default_when_provider_has_no_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        assert structured_output_kwargs("any-model", provider=_PlainProvider()) == {}
+
+    def test_provider_hint_selects_json_schema(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        assert structured_output_kwargs("needs-json-1", provider=_HintingProvider()) == {
+            "method": "json_schema"
+        }
+        assert structured_output_kwargs("other", provider=_HintingProvider()) == {}
+
+    def test_analyzer_preference_applies_only_without_explicit_configuration(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        assert structured_output_kwargs(
+            "other", provider=_PlainProvider(), preferred_method="function_calling"
+        ) == {"method": "function_calling"}
+        assert structured_output_kwargs(
+            "needs-json-1", provider=_HintingProvider(), preferred_method="function_calling"
+        ) == {"method": "json_schema"}
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "json_schema")
+        assert structured_output_kwargs(
+            "other", provider=_PlainProvider(), preferred_method="function_calling"
+        ) == {"method": "json_schema"}
+
+    @pytest.mark.parametrize("override", [None, "json_schema", "function_calling"])
+    @pytest.mark.parametrize("provider", [_PlainProvider(), _HintingProvider()])
+    def test_unknown_analyzer_preference_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, override, provider
+    ) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        if override is not None:
+            monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", override)
+        with pytest.raises(ValueError, match="preferred structured output method"):
+            structured_output_kwargs("needs-json-1", provider=provider, preferred_method="xml")
+
+    def test_selected_function_calling_rejects_none_without_changing_prompt(self, monkeypatch):
+        from langchain_core.runnables import RunnableLambda
+
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "function_calling")
+        prompts = []
+
+        class Model:
+            def with_structured_output(self, schema, **kwargs):
+                assert kwargs == {"method": "function_calling"}
+
+                def answer(prompt):
+                    prompts.append(prompt)
+                    return None
+
+                return RunnableLambda(answer)
+
+        chain = bind_structured_output(Model(), dict, "m", provider=_PlainProvider())
+        with pytest.raises(StructuredOutputParseError):
+            chain.invoke("unchanged prompt")
+        assert prompts == ["unchanged prompt"]
+
+    def test_function_calling_preserves_cli_adapter_usage_hooks(self, monkeypatch):
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "function_calling")
+
+        class Schema(BaseModel):
+            verdict: str
+
+        provider = MagicMock()
+        provider.complete.return_value = '{"verdict": "safe"}'
+        adapter = AgentCLIChatModel(provider, "m", 1024)
+        structured = bind_structured_output(adapter, Schema, "m", provider=_PlainProvider())
+        collector = InferenceUsageCollector(
+            node="test",
+            request_kind="structured_output",
+            provider="claude_cli",
+            requested_model="m",
+        )
+        result = structured.invoke_with_usage("test", collector)
+        assert result == Schema(verdict="safe")
+        assert collector.response_received
+
+    def test_env_override_wins_over_the_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "function_calling")
+        assert structured_output_kwargs("needs-json-1", provider=_HintingProvider()) == {
+            "method": "function_calling"
+        }
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", " JSON_SCHEMA ")
+        assert structured_output_kwargs("other", provider=_PlainProvider()) == {
+            "method": "json_schema"
+        }
+
+    def test_unknown_env_value_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "xml")
+        with pytest.raises(ValueError, match="SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD"):
+            structured_output_kwargs("any", provider=_PlainProvider())
+
+    def test_bind_passes_the_method_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        llm = _RecordingLLM()
+        bind_structured_output(llm, dict, "needs-json-1", provider=_HintingProvider())
+        bind_structured_output(llm, dict, "plain", provider=_HintingProvider())
+        assert llm.calls == [(dict, {"method": "json_schema"}), (dict, {})]
+
+    def test_auto_only_tool_choice_asks_for_the_call_and_rejects_prose(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from langchain_core.runnables import RunnableLambda
+
+        from skillspector.llm_utils import StructuredOutputParseError
+
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        seen: list[str] = []
+        answers: list[object] = [None, {"summary": "ok"}]
+
+        class Verdict:
+            pass
+
+        class _AutoOnlyLLM:
+            supports_tool_choice_values = ("auto",)
+
+            def with_structured_output(self, schema: type, **kwargs: object) -> RunnableLambda:
+                assert kwargs == {}
+
+                def _model(prompt: str) -> object:
+                    seen.append(prompt)
+                    return answers.pop(0)
+
+                return RunnableLambda(_model)
+
+        chain = bind_structured_output(_AutoOnlyLLM(), Verdict, "m", provider=_PlainProvider())
+        with pytest.raises(StructuredOutputParseError, match="Verdict"):
+            chain.invoke("analyse this")  # type: ignore[attr-defined]
+        assert chain.invoke("analyse this") == {"summary": "ok"}  # type: ignore[attr-defined]
+        assert seen[0].startswith("analyse this\n\n") and "calling the Verdict tool" in seen[0]
+
+    def test_forced_tool_choice_models_are_bound_untouched(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        llm = _RecordingLLM()
+        llm.supports_tool_choice_values = ("auto", "any", "tool")  # type: ignore[attr-defined]
+        assert bind_structured_output(llm, dict, "m", provider=_PlainProvider()) is llm
+
+    @pytest.mark.parametrize(
+        ("method", "wrapped"),
+        [("function_calling", True), ("json_schema", False)],
+    )
+    def test_auto_only_tool_choice_with_an_explicit_method(
+        self, monkeypatch: pytest.MonkeyPatch, method: str, wrapped: bool
+    ) -> None:
+        """An explicit ``function_calling`` still asks for the call; ``json_schema`` does not bind a tool."""
+        from langchain_core.runnables import RunnableLambda
+
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", method)
+        structured = RunnableLambda(lambda prompt: {"summary": "ok"})
+
+        class _AutoOnlyLLM(_RecordingLLM):
+            supports_tool_choice_values = ("auto",)
+
+            def with_structured_output(self, schema: type, **kwargs: object) -> RunnableLambda:
+                super().with_structured_output(schema, **kwargs)
+                return structured
+
+        llm = _AutoOnlyLLM()
+        bound = bind_structured_output(llm, dict, "m", provider=_PlainProvider())
+        assert llm.calls == [(dict, {"method": method})]
+        assert (bound is not structured) is wrapped
+
+    def test_chat_openai_with_tool_choice_disabled_asks_for_the_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skillspector.providers.openai_compatible import OpenAICompatibleProvider
+
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
+        llm, requests = _stub_chat_openai(
+            monkeypatch,
+            [
+                AIMessage(content="Verdict: looks fine."),
+                AIMessage(
+                    content="",
+                    tool_calls=[{"name": "Verdict", "args": {"summary": "ok"}, "id": "call_1"}],
+                ),
+            ],
+        )
+        chain = bind_structured_output(
+            llm, Verdict, "spark-x2.5", provider=OpenAICompatibleProvider()
+        )
+        with pytest.raises(StructuredOutputParseError, match="Verdict"):
+            chain.invoke("analyse this")  # type: ignore[attr-defined]
+        assert chain.invoke("analyse this") == Verdict(summary="ok")  # type: ignore[attr-defined]
+        prompt, request = requests[0]
+        assert prompt.startswith("analyse this\n\n") and "calling the Verdict tool" in prompt
+        assert "tool_choice" not in request
+        assert request["tools"][0]["function"]["name"] == "Verdict"
+
+    @pytest.mark.parametrize("method", [None, "json_schema"])
+    def test_chat_openai_with_tool_choice_disabled_keeps_a_non_tool_method(
+        self, monkeypatch: pytest.MonkeyPatch, method: str | None
+    ) -> None:
+        """Without an explicit ``function_calling`` the binder sends ``response_format`` unwrapped."""
+        if method:
+            monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", method)
+        else:
+            monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        llm, requests = _stub_chat_openai(
+            monkeypatch,
+            [
+                AIMessage(
+                    content='{"summary": "ok"}',
+                    additional_kwargs={"parsed": Verdict(summary="ok")},
+                )
+            ],
+        )
+        chain = bind_structured_output(llm, Verdict, "spark-x2.5", provider=_PlainProvider())
+        assert chain.invoke("analyse this") == Verdict(summary="ok")  # type: ignore[attr-defined]
+        prompt, request = requests[0]
+        assert prompt == "analyse this"
+        assert request["response_format"] is Verdict
+        assert "tools" not in request
+
+    def test_cli_adapter_accepts_the_method_keyword(self) -> None:
+        from skillspector.llm_utils import AgentCLIChatModel
+
+        adapter = AgentCLIChatModel.__new__(AgentCLIChatModel)
+        adapter._provider = object()
+        adapter._model = "m"
+        adapter._max_output_tokens = 10
+        adapter._timeout = None
+        assert adapter.with_structured_output(dict, method="json_schema") is not None

@@ -23,14 +23,20 @@ NVIDIA catalog API) is covered by the layered tests in
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import pytest
+import yaml
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 import skillspector.providers as providers_module
+import skillspector.providers._agent_cli as agent_cli_module
+import skillspector.providers._agent_cli_base as agent_cli_base_module
 import skillspector.providers.anthropic.provider as anthropic_provider_module
+from skillspector.inference_usage import chat_model_controls, chat_model_requested_controls
+from skillspector.llm_utils import get_chat_model
 from skillspector.providers import (
     NO_LLM_API_KEY_MESSAGE,
     chat_models,
@@ -120,10 +126,14 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("SKILLSPECTOR_TEMPERATURE", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_SEED", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_SCHEME", raising=False)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
     providers_module._INJECTED_PROVIDER.set(None)
     registry._load.cache_clear()
     yield
@@ -137,6 +147,7 @@ class TestNvBuildProvider:
     @pytest.mark.parametrize(
         ("model", "context_length"),
         [
+            ("z-ai/glm-5.3", 128_000),
             ("z-ai/glm-5.2", 202_749),
             ("moonshotai/kimi-k2.6", 256_000),
         ],
@@ -155,6 +166,51 @@ class TestNvBuildProvider:
         provider = NvBuildProvider()
         assert provider.get_context_length("z-ai/glm-5.2") == 202_749
         assert provider.get_max_output_tokens("z-ai/glm-5.2") == 32_768
+
+    def test_default_model_keeps_conservative_token_budgets(self) -> None:
+        provider = NvBuildProvider()
+        assert provider.DEFAULT_MODEL == "z-ai/glm-5.3"
+        assert provider.get_context_length(provider.DEFAULT_MODEL) == 128_000
+        assert provider.get_max_output_tokens(provider.DEFAULT_MODEL) == 32_000
+
+    @pytest.mark.parametrize(
+        ("model", "configured_effort", "expected_effort"),
+        [
+            ("z-ai/glm-5.3", None, "high"),
+            ("z-ai/glm-5.3", "   ", "high"),
+            ("z-ai/glm-5.3", " low ", "low"),
+            ("z-ai/glm-5.3", "high", "high"),
+            ("z-ai/glm-5.3", "max", "max"),
+            ("z-ai/glm-5.2", None, None),
+            ("z-ai/glm-5.3-flash", None, None),
+            ("another/model", None, None),
+        ],
+    )
+    def test_reasoning_default_is_model_specific_and_preserves_user_override(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        model: str,
+        configured_effort: str | None,
+        expected_effort: str | None,
+    ) -> None:
+        monkeypatch.setenv("NVIDIA_INFERENCE_KEY", "nvapi-test")
+        if configured_effort is not None:
+            monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", configured_effort)
+        llm = NvBuildProvider().create_chat_model(model, max_tokens=123)
+        assert isinstance(llm, ChatOpenAI)
+        assert llm._get_request_payload("hello").get("reasoning_effort") == expected_effort
+        assert chat_model_controls(llm)["reasoning_effort"] == expected_effort
+        assert chat_model_requested_controls(llm)["reasoning_effort"] == (
+            configured_effort.strip() or None if configured_effort else None
+        )
+
+    def test_glm_reasoning_default_does_not_apply_to_other_providers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        llm = OpenAIProvider().create_chat_model("z-ai/glm-5.3", max_tokens=123)
+        assert isinstance(llm, ChatOpenAI)
+        assert "reasoning_effort" not in llm._get_request_payload("hello")
 
     @pytest.mark.parametrize("model", ["glm-5.2", "z-ai/glm-5.2 "])
     def test_nv_build_model_near_match_stays_unresolved(self, model: str) -> None:
@@ -316,18 +372,180 @@ class TestOpenAIProvider:
         assert llm.default_headers == {"OpenAI-Project": "proj_123"}
 
     def test_default_model(self) -> None:
-        assert OpenAIProvider().resolve_model() == "gpt-5.4"
-        # All slots inherit DEFAULT_MODEL — gpt-5.4 everywhere.
-        assert OpenAIProvider().resolve_model("meta_analyzer") == "gpt-5.4"
+        provider = OpenAIProvider()
+        assert provider.resolve_model() == "gpt-5.4"
+        # All slots retain the previous default until live scanner acceptance.
+        assert provider.resolve_model("meta_analyzer") == "gpt-5.4"
+        assert provider.get_context_length(provider.DEFAULT_MODEL) == 1_050_000
+        assert provider.get_max_output_tokens(provider.DEFAULT_MODEL) == 128_000
 
     def test_metadata_known_model(self) -> None:
         provider = OpenAIProvider()
-        assert provider.get_context_length("gpt-5.4") == 1_000_000
+        assert provider.get_context_length("gpt-5.4") == 1_050_000
         assert provider.get_max_output_tokens("gpt-5.4") == 128_000
+        assert provider.get_context_length("gemini-3.5-flash") == 1_048_576
+        assert provider.get_max_output_tokens("gemini-3.5-flash") == 65_536
+
+    def test_metadata_gpt5_generation(self) -> None:
+        provider = OpenAIProvider()
+        for model in (
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-nano",
+            "gpt-5.1",
+            "gpt-5.1-codex",
+            "gpt-5.1-codex-max",
+            "gpt-5.2",
+        ):
+            assert provider.get_context_length(model) == 400_000
+            assert provider.get_max_output_tokens(model) == 128_000
+
+    def test_metadata_flagship_generation(self) -> None:
+        provider = OpenAIProvider()
+        for model in (
+            "gpt-5.5",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+            "gpt-5.6-sol",
+            "gpt-5.6",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6.1-sol",
+        ):
+            assert provider.get_context_length(model) == 1_050_000
+            assert provider.get_max_output_tokens(model) == 128_000
+
+    def test_each_model_is_mapped_once(self) -> None:
+        """Every bundled registry maps each model ID exactly once.
+
+        ``yaml.safe_load`` collapses a repeated key to its last mapping,
+        so value-only lookup assertions stay green while the resolved
+        budget becomes loader-dependent. Reading keys via ``yaml.compose``
+        catches the duplication that lookup loops cannot.
+        """
+        root = Path(__file__).resolve().parents[2]
+        registries = [
+            root / "model_registry.yaml",
+            *root.glob("src/skillspector/providers/*/model_registry.yaml"),
+        ]
+        assert registries, "expected at least one bundled model registry"
+        for registry_path in registries:
+            doc = yaml.compose(registry_path.read_text(encoding="utf-8"))
+            models = next(v for k, v in doc.value if k.value == "models")
+            keys = [k.value for k, v in models.value]
+            assert len(keys) == len(set(keys)), (
+                f"{registry_path.name} maps {[k for k in keys if keys.count(k) > 1]} twice"
+            )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ROOT_MODEL_REGISTRY = REPO_ROOT / "model_registry.yaml"
+MODEL_REGISTRIES = sorted(
+    [ROOT_MODEL_REGISTRY]
+    + list((REPO_ROOT / "src" / "skillspector" / "providers").glob("*/model_registry.yaml"))
+)
+
+
+def _model_keys_as_written(registry_path: Path) -> list[str]:
+    """Return the ``models`` keys in document order, duplicates included.
+
+    ``yaml.safe_load`` keeps only the last of a repeated key, so asserting on
+    resolved budgets cannot see a model that was mapped twice. Composing the
+    node tree preserves every key exactly as the file spells it.
+    """
+    document = yaml.compose(registry_path.read_text(encoding="utf-8"))
+    for key_node, value_node in document.value:
+        if key_node.value == "models":
+            return [key.value for key, _ in value_node.value]
+    raise AssertionError(f"{registry_path} has no top-level 'models' mapping")
+
+
+class TestModelRegistryFiles:
+    """Integrity of the shipped YAML registries themselves."""
+
+    def test_registries_are_discovered(self) -> None:
+        # Guards the glob: an empty list would make the checks below vacuous.
+        assert ROOT_MODEL_REGISTRY in MODEL_REGISTRIES
+        assert len(MODEL_REGISTRIES) > 1
+
+    @pytest.mark.parametrize(
+        "registry_path",
+        MODEL_REGISTRIES,
+        ids=lambda path: path.relative_to(REPO_ROOT).as_posix(),
+    )
+    def test_each_model_is_mapped_once(self, registry_path: Path) -> None:
+        # Loaders disagree on duplicate keys — most keep the last mapping,
+        # strict ones reject the document — so mapping one model twice makes
+        # the resolved budget loader-dependent and lets the copies drift apart
+        # while value-only assertions stay green.
+        keys = _model_keys_as_written(registry_path)
+        duplicates = sorted({key for key in keys if keys.count(key) > 1})
+        assert not duplicates, f"{registry_path} maps these models more than once: {duplicates}"
+
+    def test_root_registry_replaces_bundled_yaml(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The repo-root file is the documented SKILLSPECTOR_MODEL_REGISTRY sample."""
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(ROOT_MODEL_REGISTRY))
+        provider = OpenAIProvider()
+
+        # Gateway-prefixed ids that only the root registry carries.
+        assert provider.get_context_length("openai/openai/gpt-5.3-chat") == 128_000
+        assert provider.get_max_output_tokens("openai/openai/gpt-5.3-chat") == 16_384
+        assert provider.get_context_length("azure/anthropic/claude-sonnet-4-6") == 1_000_000
+
+        # Budgets the root registry must keep in step with the bundled YAML,
+        # since an override replaces that file instead of merging with it.
+        assert provider.get_context_length("gpt-5.6-sol") == 1_050_000
+        assert provider.get_max_output_tokens("gpt-5.6-sol") == 128_000
+
+        # Same replacement rule from the other side: a bundled-only model has
+        # no budget at all while the override is in force.
+        assert provider.get_context_length("gpt-6-astra") is None
 
 
 class TestAnthropicProvider:
     """Anthropic provider — Claude credentials + bundled YAML metadata."""
+
+    @pytest.mark.parametrize(
+        "model", ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-mythos-5-1"]
+    )
+    def test_structured_output_method_is_json_schema_for_registry_models(self, model: str) -> None:
+        assert AnthropicProvider().structured_output_method(model) == "json_schema"
+
+    @pytest.mark.parametrize("model", ["claude-fable-5-1-20260901", "claude-mythos-5-1-preview"])
+    def test_structured_output_method_accepts_a_version_suffix(self, model: str) -> None:
+        assert AnthropicProvider().structured_output_method(model) == "json_schema"
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-opus-5",
+            "claude-fable-5",
+            "claude-fable-6",
+            "claude-mythos-5",
+            "gpt-5.4",
+        ],
+    )
+    def test_structured_output_method_is_default_elsewhere(self, model: str) -> None:
+        assert AnthropicProvider().structured_output_method(model) is None
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5-1",
+            "claude-opus-4-8",
+        ],
+    )
+    def test_current_generation_models_carry_token_limits(self, model: str) -> None:
+        provider = AnthropicProvider()
+        assert provider.get_context_length(model) == 1_000_000
+        assert provider.get_max_output_tokens(model) == 128_000
 
     def test_returns_none_without_env_var(self) -> None:
         assert AnthropicProvider().resolve_credentials() is None
@@ -362,6 +580,17 @@ class TestAnthropicProvider:
         llm = AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123)
         assert isinstance(llm, ChatAnthropic)
         assert str(llm.anthropic_api_url).rstrip("/") == "http://localhost:8787"
+
+    def test_bearer_auth_scheme_sends_authorization_header(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "gateway-token")
+        monkeypatch.setenv("ANTHROPIC_AUTH_SCHEME", "bearer")
+        llm = AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123)
+        assert isinstance(llm, ChatAnthropic)
+        for client in (llm._client, llm._async_client):
+            assert client.default_headers["Authorization"] == "Bearer gateway-token"
+            assert "X-Api-Key" not in client.default_headers
 
     @pytest.mark.parametrize("effort", ["provider-specific-value"])
     def test_reasoning_effort_passthrough(
@@ -591,12 +820,37 @@ class TestOpenAICompatibleConstructor:
         assert captured["temperature"] == 0.25
         assert captured["seed"] == 42
 
+    @pytest.mark.parametrize("seed", [-(1 << 63), (1 << 63) - 1])
+    def test_signed_64_bit_seed_boundaries_are_forwarded(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        seed: int,
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_chat_openai(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(chat_models, "ChatOpenAI", fake_chat_openai)
+        monkeypatch.setenv("SKILLSPECTOR_SEED", str(seed))
+
+        create_openai_compatible_chat_model(
+            model="gpt-5.4",
+            credentials=("sk-x", "http://localhost:1234/v1"),
+            max_tokens=123,
+        )
+
+        assert captured["seed"] == seed
+
     @pytest.mark.parametrize(
         ("name", "value", "message"),
         [
             ("SKILLSPECTOR_TEMPERATURE", "warm", "must be a number"),
             ("SKILLSPECTOR_TEMPERATURE", "1.1", "must be between 0 and 1"),
             ("SKILLSPECTOR_SEED", "4.2", "must be an integer"),
+            ("SKILLSPECTOR_SEED", str(1 << 63), "must be a signed 64-bit integer"),
+            ("SKILLSPECTOR_SEED", str(-(1 << 63) - 1), "must be a signed 64-bit integer"),
         ],
     )
     def test_invalid_sampling_control_fails_before_model_construction(
@@ -828,6 +1082,165 @@ class TestAntigravityCLIProvider:
         available, reason = AntigravityCLIProvider().is_available()
         assert available is False
         assert reason
+
+
+class TestAgentCLISessionCostWarning:
+    """A usable CLI provider warns once that every LLM call is a full session."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_warned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(agent_cli_base_module, "_cost_warned", set())
+
+    def test_warns_once_when_available(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(agent_cli_module, "is_available", lambda name: (True, None))
+        provider = ClaudeCLIProvider()
+        with caplog.at_level("WARNING", logger=agent_cli_base_module.logger.name):
+            assert provider.is_available() == (True, None)
+            assert provider.is_available() == (True, None)
+        warnings = [r for r in caplog.records if "separate claude session" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "--no-llm" in warnings[0].getMessage()
+
+    def test_silent_when_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(agent_cli_module, "is_available", lambda name: (False, "not logged in"))
+        with caplog.at_level("WARNING", logger=agent_cli_base_module.logger.name):
+            assert ClaudeCLIProvider().is_available() == (False, "not logged in")
+        assert not [r for r in caplog.records if "separate claude session" in r.getMessage()]
+
+    def test_warns_before_first_cli_call_without_availability_probe(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # `skillspector scan` builds its chat model before any CLI call and only
+        # probes is_available() from the report node, after the calls have run.
+        def _no_probe(name: str) -> tuple[bool, str | None]:
+            raise AssertionError("the scan path must warn without probing availability")
+
+        warned_before_call: list[bool] = []
+
+        def _run_agent_cli(binary: str, prompt: str, **kwargs: object) -> str:
+            warned_before_call.append(
+                any("separate claude session" in r.getMessage() for r in caplog.records)
+            )
+            return "pong"
+
+        monkeypatch.setattr(agent_cli_module, "is_available", _no_probe)
+        monkeypatch.setattr(agent_cli_module, "run_agent_cli", _run_agent_cli)
+        token = use_provider(ClaudeCLIProvider())
+        try:
+            with caplog.at_level("WARNING", logger=agent_cli_base_module.logger.name):
+                assert get_chat_model().invoke("ping").content == "pong"
+                assert get_chat_model().invoke("ping").content == "pong"
+        finally:
+            reset_provider(token)
+        assert warned_before_call == [True, True]
+        warnings = [r for r in caplog.records if "separate claude session" in r.getMessage()]
+        assert len(warnings) == 1
+
+
+class TestAgentCLIProviderMetadata:
+    """Shared model-registry behavior for supported agent CLI providers."""
+
+    @pytest.mark.parametrize(
+        "provider_type", [ClaudeCLIProvider, CodexCLIProvider, GeminiCLIProvider]
+    )
+    @pytest.mark.parametrize(
+        "contents",
+        [
+            "models: [test-model]\n",
+            "models:\n  test-model: 42\n",
+            "models:\n  test-model:\n    context_length: lots\n    max_output_tokens: lots\n",
+            "models:\n  test-model:\n    context_length: -1\n    max_output_tokens: -1\n",
+            "models:\n  test-model:\n    context_length: 0\n    max_output_tokens: 0\n",
+            "models:\n  test-model:\n    context_length: .inf\n    max_output_tokens: .inf\n",
+        ],
+        ids=["models-list", "scalar-entry", "bad-string", "negative", "zero", "infinite"],
+    )
+    def test_malformed_registry_returns_none(
+        self,
+        provider_type: type[ClaudeCLIProvider | CodexCLIProvider | GeminiCLIProvider],
+        contents: str,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        registry_path = tmp_path / "model_registry.yaml"
+        registry_path.write_text(contents, encoding="utf-8")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(registry_path))
+
+        provider = provider_type()
+        assert provider.get_context_length("test-model") is None
+        assert provider.get_max_output_tokens("test-model") is None
+
+    @pytest.mark.parametrize("invalid_field", ["context_length", "max_output_tokens"])
+    def test_invalid_budget_preserves_other_field(
+        self, invalid_field: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        valid_field = "max_output_tokens" if invalid_field == "context_length" else "context_length"
+        registry_path = tmp_path / "model_registry.yaml"
+        registry_path.write_text(
+            f'models:\n  test-model:\n    {invalid_field}: lots\n    {valid_field}: "32000"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(registry_path))
+
+        provider = ClaudeCLIProvider()
+        assert getattr(provider, f"get_{invalid_field}")("test-model") is None
+        assert getattr(provider, f"get_{valid_field}")("test-model") == 32_000
+
+    @pytest.mark.parametrize(
+        "provider_type",
+        [ClaudeCLIProvider, CodexCLIProvider, GeminiCLIProvider],
+    )
+    def test_honors_model_registry_override(
+        self,
+        provider_type: type[ClaudeCLIProvider | CodexCLIProvider | GeminiCLIProvider],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        registry_path = tmp_path / "model_registry.yaml"
+        registry_path.write_text(
+            "models:\n  test-model:\n    context_length: 200000\n    max_output_tokens: 32000\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(registry_path))
+
+        provider = provider_type()
+        assert provider.get_context_length("test-model") == 200_000
+        assert provider.get_max_output_tokens("test-model") == 32_000
+
+    @pytest.mark.parametrize("registry_value", [None, "   "])
+    def test_returns_none_without_registry(
+        self,
+        registry_value: str | None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if registry_value is None:
+            monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
+        else:
+            monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", registry_value)
+
+        provider = ClaudeCLIProvider()
+        assert provider.get_context_length("test-model") is None
+        assert provider.get_max_output_tokens("test-model") is None
+
+    def test_unknown_model_returns_none(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        registry_path = tmp_path / "model_registry.yaml"
+        registry_path.write_text(
+            "models:\n  known-model:\n    context_length: 200000\n    max_output_tokens: 32000\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(registry_path))
+
+        provider = ClaudeCLIProvider()
+        assert provider.get_context_length("unknown-model") is None
+        assert provider.get_max_output_tokens("unknown-model") is None
 
 
 class TestClaudeCLIProvider:

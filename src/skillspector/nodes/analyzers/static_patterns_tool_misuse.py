@@ -24,22 +24,62 @@ Framework: ASI02.
 
 from __future__ import annotations
 
+import ast
+import heapq
 import re
 import sys
+import time
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from hashlib import sha256
 
+from skillspector.artifacts import (
+    SecurityTextView,
+    _has_derived_security_view,
+    normalized_security_prefix,
+    normalized_security_view,
+    security_text_views,
+)
 from skillspector.logging_config import get_logger
-from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.models import AnalyzerFinding, Finding, Location, Severity
+from skillspector.python_ast import ParsedPythonFile, parse_python_source
+from skillspector.python_tokens import PythonLiteralSpans
+from skillspector.python_tokens import python_literal_spans as _python_literal_spans
+from skillspector.python_tokens import python_string_body as _python_string_body
+from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import (
+    LINE_BREAK_CHARS,
+    LOGICAL_LINE_BREAK,
+    MARKDOWN_FENCE_CLOSE,
+    MARKDOWN_FENCE_OPEN,
+    SourceLocationIndex,
+    get_context,
+    get_context_from_lines,
+    is_reference_material,
+)
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_tool_misuse"
+USES_RUNTIME_CHECK = True
+ANALYZE_USES_POSTPROCESS = True
+POSTPROCESS_USES_PYTHON_AST = True
+POSTPROCESS_USES_RUNTIME_BUDGET = True
+_VARIABLE_SHELL_FLAG_EVIDENCE = "_tm1_variable_shell_flag"
+LEXICAL_DIRECT_SHELL_EVIDENCE = "_tm1_lexical_direct_shell"
+LEXICAL_RAW_OWNER_EVIDENCE = "_tm1_lexical_raw_owner"
+LEXICAL_NORMALIZED_MATCH_EVIDENCE = "_tm1_lexical_normalized_match"
+LEXICAL_BOUND_IDENTITY_EVIDENCE = "_tm1_lexical_bound_identity"
+LEXICAL_BOUND_IDENTITY_SOURCE_EVIDENCE = "_tm1_lexical_bound_identity_source"
+LEXICAL_BOUND_CLASSIFICATION_EVIDENCE = "_tm1_lexical_bound_classification"
+LEXICAL_REACH_TERMINATED_EVIDENCE = "_tm1_lexical_reach_terminated"
+LEXICAL_BOUND_REACHABLE_EVIDENCE = "_tm1_lexical_bound_reachable"
+_MAX_DIRECT_SHELL_CONTEXT_CHARS = 1024
 
 _SHELL_COMMAND_WORD_START_RE = re.compile(r"[rRdDeE$'\"`\\]")
 _SHELL_COMMAND_WORD_CHARS = 4096
@@ -50,9 +90,99 @@ _STATIC_BRACE_WORD_CHARS = 256
 _PRINTF_STATIC_CHARS = 256
 _PRINTF_STATIC_ARGUMENTS = 32
 _PRINTF_STATIC_WORD_RE = re.compile(r"[-A-Za-z0-9_./*?%]{0,64}")
+# A bounded ``printf`` format operand may also carry POSIX backslash escapes.
+_PRINTF_FORMAT_WORD_RE = re.compile(r"[-A-Za-z0-9_./*?%\\]{0,64}")
+# The old deterministic alphabet plus the control/high-byte values needed by
+# byte-oriented probes. Command substitutions are expanded after shell syntax
+# has been recognized, so decoded angle brackets remain literal word data
+# rather than redirections. Anything else outside this set is either a shell
+# separator, a metacharacter the downstream glob model does not handle, or
+# otherwise not provably inert, so the substitution stays undecidable.
+_PRINTF_SAFE_WORD_RE = re.compile(r"[\x01-\x08\x0e-\x1f\x7f-\xffA-Za-z0-9_./*?%<>-]*")
 _DESTRUCTIVE_COMMAND_BASENAMES = frozenset({"rm", "del", "erase"})
 _QUOTED_GLOB_SENTINEL = "\ue000"
 _DYNAMIC_SHELL_WORD_SENTINEL = "\ue001"
+_RUNTIME_SHELL_PARAMETER_SENTINEL = "\ue002"
+# A braced expansion head whose result depends only on parameter values: an
+# optional length prefix, a name with an optional literal subscript or a
+# numeric/special parameter, then the closing brace or a value operator.
+# Indirection, arithmetic subscripts, substring offsets, ``@`` transformations,
+# zsh flags and ``${ cmd; }`` can evaluate code, so they do not match. The
+# documentation placeholder ``${...}`` is a bad substitution in every shell.
+_VALUE_PARAMETER_EXPANSION_HEAD_RE = re.compile(
+    r"\$\{(?:#?(?:[A-Za-z_][A-Za-z0-9_]*(?:\[(?:[@*]|[0-9]+)\])?|[0-9]+|[@*#?$!-])"
+    r"(?:\}|:?[-=?+]|##?|%%?|/[/#%]?|\^\^?|,,?)|\.\.\.\})"
+)
+_VALUE_PARAMETER_EXPANSION_START_RE = re.compile(r"\$\{")
+_EXECUTABLE_EXPANSION_MARKERS = ("`", "$(", "$[", "<(", ">(")
+_SHELL_ASSIGNMENT_PREFIX_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+_SHELL_ASSIGNMENT_NAME_CHARACTERS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+)
+_SHELL_CLAUSE_BOUNDARY_CHARACTERS = "\r\n;|&(){}`"
+_SHELL_DELIMITER_WORD_RE = re.compile(r"[^$'\"`\\(){}<>#;|&!\s]++")
+# A ``#`` that starts a word begins a shell comment. Quoting is not tracked, so
+# ``echo "a # b"`` also matches; callers only use this to restrict ownership.
+_SHELL_COMMENT_START_RE = re.compile(r"(?<![^\s;&|()<>])#")
+_PERL_LITERAL_PRINT_RE = re.compile(
+    r"^[ \t]*+print\b(?:[ \t]++(?:STDOUT|STDERR)\b)?[ \t]*+(?P<paren>\()?[ \t]*+"
+    r"(?P<literal>\"(?:\\[\\\"'nrt]|[^\\\"$@`\r\n])*+\""
+    r"|'(?:\\[\\\"'nrt]|[^\\'$@`\r\n])*+')"
+    r"[ \t]*+(?(paren)\))[ \t]*+;[ \t]*+(?:\#[^\r\n]*+)?\r?$",
+    re.MULTILINE,
+)
+_PERL_QUOTE_OPERATOR_RE = re.compile(r"\b(?:q[qwxr]?|m|s|tr|y)(?:\s+\S|[^\w\s])")
+_PERL_AMBIGUOUS_SIGIL_RE = re.compile(r"[$@%&*]\s*+[{#'\"`]")
+# Perl's ``eval BLOCK`` runs already-compiled statements and traps exceptions.
+# Only ``eval EXPR`` (a string, variable, or quote operator) reparses source.
+_PERL_EVAL_BLOCK_RE = re.compile(r"\s*+\{")
+# Outside string and comment tokens, valid Python ends a shell word at
+# whitespace or a shell control character. A backslash-newline is a line
+# continuation in both languages, so it does not end the word.
+_PYTHON_SHELL_WORD_BREAK_RE = re.compile(r"(?<!\\)(?<!\\\r)[\s;|&()<>]")
+# Whitespace and line continuations between Python tokens. Comments are
+# tokens of their own.
+_PYTHON_TOKEN_GAP_RE = re.compile(r"(?:\s|\\\r?\n)*+")
+# Python operators that can still extend or rewrite a string value.
+_PYTHON_STRING_EXTENSION_OPERATORS = frozenset({"+", "%", ".", "*", "["})
+# One brace opens an f-string replacement field; a doubled brace is literal.
+_PYTHON_REPLACEMENT_FIELD_RE = re.compile(r"\{\{|(\{)")
+_PRINTF_FORMAT_CONVERSION_RE = re.compile(r"%[-+ #0-9.*']*[A-Za-z%]")
+_SHELL_ROOT_TARGET_ESCAPE_RE = re.compile(
+    r"\\(?:[/~*?]|x(?:2[fF]|7[eE]|2[aA]|3[fF])|"
+    r"u(?:002[fF]|007[eE]|002[aA]|003[fF])|"
+    r"U(?:0000002[fF]|0000007[eE]|0000002[aA]|0000003[fF])|"
+    r"(?:057|176|052|077)(?![0-7]))"
+)
+_POWERSHELL_REPLACE_EXPRESSION_RE = re.compile(
+    r"\A\s*\$(?:[A-Za-z_][A-Za-z0-9_]*|_[A-Za-z0-9_.]*)"
+    r"(?:\.[A-Za-z_][A-Za-z0-9_]*)*\s+-replace\b",
+    re.IGNORECASE,
+)
+_SHELL_COMMAND_STRING_SHELLS = frozenset({"sh", "ash", "bash", "dash", "ksh", "yash", "zsh"})
+_SHELL_COMMAND_STRING_ARGUMENTS = 32
+_SHELL_CLAUSE_PREFIX_WORDS = frozenset({"do", "else", "elif", "then", "time", "!"})
+_SHELL_ASSIGNMENT_PREFIX_WORDS = _SHELL_CLAUSE_PREFIX_WORDS | frozenset(
+    {"if", "while", "until", "export", "local", "declare", "readonly", "typeset"}
+)
+_SHELL_REDIRECTION_PREFIX_RE = re.compile(r"(?:[0-9]+)?(?:&>>?|<>|>>?|<<-?|>&|<&|[<>])")
+_RECURSIVE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*[rR]|-recursive)")
+_FORCE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*f|-force)")
+_MARKDOWN_CONTRACTION_PROSE_RE = re.compile(
+    r"(?:The|This|That|These|Those|It|They|We|You|I|A|An)[ \t]+[A-Za-z \t,]*\b"
+    r"(?:doesn|isn|aren|wasn|weren|don|didn|hasn|haven|hadn|can|couldn|shouldn|wouldn|won|mustn)"
+    r"(?P<apostrophe>')t\b[A-Za-z \t,]*[.!?]",
+    re.IGNORECASE,
+)
+# An English possessive or contraction inside one prose word, such as
+# ``reference's`` or ``don't``. The suffix must end the word, so a quote that
+# closes a shell word, as in ``r'm'``, never matches.
+_MARKDOWN_WORD_APOSTROPHE_RE = re.compile(
+    r"(?<![\w'/.~-])[A-Za-z]++(?P<apostrophe>')(?:s|t|d|m|re|ve|ll)(?![\w'/])",
+    re.IGNORECASE,
+)
+# Shell syntax that opens a quote, an expansion, or a line continuation.
+_MARKDOWN_PROSE_SHELL_SYNTAX_RE = re.compile(r"[$`\\\"]")
 _ROOT_GLOB_DOCUMENTATION_LINE_RE = re.compile(
     r"[ \t]*(?:(?:[-*+]|#{1,6})[ \t]+)?"
     r"(?:(?:(?:documentation|note|example)[ \t]*:[ \t]*)"
@@ -101,11 +231,32 @@ _ROOT_GLOB_AFFIRMATIVE_NEGATION_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Match a literal True assigned to a local name shortly before it is passed as
+# shell=<name> to a subprocess invocation.  The bounded newline gap and the
+# AST binding-evidence guard keep this a local data-flow fact; Python scope
+# visibility is enforced separately in analyze() via _VARIABLE_SHELL_FLAG_RE.
+_VARIABLE_SHELL_ASSIGNMENT_PATTERN = r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*True\s*$\n"
+_VARIABLE_SHELL_FLAG_PATTERN = (
+    _VARIABLE_SHELL_ASSIGNMENT_PATTERN + r"(?:[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
+    r"(?:subprocess\.\w+|Popen)\s*\([^)]*\bshell\s*=\s*\1\b"
+)
+_VARIABLE_SHELL_FLAG_RE = re.compile(_VARIABLE_SHELL_FLAG_PATTERN, re.IGNORECASE | re.MULTILINE)
+_VARIABLE_SHELL_ASSIGNMENT_RE = re.compile(
+    _VARIABLE_SHELL_ASSIGNMENT_PATTERN, re.IGNORECASE | re.MULTILINE
+)
+_SHELL_NAME_ARGUMENT_RE = re.compile(r"\bshell\s*=\s*\w+", re.IGNORECASE)
+
 # TM1: Tool Parameter Abuse — dangerous parameter values
-TM1_PATTERNS = [
+DIRECT_SHELL_TRUE_PATTERNS: tuple[tuple[str, float], ...] = (
     # shell=True is a classic command injection vector
-    (r"subprocess\.\w+\s*\([^)]*shell\s*=\s*True", 0.8),
-    (r"Popen\s*\([^)]*shell\s*=\s*True", 0.8),
+    (r"subprocess\.\w+\s*\([^)]*shell\s*=\s*True\b", 0.8),
+    (r"Popen\s*\([^)]*shell\s*=\s*True\b", 0.8),
+)
+_DIRECT_SHELL_TRUE_VALUE = re.compile(r"shell\s*=\s*True\b", re.IGNORECASE)
+TM1_CODE_PATTERNS = [
+    *DIRECT_SHELL_TRUE_PATTERNS,
+    # Preserve the current-main fallback when the Python AST is unavailable.
+    (_VARIABLE_SHELL_FLAG_PATTERN, 0.8),
     # Bound command names on both sides so prefixes such as rmm/ (RAPIDS
     # Memory Manager headers) are not interpreted as destructive commands.
     # Keep the scan within one bounded shell command.  The former ``[^|]*``
@@ -135,7 +286,24 @@ TM1_PATTERNS = [
         0.85,
     ),
     (r"\bshutil\.rmtree\s*\(\s*['\"]\s*/", 0.85),
-    (r"(?:chmod|chown)\s+[^|]*(?:777|666|a\+rwx)", 0.8),
+    # A numeric chmod mode is world-writable when the others-triple carries the
+    # write bit, i.e. its last digit is 2, 3, 6 or 7.  Matching the mode argument
+    # itself rather than a bare `777`/`666` substring also keeps a path or a
+    # trailing comment from being read as the mode (chmod 755 /tmp/6660 is a
+    # chmod 755).  This owns the numeric forms that TM1 already owned for
+    # 777/666, plus the 646/757/0662 spellings the privilege-escalation rule used
+    # to catch as a side effect of matching 4/5/6/7 anywhere in the mode.
+    # Only `chmod` is matched here: `chown` takes an owner rather than a mode, so
+    # a numeric owner ID whose last digit is 2/3/6/7 (Grafana's 472:472, Istio's
+    # 1337:1337) is not a world-writable mode.  The optional [+=] accepts the
+    # operator GNU chmod allows in front of the digits (chmod +777, chmod =666);
+    # BSD chmod rejects those, so they are reported rather than assumed safe.
+    # The option group takes a single leading dash for the reason given in the
+    # privilege-escalation rule: `--?` made the match exponential on a line of
+    # unmatched `-- ` tokens, and `[\w=-]*` already absorbs a long option's
+    # second dash.
+    (r"chmod\s+(?:-[\w=-]*[ \t]+)*[\"']?[+=]?0*[0-7]{2,3}[2367](?![0-9\w])[\"']?", 0.8),
+    (r"(?:chmod|chown)\s+[^|]*a\+rwx", 0.8),
     # Git force operations
     (r"git\s+push\s+[^|]*--force", 0.7),
     (r"git\s+reset\s+--hard", 0.65),
@@ -154,20 +322,29 @@ TM1_PATTERNS = [
         r"(?:execute|query)\s*\(\s*f?['\"].*?\{.*?\}.*?\b(?:DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE)\b",
         0.85,
     ),
+]
+TM1_PROSE_PATTERNS = [
     # Dangerous tool parameter patterns in instructions
     (
         r"(?:set|pass|use)\s+(?:the\s+)?(?:parameter|argument|flag|option)\s+(?:to\s+)?(?:shell\s*=\s*True|--force|-rf)\b",
         0.8,
     ),
 ]
+TM1_PATTERNS = TM1_CODE_PATTERNS + TM1_PROSE_PATTERNS
 
 # TM2: Chaining Abuse — chained commands to bypass safety
-TM2_PATTERNS = [
+TM2_CODE_PATTERNS = [
     # Shell command chaining with dangerous commands (\b prevents substring matches)
     (r"(?:&&|;)\s*\b(?:rm\b|del\b|erase\b)\s+-", 0.75),
     (r"(?:&&|;)\s*(?:curl|wget)\s+[^|]*\|\s*(?:ba)?sh", 0.9),
     (r"(?:&&|;)\s*(?:sudo|su\s+)", 0.75),
     (r"(?:&&|;)\s*(?:chmod|chown)\s+(?:777|666|a\+rwx|-R)", 0.75),
+    # Pipe chains with escalating danger
+    (r"\|\s*(?:sudo|su)\s+", 0.75),
+    (r"\|\s*(?:sh|bash|zsh|python|node|ruby|perl)\s*$", 0.7),
+    (r"\|\s*(?:tee|xargs)\s+.*?\b(?:rm|del|sudo|curl)\b", 0.75),
+]
+TM2_PROSE_PATTERNS = [
     # Multi-step chains designed to circumvent individual checks
     # Bounded to ~500 chars per gap to avoid spanning entire documents
     (
@@ -182,19 +359,39 @@ TM2_PATTERNS = [
         r"(?:use|call)\s+(?:tool\s+)?(?:A|one|the\s+first)\s+(?:to|and)[^\n]{0,300}(?:then\s+)?(?:use|call|pass\s+(?:the\s+)?(?:output|result)\s+to)\s+(?:tool\s+)?(?:B|two|another)",
         0.6,
     ),
-    # Pipe chains with escalating danger
-    (r"\|\s*(?:sudo|su)\s+", 0.75),
-    (r"\|\s*(?:sh|bash|zsh|python|node|ruby|perl)\s*$", 0.7),
-    (r"\|\s*(?:tee|xargs)\s+.*?\b(?:rm|del|sudo|curl)\b", 0.75),
     # Natural language chaining instructions
     (
         r"(?:after|once)\s+(?:the\s+)?(?:first|initial)\s+(?:tool|command|action)\s+(?:succeeds|completes|runs)[^\n]{0,300}(?:immediately|then|next)\s+(?:run|execute|call|invoke)",
         0.6,
     ),
 ]
+TM2_PATTERNS = TM2_CODE_PATTERNS + TM2_PROSE_PATTERNS
 
 # TM3: Unsafe Defaults — overly permissive default settings
-TM3_PATTERNS = [
+#
+# A umask leaves new files world-writable when its world-write bit (0o002) is unset.
+# In octal digits that is a last digit of 0, 1, 4 or 5.
+_UMASK_OCTAL_WORLD_WRITE = r"[0-7]*[0145]\b"
+# Python, JavaScript and C read a number as octal only with a 0o prefix or a leading
+# 0, so a bare 14 is 0o016 (world-write masked) and a bare 8 is 0o010 (unmasked). A
+# decimal N leaves the bit unset when N % 4 is 0 or 1, which its last two digits decide.
+_UMASK_NUMBER_WORLD_WRITE = (
+    rf"(?:0(?:o?{_UMASK_OCTAL_WORLD_WRITE})?\b"
+    r"|[1-9]\d*+(?<=[02468][014589]|[13579][2367]|\D[14589])\b)"
+)
+# umask 000, or an assigned value such as umask = 0o000 or umask = 8.
+_TM3_UMASK = (
+    rf"umask(?:[ \t]+(?:0o)?{_UMASK_OCTAL_WORLD_WRITE}|\s*=\s*{_UMASK_NUMBER_WORLD_WRITE})",
+    0.8,
+)
+# Shell reads every umask value as octal, including a variable such as UMASK=14 that
+# is later passed to the umask command.
+_TM3_SHELL_UMASK = (rf"umask(?:\s*=\s*|[ \t]+)(?:0o)?{_UMASK_OCTAL_WORLD_WRITE}", 0.8)
+# umask(0) as a statement or inside an expression. `old = os.umask(0)` is how Python
+# reads the umask before restoring it, so analyze() skips a call whose result is
+# assigned (see _is_assigned_value).
+_TM3_UMASK_CALL = (rf"(?<![\w.])(?:\w+\.)*umask\(\s*{_UMASK_NUMBER_WORLD_WRITE}\s*\)", 0.8)
+TM3_CODE_PATTERNS = [
     # TLS/SSL verification disabled
     (r"verify\s*=\s*False", 0.75),
     (r"VERIFY_SSL\s*=\s*False", 0.8),
@@ -208,9 +405,21 @@ TM3_PATTERNS = [
     # Overly permissive CORS / access
     (r"(?:CORS|cors)[^=]*=\s*['\"]?\*['\"]?", 0.65),
     (r"(?:allow|access)[_-]?(?:origin|hosts?)\s*=\s*['\"]?\*['\"]?", 0.7),
-    (r"(?:allow|trust)\s+(?:all|any|every)\s+(?:origins?|hosts?|domains?|ips?)", 0.7),
-    # Unsafe permissions
-    (r"(?:mode|permission|umask)\s*=\s*(?:0?o?777|0?o?666)", 0.8),
+    # Unsafe permissions. A mode masked with the umask (0o666 & ~umask) respects it,
+    # like a plain open(), when the mask ends the expression: a closing bracket, a
+    # separator, or the end of a line (LF or CRLF, after an optional # comment) whose
+    # next line does not continue it with an operator, `and` or `or`. Any other
+    # operator, such as | 0o777 or the floor division // 512, can change the result
+    # and is still reported. The comment is bounded so the check stays linear.
+    (
+        r"(?:mode|permission)\s*=\s*(?:0?o?777|0?o?666)"
+        r"(?![ \t]*&[ \t]*~[ \t]*[\w.]*umask\b(?:\([^()\n]*\))?[ \t]*"
+        r"(?:[),;\]}]|(?:#[^\n]{0,240}|\r)?$"
+        r"(?!\n[ \t]*(?:[-+*/%|&^<>=?:.]|(?:and|or)\b))))",
+        0.8,
+    ),
+    _TM3_UMASK,
+    _TM3_UMASK_CALL,
     (r"world[_-]?(?:readable|writable|executable)", 0.7),
     # Debug/dev mode in production
     (r"(?:debug|dev|development)[_-]?mode\s*=\s*(?:True|true|1|on|yes|enable)", 0.6),
@@ -224,6 +433,9 @@ TM3_PATTERNS = [
         0.8,
     ),
     (r"(?:safe[_-]?mode|secure[_-]?mode|sandbox)\s*=\s*(?:False|false|0|off|no|disable)", 0.8),
+]
+TM3_PROSE_PATTERNS = [
+    (r"(?:allow|trust)\s+(?:all|any|every)\s+(?:origins?|hosts?|domains?|ips?)", 0.7),
     # Natural language unsafe defaults
     (r"(?:by\s+default|default\s+to)\s+(?:allow|accept|trust)\s+(?:all|any|everything)", 0.7),
     (
@@ -231,6 +443,8 @@ TM3_PATTERNS = [
         0.7,
     ),
 ]
+TM3_PATTERNS = TM3_CODE_PATTERNS + TM3_PROSE_PATTERNS
+_TM3_SHELL_PATTERNS = [_TM3_SHELL_UMASK if entry == _TM3_UMASK else entry for entry in TM3_PATTERNS]
 
 # TM4: Privileged Kubernetes Workload — manifest/CLI primitives that grant
 # node/host takeover (the cluster-scale counterpart of a privileged container).
@@ -337,6 +551,8 @@ class _ShellDelimiterFrame:
     word_started: bool = False
     inherited_double_quote: bool = False
     inherited_quote_closed: bool = False
+    pending_case_clauses: int = 0
+    open_case_clauses: int = 0
 
 
 def _is_shell_command_word_start(content: str, start: int) -> bool:
@@ -448,6 +664,7 @@ def _skip_shell_delimited_expansion(
         )
     ]
     cursor = start + opener_width
+    next_runtime_check = ((cursor + 4095) // 4096) * 4096
 
     def cache_frame(frame: _ShellDelimiterFrame, end: int | None) -> None:
         if frame.start is None:
@@ -496,9 +713,19 @@ def _skip_shell_delimited_expansion(
         )
         cursor += width
 
+    def at_shell_keyword(keyword: str) -> bool:
+        end = cursor + len(keyword)
+        if end > limit or content[cursor:end] != keyword:
+            return False
+        before = content[cursor - 1] if cursor else " "
+        after = content[end] if end < limit else " "
+        delimiters = ";|&(){}<>! \t\r\n"
+        return before in delimiters and after in delimiters
+
     while cursor < limit:
-        if check_runtime is not None and cursor % 4096 == 0:
+        if check_runtime is not None and cursor >= next_runtime_check:
             check_runtime()
+            next_runtime_check = cursor + 4096
         frame = frames[-1]
         character = content[cursor]
 
@@ -535,6 +762,24 @@ def _skip_shell_delimited_expansion(
                 cursor += 2
                 continue
             cursor += 1
+            continue
+
+        # Ordinary words cannot change the delimiter stack. Consume them in
+        # one bounded match rather than testing each character for every shell
+        # opener, quote, and keyword. Nested static-evaluator windows otherwise
+        # repeat those Python-level checks hundreds of thousands of times.
+        word = _SHELL_DELIMITER_WORD_RE.match(content, cursor, min(limit, cursor + 4096))
+        if word is not None:
+            if frame.kind in {"command", "paren"}:
+                if at_shell_keyword("case"):
+                    frame.pending_case_clauses += 1
+                elif frame.pending_case_clauses and at_shell_keyword("in"):
+                    frame.pending_case_clauses -= 1
+                    frame.open_case_clauses += 1
+                elif frame.open_case_clauses and at_shell_keyword("esac"):
+                    frame.open_case_clauses -= 1
+                frame.word_started = True
+            cursor = word.end()
             continue
 
         if content.startswith("${", cursor):
@@ -623,6 +868,13 @@ def _skip_shell_delimited_expansion(
             push("paren", None, 1)
             continue
         if character == ")":
+            if frame.open_case_clauses:
+                # ``)`` terminates a case pattern, not the surrounding command
+                # substitution. The corresponding ``esac`` above releases the
+                # real substitution closer without requiring a full shell AST.
+                frame.word_started = False
+                cursor += 1
+                continue
             endpoint = close_frame(cursor + 1)
             cursor += 1
             if endpoint is not None:
@@ -693,6 +945,8 @@ def _is_ifs_expansion(content: str, start: int, end: int) -> bool:
 
 def _consume_printf_invocation(
     next_word: Callable[[], str | None],
+    *,
+    runtime_command_context: bool = False,
 ) -> tuple[bool, bool]:
     """Resolve an allowlisted invocation; return ``(recognized, exact)``."""
     pending: str | None = None
@@ -702,10 +956,40 @@ def _consume_printf_invocation(
         if word is None:
             return False, False
         if _DYNAMIC_SHELL_WORD_SENTINEL in word:
-            # A runtime expansion participates in the invocation or wrapper
-            # command word. Its executable basename is not deterministic.
+            # A command substitution or complex expansion participates in the
+            # invocation or wrapper word. Its basename is not deterministic.
             return True, False
         command = word.casefold().rsplit("/", 1)[-1]
+        if _RUNTIME_SHELL_PARAMETER_SENTINEL in word and command in {
+            "printf",
+            "command",
+            "builtin",
+            "env",
+        }:
+            # A known basename does not make a runtime-selected executable exact.
+            return True, False
+        if _RUNTIME_SHELL_PARAMETER_SENTINEL in command:
+            # An opaque basename can still participate in printf reconstruction.
+            # Require bounded invocation evidence or destructive outer operands,
+            # rather than reclassifying ordinary runtime-parameter notation.
+            if runtime_command_context:
+                return True, False
+            characters = 0
+            for _ in range(_PRINTF_STATIC_ARGUMENTS):
+                operand = next_word()
+                if operand is None:
+                    break
+                characters += len(operand)
+                if characters > _PRINTF_STATIC_CHARS:
+                    return True, False
+                if (
+                    operand.casefold().rsplit("/", 1)[-1] == "printf"
+                    or _PRINTF_FORMAT_CONVERSION_RE.search(operand) is not None
+                ):
+                    return True, False
+            else:
+                return True, False
+            return False, False
         if command == "printf":
             return True, True
         if command == "command":
@@ -761,8 +1045,15 @@ def _consume_printf_invocation(
     return True, False
 
 
-def _printf_invocation_arguments(inner: str) -> tuple[bool, list[str]]:
+def _printf_invocation_arguments(
+    inner: str,
+    *,
+    runtime_command_context: bool = False,
+    check_runtime: Callable[[], None] | None = None,
+) -> tuple[bool, list[str]]:
     """Parse direct or allowlisted wrapper invocations of shell ``printf``."""
+    runtime_check = check_runtime or (lambda: None)
+
     cursor = 0
     limited = False
 
@@ -771,12 +1062,14 @@ def _printf_invocation_arguments(inner: str) -> tuple[bool, list[str]]:
         word, cursor, word_limited = _next_shell_invocation_word(
             inner,
             cursor,
-            lambda: None,
+            runtime_check,
         )
         limited = limited or word_limited or (word is None and cursor < len(inner))
         return word
 
-    recognized, exact = _consume_printf_invocation(next_word)
+    recognized, exact = _consume_printf_invocation(
+        next_word, runtime_command_context=runtime_command_context
+    )
     if not recognized or not exact or limited:
         return recognized, []
 
@@ -787,6 +1080,30 @@ def _printf_invocation_arguments(inner: str) -> tuple[bool, list[str]]:
             return (True, []) if limited or cursor < len(inner) else (True, arguments)
         arguments.append(word)
     return True, arguments
+
+
+def _is_value_parameter_expansion(content: str, start: int, end: int) -> bool:
+    """Return whether a braced expansion and its nested expansions substitute only values."""
+    expansion = content[start:end]
+    if any(marker in expansion for marker in _EXECUTABLE_EXPANSION_MARKERS):
+        return False
+    return all(
+        _VALUE_PARAMETER_EXPANSION_HEAD_RE.match(expansion, nested.start()) is not None
+        for nested in _VALUE_PARAMETER_EXPANSION_START_RE.finditer(expansion)
+    )
+
+
+def _invocation_expansion_marker(content: str, start: int, end: int) -> str:
+    """Distinguish runtime-only parameters from possible command reconstruction."""
+    if content.startswith("$(", start) or (
+        content.startswith("${", start) and not _is_value_parameter_expansion(content, start, end)
+    ):
+        # Other parameter expansions may contain nested command substitutions
+        # or evaluate a value as code.
+        return _DYNAMIC_SHELL_WORD_SENTINEL
+    # ``${NAME:-default}``, ``${ARR[@]}`` and similar forms select the same
+    # runtime value as ``$NAME`` and need the same printf invocation evidence.
+    return _RUNTIME_SHELL_PARAMETER_SENTINEL
 
 
 def _next_shell_invocation_word(
@@ -820,6 +1137,7 @@ def _next_shell_invocation_word(
     quote: str | None = None
     ansi_c_quote = False
     word_started = False
+    unquoted_characters = 0
     while cursor < limit:
         if cursor % 4096 == 0:
             check_runtime()
@@ -884,7 +1202,7 @@ def _next_shell_invocation_word(
                     word_started = True
                     cursor += 1
                     continue
-                output.append(_DYNAMIC_SHELL_WORD_SENTINEL)
+                output.append(_invocation_expansion_marker(content, cursor, parameter_end))
                 word_started = True
                 cursor = parameter_end
                 if inherited_quote_closed[0]:
@@ -959,7 +1277,8 @@ def _next_shell_invocation_word(
                 word_started = True
                 cursor += 1
                 continue
-            output.append(_DYNAMIC_SHELL_WORD_SENTINEL)
+            # A simple runtime parameter does not invoke the printf evaluator.
+            output.append(_invocation_expansion_marker(content, cursor, parameter_end))
             word_started = True
             cursor = parameter_end
             continue
@@ -1002,7 +1321,8 @@ def _next_shell_invocation_word(
         else:
             output.append(character)
             word_started = True
-            if len(output) > _SHELL_COMMAND_WORD_CHARS:
+            unquoted_characters += 1
+            if unquoted_characters > _SHELL_COMMAND_WORD_CHARS:
                 return None, cursor, True
         cursor += 1
     if quote is not None:
@@ -1010,33 +1330,75 @@ def _next_shell_invocation_word(
     return "".join(output) if word_started else None, cursor, False
 
 
-def _has_printf_invocation_prefix(
-    content: str,
-    start: int,
-    check_runtime: Callable[[], None],
-    parameter_end_cache: dict[int, _ParameterExpansionEnd],
-    substitution_end_cache: dict[int, int | None],
-    backtick_end_cache: dict[int, int | None],
-) -> bool:
-    """Recognize over-bound direct ``printf`` without copying or suffix rescans."""
-    cursor = start + 2
-    limited = False
+_PRINTF_HEX_ESCAPE_RE = re.compile(r"[0-9A-Fa-f]{1,2}")
+_PRINTF_OCTAL_ESCAPE_RE = re.compile(r"[0-7]{1,3}")
+_PRINTF_ESCAPE_SEQUENCES = {
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+}
 
-    def next_word() -> str | None:
-        nonlocal cursor, limited
-        word, cursor, word_limited = _next_shell_invocation_word(
-            content,
-            cursor,
-            check_runtime,
-            parameter_end_cache,
-            substitution_end_cache,
-            backtick_end_cache,
-        )
-        limited = limited or word_limited
-        return word
 
-    recognized, _ = _consume_printf_invocation(next_word)
-    return recognized or limited
+def _decode_printf_escapes(text: str) -> str | None:
+    """Decode bounded escapes as modeled by Bash builtin/coreutils ``printf``.
+
+    This intentionally models the Bash/GNU-coreutils escape subset used by the
+    static parser.  Extensions such as ``\\xHH``, ``\\e``/``\\E``, ``\\'`` and
+    ``\\"`` are not portable to a dash ``printf`` and are not a general POSIX
+    guarantee.  Unknown or trailing escapes make the substitution undecidable
+    and return ``None`` so the caller keeps its fail-closed behaviour.
+    """
+    output: list[str] = []
+    cursor = 0
+    while cursor < len(text):
+        character = text[cursor]
+        if character != "\\":
+            output.append(character)
+            cursor += 1
+            continue
+        if cursor + 1 >= len(text):
+            return None
+        escaped = text[cursor + 1]
+        simple = _PRINTF_ESCAPE_SEQUENCES.get(escaped)
+        if simple is not None:
+            output.append(simple)
+            cursor += 2
+            continue
+        if escaped == "x":
+            digits = _PRINTF_HEX_ESCAPE_RE.match(text, cursor + 2)
+            if digits is None:
+                return None
+            output.append(chr(int(digits.group(0), 16)))
+            cursor = digits.end()
+            continue
+        if escaped in "01234567":
+            digits = _PRINTF_OCTAL_ESCAPE_RE.match(text, cursor + 1)
+            if digits is None:
+                return None
+            value = int(digits.group(0), 8)
+            if value > 0o377:
+                return None
+            output.append(chr(value))
+            cursor = digits.end()
+            continue
+        return None
+    return "".join(output)
+
+
+def _bounded_printf_word(result: str) -> str | None:
+    """Return a decoded ``printf`` result only when it stays one inert word."""
+    if _PRINTF_SAFE_WORD_RE.fullmatch(result) is None:
+        return None
+    return result
 
 
 def _static_printf_substitution(
@@ -1062,13 +1424,29 @@ def _static_printf_substitution(
     if not arguments or len(arguments) > _PRINTF_STATIC_ARGUMENTS + 1:
         return None
     format_word, *values = arguments
-    if _PRINTF_STATIC_WORD_RE.fullmatch(format_word) is None or any(
+    if _PRINTF_FORMAT_WORD_RE.fullmatch(format_word) is None or any(
         _PRINTF_STATIC_WORD_RE.fullmatch(value) is None for value in values
     ):
         return None
 
     segments: list[str | None] = []
     literal: list[str] = []
+
+    def flush_literal() -> bool:
+        # POSIX ``printf`` decodes escapes in the format operand before any
+        # conversion runs, so decode each literal segment in place. Decoding
+        # after the conversion split keeps an escaped percent sign from
+        # re-entering conversion parsing.
+        text = "".join(literal)
+        literal.clear()
+        if "\\" in text:
+            decoded = _decode_printf_escapes(text)
+            if decoded is None:
+                return False
+            text = decoded
+        segments.append(text)
+        return True
+
     cursor = 0
     while cursor < len(format_word):
         character = format_word[cursor]
@@ -1078,18 +1456,17 @@ def _static_printf_substitution(
             continue
         if cursor + 1 >= len(format_word) or format_word[cursor + 1] not in "s%":
             return None
-        if literal:
-            segments.append("".join(literal))
-            literal.clear()
+        if literal and not flush_literal():
+            return None
         conversion = format_word[cursor + 1]
         segments.append(None if conversion == "s" else "%")
         cursor += 2
-    if literal:
-        segments.append("".join(literal))
+    if literal and not flush_literal():
+        return None
 
     conversions = sum(segment is None for segment in segments)
     if conversions == 0:
-        return format_word
+        return _bounded_printf_word("".join(segments))
     remaining = iter(values)
     output: list[str] = []
     cycles = max(1, (len(values) + conversions - 1) // conversions)
@@ -1098,8 +1475,103 @@ def _static_printf_substitution(
             output.append(next(remaining, "") if segment is None else segment)
         if sum(len(piece) for piece in output) > 64:
             return None
-    result = "".join(output)
-    return result if _PRINTF_STATIC_WORD_RE.fullmatch(result) is not None else None
+    return _bounded_printf_word("".join(output))
+
+
+def _may_have_destructive_outer_operands(content: str) -> bool:
+    """Conservatively prove whether one view can contain destructive operands."""
+    target_evidence = (
+        any(marker in content for marker in "/~*?")
+        or _SHELL_ROOT_TARGET_ESCAPE_RE.search(content) is not None
+    )
+    option_evidence = (
+        _RECURSIVE_OPTION_SOURCE_RE.search(content) is not None
+        and _FORCE_OPTION_SOURCE_RE.search(content) is not None
+    ) or _has_constructed_recursive_force_option_source(content)
+    return target_evidence and option_evidence
+
+
+def _has_constructed_recursive_force_option_source(content: str) -> bool:
+    """Return whether a bounded option word can construct both ``r`` and ``f``."""
+    for hyphen in re.finditer(r"-(?=\S)", content):
+        fragment = content[hyphen.start() : hyphen.start() + 128]
+        command_substitution = fragment.startswith("-$(")
+        if command_substitution:
+            close = fragment.find(")")
+            if close >= 0:
+                fragment = fragment[: close + 1]
+        else:
+            boundary = re.search(r"[\s;|&]", fragment)
+            if boundary is not None:
+                fragment = fragment[: boundary.start()]
+        if not any(marker in fragment for marker in ("\\", "'", '"', "{", "}", "$(")):
+            continue
+        lowered = fragment.casefold()
+        if "r" in lowered and "f" in lowered:
+            return True
+    return False
+
+
+def _is_powershell_replace_value_context(
+    content: str,
+    start: int,
+    end: int,
+    inner: str,
+) -> bool:
+    """Recognize a bounded PowerShell ``-replace`` value statement."""
+    if (
+        _POWERSHELL_REPLACE_EXPRESSION_RE.search(inner) is None
+        or any(separator in inner for separator in ";|&\n")
+        or any(marker in inner for marker in ("$(", "`", "<(", ">("))
+    ):
+        return False
+
+    line_start = content.rfind("\n", 0, start) + 1
+    line_end = content.find("\n", end)
+    if line_end < 0:
+        line_end = len(content)
+    placeholder = "\ue003"
+    statement = (content[line_start:start] + placeholder + content[end:line_end]).strip()
+
+    if statement.startswith("|") and statement.endswith("|"):
+        cells = [cell.strip() for cell in statement[1:-1].split("|")]
+        value_cells = [cell for cell in cells if placeholder in cell]
+        if len(value_cells) != 1:
+            return False
+        statement = value_cells[0]
+    container = re.match(
+        r"(?:(?:>[ \t]*)+|(?:[-*+]|[0-9]+[.)]|#{1,6})[ \t]+)",
+        statement,
+    )
+    if container is not None:
+        statement = statement[container.end() :].strip()
+
+    # Raw Markdown inline code retains its delimiter; the normalized Markdown
+    # view blanks it. Support the explicit documentary prefix in both views
+    # without trusting a fenced-code language label as a security boundary.
+    prefix = re.match(
+        r"(?:The[ \t]+following[ \t]+is[ \t]+(?:a[ \t]+)?)?"
+        r"PowerShell(?:[ \t]+(?:example|snippet|command))?[ \t]*:[ \t]*",
+        statement,
+        re.IGNORECASE,
+    )
+    if prefix is not None:
+        statement = statement[prefix.end() :].strip()
+        if statement.endswith("."):
+            statement = statement[:-1].rstrip()
+    inline = re.fullmatch(r"(?P<ticks>`+)(?P<body>.*)(?P=ticks)", statement)
+    if inline is not None:
+        statement = inline.group("body").strip()
+
+    value = f'"{placeholder}"'
+    shapes = (
+        rf"Write-Output[ \t]+(?:{re.escape(value)}|\([ \t]*{re.escape(value)}[ \t]*\))",
+        rf"Write-Host(?:[ \t]+-NoNewline)?[ \t]+"
+        rf"(?:{re.escape(value)}|\([ \t]*{re.escape(value)}[ \t]*\))",
+        rf"{re.escape(value)}[ \t]*\|[ \t]*Write-Output",
+        rf"\$[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*{re.escape(value)}",
+    )
+    return any(re.fullmatch(shape, statement, re.IGNORECASE) is not None for shape in shapes)
 
 
 def _is_printf_substitution(
@@ -1108,12 +1580,62 @@ def _is_printf_substitution(
     end: int,
     *,
     backtick: bool = False,
+    check_command_context: bool = True,
+    check_runtime: Callable[[], None] | None = None,
 ) -> bool:
     """Return whether a substitution invokes the bounded ``printf`` evaluator."""
+    runtime_check = check_runtime or (lambda: None)
     inner_start = start + (1 if backtick else 2)
     inner_end = end - 1
-    recognized, _ = _printf_invocation_arguments(content[inner_start:inner_end])
-    return recognized
+    inner = content[inner_start:inner_end]
+    if not backtick and _is_powershell_replace_value_context(content, start, end, inner):
+        return False
+    recognized, _ = _printf_invocation_arguments(inner, check_runtime=runtime_check)
+    if recognized or not check_command_context:
+        return recognized
+    if "$" not in inner:
+        return False
+    command_start, body_start = start, end
+    if start > 0 and content[start - 1] == '"' and end < len(content) and content[end] == '"':
+        command_start -= 1
+        body_start += 1
+    tail = content[body_start : body_start + _ROOT_GLOB_COMMAND_CHARS]
+    if "\\" not in tail and ("-" not in tail or not any(marker in tail for marker in "/~*?")):
+        # Without option and target characters the bounded tokenizer cannot
+        # produce a destructive root command. Keep repeated parameter notation
+        # cheap; escapes still require tokenization because they can encode both.
+        return False
+    if (
+        not any(marker in tail for marker in ("\\", "'", '"', "{", "}"))
+        and "printf" not in tail.casefold()
+        and (
+            _RECURSIVE_OPTION_SOURCE_RE.search(tail) is None
+            or _FORCE_OPTION_SOURCE_RE.search(tail) is None
+        )
+    ):
+        # Plain options must contain recursive and force spelling in the source.
+        # Quoting, escapes, braces, or printf can construct those spellings, so
+        # keep those cases on the full tokenizer path.
+        return False
+    possible_runtime, _ = _printf_invocation_arguments(
+        inner,
+        runtime_command_context=True,
+        check_runtime=runtime_check,
+    )
+    if not possible_runtime:
+        return False
+    tokens, _, exhausted = _bounded_shell_tokens(
+        content,
+        command_start,
+        body_start,
+        check_runtime=runtime_check,
+    )
+    return (
+        exhausted
+        or _has_unsupported_brace_expansion(tokens)
+        or _has_destructive_root_glob(tokens)
+        or _has_destructive_root_path(tokens)
+    )
 
 
 def _skip_backtick_substitution(
@@ -1139,24 +1661,98 @@ def _skip_backtick_substitution(
     )
 
 
+def _previous_word_end(content: str, start: int) -> int | None:
+    """Return where the previous word in this clause ends, or ``None`` at a clause start."""
+    cursor = start
+    while cursor > 0 and content[cursor - 1] in " \t":
+        cursor -= 1
+    if cursor == 0 or content[cursor - 1] in _SHELL_CLAUSE_BOUNDARY_CHARACTERS:
+        return None
+    return cursor
+
+
+def _is_assignment_word(content: str, start: int) -> bool:
+    """Return whether ``start`` begins a prefix assignment word or its quoted value."""
+    word_start = start
+    # The exhaustion sweep already skips the checks for a quote after ``=``.
+    # Recognizing it here keeps the parser consistent for any caller and avoids
+    # evaluating printf reconstruction whose result would be discarded.
+    if 0 < start < len(content) and content[start] in "'\"" and content[start - 1] == "=":
+        word_start = start - 1
+        if word_start > 0 and content[word_start - 1] == "+":
+            word_start -= 1
+        while word_start > 0 and content[word_start - 1] in _SHELL_ASSIGNMENT_NAME_CHARACTERS:
+            word_start -= 1
+    prefix = _SHELL_ASSIGNMENT_PREFIX_RE.match(content, word_start)
+    if prefix is None or (word_start != start and prefix.end() != start):
+        return False
+    # The shell recognizes assignments only before the command name. After
+    # ``alias``, ``echo`` or a path prefix, ``NAME=value`` is an ordinary word.
+    previous_end = _previous_word_end(content, word_start)
+    if previous_end is None:
+        return True
+    if previous_end == word_start:
+        return False
+    previous_start = previous_end
+    while (
+        previous_start > 0
+        and content[previous_start - 1] not in " \t" + _SHELL_CLAUSE_BOUNDARY_CHARACTERS
+    ):
+        previous_start -= 1
+    return (
+        content[previous_start:previous_end] in _SHELL_ASSIGNMENT_PREFIX_WORDS
+        and _previous_word_end(content, previous_start) is None
+    )
+
+
 def _parse_shell_command_word(
     content: str,
     start: int,
     parameter_end_cache: dict[int, _ParameterExpansionEnd] | None = None,
     substitution_end_cache: dict[int, int | None] | None = None,
     backtick_end_cache: dict[int, int | None] | None = None,
+    *,
+    check_runtime: Callable[[], None] | None = None,
+    owned_word_positions: set[int] | None = None,
+    enclosing_delimiter: str | None = None,
 ) -> _ShellCommandWord | None:
+    runtime_check = check_runtime or (lambda: None)
+    # The shell recognizes ``NAME=value`` before expansion and never runs the
+    # value as the command name. Its substitutions keep their own candidate
+    # positions, and a later ``$NAME`` command word is still checked, so only
+    # this word's printf reconstruction check is skipped.
+    assignment = _is_assignment_word(content, start)
+
+    def reconstructs_command(
+        substitution_start: int, substitution_end: int, *, backtick: bool = False
+    ) -> bool:
+        return not assignment and _is_printf_substitution(
+            content,
+            substitution_start,
+            substitution_end,
+            backtick=backtick,
+            check_runtime=runtime_check,
+        )
+
     output: list[str] = []
+    wrapper_quote = enclosing_delimiter or (
+        _command_wrapper_quote(content, start) if content[start] in "$`" else None
+    )
     quote: str | None = None
     ansi_c_quote = False
     dynamic = False
     limited = False
+    unquoted_characters = 0
     cursor = start
     limit = len(content)
     while cursor < limit:
+        if cursor > start and (cursor - start) % 4096 == 0:
+            runtime_check()
         character = content[cursor]
         if quote is not None:
             if character == quote:
+                if owned_word_positions is not None:
+                    owned_word_positions.add(cursor)
                 quote = None
                 ansi_c_quote = False
             elif character == "\\" and ansi_c_quote:
@@ -1176,6 +1772,7 @@ def _parse_shell_command_word(
                         content,
                         cursor,
                         limit,
+                        runtime_check,
                         end_cache=substitution_end_cache,
                         parameter_end_cache=parameter_end_cache,
                         backtick_end_cache=backtick_end_cache,
@@ -1190,11 +1787,7 @@ def _parse_shell_command_word(
                     if static_value is None:
                         output.append("$()")
                         dynamic = True
-                        limited = limited or _is_printf_substitution(
-                            content,
-                            cursor,
-                            substitution_end,
-                        )
+                        limited = limited or reconstructs_command(cursor, substitution_end)
                     else:
                         output.append(static_value)
                     cursor = substitution_end
@@ -1203,6 +1796,7 @@ def _parse_shell_command_word(
                     content,
                     cursor,
                     limit,
+                    runtime_check,
                     end_cache=parameter_end_cache,
                     substitution_end_cache=substitution_end_cache,
                     backtick_end_cache=backtick_end_cache,
@@ -1222,6 +1816,7 @@ def _parse_shell_command_word(
                     content,
                     cursor,
                     limit,
+                    runtime_check,
                     end_cache=backtick_end_cache,
                     parameter_end_cache=parameter_end_cache,
                     substitution_end_cache=substitution_end_cache,
@@ -1237,11 +1832,8 @@ def _parse_shell_command_word(
                 if static_value is None:
                     output.append("$()")
                     dynamic = True
-                    limited = limited or _is_printf_substitution(
-                        content,
-                        cursor,
-                        substitution_end,
-                        backtick=True,
+                    limited = limited or reconstructs_command(
+                        cursor, substitution_end, backtick=True
                     )
                 else:
                     output.append(static_value)
@@ -1273,6 +1865,7 @@ def _parse_shell_command_word(
                 content,
                 cursor,
                 limit,
+                runtime_check,
                 end_cache=substitution_end_cache,
                 parameter_end_cache=parameter_end_cache,
                 backtick_end_cache=backtick_end_cache,
@@ -1283,11 +1876,7 @@ def _parse_shell_command_word(
             if static_value is None:
                 output.append("$()")
                 dynamic = True
-                limited = limited or _is_printf_substitution(
-                    content,
-                    cursor,
-                    substitution_end,
-                )
+                limited = limited or reconstructs_command(cursor, substitution_end)
             else:
                 output.append(static_value)
             cursor = substitution_end
@@ -1297,6 +1886,7 @@ def _parse_shell_command_word(
                 content,
                 cursor,
                 limit,
+                runtime_check,
                 end_cache=parameter_end_cache,
                 substitution_end_cache=substitution_end_cache,
                 backtick_end_cache=backtick_end_cache,
@@ -1310,10 +1900,16 @@ def _parse_shell_command_word(
                 cursor = parameter_end
                 continue
         elif character == "`":
+            if enclosing_delimiter == "`":
+                # The enclosing substitution ends here; this is not an opener.
+                if owned_word_positions is not None:
+                    owned_word_positions.add(cursor)
+                break
             substitution_end = _skip_backtick_substitution(
                 content,
                 cursor,
                 limit,
+                runtime_check,
                 end_cache=backtick_end_cache,
                 parameter_end_cache=parameter_end_cache,
                 substitution_end_cache=substitution_end_cache,
@@ -1329,17 +1925,14 @@ def _parse_shell_command_word(
             if static_value is None:
                 output.append("$()")
                 dynamic = True
-                limited = limited or _is_printf_substitution(
-                    content,
-                    cursor,
-                    substitution_end,
-                    backtick=True,
-                )
+                limited = limited or reconstructs_command(cursor, substitution_end, backtick=True)
             else:
                 output.append(static_value)
             cursor = substitution_end
             continue
         elif character in "'\"":
+            if character == wrapper_quote:
+                break
             quote = character
         elif character == "\\" and cursor + 1 < limit:
             if content[cursor + 1] == "\n":
@@ -1354,7 +1947,11 @@ def _parse_shell_command_word(
             break
         else:
             output.append(character)
-            if len(output) > _SHELL_COMMAND_WORD_CHARS:
+            # Quoted spans have already been consumed in full. Their decoded
+            # length must not exhaust the budget for the following literal
+            # suffix, which can resolve the candidate as an ordinary word.
+            unquoted_characters += 1
+            if unquoted_characters > _SHELL_COMMAND_WORD_CHARS:
                 return _ShellCommandWord("".join(output), cursor, dynamic, limited=True)
         cursor += 1
     if quote is not None:
@@ -1379,10 +1976,14 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
             continue
         if content.startswith("$(", start):
             substitution_end = _bounded_static_substitution_end(content, start)
-            if substitution_end is None or not _is_printf_substitution(
-                content,
-                start,
-                substitution_end,
+            if (
+                substitution_end is None
+                or _static_printf_substitution(
+                    content,
+                    start,
+                    substitution_end,
+                )
+                is None
             ):
                 # Dynamic substitutions cannot deterministically name a
                 # destructive command. Their inner literal commands remain
@@ -1421,51 +2022,513 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
 def _has_shell_command_word_exhaustion(
     content: str,
     check_runtime: Callable[[], None],
+    *,
+    structural_quote_closers: set[int] | None = None,
+    structural_quote_openers: set[int] | None = None,
+    python_source: _PythonSourceOwnership | None = None,
+    perl_eval_blocks: bool = False,
+    _command_string_depth: int = 0,
 ) -> bool:
-    """Find candidate command words whose deterministic parse hit a safety bound."""
+    """Find candidate command words whose deterministic parse hit a safety bound.
+
+    ``python_source`` supplies proven Python string and comment ownership, so
+    host code is never charged to a shell word or command string.
+    ``perl_eval_blocks`` recognizes Perl's exception-trapping ``eval BLOCK``,
+    which reparses no string.
+    """
     parsed_through = 0
+    # Completed words own closing quotes, never executable expansion starts.
+    # Inner commands remain independent candidates; never suppress their bodies.
+    owned_word_positions: set[int] = set()
     parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
     substitution_end_cache: dict[int, int | None] = {}
     backtick_end_cache: dict[int, int | None] = {}
+    may_have_destructive_outer_operands = _may_have_destructive_outer_operands(content)
+    json_openers = sorted(structural_quote_openers or ())
+    complete_comments: set[tuple[int, int]] = set()
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
-        if start < parsed_through or not _is_shell_command_word_start(content, start):
+        if start in owned_word_positions:
+            continue
+        if structural_quote_closers is not None and start in structural_quote_closers:
+            continue
+        json_string_start = structural_quote_openers is not None and (
+            start in structural_quote_openers or start - 1 in structural_quote_openers
+        )
+        assignment_quote = start > 0 and content[start - 1] == "=" and content[start] in "'\""
+        if start < parsed_through or (
+            not json_string_start
+            and not assignment_quote
+            and not _is_shell_command_word_start(content, start)
+        ):
             continue
         if _has_quoted_assignment_prefix(content, start):
             continue
-        if content.startswith("$(", start):
-            substitution_end = _bounded_static_substitution_end(content, start)
-            if substitution_end is None:
-                if _has_printf_invocation_prefix(
-                    content,
-                    start,
-                    check_runtime,
-                    parameter_end_cache,
-                    substitution_end_cache,
-                    backtick_end_cache,
-                ):
-                    return True
-                continue
-            if not _is_printf_substitution(
-                content,
-                start,
-                substitution_end,
-            ):
-                continue
+        candidate_word_positions: set[int] = set()
         parsed = _parse_shell_command_word(
             content,
             start,
             parameter_end_cache,
             substitution_end_cache,
             backtick_end_cache,
+            check_runtime=check_runtime,
+            owned_word_positions=candidate_word_positions,
+            enclosing_delimiter=(
+                _assignment_value_wrapper(content, start) if assignment_quote else None
+            ),
         )
         if parsed is None:
+            substitution_start = (
+                start + 1
+                if content[start : start + 1] in {"'", '"'} and content.startswith("$(", start + 1)
+                else start
+            )
+            if content.startswith("$(", substitution_start):
+                substitution_end = _skip_command_substitution(
+                    content,
+                    substitution_start,
+                    len(content),
+                    check_runtime,
+                    end_cache=substitution_end_cache,
+                    parameter_end_cache=parameter_end_cache,
+                    backtick_end_cache=backtick_end_cache,
+                )
+                if substitution_end is not None and _is_printf_substitution(
+                    content,
+                    substitution_start,
+                    substitution_end,
+                    check_runtime=check_runtime,
+                ):
+                    return True
+            # An unclosed expansion or quote can consume the rest of the
+            # artifact. Once that unresolved span exceeds the command-word
+            # budget, treating it as clean would turn malformed, deeply nested
+            # runtime selection into a fail-open result.
+            # A validated JSON value owns its bytes and is checked separately.
+            # Do not charge that value to an earlier unmatched Markdown tick.
+            next_json = bisect_right(json_openers, start)
+            unresolved_end = (
+                json_openers[next_json] if next_json < len(json_openers) else len(content)
+            )
+            if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS and python_source is not None:
+                # Likewise, a host string or comment token owns its bytes: a
+                # shell quote it opens cannot continue into later host code.
+                unresolved_end = min(unresolved_end, python_source.word_end(start))
+            if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS:
+                return True
             continue
-        parsed_through = max(parsed_through, parsed.end)
+        # Comments end at a newline, and a quote after ``=`` in prose or host
+        # source may be mis-paired. Such a word cannot own a later line.
+        confined_word = "\n" in content[start : parsed.end] and (
+            assignment_quote
+            or _SHELL_COMMENT_START_RE.search(content, content.rfind("\n", 0, start) + 1, start)
+            is not None
+        )
+        if not confined_word:
+            # A quote that opens a runtime-selected word stays an independent
+            # candidate, so a mis-paired claim cannot hide its operands.
+            owned_word_positions.update(
+                position
+                for position in candidate_word_positions
+                if content[position + 1 : position + 2] not in ("$", "`")
+            )
+        # Only executable nested substitutions retain independent command
+        # positions. A plain dynamic data argument still owns its inner bytes;
+        # revisiting those as commands would turn quoted printf data into code.
+        raw_word = content[start : parsed.end]
+        simple_backtick_parameter = (
+            re.fullmatch(
+                r"`\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})`",
+                raw_word,
+            )
+            is not None
+        )
+        if (
+            not parsed.dynamic
+            or "$" not in raw_word
+            or not any(marker in raw_word for marker in ("$(", "`"))
+            or simple_backtick_parameter
+        ) and not (assignment_quote and confined_word):
+            parsed_through = max(parsed_through, parsed.end)
+        if assignment_quote:
+            # An assignment value never names the command, and main never
+            # parsed this position, so it only claims ownership.
+            continue
         if parsed.limited:
             return True
+        if (
+            parsed.dynamic
+            and may_have_destructive_outer_operands
+            and _has_runtime_command_operand_exhaustion(
+                content,
+                start,
+                parsed.end,
+                check_runtime,
+            )
+        ):
+            comment = python_source.comment(start) if python_source is not None else None
+            if comment is None:
+                # Host code after a Python string's closing quote is not shell
+                # text, so a command in the string takes operands only from
+                # the rest of the string's value, including literals
+                # concatenated with it. A value that code can still extend,
+                # for example with ``%`` or ``.format``, stays partial.
+                value = (
+                    python_source.string_value(start, parsed.end)
+                    if python_source is not None
+                    else None
+                )
+                if value is None or _has_runtime_command_operand_exhaustion(*value, check_runtime):
+                    return True
+                continue
+            # A Python comment is prose that no shell receives, so a command
+            # named in it can take operands only from the same comment, never
+            # from later host code. Recheck that comment as standalone shell
+            # text.
+            if comment not in complete_comments:
+                if _has_shell_command_word_exhaustion(
+                    content[comment[0] : comment[1]],
+                    check_runtime,
+                    _command_string_depth=_command_string_depth,
+                ):
+                    return True
+                complete_comments.add(comment)
+    for command_string in _shell_command_strings(
+        content,
+        check_runtime,
+        perl_eval_blocks=perl_eval_blocks,
+        python_source=python_source,
+    ):
+        if command_string is None or _command_string_depth >= 8:
+            return True
+        if _has_shell_command_word_exhaustion(
+            command_string,
+            check_runtime,
+            _command_string_depth=_command_string_depth + 1,
+        ):
+            return True
     return False
+
+
+def _has_runtime_command_operand_exhaustion(
+    content: str,
+    start: int,
+    word_end: int,
+    check_runtime: Callable[[], None],
+) -> bool:
+    """Return whether a runtime-selected command's operands are undecidable."""
+    tokens, command_end, exhausted = _bounded_shell_tokens(
+        content,
+        start,
+        word_end,
+        check_runtime=check_runtime,
+    )
+    if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
+        # Earlier prose (for example "row-first") cannot supply this
+        # command's operands. Refine only this candidate's exhausted
+        # span, including nested commands inside the executable word.
+        # Hitting the span bound always remains partial, including when
+        # real operands occur beyond that bound. This rescan is bounded
+        # by the same constant as the tokenizer.
+        check_runtime()
+        exhausted = _may_have_destructive_outer_operands(content[start:command_end])
+    return (
+        exhausted
+        or _has_unsupported_brace_expansion(tokens)
+        or _has_destructive_root_glob(tokens)
+        or _has_destructive_root_path(tokens)
+    )
+
+
+def _shell_command_strings(
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    perl_eval_blocks: bool = False,
+    python_source: _PythonSourceOwnership | None = None,
+) -> Iterator[str | None]:
+    """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
+    for clause_start in _shell_clause_starts(content, check_runtime):
+        check_runtime()
+        recognized, command_string = _command_string_from_clause(
+            content,
+            clause_start,
+            check_runtime,
+            perl_eval_blocks=perl_eval_blocks,
+        )
+        if not recognized:
+            continue
+        if python_source is not None:
+            word_start = clause_start
+            while word_start < len(content) and content[word_start].isspace():
+                word_start += 1
+            if python_source.is_code(word_start):
+                # A clause that begins in Python code is Python, not shell:
+                # ``signal.alarm(timeout)`` names no ``timeout`` command.
+                # Shell text can only be reparsed from a string literal.
+                continue
+        yield command_string
+
+
+def _shell_clause_starts(
+    content: str,
+    check_runtime: Callable[[], None],
+) -> Iterator[int]:
+    """Yield command-clause starts outside quotes and comments in one pass."""
+    yield 0
+    quote: str | None = None
+    word_started = False
+    cursor = 0
+    while cursor < len(content):
+        if cursor % 4096 == 0:
+            check_runtime()
+        character = content[cursor]
+        if quote is not None:
+            if character == quote:
+                quote = None
+            elif quote == '"' and character == "\\" and cursor + 1 < len(content):
+                cursor += 2
+                continue
+        elif character in "'\"":
+            quote = character
+            word_started = True
+        elif character == "\\" and cursor + 1 < len(content):
+            cursor += 2
+            word_started = True
+            continue
+        elif character == "#" and not word_started:
+            newline = content.find("\n", cursor + 1)
+            if newline < 0:
+                return
+            cursor = newline + 1
+            word_started = False
+            yield cursor
+            continue
+        elif character in ";|&(){}\n":
+            word_started = False
+            yield cursor + 1
+        elif character.isspace():
+            word_started = False
+        else:
+            word_started = True
+        cursor += 1
+
+
+def _eval_command_string(
+    content: str,
+    start: int,
+    check_runtime: Callable[[], None],
+) -> str | None:
+    """Join bounded eval operands, excluding outer redirections and clauses."""
+    # Include one lookahead character so reaching the limit cannot masquerade
+    # as a complete final word. No individual word can scan beyond this slice.
+    source = content[start : start + _ROOT_GLOB_COMMAND_CHARS + 1]
+    cursor = 0
+    operands: list[str] = []
+    for count in range(_SHELL_COMMAND_STRING_ARGUMENTS + 1):
+        check_runtime()
+        while cursor < len(source):
+            if source.startswith("\\\r\n", cursor):
+                cursor += 3
+            elif source.startswith("\\\n", cursor):
+                cursor += 2
+            elif source[cursor].isspace() and source[cursor] not in "\r\n":
+                cursor += 1
+            else:
+                break
+        if cursor > _ROOT_GLOB_COMMAND_CHARS:
+            return None
+        redirection = _SHELL_REDIRECTION_PREFIX_RE.match(source, cursor)
+        if redirection is None and (cursor == len(source) or source[cursor] in "\r\n;|&()#"):
+            return " ".join(operands)
+        if count == _SHELL_COMMAND_STRING_ARGUMENTS:
+            return None
+        if redirection is not None:
+            # Here-documents/strings require a different grammar. Keep their
+            # coverage partial instead of treating their delimiter as code.
+            if "<<" in redirection.group():
+                return None
+            cursor = redirection.end()
+            while cursor < len(source) and source[cursor] in " \t":
+                cursor += 1
+            if cursor == len(source) or source[cursor] in "\r\n;|&()#":
+                return None
+        word, cursor, limited = _next_shell_invocation_word(source, cursor, check_runtime)
+        if limited or word is None or cursor > _ROOT_GLOB_COMMAND_CHARS:
+            return None
+        if redirection is not None:
+            continue
+        if any(
+            marker in word
+            for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+        ):
+            return None
+        if not operands and word == "--":
+            continue
+        operands.append(word)
+    return None
+
+
+def _command_string_from_clause(
+    content: str,
+    start: int,
+    check_runtime: Callable[[], None],
+    *,
+    perl_eval_blocks: bool = False,
+) -> tuple[bool, str | None]:
+    """Resolve a bounded wrapper chain to an ``eval`` or shell command string."""
+    cursor = start
+    pending: str | None = None
+    wrapper_seen = False
+
+    def next_word() -> tuple[str | None, bool]:
+        nonlocal cursor
+        word, cursor, limited = _next_shell_invocation_word(content, cursor, check_runtime)
+        return word, limited
+
+    def resolved_command_string(word: str | None, limited: bool) -> str | None:
+        if (
+            limited
+            or word is None
+            or any(
+                marker in word
+                for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+            )
+        ):
+            return None
+        return word
+
+    for _ in range(32):
+        while cursor < len(content) and content[cursor].isspace():
+            cursor += 1
+        redirection = _SHELL_REDIRECTION_PREFIX_RE.match(content, cursor)
+        if redirection is not None:
+            cursor = redirection.end()
+            target, limited = next_word()
+            if limited or target is None:
+                return wrapper_seen, None
+            continue
+
+        word, limited = (pending, False) if pending is not None else next_word()
+        pending = None
+        if limited:
+            return wrapper_seen, None
+        if word is None:
+            return False, None
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word, re.DOTALL) is not None:
+            continue
+        command = word.casefold().rsplit("/", 1)[-1]
+        if command in _SHELL_CLAUSE_PREFIX_WORDS:
+            continue
+        if command == "eval":
+            if (
+                perl_eval_blocks
+                and word == "eval"
+                and _PERL_EVAL_BLOCK_RE.match(content, cursor) is not None
+            ):
+                # Perl ``eval BLOCK`` is exception handling, not a string
+                # reparse. ``{`` starts a new clause, so the statements in the
+                # block are still scanned as ordinary command candidates.
+                return False, None
+            return True, _eval_command_string(content, cursor, check_runtime)
+        if command in _SHELL_COMMAND_STRING_SHELLS:
+            for _ in range(16):
+                option, limited = next_word()
+                if limited:
+                    return True, None
+                if option is None:
+                    # Without -c there is no command string to reconstruct.
+                    # This also keeps Markdown fence labels such as sh inert.
+                    return False, None
+                if option.startswith("-") and not option.startswith("--"):
+                    if "c" in option[1:]:
+                        command_string, limited = next_word()
+                        return True, resolved_command_string(command_string, limited)
+                    continue
+                if option.startswith("+") or option.startswith("--"):
+                    continue
+                return False, None
+            return True, None
+
+        if command in {"env", "command", "nohup"}:
+            wrapper_seen = True
+            continue
+        if command in {"sudo", "nice", "xargs"}:
+            wrapper_seen = True
+            while True:
+                option, limited = next_word()
+                if limited:
+                    return True, None
+                if option is None:
+                    return not _ends_wrapped_clause(content, cursor), None
+                if option == "--":
+                    pending, limited = next_word()
+                    if limited:
+                        return True, None
+                    break
+                if not option.startswith("-"):
+                    pending = option
+                    break
+                if option in {
+                    "-u",
+                    "-g",
+                    "-h",
+                    "-p",
+                    "-C",
+                    "-T",
+                    "-R",
+                    "-D",
+                    "-n",
+                    "-I",
+                    "-L",
+                    "-P",
+                    "-s",
+                }:
+                    _, limited = next_word()
+                    if limited:
+                        return True, None
+            continue
+        if command == "timeout":
+            wrapper_seen = True
+            while True:
+                option, limited = next_word()
+                if limited:
+                    return True, None
+                if option is None:
+                    return not _ends_wrapped_clause(content, cursor), None
+                if option in {"-k", "--kill-after", "-s", "--signal"}:
+                    _, limited = next_word()
+                    if limited:
+                        return True, None
+                    continue
+                if option.startswith("-"):
+                    continue
+                break
+            pending, limited = next_word()
+            if limited:
+                return True, None
+            continue
+        return False, None
+    return wrapper_seen, None
+
+
+def _ends_wrapped_clause(content: str, cursor: int) -> bool:
+    """Return whether a wrapper's missing command is a proven end of its clause.
+
+    When a control operator follows ``sudo``, ``nice``, ``xargs`` or
+    ``timeout`` directly, the clause names no wrapped command, so there is no
+    command string to reconstruct. A shell such a wrapper starts on its own
+    (``sudo -s``) reads its input like ``sh`` in a pipeline, which this check
+    does not model either. Commands after the operator start their own
+    clause and are checked separately. A redirection may still precede the
+    wrapped command, and a fragment may continue past its end, so both
+    remain unresolved.
+    """
+    if cursor >= len(content):
+        return False
+    character = content[cursor]
+    return character in ";|)" or (character == "&" and content[cursor + 1 : cursor + 2] != ">")
 
 
 def _command_wrapper_quote(content: str, command_start: int) -> str | None:
@@ -1477,6 +2540,283 @@ def _command_wrapper_quote(content: str, command_start: int) -> str | None:
         backslashes += 1
         cursor -= 1
     return content[command_start - 1] if backslashes % 2 == 0 else None
+
+
+def _assignment_value_wrapper(content: str, value_start: int) -> str | None:
+    """Return an unescaped quote or backtick directly enclosing an assignment."""
+    name_start = value_start - 1
+    if name_start > 0 and content[name_start - 1] == "+":
+        name_start -= 1
+    while name_start > 0 and (
+        content[name_start - 1] == "_"
+        or (content[name_start - 1].isascii() and content[name_start - 1].isalnum())
+    ):
+        name_start -= 1
+    return _command_wrapper_quote(content, name_start)
+
+
+def _perl_literal_print_shell_text(
+    content: str,
+    check_runtime: Callable[[], None],
+) -> str:
+    """Project only proven ordinary Perl print delimiters, retaining the payload.
+
+    This deliberately recognizes a small source subset, not general Perl: a
+    standalone print of one non-interpolated, single-line quoted literal, with
+    an optional standard output handle or parentheses. Ordinary surrounding
+    quotes and comments must also balance. Quote operators, heredocs, regexes,
+    and interpolation make host ownership uncertain, so leave that source on
+    the conservative path. Never use this to grant ownership to a fragment.
+
+    Only the two host delimiters change, with offsets preserved. In particular,
+    commands, prompt instructions and parser-limit payloads remain available to
+    the security scanners; printed text is not an analysis exemption.
+    """
+    literals: set[tuple[int, int]] = set()
+    check_runtime()
+    for match in _PERL_LITERAL_PRINT_RE.finditer(content):
+        check_runtime()
+        literals.add(match.span("literal"))
+    check_runtime()
+    if not literals:
+        return content
+    owned: list[tuple[int, int]] = []
+    cursor = 0
+    next_runtime_check = 0
+    while cursor < len(content):
+        if cursor >= next_runtime_check:
+            check_runtime()
+            next_runtime_check = cursor + 256
+        character = content[cursor]
+        if character == "#" and (cursor == 0 or content[cursor - 1] != "$"):
+            newline = content.find("\n", cursor)
+            cursor = len(content) if newline < 0 else newline + 1
+            continue
+        if character in "$@%&*" and _PERL_AMBIGUOUS_SIGIL_RE.match(content, cursor) is not None:
+            # Perl sigils can own quote punctuation (for example $' and *"),
+            # with whitespace/comments or braces inside the variable spelling.
+            # Leave those ambiguous forms outside this bounded source subset.
+            return content
+        if (
+            character == "/"
+            or content.startswith("<<", cursor)
+            or character in "qmsty"
+            and (cursor == 0 or content[cursor - 1] not in "$@%&")
+            and _PERL_QUOTE_OPERATOR_RE.match(content, cursor) is not None
+        ):
+            return content
+        if character not in "'\"`":
+            cursor += 1
+            continue
+        if cursor > 0:
+            previous = content[cursor - 1]
+            if character == "'" and (
+                previous.isalnum() or previous in "_:@%&*" or ord(previous) > 127
+            ):
+                # Apostrophes can separate legacy package names. Treat ambiguous adjacency
+                # (including print'...') conservatively instead of inventing
+                # a string that could hide an executable quote operator.
+                return content
+        start = cursor
+        quote = character
+        cursor += 1
+        while cursor < len(content):
+            if cursor >= next_runtime_check:
+                check_runtime()
+                next_runtime_check = cursor + 256
+            character = content[cursor]
+            if character == "\\":
+                cursor += 2
+                continue
+            if character == quote:
+                cursor += 1
+                if (start, cursor) in literals:
+                    owned.append((start, cursor))
+                break
+            if quote != "'" and character in "$@":
+                # Interpolation can itself contain Perl expressions/quotes.
+                return content
+            cursor += 1
+        else:
+            return content
+    if not owned:
+        return content
+    output = list(content)
+    for start, end in owned:
+        output[start] = output[end - 1] = " "
+    return "".join(output)
+
+
+def _python_literal_operands(content: str, token: tuple[int, int], start: int, end: int) -> str:
+    """Return string literal body text from ``start`` that a shell reads as operands.
+
+    Code supplies an f-string or t-string replacement field's text at runtime,
+    and that text can hold the recursive and force options. Each field also
+    counts as them, so a root target beside a field stays undecided.
+    """
+    text = content[start:end]
+    body_start = _python_string_body(content, *token)[0]
+    if not {"f", "t"} & set(content[token[0] : body_start].lower()):
+        return text
+    return _PYTHON_REPLACEMENT_FIELD_RE.sub(
+        lambda field: field[0] if field[1] is None else " -rf {", text
+    )
+
+
+class _PythonSourceOwnership:
+    """Lazily proven Python string and comment ownership for one source text.
+
+    Python has no shell semantics. Shell text can occur only inside a Python
+    string, which owns its bytes, or as prose in a comment that no shell ever
+    receives. Python code between those tokens contains no shell quote or
+    expansion opener, so an in-phase shell word ends at the first code-level
+    whitespace or control character. A quote or substitution that is still
+    open there was opened inside an earlier string or comment token of the
+    same word, and that token owns the rest of it.
+
+    The token spans are computed lazily, only for source that reaches one of
+    these decisions. Invalid or ambiguous source keeps every conservative bound.
+    """
+
+    def __init__(self, content: str, check_runtime: Callable[[], None]) -> None:
+        self._content = content
+        self._check_runtime = check_runtime
+        self._spans: PythonLiteralSpans | None = None
+        self._spans_computed = False
+        self._cached_word_start = -1
+        self._cached_word_end = -1
+
+    def _owned_spans(self) -> PythonLiteralSpans | None:
+        if not self._spans_computed:
+            self._spans = _python_literal_spans(self._content, self._check_runtime)
+            self._spans_computed = True
+        return self._spans
+
+    def _owner(self, position: int) -> tuple[int, int] | None:
+        spans = self._owned_spans()
+        if spans is None:
+            return None
+        starts, ends = spans
+        index = bisect_right(starts, position) - 1
+        if index >= 0 and position < ends[index]:
+            return starts[index], ends[index]
+        return None
+
+    def is_code(self, position: int) -> bool:
+        """Return whether a position is proven Python code, not a literal."""
+        return self._owned_spans() is not None and self._owner(position) is None
+
+    def comment(self, position: int) -> tuple[int, int] | None:
+        """Return the span of a proven Python comment containing a position."""
+        owner = self._owner(position)
+        if owner is None or self._content[owner[0]] != "#":
+            return None
+        return owner
+
+    def string_value(self, start: int, end: int) -> tuple[str, int, int] | None:
+        """Return the proven string value that holds a shell word, and its span.
+
+        A string literal's quotes are Python syntax: the shell receives only
+        its body, so a word ends at the closing quote, and a word starting at
+        that quote is not shell text at all. Implicit or ``+`` concatenation
+        continues the value with later literal bodies. Return ``None`` for a
+        word outside a string literal, or for a value that a format operator,
+        method call, subscript, repetition or non-literal operand can still
+        extend, also after a closing parenthesis.
+        """
+        spans = self._owned_spans()
+        owner = self._owner(start)
+        content = self._content
+        if spans is None or owner is None or content[owner[0]] == "#":
+            return None
+        body_start, body_end = _python_string_body(content, *owner)
+        if start >= body_end:
+            return "", 0, 0
+        word_start = max(start, body_start)
+        word_end = max(min(end, body_end), word_start)
+        # Keep the character before the word and its escaping backslashes:
+        # they decide whether a quote in the body wraps the command.
+        origin = word_start - 1 if word_start > body_start else word_start
+        while origin > body_start and content[origin - 1] == "\\":
+            origin -= 1
+        # The operand tokenizer reads at most this much after the word.
+        limit = word_end + _ROOT_GLOB_COMMAND_CHARS + 1
+        pieces = [
+            content[origin:word_end],
+            _python_literal_operands(content, owner, word_end, min(body_end, limit)),
+        ]
+        remaining = limit - body_end
+        starts, ends = spans
+        index = bisect_right(starts, start) - 1
+
+        def next_token(position: int) -> int:
+            # Skip whitespace, line continuations and comment tokens.
+            nonlocal index
+            while True:
+                gap = _PYTHON_TOKEN_GAP_RE.match(content, position)
+                position = position if gap is None else gap.end()
+                if (
+                    index + 1 == len(starts)
+                    or starts[index + 1] != position
+                    or content[position] != "#"
+                ):
+                    return position
+                index += 1
+                position = ends[index]
+
+        while remaining > 0:
+            self._check_runtime()
+            cursor = next_token(ends[index])
+            operator = content[cursor : cursor + 1]
+            if operator == "+":
+                cursor = next_token(cursor + 1)
+            if index + 1 < len(starts) and starts[index + 1] == cursor:
+                index += 1
+                literal = (starts[index], ends[index])
+                literal_start, literal_end = _python_string_body(content, *literal)
+                pieces.append(
+                    _python_literal_operands(content, literal, literal_start, literal_end)
+                )
+                remaining -= literal_end - literal_start
+                continue
+            # A parenthesized value, as in ``("$TOOL ") + "-rf /"``, can
+            # still be extended after its closing parenthesis.
+            while operator == ")":
+                cursor = next_token(cursor + 1)
+                operator = content[cursor : cursor + 1]
+            if operator in _PYTHON_STRING_EXTENSION_OPERATORS:
+                return None
+            break
+        return "".join(pieces), word_start - origin, word_end - origin
+
+    def word_end(self, start: int) -> int:
+        """Return the end of the host region a shell word at ``start`` can own."""
+        spans = self._owned_spans()
+        content = self._content
+        if spans is None:
+            return len(content)
+        # Candidates arrive in source order. No code-level break exists
+        # between a cached start and its result, so they share that result.
+        if self._cached_word_start <= start <= self._cached_word_end:
+            return self._cached_word_end
+        starts, ends = spans
+        cursor = start
+        while True:
+            self._check_runtime()
+            index = bisect_right(starts, cursor) - 1
+            if index >= 0 and cursor < ends[index]:
+                cursor = ends[index]
+            segment_end = starts[index + 1] if index + 1 < len(starts) else len(content)
+            match = _PYTHON_SHELL_WORD_BREAK_RE.search(content, cursor, segment_end)
+            if match is not None:
+                result = match.start()
+                break
+            if segment_end == len(content):
+                result = segment_end
+                break
+            cursor = segment_end
+        self._cached_word_start, self._cached_word_end = start, result
+        return result
 
 
 def _skip_command_substitution(
@@ -1516,8 +2856,11 @@ def _bounded_shell_tokens(
     content: str,
     command_start: int,
     body_start: int,
+    *,
+    check_runtime: Callable[[], None] | None = None,
 ) -> tuple[tuple[_ShellToken, ...], int, bool]:
     """Return argument words from one security-view-bounded shell command."""
+    runtime_check = check_runtime or (lambda: None)
     tokens: list[_ShellToken] = []
     current: list[str] = []
     current_glob_projection: list[str] = []
@@ -1622,6 +2965,8 @@ def _bounded_shell_tokens(
             current_leading_tilde_unquoted = False
 
     while cursor < limit:
+        if (cursor - body_start) % 256 == 0:
+            runtime_check()
         character = content[cursor]
         if quote is not None:
             if character == quote:
@@ -1640,7 +2985,12 @@ def _bounded_shell_tokens(
             elif quote == '"' and character == "$" and cursor + 1 < limit:
                 inherited_quote_closed = [False]
                 if content[cursor + 1] == "(":
-                    substitution_end = _skip_command_substitution(content, cursor, limit)
+                    substitution_end = _skip_command_substitution(
+                        content,
+                        cursor,
+                        limit,
+                        runtime_check,
+                    )
                     if substitution_end is None:
                         return tuple(tokens), limit, True
                     static_value = _static_printf_substitution(
@@ -1650,7 +3000,13 @@ def _bounded_shell_tokens(
                     )
                     parse_limited = parse_limited or (
                         static_value is None
-                        and _is_printf_substitution(content, cursor, substitution_end)
+                        and _is_printf_substitution(
+                            content,
+                            cursor,
+                            substitution_end,
+                            check_command_context=False,
+                            check_runtime=runtime_check,
+                        )
                     )
                     append_piece(
                         "$DYNAMIC" if static_value is None else static_value,
@@ -1663,6 +3019,7 @@ def _bounded_shell_tokens(
                     content,
                     cursor,
                     limit,
+                    runtime_check,
                     inherited_double_quote=True,
                     inherited_quote_closed=inherited_quote_closed,
                 )
@@ -1678,7 +3035,12 @@ def _bounded_shell_tokens(
                         ansi_c_quote = False
                     continue
             elif quote == '"' and character == "`":
-                substitution_end = _skip_backtick_substitution(content, cursor, limit)
+                substitution_end = _skip_backtick_substitution(
+                    content,
+                    cursor,
+                    limit,
+                    runtime_check,
+                )
                 if substitution_end is None:
                     return tuple(tokens), limit, True
                 static_value = _static_printf_substitution(
@@ -1694,6 +3056,8 @@ def _bounded_shell_tokens(
                         cursor,
                         substitution_end,
                         backtick=True,
+                        check_command_context=False,
+                        check_runtime=runtime_check,
                     )
                 )
                 append_piece(
@@ -1738,7 +3102,12 @@ def _bounded_shell_tokens(
             mark_quoted_word()
             quote = character
         elif character == "`":
-            substitution_end = _skip_backtick_substitution(content, cursor, limit)
+            substitution_end = _skip_backtick_substitution(
+                content,
+                cursor,
+                limit,
+                runtime_check,
+            )
             if substitution_end is None:
                 return tuple(tokens), limit, True
             static_value = _static_printf_substitution(
@@ -1754,6 +3123,8 @@ def _bounded_shell_tokens(
                     cursor,
                     substitution_end,
                     backtick=True,
+                    check_command_context=False,
+                    check_runtime=runtime_check,
                 )
             )
             append_piece(
@@ -1764,12 +3135,24 @@ def _bounded_shell_tokens(
             cursor = substitution_end
             continue
         elif character == "$" and cursor + 1 < limit and content[cursor + 1] == "(":
-            substitution_end = _skip_command_substitution(content, cursor, limit)
+            substitution_end = _skip_command_substitution(
+                content,
+                cursor,
+                limit,
+                runtime_check,
+            )
             if substitution_end is None:
                 return tuple(tokens), limit, True
             static_value = _static_printf_substitution(content, cursor, substitution_end)
             parse_limited = parse_limited or (
-                static_value is None and _is_printf_substitution(content, cursor, substitution_end)
+                static_value is None
+                and _is_printf_substitution(
+                    content,
+                    cursor,
+                    substitution_end,
+                    check_command_context=False,
+                    check_runtime=runtime_check,
+                )
             )
             append_piece(
                 "$DYNAMIC" if static_value is None else static_value,
@@ -1779,7 +3162,12 @@ def _bounded_shell_tokens(
             cursor = substitution_end
             continue
         elif character == "$":
-            parameter_end = _skip_parameter_expansion(content, cursor, limit)
+            parameter_end = _skip_parameter_expansion(
+                content,
+                cursor,
+                limit,
+                runtime_check,
+            )
             if parameter_end is not None:
                 if _is_ifs_expansion(content, cursor, parameter_end):
                     source_word_has_content = True
@@ -1791,7 +3179,12 @@ def _bounded_shell_tokens(
             if cursor + 1 == limit and limit < len(content) and content[limit] == "(":
                 boundary_incomplete = True
         elif character in "<>" and cursor + 1 < limit and content[cursor + 1] == "(":
-            substitution_end = _skip_command_substitution(content, cursor, limit)
+            substitution_end = _skip_command_substitution(
+                content,
+                cursor,
+                limit,
+                runtime_check,
+            )
             if substitution_end is None:
                 return tuple(tokens), limit, True
             append_piece(character + "$DYNAMIC", dynamic_can_be_empty=True)
@@ -2041,10 +3434,19 @@ def _has_destructive_root_glob(tokens: tuple[_ShellToken, ...]) -> bool:
 
 def _has_destructive_root_path(tokens: tuple[_ShellToken, ...]) -> bool:
     """Return whether recursive-force options target root or home expansion."""
-    has_root_path = any(
-        token.text.startswith("/") or token.text.startswith("~") and token.leading_tilde_unquoted
-        for token in tokens
-    )
+
+    def is_root_path(token: _ShellToken) -> bool:
+        candidates: tuple[str, ...] = (token.text,)
+        if token.brace_expansion:
+            expanded = _static_brace_expansions(token.text)
+            if expanded is not None:
+                candidates = expanded
+        return any(candidate.startswith("/") for candidate in candidates) or (
+            token.leading_tilde_unquoted
+            and any(candidate.startswith("~") for candidate in candidates)
+        )
+
+    has_root_path = any(is_root_path(token) for token in tokens)
     return has_root_path and _has_recursive_force_options(tokens)
 
 
@@ -2054,44 +3456,1720 @@ def _has_unsupported_brace_expansion(tokens: tuple[_ShellToken, ...]) -> bool:
     )
 
 
+def _projected_subprocess_qualifier(
+    content: str,
+    popen_start: int,
+    maximum_lookbehind: int,
+) -> tuple[int, int, str, bool] | None:
+    """Return a security-view ``subprocess.`` suffix and its raw source span."""
+    qualifier = "subprocess."
+    if popen_start <= 0:
+        return None
+    maximum = min(popen_start, max(0, maximum_lookbehind))
+    lookbehind = min(maximum, 64)
+    while lookbehind:
+        prefix_start = popen_start - lookbehind
+        # Include the first method character so contextual default-ignorable
+        # handling sees the same right boundary as the full security view.
+        needs_more_source = False
+        source = content[prefix_start : popen_start + 1]
+        for view in security_text_views(source):
+            derived_popen_start = (
+                popen_start - prefix_start
+                if view.source_offsets is None
+                else bisect_left(view.source_offsets, popen_start - prefix_start)
+            )
+            prefix = view.text[:derived_popen_start]
+            if len(prefix) < len(qualifier):
+                needs_more_source = True
+                continue
+            suffix_start = len(prefix) - len(qualifier)
+            suffix = prefix[suffix_start:]
+            if suffix.casefold() == qualifier:
+                return (
+                    prefix_start + view.source_offset(suffix_start),
+                    prefix_start + view.source_offset(derived_popen_start - 1) + 1,
+                    suffix,
+                    view.name != "raw",
+                )
+        if not needs_more_source:
+            return None
+        if lookbehind == maximum:
+            return None
+        lookbehind = min(maximum, lookbehind * 2)
+    return None
+
+
+def _subprocess_qualifier_start(content: str, popen_start: int) -> int | None:
+    """Find a bounded security-view ``subprocess.`` suffix before bare Popen."""
+    qualifier = _projected_subprocess_qualifier(
+        content,
+        popen_start,
+        static_runner._WINDOW_OVERLAP_CHARS + len("subprocess."),
+    )
+    return qualifier[0] if qualifier is not None else None
+
+
+def _outer_shell_true_anchor(matched_text: str) -> int | None:
+    """Locate the first outer-call shell literal, ignoring quoted lookalikes."""
+    stack: list[str] = []
+    quote: str | None = None
+    triple = False
+    in_comment = False
+    cursor = 0
+    pairs = {")": "(", "]": "[", "}": "{"}
+    while cursor < len(matched_text):
+        character = matched_text[cursor]
+        if in_comment:
+            if character in LINE_BREAK_CHARS:
+                in_comment = False
+            cursor += 1
+            continue
+        if quote is not None:
+            if character == "\\":
+                cursor = min(len(matched_text), cursor + 2)
+                continue
+            marker = quote * (3 if triple else 1)
+            if matched_text.startswith(marker, cursor):
+                cursor += len(marker)
+                quote = None
+                triple = False
+            else:
+                cursor += 1
+            continue
+        if character in "'\"":
+            quote = character
+            triple = matched_text.startswith(character * 3, cursor)
+            cursor += 3 if triple else 1
+            continue
+        if character == "#":
+            in_comment = True
+            cursor += 1
+            continue
+        if character in "([{":
+            stack.append(character)
+            cursor += 1
+            continue
+        if character in pairs:
+            if stack and stack[-1] == pairs[character]:
+                stack.pop()
+            cursor += 1
+            continue
+        if (
+            stack == ["("]
+            and (
+                cursor == 0
+                or not (matched_text[cursor - 1].isalnum() or matched_text[cursor - 1] == "_")
+            )
+            and _DIRECT_SHELL_TRUE_VALUE.match(matched_text, cursor) is not None
+        ):
+            return cursor
+        cursor += 1
+    return None
+
+
+_SCOPE_NODE_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+_COMPREHENSION_SCOPE_TYPES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+_NATIVE_SHELL_RECEIVERS = frozenset({"subprocess", "Popen"})
+
+
+def _paired_store_values(target: ast.AST, value: ast.AST) -> Iterator[tuple[ast.AST, ast.AST]]:
+    """Yield each store target with the RHS element it receives, when the shapes match."""
+    pairs = [(target, value)]
+    while pairs:
+        destination, source = pairs.pop()
+        if (
+            isinstance(destination, (ast.Tuple, ast.List))
+            and isinstance(source, (ast.Tuple, ast.List))
+            and len(destination.elts) == len(source.elts)
+            and not any(isinstance(item, ast.Starred) for item in (*destination.elts, *source.elts))
+        ):
+            pairs.extend(zip(destination.elts, source.elts, strict=True))
+        else:
+            yield destination, source
+
+
+def _captures_native_receiver(value: ast.AST, receiver: str) -> bool:
+    """Return whether *value* reads the native *receiver* callable or module."""
+    if isinstance(value, ast.Name):
+        return value.id == receiver
+    return (
+        receiver == "Popen"
+        and isinstance(value, ast.Attribute)
+        and value.attr == "Popen"
+        and isinstance(value.value, ast.Name)
+        and value.value.id == "subprocess"
+    )
+
+
+def _native_receiver_aliases(tree: ast.Module) -> dict[str, str]:
+    """Map each name whose every binding captures one native receiver to it."""
+    paired: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                paired.update(_paired_store_values(target, node.value))
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+            paired[node.target] = node.value
+    captures: dict[str, set[str | None]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                native = (
+                    "subprocess"
+                    if isinstance(node, ast.Import) and alias.name == "subprocess"
+                    else "Popen"
+                    if isinstance(node, ast.ImportFrom)
+                    and node.level == 0
+                    and node.module == "subprocess"
+                    and alias.name == "Popen"
+                    else None
+                )
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                captures.setdefault(bound, set()).add(native)
+            continue
+        name: str | None = None
+        native = None
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            name = node.id
+            value = paired.get(node) if isinstance(node.ctx, ast.Store) else None
+            native = next(
+                (
+                    receiver
+                    for receiver in sorted(_NATIVE_SHELL_RECEIVERS)
+                    if value is not None and _captures_native_receiver(value, receiver)
+                ),
+                None,
+            )
+        elif isinstance(node, ast.arg):
+            name = node.arg
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            name = node.name
+        elif isinstance(node, ast.MatchMapping):
+            name = node.rest
+        if name is not None:
+            captures.setdefault(name, set()).add(native)
+    return {
+        name: receiver
+        for name, values in captures.items()
+        if len(values) == 1 and (receiver := next(iter(values))) is not None
+    }
+
+
+def _store_keeps_shell_signal(name: str, value: ast.AST, aliases: dict[str, str]) -> bool | None:
+    """Classify one simple-name store for lexical TM1 reconciliation.
+
+    ``None`` means an identity store that leaves the binding unchanged. ``True``
+    means the store keeps the native receiver or a truthy shell flag. ``False``
+    means the store may replace the binding.
+    """
+    if isinstance(value, ast.Name) and value.id == name:
+        return None
+    if name in _NATIVE_SHELL_RECEIVERS:
+        return _captures_native_receiver(value, name) or (
+            isinstance(value, ast.Name) and aliases.get(value.id) == name
+        )
+    if name.casefold() in {"subprocess", "popen"}:
+        return False
+    return isinstance(value, ast.Constant) and bool(value.value)
+
+
+@dataclass(frozen=True)
+class _ScopedShellNode:
+    """One relevant AST node plus its source and lexical-scope identity."""
+
+    node: ast.Assign | ast.Call
+    scope_chain: tuple[ast.AST, ...]
+    start: int
+
+
+@dataclass(frozen=True)
+class _VariableShellAstIndex:
+    """Linear-time index used to reconcile every bounded regex candidate."""
+
+    tree: ast.Module
+    line_character_starts: tuple[int, ...]
+    assignments: dict[tuple[int, str], tuple[_ScopedShellNode, ...]]
+    calls: dict[str, tuple[_ScopedShellNode, ...]]
+    call_starts: dict[str, tuple[int, ...]]
+    bindings: dict[ast.AST, frozenset[str]]
+    class_binding_starts: dict[ast.ClassDef, dict[str, tuple[int, ...]]]
+    declarations: dict[ast.AST, dict[str, str]]
+    binding_events: dict[tuple[ast.AST, ast.AST], dict[str, tuple[tuple[int, bool], ...]]]
+    eager_effect_starts: dict[ast.AST, tuple[int, ...]]
+    reference_starts: dict[str, tuple[int, ...]]
+
+
+@dataclass(frozen=True)
+class _VariableShellCandidate:
+    """One raw variable-shell regex candidate resolved against the shared AST."""
+
+    name: str
+    call: ast.Call
+    same_scope: bool
+    visible: bool
+    assignment_start: int
+    assignment_scope: ast.AST
+    call_scope_chain: tuple[ast.AST, ...]
+
+
+def _resolved_name_scope(
+    index: _VariableShellAstIndex,
+    use_chain: tuple[ast.AST, ...],
+    name: str,
+    use_start: int,
+) -> ast.AST:
+    """Return the Python scope that resolves *name* at one use site."""
+    crossed_function = False
+    nonlocal_lookup = False
+    seen_class_scope = False
+    for scope in reversed(use_chain):
+        if scope is index.tree:
+            return index.tree
+        declaration = index.declarations.get(scope, {}).get(name)
+        if declaration == "global":
+            return index.tree
+        if declaration == "nonlocal":
+            nonlocal_lookup = True
+            crossed_function = True
+            continue
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if name in index.bindings.get(scope, frozenset()):
+                return scope
+            crossed_function = True
+            continue
+        if isinstance(scope, _COMPREHENSION_SCOPE_TYPES):
+            if name in index.bindings.get(scope, frozenset()):
+                return scope
+            # Comprehensions use an implicit function scope.  Free names skip a
+            # surrounding class namespace just like names in a method body.
+            crossed_function = True
+            continue
+        if isinstance(scope, ast.ClassDef):
+            # A method does not close over its class namespace.  A call evaluated
+            # directly in the class body sees assignments already executed, but
+            # a later class assignment does not create a compile-time local.
+            starts = index.class_binding_starts.get(scope, {}).get(name, ())
+            if (
+                not crossed_function
+                and not nonlocal_lookup
+                and not seen_class_scope
+                and bisect_left(starts, use_start)
+            ):
+                return scope
+            seen_class_scope = True
+    return index.tree
+
+
+def _node_character_span(parsed: ParsedPythonFile, node: ast.AST) -> tuple[int, int] | None:
+    """Return one AST node's absolute character span."""
+    line = getattr(node, "lineno", None)
+    end_line = getattr(node, "end_lineno", None)
+    byte_column = getattr(node, "col_offset", None)
+    end_byte_column = getattr(node, "end_col_offset", None)
+    if not all(isinstance(value, int) for value in (line, end_line, byte_column, end_byte_column)):
+        return None
+    assert isinstance(line, int)
+    assert isinstance(end_line, int)
+    assert isinstance(byte_column, int)
+    assert isinstance(end_byte_column, int)
+    start_column = parsed.character_column(line, byte_column)
+    end_column = parsed.character_column(end_line, end_byte_column)
+    if start_column is None or end_column is None:
+        return None
+    start = parsed.line_character_starts[line - 1] + start_column
+    end = parsed.line_character_starts[end_line - 1] + end_column
+    return start, end
+
+
+def _parameter_names(arguments: ast.arguments) -> tuple[str, ...]:
+    names = [
+        argument.arg
+        for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)
+    ]
+    if arguments.vararg is not None:
+        names.append(arguments.vararg.arg)
+    if arguments.kwarg is not None:
+        names.append(arguments.kwarg.arg)
+    return tuple(names)
+
+
+def _direct_shell_name(call: ast.Call) -> str | None:
+    function = call.func
+    direct = isinstance(function, ast.Name) and function.id == "Popen"
+    direct = direct or (
+        isinstance(function, ast.Attribute)
+        and isinstance(function.value, ast.Name)
+        and function.value.id == "subprocess"
+    )
+    if not direct:
+        return None
+    for keyword in call.keywords:
+        if keyword.arg == "shell" and isinstance(keyword.value, ast.Name):
+            return keyword.value.id
+    return None
+
+
+def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellAstIndex | None:
+    """Index relevant nodes, bindings, and declarations in one AST traversal."""
+    tree = parsed.tree
+    if tree is None:
+        return None
+    assignments: dict[tuple[int, str], list[_ScopedShellNode]] = {}
+    calls: dict[str, list[_ScopedShellNode]] = {}
+    bindings: dict[ast.AST, set[str]] = {tree: set()}
+    class_binding_starts: dict[ast.ClassDef, dict[str, list[int]]] = {}
+    declarations: dict[ast.AST, dict[str, str]] = {}
+    binding_events: dict[ast.AST, dict[str, list[tuple[int, bool]]]] = {}
+    eager_effect_starts: dict[ast.AST, list[int]] = {}
+    reference_starts: dict[str, list[int]] = {}
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    attribute_identity_stores: set[ast.Attribute] = set()
+    # Simple-name stores that keep the current binding, including unpacked
+    # self-stores. They neither replace nor restore a binding.
+    identity_name_stores: set[ast.Name] = set()
+    native_aliases = _native_receiver_aliases(tree)
+
+    def mark_attribute_identity_stores(target: ast.AST, value: ast.AST) -> None:
+        for destination, source in _paired_store_values(target, value):
+            if (
+                isinstance(destination, ast.Attribute)
+                and isinstance(destination.value, ast.Name)
+                and isinstance(source, ast.Attribute)
+                and isinstance(source.value, ast.Name)
+                and destination.attr == source.attr
+                and destination.value.id == source.value.id
+            ):
+                attribute_identity_stores.add(destination)
+
+    def record_name_store_values(scope: ast.AST, target: ast.AST, value: ast.AST, end: int) -> None:
+        # Pair unpacked targets with their RHS elements so a native alias, a
+        # truthy flag, or a self-store is not mistaken for a replacement.
+        for destination, source in _paired_store_values(target, value):
+            if not isinstance(destination, ast.Name):
+                continue
+            keeps_signal = _store_keeps_shell_signal(destination.id, source, native_aliases)
+            if keeps_signal is None:
+                identity_name_stores.add(destination)
+            elif keeps_signal:
+                record_binding(scope, destination.id, end, True)
+
+    def record_binding(scope: ast.AST, name: str, start: int, restores: bool = False) -> None:
+        # A conditional store is not affirmative replacement evidence. Only a
+        # literal branch whose execution is proven can revoke the lexical owner.
+        child = node
+        if child in identity_name_stores:
+            return
+        parent = parents.get(child)
+        if isinstance(parent, ast.AnnAssign) and parent.value is None and child is parent.target:
+            return
+        while parent is not None and parent is not scope:
+            if isinstance(parent, ast.If):
+                if not isinstance(parent.test, ast.Constant):
+                    return
+                taken = parent.body if bool(parent.test.value) else parent.orelse
+                if child not in taken:
+                    return
+            elif isinstance(parent, ast.BoolOp):
+                # Later operands run only after every earlier operand lets the
+                # short circuit continue. Only constant operands prove that.
+                continues = isinstance(parent.op, ast.And)
+                for operand in parent.values:
+                    if operand is child:
+                        break
+                    if (
+                        not isinstance(operand, ast.Constant)
+                        or bool(operand.value) is not continues
+                    ):
+                        return
+            elif isinstance(parent, ast.IfExp) and child is not parent.test:
+                if not isinstance(parent.test, ast.Constant):
+                    return
+                if child is not (parent.body if bool(parent.test.value) else parent.orelse):
+                    return
+            elif isinstance(
+                parent,
+                (
+                    ast.For,
+                    ast.AsyncFor,
+                    ast.While,
+                    ast.With,
+                    ast.AsyncWith,
+                    ast.Try,
+                    ast.TryStar,
+                    ast.Match,
+                    ast.comprehension,
+                    *_COMPREHENSION_SCOPE_TYPES,
+                ),
+            ):
+                return
+            child, parent = parent, parents.get(parent)
+        binding_events.setdefault(scope, {}).setdefault(name, []).append((start, restores))
+
+    def bind(scope: ast.AST, name: str, start: int) -> None:
+        bindings.setdefault(scope, set()).add(name)
+        record_binding(scope, name, start)
+        if isinstance(scope, ast.ClassDef):
+            class_binding_starts.setdefault(scope, {}).setdefault(name, []).append(start)
+
+    stack: list[tuple[ast.AST, tuple[ast.AST, ...], int | None]] = [(tree, (tree,), None)]
+    while stack:
+        node, scope_chain, binding_start = stack.pop()
+        scope = scope_chain[-1]
+        span = _node_character_span(parsed, node)
+        start = span[0] if span is not None else 0
+        end = span[1] if span is not None else start
+        # A direct observed slot write is useful only before another eager
+        # effect. Cached-module lifetime across imports belongs to the companion.
+        if isinstance(
+            node,
+            (
+                ast.Call,
+                ast.Attribute,
+                ast.Subscript,
+                ast.BinOp,
+                ast.BoolOp,
+                ast.Compare,
+                ast.UnaryOp,
+                ast.NamedExpr,
+                ast.JoinedStr,
+                ast.Import,
+                ast.ImportFrom,
+                ast.Delete,
+                ast.AugAssign,
+                ast.If,
+                ast.For,
+                ast.AsyncFor,
+                ast.While,
+                ast.With,
+                ast.AsyncWith,
+                ast.Try,
+                ast.TryStar,
+                ast.Match,
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.Await,
+                ast.Yield,
+                ast.YieldFrom,
+                *_COMPREHENSION_SCOPE_TYPES,
+            ),
+        ):
+            execution = next(
+                (
+                    item
+                    for item in reversed(scope_chain)
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                ),
+                tree,
+            )
+            eager_effect_starts.setdefault(execution, []).append(start)
+        # Any later reference may invoke a deferred body, so keep every load.
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            reference_starts.setdefault(node.id, []).append(start)
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+            reference_starts.setdefault(node.attr, []).append(start)
+
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                mark_attribute_identity_stores(target, node.value)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            mark_attribute_identity_stores(node.target, node.value)
+        if isinstance(node, ast.Assign):
+            # The RHS is captured before any target is assigned. A final
+            # same-slot store restores that snapshot after earlier writes in
+            # this statement, including chained and repeated unpacking targets.
+            stores: dict[tuple[str, str], list[ast.Attribute]] = {}
+            targets = list(reversed(node.targets))
+            while targets:
+                target = targets.pop()
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                    stores.setdefault((target.value.id, target.attr), []).append(target)
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    targets.extend(reversed(target.elts))
+            for slot_stores in stores.values():
+                if slot_stores[-1] in attribute_identity_stores:
+                    attribute_identity_stores.update(slot_stores)
+
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bind(scope, node.name, end)
+            nested_chain = (*scope_chain, node)
+            bindings.setdefault(node, set()).update(_parameter_names(node.args))
+            header_nodes: list[ast.AST] = [*node.decorator_list, node.args]
+            if node.returns is not None:
+                header_nodes.append(node.returns)
+            header_nodes.extend(getattr(node, "type_params", []))
+            stack.extend((child, scope_chain, None) for child in header_nodes)
+            stack.extend((child, nested_chain, None) for child in node.body)
+            continue
+        if isinstance(node, ast.Lambda):
+            nested_chain = (*scope_chain, node)
+            bindings.setdefault(node, set()).update(_parameter_names(node.args))
+            stack.append((node.args, scope_chain, None))
+            stack.append((node.body, nested_chain, None))
+            continue
+        if isinstance(node, ast.ClassDef):
+            bind(scope, node.name, end)
+            nested_chain = (*scope_chain, node)
+            bindings.setdefault(node, set())
+            header_nodes = [*node.decorator_list, *node.bases]
+            header_nodes.extend(keyword.value for keyword in node.keywords)
+            header_nodes.extend(getattr(node, "type_params", []))
+            stack.extend((child, scope_chain, None) for child in header_nodes)
+            stack.extend((child, nested_chain, None) for child in node.body)
+            continue
+        if isinstance(node, _COMPREHENSION_SCOPE_TYPES):
+            nested_chain = (*scope_chain, node)
+            bindings.setdefault(node, set())
+            generators = node.generators
+            if generators:
+                first, *remaining = generators
+                # The leftmost iterable is the only comprehension expression
+                # evaluated in the enclosing scope.
+                stack.append((first.iter, scope_chain, None))
+                stack.append((first.target, nested_chain, None))
+                stack.extend((condition, nested_chain, None) for condition in first.ifs)
+                for generator in remaining:
+                    stack.append((generator.iter, nested_chain, None))
+                    stack.append((generator.target, nested_chain, None))
+                    stack.extend((condition, nested_chain, None) for condition in generator.ifs)
+            if isinstance(node, ast.DictComp):
+                stack.append((node.key, nested_chain, None))
+                stack.append((node.value, nested_chain, None))
+            else:
+                stack.append((node.elt, nested_chain, None))
+            continue
+
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Store)
+            and isinstance(node.value, ast.Name)
+        ):
+            assignment = parents.get(node)
+            if (
+                node not in attribute_identity_stores
+                and isinstance(assignment, ast.Assign)
+                and len(assignment.targets) == 1
+                and assignment.targets[0] is node
+                and tree.body
+                and assignment is tree.body[0]
+                and not any(
+                    isinstance(value, ast.Name)
+                    and isinstance(value.ctx, ast.Load)
+                    and value.id in {node.value.id, "Popen"}
+                    for value in ast.walk(assignment.value)
+                )
+            ):
+                # Retain the legacy first-statement direct shadow control only.
+                # An RHS using the receiver or Popen may preserve a native callable.
+                # Prior stores/protocol effects need the companion's explicit proof.
+                record_binding(
+                    scope,
+                    node.value.id + "." + node.attr,
+                    binding_start if binding_start is not None else end,
+                )
+
+        if isinstance(node, ast.Global):
+            for name in node.names:
+                declarations.setdefault(scope, {})[name] = "global"
+        elif isinstance(node, ast.Nonlocal):
+            for name in node.names:
+                declarations.setdefault(scope, {})[name] = "nonlocal"
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bind(scope, node.id, binding_start if binding_start is not None else start)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name != "*":
+                    bound_name = alias.asname or alias.name.split(".", 1)[0]
+                    bind(scope, bound_name, end)
+                    restores = (
+                        isinstance(node, ast.Import)
+                        and alias.name == "subprocess"
+                        and bound_name == "subprocess"
+                    ) or (
+                        isinstance(node, ast.ImportFrom)
+                        and node.level == 0
+                        and node.module == "subprocess"
+                        and alias.name == "Popen"
+                        and bound_name == "Popen"
+                    )
+                    if restores:
+                        record_binding(scope, bound_name, end, True)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            type_span = _node_character_span(parsed, node.type) if node.type is not None else None
+            bind(scope, node.name, type_span[1] if type_span is not None else start)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            bind(scope, node.name, start)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bind(scope, node.rest, start)
+
+        if (
+            isinstance(node, ast.Assign)
+            and span is not None
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is True
+        ):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    scoped = _ScopedShellNode(node=node, scope_chain=scope_chain, start=start)
+                    assignments.setdefault((node.lineno, target.id), []).append(scoped)
+        elif isinstance(node, ast.Call) and span is not None:
+            shell_name = _direct_shell_name(node)
+            if shell_name is not None:
+                scoped = _ScopedShellNode(node=node, scope_chain=scope_chain, start=start)
+                calls.setdefault(shell_name, []).append(scoped)
+
+        if isinstance(node, ast.Assign):
+            stack.append((node.value, scope_chain, None))
+            stack.extend((target, scope_chain, end) for target in node.targets)
+            for target in node.targets:
+                record_name_store_values(scope, target, node.value, end)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            if node.value is not None:
+                stack.append((node.value, scope_chain, None))
+            stack.append((node.target, scope_chain, end))
+            if isinstance(node, ast.AnnAssign):
+                stack.append((node.annotation, scope_chain, None))
+                if node.value is not None:
+                    record_name_store_values(scope, node.target, node.value, end)
+        elif isinstance(node, ast.NamedExpr):
+            stack.append((node.value, scope_chain, None))
+            # PEP 572 makes a walrus target inside one or more
+            # comprehensions local to the nearest containing real scope.
+            # Comprehension ``for`` targets remain local to their implicit
+            # scope, but the named-expression target skips those scopes.
+            target_chain = scope_chain
+            while len(target_chain) > 1 and isinstance(
+                target_chain[-1], _COMPREHENSION_SCOPE_TYPES
+            ):
+                target_chain = target_chain[:-1]
+            stack.append((node.target, target_chain, end))
+            record_name_store_values(target_chain[-1], node.target, node.value, end)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            iteration_span = _node_character_span(parsed, node.iter)
+            iteration_end = iteration_span[1] if iteration_span is not None else end
+            stack.append((node.iter, scope_chain, None))
+            stack.append((node.target, scope_chain, iteration_end))
+            stack.extend((child, scope_chain, None) for child in (*node.body, *node.orelse))
+        elif isinstance(node, ast.withitem):
+            context_span = _node_character_span(parsed, node.context_expr)
+            context_end = context_span[1] if context_span is not None else end
+            stack.append((node.context_expr, scope_chain, None))
+            if node.optional_vars is not None:
+                stack.append((node.optional_vars, scope_chain, context_end))
+        else:
+            stack.extend(
+                (child, scope_chain, binding_start) for child in ast.iter_child_nodes(node)
+            )
+
+    def execution_scope(scope: ast.AST) -> ast.AST:
+        current: ast.AST | None = scope
+        while current is not None:
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                return current
+            current = parents.get(current)
+        return tree
+
+    # Keep the execution scope of every store. A global/nonlocal declaration
+    # changes the binding namespace; it never proves a deferred body was run.
+    scoped_events: dict[tuple[ast.AST, ast.AST], dict[str, list[tuple[int, bool]]]] = {}
+    sorted_class_starts = {
+        scope: {name: tuple(sorted(starts)) for name, starts in names.items()}
+        for scope, names in class_binding_starts.items()
+    }
+    for scope, names in binding_events.items():
+        for name, events in names.items():
+            receiver_name = name.partition(".")[0]
+            declaration = declarations.get(scope, {}).get(receiver_name)
+            for event in events:
+                target_scope = scope
+                if "." in name and declaration is None:
+                    # A class body can change where its receiver resolves
+                    # between stores. Resolve each slot store at its own offset.
+                    current: ast.AST | None = scope
+                    crossed_function = False
+                    while current is not None:
+                        if current is tree:
+                            target_scope = tree
+                            break
+                        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                            if receiver_name in bindings.get(current, set()):
+                                target_scope = current
+                                break
+                            crossed_function = True
+                        elif isinstance(current, ast.ClassDef) and not crossed_function:
+                            starts = sorted_class_starts.get(current, {}).get(receiver_name, ())
+                            if bisect_right(starts, event[0]):
+                                target_scope = current
+                                break
+                        current = parents.get(current)
+                if declaration == "global":
+                    target_scope = tree
+                elif declaration == "nonlocal":
+                    outer = parents.get(scope)
+                    while outer is not None:
+                        if isinstance(
+                            outer, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+                        ) and receiver_name in bindings.get(outer, set()):
+                            target_scope = outer
+                            break
+                        outer = parents.get(outer)
+                key = (target_scope, execution_scope(scope))
+                scoped_events.setdefault(key, {}).setdefault(name, []).append(event)
+
+    frozen_calls = {
+        name: tuple(sorted(nodes, key=lambda item: item.start)) for name, nodes in calls.items()
+    }
+    return _VariableShellAstIndex(
+        tree=tree,
+        line_character_starts=parsed.line_character_starts,
+        assignments={key: tuple(nodes) for key, nodes in assignments.items()},
+        calls=frozen_calls,
+        call_starts={
+            name: tuple(item.start for item in nodes) for name, nodes in frozen_calls.items()
+        },
+        bindings={scope: frozenset(names) for scope, names in bindings.items()},
+        class_binding_starts=sorted_class_starts,
+        declarations=declarations,
+        eager_effect_starts={
+            scope: tuple(sorted(set(starts))) for scope, starts in eager_effect_starts.items()
+        },
+        reference_starts={name: tuple(sorted(starts)) for name, starts in reference_starts.items()},
+        binding_events={
+            scope: {name: tuple(sorted(set(events))) for name, events in names.items()}
+            for scope, names in scoped_events.items()
+        },
+    )
+
+
+def _assignment_name_scope(
+    index: _VariableShellAstIndex,
+    scope_chain: tuple[ast.AST, ...],
+    name: str,
+) -> ast.AST:
+    """Return the scope mutated by a simple-name assignment."""
+    scope = scope_chain[-1]
+    declaration = index.declarations.get(scope, {}).get(name)
+    if declaration == "global":
+        return index.tree
+    if declaration == "nonlocal":
+        for outer in reversed(scope_chain[:-1]):
+            if isinstance(outer, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and name in (
+                index.bindings.get(outer, frozenset())
+            ):
+                return outer
+    return scope
+
+
+def _variable_shell_call_start(match: re.Match[str]) -> int | None:
+    """Return the final call selected by one bounded variable-shell match."""
+    callees = tuple(re.finditer(r"(?:subprocess\.\w+|Popen)\s*\(", match.group(0), re.IGNORECASE))
+    return match.start() + callees[-1].start() if callees else None
+
+
+def _is_true_prefixed_name(name: str) -> bool:
+    """Return whether a variable window keeps a call-anchored fallback for a name."""
+    return name.casefold().startswith("true")
+
+
+def _variable_shell_matches(content: str) -> list[re.Match[str]]:
+    """Return bounded variable-shell windows, one per call for true-prefixed names.
+
+    The non-overlapping scan pairs an assignment with one call and skips an
+    assignment inside an earlier window. The ``\\b``-bounded direct pattern
+    does not report ``shell=true_value`` and folds identical same-line
+    ``shell=true`` calls into one candidate, so every assignment of a
+    true-prefixed name is also paired with each call its bounded window
+    reaches. The nearest assignment owns each call.
+    """
+    windows: dict[int, re.Match[str]] = {}
+
+    def keep(window: re.Match[str]) -> None:
+        previous = windows.get(window.end())
+        if previous is None or window.start() > previous.start():
+            windows[window.end()] = window
+
+    for match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
+        keep(match)
+    for assignment in _VARIABLE_SHELL_ASSIGNMENT_RE.finditer(content):
+        if not _is_true_prefixed_name(assignment.group(1)):
+            continue
+        search_end = assignment.end() - 1
+        for _ in range(5):
+            search_end = content.find("\n", search_end + 1)
+            if search_end == -1:
+                search_end = len(content)
+                break
+        for argument in _SHELL_NAME_ARGUMENT_RE.finditer(content, assignment.end(), search_end):
+            window = _VARIABLE_SHELL_FLAG_RE.fullmatch(content, assignment.start(), argument.end())
+            if window is not None:
+                keep(window)
+    return sorted(windows.values(), key=lambda window: (window.start(), window.end()))
+
+
+def _resolve_variable_shell_candidate(
+    index: _VariableShellAstIndex,
+    match: re.Match[str],
+    assignment_line: int,
+) -> _VariableShellCandidate | None:
+    """Resolve a bounded regex match to its exact assignment, call, and binding."""
+    name = match.group(1)
+    assignment_nodes = [
+        item
+        for item in index.assignments.get((assignment_line, name), ())
+        if match.start() <= item.start < match.end()
+    ]
+    call_nodes = index.calls.get(name, ())
+    starts = index.call_starts.get(name, ())
+    expected_call_start = _variable_shell_call_start(match)
+    if expected_call_start is None:
+        return None
+    call_index = bisect_left(starts, expected_call_start)
+    if (
+        len(assignment_nodes) != 1
+        or call_index >= len(call_nodes)
+        or call_nodes[call_index].start != expected_call_start
+    ):
+        return None
+    assignment = assignment_nodes[0]
+    call = call_nodes[call_index]
+    if call.start >= match.end():
+        return None
+    assignment_scope = _assignment_name_scope(index, assignment.scope_chain, name)
+    resolved_scope = _resolved_name_scope(index, call.scope_chain, name, call.start)
+    return _VariableShellCandidate(
+        name=name,
+        call=call.node,
+        same_scope=assignment.scope_chain == call.scope_chain,
+        visible=resolved_scope is assignment_scope,
+        assignment_start=assignment.start,
+        assignment_scope=assignment_scope,
+        call_scope_chain=call.scope_chain,
+    )
+
+
+def _earliest_deferred_invocation(
+    index: _VariableShellAstIndex,
+    parsed: ParsedPythonFile,
+    call_scope_chain: tuple[ast.AST, ...],
+    owner_execution: ast.AST,
+) -> float:
+    """Return the earliest owner-scope offset at which a deferred call may run.
+
+    A function, method, or lambda can run once it exists and something refers to
+    it: a call in any statement (including ``if``/``try``/main guards), a callback
+    registration, a decorator, or another body. Without a visible reference it
+    runs only after the owner scope finishes.
+    """
+    owner_position = next(
+        (position for position, scope in enumerate(call_scope_chain) if scope is owner_execution),
+        None,
+    )
+    if owner_position is None or owner_position + 1 >= len(call_scope_chain):
+        return 0
+    entries = call_scope_chain[owner_position + 1 :]
+    span = _node_character_span(parsed, entries[0])
+    if span is None:
+        return 0
+    defined = span[1]
+    if any(
+        isinstance(entry, (ast.Lambda, ast.GeneratorExp)) or getattr(entry, "decorator_list", None)
+        for entry in entries
+    ):
+        return defined
+    names = {
+        entry.name
+        for entry in entries
+        if isinstance(entry, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    references = [
+        start
+        for name in names
+        for start in index.reference_starts.get(name, ())
+        if not span[0] <= start < span[1]
+    ]
+    if not references:
+        return float("inf")
+    return max(defined, min(references))
+
+
+def _deferred_receiver_is_replaced(
+    index: _VariableShellAstIndex,
+    parsed: ParsedPythonFile,
+    candidate: _VariableShellCandidate,
+    receiver: str,
+    receiver_scope: ast.AST,
+    receiver_execution: ast.AST,
+    current_execution: ast.AST,
+    call_start: int,
+) -> bool:
+    """Return whether every possible invocation of a deferred call sees a replacement."""
+    local_events = index.binding_events.get((receiver_scope, current_execution), {}).get(
+        receiver, ()
+    )
+    local_index = bisect_right(local_events, (call_start, True))
+    if local_index:
+        # A store earlier in the same invocation decides the receiver.
+        return not local_events[local_index - 1][1]
+    outer_events = index.binding_events.get((receiver_scope, receiver_execution), {}).get(
+        receiver, ()
+    )
+    first_invocation = _earliest_deferred_invocation(
+        index, parsed, candidate.call_scope_chain, receiver_execution
+    )
+    keeps_receiver: dict[int, bool] = {}
+    for start, restores in outer_events:
+        keeps_receiver[start] = keeps_receiver.get(start, False) or restores
+    starts = sorted(keeps_receiver)
+    earlier = bisect_left(starts, first_invocation)
+    if not earlier:
+        return False
+    # The binding seen by the first possible invocation, then every later one.
+    return not any(keeps_receiver[start] for start in starts[earlier - 1 :])
+
+
+def _lexical_shell_has_counterevidence(
+    index: _VariableShellAstIndex,
+    parsed: ParsedPythonFile,
+    candidate: _VariableShellCandidate,
+    *,
+    receiver_trusted: bool | None,
+) -> bool:
+    """Reject a lexical candidate only for an observed binding replacement.
+
+    The companion's unknown receiver trust is an abstention. Generic calls,
+    protocol effects, and unsupported statements do not prove a replacement.
+    Stores/imports do; use their source order and Python binding scopes.
+    """
+    call_span = _node_character_span(parsed, candidate.call)
+    if call_span is None:
+        return False
+    call_start = call_span[0]
+    shell = next((item.value for item in candidate.call.keywords if item.arg == "shell"), None)
+    shell_span = _node_character_span(parsed, shell) if shell is not None else None
+    shell_start = shell_span[0] if shell_span is not None else call_start
+    current_execution = next(
+        (
+            scope
+            for scope in reversed(candidate.call_scope_chain)
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+        ),
+        index.tree,
+    )
+
+    def binding_events(scope: ast.AST, name: str) -> tuple[tuple[int, bool], ...]:
+        owner_execution = (
+            scope
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+            else index.tree
+        )
+        events = index.binding_events.get((scope, owner_execution), {}).get(name, ())
+        if current_execution is not owner_execution:
+            local_events = index.binding_events.get((scope, current_execution), {}).get(name, ())
+            return tuple(sorted((*events, *local_events)))
+        return events
+
+    flag_events = binding_events(candidate.assignment_scope, candidate.name)
+    flag_index = bisect_right(flag_events, (shell_start, True))
+    if flag_index:
+        last_flag = flag_events[flag_index - 1]
+        if last_flag[0] > candidate.assignment_start and not last_flag[1]:
+            return True
+    if receiver_trusted is True:
+        return False
+    function = candidate.call.func
+    receiver = function.id if isinstance(function, ast.Name) else function.value.id
+    receiver_scope = _resolved_name_scope(index, candidate.call_scope_chain, receiver, call_start)
+    receiver_execution = (
+        receiver_scope
+        if isinstance(receiver_scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+        else index.tree
+    )
+    # Called-module slot replacement is proved only by the companion cache
+    # state, which discards stale proof after an unknown eager effect.
+    receiver_events = binding_events(receiver_scope, receiver)
+    receiver_index = bisect_right(receiver_events, (call_start, True))
+    if receiver_execution is not current_execution:
+        # Source order does not order a deferred body against outer stores.
+        # Require a replacement at every invocation the outer scope can reach.
+        if _deferred_receiver_is_replaced(
+            index,
+            parsed,
+            candidate,
+            receiver,
+            receiver_scope,
+            receiver_execution,
+            current_execution,
+            call_start,
+        ):
+            return True
+    elif receiver_index:
+        if not receiver_events[receiver_index - 1][1]:
+            return True
+    elif isinstance(receiver_scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        # Compile-time local bindings shadow a global receiver even before store.
+        if receiver in index.bindings.get(receiver_scope, frozenset()):
+            return True
+    if isinstance(function, ast.Attribute):
+        # Preserve a direct same-name replacement only in this execution scope,
+        # after the completed store and before another effect or receiver binding.
+        method_events = index.binding_events.get((receiver_scope, current_execution), {}).get(
+            receiver + "." + function.attr, ()
+        )
+        method_index = bisect_right(method_events, (call_start, True))
+        if method_index:
+            method_start, restores = method_events[method_index - 1]
+            effects = index.eager_effect_starts.get(current_execution, ())
+            effect_index = bisect_right(effects, method_start)
+            later_binding = receiver_index and receiver_events[receiver_index - 1][0] > method_start
+            if (
+                not restores
+                and not later_binding
+                and (effect_index == len(effects) or effects[effect_index] >= call_start)
+            ):
+                return True
+    return False
+
+
 def _tm1_candidates(
     content: str,
-) -> Iterator[tuple[int, int, str, float]]:
-    for pattern, confidence in TM1_PATTERNS:
+    *,
+    direct_shell_only: bool = False,
+    shell_content: str | None = None,
+) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
+    def direct_matches(
+        pattern_index: int,
+        pattern: str,
+        confidence: float,
+    ) -> Iterator[tuple[int, int, re.Match[str], float]]:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            yield match.start(), match.end(), match.group(0), confidence
+            yield match.start(), pattern_index, match, confidence
 
-    seen_commands: set[tuple[int, int]] = set()
-    covered_until = 0
-    for command_start, body_start in _destructive_command_words(content):
-        if command_start < covered_until:
-            continue
-        command_key = (command_start, body_start)
-        if command_key in seen_commands:
-            continue
-        seen_commands.add(command_key)
-        # Documentation is excluded regardless of the shell parse result.  Apply
-        # that existing semantic gate first so large manuals do not pay for a
-        # character-by-character shell parse for every explanatory ``rm`` noun.
-        if _is_root_glob_documentation(content, command_start, body_start):
-            continue
-        tokens, command_end, _ = _bounded_shell_tokens(
-            content,
-            command_start,
-            body_start,
+    def direct_candidates() -> Iterator[
+        tuple[int, int, str, float, bool, int | None, int | None, str | None]
+    ]:
+        direct_iterators = (
+            direct_matches(pattern_index, pattern, confidence)
+            for pattern_index, (pattern, confidence) in enumerate(DIRECT_SHELL_TRUE_PATTERNS)
         )
-        covered_until = max(covered_until, command_end)
-        command = content[command_start:command_end]
-        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
-            yield command_start, command_end, command, 0.9
+        qualified_popen_starts: set[int] = set()
+        for _, pattern_index, match, confidence in heapq.merge(
+            *direct_iterators,
+            key=lambda candidate: (candidate[0], candidate[1]),
+        ):
+            alternate_start: int | None = None
+            alternate_matched_text: str | None = None
+            if pattern_index == 0:
+                method = re.match(r"subprocess\.(?P<method>\w+)", match.group(0), re.IGNORECASE)
+                if method is not None and method.group("method").casefold() == "popen":
+                    alternate_start = match.start() + method.start("method")
+                    alternate_matched_text = content[alternate_start : match.end()]
+                    qualified_popen_starts.add(alternate_start)
+            elif match.start() in qualified_popen_starts:
+                # Emit one candidate for a qualified ``subprocess.Popen`` call,
+                # but retain the bare-method coordinate as an ownership fallback
+                # when the qualifier belongs to an adjacent scan window.
+                qualified_popen_starts.remove(match.start())
+                continue
+            elif (
+                qualifier_start := _subprocess_qualifier_start(content, match.start())
+            ) is not None:
+                alternate_start = qualifier_start
+                alternate_matched_text = content[qualifier_start : match.end()]
+            relative_anchor = _outer_shell_true_anchor(match.group(0))
+            if relative_anchor is None:
+                for shell_value in _DIRECT_SHELL_TRUE_VALUE.finditer(match.group(0)):
+                    relative_anchor = shell_value.start()
+            anchor = match.start() + relative_anchor if relative_anchor is not None else None
+            yield (
+                match.start(),
+                match.end(),
+                match.group(0),
+                confidence,
+                True,
+                anchor,
+                alternate_start,
+                alternate_matched_text,
+            )
+
+    if direct_shell_only:
+        yield from direct_candidates()
+        return
+
+    def ordinary_matches(
+        pattern_index: int,
+        pattern: str,
+        confidence: float,
+    ) -> Iterator[tuple[int, int, re.Match[str], float]]:
+        if pattern == _VARIABLE_SHELL_FLAG_PATTERN:
+            for match in _variable_shell_matches(content):
+                yield match.start(), pattern_index, match, confidence
+            return
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in TM1_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            yield match.start(), pattern_index, match, confidence
+
+    def ordinary_candidates() -> Iterator[
+        tuple[int, int, str, float, bool, int | None, int | None, str | None]
+    ]:
+        ordinary_iterators = (
+            ordinary_matches(pattern_index, pattern, confidence)
+            for pattern_index, (pattern, confidence) in enumerate(
+                TM1_PATTERNS[len(DIRECT_SHELL_TRUE_PATTERNS) :]
+            )
+        )
+        for _, _, match, confidence in heapq.merge(
+            *ordinary_iterators,
+            key=lambda candidate: (candidate[0], candidate[1]),
+        ):
+            yield (
+                match.start(),
+                match.end(),
+                match.group(0),
+                confidence,
+                False,
+                None,
+                None,
+                None,
+            )
+
+    def destructive_candidates(
+        candidate_content: str,
+    ) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
+        seen_commands: set[tuple[int, int]] = set()
+        covered_until = 0
+        for command_start, body_start in _destructive_command_words(candidate_content):
+            if command_start < covered_until:
+                continue
+            command_key = (command_start, body_start)
+            if command_key in seen_commands:
+                continue
+            seen_commands.add(command_key)
+            # Documentation is excluded regardless of the shell parse result. Apply
+            # that existing semantic gate first so large manuals do not pay for a
+            # character-by-character shell parse for every explanatory ``rm`` noun.
+            if _is_root_glob_documentation(candidate_content, command_start, body_start):
+                continue
+            tokens, command_end, _ = _bounded_shell_tokens(
+                candidate_content,
+                command_start,
+                body_start,
+            )
+            covered_until = max(covered_until, command_end)
+            command = candidate_content[command_start:command_end]
+            if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
+                yield command_start, command_end, command, 0.9, False, None, None, None
+
+    destructive_iterators = [destructive_candidates(content)]
+    if shell_content is not None and shell_content != content:
+        destructive_iterators.append(destructive_candidates(shell_content))
+    yield from heapq.merge(
+        direct_candidates(),
+        ordinary_candidates(),
+        *destructive_iterators,
+        key=lambda candidate: candidate[0],
+    )
+
+
+def _markdown_block_separator(line: str, check_runtime: Callable[[], None]) -> bool:
+    """Recognize Setext underlines/thematic breaks with bounded, linear work."""
+    line = line.strip(" \t")
+    marker = line[:1]
+    if marker not in {"=", "-", "*", "_"}:
+        return False
+    count = 0
+    internal_gap = False
+    for index, character in enumerate(line):
+        if index % 256 == 0:
+            check_runtime()
+        if character == marker:
+            count += 1
+        elif character in " \t" and marker != "=":
+            internal_gap = True
+        else:
+            return False
+    return count >= (3 if internal_gap or marker in {"*", "_"} else 1)
+
+
+def _markdown_table_cells(
+    line: str, start: int, check_runtime: Callable[[], None]
+) -> list[tuple[int, int]]:
+    """Locate GFM cells without copying content or changing source offsets."""
+    end = len(line)
+    while start < end and line[start] in " \t":
+        if start % 256 == 0:
+            check_runtime()
+        start += 1
+    while end > start and line[end - 1] in " \t":
+        if end % 256 == 0:
+            check_runtime()
+        end -= 1
+    if start == end:
+        return []
+    # Edge pipes are optional. In cmark-gfm a backslash immediately before a
+    # pipe escapes it even when that backslash follows another backslash.
+    if line[start] == "|":
+        start += 1
+    if line[end - 1] == "|" and (end == 1 or line[end - 2] != "\\"):
+        end -= 1
+    if start > end:
+        return []
+    cells: list[tuple[int, int]] = []
+    cell_start = start
+    for cursor in range(start, end):
+        if (cursor - start) % 256 == 0:
+            check_runtime()
+        if line[cursor] == "|" and (cursor == start or line[cursor - 1] != "\\"):
+            cells.append((cell_start, cursor))
+            cell_start = cursor + 1
+    cells.append((cell_start, end))
+    return cells
+
+
+def _markdown_table_delimiter_columns(
+    line: str, minimum_indent: int, check_runtime: Callable[[], None]
+) -> int | None:
+    """Prove a compatible delimiter row under the existing container scope."""
+    line = line.rstrip(LINE_BREAK_CHARS)
+    prefix = 0
+    column = 0
+    while prefix < len(line) and line[prefix] in " \t":
+        if prefix % 256 == 0:
+            check_runtime()
+        column += 4 - column % 4 if line[prefix] == "\t" else 1
+        prefix += 1
+    if column < minimum_indent or column >= 4 or prefix == len(line):
+        return None
+    if line[prefix] not in "|:-":
+        return None
+    # A new list item or a bare Setext/thematic underline takes precedence
+    # over table recognition, including a pipe-bearing preceding header.
+    if (
+        line[prefix] == "-" and prefix + 1 < len(line) and line[prefix + 1] in " \t"
+    ) or _markdown_block_separator(line, check_runtime):
+        return None
+    cells = _markdown_table_cells(line, prefix, check_runtime)
+    if not cells:
+        return None
+    for start, end in cells:
+        check_runtime()
+        while start < end and line[start] in " \t":
+            if start % 256 == 0:
+                check_runtime()
+            start += 1
+        while end > start and line[end - 1] in " \t":
+            if end % 256 == 0:
+                check_runtime()
+            end -= 1
+        if start < end and line[start] == ":":
+            start += 1
+        hyphen_start = start
+        while start < end and line[start] == "-":
+            if (start - hyphen_start) % 256 == 0:
+                check_runtime()
+            start += 1
+        if start == hyphen_start:
+            return None
+        if start < end and line[start] == ":":
+            start += 1
+        if start != end:
+            return None
+    return len(cells)
+
+
+def _markdown_shell_text(
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    complete_context: bool = True,
+    word_apostrophes: bool = False,
+) -> str:
+    """Mask Markdown delimiters while retaining code and exact source offsets.
+
+    Inline code delimiters are not legacy shell substitutions. Fenced and
+    indented code stays literal; longer inline delimiters preserve backticks
+    inside their bodies. Pair equal-length runs in linear time.
+    ``word_apostrophes`` selects the prose reading, which also masks the
+    possessives and contractions of plain prose lines.
+    """
+    output = list(content)
+    prose_apostrophes: set[int] = set()
+    runs: list[tuple[int, int]] = []
+    list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
+    backtick_runs = re.compile(r"`+")
+
+    def mask_inline_delimiters() -> None:
+        if not complete_context:
+            runs.clear()
+            return
+        next_by_length: dict[int, int] = {}
+        closing: dict[int, int] = {}
+        for index in range(len(runs) - 1, -1, -1):
+            check_runtime()
+            start, end = runs[index]
+            length = end - start
+            if length in next_by_length:
+                closing[index] = next_by_length[length]
+            next_by_length[length] = index
+        index = 0
+        while index < len(runs):
+            check_runtime()
+            start, end = runs[index]
+            escape_start = start
+            while escape_start > 0 and content[escape_start - 1] == "\\":
+                escape_start -= 1
+            close_index = closing.get(index)
+            if (start - escape_start) % 2 or close_index is None:
+                index += 1
+                continue
+            close_start, close_end = runs[close_index]
+            output[start:end] = " " * (end - start)
+            output[close_start:close_end] = " " * (close_end - close_start)
+            index = close_index + 1
+        runs.clear()
+
+    # This is a conservative projection, not a general Markdown renderer.
+    # Container/HTML bodies with uncertain inline ownership remain literal.
+    fence: tuple[str, int, int] | None = None
+    quoted_block = False
+    html_end: str | None = None
+    paragraph_open = False
+    paragraph_in_list = False
+    paragraph_list_indent = 0
+    table_columns: int | None = None
+    table_minimum_indent = 0
+    table_delimiter_line = -1
+    offset = 0
+    lines = content.splitlines(keepends=True)
+    for line_index, line in enumerate(lines):
+        check_runtime()
+        stripped = line.rstrip(LINE_BREAK_CHARS)
+        leading = stripped.lstrip(" \t")
+        indentation = len(stripped[: len(stripped) - len(leading)].expandtabs(4))
+        # Interpret list padding in columns, preserving the original offsets.
+        # More than four columns after a marker can introduce indented code.
+        prefix = len(stripped) - len(leading)
+        column = indentation
+        list_indented = False
+        has_list_marker = False
+        list_markers = 0
+        if indentation < 4:
+            while marker := list_marker.match(stripped, prefix):
+                check_runtime()
+                if (
+                    not has_list_marker
+                    and paragraph_open
+                    and not paragraph_in_list
+                    and marker[0][0].isdigit()
+                    and int(marker[0][:-1]) != 1
+                ):
+                    # Only a list starting at 1 can interrupt a paragraph.
+                    # Other numbers may be literal text within an inline span.
+                    break
+                has_list_marker = True
+                list_markers += 1
+                column += marker.end() - prefix
+                prefix = marker.end()
+                padding_start = column
+                while prefix < len(stripped) and stripped[prefix] in " \t":
+                    check_runtime()
+                    column += 4 - column % 4 if stripped[prefix] == "\t" else 1
+                    prefix += 1
+                if column - padding_start > 4:
+                    list_indented = True
+                    break
+            leading = stripped[prefix:]
+        quote_start = indentation < 4 and leading.startswith(">")
+        heading = indentation < 4 and re.match(r"#{1,6}(?:[ \t]|$)", leading) is not None
+        separator = indentation < 4 and _markdown_block_separator(stripped, check_runtime)
+        setext_only = separator and (leading.startswith("=") or leading.rstrip(" \t") == "--")
+        empty_list_item = (
+            not paragraph_open and re.fullmatch(r"(?:[-+*]|[0-9]{1,9}[.)])", leading) is not None
+        )
+        if table_columns is not None and setext_only:
+            # A table row has no paragraph for a Setext underline to close.
+            # Single '-' still starts an empty item; '---' remains thematic.
+            separator = False
+        html_open = re.match(r"<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|[!?/])", leading)
+        continuing_paragraph = False
+        if table_columns is not None and (
+            html_end is not None
+            or fence is not None
+            or quote_start
+            or quoted_block
+            or html_open
+            or not leading
+            or indentation >= 4
+            or indentation < table_minimum_indent
+            or list_indented
+            or has_list_marker
+            or empty_list_item
+            or heading
+            or separator
+        ):
+            table_columns = None
+        if html_end is not None:
+            mask_inline_delimiters()
+            if (html_end and html_end in leading.lower()) or (not html_end and not leading):
+                html_end = None
+        elif fence is not None:
+            fence_body = stripped.lstrip(" \t")
+            closing_fence = MARKDOWN_FENCE_CLOSE.fullmatch(fence_body)
+            if (
+                closing_fence
+                and 0 <= indentation - fence[2] <= 3
+                and closing_fence[1][0] == fence[0]
+                and len(closing_fence[1]) >= fence[1]
+            ):
+                begin, end = closing_fence.span(1)
+                body_start = offset + len(stripped) - len(fence_body)
+                output[body_start + begin : body_start + end] = " " * (end - begin)
+                fence = None
+        elif quote_start or quoted_block:
+            mask_inline_delimiters()
+            quoted_block = bool(leading)
+        elif html_open:
+            mask_inline_delimiters()
+            raw_tag = re.match(r"<(pre|script|style|textarea)(?=[\s/>]|$)", leading, re.I)
+            terminator = (
+                f"</{raw_tag[1].lower()}>"
+                if raw_tag
+                else "-->"
+                if leading.startswith("<!--")
+                else "?>"
+                if leading.startswith("<?")
+                else "]]>"
+                if leading.startswith("<![CDATA[")
+                else ">"
+                if re.match(r"<![A-Z]", leading)
+                else ""
+            )
+            html_end = None if terminator and terminator in leading.lower() else terminator
+        elif not leading or indentation >= 4 or list_indented:
+            mask_inline_delimiters()
+        else:
+            # Inline code may continue within a paragraph/list item, but cannot
+            # pair with delimiters in a new item, heading, or following block.
+            if has_list_marker or heading or separator:
+                mask_inline_delimiters()
+            # The body after any list markers can begin a fenced block.
+            opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped[prefix:])
+            if opening:
+                mask_inline_delimiters()
+                fence = (opening[1][0], len(opening[1]), column if has_list_marker else 0)
+                begin, end = opening.span(1)
+                output[offset + prefix + begin : offset + prefix + end] = " " * (end - begin)
+            else:
+                minimum_indent = (
+                    column if has_list_marker else paragraph_list_indent if paragraph_in_list else 0
+                )
+                if (
+                    table_columns is None
+                    and not heading
+                    and not empty_list_item
+                    and (not separator or setext_only and not paragraph_open)
+                    and list_markers <= 1
+                    and (has_list_marker or indentation >= minimum_indent)
+                    and line_index + 1 < len(lines)
+                ):
+                    columns = _markdown_table_delimiter_columns(
+                        lines[line_index + 1], minimum_indent, check_runtime
+                    )
+                    if (
+                        columns is not None
+                        and len(_markdown_table_cells(stripped, prefix, check_runtime)) == columns
+                    ):
+                        # Establish the header boundary before pairing any
+                        # opener from the preceding paragraph with this row.
+                        mask_inline_delimiters()
+                        # A Setext-looking line at a fresh block boundary is
+                        # a header only after the next row proves that role.
+                        separator = False
+                        table_columns = columns
+                        table_minimum_indent = minimum_indent
+                        table_delimiter_line = line_index + 1
+                if table_columns is not None:
+                    mask_inline_delimiters()
+                    if line_index != table_delimiter_line:
+                        cells = _markdown_table_cells(stripped, prefix, check_runtime)
+                        for cell_index, (cell_start, cell_end) in enumerate(cells):
+                            if cell_index >= table_columns:
+                                # GFM drops excess body cells: no rendered
+                                # inline node can grant ownership to their ticks.
+                                break
+                            for match in backtick_runs.finditer(stripped, cell_start, cell_end):
+                                check_runtime()
+                                runs.append((offset + match.start(), offset + match.end()))
+                            mask_inline_delimiters()
+                        if not cells:
+                            table_columns = None
+                elif not separator and not empty_list_item:
+                    if (
+                        complete_context
+                        and not runs
+                        and not heading
+                        and len(leading) <= 512
+                        and (prose := _MARKDOWN_CONTRACTION_PROSE_RE.fullmatch(leading))
+                    ):
+                        # A whole plain-language sentence, including a parsed
+                        # list-item body, owns its contraction;
+                        # it is not an unclosed shell quote spanning later prose.
+                        # The restrictive grammar excludes code delimiters and
+                        # shell syntax. Fences, indented code, HTML, tables, and
+                        # pending multiline inline spans never reach this rule.
+                        prose_apostrophes.add(offset + prefix + prose.start("apostrophe"))
+                    elif (
+                        word_apostrophes
+                        and complete_context
+                        and not runs
+                        and not heading
+                        and "'" in leading
+                        and _MARKDOWN_PROSE_SHELL_SYNTAX_RE.search(leading) is None
+                        and (
+                            line_index == 0
+                            or (
+                                lines[line_index - 1].endswith("\n")
+                                and not lines[line_index - 1].rstrip("\r\n").endswith("\\")
+                            )
+                        )
+                    ):
+                        # In the prose reading, a prose line owns every
+                        # possessive and contraction in it. Every quote on the
+                        # line must be one, the line has no expansion or line
+                        # continuation, and it starts a new shell line, so no
+                        # runtime-selected command can take later text as
+                        # operands through it. The same block exclusions apply.
+                        apostrophes: list[int] = []
+                        for word in _MARKDOWN_WORD_APOSTROPHE_RE.finditer(leading):
+                            check_runtime()
+                            apostrophes.append(offset + prefix + word.start("apostrophe"))
+                        if len(apostrophes) == leading.count("'"):
+                            prose_apostrophes.update(apostrophes)
+                    for match in backtick_runs.finditer(line):
+                        check_runtime()
+                        runs.append((offset + match.start(), offset + match.end()))
+                    if heading:
+                        mask_inline_delimiters()
+                    else:
+                        continuing_paragraph = True
+                        paragraph_in_list = has_list_marker or paragraph_in_list
+                        if has_list_marker:
+                            paragraph_list_indent = column
+        paragraph_open = continuing_paragraph
+        if not paragraph_open:
+            paragraph_in_list = False
+            paragraph_list_indent = 0
+        offset += len(line)
+    mask_inline_delimiters()
+    projected = "".join(output)
+    if prose_apostrophes:
+        # A prose-looking line can still be inside an earlier shell word, such
+        # as a multiline bash -c string. Reuse the shell parser to preserve that
+        # ownership before masking any apostrophe. Unresolved words retain all
+        # remaining bytes; this pass never grants ownership past a parse limit.
+        cursor = 0
+        next_runtime_check = 0
+        last_apostrophe = max(prose_apostrophes)
+        parameter_ends: dict[int, _ParameterExpansionEnd] = {}
+        substitution_ends: dict[int, int | None] = {}
+        backtick_ends: dict[int, int | None] = {}
+        while cursor <= last_apostrophe:
+            if cursor >= next_runtime_check:
+                check_runtime()
+                next_runtime_check = cursor + 4096
+            if cursor in prose_apostrophes:
+                output[cursor] = " "
+            elif projected[cursor] in "'\"`$\\":
+                parsed = _parse_shell_command_word(
+                    projected,
+                    cursor,
+                    parameter_ends,
+                    substitution_ends,
+                    backtick_ends,
+                    check_runtime=check_runtime,
+                )
+                if parsed is None or parsed.limited:
+                    break
+                cursor = max(cursor + 1, parsed.end)
+                continue
+            cursor += 1
+        return "".join(output)
+    return projected
 
 
 def has_bounded_parse_exhaustion(
     content: str,
     check_runtime: Callable[[], None],
+    *,
+    file_type: str = "shell",
+    complete_context: bool = True,
 ) -> bool:
     """Return whether a destructive rm command exceeded the parser's span contract."""
-    if _has_shell_command_word_exhaustion(content, check_runtime):
+    exhausted = _has_bounded_parse_exhaustion(
+        content, check_runtime, file_type=file_type, complete_context=complete_context
+    )
+    if not exhausted or file_type != "markdown" or not complete_context:
+        return exhausted
+    # A possessive such as "reference's" in prose is punctuation, yet the
+    # lexical reading can leave it open as a shell quote to the end of the
+    # file. Retry with the prose reading. Masking an apostrophe can also turn
+    # a later closing quote into an opener, so the prose reading may only
+    # resolve a limit of the lexical one, never introduce one.
+    return _has_bounded_parse_exhaustion(
+        content, check_runtime, file_type=file_type, word_apostrophes=True
+    )
+
+
+def _has_bounded_parse_exhaustion(
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    file_type: str,
+    complete_context: bool = True,
+    word_apostrophes: bool = False,
+) -> bool:
+    # PowerShell source can invoke another shell with an executable command
+    # string. Apply the same bounded checks to those strings; benign PowerShell
+    # -replace values have their own narrowly proven expression context.
+    structural_quote_closers = None
+    structural_quote_openers = None
+    json_strings: list[tuple[int, int]] = []
+    python_source = None
+    if file_type == "perl" and complete_context:
+        content = _perl_literal_print_shell_text(content, check_runtime)
+    if file_type == "python" and complete_context:
+        # Only a complete module can prove Python token ownership. A fragment
+        # may begin inside a string and would invert code and literal bytes.
+        python_source = _PythonSourceOwnership(content, check_runtime)
+    if file_type == "markdown":
+        if complete_context:
+            json_strings = validated_json_string_spans(content, check_runtime)
+            structural_quote_closers = {end - 1 for _, end in json_strings}
+            structural_quote_openers = {start for start, _ in json_strings}
+        content = _markdown_shell_text(
+            content,
+            check_runtime,
+            complete_context=complete_context,
+            word_apostrophes=word_apostrophes,
+        )
+    # Perl ``eval BLOCK`` is recognized from its clause-initial ``eval`` and the
+    # adjacent brace alone, so unlike quote ownership it needs no full context.
+    if _has_shell_command_word_exhaustion(
+        content,
+        check_runtime,
+        structural_quote_closers=structural_quote_closers,
+        structural_quote_openers=structural_quote_openers,
+        python_source=python_source,
+        perl_eval_blocks=file_type == "perl",
+    ):
         return True
     covered_until = 0
     for command_start, body_start in _destructive_command_words(content):
@@ -2107,9 +5185,29 @@ def has_bounded_parse_exhaustion(
             content,
             command_start,
             body_start,
+            check_runtime=check_runtime,
         )
         covered_until = max(covered_until, command_end)
         if exhausted or _has_unsupported_brace_expansion(tokens):
+            return True
+    # A literal candidate outside a JSON string can consume it before the
+    # whole-content parser reaches its structural opener. Recover each proven
+    # string independently, without bypassing that parser's forward watermark
+    # and reparsing overlapping suffixes. These raw spans are disjoint and
+    # bounded by JSON validation. Reuse the whole-document projection so each
+    # string retains its original fenced/literal or inline-code ownership.
+    # Reinterpreting a string as standalone Markdown could mask shell backticks
+    # that were literal inside its surrounding code fence. The projection keeps
+    # source offsets, outer JSON quotes and escaped bytes unchanged.
+    for start, end in json_strings:
+        check_runtime()
+        projected = content[start:end]
+        if _has_shell_command_word_exhaustion(
+            projected,
+            check_runtime,
+            structural_quote_openers={0},
+            structural_quote_closers={len(projected) - 1},
+        ):
             return True
     return False
 
@@ -2123,46 +5221,269 @@ def _line_containing(content: str, start: int, end: int) -> str:
     return content[line_start:line_end]
 
 
-def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+def _is_assigned_value(content: str, start: int) -> bool:
+    """Return whether the expression at *start* is the value of an assignment.
+
+    Whitespace, line continuations and opening parentheses after the ``=`` are
+    skipped, so ``old =  (os.umask(0))`` reads like ``old = os.umask(0)``.
+    ``==``, ``!=``, ``<=`` and ``>=`` compare rather than assign.
+    """
+    index = start
+    while index and content[index - 1] in " \t\r\n\\(":
+        index -= 1
+    if not index or content[index - 1] != "=":
+        return False
+    return index < 2 or content[index - 2] not in "=!<>"
+
+
+def _bounded_context(content: str, match_start: int) -> str:
+    """Return a fixed-size context centered on one direct shell call."""
+    left = max(0, match_start - _MAX_DIRECT_SHELL_CONTEXT_CHARS // 2)
+    right = min(len(content), left + _MAX_DIRECT_SHELL_CONTEXT_CHARS)
+    left = max(0, right - _MAX_DIRECT_SHELL_CONTEXT_CHARS)
+    return content[left:right].rstrip(LINE_BREAK_CHARS)
+
+
+def _raw_classification_bounds(content: str, source_start: int) -> tuple[int, int]:
+    """Return the raw scanner-window bounds that own *source_start*."""
+    if len(content) <= static_runner.SECURITY_VIEW_WINDOW_CHARS:
+        return 0, len(content)
+    owned_start = (
+        source_start // static_runner._RAW_WINDOW_OWNED_CHARS
+    ) * static_runner._RAW_WINDOW_OWNED_CHARS
+    owned_end = min(len(content), owned_start + static_runner._RAW_WINDOW_OWNED_CHARS)
+    raw_start = max(0, owned_start - static_runner._WINDOW_OVERLAP_CHARS)
+    raw_end = min(len(content), owned_end + static_runner._WINDOW_OVERLAP_CHARS)
+    return raw_start, raw_end
+
+
+def _classify_tm1(
+    context: str,
+    matched_text: str,
+    matched_line: str,
+    confidence: float,
+    file_type: str,
+    *,
+    safe_context: bool | None = None,
+    safe_matched_line: bool | None = None,
+) -> tuple[Severity, float]:
+    """Apply the existing TM1 contextual classification to one candidate."""
+    if safe_context is None:
+        safe_context = _is_safe_container_command(context) or _is_safe_dockerfile_idiom(
+            context, matched_text
+        )
+    if safe_matched_line is None:
+        safe_matched_line = _is_safe_cache_cleanup(matched_line)
+    if safe_context or safe_matched_line:
+        return Severity.LOW, min(confidence, 0.15)
+    adjusted = (
+        min(1.0, confidence + 0.1) if file_type in ("python", "shell", "javascript") else confidence
+    )
+    return Severity.HIGH, adjusted
+
+
+def analyze(
+    content: str,
+    file_path: str,
+    file_type: str,
+    *,
+    check_runtime: Callable[[], None] | None = None,
+    _direct_shell_only: bool = False,
+    defer_variable_reconciliation: bool = False,
+) -> list[AnalyzerFinding]:
     """Analyze content for tool misuse patterns (TM1–TM3)."""
+    runtime_check = check_runtime or (lambda: None)
+    runtime_check()
     findings: list[AnalyzerFinding] = []
+    locations = SourceLocationIndex(content, file_path)
+    lines = content.splitlines()
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
 
+    def line_number(start: int) -> int:
+        return locations.line_and_column(start)[0]
+
+    context_by_line: dict[int, str] = {}
+
     def ctx(start: int) -> str:
-        return get_context(content, start)
+        line, column = locations.line_and_column(start)
+        context = context_by_line.get(line)
+        if context is None:
+            context = get_context_from_lines(lines, line, column=column)
+            context_by_line[line] = context
+        return context
 
     tag = [PatternCategory.TOOL_MISUSE.value]
     tm1_findings_by_key: dict[tuple[int, str], AnalyzerFinding] = {}
+    direct_safety_by_line: dict[int, tuple[bool, bool]] = {}
 
-    for match_start, match_end, matched_text, confidence in _tm1_candidates(content):
-        line_num = get_line_number(content, match_start)
-        context_text = ctx(match_start)
+    variable_matches = (
+        {}
+        if _direct_shell_only
+        else {
+            (match.start(), match.end()): (match.group(1), match)
+            for match in _variable_shell_matches(content)
+        }
+    )
+    invisible_variable_matches: set[tuple[int, int]] = set()
+    if file_type == "python" and variable_matches and not defer_variable_reconciliation:
+        runtime_check()
+        parsed = parse_python_source(content, file_path)
+        runtime_check()
+        ast_index = _build_variable_shell_ast_index(parsed)
+        runtime_check()
+        if ast_index is not None:
+            for span, (_, match) in variable_matches.items():
+                runtime_check()
+                assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
+                candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)
+                if candidate is not None and (
+                    not candidate.visible
+                    or _lexical_shell_has_counterevidence(
+                        ast_index, parsed, candidate, receiver_trusted=None
+                    )
+                ):
+                    invisible_variable_matches.add(span)
+
+    shell_content = (
+        _perl_literal_print_shell_text(content, runtime_check) if file_type == "perl" else None
+    )
+    for (
+        match_start,
+        match_end,
+        matched_text,
+        confidence,
+        is_direct_shell_true,
+        direct_shell_anchor,
+        alternate_start,
+        alternate_matched_text,
+    ) in _tm1_candidates(
+        content,
+        direct_shell_only=_direct_shell_only,
+        shell_content=shell_content,
+    ):
+        runtime_check()
+        variable_match = variable_matches.get((match_start, match_end))
+        if variable_match is not None and (match_start, match_end) in invisible_variable_matches:
+            continue
+        line_num = line_number(match_start)
+        classification_context = ctx(match_start)
+        context_text = (
+            _bounded_context(content, match_start)
+            if is_direct_shell_true
+            else classification_context
+        )
         matched = matched_text[:200]
         matched_line = _line_containing(content, match_start, match_end)
 
-        if (
-            _is_safe_container_command(context_text)
-            or _is_safe_dockerfile_idiom(context_text, matched)
-            or _is_safe_cache_cleanup(matched_line)
-        ):
-            adj = min(confidence, 0.15)
-            sev = Severity.LOW
-        else:
-            adj = (
-                min(1.0, confidence + 0.1)
-                if file_type in ("python", "shell", "javascript")
-                else confidence
+        if is_direct_shell_true:
+            safety = direct_safety_by_line.get(line_num)
+            if safety is None:
+                safety = (
+                    _is_safe_container_command(classification_context)
+                    or _is_safe_dockerfile_idiom(classification_context, matched),
+                    _is_safe_cache_cleanup(matched_line),
+                )
+                direct_safety_by_line[line_num] = safety
+            sev, adj = _classify_tm1(
+                classification_context,
+                matched,
+                matched_line,
+                confidence,
+                file_type,
+                safe_context=safety[0],
+                safe_matched_line=safety[1],
             )
-            sev = Severity.HIGH
-        candidate_key = (line_num, " ".join(matched.strip().split()))
+        else:
+            sev, adj = _classify_tm1(
+                classification_context,
+                matched,
+                matched_line,
+                confidence,
+                file_type,
+            )
+        candidate_identity = (
+            matched_text if is_direct_shell_true or variable_match is not None else matched
+        )
+        complete_identity_match = matched_text
+        candidate_key = (
+            line_num,
+            sha256(" ".join(candidate_identity.strip().split()).encode()).hexdigest(),
+        )
         existing = tm1_findings_by_key.get(candidate_key)
         if existing is not None:
             if adj > existing.confidence:
                 existing.confidence = adj
                 existing.severity = sev
             continue
+        evidence: dict[str, object] = {static_runner._VIEW_START_EVIDENCE: match_start}
+        if is_direct_shell_true:
+            canonical_start = (
+                alternate_start
+                if alternate_start is not None and alternate_start < match_start
+                else match_start
+            )
+            shell_match = (
+                _DIRECT_SHELL_TRUE_VALUE.match(content, direct_shell_anchor)
+                if direct_shell_anchor is not None
+                else None
+            )
+            canonical_match = (
+                content[canonical_start : shell_match.end()]
+                if shell_match is not None
+                else (
+                    alternate_matched_text
+                    if alternate_start is not None
+                    and alternate_start < match_start
+                    and alternate_matched_text is not None
+                    else matched_text
+                )
+            )
+            complete_identity_match = normalized_security_view(canonical_match).text
+            reach_end = content.find(")", match_start)
+            reach_terminated = reach_end != -1
+            if not reach_terminated:
+                reach_end = len(content)
+            evidence.update(
+                {
+                    static_runner._PRESERVE_SOURCE_START_EVIDENCE: True,
+                    static_runner._VIEW_REACH_END_EVIDENCE: reach_end,
+                    static_runner._VIEW_REPLACEMENT_START_LIMIT_EVIDENCE: max(
+                        0,
+                        len(content) - len("True"),
+                    ),
+                    LEXICAL_REACH_TERMINATED_EVIDENCE: reach_terminated,
+                    LEXICAL_DIRECT_SHELL_EVIDENCE: True,
+                    LEXICAL_NORMALIZED_MATCH_EVIDENCE: normalized_security_prefix(
+                        canonical_match,
+                        200,
+                    ),
+                }
+            )
+            if direct_shell_anchor is not None:
+                evidence[static_runner._VIEW_ANCHOR_EVIDENCE] = direct_shell_anchor
+            if alternate_start is not None:
+                evidence[static_runner._VIEW_ALTERNATE_START_EVIDENCE] = alternate_start
+            if alternate_matched_text is not None:
+                evidence[static_runner._ALTERNATE_MATCHED_TEXT_EVIDENCE] = alternate_matched_text[
+                    :200
+                ]
+        if variable_match is not None and defer_variable_reconciliation:
+            # Without Python bindings, keep only call-anchored windows for
+            # true-prefixed names; coalescing drops one a direct owner reports.
+            if file_type != "python" and not _is_true_prefixed_name(variable_match[0]):
+                continue
+            evidence[_VARIABLE_SHELL_FLAG_EVIDENCE] = variable_match[0]
+            evidence[static_runner._PRESERVE_SOURCE_START_EVIDENCE] = True
+            call_start = _variable_shell_call_start(variable_match[1])
+            if call_start is not None:
+                if variable_match[0].casefold().startswith("true"):
+                    evidence[static_runner._VIEW_START_EVIDENCE] = call_start
+                    # Like a direct owner, a call-anchored window keeps one
+                    # identity across raw and normalized security views.
+                    complete_identity_match = normalized_security_view(matched_text).text
+                evidence[static_runner._VIEW_ANCHOR_EVIDENCE] = call_start
         finding = AnalyzerFinding(
             rule_id="TM1",
             message="Tool Parameter Abuse",
@@ -2172,13 +5493,24 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             tags=tag,
             context=context_text,
             matched_text=matched,
-            evidence={static_runner._VIEW_START_EVIDENCE: match_start},
+            complete_match=complete_identity_match,
+            evidence=evidence,
         )
         tm1_findings_by_key[candidate_key] = finding
         findings.append(finding)
+
+    if _direct_shell_only:
+        return findings
+
     for pattern, confidence in TM2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in TM2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            runtime_check()
+            line_num = line_number(match.start())
             context_text = ctx(match.start())
             matched = match.group(0)[:200]
 
@@ -2198,11 +5530,21 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=context_text,
                     matched_text=matched,
+                    complete_match=match.group(0),
                 )
             )
-    for pattern, confidence in TM3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+    for pattern, confidence in _TM3_SHELL_PATTERNS if file_type == "shell" else TM3_PATTERNS:
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in TM3_PROSE_PATTERNS
+            else re.finditer
+        )
+        skip_assigned = (pattern, confidence) == _TM3_UMASK_CALL
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            runtime_check()
+            if skip_assigned and _is_assigned_value(content, match.start()):
+                continue
+            line_num = line_number(match.start())
             findings.append(
                 AnalyzerFinding(
                     rule_id="TM3",
@@ -2213,12 +5555,19 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
-    # TM4: privileged K8s workload. Example filtering is delegated to the runner.
+    # TM4: privileged K8s workload. Example filtering is delegated to the runner,
+    # which keeps reference material because it is part of the skill. Findings in
+    # top-level `references/` are tagged for triage only; the agent reads those
+    # files as instructions, so confidence and score are left unchanged.
+    reference_material = is_reference_material(file_path, file_type)
+    tm4_tags = [*tag, "contextual-triage", "likely-benign-context"] if reference_material else tag
     for pattern, confidence in TM4_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+            runtime_check()
+            line_num = line_number(match.start())
             findings.append(
                 AnalyzerFinding(
                     rule_id="TM4",
@@ -2226,16 +5575,1632 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     severity=Severity.HIGH,
                     location=loc(line_num),
                     confidence=confidence,
-                    tags=tag,
+                    tags=tm4_tags,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     return findings
 
 
+def coalesce_path_findings(content: str, findings: list[Finding]) -> list[Finding]:
+    """Select one owner per direct call without discarding private coordinates."""
+    from . import static_python_shell_truthiness
+
+    full_match_identities = {
+        finding.finding_id: finding.match_fingerprint
+        for finding in findings
+        if finding.match_fingerprint is not None
+    }
+    bound_call_starts = {
+        call_start
+        for finding in findings
+        if finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is True
+        and type(
+            call_start := finding.evidence.get(
+                static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE
+            )
+        )
+        is int
+    }
+    # The case-insensitive direct ``shell=True`` pattern also matches a name
+    # spelled ``true``, so its lexical owner already reports that exact call
+    # even when no Python AST can reconcile the variable window.
+    true_name_call_starts = bound_call_starts | {
+        coordinate
+        for finding in findings
+        if finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is True
+        for key in (
+            static_runner._ABSOLUTE_START_EVIDENCE,
+            static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+        )
+        if type(coordinate := finding.evidence.get(key)) is int
+    }
+    findings = [
+        finding
+        for finding in findings
+        if not (
+            isinstance(variable_name := finding.evidence.get(_VARIABLE_SHELL_FLAG_EVIDENCE), str)
+            and finding.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE)
+            in (true_name_call_starts if variable_name.casefold() == "true" else bound_call_starts)
+        )
+    ]
+    canonical_bound_calls: dict[tuple[str, int, str], set[int]] = {}
+    for finding in findings:
+        canonical = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_CANONICAL_FINGERPRINT_EVIDENCE
+        )
+        call_start = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE)
+        if isinstance(canonical, str) and type(call_start) is int:
+            canonical_bound_calls.setdefault(
+                (finding.file, finding.start_line, canonical),
+                set(),
+            ).add(call_start)
+    colliding_bound_identities = {
+        key for key, call_starts in canonical_bound_calls.items() if len(call_starts) > 1
+    }
+
+    lexical_records: list[tuple[Finding, int]] = []
+    parents: dict[int, int] = {}
+
+    def find(coordinate: int) -> int:
+        parent = parents.setdefault(coordinate, coordinate)
+        while parent != coordinate:
+            grandparent = parents[parent]
+            parents[coordinate] = grandparent
+            coordinate = parent
+            parent = grandparent
+        return coordinate
+
+    def union(first: int, second: int) -> None:
+        first_root = find(first)
+        second_root = find(second)
+        if first_root == second_root:
+            return
+        canonical = min(first_root, second_root)
+        parents[max(first_root, second_root)] = canonical
+
+    for finding in findings:
+        if finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is not True:
+            continue
+        start = finding.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE)
+        if type(start) is int:
+            find(start)
+            alternate_start = finding.evidence.get(static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE)
+            if type(alternate_start) is int:
+                union(start, alternate_start)
+            lexical_records.append((finding, start))
+
+    lexical_groups: dict[int, list[Finding]] = {}
+    for finding, start in lexical_records:
+        lexical_groups.setdefault(find(start), []).append(finding)
+
+    severity_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+
+    def lexical_owner_rank(
+        finding: Finding,
+        call_start: int,
+    ) -> tuple[bool, bool, bool, int, float]:
+        """Rank public classification donors independently of scan order."""
+        return (
+            finding.evidence.get(LEXICAL_RAW_OWNER_EVIDENCE) is True,
+            "normalized-view" not in finding.tags,
+            finding.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE) == call_start,
+            severity_rank.get(finding.severity, -1),
+            finding.confidence,
+        )
+
+    def select_lexical_owner(group: list[Finding], call_start: int) -> Finding:
+        return max(
+            enumerate(group),
+            key=lambda item: (*lexical_owner_rank(item[1], call_start), -item[0]),
+        )[1]
+
+    def fingerprint_source_rank(
+        finding: Finding,
+        call_start: int,
+    ) -> tuple[bool, bool, int, bool, int]:
+        """Rank immutable identity donors independently of scan order."""
+        anchor = finding.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE)
+        reach_end = finding.evidence.get(static_runner._ABSOLUTE_REACH_END_EVIDENCE)
+        return (
+            finding.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE) == call_start,
+            "normalized-view" in finding.tags,
+            anchor if type(anchor) is int else -1,
+            finding.evidence.get(LEXICAL_REACH_TERMINATED_EVIDENCE) is True,
+            reach_end if type(reach_end) is int else -1,
+        )
+
+    def fingerprint_record_rank(
+        record: dict[str, object],
+        call_start: int,
+    ) -> tuple[bool, bool, int, bool, int]:
+        """Re-rank a retained identity donor at the current group coordinate."""
+        anchor = record.get("anchor")
+        reach_end = record.get("reach_end")
+        return (
+            record.get("start") == call_start,
+            record.get("normalized") is True,
+            anchor if type(anchor) is int else -1,
+            record.get("reach_terminated") is True,
+            reach_end if type(reach_end) is int else -1,
+        )
+
+    def classification_record(
+        finding: Finding,
+    ) -> dict[str, object]:
+        """Snapshot the bounded public fields needed across cap finalizers."""
+        return {
+            "severity": finding.severity,
+            "confidence": finding.confidence,
+            "base_tags": tuple(finding.tags),
+            "tags": tuple(finding.tags),
+            "raw_owner": finding.evidence.get(LEXICAL_RAW_OWNER_EVIDENCE) is True,
+            "raw_view": "normalized-view" not in finding.tags,
+            "start": finding.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE),
+        }
+
+    def classification_record_rank(
+        record: dict[str, object],
+        call_start: int,
+    ) -> tuple[bool, bool, bool, int, float]:
+        """Re-rank a retained public donor at the current group coordinate."""
+        severity = record.get("severity")
+        confidence = record.get("confidence")
+        return (
+            record.get("raw_owner") is True,
+            record.get("raw_view") is True,
+            record.get("start") == call_start,
+            severity_rank.get(severity, -1) if isinstance(severity, str) else -1,
+            (
+                float(confidence)
+                if isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
+                else -1.0
+            ),
+        )
+
+    def select_fingerprint_source(group: list[Finding], call_start: int) -> Finding:
+        """Prefer the canonical-coordinate normalized match, independent of scan order."""
+        return max(
+            enumerate(group),
+            key=lambda item: (*fingerprint_source_rank(item[1], call_start), -item[0]),
+        )[1]
+
+    def lexical_fingerprint(finding: Finding) -> str | None:
+        """Hash immutable lexical text instead of a prior coalescing override."""
+        canonical_match = finding.evidence.get(LEXICAL_NORMALIZED_MATCH_EVIDENCE)
+        if not isinstance(canonical_match, str) and finding.matched_text is None:
+            return finding.fingerprint()
+        if not isinstance(canonical_match, str):
+            canonical_match = normalized_security_prefix(finding.matched_text or "", 200)
+        normalized = " ".join(canonical_match.strip().split())
+        return sha256(f"{finding.rule_id}\x1f{normalized}".encode()).hexdigest()
+
+    def actual_shell_is_reachable(
+        candidate: Finding,
+        shell_value_start: int,
+        direct_match_end: int,
+    ) -> bool | None:
+        """Compare an AST shell value with this candidate's exact regex reach."""
+        reach_end = candidate.evidence.get(static_runner._ABSOLUTE_REACH_END_EVIDENCE)
+        reach_terminated = candidate.evidence.get(LEXICAL_REACH_TERMINATED_EVIDENCE)
+        if type(reach_end) is not int or type(reach_terminated) is not bool:
+            return None
+        replacement_start_limit = candidate.evidence.get(
+            static_runner._ABSOLUTE_REPLACEMENT_START_LIMIT_EVIDENCE
+        )
+        if type(replacement_start_limit) is int and shell_value_start > replacement_start_limit:
+            replacement_recovery_start = candidate.evidence.get(
+                static_runner._ABSOLUTE_REPLACEMENT_RECOVERY_START_EVIDENCE
+            )
+            if type(replacement_recovery_start) is not int or not any(
+                type(candidate_start) is int and candidate_start >= replacement_recovery_start
+                for candidate_start in (
+                    candidate.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE),
+                    candidate.evidence.get(static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE),
+                )
+            ):
+                return False
+        if reach_terminated:
+            return reach_end > shell_value_start
+        return reach_end >= direct_match_end
+
+    lexical_owners: dict[int, Finding] = {}
+    lexical_member_starts: dict[str, int] = {}
+    for call_start, group in lexical_groups.items():
+        owner = select_lexical_owner(group, call_start)
+        canonical = select_fingerprint_source(group, call_start)
+        if "normalized-view" not in owner.tags:
+            owner.evidence[LEXICAL_RAW_OWNER_EVIDENCE] = True
+        owner_start = owner.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE)
+        if owner is not canonical:
+            # Coalescing can run repeatedly while a finding cap is being
+            # finalized. Persist the canonical identity coordinates on the
+            # retained public owner even when both candidates start together,
+            # otherwise a later pass re-hashes the earlier lexical lookalike.
+            canonical_match = canonical.evidence.get(LEXICAL_NORMALIZED_MATCH_EVIDENCE)
+            if isinstance(canonical_match, str):
+                owner.evidence[LEXICAL_NORMALIZED_MATCH_EVIDENCE] = canonical_match
+            for evidence_key in (
+                static_runner._ABSOLUTE_ANCHOR_EVIDENCE,
+                static_runner._ABSOLUTE_REACH_END_EVIDENCE,
+                static_runner._ABSOLUTE_REPLACEMENT_START_LIMIT_EVIDENCE,
+                static_runner._ABSOLUTE_REPLACEMENT_RECOVERY_START_EVIDENCE,
+                LEXICAL_REACH_TERMINATED_EVIDENCE,
+            ):
+                if evidence_key in canonical.evidence:
+                    owner.evidence[evidence_key] = canonical.evidence[evidence_key]
+                else:
+                    owner.evidence.pop(evidence_key, None)
+        if (
+            owner is not canonical
+            and type(owner_start) is int
+            and owner_start != call_start
+            and canonical.matched_text is not None
+        ):
+            # A raw bare-Popen owner can be the only classification context
+            # that existed before a cross-window normalized qualifier was
+            # reconstructed. Preserve that public owner while borrowing only
+            # the canonical call identity from the derived candidate.
+            owner.matched_text = canonical.matched_text
+            owner.finding = canonical.finding
+            owner.evidence[static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE] = call_start
+            if "normalized-view" in canonical.tags and "normalized-view" not in owner.tags:
+                owner.tags.append("normalized-view")
+        lexical_canonical_fingerprint = lexical_fingerprint(canonical)
+        complete_identity = full_match_identities.get(canonical.finding_id)
+        owner.match_fingerprint = (
+            complete_identity
+            if isinstance(complete_identity, str)
+            else lexical_canonical_fingerprint
+        )
+        lexical_owners[call_start] = owner
+        lexical_member_starts.update((candidate.finding_id, call_start) for candidate in group)
+
+    ast_call_starts: set[int] = set()
+    ast_owners: dict[str, Finding] = {}
+    for finding in findings:
+        if finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is not True:
+            continue
+        canonical_fingerprint = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_CANONICAL_FINGERPRINT_EVIDENCE
+        )
+        lexical_identity = finding.evidence.get(LEXICAL_BOUND_IDENTITY_EVIDENCE)
+        previously_reachable = finding.evidence.get(LEXICAL_BOUND_REACHABLE_EVIDENCE) is True
+        complete_identity = full_match_identities.get(finding.finding_id)
+        canonical_collision = (
+            isinstance(canonical_fingerprint, str)
+            and (
+                finding.file,
+                finding.start_line,
+                canonical_fingerprint,
+            )
+            in colliding_bound_identities
+        )
+        fingerprint = (
+            lexical_identity
+            if isinstance(lexical_identity, str)
+            else complete_identity
+            if canonical_collision and isinstance(complete_identity, str)
+            else canonical_fingerprint
+        )
+        if canonical_collision and isinstance(fingerprint, str):
+            finding.evidence[LEXICAL_BOUND_IDENTITY_EVIDENCE] = fingerprint
+        if isinstance(fingerprint, str):
+            finding.match_fingerprint = fingerprint
+        ast_call_start = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE
+        )
+        ast_call_end = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_END_EVIDENCE)
+        direct_match_end = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_DIRECT_MATCH_END_EVIDENCE
+        )
+        popen_start = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_POPEN_START_EVIDENCE
+        )
+        shell_anchor = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_SHELL_ANCHOR_EVIDENCE
+        )
+        ast_owner: Finding | None = None
+        if type(ast_call_start) is int:
+            ast_call_starts.add(ast_call_start)
+            lexical_coordinates = [ast_call_start]
+            if type(popen_start) is int:
+                # Parenthesized, spaced, and explicitly continued receivers
+                # can only be recognized lexically from the method token. That
+                # token still belongs to this parsed call even when a quoted
+                # trailing ``shell=True`` produces a different shell anchor.
+                ast_call_starts.add(popen_start)
+                lexical_coordinates.append(popen_start)
+            coordinate_groups = [
+                (coordinate, lexical_groups[coordinate])
+                for coordinate in lexical_coordinates
+                if coordinate in lexical_groups
+            ]
+            exact_group = [
+                candidate
+                for _, group in coordinate_groups
+                for candidate in group
+                if type(shell_anchor) is int
+                and candidate.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE) == shell_anchor
+            ]
+            if exact_group:
+                ast_owner = select_lexical_owner(exact_group, ast_call_start)
+                ast_owners[finding.finding_id] = ast_owner
+                finding.evidence.pop(LEXICAL_BOUND_IDENTITY_EVIDENCE, None)
+                finding.evidence.pop(LEXICAL_BOUND_IDENTITY_SOURCE_EVIDENCE, None)
+                finding.evidence.pop(LEXICAL_BOUND_CLASSIFICATION_EVIDENCE, None)
+            elif type(shell_anchor) is int and type(direct_match_end) is int:
+                # The legacy regex stops at the first nested ``)``. If an
+                # earlier parenthesized argument contains ``shell=True``, a
+                # direct literal is therefore fingerprinted from that retained
+                # same-call prefix in every file type. Keep a bound-name call
+                # on that established identity without borrowing its public
+                # text, tags, or classification. Exact coordinates exclude a
+                # separate nested call that happens to appear in the arguments.
+                same_call_candidates = [
+                    candidate for _, group in coordinate_groups for candidate in group
+                ]
+                shell_value_start = direct_match_end - len("True")
+                reachability = [
+                    actual_shell_is_reachable(
+                        candidate,
+                        shell_value_start,
+                        direct_match_end,
+                    )
+                    for candidate in same_call_candidates
+                ]
+                actual_shell_is_unreachable = bool(same_call_candidates) and all(
+                    type(
+                        candidate_anchor := candidate.evidence.get(
+                            static_runner._ABSOLUTE_ANCHOR_EVIDENCE
+                        )
+                    )
+                    is int
+                    and ast_call_start <= candidate_anchor < shell_anchor
+                    and (type(ast_call_end) is not int or candidate_anchor < ast_call_end)
+                    and reachable is False
+                    for candidate, reachable in zip(
+                        same_call_candidates,
+                        reachability,
+                        strict=True,
+                    )
+                )
+                if previously_reachable or any(reachable is True for reachable in reachability):
+                    finding.evidence[LEXICAL_BOUND_REACHABLE_EVIDENCE] = True
+                    finding.evidence.pop(LEXICAL_BOUND_IDENTITY_EVIDENCE, None)
+                    finding.evidence.pop(LEXICAL_BOUND_IDENTITY_SOURCE_EVIDENCE, None)
+                    finding.evidence.pop(LEXICAL_BOUND_CLASSIFICATION_EVIDENCE, None)
+                    if isinstance(canonical_fingerprint, str):
+                        finding.match_fingerprint = canonical_fingerprint
+                elif actual_shell_is_unreachable:
+                    identity_coordinate = min(coordinate for coordinate, _ in coordinate_groups)
+                    identity_source = select_fingerprint_source(
+                        same_call_candidates,
+                        identity_coordinate,
+                    )
+                    public_owner = select_lexical_owner(
+                        same_call_candidates,
+                        identity_coordinate,
+                    )
+                    legacy_fingerprint = lexical_fingerprint(identity_source)
+                    if isinstance(legacy_fingerprint, str):
+                        identity_record: dict[str, object] = {
+                            "start": identity_source.evidence.get(
+                                static_runner._ABSOLUTE_START_EVIDENCE
+                            ),
+                            "normalized": "normalized-view" in identity_source.tags,
+                            "anchor": identity_source.evidence.get(
+                                static_runner._ABSOLUTE_ANCHOR_EVIDENCE
+                            ),
+                            "reach_terminated": identity_source.evidence.get(
+                                LEXICAL_REACH_TERMINATED_EVIDENCE
+                            ),
+                            "reach_end": identity_source.evidence.get(
+                                static_runner._ABSOLUTE_REACH_END_EVIDENCE
+                            ),
+                        }
+                        prior_identity_record = finding.evidence.get(
+                            LEXICAL_BOUND_IDENTITY_SOURCE_EVIDENCE
+                        )
+                        if not isinstance(prior_identity_record, dict) or (
+                            fingerprint_record_rank(identity_record, identity_coordinate)
+                            > fingerprint_record_rank(
+                                prior_identity_record,
+                                identity_coordinate,
+                            )
+                        ):
+                            finding.evidence[LEXICAL_BOUND_IDENTITY_EVIDENCE] = legacy_fingerprint
+                            finding.evidence[LEXICAL_BOUND_IDENTITY_SOURCE_EVIDENCE] = (
+                                identity_record
+                            )
+                        persisted_identity = finding.evidence.get(LEXICAL_BOUND_IDENTITY_EVIDENCE)
+                        if isinstance(persisted_identity, str):
+                            finding.match_fingerprint = persisted_identity
+
+                        prior_classification = finding.evidence.get(
+                            LEXICAL_BOUND_CLASSIFICATION_EVIDENCE
+                        )
+                        current_classification = classification_record(public_owner)
+                        if not isinstance(prior_classification, dict) or (
+                            classification_record_rank(
+                                current_classification,
+                                identity_coordinate,
+                            )
+                            > classification_record_rank(
+                                prior_classification,
+                                identity_coordinate,
+                            )
+                        ):
+                            prior_classification = current_classification
+
+                        base_tags = prior_classification.get("base_tags")
+                        projected_tags = (
+                            list(base_tags)
+                            if isinstance(base_tags, (list, tuple))
+                            and all(isinstance(tag, str) for tag in base_tags)
+                            else []
+                        )
+                        persisted_identity_record = finding.evidence.get(
+                            LEXICAL_BOUND_IDENTITY_SOURCE_EVIDENCE
+                        )
+                        if (
+                            isinstance(persisted_identity_record, dict)
+                            and persisted_identity_record.get("normalized") is True
+                            and persisted_identity_record.get("start") == identity_coordinate
+                            and prior_classification.get("start") != identity_coordinate
+                            and "normalized-view" not in projected_tags
+                        ):
+                            # This is the same projection performed above when
+                            # a raw bare-Popen owner and its normalized qualified
+                            # identity coexist in one pass. Re-derive it when
+                            # those bounded donors arrive in separate cap passes.
+                            projected_tags.append("normalized-view")
+                        prior_classification["tags"] = tuple(projected_tags)
+                        finding.evidence[LEXICAL_BOUND_CLASSIFICATION_EVIDENCE] = (
+                            prior_classification
+                        )
+        if ast_owner is not None and isinstance(canonical_fingerprint, str):
+            ast_owner.match_fingerprint = canonical_fingerprint
+
+    reconciled: list[Finding] = []
+    emitted_call_starts: set[int] = set()
+    for finding in findings:
+        is_ast = finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is True
+        ast_call_start = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE
+        )
+        ast_owner = ast_owners.get(finding.finding_id)
+        if is_ast:
+            if type(ast_call_start) is int and ast_call_start in emitted_call_starts:
+                continue
+            if ast_owner is not None:
+                reconciled.append(ast_owner)
+            else:
+                reconciled.append(finding)
+            if type(ast_call_start) is int:
+                emitted_call_starts.add(ast_call_start)
+            continue
+        lexical_start = lexical_member_starts.get(finding.finding_id)
+        if lexical_start is not None:
+            if lexical_start not in ast_call_starts and lexical_start not in emitted_call_starts:
+                reconciled.append(lexical_owners[lexical_start])
+                emitted_call_starts.add(lexical_start)
+            continue
+        reconciled.append(finding)
+
+    source_line_starts = (0, *(match.end() for match in LOGICAL_LINE_BREAK.finditer(content)))
+    tm1_slots: list[int] = []
+    tm1_by_source: list[tuple[int, int, Finding]] = []
+    for index, finding in enumerate(reconciled):
+        if finding.rule_id != "TM1":
+            continue
+        bound_start = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE)
+        lexical_coordinate = finding.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE)
+        source_start = (
+            bound_start
+            if type(bound_start) is int
+            else lexical_coordinate
+            if type(lexical_coordinate) is int
+            else None
+        )
+        if source_start is None:
+            line_index = min(max(finding.start_line - 1, 0), len(source_line_starts) - 1)
+            source_start = source_line_starts[line_index]
+            if type(finding.start_column) is int and finding.start_column > 0:
+                source_start += finding.start_column
+        tm1_slots.append(index)
+        tm1_by_source.append((source_start, index, finding))
+    for slot, (_, _, finding) in zip(
+        tm1_slots,
+        sorted(tm1_by_source, key=lambda item: (item[0], item[1])),
+        strict=True,
+    ):
+        reconciled[slot] = finding
+    public: list[Finding] = []
+    seen_direct_calls: set[tuple[str, int, str | None]] = set()
+    for finding in reconciled:
+        is_direct_shell = (
+            finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is True
+            or finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is True
+        )
+        if finding.rule_id != "TM1" or not is_direct_shell:
+            public.append(finding)
+            continue
+        key = (finding.file, finding.start_line, finding.fingerprint())
+        if key in seen_direct_calls:
+            continue
+        seen_direct_calls.add(key)
+        public.append(finding)
+    return public
+
+
+def _owning_raw_window(
+    content: str,
+    source_start: int,
+) -> tuple[int, int, int, int]:
+    """Return the raw and owned bounds used by the ordinary window scanner."""
+    if len(content) <= static_runner.SECURITY_VIEW_WINDOW_CHARS:
+        return 0, len(content), 0, len(content)
+    owned_start = (
+        source_start // static_runner._RAW_WINDOW_OWNED_CHARS
+    ) * static_runner._RAW_WINDOW_OWNED_CHARS
+    owned_end = min(len(content), owned_start + static_runner._RAW_WINDOW_OWNED_CHARS)
+    raw_start = max(0, owned_start - static_runner._WINDOW_OVERLAP_CHARS)
+    raw_end = min(len(content), owned_end + static_runner._WINDOW_OVERLAP_CHARS)
+    return raw_start, raw_end, owned_start, owned_end
+
+
+def _window_popen_qualifiers(
+    content: str,
+    popen_starts: set[int],
+    check_runtime: Callable[[], None],
+    source_context: static_runner._WindowSourceContext,
+) -> dict[int, tuple[int, int, str, str, bool, bool]]:
+    """Replay each owning bounded window once for retained Popen anchors."""
+    targets_by_window: dict[tuple[int, int, int, int], set[int]] = {}
+    for popen_start in popen_starts:
+        bounds = _owning_raw_window(content, popen_start)
+        targets_by_window.setdefault(bounds, set()).add(popen_start)
+
+    qualifiers: dict[int, tuple[int, int, str, str, bool, bool]] = {}
+    qualified_pattern = DIRECT_SHELL_TRUE_PATTERNS[0][0]
+    for (raw_start, raw_end, owned_start, owned_end), targets in targets_by_window.items():
+        check_runtime()
+        raw_window = content[raw_start:raw_end]
+        context_prefix = static_runner._markdown_context_prefix(
+            content,
+            raw_start,
+            raw_end,
+            source_context.fence_states,
+            source_context.fence_transitions,
+        )
+        for raw_view in security_text_views(context_prefix + raw_window):
+            full_view = static_runner._window_view_with_markdown_context(
+                raw_view,
+                len(context_prefix),
+            )
+            check_runtime()
+            for view in static_runner._bounded_view_slices(full_view):
+                check_runtime()
+                for match in re.finditer(
+                    qualified_pattern, view.text, re.IGNORECASE | re.MULTILINE
+                ):
+                    method = re.match(
+                        r"subprocess\.(?P<method>\w+)",
+                        match.group(0),
+                        re.IGNORECASE,
+                    )
+                    if method is None or method.group("method").casefold() != "popen":
+                        continue
+                    derived_popen_start = match.start() + method.start("method")
+                    popen_start = raw_start + view.source_offset(derived_popen_start)
+                    if popen_start not in targets:
+                        continue
+                    qualifier_start = raw_start + view.source_offset(match.start())
+                    qualifier_end = raw_start + view.source_offset(derived_popen_start - 1) + 1
+                    qualifier_text = view.text[match.start() : derived_popen_start]
+                    raw_match_end = raw_start + view.source_offset(match.end() - 1) + 1
+                    requires_derived_match = (
+                        view.name != "raw"
+                        and match.group(0) != content[qualifier_start:raw_match_end]
+                    )
+                    candidate = (
+                        qualifier_start,
+                        qualifier_end,
+                        qualifier_text,
+                        match.group(0),
+                        requires_derived_match,
+                        owned_start <= qualifier_start < owned_end,
+                    )
+                    previous = qualifiers.get(popen_start)
+                    if previous is None or (candidate[4], candidate[5]) > (
+                        previous[4],
+                        previous[5],
+                    ):
+                        qualifiers[popen_start] = candidate
+    return qualifiers
+
+
+def _cross_window_subprocess_qualifiers(
+    content: str,
+    popen_anchors: dict[int, int],
+    check_runtime: Callable[[], None],
+) -> dict[int, tuple[int, int, str, str, bool]]:
+    """Recover retained qualifiers while replaying each shared projection once."""
+    qualifiers: dict[int, tuple[int, int, str, str, bool]] = {}
+    qualified_pattern = DIRECT_SHELL_TRUE_PATTERNS[0][0]
+    targets_by_run: dict[tuple[int, int], dict[int, int]] = {}
+    runs_by_anchor = static_runner._continuity_runs_for_anchors(
+        content,
+        set(popen_anchors.values()),
+        check_runtime,
+    )
+    for popen_start, anchor in popen_anchors.items():
+        run = runs_by_anchor.get(anchor)
+        if run is not None:
+            targets_by_run.setdefault(run, {})[popen_start] = anchor
+
+    for _, projection_target_anchors in sorted(targets_by_run.items()):
+        projection_targets = set(projection_target_anchors)
+        projection = static_runner._anchored_continuity_view(
+            content,
+            min(projection_target_anchors.values()),
+            check_runtime,
+        )
+        if projection is None or not projection.text or projection.source_offsets is None:
+            continue
+
+        for full_view in security_text_views(projection.text):
+            for view in static_runner._bounded_view_slices(full_view):
+                check_runtime()
+                for match in re.finditer(
+                    qualified_pattern,
+                    view.text,
+                    re.IGNORECASE | re.MULTILINE,
+                ):
+                    method = re.match(
+                        r"subprocess\.(?P<method>\w+)",
+                        match.group(0),
+                        re.IGNORECASE,
+                    )
+                    if method is None or method.group("method").casefold() != "popen":
+                        continue
+                    derived_popen_start = match.start() + method.start("method")
+                    projected_popen_start = view.source_offset(derived_popen_start)
+                    raw_popen_start = projection.source_offset(projected_popen_start)
+                    if raw_popen_start not in projection_targets or raw_popen_start in qualifiers:
+                        continue
+                    projected_start = view.source_offset(match.start())
+                    projected_end = view.source_offset(derived_popen_start - 1)
+                    qualifiers[raw_popen_start] = (
+                        projection.source_offset(projected_start),
+                        projection.source_offset(projected_end) + 1,
+                        view.text[match.start() : derived_popen_start],
+                        match.group(0),
+                        True,
+                    )
+    return qualifiers
+
+
+def reconcile_retained_findings(
+    content: str,
+    findings: list[Finding],
+    check_runtime: Callable[[], None],
+    source_context: static_runner._WindowSourceContext,
+) -> None:
+    """Finalize retained bare-Popen identity without discovering new findings."""
+    retained: list[tuple[Finding, int, int]] = []
+    for finding in findings:
+        if (
+            finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is not True
+            or re.match(r"Popen\b", finding.matched_text or "", re.IGNORECASE) is None
+        ):
+            continue
+        coordinates = [
+            coordinate
+            for key in (
+                static_runner._ABSOLUTE_START_EVIDENCE,
+                static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+            )
+            if type(coordinate := finding.evidence.get(key)) is int
+        ]
+        if coordinates:
+            popen_start = max(coordinates)
+            shell_anchor = finding.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE)
+            retained.append(
+                (
+                    finding,
+                    popen_start,
+                    shell_anchor if type(shell_anchor) is int else popen_start,
+                )
+            )
+
+    window_qualifiers = _window_popen_qualifiers(
+        content,
+        {popen_start for _, popen_start, _ in retained},
+        check_runtime,
+        source_context,
+    )
+    cross_window_qualifiers = _cross_window_subprocess_qualifiers(
+        content,
+        {popen_start: continuity_anchor for _, popen_start, continuity_anchor in retained},
+        check_runtime,
+    )
+    for finding, popen_start, _ in retained:
+        check_runtime()
+        window_qualifier = window_qualifiers.get(popen_start)
+        cross_window_qualifier = cross_window_qualifiers.get(popen_start)
+        if cross_window_qualifier is not None:
+            qualifier = cross_window_qualifier
+            update_public_match = True
+        elif window_qualifier is not None:
+            (
+                qualifier_start,
+                qualifier_end,
+                qualifier_text,
+                canonical_match,
+                normalized_view,
+                qualifier_owned,
+            ) = window_qualifier
+            update_public_match = normalized_view or qualifier_owned
+            qualifier = (
+                qualifier_start,
+                qualifier_end,
+                qualifier_text,
+                canonical_match,
+                normalized_view,
+            )
+        else:
+            qualifier = None
+            update_public_match = False
+        if qualifier is None:
+            continue
+        qualifier_start, _, _, canonical_match, normalized_view = qualifier
+        canonical_projection = normalized_security_view(canonical_match).text
+        canonical_preview = canonical_projection[:200]
+        finding.evidence[LEXICAL_NORMALIZED_MATCH_EVIDENCE] = canonical_preview
+        if update_public_match:
+            finding.matched_text = canonical_preview
+            finding.finding = canonical_preview
+        finding.evidence[static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE] = qualifier_start
+        finding.match_fingerprint = sha256(
+            f"{finding.rule_id}\x1f{' '.join(canonical_projection.strip().split())}".encode()
+        ).hexdigest()
+        if normalized_view and "normalized-view" not in finding.tags:
+            finding.tags.append("normalized-view")
+
+
+def _lexical_call_start(finding: Finding) -> int | None:
+    """Return a lexical owner's canonical call coordinate."""
+    coordinates = (
+        coordinate
+        for key in (
+            static_runner._ABSOLUTE_START_EVIDENCE,
+            static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+        )
+        if type(coordinate := finding.evidence.get(key)) is int
+    )
+    return min(coordinates, default=None)
+
+
+def _internal_evidence_keys() -> tuple[str, ...]:
+    """Return private reconciliation keys that must not escape public findings."""
+    from . import static_python_shell_truthiness
+
+    return (
+        _VARIABLE_SHELL_FLAG_EVIDENCE,
+        LEXICAL_DIRECT_SHELL_EVIDENCE,
+        LEXICAL_RAW_OWNER_EVIDENCE,
+        LEXICAL_NORMALIZED_MATCH_EVIDENCE,
+        LEXICAL_BOUND_IDENTITY_EVIDENCE,
+        LEXICAL_BOUND_IDENTITY_SOURCE_EVIDENCE,
+        LEXICAL_BOUND_CLASSIFICATION_EVIDENCE,
+        LEXICAL_REACH_TERMINATED_EVIDENCE,
+        LEXICAL_BOUND_REACHABLE_EVIDENCE,
+        static_python_shell_truthiness.BOUND_SHELL_EVIDENCE,
+        static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE,
+        static_python_shell_truthiness.BOUND_CALL_END_EVIDENCE,
+        static_python_shell_truthiness.BOUND_SHELL_ANCHOR_EVIDENCE,
+        static_python_shell_truthiness.BOUND_CANONICAL_FINGERPRINT_EVIDENCE,
+        static_python_shell_truthiness.BOUND_NORMALIZED_VIEW_EVIDENCE,
+        static_python_shell_truthiness.BOUND_CLASSIFICATION_MATCH_EVIDENCE,
+        static_python_shell_truthiness.BOUND_DIRECT_MATCH_END_EVIDENCE,
+        static_python_shell_truthiness.BOUND_POPEN_START_EVIDENCE,
+        static_python_shell_truthiness.BOUND_DIRECT_OWNER_START_EVIDENCE,
+        static_python_shell_truthiness.BOUND_SHELL_VALUE_START_EVIDENCE,
+        static_python_shell_truthiness.BOUND_SHELL_VALUE_END_EVIDENCE,
+        static_python_shell_truthiness.DIRECT_LITERAL_METADATA_EVIDENCE,
+        static_runner._VIEW_START_EVIDENCE,
+        static_runner._VIEW_ANCHOR_EVIDENCE,
+        static_runner._VIEW_ALTERNATE_START_EVIDENCE,
+        static_runner._VIEW_REACH_END_EVIDENCE,
+        static_runner._VIEW_REPLACEMENT_START_LIMIT_EVIDENCE,
+        static_runner._SOURCE_START_EVIDENCE,
+        static_runner._SOURCE_ANCHOR_EVIDENCE,
+        static_runner._SOURCE_ALTERNATE_START_EVIDENCE,
+        static_runner._SOURCE_REACH_END_EVIDENCE,
+        static_runner._SOURCE_REPLACEMENT_START_LIMIT_EVIDENCE,
+        static_runner._SOURCE_REPLACEMENT_RECOVERY_START_EVIDENCE,
+        static_runner._PRESERVE_SOURCE_START_EVIDENCE,
+        static_runner._ABSOLUTE_START_EVIDENCE,
+        static_runner._ABSOLUTE_ANCHOR_EVIDENCE,
+        static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+        static_runner._ABSOLUTE_REACH_END_EVIDENCE,
+        static_runner._ABSOLUTE_REPLACEMENT_START_LIMIT_EVIDENCE,
+        static_runner._ABSOLUTE_REPLACEMENT_RECOVERY_START_EVIDENCE,
+        static_runner._ALTERNATE_MATCHED_TEXT_EVIDENCE,
+    )
+
+
+def cleanup_path_findings(findings: list[Finding]) -> list[Finding]:
+    """Strip private reconciliation state when the analysis deadline has expired."""
+    internal_keys = _internal_evidence_keys()
+    for finding in findings:
+        for key in internal_keys:
+            finding.evidence.pop(key, None)
+    return findings
+
+
+class _DirectShellReplayLexical:
+    """Lexical-only facade used for direct-equivalent bounded windows."""
+
+    USES_PYTHON_SOURCE_TYPE = True
+
+    @staticmethod
+    def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+        return analyze(
+            content,
+            file_path,
+            file_type,
+            _direct_shell_only=True,
+        )
+
+
+def _bound_direct_replays(
+    content: str,
+    findings: list[Finding],
+    python_ast: ParsedPythonFile | None,
+    *,
+    started_at: float | None = None,
+    timeout_seconds: float | None = None,
+) -> dict[int, Finding]:
+    """Replay only retained owners in one cap-independent virtual artifact."""
+    from . import static_python_shell_truthiness
+
+    if python_ast is None or python_ast.tree is None:
+        return {}
+    retained_call_starts: set[int] = set()
+    file_path = "<unknown>"
+    for finding in findings:
+        if (
+            finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is not True
+            or finding.evidence.get(static_python_shell_truthiness.DIRECT_LITERAL_METADATA_EVIDENCE)
+            is True
+        ):
+            continue
+        call_start = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE)
+        if type(call_start) is int:
+            retained_call_starts.add(call_start)
+            file_path = finding.file
+    if not retained_call_starts:
+        return {}
+
+    budget_started_at = time.monotonic() if started_at is None else started_at
+    runtime_limit = static_runner.MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
+    if timeout_seconds is not None:
+        runtime_limit = min(runtime_limit, max(0.0, timeout_seconds))
+    replay_budget = static_runner._FindingBudget(
+        max_findings=static_runner.MAX_FILE_CHARS,
+        started_at=budget_started_at,
+        deadline=budget_started_at + runtime_limit,
+        clock=time.monotonic,
+    )
+    try:
+        specs = static_python_shell_truthiness.bound_shell_metadata(
+            python_ast,
+            file_path,
+            check_runtime=replay_budget.check_runtime,
+        )
+    except static_runner._StaticResourceLimitError:
+        return {}
+    if not specs:
+        return {}
+
+    cursor = 0
+    shift = 0
+    virtual_parts: list[str] = []
+    virtual_coordinates_by_call: dict[int, tuple[int, int | None, int]] = {}
+    try:
+        for spec in specs:
+            if spec.value_start < cursor:
+                # The supported straight-line grammar cannot overlap shell-name
+                # spans. Stay conservative if malformed coordinates ever do.
+                return {}
+            replay_budget.check_runtime()
+            virtual_parts.append(content[cursor : spec.value_start])
+            virtual_call_start = spec.call_start + shift
+            virtual_coordinates_by_call[spec.call_start] = (
+                virtual_call_start,
+                spec.popen_start + shift if spec.popen_start is not None else None,
+                spec.shell_anchor + shift,
+            )
+            virtual_parts.append("True")
+            cursor = spec.value_end
+            shift += len("True") - (spec.value_end - spec.value_start)
+        virtual_parts.append(content[cursor:])
+        virtual_content = "".join(virtual_parts)
+        replay_budget.check_runtime()
+    except static_runner._StaticResourceLimitError:
+        return {}
+    replacement_starts = [spec.value_start for spec in specs]
+    replacement_ends: list[int] = []
+    cumulative_deltas: list[int] = [0]
+    for spec in specs:
+        replacement_ends.append(spec.value_end)
+        cumulative_deltas.append(
+            cumulative_deltas[-1] + len("True") - (spec.value_end - spec.value_start)
+        )
+
+    def source_to_virtual_boundary(source_offset: int) -> int:
+        replacement_count = bisect_right(replacement_ends, source_offset)
+        return source_offset + cumulative_deltas[replacement_count]
+
+    def boundary_is_preserved(source_offset: int, virtual_offset: int) -> bool:
+        """Return whether a raw-window edge has one unambiguous virtual edge."""
+        replacement_index = bisect_right(replacement_starts, source_offset) - 1
+        if (
+            replacement_index >= 0
+            and replacement_starts[replacement_index]
+            < source_offset
+            < replacement_ends[replacement_index]
+        ):
+            return False
+        return source_to_virtual_boundary(source_offset) == virtual_offset
+
+    metadata_by_call = {spec.call_start: spec for spec in specs}
+    fixed_coordinates = {
+        coordinate
+        for finding in findings
+        if finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is True
+        and type(finding.evidence.get(static_runner._ABSOLUTE_REPLACEMENT_START_LIMIT_EVIDENCE))
+        is int
+        for key in (
+            static_runner._ABSOLUTE_START_EVIDENCE,
+            static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+        )
+        if type(coordinate := finding.evidence.get(key)) is int
+    }
+    retained_shell_anchors = {
+        spec.shell_anchor for spec in specs if spec.call_start in retained_call_starts
+    }
+    try:
+        continuity_runs = static_runner._continuity_runs_for_anchors(
+            content,
+            retained_shell_anchors,
+            replay_budget.check_runtime,
+        )
+    except static_runner._StaticResourceLimitError:
+        return {}
+    continuity_calls = {
+        spec.call_start
+        for spec in specs
+        if spec.call_start in retained_call_starts and spec.shell_anchor in continuity_runs
+    }
+    replay_targets: dict[int, int] = {}
+    target_calls: set[int] = set()
+    for call_start in retained_call_starts:
+        target_spec = metadata_by_call.get(call_start)
+        target_coordinates = virtual_coordinates_by_call.get(call_start)
+        if target_spec is None or target_coordinates is None:
+            continue
+        virtual_call_start, virtual_popen_start, _ = target_coordinates
+        related_fixed_boundary = bool(
+            {call_start, target_spec.popen_start}.difference({None}).intersection(fixed_coordinates)
+        )
+        source_coordinates = (call_start, target_spec.popen_start)
+        virtual_coordinates = (virtual_call_start, virtual_popen_start)
+        changes_outer_window = any(
+            not all(
+                boundary_is_preserved(source_boundary, virtual_boundary)
+                for source_boundary, virtual_boundary in zip(
+                    _owning_raw_window(content, source_coordinate),
+                    _owning_raw_window(virtual_content, virtual_coordinate),
+                    strict=True,
+                )
+            )
+            for source_coordinate, virtual_coordinate in zip(
+                source_coordinates,
+                virtual_coordinates,
+                strict=True,
+            )
+            if source_coordinate is not None and virtual_coordinate is not None
+        ) or (len(content) <= static_runner.SECURITY_VIEW_WINDOW_CHARS) != (
+            len(virtual_content) <= static_runner.SECURITY_VIEW_WINDOW_CHARS
+        )
+        call_end = (
+            target_spec.call_end if target_spec.call_end is not None else target_spec.value_end
+        )
+        try:
+            replay_budget.check_runtime()
+            call_text = content[target_spec.call_start : call_end]
+            call_has_derived_view = _has_derived_security_view(call_text)
+            call_has_direct_lookalike = _DIRECT_SHELL_TRUE_VALUE.search(call_text) is not None
+            replay_budget.check_runtime()
+        except static_runner._StaticResourceLimitError:
+            return {}
+        if not (
+            target_spec.normalized_view
+            or call_has_derived_view
+            or call_has_direct_lookalike
+            or related_fixed_boundary
+            or changes_outer_window
+            or call_start in continuity_calls
+        ):
+            continue
+        target_calls.add(call_start)
+        replay_targets[virtual_call_start] = call_start
+        if virtual_popen_start is not None:
+            replay_targets[virtual_popen_start] = call_start
+    if not target_calls:
+        return {}
+
+    source_line_starts = (
+        0,
+        *(match.end() for match in LOGICAL_LINE_BREAK.finditer(virtual_content)),
+    )
+    window_targets: dict[tuple[int, int, int, int], set[int]] = {}
+    for coordinate in replay_targets:
+        bounds = _owning_raw_window(virtual_content, coordinate)
+        window_targets.setdefault(bounds, set()).add(coordinate)
+
+    replay_candidates: list[Finding] = []
+    seen_candidates: set[static_runner._ViewFindingKey] = set()
+    whole_artifact_window = len(virtual_content) <= static_runner.SECURITY_VIEW_WINDOW_CHARS
+    try:
+        for (raw_start, raw_end, owned_start, owned_end), _ in window_targets.items():
+            replay_budget.check_runtime()
+            raw_window = virtual_content[raw_start:raw_end]
+            owned_source_start = owned_start - raw_start
+            owned_source_end = owned_end - raw_start
+            outer_right_boundary_is_fixed = raw_end < len(virtual_content) or (
+                whole_artifact_window
+                and len(virtual_content) == static_runner.SECURITY_VIEW_WINDOW_CHARS
+            )
+            right_boundary_recovery_start = (
+                owned_start + static_runner._RAW_WINDOW_OWNED_CHARS - raw_start
+                if raw_end < len(virtual_content)
+                else static_runner._RAW_WINDOW_OWNED_CHARS
+                if whole_artifact_window
+                and len(virtual_content) > static_runner.SECURITY_VIEW_WINDOW_CHARS - len("True")
+                else None
+            )
+            for full_view in security_text_views(raw_window):
+                full_view = static_runner._with_fixed_right_boundary(
+                    full_view,
+                    outer_right_boundary_is_fixed,
+                    right_boundary_recovery_start,
+                )
+                for view in static_runner._bounded_view_slices(full_view):
+                    replay_budget.check_runtime()
+                    view_findings, _ = static_runner._scan_view_windows(
+                        file_path,
+                        view,
+                        [_DirectShellReplayLexical],
+                        replay_budget,
+                        None,
+                        python_source=True,
+                        source_text=raw_window,
+                    )
+                    owned_findings: list[Finding] = []
+                    for replay in view_findings:
+                        source_start = replay.evidence.get(static_runner._SOURCE_START_EVIDENCE)
+                        if isinstance(source_start, int) and not (
+                            owned_source_start <= source_start < owned_source_end
+                        ):
+                            alternate_start = replay.evidence.get(
+                                static_runner._SOURCE_ALTERNATE_START_EVIDENCE
+                            )
+                            if not (
+                                isinstance(alternate_start, int)
+                                and owned_source_start <= alternate_start < owned_source_end
+                            ):
+                                continue
+                            replay.evidence[static_runner._SOURCE_START_EVIDENCE] = alternate_start
+                            replay.evidence[static_runner._SOURCE_ALTERNATE_START_EVIDENCE] = (
+                                source_start
+                            )
+                        owned_findings.append(replay)
+                    static_runner._restore_source_lines(
+                        owned_findings,
+                        raw_window=raw_window,
+                        window_line=1,
+                        view=view,
+                        window_start=raw_start,
+                        source_line_starts=source_line_starts,
+                    )
+                    for replay in owned_findings:
+                        candidate_coordinates = {
+                            coordinate
+                            for key in (
+                                static_runner._ABSOLUTE_START_EVIDENCE,
+                                static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+                            )
+                            if type(coordinate := replay.evidence.get(key)) is int
+                        }
+                        if not candidate_coordinates.intersection(replay_targets):
+                            continue
+                        key = static_runner._view_finding_key(replay)
+                        if key not in seen_candidates:
+                            seen_candidates.add(key)
+                            replay_candidates.append(replay)
+
+        for call_start in continuity_calls.intersection(target_calls):
+            replay_budget.check_runtime()
+            _, _, virtual_shell_anchor = virtual_coordinates_by_call[call_start]
+            projection = static_runner._anchored_continuity_view(
+                virtual_content,
+                virtual_shell_anchor,
+                replay_budget.check_runtime,
+            )
+            if projection is None or not projection.text or projection.source_offsets is None:
+                continue
+            projection_is_fixed = projection.source_offsets[-1] + 1 < len(virtual_content)
+            for full_view in security_text_views(projection.text):
+                full_view = SecurityTextView(
+                    name=f"continuity-{full_view.name}",
+                    text=full_view.text,
+                    source_offsets=full_view.source_offsets,
+                    right_boundary_is_fixed=projection_is_fixed,
+                )
+                for view in static_runner._bounded_view_slices(full_view):
+                    replay_budget.check_runtime()
+                    view_findings, _ = static_runner._scan_view_windows(
+                        file_path,
+                        view,
+                        [_DirectShellReplayLexical],
+                        replay_budget,
+                        None,
+                        python_source=True,
+                        source_text=projection.text,
+                    )
+                    static_runner._restore_source_lines(
+                        view_findings,
+                        raw_window=projection.text,
+                        window_line=1,
+                        view=view,
+                        start_source_offsets=projection.source_offsets,
+                    )
+                    for replay in view_findings:
+                        candidate_coordinates = {
+                            coordinate
+                            for key in (
+                                static_runner._ABSOLUTE_START_EVIDENCE,
+                                static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+                            )
+                            if type(coordinate := replay.evidence.get(key)) is int
+                        }
+                        if not candidate_coordinates.intersection(replay_targets):
+                            continue
+                        key = static_runner._view_finding_key(replay)
+                        if key not in seen_candidates:
+                            seen_candidates.add(key)
+                            replay_candidates.append(replay)
+    except static_runner._StaticResourceLimitError:
+        return {}
+
+    replay_findings = static_runner._deduplicate_view_findings(
+        coalesce_path_findings(virtual_content, replay_candidates)
+    )
+    replay_by_call: dict[int, Finding] = {}
+    for replay in replay_findings:
+        replay_coordinates = {
+            coordinate
+            for key in (
+                static_runner._ABSOLUTE_START_EVIDENCE,
+                static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE,
+            )
+            if type(coordinate := replay.evidence.get(key)) is int
+        }
+        for coordinate in sorted(replay_coordinates):
+            call_start = replay_targets.get(coordinate)
+            if call_start is not None:
+                spec = metadata_by_call[call_start]
+                _, _, virtual_shell_anchor = virtual_coordinates_by_call[call_start]
+                lexical_anchor = replay.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE)
+                if lexical_anchor == virtual_shell_anchor:
+                    replay.match_fingerprint = spec.canonical_fingerprint
+                    if spec.normalized_view and "normalized-view" not in replay.tags:
+                        replay.tags.append("normalized-view")
+                replay_by_call.setdefault(call_start, replay)
+                break
+    return replay_by_call
+
+
+def _bound_shell_call_key(call: ast.Call) -> tuple[int, int, int, int]:
+    """Return the call key shared with the flow-sensitive companion."""
+    return (
+        getattr(call, "lineno", 1),
+        getattr(call, "col_offset", 0),
+        getattr(call, "end_lineno", getattr(call, "lineno", 1)),
+        getattr(call, "end_col_offset", getattr(call, "col_offset", 0)),
+    )
+
+
+def _reconcile_variable_shell_findings(
+    content: str,
+    findings: list[Finding],
+    python_ast: ParsedPythonFile | None,
+) -> list[Finding]:
+    """Reconcile the bounded variable regex with the shared Python AST."""
+    marked = [
+        finding
+        for finding in findings
+        if isinstance(finding.evidence.get(_VARIABLE_SHELL_FLAG_EVIDENCE), str)
+    ]
+    if not marked:
+        return findings
+
+    file_path = marked[0].file
+    if python_ast is None or python_ast.tree is None:
+        return findings
+
+    from . import static_python_shell_truthiness
+
+    ast_index = _build_variable_shell_ast_index(python_ast)
+    if ast_index is None:
+        return findings
+    resolved: dict[tuple[int, str], list[_VariableShellCandidate]] = {}
+    for match in _variable_shell_matches(content):
+        assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
+        candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)
+        if candidate is not None:
+            call_span = _node_character_span(python_ast, candidate.call)
+            if call_span is not None:
+                resolved.setdefault((call_span[0], candidate.name), []).append(candidate)
+    ownership, emitted, cached_replacements = (
+        static_python_shell_truthiness.bound_shell_call_analysis(file_path, python_ast)
+    )
+    supported_calls = set(emitted)
+    retained_companion_starts: set[int] = set()
+    retained_companion_sources: set[tuple[int, str]] = set()
+    for finding in findings:
+        if finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is not True:
+            continue
+        start = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE)
+        end = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_END_EVIDENCE)
+        if type(start) is int and type(end) is int and 0 <= start < end <= len(content):
+            retained_companion_starts.add(start)
+            retained_companion_sources.add(
+                (bisect_right(python_ast.line_character_starts, start), content[start:end])
+            )
+    retained_emitted: set[tuple[int, int, int, int]] = set()
+    for key in emitted:
+        start = python_ast.line_character_starts[key[0] - 1] + (
+            python_ast.character_column(key[0], key[1]) or 0
+        )
+        end = python_ast.line_character_starts[key[2] - 1] + (
+            python_ast.character_column(key[2], key[3]) or 0
+        )
+        # The companion shares one report owner for identical same-line calls.
+        # Compare the complete raw source, since displayed previews can collide.
+        if (
+            start in retained_companion_starts
+            or (key[0], content[start:end]) in retained_companion_sources
+        ):
+            retained_emitted.add(key)
+    emitted = retained_emitted
+
+    reconciled: list[Finding] = []
+    for finding in findings:
+        variable_name = finding.evidence.get(_VARIABLE_SHELL_FLAG_EVIDENCE)
+        if not isinstance(variable_name, str):
+            reconciled.append(finding)
+            continue
+        call_start = finding.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE)
+        candidates = (
+            resolved.get((call_start, variable_name), []) if type(call_start) is int else []
+        )
+        if len(candidates) != 1:
+            reconciled.append(finding)
+            continue
+        candidate = candidates[0]
+        if not candidate.visible:
+            continue
+        call_key = _bound_shell_call_key(candidate.call)
+        if (
+            call_key in cached_replacements
+            or call_key in emitted
+            or _lexical_shell_has_counterevidence(
+                ast_index, python_ast, candidate, receiver_trusted=ownership.get(call_key)
+            )
+        ):
+            continue
+        if call_key in supported_calls:
+            retained_owner = static_python_shell_truthiness.bound_shell_finding_for_call(
+                file_path, python_ast, candidate.call
+            )
+            if retained_owner is not None:
+                replacement = static_runner.analyzer_finding_to_finding(retained_owner)
+                replacement.finding_id = finding.finding_id
+                reconciled.append(replacement)
+                continue
+        if variable_name.casefold().startswith("true"):
+            call = candidate.call
+            finding.start_line = getattr(call, "lineno", finding.start_line)
+            finding.end_line = getattr(call, "end_lineno", finding.end_line)
+            finding.start_column = python_ast.character_column(
+                finding.start_line, getattr(call, "col_offset", 0)
+            )
+            if finding.end_line is not None:
+                finding.end_column = python_ast.character_column(
+                    finding.end_line, getattr(call, "end_col_offset", 0)
+                )
+            call_source = python_ast.source_segment(call)
+            if call_source is not None:
+                finding.matched_text = call_source[:200]
+                finding.finding = call_source[:200]
+            if type(call_start) is int:
+                call_context = get_context(content, call_start)
+                finding.context = call_context
+                finding.code_snippet = call_context
+        reconciled.append(finding)
+    return reconciled
+
+
+def postprocess_path_findings(
+    content: str,
+    findings: list[Finding],
+    *,
+    python_ast: ParsedPythonFile | None = None,
+    started_at: float | None = None,
+    timeout_seconds: float | None = None,
+) -> list[Finding]:
+    """Finalize ownership, classification, and private TM1 coordinates."""
+    from . import static_python_shell_truthiness
+
+    findings = _reconcile_variable_shell_findings(content, findings, python_ast)
+    direct_replays = _bound_direct_replays(
+        content,
+        findings,
+        python_ast,
+        started_at=started_at,
+        timeout_seconds=timeout_seconds,
+    )
+    reconciled = coalesce_path_findings(content, findings)
+    if python_ast is not None:
+        direct_starts = {
+            start
+            for finding in reconciled
+            if finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is True
+            and type(start := _lexical_call_start(finding)) is int
+        }
+        direct_metadata = static_python_shell_truthiness.direct_literal_metadata(
+            python_ast,
+            next((finding.file for finding in reconciled), "<unknown>"),
+            direct_starts,
+        )
+        canonical_direct_calls: dict[tuple[str, int, str], set[int]] = {}
+        for finding in reconciled:
+            direct_call_start = _lexical_call_start(finding)
+            metadata = (
+                direct_metadata.get(direct_call_start) if type(direct_call_start) is int else None
+            )
+            if metadata is not None:
+                canonical_direct_calls.setdefault(
+                    (finding.file, finding.start_line, metadata.match_fingerprint),
+                    set(),
+                ).add(metadata.call_start)
+        colliding_direct_identities = {
+            key for key, call_starts in canonical_direct_calls.items() if len(call_starts) > 1
+        }
+        for finding in reconciled:
+            direct_call_start = _lexical_call_start(finding)
+            metadata = (
+                direct_metadata.get(direct_call_start) if type(direct_call_start) is int else None
+            )
+            lexical_anchor = finding.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE)
+            if metadata is None or lexical_anchor != metadata.shell_anchor:
+                continue
+            if (
+                finding.file,
+                finding.start_line,
+                metadata.match_fingerprint,
+            ) not in colliding_direct_identities:
+                finding.match_fingerprint = metadata.match_fingerprint
+            finding.evidence.update(
+                {
+                    static_python_shell_truthiness.BOUND_SHELL_EVIDENCE: True,
+                    static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE: metadata.call_start,
+                    static_python_shell_truthiness.DIRECT_LITERAL_METADATA_EVIDENCE: True,
+                }
+            )
+            if metadata.call_end is not None:
+                finding.evidence[static_python_shell_truthiness.BOUND_CALL_END_EVIDENCE] = (
+                    metadata.call_end
+                )
+            if metadata.normalized_view and "normalized-view" not in finding.tags:
+                finding.tags.append("normalized-view")
+            if metadata.normalized_view:
+                finding.evidence[static_python_shell_truthiness.BOUND_NORMALIZED_VIEW_EVIDENCE] = (
+                    True
+                )
+    safety_by_scope: dict[tuple[int, int, bool], tuple[bool, bool]] = {}
+    raw_lines_by_start: dict[int, tuple[str, ...]] = {}
+    source_line_starts = (0, *(match.end() for match in LOGICAL_LINE_BREAK.finditer(content)))
+
+    for finding in reconciled:
+        is_bound = finding.evidence.get(static_python_shell_truthiness.BOUND_SHELL_EVIDENCE) is True
+        if (
+            finding.evidence.get(LEXICAL_DIRECT_SHELL_EVIDENCE) is True
+            and "normalized-view" in finding.tags
+            and isinstance(
+                canonical_match := finding.evidence.get(LEXICAL_NORMALIZED_MATCH_EVIDENCE),
+                str,
+            )
+        ):
+            finding.matched_text = canonical_match
+            finding.finding = canonical_match
+        is_direct_literal = (
+            finding.evidence.get(static_python_shell_truthiness.DIRECT_LITERAL_METADATA_EVIDENCE)
+            is True
+        )
+        if is_bound and not is_direct_literal:
+            if (
+                finding.evidence.get(static_python_shell_truthiness.BOUND_NORMALIZED_VIEW_EVIDENCE)
+                is True
+                and "normalized-view" not in finding.tags
+            ):
+                finding.tags.append("normalized-view")
+            matched = (finding.matched_text or "")[:200]
+            classification_match = finding.evidence.get(
+                static_python_shell_truthiness.BOUND_CLASSIFICATION_MATCH_EVIDENCE,
+                matched,
+            )
+            if not isinstance(classification_match, str):
+                classification_match = matched
+            call_start = finding.evidence.get(
+                static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE
+            )
+            call_end = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_END_EVIDENCE)
+            classification_context = finding.context or ""
+            matched_line = matched
+            safe_context: bool | None = None
+            safe_matched_line: bool | None = None
+            if type(call_start) is int:
+                preserves_lexical_location = (
+                    finding.evidence.get(
+                        static_python_shell_truthiness.DIRECT_LITERAL_METADATA_EVIDENCE
+                    )
+                    is True
+                )
+                if not preserves_lexical_location:
+                    finding.start_line = bisect_right(source_line_starts, call_start)
+                    if type(call_end) is int and call_end > call_start:
+                        finding.end_line = bisect_right(source_line_starts, call_end - 1)
+                retained_start = finding.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE)
+                direct_owner_start = finding.evidence.get(
+                    static_python_shell_truthiness.BOUND_DIRECT_OWNER_START_EVIDENCE
+                )
+                classification_start = (
+                    retained_start
+                    if preserves_lexical_location and type(retained_start) is int
+                    else direct_owner_start
+                    if type(direct_owner_start) is int
+                    else call_start
+                )
+                direct_match_end = finding.evidence.get(
+                    static_python_shell_truthiness.BOUND_DIRECT_MATCH_END_EVIDENCE
+                )
+                popen_start = finding.evidence.get(
+                    static_python_shell_truthiness.BOUND_POPEN_START_EVIDENCE
+                )
+                _, qualifier_window_end = _raw_classification_bounds(content, call_start)
+                if (
+                    not preserves_lexical_location
+                    and classification_start == call_start
+                    and type(direct_match_end) is int
+                    and direct_match_end > qualifier_window_end
+                    and type(popen_start) is int
+                ):
+                    classification_start = popen_start
+                raw_start, raw_end = _raw_classification_bounds(content, classification_start)
+                classification_line = bisect_right(
+                    source_line_starts,
+                    classification_start,
+                )
+                normalized_view = (
+                    finding.evidence.get(
+                        static_python_shell_truthiness.BOUND_NORMALIZED_VIEW_EVIDENCE
+                    )
+                    is True
+                )
+                scope_key = (raw_start, classification_line, normalized_view)
+                safety = safety_by_scope.get(scope_key)
+                if safety is None:
+                    raw_lines = raw_lines_by_start.get(raw_start)
+                    if raw_lines is None:
+                        raw_lines = tuple(content[raw_start:raw_end].splitlines())
+                        raw_lines_by_start[raw_start] = raw_lines
+                    raw_start_line = bisect_right(source_line_starts, raw_start)
+                    local_line = classification_line - raw_start_line
+                    if 0 <= local_line < len(raw_lines):
+                        context_start = max(0, local_line - 3)
+                        context_end = min(len(raw_lines), local_line + 4)
+                        classification_context = "\n".join(raw_lines[context_start:context_end])
+                        matched_line = raw_lines[local_line]
+                    if normalized_view:
+                        classification_context = normalized_security_view(
+                            classification_context
+                        ).text
+                        matched_line = normalized_security_view(matched_line).text
+                        classification_match = normalized_security_view(classification_match).text
+                    safety = (
+                        _is_safe_container_command(classification_context)
+                        or _is_safe_dockerfile_idiom(
+                            classification_context,
+                            classification_match,
+                        ),
+                        _is_safe_cache_cleanup(matched_line),
+                    )
+                    safety_by_scope[scope_key] = safety
+                safe_context, safe_matched_line = safety
+            severity, finding.confidence = _classify_tm1(
+                classification_context,
+                classification_match,
+                matched_line,
+                (
+                    0.8
+                    if finding.evidence.get(
+                        static_python_shell_truthiness.DIRECT_LITERAL_METADATA_EVIDENCE
+                    )
+                    is True
+                    else finding.confidence
+                ),
+                "python",
+                safe_context=safe_context,
+                safe_matched_line=safe_matched_line,
+            )
+            finding.severity = severity.value
+        borrowed_classification = finding.evidence.get(LEXICAL_BOUND_CLASSIFICATION_EVIDENCE)
+        if isinstance(borrowed_classification, dict):
+            borrowed_severity = borrowed_classification.get("severity")
+            borrowed_confidence = borrowed_classification.get("confidence")
+            borrowed_tags = borrowed_classification.get("tags")
+            if isinstance(borrowed_severity, str):
+                finding.severity = borrowed_severity
+            if isinstance(borrowed_confidence, (int, float)) and not isinstance(
+                borrowed_confidence, bool
+            ):
+                finding.confidence = float(borrowed_confidence)
+            if isinstance(borrowed_tags, (list, tuple)) and all(
+                isinstance(tag, str) for tag in borrowed_tags
+            ):
+                finding.tags = list(borrowed_tags)
+        replay_call_start = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE
+        )
+        replay = (
+            direct_replays.get(replay_call_start)
+            if type(replay_call_start) is int and not is_direct_literal
+            else None
+        )
+        if replay is not None:
+            finding.match_fingerprint = replay.fingerprint()
+            finding.severity = replay.severity
+            finding.confidence = replay.confidence
+            finding.tags = list(replay.tags)
+    return cleanup_path_findings(reconciled)
+
+
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run tool_misuse patterns and return findings."""
-    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    from . import static_python_shell_truthiness
+
+    response = static_runner.run_static_patterns_with_ledger(
+        state,
+        [sys.modules[__name__], static_python_shell_truthiness],
+    )
     logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
     return response

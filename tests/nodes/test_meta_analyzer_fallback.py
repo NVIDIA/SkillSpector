@@ -239,6 +239,9 @@ class TestLLMFailurePassthrough:
             confidence=0.2,
             file="tool.py",
             start_line=3,
+            end_line=3,
+            start_column=4,
+            end_column=18,
             intent="malicious",
             evidence={"source": "static", "local_only": True},
             match_fingerprint="sha256:deterministic",
@@ -253,6 +256,7 @@ class TestLLMFailurePassthrough:
             assert clone.evidence == original.evidence
             assert clone.match_fingerprint == original.match_fingerprint
             assert clone.occurrences == original.occurrences
+            assert (clone.start_column, clone.end_column) == (4, 18)
 
     def test_meta_analyzer_llm_failure_uses_passthrough(self) -> None:
         """When LLM call raises, meta_analyzer passes all findings through."""

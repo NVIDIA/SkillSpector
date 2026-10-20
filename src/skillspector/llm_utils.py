@@ -17,8 +17,9 @@
 
 Credentials are resolved in this order:
     1. The active provider (see :mod:`skillspector.providers`):
-       - CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``): use
-         ``is_available()`` and ``complete()`` — no API key needed.
+       - CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
+         ``opencode_cli``): use ``is_available()`` and ``complete()`` — no
+         API key needed.
        - HTTP providers (``anthropic``, ``openai``, ``nv_build``): read their
          respective credential env vars and supply a base URL.
     2. ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` (the langchain-openai
@@ -37,17 +38,29 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import os
 import threading
 import weakref
 from collections.abc import Coroutine
 from typing import Any, NoReturn
 
+from google.auth.exceptions import RefreshError
+from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.runnables import Runnable
+from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
+from langchain_core.utils.function_calling import convert_to_openai_tool
 
-from skillspector.inference_usage import InferenceUsageCollector, provider_name
+from skillspector.constants import build_model_config
+from skillspector.inference_usage import (
+    InferenceUsageCollector,
+    chat_model_controls,
+    chat_model_requested_controls,
+    provider_name,
+)
+from skillspector.llm_provenance import LLM_ANALYZER_SLOTS
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
 from skillspector.providers import (
+    UnknownProviderError,
     create_chat_model,
     create_chat_model_with_provider,
     get_active_provider,
@@ -58,6 +71,8 @@ from skillspector.providers import (
     resolve_chat_model_credentials,
     resolve_provider_credentials,
 )
+from skillspector.providers.chat_models import UnsupportedControlError
+from skillspector.providers.gemini import GeminiProvider
 from skillspector.providers.openai import OpenAIProvider
 
 _CHAT_MODEL_PROVIDERS: dict[int, tuple[weakref.ReferenceType[object], str]] = {}
@@ -123,34 +138,76 @@ def _resolve_default_chat_model() -> str:
     raise_no_llm_api_key_configured()
 
 
-def is_llm_available() -> tuple[bool, str | None]:
+def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
     """Return ``(available, error_message)`` describing LLM availability.
 
-    CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``) are checked
-    through their ``is_available()`` method first.  Other providers probe the
-    same native chat-model path used by :func:`get_chat_model`; unbound HTTP
-    providers keep the credential-resolution and OpenAI fallback path.
+    CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
+    ``opencode_cli``) are checked through their ``is_available()`` method
+    first. Other providers probe the same native chat-model path used by
+    :func:`get_chat_model`; unbound HTTP providers keep the
+    credential-resolution and OpenAI fallback path.  A configured model that
+    rejects a requested control makes the LLM unavailable, with the reason
+    from :func:`unsupported_control_error`.
     """
-    provider = get_active_provider()
+    try:
+        provider = get_active_provider()
+    except UnknownProviderError as exc:
+        return False, str(exc)
     if has_cli_capability(provider):
         return provider.is_available()  # type: ignore[attr-defined]
 
-    if has_provider_binding():
-        try:
-            model = provider.resolve_model()
+    try:
+        if has_provider_binding():
+            model = next(iter(_llm_slot_models()))
             create_chat_model(
                 model=model,
                 max_tokens=get_max_output_tokens(model),
-                timeout=120,
+                timeout=timeout,
             )
-        except ValueError as exc:
-            return False, str(exc)
-        return True, None
-    try:
-        _resolve_llm_credentials()
-    except ValueError as exc:
+        elif isinstance(provider, GeminiProvider):
+            provider.resolve_credentials(timeout=timeout)
+        else:
+            _resolve_llm_credentials()
+    except (ValueError, RefreshError, TimeoutError) as exc:
         return False, str(exc)
-    return True, None
+    control_error = unsupported_control_error(timeout)
+    return control_error is None, control_error
+
+
+def _llm_slot_models() -> dict[str, None]:
+    """Return distinct models for slots whose analyzers can make LLM calls."""
+    model_config = build_model_config()
+    return dict.fromkeys(model_config[slot] for slot in LLM_ANALYZER_SLOTS)
+
+
+def unsupported_control_error(timeout: float | None = 120) -> str | None:
+    """Return why a configured slot model rejects a requested control, else ``None``.
+
+    Only ``SKILLSPECTOR_TEMPERATURE`` and ``SKILLSPECTOR_REASONING_EFFORT`` can
+    be rejected, so nothing runs when both are unset.  Otherwise each distinct
+    LLM slot model is built the way the analyzers build it, so the provider's own
+    guard (model name or registry entry) reports an
+    :class:`~skillspector.providers.chat_models.UnsupportedControlError`
+    before any analysis.  Other failures, such as missing credentials, are
+    left to the regular availability path.
+    """
+    if not any(
+        os.environ.get(name, "").strip()
+        for name in ("SKILLSPECTOR_TEMPERATURE", "SKILLSPECTOR_REASONING_EFFORT")
+    ):
+        return None
+    try:
+        if has_cli_capability(get_active_provider()):
+            return None
+        models = _llm_slot_models()
+        for model in models:
+            get_chat_model(model, timeout=timeout)
+    except UnsupportedControlError as exc:
+        return str(exc)
+    except Exception:
+        # Not a control rejection; availability checks report it.
+        return None
+    return None
 
 
 def fetch_model_token_limits(model_label: str) -> tuple[int, int]:
@@ -252,19 +309,11 @@ class _StructuredAgentCLIModel:
     ``complete()``, then parses and validates the response into *schema*.
     """
 
-    def __init__(
-        self,
-        provider: object,
-        model: str,
-        max_output_tokens: int,
-        schema: type,
-        timeout: float | None = None,
-    ) -> None:
-        self._provider = provider
-        self._model = model
-        self._max_output_tokens = max_output_tokens
+    def __init__(self, owner: AgentCLIChatModel, schema: type) -> None:
+        # Read transport settings through the owner so a structured wrapper does not pin the
+        # deadline it happened to be created with.
+        self._owner = owner
         self._schema = schema
-        self._timeout = timeout
 
     def _augment(self, prompt: str) -> str:
         schema_json = json.dumps(self._schema.model_json_schema(), indent=2)
@@ -278,11 +327,11 @@ class _StructuredAgentCLIModel:
     def _complete(self, prompt: str) -> str:
         """Return provider output before structured parsing begins."""
         return _complete_agent_cli(
-            self._provider,
+            self._owner._provider,
             self._augment(prompt),
-            model=self._model,
-            max_output_tokens=self._max_output_tokens,
-            timeout=self._timeout,
+            model=self._owner._model,
+            max_output_tokens=self._owner._max_output_tokens,
+            timeout=self._owner._timeout,
         )
 
     def invoke(self, prompt: str) -> object:
@@ -355,10 +404,193 @@ class AgentCLIChatModel:
     async def ainvoke(self, prompt: str) -> _AgentCLIMessage:
         return await asyncio.to_thread(self.invoke, prompt)
 
-    def with_structured_output(self, schema: type) -> _StructuredAgentCLIModel:
-        return _StructuredAgentCLIModel(
-            self._provider, self._model, self._max_output_tokens, schema, self._timeout
+    def with_structured_output(
+        self, schema: type, method: str | None = None
+    ) -> _StructuredAgentCLIModel:
+        del method  # parity with LangChain chat models; the CLI transport always asks for JSON
+        return _StructuredAgentCLIModel(self, schema)
+
+    def set_timeout(self, timeout: float | None) -> None:
+        """Retarget this adapter, and its structured wrappers, at a new deadline."""
+        self._timeout = timeout
+
+
+STRUCTURED_OUTPUT_METHODS = ("function_calling", "json_schema")
+
+
+def structured_output_kwargs(
+    model: str,
+    provider: object | None = None,
+    *,
+    preferred_method: str | None = None,
+) -> dict[str, str]:
+    """Keyword arguments for ``with_structured_output`` when binding a schema for *model*.
+
+    ``SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD`` wins, then the active provider's
+    ``structured_output_method(model)`` hint, then an analyzer preference, else
+    LangChain's default (no kwargs).
+
+    Raises:
+        ValueError: when the environment override or preference is not a known method.
+    """
+    if preferred_method is not None and preferred_method not in STRUCTURED_OUTPUT_METHODS:
+        raise ValueError(
+            "preferred structured output method must be one of "
+            f"{', '.join(STRUCTURED_OUTPUT_METHODS)}; got {preferred_method!r}"
         )
+    override = os.environ.get("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "").strip().lower()
+    if override:
+        if override not in STRUCTURED_OUTPUT_METHODS:
+            raise ValueError(
+                "SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD must be one of "
+                f"{', '.join(STRUCTURED_OUTPUT_METHODS)}; got {override!r}"
+            )
+        return {"method": override}
+    if provider is None:
+        provider = get_active_provider()
+    hint = getattr(provider, "structured_output_method", None)
+    method = hint(model) if callable(hint) else None
+    if method:
+        return {"method": method}
+    method = preferred_method
+    return {"method": method} if method else {}
+
+
+def bind_structured_output(
+    llm: object,
+    schema: type,
+    model: str,
+    provider: object | None = None,
+    *,
+    preferred_method: str | None = None,
+) -> object:
+    """``llm.with_structured_output(schema)`` with the method *model* needs.
+
+    A chat model restricted to ``toolChoice`` ``auto`` (Bedrock models that
+    reject a forced tool call, or a ``ChatOpenAI`` with ``tool_choice``
+    disabled) and bound with a tool method gets the tool call asked for in
+    the prompt, and a prose answer raises :class:`StructuredOutputParseError`,
+    which the analyzers retry like any other malformed structured response.
+    """
+    kwargs = structured_output_kwargs(model, provider, preferred_method=preferred_method)
+    unforced = _binds_unforced_tool_call(llm, kwargs.get("method"))
+    include_raw = isinstance(llm, BaseChatModel) and (
+        unforced or kwargs.get("method") == "function_calling"
+    )
+    binding_kwargs: dict[str, Any] = dict(kwargs)
+    if include_raw:
+        # Native parsers may silently keep only the first tool call. Retain the
+        # raw message so validation can reject extra or invalid calls instead.
+        binding_kwargs["include_raw"] = True
+    structured = llm.with_structured_output(schema, **binding_kwargs)  # type: ignore[attr-defined]
+    if unforced:
+        return _require_tool_call(structured, schema, include_raw=include_raw)
+    if kwargs.get("method") == "function_calling" and not isinstance(
+        structured, _StructuredAgentCLIModel
+    ):
+        return _validate_tool_call_result(structured, schema, include_raw=include_raw)
+    return structured
+
+
+def _binds_unforced_tool_call(llm: object, method: str | None) -> bool:
+    """``True`` when *method* binds the schema as a tool *llm* is not forced to call.
+
+    ``ChatBedrockConverse`` binds a tool by default; ``ChatOpenAI`` defaults to
+    ``json_schema``, so its ``tool_choice``-disabled form needs an explicit
+    ``function_calling``.
+    """
+    if getattr(llm, "supports_tool_choice_values", None) == ("auto",):
+        return method in (None, "function_calling")
+    disabled = getattr(llm, "disabled_params", None)
+    return (
+        method == "function_calling"
+        and isinstance(disabled, dict)
+        and "tool_choice" in disabled
+        and disabled["tool_choice"] is None
+    )
+
+
+_TOOL_CALL_INSTRUCTION = (
+    "Report your result by calling the {tool} tool exactly once. Do not answer in prose."
+)
+
+
+def _require_tool_call(
+    structured: Runnable, schema: type, *, include_raw: bool = False
+) -> Runnable:
+    """Ask for the tool call in the prompt and fail closed when it does not happen."""
+    tool = (
+        convert_to_openai_tool(schema)["function"]["name"]
+        if include_raw
+        else schema.__name__
+        if isinstance(schema, type)
+        else "response"
+    )
+
+    def _ask(prompt: str) -> str:
+        return f"{prompt}\n\n{_TOOL_CALL_INSTRUCTION.format(tool=tool)}"
+
+    return RunnableLambda(_ask) | _validate_tool_call_result(
+        structured, schema, include_raw=include_raw
+    )
+
+
+def _validate_tool_call_result(
+    structured: Runnable, schema: type, *, include_raw: bool = False
+) -> Runnable:
+    """Validate forced/auto tool results without changing the bound model prompt."""
+    tool = (
+        convert_to_openai_tool(schema)["function"]["name"]
+        if include_raw
+        else schema.__name__
+        if isinstance(schema, type)
+        else "response"
+    )
+
+    def _check(result: object) -> object:
+        if include_raw:
+            if not isinstance(result, dict):
+                raise StructuredOutputParseError(f"model returned invalid {tool} tool output")
+            raw = result.get("raw")
+            calls = getattr(raw, "tool_calls", None)
+            if (
+                not isinstance(calls, list)
+                or len(calls) != 1
+                or calls[0].get("name") != tool
+                or getattr(raw, "invalid_tool_calls", None)
+            ):
+                raise StructuredOutputParseError(
+                    f"model must return exactly one valid {tool} tool call"
+                )
+            error = result.get("parsing_error")
+            if error is not None:
+                raise StructuredOutputParseError(
+                    f"model returned invalid {tool} tool arguments"
+                ) from error
+            result = result.get("parsed")
+        if result is None:
+            raise StructuredOutputParseError(
+                f"model answered in prose instead of calling the {tool} tool"
+            )
+        return result
+
+    def _invoke(prompt: Any, config: RunnableConfig) -> object:
+        try:
+            return _check(structured.invoke(prompt, config=config))
+        except OutputParserException as exc:
+            raise StructuredOutputParseError(
+                f"model returned invalid {tool} tool arguments"
+            ) from exc
+
+    async def _ainvoke(prompt: Any, config: RunnableConfig) -> object:
+        try:
+            return _check(await structured.ainvoke(prompt, config=config))
+        except OutputParserException as exc:
+            raise StructuredOutputParseError(
+                f"model returned invalid {tool} tool arguments"
+            ) from exc
+
+    return RunnableLambda(_invoke, _ainvoke)
 
 
 def get_chat_model(
@@ -366,10 +598,11 @@ def get_chat_model(
 ) -> BaseChatModel | AgentCLIChatModel:
     """Return a chat model for the active provider.
 
-    For CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``) this
-    returns an :class:`AgentCLIChatModel` adapter backed by the provider's
-    ``complete()`` subprocess transport — so the LLM analyzers (which use
-    ``.invoke()`` and ``.with_structured_output()``) work with no API key.
+    For CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
+    ``opencode_cli``) this returns an :class:`AgentCLIChatModel` adapter
+    backed by the provider's ``complete()`` subprocess transport — so the
+    LLM analyzers (which use ``.invoke()`` and ``.with_structured_output()``)
+    work with no API key.
 
     For HTTP providers it delegates to
     :func:`skillspector.providers.create_chat_model`, which uses the
@@ -381,6 +614,12 @@ def get_chat_model(
     """
     provider = get_active_provider()
     if has_cli_capability(provider):
+        # Every CLI call is a full agent session on the user's plan. Warn here,
+        # before the analyzers fan out; the scan path only probes availability
+        # from the report node, after the calls have run.
+        warn_session_cost = getattr(provider, "warn_session_cost", None)
+        if callable(warn_session_cost):
+            warn_session_cost()
         resolved_model = model or provider.resolve_model()
         chat_model = AgentCLIChatModel(
             provider,
@@ -447,6 +686,8 @@ def new_inference_usage_collector(
         request_kind=request_kind,
         provider=effective_provider,
         requested_model=model,
+        requested_controls=chat_model_requested_controls(chat_model),
+        forwarded_controls=chat_model_controls(chat_model),
     )
 
 
@@ -483,8 +724,13 @@ def chat_completion(
         chat_model=chat_model,
     )
     effective_provider = chat_model_provider_name(chat_model)
-    if usage_collector is not None and effective_provider is not None:
-        collector.set_provider(effective_provider)
+    if usage_collector is not None:
+        if effective_provider is not None:
+            collector.set_provider(effective_provider)
+        collector.set_controls(
+            chat_model_requested_controls(chat_model),
+            chat_model_controls(chat_model),
+        )
     response = _invoke_with_usage(chat_model, prompt, collector)
     if hasattr(response, "text"):
         return response.text  # type: ignore[union-attr]

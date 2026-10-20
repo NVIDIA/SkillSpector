@@ -26,8 +26,8 @@ which enforces:
   adversarial skill content) is written to the process stdin, never
   injected into argv.
 - **Capability stripping** (per-binary): tools disabled, MCP disabled,
-  no extra directories, deny permission mode (claude); read-only sandbox
-  (codex).  ``--dangerously-skip-permissions`` is NEVER used.
+  no extra directories, deny permission mode (claude). Codex is disabled
+  until a complete no-tools policy is verified.  ``--dangerously-skip-permissions`` is NEVER used.
 - **Environment scrubbing**: API keys, SSH keys, cloud credentials, and
   other secrets are stripped from the child environment.
 - **Timeout enforcement**: the call raises ``TimeoutError`` rather than
@@ -41,14 +41,16 @@ which enforces:
   of capability removal).
 
 The JSON output envelope (``claude -p --output-format json``) is parsed
-and the assistant text is returned.  ``codex exec --json`` produces
-JSONL events; the last assistant message is extracted.
+and the assistant text is returned. The Codex JSONL parser is retained for
+compatibility, but Codex inference is disabled before a subprocess is started.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -73,33 +75,46 @@ MAX_OUTPUT_BYTES = 10_000_000  # 10 MB safety cap on stdout
 MAX_STDERR_BYTES = 64_000  # stderr is only used for error snippets
 CLI_TIMEOUT_SECONDS = 300  # 5-minute per-call hard limit
 
-# Environment variables that must NOT be forwarded to child processes.
-# Includes API keys, cloud creds, SSH agent, and SkillSpector's own keys.
-_SECRET_ENV_PREFIXES: tuple[str, ...] = (
-    "ANTHROPIC_API_KEY",
-    "MINIMAX_API_KEY",
-    "OPENAI_API_KEY",
-    "NVIDIA_INFERENCE_KEY",
-    "NVIDIA_INFERENCE_METADATA_KEY",
-    "AWS_",
-    "AZURE_",
-    "GOOGLE_",
-    "GCLOUD_",
-    "GCP_",
-    "SSH_",
-    "GPG_",
-    "GITHUB_TOKEN",
-    "GITLAB_TOKEN",
-    "HUGGINGFACE_TOKEN",
-    "HF_TOKEN",
-    "COHERE_API_KEY",
-    "REPLICATE_API_TOKEN",
-    "MISTRAL_API_KEY",
-    "TOGETHER_API_KEY",
-    "GROQ_API_KEY",
-    "FIREWORKS_API_KEY",
-    "LANGCHAIN_API_KEY",
-    "LANGSMITH_API_KEY",
+# Only runtime, network transport, and local-login discovery variables cross into agent processes.
+# Do not inherit provider keys, arbitrary application variables, loader hooks,
+# or CLI configuration overrides from the operator's environment.
+_RUNTIME_ENV_NAMES = frozenset(
+    {
+        "PATH",
+        "PATHEXT",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "USERNAME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "XDG_DATA_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "NODE_EXTRA_CA_CERTS",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "TERM",
+        "NO_COLOR",
+    }
 )
 
 
@@ -113,18 +128,13 @@ class AgentCLIError(RuntimeError):
 
 
 def _scrub_env() -> dict[str, str]:
-    """Return a copy of ``os.environ`` with secret variables removed.
+    """Keep only runtime variables needed by the CLIs and their local logins.
 
-    Any variable whose name starts with a prefix in ``_SECRET_ENV_PREFIXES``
-    is stripped.  The resulting environment is passed to the subprocess.
+    Exact names (case-insensitive for Windows) fail closed for new secret names
+    and configuration overrides. Provider API keys are deliberately excluded:
+    agent CLI providers authenticate through the user's existing local login.
     """
-    clean: dict[str, str] = {}
-    for key, val in os.environ.items():
-        upper = key.upper()
-        if any(upper.startswith(p.upper()) for p in _SECRET_ENV_PREFIXES):
-            continue
-        clean[key] = val
-    return clean
+    return {key: val for key, val in os.environ.items() if key.upper() in _RUNTIME_ENV_NAMES}
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +181,15 @@ def _validate_model_label(model: str) -> str:
 # ---------------------------------------------------------------------------
 # Claude CLI invocation
 # ---------------------------------------------------------------------------
+
+
+# Fixed text, never derived from untrusted input. Short on purpose: it replaces
+# Claude Code's default agent prompt, which is sent again on every call.
+_CLAUDE_SYSTEM_PROMPT = (
+    "You are a non-interactive text analysis component. You have no tools. "
+    "Follow the instructions in the user message and reply only with the "
+    "requested output."
+)
 
 
 def _build_claude_argv(binary: str, model: str, max_output_tokens: int) -> list[str]:
@@ -221,6 +240,23 @@ def _build_claude_argv(binary: str, model: str, max_output_tokens: int) -> list[
     ``--disable-slash-commands``
         Prevents skill/plugin invocations from within the sandboxed call.
 
+    ``--tools ""``
+        Removes every built-in tool definition from the model's context.
+        ``--allowed-tools ""`` only denies tool *use*; without ``--tools ""``
+        each call still carries the full tool schemas, which a scan pays for
+        once per LLM call.
+
+    ``--system-prompt <_CLAUDE_SYSTEM_PROMPT>``
+        Replaces Claude Code's default agent system prompt, which describes
+        tools and coding workflows this call cannot use. The analyzer's own
+        instructions still arrive on stdin. Together with ``--tools ""`` this
+        is most of the fixed per-call startup cost.
+
+    ``--no-session-persistence``
+        Do not write a session transcript. Each call runs in a fresh temporary
+        cwd, so without this every call leaves a new project folder under
+        ``~/.claude/projects``.
+
     Deliberately NOT included:
     - ``--dangerously-skip-permissions`` / ``--allow-dangerously-skip-permissions``
       — explicitly forbidden.
@@ -246,6 +282,11 @@ def _build_claude_argv(binary: str, model: str, max_output_tokens: int) -> list[
         "--strict-mcp-config",
         "--setting-sources=",
         "--disable-slash-commands",
+        "--tools",
+        "",
+        "--system-prompt",
+        _CLAUDE_SYSTEM_PROMPT,
+        "--no-session-persistence",
     ]
 
 
@@ -272,60 +313,23 @@ def _parse_claude_output(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Registered but disabled. Re-enabling requires a pinned CLI version and a
+# verified policy preflight that denies every model-driven tool and host-file read.
+_CODEX_DISABLED_REASON = (
+    "codex_cli is disabled: its read-only sandbox still permits commands to read "
+    "host files, and SkillSpector has no verified deny-all-tools policy for Codex. "
+    "Use an HTTP API provider or another supported CLI provider instead."
+)
+
+
 def _build_codex_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
-    """Build the argv list for a capability-stripped ``codex exec`` call.
+    """Refuse inference until all model tool execution can be disabled.
 
-    Flags chosen (verified end-to-end against codex 0.139.0):
-
-    ``exec``
-        Non-interactive subcommand. With NO positional prompt, codex reads the
-        instructions from stdin — which is exactly where the runner pipes the
-        prompt. (Passing ``-`` makes the prompt literally ``"-"`` and demotes
-        the real content to a ``<stdin>`` block, so we do not pass it.)
-
-    ``--json``
-        Emit JSONL events to stdout, enabling structured parsing.
-
-    ``--sandbox read-only``
-        Most restrictive sandbox mode. Model-generated shell commands are
-        restricted to read-only filesystem access; no code execution. Unlike
-        claude/gemini (which block model tool use entirely), codex's strictest
-        mode still permits read-only filesystem *reads* by model-generated
-        commands. This is informational, not an exfil channel: the call runs in
-        an isolated empty temp CWD, output returns only to the operator's own
-        report, and there is no network egress path.
-
-    ``--ephemeral``
-        Do not persist session files to disk (no residue from the scan).
-
-    ``--ignore-user-config``
-        Ignore ``$CODEX_HOME/config.toml``; use only our explicit flags.
-
-    ``--ignore-rules``
-        Do not load user/project ``.rules`` files.
-
-    ``--model <label>``
-        Use the requested model.
-
-    ``-m`` / ``--model`` label is validated via ``_validate_model_label``.
+    Read-only access is insufficient for untrusted prompts: host file contents
+    can leave through the model response. Disabling one shell feature does not
+    establish a deny-all policy for other or future tools.
     """
-    return [
-        binary,
-        "exec",
-        "--json",
-        "--sandbox",
-        "read-only",
-        # We run in an isolated empty temp dir (not a git repo); codex refuses
-        # an "untrusted" dir without this. Safe: --sandbox read-only still bars
-        # code execution, and the temp dir holds no project files.
-        "--skip-git-repo-check",
-        "--ephemeral",
-        "--ignore-user-config",
-        "--ignore-rules",
-        # --model omitted by default -> codex uses the account's default model
-        # (forwarded only when SKILLSPECTOR_MODEL is set).
-        *(["--model", _validate_model_label(model)] if model else []),
-    ]
+    raise AgentCLIError(_CODEX_DISABLED_REASON)
 
 
 def _parse_codex_output(raw: str) -> str:
@@ -450,6 +454,332 @@ def _parse_gemini_output(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# OpenCode CLI invocation  (verified against opencode 1.18.33)
+# ---------------------------------------------------------------------------
+
+
+_OPENCODE_AGENT_PREFIX = "skillspector-deny-all"
+_OPENCODE_DENY_ALL = json.dumps({"*": "deny"}, separators=(",", ":"))
+_OPENCODE_SUPPORTED_VERSION = "1.18.33"
+# Markers of a Zen free-tier refusal. Zen answers 403 to
+# any call carrying the deny-all isolation (OPENCODE_CONFIG_CONTENT or
+# OPENCODE_PERMISSION alone suffices; verified by env bisect), so free-tier
+# models and this sandbox are mutually exclusive until Zen's policy changes.
+_ZEN_FREE_TIER_MARKERS = ("FreeTierError", "can only be used from within OpenCode")
+
+
+def _opencode_agent_name(argv: list[str]) -> str:
+    """Return the unpredictable agent selected by an OpenCode argv."""
+    try:
+        name = argv[argv.index("--agent") + 1]
+    except (ValueError, IndexError) as exc:
+        raise AgentCLIError("OpenCode invocation is missing its fixed deny-all agent") from exc
+    if not name.startswith(f"{_OPENCODE_AGENT_PREFIX}-"):
+        raise AgentCLIError("OpenCode invocation selected an unexpected agent")
+    return name
+
+
+def _opencode_config(agent_name: str) -> str:
+    """Build the inline policy for one unguessable OpenCode agent identity."""
+    deny_all = {"*": "deny"}
+    return json.dumps(
+        {
+            "$schema": "https://opencode.ai/config.json",
+            "agent": {
+                agent_name: {
+                    "description": "SkillSpector text-only semantic analysis",
+                    "mode": "primary",
+                    "permission": deny_all,
+                }
+            },
+            "autoshare": False,
+            "autoupdate": False,
+            "default_agent": agent_name,
+            "instructions": [],
+            "mcp": {},
+            "permission": deny_all,
+            "plugin": [],
+            "share": "disabled",
+            "skills": {"paths": [], "urls": []},
+            "snapshot": False,
+        },
+        separators=(",", ":"),
+    )
+
+
+def _parse_opencode_version(raw: bytes) -> str | None:
+    """Parse an exact stable semantic version from ``opencode --version``."""
+    text = raw.decode("utf-8", errors="replace").strip()
+    match = re.fullmatch(
+        r"(?:opencode(?:\s+version)?\s+)?v?(\d+\.\d+\.\d+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1) if match is not None else None
+
+
+def _prepare_opencode_env(
+    base_env: dict[str, str], temp_root: str, argv: list[str]
+) -> dict[str, str]:
+    """Return an isolated, non-overridable deny-all OpenCode environment.
+
+    OpenCode merges several ambient configuration layers and lets agent-local
+    permissions override top-level permissions. The inline config therefore
+    defines an unpredictable per-invocation agent selected in argv *and* denies
+    that agent every current or future tool. A later managed config therefore
+    cannot name the agent in advance and append a more-specific allow rule.
+    ``OPENCODE_PERMISSION`` repeats the wildcard at OpenCode's final top-level
+    permission-merge stage. Project/global extension loading, auto-sharing,
+    updates, external skills, and optional tool surfaces are disabled
+    independently as defense in depth.
+
+    The real OpenCode authentication store remains available so this CLI
+    provider can use the user's existing login. OpenCode's internal plugins stay
+    enabled for the same reason: they implement the OAuth logins (ChatGPT,
+    Copilot, GitLab, ...) and register no tools. External plugins remain off
+    through ``--pure`` / ``OPENCODE_PURE``. All mutable config, cache,
+    state, database, and temporary paths are redirected below the invocation's
+    already-isolated temporary root.
+    """
+    env = {key: value for key, value in base_env.items() if not key.upper().startswith("OPENCODE_")}
+    agent_name = _opencode_agent_name(argv)
+    config_home = os.path.join(temp_root, "xdg-config")
+    config_dir = os.path.join(config_home, "opencode")
+    cache_home = os.path.join(temp_root, "xdg-cache")
+    state_home = os.path.join(temp_root, "xdg-state")
+    isolated_home = os.path.join(temp_root, "home")
+    managed_config = os.path.join(temp_root, "managed-config")
+    child_tmp = os.path.join(temp_root, "tmp")
+    for directory in (
+        config_dir,
+        cache_home,
+        state_home,
+        isolated_home,
+        managed_config,
+        child_tmp,
+    ):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+
+    env.update(
+        {
+            "OPENCODE_AUTO_SHARE": "0",
+            "OPENCODE_CLIENT": "skillspector",
+            "OPENCODE_CONFIG_CONTENT": _opencode_config(agent_name),
+            "OPENCODE_CONFIG_DIR": config_dir,
+            "OPENCODE_DB": os.path.join(temp_root, "opencode.db"),
+            "OPENCODE_DISABLE_AUTOCOMPACT": "1",
+            "OPENCODE_DISABLE_AUTOUPDATE": "1",
+            "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+            "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
+            "OPENCODE_DISABLE_LSP_DOWNLOAD": "1",
+            "OPENCODE_DISABLE_MODELS_FETCH": "1",
+            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+            "OPENCODE_DISABLE_PRUNE": "1",
+            "OPENCODE_DISABLE_TERMINAL_TITLE": "1",
+            "OPENCODE_ENABLE_EXA": "0",
+            "OPENCODE_ENABLE_PARALLEL": "0",
+            "OPENCODE_ENABLE_QUESTION_TOOL": "0",
+            "OPENCODE_EXPERIMENTAL": "0",
+            "OPENCODE_EXPERIMENTAL_CODE_MODE": "0",
+            "OPENCODE_EXPERIMENTAL_LSP_TOOL": "0",
+            "OPENCODE_EXPERIMENTAL_PLAN_MODE": "0",
+            "OPENCODE_PERMISSION": _OPENCODE_DENY_ALL,
+            "OPENCODE_PURE": "1",
+            # OpenCode 1.18.33 uses this internal override for the home paths
+            # searched for AGENTS.md, .opencode, .claude, and .agents content.
+            "OPENCODE_TEST_HOME": isolated_home,
+            # The same pinned version uses this override instead of the
+            # platform's /etc, ProgramData, or /Library managed-config path.
+            "OPENCODE_TEST_MANAGED_CONFIG_DIR": managed_config,
+            "TEMP": child_tmp,
+            "TMP": child_tmp,
+            "TMPDIR": child_tmp,
+            "XDG_CACHE_HOME": cache_home,
+            "XDG_CONFIG_HOME": config_home,
+            "XDG_STATE_HOME": state_home,
+        }
+    )
+    return env
+
+
+def _preflight_opencode_policy(
+    binary: str, argv: list[str], child_env: dict[str, str], temp_root: str
+) -> None:
+    """Fail closed unless OpenCode's fully resolved sensitive config is exact.
+
+    macOS MDM preferences are loaded after ``OPENCODE_CONFIG_CONTENT`` and do
+    not have a supported disable flag in OpenCode 1.18.33. Querying the final
+    config with the exact environment and directory prevents a managed
+    ``share: auto`` (or another late source) from silently reopening ambient
+    capabilities before the inference process is allowed to start.
+    """
+
+    def run_probe(command: list[str], label: str) -> bytes:
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                cwd=temp_root,
+                env=child_env,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            raise AgentCLIError(f"OpenCode {label} preflight could not start: {exc}") from exc
+
+        returncode, stdout_raw, _stderr_raw, overflow = _run_bounded(proc, b"", 15)
+        if overflow:
+            raise AgentCLIError(f"OpenCode {label} preflight exceeded its output limit")
+        if returncode is None:
+            raise AgentCLIError(f"OpenCode {label} preflight timed out")
+        if returncode != 0:
+            raise AgentCLIError(f"OpenCode {label} preflight exited with code {returncode}")
+        return stdout_raw
+
+    version_raw = run_probe([binary, "--version"], "version")
+    version = _parse_opencode_version(version_raw)
+    if version != _OPENCODE_SUPPORTED_VERSION:
+        version_text = version_raw.decode("utf-8", errors="replace").strip()
+        raise AgentCLIError(
+            "OpenCode security policy is verified only for version "
+            f"{_OPENCODE_SUPPORTED_VERSION}; found {version_text[:80]!r}"
+        )
+
+    agent_name = _opencode_agent_name(argv)
+    stdout_raw = run_probe([binary, "debug", "config"], "policy")
+    try:
+        config = json.loads(stdout_raw.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentCLIError("OpenCode policy preflight returned malformed JSON") from exc
+    if not isinstance(config, dict):
+        raise AgentCLIError("OpenCode policy preflight returned a non-object config")
+
+    expected_sensitive = {
+        "autoshare": False,
+        "autoupdate": False,
+        "default_agent": agent_name,
+        "instructions": [],
+        "mcp": {},
+        "permission": {"*": "deny"},
+        "plugin": [],
+        "share": "disabled",
+        "skills": {"paths": [], "urls": []},
+        "snapshot": False,
+        "tools": None,
+    }
+    for key, expected in expected_sensitive.items():
+        if config.get(key) != expected:
+            raise AgentCLIError(f"OpenCode policy preflight found unsafe resolved setting {key!r}")
+
+    agents = config.get("agent")
+    selected = agents.get(agent_name) if isinstance(agents, dict) else None
+    if not isinstance(selected, dict) or selected.get("permission") != {"*": "deny"}:
+        raise AgentCLIError("OpenCode policy preflight found an overridable agent permission")
+
+
+def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
+    """Build argv for a text-only, deny-all ``opencode run`` call.
+
+    Flags chosen (verified against ``opencode`` 1.18.33 ``run --help``):
+
+    ``run``
+        Non-interactive single-shot mode. With no positional message, the
+        prompt is piped to stdin by run_agent_cli — untrusted content never
+        reaches argv.
+
+    ``--pure``
+        Run without external plugins.
+
+    ``--agent skillspector-deny-all-<nonce>``
+        Select the unguessable per-invocation agent installed through
+        ``OPENCODE_CONFIG_CONTENT``. Its agent-local permission is a wildcard
+        deny; the child environment also supplies final-merge
+        ``OPENCODE_PERMISSION={"*":"deny"}`` so built-in, custom, MCP, and
+        future tool names all remain unavailable.
+
+    ``--format json``
+        Emit raw JSON events to stdout for structured parsing.
+
+    ``--model <label>``
+        Model in ``provider/model`` form (validated). Omitted by default so
+        opencode uses the CLI default model (forwarded only when
+        SKILLSPECTOR_MODEL is set).
+
+    The shared runner also isolates every OpenCode config/state path, disables
+    ambient instructions, skills, external plugins (the internal OAuth/provider
+    plugins stay enabled, see ``_prepare_opencode_env``), auto-sharing,
+    snapshots and updates,
+    scrubs secret-bearing environment variables, delivers untrusted content
+    via stdin only, and never passes ``--auto``.
+
+    Deliberately NOT included:
+    - ``--auto`` — auto-approves permissions (dangerous); never use it.
+    - ``max_output_tokens`` — ``run`` has no token flag (accepted for
+      CliSpec uniformity and ignored, like codex/gemini).
+    """
+    # --model omitted by default -> opencode uses the CLI default model
+    # (forwarded only when SKILLSPECTOR_MODEL is set).
+    model_arg = ["--model", _validate_model_label(model)] if model else []
+    agent_name = f"{_OPENCODE_AGENT_PREFIX}-{secrets.token_hex(16)}"
+    return [
+        binary,
+        "run",
+        "--pure",
+        "--agent",
+        agent_name,
+        "--format",
+        "json",
+        *model_arg,
+    ]
+
+
+def _parse_opencode_output(raw: str) -> str:
+    """Extract assistant text from ``opencode run --format json`` JSONL events.
+
+    Verified against opencode 1.18.33, whose events look like::
+
+        {"type": "step_start", ..., "part": {"type": "step-start", ...}}
+        {"type": "text", ..., "part": {"type": "text", "text": "hi", ...}}
+        {"type": "step_finish", ..., "part": {"type": "step-finish", ...}}
+
+    The assistant text arrives in ``part.text`` of ``text`` events; every
+    other event (step boundaries and the like) carries no reply text and is
+    skipped. Non-JSON lines (banner/TUI noise) are skipped, mirroring the
+    codex parser's tolerance. Multiple ``text`` events are concatenated in
+    order (streamed chunks).
+
+    Raises:
+        AgentCLIError: when stdout is empty or holds no ``text`` event.
+    """
+    chunks: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj: Any = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        part = obj.get("part")
+        if not isinstance(part, dict):
+            continue
+        if str(part.get("type", "")).lower() != "text":
+            continue
+        text = part.get("text")
+        if isinstance(text, str) and text:
+            chunks.append(text)
+    reply = "".join(chunks).strip()
+    if not reply:
+        raise AgentCLIError(
+            f"opencode returned no assistant text in JSON output; raw={raw[:400]!r}"
+        )
+    return reply
+
+
+# ---------------------------------------------------------------------------
 # Per-CLI authentication probes (cheap, local — run once per scan)
 # ---------------------------------------------------------------------------
 
@@ -458,7 +788,11 @@ def _claude_auth_check(binary: str) -> tuple[bool, str | None]:
     """Check claude is authenticated via ``claude auth status`` (no inference)."""
     try:
         result = subprocess.run(
-            [binary, "auth", "status"], capture_output=True, shell=False, timeout=15
+            [binary, "auth", "status"],
+            capture_output=True,
+            shell=False,
+            timeout=15,
+            env=_scrub_env(),
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
         return False, f"claude auth status check failed: {exc}"
@@ -473,17 +807,8 @@ def _claude_auth_check(binary: str) -> tuple[bool, str | None]:
 
 
 def _codex_auth_check(binary: str) -> tuple[bool, str | None]:
-    """Check codex is authenticated via ``codex login status`` (no inference)."""
-    try:
-        result = subprocess.run(
-            [binary, "login", "status"], capture_output=True, shell=False, timeout=15
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
-        return False, f"codex login status check failed: {exc}"
-    out = (result.stdout or b"").decode("utf-8", errors="replace").lower()
-    if result.returncode != 0 or "not logged in" in out:
-        return False, "codex is not authenticated (run `codex login`)"
-    return True, None
+    """Report Codex unavailable without starting a process (fail closed)."""
+    return False, _CODEX_DISABLED_REASON
 
 
 def _gemini_auth_check(binary: str) -> tuple[bool, str | None]:
@@ -493,6 +818,63 @@ def _gemini_auth_check(binary: str) -> tuple[bool, str | None]:
     we treat binary-on-PATH as available and let the first real call fail closed
     if auth is missing.
     """
+    return True, None
+
+
+def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
+    """Check opencode is authenticated via ``opencode auth list`` (no inference).
+
+    The caller must already have resolved ``binary``. The probe uses the same
+    scrubbed environment as inference, performs no inference, and completes
+    well under 15s. Fail-closed: probe error/timeout, non-zero exit, zero
+    parsed credentials everywhere, or unparseable output all return
+    ``(False, reason)``. ``True`` is returned only when at least one parsed
+    credential/environment-key count is positive.
+    """
+    tmp_root = tempfile.mkdtemp(prefix="skillspector_opencode_auth_")
+    try:
+        try:
+            policy_argv = _build_opencode_argv(binary, "", 0)
+            child_env = _prepare_opencode_env(_scrub_env(), tmp_root, policy_argv)
+            version_result = subprocess.run(
+                [binary, "--version"],
+                capture_output=True,
+                shell=False,
+                timeout=15,
+                env=child_env,
+            )
+            if (
+                version_result.returncode != 0
+                or _parse_opencode_version(version_result.stdout or b"")
+                != _OPENCODE_SUPPORTED_VERSION
+            ):
+                return (
+                    False,
+                    "opencode_cli requires exactly OpenCode "
+                    f"{_OPENCODE_SUPPORTED_VERSION} for its verified deny-all policy",
+                )
+            result = subprocess.run(
+                [binary, "auth", "list"],
+                capture_output=True,
+                shell=False,
+                timeout=15,
+                env=child_env,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+            return False, f"opencode auth list check failed: {exc}"
+    finally:
+        _cleanup_temp_dir(tmp_root)
+    if result.returncode != 0:
+        return False, "opencode is not authenticated (run `opencode auth login`)"
+    out = re.compile(r"\x1b\[[0-9;]*m").sub(
+        "", (result.stdout or b"").decode("utf-8", errors="replace")
+    )
+    creds_match = re.compile(r"(\d+)\s+credentials?").search(out)
+    env_match = re.compile(r"(\d+)\s+environment variables?").search(out)
+    num_creds = int(creds_match.group(1)) if creds_match else 0
+    num_env_keys = int(env_match.group(1)) if env_match else 0
+    if num_creds <= 0 and num_env_keys <= 0:
+        return False, "opencode is not authenticated (run `opencode auth login`)"
     return True, None
 
 
@@ -553,6 +935,9 @@ def _agy_auth_check(binary: str) -> tuple[bool, str | None]:
 #        _build_<name>_argv(binary, model, max_output_tokens) -> argv
 #        _parse_<name>_output(raw) -> str
 #        _<name>_auth_check(binary) -> (available, reason)
+#      If the CLI needs extra process isolation, also provide a fixed
+#      ``prepare_env(clean_env, temp_root, argv)`` callback and optional
+#      ``preflight(binary, argv, child_env, temp_root)`` in its ``CliSpec``.
 #      Keep the security posture: no shell, NO tool execution, NO auto-approve,
 #      prompt via stdin (run_agent_cli handles stdin), fail-closed on any error.
 #   2. Add a CliSpec entry to _REGISTRY below.
@@ -571,12 +956,22 @@ class CliSpec:
     build_argv: Callable[[str, str, int], list[str]]
     parse_output: Callable[[str], str]
     auth_check: Callable[[str], tuple[bool, str | None]]
+    prepare_env: Callable[[dict[str, str], str, list[str]], dict[str, str]] | None = None
+    preflight: Callable[[str, list[str], dict[str, str], str], None] | None = None
 
 
 _REGISTRY: dict[str, CliSpec] = {
     "claude": CliSpec("claude", _build_claude_argv, _parse_claude_output, _claude_auth_check),
     "codex": CliSpec("codex", _build_codex_argv, _parse_codex_output, _codex_auth_check),
     "gemini": CliSpec("gemini", _build_gemini_argv, _parse_gemini_output, _gemini_auth_check),
+    "opencode": CliSpec(
+        "opencode",
+        _build_opencode_argv,
+        _parse_opencode_output,
+        _opencode_auth_check,
+        _prepare_opencode_env,
+        _preflight_opencode_policy,
+    ),
     # Disabled (fails closed via _build_agy_argv). agy's backend is Gemini, so it
     # reuses _parse_gemini_output rather than duplicating it — though parse is
     # never reached while _build_agy_argv raises. See the antigravity note above.
@@ -796,9 +1191,6 @@ def run_agent_cli(
     # -- Build argv via the registry (no untrusted content here) ---------------
     argv = spec.build_argv(binary, model, max_output_tokens)
 
-    # -- Scrub environment ----------------------------------------------------
-    child_env = _scrub_env()
-
     # -- Run in a temporary directory (no CWD access) -------------------------
     # mkdtemp + explicit best-effort cleanup instead of TemporaryDirectory:
     # the context manager's rmtree-at-__exit__ raises on Windows while the
@@ -806,6 +1198,21 @@ def run_agent_cli(
     # already-successful call into a batch failure (#315).
     tmp_cwd = tempfile.mkdtemp(prefix="skillspector_cli_")
     try:
+        # -- Scrub and apply any CLI-specific isolation policy ----------------
+        child_env = _scrub_env()
+        if spec.prepare_env is not None:
+            try:
+                child_env = spec.prepare_env(child_env, tmp_cwd, argv)
+            except OSError as exc:
+                raise AgentCLIError(
+                    f"{binary_name} environment isolation could not be established: {exc}"
+                ) from exc
+
+        # A CLI whose security depends on resolved runtime configuration must
+        # prove that configuration safe before receiving untrusted input.
+        if spec.preflight is not None:
+            spec.preflight(binary, argv, child_env, tmp_cwd)
+
         logger.debug(
             "Running %s argv=%r cwd=%s timeout=%ss",
             binary_name,
@@ -842,6 +1249,17 @@ def run_agent_cli(
         raise AgentCLIError(f"{binary_name} timed out after {timeout}s")
     if returncode != 0:
         stderr_snippet = stderr_raw[:500].decode("utf-8", errors="replace")
+        stdout_snippet = stdout_raw[:2000].decode("utf-8", errors="replace")
+        if binary_name == "opencode" and any(
+            marker in stdout_snippet for marker in _ZEN_FREE_TIER_MARKERS
+        ):
+            raise AgentCLIError(
+                "opencode Zen refused the call: its free tier can only be used "
+                "from within OpenCode, and it rejects the deny-all sandbox "
+                "isolation this provider requires. Use a key-backed model "
+                "instead, or retry if Zen's policy changes. Refusing to "
+                "weaken the sandbox: no fallback without isolation."
+            )
         raise AgentCLIError(
             f"{binary_name} exited with code {returncode}; stderr={stderr_snippet!r}"
         )

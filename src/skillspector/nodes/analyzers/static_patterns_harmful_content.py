@@ -25,7 +25,7 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import SourceLocationIndex, get_context
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -85,30 +85,32 @@ SUBSTANCE_PATTERNS = [(rf"\b{s}\b", 0.7) for s in HARMFUL_SUBSTANCES]
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for harmful content patterns (P5)."""
     findings: list[AnalyzerFinding] = []
+    locations = SourceLocationIndex(content, file_path)
 
-    def loc(ln: int) -> Location:
-        return Location(file=file_path, start_line=ln)
+    def loc(start: int, end: int) -> Location:
+        return locations.location(start, end)
 
     tag = [PatternCategory.PROMPT_INJECTION.value]
 
     for pattern, confidence in DANGEROUS_ACTIONS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE | re.DOTALL):
-            line_num = get_line_number(content, match.start())
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE | re.DOTALL
+        ):
             findings.append(
                 AnalyzerFinding(
                     rule_id="P5",
                     message="Harmful Content Injection",
                     severity=Severity.CRITICAL,
-                    location=loc(line_num),
+                    location=loc(match.start(), match.end()),
                     confidence=confidence,
                     tags=tag,
                     context=get_context(content, match.start(), context_lines=5),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for substance, base_confidence in SUBSTANCE_PATTERNS:
         for match in re.finditer(substance, content, re.IGNORECASE):
-            line_num = get_line_number(content, match.start())
             context = get_context(content, match.start(), context_lines=5)
             confidence = base_confidence
             if _is_instructional_context(content, match.start()):
@@ -123,11 +125,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         rule_id="P5",
                         message="Harmful Content Injection",
                         severity=Severity.CRITICAL,
-                        location=loc(line_num),
+                        location=loc(match.start(), match.end()),
                         confidence=confidence,
                         tags=tag,
                         context=context,
                         matched_text=match.group(0)[:200],
+                        complete_match=match.group(0),
                     )
                 )
     return _deduplicate_findings(findings)
@@ -196,22 +199,8 @@ def _is_warning_context(context: str) -> bool:
 
 
 def _deduplicate_findings(findings: list[AnalyzerFinding]) -> list[AnalyzerFinding]:
-    seen: set[tuple[str, int]] = set()
-    unique: list[AnalyzerFinding] = []
-    for f in findings:
-        key = (f.location.file, f.location.start_line)
-        if key not in seen:
-            seen.add(key)
-            unique.append(f)
-        else:
-            for i, ex in enumerate(unique):
-                if (
-                    ex.location.file,
-                    ex.location.start_line,
-                ) == key and f.confidence > ex.confidence:
-                    unique[i] = f
-                    break
-    return unique
+    """Compact only exact same-location matches."""
+    return static_runner.deduplicate_analyzer_findings(findings)
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:

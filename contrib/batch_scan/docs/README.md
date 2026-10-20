@@ -202,7 +202,8 @@ python -m contrib.batch_scan.batch_scan ./tests/fixtures/ -f json -o batch.json
 
 Key differences in batch output:
 - `scan_mode: "multilingual-enhanced"` — provenance marker
-- `enhancements.gap_fill_applied` — true if LLM gap-fill was used
+- `enhancements.gap_fill_applied` — true only if every gap-fill batch completed;
+  partial passes can still have `gap_fill_findings > 0`
 - `enhancements.english_keyword_rules_skipped` — count of static rules bypassed
 - `skill.language` — detected language tag
 
@@ -313,7 +314,19 @@ python -m contrib.batch_scan.batch_scan ./tests/fixtures/ --no-require-llm --no-
 |------|---------|
 | 0 | All safe (no HIGH/CRITICAL) |
 | 1 | ≥1 skill has HIGH or CRITICAL risk |
-| 2 | Scan errors occurred |
+| 2 | Scan errors or incomplete gap-fill occurred; `skills[].error` or `enhancements.gap_fill_error` explains the failure |
+
+
+Gap-fill uses the remaining per-skill budget after core analysis, leaving up to
+five seconds for reporting before the worker's 90-second hard limit. Its pooled
+calls receive that remaining budget; the provider pool otherwise uses its
+caller's timeout. Invalid responses can take up to four attempts within it.
+Failed setup and failed batches retain core findings and completed gap-fill
+findings. An incomplete pass records `enhancements.gap_fill_status: "incomplete"`,
+`gap_fill_error_reasons`, and `enhancements.gap_fill_error`, and exits 2 even when
+its ledger outcome is nonfatal. This deadline covers gap-fill only. Core analysis
+keeps its own budget and can reach the worker limit even when providers respect
+request timeouts. The worker limit also applies if a provider ignores its timeout.
 
 CI usage:
 
@@ -330,7 +343,7 @@ fi
 |---------|-----|
 | "No LLM API key configured" | Set up `.env` or use `--no-llm` |
 | Connection errors / 429 | Reduce `--workers` |
-| Skills timing out (90s) | Check network; the scanner skips and continues |
+| Skills timing out (90s of scanning) | Check network and API-pool capacity; the saved report retains an ERROR entry and other skills continue. Worker startup has its own 90s bound. |
 | "Event loop is closed" | Harmless, suppressed |
 | model_info token limit warning | Harmless, 128K default used |
 
@@ -341,10 +354,11 @@ fi
    classified as English and lose gap-fill coverage.
 3. **No SARIF output.**  Upstream supports it; this contrib adds terminal/JSON/Markdown.
 4. **Gap-fill quality not benchmarked for non-English.**  No ground-truth comparison exists.
-5. **`parse_response` JSON recovery is best-effort.**  When the LLM returns
-   malformed JSON, the analyzer returns empty findings (no crash).  This is a
-   graceful-degradation choice: a single malformed response won't block the
-   pipeline, but the user won't know which findings were lost.
+5. **Malformed provider responses reduce coverage.** Compatibility-mode discovery
+   and meta responses are retried up to four attempts, then recorded as
+   `llm_structured_response_invalid` and counted as incomplete. Valid findings
+   from completed batches are kept. Gap-fill parsing still drops malformed
+   responses until the separate gap-fill failure fix is included.
 
 See `DESIGN.md` for architecture details and `docs/archive/FUTURE_WORK.md` for suggested directions.
 
@@ -414,7 +428,7 @@ tests/
 ├── test_monkeypatch_fragility.py     ← Issue #2: 26 tests (guard verification)
 ├── tests-pro/
 │   ├── test_api_pool.py              ← Issue #3: 45 tests (acquire/backoff)
-│   ├── test_gap_fill.py              ← Issue #3: 41 tests (JSON parsing)
+│   ├── test_gap_fill.py              ← Issue #3: 29 tests (JSON parsing)
 │   ├── test_runner_patches.py        ← Issue #3: 24 tests (context manager)
 │   └── test_annotation.py            ← Issue #3: 10 tests (language compat)
 └── docs/

@@ -17,7 +17,12 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from skillspector.nodes.analyzers import behavioral_ast
+from skillspector.nodes.deduplicate import deduplicate
 from skillspector.state import WorkflowResourceBudget
 
 
@@ -31,6 +36,67 @@ def _run(code: str, filename: str = "script.py") -> list:
 
 
 class TestExecDetection:
+    def test_same_line_exec_calls_keep_exact_node_identities(self) -> None:
+        """Separate AST calls on one line must not compact as one whole-line match."""
+        findings = _run('exec("first_payload_alpha"); exec("second_payload_beta")')
+        ast1 = [finding for finding in findings if finding.rule_id == "AST1"]
+
+        assert len(ast1) == 2
+        assert len({finding.fingerprint() for finding in ast1}) == 2
+        assert len(deduplicate(ast1)) == 2
+
+    def test_same_match_at_different_columns_groups_distinct_occurrences(self) -> None:
+        findings = _run('exec("same_payload")\nif True:\n    exec("same_payload")\n')
+        ast1 = [finding for finding in findings if finding.rule_id == "AST1"]
+
+        assert len(ast1) == 2
+        assert len({finding.fingerprint() for finding in ast1}) == 1
+        assert {finding.start_column for finding in ast1} == {0, 4}
+
+        compacted = deduplicate(ast1)
+        assert len(compacted) == 1
+        assert {
+            (item["start_line"], item["start_column"]) for item in compacted[0].occurrences
+        } == {
+            (1, 0),
+            (3, 4),
+        }
+
+    def test_utf8_ast_columns_are_published_as_character_columns(self) -> None:
+        code = 'label = "🦄"; exec(\n    "payload"\n)\n'
+        ast1 = next(finding for finding in _run(code) if finding.rule_id == "AST1")
+
+        assert ast1.matched_text == 'exec(\n    "payload"\n)'
+        assert ast1.start_line == 1
+        assert ast1.start_column == code.index("exec")
+        assert ast1.end_line == 3
+        assert ast1.end_column == 1
+
+    def test_many_same_line_calls_use_preindexed_source_slices(self, monkeypatch) -> None:
+        def fail_full_source_rescan(*_args, **_kwargs):
+            raise AssertionError("ast.get_source_segment must not run per finding")
+
+        monkeypatch.setattr(behavioral_ast.ast, "get_source_segment", fail_full_source_rescan)
+        call_count = 2_000
+        code = "; ".join('exec("payload")' for _ in range(call_count))
+
+        ast1 = [finding for finding in _run(code) if finding.rule_id == "AST1"]
+
+        assert len(ast1) == call_count
+        assert ast1[0].start_column == 0
+        assert ast1[-1].start_column == code.rindex("exec")
+
+    def test_long_line_context_is_centered_on_the_ast_call(self) -> None:
+        prefix = "value = 0; " * 150
+        code = prefix + 'exec("LATE_AST_PAYLOAD")'
+
+        ast1 = next(finding for finding in _run(code) if finding.rule_id == "AST1")
+
+        assert ast1.start_column == len(prefix)
+        assert ast1.context is not None
+        assert len(ast1.context) <= 1_000
+        assert 'exec("LATE_AST_PAYLOAD")' in ast1.context
+
     def test_exec_produces_ast1(self):
         findings = _run('exec("print(1)")')
         ast1 = [f for f in findings if f.rule_id == "AST1"]
@@ -66,6 +132,22 @@ class TestDunderImport:
 
 
 class TestSubprocess:
+    def test_long_ast_matches_use_complete_source_identity(self):
+        def code(tail: str) -> str:
+            shared_arguments = "\n".join(f'    "{"a" * 80}",' for _ in range(5))
+            return f'import subprocess\nsubprocess.run([\n{shared_arguments}\n    "{tail}",\n])\n'
+
+        first_code = code("UNIQUE_FIRST_TAIL")
+        second_code = code("UNIQUE_SECOND_TAIL")
+        first = next(f for f in _run(first_code, "first.py") if f.rule_id == "AST4")
+        second = next(f for f in _run(second_code, "second.py") if f.rule_id == "AST4")
+
+        assert first.matched_text == second.matched_text
+        assert len(first.matched_text or "") == 200
+        assert first.fingerprint() != second.fingerprint()
+        assert len(deduplicate([first, second])) == 2
+        assert "UNIQUE_FIRST_TAIL" not in json.dumps(first.to_dict(), sort_keys=True)
+
     def test_subprocess_run_produces_ast4(self):
         code = 'import subprocess\nsubprocess.run(["ls", "-la"])'
         findings = _run(code)
@@ -120,6 +202,14 @@ class TestDynamicGetattr:
         findings = _run(code)
         assert not any(f.rule_id == "AST7" for f in findings)
 
+    def test_getattr_with_direct_non_string_literal_is_silent(self):
+        findings = _run("getattr(obj, 42)")
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+    def test_getattr_with_constructed_benign_name_remains_dynamic(self):
+        findings = _run("getattr(subprocess, ''.join(['P', 'o', 'p', 'e', 'n']))(cmd)")
+        assert any(f.rule_id == "AST7" for f in findings)
+
 
 class TestReflectiveGetattrExec:
     """getattr(obj, "<sink>")(...) is a reflective handle on an exec/os sink.
@@ -137,6 +227,12 @@ class TestReflectiveGetattrExec:
 
     def test_getattr_builtins_exec_produces_ast9(self):
         findings = _run("import builtins\ngetattr(builtins, 'exec')(payload)")
+        assert any(f.rule_id == "AST9" for f in findings)
+
+    def test_getattr_joined_exec_name_produces_ast9(self):
+        findings = _run(
+            "import builtins\ngetattr(builtins, ''.join(['e', 'x', 'e', 'c']))(payload)"
+        )
         assert any(f.rule_id == "AST9" for f in findings)
 
     def test_getattr_eval_double_quotes_produces_ast9(self):
@@ -157,6 +253,175 @@ class TestReflectiveGetattrExec:
         for name in ("name", "timeout", "value", "data", "run", "compile"):
             findings = _run(f"v = getattr(config, '{name}')")
             assert not any(f.rule_id == "AST9" for f in findings), name
+
+
+class TestJoinedGetattrNameBounds:
+    """Joined getattr names must be length-bounded before the join allocates.
+
+    A parseable source can carry a separator/element combination whose expanded
+    join dwarfs the source-size gate; resolving it would allocate the full
+    payload from untrusted skill source. Over-cap joins must return unresolved
+    so the caller keeps the existing AST7 dynamic-name fallback (never AST9),
+    while bounded joins keep their AST7/AST9 classification.
+    """
+
+    @staticmethod
+    def _resolve(join_code: str):
+        node = behavioral_ast.ast.parse(join_code, mode="eval").body
+        return behavioral_ast._constant_string(node)
+
+    def test_huge_separator_and_list_return_unresolved_without_allocating(self):
+        # Reviewer P1 example shape: a 100,000-character separator joined over
+        # 10,000 empty literals fits in ~130,024 source characters but expands
+        # to ~999,900,000. The test builds the source, never the payload.
+        separator = "x" * 100_000
+        elements = ", ".join(["''"] * 10_000)
+        assert self._resolve(f"{separator!r}.join([{elements}])") is None
+
+    def test_nested_join_returns_unresolved(self):
+        # The inner join is already over the cap, so the whole expression
+        # must stay unresolved.
+        assert self._resolve("'-'.join(['p', 'ab'.join(['xy'] * 30)])") is None
+
+    def test_bounded_join_still_resolves(self):
+        assert self._resolve("''.join(['e', 'x', 'e', 'c'])") == "exec"
+
+    def test_over_cap_join_falls_back_to_ast7_not_ast9(self):
+        separator = "x" * 64
+        elements = ", ".join(["''"] * 300)
+        findings = _run(f"import os\ngetattr(os, {separator!r}.join([{elements}]))(cmd)")
+        assert any(f.rule_id == "AST7" for f in findings)
+        assert not any(f.rule_id == "AST9" for f in findings)
+
+    def test_over_cap_join_spelling_dangerous_name_stays_ast7(self):
+        # Even when the bounded parts would spell a dangerous name, an
+        # over-cap join must not resolve to it.
+        elements = ", ".join(["'e'", "'x'", "'e'", "'c'"] + ["''"] * 300)
+        findings = _run(f"import os\ngetattr(os, {('x' * 64)!r}.join([{elements}]))(cmd)")
+        assert not any(f.rule_id == "AST9" for f in findings)
+        assert any(f.rule_id == "AST7" for f in findings)
+
+
+class TestModuleDictSubscript:
+    """<module>.__dict__[key] / vars(<module>)[key] are subscript getattr equivalents.
+
+    Both index the module namespace, so they must get the same AST7/AST9
+    treatment as getattr(module, key); changing only the spelling must not
+    change the verdict.
+    """
+
+    def test_dunder_dict_computed_key_produces_ast7(self):
+        code = 'import os\nhandle = os.__dict__["po" + "pen"]("id")'
+        findings = _run(code)
+        ast7 = [f for f in findings if f.rule_id == "AST7"]
+        assert len(ast7) == 1
+        assert ast7[0].severity == "LOW"
+        assert "__dict__" in ast7[0].message
+
+    def test_dunder_dict_literal_sink_produces_ast9(self):
+        code = 'import os\nhandle = os.__dict__["popen"]("whoami")'
+        findings = _run(code)
+        ast9 = [f for f in findings if f.rule_id == "AST9"]
+        assert len(ast9) == 1
+        assert ast9[0].severity == "HIGH"
+
+    def test_vars_module_computed_key_produces_ast7(self):
+        code = "import os\nkey = 'po' + 'pen'\nhandle = vars(os)[key]"
+        findings = _run(code)
+        assert any(f.rule_id == "AST7" for f in findings)
+
+    def test_aliased_module_dunder_dict_produces_ast7(self):
+        code = "import os as o\nkey = 'system'\nhandle = o.__dict__[key]"
+        findings = _run(code)
+        assert any(f.rule_id == "AST7" for f in findings)
+
+    def test_instance_dunder_dict_no_finding(self):
+        # Instance attribute bags are idiomatic and must stay unflagged.
+        code = "class C:\n    def set(self, key, value):\n        self.__dict__[key] = value"
+        findings = _run(code)
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+    def test_dunder_dict_safe_literal_no_finding(self):
+        code = 'import os\nenv = os.__dict__["environ"]'
+        findings = _run(code)
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+
+class TestModuleDictReadMethods:
+    """<module>.__dict__.get/setdefault/pop(key) (and the same on vars(<module>))
+    are further spellings of the same reflective access as the subscript form.
+
+    Each of the three returns the identical object a subscript would for any
+    key that already exists — every name in ``_DANGEROUS_GETATTR_NAMES`` always
+    does, on the module that defines it — so all three must get the same
+    AST7/AST9 treatment: an evasion that only changes spelling must not change
+    the verdict, no matter how many method-call spellings it has.
+    """
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_dunder_dict_method_computed_key_produces_ast7(self, method):
+        code = f'import os\nhandle = os.__dict__.{method}("po" + "pen")("id")'
+        findings = _run(code)
+        ast7 = [f for f in findings if f.rule_id == "AST7"]
+        assert len(ast7) == 1
+        assert ast7[0].severity == "LOW"
+        assert "__dict__" in ast7[0].message
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_dunder_dict_method_literal_sink_produces_ast9(self, method):
+        code = f'import os\nhandle = os.__dict__.{method}("popen")("whoami")'
+        findings = _run(code)
+        ast9 = [f for f in findings if f.rule_id == "AST9"]
+        assert len(ast9) == 1
+        assert ast9[0].severity == "HIGH"
+
+    def test_dunder_dict_get_with_default_still_detected(self):
+        code = 'import os\nhandle = os.__dict__.get("popen", None)("whoami")'
+        findings = _run(code)
+        assert any(f.rule_id == "AST9" for f in findings)
+
+    def test_dunder_dict_setdefault_with_default_still_detected(self):
+        code = 'import os\nhandle = os.__dict__.setdefault("popen", None)("whoami")'
+        findings = _run(code)
+        assert any(f.rule_id == "AST9" for f in findings)
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_vars_module_method_computed_key_produces_ast7(self, method):
+        code = f"import os\nkey = 'po' + 'pen'\nhandle = vars(os).{method}(key)"
+        findings = _run(code)
+        assert any(f.rule_id == "AST7" for f in findings)
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_aliased_module_dunder_dict_method_produces_ast7(self, method):
+        code = f"import os as o\nkey = 'system'\nhandle = o.__dict__.{method}(key)"
+        findings = _run(code)
+        assert any(f.rule_id == "AST7" for f in findings)
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_instance_dunder_dict_method_no_finding(self, method):
+        # Instance attribute bags are idiomatic and must stay unflagged.
+        code = f"class C:\n    def get_key(self, key):\n        return self.__dict__.{method}(key)"
+        findings = _run(code)
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_vars_self_method_no_finding(self, method):
+        code = f"class C:\n    def get_key(self, key):\n        return vars(self).{method}(key)"
+        findings = _run(code)
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_dunder_dict_method_safe_literal_no_finding(self, method):
+        code = f'import os\nenv = os.__dict__.{method}("environ")'
+        findings = _run(code)
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_unrelated_method_call_no_finding(self, method):
+        # A plain dict method unrelated to any module namespace must stay silent.
+        code = f'd = {{"a": 1}}\nval = d.{method}("a")'
+        findings = _run(code)
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
 
 
 class TestDangerousChains:

@@ -34,15 +34,26 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from skillspector.graph import graph
-from skillspector.llm_analyzer_base import LLMAnalyzerBase, LLMAnalysisResult
+from skillspector.inspection_ledger import finalize_ledger
+from skillspector.llm_analyzer_base import (
+    LLMAnalyzerBase,
+    LLMAnalysisResult,
+    _StructuredResponseValidationError,
+    ledger_events_for_batches,
+)
 from skillspector.logging_config import get_logger
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, MetaAnalyzerResult
 
 from .annotation import annotate_findings
+from .detection import detect_skill_language
+from .gap_fill import GapFillError, run_gap_fill
 
 logger = get_logger(__name__)
 
@@ -83,13 +94,16 @@ def set_api_pool(pool: "ApiKeyPool | None") -> None:
     if _original_get_chat_model is None:
         _original_get_chat_model = _llm_utils.get_chat_model
 
-    def _pooled_get_chat_model(model=None):
+    def _pooled_get_chat_model(model=None, *, timeout=None):
         if _api_pool:
             from .api_pool import PooledChatModel
-            pooled_model = PooledChatModel(_api_pool)
+            pooled_model = PooledChatModel(
+                _api_pool,
+                timeout=_DEFAULT_REQUEST_TIMEOUT if timeout is None else timeout,
+            )
             _llm_utils.register_chat_model_provider(pooled_model, "openai")
             return pooled_model
-        return _original_get_chat_model(model)
+        return _original_get_chat_model(model=model, timeout=timeout)
 
     _llm_utils.get_chat_model = _pooled_get_chat_model
     _llm_analyzer_base.get_chat_model = _pooled_get_chat_model
@@ -122,7 +136,7 @@ _patches_depth: int = 0  # nesting counter — safe for re-entrant context manag
 _original_base_init = LLMAnalyzerBase.__init__
 
 
-def _patched_base_init(self, base_prompt, model, *, node="llm_analyzer"):
+def _patched_base_init(self, base_prompt, model, *, node="llm_analyzer", timeout=None):
     """Set response_schema=None on the instance dict BEFORE original init.
 
     Relies on Python MRO guarantee: instance.__dict__ is always checked
@@ -130,7 +144,7 @@ def _patched_base_init(self, base_prompt, model, *, node="llm_analyzer"):
     a library internal.
     """
     self.response_schema = None
-    _original_base_init(self, base_prompt, model, node=node)
+    _original_base_init(self, base_prompt, model, node=node, timeout=timeout)
 
 
 # -- Patch 2: LLMAnalyzerBase.parse_response handles raw JSON --------------
@@ -144,23 +158,11 @@ def _patched_base_parse(self, response, batch):
     text = _strip_markdown_fences(str(response))
     try:
         data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        logger.warning(
-            "LLMAnalyzerBase.parse_response: invalid JSON for %s: %s",
-            batch.file_label,
-            exc,
-        )
-        return []
-    try:
         result = LLMAnalysisResult.model_validate(data)
-        return [f.to_finding(batch.file_path) for f in result.findings]
-    except Exception as exc:
-        logger.warning(
-            "LLMAnalyzerBase.parse_response: schema validation failed for %s: %s",
-            batch.file_label,
-            exc,
-        )
-        return []
+    except (json.JSONDecodeError, ValidationError) as exc:
+        # Keep raw-response providers on the core retry and failure-ledger path.
+        raise _StructuredResponseValidationError from exc
+    return [f.to_finding(batch.file_path) for f in result.findings]
 
 
 # -- Patch 3: LLMMetaAnalyzer.parse_response handles raw JSON ---------------
@@ -172,7 +174,9 @@ def _sanitize_meta_finding(d: dict) -> dict:
     for key in ("remediation", "explanation"):
         if d.get(key) is None:
             d[key] = ""
-    if d.get("impact") not in ("critical", "high", "medium", "low"):
+    impact = d.get("impact")
+    d["impact"] = impact.casefold() if isinstance(impact, str) else "low"
+    if d["impact"] not in ("critical", "high", "medium", "low"):
         d["impact"] = "low"
     return d
 
@@ -184,28 +188,20 @@ def _patched_meta_parse(self, response, batch):
     text = _strip_markdown_fences(str(response))
     try:
         data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        logger.warning(
-            "LLMMetaAnalyzer.parse_response: invalid JSON for %s: %s",
-            batch.file_label,
-            exc,
-        )
-        return []
-    try:
+        if isinstance(data, dict) and isinstance(data.get("findings"), list):
+            data["findings"] = [
+                _sanitize_meta_finding(dict(item)) if isinstance(item, dict) else item
+                for item in data["findings"]
+            ]
         result = MetaAnalyzerResult.model_validate(data)
-        items = []
-        for f in result.findings:
-            d = _sanitize_meta_finding(f.model_dump())
-            d["_file"] = batch.file_path
-            items.append(d)
-        return items
-    except Exception as exc:
-        logger.warning(
-            "LLMMetaAnalyzer.parse_response: schema validation failed for %s: %s",
-            batch.file_label,
-            exc,
-        )
-        return []
+    except (json.JSONDecodeError, ValidationError) as exc:
+        raise _StructuredResponseValidationError from exc
+    items = []
+    for f in result.findings:
+        d = f.model_dump()
+        d["_file"] = batch.file_path
+        items.append(d)
+    return items
 
 
 # -- Patch 4: append JSON output format to base prompt ---------------------
@@ -262,10 +258,14 @@ except ImportError:
 def _patched_chatopenai_init(self, **kwargs):
     import httpx
 
-    _to = httpx.Timeout(
-        _DEFAULT_REQUEST_TIMEOUT,
-        connect=_DEFAULT_CONNECT_TIMEOUT,
-    )
+    requested = kwargs.get("request_timeout", kwargs.get("timeout"))
+    _to = httpx.Timeout(_DEFAULT_REQUEST_TIMEOUT, connect=_DEFAULT_CONNECT_TIMEOUT)
+    if requested is not None:
+        requested = httpx.Timeout(requested).as_dict()
+        _to = httpx.Timeout(**{
+            key: min(cap, requested[key]) if requested[key] is not None else cap
+            for key, cap in _to.as_dict().items()
+        })
     # Set both the Pydantic alias AND the canonical field name so we don't
     # depend on alias-precedence behaviour (which is a Pydantic v2 internal).
     kwargs["timeout"] = _to
@@ -325,12 +325,13 @@ def _verify_patch_targets() -> None:
         "LLMAnalyzerBase.__init__",
         1,
     )
-    _node_param = inspect.signature(LLMAnalyzerBase.__init__).parameters.get("node")
-    if _node_param is None or _node_param.kind != inspect.Parameter.KEYWORD_ONLY:
-        raise RuntimeError(
-            "Patch 1 target changed: LLMAnalyzerBase.__init__ must retain its "
-            "keyword-only 'node' parameter."
-        )
+    for name in ("node", "timeout"):
+        parameter = inspect.signature(LLMAnalyzerBase.__init__).parameters.get(name)
+        if parameter is None or parameter.kind != inspect.Parameter.KEYWORD_ONLY:
+            raise RuntimeError(
+                "Patch 1 target changed: LLMAnalyzerBase.__init__ must retain its "
+                f"keyword-only '{name}' parameter."
+            )
     if not hasattr(LLMAnalyzerBase, "response_schema"):
         raise RuntimeError(
             "Patch 1 target lost: LLMAnalyzerBase no longer has "
@@ -345,7 +346,7 @@ def _verify_patch_targets() -> None:
         "LLMAnalyzerBase.parse_response",
         2,
     )
-    # Deep deps (called inside try/except — silent degradation if broken):
+    # Validate dependencies before patching rather than failing during a scan:
     if not hasattr(LLMAnalysisResult, "model_validate"):
         raise RuntimeError(
             "Patch 2 deep dependency lost: LLMAnalysisResult.model_validate "
@@ -725,6 +726,9 @@ def run_one(
     detected_language: str = "en",
     gap_fill_applied: bool = False,
     gap_fill_findings: int = 0,
+    apply_gap_fill: bool = False,
+    api_pool=None,
+    timeout: float = 90,
 ) -> tuple[dict[str, object], str | None]:
     """Scan a single skill through the full graph pipeline.
 
@@ -737,23 +741,38 @@ def run_one(
     use_llm :
         Passed through to the graph as ``state["use_llm"]``.
     detected_language :
-        Language tag for annotation and reporting.
+        Language tag for annotation and reporting. ``"auto"`` detects it
+        from the graph's provider-eligible cache without rereading files.
     gap_fill_applied :
-        ``True`` when the caller has applied gap-fill (set by
-        :func:`~.batch_scan._scan_skill` after the graph returns).
+        Whether the caller has already applied gap-fill.
     gap_fill_findings :
         Number of gap-fill findings appended post-graph.
+    apply_gap_fill :
+        Run non-English gap-fill against the graph's provider-eligible cache.
+    api_pool :
+        Optional API key pool for gap-fill calls.
+    timeout :
+        Per-skill worker budget in seconds. Gap-fill uses the time remaining
+        after core analysis, with reporting headroom. Core analysis keeps its
+        own budget and can still reach the worker's process timeout.
 
     Returns
     -------
     ``(entry, error_message_or_None)`` — on success *error_message*
-    is ``None``; on failure *entry* is a stub error entry and
-    *error_message* carries the exception text.
+    is ``None``. Gap-fill failure retains the core entry and adds incomplete
+    coverage and a machine-readable error. A failure before the core result
+    returns a stub error entry.
     """
+    # Leave time to serialize partial findings before the worker hard limit.
+    deadline = time.monotonic() + max(0, timeout - min(5.0, timeout / 10))
     result = None
     try:
         state = scan_state(skill_dir, use_llm=use_llm)
         result = graph.invoke(state)
+        # Use the validated snapshot; never reread paths or fall back to local-only content.
+        file_cache = result.get("llm_file_cache") or {}
+        if detected_language == "auto":
+            detected_language = detect_skill_language(file_cache)
         entry = entry_from_result(
             result,
             skill_dir,
@@ -762,36 +781,75 @@ def run_one(
             gap_fill_applied=gap_fill_applied,
             gap_fill_findings=gap_fill_findings,
         )
+        if apply_gap_fill and use_llm and detected_language != "en":
+            gap_error = None
+            try:
+                gap_findings = run_gap_fill(
+                    file_cache, detected_language, api_pool=api_pool,
+                    timeout=lambda: deadline - time.monotonic(),
+                )
+            except GapFillError as exc:
+                gap_error = exc
+                gap_findings = exc.findings
+            entry["issues"] = list(entry.get("issues", [])) + annotate_findings(
+                [finding.to_dict() for finding in gap_findings], detected_language
+            )
+            entry["enhancements"]["gap_fill_applied"] = bool(file_cache) and gap_error is None
+            entry["enhancements"]["gap_fill_findings"] = len(gap_findings)
+            if gap_error is not None:
+                events, status = ledger_events_for_batches("gap_fill", gap_error.outcome)
+                completeness, _ = finalize_ledger({
+                    **result,
+                    "findings": [*(result.get("findings") or []), *gap_findings],
+                    "inspection_ledger": [*(result.get("inspection_ledger") or []), *events],
+                    "analyzer_status_events": [*(result.get("analyzer_status_events") or []), status],
+                })
+                entry["analysis_completeness"] = completeness
+                entry["execution_successful"] = completeness["execution_successful"]
+                if entry["risk_assessment"]["recommendation"] == "SAFE":
+                    entry["risk_assessment"]["recommendation"] = "CAUTION"
+                entry["enhancements"]["gap_fill_error"] = str(gap_error)
+                entry["enhancements"]["gap_fill_status"] = "incomplete"
+                entry["enhancements"]["gap_fill_error_reasons"] = sorted({
+                    failure.reason.value for failure in gap_error.outcome.failures
+                })
+                return entry, str(gap_error)
         return entry, None
     except Exception as exc:
-        rel_name = _rel_name(skill_dir, root)
-        error_entry: dict[str, object] = {
-            "skill": {
-                "name": rel_name,
-                "source": str(skill_dir),
-                "source_group": rel_name.split("/")[0] if "/" in rel_name else ".",
-                "language": detected_language,
-                "scanned_at": datetime.now(UTC).isoformat(),
-            },
-            "risk_assessment": {
-                "score": 0,
-                "severity": "ERROR",
-                "recommendation": "ERROR",
-            },
-            "components": [],
-            "issues": [],
-            "scan_mode": "multilingual-enhanced",
-            "enhancements": {
-                "gap_fill_applied": False,
-                "gap_fill_findings": 0,
-                "english_keyword_rules_skipped": 0,
-            },
-            "error": str(exc),
-        }
-        return error_entry, str(exc)
+        return entry_from_error(skill_dir, root, str(exc), detected_language), str(exc)
     finally:
         if result is not None:
             cleanup_result(result)
+
+
+def entry_from_error(
+    skill_dir: Path, root: Path, error: str, detected_language: str
+) -> dict[str, object]:
+    """Keep failed and interrupted scans visible in every batch report."""
+    rel_name = _rel_name(skill_dir, root)
+    return {
+        "skill": {
+            "name": rel_name,
+            "source": str(skill_dir),
+            "source_group": rel_name.split("/")[0] if "/" in rel_name else ".",
+            "language": "unknown" if detected_language == "auto" else detected_language,
+            "scanned_at": datetime.now(UTC).isoformat(),
+        },
+        "risk_assessment": {
+            "score": 0,
+            "severity": "ERROR",
+            "recommendation": "ERROR",
+        },
+        "components": [],
+        "issues": [],
+        "scan_mode": "multilingual-enhanced",
+        "enhancements": {
+            "gap_fill_applied": False,
+            "gap_fill_findings": 0,
+            "english_keyword_rules_skipped": 0,
+        },
+        "error": error,
+    }
 
 
 def _rel_name(skill_dir: Path, root: Path) -> str:

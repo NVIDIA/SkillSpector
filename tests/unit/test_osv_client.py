@@ -120,6 +120,20 @@ class TestSeverityFromVuln:
     def test_no_severity_defaults_high(self) -> None:
         assert _severity_from_vuln({}) == "HIGH"
 
+    def test_ghsa_moderate_normalizes_to_medium(self) -> None:
+        # GHSA's own four levels are LOW/MODERATE/HIGH/CRITICAL, not
+        # LOW/MEDIUM/HIGH/CRITICAL — confirmed live against api.osv.dev
+        # (e.g. GHSA-29mw-wpgm-hmr9, a real lodash prototype-pollution
+        # advisory, reports `"database_specific": {"severity": "MODERATE"}`).
+        # Every downstream table keys on the app's own vocabulary, so this
+        # must normalize here rather than leak the external spelling.
+        vuln = {"database_specific": {"severity": "MODERATE"}}
+        assert _severity_from_vuln(vuln) == "MEDIUM"
+
+    def test_ecosystem_specific_moderate_normalizes_to_medium(self) -> None:
+        vuln = {"affected": [{"ecosystem_specific": {"severity": "moderate"}}]}
+        assert _severity_from_vuln(vuln) == "MEDIUM"
+
 
 class TestQueryBatch:
     def test_empty_packages_returns_empty(self) -> None:
@@ -169,6 +183,43 @@ class TestQueryBatch:
         assert results[0][0].severity == "HIGH"
         assert "CVE-2024-22195" in results[0][0].aliases
         assert len(results[1]) == 0
+
+    def test_batch_query_ghsa_moderate_normalizes_to_medium(self) -> None:
+        # Real OSV.dev record for lodash 4.17.15 (GHSA-29mw-wpgm-hmr9, a
+        # prototype-pollution advisory): `database_specific.severity` is the
+        # literal string "MODERATE", GHSA's own term, not "MEDIUM".
+        mock_batch_response = {
+            "results": [{"vulns": [{"id": "GHSA-29mw", "modified": "2024-01-01T00:00:00Z"}]}]
+        }
+        mock_detail_response = {
+            "id": "GHSA-29mw",
+            "summary": "Prototype pollution in lodash",
+            "database_specific": {"severity": "MODERATE"},
+            "aliases": ["CVE-2020-8203"],
+        }
+
+        mock_client = MagicMock()
+        mock_post_resp = MagicMock()
+        mock_post_resp.json.return_value = mock_batch_response
+        mock_post_resp.raise_for_status = MagicMock()
+
+        mock_get_resp = MagicMock()
+        mock_get_resp.json.return_value = mock_detail_response
+        mock_get_resp.raise_for_status = MagicMock()
+
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = mock_post_resp
+        mock_client.get.return_value = mock_get_resp
+
+        with patch(
+            "skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=mock_client
+        ):
+            results = query_batch([("lodash", "4.17.15")], ECOSYSTEM_NPM)
+
+        assert len(results) == 1
+        assert len(results[0]) == 1
+        assert results[0][0].severity == "MEDIUM"
 
     def test_network_failure_returns_empty(self) -> None:
         mock_client = MagicMock()

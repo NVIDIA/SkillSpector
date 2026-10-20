@@ -27,7 +27,12 @@ from pathlib import Path
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from skillspector.providers import registry
-from skillspector.providers.chat_models import create_openai_compatible_chat_model
+from skillspector.providers.chat_models import (
+    UnsupportedControlError,
+    create_openai_compatible_chat_model,
+    resolve_reasoning_effort,
+)
+from skillspector.providers.minimax.chat_model import MiniMaxChatOpenAI
 
 MINIMAX_GLOBAL_BASE_URL = "https://api.minimax.io/v1"
 MINIMAX_CN_BASE_URL = "https://api.minimaxi.com/v1"
@@ -54,7 +59,7 @@ def _resolve_base_url() -> str:
 class MiniMaxProvider:
     """MiniMax credentials, regional routing, and bundled model metadata."""
 
-    DEFAULT_MODEL = "MiniMax-M2.7"
+    DEFAULT_MODEL = "MiniMax-M3.1-Flash"
     SLOT_DEFAULTS: dict[str, str] = {}
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
@@ -72,12 +77,24 @@ class MiniMaxProvider:
         timeout: float | None = 120,
     ) -> BaseChatModel | None:
         """Create a chat model for the selected MiniMax endpoint."""
+        effort = resolve_reasoning_effort()
+        allowed_efforts = ("low", "medium", "high", "xhigh", "max")
+        if model == "MiniMax-M3.1-Flash" and effort and effort not in allowed_efforts:
+            raise UnsupportedControlError(
+                f"SKILLSPECTOR_REASONING_EFFORT={effort!r} is not supported by {model}; "
+                f"use one of {', '.join(allowed_efforts)} or unset it"
+            )
         return create_openai_compatible_chat_model(
             model=model,
             credentials=self.resolve_credentials(),
             max_tokens=max_tokens,
             timeout=timeout,
+            chat_model_class=MiniMaxChatOpenAI,
         )
+
+    def structured_output_method(self, model: str) -> str:
+        """Use the documented tool-calling API for scanner schemas."""
+        return registry.lookup_structured_output_method(REGISTRY_PATH, model) or "function_calling"
 
     def get_context_length(self, model: str) -> int | None:
         return registry.lookup_context_length(REGISTRY_PATH, model)

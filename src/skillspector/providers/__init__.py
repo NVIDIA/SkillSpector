@@ -31,15 +31,17 @@ Selection happens via the ``SKILLSPECTOR_PROVIDER`` env var:
     ollama            → OllamaProvider               (local Ollama instance)
     azure_openai      → AzureOpenAIProvider          (Azure OpenAI Service)
     openai_compatible → OpenAICompatibleProvider     (Groq, Together AI, Mistral, etc.)
+    gemini            → GeminiProvider               (Google Cloud ADC / Workload Identity)
     claude_cli        → ClaudeCLIProvider            (local ``claude`` binary, no API key)
-    codex_cli         → CodexCLIProvider             (local ``codex`` binary, no API key)
+    codex_cli         → CodexCLIProvider             (registered but disabled: host-file reads)
     gemini_cli        → GeminiCLIProvider            (local ``gemini`` binary, no API key)
+    opencode_cli      → OpencodeCLIProvider          (local ``opencode`` binary, no API key)
     antigravity_cli   → AntigravityCLIProvider       (local ``agy`` binary; registered
-                                                       but disabled; use gemini_cli)
+                                                      but disabled; use gemini_cli)
 
 When unset, the selector defaults to ``nv_build``.
 
-CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``) implement the
+CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``, ``opencode_cli``) implement the
 optional :class:`~skillspector.providers.base.AgentCLICapable` interface — they
 expose ``is_available()`` and ``complete()`` so that
 :func:`skillspector.llm_utils.get_chat_model` uses the local CLI subprocess
@@ -76,6 +78,10 @@ _INJECTED_PROVIDER: ContextVar[LLMProvider | None] = ContextVar(
     "skillspector_injected_provider",
     default=None,
 )
+
+
+class UnknownProviderError(ValueError):
+    """The configured provider name does not identify a supported provider."""
 
 
 def raise_no_llm_api_key_configured() -> NoReturn:
@@ -138,6 +144,10 @@ def _select_active_provider() -> LLMProvider:
         from .openai_compatible import OpenAICompatibleProvider
 
         return OpenAICompatibleProvider()
+    if name == "gemini":
+        from .gemini import GeminiProvider
+
+        return GeminiProvider()
     if name == "nv_build":
         return NvBuildProvider()
     if name == "claude_cli":
@@ -152,6 +162,10 @@ def _select_active_provider() -> LLMProvider:
         from .gemini_cli import GeminiCLIProvider
 
         return GeminiCLIProvider()
+    if name == "opencode_cli":
+        from .opencode_cli import OpencodeCLIProvider
+
+        return OpencodeCLIProvider()
     if name == "antigravity_cli":
         from .antigravity_cli import AntigravityCLIProvider
 
@@ -166,11 +180,11 @@ def _select_active_provider() -> LLMProvider:
         except ImportError:
             return NvBuildProvider()
 
-    raise ValueError(
+    raise UnknownProviderError(
         f"Unknown SKILLSPECTOR_PROVIDER: {name!r}. "
         "Expected one of: openai, anthropic, anthropic_proxy, bedrock, minimax, nv_build, "
-        "ollama, azure_openai, openai_compatible, "
-        "claude_cli, codex_cli, gemini_cli, antigravity_cli (or unset)."
+        "ollama, azure_openai, openai_compatible, gemini, "
+        "claude_cli, codex_cli, gemini_cli, opencode_cli, antigravity_cli (or unset)."
     )
 
 
@@ -221,20 +235,25 @@ def resolve_chat_model_credentials() -> tuple[str, str | None] | None:
 def get_model_config_provider() -> ModelMetadataProvider:
     """Return the provider whose model defaults match graph chat-model routing.
 
-    Explicit bindings, CLI providers, and Bedrock's native AWS credential path
-    remain authoritative. Unbound API-key providers use OpenAI metadata only
-    when their own credentials are absent and the OpenAI fallback is configured.
+    Explicit bindings, CLI providers, Bedrock's native AWS credential path,
+    and Gemini's ADC path remain authoritative. Unbound API-key providers use
+    OpenAI metadata only when their own credentials are absent and the OpenAI
+    fallback is configured.
     """
     provider = _select_active_provider()
     from .bedrock import BedrockProvider
+    from .gemini import GeminiProvider
 
     if (
         has_provider_binding()
         or has_cli_capability(provider)
-        or isinstance(provider, BedrockProvider)
+        or isinstance(provider, (BedrockProvider, GeminiProvider))
     ):
         return provider
-    if provider.resolve_credentials() is not None:
+    try:
+        if provider.resolve_credentials() is not None:
+            return provider
+    except ValueError:
         return provider
 
     fallback = _openai_fallback_provider()
@@ -251,8 +270,9 @@ def create_chat_model_with_provider(
 ) -> tuple[BaseChatModel, LLMProvider]:
     """Create a chat model and return the provider that actually built it.
 
-    CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``) do not have
-    a native LangChain chat model — callers that need CLI transport should use
+    CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
+    ``opencode_cli``) do not have a native LangChain chat model — callers
+    that need CLI transport should use
     :func:`skillspector.llm_utils.get_chat_model` instead (which returns an
     :class:`~skillspector.llm_utils.AgentCLIChatModel` adapter).
 
@@ -308,6 +328,7 @@ __all__ = [
     "LLMProvider",
     "ModelMetadataProvider",
     "NO_LLM_API_KEY_MESSAGE",
+    "UnknownProviderError",
     "create_chat_model",
     "create_chat_model_with_provider",
     "get_active_provider",

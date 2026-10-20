@@ -22,8 +22,7 @@ Security invariants verified:
   - Untrusted content is passed via stdin, never in argv
   - Capability-stripping flags (--allowed-tools "" deny-by-default,
     --permission-mode dontAsk, --strict-mcp-config, --disable-slash-commands for
-    claude; --sandbox read-only, --ephemeral, --ignore-user-config, --ignore-rules
-    for codex) are present in argv
+    claude) are present in argv; Codex is rejected before any subprocess starts
   - --dangerously-skip-permissions is NEVER in argv
   - A timeout parameter is set
   - Environment passed to the child is scrubbed of API keys and secrets
@@ -43,6 +42,7 @@ import pytest
 
 from skillspector.providers import _agent_cli
 from skillspector.providers._agent_cli import (
+    _CLAUDE_SYSTEM_PROMPT,
     MAX_INPUT_BYTES,
     AgentCLIError,
     _build_claude_argv,
@@ -194,7 +194,9 @@ class TestBuildClaudeArgv:
         # --no-mcp-config is not a real claude flag and must not be used.
         assert "--no-mcp-config" not in argv
 
-    def test_setting_sources_is_empty_single_token_after_strict_mcp_config(self) -> None:
+    def test_setting_sources_is_empty_single_token_after_strict_mcp_config(
+        self,
+    ) -> None:
         argv = _build_claude_argv(CLAUDE_BINARY, MODEL, 4096)
         assert "--setting-sources=" in argv
         assert argv[argv.index("--strict-mcp-config") + 1] == "--setting-sources="
@@ -208,6 +210,23 @@ class TestBuildClaudeArgv:
     def test_disable_slash_commands_present(self) -> None:
         argv = _build_claude_argv(CLAUDE_BINARY, MODEL, 4096)
         assert "--disable-slash-commands" in argv
+
+    def test_tools_flag_removes_all_builtin_tools(self) -> None:
+        argv = _build_claude_argv(CLAUDE_BINARY, MODEL, 4096)
+        # --allowed-tools "" only denies use; --tools "" also drops the schemas
+        # from context, which every call would otherwise pay for.
+        assert argv[argv.index("--tools") + 1] == ""
+
+    def test_system_prompt_replaced_with_fixed_text(self) -> None:
+        argv = _build_claude_argv(CLAUDE_BINARY, MODEL, 4096)
+        assert argv[argv.index("--system-prompt") + 1] == _CLAUDE_SYSTEM_PROMPT
+        assert "--append-system-prompt" not in argv
+
+    def test_no_session_persistence(self) -> None:
+        argv = _build_claude_argv(CLAUDE_BINARY, MODEL, 4096)
+        # Each call runs in a fresh temp cwd; persisting would leave one
+        # ~/.claude/projects folder per call.
+        assert "--no-session-persistence" in argv
 
     def test_dangerously_skip_permissions_never_in_argv(self) -> None:
         argv = _build_claude_argv(CLAUDE_BINARY, MODEL, 4096)
@@ -228,40 +247,10 @@ class TestBuildClaudeArgv:
 
 
 class TestBuildCodexArgv:
-    def test_exec_subcommand(self) -> None:
-        argv = _build_codex_argv(CODEX_BINARY, "o4-mini")
-        assert "exec" in argv
-
-    def test_json_flag_present(self) -> None:
-        argv = _build_codex_argv(CODEX_BINARY, "o4-mini")
-        assert "--json" in argv
-
-    def test_sandbox_read_only(self) -> None:
-        argv = _build_codex_argv(CODEX_BINARY, "o4-mini")
-        assert "--sandbox" in argv
-        idx = argv.index("--sandbox")
-        assert argv[idx + 1] == "read-only"
-
-    def test_ephemeral_present(self) -> None:
-        argv = _build_codex_argv(CODEX_BINARY, "o4-mini")
-        assert "--ephemeral" in argv
-
-    def test_ignore_user_config_present(self) -> None:
-        argv = _build_codex_argv(CODEX_BINARY, "o4-mini")
-        assert "--ignore-user-config" in argv
-
-    def test_ignore_rules_present(self) -> None:
-        argv = _build_codex_argv(CODEX_BINARY, "o4-mini")
-        assert "--ignore-rules" in argv
-
-    def test_dangerous_bypass_never_present(self) -> None:
-        argv = _build_codex_argv(CODEX_BINARY, "o4-mini")
-        full_cmd = " ".join(argv)
-        assert "dangerously" not in full_cmd.lower()
-
-    def test_setting_sources_flag_absent(self) -> None:
-        argv = _build_codex_argv(CODEX_BINARY, "o4-mini")
-        assert "--setting-sources=" not in argv
+    @pytest.mark.parametrize("model", ["", "o4-mini", "--dangerously-bypass-approvals-and-sandbox"])
+    def test_disabled_for_every_model(self, model: str) -> None:
+        with pytest.raises(AgentCLIError, match="codex_cli is disabled"):
+            _build_codex_argv(CODEX_BINARY, model)
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +297,116 @@ class TestScrubEnv:
         env = _scrub_env()
         assert "PATH" in env
         assert "HOME" in env
+
+    def test_allowlist_preserves_runtime_and_drops_unknown_secrets(self) -> None:
+        runtime = {
+            "PATH": "/usr/bin",
+            "HOME": "/home/operator",
+            "USER": "operator",
+            "LOGNAME": "operator",
+            "USERNAME": "operator",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "TERM": "dumb",
+            "TMPDIR": "/tmp",
+            "SystemRoot": "C:/Windows",
+            "AppData": "C:/Users/operator/AppData",
+            "XDG_DATA_HOME": "/home/operator/.local/share",
+            "CLAUDE_CONFIG_DIR": "/home/operator/claude-login",
+            "HTTPS_PROXY": "http://proxy.example:8080",
+            "https_proxy": "http://proxy.example:8080",
+            "HTTP_PROXY": "http://proxy.example:8080",
+            "http_proxy": "http://proxy.example:8080",
+            "ALL_PROXY": "socks5://proxy.example:1080",
+            "all_proxy": "socks5://proxy.example:1080",
+            "NO_PROXY": "localhost",
+            "no_proxy": "localhost",
+            "NODE_EXTRA_CA_CERTS": "/certs/ca.pem",
+            "SSL_CERT_FILE": "/certs/ca.pem",
+            "SSL_CERT_DIR": "/certs",
+        }
+        secrets = dict.fromkeys(
+            (
+                "ANTHROPIC_AUTH_TOKEN",
+                "GEMINI_API_KEY",
+                "GH_TOKEN",
+                "GH_ENTERPRISE_TOKEN",
+                "GIT_SSL_CERT",
+                "GIT_SSL_KEY",
+                "SSLKEYLOGFILE",
+                "OPENROUTER_API_KEY",
+                "NPM_TOKEN",
+                "PYPI_TOKEN",
+                "DATABASE_URL",
+                "VAULT_TOKEN",
+                "future_vendor_auth",
+                "LC_SECRET",
+                "NODE_OPTIONS",
+                "PYTHONPATH",
+            ),
+            "synthetic-secret",
+        )
+        if sys.platform == "win32":
+            # Windows os.environ uppercases names and collapses case aliases.
+            runtime = {key.upper(): value for key, value in runtime.items()}
+            secrets = {key.upper(): value for key, value in secrets.items()}
+        original = runtime | secrets
+        with patch.dict(_agent_cli.os.environ, original, clear=True):
+            assert _scrub_env() == runtime
+            assert dict(_agent_cli.os.environ) == original
+
+    def test_claude_auth_probe_uses_the_inference_environment(self) -> None:
+        runtime = {
+            "PATH": "/usr/bin",
+            "CLAUDE_CONFIG_DIR": "/home/operator/claude-login",
+            "HTTPS_PROXY": "http://proxy.example:8080",
+        }
+        with (
+            patch.dict(
+                _agent_cli.os.environ, runtime | {"GH_TOKEN": "synthetic-secret"}, clear=True
+            ),
+            patch.object(_agent_cli.subprocess, "run") as run,
+        ):
+            run.return_value = subprocess.CompletedProcess(
+                [CLAUDE_BINARY, "auth", "status"], 0, b'{"loggedIn": true}'
+            )
+            assert _agent_cli._claude_auth_check(CLAUDE_BINARY) == (True, None)
+        assert run.call_args.kwargs["env"] == runtime
+        assert run.call_args.kwargs["shell"] is False
+        assert run.call_args.kwargs["timeout"] == 15
+
+    @pytest.mark.parametrize("binary_name", ["claude", "gemini"])
+    @pytest.mark.parametrize("lowercase", [False, True])
+    def test_project_credentials_never_reach_child(
+        self, monkeypatch: pytest.MonkeyPatch, binary_name: str, lowercase: bool
+    ) -> None:
+        secrets = [
+            "SKILLSPECTOR_API_KEYS",
+            "ANTHROPIC_PROXY_API_KEY",
+            "SKILLSPECTOR_COMPAT_API_KEY",
+        ]
+        if lowercase:
+            secrets = [key.lower() for key in secrets]
+        for key in secrets:
+            monkeypatch.setenv(key, "synthetic-credential")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "test-model")
+        monkeypatch.setenv("SKILLSPECTOR_COMPAT_BASE_URL", "https://example.invalid")
+        output = _GOOD_CLAUDE_OUTPUT
+        with (
+            patch(
+                "skillspector.providers._agent_cli.find_binary",
+                return_value="/usr/bin/mock-cli",
+            ),
+            patch("skillspector.providers._agent_cli.subprocess.Popen") as popen,
+        ):
+            popen.return_value = _make_ok_process(output.encode())
+            run_agent_cli(binary_name, PROMPT, model="")
+        child_env = popen.call_args.kwargs["env"]
+        assert not set(secrets).intersection(child_env)
+        assert "SKILLSPECTOR_MODEL" not in child_env
+        assert "SKILLSPECTOR_COMPAT_BASE_URL" not in child_env
+        for key in secrets:
+            assert _agent_cli.os.environ[key] == "synthetic-credential"
 
 
 # ---------------------------------------------------------------------------
@@ -474,60 +573,26 @@ class TestRunAgentCLIClaude:
         assert "dangerously_skip_permissions" not in full_argv
 
 
-@patch("skillspector.providers._agent_cli.find_binary", return_value=CODEX_BINARY)
-@patch("skillspector.providers._agent_cli.subprocess.Popen")
 class TestRunAgentCLICodex:
-    def test_shell_is_false(self, mock_popen: MagicMock, _mock_binary: MagicMock) -> None:
-        mock_popen.return_value = _make_ok_process(_GOOD_CODEX_JSONL.encode())
-        run_agent_cli("codex", PROMPT, model="o4-mini")
-        call_kwargs = mock_popen.call_args[1]
-        assert call_kwargs.get("shell") is False
-
-    def test_prompt_in_stdin_not_argv(self, mock_popen: MagicMock, _mock_binary: MagicMock) -> None:
-        proc = _make_ok_process(_GOOD_CODEX_JSONL.encode())
-        mock_popen.return_value = proc
-        run_agent_cli("codex", PROMPT, model="o4-mini")
-        argv = mock_popen.call_args[0][0]
-        assert PROMPT.encode("utf-8") in proc.stdin_bytes
-        for token in argv:
-            assert PROMPT not in str(token)
-
-    def test_timeout_is_set(self, mock_popen: MagicMock, _mock_binary: MagicMock) -> None:
-        proc = _make_ok_process(_GOOD_CODEX_JSONL.encode())
-        mock_popen.return_value = proc
-        run_agent_cli("codex", PROMPT, model="o4-mini")
-        proc.wait.assert_called_once()
-        timeout_arg = proc.wait.call_args.kwargs.get("timeout")
-        assert isinstance(timeout_arg, (int, float))
-        assert timeout_arg > 0
-
-    def test_env_scrubbed(
-        self, mock_popen: MagicMock, _mock_binary: MagicMock, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
-        mock_popen.return_value = _make_ok_process(_GOOD_CODEX_JSONL.encode())
-        run_agent_cli("codex", PROMPT, model="o4-mini")
-        child_env = mock_popen.call_args[1].get("env", {})
-        assert "OPENAI_API_KEY" not in child_env
-
-    def test_nonzero_exit_raises(self, mock_popen: MagicMock, _mock_binary: MagicMock) -> None:
-        mock_popen.return_value = _make_ok_process(b"", returncode=1)
-        with pytest.raises(AgentCLIError, match="exited with code"):
-            run_agent_cli("codex", PROMPT, model="o4-mini")
-
-    def test_timeout_raises(self, mock_popen: MagicMock, _mock_binary: MagicMock) -> None:
-        mock_popen.return_value = _make_ok_process(
-            b"", wait_exc=subprocess.TimeoutExpired(cmd="codex", timeout=5)
-        )
-        with pytest.raises(AgentCLIError, match="timed out"):
-            run_agent_cli("codex", PROMPT, model="o4-mini")
-
-    def test_no_message_in_output_raises(
-        self, mock_popen: MagicMock, _mock_binary: MagicMock
-    ) -> None:
-        mock_popen.return_value = _make_ok_process(b'{"type": "done"}\n')
-        with pytest.raises(AgentCLIError, match="no assistant message"):
-            run_agent_cli("codex", PROMPT, model="o4-mini")
+    def test_rejects_untrusted_prompt_without_starting_process(self) -> None:
+        with (
+            patch("skillspector.providers._agent_cli.find_binary", return_value=CODEX_BINARY),
+            patch(
+                "skillspector.providers._agent_cli.subprocess.Popen",
+                side_effect=AssertionError("Codex must not start"),
+            ) as popen,
+            patch(
+                "skillspector.providers._agent_cli.subprocess.run",
+                side_effect=AssertionError("Codex must not start"),
+            ) as run,
+        ):
+            with pytest.raises(AgentCLIError, match="host files"):
+                run_agent_cli("codex", INJECTION_PAYLOAD, model="")
+            available, reason = _agent_cli.is_available("codex")
+        assert available is False
+        assert "disabled" in reason
+        popen.assert_not_called()
+        run.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -651,10 +716,10 @@ class TestRunBounded:
 
 class TestCliRegistry:
     def test_registry_covers_known_clis(self) -> None:
-        assert set(_agent_cli._REGISTRY) == {"claude", "codex", "gemini", "agy"}
+        assert set(_agent_cli._REGISTRY) == {"claude", "codex", "gemini", "opencode", "agy"}
 
     def test_get_spec_returns_matching_binary(self) -> None:
-        for name in ("claude", "codex", "gemini", "agy"):
+        for name in ("claude", "codex", "gemini", "opencode", "agy"):
             assert _agent_cli.get_spec(name).binary == name
 
     def test_get_spec_unknown_raises(self) -> None:

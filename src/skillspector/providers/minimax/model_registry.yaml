@@ -7,7 +7,8 @@
 #       max_output_tokens: <int>       # optional when no output cap is published
 
 models:
+  "MiniMax-M3.1-Flash":
+    context_length: 1000000
+    max_output_tokens: 524288
   "MiniMax-M3":
     context_length: 1000000
-  "MiniMax-M2.7":
-    context_length: 204800

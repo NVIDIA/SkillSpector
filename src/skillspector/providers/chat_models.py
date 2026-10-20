@@ -25,7 +25,22 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
+from skillspector.inference_usage import (
+    register_chat_model_controls,
+    retained_chat_model_controls,
+)
+from skillspector.providers.structured_output import is_gpt_6_1_sol, rejects_sampling_controls
+
 logger = logging.getLogger(__name__)
+MIN_SAMPLING_SEED = -(1 << 63)
+MAX_SAMPLING_SEED = (1 << 63) - 1
+
+# Reasoning efforts GPT-6.1 Sol accepts; it rejects ``none`` and ``minimal``.
+GPT_6_1_SOL_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+class UnsupportedControlError(ValueError):
+    """A requested sampling or reasoning control the model rejects, raised before any request."""
 
 
 def resolve_reasoning_effort() -> str | None:
@@ -34,26 +49,106 @@ def resolve_reasoning_effort() -> str | None:
     return reasoning_effort or None
 
 
-def resolve_sampling_parameters(*, include_seed: bool = False) -> dict[str, float | int]:
-    """Resolve optional, validated sampling controls for hosted providers."""
-    parameters: dict[str, float | int] = {}
+def resolve_temperature() -> float | None:
+    """Resolve the optional temperature using the provider validation contract."""
     raw_temperature = os.environ.get("SKILLSPECTOR_TEMPERATURE", "").strip()
-    if raw_temperature:
-        try:
-            temperature = float(raw_temperature)
-        except ValueError as exc:
-            raise ValueError("SKILLSPECTOR_TEMPERATURE must be a number between 0 and 1") from exc
-        if not 0 <= temperature <= 1:
-            raise ValueError("SKILLSPECTOR_TEMPERATURE must be between 0 and 1")
+    if not raw_temperature:
+        return None
+    try:
+        temperature = float(raw_temperature)
+    except ValueError as exc:
+        raise ValueError("SKILLSPECTOR_TEMPERATURE must be a number between 0 and 1") from exc
+    if not 0 <= temperature <= 1:
+        raise ValueError("SKILLSPECTOR_TEMPERATURE must be between 0 and 1")
+    return temperature
+
+
+def resolve_seed() -> int | None:
+    """Resolve the optional seed within the portable signed 64-bit contract."""
+    raw_seed = os.environ.get("SKILLSPECTOR_SEED", "").strip()
+    if not raw_seed:
+        return None
+    try:
+        seed = int(raw_seed)
+    except ValueError as exc:
+        raise ValueError("SKILLSPECTOR_SEED must be an integer") from exc
+    if not MIN_SAMPLING_SEED <= seed <= MAX_SAMPLING_SEED:
+        raise ValueError("SKILLSPECTOR_SEED must be a signed 64-bit integer")
+    return seed
+
+
+def resolve_sampling_parameters(
+    model: str,
+    *,
+    include_seed: bool = False,
+    reasoning_effort: str | None = None,
+    registry_path: str | None = None,
+    native_anthropic: bool = False,
+) -> dict[str, float | int]:
+    """Resolve optional, validated sampling controls for a request to *model*.
+
+    Raises :class:`UnsupportedControlError` when *model* rejects the requested
+    temperature or *reasoning_effort* (see :func:`reject_unsupported_controls`),
+    so every hosted provider applies the same guard before any request.
+    Only the official Anthropic endpoint sets *native_anthropic* to allow
+    Claude's backwards-compatible ``temperature=1.0``.
+    """
+    parameters: dict[str, float | int] = {}
+    temperature = resolve_temperature()
+    if temperature is not None:
         parameters["temperature"] = temperature
 
-    raw_seed = os.environ.get("SKILLSPECTOR_SEED", "").strip()
-    if include_seed and raw_seed:
-        try:
-            parameters["seed"] = int(raw_seed)
-        except ValueError as exc:
-            raise ValueError("SKILLSPECTOR_SEED must be an integer") from exc
+    seed = resolve_seed() if include_seed else None
+    if seed is not None:
+        parameters["seed"] = seed
+    reject_unsupported_controls(
+        model,
+        parameters,
+        reasoning_effort,
+        registry_path=registry_path,
+        native_anthropic=native_anthropic,
+    )
     return parameters
+
+
+def reject_unsupported_controls(
+    model: str,
+    sampling_parameters: dict[str, float | int],
+    reasoning_effort: str | None = None,
+    *,
+    registry_path: str | None = None,
+    native_anthropic: bool = False,
+) -> None:
+    """Raise :class:`UnsupportedControlError` when *model* rejects a requested control.
+
+    Any explicit ``temperature``, ``1.0`` included, fails for GPT-6.1 Sol, the
+    Claude models in ``SAMPLING_REJECTED_MODELS``, and registry entries at
+    *registry_path* declaring ``sampling: rejected``. The official Anthropic
+    endpoint accepts ``1.0`` for the known Claude models when
+    *native_anthropic* is set; other routes keep the strict guard.
+    GPT-6.1 Sol also accepts only ``GPT_6_1_SOL_REASONING_EFFORTS``.
+    """
+    sol = is_gpt_6_1_sol(model)
+    native_default_temperature = (
+        native_anthropic
+        and sampling_parameters.get("temperature") == 1.0
+        and rejects_sampling_controls(model)
+    )
+    if "temperature" in sampling_parameters and (
+        sol or (rejects_sampling_controls(model, registry_path) and not native_default_temperature)
+    ):
+        raise UnsupportedControlError(
+            f"SKILLSPECTOR_TEMPERATURE is not supported by {model}; unset it to use this model"
+        )
+    if (
+        sol
+        and reasoning_effort is not None
+        and reasoning_effort not in GPT_6_1_SOL_REASONING_EFFORTS
+    ):
+        raise UnsupportedControlError(
+            f"SKILLSPECTOR_REASONING_EFFORT={reasoning_effort!r} is not supported by {model}; "
+            f"use one of {', '.join(GPT_6_1_SOL_REASONING_EFFORTS)} or unset it"
+        )
 
 
 def validate_base_url(url: str | None) -> None:
@@ -86,8 +181,16 @@ def create_openai_compatible_chat_model(
     max_tokens: int,
     timeout: float | None = 120,
     default_headers: dict[str, str] | None = None,
+    forced_tool_choice: bool = True,
+    default_reasoning_effort: str | None = None,
+    chat_model_class: type[ChatOpenAI] | None = None,
 ) -> BaseChatModel | None:
-    """Create ``ChatOpenAI`` for providers serving OpenAI-compatible endpoints."""
+    """Create ``ChatOpenAI`` for providers serving OpenAI-compatible endpoints.
+
+    ``forced_tool_choice=False`` sets ``disabled_params={"tool_choice": None}``
+    so ``with_structured_output`` never forces a tool call; this is the shape
+    ``llm_utils._binds_unforced_tool_call`` looks for.
+    """
     if credentials is None:
         return None
 
@@ -101,8 +204,26 @@ def create_openai_compatible_chat_model(
         "timeout": timeout,
         "default_headers": default_headers,
     }
+    if not forced_tool_choice:
+        kwargs["disabled_params"] = {"tool_choice": None}
     reasoning_effort = resolve_reasoning_effort()
-    if reasoning_effort:
-        kwargs["reasoning_effort"] = reasoning_effort
-    kwargs.update(resolve_sampling_parameters(include_seed=True))
-    return ChatOpenAI(**kwargs)
+    if reasoning_effort or default_reasoning_effort:
+        kwargs["reasoning_effort"] = reasoning_effort or default_reasoning_effort
+    sampling_parameters = resolve_sampling_parameters(
+        model, include_seed=True, reasoning_effort=reasoning_effort
+    )
+    kwargs.update(sampling_parameters)
+    chat_model = (chat_model_class or ChatOpenAI)(**kwargs)
+    register_chat_model_controls(
+        chat_model,
+        retained_chat_model_controls(
+            chat_model,
+            ("temperature", "seed", "reasoning_effort"),
+        ),
+        requested_controls={
+            "temperature": sampling_parameters.get("temperature"),
+            "seed": sampling_parameters.get("seed"),
+            "reasoning_effort": reasoning_effort,
+        },
+    )
+    return chat_model

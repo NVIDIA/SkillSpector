@@ -36,11 +36,21 @@ class LedgerRecordType(StrEnum):
     WORK_ITEM = "work_item"
     SYSTEM = "system"
     SCOPE_BOUNDARY = "scope_boundary"
+    # An analyzer's own configuration (e.g. its YARA rule set), not a skill
+    # artifact. Its ``path`` is only a report-safe label, and every relative
+    # path is also a legal file name, so path-keyed accounting must exclude
+    # these records by type -- no choice of label can be collision-free.
+    RULE_SET = "rule_set"
+
+
+RULE_SET_SCOPE: Final = "rule_set"
+"""Public ``scope`` of exception rows describing a rule set rather than a file."""
 
 
 class LedgerReason(StrEnum):
     """Allowlisted reasons for omitted, skipped, or failed inspection work."""
 
+    USER_EXCLUSION = "user_exclusion"
     EXCLUDED_DIRECTORY = "excluded_directory"
     HIDDEN_FILE = "hidden_file"
     FILE_DISAPPEARED = "file_disappeared"
@@ -50,13 +60,17 @@ class LedgerReason(StrEnum):
     MISSING_FILE_CACHE = "missing_file_cache"
     SIZE_LIMIT = "size_limit"
     BINARY_CONTENT = "binary_content"
+    BINARY_TEXT_PROJECTION = "binary_text_projection"
+    BINARY_EXECUTABLE_TEXT = "binary_executable_text"
     EVAL_DATASET = "eval_dataset"
     SYNTAX_ERROR = "syntax_error"
     LLM_BATCH_FAILED = "llm_batch_failed"
     LLM_STRUCTURED_RESPONSE_INVALID = "llm_structured_response_invalid"
     LLM_CONNECTION_RETRIES_EXHAUSTED = "llm_connection_retries_exhausted"
     ANALYZER_RUNTIME_ERROR = "analyzer_runtime_error"
+    ANALYZER_LOAD_ERROR = "analyzer_load_error"
     UNACCOUNTED_WORK = "unaccounted_work"
+    SEMANTIC_RUNTIME_INCOMPLETE = "semantic_runtime_incomplete"
     FINDING_ACCOUNTING_ERROR = "finding_accounting_error"
     DISABLED_BY_CONFIGURATION = "disabled_by_configuration"
     MISSING_CREDENTIALS = "missing_credentials"
@@ -72,6 +86,7 @@ class LedgerReason(StrEnum):
     ARCHIVE_TRUNCATED = "archive_truncated"
     ARCHIVE_UNSAFE_MEMBER_PATH = "archive_unsafe_member_path"
     ARCHIVE_AMBIGUOUS_MEMBER_PATH = "archive_ambiguous_member_path"
+    ARTIFACT_PATH_COLLISION = "artifact_path_collision"
     ARCHIVE_LINK_MEMBER = "archive_link_member"
     ARCHIVE_DEPTH_LIMIT = "archive_depth_limit"
     ARCHIVE_MEMBER_LIMIT = "archive_member_limit"
@@ -81,8 +96,10 @@ class LedgerReason(StrEnum):
     ARCHIVE_TIME_LIMIT = "archive_time_limit"
     VCS_METADATA = "vcs_metadata"
     OPAQUE_CONTENT = "opaque_content"
+    UNSUPPORTED_PRIMARY_CONTENT = "unsupported_primary_content"
     REFERENCED_UNINSPECTED = "referenced_uninspected"
     REFERENCE_EXTRACTION_LIMIT = "reference_extraction_limit"
+    REFERENCE_MISSING = "reference_missing"
     REFERENCE_UNRESOLVED = "reference_unresolved"
     MANIFEST_PARSE_ERROR = "manifest_parse_error"
     MANIFEST_PARSE_LIMIT = "manifest_parse_limit"
@@ -90,12 +107,18 @@ class LedgerReason(StrEnum):
     TRAVERSAL_DEPTH_LIMIT = "traversal_depth_limit"
     TOTAL_BYTES_LIMIT = "total_bytes_limit"
     RUNTIME_LIMIT = "runtime_limit"
+    EXCLUDED_EXECUTABLE_CONTENT = "excluded_executable_content"
+    HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY = "hidden_skill_executable_local_only"
     OUTPUT_LIMIT = "output_limit"
+    TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
+    PYTHON_SOURCE_AMBIGUOUS = "python_source_ambiguous"
+    PYTHON_SOURCE_DECODE_ERROR = "python_source_decode_error"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
 
 
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
+    LedgerReason.USER_EXCLUSION: "File was not inspected because of an explicit caller exclusion.",
     LedgerReason.EXCLUDED_DIRECTORY: ("Directory tree is excluded from the configured scan scope."),
     LedgerReason.HIDDEN_FILE: "Hidden file is excluded from the configured scan scope.",
     LedgerReason.FILE_DISAPPEARED: ("Inventoried file disappeared before it could be inspected."),
@@ -105,6 +128,12 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.MISSING_FILE_CACHE: "Applicable analyzer could not obtain file content.",
     LedgerReason.SIZE_LIMIT: "File exceeds this analyzer's character limit.",
     LedgerReason.BINARY_CONTENT: "Binary content is unsupported by this analyzer.",
+    LedgerReason.BINARY_TEXT_PROJECTION: (
+        "Only bounded printable text was inspected; binary structure and behavior are outside scope."
+    ),
+    LedgerReason.BINARY_EXECUTABLE_TEXT: (
+        "Readable text was inspected, but binary executable behavior remains outside analyzer coverage."
+    ),
     LedgerReason.EVAL_DATASET: (
         "Evaluation dataset prose is excluded from static pattern analysis."
     ),
@@ -113,9 +142,17 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
         "LLM returned a malformed structured response after bounded retries."
     ),
-    LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: ("LLM connection failed after bounded retries."),
+    LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: (
+        "Transient LLM provider failure persisted after bounded retries."
+    ),
     LedgerReason.ANALYZER_RUNTIME_ERROR: ("Analyzer failed after beginning applicable work."),
+    LedgerReason.ANALYZER_LOAD_ERROR: (
+        "Analyzer module failed to load and never began any inspection work."
+    ),
     LedgerReason.UNACCOUNTED_WORK: ("Planned inspection work has no unique terminal outcome."),
+    LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE: (
+        "Requested semantic analysis did not produce complete per-source runtime telemetry."
+    ),
     LedgerReason.FINDING_ACCOUNTING_ERROR: (
         "Finding identity could not be reconciled with completed work."
     ),
@@ -127,7 +164,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.MANIFEST_ABSENT: ("No compatible manifest was present for this analyzer."),
     LedgerReason.NO_APPLICABLE_FILES: ("No files matched this analyzer's applicability contract."),
     LedgerReason.OMS_SIGNATURE: (
-        "Recognized OMS signature metadata is excluded from content analysis."
+        "DSSE content decoding is incomplete or unsupported; raw fields were retained for inspection. Signature authenticity was not verified."
     ),
     LedgerReason.BASELINE_FILE: (
         "The explicitly selected suppression baseline is excluded from content analysis."
@@ -147,6 +184,10 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH: (
         "Archive member name has an ambiguous or duplicate provenance identity."
     ),
+    LedgerReason.ARTIFACT_PATH_COLLISION: (
+        "A disk path containing '!/' collides with an archive member. Rename the directory "
+        "ending in '!'; the colliding archive member was not analyzed."
+    ),
     LedgerReason.ARCHIVE_LINK_MEMBER: "Archive link member was not followed or read.",
     LedgerReason.ARCHIVE_DEPTH_LIMIT: "Nested archive depth limit was reached.",
     LedgerReason.ARCHIVE_MEMBER_LIMIT: "Cumulative archive member limit was reached.",
@@ -160,12 +201,21 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "VCS object and history metadata is outside the bounded artifact inspection profile."
     ),
     LedgerReason.OPAQUE_CONTENT: "Artifact contents could not be fully interpreted.",
+    LedgerReason.UNSUPPORTED_PRIMARY_CONTENT: (
+        "The requested file or primary instructions could not be interpreted. "
+        "Provide UTF-8 text, a supported ZIP, or an extracted directory instead."
+    ),
     LedgerReason.REFERENCED_UNINSPECTED: ("A referenced artifact was not completely inspected."),
     LedgerReason.REFERENCE_EXTRACTION_LIMIT: (
         "Reference extraction reached an explicit resource bound before completion."
     ),
+    LedgerReason.REFERENCE_MISSING: (
+        "A local path-like reference does not match any bundled artifact,"
+        " such as a file the skill writes at runtime."
+    ),
     LedgerReason.REFERENCE_UNRESOLVED: (
-        "A local path-like reference could not be resolved unambiguously."
+        "A local path-like reference matched more than one bundled artifact"
+        " and could not be resolved to a single target."
     ),
     LedgerReason.MANIFEST_PARSE_ERROR: (
         "Manifest frontmatter is malformed or uses an unsupported value shape."
@@ -177,9 +227,24 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.TRAVERSAL_DEPTH_LIMIT: ("Bundle discovery reached its directory-depth limit."),
     LedgerReason.TOTAL_BYTES_LIMIT: "Bundle caching reached its aggregate byte limit.",
     LedgerReason.RUNTIME_LIMIT: "Inspection reached its configured runtime limit.",
+    LedgerReason.EXCLUDED_EXECUTABLE_CONTENT: (
+        "Executable content was inventoried but excluded from content analysis."
+    ),
+    LedgerReason.HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY: (
+        "Conventional hidden-skill helper script was kept local and not sent to an external LLM."
+    ),
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
+    LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED: (
+        "A transitive child scan failed before complete inspection."
+    ),
     LedgerReason.STATIC_PARSE_LIMIT: (
         "A security-relevant expression exceeded a bounded static parser's span limit."
+    ),
+    LedgerReason.PYTHON_SOURCE_AMBIGUOUS: (
+        "Python execution intent depends on runtime or platform-specific shebang semantics."
+    ),
+    LedgerReason.PYTHON_SOURCE_DECODE_ERROR: (
+        "Python source bytes could not be decoded under their declared encoding."
     ),
     LedgerReason.OBFUSCATED_INSTRUCTION_TEXT: (
         "Obfuscated instruction text could not be fully evaluated by the deterministic layer."
@@ -246,6 +311,9 @@ class AnalyzerStatusEvent(TypedDict):
     planned_work: list[PlannedWorkTarget]
     reason_code: NotRequired[LedgerReason]
     message: NotRequired[str]
+    source_url: NotRequired[str]
+    source_identity: NotRequired[str]
+    source_digest: NotRequired[str]
 
 
 class InspectionLedgerException(TypedDict):
@@ -261,6 +329,7 @@ class InspectionLedgerException(TypedDict):
     error_class: NotRequired[str]
     analyzers: NotRequired[list[str]]
     fatal: NotRequired[bool]
+    scope: NotRequired[str]
 
 
 class AnalysisCompleteness(TypedDict):
@@ -277,6 +346,8 @@ class AnalysisCompleteness(TypedDict):
     entirely_uninspected_files: int
     ledger_exceptions: list[InspectionLedgerException]
     scope_exclusions: list[InspectionLedgerException]
+    exclude_patterns: NotRequired[list[str]]
+    excluded_file_count: NotRequired[int]
     analyzer_statuses: list[dict[str, object]]
     references: NotRequired[list[dict[str, object]]]
     limitations: NotRequired[list[str]]
@@ -490,8 +561,10 @@ def analyzer_status_event(
 def analyzer_status_for_events(
     analyzer_id: str, events: Iterable[InspectionLedgerEvent]
 ) -> AnalyzerStatusEvent:
-    """Summarize an analyzer's terminal work without exposing event payloads."""
-    terminal_events = list(events)
+    """Summarize analyzer work; scope-boundary records remain separate exclusions."""
+    terminal_events = [
+        event for event in events if event.get("record_type") != LedgerRecordType.SCOPE_BOUNDARY
+    ]
     if not terminal_events:
         return analyzer_status_event(
             analyzer_id=analyzer_id,
@@ -553,6 +626,7 @@ def _exception(
     error_class: str | None = None,
     analyzers: Iterable[str] = (),
     fatal: bool,
+    scope: str | None = None,
 ) -> InspectionLedgerException:
     """Build the public, safe projection of one exceptional ledger fact."""
     exception: InspectionLedgerException = {
@@ -570,7 +644,14 @@ def _exception(
         exception["analyzers"] = analyzer_ids
     if error_class:
         exception["error_class"] = error_class
+    if scope:
+        exception["scope"] = scope
     return exception
+
+
+def _is_rule_set_record(event: Mapping[str, object]) -> bool:
+    """Return whether a ledger row describes a rule set rather than an artifact."""
+    return event.get("record_type") == LedgerRecordType.RULE_SET
 
 
 def _exception_from_event(
@@ -593,6 +674,7 @@ def _exception_from_event(
         error_class=event.get("error_class"),
         analyzers=[str(event.get("analyzer_id", ""))],
         fatal=fatal,
+        scope=RULE_SET_SCOPE if _is_rule_set_record(event) else None,
     )
 
 
@@ -611,6 +693,9 @@ def _merge_exception_projection(
             exception["start_line"],
             exception["end_line"],
             exception.get("error_class"),
+            # A rule-set row and a real file's row can share a path label;
+            # they must never merge into one public row.
+            exception.get("scope"),
         )
         existing = grouped.get(key)
         if existing is None:
@@ -860,12 +945,47 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
     ]
     exceptional_rows.extend(unaccounted_exceptions)
     exceptional_rows.extend(accounting_exceptions)
+    raw_inventory = state.get("artifact_inventory", [])
+    inventory = (
+        [item for item in raw_inventory if isinstance(item, dict)]
+        if isinstance(raw_inventory, list)
+        else []
+    )
+    fatal_reasons = {
+        (row["path"], row["reason_code"]) for row in exceptional_rows if row.get("fatal")
+    }
+    # The bounded detail ledger may omit a cache failure. Canonical inventory
+    # still owns the artifact's disposition: truncation cannot restore success.
+    for artifact in inventory:
+        if artifact.get("disposition") != "failed":
+            continue
+        path = _safe_path(artifact.get("path"), components)
+        reason = _reason(artifact.get("reason"), LedgerReason.READ_ERROR)
+        if (path, reason) not in fatal_reasons:
+            exceptional_rows.append(
+                _exception(
+                    outcome=LedgerOutcome.FAILED,
+                    phase="cache",
+                    reason=reason,
+                    path=path,
+                    fatal=True,
+                )
+            )
+            fatal_reasons.add((path, reason))
     ledger_exceptions = _merge_exception_projection(exceptional_rows)
     scope_exclusions = _merge_exception_projection(scope_rows)
 
+    # Rule-set rows describe an analyzer's configuration, not an artifact. Their
+    # path is only a label, so folding them into per-component coverage would
+    # charge the rule set's incompleteness to any real file with that name.
+    rule_set_work_ids = {
+        str(event.get("work_id", "")) for event in events if _is_rule_set_record(event)
+    }
     per_component: dict[str, list[LedgerOutcome]] = {component: [] for component in components}
     if primary_targets:
         for _analyzer_id, target, matches in primary_targets:
+            if str(target.get("work_id", "")) in rule_set_work_ids:
+                continue
             path = _safe_path(target.get("path"), components)
             outcomes = per_component.setdefault(path, [])
             if len(matches) == 1:
@@ -885,12 +1005,6 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
                 LedgerOutcome.FAILED if component in cache_failures else LedgerOutcome.COMPLETED
             )
 
-    raw_inventory = state.get("artifact_inventory", [])
-    inventory = (
-        [item for item in raw_inventory if isinstance(item, dict)]
-        if isinstance(raw_inventory, list)
-        else []
-    )
     disposition_by_path = {
         str(item.get("path", "")): str(item.get("disposition", "")) for item in inventory
     }
@@ -1017,6 +1131,12 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_before_filtering": len(findings_by_id),
         "findings_after_filtering": len(validated_effective),
     }
+    patterns = state.get("exclude_patterns", [])
+    if patterns:
+        completeness["exclude_patterns"] = list(patterns)
+        completeness["excluded_file_count"] = sum(
+            item.get("reason") == LedgerReason.USER_EXCLUSION for item in inventory
+        )
     return completeness, validated_effective
 
 

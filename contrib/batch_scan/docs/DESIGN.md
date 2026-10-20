@@ -16,10 +16,10 @@ batch_scan.py :: main()
  ├─ detect language (Unicode script-ratio, per skill)
  ├─ create API pool (optional, 10-key scheduler)
  ├─ ThreadPoolExecutor(max_workers=N)
- │   ├─ Thread A: skill_1 → graph.invoke() + gap-fill
- │   ├─ Thread B: skill_2 → graph.invoke() + gap-fill
+ │   ├─ Thread A: supervise process → skill_1 → graph.invoke() + gap-fill
+ │   ├─ Thread B: supervise process → skill_2 → graph.invoke() + gap-fill
  │   └─ ...
- ├─ collect results, sort by risk score
+ ├─ retain successful, timed-out and crashed scans; sort by risk score
  └─ report (terminal / JSON / Markdown)
 ```
 
@@ -39,7 +39,7 @@ run_one(skill_dir)
 ## Three-layer concurrency
 
 ```
-Layer 3 — batch_scan.py:        ThreadPoolExecutor(max_workers=N)  [CONTRIB]
+Layer 3 — batch_scan.py:        ThreadPoolExecutor → per-skill processes  [CONTRIB]
 Layer 2 — llm_analyzer_base:    asyncio.Semaphore(10)               [UPSTREAM]
 Layer 1 — graph.py:             20 analyzers fan-out                [UPSTREAM]
 ```
@@ -47,11 +47,20 @@ Layer 1 — graph.py:             20 analyzers fan-out                [UPSTREAM]
 Each layer is unaware of the others.  The graph doesn't know it's being called
 concurrently; the workers don't know the graph fans out internally.
 
-## Why ThreadPoolExecutor
+## Why supervised scan processes
 
-- ProcessPoolExecutor hangs on macOS (spawn mode reimports LangGraph per child)
-- `graph.invoke()` is a pure function — same state → same result, no shared state
-- Each thread operates on its own state dict, isolated from other threads
+Threads supervise independently killable processes; they do not run scans themselves.
+A worker has up to 90 seconds to start its interpreter and import the graph. It then
+signals that scanning has begun, starting a separate 90-second work deadline.
+Timeouts and crashes remain ERROR entries in every saved report, and other skills
+continue. The work deadline includes provider-pool waits and gap-fill.
+
+Each worker owns a process group. The supervisor kills that group on timeout,
+reclaims API-pool leases, and removes scratch files. A worker also watches its
+parent's process sentinel so parent termination stops the group and removes its
+scratch. Descendants that deliberately start a new session are outside this group.
+The API-pool manager also watches its parent and exits if the supervisor dies.
+Verbose logging is forwarded explicitly to spawned workers.
 
 ## DeepSeek compatibility patches
 
@@ -173,7 +182,8 @@ Windows.
 
 ## Per-skill timeout (90s)
 
-A skill that takes >90s is marked TIMEOUT and skipped.  Other workers continue.
+A skill that takes more than 90 seconds of scan time is retained as an ERROR
+entry in the report. Startup has a separate 90-second bound. Other workers continue.
 HTTP-level timeouts (Patch 6) prevent most hangs from reaching the 90s ceiling.
 
 ## Exit codes
@@ -189,7 +199,7 @@ HTTP-level timeouts (Patch 6) prevent most hangs from reaching the 90s ceiling.
 ```
 contrib/batch_scan/
 ├── __init__.py          # package init + dotenv preload
-├── batch_scan.py        # CLI + ThreadPoolExecutor
+├── batch_scan.py        # CLI + supervised scan processes
 ├── runner.py            # graph wrapper + setup_deepseek_compat()
 ├── discovery.py         # SKILL.md finder
 ├── detection.py         # language detection
@@ -228,9 +238,10 @@ requirement.  It would also require all batch orchestration code to be async,
 complicating the CLI layer (`argparse`, Rich console output) with no throughput
 gain.
 
-`ProcessPoolExecutor` was tested and rejected: macOS Python 3.13 `spawn` mode
-reimports LangGraph + LangChain per child process, causing 30+ second startup
-timeouts.  `fork` mode is unavailable on macOS since Python 3.8.
+The earlier `ProcessPoolExecutor` experiment had 30+ second startup delays on
+macOS because `spawn` reimports LangGraph and LangChain. The current supervisor
+still pays this import cost per skill, but accounts for it separately from scan
+time. It uses `spawn` consistently rather than forking a threaded scanner.
 
 ### Why monkey-patch, not fork upstream?
 
@@ -273,22 +284,22 @@ raw LLM string → _strip_markdown_fences() → json.loads() → model_validate(
 The two-step parse (stdlib `json.loads` then Pydantic `model_validate`) exists
 because:
 
-1. `json.loads` is fast, deterministic, and raises clear `JSONDecodeError` on
-   malformed output — we catch this and return `[]` (empty findings).
-2. `model_validate` enforces the schema: required fields, literal enums,
-   confidence range, string length.  Schema violations are caught and returned
-   as `[]` with a warning log.
+1. `json.loads` parses the response. Invalid JSON raises the core structured-response
+   validation error rather than producing an empty findings list.
+2. `model_validate` checks the required fields and value types. Schema failures
+   use the same retry and reporting path.
 
-**Error propagation:** If the LLM returns invalid JSON or schema-mismatched
-output, the analyzer returns `[]` (no findings for that file).  The scan
-continues — a single malformed LLM response never blocks the pipeline.
-The warning is logged at `WARNING` level so operators can monitor parse-failure
-rates without sifting through debug logs.
+**Error propagation:** Invalid JSON and schema failures are retried up to four
+attempts. If they persist, the ledger records `skipped` with reason
+`llm_structured_response_invalid`; the analyzer is degraded and the skill counts
+as incomplete. The scan continues and keeps findings from completed work.
+Core logs `LLM structured response validation failed for ... retrying` and,
+on exhaustion, `... after 4 attempts`, without logging the raw response.
 
-Patch 3 adds a `_sanitize_meta_finding()` pass after validation to handle
-known LLM quirks: `null` string fields → `""`, unrecognized enum values
-(e.g., `"none"`) → `"low"`.  These are applied post-validation because they
-represent recoverable soft errors, not hard schema violations.
+Patch 3 sanitizes known soft quirks before validation: null explanation and
+remediation become empty strings, impact labels are case-folded, and unknown
+impact labels use `low`. Invalid findings still fail validation. Optional prose
+in `overall_assessment` is ignored so valid finding verdicts are retained.
 
 ## Gap-Fill Rule Selection Criteria
 
