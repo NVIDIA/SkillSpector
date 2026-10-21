@@ -37,6 +37,7 @@ from typing import Annotated, cast
 from urllib.parse import quote
 
 import typer
+from click.core import ParameterSource
 from langchain_core.runnables import RunnableConfig
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
@@ -69,7 +70,7 @@ from skillspector.multi_skill import (
     detect_skills,
 )
 from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
-from skillspector.nodes.report import report
+from skillspector.nodes.report import report, risk_severity_and_recommendation
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
 from skillspector.semantic_runtime import (
     has_semantic_runtime_event,
@@ -474,6 +475,7 @@ def _multi_skill_limitation_events(
 
 @app.command()
 def scan(
+    ctx: typer.Context,
     input_path: Annotated[
         str,
         typer.Argument(
@@ -552,7 +554,8 @@ def scan(
             "directory (.skillspector-baseline.yaml). Off by default: a skill "
             "author's baseline can suppress findings in your scan, so a discovered "
             "baseline is only reported until you opt in. Ignored when --baseline "
-            "is given.",
+            "is given. Not supported for recursive multi-skill scans; scan each "
+            "sub-skill separately.",
         ),
     ] = False,
     transitive_enabled: Annotated[
@@ -706,11 +709,18 @@ def scan(
             or show_suppressed
             or yara_rules_dir is not None
             or min_coverage is not None
+            or use_shipped_baseline
+            or transitive_enabled
+            or transitive_allow_prefix
+            or transitive_deny_prefix
+            # Even an explicitly supplied default depth requests an unsupported option.
+            or ctx.get_parameter_source("transitive_depth") not in (None, ParameterSource.DEFAULT)
         ):
             err_console.print(
                 "[red]Error:[/red] --mcp-registry cannot be combined with "
                 "--recursive, --baseline, --show-suppressed, --yara-rules-dir, "
-                "or --min-coverage"
+                "--min-coverage, --use-shipped-baseline, --transitive, "
+                "--transitive-depth, --transitive-allow-prefix, or --transitive-deny-prefix"
             )
             raise typer.Exit(code=2)
         if format != FormatChoice.json:
@@ -783,6 +793,12 @@ def scan(
                 err_console.print(
                     "[red]Error:[/red] --baseline is not supported for recursive "
                     "multi-skill scans; scan each sub-skill with its own baseline"
+                )
+                raise typer.Exit(code=2)
+            if use_shipped_baseline:
+                err_console.print(
+                    "[red]Error:[/red] --use-shipped-baseline is not supported for recursive "
+                    "multi-skill scans; scan each sub-skill separately with --use-shipped-baseline"
                 )
                 raise typer.Exit(code=2)
             # Same error contract as the single-skill scan below: an error that
@@ -2747,21 +2763,11 @@ def _multi_skill_risk_assessment(
     analysis_incomplete: bool,
 ) -> dict[str, object]:
     """Return bounded aggregate risk evidence independent of child retention."""
-    if max_score >= 81:
-        severity = "CRITICAL"
-    elif max_score >= 51:
-        severity = "HIGH"
-    elif max_score >= 21:
-        severity = "MEDIUM"
-    else:
-        severity = "LOW"
-    recommendation = (
-        "DO_NOT_INSTALL"
-        if execution_failed or max_score > RISK_THRESHOLD
-        else "CAUTION"
-        if analysis_incomplete
-        else "SAFE"
-    )
+    severity, recommendation = risk_severity_and_recommendation(max_score)
+    if execution_failed:
+        recommendation = "DO_NOT_INSTALL"
+    elif analysis_incomplete and recommendation == "SAFE":
+        recommendation = "CAUTION"
     return {
         "max_risk_score": max_score,
         "severity": severity,

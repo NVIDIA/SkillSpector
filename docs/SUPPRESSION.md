@@ -171,10 +171,12 @@ and commit the v2 file. Legacy files containing only explicit rules remain
 loadable with a warning so reviewed policy suppressions are preserved. Do not
 copy old hashes into the new file.
 
-Recursive multi-skill scans do not accept one shared baseline because exact
-fingerprints are scoped to each independently scanned skill. Run each sub-skill
-with its own baseline. A single-skill scan still supports `--recursive` together
-with `--baseline`.
+Recursive multi-skill scans reject both `--baseline` and `--use-shipped-baseline`
+with exit code 2. Exact fingerprints are scoped to each independently scanned
+skill, and recursive multi-skill scans do not apply per-child shipped baselines.
+Scan each sub-skill separately with its own `--baseline` or with
+`--use-shipped-baseline`. A single-skill scan still supports `--recursive`
+together with either option.
 
 ## How it fits the pipeline
 
