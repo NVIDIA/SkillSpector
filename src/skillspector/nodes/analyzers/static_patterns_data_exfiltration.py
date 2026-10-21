@@ -177,9 +177,13 @@ _CLOUD_DOWNLOAD_SHELL_META = re.compile(r"[;&|<>(){}\[\]*?$\x60%!#~\x00-\x1f\x7f
 _CLOUD_DOWNLOAD_BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]*")
 _CLOUD_DOWNLOAD_CONTEXT_CHARS = 4_096
 _CLOUD_DOWNLOAD_SETUP = re.compile(
-    r"""[\\'"$\x60]|\b(?:alias|function|source|eval|trap)\b"""
-    r"|(?:^|[;\r\n])[ \t]*\.[ \t]+|\([ \t\r\n]*\)|\bPATH\s*\+?="
+    r"""[\\'"$\x60]|\b(?:alias|function|source|eval|trap|hash)\b"""
+    r"|(?:^|[;\r\n])[ \t]*\.[ \t]+|\([ \t\r\n]*\)"
+    r"|\b(?:PATH|path|commands)\s*(?:\+?=|\[)"
+    r"|\b(?:read|readarray|mapfile|printf|set|typeset|declare|local|export|readonly|unset)\b"
+    r"[^;\r\n]*\b(?:PATH|path|commands)\b"
 )
+_CLOUD_DOWNLOAD_DIRECTORY_CHANGE = re.compile(r"\b(?:cd|chdir|pushd|popd)\b")
 
 
 def _is_literal_cloud_download(
@@ -205,6 +209,7 @@ def _is_literal_cloud_download(
         return False
     if _CLOUD_DOWNLOAD_SETUP.search(content, 0, offset):
         # Quotes, escapes or expansions can conceal alias/setup command names.
+        # Hash tables and shell variables can also redirect executable lookup.
         # Without evaluating that setup, retain the existing upload evidence.
         return False
     command = _sc2_logical_command(content, offset, line_starts)
@@ -248,6 +253,12 @@ def _is_literal_cloud_download(
         return False
     bucket = source[len(scheme) :].split("/", 1)[0]
     if _CLOUD_DOWNLOAD_BUCKET.fullmatch(bucket) is None:
+        return False
+    if not destination.startswith("/") and _CLOUD_DOWNLOAD_DIRECTORY_CHANGE.search(
+        content, 0, offset
+    ):
+        # A relative file may resolve to a stream after cd /dev (or a directory
+        # stack change). Absolute destinations do not depend on this setup.
         return False
     normalized_destination = posixpath.normpath(destination)
     # A static local destination cannot be a cloud URI, stream or shell expansion.

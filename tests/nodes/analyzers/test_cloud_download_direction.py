@@ -191,6 +191,17 @@ def test_other_host_language_syntax_keeps_legacy_cloud_evidence(path: str, file_
         'eval "$setup"\n',
         'trap "$setup" DEBUG\n',
         "PATH=./tools\n",
+        "hash -p ./custom-aws aws\n",
+        "builtin hash -p ./custom-aws aws\n",
+        "hash aws=./custom-aws\n",
+        "commands[aws]=./custom-aws\n",
+        "commands=(aws ./custom-aws)\n",
+        "path=./tools\n",
+        "path+=./tools\n",
+        "path[1]=./tools\n",
+        "set -A path ./tools\n",
+        "printf -v PATH ./tools\n",
+        "read PATH\n",
     ],
 )
 def test_visible_command_redefinition_keeps_cloud_finding(prefix: str) -> None:
@@ -200,6 +211,39 @@ def test_visible_command_redefinition_keeps_cloud_finding(prefix: str) -> None:
         "shell",
     )
     assert any(finding.rule_id == "E5" for finding in findings)
+
+
+@pytest.mark.parametrize("setup", ["cd /dev", "chdir /dev", "pushd /dev", "popd"])
+@pytest.mark.parametrize(
+    "transfer",
+    [
+        "aws s3 cp s3://example-bucket/public.csv",
+        "aws s3 sync s3://example-bucket/public",
+        "gsutil cp gs://example-bucket/public.csv",
+        "gsutil rsync gs://example-bucket/public",
+    ],
+)
+@pytest.mark.parametrize("destination", ["stdout", "./stdout", "../dev/stdout"])
+def test_directory_changes_keep_relative_destination_unproved(
+    setup: str, transfer: str, destination: str
+) -> None:
+    findings = data_exfiltration.analyze(
+        f"{setup}\n{transfer} {destination}\n", "download.sh", "shell"
+    )
+    e5 = [finding for finding in findings if finding.rule_id == "E5"]
+    assert len(e5) == 1
+    assert e5[0].location.start_line == 2
+
+
+@pytest.mark.parametrize(
+    "transfer", ["aws s3 cp s3://example-bucket/a", "gsutil cp gs://example-bucket/a"]
+)
+@pytest.mark.parametrize("setup", ["cd /dev", "set -eu", "read filename"])
+def test_proved_file_destination_survives_unrelated_setup(transfer: str, setup: str) -> None:
+    findings = data_exfiltration.analyze(
+        f"{setup}\n{transfer} /tmp/public.csv\n", "download.sh", "shell"
+    )
+    assert not any(finding.rule_id == "E5" for finding in findings)
 
 
 def test_large_prefix_cannot_forget_an_earlier_alias() -> None:
@@ -214,14 +258,28 @@ def test_large_prefix_cannot_forget_an_earlier_alias() -> None:
     assert any(finding.rule_id == "E5" for finding in findings)
 
 
-def test_real_cli_download_passes_strict_static_policy(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "commands, expected_lines",
+    [
+        ("aws s3 cp s3://example-bucket/public.csv ./public.csv\n", []),
+        ("set -eu\naws s3 cp s3://example-bucket/public.csv ./public.csv\n", []),
+        (
+            "hash -p ./custom-aws aws\naws s3 cp s3://example-bucket/public.csv ./public.csv\n",
+            [3],
+        ),
+        ("cd /dev\naws s3 cp s3://example-bucket/public.csv stdout\n", [3]),
+        ("cd /dev\ngsutil cp gs://example-bucket/public.csv stdout\n", [3]),
+        ("cd /dev\naws s3 cp s3://example-bucket/public.csv /tmp/public.csv\n", []),
+    ],
+)
+def test_real_cli_download_strict_static_policy(
+    tmp_path: Path, commands: str, expected_lines: list[int]
+) -> None:
     (tmp_path / "SKILL.md").write_text(
         "---\nname: public-data-helper\ndescription: Read a selected public data file.\n---\n"
         "# Public data\nRead [the helper](download.sh).\n"
     )
-    (tmp_path / "download.sh").write_text(
-        "#!/bin/sh\naws s3 cp s3://example-bucket/public.csv ./public.csv\n"
-    )
+    (tmp_path / "download.sh").write_text("#!/bin/sh\n" + commands)
     result = CliRunner().invoke(
         app,
         [
@@ -236,8 +294,10 @@ def test_real_cli_download_passes_strict_static_policy(tmp_path: Path) -> None:
             "100",
         ],
     )
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == bool(expected_lines), result.output
     report = json.loads(result.stdout)
     assert report["execution_successful"] is True
     assert report["analysis_completeness"]["is_complete"] is True
-    assert report["issues"] == []
+    assert [issue["id"] for issue in report["issues"]] == ["E5"] * len(expected_lines)
+    assert [issue["location"]["start_line"] for issue in report["issues"]] == expected_lines
+    assert all(issue["location"]["file"] == "download.sh" for issue in report["issues"])

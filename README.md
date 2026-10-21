@@ -572,7 +572,9 @@ findings. Moves, deletion options, unknown flags, dynamic operands, streams and
 compound shell commands retain conservative findings. This direction check does
 not change SDK upload detection or the CLI's exit-code policy. Direction proofs
 require the complete preceding context to fit within 4,096 characters; visible
-command redefinitions or unknown shell setup also retain the original finding.
+command redefinitions (including command hashes) or unknown shell setup also
+retain the original finding. Relative destinations after directory changes
+remain unproved; literal absolute file destinations are still eligible.
 
 ### Privilege Escalation (3 patterns)
 
