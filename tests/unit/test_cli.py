@@ -7841,3 +7841,53 @@ def test_cli_baseline_rejects_failed_scan_before_writing(
     assert output.read_bytes() == previous
     build.assert_not_called()
     cleanup.assert_called_once_with(result)
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("plain message", "Error: plain message"),
+        ("skills[old]/demo", "Error: skills[old]/demo"),
+        ("nope[/x]", "Error: nope[/x]"),
+        ("[bold]x[/bold]", "Error: [bold]x[/bold]"),
+        (
+            "Install it with: pip install 'skillspector[mcp]'",
+            "Error: Install it with: pip install 'skillspector[mcp]'",
+        ),
+        ("emoji :smile: here", "Error: emoji :smile: here"),
+        ("C:\\Users\\", "Error: C:\\Users\\"),
+        ("first\nsecond", "Error: first\nsecond"),
+        ("esc \x1b[2J", "Error: esc \\x1b[2J"),
+    ],
+)
+def test_error_line_renders_message_literally(message: str, expected: str) -> None:
+    assert cli_module._error_line(message).plain == expected
+
+
+def test_error_line_survives_console_print() -> None:
+    buffer = StringIO()
+    Console(file=buffer, width=120).print(cli_module._error_line("a :smile: [bold]b[/bold] C:\\"))
+    assert buffer.getvalue() == "Error: a :smile: [bold]b[/bold] C:\\\n"
+
+
+@pytest.mark.parametrize("bad_input", ["skills[old]/demo", "nope[/x]"])
+def test_scan_input_error_shows_bracketed_path_literally(bad_input: str) -> None:
+    result = runner.invoke(app, ["scan", bad_input])
+    assert result.exit_code == 2
+    assert bad_input in result.output
+    assert "MarkupError" not in result.output
+
+
+def test_mcp_missing_extra_install_hint_keeps_extra_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(**_kwargs: object) -> None:
+        raise ModuleNotFoundError(
+            "The MCP server requires the optional 'mcp' dependency. "
+            "Install it with: pip install 'skillspector[mcp]'"
+        )
+
+    monkeypatch.setattr("skillspector.mcp_server.run", fake_run)
+    result = runner.invoke(app, ["mcp"])
+    assert result.exit_code != 0
+    assert "skillspector[mcp]" in result.output

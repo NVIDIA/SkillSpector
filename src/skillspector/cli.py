@@ -122,6 +122,14 @@ app = typer.Typer(
 console = Console()
 err_console = Console(stderr=True)
 
+
+def _error_line(message: object) -> Text:
+    """Render an error line literally: no Rich markup, emoji or control characters."""
+    lines = str(message).split("\n")
+    body = "\n".join(_visible_terminal_text(line) for line in lines)
+    return Text.assemble(("Error:", "red"), " ", body)
+
+
 _PROGRESS_TREE_MAX_PATHS = 200
 _PROGRESS_TREE_MAX_NODES = 1_000
 _TRANSITIVE_MAX_TARGETS = 32
@@ -394,7 +402,7 @@ def _exit_on_unsupported_llm_controls(no_llm: bool) -> None:
         return
     error = unsupported_control_error()
     if error is not None:
-        err_console.print(f"[red]Error:[/red] {error}")
+        err_console.print(_error_line(error))
         raise typer.Exit(code=2)
 
 
@@ -699,7 +707,7 @@ def scan(
         try:
             require_secure_file_output()
         except ValueError as exc:
-            err_console.print(f"[red]Error:[/red] {exc}")
+            err_console.print(_error_line(exc))
             raise typer.Exit(code=2) from exc
 
     if mcp_registry:
@@ -750,7 +758,7 @@ def scan(
         except typer.Exit:
             raise
         except Exception as e:
-            err_console.print(f"[red]Error:[/red] {e}")
+            err_console.print(_error_line(e))
             raise typer.Exit(code=2) from e
         return
 
@@ -763,14 +771,14 @@ def scan(
             resolved_path = validate_local_input_path(resolved_path)
             _validate_report_destination(resolved_path, output)
         except (OSError, ValueError) as e:
-            err_console.print(f"[red]Error:[/red] {e}")
+            err_console.print(_error_line(e))
             raise typer.Exit(code=2) from e
     try:
         transitive_allow_prefix, transitive_deny_prefix = transitive.normalize_prefixes(
             transitive_allow_prefix, transitive_deny_prefix
         )
     except ValueError as exc:
-        err_console.print(f"[red]Error:[/red] invalid transitive prefix: {exc}")
+        err_console.print(_error_line(f"invalid transitive prefix: {exc}"))
         raise typer.Exit(code=2) from exc
     _exit_on_unsupported_llm_controls(no_llm)
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
@@ -825,13 +833,13 @@ def scan(
             except typer.Exit:
                 raise
             except (FileNotFoundError, ValueError) as e:
-                err_console.print(f"[red]Error:[/red] {e}")
+                err_console.print(_error_line(e))
                 raise typer.Exit(code=2) from e
             except Exception as e:
                 if verbose:
                     err_console.print_exception()
                 else:
-                    err_console.print(f"[red]Error:[/red] {e}")
+                    err_console.print(_error_line(e))
                 raise typer.Exit(code=2) from e
             return
         if detection.complete and not detection.has_root_skill and len(detection.skills) == 0:
@@ -921,13 +929,13 @@ def scan(
     except typer.Exit:
         raise
     except (FileNotFoundError, ValueError) as e:
-        err_console.print(f"[red]Error:[/red] {e}")
+        err_console.print(_error_line(e))
         raise typer.Exit(code=2) from e
     except Exception as e:
         if verbose:
             err_console.print_exception()
         else:
-            err_console.print(f"[red]Error:[/red] {e}")
+            err_console.print(_error_line(e))
         raise typer.Exit(code=2) from e
     finally:
         if result is not None:
@@ -3416,7 +3424,7 @@ def mcp(
 
         run_mcp(transport=transport.value, host=host, port=port)
     except (ModuleNotFoundError, ValueError) as e:
-        err_console.print(f"[red]Error:[/red] {e}")
+        err_console.print(_error_line(e))
         raise typer.Exit(code=2) from e
 
 
@@ -3520,13 +3528,13 @@ def baseline(
     except typer.Exit:
         raise
     except (FileNotFoundError, ValueError) as e:
-        err_console.print(f"[red]Error:[/red] {e}")
+        err_console.print(_error_line(e))
         raise typer.Exit(code=2) from e
     except Exception as e:
         if verbose:
             err_console.print_exception()
         else:
-            err_console.print(f"[red]Error:[/red] {e}")
+            err_console.print(_error_line(e))
         raise typer.Exit(code=2) from e
     finally:
         if result is not None:
