@@ -294,7 +294,7 @@ def _p2_pattern_matches(
         return
     compiled = re.compile(pattern, re.IGNORECASE | re.DOTALL)
     if pattern not in _SINGLE_CHARACTER_P2_PATTERNS:
-        for match in compiled.finditer(content):
+        for match in static_runner.iter_pattern_matches(compiled, content):
             if check_runtime is not None:
                 check_runtime()
             yield match

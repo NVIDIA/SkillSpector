@@ -40,7 +40,7 @@ from skillspector.python_tokens import python_literal_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import SourceLocationIndex, get_context, get_line_number, is_code_example
+from .common import SourceLocationIndex, get_context_from_lines, is_code_example
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -188,14 +188,14 @@ _AR2_DIRECT_INTENT_PATTERNS = (
 )
 _BENIGN_AR_SCHEMA_FIELD_PATTERN = re.compile(
     r"""
-    ^\s*(?:\[\])?\s+(?:field|key|property|array|list|entry)\b
+    ^(?:\s*\[\])?\s+(?:field|key|property|array|list|entry)\b
     |
-    ^\s*(?:\[\])?\s+(?:in|of)\s+(?:the\s+)?(?:json(?:\s+output)?|output|response)\s+schema\b
+    ^(?:\s*\[\])?\s+(?:in|of)\s+(?:the\s+)?(?:json(?:\s+output)?|output|response)\s+schema\b
     |
-    ^\s*(?:\[\])?\s+(?:in|of)\s+(?:the\s+)?(?:warnings?|disclaimers?|caveats?)\b(?:\[\])?\s+
+    ^(?:\s*\[\])?\s+(?:in|of)\s+(?:the\s+)?(?:warnings?|disclaimers?|caveats?)\b(?:\[\])?\s+
     (?:field|key|property|array|list|entry)\b
     |
-    ^\s*(?:\[\])?\s+in\s+(?:the\s+)?errors\[\]\s+array\b
+    ^(?:\s*\[\])?\s+in\s+(?:the\s+)?errors\[\]\s+array\b
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -566,6 +566,7 @@ def analyze(
     """Analyze content for anti-refusal statements (AR1-AR3)."""
     findings: list[AnalyzerFinding] = []
     locations = SourceLocationIndex(content, file_path)
+    lines = content.splitlines()
     tag = [PatternCategory.ANTI_REFUSAL.value]
     python_comments = (
         _PythonComments(content, check_runtime or _no_runtime_check)
@@ -584,11 +585,10 @@ def analyze(
                     and _is_descriptive_python_comment(python_comments, match)
                 ):
                     continue
-                lines = content.splitlines()
-                line_num = get_line_number(content, match.start())
+                line_num, column = locations.line_and_column(match.start())
                 match_line = lines[line_num - 1] if lines else content
                 previous_line = lines[line_num - 2] if line_num > 1 else None
-                context = get_context(content, match.start(), context_lines=3)
+                context = get_context_from_lines(lines, line_num, window=3, column=column)
                 security_review_context = bool(
                     _MODE_ENABLED_RE.fullmatch(match.group(0))
                     and _SECURITY_REVIEW_CONTEXT_RE.search(context)
