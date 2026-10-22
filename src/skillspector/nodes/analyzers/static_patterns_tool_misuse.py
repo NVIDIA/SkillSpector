@@ -2019,6 +2019,31 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
             yield start, parsed.end
 
 
+def _is_comment_candidate(
+    content: str,
+    start: int,
+    python_source: _PythonSourceOwnership | None,
+) -> bool:
+    """Return whether a candidate position sits inside a ``#`` comment.
+
+    The shell comment-start idiom is checked first so host Python source only
+    pays for proven token ownership when a ``#`` actually precedes the
+    candidate on its line. A ``#`` inside a string literal never counts: for
+    host source the comment token must be proven.
+    """
+    if _SHELL_COMMENT_START_RE.search(content, content.rfind("\n", 0, start) + 1, start) is None:
+        return False
+    if python_source is None:
+        return True
+    return python_source.comment(start) is not None
+
+
+# File types where ``#`` opens a comment. Markdown and plain text are
+# excluded: there ``#`` starts a heading or is prose, and the conservative
+# partial result for fragmented headings is deliberate.
+_HASH_COMMENT_FILE_TYPES = frozenset({"shell", "python", "perl", "ruby", "powershell"})
+
+
 def _has_shell_command_word_exhaustion(
     content: str,
     check_runtime: Callable[[], None],
@@ -2027,6 +2052,7 @@ def _has_shell_command_word_exhaustion(
     structural_quote_openers: set[int] | None = None,
     python_source: _PythonSourceOwnership | None = None,
     perl_eval_blocks: bool = False,
+    file_type: str = "shell",
     _command_string_depth: int = 0,
 ) -> bool:
     """Find candidate command words whose deterministic parse hit a safety bound.
@@ -2156,6 +2182,15 @@ def _has_shell_command_word_exhaustion(
             # parsed this position, so it only claims ownership.
             continue
         if parsed.limited:
+            if file_type in _HASH_COMMENT_FILE_TYPES and _is_comment_candidate(
+                content, start, python_source
+            ):
+                # A comment is never executed: a backtick there is literal
+                # text, so it cannot open a command substitution that
+                # reconstructs a printf invocation (issue #901). Unresolved
+                # spans and runtime-selected operands keep their existing
+                # conservative treatment.
+                continue
             return True
         if (
             parsed.dynamic
@@ -4890,6 +4925,41 @@ def _markdown_table_delimiter_columns(
     return len(cells)
 
 
+def _blank_line_local_paired_backticks(line: str) -> str:
+    """Blank backtick runs on one line that pair as inline-code delimiters.
+
+    Mirrors the equal-length, right-to-left pairing of the paragraph-scope
+    inline-code masking: a backtick that demonstrably delimits inline code on
+    its own line is Markdown syntax, never a shell substitution opener. Runs
+    that could only pair across lines stay visible, keeping the prose check
+    conservative, and escaped runs stay visible exactly as the masking does.
+    """
+    runs = [(match.start(), match.end()) for match in re.finditer(r"`+", line)]
+    next_by_length: dict[int, int] = {}
+    closing: dict[int, int] = {}
+    for index in range(len(runs) - 1, -1, -1):
+        length = runs[index][1] - runs[index][0]
+        if length in next_by_length:
+            closing[index] = next_by_length[length]
+        next_by_length[length] = index
+    chars = list(line)
+    index = 0
+    while index < len(runs):
+        start, end = runs[index]
+        escape_start = start
+        while escape_start > 0 and line[escape_start - 1] == "\\":
+            escape_start -= 1
+        close_index = closing.get(index)
+        if (start - escape_start) % 2 or close_index is None:
+            index += 1
+            continue
+        close_start, close_end = runs[close_index]
+        chars[start:end] = [" "] * (end - start)
+        chars[close_start:close_end] = [" "] * (close_end - close_start)
+        index = close_index + 1
+    return "".join(chars)
+
+
 def _markdown_shell_text(
     content: str,
     check_runtime: Callable[[], None],
@@ -5137,7 +5207,13 @@ def _markdown_shell_text(
                         and not runs
                         and not heading
                         and "'" in leading
-                        and _MARKDOWN_PROSE_SHELL_SYNTAX_RE.search(leading) is None
+                        # Inline-code delimiters are Markdown, not shell
+                        # syntax: judge the line with its line-local pairs
+                        # blanked, exactly as the masking pass will.
+                        and _MARKDOWN_PROSE_SHELL_SYNTAX_RE.search(
+                            _blank_line_local_paired_backticks(leading)
+                        )
+                        is None
                         and (
                             line_index == 0
                             or (
@@ -5274,6 +5350,7 @@ def _has_bounded_parse_exhaustion(
         structural_quote_openers=structural_quote_openers,
         python_source=python_source,
         perl_eval_blocks=file_type == "perl",
+        file_type=file_type,
     ):
         return True
     covered_until = 0
