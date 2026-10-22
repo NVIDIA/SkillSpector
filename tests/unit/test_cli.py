@@ -7632,6 +7632,96 @@ def test_report_output_rejects_symlinks_and_cleans_failed_replace(tmp_path, monk
     assert not list(tmp_path.glob(".skillspector-output-*"))
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+@pytest.mark.parametrize("existing", [False, True])
+def test_report_output_restricts_access_before_writing(tmp_path, monkeypatch, existing):
+    from skillspector import file_output
+
+    output = tmp_path / "report.json"
+    if existing:
+        output.write_text("previous", encoding="utf-8")
+    original_restrict = file_output.restrict_temporary_access
+    target_sizes = []
+
+    def restrict_empty_file(descriptor, *, output_kind):
+        target_sizes.append(os.fstat(descriptor).st_size)
+        original_restrict(descriptor, output_kind=output_kind)
+
+    monkeypatch.setattr(file_output, "restrict_temporary_access", restrict_empty_file)
+    file_output.write_text_no_follow(output, "private report")
+
+    assert target_sizes == [0]
+    assert output.read_text(encoding="utf-8") == "private report"
+    assert output.stat().st_mode & 0o777 == 0o600
+    assert not list(tmp_path.glob(".skillspector-output-*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+@pytest.mark.parametrize("existing", [False, True])
+def test_report_output_preserves_destination_when_acl_removal_fails(
+    tmp_path, monkeypatch, existing
+):
+    import ctypes
+    import errno
+
+    from skillspector import file_output
+
+    output = tmp_path / "report.json"
+    if existing:
+        output.write_text("previous", encoding="utf-8")
+    target_sizes = []
+
+    def fail_set_acl(descriptor, acl, acl_type):
+        target_sizes.append(os.fstat(descriptor).st_size)
+        ctypes.set_errno(errno.EACCES)
+        return -1
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda *args, **kwargs: SimpleNamespace(
+            acl_init=lambda count: 1, acl_set_fd_np=fail_set_acl, acl_free=lambda acl: 0
+        ),
+    )
+    with pytest.raises(ValueError, match="clear inherited report ACLs"):
+        file_output.write_text_no_follow(output, "private report")
+
+    assert target_sizes == [0]
+    if existing:
+        assert output.read_text(encoding="utf-8") == "previous"
+    else:
+        assert not output.exists()
+    assert not list(tmp_path.glob(".skillspector-output-*"))
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS inherited ACLs")
+@pytest.mark.parametrize("mode", [None, 0o600, 0o200])
+def test_report_output_clears_inherited_macos_acl(tmp_path, mode):
+    import subprocess
+
+    from skillspector import file_output
+
+    output = tmp_path / "report.json"
+    if mode is not None:
+        output.write_text("previous", encoding="utf-8")
+        output.chmod(mode)
+    subprocess.run(
+        ["/bin/chmod", "+a", "everyone allow read,file_inherit", str(tmp_path)],
+        check=True,
+        capture_output=True,
+    )
+
+    file_output.write_text_no_follow(output, "private report")
+
+    acl_listing = subprocess.run(
+        ["/bin/ls", "-le", str(output)], check=True, capture_output=True, text=True
+    ).stdout
+    assert "everyone" not in acl_listing
+    assert output.stat().st_mode & 0o777 == 0o600
+    assert output.read_text(encoding="utf-8") == "private report"
+
+
 def test_report_output_unsupported_platform_keeps_stdout(tmp_path, monkeypatch):
     from skillspector import file_output
 
