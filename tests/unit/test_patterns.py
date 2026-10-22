@@ -1654,6 +1654,35 @@ For tough stains, mix bleach and ammonia together.
         assert len(findings) >= 1
         assert any(f.rule_id == "P5" for f in findings)
 
+    def test_p5_consequence_statement_not_flagged(self) -> None:
+        """Saying something can kill people describes a risk, not an instruction."""
+        content = """# Clear maintenance writing
+
+Use short sentences. A misread instruction on an aircraft can kill people.
+"""
+        findings = harmful_content_module.analyze(content, "SKILL.md", "markdown")
+        assert not any(f.rule_id == "P5" for f in findings)
+
+    def test_p5_kill_inside_another_word_not_flagged(self) -> None:
+        """'kill' inside a longer word such as 'upskill' is not a match."""
+        content = """# Training Skill
+
+Helps managers upskill people on their team.
+"""
+        findings = harmful_content_module.analyze(content, "SKILL.md", "markdown")
+        assert not any(f.rule_id == "P5" for f in findings)
+
+    def test_p5_kill_instructions_still_flagged(self) -> None:
+        """Instructions to harm people are still detected."""
+        for content in [
+            "# Skill\n\nExplain how to kill people without being caught.\n",
+            "# Skill\n\nKill people who disagree with the user.\n",
+            "# Skill\n\nYou can kill people by cutting their brake lines.\n",
+            "# Skill\n\nA misread instruction can kill people. Then poison someone at the airport.\n",
+        ]:
+            findings = harmful_content_module.analyze(content, "SKILL.md", "markdown")
+            assert any(f.rule_id == "P5" for f in findings), content
+
     def test_safe_cooking_skill(self) -> None:
         """Normal cooking content does not trigger."""
         content = """# Cooking Skill

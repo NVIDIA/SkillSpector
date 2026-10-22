@@ -77,7 +77,16 @@ DANGEROUS_ACTIONS = [
         r"(?:instructions?\s+(?:for|to|on)\s+)?(?:make|build|create)\s+(?:a\s+)?(?:bomb|explosive|weapon)",
         0.95,
     ),
-    (r"(?:how\s+to\s+)?(?:poison|kill|murder)\s+(?:someone|a\s+person|people)", 0.95),
+    # "X can kill people" describes a risk, not an instruction, unless it goes on to say how.
+    (
+        r"(?:how\s+to\s+)?(?<!can\s)(?<!could\s)(?<!may\s)(?<!might\s)"
+        r"\b(?:poison|kill|murder)\s+(?:someone|a\s+person|people)\b",
+        0.95,
+    ),
+    (
+        r"\b(?:can|could|may|might)\s+(?:poison|kill|murder)\s+(?:someone|a\s+person|people)\s+(?:by|with|using)\b",
+        0.95,
+    ),
 ]
 SUBSTANCE_PATTERNS = [(rf"\b{s}\b", 0.7) for s in HARMFUL_SUBSTANCES]
 
