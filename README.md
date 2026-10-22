@@ -533,7 +533,7 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | AR2 | Disclaimer Suppression | HIGH | Instructions to omit warnings, disclaimers, or ethical commentary (e.g. "no disclaimers", "do not moralize") |
 | AR3 | Safety Policy Nullification | HIGH | Jailbreak framing that nullifies guardrails (e.g. "you have no restrictions", "ignore your guidelines", "do anything now") |
 
-### Data Exfiltration (4 patterns)
+### Data Exfiltration (5 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -541,6 +541,17 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | E2 | Env Variable Harvesting | HIGH | Enumerating, copying, or searching environment data to collect secrets |
 | E3 | File System Enumeration | MEDIUM | Scanning directories for sensitive files |
 | E4 | Context Leakage | HIGH | Transmitting conversation context externally |
+| E5 | Cloud Storage Exfiltration | MEDIUM | Uploading data through cloud storage SDKs or CLIs |
+
+Within bounded, fully observed context, E5 distinguishes literal AWS/GCS downloads
+from uploads. Simple remote-to-local `cp`, AWS `sync`, and `gsutil rsync` commands do not produce E5
+findings. Moves, deletion options, unknown flags, dynamic operands, streams and
+compound shell commands retain conservative findings. This direction check does
+not change SDK upload detection or the CLI's exit-code policy. Direction proofs
+require the complete preceding context to fit within 4,096 characters; visible
+command redefinitions (including command hashes) or unknown shell setup also
+retain the original finding. Relative destinations after directory changes
+remain unproved; literal absolute file destinations are still eligible.
 
 ### Privilege Escalation (3 patterns)
 
