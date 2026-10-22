@@ -1498,6 +1498,7 @@ def _extract_packages_from_package_json(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract (package_name, version_or_None, line_number) from package.json content.
 
@@ -1510,7 +1511,9 @@ def _extract_packages_from_package_json(
         return []
     try:
         data = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
         return _extract_packages_from_package_json_scan(content, limit=limit)
     if not isinstance(data, dict):
         return []
@@ -1554,6 +1557,7 @@ def _extract_packages_from_pyproject(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract (package_name, version_or_None, line_number) from pyproject.toml.
 
@@ -1566,7 +1570,9 @@ def _extract_packages_from_pyproject(
         return []
     try:
         data = tomllib.loads(content)
-    except tomllib.TOMLDecodeError:
+    except (ValueError, RecursionError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
         return []
 
     specs: list[str] = []
@@ -1663,7 +1669,11 @@ def _npm_lock_line_index(content: str) -> dict[str, int]:
     return index
 
 
-def _npm_lock_entries(content: str) -> list[tuple[str, str, int, int]]:
+def _npm_lock_entries(
+    content: str,
+    *,
+    on_parse_error: Callable[[str], None] | None = None,
+) -> list[tuple[str, str, int, int]]:
     """Extract (name, version, line, depth) for every install recorded in an npm lockfile.
 
     Covers both layouts: ``lockfileVersion`` 2/3 keep every install under ``packages`` keyed by
@@ -1680,7 +1690,11 @@ def _npm_lock_entries(content: str) -> list[tuple[str, str, int, int]]:
     """
     try:
         data = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, RecursionError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
+        return []
+    except TypeError:
         return []
     if not isinstance(data, dict):
         return []
@@ -1730,12 +1744,14 @@ def _extract_packages_from_npm_lock(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract exact package versions from an npm lockfile."""
     if limit is not None and limit <= 0:
         return []
     found: list[tuple[str, str | None, int]] = [
-        (name, version, line) for name, version, line, _depth in _npm_lock_entries(content)
+        (name, version, line)
+        for name, version, line, _depth in _npm_lock_entries(content, on_parse_error=on_parse_error)
     ]
     return found if limit is None else found[:limit]
 
@@ -1744,13 +1760,16 @@ def _extract_packages_from_toml_lock(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract exact package versions from TOML lockfiles such as uv.lock and poetry.lock."""
     if limit is not None and limit <= 0:
         return []
     try:
         data = tomllib.loads(content)
-    except tomllib.TOMLDecodeError:
+    except (ValueError, RecursionError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
         return []
     packages = data.get("package")
     if not isinstance(packages, list):
@@ -2928,11 +2947,27 @@ def _analyze_dependencies_detailed(
     )
     extraction_limit = package_limit + 1
 
+    def record_parse_error(error_class: str) -> None:
+        limitations.append(
+            OsvQueryLimitation(
+                reason=LedgerReason.DEPENDENCY_PARSE_ERROR,
+                error_class=error_class,
+            )
+        )
+
     if is_python_dep:
         if "pyproject.toml" in lower_path:
-            packages = _extract_packages_from_pyproject(content, limit=extraction_limit)
+            packages = _extract_packages_from_pyproject(
+                content,
+                limit=extraction_limit,
+                on_parse_error=record_parse_error,
+            )
         elif is_lockfile:
-            packages = _extract_packages_from_toml_lock(content, limit=extraction_limit)
+            packages = _extract_packages_from_toml_lock(
+                content,
+                limit=extraction_limit,
+                on_parse_error=record_parse_error,
+            )
         else:
             packages, oversized_spec = _extract_packages_from_requirements_detailed(
                 content,
@@ -2954,10 +2989,18 @@ def _analyze_dependencies_detailed(
         known_legit = _KNOWN_LEGIT_PYPI
     else:
         if is_npm_lock:
-            packages = _extract_packages_from_npm_lock(content, limit=extraction_limit)
+            packages = _extract_packages_from_npm_lock(
+                content,
+                limit=extraction_limit,
+                on_parse_error=record_parse_error,
+            )
         else:
             packages = _apply_locked_versions(
-                _extract_packages_from_package_json(content, limit=extraction_limit),
+                _extract_packages_from_package_json(
+                    content,
+                    limit=extraction_limit,
+                    on_parse_error=record_parse_error,
+                ),
                 npm_locked_versions,
                 _normalize_npm_package_name,
             )
