@@ -11,14 +11,22 @@ that: the answers must not change, and the cache must not bleed between inputs.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import unicodedata
+
 import pytest
 
 from skillspector.artifacts import (
+    _NON_ASCII_SEPARATOR_PATTERN,
     _has_letter_spacing_run,
     _has_obfuscated_instruction,
+    _has_security_word_character_after,
+    _has_security_word_character_before,
     _letter_spacing_run_spans,
     _obfuscated_instruction_matches,
     _requires_normalized_security_view,
+    multiline_prompt_injection_view,
+    prompt_injection_letter_spacing_view,
     security_text_views,
 )
 
@@ -126,3 +134,64 @@ def test_warm_cache_does_not_bypass_predicate_deadline(text: str) -> None:
 
     with pytest.raises(TimeoutError, match="during predicate evaluation"):
         security_text_views(text, Deadline())
+
+
+def test_security_text_views_concurrent_threads() -> None:
+    """Verify thread safety and cache integrity when called across concurrent workers."""
+    sample_texts = _TEXTS * 8
+
+    def invoke_views(t: str) -> tuple[str, ...]:
+        return tuple(v.name for v in security_text_views(t))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(invoke_views, sample_texts))
+
+    assert len(results) == len(sample_texts)
+    for text, res in zip(sample_texts, results):
+        expected = tuple(v.name for v in security_text_views(text))
+        assert res == expected
+
+
+def test_periodic_runtime_checks_in_prompt_letter_spacing_view() -> None:
+    """Ensure periodic runtime checks occur during large contiguous spans."""
+    calls = 0
+
+    def check() -> None:
+        nonlocal calls
+        calls += 1
+
+    text = "normal word " * 2000 + " a  b  c  d  e  f " + "normal word " * 2000
+    res = prompt_injection_letter_spacing_view(text, check)
+    assert calls >= 4
+    assert res.text != text
+
+
+def test_periodic_runtime_checks_in_multiline_prompt_injection_view() -> None:
+    """Ensure periodic runtime checks occur during large contiguous non-matching spans."""
+    calls = 0
+
+    def check() -> None:
+        nonlocal calls
+        calls += 1
+
+    text = ("- " * 6000) + "a\nb" + (" - " * 6000)
+    res = multiline_prompt_injection_view(text, check)
+    assert calls >= 4
+    assert res.text != text
+
+
+def test_unicode_separator_pattern_equivalence_full_codepoints() -> None:
+    """Verify _NON_ASCII_SEPARATOR_PATTERN matches all Unicode category Z separators."""
+    for cp in range(0x110000):
+        ch = chr(cp)
+        expected = not ch.isascii() and unicodedata.category(ch).startswith("Z")
+        actual = bool(_NON_ASCII_SEPARATOR_PATTERN.match(ch))
+        assert actual == expected
+
+
+def test_security_word_character_bounds_safety() -> None:
+    """Verify boundary cursor checks handle out-of-range offsets safely."""
+    for text in ("", "hello", "   "):
+        for offset in (-10, -1, 0, len(text), len(text) + 5):
+            assert _has_security_word_character_before(text, offset) is False or offset > 0
+            assert _has_security_word_character_after(text, offset) is False or offset < len(text)

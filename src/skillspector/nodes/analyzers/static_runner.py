@@ -291,7 +291,7 @@ _PARAGRAPH_BOUNDARY = re.compile(
     rf"(?>{LOGICAL_LINE_BREAK.pattern})[ \t]*(?>{LOGICAL_LINE_BREAK.pattern})"
 )
 _PARAGRAPH_RANGE_CACHE: dict[int, tuple[str, tuple[tuple[int, int], ...]]] = {}
-_PARAGRAPH_RANGE_CACHE_SIZE = 2
+_PARAGRAPH_RANGE_CACHE_SIZE = 16
 _PARAGRAPH_RANGE_CACHE_MAX_CONTENT_CHARS = 1_000_000
 _PARAGRAPH_RANGE_CACHE_MAX_RANGES = 4_096
 
@@ -327,7 +327,7 @@ def iter_paragraph_matches(
     pattern: str | re.Pattern[str], content: str, flags: int = 0
 ) -> Iterator[re.Match[str]]:
     """Match prose within paragraphs; executable and structured rules use finditer."""
-    regex = re.compile(pattern, flags)
+    regex = pattern if isinstance(pattern, re.Pattern) and not flags else re.compile(pattern, flags)
     ranges = _paragraph_ranges(content)
     if not ranges:
         yield from regex.finditer(content)

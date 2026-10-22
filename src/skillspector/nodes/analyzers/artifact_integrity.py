@@ -851,6 +851,8 @@ def _irregular_spacing_prompt_projection(
 def _text_signals(
     content: str,
     budget: _ArtifactIntegrityBudget,
+    *,
+    only_obfuscation: bool = False,
 ) -> tuple[float, bool, int | None, int | None]:
     """Derive Unicode and NUL signals with cooperative deadline checks.
 
@@ -898,6 +900,8 @@ def _text_signals(
         if value is not None
     ]
     first_obfuscation_line = min(obfuscation_lines, default=None)
+    if only_obfuscation:
+        return 0.0, False, None, first_obfuscation_line
 
     for index, character in enumerate(content):
         if index % _RUNTIME_CHECK_INTERVAL_CHARS == 0:
@@ -1069,7 +1073,11 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                         mixed_script,
                         first_nul_line,
                         first_obfuscation_line,
-                    ) = _text_signals(signal_content, budget)
+                    ) = _text_signals(
+                        signal_content,
+                        budget,
+                        only_obfuscation=bool(artifact.get("readable_binary")),
+                    )
                     if first_obfuscation_line is not None and binary_view is not None:
                         projected_start = sum(
                             len(line)

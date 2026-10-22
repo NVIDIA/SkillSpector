@@ -12,8 +12,10 @@ that was inspected.
 from __future__ import annotations
 
 import re
+import threading
 import unicodedata
 from array import array
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
@@ -419,6 +421,7 @@ BINARY_TEXT_MAX_CHARS = 32_768
 _BINARY_PRINTABLE_RUN = re.compile(r"[^\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufffd]{8,}")
 
 
+@lru_cache(maxsize=16)
 def binary_instruction_view(content: str) -> tuple[SecurityTextView, bool]:
     """Bound human-readable binary strings without treating binary noise as text."""
     # Packet formatting is recognized once on the whole artifact, before windows.
@@ -542,12 +545,40 @@ def _is_security_word_character(ch: str) -> bool:
     )
 
 
+_ASCII_SECURITY_WORD_CHARS = frozenset(
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+)
+_NON_ASCII_SEPARATOR_PATTERN = re.compile(
+    r"[\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]"
+)
+
+
+def _contains_non_ascii_separator(text: str) -> bool:
+    """Return whether *text* contains any non-ASCII Unicode separator."""
+    return _NON_ASCII_SEPARATOR_PATTERN.search(text) is not None
+
+
 def _is_non_ascii_separator(ch: str) -> bool:
     return not ch.isascii() and unicodedata.category(ch).startswith("Z")
 
 
+_ASCII_LETTER_SPACING_SEPARATORS = frozenset(
+    ch
+    for ch in map(chr, range(128))
+    if ch not in {"\n", "\r"}
+    and not ch.isalnum()
+    and (
+        ch.isspace()
+        or unicodedata.category(ch).startswith(("P", "S", "Z"))
+        or _compute_unconditionally_ignored(ch)
+    )
+)
+
+
 def _is_letter_spacing_separator(ch: str) -> bool:
     """Return whether *ch* can separate single-letter obfuscation tokens."""
+    if ch.isascii():
+        return ch in _ASCII_LETTER_SPACING_SEPARATORS
     if ch in {"\n", "\r", "\u2028", "\u2029"} or ch.isalnum():
         return False
     category = unicodedata.category(ch)
@@ -564,11 +595,11 @@ def _letter_spacing_gap_signature(gap: str) -> tuple[str, str] | None:
     """Return a stable signature for one unambiguous inter-letter gap."""
     if not gap:
         return None
-    if all(ch.isspace() for ch in gap):
-        return ("spacing", gap) if len(set(gap)) == 1 else None
+    if gap.isspace():
+        return ("spacing", gap) if len(gap) == gap.count(gap[0]) else None
 
     marker = "".join(ch for ch in gap if not ch.isspace())
-    if not marker or len(set(marker)) != 1:
+    if not marker or len(marker) != marker.count(marker[0]):
         return None
     return ("marked", marker[0])
 
@@ -702,6 +733,8 @@ def _security_skeleton_piece(character: str) -> str:
 
 def _fold_security_character(character: str) -> str:
     """Return a one-letter ASCII security skeleton, or an empty sentinel."""
+    if character.isascii():
+        return character.lower() if character.isalpha() else ""
     folded = _security_skeleton_piece(character)
     return folded if len(folded) == 1 and folded.isascii() and folded.isalpha() else ""
 
@@ -726,7 +759,15 @@ def _has_security_word_character_before(
     offset: int,
     check_runtime: Callable[[], None] | None = None,
 ) -> bool:
-    cursor = offset
+    if offset <= 0:
+        return False
+    cursor = min(offset, len(text))
+    if cursor > 0 and text[cursor - 1].isascii():
+        prev = text[cursor - 1]
+        if prev in _ASCII_SECURITY_WORD_CHARS:
+            return True
+        if prev not in _ASCII_UNCONDITIONALLY_IGNORED:
+            return False
     while (
         cursor > 0
         and text[cursor - 1] not in _LOGICAL_LINE_BREAK_CHARACTERS
@@ -742,7 +783,15 @@ def _has_security_word_character_after(
     offset: int,
     check_runtime: Callable[[], None] | None = None,
 ) -> bool:
+    if offset < 0 or offset >= len(text):
+        return False
     cursor = offset
+    if text[cursor].isascii():
+        nxt = text[cursor]
+        if nxt in _ASCII_SECURITY_WORD_CHARS:
+            return True
+        if nxt not in _ASCII_UNCONDITIONALLY_IGNORED:
+            return False
     while (
         cursor < len(text)
         and text[cursor] not in _LOGICAL_LINE_BREAK_CHARACTERS
@@ -1846,6 +1895,10 @@ def _compact_gap_offsets(
     check_runtime: Callable[[], None] | None = None,
 ) -> Iterator[int]:
     """Yield word-bounded separator runs that the compact view may remove."""
+    if not _contains_non_ascii_separator(text):
+        if check_runtime is not None:
+            check_runtime()
+        return
     for start, end in _token_bridging_gap_spans(text, check_runtime=check_runtime):
         character = text[start]
         if text.count(character, start, end) == end - start:
@@ -2064,9 +2117,9 @@ def prompt_injection_letter_spacing_view(
         if check_runtime is None:
             return
         processed_since_check += characters
-        if processed_since_check >= 4096:
+        while processed_since_check >= 4096:
             check_runtime()
-            processed_since_check %= 4096
+            processed_since_check -= 4096
 
     output = StringIO()
     offsets = array("I")
@@ -2074,10 +2127,11 @@ def prompt_injection_letter_spacing_view(
     transformed = False
 
     def append_source(start: int, end: int) -> None:
-        for source_offset in range(start, end):
-            record_work()
-            output.write(text[source_offset])
-            offsets.append(source_offset)
+        if start >= end:
+            return
+        record_work(end - start)
+        output.write(text[start:end])
+        offsets.extend(range(start, end))
 
     cursor = 0
     index = 0
@@ -2249,10 +2303,17 @@ def multiline_prompt_injection_view(
             checked_offset = source_offset
 
     def append_source(start: int, end: int) -> None:
-        for source_offset in range(start, end):
-            record_work(source_offset)
-            output.write(text[source_offset])
-            offsets.append(source_offset)
+        nonlocal checked_offset
+        if start >= end:
+            return
+        if check_runtime is not None:
+            step = max(start, checked_offset + 4096)
+            while step < end:
+                check_runtime()
+                checked_offset = step
+                step += 4096
+        output.write(text[start:end])
+        offsets.extend(range(start, end))
 
     while match is not None:
         run_start = match.start()
@@ -2328,7 +2389,9 @@ def _has_derived_security_view(text: str) -> bool:
         return True
     if next(_normalization_ignored_spans(text), None) is not None:
         return True
-    if "\ufffd" in text or next(_compact_gap_offsets(text), None) is not None:
+    if "\ufffd" in text or (
+        _contains_non_ascii_separator(text) and next(_compact_gap_offsets(text), None) is not None
+    ):
         return True
     return (
         _has_letter_spacing_run(text)
@@ -2340,6 +2403,11 @@ def _has_derived_security_view(text: str) -> bool:
     )
 
 
+_SECURITY_VIEWS_LOCK = threading.Lock()
+_SECURITY_VIEWS_CACHE: OrderedDict[str, tuple[SecurityTextView, ...]] = OrderedDict()
+_MAX_SECURITY_VIEWS_CACHE = 32
+
+
 def security_text_views(
     text: str,
     check_runtime: Callable[[], None] | None = None,
@@ -2347,6 +2415,12 @@ def security_text_views(
     """Return distinct raw, normalized, and compact views deterministically."""
     if check_runtime is not None:
         check_runtime()
+    else:
+        with _SECURITY_VIEWS_LOCK:
+            cached = _SECURITY_VIEWS_CACHE.get(text)
+            if cached is not None:
+                _SECURITY_VIEWS_CACHE.move_to_end(text)
+                return cached
     raw = SecurityTextView("raw", text)
     if check_runtime is None:
         has_letter_spacing = _has_letter_spacing_run(text)
@@ -2364,7 +2438,14 @@ def security_text_views(
         and not has_letter_spacing
         and not has_obfuscated_instruction
     ):
-        return (raw,)
+        result = (raw,)
+        if len(text) <= 256_000:
+            with _SECURITY_VIEWS_LOCK:
+                if len(_SECURITY_VIEWS_CACHE) >= _MAX_SECURITY_VIEWS_CACHE:
+                    _SECURITY_VIEWS_CACHE.popitem(last=False)
+                _SECURITY_VIEWS_CACHE[text] = result
+                _SECURITY_VIEWS_CACHE.move_to_end(text)
+        return result
     unique = [raw]
     seen = {text}
     builders: list[Callable[[str, Callable[[], None] | None], SecurityTextView]] = []
@@ -2377,7 +2458,10 @@ def security_text_views(
         builders.append(normalized_security_view)
     if (
         "\ufffd" in text
-        or _next_offset(iter(_compact_gap_offsets(text, check_runtime))) is not None
+        or (
+            _contains_non_ascii_separator(text)
+            and _next_offset(iter(_compact_gap_offsets(text, check_runtime))) is not None
+        )
         or has_letter_spacing
         or has_obfuscated_instruction
     ):
@@ -2391,7 +2475,14 @@ def security_text_views(
         if view.text not in seen:
             seen.add(view.text)
             unique.append(view)
-    return tuple(unique)
+    result = tuple(unique)
+    if len(text) <= 256_000:
+        with _SECURITY_VIEWS_LOCK:
+            if len(_SECURITY_VIEWS_CACHE) >= _MAX_SECURITY_VIEWS_CACHE:
+                _SECURITY_VIEWS_CACHE.popitem(last=False)
+            _SECURITY_VIEWS_CACHE[text] = result
+            _SECURITY_VIEWS_CACHE.move_to_end(text)
+    return result
 
 
 def unicode_anomaly_density(text: str) -> float:
