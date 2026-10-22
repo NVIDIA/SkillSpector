@@ -136,6 +136,65 @@ AS3_PROSE_PATTERNS = [
     ),
 ]
 AS3_PATTERNS = AS3_CODE_PATTERNS + AS3_PROSE_PATTERNS
+_PINNED_GITHUB_SOURCE_URL = re.compile(
+    r"`?https://github\.com/[^/\s]+/[^/\s]+/blob/(?P<ref>[0-9a-f]{7,40})/"
+    r"[^\s]*/skills?/[^/\s]+/SKILL\.md`?\.?",
+    re.IGNORECASE,
+)
+_SOURCE_COMMIT_ATTRIBUTION = re.compile(
+    r"source\s+(?:commit|revision)\s+`?(?P<ref>[0-9a-f]{40})`?:",
+    re.IGNORECASE,
+)
+_DERIVED_SOURCE_ATTRIBUTION = re.compile(
+    r"(?:This|The)\s+.+?\s+is\s+derived\s+from\s+.+?\n"
+    r"source\s+(?:commit|revision)\s+`?(?P<ref>[0-9a-f]{40})`?:\n"
+    r"`?https://github\.com/[^/\s]+/[^/\s]+/blob/\1/[^\s]*/skills?/[^/\s]+/SKILL\.md`?\.?",
+    re.IGNORECASE,
+)
+_MIT_NOTICE = re.compile(
+    r"\n\nMIT License\n\nCopyright \(c\) [^\n]+\n\n"
+    r"Permission is hereby granted, free of charge, to any person obtaining a copy\n"
+    r"of this software and associated documentation files \(the \"Software\"\), to deal\n"
+    r"in the Software without restriction, including without limitation the rights\n"
+    r"to use, copy, modify, merge, publish, distribute, sublicense, and/or sell\n"
+    r"copies of the Software, and to permit persons to whom the Software is\n"
+    r"furnished to do so, subject to the following conditions:\n\n"
+    r"The above copyright notice and this permission notice shall be included in all\n"
+    r"copies or substantial portions of the Software\.\n\n"
+    r"THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\n"
+    r"IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\n"
+    r"FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT\. IN NO EVENT SHALL THE\n"
+    r"AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\n"
+    r"LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\n"
+    r"OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\n"
+    r"SOFTWARE\.\n?\Z"
+)
+
+
+def _is_pinned_source_attribution(content: str, start: int, end: int) -> bool:
+    """Return whether an AS3 path appears in a standalone pinned source citation."""
+    line_start = content.rfind("\n", 0, start) + 1
+    line_end = content.find("\n", end)
+    line_end = len(content) if line_end == -1 else line_end
+    source_link = _PINNED_GITHUB_SOURCE_URL.fullmatch(content[line_start:line_end].strip())
+    if source_link is None:
+        return False
+    separator = content.rfind("\n\n", 0, line_start)
+    paragraph_start = separator + 2 if separator != -1 else 0
+    citation = content[paragraph_start:line_end].strip()
+    canonical = _SOURCE_COMMIT_ATTRIBUTION.fullmatch(
+        content[paragraph_start:line_start].strip()
+    )
+    if canonical is not None:
+        attributed = canonical.group("ref") == source_link.group("ref")
+    else:
+        attributed = _DERIVED_SOURCE_ATTRIBUTION.fullmatch(citation) is not None
+    if not attributed:
+        return False
+    following = content[line_end:]
+    if not following.strip():
+        return True
+    return _MIT_NOTICE.fullmatch(following) is not None
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
@@ -201,6 +260,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             if is_prose and is_directly_prohibited(content, match.start(), match.end()):
                 continue
             full_match = match.group(0)
+            if _is_pinned_source_attribution(content, match.start(), match.end()):
+                continue
             if _is_current_skill_path_reference(
                 full_match, _CURRENT_SKILL_IDENTIFIERS.get()
             ) and static_runner.security_view_match_is_literal(content, match.start(), match.end()):
