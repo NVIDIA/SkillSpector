@@ -34,6 +34,7 @@ from pathlib import Path, PurePosixPath
 from stat import S_ISREG
 from time import monotonic
 from typing import cast
+from urllib.parse import unquote_to_bytes
 
 import yaml
 
@@ -54,6 +55,7 @@ from skillspector.constants import (
     MODEL_CONFIG,
     build_model_config,
 )
+from skillspector.image_text import extract_image_text_detailed, has_image_magic
 from skillspector.input_handler import (
     _FileOpenError,
     _open_regular_file_no_follow,
@@ -91,6 +93,8 @@ from skillspector.references import (
     MAX_REFERENCE_RECORDS,
     MAX_REFERENCE_SOURCE_BYTES,
     ReferenceResolutionResult,
+    collect_image_inventory,
+    image_inventory_ledger_events,
     resolve_bundle_references_with_metadata,
 )
 from skillspector.state import (
@@ -2934,6 +2938,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     reference_events: list[InspectionLedgerEvent] = []
     reference_resolution: dict[str, object] = {}
     inventory_by_path = {item["path"]: item for item in artifact_inventory}
+    primary_text = ""
     if primary_path is not None and primary_path in raw_file_cache:
         primary_raw = raw_file_cache[primary_path]
         reference_started = monotonic()
@@ -3087,6 +3092,110 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             excluded_component_metadata,
         )
     )
+    # Per-skill local image inventory: resolved markdown-image records plus
+    # loose image files, with remote URLs cited-but-unfetched. The primary
+    # file matches reference resolution scope; loose files cover the rest
+    # of the skill tree. Ledger rows are COMPLETED: no verdicts. A
+    # truncated inventory appends a PARTIAL row (never silent success).
+    image_inventory: dict[str, list[str]] = {
+        "local_images": [],
+        "remote_images": [],
+        "inline_images": [],
+    }
+    image_inventory_events: list[InspectionLedgerEvent] = []
+    image_text_cache: dict[str, tuple[str, bool]] = {}
+    image_inline_text_cache: dict[str, tuple[str, bool, str | None]] = {}
+    # Whether the image inventory could be built: it needs the primary text.
+    # Container scans and nested manifests have no cached primary file, but
+    # the extraction caches below still publish, so the runner can treat a
+    # present cache with a missing entry as a deadline skip (PARTIAL) and
+    # never re-extracts raw bytes.
+    if primary_path is not None and primary_path in raw_file_cache:
+        image_inventory, inventory_truncated = collect_image_inventory(
+            primary_text,
+            primary_path,
+            sorted(dict.fromkeys([*inventoried_components, *excluded_artifacts])),
+            references,
+            clock=monotonic,
+            deadline=processing_deadline,
+        )
+        image_inventory_events = image_inventory_ledger_events(
+            image_inventory, primary_path, inventory_truncated
+        )
+
+    # Extract-once image text: one bounded pass per image here, so the
+    # static analyzers share the cache instead of each re-parsing (and
+    # re-paying a crafted sub-block walk). Identified by magic bytes, so a
+    # renamed image is still covered. The shared deadline gates the loop;
+    # each extraction is structurally bounded (text-byte caps, capped
+    # sub-block walks), so no per-image timer is needed. Runs for every
+    # input shape: gating it on the inventory would leave container and
+    # nested-manifest images uncached, and analyzers re-extracting them.
+    def _image_runtime_limit_row(path: str) -> None:
+        image_inventory_events.append(
+            ledger_event(
+                outcome=LedgerOutcome.PARTIAL,
+                record_type=LedgerRecordType.SYSTEM,
+                # Own phase, not image_inventory: the inventory rows
+                # already claim these work ids as COMPLETED.
+                phase="image_text",
+                path=path,
+                reason=LedgerReason.RUNTIME_LIMIT,
+                observed_seconds=max(0.0, monotonic() - processing_started),
+                limit_seconds=processing_runtime_limit,
+            )
+        )
+
+    if monotonic() >= processing_deadline:
+        for image_path in sorted(image_inventory["local_images"]):
+            _image_runtime_limit_row(image_path)
+    else:
+        for image_path in sorted(image_inventory["local_images"]):
+            if monotonic() >= processing_deadline:
+                _image_runtime_limit_row(image_path)
+                break
+            raw = raw_file_cache.get(image_path)
+            if isinstance(raw, bytes) and raw:
+                image_text_cache[image_path] = extract_image_text_detailed(raw)
+        for path, raw in raw_file_cache.items():
+            if monotonic() >= processing_deadline:
+                if isinstance(raw, bytes) and has_image_magic(raw):
+                    _image_runtime_limit_row(path)
+                break
+            if (
+                path not in image_text_cache
+                and isinstance(raw, bytes)
+                and raw
+                and has_image_magic(raw)
+            ):
+                image_text_cache[path] = extract_image_text_detailed(raw)
+        inline_parts: list[str] = []
+        inline_truncated = False
+        inline_reason: str | None = None
+        for uri in image_inventory["inline_images"]:
+            if monotonic() >= processing_deadline:
+                inline_truncated = True
+                break
+            header, _, data = uri.partition(",")
+            try:
+                if header.rstrip().lower().endswith(";base64"):
+                    inline_raw = base64.b64decode(data, validate=True)
+                else:
+                    # RFC 2397 default encoding: percent-escaped bytes.
+                    inline_raw = unquote_to_bytes(data)
+            except ValueError:
+                inline_reason = LedgerReason.INLINE_IMAGE_DECODE_ERROR.value
+                continue
+            text, capped = extract_image_text_detailed(inline_raw)
+            inline_truncated = inline_truncated or capped
+            if text:
+                inline_parts.append(text)
+        if primary_path is not None and (inline_parts or inline_truncated or inline_reason):
+            image_inline_text_cache[primary_path] = (
+                "\n".join(inline_parts),
+                inline_truncated,
+                inline_reason,
+            )
 
     # Omitted paths remain represented in artifact_inventory, but are not fed
     # to analyzers without content. Genuine read failures remain analyzer work
@@ -3946,6 +4055,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "artifact_inventory": artifact_inventory,
         "artifact_references": references,
         "reference_resolution": reference_resolution,
+        "image_inventory": image_inventory,
         "inspection_ledger": _bounded_ledger_output(
             [
                 *discovery_events,
@@ -3965,6 +4075,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 *postprocessing_events,
                 *coverage_policy_events,
                 *hidden_skill_llm_events,
+                *image_inventory_events,
             ]
         ),
         "ast_cache": {},
@@ -3977,6 +4088,8 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "has_executable_scripts": has_executable_scripts,
         "workflow_resource_budget": workflow_budget,
     }
+    result["image_text_cache"] = image_text_cache
+    result["image_inline_text_cache"] = image_inline_text_cache
 
     if structured.context is not None:
         result["structured_skill_context"] = structured.context
