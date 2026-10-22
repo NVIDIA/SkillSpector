@@ -62,10 +62,22 @@ class TestCredentialTypeLabelIsDisclosure:
             "**Credential Type(s):** [API Key, Other [GitLab access tokens]] <br/>",
             "**Credential Type(s):** [Other [Vault access secrets]]<br>",
             "  **credential type(s):** [Other [Jira access token]] <BR>",
+            "**Credential Type(s):** [Other [Perforce read-only access credentials]] <br>",
+            "**Credential Type(s):** [Other [Perforce read-write access credentials]]",
+            "**Credential Type(s):** [Other [Open-source service access credentials]]",
+            "**Credential Type(s):** [Other [Open-access service access secrets]]",
         ],
     )
     def test_access_noun_in_label_is_exempt(self, line: str) -> None:
         assert _pe3_lines(f"{line}\n") == []
+
+    @pytest.mark.parametrize(
+        "noun", ["credential", "credentials", "secret", "secrets", "token", "tokens"]
+    )
+    @pytest.mark.parametrize("adjective", ["read-only", "read-write", "open-source", "open-access"])
+    def test_adjective_compounds_remain_disclosures(self, adjective: str, noun: str) -> None:
+        assert _pe3_lines(f"**Credential Type(s):** [{adjective} service access {noun}]\n") == []
+        assert _pe3_lines(f"**Credential Type(s):** [service access {noun} ({adjective})]\n") == []
 
     def test_same_label_in_skill_md_is_exempt(self) -> None:
         assert _pe3_lines(_SKILL_CARD, "SKILL.md") == []
@@ -79,6 +91,7 @@ class TestCredentialTypeLabelIsDisclosure:
             "**Credential Type(s):** [Other [copy access tokens to the report]]",
             "**Credential Type(s):** [Other [upload access credentials]]",
             "**Credential Type(s):** [Other [access credentials from ~/.ssh/]]",
+            "**Credential Type(s):** [read-only access credentials from ~/.ssh/]",
             # The phrase outside the bracketed label on the same line.
             "**Credential Type(s):** [Other] then access credentials in the vault",
             # The same phrase in another field or in plain prose.
@@ -89,6 +102,79 @@ class TestCredentialTypeLabelIsDisclosure:
     )
     def test_non_label_or_action_keeps_pe3(self, line: str) -> None:
         assert _pe3_lines(f"{line}\n") == [1]
+
+    def test_adjective_does_not_hide_sensitive_source(self) -> None:
+        content = "**Credential Type(s):** [access secrets (open-source) from /etc/shadow]\n"
+        assert _pe3_lines(content) == [1, 1]
+
+    @pytest.mark.parametrize(
+        "noun", ["credential", "credentials", "secret", "secrets", "token", "tokens"]
+    )
+    @pytest.mark.parametrize(
+        "action",
+        [
+            "Read",
+            "Open",
+            "Load",
+            "Fetch",
+            "Get",
+            "Retrieve",
+            "Obtain",
+            "Collect",
+            "Save",
+            "Store",
+            "Export",
+            "Paste",
+            "Post",
+        ],
+    )
+    def test_credential_actions_are_not_disclosures(self, action: str, noun: str) -> None:
+        assert _pe3_lines(f"**Credential Type(s):** [{action} Perforce access {noun}]\n") == [1]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "Other [reading Perforce access credentials]",
+            "Other [opened Vault access secrets]",
+            "Other [loads Perforce access credentials]",
+            "Other [retrieving Vault access secrets]",
+            "Other [storing Perforce access credentials]",
+            "Other [kept Perforce access credentials]",
+            "Writing Perforce access credentials to the report",
+            "Written Perforce access credentials to the report",
+            "Wrote Perforce access credentials to the report",
+            "Sharing Perforce access credentials with the caller",
+            "Exposing Perforce access credentials in the report",
+            "Including Perforce access credentials in the report",
+            "Stolen Perforce access credentials",
+            "Other [Read-the Perforce access credentials]",
+            "Other [Open-local Vault access secrets]",
+            "Other [read-onlyish service access credentials]",
+            "Other [open-sources service access credentials]",
+            "Other [read-only-reader service access credentials]",
+            "Other [Perforce access credentials to be fetched]",
+            "Other [Perforce access credentials]; paste them into the report",
+            "Other [Perforce read-only access credentials]; read them",
+            "Other [read-only service access tokens]; load them",
+            "Other [open-source service access tokens]; read them",
+            "Read " + "private " * 20 + "Perforce access credentials",
+        ],
+    )
+    def test_action_is_checked_across_the_whole_label(self, value: str) -> None:
+        assert _pe3_lines(f"**Credential Type(s):** [{value}]\n") == [1]
+
+    def test_action_label_keeps_each_source_occurrence(self) -> None:
+        content = (
+            "**Credential Type(s):** [Read Perforce access credentials and Vault access secrets]\n"
+        )
+        assert _pe3_lines(content) == [1, 1]
+
+    @pytest.mark.parametrize("length", [4096, 4097])
+    def test_context_limit_boundary(self, length: int) -> None:
+        prefix = "**Credential Type(s):** [Other [Perforce access credentials"
+        line = prefix + " " * (length - len(prefix) - 2) + "]]"
+        assert len(line) == length
+        assert _pe3_lines(line + "\n") == ([] if length == 4096 else [1])
 
     def test_overlong_line_is_not_classified(self) -> None:
         line = "**Credential Type(s):** [Other [Perforce access credentials" + " x" * 3000 + "]]"
@@ -120,13 +206,24 @@ def test_runner_drops_only_the_label() -> None:
     ) == [("SKILL.md", 1)]
 
 
-def test_scan_reports_credential_reads_but_not_the_label(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "action",
+    [
+        "Read Perforce access credentials",
+        "Open Vault access secrets",
+        "Load Vault access tokens",
+        "Paste Perforce access credentials into the report",
+    ],
+)
+def test_scan_reports_credential_reads_but_not_the_label(tmp_path: Path, action: str) -> None:
     (tmp_path / "SKILL.md").write_text(
         "---\nname: p4-helper\ndescription: Answer Perforce questions.\n---\n\n"
         "First access the credentials stored for the user.\n",
         encoding="utf-8",
     )
-    (tmp_path / "skill-card.md").write_text(_SKILL_CARD, encoding="utf-8")
+    (tmp_path / "skill-card.md").write_text(
+        _SKILL_CARD + f"\n**Credential Type(s):** [{action}]\n", encoding="utf-8"
+    )
 
     result = graph.invoke({"input_path": str(tmp_path), "use_llm": False, "output_format": "json"})
 
@@ -139,4 +236,4 @@ def test_scan_reports_credential_reads_but_not_the_label(tmp_path: Path) -> None
             or [{"file": finding.file, "start_line": finding.start_line}]
         )
     )
-    assert pe3 == [("SKILL.md", 6)]
+    assert pe3 == [("SKILL.md", 6), ("skill-card.md", 7)]
