@@ -26,6 +26,7 @@ Selection happens via the ``SKILLSPECTOR_PROVIDER`` env var:
     anthropic         → AnthropicProvider            (api.anthropic.com)
     anthropic_proxy   → AnthropicProxyProvider       (Vertex-style raw-predict proxy)
     bedrock           → BedrockProvider              (AWS Bedrock Runtime, SigV4)
+    minimax           → MiniMaxProvider              (global or China regional endpoint)
     nv_build          → NvBuildProvider              (build.nvidia.com)
     ollama            → OllamaProvider               (local Ollama instance)
     azure_openai      → AzureOpenAIProvider          (Azure OpenAI Service)
@@ -127,6 +128,10 @@ def _select_active_provider() -> LLMProvider:
         from .bedrock import BedrockProvider
 
         return BedrockProvider()
+    if name == "minimax":
+        from .minimax import MiniMaxProvider
+
+        return MiniMaxProvider()
     if name == "ollama":
         from .ollama import OllamaProvider
 
@@ -177,7 +182,7 @@ def _select_active_provider() -> LLMProvider:
 
     raise UnknownProviderError(
         f"Unknown SKILLSPECTOR_PROVIDER: {name!r}. "
-        "Expected one of: openai, anthropic, anthropic_proxy, bedrock, nv_build, "
+        "Expected one of: openai, anthropic, anthropic_proxy, bedrock, minimax, nv_build, "
         "ollama, azure_openai, openai_compatible, gemini, "
         "claude_cli, codex_cli, gemini_cli, opencode_cli, antigravity_cli (or unset)."
     )
