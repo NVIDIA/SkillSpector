@@ -61,6 +61,7 @@ import os
 import platform
 import sys
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 MAX_DEPENDENCY_FILES = 200_000
@@ -178,7 +179,13 @@ for distribution in importlib.metadata.distributions():
             parsed = urllib.parse.urlsplit(raw_url)
             if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
                 raise RuntimeError(f"editable dependency is not a local file target: {normalized_name}")
-            editable_root = Path(urllib.parse.unquote(parsed.path)).resolve(strict=True)
+            # url2pathname needs the empty-authority delimiter for paths beginning
+            # with "//". Build it explicitly because urlunsplit() normalizes this
+            # form differently across Python patch releases.
+            converter_input = parsed.path
+            if not parsed.netloc and converter_input.startswith("//"):
+                converter_input = f"//{converter_input}"
+            editable_root = Path(urllib.request.url2pathname(converter_input)).resolve(strict=True)
             if not editable_root.is_dir():
                 raise RuntimeError(f"editable dependency target is not a directory: {normalized_name}")
             for editable_path in sorted(editable_root.rglob("*")):
