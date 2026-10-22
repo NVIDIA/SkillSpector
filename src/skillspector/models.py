@@ -122,7 +122,10 @@ def _new_finding_id() -> str:
 
 OCCURRENCE_FINDING_ID_KEY = "_skillspector_report_finding_id"
 OCCURRENCE_CODE_SNIPPET_KEY = "_skillspector_report_code_snippet"
-_PRIVATE_OCCURRENCE_KEYS = frozenset({OCCURRENCE_FINDING_ID_KEY, OCCURRENCE_CODE_SNIPPET_KEY})
+OCCURRENCE_FINDING_TEXT_KEY = "_skillspector_report_finding_text"
+_PRIVATE_OCCURRENCE_KEYS = frozenset(
+    {OCCURRENCE_FINDING_ID_KEY, OCCURRENCE_CODE_SNIPPET_KEY, OCCURRENCE_FINDING_TEXT_KEY}
+)
 
 
 @dataclass
