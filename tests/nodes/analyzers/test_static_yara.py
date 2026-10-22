@@ -1926,6 +1926,143 @@ with open("README_RESTORE_FILES.txt", "w") as note:
 
         assert _has_rule(findings, "ransomware_behavior")
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param(
+                """\
+import os
+from cryptography.fernet import Fernet
+
+fernet = Fernet(Fernet.generate_key())
+for root, _dirs, files in os.walk(os.path.expanduser("~")):
+    for name in files:
+        path = os.path.join(root, name)
+        with open(path, "rb") as source:
+            data = source.read()
+        with open(path, "wb") as destination:
+            destination.write(fernet.encrypt(data))
+""",
+                id="overwrite-in-walk-loop",
+            ),
+            pytest.param(
+                """\
+import os
+from cryptography.fernet import Fernet
+
+fernet = Fernet(Fernet.generate_key())
+
+
+def lock(path):
+    with open(path, "rb") as source:
+        data = source.read()
+    with open(path, "wb") as destination:
+        destination.write(fernet.encrypt(data))
+
+
+for root, _dirs, files in os.walk(os.path.expanduser("~/Documents")):
+    for name in files:
+        lock(os.path.join(root, name))
+""",
+                id="helper-defined-before-walk",
+            ),
+            pytest.param(
+                """\
+import os
+from Crypto.Cipher import AES
+
+cipher = AES.new(key, AES.MODE_CTR)
+for root, _dirs, files in os.walk("/home"):
+    for name in files:
+        with open(os.path.join(root, name), "r+b") as handle:
+            data = handle.read()
+            handle.seek(0)
+            handle.write(cipher.encrypt(data))
+""",
+                id="read-write-in-place",
+            ),
+        ],
+    )
+    def test_multiline_walk_encrypt_overwrite_without_note_is_detected(self, content):
+        # Without a ransom note, ``ransomware_behavior`` only fires when
+        # ``os.walk`` shares a line with the encrypt/open call.
+        findings = _run_builtin(content, "organize.py")
+
+        heuristic = _findings_from_rule(findings, "ransomware_behavior_multiline")
+        assert len(heuristic) == 1
+        assert heuristic[0].rule_id == "YR1"
+        assert heuristic[0].severity == "HIGH"
+        assert heuristic[0].confidence == 0.6
+        assert not _findings_from_rule(findings, "ransomware_behavior")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param(
+                """\
+import os
+import requests
+
+for root, _dirs, files in os.walk("assets"):
+    print(root, len(files))
+response = requests.get("https://example.com/model.bin")
+with open("model.bin", "wb") as handle:
+    handle.write(response.content)
+""",
+                id="walk-and-download-without-encryption",
+            ),
+            pytest.param(
+                """\
+import hashlib
+import os
+
+for root, _dirs, files in os.walk("."):
+    for name in files:
+        with open(os.path.join(root, name), "rb") as handle:
+            print(hashlib.sha256(handle.read()).hexdigest(), name)
+""",
+                id="walk-and-hash-read-only",
+            ),
+            pytest.param(
+                """\
+import sys
+from cryptography.fernet import Fernet
+
+fernet = Fernet(open("key", "rb").read())
+with open(sys.argv[1], "rb") as source:
+    data = source.read()
+with open(sys.argv[1] + ".enc", "wb") as destination:
+    destination.write(fernet.encrypt(data))
+""",
+                id="single-file-encryption-without-walk",
+            ),
+            pytest.param(
+                "import os\nfor root, _dirs, files in os.walk('.'):\n    print(root)\n"
+                + "# unrelated\n" * 100
+                + "with open('out.bin', 'wb') as handle:\n"
+                + "    handle.write(cipher.encrypt(b'data'))\n",
+                id="walk-far-from-encrypt-and-write",
+            ),
+        ],
+    )
+    def test_multiline_walk_without_nearby_encrypt_and_write_is_not_ransomware(self, content):
+        findings = _run_builtin(content, "tool.py")
+
+        assert not _has_rule(findings, "ransomware_behavior")
+
+    def test_single_line_walk_encrypt_reports_only_the_certain_rule(self):
+        content = (
+            "for root, _, files in os.walk(home): "
+            "[open(os.path.join(root, n), 'wb').write(f.encrypt(b'')) for n in files]\n"
+        )
+
+        findings = _run_builtin(content, "organize.py")
+
+        certain = _findings_from_rule(findings, "ransomware_behavior")
+        assert len(certain) == 1
+        assert certain[0].severity == "CRITICAL"
+        assert not _findings_from_rule(findings, "ransomware_behavior_multiline")
+
     def test_wallet_text_still_reaches_custom_rules(self, tmp_path):
         _write_rule(
             tmp_path,
