@@ -2031,10 +2031,7 @@ def _is_comment_candidate(
     candidate on its line. A ``#`` inside a string literal never counts: for
     host source the comment token must be proven.
     """
-    if (
-        _SHELL_COMMENT_START_RE.search(content, content.rfind("\n", 0, start) + 1, start)
-        is None
-    ):
+    if _SHELL_COMMENT_START_RE.search(content, content.rfind("\n", 0, start) + 1, start) is None:
         return False
     if python_source is None:
         return True

@@ -25,9 +25,7 @@ from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.nodes.analyzers import static_runner
 
 # Verbatim reproducer 1 from the issue: backticks inside a shell comment.
-_COMMENT_BACKTICK_SCRIPT = (
-    "#!/usr/bin/env bash\n" "# Uses the `printf` builtin.\n" "echo ok\n"
-)
+_COMMENT_BACKTICK_SCRIPT = "#!/usr/bin/env bash\n# Uses the `printf` builtin.\necho ok\n"
 
 # Verbatim reproducer 2 from the issue: inline code plus a possessive.
 _INLINE_CODE_POSSESSIVE_MD = "Run `rm -f build.log` to clean the project's output.\n"
@@ -35,37 +33,26 @@ _INLINE_CODE_POSSESSIVE_MD = "Run `rm -f build.log` to clean the project's outpu
 
 def test_backtick_in_shell_comment_completes_static_analysis() -> None:
     assert (
-        tm.has_bounded_parse_exhaustion(
-            _COMMENT_BACKTICK_SCRIPT, lambda: None, file_type="shell"
-        )
+        tm.has_bounded_parse_exhaustion(_COMMENT_BACKTICK_SCRIPT, lambda: None, file_type="shell")
         is False
     )
 
 
 def test_backtick_in_python_comment_completes_static_analysis() -> None:
     source = "# Uses the `printf` builtin.\nprint('ok')\n"
-    assert (
-        tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="python")
-        is False
-    )
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="python") is False
 
 
 def test_hash_inside_shell_string_is_not_a_comment() -> None:
     # A ``#`` inside quotes never opens a comment: the backtick substitution
     # that follows is still parsed, keeping the conservative bound.
     source = 'echo "# not a comment `printf`"\n'
-    assert (
-        tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
-        is True
-    )
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is True
 
 
 def test_hash_inside_python_string_is_not_a_comment() -> None:
     source = 'x = "# not a comment `printf`"\n'
-    assert (
-        tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="python")
-        is True
-    )
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="python") is True
 
 
 def test_runtime_command_in_comment_keeps_conservative_result() -> None:
@@ -73,10 +60,7 @@ def test_runtime_command_in_comment_keeps_conservative_result() -> None:
     # its partial result: only the printf-reconstruction trigger is
     # resolved for comments, never the operand-undecidability one.
     source = "# $TOOL -rf /\nvalue = 1\n"
-    assert (
-        tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
-        is True
-    )
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is True
 
 
 def test_apostrophe_after_inline_code_completes_static_analysis() -> None:
