@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import re
 import sys
+from bisect import bisect_right
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
@@ -43,6 +44,7 @@ from .common import (
     resolve_dynamic_import_call,
 )
 from .pattern_defaults import PatternCategory
+from .sql_parameter_binding import bound_sql_call_spans
 
 logger = get_logger(__name__)
 
@@ -71,6 +73,7 @@ _SUBPROCESS_FALLBACK_PATTERN = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+_SQL_OUTPUT_PATTERN = r"(?:execute|cursor\.execute|query)\s*\([^)]*(?:\+|%|\.format|f['\"])\s*.*?(?:response|output|result)"
 _EXEC_OUTPUT_PATTERN = r"exec\s*\(\s*(?:response|output|result|answer|completion|reply|generated)"
 _JAVASCRIPT_FILE_TYPES = frozenset({"javascript", "typescript"})
 _JAVASCRIPT_EXTENSIONS = frozenset({".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"})
@@ -108,7 +111,7 @@ OH1_CODE_PATTERNS = [
     (r"dangerouslySetInnerHTML\s*=\s*\{", 0.65),
     # SQL: output concatenated into queries
     (
-        r"(?:execute|cursor\.execute|query)\s*\([^)]*(?:\+|%|\.format|f['\"])\s*.*?(?:response|output|result)",
+        _SQL_OUTPUT_PATTERN,
         0.85,
     ),
     (r"f['\"](?:SELECT|INSERT|UPDATE|DELETE)\s+.*?\{(?:response|output|result)", 0.9),
@@ -630,6 +633,9 @@ def analyze(
 
     tag = [PatternCategory.OUTPUT_HANDLING.value]
 
+    sql_calls: tuple[tuple[int, int, int], ...] | None = None
+    sql_call_starts: tuple[int, ...] = ()
+
     for pattern, confidence in OH1_PATTERNS:
         matches = (
             static_runner.iter_paragraph_matches
@@ -641,6 +647,16 @@ def analyze(
                 content, match, file_path, file_type
             ):
                 continue
+            if pattern == _SQL_OUTPUT_PATTERN and file_type == "python":
+                if sql_calls is None:
+                    parsed = python_ast or parse_python_source(content, file_path)
+                    sql_calls = bound_sql_call_spans(parsed, content)
+                    sql_call_starts = tuple(start for start, _callee_end, _call_end in sql_calls)
+                owner_index = bisect_right(sql_call_starts, match.start()) - 1
+                if owner_index >= 0:
+                    _start, callee_end, call_end = sql_calls[owner_index]
+                    if match.start() < callee_end and match.end() <= call_end:
+                        continue
             line_num = get_line_number(content, match.start())
             adj = (
                 min(1.0, confidence + 0.1)
