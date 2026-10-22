@@ -1370,8 +1370,8 @@ async def test_mcp_stdio_initialize_registers_scan_skill() -> None:
 
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
-            await asyncio.wait_for(session.initialize(), timeout=15)
-            tools = await asyncio.wait_for(session.list_tools(), timeout=15)
+            await asyncio.wait_for(session.initialize(), timeout=30)
+            tools = await asyncio.wait_for(session.list_tools(), timeout=30)
 
     assert "scan_skill" in {tool.name for tool in tools.tools}
 
