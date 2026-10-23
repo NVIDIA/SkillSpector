@@ -63,6 +63,100 @@ def _write_skill(path: Path, body: str = "# Helper\n\nFormat a table.\n") -> Pat
     return path
 
 
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--use-shipped-baseline"],
+        ["--transitive"],
+        ["--transitive-depth", "1"],
+        ["--transitive-depth", "2"],
+        ["--transitive-allow-prefix", "https://example.com/"],
+        ["--transitive-deny-prefix", "https://example.com/"],
+    ],
+)
+def test_registry_unsupported_options_stop_before_input_or_output_access(
+    tmp_path: Path, flags: list[str]
+) -> None:
+    output = tmp_path / "report.json"
+    output.write_text("previous report", encoding="utf-8")
+
+    result = _run_cli(
+        "scan",
+        str(tmp_path / "missing-registry.json"),
+        "--mcp-registry",
+        "--format",
+        "json",
+        "--output",
+        str(output),
+        *flags,
+    )
+
+    assert result.returncode == 2
+    assert "cannot be combined" in result.stderr
+    assert flags[0] in result.stderr
+    assert result.stdout == ""
+    assert output.read_text(encoding="utf-8") == "previous report"
+
+
+def test_registry_default_options_still_allow_snapshot_comparison(tmp_path: Path) -> None:
+    source = tmp_path / "registry.json"
+    source.write_text(
+        json.dumps(
+            {
+                "servers": [
+                    {
+                        "server": {
+                            "name": "example/notes",
+                            "version": "1.0.0",
+                            "repository": {
+                                "url": "https://github.com/example/notes",
+                                "source": "github",
+                            },
+                            "packages": [
+                                {
+                                    "registryType": "npm",
+                                    "identifier": "example-notes",
+                                    "version": "1.0.0",
+                                    "fileSha256": "a" * 64,
+                                    "transport": {"type": "stdio"},
+                                }
+                            ],
+                        },
+                        "_meta": {
+                            "io.modelcontextprotocol.registry/official": {"status": "active"}
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    previous = tmp_path / "previous.json"
+    initial = _run_cli(
+        "scan", str(source), "--mcp-registry", "--format", "json", "--output", str(previous)
+    )
+    assert initial.returncode == 0, initial.stderr
+    previous_bytes = previous.read_bytes()
+
+    compared = _run_cli(
+        "scan",
+        str(source),
+        "--mcp-registry",
+        "--format",
+        "json",
+        "--mcp-registry-compare",
+        str(previous),
+    )
+
+    assert compared.returncode == 0, compared.stderr
+    payload = json.loads(compared.stdout)
+    assert payload["mcp_registry"] is True
+    assert payload["server_count"] == 1
+    assert payload["risk_score"] == 0
+    assert payload["comparison"]["unchanged_count"] == 1
+    assert previous.read_bytes() == previous_bytes
+
+
 @pytest.mark.parametrize("verbose", [False, True])
 def test_recursive_json_stdout_is_one_complete_report(tmp_path: Path, verbose: bool) -> None:
     collection = tmp_path / "collection"
@@ -90,6 +184,65 @@ def test_recursive_json_stdout_is_one_complete_report(tmp_path: Path, verbose: b
     assert "P6" not in {f["id"] for f in children["clean"]["issues"]}
     assert payload["max_risk_score"] == max(child["risk_score"] for child in children.values())
     assert "Multi-Skill Summary" in result.stderr
+
+
+@pytest.mark.parametrize("output_format", ["json", "sarif", "markdown", "terminal"])
+def test_recursive_medium_recommendation_matches_direct_scan(
+    tmp_path: Path, output_format: str
+) -> None:
+    """A complete MEDIUM scan stays CAUTION when reported as a collection."""
+    collection = tmp_path / "collection"
+    marked = _write_skill(collection / "marked", "# Notes\n\nordinary project notes\n")
+    _write_skill(collection / "clean")
+    rules = tmp_path / "rules"
+    rules.mkdir()
+    (rules / "marker.yar").write_text(
+        "rule ordinary_notes_marker {\n"
+        " meta:\n"
+        '  severity = "HIGH"\n'
+        '  confidence = "1.0"\n'
+        '  description = "Harmless marker for report parity"\n'
+        " strings:\n"
+        '  $marker = "ordinary project notes"\n'
+        " condition:\n"
+        "  $marker\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    options = ["--no-llm", "--yara-rules-dir", str(rules)]
+    direct = _run_cli("scan", str(marked), *options, "--format", "json")
+    assert direct.returncode == 0, direct.stderr
+    direct_risk = json.loads(direct.stdout)["risk_assessment"]
+    assert direct_risk["score"] == 25
+    assert direct_risk["severity"] == "MEDIUM"
+    assert direct_risk["recommendation"] == "CAUTION"
+
+    result = _run_cli("scan", str(collection), "--recursive", *options, "--format", output_format)
+    assert result.returncode == 0, result.stderr
+    if output_format == "json":
+        payload = json.loads(result.stdout)
+        assert payload["analysis_completeness"]["is_complete"] is True
+        assert payload["execution_successful"] is True
+        assert payload["max_risk_score"] == 25
+        assert payload["risk_severity"] == "MEDIUM"
+        assert payload["risk_recommendation"] == "CAUTION"
+        children = {child["path"]: child for child in payload["skills"]}
+        assert children["marked"]["risk_assessment"]["recommendation"] == "CAUTION"
+        assert children["clean"]["risk_assessment"]["recommendation"] == "SAFE"
+    elif output_format == "sarif":
+        payload = json.loads(result.stdout)
+        aggregate = payload["runs"][-1]["invocations"][0]
+        assert aggregate["executionSuccessful"] is True
+        assert aggregate["properties"]["analysisCompleteness"]["is_complete"] is True
+        assert aggregate["properties"]["riskAssessment"] == {
+            "maxRiskScore": 25,
+            "severity": "MEDIUM",
+            "recommendation": "CAUTION",
+        }
+    else:
+        # Complete human-readable collections preserve their child reports.
+        assert "MEDIUM" in result.stdout
+        assert "CAUTION" in result.stdout
 
 
 @pytest.mark.parametrize(
