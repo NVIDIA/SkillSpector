@@ -46,6 +46,9 @@ from rich.tree import Tree
 
 from skillspector import __version__, transitive
 from skillspector.cleanup import TempDirTracker, cleanup_result
+from skillspector.cli_entry import create_app
+from skillspector.cli_entry import main as main
+from skillspector.cli_entry import version_callback as version_callback
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.file_output import require_secure_file_output, write_text_no_follow
 from skillspector.graph_proxy import graph
@@ -112,12 +115,7 @@ def _ensure_utf8_streams() -> None:
 
 _ensure_utf8_streams()
 
-app = typer.Typer(
-    name="skillspector",
-    help="Security scanner for AI agent skills (LangGraph). Detect vulnerabilities before installation.",
-    add_completion=False,
-    no_args_is_help=True,
-)
+app = create_app()
 
 console = Console()
 err_console = Console(stderr=True)
@@ -289,35 +287,6 @@ class _TransitiveTraversalState:
             assert self.started_at is not None
             self.started_at += monotonic() - self.paused_at
             self.paused_at = None
-
-
-def version_callback(value: bool) -> None:
-    """Print version and exit."""
-    if value:
-        console.print(f"SkillSpector v{__version__}")
-        raise typer.Exit()
-
-
-@app.callback()
-def main(
-    version: Annotated[
-        bool | None,
-        typer.Option(
-            "--version",
-            "-v",
-            help="Show version and exit.",
-            callback=version_callback,
-            is_eager=True,
-        ),
-    ] = None,
-) -> None:
-    """
-    SkillSpector - Security scanner for AI agent skills (LangGraph).
-
-    Analyze skill bundles to detect vulnerabilities and security risks.
-    Supports: Git URL, file URL, .zip file, .md file, or directory.
-    """
-    pass
 
 
 def _scan_state(

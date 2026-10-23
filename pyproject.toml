@@ -73,7 +73,7 @@ dev = [
 ]
 
 [project.scripts]
-skillspector = "skillspector.cli:app"
+skillspector = "skillspector.cli_entry:app"
 
 [tool.uv]
 # Enable `uv tool install git+https://github.com/NVIDIA/skillspector.git`
