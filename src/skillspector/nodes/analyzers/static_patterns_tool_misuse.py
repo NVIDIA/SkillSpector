@@ -315,7 +315,8 @@ TM1_CODE_PATTERNS = [
     (r"wget\s+[^|]*--no-check-certificate", 0.65),
     # File deletion commands (delete/remove) with explicit path argument
     # Separate from rm pattern: requires \b and a short span to a "/" to avoid
-    # matching HTTP verb DELETE in REST docs or "remove" in prose
+    # matching "remove" in prose; HTTP verb DELETE in REST route tables is
+    # abstained in _is_rest_route.
     (r"\b(?:delete|remove)\s+['\"]?/[^\s'\"]{1,100}", 0.80),
     # SQL injection via parameter construction
     (
@@ -486,6 +487,70 @@ _SAFE_CACHE_CLEANUP_RE = re.compile(
 _DOCKERFILE_CONTEXT_RE = re.compile(
     r"\b(?:FROM|RUN|WORKDIR|COPY|ADD|ENV|EXPOSE|ENTRYPOINT|CMD|USER|HEALTHCHECK|ARG)\s",
 )
+
+_HOST_SYSTEM_ROOTS: frozenset[str] = frozenset(
+    {
+        "bin",
+        "boot",
+        "dev",
+        "etc",
+        "home",
+        "lib",
+        "lib64",
+        "media",
+        "mnt",
+        "opt",
+        "private",
+        "proc",
+        "root",
+        "run",
+        "sbin",
+        "sys",
+        "tmp",
+        "usr",
+        "var",
+        "Volumes",
+        "Users",
+    }
+)
+
+_REST_ROUTE_LINE_RE = re.compile(
+    r"^[ \t]*(?:[-*#|>~`]+\s*)*`?DELETE\b",
+)
+
+
+def _is_rest_route(matched_text: str, matched_line: str) -> bool:
+    """Return whether an uppercase DELETE match is a REST route rather than file deletion."""
+    if not matched_text.startswith("DELETE"):
+        return False
+    parts = matched_text.split(None, 1)
+    if len(parts) < 2:
+        return False
+    raw_path = parts[1].strip("'\"")
+    if not raw_path.startswith("/"):
+        return False
+    path_segments = [s for s in raw_path.split("/") if s]
+    if not path_segments:
+        return False
+    if path_segments[0].lower() in _HOST_SYSTEM_ROOTS:
+        return False
+    if _REST_ROUTE_LINE_RE.match(matched_line):
+        return True
+    if any(marker in raw_path for marker in (":", "{", "}", "?")):
+        return True
+    if path_segments[0].lower() in {
+        "api",
+        "v1",
+        "v2",
+        "v3",
+        "v4",
+        "rest",
+        "graphql",
+        "auth",
+        "oauth",
+    }:
+        return True
+    return False
 
 
 def _is_safe_container_command(text: str) -> bool:
@@ -5481,6 +5546,9 @@ def analyze(
         )
         matched = matched_text[:200]
         matched_line = _line_containing(content, match_start, match_end)
+
+        if not is_direct_shell_true and _is_rest_route(matched_text, matched_line):
+            continue
 
         if is_direct_shell_true:
             safety = direct_safety_by_line.get(line_num)

@@ -1764,6 +1764,31 @@ guidance = "Set the flag to --no-verify to skip deterministic result verificatio
                 "python",
                 id="rmtree_documentation_placeholder",
             ),
+            pytest.param(
+                "GET    /api/markets/:id             # Get single resource\n"
+                "DELETE /api/markets/:id             # Delete resource",
+                "SKILL.md",
+                "markdown",
+                id="rest_route_table_delete",
+            ),
+            pytest.param(
+                "| DELETE /api/markets/:id | Delete resource |",
+                "SKILL.md",
+                "markdown",
+                id="markdown_table_delete_route",
+            ),
+            pytest.param(
+                "- DELETE /api/v1/users/:id",
+                "SKILL.md",
+                "markdown",
+                id="list_item_delete_route",
+            ),
+            pytest.param(
+                "`DELETE /api/items/{item_id}`",
+                "SKILL.md",
+                "markdown",
+                id="backticked_delete_route",
+            ),
         ],
     )
     def test_tm1_false_positive_not_flagged(
@@ -1778,6 +1803,9 @@ guidance = "Set the flag to --no-verify to skip deterministic result verificatio
             pytest.param('rm "/etc/passwd"', "danger.sh", "shell", id="actual_rm_command"),
             pytest.param(
                 "delete /var/log/important.log", "danger.sh", "shell", id="actual_delete_path"
+            ),
+            pytest.param(
+                "DELETE /etc/shadow", "danger.sh", "shell", id="uppercase_delete_system_root"
             ),
             pytest.param('shutil.rmtree("/var/data")', "cleanup.py", "python", id="shutil_rmtree"),
             pytest.param('rm "$ROOT/path"', "cleanup.sh", "shell", id="rm_variable_path"),
