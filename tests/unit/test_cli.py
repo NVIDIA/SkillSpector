@@ -1754,6 +1754,69 @@ def test_cli_mcp_registry_rejects_skill_only_flags(tmp_path: Path, flag: str) ->
     assert "cannot be combined" in result.output
 
 
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--use-shipped-baseline"],
+        ["--transitive"],
+        ["--transitive-depth", "1"],
+        ["--transitive-depth", "0"],
+        ["--transitive-depth", "-1"],
+        ["--transitive-depth", "2"],
+        ["--transitive-allow-prefix", "https://example.com/"],
+        ["--transitive-deny-prefix", "https://example.com/"],
+        ["--transitive-allow-prefix", ""],
+        ["--transitive-deny-prefix", "not-a-prefix"],
+        ["--transitive", "--transitive-depth", "2", "--use-shipped-baseline"],
+    ],
+)
+def test_cli_mcp_registry_rejects_ignored_options_before_scanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flags: list[str]
+) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text('{"servers": []}', encoding="utf-8")
+    output = tmp_path / "report.json"
+    output.write_text("previous report", encoding="utf-8")
+    scan_registry = MagicMock(return_value={"findings": [], "risk_score": 0})
+    monkeypatch.setattr(cli, "scan_registry", scan_registry)
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(payload),
+            "--mcp-registry",
+            "--format",
+            "json",
+            "--output",
+            str(output),
+            *flags,
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "cannot be combined" in result.stderr
+    assert flags[0] in result.stderr
+    assert result.stdout == ""
+    assert output.read_text(encoding="utf-8") == "previous report"
+    scan_registry.assert_not_called()
+
+
+def test_cli_mcp_registry_rejects_configured_transitive_depth(tmp_path: Path) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text('{"servers": []}', encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["scan", str(payload), "--mcp-registry", "--format", "json"],
+        default_map={"scan": {"transitive_depth": 1}},
+    )
+
+    assert result.exit_code == 2
+    assert "--transitive-depth" in result.stderr
+    assert result.stdout == ""
+
+
 def test_cli_scan_missing_baseline_exits_2(tmp_path: Path) -> None:
     """scan with a --baseline pointing at a missing file exits with code 2."""
     (tmp_path / "SKILL.md").write_text("# Hi", encoding="utf-8")
@@ -2035,7 +2098,10 @@ def test_cli_scan_excludes_only_the_selected_baseline(tmp_path: Path) -> None:
     assert data["suppressed_count"] == 0
 
 
-def test_recursive_multi_skill_scan_rejects_shared_baseline(tmp_path: Path) -> None:
+@pytest.mark.parametrize("extra", [[], ["--use-shipped-baseline"]])
+def test_recursive_multi_skill_scan_rejects_shared_baseline(
+    tmp_path: Path, extra: list[str]
+) -> None:
     """Exact baselines are per-skill and cannot be silently reused recursively."""
     root = tmp_path / "skills"
     for name in ("one", "two"):
@@ -2050,11 +2116,53 @@ def test_recursive_multi_skill_scan_rejects_shared_baseline(tmp_path: Path) -> N
 
     result = runner.invoke(
         app,
-        ["scan", str(root), "--recursive", "--no-llm", "--baseline", str(baseline)],
+        ["scan", str(root), "--recursive", "--no-llm", "--baseline", str(baseline), *extra],
     )
 
     assert result.exit_code == 2
-    assert "not supported for recursive multi-skill scans" in result.output
+    assert "--baseline is not supported for recursive multi-skill scans" in " ".join(
+        result.stderr.split()
+    )
+
+
+@pytest.mark.parametrize("child_count", [1, 2])
+@pytest.mark.parametrize("fmt", ["terminal", "json", "sarif", "markdown"])
+def test_recursive_multi_skill_scan_rejects_shipped_baseline(
+    tmp_path: Path, child_count: int, fmt: str
+) -> None:
+    """Do not silently ignore opt-in or overwrite a report with unsuppressed results."""
+    root = tmp_path / "skills"
+    for i in range(child_count):
+        skill = root / f"skill-{i}"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(f"---\nname: skill-{i}\n---\n# Safe\n")
+        (skill / ".skillspector-baseline.yaml").write_text(
+            "version: 2\nrules:\n  - id: P1\n    reason: reviewed policy\n"
+        )
+    output = tmp_path / "report.txt"
+    output.write_text("previous report")
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(root),
+            "--recursive",
+            "--no-llm",
+            "--use-shipped-baseline",
+            "--format",
+            fmt,
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    error = " ".join(result.stderr.split())
+    assert "--use-shipped-baseline is not supported for recursive multi-skill scans" in error
+    assert "scan each sub-skill separately with --use-shipped-baseline" in error
+    assert result.stdout == ""
+    assert output.read_text() == "previous report"
 
 
 def test_recursive_single_skill_scan_still_accepts_baseline(tmp_path: Path) -> None:
@@ -2410,6 +2518,46 @@ def _bounded_recursive_result(label: str, *, finding_count: int = 1) -> dict[str
     }
 
 
+@pytest.mark.parametrize(
+    ("score", "severity", "recommendation"),
+    [
+        (0, "LOW", "SAFE"),
+        (20, "LOW", "SAFE"),
+        (21, "MEDIUM", "CAUTION"),
+        (50, "MEDIUM", "CAUTION"),
+        (51, "HIGH", "DO_NOT_INSTALL"),
+        (80, "HIGH", "DO_NOT_INSTALL"),
+        (81, "CRITICAL", "DO_NOT_INSTALL"),
+        (100, "CRITICAL", "DO_NOT_INSTALL"),
+    ],
+)
+@pytest.mark.parametrize("execution_failed", [False, True])
+@pytest.mark.parametrize("analysis_incomplete", [False, True])
+def test_recursive_risk_recommendation_bands_and_overrides(
+    score: int,
+    severity: str,
+    recommendation: str,
+    execution_failed: bool,
+    analysis_incomplete: bool,
+) -> None:
+    """Completeness can increase caution, but cannot erase known risk."""
+    expected = recommendation
+    if execution_failed:
+        expected = "DO_NOT_INSTALL"
+    elif analysis_incomplete and expected == "SAFE":
+        expected = "CAUTION"
+
+    assert cli._multi_skill_risk_assessment(
+        score,
+        execution_failed=execution_failed,
+        analysis_incomplete=analysis_incomplete,
+    ) == {
+        "max_risk_score": score,
+        "severity": severity,
+        "recommendation": expected,
+    }
+
+
 def test_recursive_fail_on_findings_exits_one_below_risk_threshold(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2584,19 +2732,26 @@ def test_recursive_over_record_budget_child_preserves_risk_and_exit(
     list(FormatChoice),
 )
 @pytest.mark.parametrize("cap_kind", ["child-retention", "serialized-output"])
+@pytest.mark.parametrize(
+    ("score", "severity", "recommendation"),
+    [(25, "MEDIUM", "CAUTION"), (100, "CRITICAL", "DO_NOT_INSTALL")],
+)
 def test_recursive_non_json_caps_preserve_aggregate_risk(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     output_format: FormatChoice,
     cap_kind: str,
+    score: int,
+    severity: str,
+    recommendation: str,
 ) -> None:
-    """Omitted child details never erase known high aggregate risk."""
+    """Omitted child details never erase known aggregate risk."""
     relative_path = "critical"
     child = {
         **_bounded_recursive_result("critical", finding_count=2),
-        "risk_score": 100,
-        "risk_severity": "CRITICAL",
-        "risk_recommendation": "DO_NOT_INSTALL",
+        "risk_score": score,
+        "risk_severity": severity,
+        "risk_recommendation": recommendation,
     }
     if cap_kind == "child-retention":
         monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_PUBLIC_RECORDS", 1)
@@ -2617,7 +2772,8 @@ def test_recursive_non_json_caps_preserve_aggregate_risk(
     output = tmp_path / f"combined.{output_format.value}"
     monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: child)
 
-    with pytest.raises(typer.Exit) as exit_info:
+    exit_context = pytest.raises(typer.Exit) if score > 50 else nullcontext()
+    with exit_context as exit_info:
         cli._scan_multi_skill(
             MultiSkillDetectionResult(is_multi_skill=True, skills=[skill]),
             output_format,
@@ -2625,28 +2781,29 @@ def test_recursive_non_json_caps_preserve_aggregate_risk(
             no_llm=True,
         )
 
-    assert exit_info.value.exit_code == 1
+    if score > 50:
+        assert exit_info.value.exit_code == 1
     body = output.read_text(encoding="utf-8")
     if output_format is FormatChoice.json:
         payload = json.loads(body)
-        assert payload["max_risk_score"] == 100
-        assert payload["risk_severity"] == "CRITICAL"
-        assert payload["risk_recommendation"] == "DO_NOT_INSTALL"
+        assert payload["max_risk_score"] == score
+        assert payload["risk_severity"] == severity
+        assert payload["risk_recommendation"] == recommendation
     elif output_format is FormatChoice.sarif:
         payload = json.loads(body)
         validate_sarif_report(payload)
         aggregate = payload["runs"][-1]["invocations"][0]["properties"]
         risk = aggregate["riskAssessment"]
         assert risk == {
-            "maxRiskScore": 100,
-            "severity": "CRITICAL",
-            "recommendation": "DO_NOT_INSTALL",
+            "maxRiskScore": score,
+            "severity": severity,
+            "recommendation": recommendation,
         }
     else:
-        assert "Maximum score: 100/100" in body
-        assert "Severity: CRITICAL" in body
+        assert f"Maximum score: {score}/100" in body
+        assert f"Severity: {severity}" in body
         # Human-readable report formats follow the single-skill convention.
-        assert "Recommendation: DO NOT INSTALL" in body
+        assert f"Recommendation: {recommendation.replace('_', ' ')}" in body
 
 
 @pytest.mark.parametrize(
@@ -3622,12 +3779,13 @@ def test_cli_shipped_baseline_without_opt_in(tmp_path: Path) -> None:
     assert "baseline" in result2.output.lower()
 
 
-def test_cli_shipped_baseline_opt_in(tmp_path: Path) -> None:
+@pytest.mark.parametrize("extra", [[], ["--recursive"]])
+def test_cli_shipped_baseline_opt_in(tmp_path: Path, extra: list[str]) -> None:
     """Opt-in applies the shipped baseline and reports provenance on stderr (R1 head/R6)."""
     skill_dir = _make_skill_dir(tmp_path)
     result = runner.invoke(
         app,
-        ["scan", str(skill_dir), "--no-llm", "--format", "json", "--use-shipped-baseline"],
+        ["scan", str(skill_dir), "--no-llm", "--format", "json", "--use-shipped-baseline", *extra],
     )
     assert result.exit_code == 0
     data = json.loads(result.stdout)

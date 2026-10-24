@@ -228,6 +228,11 @@ are rejected. This option requires `--mcp-registry` and is separate from the
 finding-suppression `--baseline`: it never suppresses findings or changes risk
 scores, and it does not fetch or execute listed server endpoints.
 
+Registry mode rejects skill-only controls such as `--use-shipped-baseline`,
+`--transitive`, `--transitive-depth`, `--transitive-allow-prefix`, and
+`--transitive-deny-prefix` with exit code 2, including an explicitly supplied
+default depth (`--transitive-depth 1`). Omit these options for registry scans.
+
 ### Suppressing False Positives (baseline)
 
 Suppress known/accepted findings so the risk score reflects only un-triaged
