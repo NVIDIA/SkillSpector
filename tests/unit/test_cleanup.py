@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from skillspector.cleanup import _retry_writable, cleanup_result
+from skillspector.cleanup import TempDirTracker, _retry_writable, cleanup_result
 from skillspector.input_handler import InputHandler
 
 
@@ -163,3 +163,111 @@ def test_input_handler_cleanup_removes_read_only_git_objects(
 
     assert not temp_dir.exists()
     assert handler.temp_dir_for_cleanup() is None
+
+
+def _scan_temp_dir(root: Path) -> Path:
+    """Create a directory named like the ones ``InputHandler`` materializes."""
+    path = root / "skillspector_abc123"
+    path.mkdir()
+    (path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    return path
+
+
+def test_tracker_records_a_scan_temp_dir(tmp_path: Path) -> None:
+    """A node output naming an existing skillspector_ directory is recorded."""
+    temp_dir = _scan_temp_dir(tmp_path)
+    tracker = TempDirTracker()
+
+    tracker.on_chain_end({"temp_dir_for_cleanup": str(temp_dir)})
+
+    assert tracker.temp_dir == str(temp_dir)
+
+
+@pytest.mark.parametrize("later", [None, "", 42, ["x"]])
+def test_tracker_keeps_recorded_path_when_a_later_output_has_none(
+    tmp_path: Path, later: object
+) -> None:
+    """A later output without a usable path does not erase the recorded one."""
+    temp_dir = _scan_temp_dir(tmp_path)
+    tracker = TempDirTracker()
+    tracker.on_chain_end({"temp_dir_for_cleanup": str(temp_dir)})
+
+    tracker.on_chain_end({"temp_dir_for_cleanup": later})
+    tracker.on_chain_end({"other": "value"})
+    tracker.on_chain_end("not a mapping")
+
+    assert tracker.temp_dir == str(temp_dir)
+
+
+def test_tracker_ignores_paths_that_are_not_scan_temp_dirs(tmp_path: Path) -> None:
+    """Only an existing, non-symlink skillspector_ directory can become a deletion target."""
+    user_dir = tmp_path / "my-skill"
+    user_dir.mkdir()
+    missing = tmp_path / "skillspector_missing"
+    a_file = tmp_path / "skillspector_file"
+    a_file.write_text("x", encoding="utf-8")
+    tracker = TempDirTracker()
+
+    for candidate in (user_dir, missing, a_file):
+        tracker.on_chain_end({"temp_dir_for_cleanup": str(candidate)})
+
+    assert tracker.temp_dir is None
+    assert user_dir.exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks unavailable")
+def test_tracker_ignores_a_symlink_named_like_a_scan_temp_dir(tmp_path: Path) -> None:
+    """A symlink is never recorded, even with the scan prefix and a directory target."""
+    target = tmp_path / "keep"
+    target.mkdir()
+    link = tmp_path / "skillspector_link"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("cannot create symlinks here")
+    tracker = TempDirTracker()
+
+    tracker.on_chain_end({"temp_dir_for_cleanup": str(link)})
+
+    assert tracker.temp_dir is None
+
+
+def test_tracker_remove_twice_is_a_no_op(tmp_path: Path) -> None:
+    """Removing an already-removed directory does not raise."""
+    temp_dir = _scan_temp_dir(tmp_path)
+    tracker = TempDirTracker()
+    tracker.on_chain_end({"temp_dir_for_cleanup": str(temp_dir)})
+
+    tracker.remove()
+    tracker.remove()
+
+    assert not temp_dir.exists()
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, RuntimeError])
+def test_removing_on_error_reraises_the_original_exception(
+    tmp_path: Path, error: type[BaseException]
+) -> None:
+    """The wrapped run's exception propagates unchanged after the directory is removed."""
+    temp_dir = _scan_temp_dir(tmp_path)
+    tracker = TempDirTracker()
+    original = error("stopped")
+
+    with pytest.raises(error) as raised:
+        with tracker.removing_on_error():
+            tracker.on_chain_end({"temp_dir_for_cleanup": str(temp_dir)})
+            raise original
+
+    assert raised.value is original
+    assert not temp_dir.exists()
+
+
+def test_removing_on_error_leaves_the_directory_on_success(tmp_path: Path) -> None:
+    """A run that completes leaves removal to the caller's cleanup_result."""
+    temp_dir = _scan_temp_dir(tmp_path)
+    tracker = TempDirTracker()
+
+    with tracker.removing_on_error():
+        tracker.on_chain_end({"temp_dir_for_cleanup": str(temp_dir)})
+
+    assert temp_dir.exists()

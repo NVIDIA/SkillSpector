@@ -78,6 +78,18 @@ def _source_scope(record: Mapping[str, object]) -> str | None:
 
 def _has_effective_findings(result: Mapping[str, object]) -> bool:
     """Return whether meta-analysis had effective findings to process."""
+    required = result.get("meta_review_required")
+    if isinstance(required, bool):
+        return required
+    findings = result.get("findings")
+    if isinstance(findings, list) and findings:
+        for finding in findings:
+            tags: object = getattr(finding, "tags", None)
+            if tags is None and isinstance(finding, Mapping):
+                tags = finding.get("tags")
+            if not isinstance(tags, list) or "coverage" not in tags:
+                return True
+        return False
     effective_ids = result.get("effective_finding_ids")
     if isinstance(effective_ids, list):
         return bool(effective_ids)

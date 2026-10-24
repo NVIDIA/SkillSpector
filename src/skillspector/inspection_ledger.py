@@ -36,11 +36,21 @@ class LedgerRecordType(StrEnum):
     WORK_ITEM = "work_item"
     SYSTEM = "system"
     SCOPE_BOUNDARY = "scope_boundary"
+    # An analyzer's own configuration (e.g. its YARA rule set), not a skill
+    # artifact. Its ``path`` is only a report-safe label, and every relative
+    # path is also a legal file name, so path-keyed accounting must exclude
+    # these records by type -- no choice of label can be collision-free.
+    RULE_SET = "rule_set"
+
+
+RULE_SET_SCOPE: Final = "rule_set"
+"""Public ``scope`` of exception rows describing a rule set rather than a file."""
 
 
 class LedgerReason(StrEnum):
     """Allowlisted reasons for omitted, skipped, or failed inspection work."""
 
+    USER_EXCLUSION = "user_exclusion"
     EXCLUDED_DIRECTORY = "excluded_directory"
     HIDDEN_FILE = "hidden_file"
     FILE_DISAPPEARED = "file_disappeared"
@@ -50,6 +60,8 @@ class LedgerReason(StrEnum):
     MISSING_FILE_CACHE = "missing_file_cache"
     SIZE_LIMIT = "size_limit"
     BINARY_CONTENT = "binary_content"
+    BINARY_TEXT_PROJECTION = "binary_text_projection"
+    BINARY_EXECUTABLE_TEXT = "binary_executable_text"
     EVAL_DATASET = "eval_dataset"
     SYNTAX_ERROR = "syntax_error"
     LLM_BATCH_FAILED = "llm_batch_failed"
@@ -74,6 +86,7 @@ class LedgerReason(StrEnum):
     ARCHIVE_TRUNCATED = "archive_truncated"
     ARCHIVE_UNSAFE_MEMBER_PATH = "archive_unsafe_member_path"
     ARCHIVE_AMBIGUOUS_MEMBER_PATH = "archive_ambiguous_member_path"
+    ARTIFACT_PATH_COLLISION = "artifact_path_collision"
     ARCHIVE_LINK_MEMBER = "archive_link_member"
     ARCHIVE_DEPTH_LIMIT = "archive_depth_limit"
     ARCHIVE_MEMBER_LIMIT = "archive_member_limit"
@@ -95,13 +108,17 @@ class LedgerReason(StrEnum):
     TOTAL_BYTES_LIMIT = "total_bytes_limit"
     RUNTIME_LIMIT = "runtime_limit"
     EXCLUDED_EXECUTABLE_CONTENT = "excluded_executable_content"
+    HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY = "hidden_skill_executable_local_only"
     OUTPUT_LIMIT = "output_limit"
     TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
+    PYTHON_SOURCE_AMBIGUOUS = "python_source_ambiguous"
+    PYTHON_SOURCE_DECODE_ERROR = "python_source_decode_error"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
 
 
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
+    LedgerReason.USER_EXCLUSION: "File was not inspected because of an explicit caller exclusion.",
     LedgerReason.EXCLUDED_DIRECTORY: ("Directory tree is excluded from the configured scan scope."),
     LedgerReason.HIDDEN_FILE: "Hidden file is excluded from the configured scan scope.",
     LedgerReason.FILE_DISAPPEARED: ("Inventoried file disappeared before it could be inspected."),
@@ -111,6 +128,12 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.MISSING_FILE_CACHE: "Applicable analyzer could not obtain file content.",
     LedgerReason.SIZE_LIMIT: "File exceeds this analyzer's character limit.",
     LedgerReason.BINARY_CONTENT: "Binary content is unsupported by this analyzer.",
+    LedgerReason.BINARY_TEXT_PROJECTION: (
+        "Only bounded printable text was inspected; binary structure and behavior are outside scope."
+    ),
+    LedgerReason.BINARY_EXECUTABLE_TEXT: (
+        "Readable text was inspected, but binary executable behavior remains outside analyzer coverage."
+    ),
     LedgerReason.EVAL_DATASET: (
         "Evaluation dataset prose is excluded from static pattern analysis."
     ),
@@ -141,7 +164,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.MANIFEST_ABSENT: ("No compatible manifest was present for this analyzer."),
     LedgerReason.NO_APPLICABLE_FILES: ("No files matched this analyzer's applicability contract."),
     LedgerReason.OMS_SIGNATURE: (
-        "Recognized OMS signature metadata is excluded from content analysis."
+        "DSSE content decoding is incomplete or unsupported; raw fields were retained for inspection. Signature authenticity was not verified."
     ),
     LedgerReason.BASELINE_FILE: (
         "The explicitly selected suppression baseline is excluded from content analysis."
@@ -160,6 +183,10 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     ),
     LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH: (
         "Archive member name has an ambiguous or duplicate provenance identity."
+    ),
+    LedgerReason.ARTIFACT_PATH_COLLISION: (
+        "A disk path containing '!/' collides with an archive member. Rename the directory "
+        "ending in '!'; the colliding archive member was not analyzed."
     ),
     LedgerReason.ARCHIVE_LINK_MEMBER: "Archive link member was not followed or read.",
     LedgerReason.ARCHIVE_DEPTH_LIMIT: "Nested archive depth limit was reached.",
@@ -203,12 +230,21 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.EXCLUDED_EXECUTABLE_CONTENT: (
         "Executable content was inventoried but excluded from content analysis."
     ),
+    LedgerReason.HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY: (
+        "Conventional hidden-skill helper script was kept local and not sent to an external LLM."
+    ),
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
     LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED: (
         "A transitive child scan failed before complete inspection."
     ),
     LedgerReason.STATIC_PARSE_LIMIT: (
         "A security-relevant expression exceeded a bounded static parser's span limit."
+    ),
+    LedgerReason.PYTHON_SOURCE_AMBIGUOUS: (
+        "Python execution intent depends on runtime or platform-specific shebang semantics."
+    ),
+    LedgerReason.PYTHON_SOURCE_DECODE_ERROR: (
+        "Python source bytes could not be decoded under their declared encoding."
     ),
     LedgerReason.OBFUSCATED_INSTRUCTION_TEXT: (
         "Obfuscated instruction text could not be fully evaluated by the deterministic layer."
@@ -293,6 +329,7 @@ class InspectionLedgerException(TypedDict):
     error_class: NotRequired[str]
     analyzers: NotRequired[list[str]]
     fatal: NotRequired[bool]
+    scope: NotRequired[str]
 
 
 class AnalysisCompleteness(TypedDict):
@@ -309,6 +346,8 @@ class AnalysisCompleteness(TypedDict):
     entirely_uninspected_files: int
     ledger_exceptions: list[InspectionLedgerException]
     scope_exclusions: list[InspectionLedgerException]
+    exclude_patterns: NotRequired[list[str]]
+    excluded_file_count: NotRequired[int]
     analyzer_statuses: list[dict[str, object]]
     references: NotRequired[list[dict[str, object]]]
     limitations: NotRequired[list[str]]
@@ -522,8 +561,10 @@ def analyzer_status_event(
 def analyzer_status_for_events(
     analyzer_id: str, events: Iterable[InspectionLedgerEvent]
 ) -> AnalyzerStatusEvent:
-    """Summarize an analyzer's terminal work without exposing event payloads."""
-    terminal_events = list(events)
+    """Summarize analyzer work; scope-boundary records remain separate exclusions."""
+    terminal_events = [
+        event for event in events if event.get("record_type") != LedgerRecordType.SCOPE_BOUNDARY
+    ]
     if not terminal_events:
         return analyzer_status_event(
             analyzer_id=analyzer_id,
@@ -585,6 +626,7 @@ def _exception(
     error_class: str | None = None,
     analyzers: Iterable[str] = (),
     fatal: bool,
+    scope: str | None = None,
 ) -> InspectionLedgerException:
     """Build the public, safe projection of one exceptional ledger fact."""
     exception: InspectionLedgerException = {
@@ -602,7 +644,14 @@ def _exception(
         exception["analyzers"] = analyzer_ids
     if error_class:
         exception["error_class"] = error_class
+    if scope:
+        exception["scope"] = scope
     return exception
+
+
+def _is_rule_set_record(event: Mapping[str, object]) -> bool:
+    """Return whether a ledger row describes a rule set rather than an artifact."""
+    return event.get("record_type") == LedgerRecordType.RULE_SET
 
 
 def _exception_from_event(
@@ -625,6 +674,7 @@ def _exception_from_event(
         error_class=event.get("error_class"),
         analyzers=[str(event.get("analyzer_id", ""))],
         fatal=fatal,
+        scope=RULE_SET_SCOPE if _is_rule_set_record(event) else None,
     )
 
 
@@ -643,6 +693,9 @@ def _merge_exception_projection(
             exception["start_line"],
             exception["end_line"],
             exception.get("error_class"),
+            # A rule-set row and a real file's row can share a path label;
+            # they must never merge into one public row.
+            exception.get("scope"),
         )
         existing = grouped.get(key)
         if existing is None:
@@ -922,9 +975,17 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
     ledger_exceptions = _merge_exception_projection(exceptional_rows)
     scope_exclusions = _merge_exception_projection(scope_rows)
 
+    # Rule-set rows describe an analyzer's configuration, not an artifact. Their
+    # path is only a label, so folding them into per-component coverage would
+    # charge the rule set's incompleteness to any real file with that name.
+    rule_set_work_ids = {
+        str(event.get("work_id", "")) for event in events if _is_rule_set_record(event)
+    }
     per_component: dict[str, list[LedgerOutcome]] = {component: [] for component in components}
     if primary_targets:
         for _analyzer_id, target, matches in primary_targets:
+            if str(target.get("work_id", "")) in rule_set_work_ids:
+                continue
             path = _safe_path(target.get("path"), components)
             outcomes = per_component.setdefault(path, [])
             if len(matches) == 1:
@@ -1070,6 +1131,12 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_before_filtering": len(findings_by_id),
         "findings_after_filtering": len(validated_effective),
     }
+    patterns = state.get("exclude_patterns", [])
+    if patterns:
+        completeness["exclude_patterns"] = list(patterns)
+        completeness["excluded_file_count"] = sum(
+            item.get("reason") == LedgerReason.USER_EXCLUSION for item in inventory
+        )
     return completeness, validated_effective
 
 

@@ -16,12 +16,15 @@
 """Tests for the MCP server wrapper (run_scan core + scan_skill tool)."""
 
 import asyncio
-import importlib
 import json
 import os
 import sys
+import tempfile
+import threading
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -58,6 +61,78 @@ async def test_run_scan_returns_structured_verdict(
     assert isinstance(result["safe_to_install"], bool)
     assert result["safe_to_install"] == (result["risk_score"] <= 50)
     assert result["report"]  # non-empty rendered report
+
+
+def _record_scan_temp_dirs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, list[Path]]:
+    """Build a zipped skill and create the scan temp dirs under tmp_path, recording them."""
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("SKILL.md", "---\nname: demo\ndescription: d\n---\n# Demo\n")
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def recording_mkdtemp(*args: Any, **kwargs: Any) -> str:
+        """Create scan temp dirs under tmp_path and remember them."""
+        if kwargs.get("prefix") != "skillspector_":
+            return real_mkdtemp(*args, **kwargs)
+        path = real_mkdtemp(*args, **{**kwargs, "dir": tmp_path})
+        created.append(Path(path))
+        return path
+
+    monkeypatch.setattr("skillspector.input_handler.tempfile.mkdtemp", recording_mkdtemp)
+    return archive, created
+
+
+async def test_run_scan_that_fails_removes_its_temp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scan failing after input resolution removes the temp dir it made."""
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    archive, created = _record_scan_temp_dirs(monkeypatch, tmp_path)
+
+    def fail(*args: Any, **kwargs: Any) -> str:
+        """Stand in for a failure after the input is materialized."""
+        raise RuntimeError("report failed")
+
+    monkeypatch.setattr("skillspector.nodes.report._format_json", fail)
+
+    with pytest.raises(RuntimeError, match="report failed"):
+        await run_scan(str(archive), use_llm=False, output_format="json")
+
+    assert created
+    assert not any(path.exists() for path in created)
+
+
+async def test_run_scan_that_is_cancelled_removes_its_temp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling the tool call after input resolution removes the temp dir."""
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    archive, created = _record_scan_temp_dirs(monkeypatch, tmp_path)
+    reporting = threading.Event()
+    release = threading.Event()
+
+    def block(*args: Any, **kwargs: Any) -> str:
+        """Hold the report step so the caller can cancel the running scan."""
+        reporting.set()
+        release.wait(timeout=10)
+        raise RuntimeError("released after cancellation")
+
+    monkeypatch.setattr("skillspector.nodes.report._format_json", block)
+
+    scan = asyncio.create_task(run_scan(str(archive), use_llm=False, output_format="json"))
+    try:
+        assert await asyncio.to_thread(reporting.wait, 10)
+        scan.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await scan
+    finally:
+        release.set()
+
+    assert created
+    assert not any(path.exists() for path in created)
 
 
 @pytest.mark.parametrize(
@@ -322,9 +397,9 @@ def test_static_only_graph_keeps_semantic_nodes_without_constructing_a_model(
     finally:
         reset_provider(token)
 
-    assert capability_probes > 0
+    assert capability_probes == 0
     semantic_model_factory.assert_not_called()
-    assert json.loads(result["report_body"])["metadata"]["llm_available"] is True
+    assert json.loads(result["report_body"])["metadata"]["llm_available"] is False
     semantic_statuses = {
         status["analyzer_id"]: status["status"]
         for status in result["analyzer_status_events"]
@@ -342,14 +417,9 @@ async def test_late_provider_binding_cannot_claim_a_complete_semantic_scan(
 ) -> None:
     """A graph built without credentials keeps semantic nodes for a later provider."""
     _write_skill(tmp_path)
-    graph_module = importlib.import_module("skillspector.graph")
-    monkeypatch.setattr(
-        graph_module,
-        "is_llm_available",
-        lambda: (False, "not configured"),
-        raising=False,
-    )
-    late_bound_graph = graph_module.create_graph()
+    # The public graph is now credential-independent: semantic analyzers are
+    # always wired and report their disabled state at execution time.
+    late_bound_graph = workflow_graph
 
     def transport_failure(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("simulated late-bound provider failure")
@@ -545,7 +615,7 @@ async def test_unavailable_requested_llm_aligns_embedded_json_report(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "not configured"))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (False, "not configured"),
+        lambda **_: (False, "not configured"),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
 
@@ -567,7 +637,7 @@ async def test_empty_runtime_telemetry_aligns_mcp_and_embedded_json_caution(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda **_: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
 
@@ -620,7 +690,7 @@ async def test_malformed_runtime_telemetry_preserves_failed_meta_availability(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda **_: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", render_mixed_telemetry)
 
@@ -672,7 +742,7 @@ async def test_truthy_malformed_ok_is_not_counted_as_runtime_success(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda **_: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", render_truthy_malformed_telemetry)
 
@@ -728,7 +798,7 @@ async def test_failed_meta_analysis_aligns_mcp_and_embedded_json_availability(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda **_: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", render_failed_meta_analysis)
 
@@ -749,7 +819,7 @@ async def test_explicit_static_only_keeps_embedded_json_report_unchanged(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "not configured"))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (False, "not configured"),
+        lambda **_: (False, "not configured"),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
 
@@ -762,16 +832,16 @@ async def test_explicit_static_only_keeps_embedded_json_report_unchanged(
     assert payload["metadata"]["meta_analysis_applied"] is False
 
 
-async def test_run_scan_reports_llm_available_with_credentials(
+async def test_run_scan_static_mode_skips_availability_with_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Credentials present but use_llm=False: available, but honestly not used."""
+    """Static scans do not advertise availability without probing credentials."""
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
 
-    assert result["llm_available"] is True
+    assert result["llm_available"] is False
     assert result["llm_requested"] is False
     assert result["llm_used"] is False
     assert result["scan_mode"] == "static-only"
@@ -1072,6 +1142,26 @@ def test_is_local_target_fails_closed_when_home_cannot_be_resolved(
     assert mcp_server._is_local_target("~nosuchuser/skill") is True
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        "git@github.com:org/private.git",
+        "ssh://git@github.com/org/private.git",
+        "git+ssh://git@github.com/org/private.git",
+        "https://token@github.com/org/private.git",
+        "https://user:password@github.com/org/private.git",
+    ],
+)
+async def test_http_rejects_credentialed_targets_before_graph(
+    target: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_ainvoke = AsyncMock()
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", graph_ainvoke)
+    with pytest.raises(ValueError, match="unauthenticated HTTPS"):
+        await run_scan(target, allow_local_targets=False)
+    graph_ainvoke.assert_not_awaited()
+
+
 async def test_run_scan_allows_remote_target_when_local_targets_disallowed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1094,6 +1184,7 @@ async def test_run_scan_allows_remote_target_when_local_targets_disallowed(
     assert result["target"] == target
     assert graph_ainvoke.await_count == 1
     assert graph_ainvoke.await_args.args[0]["input_path"] == target
+    assert graph_ainvoke.await_args.args[0]["allow_git_credentials"] is False
 
 
 async def test_run_scan_keeps_default_local_target_compatibility(
@@ -1117,6 +1208,7 @@ async def test_run_scan_keeps_default_local_target_compatibility(
     assert result["target"] == str(tmp_path)
     assert graph_ainvoke.await_count == 1
     assert graph_ainvoke.await_args.args[0]["input_path"] == str(tmp_path)
+    assert graph_ainvoke.await_args.args[0]["allow_git_credentials"] is True
 
 
 @pytest.mark.parametrize(
@@ -1141,15 +1233,57 @@ def test_run_passes_transport_local_target_policy(
 
     monkeypatch.setattr(mcp_server, "build_server", fake_build_server)
 
-    mcp_server.run(transport=transport, host="0.0.0.0", port=9000)
+    mcp_server.run(transport=transport, host="127.0.0.1", port=9000)
 
     assert captured["allow_local_targets"] is expected_allow_local_targets
     if transport == "http":
-        assert server.settings.host == "0.0.0.0"
+        assert server.settings.host == "127.0.0.1"
         assert server.settings.port == 9000
         server.run.assert_called_once_with(transport="streamable-http")
     else:
         server.run.assert_called_once_with(transport="stdio")
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "0.0.0.0",
+        "::",
+        "10.0.0.1",
+        "192.0.2.1",
+        "example.com",
+        "127.0.0.1.example.com",
+        "127.1",
+        "127.3.2.1",
+        "::1%lo",
+        "2130706433",
+        "",
+    ],
+)
+def test_http_rejects_non_loopback_before_constructing_server(host, monkeypatch):
+    build = MagicMock()
+    monkeypatch.setattr(mcp_server, "build_server", build)
+    with pytest.raises(ValueError, match="must bind to a loopback IP"):
+        mcp_server.run(transport="http", host=host)
+    build.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "host, bound",
+    [
+        ("127.0.0.1", "127.0.0.1"),
+        ("0:0:0:0:0:0:0:1", "::1"),
+        ("::1", "::1"),
+        ("localhost", "127.0.0.1"),
+        ("LOCALHOST", "127.0.0.1"),
+    ],
+)
+def test_http_accepts_only_loopback_bindings(host, bound, monkeypatch):
+    server = SimpleNamespace(settings=SimpleNamespace(host=None, port=None), run=MagicMock())
+    monkeypatch.setattr(mcp_server, "build_server", lambda **_: server)
+    mcp_server.run(transport="http", host=host, port=9000)
+    assert server.settings.host == bound
+    server.run.assert_called_once_with(transport="streamable-http")
 
 
 def test_run_rejects_unknown_transport_without_allowing_local_targets(
@@ -1285,3 +1419,114 @@ async def test_run_scan_respects_an_empty_filtered_list(
     verdict = await run_scan(str(_write_skill(tmp_path)), use_llm=False, output_format="json")
 
     assert verdict["findings"] == []
+
+
+async def test_run_scan_preserves_sol_preflight_setting_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real Sol control rejection stays actionable in the MCP JSON report."""
+    for name in tuple(os.environ):
+        if name.startswith("SKILLSPECTOR_MODEL_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+    monkeypatch.setenv("SKILLSPECTOR_MODEL", "gpt-6.1-sol")
+    monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-preflight-only")
+    monkeypatch.delenv("SKILLSPECTOR_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_SEED", raising=False)
+    monkeypatch.setattr(
+        "skillspector.nodes.report.is_llm_available",
+        lambda **_: (False, "provider context changed after preflight"),
+    )
+    _write_skill(tmp_path)
+
+    verdict = await run_scan(str(tmp_path), use_llm=True, output_format="json")
+    metadata = json.loads(verdict["report"])["metadata"]
+
+    assert "SKILLSPECTOR_TEMPERATURE" in metadata["llm_error"]
+    assert "unset" in metadata["llm_error"]
+    assert "context changed" not in metadata["llm_error"]
+    assert verdict["llm_available"] is metadata["llm_available"] is False
+    assert verdict["llm_used"] is False
+    assert verdict["safe_to_install"] is False
+
+
+@pytest.mark.parametrize(
+    ("reason", "secrets"),
+    [
+        (
+            "Unset SKILLSPECTOR_TEMPERATURE for https://alice:fake-password@provider.example/v1?token=fake-query-secret&route=sol",
+            ("alice", "fake-password", "fake-query-secret"),
+        ),
+        (
+            "Unset SKILLSPECTOR_TEMPERATURE; key sk-test-preflight-secret; Authorization: Bearer fake-bearer-secret",
+            ("sk-test-preflight-secret", "fake-bearer-secret"),
+        ),
+    ],
+)
+async def test_run_scan_redacts_preflight_reason_before_graph_and_report(
+    monkeypatch: pytest.MonkeyPatch, reason: str, secrets: tuple[str, ...]
+) -> None:
+    """Provider error details cannot publish credentials or pass them into graph state."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, reason))
+
+    def unexpected_probe(**_: object) -> tuple[bool, str | None]:
+        raise AssertionError("report must retain the original preflight result")
+
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", unexpected_probe)
+
+    async def render(state: dict[str, object], config: dict[str, object]) -> dict[str, object]:
+        captured.update(state)
+        return await _render_complete_zero_risk_result(state, config)
+
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", render)
+
+    verdict = await run_scan("fixture", use_llm=True, output_format="json")
+    metadata = json.loads(verdict["report"])["metadata"]
+
+    assert "SKILLSPECTOR_TEMPERATURE" in metadata["llm_error"]
+    for secret in secrets:
+        assert secret not in json.dumps(captured)
+        assert secret not in json.dumps(verdict)
+
+
+async def test_run_scan_preflight_without_reason_keeps_generic_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reason-less unavailable preflight still renders an honest static-only warning."""
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, None))
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
+
+    def unexpected_probe(**_: object) -> tuple[bool, str | None]:
+        raise AssertionError("report must retain the original preflight result")
+
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", unexpected_probe)
+
+    verdict = await run_scan("fixture", use_llm=True, output_format="json")
+    metadata = json.loads(verdict["report"])["metadata"]
+
+    assert "unavailable during preflight" in metadata["llm_error"]
+    assert "static analysis only" in metadata["llm_error"]
+    assert metadata["llm_available"] is False
+
+
+async def test_run_scan_explicit_static_mode_skips_provider_initialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The new preflight error path never initializes providers for explicit static scans."""
+
+    def unexpected_provider(*_: object, **__: object) -> object:
+        raise AssertionError("explicit static scans must not initialize or probe providers")
+
+    monkeypatch.setattr(mcp_server, "is_llm_available", unexpected_provider)
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", unexpected_provider)
+    monkeypatch.setattr("skillspector.providers._select_active_provider", unexpected_provider)
+    _write_skill(tmp_path)
+
+    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+    metadata = json.loads(verdict["report"])["metadata"]
+
+    assert metadata["llm_requested"] is False
+    assert "llm_error" not in metadata
+    assert verdict["llm_used"] is False

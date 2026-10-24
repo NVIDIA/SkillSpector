@@ -22,6 +22,7 @@ from skillspector.inspection_ledger import (
     LedgerReason,
     LedgerRecordType,
     analyzer_status_event,
+    analyzer_status_for_events,
     finalize_ledger,
     guard_analyzer_node,
     inspection_work_id,
@@ -123,6 +124,55 @@ def test_completed_work_is_covered_and_resolves_emitted_finding_ids() -> None:
     assert completeness["coverage_percent"] == 100.0
     assert completeness["ledger_exceptions"] == []
     assert effective_ids == [finding.finding_id]
+
+
+def test_out_of_scope_boundaries_do_not_count_as_analyzer_failures() -> None:
+    """Non-fatal scope boundaries are not planned work for an analyzer."""
+    analyzer_id = "static_patterns_prompt_injection"
+    inspected = ledger_event(
+        outcome=LedgerOutcome.COMPLETED,
+        phase="static",
+        analyzer_id=analyzer_id,
+        path="scripts/run.py",
+    )
+    excluded = ledger_event(
+        outcome=LedgerOutcome.OUT_OF_SCOPE,
+        record_type=LedgerRecordType.SCOPE_BOUNDARY,
+        phase="static",
+        analyzer_id=analyzer_id,
+        path="assets/font.ttf",
+        reason=LedgerReason.BINARY_CONTENT,
+    )
+
+    completeness, _ = finalize_ledger(
+        {
+            "components": ["scripts/run.py", "assets/font.ttf"],
+            "findings": [],
+            "inspection_ledger": [inspected, excluded],
+            "analyzer_status_events": [
+                analyzer_status_for_events(analyzer_id, [inspected, excluded])
+            ],
+            "artifact_inventory": [
+                {"path": "scripts/run.py", "disposition": "complete"},
+                {
+                    "path": "assets/font.ttf",
+                    "disposition": "out_of_scope",
+                    "content_kind": "binary",
+                },
+            ],
+        }
+    )
+
+    status = next(
+        row for row in completeness["analyzer_statuses"] if row["analyzer_id"] == analyzer_id
+    )
+    assert status["status"] == "completed"
+    assert status["planned_work"] == 1
+    assert status["completed"] == 1
+    assert status["failed"] == 0
+    assert completeness["scope_exclusions"][0]["path"] == "assets/font.ttf"
+    assert completeness["status"] == "complete"
+    assert completeness["coverage_percent"] == 100.0
 
 
 def test_missing_terminal_row_becomes_fatal_unaccounted_work() -> None:
@@ -693,6 +743,49 @@ def test_resolved_partial_reference_produces_one_canonically_counted_ae1() -> No
     assert completeness["findings_before_filtering"] == 1
     assert completeness["findings_after_filtering"] == 1
     assert completeness["is_complete"] is False
+
+
+def test_finalization_coverage_finding_does_not_require_meta_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A coverage finding added after meta-review cannot invent a failed review."""
+    coverage = Finding(
+        rule_id="AE1",
+        message="coverage",
+        finding_id="coverage",
+        severity="HIGH",
+        file="SKILL.md",
+        start_line=1,
+        tags=["coverage"],
+    )
+    monkeypatch.setattr(finalizer_module, "_reference_coverage_findings", lambda _state: [coverage])
+    monkeypatch.setattr(finalizer_module, "_size_coverage_findings", lambda *_args, **_kwargs: [])
+    result = finalize_inspection_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [],
+            "effective_finding_ids": [],
+            "meta_review_required": False,
+            "use_llm": True,
+            "llm_requested": True,
+            "llm_call_log": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(analyzer_id=analyzer_id, status="not_applicable")
+                for analyzer_id in (
+                    "semantic_developer_intent",
+                    "semantic_quality_policy",
+                    "semantic_security_discovery",
+                )
+            ],
+        }
+    )
+
+    assert [finding.rule_id for finding in result["findings"]] == ["AE1"]
+    assert result["meta_review_required"] is False
+    assert not any(
+        event.get("phase") == "semantic_runtime" for event in result["inspection_ledger"]
+    )
 
 
 def test_ae1_reports_target_specific_parser_diagnostics_for_each_reference() -> None:
@@ -1797,6 +1890,103 @@ def test_unrelated_fatal_does_not_reclassify_a_format_only_reference() -> None:
         event["path"] == "broken.txt" and event["fatal"] is True
         for event in result["analysis_completeness"]["ledger_exceptions"]
     )
+
+
+def test_rule_set_row_is_excluded_from_path_keyed_accounting_by_type() -> None:
+    """A rule-set label equal to a real file's path must not touch that file.
+
+    ``components`` holds a fully read file whose path equals the rule-set label,
+    and SKILL.md links to it. The rule-set row must keep the scan partial without
+    lowering that file's coverage, synthesizing AE1, or merging with the file's
+    own public exception row.
+    """
+    file_event = ledger_event(
+        analyzer_id="static_runner",
+        outcome=LedgerOutcome.COMPLETED,
+        phase="static",
+        path="yara_rules",
+    )
+    rule_set_event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        record_type=LedgerRecordType.RULE_SET,
+        phase="static",
+        path="yara_rules/",
+        reason=LedgerReason.READ_ERROR,
+        observed_artifacts=1,
+        limit_artifacts=0,
+    )
+    # A real, same-path, same-reason row from the file itself must stay separate.
+    real_file_row = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        record_type=LedgerRecordType.SYSTEM,
+        phase="static",
+        path="yara_rules",
+        reason=LedgerReason.READ_ERROR,
+    )
+    assert rule_set_event["path"] == file_event["path"] == "yara_rules"
+    state: SkillspectorState = {
+        "components": ["SKILL.md", "yara_rules"],
+        "findings": [],
+        "effective_finding_ids": [],
+        "artifact_references": [
+            {
+                "source_path": "SKILL.md",
+                "line": 3,
+                "column": 5,
+                "evidence": "See [the notes](yara_rules).",
+                "target_path": "yara_rules",
+                "status": "resolved",
+                "disposition": "complete",
+            }
+        ],
+        "inspection_ledger": [
+            ledger_event(
+                analyzer_id="static_runner",
+                outcome=LedgerOutcome.COMPLETED,
+                phase="static",
+                path="SKILL.md",
+            ),
+            file_event,
+            rule_set_event,
+        ],
+        "analyzer_status_events": [
+            analyzer_status_event(
+                analyzer_id="static_runner",
+                status="completed",
+                planned_work=[
+                    _target(
+                        inspection_work_id("static_runner", "SKILL.md", None, None), "SKILL.md"
+                    ),
+                    _target(file_event["work_id"], "yara_rules"),
+                ],
+            ),
+            analyzer_status_event(
+                analyzer_id="static_yara",
+                status="degraded",
+                planned_work=[_target(rule_set_event["work_id"], "yara_rules")],
+            ),
+        ],
+    }
+
+    result = finalize_inspection_ledger(state)
+
+    assert [finding.rule_id for finding in result["findings"]] == []
+    completeness = result["analysis_completeness"]
+    assert completeness["coverage_percent"] == 100.0
+    assert completeness["fully_inspected_files"] == 2
+    assert completeness["partially_inspected_files"] == 0
+    assert completeness["is_complete"] is False
+    assert completeness["execution_successful"] is True
+    assert [row.get("scope") for row in completeness["ledger_exceptions"]] == ["rule_set"]
+
+    # Control: the same label on a SYSTEM row is real artifact evidence and must
+    # still drive both AE1 and coverage, and must not merge with the rule-set row.
+    control_state = dict(state)
+    control_state["inspection_ledger"] = [*state["inspection_ledger"], real_file_row]
+    control = finalize_inspection_ledger(control_state)
+    assert [finding.rule_id for finding in control["findings"]] == ["AE1"]
+    rows = control["analysis_completeness"]["ledger_exceptions"]
+    assert sorted(str(row.get("scope")) for row in rows) == ["None", "rule_set"]
 
 
 @pytest.mark.parametrize(

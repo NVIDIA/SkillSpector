@@ -18,6 +18,7 @@ from skillspector.llm_provenance import (
 )
 from skillspector.llm_utils import new_inference_usage_collector
 from skillspector.providers.chat_models import create_openai_compatible_chat_model
+from skillspector.providers.nv_build import NvBuildProvider
 
 
 class OpenAIProvider:
@@ -260,6 +261,46 @@ def test_constructor_observation_supersedes_stale_configuration_capture(
     assert result["sampling"]["seed"]["forwarded_to_client"] == 99
     assert result["sampling"]["reasoning_effort"]["requested"] == "high"
     assert result["sampling"]["reasoning_effort"]["forwarded_to_client"] == "high"
+
+
+@pytest.mark.parametrize("effort", [None, "   "])
+def test_nv_build_adapter_default_is_recorded_without_a_user_override(
+    monkeypatch: pytest.MonkeyPatch, effort: str | None
+) -> None:
+    provider = NvBuildProvider()
+    for name in ("SKILLSPECTOR_TEMPERATURE", "SKILLSPECTOR_SEED", "SKILLSPECTOR_REASONING_EFFORT"):
+        monkeypatch.delenv(name, raising=False)
+    if effort is not None:
+        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", effort)
+    monkeypatch.setenv("NVIDIA_INFERENCE_KEY", "nvapi-test")
+    monkeypatch.setattr("skillspector.llm_provenance.get_active_provider", lambda: provider)
+    monkeypatch.setattr("skillspector.llm_provenance.get_model_config_provider", lambda: provider)
+    monkeypatch.setattr("skillspector.llm_utils.get_active_provider", lambda: provider)
+    model = provider.DEFAULT_MODEL
+    chat_model = provider.create_chat_model(model, max_tokens=128)
+    collector = new_inference_usage_collector(
+        node="semantic_security_discovery",
+        request_kind="structured_output",
+        model=model,
+        chat_model=chat_model,
+    )
+    collector.mark_response_received()
+
+    result = sanitize_llm_provenance(
+        capture_llm_provenance(_models(model)),
+        use_llm=True,
+        inference_usage=collector.snapshot(),
+    )
+
+    assert result["sampling"]["reasoning_effort"] == {
+        "requested": None,
+        "source": "provider_default",  # SkillSpector's adapter default.
+        "forwarded_to_client": "high",
+        "adapter_support": True,
+        "provider_support": "unknown",
+    }
+    assert result["determinism"]["control_status"] == "provider_defaults"
+    assert result["determinism"]["provider_guarantee"] is False
 
 
 def test_gpt_5_4_reports_only_controls_retained_by_request_payload(

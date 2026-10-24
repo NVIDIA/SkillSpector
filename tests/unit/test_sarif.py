@@ -138,3 +138,46 @@ def test_validate_sarif_report_rejects_result_without_message_text() -> None:
                 ],
             }
         )
+
+
+def test_sarif_artifact_location_uri_base_id_roundtrip() -> None:
+    """uriBaseId survives a model round trip through the SARIF 2.1.0 alias."""
+    location = SarifArtifactLocation(uri="SKILL.md", uriBaseId="SKILLROOT")
+    data = location.model_dump(mode="json", by_alias=True, exclude_none=True)
+    assert data == {"uri": "SKILL.md", "uriBaseId": "SKILLROOT"}
+    assert SarifArtifactLocation.model_validate(data).uri_base_id == "SKILLROOT"
+
+
+def test_sarif_run_original_uri_base_ids_roundtrip() -> None:
+    """originalUriBaseIds survives a run round trip and validates raw dicts."""
+    run = SarifRun(
+        tool=SarifTool(driver=SarifDriver(name="skillspector")),
+        originalUriBaseIds={"SKILLROOT": {"uri": "malicious_skill/"}},
+    )
+    data = run.model_dump(mode="json", by_alias=True, exclude_none=True)
+    assert data["originalUriBaseIds"] == {"SKILLROOT": {"uri": "malicious_skill/"}}
+    validate_sarif_report({"version": "2.1.0", "runs": [data]})
+
+
+def test_sarif_run_without_base_ids_omits_them() -> None:
+    """Runs that do not set base IDs keep the previous wire shape."""
+    run = SarifRun(
+        tool=SarifTool(driver=SarifDriver(name="skillspector")),
+        results=[
+            SarifResult(
+                ruleId="R1",
+                message=SarifMessage(text="msg"),
+                locations=[
+                    SarifLocation(
+                        physicalLocation=SarifPhysicalLocation(
+                            artifactLocation=SarifArtifactLocation(uri="SKILL.md"),
+                        )
+                    )
+                ],
+            )
+        ],
+    )
+    data = run.model_dump(mode="json", by_alias=True, exclude_none=True)
+    assert "originalUriBaseIds" not in data
+    artifact = data["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]
+    assert artifact == {"uri": "SKILL.md"}

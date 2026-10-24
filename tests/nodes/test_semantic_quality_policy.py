@@ -394,6 +394,27 @@ class TestPromptContent:
     def test_analyzer_id_is_correct(self) -> None:
         assert ANALYZER_ID == "semantic_quality_policy"
 
+    def test_prompt_exempts_listed_tools_from_sqp2(self) -> None:
+        # Naming a tool in a catalog or reference table does not select an
+        # operation (#669); only an instruction to use it does.
+        prompt = " ".join(ANALYZER_PROMPT.split())
+        assert "tool catalog" in prompt
+        assert "does not select an action" in prompt
+        # ...but a step in the skill's own workflow that performs it is still an
+        # instruction, while describing another skill or tool is not.
+        assert "whatever its grammatical form" in prompt
+        assert "Describing what a different skill or tool does" in prompt
+        assert "third-party service still needs a warning" in prompt
+
+    def test_prompt_exempts_readability_idioms_from_sqp3(self) -> None:
+        # "In plain English" asks for clarity, not a language (#669).
+        prompt = " ".join(ANALYZER_PROMPT.split())
+        assert "readability idiom that only asks for clarity" in prompt
+        assert '"in plain English"' in prompt
+        # ...but the same idiom overriding the user's language still counts.
+        assert "overrides the user's language" in prompt
+        assert "always respond in Japanese" in prompt
+
 
 # ---------------------------------------------------------------------------
 # Helpers for fixture-based tests
@@ -991,3 +1012,150 @@ class TestSqp3Clean:
             result = node(state)
 
         assert result["findings"] == []
+
+
+class TestSqp2ToolCatalogClean:
+    """SQP-2: a tool listed in a quick-reference table is not an instruction (#669).
+
+    The LLM is mocked, so this checks the fixture and node plumbing only. The
+    regression guard for the wording is TestPromptContent; the fixture is also an
+    input for live-model checks.
+    """
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_listed_tool_not_flagged(self) -> None:
+        skill_dir = _SQP_FIXTURES / "sqp2_tool_catalog_clean"
+        if not skill_dir.is_dir():
+            pytest.skip("sqp2_tool_catalog_clean fixture not present")
+
+        file_cache = _build_file_cache(skill_dir)
+        state: dict = {"file_cache": file_cache}
+
+        from skillspector.llm_analyzer_base import LLMAnalyzerBase
+
+        orig_init = LLMAnalyzerBase.__init__
+
+        def _patched_init(self_inner, *args, **kwargs):
+            orig_init(self_inner, *args, **kwargs)
+            self_inner._structured_llm.ainvoke = AsyncMock(
+                return_value=LLMAnalysisResult(findings=[])
+            )
+
+        with patch.object(LLMAnalyzerBase, "__init__", _patched_init):
+            result = node(state)
+
+        assert result["findings"] == []
+
+
+class TestSqp3PlainEnglishClean:
+    """SQP-3: "in plain English" is a readability idiom, not a language rule (#669).
+
+    The LLM is mocked, so this checks the fixture and node plumbing only. The
+    regression guard for the wording is TestPromptContent; the fixture is also an
+    input for live-model checks.
+    """
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_readability_idiom_not_flagged(self) -> None:
+        skill_dir = _SQP_FIXTURES / "sqp3_plain_english_clean"
+        if not skill_dir.is_dir():
+            pytest.skip("sqp3_plain_english_clean fixture not present")
+
+        file_cache = _build_file_cache(skill_dir)
+        state: dict = {"file_cache": file_cache}
+
+        from skillspector.llm_analyzer_base import LLMAnalyzerBase
+
+        orig_init = LLMAnalyzerBase.__init__
+
+        def _patched_init(self_inner, *args, **kwargs):
+            orig_init(self_inner, *args, **kwargs)
+            self_inner._structured_llm.ainvoke = AsyncMock(
+                return_value=LLMAnalysisResult(findings=[])
+            )
+
+        with patch.object(LLMAnalyzerBase, "__init__", _patched_init):
+            result = node(state)
+
+        assert result["findings"] == []
+
+
+# Risky counterparts of the #669 clean fixtures. Each differs from its clean
+# partner only in the deciding line, so a live-model check can compare the pair.
+_SQP_669_RISKY = [
+    (
+        "sqp2_tool_instructed",
+        "SQP-2",
+        12,
+        "Workflow tells the agent to bulk-delete orders without a warning",
+    ),
+    (
+        "sqp2_tool_descriptive_step",
+        "SQP-2",
+        12,
+        "Workflow step purges orders (descriptive voice) without a warning",
+    ),
+    (
+        "sqp3_forced_language",
+        "SQP-3",
+        9,
+        "Explanation forced into French regardless of the user's language",
+    ),
+    (
+        "sqp3_plain_english_override",
+        "SQP-3",
+        9,
+        "Plain English forced even when the user writes in Spanish",
+    ),
+]
+
+
+class TestSqp669RiskyFixtures:
+    """SQP-2/SQP-3: the risky #669 fixtures still produce their finding.
+
+    Like TestSqp2MissingWarnings, the LLM is mocked with the expected finding, so
+    this checks that each fixture exists and flows through the node with the right
+    rule and file. Whether the model actually flags it is the live-model check.
+    """
+
+    @pytest.mark.parametrize(("fixture", "rule_id", "line", "message"), _SQP_669_RISKY)
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_risky_fixture_flagged(
+        self, fixture: str, rule_id: str, line: int, message: str
+    ) -> None:
+        skill_dir = _SQP_FIXTURES / fixture
+        if not skill_dir.is_dir():
+            pytest.skip(f"{fixture} fixture not present")
+
+        file_cache = _build_file_cache(skill_dir)
+        state: dict = {"file_cache": file_cache}
+        responses = {
+            "SKILL.md": LLMAnalysisResult(
+                findings=[
+                    LLMFinding(
+                        rule_id=rule_id,
+                        message=message,
+                        severity="MEDIUM",
+                        start_line=line,
+                        confidence=0.85,
+                    ),
+                ]
+            ),
+        }
+
+        from skillspector.llm_analyzer_base import LLMAnalyzerBase
+
+        orig_init = LLMAnalyzerBase.__init__
+
+        def _patched_init(self_inner, *args, **kwargs):
+            orig_init(self_inner, *args, **kwargs)
+            self_inner._structured_llm.ainvoke = _make_file_aware_ainvoke(responses)
+
+        with patch.object(LLMAnalyzerBase, "__init__", _patched_init):
+            result = node(state)
+
+        assert len(result["findings"]) == 1
+        finding = result["findings"][0]
+        assert finding.rule_id == rule_id
+        assert finding.file == "SKILL.md"
+        assert finding.start_line == line
