@@ -53,9 +53,6 @@ import os
 from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, NoReturn
 
-if TYPE_CHECKING:
-    from langchain_core.language_models.chat_models import BaseChatModel
-
 from .base import (
     AgentCLICapable,
     ChatModelProvider,
@@ -64,6 +61,9 @@ from .base import (
     ModelMetadataProvider,
     has_cli_capability,
 )
+
+if TYPE_CHECKING:
+    from langchain_core.language_models.chat_models import BaseChatModel
 
 NO_LLM_API_KEY_MESSAGE = (
     "No LLM API key configured. Set the credential env var for the "
