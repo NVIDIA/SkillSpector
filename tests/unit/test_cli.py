@@ -412,13 +412,22 @@ def test_cli_scan_local_directory(tmp_path: Path) -> None:
     ("manifest_path", "manifest", "incomplete"),
     [
         ("pyproject.toml", "[project]\ndependencies = [", True),
+        ("pyproject.toml", "[project]\nname = " + "9" * 5_000, True),
         ("package.json", '{"dependencies": {', True),
+        ("package.json", "", True),
         ("package-lock.json", '{"packages": ', True),
+        ("package-lock.json", "", True),
         ("npm-shrinkwrap.json", '{"dependencies": ', True),
+        ("npm-shrinkwrap.json", "", True),
         ("uv.lock", '[[package]\nname = "broken"', True),
         ("pyproject.toml", "[project]\nname = 'example'\n", False),
+        ("pyproject.toml", "", False),
         ("package.json", '{"name": "example"}', False),
         ("uv.lock", "version = 1\n", False),
+        ("uv.lock", "", False),
+        ("docs/pyproject.toml.md", "Documentation describing pyproject.toml fields.\n", False),
+        ("docs/package.json.md", "Documentation describing package.json fields.\n", False),
+        ("docs/uv.lock.md", "Documentation describing uv.lock fields.\n", False),
     ],
 )
 def test_cli_reports_malformed_dependency_manifest_completeness(
@@ -426,7 +435,9 @@ def test_cli_reports_malformed_dependency_manifest_completeness(
 ) -> None:
     """Malformed dependency metadata must affect the strict completeness gate."""
     (tmp_path / "SKILL.md").write_text("---\nname: manifest-test\n---\n# Safe", encoding="utf-8")
-    (tmp_path / manifest_path).write_text(manifest, encoding="utf-8")
+    manifest_file = tmp_path / manifest_path
+    manifest_file.parent.mkdir(parents=True, exist_ok=True)
+    manifest_file.write_text(manifest, encoding="utf-8")
     output = tmp_path / "report.json"
 
     result = runner.invoke(

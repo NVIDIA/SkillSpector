@@ -109,6 +109,39 @@ name = "broken"
 
 
 @pytest.mark.parametrize(
+    ("file_cache", "expected_parse_error"),
+    [({"package.json": ""}, True), ({}, False)],
+)
+def test_node_distinguishes_empty_dependency_file_from_missing_cache_entry(
+    monkeypatch, file_cache, expected_parse_error
+):
+    monkeypatch.setattr(
+        supply_chain.static_runner,
+        "run_static_patterns_with_ledger",
+        lambda _state, _modules: {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+        },
+    )
+    response = supply_chain.node(
+        {
+            "components": ["package.json"],
+            "file_cache": file_cache,
+            "local_file_cache": file_cache,
+            "manifest": {},
+            "component_metadata": [],
+        }
+    )
+
+    has_parse_error = any(
+        event["reason_code"] is LedgerReason.DEPENDENCY_PARSE_ERROR
+        for event in response["inspection_ledger"]
+    )
+    assert has_parse_error is expected_parse_error
+
+
+@pytest.mark.parametrize(
     ("path", "content"),
     [
         ("pyproject.toml", "[project]\ndependencies = ["),
