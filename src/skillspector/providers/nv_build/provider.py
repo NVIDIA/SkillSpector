@@ -26,10 +26,10 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from skillspector.providers import registry
+
 if TYPE_CHECKING:
     from langchain_core.language_models.chat_models import BaseChatModel
-
-from skillspector.providers import registry
 
 BUILD_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
