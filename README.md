@@ -116,7 +116,7 @@ docker run --rm \
 **Write a report to the host filesystem** by writing to the mounted directory:
 
 ```bash
-docker run --rm \
+docker run --rm --user "$(id -u):$(id -g)" \
   -v "$PWD:/scan" \
   skillspector scan ./my-skill/ --no-llm --format json --output report.json
 ```
@@ -227,6 +227,11 @@ valid normalized snapshots. Malformed, oversized or duplicate server identities
 are rejected. This option requires `--mcp-registry` and is separate from the
 finding-suppression `--baseline`: it never suppresses findings or changes risk
 scores, and it does not fetch or execute listed server endpoints.
+
+Registry mode rejects skill-only controls such as `--use-shipped-baseline`,
+`--transitive`, `--transitive-depth`, `--transitive-allow-prefix`, and
+`--transitive-deny-prefix` with exit code 2, including an explicitly supplied
+default depth (`--transitive-depth 1`). Omit these options for registry scans.
 
 ### Suppressing False Positives (baseline)
 
@@ -796,6 +801,17 @@ Options:
 # Generate a baseline of all current findings (see docs/SUPPRESSION.md)
 skillspector baseline <path> [-o FILE] [--no-llm] [--reason TEXT]
 ```
+
+Report files and new baselines use private permissions (0600). Existing baselines
+retain their access metadata when safely replaced; updates requiring in-place
+writes are refused. All file output uses atomic replacement. The parent directory
+must be writable; symlinked
+parents and non-regular destinations such as devices are refused. On macOS,
+ancestor directories must also be readable. File output requires POSIX no-follow
+directory operations and is unavailable on Windows. Unsupported file output fails
+before analysis. Omit `--output` for scan/batch stdout, or use
+`skillspector baseline <path> -o -` for JSON on stdout, then redirect only to a
+trusted destination. Run Docker with your user ID as above so you can read its files.
 
 ## Integrating SkillSpector
 

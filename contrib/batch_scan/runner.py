@@ -34,23 +34,26 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import ValidationError
 
 from skillspector.graph import graph
+from skillspector.inspection_ledger import finalize_ledger
 from skillspector.llm_analyzer_base import (
     LLMAnalyzerBase,
     LLMAnalysisResult,
     _StructuredResponseValidationError,
+    ledger_events_for_batches,
 )
 from skillspector.logging_config import get_logger
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, MetaAnalyzerResult
 
 from .annotation import annotate_findings
 from .detection import detect_skill_language
-from .gap_fill import run_gap_fill
+from .gap_fill import GapFillError, run_gap_fill
 
 logger = get_logger(__name__)
 
@@ -725,6 +728,7 @@ def run_one(
     gap_fill_findings: int = 0,
     apply_gap_fill: bool = False,
     api_pool=None,
+    timeout: float = 90,
 ) -> tuple[dict[str, object], str | None]:
     """Scan a single skill through the full graph pipeline.
 
@@ -747,13 +751,20 @@ def run_one(
         Run non-English gap-fill against the graph's provider-eligible cache.
     api_pool :
         Optional API key pool for gap-fill calls.
+    timeout :
+        Per-skill worker budget in seconds. Gap-fill uses the time remaining
+        after core analysis, with reporting headroom. Core analysis keeps its
+        own budget and can still reach the worker's process timeout.
 
     Returns
     -------
     ``(entry, error_message_or_None)`` — on success *error_message*
-    is ``None``; on failure *entry* is a stub error entry and
-    *error_message* carries the exception text.
+    is ``None``. Gap-fill failure retains the core entry and adds incomplete
+    coverage and a machine-readable error. A failure before the core result
+    returns a stub error entry.
     """
+    # Leave time to serialize partial findings before the worker hard limit.
+    deadline = time.monotonic() + max(0, timeout - min(5.0, timeout / 10))
     result = None
     try:
         state = scan_state(skill_dir, use_llm=use_llm)
@@ -771,12 +782,38 @@ def run_one(
             gap_fill_findings=gap_fill_findings,
         )
         if apply_gap_fill and use_llm and detected_language != "en":
-            gap_findings = run_gap_fill(file_cache, detected_language, api_pool=api_pool)
+            gap_error = None
+            try:
+                gap_findings = run_gap_fill(
+                    file_cache, detected_language, api_pool=api_pool,
+                    timeout=lambda: deadline - time.monotonic(),
+                )
+            except GapFillError as exc:
+                gap_error = exc
+                gap_findings = exc.findings
             entry["issues"] = list(entry.get("issues", [])) + annotate_findings(
                 [finding.to_dict() for finding in gap_findings], detected_language
             )
-            entry["enhancements"]["gap_fill_applied"] = True
+            entry["enhancements"]["gap_fill_applied"] = bool(file_cache) and gap_error is None
             entry["enhancements"]["gap_fill_findings"] = len(gap_findings)
+            if gap_error is not None:
+                events, status = ledger_events_for_batches("gap_fill", gap_error.outcome)
+                completeness, _ = finalize_ledger({
+                    **result,
+                    "findings": [*(result.get("findings") or []), *gap_findings],
+                    "inspection_ledger": [*(result.get("inspection_ledger") or []), *events],
+                    "analyzer_status_events": [*(result.get("analyzer_status_events") or []), status],
+                })
+                entry["analysis_completeness"] = completeness
+                entry["execution_successful"] = completeness["execution_successful"]
+                if entry["risk_assessment"]["recommendation"] == "SAFE":
+                    entry["risk_assessment"]["recommendation"] = "CAUTION"
+                entry["enhancements"]["gap_fill_error"] = str(gap_error)
+                entry["enhancements"]["gap_fill_status"] = "incomplete"
+                entry["enhancements"]["gap_fill_error_reasons"] = sorted({
+                    failure.reason.value for failure in gap_error.outcome.failures
+                })
+                return entry, str(gap_error)
         return entry, None
     except Exception as exc:
         return entry_from_error(skill_dir, root, str(exc), detected_language), str(exc)
