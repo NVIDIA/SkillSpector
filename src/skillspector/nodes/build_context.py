@@ -3526,6 +3526,13 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             if path not in blocked_nested_paths
         }
     )
+    # Container members merge after the fill above; index them too.
+    for path, raw in raw_file_cache.items():
+        if path not in image_text_cache and isinstance(raw, bytes) and raw and has_image_magic(raw):
+            if monotonic() >= processing_deadline:
+                _image_runtime_limit_row(path)
+                break
+            image_text_cache[path] = extract_image_text_detailed(raw)
     artifact_inventory.extend(
         item for item in nested.artifact_inventory if item["path"] not in reserved_paths
     )
