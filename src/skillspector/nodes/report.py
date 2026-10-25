@@ -100,6 +100,16 @@ _RISK_RECOMMENDATION: dict[str, str] = {
 }
 
 
+def risk_severity_and_recommendation(score: int) -> tuple[str, str]:
+    """Map a computed score to the shared single-skill and recursive verdict."""
+    severity = "LOW"
+    for threshold, band in _RISK_SEVERITY_BANDS:
+        if score >= threshold:
+            severity = band
+            break
+    return severity, _RISK_RECOMMENDATION.get(severity, "CAUTION")
+
+
 # Scanned skill content (and LLM output that quotes it) can carry ANSI escape
 # sequences and control bytes (e.g. NUL, ESC) into finding text. Left in, they
 # make a rendered report register as binary — GitLab/editors show "download"
@@ -669,12 +679,7 @@ def _compute_risk_score(
         score_floor = max(score_floor, 51)
     final_score = min(100, max(score_floor, int(score)))
 
-    severity_band = "LOW"
-    for threshold, band in _RISK_SEVERITY_BANDS:
-        if final_score >= threshold:
-            severity_band = band
-            break
-    recommendation = _RISK_RECOMMENDATION.get(severity_band, "CAUTION")
+    severity_band, recommendation = risk_severity_and_recommendation(final_score)
     return final_score, severity_band, recommendation
 
 
