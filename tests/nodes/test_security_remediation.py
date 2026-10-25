@@ -4188,7 +4188,8 @@ def test_real_binary_structure_is_not_instruction_noise(
         (tmp_path / path).write_bytes(payload)
     started = time.monotonic()
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
-    assert time.monotonic() - started < 10
+    # Smoke bound: instrumented CI runners run 2-4x slower; asserts below are the guard.
+    assert time.monotonic() - started < 30
     assert not {"AE4", "P2", "P9", "MP2", "TM1"} & {
         finding.rule_id for finding in result["findings"]
     }
