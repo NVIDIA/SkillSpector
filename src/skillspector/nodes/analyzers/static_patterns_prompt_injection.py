@@ -774,6 +774,7 @@ def _reference_comment_matches(
         title_start = title.end()
         end = title_start
         closed = False
+        depth = 0
         line_has_text = True
         next_runtime_check = title_start
         while end < len(content):
@@ -785,7 +786,17 @@ def _reference_comment_matches(
                 end += 2
                 line_has_text = True
                 continue
+            if char == "(":
+                depth += 1
+                line_has_text = True
+                end += 1
+                continue
             if char == ")":
+                if depth:
+                    depth -= 1
+                    line_has_text = True
+                    end += 1
+                    continue
                 end += 1
                 closed = True
                 break
