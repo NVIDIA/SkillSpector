@@ -309,6 +309,7 @@ class TestOpencodeVersionRange:
                 (1, 19, 1),
                 (1, 19, 2),
                 (1, 19, 3),
+                (1, 19, 4),
             }
         )
 
@@ -324,6 +325,7 @@ class TestOpencodeVersionRange:
             "1.19.1",
             "1.19.2",
             "1.19.3",
+            "1.19.4",
         ],
     )
     def test_parse_supported_versions_compare_in_range(self, version: str) -> None:
@@ -332,7 +334,7 @@ class TestOpencodeVersionRange:
         assert _is_supported_opencode_version(parsed)
 
     @pytest.mark.parametrize(
-        "raw", [b"1.18.30\n", b"1.18.36\n", b"1.19.4\n", b"1.18.34-1\n", b"garbage\n", b"\n"]
+        "raw", [b"1.18.30\n", b"1.18.36\n", b"1.19.5\n", b"1.18.34-1\n", b"garbage\n", b"\n"]
     )
     def test_parse_unsupported_versions_rejected(self, raw: bytes) -> None:
         parsed = _parse_opencode_version(raw)
@@ -349,6 +351,7 @@ class TestOpencodeVersionRange:
             "1.19.1",
             "1.19.2",
             "1.19.3",
+            "1.19.4",
         ],
     )
     @patch("skillspector.providers._agent_cli.subprocess.run")
@@ -356,13 +359,13 @@ class TestOpencodeVersionRange:
         mock_run.side_effect = [_ok_result(f"{version}\n".encode()), _ok_result()]
         assert _opencode_auth_check(OPENCODE_BINARY) == (True, None)
 
-    @pytest.mark.parametrize("version", ["1.18.30", "1.18.36", "1.19.4"])
+    @pytest.mark.parametrize("version", ["1.18.30", "1.18.36", "1.19.5"])
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_rejects_out_of_range_versions(self, mock_run: MagicMock, version: str) -> None:
         mock_run.return_value = _ok_result(f"{version}\n".encode())
         ok, reason = _opencode_auth_check(OPENCODE_BINARY)
         assert ok is False
-        assert "1.18.31" in (reason or "") and "1.19.3" in (reason or "")
+        assert "1.18.31" in (reason or "") and "1.19.4" in (reason or "")
         mock_run.assert_called_once()
 
 
@@ -512,7 +515,7 @@ class TestOpencodeDenyAllPolicy:
         assert list(markers.iterdir()) == []
 
     @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
-    @pytest.mark.parametrize("version", ["1.18.30", "1.18.36", "1.19.4"])
+    @pytest.mark.parametrize("version", ["1.18.30", "1.18.36", "1.19.5"])
     def test_preflight_rejects_boundary_versions_before_inference(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
     ) -> None:

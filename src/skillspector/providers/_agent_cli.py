@@ -454,7 +454,7 @@ def _parse_gemini_output(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# OpenCode CLI invocation (verified against opencode 1.18.31-1.18.35 and 1.19.0-1.19.3;
+# OpenCode CLI invocation (verified against opencode 1.18.31-1.18.35 and 1.19.0-1.19.4;
 # per-version evidence beside _OPENCODE_SUPPORTED_VERSIONS)
 # ---------------------------------------------------------------------------
 
@@ -473,7 +473,10 @@ _OPENCODE_DENY_ALL = json.dumps({"*": "deny"}, separators=(",", ":"))
 # being the hidden --share flag; plugin packages unchanged across
 # 1.19.0-1.19.3 in bun.lock (opencode-gitlab-auth 2.1.0,
 # opencode-poe-auth 0.0.1, @gitlab/opencode-gitlab-auth 1.3.3, same
-# integrity hashes) and no in-tree plugin source changed). The gate stays
+# integrity hashes) and no in-tree plugin source changed), 1.19.4
+# (same live matrix with exact nonce replies; auth-list, both --help
+# surfaces, plugin packages, and in-tree plugin source all unchanged
+# from 1.19.3). The gate stays
 # load-bearing, not belt-and-suspenders: the debug-config check cannot
 # tell whether the TEST_HOME / TEST_MANAGED_CONFIG_DIR hooks below
 # still apply, so each widening needs the same per-version review.
@@ -488,6 +491,7 @@ _OPENCODE_SUPPORTED_VERSIONS = frozenset(
         (1, 19, 1),
         (1, 19, 2),
         (1, 19, 3),
+        (1, 19, 4),
     }
 )
 # Markers of a Zen free-tier refusal. Zen answers 403 to
@@ -732,8 +736,8 @@ def _preflight_opencode_policy(
 def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
     """Build argv for a text-only, deny-all ``opencode run`` call.
 
-    Flags chosen (verified against ``opencode`` 1.18.31-1.19.3 ``run --help``,
-    byte-identical across .34/.35/1.19.0 and across 1.19.1-1.19.3, whose
+    Flags chosen (verified against ``opencode`` 1.18.31-1.19.4 ``run --help``,
+    byte-identical across .34/.35/1.19.0 and across 1.19.1-1.19.4, whose
     only change is the hidden ``--share`` flag):
 
     ``run``
@@ -791,9 +795,8 @@ def _parse_opencode_output(raw: str) -> str:
     """Extract assistant text from ``opencode run --format json`` JSONL events.
 
     Recorded against opencode 1.18.33 (``run --help`` is byte-identical
-    across 1.18.31-1.18.35/1.19.0 and across 1.19.1-1.19.3, and every
-    member carries the live nonce run recorded above), whose
-    events look like::
+    across 1.18.31-1.18.35/1.19.0 and across 1.19.1-1.19.4, and every member
+    carries the live nonce run recorded above), whose events look like:
 
         {"type": "step_start", ..., "part": {"type": "step-start", ...}}
         {"type": "text", ..., "part": {"type": "text", "text": "hi", ...}}
