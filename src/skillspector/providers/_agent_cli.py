@@ -882,13 +882,13 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
 
 
 # ---------------------------------------------------------------------------
-# GitHub Copilot CLI invocation  (verified against copilot 1.0.98)
+# GitHub Copilot CLI invocation  (verified against copilot 1.0.103)
 # ---------------------------------------------------------------------------
 
 
 # Single pin both gates compare against, so a bump cannot update one
 # gate but not the other (mirrors _OPENCODE_SUPPORTED_VERSION).
-_COPILOT_SUPPORTED_VERSION = "1.0.98"
+_COPILOT_SUPPORTED_VERSION = "1.0.103"
 
 # Token variables the Copilot CLI silently accepts as credentials, in
 # preference order after COPILOT_GITHUB_TOKEN. GH_TOKEN commonly carries
@@ -979,17 +979,13 @@ def _prepare_copilot_env(
         # absolute form keeps both sides on the same tree. No
         # expanduser: the CLI does not expand a leading `~` either.
         env["COPILOT_HOME"] = os.path.abspath(home)
-    # NOTE: COPILOT_AUTO_UPDATE is deliberately neither forwarded nor
-    # forced (see docstring): updates stay enabled so the CLI runs its
-    # newest cached generation, and the per-completion preflight
-    # fail-closes any mid-scan drift.
     return env
 
 
 def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
     """Build the argv list for a non-interactive ``copilot`` call.
 
-    Flags chosen (verified against Copilot CLI 1.0.98 ``--help``):
+    Flags chosen (verified against Copilot CLI 1.0.103 ``--help``):
 
     (no ``-p``)
         With no prompt flag, the prompt is piped to stdin by run_agent_cli —
@@ -1016,7 +1012,7 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
     ``--disallow-temp-dir``
         Prevent automatic access to the system temporary directory
         (verified live on 1.0.95: inference from a temp working dir
-        still answers exactly; --help surface re-verified on 1.0.98).
+        still answers exactly; --help surface re-verified on 1.0.103).
 
     Deliberately NOT included:
     - ``--allow-all*`` / ``--yolo`` — auto-approve permissions (dangerous); never use them.
@@ -1026,6 +1022,9 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
       by the per-completion preflight instead.
     - ``max_output_tokens`` — copilot has no token flag (accepted for
       CliSpec uniformity and ignored, like codex/gemini).
+    - ``--trust-folder`` (new in 1.0.100) — trusts the resolved working
+      dir's configuration for one prompt-mode session; the fresh temp
+      cwd must stay untrusted, so repo config can never load.
 
     ``--available-tools skillspector-no-tools``
         Allowlist holding a fixed implausible name, so the model is offered
@@ -1043,8 +1042,6 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
         Model in plain form (validated). Omitted by default so copilot uses
         the CLI default model (forwarded only when SKILLSPECTOR_MODEL is set).
     """
-    # --model omitted by default -> copilot uses the CLI default model
-    # (forwarded only when SKILLSPECTOR_MODEL is set).
     model_arg = ["--model", _validate_model_label(model)] if model else []
     return [
         binary,
@@ -1065,11 +1062,11 @@ def _parse_copilot_output(raw: str) -> str:
     """Extract the assistant reply from ``copilot -s`` plain-text output.
 
     Supported runtime is exactly ``_COPILOT_SUPPORTED_VERSION``
-    (currently 1.0.98: the version gate refuses anything else, so
+    (currently 1.0.103: the version gate refuses anything else, so
     this parser only ever runs on that release). Output shape proven
     live on 1.0.95 (``-s`` emits only the response text; 2026-10-11
     nonce probe from a temp working dir returned the exact string);
-    on 1.0.98 the flag is confirmed present via ``--help``, with the
+    on 1.0.103 the flag is confirmed present via ``--help``, with the
     live shape re-probe pending.
     The whole stripped output is the reply; empty output raises fail-closed
     (an empty response must never be mistaken for a clean analysis).
@@ -1087,7 +1084,7 @@ def _copilot_auth_check(binary: str) -> tuple[bool, str | None]:
     shared scrubbed environment (token re-injection is inference-only and
     version output does not depend on it), performs no inference, and
     completes well under 15s. Fail-closed: probe error/timeout, non-zero
-    exit, or a version other than the verified 1.0.98 all return
+    exit, or a version other than the verified 1.0.103 all return
     ``(False, reason)``.
 
     There is no status subcommand, so a passing probe means the binary runs
@@ -1137,7 +1134,7 @@ def _preflight_copilot_policy(
        runtime. Re-verifies ``[binary, --version]`` under the isolated
        child env on EVERY completion. ``argv`` is unused (CliSpec
        signature uniformity). Fail-closed: probe error/timeout,
-       non-zero exit, or a version other than the verified 1.0.98 all
+       non-zero exit, or a version other than the verified 1.0.103 all
        raise before any prompt bytes move.
     2. Temp-dir tripwire: repo-level hook sources (``.github/hooks/``,
        ``.github/agents/``, repo settings) cannot exist in the fresh
@@ -1192,7 +1189,7 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
 
     Audited behavior is the 1.0.92 release source (hook source order
     and XDG migration sets); the no-argv-off-switch premise is
-    re-verified on each pin bump, currently 1.0.98 ``--help``. As
+    re-verified on each pin bump, currently 1.0.103 ``--help``. As
     probed 2026-09-19, the CLI silently refuses inference under ANY
     redirected home, so home isolation is not a usable lever. The
     enforceable property is absence, checked here for every user

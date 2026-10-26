@@ -81,7 +81,7 @@ from skillspector.providers.copilot_cli import CopilotCLIProvider
 COPILOT_BINARY = "/usr/bin/copilot"
 MODEL = "gpt-5.2"
 
-_VERSION_OK = b"GitHub Copilot CLI 1.0.98.\nRun 'copilot update' to check for updates.\n"
+_VERSION_OK = b"GitHub Copilot CLI 1.0.103.\nRun 'copilot update' to check for updates.\n"
 
 
 def _version_result(stdout: bytes = _VERSION_OK) -> SimpleNamespace:
@@ -221,7 +221,7 @@ def test_hostile_prompt_roundtrips_byte_exact(prompt: str) -> None:
 
 class TestCopilotAuthCheck:
     def test_version_parses(self) -> None:
-        assert _parse_copilot_version(_VERSION_OK) == "1.0.98"
+        assert _parse_copilot_version(_VERSION_OK) == "1.0.103"
 
     def test_version_unparseable_returns_none(self) -> None:
         assert _parse_copilot_version(b"") is None
@@ -276,7 +276,7 @@ class TestCopilotAuthCheck:
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
         ok, reason = _copilot_auth_check(COPILOT_BINARY)
         assert ok is False
-        assert "1.0.98" in (reason or "")
+        assert "1.0.103" in (reason or "")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_unparseable_version_is_fail_closed(self, mock_run: MagicMock) -> None:
@@ -303,13 +303,13 @@ class TestPreflightCopilotPolicy:
     ) -> None:
         # The reviewer's repro: a 9.9.99 binary must never receive scan content.
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
-        with pytest.raises(AgentCLIError, match="1.0.98"):
+        with pytest.raises(AgentCLIError, match="1.0.103"):
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {"PATH": "/bin"}, str(tmp_path))
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_nonzero_exit_rejected(self, mock_run: MagicMock, tmp_path: Path) -> None:
         mock_run.return_value = SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom")
-        with pytest.raises(AgentCLIError, match="preflight|1.0.98"):
+        with pytest.raises(AgentCLIError, match="requires exactly"):
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {}, str(tmp_path))
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
@@ -1158,7 +1158,7 @@ class TestHookHomeEndToEnd:
         )
 
     @staticmethod
-    def _write_recording_copilot(binary: Path, markers: Path, *, version: str = "1.0.98") -> None:
+    def _write_recording_copilot(binary: Path, markers: Path, *, version: str = "1.0.103") -> None:
         """Fake host: answers --version, otherwise records invocation."""
         binary.write_text(
             textwrap.dedent(
@@ -1210,7 +1210,7 @@ class TestHookHomeEndToEnd:
 
     @staticmethod
     def _write_env_recording_copilot(
-        binary: Path, markers: Path, *, version: str = "1.0.98"
+        binary: Path, markers: Path, *, version: str = "1.0.103"
     ) -> None:
         """Fake host: answers --version, otherwise records its env."""
         binary.write_text(
@@ -1376,7 +1376,7 @@ class TestHookHomeEndToEnd:
 
 class TestAdversarialTransport:
     @staticmethod
-    def _write_fake_copilot(binary: Path, markers: Path, *, version: str = "1.0.98") -> None:
+    def _write_fake_copilot(binary: Path, markers: Path, *, version: str = "1.0.103") -> None:
         """Write a host simulator with real version/argv boundaries."""
         binary.write_text(
             textwrap.dedent(
@@ -1482,6 +1482,6 @@ class TestAdversarialTransport:
         self._write_fake_copilot(binary, markers, version="9.9.99")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
-        with pytest.raises(AgentCLIError, match="1.0.98"):
+        with pytest.raises(AgentCLIError, match="1.0.103"):
             run_agent_cli("copilot", "use every host tool", model="")
         assert list(markers.iterdir()) == []
