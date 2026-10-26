@@ -139,6 +139,10 @@ class OsvQueryBudget:
     limitations: list[OsvQueryLimitation] | None = None
     limitation_generation: int = 0
     last_limitation: OsvQueryLimitation | None = None
+    # Call-scoped reachability for this budget's own query_batch() calls, so
+    # concurrent scans (same process, different budgets) can't overwrite each
+    # other's reachability outcome. See was_osv_reachable().
+    query_ok: bool | None = None
 
     @classmethod
     def create(cls, timeout_seconds: float | None = None) -> OsvQueryBudget:
@@ -785,15 +789,18 @@ def query_batch(
                         _put_cache(_cache_key(name, version, ecosystem), vuln_details)
 
         _last_query_ok = successful_batches > 0
+        active_budget.query_ok = _last_query_ok
     except _OsvLimitReachedError:
         # The exact limit is already recorded on the result.  Keep completed
         # prefix results and let static fallback cover the remainder.
         _last_query_ok = successful_batches > 0
+        active_budget.query_ok = _last_query_ok
     except httpx.TimeoutException:
         logger.warning("OSV.dev API request timed out, falling back to static data")
         active_budget.note_runtime_limit()
         provider_failed = True
         _last_query_ok = False
+        active_budget.query_ok = False
     except (
         httpx.HTTPError,
         ValueError,
@@ -810,6 +817,7 @@ def query_batch(
         )
         provider_failed = True
         _last_query_ok = False
+        active_budget.query_ok = False
 
     if not provider_failed and _last_query_ok:
         _last_query_ok = True
@@ -847,10 +855,17 @@ def is_available() -> bool:
         return False
 
 
-def was_osv_reachable() -> bool:
-    """Return True if the last query_batch() call succeeded.
+def was_osv_reachable(budget: OsvQueryBudget | None = None) -> bool:
+    """Return True if the relevant query_batch() call succeeded.
+
+    Pass the same `budget` used for that call so concurrent scans each get
+    their own call-scoped answer instead of racing on a shared global — the
+    module-level flag is kept only as a fallback for callers that don't have
+    a budget to pass (and is itself still racy under concurrent scans).
 
     Callers can use this to decide whether to surface a fallback warning
     when query_batch returns empty results.
     """
+    if budget is not None and budget.query_ok is not None:
+        return budget.query_ok
     return _last_query_ok
