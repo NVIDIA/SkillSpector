@@ -66,6 +66,7 @@ from skillspector.inspection_ledger import (
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import (
+    MAX_WORKFLOW_SECONDS,
     AnalyzerNodeResponse,
     SkillspectorState,
     transitive_note_truncation,
@@ -330,6 +331,10 @@ _SC3_HERE_STRING_LITERAL = re.compile(
     re.IGNORECASE,
 )
 _SC3_SHELL_DECODE_COMMAND = re.compile(_SC3_SHELL_DECODER, re.IGNORECASE)
+_SC3_DECODED_DATA_SINK = re.compile(
+    r"(?:[ \t]{1,16}-[A-Za-z0-9-]{1,16}){0,4}[ \t]{0,16}"
+    r"\|(?!\|)&?[ \t]{0,16}sha256sum(?=$|[\s;&|)`])"
+)
 
 
 def _decoded_shell_literal_payloads(content: str) -> list[tuple[int, str]]:
@@ -337,13 +342,29 @@ def _decoded_shell_literal_payloads(content: str) -> list[tuple[int, str]]:
 
     Only an inline echo/printf argument or a here-string is decoded, as base64,
     base32 or (for xxd) hex; an ``openssl enc`` cipher is not applied.
+    Direct checksum consumers are exempt only in a simple shell context without
+    alias, function or dynamic-command syntax. Other flows remain conservative
+    because a saved payload can be executed later.
     Variables, files and downloads stay opaque. Invalid UTF-8 becomes U+FFFD,
     so a stray byte cannot hide the command. Returns ``(offset, text)`` pairs
     in source order.
     """
+    checksum_exemption_allowed: bool | None = None
     decoded: list[tuple[int, str]] = []
     for pattern in (_SC3_PIPED_LITERAL, _SC3_HERE_STRING_LITERAL):
         for match in pattern.finditer(content):
+            if _SC3_DECODED_DATA_SINK.match(content, match.end()) is not None:
+                if checksum_exemption_allowed is None:
+                    # Normalize once: escaped or quoted words can still configure aliases.
+                    tokens = _shell_tokens(content)
+                    checksum_exemption_allowed = tokens is not None and not any(
+                        token in {"alias", "function", "eval", "source", "."}
+                        or token.startswith("sha256sum=")
+                        or any(character.isspace() or character in "()" for character in token)
+                        for token in tokens
+                    )
+                if checksum_exemption_allowed:
+                    continue
             literal = match.group("literal")
             decoder = match.group("decoder").lower()
             try:
@@ -3361,6 +3382,8 @@ _SC8_BYTECODE_SUFFIXES = (".pyc", ".pyo")
 MAX_SC8_DISCOVERED_ENTRIES = 10_000
 MAX_SC8_DIRECTORY_ENTRIES = 10_000
 MAX_SC8_TRAVERSAL_DEPTH = 64
+# Processing budget, measured with ``time.thread_time()`` so that time spent
+# waiting for the GIL behind concurrently running analyzers does not count.
 MAX_SC8_ANALYSIS_SECONDS = 5.0
 MAX_SC8_FINDINGS = 10_000
 MAX_SC8_LIMITATIONS = 256
@@ -3395,7 +3418,14 @@ def _scan_shipped_bytecode(
     timeout_seconds: float | None = None,
     max_findings: int | None = None,
 ) -> _ShippedBytecodeScanResult:
-    """Discover shipped bytecode with deterministic aggregate resource bounds."""
+    """Discover shipped bytecode with deterministic aggregate resource bounds.
+
+    Analyzers run concurrently in one process, so the walk can spend most of
+    its wall-clock time waiting for the GIL. The processing budget therefore
+    counts only this thread's CPU time. Wall-clock time is bounded by the
+    remaining workflow deadline (``timeout_seconds``), or by the full workflow
+    limit for callers outside a workflow.
+    """
     findings: list[Finding] = []
     limitations: list[_SupplementalLimitation] = []
     if not skill_path or not isinstance(skill_path, str):
@@ -3405,10 +3435,11 @@ def _scan_shipped_bytecode(
         return _ShippedBytecodeScanResult(findings, limitations)
 
     started_at = time.monotonic()
-    runtime_limit = max(0.0, MAX_SC8_ANALYSIS_SECONDS)
-    if timeout_seconds is not None:
-        runtime_limit = min(runtime_limit, max(0.0, timeout_seconds))
-    deadline = started_at + runtime_limit
+    active_started_at = time.thread_time()
+    active_limit = max(0.0, MAX_SC8_ANALYSIS_SECONDS)
+    wall_clock_limit = max(
+        0.0, MAX_WORKFLOW_SECONDS if timeout_seconds is None else timeout_seconds
+    )
     requested_finding_limit = MAX_SC8_FINDINGS if max_findings is None else max_findings
     finding_limit = max(0, min(requested_finding_limit, MAX_SC8_FINDINGS))
     discovered_entries = 0
@@ -3432,15 +3463,20 @@ def _scan_shipped_bytecode(
         )
 
     def runtime_exhausted(relative_directory: str) -> bool:
-        now = time.monotonic()
-        if now < deadline:
+        wall_clock_elapsed = max(0.0, time.monotonic() - started_at)
+        active_elapsed = max(0.0, time.thread_time() - active_started_at)
+        if wall_clock_elapsed >= wall_clock_limit:
+            observed_seconds, limit_seconds = wall_clock_elapsed, wall_clock_limit
+        elif active_elapsed >= active_limit:
+            observed_seconds, limit_seconds = active_elapsed, active_limit
+        else:
             return False
         add_limitation(
             _SupplementalLimitation(
                 path=scope_path(relative_directory),
                 reason=LedgerReason.RUNTIME_LIMIT,
-                observed_seconds=max(0.0, now - started_at),
-                limit_seconds=runtime_limit,
+                observed_seconds=observed_seconds,
+                limit_seconds=limit_seconds,
             )
         )
         return True
@@ -3639,6 +3675,7 @@ def _analyze_concealed_executables(
                 concealment_reasons.append("disguised_container")
         concealment = concealment_reasons[0]
         excluded_from_analysis = metadata.get("excluded_from_analysis") is True
+        partially_analyzed_executable = metadata.get("partially_analyzed_executable") is True
         referenced_uninspected = (
             metadata.get("inspection_limitation_reason")
             == LedgerReason.REFERENCED_UNINSPECTED.value
@@ -3651,6 +3688,8 @@ def _analyze_concealed_executables(
                     if referenced_uninspected
                     else "An excluded artifact could not be completely inspected."
                     if inspection_incomplete
+                    else "Readable text was inspected, but binary executable behavior was not analyzed."
+                    if partially_analyzed_executable
                     else "Executable content is excluded from analysis."
                     if excluded_from_analysis
                     else "Executable content is concealed inside a document, hidden, "
@@ -3676,6 +3715,9 @@ def _analyze_concealed_executables(
                     else "A resource, read, or archive-safety limit left excluded content "
                     "outside deterministic inspection coverage."
                     if inspection_incomplete
+                    else "Text-based checks covered the readable projection, but they cannot "
+                    "establish the behavior of the binary executable."
+                    if partially_analyzed_executable
                     else "An executable artifact remains available under the skill install path "
                     "but its content is outside analyzer coverage."
                     if excluded_from_analysis
@@ -3708,6 +3750,7 @@ def _analyze_concealed_executables(
                     "local_only": True,
                     "referenced": metadata.get("referenced") is True,
                     "excluded_from_analysis": excluded_from_analysis,
+                    "partially_analyzed_executable": partially_analyzed_executable,
                     "excluded_inspection_incomplete": inspection_incomplete,
                     "inherited_exclusion_reason": metadata.get("inherited_exclusion_reason"),
                     "inspection_limitation_reason": metadata.get("inspection_limitation_reason"),

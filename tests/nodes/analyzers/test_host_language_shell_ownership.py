@@ -170,6 +170,32 @@ _BENIGN_PYTHON = [
         "# branch runs (and `command -v` is skipped).\n",
         id="comment-runtime-parameter",
     ),
+    # Markdown inline code and parameter names in report strings. Read past
+    # the closing quote, they would take the following code as operands.
+    pytest.param(
+        _OPTION_TEXT + "def report(path, detail):\n"
+        '    return [f"Inspected `{path}` and found {detail}."]\n',
+        id="f-string-inline-code",
+    ),
+    pytest.param(
+        _OPTION_TEXT
+        + "def lines(payload):\n    return [\n"
+        + "".join(f"        f\"- Field {i}: `{{payload['field_{i}']}}`\",\n" for i in range(8))
+        + "    ]\n",
+        id="f-string-inline-code-list",
+    ),
+    pytest.param(
+        _OPTION_TEXT + "def message(tool):\n    return (\n"
+        '        f"{tool} was not found at "\n'
+        '        f"$TOOL_ROOT, $UPSTREAM_ROOT/{tool}, "\n'
+        '        f"or $HOME/.cache/upstreams/{tool} "\n'
+        '        "or elsewhere"\n    )\n',
+        id="concatenated-f-strings-naming-parameters",
+    ),
+    pytest.param(
+        _OPTION_TEXT + 'def run():\n    """Run `$TOOL` once, then report."""\n',
+        id="docstring-runtime-parameter",
+    ),
 ]
 
 
@@ -303,6 +329,88 @@ def test_long_unresolved_shell_inside_one_python_token_stays_partial(source: str
 
 def test_runtime_command_with_destructive_operands_in_python_comment_stays_partial() -> None:
     assert _python(_OPTION_TEXT + "# $TOOL -rf /\nvalue = 1\n" + _TAIL) is True
+
+
+@pytest.mark.parametrize(
+    "joiner", ["\n           ", "  # tool\n           + "], ids=["implicit", "plus"]
+)
+@pytest.mark.parametrize(
+    "operands,partial",
+    [('"-rf /"', True), ('"--force --recursive /"', True), ('"-rf build"', False)],
+    ids=["root", "long-options", "relative"],
+)
+def test_runtime_command_takes_operands_from_concatenated_python_literals(
+    joiner: str, operands: str, partial: bool
+) -> None:
+    source = f'COMMAND = (f"run `{{tool}}` "{joiner}{operands})\n'
+
+    assert _python(_OPTION_TEXT + source + _TAIL) is partial
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param('COMMAND = f"run `{tool}` -rf /"\n', id="same-literal"),
+        pytest.param('COMMAND = f"Inspected `{path}` and found %s." % detail\n', id="percent"),
+        pytest.param('COMMAND = "Inspected `$P` and found {}.".format(detail)\n', id="format"),
+        pytest.param('COMMAND = f"Inspected `{path}` and " + detail\n', id="non-literal"),
+        pytest.param('COMMAND = (f"run `{tool}` %s") % "-rf /"\n', id="parenthesized-percent"),
+        pytest.param('COMMAND = ("run $(tool) ") + "-rf /"\n', id="parenthesized-plus"),
+        pytest.param('COMMAND = "run $(tool) "[0:] + "-rf /"\n', id="subscript"),
+        pytest.param('COMMAND = f"run `{tool}` {flag} /"\n', id="replacement-field"),
+    ],
+)
+def test_runtime_command_in_python_string_keeps_undecided_operands_partial(source: str) -> None:
+    # Code can still append operands to a string that is formatted, sliced,
+    # joined with a non-literal, or followed by a method call, also after a
+    # closing parenthesis. A replacement field can supply the options for a
+    # root target.
+    assert _python(_OPTION_TEXT + source + _TAIL) is True
+
+
+@pytest.mark.parametrize(
+    "source,shell_text",
+    [
+        pytest.param('X = f"a `{b}` c"\n', "`{b}` c", id="f-string"),
+        pytest.param(
+            "X = (\"a `{b}` \"  # note\n     + \"c\" \\\n     r'''d''')\n",
+            "`{b}` cd",
+            id="concatenated",
+        ),
+        pytest.param('X = ["a `{b}` ", "c"]\n', "`{b}` ", id="list-items"),
+        pytest.param('X = "a `{b}` " if c else "d"\n', "`{b}` ", id="conditional"),
+        pytest.param('X = "a `{b}` %s" % c\n', None, id="percent"),
+        pytest.param('X = "a `{b}` ".join(c)\n', None, id="method"),
+        pytest.param('X = "a `{b}` " * c\n', None, id="repetition"),
+        pytest.param('X = "a `{b}` " + c\n', None, id="non-literal"),
+        pytest.param('X = ("a `{b}` ") % c\n', None, id="parenthesized"),
+        pytest.param('X = "a `{b}` "[c]\n', None, id="subscript"),
+        pytest.param(
+            'X = f"a `{b}` {c} {{d}}" "{e}" f"{{{g}}}"\n',
+            "`{b}`  -rf {c} {{d}}{e}{{ -rf {g}}}",
+            id="replacement-fields",
+        ),
+    ],
+)
+def test_python_string_value_joins_only_concatenated_literals(
+    source: str, shell_text: str | None
+) -> None:
+    start = source.index("`")
+    value = tm._PythonSourceOwnership(source, lambda: None).string_value(start, start + 5)
+
+    # The shell word and the operands that the rest of the value supplies.
+    assert (value if value is None else value[0][value[1] :]) == shell_text
+
+
+def test_python_closing_quote_starts_no_shell_word() -> None:
+    source = 'X = ("a "\n     "$B -rf /")\n'
+    start = source.index('"\n')
+
+    assert tm._PythonSourceOwnership(source, lambda: None).string_value(start, start + 1) == (
+        "",
+        0,
+        0,
+    )
 
 
 def test_shell_file_with_unmatched_backtick_and_long_tail_stays_partial() -> None:

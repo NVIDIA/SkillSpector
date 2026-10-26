@@ -99,6 +99,16 @@ _RISK_RECOMMENDATION: dict[str, str] = {
 }
 
 
+def risk_severity_and_recommendation(score: int) -> tuple[str, str]:
+    """Map a computed score to the shared single-skill and recursive verdict."""
+    severity = "LOW"
+    for threshold, band in _RISK_SEVERITY_BANDS:
+        if score >= threshold:
+            severity = band
+            break
+    return severity, _RISK_RECOMMENDATION.get(severity, "CAUTION")
+
+
 # Scanned skill content (and LLM output that quotes it) can carry ANSI escape
 # sequences and control bytes (e.g. NUL, ESC) into finding text. Left in, they
 # make a rendered report register as binary — GitLab/editors show "download"
@@ -543,7 +553,10 @@ def _risk_score_floor(finding: Finding) -> int:
     configured_floor = _RISK_SCORE_FLOORS_BY_RULE_ID.get(finding.rule_id, 0)
     if configured_floor:
         return configured_floor
-    if finding.rule_id == "SC9" and finding.evidence.get("excluded_from_analysis") is True:
+    if finding.rule_id == "SC9" and (
+        finding.evidence.get("excluded_from_analysis") is True
+        or finding.evidence.get("partially_analyzed_executable") is True
+    ):
         return 51
     if (finding.severity or "").upper() != "CRITICAL":
         return 0
@@ -643,7 +656,10 @@ def _compute_risk_score(
         default=0,
     )
     if component_metadata and any(
-        component.get("excluded_from_analysis") is True
+        (
+            component.get("excluded_from_analysis") is True
+            or component.get("partially_analyzed_executable") is True
+        )
         and component.get("allowed_exclusion") is not True
         and (
             component.get("executable") is True
@@ -654,12 +670,7 @@ def _compute_risk_score(
         score_floor = max(score_floor, 51)
     final_score = min(100, max(score_floor, int(score)))
 
-    severity_band = "LOW"
-    for threshold, band in _RISK_SEVERITY_BANDS:
-        if final_score >= threshold:
-            severity_band = band
-            break
-    recommendation = _RISK_RECOMMENDATION.get(severity_band, "CAUTION")
+    severity_band, recommendation = risk_severity_and_recommendation(final_score)
     return final_score, severity_band, recommendation
 
 

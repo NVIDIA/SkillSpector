@@ -1755,6 +1755,69 @@ def test_cli_mcp_registry_rejects_skill_only_flags(tmp_path: Path, flag: str) ->
     assert "cannot be combined" in result.output
 
 
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--use-shipped-baseline"],
+        ["--transitive"],
+        ["--transitive-depth", "1"],
+        ["--transitive-depth", "0"],
+        ["--transitive-depth", "-1"],
+        ["--transitive-depth", "2"],
+        ["--transitive-allow-prefix", "https://example.com/"],
+        ["--transitive-deny-prefix", "https://example.com/"],
+        ["--transitive-allow-prefix", ""],
+        ["--transitive-deny-prefix", "not-a-prefix"],
+        ["--transitive", "--transitive-depth", "2", "--use-shipped-baseline"],
+    ],
+)
+def test_cli_mcp_registry_rejects_ignored_options_before_scanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flags: list[str]
+) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text('{"servers": []}', encoding="utf-8")
+    output = tmp_path / "report.json"
+    output.write_text("previous report", encoding="utf-8")
+    scan_registry = MagicMock(return_value={"findings": [], "risk_score": 0})
+    monkeypatch.setattr(cli, "scan_registry", scan_registry)
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(payload),
+            "--mcp-registry",
+            "--format",
+            "json",
+            "--output",
+            str(output),
+            *flags,
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "cannot be combined" in result.stderr
+    assert flags[0] in result.stderr
+    assert result.stdout == ""
+    assert output.read_text(encoding="utf-8") == "previous report"
+    scan_registry.assert_not_called()
+
+
+def test_cli_mcp_registry_rejects_configured_transitive_depth(tmp_path: Path) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text('{"servers": []}', encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["scan", str(payload), "--mcp-registry", "--format", "json"],
+        default_map={"scan": {"transitive_depth": 1}},
+    )
+
+    assert result.exit_code == 2
+    assert "--transitive-depth" in result.stderr
+    assert result.stdout == ""
+
+
 def test_cli_scan_missing_baseline_exits_2(tmp_path: Path) -> None:
     """scan with a --baseline pointing at a missing file exits with code 2."""
     (tmp_path / "SKILL.md").write_text("# Hi", encoding="utf-8")
@@ -2036,7 +2099,10 @@ def test_cli_scan_excludes_only_the_selected_baseline(tmp_path: Path) -> None:
     assert data["suppressed_count"] == 0
 
 
-def test_recursive_multi_skill_scan_rejects_shared_baseline(tmp_path: Path) -> None:
+@pytest.mark.parametrize("extra", [[], ["--use-shipped-baseline"]])
+def test_recursive_multi_skill_scan_rejects_shared_baseline(
+    tmp_path: Path, extra: list[str]
+) -> None:
     """Exact baselines are per-skill and cannot be silently reused recursively."""
     root = tmp_path / "skills"
     for name in ("one", "two"):
@@ -2051,11 +2117,53 @@ def test_recursive_multi_skill_scan_rejects_shared_baseline(tmp_path: Path) -> N
 
     result = runner.invoke(
         app,
-        ["scan", str(root), "--recursive", "--no-llm", "--baseline", str(baseline)],
+        ["scan", str(root), "--recursive", "--no-llm", "--baseline", str(baseline), *extra],
     )
 
     assert result.exit_code == 2
-    assert "not supported for recursive multi-skill scans" in result.output
+    assert "--baseline is not supported for recursive multi-skill scans" in " ".join(
+        result.stderr.split()
+    )
+
+
+@pytest.mark.parametrize("child_count", [1, 2])
+@pytest.mark.parametrize("fmt", ["terminal", "json", "sarif", "markdown"])
+def test_recursive_multi_skill_scan_rejects_shipped_baseline(
+    tmp_path: Path, child_count: int, fmt: str
+) -> None:
+    """Do not silently ignore opt-in or overwrite a report with unsuppressed results."""
+    root = tmp_path / "skills"
+    for i in range(child_count):
+        skill = root / f"skill-{i}"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(f"---\nname: skill-{i}\n---\n# Safe\n")
+        (skill / ".skillspector-baseline.yaml").write_text(
+            "version: 2\nrules:\n  - id: P1\n    reason: reviewed policy\n"
+        )
+    output = tmp_path / "report.txt"
+    output.write_text("previous report")
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(root),
+            "--recursive",
+            "--no-llm",
+            "--use-shipped-baseline",
+            "--format",
+            fmt,
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    error = " ".join(result.stderr.split())
+    assert "--use-shipped-baseline is not supported for recursive multi-skill scans" in error
+    assert "scan each sub-skill separately with --use-shipped-baseline" in error
+    assert result.stdout == ""
+    assert output.read_text() == "previous report"
 
 
 def test_recursive_single_skill_scan_still_accepts_baseline(tmp_path: Path) -> None:
@@ -2411,6 +2519,46 @@ def _bounded_recursive_result(label: str, *, finding_count: int = 1) -> dict[str
     }
 
 
+@pytest.mark.parametrize(
+    ("score", "severity", "recommendation"),
+    [
+        (0, "LOW", "SAFE"),
+        (20, "LOW", "SAFE"),
+        (21, "MEDIUM", "CAUTION"),
+        (50, "MEDIUM", "CAUTION"),
+        (51, "HIGH", "DO_NOT_INSTALL"),
+        (80, "HIGH", "DO_NOT_INSTALL"),
+        (81, "CRITICAL", "DO_NOT_INSTALL"),
+        (100, "CRITICAL", "DO_NOT_INSTALL"),
+    ],
+)
+@pytest.mark.parametrize("execution_failed", [False, True])
+@pytest.mark.parametrize("analysis_incomplete", [False, True])
+def test_recursive_risk_recommendation_bands_and_overrides(
+    score: int,
+    severity: str,
+    recommendation: str,
+    execution_failed: bool,
+    analysis_incomplete: bool,
+) -> None:
+    """Completeness can increase caution, but cannot erase known risk."""
+    expected = recommendation
+    if execution_failed:
+        expected = "DO_NOT_INSTALL"
+    elif analysis_incomplete and expected == "SAFE":
+        expected = "CAUTION"
+
+    assert cli._multi_skill_risk_assessment(
+        score,
+        execution_failed=execution_failed,
+        analysis_incomplete=analysis_incomplete,
+    ) == {
+        "max_risk_score": score,
+        "severity": severity,
+        "recommendation": expected,
+    }
+
+
 def test_recursive_fail_on_findings_exits_one_below_risk_threshold(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2698,19 +2846,26 @@ def test_recursive_over_record_budget_child_preserves_risk_and_exit(
     list(FormatChoice),
 )
 @pytest.mark.parametrize("cap_kind", ["child-retention", "serialized-output"])
+@pytest.mark.parametrize(
+    ("score", "severity", "recommendation"),
+    [(25, "MEDIUM", "CAUTION"), (100, "CRITICAL", "DO_NOT_INSTALL")],
+)
 def test_recursive_non_json_caps_preserve_aggregate_risk(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     output_format: FormatChoice,
     cap_kind: str,
+    score: int,
+    severity: str,
+    recommendation: str,
 ) -> None:
-    """Omitted child details never erase known high aggregate risk."""
+    """Omitted child details never erase known aggregate risk."""
     relative_path = "critical"
     child = {
         **_bounded_recursive_result("critical", finding_count=2),
-        "risk_score": 100,
-        "risk_severity": "CRITICAL",
-        "risk_recommendation": "DO_NOT_INSTALL",
+        "risk_score": score,
+        "risk_severity": severity,
+        "risk_recommendation": recommendation,
     }
     if cap_kind == "child-retention":
         monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_PUBLIC_RECORDS", 1)
@@ -2731,7 +2886,8 @@ def test_recursive_non_json_caps_preserve_aggregate_risk(
     output = tmp_path / f"combined.{output_format.value}"
     monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: child)
 
-    with pytest.raises(typer.Exit) as exit_info:
+    exit_context = pytest.raises(typer.Exit) if score > 50 else nullcontext()
+    with exit_context as exit_info:
         cli._scan_multi_skill(
             MultiSkillDetectionResult(is_multi_skill=True, skills=[skill]),
             output_format,
@@ -2739,28 +2895,29 @@ def test_recursive_non_json_caps_preserve_aggregate_risk(
             no_llm=True,
         )
 
-    assert exit_info.value.exit_code == 1
+    if score > 50:
+        assert exit_info.value.exit_code == 1
     body = output.read_text(encoding="utf-8")
     if output_format is FormatChoice.json:
         payload = json.loads(body)
-        assert payload["max_risk_score"] == 100
-        assert payload["risk_severity"] == "CRITICAL"
-        assert payload["risk_recommendation"] == "DO_NOT_INSTALL"
+        assert payload["max_risk_score"] == score
+        assert payload["risk_severity"] == severity
+        assert payload["risk_recommendation"] == recommendation
     elif output_format is FormatChoice.sarif:
         payload = json.loads(body)
         validate_sarif_report(payload)
         aggregate = payload["runs"][-1]["invocations"][0]["properties"]
         risk = aggregate["riskAssessment"]
         assert risk == {
-            "maxRiskScore": 100,
-            "severity": "CRITICAL",
-            "recommendation": "DO_NOT_INSTALL",
+            "maxRiskScore": score,
+            "severity": severity,
+            "recommendation": recommendation,
         }
     else:
-        assert "Maximum score: 100/100" in body
-        assert "Severity: CRITICAL" in body
+        assert f"Maximum score: {score}/100" in body
+        assert f"Severity: {severity}" in body
         # Human-readable report formats follow the single-skill convention.
-        assert "Recommendation: DO NOT INSTALL" in body
+        assert f"Recommendation: {recommendation.replace('_', ' ')}" in body
 
 
 @pytest.mark.parametrize(
@@ -3736,12 +3893,13 @@ def test_cli_shipped_baseline_without_opt_in(tmp_path: Path) -> None:
     assert "baseline" in result2.output.lower()
 
 
-def test_cli_shipped_baseline_opt_in(tmp_path: Path) -> None:
+@pytest.mark.parametrize("extra", [[], ["--recursive"]])
+def test_cli_shipped_baseline_opt_in(tmp_path: Path, extra: list[str]) -> None:
     """Opt-in applies the shipped baseline and reports provenance on stderr (R1 head/R6)."""
     skill_dir = _make_skill_dir(tmp_path)
     result = runner.invoke(
         app,
-        ["scan", str(skill_dir), "--no-llm", "--format", "json", "--use-shipped-baseline"],
+        ["scan", str(skill_dir), "--no-llm", "--format", "json", "--use-shipped-baseline", *extra],
     )
     assert result.exit_code == 0
     data = json.loads(result.stdout)
@@ -7497,6 +7655,270 @@ def test_recursive_sarif_uses_real_encoded_directory_and_preserves_external_sour
     local = locations[1]["physicalLocation"]["artifactLocation"]
     resolved = urljoin(urljoin(bases["SCANROOT"]["uri"], bases["SKILLROOT"]["uri"]), local["uri"])
     assert Path(unquote(urlsplit(resolved).path)) == skill.path / "scripts/helper.py"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative output requires POSIX")
+@pytest.mark.parametrize("race", ["leaf", "parent-before-open", "parent-after-open", "hard-link"])
+@pytest.mark.parametrize("writer", ["report", "baseline"])
+def test_report_output_cannot_redirect_to_external_file(tmp_path, monkeypatch, race, writer):
+    from skillspector import file_output
+    from skillspector.suppression import dump_baseline
+
+    def write_output(path):
+        if writer == "baseline":
+            dump_baseline({"version": 2}, path)
+        else:
+            file_output.write_text_no_follow(path, "report")
+
+    parent = tmp_path / "reports"
+    parent.mkdir()
+    moved = tmp_path / "original-reports"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    protected = outside / "report.json"
+    protected.write_text("protected", encoding="utf-8")
+    output = parent / protected.name
+    original_open = os.open
+    original_replace = os.replace
+    if race == "hard-link":
+        os.link(protected, output)
+    elif race == "leaf":
+
+        def replace_after_swap(src, dst, **kwargs):
+            output.symlink_to(protected)
+            return original_replace(src, dst, **kwargs)
+
+        monkeypatch.setattr(file_output.os, "replace", replace_after_swap)
+    else:
+
+        def open_after_swap(path, flags, *args, **kwargs):
+            if path == parent.name:
+                if race == "parent-after-open":
+                    fd = original_open(path, flags, *args, **kwargs)
+                parent.rename(moved)
+                parent.symlink_to(outside, target_is_directory=True)
+                if race == "parent-after-open":
+                    return fd
+            return original_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(file_output.os, "open", open_after_swap)
+    if race == "parent-before-open":
+        with pytest.raises(ValueError, match="symlink or is not a directory"):
+            write_output(output)
+    else:
+        write_output(output)
+        written = (moved if race == "parent-after-open" else parent) / output.name
+        if writer == "baseline":
+            assert json.loads(written.read_text(encoding="utf-8")) == {"version": 2}
+        else:
+            assert written.read_text(encoding="utf-8") == "report"
+        expected_mode = (
+            protected.stat().st_mode & 0o777
+            if writer == "baseline" and race == "hard-link"
+            else 0o600
+        )
+        assert written.stat().st_mode & 0o777 == expected_mode
+        assert not written.is_symlink()
+    assert protected.read_text(encoding="utf-8") == "protected"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative output requires POSIX")
+def test_report_output_rejects_symlinks_and_cleans_failed_replace(tmp_path, monkeypatch):
+    from skillspector import file_output
+
+    protected = tmp_path / "protected"
+    protected.write_text("original", encoding="utf-8")
+    output = tmp_path / "report"
+    output.symlink_to(protected)
+    with pytest.raises(ValueError, match="non-regular"):
+        file_output.write_text_no_follow(output, "report")
+    output.unlink()
+    output.write_text("previous", encoding="utf-8")
+
+    def fail_replace(*args, **kwargs):
+        raise PermissionError("synthetic replacement failure")
+
+    monkeypatch.setattr(file_output.os, "replace", fail_replace)
+    with pytest.raises(ValueError, match="synthetic replacement failure"):
+        file_output.write_text_no_follow(output, "report")
+    assert output.read_text(encoding="utf-8") == "previous"
+    assert protected.read_text(encoding="utf-8") == "original"
+    assert not list(tmp_path.glob(".skillspector-output-*"))
+
+
+def test_report_output_unsupported_platform_keeps_stdout(tmp_path, monkeypatch):
+    from skillspector import file_output
+
+    monkeypatch.setattr(file_output, "_SECURE_OUTPUT_SUPPORTED", False)
+    skill = tmp_path / "SKILL.md"
+    skill.write_text("---\nname: safe\n---\nHello", encoding="utf-8")
+    monkeypatch.setattr(
+        cli, "_scan_skill", lambda **kwargs: {"report_body": "report", "risk_score": 0}
+    )
+    result = runner.invoke(
+        app, ["scan", str(skill), "--no-llm", "--output", str(tmp_path / "report")]
+    )
+    assert result.exit_code == 2
+    assert "unsupported on this platform" in " ".join(result.output.split())
+    assert not (tmp_path / "report").exists()
+    result = runner.invoke(app, ["scan", str(skill), "--no-llm", "--format", "json"])
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "report"
+
+
+@pytest.mark.parametrize(
+    "mode", ["single", "recursive", "registry", "baseline-default", "baseline-json"]
+)
+def test_unsupported_output_stops_before_analysis(tmp_path, monkeypatch, mode):
+    from skillspector import file_output
+
+    monkeypatch.setattr(file_output, "_SECURE_OUTPUT_SUPPORTED", False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COLUMNS", "79")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("analysis must not run for unsupported output")
+
+    monkeypatch.setattr(cli, "_scan_skill", forbidden)
+    monkeypatch.setattr(cli, "detect_skills", forbidden)
+    monkeypatch.setattr(cli, "scan_registry", forbidden)
+    monkeypatch.setattr(cli.graph, "invoke", forbidden)
+    args = ["baseline" if mode.startswith("baseline") else "scan", str(tmp_path), "--no-llm"]
+    if mode == "recursive":
+        args += ["--recursive"]
+    if mode == "registry":
+        args += ["--mcp-registry", "--format", "json"]
+    if mode != "baseline-default":
+        args += ["--output", "out.json"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 2
+    assert "unsupported on this platform" in " ".join(result.output.split())
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("reason", ["Accepted", "Accepted 🚀 𐐷\u2028--- with notes"])
+def test_baseline_stdout_works_without_secure_file_output(tmp_path, monkeypatch, reason):
+    from skillspector import file_output
+
+    monkeypatch.setattr(file_output, "_SECURE_OUTPUT_SUPPORTED", False)
+    monkeypatch.chdir(tmp_path)
+    states = []
+
+    def invoke(state):
+        states.append(state)
+        return {
+            "active_findings": [_finding("P1", "instruction")],
+            "file_cache": {"SKILL.md": "instruction"},
+            "risk_score": 0,
+        }
+
+    monkeypatch.setattr(cli.graph, "invoke", invoke)
+    result = runner.invoke(
+        app, ["baseline", str(tmp_path), "--no-llm", "-o", "-", "--verbose", "--reason", reason]
+    )
+    assert result.exit_code == 0, result.output
+    import yaml
+
+    from skillspector.suppression import baseline_from_dict
+
+    parsed = baseline_from_dict(yaml.safe_load(result.stdout))
+    assert list(parsed.fingerprints.values()) == [reason]
+    assert json.loads(result.stdout)["fingerprints"][0]["reason"] == reason
+    assert "baseline_path" not in states[0]
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative output requires POSIX")
+@pytest.mark.parametrize(
+    "mode", ["single", "baseline-default", "baseline-json", "registry", "json", "sarif", "markdown"]
+)
+def test_all_cli_writers_reject_symlink_destinations(tmp_path, monkeypatch, mode):
+    monkeypatch.chdir(tmp_path)
+    protected = tmp_path / "protected"
+    protected.write_text("preserve", encoding="utf-8")
+    output = tmp_path / (
+        ".skillspector-baseline.yaml" if mode == "baseline-default" else "out.json"
+    )
+    output.symlink_to(protected.name)
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("# Safe skill", encoding="utf-8")
+    if mode.startswith("baseline"):
+        monkeypatch.setattr(
+            cli.graph,
+            "invoke",
+            lambda state: {"active_findings": [], "file_cache": {}, "risk_score": 0},
+        )
+        args = ["baseline", str(skill), "--no-llm"]
+    elif mode == "single":
+        monkeypatch.setattr(
+            cli, "_scan_skill", lambda **kwargs: {"report_body": "report", "risk_score": 0}
+        )
+        args = ["scan", str(skill), "--no-llm", "--format", "json"]
+    elif mode == "registry":
+        monkeypatch.setattr(
+            cli, "scan_registry", lambda *args, **kwargs: {"findings": [], "risk_score": 0}
+        )
+        args = ["scan", "registry.json", "--mcp-registry", "--format", "json"]
+    else:
+        monkeypatch.setattr(
+            cli,
+            "detect_skills",
+            lambda root: MultiSkillDetectionResult(
+                is_multi_skill=True,
+                has_root_skill=False,
+                skills=[SkillDirectory(path=skill, name="skill", relative_path="skill")],
+            ),
+        )
+        monkeypatch.setattr(
+            cli, "_scan_skill", lambda *args, **kwargs: _bounded_recursive_result("safe")
+        )
+        args = ["scan", str(tmp_path), "--recursive", "--no-llm", "--format", mode]
+    if mode != "baseline-default":
+        args += ["--output", str(output)]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 2, result.output
+    expected_error = "must be a regular file" if mode.startswith("baseline") else "non-regular"
+    assert expected_error in result.output
+    assert protected.read_text(encoding="utf-8") == "preserve"
+    assert output.is_symlink()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative output requires POSIX")
+@pytest.mark.parametrize("kind", ["missing", "symlink", "file", "device"])
+def test_output_errors_name_the_requested_path(tmp_path, kind):
+    from skillspector.file_output import write_text_no_follow
+
+    output = tmp_path / "parent" / "report.json"
+    if kind == "symlink":
+        (tmp_path / "parent").symlink_to(tmp_path, target_is_directory=True)
+    elif kind == "file":
+        (tmp_path / "parent").write_text("not a directory", encoding="utf-8")
+    elif kind == "device":
+        output = Path(os.devnull)
+    with pytest.raises(ValueError) as error:
+        write_text_no_follow(output, "report")
+    assert str(output) in str(error.value)
+    assert not list(tmp_path.glob(".skillspector-output-*"))
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0, reason="requires unprivileged POSIX permissions"
+)
+def test_report_output_preserves_read_only_file(tmp_path):
+    from skillspector.file_output import write_text_no_follow
+
+    output = tmp_path / "report.json"
+    output.write_text("preserve", encoding="utf-8")
+    output.chmod(0o444)
+    original = output.stat()
+    with pytest.raises(ValueError) as error:
+        write_text_no_follow(output, "replacement")
+    assert str(output) in str(error.value)
+    assert output.read_text(encoding="utf-8") == "preserve"
+    assert output.stat().st_ino == original.st_ino
+    assert output.stat().st_mode == original.st_mode
+    assert list(tmp_path.iterdir()) == [output]
 
 
 @pytest.mark.parametrize(

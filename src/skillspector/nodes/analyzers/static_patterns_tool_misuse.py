@@ -46,6 +46,7 @@ from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_tokens import PythonLiteralSpans
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
+from skillspector.python_tokens import python_string_body as _python_string_body
 from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
@@ -55,7 +56,9 @@ from .common import (
     LOGICAL_LINE_BREAK,
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
+    SourceLocationIndex,
     get_context,
+    get_context_from_lines,
     is_reference_material,
 )
 from .pattern_defaults import PatternCategory
@@ -63,6 +66,7 @@ from .pattern_defaults import PatternCategory
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_tool_misuse"
+USES_RUNTIME_CHECK = True
 ANALYZE_USES_POSTPROCESS = True
 POSTPROCESS_USES_PYTHON_AST = True
 POSTPROCESS_USES_RUNTIME_BUDGET = True
@@ -136,6 +140,13 @@ _PERL_EVAL_BLOCK_RE = re.compile(r"\s*+\{")
 # whitespace or a shell control character. A backslash-newline is a line
 # continuation in both languages, so it does not end the word.
 _PYTHON_SHELL_WORD_BREAK_RE = re.compile(r"(?<!\\)(?<!\\\r)[\s;|&()<>]")
+# Whitespace and line continuations between Python tokens. Comments are
+# tokens of their own.
+_PYTHON_TOKEN_GAP_RE = re.compile(r"(?:\s|\\\r?\n)*+")
+# Python operators that can still extend or rewrite a string value.
+_PYTHON_STRING_EXTENSION_OPERATORS = frozenset({"+", "%", ".", "*", "["})
+# One brace opens an f-string replacement field; a doubled brace is literal.
+_PYTHON_REPLACEMENT_FIELD_RE = re.compile(r"\{\{|(\{)")
 _PRINTF_FORMAT_CONVERSION_RE = re.compile(r"%[-+ #0-9.*']*[A-Za-z%]")
 _SHELL_ROOT_TARGET_ESCAPE_RE = re.compile(
     r"\\(?:[/~*?]|x(?:2[fF]|7[eE]|2[aA]|3[fF])|"
@@ -163,6 +174,15 @@ _MARKDOWN_CONTRACTION_PROSE_RE = re.compile(
     r"(?P<apostrophe>')t\b[A-Za-z \t,]*[.!?]",
     re.IGNORECASE,
 )
+# An English possessive or contraction inside one prose word, such as
+# ``reference's`` or ``don't``. The suffix must end the word, so a quote that
+# closes a shell word, as in ``r'm'``, never matches.
+_MARKDOWN_WORD_APOSTROPHE_RE = re.compile(
+    r"(?<![\w'/.~-])[A-Za-z]++(?P<apostrophe>')(?:s|t|d|m|re|ve|ll)(?![\w'/])",
+    re.IGNORECASE,
+)
+# Shell syntax that opens a quote, an expansion, or a line continuation.
+_MARKDOWN_PROSE_SHELL_SYNTAX_RE = re.compile(r"[$`\\\"]")
 _ROOT_GLOB_DOCUMENTATION_LINE_RE = re.compile(
     r"[ \t]*(?:(?:[-*+]|#{1,6})[ \t]+)?"
     r"(?:(?:(?:documentation|note|example)[ \t]*:[ \t]*)"
@@ -2149,12 +2169,23 @@ def _has_shell_command_word_exhaustion(
         ):
             comment = python_source.comment(start) if python_source is not None else None
             if comment is None:
-                return True
+                # Host code after a Python string's closing quote is not shell
+                # text, so a command in the string takes operands only from
+                # the rest of the string's value, including literals
+                # concatenated with it. A value that code can still extend,
+                # for example with ``%`` or ``.format``, stays partial.
+                value = (
+                    python_source.string_value(start, parsed.end)
+                    if python_source is not None
+                    else None
+                )
+                if value is None or _has_runtime_command_operand_exhaustion(*value, check_runtime):
+                    return True
+                continue
             # A Python comment is prose that no shell receives, so a command
             # named in it can take operands only from the same comment, never
             # from later host code. Recheck that comment as standalone shell
-            # text. Strings are not confined: concatenation can supply their
-            # runtime operands.
+            # text.
             if comment not in complete_comments:
                 if _has_shell_command_word_exhaustion(
                     content[comment[0] : comment[1]],
@@ -2616,6 +2647,22 @@ def _perl_literal_print_shell_text(
     return "".join(output)
 
 
+def _python_literal_operands(content: str, token: tuple[int, int], start: int, end: int) -> str:
+    """Return string literal body text from ``start`` that a shell reads as operands.
+
+    Code supplies an f-string or t-string replacement field's text at runtime,
+    and that text can hold the recursive and force options. Each field also
+    counts as them, so a root target beside a field stays undecided.
+    """
+    text = content[start:end]
+    body_start = _python_string_body(content, *token)[0]
+    if not {"f", "t"} & set(content[token[0] : body_start].lower()):
+        return text
+    return _PYTHON_REPLACEMENT_FIELD_RE.sub(
+        lambda field: field[0] if field[1] is None else " -rf {", text
+    )
+
+
 class _PythonSourceOwnership:
     """Lazily proven Python string and comment ownership for one source text.
 
@@ -2665,6 +2712,82 @@ class _PythonSourceOwnership:
         if owner is None or self._content[owner[0]] != "#":
             return None
         return owner
+
+    def string_value(self, start: int, end: int) -> tuple[str, int, int] | None:
+        """Return the proven string value that holds a shell word, and its span.
+
+        A string literal's quotes are Python syntax: the shell receives only
+        its body, so a word ends at the closing quote, and a word starting at
+        that quote is not shell text at all. Implicit or ``+`` concatenation
+        continues the value with later literal bodies. Return ``None`` for a
+        word outside a string literal, or for a value that a format operator,
+        method call, subscript, repetition or non-literal operand can still
+        extend, also after a closing parenthesis.
+        """
+        spans = self._owned_spans()
+        owner = self._owner(start)
+        content = self._content
+        if spans is None or owner is None or content[owner[0]] == "#":
+            return None
+        body_start, body_end = _python_string_body(content, *owner)
+        if start >= body_end:
+            return "", 0, 0
+        word_start = max(start, body_start)
+        word_end = max(min(end, body_end), word_start)
+        # Keep the character before the word and its escaping backslashes:
+        # they decide whether a quote in the body wraps the command.
+        origin = word_start - 1 if word_start > body_start else word_start
+        while origin > body_start and content[origin - 1] == "\\":
+            origin -= 1
+        # The operand tokenizer reads at most this much after the word.
+        limit = word_end + _ROOT_GLOB_COMMAND_CHARS + 1
+        pieces = [
+            content[origin:word_end],
+            _python_literal_operands(content, owner, word_end, min(body_end, limit)),
+        ]
+        remaining = limit - body_end
+        starts, ends = spans
+        index = bisect_right(starts, start) - 1
+
+        def next_token(position: int) -> int:
+            # Skip whitespace, line continuations and comment tokens.
+            nonlocal index
+            while True:
+                gap = _PYTHON_TOKEN_GAP_RE.match(content, position)
+                position = position if gap is None else gap.end()
+                if (
+                    index + 1 == len(starts)
+                    or starts[index + 1] != position
+                    or content[position] != "#"
+                ):
+                    return position
+                index += 1
+                position = ends[index]
+
+        while remaining > 0:
+            self._check_runtime()
+            cursor = next_token(ends[index])
+            operator = content[cursor : cursor + 1]
+            if operator == "+":
+                cursor = next_token(cursor + 1)
+            if index + 1 < len(starts) and starts[index + 1] == cursor:
+                index += 1
+                literal = (starts[index], ends[index])
+                literal_start, literal_end = _python_string_body(content, *literal)
+                pieces.append(
+                    _python_literal_operands(content, literal, literal_start, literal_end)
+                )
+                remaining -= literal_end - literal_start
+                continue
+            # A parenthesized value, as in ``("$TOOL ") + "-rf /"``, can
+            # still be extended after its closing parenthesis.
+            while operator == ")":
+                cursor = next_token(cursor + 1)
+                operator = content[cursor : cursor + 1]
+            if operator in _PYTHON_STRING_EXTENSION_OPERATORS:
+                return None
+            break
+        return "".join(pieces), word_start - origin, word_end - origin
 
     def word_end(self, start: int) -> int:
         """Return the end of the host region a shell word at ``start`` can own."""
@@ -3691,6 +3814,78 @@ def _direct_shell_name(call: ast.Call) -> str | None:
     return None
 
 
+def _passive_assignment_name_snapshots(tree: ast.AST) -> dict[ast.AST, frozenset[str]]:
+    """Prove prior simple-name bindings in supported straight-line scopes."""
+    from . import static_python_shell_truthiness
+
+    snapshots: dict[ast.AST, frozenset[str]] = {}
+    for scope in ast.walk(tree):
+        if not isinstance(scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        bound_names = (
+            set(_parameter_names(scope.args)) if not isinstance(scope, ast.Module) else set()
+        )
+        declarations = static_python_shell_truthiness._DirectBindingCollector(frozenset())
+        for statement in scope.body:
+            declarations.visit(statement)
+        bound_names.update(declarations.nonlocal_names)
+        safe_names: set[str] = set()
+        trusted_names = set(static_python_shell_truthiness._DIRECT_CALL_NAMES).difference(
+            bound_names
+        )
+        unknown_effects = [False]
+        for statement in scope.body:
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)) and not unknown_effects[0]:
+                targets = (
+                    statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                )
+                value = statement.value
+                if value is not None:
+                    pairs = [
+                        pair for target in targets for pair in _paired_store_values(target, value)
+                    ]
+                    if pairs and all(
+                        isinstance(target, ast.Name)
+                        and (target.id not in bound_names or target.id in safe_names)
+                        for target, _ in pairs
+                    ):
+                        snapshots[statement] = frozenset(
+                            item.id
+                            for item in ast.walk(value)
+                            if isinstance(item, ast.Name) and item.id in safe_names
+                        )
+            if isinstance(statement, (ast.Import, ast.ImportFrom)):
+                native_import = (
+                    isinstance(statement, ast.Import)
+                    and all(
+                        alias.name == "subprocess" and alias.asname in (None, "subprocess")
+                        for alias in statement.names
+                    )
+                    or isinstance(statement, ast.ImportFrom)
+                    and statement.level == 0
+                    and statement.module == "subprocess"
+                    and all(
+                        alias.name == "Popen" and alias.asname in (None, "Popen")
+                        for alias in statement.names
+                    )
+                )
+                if not native_import:
+                    # Arbitrary module initialization can change existing names.
+                    unknown_effects[0] = True
+                    safe_names.clear()
+            static_python_shell_truthiness._advance_trusted_names(
+                statement, trusted_names, bound_names, safe_names, unknown_effects
+            )
+            if isinstance(statement, (ast.Import, ast.ImportFrom)) and not unknown_effects[0]:
+                # Only a fresh, proven native import adds release-safe names.
+                safe_names.update(
+                    trusted_names.intersection(
+                        static_python_shell_truthiness._direct_bound_names(statement)
+                    )
+                )
+    return snapshots
+
+
 def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellAstIndex | None:
     """Index relevant nodes, bindings, and declarations in one AST traversal."""
     tree = parsed.tree
@@ -3710,6 +3905,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
     # self-stores. They neither replace nor restore a binding.
     identity_name_stores: set[ast.Name] = set()
     native_aliases = _native_receiver_aliases(tree)
+    passive_assignment_snapshots = _passive_assignment_name_snapshots(tree)
 
     def mark_attribute_identity_stores(target: ast.AST, value: ast.AST) -> None:
         for destination, source in _paired_store_values(target, value):
@@ -3723,16 +3919,49 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
             ):
                 attribute_identity_stores.add(destination)
 
-    def record_name_store_values(scope: ast.AST, target: ast.AST, value: ast.AST, end: int) -> None:
+    def record_name_store_values(
+        scope: ast.AST, targets: list[ast.AST], value: ast.AST, end: int
+    ) -> None:
+        from . import static_python_shell_truthiness
+
         # Pair unpacked targets with their RHS elements so a native alias, a
         # truthy flag, or a self-store is not mistaken for a replacement.
-        for destination, source in _paired_store_values(target, value):
-            if not isinstance(destination, ast.Name):
-                continue
+        pairs = [
+            (destination, source)
+            for target in targets
+            for destination, source in reversed(list(_paired_store_values(target, value)))
+        ]
+        stores = [
+            (destination, source)
+            for destination, source in pairs
+            if isinstance(destination, ast.Name)
+        ]
+        # The paired iterator is stack-based. Restore Python's left-to-right
+        # target order before deciding which occurrence owns the final value.
+        final_values = {destination.id: source for destination, source in stores}
+        safe_names = passive_assignment_snapshots.get(node)
+        safe_stores = safe_names is not None
+        safe_value = (
+            safe_names is not None
+            and static_python_shell_truthiness._is_finalizer_safe_value(value, set(safe_names))
+        )
+        # Unsupported RHS effects or target protocols cannot prove the final
+        # flag. Preserve the existing conservative event policy for those shapes.
+        false_values = (
+            {
+                source
+                for source in set(final_values.values())
+                if static_python_shell_truthiness._truth_value(source, {}) is False
+            }
+            if safe_stores and safe_value
+            else set()
+        )
+        definitely_false = {name for name, source in final_values.items() if source in false_values}
+        for destination, source in stores:
             keeps_signal = _store_keeps_shell_signal(destination.id, source, native_aliases)
             if keeps_signal is None:
                 identity_name_stores.add(destination)
-            elif keeps_signal:
+            elif keeps_signal and destination.id not in definitely_false:
                 record_binding(scope, destination.id, end, True)
 
     def record_binding(scope: ast.AST, name: str, start: int, restores: bool = False) -> None:
@@ -4003,8 +4232,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
         if isinstance(node, ast.Assign):
             stack.append((node.value, scope_chain, None))
             stack.extend((target, scope_chain, end) for target in node.targets)
-            for target in node.targets:
-                record_name_store_values(scope, target, node.value, end)
+            record_name_store_values(scope, list(node.targets), node.value, end)
         elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
             if node.value is not None:
                 stack.append((node.value, scope_chain, None))
@@ -4012,7 +4240,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
             if isinstance(node, ast.AnnAssign):
                 stack.append((node.annotation, scope_chain, None))
                 if node.value is not None:
-                    record_name_store_values(scope, node.target, node.value, end)
+                    record_name_store_values(scope, [node.target], node.value, end)
         elif isinstance(node, ast.NamedExpr):
             stack.append((node.value, scope_chain, None))
             # PEP 572 makes a walrus target inside one or more
@@ -4025,7 +4253,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
             ):
                 target_chain = target_chain[:-1]
             stack.append((node.target, target_chain, end))
-            record_name_store_values(target_chain[-1], node.target, node.value, end)
+            record_name_store_values(target_chain[-1], [node.target], node.value, end)
         elif isinstance(node, (ast.For, ast.AsyncFor)):
             iteration_span = _node_character_span(parsed, node.iter)
             iteration_end = iteration_span[1] if iteration_span is not None else end
@@ -4663,13 +4891,19 @@ def _markdown_table_delimiter_columns(
 
 
 def _markdown_shell_text(
-    content: str, check_runtime: Callable[[], None], *, complete_context: bool = True
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    complete_context: bool = True,
+    word_apostrophes: bool = False,
 ) -> str:
     """Mask Markdown delimiters while retaining code and exact source offsets.
 
     Inline code delimiters are not legacy shell substitutions. Fenced and
     indented code stays literal; longer inline delimiters preserve backticks
     inside their bodies. Pair equal-length runs in linear time.
+    ``word_apostrophes`` selects the prose reading, which also masks the
+    possessives and contractions of plain prose lines.
     """
     output = list(content)
     prose_apostrophes: set[int] = set()
@@ -4897,6 +5131,33 @@ def _markdown_shell_text(
                         # shell syntax. Fences, indented code, HTML, tables, and
                         # pending multiline inline spans never reach this rule.
                         prose_apostrophes.add(offset + prefix + prose.start("apostrophe"))
+                    elif (
+                        word_apostrophes
+                        and complete_context
+                        and not runs
+                        and not heading
+                        and "'" in leading
+                        and _MARKDOWN_PROSE_SHELL_SYNTAX_RE.search(leading) is None
+                        and (
+                            line_index == 0
+                            or (
+                                lines[line_index - 1].endswith("\n")
+                                and not lines[line_index - 1].rstrip("\r\n").endswith("\\")
+                            )
+                        )
+                    ):
+                        # In the prose reading, a prose line owns every
+                        # possessive and contraction in it. Every quote on the
+                        # line must be one, the line has no expansion or line
+                        # continuation, and it starts a new shell line, so no
+                        # runtime-selected command can take later text as
+                        # operands through it. The same block exclusions apply.
+                        apostrophes: list[int] = []
+                        for word in _MARKDOWN_WORD_APOSTROPHE_RE.finditer(leading):
+                            check_runtime()
+                            apostrophes.append(offset + prefix + word.start("apostrophe"))
+                        if len(apostrophes) == leading.count("'"):
+                            prose_apostrophes.update(apostrophes)
                     for match in backtick_runs.finditer(line):
                         check_runtime()
                         runs.append((offset + match.start(), offset + match.end()))
@@ -4957,6 +5218,29 @@ def has_bounded_parse_exhaustion(
     complete_context: bool = True,
 ) -> bool:
     """Return whether a destructive rm command exceeded the parser's span contract."""
+    exhausted = _has_bounded_parse_exhaustion(
+        content, check_runtime, file_type=file_type, complete_context=complete_context
+    )
+    if not exhausted or file_type != "markdown" or not complete_context:
+        return exhausted
+    # A possessive such as "reference's" in prose is punctuation, yet the
+    # lexical reading can leave it open as a shell quote to the end of the
+    # file. Retry with the prose reading. Masking an apostrophe can also turn
+    # a later closing quote into an opener, so the prose reading may only
+    # resolve a limit of the lexical one, never introduce one.
+    return _has_bounded_parse_exhaustion(
+        content, check_runtime, file_type=file_type, word_apostrophes=True
+    )
+
+
+def _has_bounded_parse_exhaustion(
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    file_type: str,
+    complete_context: bool = True,
+    word_apostrophes: bool = False,
+) -> bool:
     # PowerShell source can invoke another shell with an executable command
     # string. Apply the same bounded checks to those strings; benign PowerShell
     # -replace values have their own narrowly proven expression context.
@@ -4975,7 +5259,12 @@ def has_bounded_parse_exhaustion(
             json_strings = validated_json_string_spans(content, check_runtime)
             structural_quote_closers = {end - 1 for _, end in json_strings}
             structural_quote_openers = {start for start, _ in json_strings}
-        content = _markdown_shell_text(content, check_runtime, complete_context=complete_context)
+        content = _markdown_shell_text(
+            content,
+            check_runtime,
+            complete_context=complete_context,
+            word_apostrophes=word_apostrophes,
+        )
     # Perl ``eval BLOCK`` is recognized from its clause-initial ``eval`` and the
     # adjacent brace alone, so unlike quote ownership it needs no full context.
     if _has_shell_command_word_exhaustion(
@@ -5103,27 +5392,30 @@ def analyze(
     file_path: str,
     file_type: str,
     *,
+    check_runtime: Callable[[], None] | None = None,
     _direct_shell_only: bool = False,
     defer_variable_reconciliation: bool = False,
 ) -> list[AnalyzerFinding]:
     """Analyze content for tool misuse patterns (TM1–TM3)."""
+    runtime_check = check_runtime or (lambda: None)
+    runtime_check()
     findings: list[AnalyzerFinding] = []
+    locations = SourceLocationIndex(content, file_path)
+    lines = content.splitlines()
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
 
-    line_starts = (0, *(match.end() for match in LOGICAL_LINE_BREAK.finditer(content)))
-
     def line_number(start: int) -> int:
-        return bisect_right(line_starts, start)
+        return locations.line_and_column(start)[0]
 
     context_by_line: dict[int, str] = {}
 
     def ctx(start: int) -> str:
-        line = line_number(start)
+        line, column = locations.line_and_column(start)
         context = context_by_line.get(line)
         if context is None:
-            context = get_context(content, start)
+            context = get_context_from_lines(lines, line, column=column)
             context_by_line[line] = context
         return context
 
@@ -5141,10 +5433,14 @@ def analyze(
     )
     invisible_variable_matches: set[tuple[int, int]] = set()
     if file_type == "python" and variable_matches and not defer_variable_reconciliation:
+        runtime_check()
         parsed = parse_python_source(content, file_path)
+        runtime_check()
         ast_index = _build_variable_shell_ast_index(parsed)
+        runtime_check()
         if ast_index is not None:
             for span, (_, match) in variable_matches.items():
+                runtime_check()
                 assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
                 candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)
                 if candidate is not None and (
@@ -5156,7 +5452,7 @@ def analyze(
                     invisible_variable_matches.add(span)
 
     shell_content = (
-        _perl_literal_print_shell_text(content, lambda: None) if file_type == "perl" else None
+        _perl_literal_print_shell_text(content, runtime_check) if file_type == "perl" else None
     )
     for (
         match_start,
@@ -5172,6 +5468,7 @@ def analyze(
         direct_shell_only=_direct_shell_only,
         shell_content=shell_content,
     ):
+        runtime_check()
         variable_match = variable_matches.get((match_start, match_end))
         if variable_match is not None and (match_start, match_end) in invisible_variable_matches:
             continue
@@ -5317,6 +5614,7 @@ def analyze(
             else re.finditer
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            runtime_check()
             line_num = line_number(match.start())
             context_text = ctx(match.start())
             matched = match.group(0)[:200]
@@ -5348,6 +5646,7 @@ def analyze(
         )
         skip_assigned = (pattern, confidence) == _TM3_UMASK_CALL
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            runtime_check()
             if skip_assigned and _is_assigned_value(content, match.start()):
                 continue
             line_num = line_number(match.start())
@@ -5372,6 +5671,7 @@ def analyze(
     tm4_tags = [*tag, "contextual-triage", "likely-benign-context"] if reference_material else tag
     for pattern, confidence in TM4_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            runtime_check()
             line_num = line_number(match.start())
             findings.append(
                 AnalyzerFinding(

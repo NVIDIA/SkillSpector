@@ -214,10 +214,15 @@ class PythonStringClosers:
         start, end = starts[index], ends[index]
         if content[start] == "#":
             return False
-        # Skip a string prefix such as ``rb``, ``f`` or ``t`` to the opening
-        # quote. The closing delimiter repeats it, three times when tripled.
-        opener = start
-        while content[opener] not in "'\"":
-            opener += 1
-        width = 3 if content.startswith(content[opener] * 3, opener, end) else 1
-        return offset >= end - width
+        return offset >= python_string_body(content, start, end)[1]
+
+
+def python_string_body(content: str, start: int, end: int) -> tuple[int, int]:
+    """Return the body offsets of the string token at ``content[start:end]``."""
+    # Skip a string prefix such as ``rb``, ``f`` or ``t`` to the opening
+    # quote. The closing delimiter repeats it, three times when tripled.
+    opener = start
+    while content[opener] not in "'\"":
+        opener += 1
+    width = 3 if content.startswith(content[opener] * 3, opener, end) else 1
+    return opener + width, end - width

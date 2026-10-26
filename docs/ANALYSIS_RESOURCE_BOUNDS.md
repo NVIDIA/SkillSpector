@@ -123,6 +123,18 @@ The finding and incomplete-analysis gates remain active until the relevant
 limitations are resolved. Evidence fields are diagnostic facts, not suppression
 instructions.
 
+### Markdown prose apostrophes
+
+In a complete Markdown file, a possessive or contraction such as `reference's`,
+`drivers'` or `don't` in a prose line is punctuation, not a shell single quote
+that stays open through the rest of the file. This applies only when every quote
+on the line is such a word apostrophe, the line has no `$`, backtick, backslash
+or double quote, and the line starts a new shell line: the previous line ends in
+a newline, not a backslash continuation or a Unicode line separator. Headings,
+block quotes, code blocks, HTML blocks, tables, lines inside a pending inline
+code span, and an apostrophe inside a quote or substitution that starts earlier
+keep the lexical reading.
+
 ### Perl literal help text
 
 For `.pl` source, the tool-misuse analyzer recognizes a narrow form of standalone
@@ -163,7 +175,14 @@ apostrophe in a comment, is charged only up to the end of that token, never to
 the code that follows. Python code that happens to use a shell wrapper name, as
 in `signal.alarm(timeout)`, is not reparsed as a shell command string. A
 runtime-selected command named in a comment takes operands only from that
-comment.
+comment. One named in a string literal takes operands only from the rest of
+that string's value: the literal's body and the bodies of literals implicitly
+or `+`-concatenated after it. A value that code can still extend or rewrite,
+with `%`, `.format` or another method call, a subscript, repetition, or a
+non-literal operand, keeps the conservative result, also after a closing
+parenthesis. An f-string replacement field among the operands may supply the
+recursive and force options, so a root target beside it also stays
+conservative.
 
 Literal payloads remain visible to every security check. A single string or
 comment that itself holds more unresolved shell text than the parser bound,
@@ -263,7 +282,7 @@ removes the rejected partial checkout.
 | Retained YARA string instances | 4,096 | One matched rule |
 | Shipped-bytecode discovery entries | 10,000 | One analyzer execution |
 | Shipped-bytecode traversal depth | 64 | One analyzer execution |
-| Shipped-bytecode analysis time | 5 seconds | One analyzer execution, within the workflow deadline |
+| Shipped-bytecode active processing time | 5 seconds | One analyzer execution, within the workflow wall-clock deadline |
 | Dependency manifests | 64 | One analyzer execution |
 | Dependency packages | 256 | One manifest |
 | Dependency packages | 1,024 | One analyzer execution |

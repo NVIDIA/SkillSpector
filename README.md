@@ -116,7 +116,7 @@ docker run --rm \
 **Write a report to the host filesystem** by writing to the mounted directory:
 
 ```bash
-docker run --rm \
+docker run --rm --user "$(id -u):$(id -g)" \
   -v "$PWD:/scan" \
   skillspector scan ./my-skill/ --no-llm --format json --output report.json
 ```
@@ -244,6 +244,11 @@ valid normalized snapshots. Malformed, oversized or duplicate server identities
 are rejected. This option requires `--mcp-registry` and is separate from the
 finding-suppression `--baseline`: it never suppresses findings or changes risk
 scores, and it does not fetch or execute listed server endpoints.
+
+Registry mode rejects skill-only controls such as `--use-shipped-baseline`,
+`--transitive`, `--transitive-depth`, `--transitive-allow-prefix`, and
+`--transitive-deny-prefix` with exit code 2, including an explicitly supplied
+default depth (`--transitive-depth 1`). Omit these options for registry scans.
 
 ### Suppressing False Positives (baseline)
 
@@ -809,6 +814,17 @@ Options:
 skillspector baseline <path> [-o FILE] [--no-llm] [--reason TEXT]
 ```
 
+Report files and new baselines use private permissions (0600). Existing baselines
+retain their access metadata when safely replaced; updates requiring in-place
+writes are refused. All file output uses atomic replacement. The parent directory
+must be writable; symlinked
+parents and non-regular destinations such as devices are refused. On macOS,
+ancestor directories must also be readable. File output requires POSIX no-follow
+directory operations and is unavailable on Windows. Unsupported file output fails
+before analysis. Omit `--output` for scan/batch stdout, or use
+`skillspector baseline <path> -o -` for JSON on stdout, then redirect only to a
+trusted destination. Run Docker with your user ID as above so you can read its files.
+
 ## Integrating SkillSpector
 
 SkillSpector is built to be driven by other tools (CI pipelines, install gates, editor integrations). Its exit code and JSON output are a stable contract.
@@ -951,13 +967,15 @@ SkillSpector uses a two-stage detection pipeline:
 - High recall (catches most issues)
 - Moderate precision (some false positives)
 
-A valid, root-level OpenSSF Model Signing signature (`skill.oms.sig`) is retained in the
-component inventory as type `oms_signature`, but excluded from static and LLM content analysis.
-OMS bundles necessarily contain long base64-encoded payload, signature, and certificate fields;
-generic obfuscated-code checks can otherwise misclassify those fields as hidden executable content.
-The recognizer checks the minimal OMS DSSE/in-toto structure; it does not verify the signature,
-certificate chain, transparency-log entry, or signer identity. Invalid or unrecognized signature
-files are scanned normally.
+OpenSSF Model Signing / DSSE bundles remain in content analysis, regardless of
+filename. Static and LLM analyzers inspect decoded JSON payloads, readable DER
+certificate/signature content, and all unknown wrapper fields. Strictly parsed
+binary fields are projected rather than treated as executable base64; canonical
+bytes remain available to YARA and fingerprints. Unsupported encodings (including
+environments without the optional `cryptography` dependency) retain raw fields
+and produce an explicit incomplete-analysis warning. Findings in decoded content
+point to the original bundle and label their projection in evidence. None of this
+verifies signatures, certificate chains, transparency logs, or signer identity.
 
 ### Stage 2: LLM Semantic Analysis (Optional)
 - Evaluates context and intent
@@ -986,7 +1004,7 @@ The tool requires outbound HTTPS access to `api.osv.dev` for live vulnerability 
 SkillSpector is defense-in-depth, not a sandbox. Know what it does and does not do before relying on it:
 
 - **It never executes the scanned skill.** All analysis is static (regex, Python AST, YARA) plus optional LLM evaluation of file *contents* — the skill's code is never run.
-- **LLM analysis sends analyzer-eligible file contents to the configured provider.** When LLM analysis is enabled (the default), file contents are sent to the active `SKILLSPECTOR_PROVIDER` endpoint. Recognized OMS signature files are excluded. Use `--no-llm` to keep contents local (static analysis only).
+- **LLM analysis sends analyzer-eligible file contents to the configured provider.** When LLM analysis is enabled (the default), file contents are sent to the active `SKILLSPECTOR_PROVIDER` endpoint. DSSE payloads and readable signing metadata are included. Use `--no-llm` to keep contents local (static analysis only).
 - **SC4 sends dependency names to OSV.dev.** The supply-chain check queries [OSV.dev](https://osv.dev) with the package names and versions the skill declares, to look up known CVEs. This is fundamental to the check and runs even with `--no-llm`. It sends dependency coordinates (not file contents), requires no API key, and falls back to a bundled list when OSV.dev is unreachable.
 - **It does not sandbox the host.** SkillSpector flags risky patterns *before* you install a skill; it does not contain or isolate a skill you choose to install anyway.
 

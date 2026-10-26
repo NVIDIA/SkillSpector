@@ -64,6 +64,7 @@ class ArtifactRecord(TypedDict):
     contains_nul: bool
     misleading_extension: bool
     referenced: bool
+    readable_binary: NotRequired[bool]
     reason: NotRequired[str]
     inherited_exclusion_reason: NotRequired[str]
 
@@ -367,6 +368,13 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
         decoded = data.decode("utf-8", errors="replace")
         decodable = False
 
+    # These printable prefixes are also valid instruction text. Keep the
+    # claimed binary format's coverage limits, but inspect the readable bytes.
+    # Lossy decoding must not let one invalid byte or a binary comment hide text.
+    readable_binary = data.startswith((b"MZ", b"GIF87a", b"GIF89a", b"%PDF-")) and bool(
+        binary_instruction_view(decoded)[0].text
+    )
+
     if has_binary_magic:
         kind = ContentKind.BINARY
     elif decodable:
@@ -388,6 +396,8 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
     disposition = (
         ArtifactDisposition.PARTIAL
         if referenced and kind is not ContentKind.TEXT
+        else ArtifactDisposition.ANALYZED
+        if readable_binary
         else ArtifactDisposition.OUT_OF_SCOPE
         if kind is ContentKind.BINARY
         else ArtifactDisposition.ANALYZED
@@ -401,7 +411,61 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
         "contains_nul": contains_nul,
         "misleading_extension": misleading,
         "referenced": referenced,
+        "readable_binary": readable_binary,
     }
+
+
+BINARY_TEXT_MAX_CHARS = 32_768
+_BINARY_PRINTABLE_RUN = re.compile(r"[^\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufffd]{8,}")
+
+
+def binary_instruction_view(content: str) -> tuple[SecurityTextView, bool]:
+    """Bound human-readable binary strings without treating binary noise as text."""
+    # Packet formatting is recognized once on the whole artifact, before windows.
+    excluded: list[tuple[int, int]] = []
+    if content.startswith("%PDF-"):
+        header = '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+        start = content.find(header)
+        while start >= 0:
+            next_start = content.find(header, start + len(header))
+            packet_end = next_start if next_start >= 0 else len(content)
+            metadata = content.find("<x:xmpmeta", start + len(header), packet_end)
+            close = content.find("</x:xmpmeta>", metadata, packet_end) if metadata >= 0 else -1
+            if close < 0:
+                start = next_start
+                continue
+            padding_start = close + len("</x:xmpmeta>")
+            padding_end = padding_start
+            while padding_end < packet_end and content[padding_end] in " \t\r\n":
+                padding_end += 1
+            if content.startswith(('<?xpacket end="w"?>', '<?xpacket end="r"?>'), padding_end):
+                bom = start + header.index("\ufeff")
+                excluded.extend([(bom, bom + 1), (padding_start, padding_end)])
+            start = next_start
+    offsets = array("I")
+    parts: list[str] = []
+    truncated = False
+    cursor = 0
+    for excluded_start, excluded_end in [*excluded, (len(content), len(content))]:
+        for match in _BINARY_PRINTABLE_RUN.finditer(content, cursor, excluded_start):
+            remaining = BINARY_TEXT_MAX_CHARS - len(offsets)
+            if remaining <= 2:
+                truncated = True
+                break
+            if parts:
+                parts.append("\n\n")
+                offsets.extend([match.start(), match.start()])
+                remaining -= 2
+            end = min(match.end(), match.start() + remaining)
+            parts.append(content[match.start() : end])
+            offsets.extend(range(match.start(), end))
+            if end < match.end():
+                truncated = True
+                break
+        if truncated:
+            break
+        cursor = excluded_end
+    return SecurityTextView("binary_printable_text", "".join(parts), offsets), truncated
 
 
 def promote_artifact_to_decoded_text(artifact: ArtifactRecord) -> None:
@@ -412,6 +476,7 @@ def promote_artifact_to_decoded_text(artifact: ArtifactRecord) -> None:
         and "reason" not in artifact
     )
     artifact["content_kind"] = ContentKind.TEXT
+    artifact["readable_binary"] = False
     artifact["decodable"] = True
     artifact["misleading_extension"] = _suffix(artifact["path"]) in _BINARY_EXTENSIONS
     if generic_binary_scope:

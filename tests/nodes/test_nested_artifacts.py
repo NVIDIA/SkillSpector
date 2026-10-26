@@ -1545,6 +1545,43 @@ def test_collision_preserves_disk_container_errors(
     assert result["execution_successful"] is False
 
 
+@pytest.mark.parametrize("unsafe_source", ["disk", "member", "both"])
+def test_collision_preserves_unsafe_member_event_source(tmp_path: Path, unsafe_source: str) -> None:
+    from skillspector.graph import graph
+
+    (tmp_path / "SKILL.md").write_text("---\nname: disk-error\n---\nA helper.\n")
+    (tmp_path / "bundle.zip!").mkdir()
+    path = "bundle.zip!/inner.zip"
+    disk_members = {"disk.txt": b"Disk note.\n"}
+    archive_members = {"archive.txt": b"Archive note.\n"}
+    if unsafe_source in {"disk", "both"}:
+        disk_members["../unsafe.txt"] = b"A rejected disk entry.\n"
+    if unsafe_source in {"member", "both"}:
+        archive_members["../unsafe.txt"] = b"A rejected archive entry.\n"
+    disk_bytes = _zip_bytes(disk_members)
+    (tmp_path / path).write_bytes(disk_bytes)
+    _write_archive(tmp_path / "bundle.zip", {"inner.zip": _zip_bytes(archive_members)})
+
+    result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
+
+    events = [
+        event
+        for event in result["inspection_ledger"]
+        if event.get("reason_code") == LedgerReason.ARCHIVE_UNSAFE_MEMBER_PATH
+    ]
+    expected_paths = (
+        {path, "bundle.zip"}
+        if unsafe_source == "both"
+        else {path if unsafe_source == "disk" else "bundle.zip"}
+    )
+    assert len(events) == len(expected_paths)
+    assert {event["path"] for event in events} == expected_paths
+    for event in events:
+        assert ("withheld archive member" in event["message"]) is (event["path"] == "bundle.zip")
+    assert result["raw_file_cache"][path] == disk_bytes
+    assert result["execution_successful"] is False
+
+
 @pytest.mark.parametrize("disk_is_archive", [False, True])
 def test_collision_keeps_distinct_archive_descendants(
     tmp_path: Path, disk_is_archive: bool

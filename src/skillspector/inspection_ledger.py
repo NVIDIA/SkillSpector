@@ -60,6 +60,8 @@ class LedgerReason(StrEnum):
     MISSING_FILE_CACHE = "missing_file_cache"
     SIZE_LIMIT = "size_limit"
     BINARY_CONTENT = "binary_content"
+    BINARY_TEXT_PROJECTION = "binary_text_projection"
+    BINARY_EXECUTABLE_TEXT = "binary_executable_text"
     EVAL_DATASET = "eval_dataset"
     SYNTAX_ERROR = "syntax_error"
     LLM_BATCH_FAILED = "llm_batch_failed"
@@ -126,6 +128,12 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.MISSING_FILE_CACHE: "Applicable analyzer could not obtain file content.",
     LedgerReason.SIZE_LIMIT: "File exceeds this analyzer's character limit.",
     LedgerReason.BINARY_CONTENT: "Binary content is unsupported by this analyzer.",
+    LedgerReason.BINARY_TEXT_PROJECTION: (
+        "Only bounded printable text was inspected; binary structure and behavior are outside scope."
+    ),
+    LedgerReason.BINARY_EXECUTABLE_TEXT: (
+        "Readable text was inspected, but binary executable behavior remains outside analyzer coverage."
+    ),
     LedgerReason.EVAL_DATASET: (
         "Evaluation dataset prose is excluded from static pattern analysis."
     ),
@@ -156,7 +164,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.MANIFEST_ABSENT: ("No compatible manifest was present for this analyzer."),
     LedgerReason.NO_APPLICABLE_FILES: ("No files matched this analyzer's applicability contract."),
     LedgerReason.OMS_SIGNATURE: (
-        "Recognized OMS signature metadata is excluded from content analysis."
+        "DSSE content decoding is incomplete or unsupported; raw fields were retained for inspection. Signature authenticity was not verified."
     ),
     LedgerReason.BASELINE_FILE: (
         "The explicitly selected suppression baseline is excluded from content analysis."

