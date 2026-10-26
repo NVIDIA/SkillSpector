@@ -2019,6 +2019,153 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
             yield start, parsed.end
 
 
+def _shell_quoted_candidate_limits(
+    content: str, check_runtime: Callable[[], None]
+) -> dict[int, int]:
+    """Prove single-line double-quote bounds by walking shell source in order.
+
+    This is only an ownership refinement, never an execution or finding parser.
+    Comments and single quotes cannot open double-quoted spans. Substitution
+    bodies have independent lexical state. Unsupported heredocs/backticks or
+    unresolved syntax discard ALL ownership, retaining the conservative scan.
+    """
+    limits: dict[int, int] = {}
+    parameter_cache: dict[int, _ParameterExpansionEnd] = {}
+    substitution_cache: dict[int, int | None] = {}
+
+    def walk(begin: int, end: int, depth: int = 0) -> bool:
+        if depth > 32:
+            return False
+        cursor = begin
+        word_started = False
+        quote: str | None = None
+        quote_start = begin
+        ansi_c = False
+        candidates: list[int] = []
+        while cursor < end:
+            if (cursor - begin) % 1024 == 0:
+                check_runtime()
+            character = content[cursor]
+            if quote == "'":
+                if character == "\\" and ansi_c:
+                    cursor += 2
+                    continue
+                if character == "'":
+                    quote = None
+                cursor += 1
+                continue
+            if character == "\\":
+                # In double quotes only these escapes consume the next byte.
+                if quote is None or (cursor + 1 < end and content[cursor + 1] in '$`"\\\n\r'):
+                    if quote is None and cursor + 1 < end and content[cursor + 1] not in "\r\n":
+                        word_started = True
+                    cursor += 2
+                    continue
+            if quote == '"' and character == '"':
+                if (
+                    "\n" not in content[quote_start:cursor]
+                    and "\r" not in content[quote_start:cursor]
+                ):
+                    for position in candidates:
+                        limits[position] = cursor
+                quote = None
+                cursor += 1
+                continue
+            if character == "`" or (quote is None and content.startswith("<<", cursor)):
+                return False
+            if quote is None and character == "#" and not word_started:
+                while cursor < end and content[cursor] not in "\r\n":
+                    cursor += 1
+                continue
+            if (
+                quote is None
+                and character == "$"
+                and content[cursor + 1 : cursor + 2] in {"'", '"'}
+            ):
+                quote = content[cursor + 1]
+                ansi_c = quote == "'"
+                quote_start = cursor + 1
+                candidates = []
+                word_started = True
+                cursor += 2
+                continue
+            if quote is None and character in "'\"":
+                quote = character
+                ansi_c = False
+                quote_start = cursor
+                candidates = []
+                word_started = True
+                cursor += 1
+                continue
+            if quote == '"' and _SHELL_COMMAND_WORD_START_RE.match(content, cursor):
+                candidates.append(cursor)
+            if content.startswith("$(", cursor) or (
+                quote is None and content[cursor : cursor + 2] in {"<(", ">("}
+            ):
+                substitution_end = _skip_command_substitution(
+                    content, cursor, end, check_runtime, end_cache=substitution_cache
+                )
+                if substitution_end is None or not walk(
+                    cursor + 2, substitution_end - 1, depth + 1
+                ):
+                    return False
+                cursor = substitution_end
+                word_started = True
+                continue
+            if content.startswith("${", cursor):
+                inherited_closed = [False]
+                parameter_end = _skip_parameter_expansion(
+                    content,
+                    cursor,
+                    end,
+                    check_runtime,
+                    end_cache=parameter_cache,
+                    inherited_double_quote=quote == '"',
+                    inherited_quote_closed=inherited_closed,
+                )
+                if parameter_end is None or inherited_closed[0]:
+                    return False
+                # Keep parameter bodies opaque to ownership. Nested commands
+                # remain independent candidates in the original scanner.
+                body = content[cursor:parameter_end]
+                if "`" in body or "<<" in body:
+                    return False
+                cursor = parameter_end
+                word_started = True
+                continue
+            if quote is None:
+                word_started = not (character.isspace() or character in ";|&()<>")
+            cursor += 1
+        return quote is None and cursor <= end
+
+    return limits if walk(0, len(content)) else {}
+
+
+def _quoted_candidate_is_complete(
+    content: str,
+    start: int,
+    quote_limits: dict[int, int] | None,
+    check_runtime: Callable[[], None],
+) -> bool:
+    """Refine a failure only inside a lexically proven shell quote.
+
+    Do not change the original parser's frontier or its quote ownership. A
+    shorter diagnostic parse must never hide candidates that the original
+    scan would inspect (including after a comment's mis-paired quote).
+    """
+    end = quote_limits.get(start) if quote_limits is not None else None
+    if end is None:
+        return False
+    fragment = content[start:end]
+    parsed = _parse_shell_command_word(fragment, 0, check_runtime=check_runtime)
+    if parsed is None or parsed.limited:
+        return False
+    return not (
+        parsed.dynamic
+        and _has_runtime_command_operand_exhaustion(fragment, 0, parsed.end, check_runtime)
+    )
+
+
 def _has_shell_command_word_exhaustion(
     content: str,
     check_runtime: Callable[[], None],
@@ -2027,6 +2174,7 @@ def _has_shell_command_word_exhaustion(
     structural_quote_openers: set[int] | None = None,
     python_source: _PythonSourceOwnership | None = None,
     perl_eval_blocks: bool = False,
+    quote_limits: dict[int, int] | None = None,
     _command_string_depth: int = 0,
 ) -> bool:
     """Find candidate command words whose deterministic parse hit a safety bound.
@@ -2116,7 +2264,8 @@ def _has_shell_command_word_exhaustion(
                 # shell quote it opens cannot continue into later host code.
                 unresolved_end = min(unresolved_end, python_source.word_end(start))
             if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS:
-                return True
+                if not _quoted_candidate_is_complete(content, start, quote_limits, check_runtime):
+                    return True
             continue
         # Comments end at a newline, and a quote after ``=`` in prose or host
         # source may be mis-paired. Such a word cannot own a later line.
@@ -2156,7 +2305,8 @@ def _has_shell_command_word_exhaustion(
             # parsed this position, so it only claims ownership.
             continue
         if parsed.limited:
-            return True
+            if not _quoted_candidate_is_complete(content, start, quote_limits, check_runtime):
+                return True
         if (
             parsed.dynamic
             and may_have_destructive_outer_operands
@@ -2169,6 +2319,8 @@ def _has_shell_command_word_exhaustion(
         ):
             comment = python_source.comment(start) if python_source is not None else None
             if comment is None:
+                if _quoted_candidate_is_complete(content, start, quote_limits, check_runtime):
+                    continue
                 # Host code after a Python string's closing quote is not shell
                 # text, so a command in the string takes operands only from
                 # the rest of the string's value, including literals
@@ -5274,6 +5426,11 @@ def _has_bounded_parse_exhaustion(
         structural_quote_openers=structural_quote_openers,
         python_source=python_source,
         perl_eval_blocks=file_type == "perl",
+        quote_limits=(
+            _shell_quoted_candidate_limits(content, check_runtime)
+            if file_type == "shell" and complete_context
+            else None
+        ),
     ):
         return True
     covered_until = 0
