@@ -54,6 +54,7 @@ from skillspector.llm_analyzer_base import (
 from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
+from skillspector.providers import NO_LLM_API_KEY_MESSAGE
 from skillspector.nodes.analyzers.pattern_defaults import (
     get_explanation,
     get_remediation,
@@ -981,16 +982,25 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
                 ],
                 "inference_usage": analyzer.inference_usage if analyzer is not None else [],
             }
+        missing_credentials = (
+            isinstance(e, ValueError) and str(e) == NO_LLM_API_KEY_MESSAGE
+        )
         post_response_value_error = (
             isinstance(e, ValueError) and analyzer is not None and analyzer.response_received
         )
-        if isinstance(e, ValueError) and not post_response_value_error:
+        if isinstance(e, ValueError) and not post_response_value_error and not missing_credentials:
             raise
         logger.warning("LLM call failed, passing all findings through (fail-closed): %s", e)
         filtered = _passthrough_with_defaults(findings)
         eligible_ids = {finding.finding_id for finding in eligible_findings}
         filtered = [
-            _mark_review_failed(finding) if finding.finding_id in eligible_ids else finding
+            (
+                _mark_unconfirmed(finding, "unavailable")
+                if missing_credentials
+                else _mark_review_failed(finding)
+            )
+            if finding.finding_id in eligible_ids
+            else finding
             for finding in filtered
         ]
         filtered_local = [finding for finding in filtered if finding.finding_id in local_only_ids]
