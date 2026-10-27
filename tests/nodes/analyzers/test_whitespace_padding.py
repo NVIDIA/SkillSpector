@@ -22,6 +22,8 @@ import pytest
 from skillspector.nodes.analyzers.whitespace_padding import (
     BLOCK_BYTE_BUDGET,
     HORIZONTAL_RUN_CHARS,
+    REPEATED_CHAR_THRESHOLD,
+    REPEATED_LINE_THRESHOLD,
     VERTICAL_BLANK_LINES,
     ZERO_WIDTH_CHARS,
     PaddingRun,
@@ -466,3 +468,98 @@ class TestIssue20AdversarialEvasionCoverage:
         assert p9, f"analyzer emitted no P9 finding for U+{ord(ch):04X}"
         assert p9[0].message == "Whitespace Padding"
         assert p9[0].matched_text, "P9 finding has empty matched_text"
+
+
+class TestRepetitionDetector:
+    """Regression tests for character and line repetition visual padding detection."""
+
+    def test_repeated_char_threshold_boundary_below(self):
+        """Content below REPEATED_CHAR_THRESHOLD does not produce repetition run."""
+        content = "a" * (REPEATED_CHAR_THRESHOLD - 1)
+        runs = detect_whitespace_padding(content)
+        reps = [r for r in runs if r.kind == "repetition"]
+        assert not reps
+
+    def test_repeated_char_threshold_boundary_at(self):
+        """Content exactly at REPEATED_CHAR_THRESHOLD produces a repetition run."""
+        content = "a" * REPEATED_CHAR_THRESHOLD
+        runs = detect_whitespace_padding(content)
+        reps = [r for r in runs if r.kind == "repetition"]
+        assert len(reps) == 1
+        assert reps[0].length == REPEATED_CHAR_THRESHOLD
+        assert reps[0].start_offset == 0
+        assert reps[0].end_offset == REPEATED_CHAR_THRESHOLD
+        assert "U+0061" in reps[0].summary
+
+    def test_repeated_char_threshold_boundary_above(self):
+        """Content above REPEATED_CHAR_THRESHOLD produces a repetition run of full length."""
+        content = "a" * (REPEATED_CHAR_THRESHOLD + 10)
+        runs = detect_whitespace_padding(content)
+        reps = [r for r in runs if r.kind == "repetition"]
+        assert len(reps) == 1
+        assert reps[0].length == REPEATED_CHAR_THRESHOLD + 10
+
+    @pytest.mark.parametrize("char", ["X", "9", "-", "#", "="])
+    def test_different_repeated_characters(self, char: str):
+        """Different non-whitespace characters are detected when repeated >= threshold."""
+        content = char * (REPEATED_CHAR_THRESHOLD + 5)
+        runs = detect_whitespace_padding(content)
+        reps = [r for r in runs if r.kind == "repetition"]
+        assert len(reps) == 1
+        assert f"U+{ord(char):04X}" in reps[0].summary
+
+    @pytest.mark.parametrize("u_char", ["\u4e00", "\u00e9", "\u03c0", "\u2603"])
+    def test_unicode_characters(self, u_char: str):
+        """Non-whitespace Unicode characters repeated >= threshold are detected."""
+        content = u_char * (REPEATED_CHAR_THRESHOLD + 2)
+        runs = detect_whitespace_padding(content)
+        reps = [r for r in runs if r.kind == "repetition"]
+        assert len(reps) == 1
+        assert reps[0].length == REPEATED_CHAR_THRESHOLD + 2
+        assert f"U+{ord(u_char):04X}" in reps[0].summary
+
+    def test_newline_containing_content(self):
+        """Repetition inside multiline text tracks correct line and offsets."""
+        prefix = "first line\nsecond line\n"
+        rep_chars = "Q" * (REPEATED_CHAR_THRESHOLD + 20)
+        suffix = "\nfinal line\n"
+        content = prefix + rep_chars + suffix
+        runs = detect_whitespace_padding(content)
+        reps = [r for r in runs if r.kind == "repetition" and "U+0051" in r.summary]
+        assert len(reps) == 1
+        assert reps[0].start_line == 3
+        assert reps[0].start_offset == len(prefix)
+        assert reps[0].end_offset == len(prefix) + len(rep_chars)
+        assert reps[0].followed_by_content is True
+
+    def test_empty_and_short_inputs(self):
+        """Empty and short inputs do not trigger repetition."""
+        assert not [r for r in detect_whitespace_padding("") if r.kind == "repetition"]
+        assert not [r for r in detect_whitespace_padding("a") if r.kind == "repetition"]
+        assert not [r for r in detect_whitespace_padding("abc" * 10) if r.kind == "repetition"]
+
+    def test_large_input_performance(self):
+        """Large content with mixed non-repeated and repeated sections processes cleanly."""
+        part1 = "normal text line with code\n" * 200
+        part2 = "Z" * (REPEATED_CHAR_THRESHOLD + 50) + "\n"
+        part3 = "more standard text content\n" * 200
+        content = part1 + part2 + part3
+        runs = detect_whitespace_padding(content)
+        reps = [r for r in runs if r.kind == "repetition" and "U+005A" in r.summary]
+        assert len(reps) == 1
+        assert reps[0].length == REPEATED_CHAR_THRESHOLD + 50
+
+    def test_repeated_line_threshold_boundary_below(self):
+        """Repeated non-empty lines below REPEATED_LINE_THRESHOLD do not produce line repetition run."""
+        content = "print('hello world')\n" * (REPEATED_LINE_THRESHOLD - 1)
+        runs = detect_whitespace_padding(content)
+        line_reps = [r for r in runs if r.kind == "repetition" and "line" in r.summary]
+        assert not line_reps
+
+    def test_repeated_line_threshold_boundary_at(self):
+        """Repeated non-empty lines at REPEATED_LINE_THRESHOLD produce line repetition run."""
+        content = "print('hello world')\n" * REPEATED_LINE_THRESHOLD
+        runs = detect_whitespace_padding(content)
+        line_reps = [r for r in runs if r.kind == "repetition" and "line" in r.summary]
+        assert len(line_reps) == 1
+        assert f"x{REPEATED_LINE_THRESHOLD}" in line_reps[0].summary

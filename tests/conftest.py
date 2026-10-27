@@ -96,3 +96,12 @@ def collect_secrets():
         encoding="utf-8",
     )
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def isolate_skill_inspector_data_dir(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+):
+    """Isolate the SKILL_INSPECTOR_DATA_DIR to a temporary directory for each test session or test."""
+    p = tmp_path_factory.mktemp("skill_inspector_data")
+    monkeypatch.setenv("SKILL_INSPECTOR_DATA_DIR", str(p))
