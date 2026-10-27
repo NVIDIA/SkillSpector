@@ -1,4 +1,4 @@
-# SkillSpector 2.13.3
+# SkillSpector 2.13.2
 
 This patch release builds on the published v2.13.1 maintenance release and
 backports three fixes for false incomplete-analysis reports. It preserves the
@@ -32,7 +32,7 @@ semantics and does not prove the absence of arbitrary runtime mutation or
 object getters. Existing findings and independent inspection limitations remain
 visible; these fixes do not suppress malformed provider responses.
 
-Regenerate and review exact version-bound finding baselines for 2.13.3 rather
+Regenerate and review exact version-bound finding baselines for 2.13.2 rather
 than relabeling baselines from another scanner version. The GitHub release
 provides a wheel and source distribution; the publication workflow does not
 publish to PyPI.
