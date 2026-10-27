@@ -576,21 +576,35 @@ def test_cli_scan_output_to_file(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "format,registry_mode",
-    [(format, False) for format in FormatChoice] + [(FormatChoice.json, True)],
+    "format,mode",
+    [(format, "scan") for format in FormatChoice]
+    + [(FormatChoice.json, "registry"), (FormatChoice.json, "baseline")],
 )
 @pytest.mark.parametrize(
-    "alias", ["same-path", "relative-path", "parent-path", "symlink", "symlink-parent", "hard-link"]
+    "alias",
+    [
+        "same-path",
+        "relative-path",
+        "parent-path",
+        "symlink",
+        "symlink-parent",
+        "hard-link",
+        "tilde",
+    ],
 )
 def test_cli_scan_rejects_output_alias_of_input_file(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     format: FormatChoice,
-    registry_mode: bool,
+    mode: str,
     alias: str,
 ) -> None:
     """An output alias must not replace the original input with its report."""
+    registry_mode = mode == "registry"
     source = tmp_path / ("registry.json" if registry_mode else "SKILL.md")
+    if alias == "tilde":
+        (tmp_path / "~").mkdir()
+        source = tmp_path / "~" / source.name
     original = (
         b'{"servers": []}'
         if registry_mode
@@ -601,6 +615,8 @@ def test_cli_scan_rejects_output_alias_of_input_file(
     monkeypatch.chdir(tmp_path)
     if alias == "relative-path":
         output = Path(source.name)
+    elif alias == "tilde":
+        output = Path("~") / source.name
     elif alias == "parent-path":
         nested = tmp_path / "nested"
         nested.mkdir()
@@ -627,9 +643,15 @@ def test_cli_scan_rejects_output_alias_of_input_file(
     scan_input = MagicMock(
         return_value={"report_body": "Scan report", "risk_score": 0, "findings": []}
     )
-    monkeypatch.setattr(cli, "scan_registry" if registry_mode else "_scan_skill", scan_input)
+    if mode == "baseline":
+        monkeypatch.setattr(cli.graph, "invoke", scan_input)
+    else:
+        monkeypatch.setattr(cli, "scan_registry" if registry_mode else "_scan_skill", scan_input)
 
-    args = ["scan", str(source), "--no-llm", "--format", format.value, "--output", str(output)]
+    args = ["baseline" if mode == "baseline" else "scan", str(source), "--no-llm"]
+    args += ["--output", str(output)]
+    if mode != "baseline":
+        args += ["--format", format.value]
     if registry_mode:
         args.append("--mcp-registry")
     result = runner.invoke(app, args)
@@ -639,6 +661,22 @@ def test_cli_scan_rejects_output_alias_of_input_file(
     assert source.read_bytes() == original
     assert output.read_bytes() == original
     scan_input.assert_not_called()
+
+
+@pytest.mark.parametrize("command", ["scan", "baseline"])
+@pytest.mark.parametrize("manifest", ["SKILL.md", "skill.md"])
+def test_cli_rejects_output_overwriting_directory_manifest(
+    tmp_path: Path, command: str, manifest: str
+) -> None:
+    source = tmp_path / manifest
+    original = "---\nname: protected\ndescription: Say hello.\n---\n# Hello\n"
+    source.write_text(original)
+    with patch("skillspector.cli.graph.invoke") as invoke:
+        result = runner.invoke(app, [command, str(tmp_path), "--no-llm", "--output", str(source)])
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert source.read_text() == original
+    invoke.assert_not_called()
 
 
 @pytest.mark.parametrize("format", list(FormatChoice))
