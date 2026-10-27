@@ -1030,6 +1030,26 @@ def test_nested_python_execution_surfaces_are_typed_and_prewarmed(
     assert parsed.is_parseable
 
 
+@pytest.mark.parametrize("suffix", ["mjs", "cjs"])
+def test_javascript_module_types_and_findings_survive_archive_inventory(
+    tmp_path: Path, suffix: str
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# JavaScript modules\n", encoding="utf-8")
+    content = b'const command = "rm -rf /";\n'
+    filename = f"helper.{suffix}"
+    (tmp_path / filename).write_bytes(content)
+    _write_archive(tmp_path / "bundle.zip", {filename: content})
+
+    context = build_context({"skill_path": str(tmp_path)})
+    paths = {filename, f"bundle.zip!/{filename}"}
+    metadata = {item["path"]: item for item in context["component_metadata"]}
+
+    assert all(metadata[path]["type"] == "javascript" for path in paths)
+    assert all(metadata[path]["executable"] for path in paths)
+    findings = analyze_tool_misuse(context)["findings"]
+    assert paths <= {finding.file for finding in findings if finding.rule_id == "TM1"}
+
+
 def test_nested_relative_selected_script_remains_partial(tmp_path: Path) -> None:
     """Archive provenance cannot establish the invocation working directory."""
     (tmp_path / "SKILL.md").write_text("# Nested Python\n", encoding="utf-8")

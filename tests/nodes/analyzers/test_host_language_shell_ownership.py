@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Valid Python and Perl syntax must not exhaust the bounded shell parser.
+"""Proven host-language syntax must not exhaust the bounded shell parser.
 
 Python string and comment tokens own their bytes, and Perl ``eval BLOCK`` is
 exception handling rather than a string reparse. Neither may turn ordinary
 host source into a ``static_parse_limit`` result, while genuinely unresolved
-shell text keeps its conservative partial outcome.
+shell text keeps its conservative partial outcome. Verified Node assertion
+messages may own template delimiters without hiding executable string contents.
 """
 
 from __future__ import annotations
@@ -449,6 +450,423 @@ def test_python_ownership_keeps_tool_misuse_detection() -> None:
 
     assert any(finding.rule_id == "TM1" for finding in result["findings"])
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+# --- Node assertion diagnostic templates ----------------------------------
+
+
+_JS_ASSERT_IMPORT = 'import check from "node:assert/strict";\n'
+_JS_ASSERT_CALL = 'check.equal(typeof row.name, "string", `${row.key} must be present`);\n'
+
+
+def _javascript(content: str, *, complete_context: bool = True) -> bool:
+    return tm.has_bounded_parse_exhaustion(
+        content, lambda: None, file_type="javascript", complete_context=complete_context
+    )
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        'import check from "node:assert";',
+        'import check from "node:assert/strict";',
+        "import * as check from 'node:assert';",
+        "import * as check from 'node:assert/strict';",
+    ],
+)
+def test_imported_node_assert_message_template_is_complete(declaration: str) -> None:
+    source = declaration + "\n" + _JS_ASSERT_CALL
+
+    assert _javascript(source) is False
+    assert _shell(source) is True
+
+
+@pytest.mark.parametrize(
+    "method,arguments",
+    [
+        ("ok", "valid"),
+        ("equal", "actual, expected"),
+        ("notEqual", "actual, expected"),
+        ("strictEqual", "actual, expected"),
+        ("notStrictEqual", "actual, expected"),
+        ("deepEqual", "actual, expected"),
+        ("notDeepEqual", "actual, expected"),
+        ("deepStrictEqual", "actual, expected"),
+        ("notDeepStrictEqual", "actual, expected"),
+        ("match", "actual, /value/"),
+        ("doesNotMatch", "actual, /value/"),
+        ("throws", "() => work(), undefined"),
+        ("doesNotThrow", "() => work(), undefined"),
+    ],
+)
+def test_node_assert_owns_only_its_message_argument(method: str, arguments: str) -> None:
+    source = _JS_ASSERT_IMPORT + f"check.{method}({arguments}, `${{row.key}} needs a value`);\n"
+
+    assert _javascript(source) is False
+
+
+@pytest.mark.parametrize("suffix", [".js", ".mjs", ".cjs", ".MJS"])
+def test_node_assert_message_ownership_reaches_static_ledger(suffix: str) -> None:
+    result = _ledger("scripts/check" + suffix, _JS_ASSERT_IMPORT + _JS_ASSERT_CALL)
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert not any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_node_assert_template_offsets_preserve_dangerous_neighbor(newline: str) -> None:
+    source = (
+        _JS_ASSERT_IMPORT
+        + "check.ok(ready, `café ${row.key} is ready`);\n"
+        + 'execSync("rm -rf /");\n'
+    ).replace("\n", newline)
+
+    result = _ledger("scripts/check.mjs", source)
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert any(
+        finding.rule_id == "TM1" and finding.start_line == 3 for finding in result["findings"]
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(_JS_ASSERT_CALL, id="unbound-name"),
+        pytest.param(
+            'import check from "custom-assert";\n' + _JS_ASSERT_CALL, id="non-node-import"
+        ),
+        pytest.param(
+            'import { strict as check } from "node:assert";\n' + _JS_ASSERT_CALL,
+            id="unsupported-named-import",
+        ),
+        pytest.param(_JS_ASSERT_IMPORT + "check = run;\n" + _JS_ASSERT_CALL, id="rebound"),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "function verify(check) {\n" + _JS_ASSERT_CALL + "}\n",
+            id="shadowed-parameter",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const alias = check;\n" + _JS_ASSERT_CALL, id="escaped-binding"
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const run = check.equal;\n" + _JS_ASSERT_CALL,
+            id="aliased-method",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const message = `${check}`;\n" + _JS_ASSERT_CALL,
+            id="binding-interpolated-elsewhere",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const message = `${check.equal}`;\n" + _JS_ASSERT_CALL,
+            id="method-interpolated-elsewhere",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal = run;\n" + _JS_ASSERT_CALL,
+            id="method-replacement",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + 'check["equal"] = run;\n' + _JS_ASSERT_CALL,
+            id="computed-replacement",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "Object.assign(check, { equal: run });\n" + _JS_ASSERT_CALL,
+            id="object-mutation",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + 'import alternate from "node:assert";\nalternate.equal = run;\n'
+            + _JS_ASSERT_CALL,
+            id="second-import-alias",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + 'require("node:assert/strict").equal = run;\n' + _JS_ASSERT_CALL,
+            id="require-alias",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + r'import alternate from "node:\u0061ssert";'
+            + "\nalternate.equal = run;\n"
+            + _JS_ASSERT_CALL,
+            id="escaped-module-import",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + r'require("node:\u0061ssert").equal = run;'
+            + "\n"
+            + _JS_ASSERT_CALL,
+            id="escaped-module-require",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + "const of = 1; const n = of / (check.equal = run) / divisor;\n"
+            + _JS_ASSERT_CALL,
+            id="division-after-contextual-keyword",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + "const n = holder.return / (check.equal = run) / divisor;\n"
+            + _JS_ASSERT_CALL,
+            id="division-after-keyword-property",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + 'check["equal"](a, b, `${row.key} is required`);\n',
+            id="computed-call",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check?.equal(a, b, `${row.key} is required`);\n",
+            id="optional-call",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check(a, `${row.key} is required`);\n",
+            id="unsupported-callable-assert",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(`${row.key}`, b);\n",
+            id="template-is-actual-value",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(a, b, `${row.key}`, extra);\n",
+            id="extra-argument",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(...values, `${row.key}`);\n",
+            id="spread-argument",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(a, b, tag`${row.key}`);\n",
+            id="tagged-message",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(a, b, (`${row.key}`));\n",
+            id="parenthesized-message",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + 'check.equal(a, b, `${row.key}` + " more");\n',
+            id="concatenated-message",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(a, b, message = `${row.key}`);\n",
+            id="assigned-message",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const message = `${row.key}`;\n",
+            id="unrelated-assignment",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "function message() { return `${row.key}`; }\n",
+            id="unrelated-return",
+        ),
+        pytest.param("#!/bin/sh\n" + _JS_ASSERT_IMPORT + _JS_ASSERT_CALL, id="shell-shebang"),
+        pytest.param(_JS_ASSERT_IMPORT + "check.equal(a, b, `${row.key}\n", id="unclosed-template"),
+        pytest.param(_JS_ASSERT_IMPORT + "check.equal(a, b, `${row.key`);\n", id="unclosed-field"),
+        pytest.param(_JS_ASSERT_IMPORT + _JS_ASSERT_CALL + "/* unfinished", id="unclosed-comment"),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const pattern = /unterminated\n" + _JS_ASSERT_CALL,
+            id="unclosed-regexp",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const pattern = /value/gg;\n" + _JS_ASSERT_CALL,
+            id="invalid-regexp-flags",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const pattern = /value\\\nmore/;\n" + _JS_ASSERT_CALL,
+            id="escaped-newline-in-regexp",
+        ),
+    ],
+)
+def test_unproven_node_assert_binding_or_message_is_not_projected(source: str) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert _javascript(source) is _shell(source)
+
+
+@pytest.mark.parametrize(
+    "operand",
+    [
+        "value!",
+        "value !",
+        "value /* gap */ !",
+        "value! /* gap */",
+        "holder.value!",
+        "getValue()!",
+        "(value)!",
+        "values[0]!",
+    ],
+)
+@pytest.mark.parametrize("file_type", ["javascript", "typescript"])
+def test_postfix_non_null_assertion_cannot_hide_receiver_mutation(
+    operand: str, file_type: str
+) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = (
+        _JS_ASSERT_IMPORT
+        + f"const n = {operand} / (check.equal = run) / divisor;\n"
+        + _JS_ASSERT_CALL
+    )
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type) is True
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ["!value", "!!value", "!/value/.test(input)", "value != other", "value !== other"],
+)
+def test_prefix_negation_and_inequality_keep_assert_message_ownership(expression: str) -> None:
+    source = _JS_ASSERT_IMPORT + f"const ready = {expression};\n" + _JS_ASSERT_CALL
+
+    assert _javascript(source) is False
+    assert _shell(source) is True
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "",
+        "const n = value! / (check.equal = run) / divisor;\n",
+        "const n = factory<number> / (check.equal = run) / divisor;\n",
+    ],
+)
+def test_typescript_does_not_borrow_javascript_assert_ownership(statement: str) -> None:
+    source = _JS_ASSERT_IMPORT + statement + _JS_ASSERT_CALL
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="typescript") is True
+    result = _ledger("scripts/check.ts", source)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "prefix,message",
+    [
+        ("// check.equal = run;\n", "ready ${row.key}"),
+        ("/* check is a diagnostic receiver */\n", "ready ${row.key}"),
+        (r"""const pattern = /['"]/;""" + "\n", "ready ${row.key}"),
+        ("", r"escaped \` delimiter ${row.key}"),
+        ("", "multiple ${label} and ${row.key} values"),
+    ],
+)
+def test_node_assert_projection_changes_only_proven_delimiters(prefix: str, message: str) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = _JS_ASSERT_IMPORT + prefix + f"check.equal(a, b, `{message}`);\n"
+    opening = source.index("`", len(_JS_ASSERT_IMPORT + prefix))
+    closing = source.rindex("`")
+
+    projected = assertion_template_shell_text(source, lambda: None)
+
+    assert len(projected) == len(source)
+    assert [
+        index
+        for index, pair in enumerate(zip(source, projected, strict=True))
+        if pair[0] != pair[1]
+    ] == [
+        opening,
+        closing,
+    ]
+    assert projected[opening] == projected[closing] == " "
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "execSync(obj.cmd)",
+        "new Command(obj.cmd)",
+        "(target = obj.cmd)",
+        "counter++",
+        "++counter",
+        "obj[key]",
+        "obj?.cmd",
+        "`nested ${obj.cmd}`",
+    ],
+)
+def test_effectful_or_unproven_assert_interpolation_is_not_projected(expression: str) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = _JS_ASSERT_IMPORT + f"check.equal(a, b, `${{{expression}}} ready`);\n"
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert _javascript(source) is _shell(source)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "execSync(`${obj.cmd}`);",
+        "run(`${obj.cmd}`);",
+        "execSync(`${getCmd()}`);",
+        "execSync(`${cmd} -rf /`);",
+        "execSync(`${obj.cmd} -rf /`);",
+        'execSync(`${obj.cmd}` + " -rf /");',
+    ],
+)
+def test_node_assert_message_fix_keeps_unresolved_shell_commands_partial(statement: str) -> None:
+    source = _JS_ASSERT_IMPORT + _JS_ASSERT_CALL + statement + "\n"
+
+    assert _javascript(source) is True
+    result = _ledger("scripts/check.mjs", source)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "run(`${cmd}`);",
+        "sh`${obj.cmd}`;",
+        "sh`${obj.cmd} -rf /`;",
+        "execSync(String.raw`${obj.cmd}`);",
+        'execSync(`${cmd}` + " -rf /");',
+    ],
+)
+def test_unrecognized_template_consumers_keep_existing_behavior(statement: str) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = _JS_ASSERT_IMPORT + statement + "\n"
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert _javascript(source) is _shell(source)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "execSync(`rm -rf /`);",
+        "check.equal(a, b, `${execSync('rm -rf /')} ready`);",
+        "check.equal(a, b, `rm -rf / ${row.key}`);",
+    ],
+)
+def test_assert_template_ownership_preserves_destructive_text(statement: str) -> None:
+    result = _ledger("scripts/check.mjs", _JS_ASSERT_IMPORT + statement + "\n")
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+def test_node_assert_message_ownership_requires_complete_javascript_context() -> None:
+    source = _JS_ASSERT_IMPORT + _JS_ASSERT_CALL
+
+    assert _javascript(source, complete_context=False) is True
+    assert _shell(source) is True
+
+
+def test_node_assert_template_scan_propagates_runtime_interruptions() -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    def check_runtime() -> None:
+        raise TimeoutError("test runtime bound")
+
+    with pytest.raises(TimeoutError, match="test runtime bound"):
+        assertion_template_shell_text(_JS_ASSERT_IMPORT + _JS_ASSERT_CALL * 1000, check_runtime)
+
+
+def test_oversized_javascript_does_not_gain_template_ownership() -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = _JS_ASSERT_IMPORT + "/*" + "x" * 1_100_000 + "*/\n" + _JS_ASSERT_CALL
+
+    assert assertion_template_shell_text(source, lambda: None) == source
 
 
 # --- Whole-scan accounting -------------------------------------------------
