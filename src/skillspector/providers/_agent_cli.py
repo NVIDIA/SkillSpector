@@ -1011,7 +1011,7 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
 
     ``--disallow-temp-dir``
         Prevent automatic access to the system temporary directory
-        (verified live on 1.0.95: inference from a temp working dir
+        (verified live on 1.0.103: inference from a temp working dir
         still answers exactly; --help surface re-verified on 1.0.103).
 
     Deliberately NOT included:
@@ -1064,10 +1064,9 @@ def _parse_copilot_output(raw: str) -> str:
     Supported runtime is exactly ``_COPILOT_SUPPORTED_VERSION``
     (currently 1.0.103: the version gate refuses anything else, so
     this parser only ever runs on that release). Output shape proven
-    live on 1.0.95 (``-s`` emits only the response text; 2026-10-11
-    nonce probe from a temp working dir returned the exact string);
-    on 1.0.103 the flag is confirmed present via ``--help``, with the
-    live shape re-probe pending.
+    live on 1.0.103 (``-s`` emits only the response text; 2026-10-27
+    nonce probes from both the repo and a temp working dir returned
+    the exact string).
     The whole stripped output is the reply; empty output raises fail-closed
     (an empty response must never be mistaken for a clean analysis).
     """
