@@ -164,7 +164,7 @@ _SHELL_CLAUSE_PREFIX_WORDS = frozenset({"do", "else", "elif", "then", "time", "!
 _SHELL_ASSIGNMENT_PREFIX_WORDS = _SHELL_CLAUSE_PREFIX_WORDS | frozenset(
     {"if", "while", "until", "export", "local", "declare", "readonly", "typeset"}
 )
-_SHELL_REDIRECTION_PREFIX_RE = re.compile(r"(?:[0-9]+)?(?:&>>?|<>|>>?|<<-?|>&|<&|[<>])")
+_SHELL_REDIRECTION_PREFIX_RE = re.compile(r"(?:[0-9]+)?(?:&>>?|<>|>&|<&|>>?|<<-?|[<>])")
 _RECURSIVE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*[rR]|-recursive)")
 _FORCE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*f|-force)")
 _MARKDOWN_CONTRACTION_PROSE_RE = re.compile(
@@ -2427,6 +2427,9 @@ def _command_string_from_clause(
                 if not option.startswith("-"):
                     pending = option
                     break
+                # Unlike nice/xargs, sudo's -n is a flag, not an operand option.
+                if command == "sudo" and option == "-n":
+                    continue
                 if option in {
                     "-u",
                     "-g",

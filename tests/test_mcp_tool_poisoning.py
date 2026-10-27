@@ -1956,6 +1956,140 @@ class TestInspectionLedgerStatus:
 
 
 class TestResourceBounds:
+    @pytest.mark.parametrize(
+        ("fence_count", "expected_calls", "is_partial"),
+        [(64, 64, False), (65, 65, False), (128, 128, False), (129, 128, True)],
+    )
+    def test_tp4_batch_boundaries_preserve_late_findings_and_source_ranges(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fence_count: int,
+        expected_calls: int,
+        is_partial: bool,
+    ) -> None:
+        content = "".join(f"```python\nprint({index})\n```\n" for index in range(fence_count))
+        responses = [{"is_mismatch": False} for _ in range(expected_calls - 1)]
+        responses.append(
+            {
+                "is_mismatch": True,
+                "confidence": 0.9,
+                "mismatched_capabilities": ["network access"],
+            }
+        )
+        structured = _mock_tp4_structured_llm(monkeypatch, responses)
+
+        result = node(
+            {
+                "manifest": {"name": "bounded", "description": "Runs local calculations."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "use_llm": True,
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert structured.calls == expected_calls
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        completed = [event for event in semantic if event["outcome"] is LedgerOutcome.COMPLETED]
+        assert [(event["path"], event["start_line"], event["end_line"]) for event in completed] == [
+            ("guide.md", index * 3 + 2, index * 3 + 2) for index in range(expected_calls)
+        ]
+        finding = result["findings"][0]
+        assert len(result["findings"]) == 1
+        assert finding.evidence["code_path"] == "guide.md"
+        assert finding.evidence["code_start_line"] == (expected_calls - 1) * 3 + 2
+        assert finding.evidence["code_end_line"] == (expected_calls - 1) * 3 + 2
+        assert completed[-1]["emitted_finding_ids"] == [finding.finding_id]
+        partial = [event for event in semantic if event["outcome"] is LedgerOutcome.PARTIAL]
+        if is_partial:
+            assert len(partial) == 1
+            assert partial[0]["path"] == "guide.md"
+            assert partial[0]["reason_code"] is LedgerReason.OUTPUT_LIMIT
+            assert partial[0]["observed_records"] == 129
+            assert partial[0]["limit_records"] == 128
+            assert result["analyzer_status_events"][0]["status"] == "degraded"
+        else:
+            assert partial == []
+            assert result["analyzer_status_events"][0]["status"] == "completed"
+
+    @pytest.mark.parametrize("tail", ["oversized", "provider_error", "deadline"])
+    def test_tp4_late_incomplete_work_remains_visible(
+        self, monkeypatch: pytest.MonkeyPatch, tail: str
+    ) -> None:
+        content = "```python\nprint('local')\n```\n" * 64
+        responses: list[object] = [{"is_mismatch": False} for _ in range(64)]
+        if tail == "oversized":
+            content += "```python\n" + "x" * 128_000 + "\n```\n"
+            expected_outcome = LedgerOutcome.PARTIAL
+            expected_reason = LedgerReason.SIZE_LIMIT
+        else:
+            content += "```python\nprint('last')\n```\n"
+            if tail == "provider_error":
+                responses.append(RuntimeError("provider failure"))
+                expected_outcome = LedgerOutcome.FAILED
+                expected_reason = LedgerReason.LLM_BATCH_FAILED
+            else:
+                responses.append(mcp_tool_poisoning.LLMRuntimeLimitError("deadline"))
+                expected_outcome = LedgerOutcome.PARTIAL
+                expected_reason = LedgerReason.RUNTIME_LIMIT
+        structured = _mock_tp4_structured_llm(monkeypatch, responses)
+
+        result = node(
+            {
+                "manifest": {"name": "bounded", "description": "Runs local calculations."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "use_llm": True,
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert structured.calls == (64 if tail == "oversized" else 65)
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        assert sum(event["outcome"] is LedgerOutcome.COMPLETED for event in semantic) == 64
+        incomplete = [
+            event for event in semantic if event["outcome"] is not LedgerOutcome.COMPLETED
+        ]
+        assert len(incomplete) == 1
+        assert incomplete[0]["outcome"] is expected_outcome
+        assert incomplete[0]["reason_code"] is expected_reason
+        assert incomplete[0]["path"] == "guide.md"
+        assert incomplete[0]["start_line"] == incomplete[0]["end_line"] == 194
+        assert result["analyzer_status_events"][0]["status"] == (
+            "failed" if tail == "provider_error" else "degraded"
+        )
+
+    def test_tp4_expanded_batch_allowance_keeps_finding_output_cap(self, monkeypatch):
+        structured = _mock_tp4_structured_llm(
+            monkeypatch,
+            [
+                {
+                    "is_mismatch": True,
+                    "confidence": 0.9,
+                    "mismatched_capabilities": [f"undeclared capability {index}"],
+                }
+                for index in range(65)
+            ],
+        )
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Runs local calculations."},
+                "file_cache": {"guide.md": "```python\nprint('local')\n```\n" * 65},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert structured.calls == 65
+        assert len(result.findings) == 64
+        partial = [event for event in result.ledger if event["outcome"] is LedgerOutcome.PARTIAL]
+        assert len(partial) == 1
+        assert partial[0]["reason_code"] is LedgerReason.OUTPUT_LIMIT
+        assert partial[0]["observed_findings"] == 65
+        assert partial[0]["limit_findings"] == 64
+        assert partial[0]["path"] == "guide.md"
+        assert partial[0]["start_line"] == partial[0]["end_line"] == 194
+
     def test_static_finding_cap_is_enforced_during_detector_construction(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
