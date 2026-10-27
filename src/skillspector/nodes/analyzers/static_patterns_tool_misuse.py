@@ -41,6 +41,7 @@ from skillspector.artifacts import (
     normalized_security_view,
     security_text_views,
 )
+from skillspector.javascript_tokens import assertion_template_shell_text
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
@@ -5268,10 +5269,18 @@ def _has_bounded_parse_exhaustion(
             complete_context=complete_context,
             word_apostrophes=word_apostrophes,
         )
+    # Diagnostic template delimiters belong to JavaScript only when the whole
+    # source proves their assertion-message owner. Destructive checks stay raw.
+    # TypeScript's postfix/type expressions need a separate lexical proof.
+    shell_word_content = (
+        assertion_template_shell_text(content, check_runtime)
+        if file_type == "javascript" and complete_context
+        else content
+    )
     # Perl ``eval BLOCK`` is recognized from its clause-initial ``eval`` and the
     # adjacent brace alone, so unlike quote ownership it needs no full context.
     if _has_shell_command_word_exhaustion(
-        content,
+        shell_word_content,
         check_runtime,
         structural_quote_closers=structural_quote_closers,
         structural_quote_openers=structural_quote_openers,
