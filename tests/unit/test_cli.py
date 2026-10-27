@@ -679,6 +679,21 @@ def test_cli_rejects_output_overwriting_directory_manifest(
     invoke.assert_not_called()
 
 
+def test_cli_baseline_preserves_local_input_with_remote_like_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source = Path("git@notes.md")
+    original = "---\nname: protected\ndescription: Say hello.\n---\n# Hello\n"
+    source.write_text(original)
+    with patch("skillspector.cli.graph.invoke") as invoke:
+        result = runner.invoke(app, ["baseline", str(source), "--no-llm", "-o", str(source)])
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert source.read_text() == original
+    invoke.assert_not_called()
+
+
 @pytest.mark.parametrize("format", list(FormatChoice))
 @pytest.mark.parametrize("destination", ["new", "existing", "same-name"])
 def test_cli_scan_preserves_input_when_writing_a_separate_report(

@@ -3472,9 +3472,7 @@ def baseline(
         to_stdout = str(output) == "-"
         if not to_stdout:
             require_secure_file_output()
-            if not input_path.strip().startswith(("http://", "https://", "git@")):
-                local_path = validate_local_input_path(Path(input_path.strip()))
-                _validate_report_destination(local_path, output)
+            _validate_report_destination(Path(input_path.strip()), output)
         if verbose:
             set_level("DEBUG")
             err_console.print("[dim]Scanning to build baseline...[/dim]")
