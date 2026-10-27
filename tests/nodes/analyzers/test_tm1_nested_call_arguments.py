@@ -27,6 +27,15 @@ def _tm1(content: str, path: str = "run.py") -> list:
             "subprocess.run(\n    'tar {}'.format(shlex.quote(path)),\n    shell=True,\n)",
             id="multiline",
         ),
+        pytest.param('subprocess.run("echo :(", shell=True)', id="unbalanced_open_in_string"),
+        pytest.param(
+            "subprocess.run(\"grep -E '(foo|bar' log\", shell=True)",
+            id="unbalanced_regex_in_string",
+        ),
+        pytest.param("subprocess.run('echo )', shell=True)", id="close_paren_in_string"),
+        pytest.param(
+            "subprocess.run(cmd,  # don't quote\n    shell=True)", id="apostrophe_in_comment"
+        ),
     ],
 )
 def test_shell_true_after_nested_call_argument_is_detected(call: str) -> None:

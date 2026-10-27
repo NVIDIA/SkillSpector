@@ -249,8 +249,14 @@ _SHELL_NAME_ARGUMENT_RE = re.compile(r"\bshell\s*=\s*\w+", re.IGNORECASE)
 # Arguments preceding a keyword in the same call. Balanced parentheses up to
 # two levels deep are consumed so that a nested call in the command argument
 # (``" ".join(sys.argv[1:])``, ``"{}".format(x)``) does not end the match,
-# while an unmatched ``)`` still closes the call.
-_CALL_ARGUMENTS_PREFIX = r"(?:[^()]|\((?:[^()]|\([^()]*\))*\))*"
+# while an unmatched ``)`` still closes the call. A single-line quoted string
+# is consumed as one token so a parenthesis inside it (``"echo :("``) is not
+# counted. An unterminated quote (an apostrophe in a comment) runs to the end
+# of the line, so no character is scanned twice.
+_CALL_ARGUMENT_TOKEN = r"""(?>'(?:[^'\\\n]|\\.)*'?|"(?:[^"\\\n]|\\.)*"?|[^()])"""
+_CALL_ARGUMENTS_PREFIX = (
+    rf"(?:{_CALL_ARGUMENT_TOKEN}|\((?:{_CALL_ARGUMENT_TOKEN}|\({_CALL_ARGUMENT_TOKEN}*\))*\))*"
+)
 
 # TM1: Tool Parameter Abuse — dangerous parameter values
 DIRECT_SHELL_TRUE_PATTERNS: tuple[tuple[str, float], ...] = (
