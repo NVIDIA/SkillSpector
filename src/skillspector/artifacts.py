@@ -47,6 +47,7 @@ class ReferenceKind(StrEnum):
     """Syntactic use that produced one intra-bundle reference."""
 
     MARKDOWN_IMAGE = "markdown_image"
+    DOCUMENTATION_IMAGE = "documentation_image"
     MARKDOWN_LINK = "markdown_link"
     INLINE_COMMAND = "inline_command"
     QUOTED_OR_CODE = "quoted_or_code"
@@ -80,6 +81,7 @@ class BundleReference(TypedDict):
     status: str
     disposition: ArtifactDisposition
     reference_kind: ReferenceKind
+    source_sha256: NotRequired[str]
 
 
 @dataclass(frozen=True)

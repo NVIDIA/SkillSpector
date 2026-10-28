@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import posixpath
 import re
@@ -45,6 +46,15 @@ _HTML_CONTEXT_START = re.compile(
 )
 _QUOTED_OR_CODE_PATH = re.compile(
     r"(?:`|'|\")((?:\./)?(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?:`|'|\")"
+)
+# A declaration is a complete documentation line, not a command operand or a
+# claim inferred from nearby natural-language instructions. Keep the initial
+# grammar intentionally smaller than Markdown's general inline-code grammar.
+_DOCUMENTATION_IMAGE_DECLARATION = re.compile(
+    r"(?:Asset|Image|Illustration|Diagram|Figure|Screenshot|Photo|Picture)"
+    r":[ \t]+`((?:\./)?(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:png|jpg|jpeg))`"
+    r"\.?[ \t]*",
+    re.IGNORECASE,
 )
 # An interpreter command is an explicit path signal, but only its immediate
 # script operand is eligible.  Searching the rest of the code span would turn
@@ -274,6 +284,7 @@ def _candidate_strings(
     *,
     deadline: float,
     clock: Callable[[], float],
+    corroborate_images: bool = False,
 ) -> tuple[list[tuple[str, int, int, str, ReferenceKind]], tuple[str, ...]]:
     """Extract path-like strings without materializing all matches or lines.
 
@@ -289,10 +300,24 @@ def _candidate_strings(
     in_html = False
     html_end: re.Pattern[str] | None = None
     inline_code_delimiter: int | None = None
+    in_frontmatter = False
+    previous_line_blank = True
+    source_offset = 0
     for line_number, line in enumerate(StringIO(text), 1):
         if clock() >= deadline:
             return candidates, ("runtime",)
         stripped_line = line.rstrip("\r\n")
+        source_offset += len(line)
+        following_line_blank = source_offset == len(text) or bool(
+            re.match(r"[ \t]{0,3}(?:\r?\n|\Z)", text[source_offset : source_offset + 5])
+        )
+        line_in_frontmatter = in_frontmatter
+        frontmatter_marker = stripped_line.strip(" \t")
+        if line_number == 1 and frontmatter_marker.removeprefix("\ufeff").strip(" \t") == "---":
+            in_frontmatter = line_in_frontmatter = True
+        elif in_frontmatter and frontmatter_marker in {"---", "..."}:
+            in_frontmatter = False
+        line_started_in_inline_code = inline_code_delimiter is not None
         block_line, quote_depth, has_list, prefix_width = _markdown_block_view(stripped_line)
         fence_match = _MARKDOWN_FENCE.fullmatch(block_line)
         line_in_fence = active_fence is not None
@@ -340,6 +365,20 @@ def _candidate_strings(
                 in_html = False
                 html_end = None
         cleaned_line = " ".join(line.strip().split())
+        declaration = (
+            _DOCUMENTATION_IMAGE_DECLARATION.fullmatch(stripped_line)
+            if len(stripped_line) <= _MAX_MARKDOWN_DESTINATION_CHARS
+            and previous_line_blank
+            and following_line_blank
+            and not line_in_frontmatter
+            and not line_in_fence
+            and not line_is_indented_code
+            and not line_in_html
+            and not line_started_in_inline_code
+            and not quote_depth
+            and not has_list
+            else None
+        )
         iterators = [
             _markdown_candidates(line, deadline=deadline, clock=clock, limitations=limitations),
             _pattern_candidates(_INLINE_CODE_COMMAND_PATH, line, ReferenceKind.INLINE_COMMAND),
@@ -361,13 +400,22 @@ def _candidate_strings(
                 return candidates, ("runtime",)
             sort_start, pattern_index, match = heapq.heappop(pending)
             reference_kind = match.kind
+            if (
+                reference_kind is ReferenceKind.QUOTED_OR_CODE
+                and declaration is not None
+                and match.start == declaration.start(1)
+                and match.end == declaration.end(1)
+                and match.raw == declaration.group(1)
+            ):
+                reference_kind = ReferenceKind.DOCUMENTATION_IMAGE
             if not line_in_fence and not line_is_indented_code and not line_in_html:
                 inline_code_cursor, inline_code_delimiter = _advance_inline_code_state(
                     line, sort_start, inline_code_cursor, inline_code_delimiter
                 )
             if reference_kind is ReferenceKind.MARKDOWN_IMAGE:
                 if (
-                    line_in_fence
+                    (corroborate_images and line_in_frontmatter)
+                    or line_in_fence
                     or line_is_indented_code
                     or line_in_html
                     or inline_code_delimiter is not None
@@ -422,6 +470,7 @@ def _candidate_strings(
             )
         if closes_fence:
             active_fence = None
+        previous_line_blank = not stripped_line.strip()
     return candidates, tuple(sorted(limitations))
 
 
@@ -443,6 +492,53 @@ def _normalize_candidate(raw: str, source_path: str) -> str | None:
     if joined in {"", ".", ".."} or joined.startswith("../"):
         return None
     return joined.removeprefix("./")
+
+
+def documentation_image_provenance(
+    source_path: str,
+    source_bytes: bytes,
+    *,
+    deadline: float,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[str, frozenset[tuple[int, int, str, str]]] | None:
+    """Reconstruct passive image identities from bounded canonical source bytes.
+
+    No filesystem reads or basename inference are performed. A truncated source
+    or extraction cannot establish that all uses of an asset were observed.
+    Callers cache this result per source and share an aggregate time/byte budget.
+    """
+    if len(source_bytes) > MAX_REFERENCE_SOURCE_BYTES or clock() >= deadline:
+        return None
+    try:
+        source = source_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    candidates, limitations = _candidate_strings(
+        source, deadline=deadline, clock=clock, corroborate_images=True
+    )
+    if limitations or clock() >= deadline:
+        return None
+    identities = set()
+    non_passive_targets: set[str] = set()
+    non_passive_basenames: set[str] = set()
+    for raw, line, column, _evidence_text, kind in candidates:
+        target = _normalize_candidate(raw, source_path)
+        if kind in {ReferenceKind.DOCUMENTATION_IMAGE, ReferenceKind.MARKDOWN_IMAGE}:
+            if target is not None:
+                identities.add((line, column, target, str(kind)))
+        elif target is not None:
+            non_passive_targets.add(target)
+            if "/" not in unquote(raw).replace("\\", "/"):
+                # The public resolver may resolve a unique basename elsewhere
+                # in the inventory. Do not let a missing/altered public record
+                # hide that independent ambiguous or executable use.
+                non_passive_basenames.add(PurePosixPath(target).name)
+    return hashlib.sha256(source_bytes).hexdigest(), frozenset(
+        identity
+        for identity in identities
+        if identity[2] not in non_passive_targets
+        and PurePosixPath(identity[2]).name not in non_passive_basenames
+    )
 
 
 def resolve_bundle_references_with_metadata(
@@ -495,6 +591,7 @@ def resolve_bundle_references_with_metadata(
     limitations = ["input_bytes"] if input_limited else []
     limitations.extend(candidate_limitations)
     records: list[BundleReference] = []
+    source_sha256: str | None = None
     accepted_keys: set[tuple[str, str]] = set()
     for raw, line, column, evidence, reference_kind in candidates:
         if clock() > effective_deadline:
@@ -550,6 +647,15 @@ def resolve_bundle_references_with_metadata(
                 "reference_kind": reference_kind,
             }
         )
+        needs_provenance = reference_kind is ReferenceKind.DOCUMENTATION_IMAGE or (
+            reference_kind is ReferenceKind.MARKDOWN_IMAGE
+            and resolved_target is not None
+            and PurePosixPath(resolved_target).suffix.lower() in {".jpg", ".jpeg"}
+        )
+        if needs_provenance and not input_limited:
+            if source_sha256 is None:
+                source_sha256 = hashlib.sha256(encoded_prefix).hexdigest()
+            records[-1]["source_sha256"] = source_sha256
     stable_limitations = tuple(dict.fromkeys(limitations))
     runtime_seconds = max(0.0, clock() - started_at)
     if runtime_seconds >= runtime_limit and "runtime" not in stable_limitations:
