@@ -125,6 +125,19 @@ class _StructuredResponseValidationError(Exception):
     """Signal that provider output failed structured-response validation."""
 
 
+def _require_structured_response(response: object) -> None:
+    """Reject a structured-output call that produced no result.
+
+    LangChain's tool-call parsers return ``None`` when the reply contains no
+    tool call, for example a forced tool call answered in prose. Treat that as
+    a malformed structured response so it gets the same bounded retries,
+    instead of passing ``None`` to ``parse_response``, which expects a parsed
+    schema object.
+    """
+    if response is None:
+        raise StructuredOutputParseError("model returned no structured response")
+
+
 class LLMRuntimeLimitError(RuntimeError):
     """Signal that no shared scan time remains for an LLM operation."""
 
@@ -1178,6 +1191,7 @@ class LLMAnalyzerBase:
         if structured_llm:
             try:
                 response = _invoke_with_usage(structured_llm, prompt, self._usage_collector)
+                _require_structured_response(response)
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError from exc
         else:
@@ -1267,6 +1281,7 @@ class LLMAnalyzerBase:
         if structured_llm:
             try:
                 response = await _ainvoke_with_usage(structured_llm, prompt, self._usage_collector)
+                _require_structured_response(response)
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError from exc
         else:
@@ -1439,8 +1454,9 @@ class LLMAnalyzerBase:
         retries so each coordinator retry can re-check and cap its delay
         against remaining time.
         Unrecovered errors cost only their own batch and are omitted from the result.
-        Malformed structured responses (Pydantic ``ValidationError`` or CLI
-        JSON parse failures) receive three bounded exponential-backoff retries
+        Malformed structured responses (Pydantic ``ValidationError``, CLI
+        JSON parse failures, or no structured result at all) receive three
+        bounded exponential-backoff retries
         and are then isolated to their batch. A batch makes at most seven outer
         chat-model invocations even when both
         retry policies apply; native provider retries can make additional HTTP
