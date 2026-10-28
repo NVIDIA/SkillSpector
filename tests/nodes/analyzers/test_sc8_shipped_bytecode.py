@@ -150,7 +150,7 @@ def test_nested_executable_in_default_exclusion_blocks_install(tmp_path: Path) -
 
 
 def test_ordinary_binary_executable_cannot_remain_safe(tmp_path: Path) -> None:
-    """A visible executable excluded as binary still receives the property-based floor."""
+    """Inspecting a binary's text strings does not verify executable behavior."""
     (tmp_path / "SKILL.md").write_text("# Binary executable\n", encoding="utf-8")
     (tmp_path / "payload.exe").write_bytes(b"MZ\x00\x00binary payload")
 
@@ -163,8 +163,9 @@ def test_ordinary_binary_executable_cannot_remain_safe(tmp_path: Path) -> None:
     report = json.loads(result.output)
     issue = next(item for item in report["issues"] if item["location"]["file"] == "payload.exe")
     assert issue["id"] == "SC9"
-    assert issue["evidence"]["excluded_from_analysis"] is True
-    assert issue["evidence"]["inherited_exclusion_reason"] == "binary_content"
+    assert issue["evidence"]["excluded_from_analysis"] is False
+    assert issue["evidence"]["partially_analyzed_executable"] is True
+    assert issue["evidence"]["inherited_exclusion_reason"] == "binary_executable_text"
     assert report["risk_assessment"]["score"] >= 51
     assert report["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
 
@@ -313,3 +314,73 @@ def test_sc8_cli_projects_truncation_into_analysis_completeness(
         item["reason_code"] == LedgerReason.ARTIFACT_COUNT_LIMIT.value
         for item in completeness["ledger_exceptions"]
     )
+
+
+class _FakeClock:
+    """Stand-in for ``time`` whose two clocks advance independently per read."""
+
+    def __init__(self, *, wall_step: float, cpu_step: float) -> None:
+        self._wall = 0.0
+        self._cpu = 0.0
+        self._wall_step = wall_step
+        self._cpu_step = cpu_step
+
+    def monotonic(self) -> float:
+        self._wall += self._wall_step
+        return self._wall
+
+    def thread_time(self) -> float:
+        self._cpu += self._cpu_step
+        return self._cpu
+
+
+def _nested_clean_tree(root: Path) -> None:
+    for name in ("features/a/references", "features/b/references", "scripts/engine"):
+        directory = root / name
+        directory.mkdir(parents=True)
+        (directory / "notes.md").write_text("x\n", encoding="utf-8")
+
+
+def test_sc8_walk_ignores_time_spent_waiting_for_other_analyzers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Concurrent analyzers hold the GIL, so each step of the walk can wait a
+    # long time while doing almost no work of its own (SKILLEVAL-17).
+    _nested_clean_tree(tmp_path)
+    monkeypatch.setattr(supply_chain, "time", _FakeClock(wall_step=1.0, cpu_step=0.0))
+
+    result = supply_chain._scan_shipped_bytecode(str(tmp_path))
+
+    assert result.findings == []
+    assert result.limitations == []
+
+
+def test_sc8_processing_budget_still_bounds_the_walk(tmp_path: Path, monkeypatch) -> None:
+    _nested_clean_tree(tmp_path)
+    monkeypatch.setattr(supply_chain, "time", _FakeClock(wall_step=0.0, cpu_step=1.0))
+
+    result = supply_chain._scan_shipped_bytecode(str(tmp_path))
+
+    assert len(result.limitations) == 1
+    limitation = result.limitations[0]
+    assert limitation.reason is LedgerReason.RUNTIME_LIMIT
+    assert limitation.limit_seconds == supply_chain.MAX_SC8_ANALYSIS_SECONDS
+
+
+@pytest.mark.parametrize(("timeout_seconds", "expected_limit"), [(None, 4.0), (3.0, 3.0)])
+def test_sc8_wall_clock_is_bounded_by_the_workflow_deadline(
+    tmp_path: Path,
+    monkeypatch,
+    timeout_seconds: float | None,
+    expected_limit: float,
+) -> None:
+    _nested_clean_tree(tmp_path)
+    monkeypatch.setattr(supply_chain, "MAX_WORKFLOW_SECONDS", 4.0)
+    monkeypatch.setattr(supply_chain, "time", _FakeClock(wall_step=1.0, cpu_step=0.0))
+
+    result = supply_chain._scan_shipped_bytecode(str(tmp_path), timeout_seconds=timeout_seconds)
+
+    assert len(result.limitations) == 1
+    limitation = result.limitations[0]
+    assert limitation.reason is LedgerReason.RUNTIME_LIMIT
+    assert limitation.limit_seconds == expected_limit

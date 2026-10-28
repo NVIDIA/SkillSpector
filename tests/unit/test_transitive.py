@@ -64,6 +64,8 @@ def test_extract_excludes_badges_docs_and_issue_urls() -> None:
             "docs https://github.com/NVIDIA/SkillSpector/wiki, "
             "ci https://github.com/NVIDIA/SkillSpector/actions, "
             "src https://raw.githubusercontent.com/NVIDIA/SkillSpector/main/tool.py, "
+            "window https://raw.githubusercontent.com/NVIDIA/SkillSpector/main/tool.pyw, "
+            "binary https://raw.githubusercontent.com/NVIDIA/SkillSpector/main/tool.exe, "
             "zip https://huggingface.co/abc/archive/main.zip"
         ),
     }
@@ -71,6 +73,7 @@ def test_extract_excludes_badges_docs_and_issue_urls() -> None:
     refs = transitive.extract_external_refs(file_cache)
     assert refs == [
         "https://raw.githubusercontent.com/NVIDIA/SkillSpector/main/tool.py",
+        "https://raw.githubusercontent.com/NVIDIA/SkillSpector/main/tool.pyw",
         "https://huggingface.co/abc/archive/main.zip",
     ]
 

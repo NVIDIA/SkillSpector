@@ -71,12 +71,15 @@ from skillspector.llm_utils import (
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
-from skillspector.providers import get_active_provider
+from skillspector.providers import UnknownProviderError, get_active_provider, has_cli_capability
 from skillspector.providers.gemini import GeminiProvider
 
 logger = get_logger(__name__)
 
 DEFAULT_MAX_LLM_CONCURRENCY = 10
+# A CLI-provider call is a whole agent session on the user's own plan, so the
+# default fan-out is much smaller than for an HTTP API.
+DEFAULT_CLI_MAX_LLM_CONCURRENCY = 2
 API_CONNECTION_MAX_RETRIES = 3
 API_CONNECTION_RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
 RATE_LIMIT_RETRY_DELAYS_SECONDS = (5.0, 15.0, 30.0)
@@ -120,6 +123,19 @@ def append_output_language_instruction(prompt: str) -> str:
 
 class _StructuredResponseValidationError(Exception):
     """Signal that provider output failed structured-response validation."""
+
+
+def _require_structured_response(response: object) -> None:
+    """Reject a structured-output call that produced no result.
+
+    LangChain's tool-call parsers return ``None`` when the reply contains no
+    tool call, for example a forced tool call answered in prose. Treat that as
+    a malformed structured response so it gets the same bounded retries,
+    instead of passing ``None`` to ``parse_response``, which expects a parsed
+    schema object.
+    """
+    if response is None:
+        raise StructuredOutputParseError("model returned no structured response")
 
 
 class LLMRuntimeLimitError(RuntimeError):
@@ -536,10 +552,28 @@ def _shared_limiter(limit: int) -> _GlobalLLMLimiter:
         return limiter
 
 
+def _default_max_concurrency() -> int:
+    """Return the fan-out default for the active provider.
+
+    CLI providers get :data:`DEFAULT_CLI_MAX_LLM_CONCURRENCY` because every
+    request starts a separate agent session that counts against the user's
+    plan. An unknown provider keeps the HTTP default; provider selection
+    reports that error itself.
+    """
+    try:
+        provider = get_active_provider()
+    except UnknownProviderError:
+        return DEFAULT_MAX_LLM_CONCURRENCY
+    if has_cli_capability(provider):
+        return DEFAULT_CLI_MAX_LLM_CONCURRENCY
+    return DEFAULT_MAX_LLM_CONCURRENCY
+
+
 def resolve_max_concurrency() -> int:
     """Resolve the LLM fan-out concurrency from ``SKILLSPECTOR_MAX_LLM_CONCURRENCY``.
 
-    Defaults to :data:`DEFAULT_MAX_LLM_CONCURRENCY`. Users on rate-limited
+    Defaults to :data:`DEFAULT_MAX_LLM_CONCURRENCY`, or to
+    :data:`DEFAULT_CLI_MAX_LLM_CONCURRENCY` for CLI providers. Users on rate-limited
     providers (free tiers with a low RPM) can set it to ``1`` to serialize
     requests across every analyzer instead of bursting up to 10 in parallel — a burst that otherwise
     guarantees 429s, and 429'd batches are dropped from the result (see the
@@ -548,16 +582,17 @@ def resolve_max_concurrency() -> int:
     """
     raw = os.environ.get("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "").strip()
     if not raw:
-        return DEFAULT_MAX_LLM_CONCURRENCY
+        return _default_max_concurrency()
     try:
         value = int(raw)
     except ValueError:
+        default = _default_max_concurrency()
         logger.warning(
             "Invalid SKILLSPECTOR_MAX_LLM_CONCURRENCY=%r (not an int); using %d",
             raw,
-            DEFAULT_MAX_LLM_CONCURRENCY,
+            default,
         )
-        return DEFAULT_MAX_LLM_CONCURRENCY
+        return default
     if value < 1:
         logger.warning("SKILLSPECTOR_MAX_LLM_CONCURRENCY=%d < 1; clamping to 1", value)
         return 1
@@ -610,7 +645,10 @@ class LLMFinding(BaseModel):
     @classmethod
     def _normalize_confidence(cls, v: object) -> float:
         # Accept 0-100 scale values from some models, then clamp into [0, 1].
-        value = float(cast(Any, v))
+        try:
+            value = float(cast(Any, v))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("confidence must be numeric") from exc
         if value > 2.0:
             value = value / 100.0
         return min(1.0, max(0.0, value))
@@ -951,7 +989,7 @@ class LLMAnalyzerBase:
             max_retries=native_retries,
         )
         self._structured_llm = (
-            bind_structured_output(self._llm, self.response_schema, model)
+            self._bind_structured_output(self._llm, self.response_schema)
             if self.response_schema
             else None
         )
@@ -960,6 +998,18 @@ class LLMAnalyzerBase:
             request_kind="structured_output" if self.response_schema else "chat_completion",
             model=model,
             chat_model=self._llm,
+        )
+
+    def _structured_output_preference(self, llm: object) -> str | None:
+        """Return an analyzer-specific binding preference, if any."""
+        return None
+
+    def _bind_structured_output(self, llm: object, schema: type) -> object:
+        return bind_structured_output(
+            llm,
+            schema,
+            self.model,
+            preferred_method=self._structured_output_preference(llm),
         )
 
     def _remaining_timeout(self) -> float | None:
@@ -1022,7 +1072,7 @@ class LLMAnalyzerBase:
             chat_model_controls(llm),
         )
         structured = (
-            bind_structured_output(llm, self.response_schema, self.model)
+            self._bind_structured_output(llm, self.response_schema)
             if self.response_schema
             else None
         )
@@ -1141,6 +1191,7 @@ class LLMAnalyzerBase:
         if structured_llm:
             try:
                 response = _invoke_with_usage(structured_llm, prompt, self._usage_collector)
+                _require_structured_response(response)
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError from exc
         else:
@@ -1230,6 +1281,7 @@ class LLMAnalyzerBase:
         if structured_llm:
             try:
                 response = await _ainvoke_with_usage(structured_llm, prompt, self._usage_collector)
+                _require_structured_response(response)
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError from exc
         else:
@@ -1402,8 +1454,9 @@ class LLMAnalyzerBase:
         retries so each coordinator retry can re-check and cap its delay
         against remaining time.
         Unrecovered errors cost only their own batch and are omitted from the result.
-        Malformed structured responses (Pydantic ``ValidationError`` or CLI
-        JSON parse failures) receive three bounded exponential-backoff retries
+        Malformed structured responses (Pydantic ``ValidationError``, CLI
+        JSON parse failures, or no structured result at all) receive three
+        bounded exponential-backoff retries
         and are then isolated to their batch. A batch makes at most seven outer
         chat-model invocations even when both
         retry policies apply; native provider retries can make additional HTTP

@@ -64,6 +64,7 @@ from pydantic import ValidationError
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import (
     API_CONNECTION_MAX_RETRIES,
+    DEFAULT_CLI_MAX_LLM_CONCURRENCY,
     DEFAULT_MAX_LLM_CONCURRENCY,
     OUTPUT_LANGUAGE_MAX_LENGTH,
     PROVIDER_RETRY_AFTER_MAX_SECONDS,
@@ -130,6 +131,21 @@ class TestResolveMaxConcurrency:
     def test_below_one_clamps_to_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "0")
         assert resolve_max_concurrency() == 1
+
+    def test_cli_provider_unset_uses_cli_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", raising=False)
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        assert resolve_max_concurrency() == DEFAULT_CLI_MAX_LLM_CONCURRENCY
+
+    def test_cli_provider_explicit_value_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "6")
+        assert resolve_max_concurrency() == 6
+
+    def test_unknown_provider_uses_http_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", raising=False)
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "not-a-provider")
+        assert resolve_max_concurrency() == DEFAULT_MAX_LLM_CONCURRENCY
 
 
 class TestOutputLanguage:
@@ -992,13 +1008,13 @@ class TestMetaAnalyzerResultFindingsValidator:
         result = MetaAnalyzerResult.model_validate({"findings": [self._FINDING]})
         assert len(result.findings) == 1
 
-    def test_findings_invalid_string_yields_empty(self) -> None:
-        result = MetaAnalyzerResult.model_validate({"findings": "not json"})
-        assert result.findings == []
+    def test_findings_invalid_string_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            MetaAnalyzerResult.model_validate({"findings": "not json"})
 
-    def test_findings_non_list_json_yields_empty(self) -> None:
-        result = MetaAnalyzerResult.model_validate({"findings": json.dumps({"a": 1})})
-        assert result.findings == []
+    def test_findings_non_list_json_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            MetaAnalyzerResult.model_validate({"findings": json.dumps({"a": 1})})
 
 
 # ---------------------------------------------------------------------------
@@ -1272,6 +1288,50 @@ class TestRunBatches:
         assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
             ("malformed.py", "ValidationError")
         ]
+        assert analyzer._structured_llm.invoke.call_count == 5
+        assert sleep.call_args_list == [
+            ((0.5,), {}),
+            ((1.0,), {}),
+            ((2.0,), {}),
+        ]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_missing_structured_response_recovers_on_retry(self, sleep: MagicMock) -> None:
+        """A tool-call parser returns None when the reply has no tool call."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[None, LLMAnalysisResult(findings=[])]
+        )
+
+        outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert analyzer._structured_llm.invoke.call_count == 2
+        sleep.assert_called_once_with(0.5)
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_missing_structured_response_isolated_after_three_retries(
+        self, sleep: MagicMock
+    ) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[None, None, None, None, LLMAnalysisResult(findings=[])]
+        )
+        batches = [
+            Batch(file_path="missing.py", content="no tool call"),
+            Batch(file_path="clean.py", content="clean response"),
+        ]
+
+        outcome = analyzer.run_batches_detailed(batches)
+
+        assert [item[0].file_path for item in outcome.successful] == ["clean.py"]
+        assert [
+            (failure.batch.file_path, failure.error_class, failure.reason)
+            for failure in outcome.failures
+        ] == [("missing.py", "ValidationError", LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID)]
         assert analyzer._structured_llm.invoke.call_count == 5
         assert sleep.call_args_list == [
             ((0.5,), {}),
@@ -1979,6 +2039,50 @@ class TestARunBatches:
         assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
             ("malformed.py", "ValidationError")
         ]
+        assert analyzer._structured_llm.ainvoke.call_count == 5
+        assert sleep.await_args_list == [
+            ((0.5,), {}),
+            ((1.0,), {}),
+            ((2.0,), {}),
+        ]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_missing_structured_response_recovers_on_retry(self, sleep: AsyncMock) -> None:
+        """A tool-call parser returns None when the reply has no tool call."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
+            side_effect=[None, LLMAnalysisResult(findings=[])]
+        )
+
+        outcome = await analyzer.arun_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert analyzer._structured_llm.ainvoke.call_count == 2
+        sleep.assert_awaited_once_with(0.5)
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_missing_structured_response_isolated_after_three_retries(
+        self, sleep: AsyncMock
+    ) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
+            side_effect=[None, None, None, None, LLMAnalysisResult(findings=[])]
+        )
+        batches = [
+            Batch(file_path="missing.py", content="no tool call"),
+            Batch(file_path="clean.py", content="clean response"),
+        ]
+
+        outcome = await analyzer.arun_batches_detailed(batches, max_concurrency=1)
+
+        assert [item[0].file_path for item in outcome.successful] == ["clean.py"]
+        assert [
+            (failure.batch.file_path, failure.error_class, failure.reason)
+            for failure in outcome.failures
+        ] == [("missing.py", "ValidationError", LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID)]
         assert analyzer._structured_llm.ainvoke.call_count == 5
         assert sleep.await_args_list == [
             ((0.5,), {}),

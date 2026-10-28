@@ -36,6 +36,15 @@ class LedgerRecordType(StrEnum):
     WORK_ITEM = "work_item"
     SYSTEM = "system"
     SCOPE_BOUNDARY = "scope_boundary"
+    # An analyzer's own configuration (e.g. its YARA rule set), not a skill
+    # artifact. Its ``path`` is only a report-safe label, and every relative
+    # path is also a legal file name, so path-keyed accounting must exclude
+    # these records by type -- no choice of label can be collision-free.
+    RULE_SET = "rule_set"
+
+
+RULE_SET_SCOPE: Final = "rule_set"
+"""Public ``scope`` of exception rows describing a rule set rather than a file."""
 
 
 class LedgerReason(StrEnum):
@@ -51,6 +60,8 @@ class LedgerReason(StrEnum):
     MISSING_FILE_CACHE = "missing_file_cache"
     SIZE_LIMIT = "size_limit"
     BINARY_CONTENT = "binary_content"
+    BINARY_TEXT_PROJECTION = "binary_text_projection"
+    BINARY_EXECUTABLE_TEXT = "binary_executable_text"
     EVAL_DATASET = "eval_dataset"
     SYNTAX_ERROR = "syntax_error"
     LLM_BATCH_FAILED = "llm_batch_failed"
@@ -75,6 +86,7 @@ class LedgerReason(StrEnum):
     ARCHIVE_TRUNCATED = "archive_truncated"
     ARCHIVE_UNSAFE_MEMBER_PATH = "archive_unsafe_member_path"
     ARCHIVE_AMBIGUOUS_MEMBER_PATH = "archive_ambiguous_member_path"
+    ARTIFACT_PATH_COLLISION = "artifact_path_collision"
     ARCHIVE_LINK_MEMBER = "archive_link_member"
     ARCHIVE_DEPTH_LIMIT = "archive_depth_limit"
     ARCHIVE_MEMBER_LIMIT = "archive_member_limit"
@@ -91,16 +103,33 @@ class LedgerReason(StrEnum):
     REFERENCE_UNRESOLVED = "reference_unresolved"
     DEPENDENCY_PARSE_ERROR = "dependency_parse_error"
     MANIFEST_PARSE_ERROR = "manifest_parse_error"
+    DEPENDENCY_PARSE_ERROR = "dependency_parse_error"
     MANIFEST_PARSE_LIMIT = "manifest_parse_limit"
     ARTIFACT_COUNT_LIMIT = "artifact_count_limit"
     TRAVERSAL_DEPTH_LIMIT = "traversal_depth_limit"
     TOTAL_BYTES_LIMIT = "total_bytes_limit"
     RUNTIME_LIMIT = "runtime_limit"
     EXCLUDED_EXECUTABLE_CONTENT = "excluded_executable_content"
+    HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY = "hidden_skill_executable_local_only"
     OUTPUT_LIMIT = "output_limit"
     TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
+    PYTHON_SOURCE_AMBIGUOUS = "python_source_ambiguous"
+    PYTHON_SOURCE_DECODE_ERROR = "python_source_decode_error"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
+
+
+def only_missing_reference_exceptions(exceptions: object) -> bool:
+    """Return whether non-empty ledger exceptions are only missing references."""
+    return (
+        isinstance(exceptions, list)
+        and bool(exceptions)
+        and all(
+            isinstance(exception, Mapping)
+            and exception.get("reason_code") == LedgerReason.REFERENCE_MISSING
+            for exception in exceptions
+        )
+    )
 
 
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
@@ -114,6 +143,12 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.MISSING_FILE_CACHE: "Applicable analyzer could not obtain file content.",
     LedgerReason.SIZE_LIMIT: "File exceeds this analyzer's character limit.",
     LedgerReason.BINARY_CONTENT: "Binary content is unsupported by this analyzer.",
+    LedgerReason.BINARY_TEXT_PROJECTION: (
+        "Only bounded printable text was inspected; binary structure and behavior are outside scope."
+    ),
+    LedgerReason.BINARY_EXECUTABLE_TEXT: (
+        "Readable text was inspected, but binary executable behavior remains outside analyzer coverage."
+    ),
     LedgerReason.EVAL_DATASET: (
         "Evaluation dataset prose is excluded from static pattern analysis."
     ),
@@ -144,7 +179,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.MANIFEST_ABSENT: ("No compatible manifest was present for this analyzer."),
     LedgerReason.NO_APPLICABLE_FILES: ("No files matched this analyzer's applicability contract."),
     LedgerReason.OMS_SIGNATURE: (
-        "Recognized OMS signature metadata is excluded from content analysis."
+        "DSSE content decoding is incomplete or unsupported; raw fields were retained for inspection. Signature authenticity was not verified."
     ),
     LedgerReason.BASELINE_FILE: (
         "The explicitly selected suppression baseline is excluded from content analysis."
@@ -163,6 +198,10 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     ),
     LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH: (
         "Archive member name has an ambiguous or duplicate provenance identity."
+    ),
+    LedgerReason.ARTIFACT_PATH_COLLISION: (
+        "A disk path containing '!/' collides with an archive member. Rename the directory "
+        "ending in '!'; the colliding archive member was not analyzed."
     ),
     LedgerReason.ARCHIVE_LINK_MEMBER: "Archive link member was not followed or read.",
     LedgerReason.ARCHIVE_DEPTH_LIMIT: "Nested archive depth limit was reached.",
@@ -199,6 +238,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.MANIFEST_PARSE_ERROR: (
         "Manifest frontmatter is malformed or uses an unsupported value shape."
     ),
+    LedgerReason.DEPENDENCY_PARSE_ERROR: (
+        "Dependency metadata could not be parsed into supported registry coordinates."
+    ),
     LedgerReason.MANIFEST_PARSE_LIMIT: (
         "Manifest frontmatter could not be completely examined within its resource limits."
     ),
@@ -209,12 +251,21 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.EXCLUDED_EXECUTABLE_CONTENT: (
         "Executable content was inventoried but excluded from content analysis."
     ),
+    LedgerReason.HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY: (
+        "Conventional hidden-skill helper script was kept local and not sent to an external LLM."
+    ),
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
     LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED: (
         "A transitive child scan failed before complete inspection."
     ),
     LedgerReason.STATIC_PARSE_LIMIT: (
         "A security-relevant expression exceeded a bounded static parser's span limit."
+    ),
+    LedgerReason.PYTHON_SOURCE_AMBIGUOUS: (
+        "Python execution intent depends on runtime or platform-specific shebang semantics."
+    ),
+    LedgerReason.PYTHON_SOURCE_DECODE_ERROR: (
+        "Python source bytes could not be decoded under their declared encoding."
     ),
     LedgerReason.OBFUSCATED_INSTRUCTION_TEXT: (
         "Obfuscated instruction text could not be fully evaluated by the deterministic layer."
@@ -299,6 +350,7 @@ class InspectionLedgerException(TypedDict):
     error_class: NotRequired[str]
     analyzers: NotRequired[list[str]]
     fatal: NotRequired[bool]
+    scope: NotRequired[str]
 
 
 class AnalysisCompleteness(TypedDict):
@@ -530,8 +582,10 @@ def analyzer_status_event(
 def analyzer_status_for_events(
     analyzer_id: str, events: Iterable[InspectionLedgerEvent]
 ) -> AnalyzerStatusEvent:
-    """Summarize an analyzer's terminal work without exposing event payloads."""
-    terminal_events = list(events)
+    """Summarize analyzer work; scope-boundary records remain separate exclusions."""
+    terminal_events = [
+        event for event in events if event.get("record_type") != LedgerRecordType.SCOPE_BOUNDARY
+    ]
     if not terminal_events:
         return analyzer_status_event(
             analyzer_id=analyzer_id,
@@ -593,6 +647,7 @@ def _exception(
     error_class: str | None = None,
     analyzers: Iterable[str] = (),
     fatal: bool,
+    scope: str | None = None,
 ) -> InspectionLedgerException:
     """Build the public, safe projection of one exceptional ledger fact."""
     exception: InspectionLedgerException = {
@@ -610,7 +665,14 @@ def _exception(
         exception["analyzers"] = analyzer_ids
     if error_class:
         exception["error_class"] = error_class
+    if scope:
+        exception["scope"] = scope
     return exception
+
+
+def _is_rule_set_record(event: Mapping[str, object]) -> bool:
+    """Return whether a ledger row describes a rule set rather than an artifact."""
+    return event.get("record_type") == LedgerRecordType.RULE_SET
 
 
 def _exception_from_event(
@@ -633,6 +695,7 @@ def _exception_from_event(
         error_class=event.get("error_class"),
         analyzers=[str(event.get("analyzer_id", ""))],
         fatal=fatal,
+        scope=RULE_SET_SCOPE if _is_rule_set_record(event) else None,
     )
 
 
@@ -651,6 +714,9 @@ def _merge_exception_projection(
             exception["start_line"],
             exception["end_line"],
             exception.get("error_class"),
+            # A rule-set row and a real file's row can share a path label;
+            # they must never merge into one public row.
+            exception.get("scope"),
         )
         existing = grouped.get(key)
         if existing is None:
@@ -930,9 +996,17 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
     ledger_exceptions = _merge_exception_projection(exceptional_rows)
     scope_exclusions = _merge_exception_projection(scope_rows)
 
+    # Rule-set rows describe an analyzer's configuration, not an artifact. Their
+    # path is only a label, so folding them into per-component coverage would
+    # charge the rule set's incompleteness to any real file with that name.
+    rule_set_work_ids = {
+        str(event.get("work_id", "")) for event in events if _is_rule_set_record(event)
+    }
     per_component: dict[str, list[LedgerOutcome]] = {component: [] for component in components}
     if primary_targets:
         for _analyzer_id, target, matches in primary_targets:
+            if str(target.get("work_id", "")) in rule_set_work_ids:
+                continue
             path = _safe_path(target.get("path"), components)
             outcomes = per_component.setdefault(path, [])
             if len(matches) == 1:
@@ -1044,14 +1118,22 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
                 else f"Analyzer {status_summary['analyzer_id']} status: {status_name}."
             )
     execution_successful = not any(exception.get("fatal") for exception in ledger_exceptions)
+    reference_caveat_only = (
+        only_missing_reference_exceptions(ledger_exceptions)
+        and not limitations
+        and partially_inspected == 0
+        and entirely_uninspected == 0
+    )
     completeness_status = (
         "failed"
         if not execution_successful
+        else "complete_with_caveats"
+        if reference_caveat_only
         else "partial"
         if ledger_exceptions or limitations or partially_inspected or entirely_uninspected
         else "complete"
     )
-    is_complete = completeness_status == "complete"
+    is_complete = completeness_status in {"complete", "complete_with_caveats"}
 
     raw_references = state.get("artifact_references", [])
     public_references = (

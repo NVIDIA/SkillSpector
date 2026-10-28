@@ -22,6 +22,7 @@ Do not rely on the numeric score alone. A low score can miss semantic risk, and 
 - Run SkillSpector first when the `skillspector` CLI is available.
 - If `skillspector` is missing, say so clearly and continue with manual source review.
 - Do not install tools, dependencies, or runtimes silently.
+- Keep `--no-llm` unless the user asks for LLM analysis. Do not choose or change `SKILLSPECTOR_PROVIDER` on your own. The `claude_cli`, `codex_cli`, `gemini_cli`, and `opencode_cli` providers start a separate agent session for every LLM call, billed to the user's own plan, so ask before using them and do not run several such scans in parallel.
 - Do not execute scripts from the target skill.
 - Use read-only inspection commands such as `find`, `rg`, `sed`, `jq`, `file`, and `git diff`.
 - Read source around every high-signal finding instead of trusting the scanner summary alone.
