@@ -1,3 +1,7 @@
+### 2.13.3 (Unreleased)
+### Security and integrity fixes
+* Keep Markdown code fences from merging distinct shell lines into one marker directive. (#882)
+---
 ### 2.13.1 (Unreleased)
 ### Fixes
 * Preserve quote boundaries in inline JSON examples and inline-code ownership in nested Markdown list paragraphs, avoiding false incomplete inspection while retaining shell-command checks.
