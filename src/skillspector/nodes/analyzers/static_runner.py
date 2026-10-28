@@ -110,6 +110,8 @@ FILE_TYPES: dict[str, str] = {
     ".toml": "toml",
     ".txt": "text",
     ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
     ".ts": "typescript",
     ".rb": "ruby",
     ".pl": "perl",
