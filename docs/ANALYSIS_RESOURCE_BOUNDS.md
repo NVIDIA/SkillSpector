@@ -290,7 +290,7 @@ removes the rejected partial checkout.
 | Dependency analysis time | 30 seconds | One analyzer execution, within the workflow deadline |
 | OSV packages / query batches / detail requests | 256 / 4 / 64 | One dependency analysis budget |
 | OSV response bytes / retained results | 4 MiB / 256 | One dependency analysis budget |
-| TP4 source files / batches / findings | 128 / 64 / 64 | One analyzer execution |
+| TP4 source files / batches / findings | 128 / 128 by default (configurable 1–4,096) / 64 | One analyzer execution |
 | TP4 source and prompt input | 4 MiB each | One analyzer execution |
 | TP4 model input | 32,000 tokens | One batch |
 | Public finding and occurrence records | 10,000 | One report |
@@ -365,3 +365,27 @@ workflow deadline. A limit reached during analysis retains existing findings and
 reports partial work through the inspection ledger. These environment settings
 are read when their modules are imported, so restart the SkillSpector process
 after changing them.
+
+## Configuring TP4 assessment capacity
+
+TP4 allows up to 128 assessment batches per analyzer execution by default. A
+source file can contain several executable code fences, each assessed separately;
+large code candidates may also need multiple batches. Set
+`SKILLSPECTOR_TP4_MAX_BATCHES` to an ASCII decimal integer from `1` to `4096` when a
+different capacity is required. Surrounding whitespace and leading zeroes are
+accepted. Unset or blank values retain 128; malformed, nonpositive, or larger
+values log a warning and retain 128. The setting is read when the analyzer module
+is imported, so restart the SkillSpector process after changing it.
+
+For example, `SKILLSPECTOR_TP4_MAX_BATCHES=512` allows more code examples to be
+inspected without combining their prompts, assessments, findings, or source
+ranges. Each TP4 invocation logs the selected numeric capacity at `INFO` level;
+set `SKILLSPECTOR_LOG_LEVEL=INFO` to retain this evidence.
+
+This setting changes only the batch-count ceiling. The 128-file, 64-finding,
+source-byte, prompt-byte, token, and runtime limits remain unchanged. Raising
+capacity can increase model calls and does not guarantee complete inspection.
+Reaching any applicable limit still records partial inspection in the ledger;
+lowering capacity also retains this behavior. Check
+`analysis_completeness.is_complete` and use `--fail-on-incomplete` when complete
+inspection is required.

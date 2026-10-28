@@ -1,5 +1,6 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
+* Add bounded `SKILLSPECTOR_TP4_MAX_BATCHES` configuration (default 128, supported range 1–4096) so skills with many executable code examples can retain separate assessments and source ranges; other resource limits and incomplete-inspection reporting are unchanged.
 * fix(static): stop Markdown code fence lines from reading as an open quote that merges consecutive shell lines into one marker directive (#868)
 * fix(sc8): count only the bytecode walk's own CPU time against its 5 s budget, so time spent waiting behind concurrent analyzers no longer reports a static `runtime_limit` for skills that ship no bytecode (#828)
 * fix(providers): cut per-call cost of CLI-provider scans and default their LLM fan-out to 2 (#808)
