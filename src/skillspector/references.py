@@ -9,6 +9,7 @@ import hashlib
 import heapq
 import posixpath
 import re
+import stat
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -670,12 +671,30 @@ def documentation_image_provenance(
     )
 
 
+def _target_exists_without_following_symlinks(skill_dir: Path, target: str) -> bool:
+    """Check path metadata only, treating symlinks and stat errors as present."""
+    current = skill_dir
+    for part in PurePosixPath(target).parts:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError:
+            # We cannot prove the target is absent, so it must not be a caveat.
+            return True
+        if stat.S_ISLNK(metadata.st_mode):
+            return True
+    return True
+
+
 def resolve_bundle_references_with_metadata(
     skill_dir: Path,
     *,
     source_path: str,
     source_text: str,
     known_paths: list[str],
+    metadata_root: Path | None = None,
     clock: Callable[[], float] = time.monotonic,
     deadline: float | None = None,
 ) -> ReferenceResolutionResult:
@@ -749,10 +768,20 @@ def resolve_bundle_references_with_metadata(
                     status = "ambiguous"
                     disposition = ArtifactDisposition.PARTIAL
                 else:
-                    status = "missing"
+                    if _target_exists_without_following_symlinks(
+                        metadata_root or skill_dir, target
+                    ):
+                        resolved_target = target
+                        status = "uninspected"
+                    else:
+                        status = "missing"
                     disposition = ArtifactDisposition.PARTIAL
             else:
-                status = "missing"
+                if _target_exists_without_following_symlinks(metadata_root or skill_dir, target):
+                    resolved_target = target
+                    status = "uninspected"
+                else:
+                    status = "missing"
                 disposition = ArtifactDisposition.PARTIAL
         # Real inventory matches (including ambiguity) always take precedence
         # over prose. An independent file use of the same token stays a record.

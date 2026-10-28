@@ -240,6 +240,8 @@ class SkillspectorState(TypedDict, total=False):
     skill_path: str | None
     # Relative identity of a wrapped/downloaded explicit file, distinct from passive assets.
     primary_file_path: str | None
+    # Local parent used only for bounded path-metadata checks on single-file scans.
+    primary_file_parent_path: str | None
     # Set/reset by resolve_input from the actual selected source. None means
     # materialization could not establish a current-skill identity; analyzers
     # must not substitute generated directory names or manifest-only aliases.
