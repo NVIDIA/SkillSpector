@@ -64,6 +64,7 @@ class ArtifactRecord(TypedDict):
     contains_nul: bool
     misleading_extension: bool
     referenced: bool
+    readable_binary: NotRequired[bool]
     reason: NotRequired[str]
     inherited_exclusion_reason: NotRequired[str]
 
@@ -99,6 +100,8 @@ class SecurityTextView:
     text: str
     source_offsets: array[int] | None = None
     reconstructions: tuple[SecurityTextReconstruction, ...] = ()
+    right_boundary_is_fixed: bool = False
+    right_boundary_recovery_start: int | None = None
 
     def source_offset(self, derived_offset: int) -> int:
         """Map a derived character offset to the corresponding source offset."""
@@ -228,6 +231,7 @@ _TEXT_EXTENSIONS = frozenset(
         ".markdown",
         ".txt",
         ".py",
+        ".pyw",
         ".sh",
         ".json",
         ".yaml",
@@ -364,6 +368,13 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
         decoded = data.decode("utf-8", errors="replace")
         decodable = False
 
+    # These printable prefixes are also valid instruction text. Keep the
+    # claimed binary format's coverage limits, but inspect the readable bytes.
+    # Lossy decoding must not let one invalid byte or a binary comment hide text.
+    readable_binary = data.startswith((b"MZ", b"GIF87a", b"GIF89a", b"%PDF-")) and bool(
+        binary_instruction_view(decoded)[0].text
+    )
+
     if has_binary_magic:
         kind = ContentKind.BINARY
     elif decodable:
@@ -385,6 +396,8 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
     disposition = (
         ArtifactDisposition.PARTIAL
         if referenced and kind is not ContentKind.TEXT
+        else ArtifactDisposition.ANALYZED
+        if readable_binary
         else ArtifactDisposition.OUT_OF_SCOPE
         if kind is ContentKind.BINARY
         else ArtifactDisposition.ANALYZED
@@ -398,7 +411,76 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
         "contains_nul": contains_nul,
         "misleading_extension": misleading,
         "referenced": referenced,
+        "readable_binary": readable_binary,
     }
+
+
+BINARY_TEXT_MAX_CHARS = 32_768
+_BINARY_PRINTABLE_RUN = re.compile(r"[^\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufffd]{8,}")
+
+
+def binary_instruction_view(content: str) -> tuple[SecurityTextView, bool]:
+    """Bound human-readable binary strings without treating binary noise as text."""
+    # Packet formatting is recognized once on the whole artifact, before windows.
+    excluded: list[tuple[int, int]] = []
+    if content.startswith("%PDF-"):
+        header = '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+        start = content.find(header)
+        while start >= 0:
+            next_start = content.find(header, start + len(header))
+            packet_end = next_start if next_start >= 0 else len(content)
+            metadata = content.find("<x:xmpmeta", start + len(header), packet_end)
+            close = content.find("</x:xmpmeta>", metadata, packet_end) if metadata >= 0 else -1
+            if close < 0:
+                start = next_start
+                continue
+            padding_start = close + len("</x:xmpmeta>")
+            padding_end = padding_start
+            while padding_end < packet_end and content[padding_end] in " \t\r\n":
+                padding_end += 1
+            if content.startswith(('<?xpacket end="w"?>', '<?xpacket end="r"?>'), padding_end):
+                bom = start + header.index("\ufeff")
+                excluded.extend([(bom, bom + 1), (padding_start, padding_end)])
+            start = next_start
+    offsets = array("I")
+    parts: list[str] = []
+    truncated = False
+    cursor = 0
+    for excluded_start, excluded_end in [*excluded, (len(content), len(content))]:
+        for match in _BINARY_PRINTABLE_RUN.finditer(content, cursor, excluded_start):
+            remaining = BINARY_TEXT_MAX_CHARS - len(offsets)
+            if remaining <= 2:
+                truncated = True
+                break
+            if parts:
+                parts.append("\n\n")
+                offsets.extend([match.start(), match.start()])
+                remaining -= 2
+            end = min(match.end(), match.start() + remaining)
+            parts.append(content[match.start() : end])
+            offsets.extend(range(match.start(), end))
+            if end < match.end():
+                truncated = True
+                break
+        if truncated:
+            break
+        cursor = excluded_end
+    return SecurityTextView("binary_printable_text", "".join(parts), offsets), truncated
+
+
+def promote_artifact_to_decoded_text(artifact: ArtifactRecord) -> None:
+    """Apply a successful format-aware text decode without erasing prior limits."""
+    generic_binary_scope = artifact["content_kind"] is ContentKind.BINARY and (
+        artifact["disposition"] is ArtifactDisposition.OUT_OF_SCOPE
+        or artifact["disposition"] is ArtifactDisposition.PARTIAL
+        and "reason" not in artifact
+    )
+    artifact["content_kind"] = ContentKind.TEXT
+    artifact["readable_binary"] = False
+    artifact["decodable"] = True
+    artifact["misleading_extension"] = _suffix(artifact["path"]) in _BINARY_EXTENSIONS
+    if generic_binary_scope:
+        artifact["disposition"] = ArtifactDisposition.ANALYZED
 
 
 def decode_text(data: bytes) -> str:
@@ -609,6 +691,9 @@ def _concealed_instruction_run_spans(
 
 def _security_skeleton_piece(character: str) -> str:
     """Return the case-folded NFKC/confusable skeleton for one source character."""
+    # NFKC and the pinned confusable map leave ASCII unchanged.
+    if character.isascii():
+        return character.lower()
     folded = (
         unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON).casefold()
     )
@@ -620,6 +705,8 @@ def _security_skeleton_piece(character: str) -> str:
 
 def _fold_security_character(character: str) -> str:
     """Return a one-letter ASCII security skeleton, or an empty sentinel."""
+    if character.isascii():
+        return character.lower() if len(character) == 1 and character.isalpha() else ""
     folded = _security_skeleton_piece(character)
     return folded if len(folded) == 1 and folded.isascii() and folded.isalpha() else ""
 
@@ -1679,6 +1766,30 @@ def _contextual_default_ignorable_spans(
                 yield span_start, end
 
 
+def _normalization_ignored_spans_in_gap(
+    text: str,
+    gap_start: int,
+    gap_end: int,
+) -> Iterator[tuple[int, int]]:
+    """Yield the normalized-view removals inside one contextual gap."""
+    for match in _DEFAULT_IGNORABLE_RUN_PATTERN.finditer(text, gap_start, gap_end):
+        start, end = match.span()
+        ignored_start = (
+            start
+            if _is_unconditionally_ignored(text[start])
+            or _is_contextual_default_ignorable_offset(text, start)
+            else start + 1
+        )
+        ignored_end = (
+            end
+            if _is_unconditionally_ignored(text[end - 1])
+            or _is_contextual_default_ignorable_offset(text, end - 1)
+            else end - 1
+        )
+        if ignored_start < ignored_end:
+            yield ignored_start, ignored_end
+
+
 def _normalization_ignored_spans(
     text: str,
     check_runtime: Callable[[], None] | None = None,
@@ -1689,22 +1800,7 @@ def _normalization_ignored_spans(
         require_word_boundaries=False,
         check_runtime=check_runtime,
     ):
-        for match in _DEFAULT_IGNORABLE_RUN_PATTERN.finditer(text, gap_start, gap_end):
-            start, end = match.span()
-            ignored_start = (
-                start
-                if _is_unconditionally_ignored(text[start])
-                or _is_contextual_default_ignorable_offset(text, start)
-                else start + 1
-            )
-            ignored_end = (
-                end
-                if _is_unconditionally_ignored(text[end - 1])
-                or _is_contextual_default_ignorable_offset(text, end - 1)
-                else end - 1
-            )
-            if ignored_start < ignored_end:
-                yield ignored_start, ignored_end
+        yield from _normalization_ignored_spans_in_gap(text, gap_start, gap_end)
 
 
 def _contextual_default_ignorable_offsets(
@@ -1811,6 +1907,55 @@ def normalized_security_view(
             offsets.append(source_offset)
         source_offset += 1
     return SecurityTextView("normalized", output.getvalue(), offsets)
+
+
+def normalized_security_prefix(text: str, max_chars: int) -> str:
+    """Return an exact bounded prefix of the normalized security projection."""
+    if max_chars <= 0:
+        return ""
+
+    output = StringIO()
+    output_chars = 0
+
+    def append(character: str) -> bool:
+        nonlocal output_chars
+        normalized = unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON)
+        remaining = max_chars - output_chars
+        output.write(normalized[:remaining])
+        output_chars += min(len(normalized), remaining)
+        return output_chars >= max_chars
+
+    source_offset = 0
+    while source_offset < len(text) and output_chars < max_chars:
+        if not _is_token_gap_character(text[source_offset]):
+            if append(text[source_offset]):
+                break
+            source_offset += 1
+            continue
+
+        gap_start = source_offset
+        while source_offset < len(text) and _is_token_gap_character(text[source_offset]):
+            source_offset += 1
+        gap_end = source_offset
+        before_is_word = gap_start > 0 and _is_word_character(text[gap_start - 1])
+        after_is_word = gap_end < len(text) and _is_word_character(text[gap_end])
+        ignored_spans = iter(
+            _normalization_ignored_spans_in_gap(text, gap_start, gap_end)
+            if before_is_word or after_is_word
+            else ()
+        )
+        next_ignored = next(ignored_spans, None)
+        gap_offset = gap_start
+        while gap_offset < gap_end and output_chars < max_chars:
+            if next_ignored is not None and gap_offset == next_ignored[0]:
+                gap_offset = next_ignored[1]
+                next_ignored = next(ignored_spans, None)
+                continue
+            if not _is_unconditionally_ignored(text[gap_offset]) and append(text[gap_offset]):
+                break
+            gap_offset += 1
+
+    return output.getvalue()
 
 
 def obfuscated_instruction_view(
@@ -2169,6 +2314,35 @@ def _requires_normalized_security_view_uncached(
     # projection. Any other non-printable character still needs the exact
     # category-aware path in ``normalized_security_view``.
     return not text.translate(_REMOVE_ALLOWED_FORMAT_CHARACTERS).isprintable()
+
+
+def _has_derived_security_view(text: str) -> bool:
+    """Return whether security projection produces a distinct text view."""
+    if text.isascii():
+        return (
+            _IGNORED_ASCII_CONTROL.search(text) is not None
+            or _has_letter_spacing_run(text)
+            or next(_obfuscated_instruction_matches(text), None) is not None
+        )
+    if any(
+        unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON) != character
+        for character in text
+    ):
+        return True
+    if any(_is_unconditionally_ignored(character) for character in text):
+        return True
+    if next(_normalization_ignored_spans(text), None) is not None:
+        return True
+    if "\ufffd" in text or next(_compact_gap_offsets(text), None) is not None:
+        return True
+    return (
+        _has_letter_spacing_run(text)
+        or next(
+            _obfuscated_instruction_matches(text),
+            None,
+        )
+        is not None
+    )
 
 
 def security_text_views(

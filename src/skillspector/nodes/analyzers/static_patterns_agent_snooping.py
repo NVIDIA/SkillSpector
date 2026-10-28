@@ -40,6 +40,7 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 from . import static_runner
 from .common import get_context, get_line_number
 from .pattern_defaults import PatternCategory
+from .prohibition_context import is_directly_prohibited
 
 logger = get_logger(__name__)
 
@@ -81,11 +82,17 @@ AS1_PATTERNS = AS1_CODE_PATTERNS + AS1_PROSE_PATTERNS
 
 # AS2: MCP Config Access
 # Matches code/instructions specifically targeting MCP server configuration.
+# MCP clients keep their server lists, often with tokens in ``env``, in
+# mcp.json (Cursor, VS Code, .mcp.json in Claude Code projects),
+# mcp_config.json (Windsurf), mcp_settings.json (Roo Code, and Cline's
+# cline_mcp_settings.json), claude_desktop_config.json (Claude Desktop) and
+# ~/.claude.json (Claude Code user and local scopes).
+_MCP_CONFIG_FILE = r"(?:mcp(?:_config|_settings)?|claude_desktop_config|\.claude)\.json"
 AS2_CODE_PATTERNS = [
-    # Direct access to mcp.json files
-    (r"open\s*\(\s*['\"][^'\"]*mcp(?:_config)?\.json['\"]", 0.95),
-    (r"(?:Path|pathlib\.Path)\s*\(\s*['\"][^'\"]*mcp(?:_config)?\.json['\"]", 0.9),
-    (r"(?:cat|less|head|grep)\s+[^|&;\n]*mcp(?:_config)?\.json", 0.9),
+    # Direct access to MCP config files
+    (rf"open\s*\(\s*['\"][^'\"]*{_MCP_CONFIG_FILE}['\"]", 0.95),
+    (rf"(?:Path|pathlib\.Path)\s*\(\s*['\"][^'\"]*{_MCP_CONFIG_FILE}['\"]", 0.9),
+    (rf"(?:cat|less|head|grep)\s+[^|&;\n]*{_MCP_CONFIG_FILE}", 0.9),
     (r"\.(?:claude|codex|gemini)/mcp(?:_config)?\.json", 0.95),
     # Accessing MCP server URLs or API keys from config
     (r"mcp(?:_config)?\.json.*?(?:api_?key|token|secret|url|endpoint)", 0.9),
@@ -112,7 +119,7 @@ AS3_CODE_PATTERNS = [
         r"(?:os\.listdir|os\.scandir|glob\.glob|Path\.iterdir)\s*\([^)]*\.(?:claude|codex|gemini)/skills?",
         0.9,
     ),
-    (r"(?:ls|find|dir)\s+[^|&;\n]*\.(?:claude|codex|gemini)/skills?", 0.85),
+    (r"(?<![\w-])g?(?:ls|find|dir)\s+[^|&;\n]*\.(?:claude|codex|gemini)/skills?", 0.85),
     # Reading other skills' SKILL.md files
     (r"open\s*\(\s*['\"][^'\"]*SKILL\.md['\"].*?\bother\b", 0.85),
     # Accessing skills/CURRENT or adjacent skill directories
@@ -194,12 +201,11 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
 
     for pattern, confidence in AS3_PATTERNS:
-        matches = (
-            static_runner.iter_paragraph_matches
-            if (pattern, confidence) in AS3_PROSE_PATTERNS
-            else re.finditer
-        )
+        is_prose = (pattern, confidence) in AS3_PROSE_PATTERNS
+        matches = static_runner.iter_paragraph_matches if is_prose else re.finditer
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            if is_prose and is_directly_prohibited(content, match.start(), match.end()):
+                continue
             full_match = match.group(0)
             if _is_current_skill_path_reference(
                 full_match, _CURRENT_SKILL_IDENTIFIERS.get()

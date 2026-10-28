@@ -48,6 +48,14 @@ Equivalent CLI:
 - `yaraRulesDir`: optional directory of extra YARA rules.
 - `verbose`: optional detailed progress.
 
+Inputs inside the session's working directory run without a prompt. Remote targets
+and external paths require confirmation; redirected aliases show their resolved
+destination too. Print and JSON sessions reject these requests because they cannot
+show a dialog. Use TUI or RPC mode, move the skill into the working directory, or
+run the CLI directly. Local targets retain the CLI's refusal of symlinked paths.
+Missing rule directories fail before scanning, and YARA `include` directives are
+disabled: put self-contained rule files in the selected directory.
+
 ## LLM-backed analysis
 
 Static scan is default. To use semantic LLM analysis, configure provider credentials in your shell before launching Pi, then call the tool with `noLlm=false` and a provider.

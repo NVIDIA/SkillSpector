@@ -397,6 +397,51 @@ class TestErrorHandling:
             event["work_id"] for event in result["inspection_ledger"]
         }
 
+    @patch(MOCK_PATCH_TARGET)
+    def test_refused_structured_response_is_failed_not_clean(
+        self, mock_get_model: MagicMock
+    ) -> None:
+        """A refusal that leaves the JSON-schema response empty never reads as a clean scan."""
+        from langchain_core.exceptions import OutputParserException
+
+        from skillspector.llm_analyzer_base import LLMAnalyzerBase
+
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value.invoke.side_effect = OutputParserException(
+            "Invalid json output: "
+        )
+        mock_get_model.return_value = mock_llm
+        with patch.object(
+            LLMAnalyzerBase, "response_received", new_callable=lambda: property(lambda _: True)
+        ):
+            result = node({"file_cache": {"SKILL.md": "# Skill"}})
+
+        assert result["findings"] == []
+        assert result["analyzer_status_events"][0]["status"] == "failed"
+        assert result["llm_call_log"][0]["ok"] is False
+        assert {event["reason_code"] for event in result["inspection_ledger"]} == {
+            "llm_batch_failed"
+        }
+
+    @patch(MOCK_PATCH_TARGET)
+    def test_openai_refusal_is_failed_not_clean(self, mock_get_model: MagicMock) -> None:
+        """A structured-output refusal costs its batch and is reported, not dropped."""
+        from langchain_openai.chat_models.base import OpenAIRefusalError
+
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value.invoke.side_effect = OpenAIRefusalError(
+            "I can't help with that."
+        )
+        mock_get_model.return_value = mock_llm
+        result = node({"file_cache": {"SKILL.md": "# Skill"}})
+
+        assert result["findings"] == []
+        assert result["analyzer_status_events"][0]["status"] == "failed"
+        assert result["llm_call_log"][0]["ok"] is False
+        assert {event["reason_code"] for event in result["inspection_ledger"]} == {
+            "llm_batch_failed"
+        }
+
 
 # ---------------------------------------------------------------------------
 # TestLLMCallTelemetry — the llm_call_log record the report uses to detect a

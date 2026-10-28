@@ -41,6 +41,7 @@ from skillspector.inspection_ledger import (
     LedgerRecordType,
     ledger_event,
 )
+from skillspector.python_ast import PythonSourceClassification, classify_python_source
 
 ARCHIVE_MAX_DEPTH = 3
 ARCHIVE_MAX_MEMBERS = 1_000
@@ -80,6 +81,7 @@ _EXECUTABLE_SUFFIXES = frozenset(
         ".phtml",
         ".ps1",
         ".py",
+        ".pyw",
         ".pyc",
         ".pyo",
         ".rb",
@@ -114,6 +116,11 @@ class NestedInspectionResult:
     components: list[str] = field(default_factory=list)
     file_cache: dict[str, str] = field(default_factory=dict)
     raw_file_cache: dict[str, bytes] = field(default_factory=dict)
+    # Classify with the archive member's execution path, while retaining the
+    # virtual path as the stable cache/report key used by downstream analyzers.
+    python_source_classifications: dict[str, PythonSourceClassification] = field(
+        default_factory=dict
+    )
     artifact_inventory: list[ArtifactRecord] = field(default_factory=list)
     metadata: list[dict[str, object]] = field(default_factory=list)
     outer_metadata: dict[str, dict[str, object]] = field(default_factory=dict)
@@ -121,6 +128,10 @@ class NestedInspectionResult:
     # Expected extensions and format mismatches are not content recognition.
     recognized_zip_paths: set[str] = field(default_factory=set)
     ledger_events: list[InspectionLedgerEvent] = field(default_factory=list)
+    # Keep the actual event objects: disk and virtual paths can share both a
+    # spelling and a work ID, so neither identifies which input produced it.
+    disk_container_events: list[InspectionLedgerEvent] = field(default_factory=list)
+    _active_disk_path: str | None = None
     uncompressed_bytes: int = 0
     # Exceptions can target a top-level container before a virtual artifact row
     # exists. Preserve their canonical disposition so build_context can apply
@@ -539,14 +550,22 @@ def _record_outer_metadata(
     }
 
 
-def _virtual_type(path: str, data: bytes, nested_type: str | None) -> str:
+def _virtual_type(
+    path: str,
+    data: bytes,
+    nested_type: str | None,
+    source_classification: PythonSourceClassification,
+) -> str:
     if nested_type is not None:
         return nested_type
+    if source_classification is PythonSourceClassification.PYTHON:
+        return "python"
     suffix = Path(path).suffix.lower()
     return {
         ".md": "markdown",
         ".markdown": "markdown",
         ".py": "python",
+        ".pyw": "python",
         ".sh": "shell",
         ".bash": "shell",
         ".zsh": "shell",
@@ -556,6 +575,8 @@ def _virtual_type(path: str, data: bytes, nested_type: str | None) -> str:
         ".toml": "toml",
         ".txt": "text",
         ".js": "javascript",
+        ".mjs": "javascript",
+        ".cjs": "javascript",
         ".ts": "typescript",
         ".rb": "ruby",
         ".go": "go",
@@ -606,27 +627,26 @@ def _exception(
     limit_seconds: float | None = None,
 ) -> None:
     _mark_inventory_exception(result, path=path, reason=reason)
-    result.ledger_events.append(
-        ledger_event(
-            outcome=(
-                LedgerOutcome.PARTIAL
-                if reason in _PARTIAL_INVENTORY_REASONS
-                else LedgerOutcome.SKIPPED
-            ),
-            record_type=LedgerRecordType.SYSTEM,
-            phase="nested_artifact_inspection",
-            path=path,
-            reason=reason,
-            observed_bytes=observed_bytes,
-            limit_bytes=limit_bytes,
-            observed_artifacts=observed_artifacts,
-            limit_artifacts=limit_artifacts,
-            observed_depth=observed_depth,
-            limit_depth=limit_depth,
-            observed_seconds=observed_seconds,
-            limit_seconds=limit_seconds,
-        )
+    event = ledger_event(
+        outcome=(
+            LedgerOutcome.PARTIAL if reason in _PARTIAL_INVENTORY_REASONS else LedgerOutcome.SKIPPED
+        ),
+        record_type=LedgerRecordType.SYSTEM,
+        phase="nested_artifact_inspection",
+        path=path,
+        reason=reason,
+        observed_bytes=observed_bytes,
+        limit_bytes=limit_bytes,
+        observed_artifacts=observed_artifacts,
+        limit_artifacts=limit_artifacts,
+        observed_depth=observed_depth,
+        limit_depth=limit_depth,
+        observed_seconds=observed_seconds,
+        limit_seconds=limit_seconds,
     )
+    result.ledger_events.append(event)
+    if path == result._active_disk_path:
+        result.disk_container_events.append(event)
 
 
 def _time_exception(
@@ -841,7 +861,9 @@ def _inspect_zip_bytes(
             if safe_name in seen_names or virtual_path in result.file_cache:
                 _exception(
                     result,
-                    path=virtual_path,
+                    # A different disk container may already own this path.
+                    # Attribute that skipped copy to its current container.
+                    path=virtual_path if safe_name in seen_names else container_virtual_path,
                     reason=LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH,
                 )
                 continue
@@ -1098,10 +1120,17 @@ def _inspect_zip_bytes(
             executable = _member_executable(info, safe_name, member_data)
             member_hidden = _is_hidden_path(safe_name)
             concealed = executable and bool(concealment_reasons)
-            virtual_type = _virtual_type(safe_name, member_data, nested_type)
+            source_classification = classify_python_source(safe_name, member_data)
+            virtual_type = _virtual_type(
+                safe_name,
+                member_data,
+                nested_type,
+                source_classification,
+            )
             result.components.append(virtual_path)
             result.file_cache[virtual_path] = member_data.decode("utf-8", errors="replace")
             result.raw_file_cache[virtual_path] = member_data
+            result.python_source_classifications[virtual_path] = source_classification
             artifact = classify_artifact(virtual_path, member_data)
             result.artifact_inventory.append(artifact)
             result.metadata.append(
@@ -1209,6 +1238,7 @@ def inspect_nested_artifacts(
         last_checked_at=started_at,
     )
     for path in dict.fromkeys(components):
+        result._active_disk_path = path
         if budget.halted:
             break
         if budget.expired():
@@ -1312,6 +1342,7 @@ def inspect_nested_artifacts(
             result=result,
         )
 
+    result._active_disk_path = None
     result.components = list(dict.fromkeys(result.components))
     result.uncompressed_bytes = budget.uncompressed_bytes
     _apply_inventory_overrides(result)
