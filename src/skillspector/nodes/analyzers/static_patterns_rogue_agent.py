@@ -594,10 +594,29 @@ def _is_negated_safety_constraint(
         return False
     clause_start = max(line.rfind(sep, 0, local_start) for sep in ".;:")
     prefix = line[clause_start + 1 : local_start]
-    safe_gap = r"(?:(?:ever|again|directly|intentionally|explicitly|attempt\s+to|try\s+to)\s+){0,2}"
+    safe_gap = r"(?:(?:ever|again|directly|intentionally|explicitly|repeatedly|attempt\s+to|try\s+to)\s+){0,2}"
+    # A prohibition may target the recommendation itself ("Do not repeatedly
+    # recommend suite `self-update`"): the negated verb phrase, not the matched
+    # action, carries the prohibition. Allow one recommendation verb plus a
+    # short object gap (at most three words) between the negation and the
+    # phrase, and an opening backtick when the phrase sits in a code span.
+    # The object gap may only hold object words: a conjunction or a fresh
+    # action verb inside it ("Do not recommend it but run `self-update`")
+    # starts a new, affirmative instruction that the prohibition does not
+    # govern, so such tokens are barred from the gap and the anchored
+    # match then fails, keeping the finding.
+    recommendation_gap = (
+        r"(?:(?:recommend|advise|suggest|propose|encourage|urge)(?:s|d|es|ed|ing)?\s+"
+        r"(?:(?!(?:but|and|or|yet|then|run|execute|perform|invoke|apply|start|launch)\b)\w+\s+){0,3})?"
+    )
     negation = r"(?:must\s+not|do\s+not|don't|never|should\s+not)\s+"
     return (
-        re.search(negation + safe_gap + escaped + r"$", prefix + phrase, re.IGNORECASE) is not None
+        re.search(
+            negation + safe_gap + recommendation_gap + r"`?" + escaped + r"$",
+            prefix + phrase,
+            re.IGNORECASE,
+        )
+        is not None
     )
 
 
