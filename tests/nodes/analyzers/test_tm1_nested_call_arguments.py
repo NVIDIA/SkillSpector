@@ -36,6 +36,11 @@ def _tm1(content: str, path: str = "run.py") -> list:
         pytest.param(
             "subprocess.run(cmd,  # don't quote\n    shell=True)", id="apostrophe_in_comment"
         ),
+        pytest.param("subprocess.run(cmd,  # (\n    shell=True)", id="open_paren_in_comment"),
+        pytest.param(
+            'subprocess.run(\n    """\n    echo :(\n    """,\n    shell=True,\n)',
+            id="open_paren_in_triple_quoted_string",
+        ),
     ],
 )
 def test_shell_true_after_nested_call_argument_is_detected(call: str) -> None:
