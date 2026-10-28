@@ -7310,3 +7310,143 @@ def test_cli_baseline_rejects_failed_scan_before_writing(
     assert output.read_bytes() == previous
     build.assert_not_called()
     cleanup.assert_called_once_with(result)
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("plain message", "Error: plain message"),
+        ("skills[old]/demo", "Error: skills[old]/demo"),
+        ("nope[/x]", "Error: nope[/x]"),
+        ("[bold]x[/bold]", "Error: [bold]x[/bold]"),
+        (
+            "Install it with: pip install 'skillspector[mcp]'",
+            "Error: Install it with: pip install 'skillspector[mcp]'",
+        ),
+        ("emoji :smile: here", "Error: emoji :smile: here"),
+        ("C:\\Users\\", "Error: C:\\Users\\"),
+        ("first\nsecond", "Error: first\nsecond"),
+        ("esc \x1b[2J", "Error: esc \\x1b[2J"),
+    ],
+)
+def test_error_line_renders_message_literally(message: str, expected: str) -> None:
+    assert cli_module._error_line(message).plain == expected
+
+
+def test_error_line_survives_console_print() -> None:
+    buffer = StringIO()
+    Console(file=buffer, width=120).print(cli_module._error_line("a :smile: [bold]b[/bold] C:\\"))
+    assert buffer.getvalue() == "Error: a :smile: [bold]b[/bold] C:\\\n"
+
+
+@pytest.mark.parametrize("bad_input", ["skills[old]/demo", "nope[/x]"])
+def test_scan_input_error_shows_bracketed_path_literally(bad_input: str) -> None:
+    result = runner.invoke(app, ["scan", bad_input])
+    assert result.exit_code == 2
+    assert bad_input in result.output
+    assert "MarkupError" not in result.output
+
+
+def test_mcp_missing_extra_install_hint_keeps_extra_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(**_kwargs: object) -> None:
+        raise ModuleNotFoundError(
+            "The MCP server requires the optional 'mcp' dependency. "
+            "Install it with: pip install 'skillspector[mcp]'"
+        )
+
+    monkeypatch.setattr("skillspector.mcp_server.run", fake_run)
+    result = runner.invoke(app, ["mcp"])
+    assert result.exit_code != 0
+    assert "skillspector[mcp]" in result.output
+
+
+def test_warning_line_renders_message_literally() -> None:
+    message = (
+        "Transitive scan failed for https://raw.githubusercontent.com/acme/tools/main/setup[/x].sh"
+    )
+    assert cli_module._warning_line(message).plain == f"Warning: {message}"
+
+
+def test_literal_line_keeps_label_style_and_literal_path() -> None:
+    line = cli_module._literal_line("Report saved to", "green", Path("out[b].json"))
+    assert line.plain == "Report saved to: out[b].json"
+    assert line.spans[0].style == "green"
+
+
+def test_transitive_child_failure_warning_shows_bracketed_url_literally(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: d\n---\n# Demo\n\n"
+        "Run https://raw.githubusercontent.com/acme/tools/main/setup[/x].sh first.\n"
+    )
+    real_scan_for_source = cli._run_graph_scan_for_source
+    child_inputs: list[str] = []
+
+    def scan_for_source(**kwargs: Any) -> dict[str, object]:
+        if kwargs["input_path"] == str(skill):
+            return real_scan_for_source(**kwargs)
+        child_inputs.append(kwargs["input_path"])
+        raise RuntimeError("child scan failed")
+
+    monkeypatch.setattr(cli, "_run_graph_scan_for_source", scan_for_source)
+    cli._scan_skill(
+        input_path=str(skill),
+        format=FormatChoice.terminal,
+        no_llm=True,
+        baseline=None,
+        yara_rules_dir=None,
+        verbose=False,
+        show_suppressed=False,
+        transitive_enabled=True,
+        transitive_depth=1,
+        transitive_allow_prefix=None,
+        transitive_deny_prefix=None,
+    )
+    assert child_inputs, "the root should have reached a transitive child scan"
+    shown = "".join(capsys.readouterr().out.split())
+    assert "Transitivescanfailedfor" in shown
+    assert "setup[/x].sh" in shown
+
+
+def test_recursive_scan_shows_bracketed_skill_names_literally(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Detection sanitizes names, so build the directories directly to exercise the print path.
+    skills = []
+    for name in ("one[bold]x", "two"):
+        skill = tmp_path / name
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: d\n---\n# Demo\n\nSummarize the supplied text.\n"
+        )
+        skills.append(SkillDirectory(skill, name, name))
+
+    _scan_multi_skill(
+        MultiSkillDetectionResult(is_multi_skill=True, skills=skills),
+        FormatChoice.terminal,
+        None,
+        no_llm=True,
+    )
+
+    captured = capsys.readouterr()
+    shown = "".join((captured.out + captured.err).split())
+    assert "Scanningone[bold]x(one[bold]x/)" in shown
+
+
+def test_scan_report_saved_message_shows_bracketed_path_literally(tmp_path: Path) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: d\n---\n# Demo\n\nSummarize the supplied text.\n"
+    )
+    report = tmp_path / "out[b].json"
+    result = runner.invoke(
+        app, ["scan", str(skill), "--format", "json", "--no-llm", "-o", str(report)]
+    )
+    assert "out[b].json" in "".join(result.output.split())
+    assert report.exists()
