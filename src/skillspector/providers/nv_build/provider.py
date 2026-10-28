@@ -24,11 +24,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-
-from langchain_core.language_models.chat_models import BaseChatModel
+from typing import TYPE_CHECKING
 
 from skillspector.providers import registry
-from skillspector.providers.chat_models import create_openai_compatible_chat_model
+
+if TYPE_CHECKING:
+    from langchain_core.language_models.chat_models import BaseChatModel
 
 BUILD_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
@@ -61,6 +62,8 @@ class NvBuildProvider:
         timeout: float | None = 120,
     ) -> BaseChatModel | None:
         """Create ``ChatOpenAI`` for the build.nvidia.com endpoint."""
+        from skillspector.providers.chat_models import create_openai_compatible_chat_model
+
         return create_openai_compatible_chat_model(
             model=model,
             credentials=self.resolve_credentials(),
