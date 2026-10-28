@@ -122,6 +122,24 @@ app = typer.Typer(
 console = Console()
 err_console = Console(stderr=True)
 
+
+def _literal_line(label: str, style: str, message: object) -> Text:
+    """Render a labelled line literally: no Rich markup, emoji or control characters."""
+    lines = str(message).split("\n")
+    body = "\n".join(_visible_terminal_text(line) for line in lines)
+    return Text.assemble((f"{label}:", style), " ", body)
+
+
+def _error_line(message: object) -> Text:
+    """Render an error line literally."""
+    return _literal_line("Error", "red", message)
+
+
+def _warning_line(message: object) -> Text:
+    """Render a warning line literally."""
+    return _literal_line("Warning", "yellow", message)
+
+
 _PROGRESS_TREE_MAX_PATHS = 200
 _PROGRESS_TREE_MAX_NODES = 1_000
 _TRANSITIVE_MAX_TARGETS = 32
@@ -377,9 +395,9 @@ def _write_result(
     if output:
         write_text_no_follow(output, report_body)
         if format == FormatChoice.terminal:
-            console.print(f"\n[green]Report saved to:[/green] {output}")
+            console.print(Text.assemble("\n", _literal_line("Report saved to", "green", output)))
         else:
-            console.print(f"Report saved to: {output}")
+            console.print(_literal_line("Report saved to", "", output))
     else:
         if format == FormatChoice.terminal:
             console.print(report_body, markup=False, emoji=False)
@@ -393,7 +411,7 @@ def _exit_on_unsupported_llm_controls(no_llm: bool) -> None:
         return
     error = unsupported_control_error()
     if error is not None:
-        err_console.print(f"[red]Error:[/red] {error}")
+        err_console.print(_error_line(error))
         raise typer.Exit(code=2)
 
 
@@ -700,7 +718,7 @@ def scan(
         try:
             require_secure_file_output()
         except ValueError as exc:
-            err_console.print(f"[red]Error:[/red] {exc}")
+            err_console.print(_error_line(exc))
             raise typer.Exit(code=2) from exc
 
     if mcp_registry:
@@ -741,7 +759,7 @@ def scan(
             report = json.dumps(result, indent=2)
             if output:
                 write_text_no_follow(output, report)
-                console.print(f"Report saved to: {output}")
+                console.print(_literal_line("Report saved to", "", output))
             else:
                 print(report)
             if fail_on_findings and result["findings"]:
@@ -751,7 +769,7 @@ def scan(
         except typer.Exit:
             raise
         except Exception as e:
-            err_console.print(f"[red]Error:[/red] {e}")
+            err_console.print(_error_line(e))
             raise typer.Exit(code=2) from e
         return
 
@@ -764,14 +782,14 @@ def scan(
             resolved_path = validate_local_input_path(resolved_path)
             _validate_report_destination(resolved_path, output)
         except (OSError, ValueError) as e:
-            err_console.print(f"[red]Error:[/red] {e}")
+            err_console.print(_error_line(e))
             raise typer.Exit(code=2) from e
     try:
         transitive_allow_prefix, transitive_deny_prefix = transitive.normalize_prefixes(
             transitive_allow_prefix, transitive_deny_prefix
         )
     except ValueError as exc:
-        err_console.print(f"[red]Error:[/red] invalid transitive prefix: {exc}")
+        err_console.print(_error_line(f"invalid transitive prefix: {exc}"))
         raise typer.Exit(code=2) from exc
     _exit_on_unsupported_llm_controls(no_llm)
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
@@ -826,13 +844,13 @@ def scan(
             except typer.Exit:
                 raise
             except (FileNotFoundError, ValueError) as e:
-                err_console.print(f"[red]Error:[/red] {e}")
+                err_console.print(_error_line(e))
                 raise typer.Exit(code=2) from e
             except Exception as e:
                 if verbose:
                     err_console.print_exception()
                 else:
-                    err_console.print(f"[red]Error:[/red] {e}")
+                    err_console.print(_error_line(e))
                 raise typer.Exit(code=2) from e
             return
         if detection.complete and not detection.has_root_skill and len(detection.skills) == 0:
@@ -863,14 +881,14 @@ def scan(
     if shipped is not None:
         if use_shipped_baseline:
             baseline = shipped
-            err_console.print(f"[yellow]Applying author-shipped baseline:[/yellow] {shipped}")
+            err_console.print(_literal_line("Applying author-shipped baseline", "yellow", shipped))
             err_console.print(
                 "[dim]Suppressed findings do not count toward the risk score; "
                 "use --show-suppressed to list them.[/dim]"
             )
         else:
             err_console.print(
-                f"[yellow]Shipped baseline detected (not applied):[/yellow] {shipped}"
+                _literal_line("Shipped baseline detected (not applied)", "yellow", shipped)
             )
             err_console.print(
                 "[dim]Review it, then re-run with --use-shipped-baseline to apply its "
@@ -878,8 +896,12 @@ def scan(
             )
     elif use_shipped_baseline and baseline is None:
         err_console.print(
-            f"[dim]--use-shipped-baseline: no shipped baseline found in {resolved_path}; "
-            "scanning without a baseline.[/dim]"
+            Text(
+                _visible_terminal_text(
+                    f"--use-shipped-baseline: no shipped baseline found in {resolved_path}; scanning without a baseline."
+                ),
+                style="dim",
+            )
         )
 
     result = None
@@ -922,13 +944,13 @@ def scan(
     except typer.Exit:
         raise
     except (FileNotFoundError, ValueError) as e:
-        err_console.print(f"[red]Error:[/red] {e}")
+        err_console.print(_error_line(e))
         raise typer.Exit(code=2) from e
     except Exception as e:
         if verbose:
             err_console.print_exception()
         else:
-            err_console.print(f"[red]Error:[/red] {e}")
+            err_console.print(_error_line(e))
         raise typer.Exit(code=2) from e
     finally:
         if result is not None:
@@ -2406,7 +2428,7 @@ def _scan_transitive(
                 if format in _MACHINE_READABLE_FORMATS or format is FormatChoice.markdown:
                     logger.warning("Transitive scan failed for %s", target)
                 else:
-                    console.print(f"[yellow]Warning:[/yellow] Transitive scan failed for {target}")
+                    console.print(_warning_line(f"Transitive scan failed for {target}"))
             finally:
                 if child_result is not None:
                     cleanup_result(child_result)
@@ -3003,7 +3025,11 @@ def _scan_multi_skill(
             aggregate_limitations.extend(shared_transitive_traversal.truncation_reasons)
             break
         progress_console.print(
-            f"  [{i}/{len(skills)}] Scanning [bold]{skill.name}[/bold] ({skill.relative_path}/)"
+            Text.assemble(
+                f"  [{i}/{len(skills)}] Scanning ",
+                (_visible_terminal_text(str(skill.name)), "bold"),
+                f" ({_visible_terminal_text(str(skill.relative_path))}/)",
+            )
         )
         result: dict[str, object] | None = None
         try:
@@ -3158,7 +3184,9 @@ def _scan_multi_skill(
     for skill, result in zip(processed_skills, results, strict=True):
         if "error" in result:
             progress_console.print(
-                f"  {skill.name:<30} {'ERROR':<8} {'—':<12} {'—':<10} {'error':<10}"
+                Text(
+                    f"  {_visible_terminal_text(str(skill.name)):<30} {'ERROR':<8} {'—':<12} {'—':<10} {'error':<10}"
+                )
             )
             continue
         score = result.get("risk_score", 0)
@@ -3166,7 +3194,9 @@ def _scan_multi_skill(
         finding_count = len(effective_findings(result))
         execution = "failed" if result.get("execution_successful") is False else "successful"
         progress_console.print(
-            f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10} {execution:<10}"
+            Text(
+                f"  {_visible_terminal_text(str(skill.name)):<30} {score:<8} {severity:<12} {finding_count:<10} {execution:<10}"
+            )
         )
     if output_omitted_skill_count:
         progress_console.print(
@@ -3293,7 +3323,7 @@ def _scan_multi_skill(
         _ensure_recursive_output_bound(rendered)
         if output is not None:
             write_text_no_follow(output, rendered)
-            progress_console.print(f"[green]Combined report saved to:[/green] {output}")
+            progress_console.print(_literal_line("Combined report saved to", "green", output))
         else:
             sys.stdout.write(rendered)
     elif format == FormatChoice.sarif:
@@ -3321,7 +3351,7 @@ def _scan_multi_skill(
         _ensure_recursive_output_bound(rendered)
         if output is not None:
             write_text_no_follow(output, rendered)
-            progress_console.print(f"[green]Combined report saved to:[/green] {output}")
+            progress_console.print(_literal_line("Combined report saved to", "green", output))
         else:
             sys.stdout.write(rendered)
     else:
@@ -3354,7 +3384,7 @@ def _scan_multi_skill(
         _ensure_recursive_output_bound(rendered)
         if output is not None:
             write_text_no_follow(output, rendered)
-            progress_console.print(f"[green]Combined report saved to:[/green] {output}")
+            progress_console.print(_literal_line("Combined report saved to", "green", output))
         elif format is FormatChoice.terminal:
             console.print(rendered, markup=False, emoji=False)
         else:
@@ -3417,7 +3447,7 @@ def mcp(
 
         run_mcp(transport=transport.value, host=host, port=port)
     except (ModuleNotFoundError, ValueError) as e:
-        err_console.print(f"[red]Error:[/red] {e}")
+        err_console.print(_error_line(e))
         raise typer.Exit(code=2) from e
 
 
@@ -3517,18 +3547,20 @@ def baseline(
         else:
             dump_baseline(data, output)
             console.print(
-                f"[green]Wrote baseline with {len(findings)} suppressed finding(s) to:[/green] {output}"
+                _literal_line(
+                    f"Wrote baseline with {len(findings)} suppressed finding(s) to", "green", output
+                )
             )
     except typer.Exit:
         raise
     except (FileNotFoundError, ValueError) as e:
-        err_console.print(f"[red]Error:[/red] {e}")
+        err_console.print(_error_line(e))
         raise typer.Exit(code=2) from e
     except Exception as e:
         if verbose:
             err_console.print_exception()
         else:
-            err_console.print(f"[red]Error:[/red] {e}")
+            err_console.print(_error_line(e))
         raise typer.Exit(code=2) from e
     finally:
         if result is not None:
