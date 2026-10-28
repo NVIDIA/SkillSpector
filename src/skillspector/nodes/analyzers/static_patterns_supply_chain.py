@@ -2207,13 +2207,34 @@ def _collect_npm_locked_versions(
                         _normalize_npm_package_name(name)
                     ] = version.strip()
         elif isinstance(data.get("dependencies"), dict):
-            installs[PurePosixPath(".")] = {
-                _normalize_npm_package_name(name): entry["version"].strip()
-                for name, entry in data["dependencies"].items()
-                if isinstance(entry, dict)
-                and isinstance(entry.get("version"), str)
-                and entry["version"].strip()
-            }
+            trees = {PurePosixPath("."): data["dependencies"]}
+            for entry in data["dependencies"].values():
+                version = entry.get("version") if isinstance(entry, dict) else None
+                if not isinstance(version, str) or not version.startswith("file:"):
+                    continue
+                location = version[5:]
+                relative = PurePosixPath(location)
+                if (
+                    not location
+                    or relative == PurePosixPath(".")
+                    or relative.is_absolute()
+                    or ".." in relative.parts
+                    or "\\" in location
+                    or str(root / relative) not in manifest_dirs
+                ):
+                    continue
+                # v1 records workspace links here instead of in the packages table.
+                projects.add(relative)
+                trees[relative] = entry.get("dependencies", {})
+            for project, dependencies in trees.items():
+                if isinstance(dependencies, dict):
+                    installs[project] = {
+                        _normalize_npm_package_name(name): entry["version"].strip()
+                        for name, entry in dependencies.items()
+                        if isinstance(entry, dict)
+                        and isinstance(entry.get("version"), str)
+                        and entry["version"].strip()
+                    }
         for project in projects:
             scope = str(root / project)
             depth = len(root.parts)

@@ -381,3 +381,59 @@ def test_npm_alias_install_does_not_pin_the_alias_registry_name():
     )
     assert packages == [("lodash", None, 1)]
     assert supply_chain._extract_packages_from_npm_lock(content) == [("node-forge", "1.4.2", 1)]
+
+
+def test_npm_v1_workspace_uses_recorded_link_and_nearest_locked_install():
+    cache = {
+        "package-lock.json": json.dumps(
+            {
+                "lockfileVersion": 1,
+                "dependencies": {
+                    "workspace-a": {
+                        "version": "file:packages/a",
+                        "dependencies": {"node-forge": {"version": "1.2.1"}},
+                    },
+                    "workspace-b": {"version": "file:packages/b"},
+                    "node-forge": {"version": "1.4.2"},
+                },
+            }
+        ),
+        "packages/a/package.json": "{}",
+        "packages/b/package.json": "{}",
+        "packages/c/package.json": "{}",
+    }
+    resolved = supply_chain._collect_npm_locked_versions(cache, list(cache))
+    assert resolved["."]["node-forge"] == "1.4.2"
+    assert resolved["packages/a"]["node-forge"] == "1.2.1"
+    assert resolved["packages/b"]["node-forge"] == "1.4.2"
+    assert not resolved.get("packages/c")
+    cache["packages/b/package-lock.json"] = "{"
+    assert not supply_chain._collect_npm_locked_versions(cache, list(cache)).get("packages/b")
+
+
+@pytest.mark.parametrize(
+    "location", ["../other", "/other", "folder/../../other", "folder\\..\\other"]
+)
+def test_npm_v1_links_cannot_resolve_manifests_outside_the_project(location):
+    cache = {
+        "project/package-lock.json": json.dumps(
+            {
+                "dependencies": {
+                    "linked": {"version": f"file:{location}"},
+                    "ws": {"version": "8.20.0"},
+                }
+            }
+        ),
+        "other/package.json": "{}",
+    }
+    assert not supply_chain._collect_npm_locked_versions(cache, list(cache)).get("other")
+
+
+def test_npm_v1_self_link_does_not_replace_the_root_install_tree():
+    cache = {
+        "package-lock.json": json.dumps(
+            {"dependencies": {"self": {"version": "file:./"}, "ws": {"version": "8.20.0"}}}
+        ),
+        "package.json": "{}",
+    }
+    assert supply_chain._collect_npm_locked_versions(cache, list(cache))["."]["ws"] == "8.20.0"
