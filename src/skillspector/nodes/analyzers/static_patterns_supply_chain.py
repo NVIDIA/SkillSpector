@@ -1774,7 +1774,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
                 break
     sc3_patterns = (
-        SC3_PATTERNS if file_type in ("python", "javascript", "shell", "perl", "other") else []
+        SC3_PATTERNS
+        if file_type in ("python", "javascript", "shell", "perl", "powershell", "other")
+        else []
     )
     if has_shell_decoder:
         sc3_patterns = sc3_patterns + SC3_SHELL_PATTERNS
