@@ -669,6 +669,8 @@ def scan(
           AZURE_OPENAI_ENDPOINT              for azure_openai
         SKILLSPECTOR_COMPAT_API_KEY +
           SKILLSPECTOR_COMPAT_BASE_URL       for openai_compatible
+        SKILLSPECTOR_COMPAT_HEADERS          optional JSON object of string headers
+                                             for openai_compatible
         GOOGLE_CLOUD_PROJECT [+ GOOGLE_CLOUD_LOCATION]
                                              for gemini (uses Application
                                              Default Credentials / Workload Identity)
