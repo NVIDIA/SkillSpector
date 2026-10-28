@@ -2572,6 +2572,32 @@ class TestContentHashInvalidation:
 
 
 class TestInspectionLedgerResponse:
+    @pytest.mark.parametrize("path_kind", ["missing", "file", "symlink"])
+    def test_invalid_custom_rule_directory_is_incomplete_after_cache_hit(
+        self, tmp_path, path_kind
+    ) -> None:
+        state = {"components": ["skill.txt"], "file_cache": {"skill.txt": "ordinary text"}}
+        assert static_yara.node(state)["analyzer_status_events"][0]["status"] == "completed"
+        invalid = tmp_path / "custom-rules"
+        if path_kind == "file":
+            invalid.write_text("not a directory")
+        elif path_kind == "symlink":
+            try:
+                invalid.symlink_to(tmp_path, target_is_directory=True)
+            except OSError:
+                pytest.skip("Creating symlinks is unavailable on this platform")
+
+        result = static_yara.node({**state, "yara_rules_dir": str(invalid)})
+
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+        assert result["analyzer_status_events"][0]["reason_code"] == "read_error"
+        assert result["inspection_ledger"][0]["outcome"] == "partial"
+        assert result["inspection_ledger"][0]["reason_code"] == "read_error"
+        assert str(invalid) not in json.dumps(result)
+        assert static_yara.node(state)["analyzer_status_events"][0]["status"] == "completed"
+        empty = static_yara.node({**state, "yara_rules_dir": str(tmp_path)})
+        assert empty["analyzer_status_events"][0]["status"] == "completed"
+
     def test_rule_discovery_limit_marks_every_component_partial(
         self, monkeypatch, tmp_path
     ) -> None:
