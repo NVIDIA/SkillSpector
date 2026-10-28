@@ -22,8 +22,10 @@ Detects supply-chain rug-pull risks in agent skills:
 
 from __future__ import annotations
 
+import json
 import re
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from skillspector.inspection_ledger import (
@@ -215,6 +217,78 @@ def _operand_has_version_pin(line_remainder: str) -> bool:
     return _VERSION_PIN_RE.search(operand_suffix) is not None
 
 
+def _iter_config_commands(
+    config: object, budget: _RugPullBudget, path: str, content: str
+) -> Iterator[tuple[str, int]]:
+    """Yield JSON command lines with the line of each command key."""
+    command_keys = iter(re.finditer(r'(?<!\\)"command"\s*:', content))
+    pending = [(iter(((None, config),)), None)]
+    while pending:
+        budget.check_runtime(path)
+        items, owner = pending[-1]
+        try:
+            key, item = next(items)
+        except StopIteration:
+            pending.pop()
+            continue
+
+        if key == "command" and owner is not None:
+            key_match = next(command_keys, None)
+            args = owner.get("args")
+            if (
+                isinstance(item, str)
+                and isinstance(args, list)
+                and all(isinstance(argument, str) for argument in args)
+            ):
+                line = _find_line(content, key_match.start()) if key_match else 1
+                yield " ".join([item, *args]), line
+
+        if isinstance(item, dict):
+            pending.append((iter(item.items()), item))
+        elif isinstance(item, list):
+            pending.append((iter((None, value) for value in item), None))
+
+
+def _check_rp1_npx(
+    content: str,
+    file_path: str,
+    budget: _RugPullBudget,
+    line_number: int | None = None,
+) -> None:
+    """Report unpinned npx invocations in text or reconstructed config commands."""
+    for match in _RP1_NPX_CMD.finditer(content):
+        budget.check_runtime(file_path)
+        full_match = match.group(0)
+        line_end = content.find("\n", match.end())
+        if line_end == -1:
+            line_end = len(content)
+        line_remainder = content[match.end() : min(line_end, match.end() + 256)]
+        if _VERSION_PIN_RE.search(full_match) or _operand_has_version_pin(line_remainder):
+            continue
+        budget.emit(
+            Finding(
+                rule_id="RP1",
+                message=(
+                    f"MCP server referenced without pinned version: '{full_match.strip()[:200]}'."
+                ),
+                severity="MEDIUM",
+                confidence=0.70,
+                file=file_path,
+                start_line=line_number or _find_line(content, match.start()),
+                category=_CATEGORY,
+                tags=list(_TAGS),
+                matched_text=full_match[:200],
+                match_fingerprint=compute_match_fingerprint("RP1", full_match),
+                explanation=(
+                    "npx commands without a version suffix (e.g. @1.0.0) "
+                    "create a rug-pull risk if the upstream server is "
+                    "compromised and publishes a malicious update."
+                ),
+                remediation="Pin the version: npx @scope/server@1.2.3",
+            )
+        )
+
+
 def _check_rp1(
     manifest: dict,
     file_cache: dict[str, str],
@@ -223,40 +297,18 @@ def _check_rp1(
     """Detect unpinned MCP server command references in skill files."""
     for file_path, content in file_cache.items():
         budget.check_runtime(file_path)
-        # npx without @version
-        for m in _RP1_NPX_CMD.finditer(content):
-            budget.check_runtime(file_path)
-            full_match = m.group(0)
-            line_end = content.find("\n", m.end())
-            if line_end == -1:
-                line_end = len(content)
-            line_remainder = content[m.end() : min(line_end, m.end() + 256)]
-            if _VERSION_PIN_RE.search(full_match) or _operand_has_version_pin(line_remainder):
-                continue
-            line_num = _find_line(content, m.start())
-            budget.emit(
-                Finding(
-                    rule_id="RP1",
-                    message=(
-                        "MCP server referenced without pinned version: "
-                        f"'{full_match.strip()[:200]}'."
-                    ),
-                    severity="MEDIUM",
-                    confidence=0.70,
-                    file=file_path,
-                    start_line=line_num,
-                    category=_CATEGORY,
-                    tags=list(_TAGS),
-                    matched_text=full_match[:200],
-                    match_fingerprint=compute_match_fingerprint("RP1", full_match),
-                    explanation=(
-                        "npx commands without a version suffix (e.g. @1.0.0) "
-                        "create a rug-pull risk if the upstream server is "
-                        "compromised and publishes a malicious update."
-                    ),
-                    remediation="Pin the version: npx @scope/server@1.2.3",
-                )
-            )
+        _check_rp1_npx(content, file_path, budget)
+
+        if file_path.lower().endswith(".json"):
+            try:
+                config = json.loads(content)
+            except (json.JSONDecodeError, RecursionError):
+                config = None
+            if config is not None:
+                for command_line, command_line_number in _iter_config_commands(
+                    config, budget, file_path, content
+                ):
+                    _check_rp1_npx(command_line, file_path, budget, command_line_number)
 
         # uvx without ==version
         for m in _RP1_UVX_CMD.finditer(content):
