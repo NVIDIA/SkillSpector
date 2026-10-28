@@ -555,6 +555,7 @@ def test_cli_scan_local_directory(tmp_path: Path) -> None:
         ("docs/pyproject.toml.md", "Documentation describing pyproject.toml fields.\n", False),
         ("docs/package.json.md", "Documentation describing package.json fields.\n", False),
         ("docs/uv.lock.md", "Documentation describing uv.lock fields.\n", False),
+        ("docs/requirements/dev.txt.md", "Documentation describing requirements files.\n", False),
     ],
 )
 def test_cli_reports_malformed_dependency_manifest_completeness(

@@ -103,7 +103,6 @@ class LedgerReason(StrEnum):
     REFERENCE_UNRESOLVED = "reference_unresolved"
     DEPENDENCY_PARSE_ERROR = "dependency_parse_error"
     MANIFEST_PARSE_ERROR = "manifest_parse_error"
-    DEPENDENCY_PARSE_ERROR = "dependency_parse_error"
     MANIFEST_PARSE_LIMIT = "manifest_parse_limit"
     ARTIFACT_COUNT_LIMIT = "artifact_count_limit"
     TRAVERSAL_DEPTH_LIMIT = "traversal_depth_limit"
