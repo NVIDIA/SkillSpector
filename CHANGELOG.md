@@ -1,6 +1,7 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
 * fix(coverage): account for successfully inspected linked ZIP containers while retaining member failures and archive limits
+* fix(supply-chain): resolve npm manifest dependencies within their owning lockfile and workspace installation paths
 * fix(static): stop Markdown code fence lines from reading as an open quote that merges consecutive shell lines into one marker directive (#868)
 * fix(ra1): treat a prohibition on recommending a self-update ("Do not recommend self-update") as the prohibition it is, not as an RA1 self-modification instruction (#928)
 * fix(analyzer): stop PowerShell comments, `<# #>` blocks, backtick line continuations and display-only `Write-Host`/`Write-Verbose`-style messages from reporting a false `static_parse_limit`; payloads for `bash -c`, `Invoke-Expression`, script blocks and call operators, subexpressions inside messages, and any source whose token ownership cannot be proven keep their existing bounded checks and partial status (#711)
