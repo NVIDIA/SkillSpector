@@ -359,12 +359,11 @@ def _result_body(result: dict) -> str:
 
 def _validate_report_destination(input_path: Path, output: Path | None) -> None:
     """Reject reports that would overwrite an input, including path aliases."""
-    if (
-        output is not None
-        and input_path.is_file()
-        and output.exists()
-        and output.samefile(input_path)
-    ):
+    if output is None:
+        return
+    if input_path.is_dir():
+        input_path = _manifest_file(input_path) or input_path
+    if input_path.is_file() and output.exists() and output.samefile(input_path):
         raise ValueError("--output points to the input file. Choose a different output path.")
 
 
@@ -3473,6 +3472,7 @@ def baseline(
         to_stdout = str(output) == "-"
         if not to_stdout:
             require_secure_file_output()
+            _validate_report_destination(Path(input_path.strip()), output)
         if verbose:
             set_level("DEBUG")
             err_console.print("[dim]Scanning to build baseline...[/dim]")
