@@ -329,6 +329,7 @@ def _scan_state(
     show_suppressed: bool = False,
     source_local_only: bool = False,
     exclude_patterns: list[str] | None = None,
+    use_shipped_baseline: bool = False,
 ) -> dict[str, object]:
     """Build initial graph state from scan CLI args."""
     state: dict[str, object] = {
@@ -340,6 +341,9 @@ def _scan_state(
     }
     if exclude_patterns:
         state["exclude_patterns"] = list(exclude_patterns)
+    if use_shipped_baseline:
+        state["use_shipped_baseline"] = True
+        state["show_suppressed"] = show_suppressed
     if yara_rules_dir is not None:
         state["yara_rules_dir"] = yara_rules_dir
     if baseline is not None:
@@ -348,6 +352,34 @@ def _scan_state(
         state["baseline_path"] = os.path.abspath(baseline.expanduser())
         state["show_suppressed"] = show_suppressed
     return state
+
+
+def _shipped_baseline_notice(shipped: Path | None, input_path: Path, apply: bool) -> None:
+    if shipped is not None:
+        if apply:
+            err_console.print(
+                "[yellow]Applying author-shipped baseline:[/yellow]", Text(str(shipped))
+            )
+            err_console.print(
+                "[dim]Suppressed findings do not count toward the risk score; "
+                "use --show-suppressed to list them.[/dim]"
+            )
+        else:
+            err_console.print(
+                "[yellow]Shipped baseline detected (not applied):[/yellow]", Text(str(shipped))
+            )
+            err_console.print(
+                "[dim]Review it, then re-run with --use-shipped-baseline to apply its "
+                "suppressions. Findings and risk score are unaffected until you opt in.[/dim]"
+            )
+    elif apply:
+        err_console.print(
+            Text(
+                f"--use-shipped-baseline: no shipped baseline found in {input_path}; "
+                "scanning without a baseline.",
+                style="dim",
+            )
+        )
 
 
 def _result_body(result: dict) -> str:
@@ -551,7 +583,7 @@ def scan(
         typer.Option(
             "--use-shipped-baseline",
             help="Apply a baseline shipped at the top level of the scanned skill "
-            "directory (.skillspector-baseline.yaml). Off by default: a skill "
+            "directory or local ZIP (.skillspector-baseline.yaml). Off by default: a skill "
             "author's baseline can suppress findings in your scan, so a discovered "
             "baseline is only reported until you opt in. Ignored when --baseline "
             "is given. Not supported for recursive multi-skill scans; scan each "
@@ -856,34 +888,23 @@ def scan(
                 f"this directory. Use --recursive to scan each independently."
             )
 
-    shipped: Path | None = None
-    if baseline is None and resolved_path.is_dir():
-        shipped = discover_baseline(resolved_path)
-    if shipped is not None:
+    zip_baseline = (
+        use_shipped_baseline
+        and baseline is None
+        and resolved_path.is_file()
+        and resolved_path.suffix.lower() == ".zip"
+    )
+    if baseline is None and not zip_baseline:
+        shipped = discover_baseline(resolved_path) if resolved_path.is_dir() else None
+        _shipped_baseline_notice(shipped, resolved_path, use_shipped_baseline)
         if use_shipped_baseline:
             baseline = shipped
-            err_console.print(f"[yellow]Applying author-shipped baseline:[/yellow] {shipped}")
-            err_console.print(
-                "[dim]Suppressed findings do not count toward the risk score; "
-                "use --show-suppressed to list them.[/dim]"
-            )
-        else:
-            err_console.print(
-                f"[yellow]Shipped baseline detected (not applied):[/yellow] {shipped}"
-            )
-            err_console.print(
-                "[dim]Review it, then re-run with --use-shipped-baseline to apply its "
-                "suppressions. Findings and risk score are unaffected until you opt in.[/dim]"
-            )
-    elif use_shipped_baseline and baseline is None:
-        err_console.print(
-            f"[dim]--use-shipped-baseline: no shipped baseline found in {resolved_path}; "
-            "scanning without a baseline.[/dim]"
-        )
 
     result = None
     try:
         scan_skill = partial(_scan_skill, exclude_patterns=exclude) if exclude else _scan_skill
+        if zip_baseline:
+            scan_skill = partial(scan_skill, use_shipped_baseline=True)
         result = scan_skill(
             input_path=input_path,
             format=format,
@@ -1577,6 +1598,7 @@ def _run_graph_scan(
     source_local_only: bool = False,
     stream_progress: bool = False,
     exclude_patterns: list[str] | None = None,
+    use_shipped_baseline: bool = False,
 ) -> dict[str, object]:
     state = _scan_state(
         input_path=input_path,
@@ -1587,6 +1609,7 @@ def _run_graph_scan(
         show_suppressed=show_suppressed,
         source_local_only=source_local_only,
         exclude_patterns=exclude_patterns,
+        use_shipped_baseline=use_shipped_baseline,
     )
     if transitive_traversal is not None:
         state["transitive_traversal_state"] = transitive_traversal
@@ -1689,6 +1712,7 @@ def _run_graph_scan_for_source(
     source_local_only: bool = False,
     stream_progress: bool = False,
     exclude_patterns: list[str] | None = None,
+    use_shipped_baseline: bool = False,
 ) -> dict[str, object]:
     """Invoke a scan without widening the legacy call contract for public sources."""
     run_graph_scan = (
@@ -1696,6 +1720,8 @@ def _run_graph_scan_for_source(
     )
     if exclude_patterns:
         run_graph_scan = partial(run_graph_scan, exclude_patterns=exclude_patterns)
+    if use_shipped_baseline:
+        run_graph_scan = partial(run_graph_scan, use_shipped_baseline=True)
     if initial_inspection_ledger is not None:
         if source_local_only:
             return run_graph_scan(
@@ -2560,6 +2586,7 @@ def _scan_skill(
     pre_scan_ledger_events: list[dict[str, object]] | None = None,
     source_local_only: bool = False,
     exclude_patterns: list[str] | None = None,
+    use_shipped_baseline: bool = False,
 ) -> dict[str, object]:
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     active_visited: set[str] = set()
@@ -2579,6 +2606,8 @@ def _scan_skill(
     run_for_source = _run_graph_scan_for_source
     if exclude_patterns:
         run_for_source = partial(run_for_source, exclude_patterns=exclude_patterns)
+    if use_shipped_baseline:
+        run_for_source = partial(run_for_source, use_shipped_baseline=True)
     if pre_scan_ledger_events:
         result = run_for_source(
             input_path=input_path,
@@ -2604,6 +2633,15 @@ def _scan_skill(
             source_local_only=source_local_only,
             stream_progress=stream_progress,
         )
+    if use_shipped_baseline:
+        try:
+            selected = result.get("baseline_path")
+            _shipped_baseline_notice(
+                Path(selected) if isinstance(selected, str) else None, Path(input_path), True
+            )
+        except BaseException:
+            cleanup_result(result)
+            raise
     if not transitive_enabled:
         return result
     if transitive_traversal is None:  # Defensive: transitive scans initialize before root work.

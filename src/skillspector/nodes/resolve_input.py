@@ -35,6 +35,7 @@ from skillspector.state import (
     SkillspectorState,
     ensure_workflow_resource_budget,
 )
+from skillspector.suppression import discover_baseline, load_baseline
 
 logger = get_logger(__name__)
 
@@ -78,6 +79,16 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
                 update["temp_dir_for_cleanup"] = str(temp_dir)
             else:
                 update["temp_dir_for_cleanup"] = None
+            if (
+                source_type == "zip"
+                and state.get("use_shipped_baseline")
+                and state.get("baseline") is None
+                and not state.get("baseline_path")
+            ):
+                shipped = discover_baseline(resolved)
+                if shipped is not None:
+                    update["baseline"] = load_baseline(shipped)
+                    update["baseline_path"] = str(shipped)
             return update
         except TransitiveIngestTruncatedError as exc:
             # The graph has no directory to scan. Propagate a typed, sanitized

@@ -3798,6 +3798,95 @@ def test_cli_shipped_baseline_opt_in(tmp_path: Path, extra: list[str]) -> None:
     assert "Applying author-shipped baseline" in result.stderr
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("format", ["json", "sarif"])
+@pytest.mark.parametrize("extra", [[], ["--transitive", "--transitive-depth", "0"]])
+def test_cli_zip_shipped_baseline_opt_in(
+    tmp_path: Path, wrapped: bool, format: str, extra: list[str]
+) -> None:
+    """Load the extracted root baseline before analysis and preserve report audit trails."""
+    skill_dir = _make_skill_dir(tmp_path)
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        for path in skill_dir.iterdir():
+            bundle.write(path, f"skill/{path.name}" if wrapped else path.name)
+    result = runner.invoke(
+        app,
+        ["scan", str(archive), "--no-llm", "--format", format, "--use-shipped-baseline", *extra],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert "Applying author-shipped baseline" in result.stderr
+    if format == "json":
+        assert data["issues"] == []
+        assert data["suppressed_count"] >= 1
+        assert data["analysis_completeness"]["is_complete"] is True
+        exclusions = data["analysis_completeness"]["scope_exclusions"]
+        assert any(event["reason_code"] == "baseline_file" for event in exclusions)
+    else:
+        validate_sarif_report(data)
+        results = data["runs"][0]["results"]
+        assert results and all(finding.get("suppressions") for finding in results)
+
+
+@pytest.mark.parametrize("mode", ["default", "opt-in", "explicit", "missing-explicit"])
+def test_cli_zip_malformed_shipped_baseline_trust(tmp_path: Path, mode: str) -> None:
+    """Only author opt-in reads the shipped file; an explicit baseline takes precedence."""
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("SKILL.md", _SKILL_MD)
+        bundle.writestr(".skillspector-baseline.yaml", "version: 2\nrules: [{}]\n")
+    args = [] if mode == "default" else ["--use-shipped-baseline"]
+    if "explicit" in mode:
+        explicit = tmp_path / "explicit.yaml"
+        if mode == "explicit":
+            explicit.write_text(_SHIPPED_BASELINE_YAML)
+        args += ["--baseline", str(explicit)]
+    result = runner.invoke(app, ["scan", str(archive), "--no-llm", "--format", "json", *args])
+    assert (
+        result.exit_code == {"default": 1, "opt-in": 2, "explicit": 0, "missing-explicit": 2}[mode]
+    )
+    if mode == "default":
+        assert json.loads(result.stdout)["suppressed_count"] == 0
+    elif mode == "explicit":
+        assert json.loads(result.stdout)["suppressed_count"] >= 1
+        assert "Applying author-shipped baseline" not in result.stderr
+
+
+@pytest.mark.parametrize("failure", [OSError, KeyboardInterrupt])
+def test_cli_zip_baseline_notice_failure_cleans_extraction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: type[BaseException]
+) -> None:
+    """A failed post-graph notice must not strand a temporary tree before result handoff."""
+    from skillspector.input_handler import InputHandler
+
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("SKILL.md", _SKILL_MD)
+        bundle.writestr(".skillspector-baseline.yaml", _SHIPPED_BASELINE_YAML)
+    created: list[Path] = []
+    original = InputHandler._get_temp_dir
+    noticed: list[bool] = []
+
+    def track(handler: InputHandler) -> Path:
+        path = original(handler)
+        created.append(path)
+        return path
+
+    def fail_notice(*_args: object) -> None:
+        noticed.append(True)
+        raise failure("notice failed")
+
+    monkeypatch.setattr(InputHandler, "_get_temp_dir", track)
+    monkeypatch.setattr(cli, "_shipped_baseline_notice", fail_notice)
+    result = runner.invoke(
+        app, ["scan", str(archive), "--no-llm", "--format", "json", "--use-shipped-baseline"]
+    )
+    assert noticed == [True]
+    assert result.exit_code != 0
+    assert created and all(not path.exists() for path in created)
+
+
 def test_cli_shipped_baseline_discovered_equals_explicit(tmp_path: Path) -> None:
     """A discovered baseline yields the same result as the same file passed explicitly (R10/P5)."""
     skill_dir = _make_skill_dir(tmp_path)

@@ -317,6 +317,8 @@ class SkillspectorState(TypedDict, total=False):
     # When it is inside the scan target, build_context excludes only that file
     # so waiver text cannot scan itself or enter regenerated fingerprints.
     baseline_path: str | None
+    # Explicit root opt-in for a local ZIP, applied after safe materialization.
+    use_shipped_baseline: bool
     show_suppressed: bool
     suppressed_findings: list[object]
     # Kept findings as baseline suppression saw them: one per occurrence, before
