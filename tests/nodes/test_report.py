@@ -946,6 +946,31 @@ class TestReportNode:
         terminal = report(state)["report_body"]
         assert "https://github.com/org/dep" in terminal
 
+    state = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": False,
+        "analysis_completeness": {
+            "total_components": 0,
+            "coverage_percent": 100.0,
+            "is_complete": True,
+            "status": "complete_with_caveats",
+            "fully_inspected_files": 0,
+            "partially_inspected_files": 0,
+            "entirely_uninspected_files": 0,
+            "ledger_exceptions": [],
+            "scope_exclusions": [],
+            "limitations": [],
+        },
+        "transitive_truncation_reasons": ["target budget reached"],
+    }
+    downgraded = json.loads(report(state)["report_body"])["analysis_completeness"]
+    assert downgraded["status"] == "partial"
+    assert downgraded["is_complete"] is False
+
     def test_report_keeps_same_path_from_distinct_immutable_sources(self) -> None:
         shared_url = "https://github.com/org/shared"
         findings: list[Finding] = []

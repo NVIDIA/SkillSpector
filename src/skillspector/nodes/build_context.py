@@ -2827,6 +2827,11 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                     skill_dir,
                     source_path=primary_path,
                     source_text=primary_text,
+                    metadata_root=(
+                        Path(str(state["primary_file_parent_path"]))
+                        if state.get("primary_file_parent_path")
+                        else None
+                    ),
                     known_paths=sorted(
                         dict.fromkeys([*inventoried_components, *excluded_artifacts])
                     ),
@@ -2919,11 +2924,13 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 reason=(
                     LedgerReason.REFERENCE_MISSING
                     if reference["status"] == "missing"
+                    else LedgerReason.REFERENCED_UNINSPECTED
+                    if reference["status"] == "uninspected"
                     else LedgerReason.REFERENCE_UNRESOLVED
                 ),
             )
             for reference in references
-            if reference["status"] in {"missing", "ambiguous"}
+            if reference["status"] in {"missing", "ambiguous", "uninspected"}
         )
 
     referenced_paths = frozenset(
