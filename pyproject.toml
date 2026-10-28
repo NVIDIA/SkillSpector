@@ -8,7 +8,7 @@ version = "2.13.3"
 description = "SkillSpector: Security scanner for AI agent skills (Claude Code, Cursor, and similar). Scans skills for vulnerabilities, malicious patterns, and security risks before installation. Supports Git repos, URLs, zips, and local directories; runs static pattern checks and optional LLM semantic analysis; outputs terminal, JSON, and Markdown reports with risk scoring."
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.12,<3.15"
+requires-python = ">=3.12,<3.16"
 keywords = [
     "security",
     "ai-agents",
@@ -26,6 +26,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Security",
     "Topic :: Software Development :: Quality Assurance",
 ]
