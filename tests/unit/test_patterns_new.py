@@ -4099,7 +4099,7 @@ class TestSupplyChainHelpers:
             indent=2,
         )
         cache = {"package-lock.json": content}
-        assert sc_mod._collect_npm_locked_versions(cache, list(cache)) == {"ws": "8.20.0"}
+        assert sc_mod._collect_npm_locked_versions(cache, list(cache))["."] == {"ws": "8.20.0"}
 
     def test_npm_normalization_keeps_underscores_distinct(self) -> None:
         # PyPI folds "_" into "-"; npm does not, and both string_decoder and string-decoder
@@ -4138,7 +4138,7 @@ class TestSupplyChainHelpers:
         }
         components = list(cache)
         assert sc_mod._collect_locked_versions(cache, components) == {"semver": "3.0.2"}
-        assert sc_mod._collect_npm_locked_versions(cache, components) == {"semver": "7.6.0"}
+        assert sc_mod._collect_npm_locked_versions(cache, components)["."] == {"semver": "7.6.0"}
 
     def test_extract_packages_requirements_specifier_is_not_a_pin(self) -> None:
         # Regression: any specifier was treated as "==", so the floor "pillow>=10.0.0" was

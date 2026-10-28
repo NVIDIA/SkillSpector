@@ -1,5 +1,6 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
+* fix(supply-chain): resolve npm manifest dependencies within their owning lockfile and workspace installation paths
 * fix(static): stop Markdown code fence lines from reading as an open quote that merges consecutive shell lines into one marker directive (#868)
 * fix(sc8): count only the bytecode walk's own CPU time against its 5 s budget, so time spent waiting behind concurrent analyzers no longer reports a static `runtime_limit` for skills that ship no bytecode (#828)
 * fix(providers): cut per-call cost of CLI-provider scans and default their LLM fan-out to 2 (#808)
