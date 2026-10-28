@@ -2190,6 +2190,13 @@ def _collect_npm_locked_versions(
                     projects.add(relative)
                 owner, separator, name = location.rpartition("node_modules/")
                 version = entry.get("version")
+                registry_name = entry.get("name")
+                if (
+                    isinstance(registry_name, str)
+                    and registry_name.strip()
+                    and registry_name != name
+                ):
+                    continue  # Alias slots must not borrow their target package's version.
                 if (
                     separator
                     and (not owner or owner.endswith("/"))

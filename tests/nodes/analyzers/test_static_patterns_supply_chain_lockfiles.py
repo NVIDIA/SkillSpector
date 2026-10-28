@@ -365,3 +365,19 @@ def test_npm_lock_paths_cannot_resolve_manifests_outside_the_project(location):
         "other/package.json": "{}",
     }
     assert not supply_chain._collect_npm_locked_versions(cache, list(cache)).get("other")
+
+
+def test_npm_alias_install_does_not_pin_the_alias_registry_name():
+    content = json.dumps(
+        {"packages": {"node_modules/lodash": {"name": "node-forge", "version": "1.4.2"}}}
+    )
+    cache = {"package-lock.json": content}
+    resolved = supply_chain._collect_npm_locked_versions(cache, list(cache))
+    manifest = '{"dependencies": {"lodash": "npm:node-forge@1.4.2"}}'
+    packages = supply_chain._apply_locked_versions(
+        supply_chain._extract_packages_from_package_json(manifest),
+        resolved["."],
+        supply_chain._normalize_npm_package_name,
+    )
+    assert packages == [("lodash", None, 1)]
+    assert supply_chain._extract_packages_from_npm_lock(content) == [("node-forge", "1.4.2", 1)]
