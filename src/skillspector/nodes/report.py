@@ -45,6 +45,7 @@ from skillspector.inspection_ledger import (
     RULE_SET_SCOPE,
     AnalysisCompleteness,
     finalize_ledger,
+    only_missing_reference_exceptions,
 )
 from skillspector.llm_provenance import sanitize_llm_provenance
 from skillspector.llm_utils import is_llm_available
@@ -823,20 +824,24 @@ def _build_sarif(
     raw_status = completeness.get("status")
     requested_status = (
         raw_status
-        if isinstance(raw_status, str) and raw_status in {"complete", "partial", "failed"}
+        if isinstance(raw_status, str)
+        and raw_status in {"complete", "complete_with_caveats", "partial", "failed"}
         else None
     )
+    reference_caveat_only = only_missing_reference_exceptions(raw_ledger_exceptions)
     is_complete = (
         completeness.get("is_complete", True) is True
-        and requested_status in {None, "complete"}
+        and requested_status in {None, "complete", "complete_with_caveats"}
         and execution_successful
         and partially_inspected == 0
         and entirely_uninspected == 0
-        and ledger_exception_count == 0
+        and (ledger_exception_count == 0 or reference_caveat_only)
         and limitation_count == 0
     )
     status = (
-        "complete"
+        requested_status
+        if is_complete and requested_status == "complete_with_caveats"
+        else "complete"
         if is_complete
         else "failed"
         if not execution_successful or requested_status == "failed"
@@ -1884,7 +1889,10 @@ def report(state: SkillspectorState) -> dict[str, object]:
             limitations.append(transitive_limitation)
         analysis_completeness["limitations"] = limitations
         analysis_completeness["is_complete"] = False
-        if analysis_completeness.get("status", "complete") == "complete":
+        if analysis_completeness.get("status", "complete") in {
+            "complete",
+            "complete_with_caveats",
+        }:
             analysis_completeness["status"] = "partial"
     _attempted, _succeeded, degraded = _llm_runtime_status(llm_requested, llm_call_log)
     remaining = transitive_remaining_seconds(state)
