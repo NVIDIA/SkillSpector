@@ -601,6 +601,8 @@ def scan(
           AZURE_OPENAI_ENDPOINT              for azure_openai
         SKILLSPECTOR_COMPAT_API_KEY +
           SKILLSPECTOR_COMPAT_BASE_URL       for openai_compatible
+        SKILLSPECTOR_COMPAT_HEADERS          optional JSON object of string headers
+                                             for openai_compatible
 
         ollama uses the local Ollama service. claude_cli,
         gemini_cli, and opencode_cli use their CLI's existing local

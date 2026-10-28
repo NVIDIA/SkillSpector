@@ -269,6 +269,12 @@ inference gateways.
 | `gemini_cli` | _(none — uses local CLI auth)_ | local `gemini` binary | local Gemini runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` 1.18.31 binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
 
+For `openai_compatible` gateways requiring extra HTTP headers, set
+`SKILLSPECTOR_COMPAT_HEADERS='{"X-Tenant-ID":"my-tenant","X-API-Key":"gateway-key"}'`.
+It must be a JSON object with string keys and values and applies to sync and async requests.
+Unset or blank values add no headers; invalid configuration is rejected without exposing header values.
+Treat this environment variable as a secret when it contains gateway API keys.
+
 For NVIDIA Build's `z-ai/glm-5.3`, SkillSpector requests `high` reasoning effort.
 Set `SKILLSPECTOR_REASONING_EFFORT` to override it with `low`, `high`, or `max`.
 The bundled 128,000-token context and 32,000-token output budgets are conservative
