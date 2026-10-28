@@ -60,6 +60,26 @@ PY_CARRIER = (
             "python",
             "C:\\\\notes\\\\MEMORY.md",
         ),
+        # Raw prefixes keep backslashes literal: the same Windows path
+        # written with r or rf prefixes must still resolve to MEMORY.md.
+        (
+            'open(r"C:\\Users\\alice\\MEMORY.md", "a")',
+            "test_notes.py",
+            "python",
+            "C:\\Users\\alice\\MEMORY.md",
+        ),
+        (
+            'open(rf"C:\\Users\\alice\\MEMORY.md", "a")',
+            "test_notes.py",
+            "python",
+            "C:\\Users\\alice\\MEMORY.md",
+        ),
+        (
+            'open(r"C:\\Users\\alice\\.claude\\settings.json", "a")',
+            "test_notes.py",
+            "python",
+            "C:\\Users\\alice\\.claude\\settings.json",
+        ),
         ('fs.writeFileSync("MEMORY.md", "x")', "notes.test.ts", "typescript", "MEMORY.md"),
         (
             'await fs.promises.appendFile("MEMORY.md", "x")',

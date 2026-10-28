@@ -655,11 +655,18 @@ _TS_WRITE_SINKS = [
 ]
 
 
-def _is_agent_memory_destination(raw_destination: str) -> bool:
+def _is_agent_memory_destination(raw_destination: str, prefix: str = "") -> bool:
     """Return True when a write destination is an agent-memory file or directory."""
     # Literal path only: interpolation in directory segments does not change
     # which well-known file is targeted, so f"{base}/MEMORY.md" still counts.
-    unescaped = re.sub(r"\\(.)", r"\1", raw_destination, flags=re.DOTALL)
+    # A raw prefix (r, rf) keeps backslashes literal: decoding escapes there
+    # would eat the separators, so r"C:\Users\alice\MEMORY.md" would collapse
+    # to "C:UsersaliceMEMORY.md" and lose every path segment. Only non-raw
+    # literals get escape decoding; both forms then normalize separators.
+    if "r" in prefix.lower():
+        unescaped = raw_destination
+    else:
+        unescaped = re.sub(r"\\(.)", r"\1", raw_destination, flags=re.DOTALL)
     normalized = unescaped.replace("\\", "/").strip()
     segments = [s for s in normalized.split("/") if s not in ("", ".", "..")]
     if not segments:
@@ -681,7 +688,8 @@ def _iter_memory_file_writes(content: str, file_type: str) -> Iterator[tuple[re.
     for sink in sinks:
         for match in sink.finditer(content):
             destination = match.group("dest")
-            if not _is_agent_memory_destination(destination):
+            prefix = match.groupdict().get("prefix") or ""
+            if not _is_agent_memory_destination(destination, prefix):
                 continue
             mode = match.groupdict().get("mode")
             if mode is not None and not any(char in "wxa+" for char in mode):
