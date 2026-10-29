@@ -3332,6 +3332,9 @@ def run_static_patterns_with_ledger(
         if isinstance(raw_inventory, list)
         else {}
     )
+    container_paths.update(
+        path for path, artifact in inventory.items() if "inspected_members" in artifact
+    )
 
     for path in components:
         if path in container_paths:
