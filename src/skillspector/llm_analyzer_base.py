@@ -1024,17 +1024,8 @@ class LLMAnalyzerBase:
             chat_model=self._llm,
         )
 
-    def _structured_output_preference(self, llm: object) -> str | None:
-        """Return an analyzer-specific binding preference, if any."""
-        return None
-
     def _bind_structured_output(self, llm: object, schema: type) -> object:
-        return bind_structured_output(
-            llm,
-            schema,
-            self.model,
-            preferred_method=self._structured_output_preference(llm),
-        )
+        return bind_structured_output(llm, schema, self.model)
 
     def _remaining_timeout(self) -> float | None:
         if callable(self._timeout):
@@ -1246,7 +1237,6 @@ class LLMAnalyzerBase:
             llm,
             schema,
             self.model,
-            preferred_method=self._structured_output_preference(llm),
             preserve_text=source,
         ), prompt
 
