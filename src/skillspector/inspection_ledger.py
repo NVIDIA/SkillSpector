@@ -84,6 +84,7 @@ class LedgerReason(StrEnum):
     ARCHIVE_ENCRYPTED = "archive_encrypted"
     ARCHIVE_UNSUPPORTED_COMPRESSION = "archive_unsupported_compression"
     ARCHIVE_TRUNCATED = "archive_truncated"
+    ARCHIVE_MEMBER_INCOMPLETE = "archive_member_incomplete"
     ARCHIVE_UNSAFE_MEMBER_PATH = "archive_unsafe_member_path"
     ARCHIVE_AMBIGUOUS_MEMBER_PATH = "archive_ambiguous_member_path"
     ARTIFACT_PATH_COLLISION = "artifact_path_collision"
@@ -192,6 +193,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "Archive member uses an unsupported compression method."
     ),
     LedgerReason.ARCHIVE_TRUNCATED: "Archive member is truncated or unreadable.",
+    LedgerReason.ARCHIVE_MEMBER_INCOMPLETE: "Nested artifact inspection is incomplete.",
     LedgerReason.ARCHIVE_UNSAFE_MEMBER_PATH: (
         "Archive member uses an absolute, traversal, or otherwise unsafe path."
     ),
