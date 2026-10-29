@@ -1837,6 +1837,7 @@ def _classify_directive(
     directive: _Directive,
     *,
     end_is_truncated: bool,
+    closes_owned_string: Callable[[int], bool] | None = None,
 ) -> _DirectiveClassification:
     if directive.exhausted:
         return _DirectiveClassification(None, False, True)
@@ -1846,13 +1847,21 @@ def _classify_directive(
         directive.start,
         MAX_MARKER_LOOKAHEAD_CHARS,
     )
+    # A bounded lookbehind can begin inside an earlier string and invert its
+    # quote state. When this directive consumed a proven host-string closer,
+    # that string has ended; do not carry the uncertain state into later code.
+    context_start = (
+        None
+        if closes_owned_string is not None and closes_owned_string(directive.end - 1)
+        else clause_start
+    )
     scope_cap = min(len(view.text), directive.end + MAX_MARKER_SCOPE_CHARS)
     scope_end, _ = _bounded_sentence_end(
         view.text,
         directive.end,
         scope_cap,
         end_is_truncated=end_is_truncated,
-        context_start=clause_start,
+        context_start=context_start,
     )
     lookahead_cap = min(len(view.text), directive.end + MAX_MARKER_LOOKAHEAD_CHARS)
     lookahead_end, lookahead_exhausted = _bounded_sentence_end(
@@ -1860,7 +1869,7 @@ def _classify_directive(
         directive.end,
         lookahead_cap,
         end_is_truncated=end_is_truncated,
-        context_start=clause_start,
+        context_start=context_start,
     )
     first_sentence_end = lookahead_end
     directive_clause = view.text[clause_start:first_sentence_end]
@@ -2025,6 +2034,7 @@ def build_declared_marker_views(
             view,
             directive,
             end_is_truncated=source_end_is_truncated,
+            closes_owned_string=closes_owned_string,
         )
         limited = limited or classification.limited
         if classification.active and classification.limited:
