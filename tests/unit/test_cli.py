@@ -525,6 +525,91 @@ def test_cli_rejects_output_overwriting_directory_manifest(
     invoke.assert_not_called()
 
 
+@pytest.mark.parametrize("primary", ["SKILL.md", "skill.md", ".aisop/workflow.aisop.json"])
+@pytest.mark.parametrize("max_skills", [1, 2])
+def test_recursive_output_preserves_child_primary_before_scanning(
+    tmp_path: Path, primary: str, max_skills: int
+) -> None:
+    first = tmp_path / "a" / "SKILL.md"
+    first.parent.mkdir()
+    first.write_text("# First skill\n")
+    source = tmp_path / "b" / primary
+    source.parent.mkdir(parents=True)
+    original = (
+        json.dumps(
+            [
+                {"role": "system", "content": {"protocol": "AISOP V1"}},
+                {"role": "user", "content": {"aisop": {}, "functions": {"lookup": {}}}},
+            ]
+        )
+        if primary.endswith(".json")
+        else "# Second skill\n"
+    )
+    source.write_text(original)
+    with patch("skillspector.cli._scan_skill") as scan_skill:
+        result = runner.invoke(
+            app,
+            [
+                "scan",
+                str(tmp_path),
+                "--recursive",
+                "--no-llm",
+                "--format",
+                "json",
+                "--max-skills",
+                str(max_skills),
+                "--output",
+                str(source),
+            ],
+        )
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert source.read_text() == original
+    scan_skill.assert_not_called()
+
+
+@pytest.mark.parametrize("alias", ["relative", "hard-link", "symlink", "symlink-parent"])
+@pytest.mark.parametrize("format", ["markdown", "sarif"])
+def test_recursive_output_rejects_child_primary_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alias: str, format: str
+) -> None:
+    source = tmp_path / "child" / "SKILL.md"
+    source.parent.mkdir()
+    source.write_text("# Child skill\n")
+    monkeypatch.chdir(tmp_path)
+    output = Path("report.txt")
+    try:
+        if alias == "relative":
+            output = Path("child") / ".." / "child" / source.name
+        elif alias == "hard-link":
+            os.link(source, output)
+        elif alias == "symlink":
+            output.symlink_to(source)
+        else:
+            Path("linked").symlink_to(source.parent, target_is_directory=True)
+            output = Path("linked") / source.name
+    except OSError:
+        pytest.skip("filesystem does not support this alias")
+    with patch("skillspector.cli._scan_skill") as scan_skill:
+        result = runner.invoke(
+            app,
+            [
+                "scan",
+                str(tmp_path),
+                "--recursive",
+                "--no-llm",
+                "--format",
+                format,
+                "--output",
+                str(output),
+            ],
+        )
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert source.read_text() == "# Child skill\n"
+    scan_skill.assert_not_called()
+
+
 def test_cli_baseline_preserves_local_input_with_remote_like_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
