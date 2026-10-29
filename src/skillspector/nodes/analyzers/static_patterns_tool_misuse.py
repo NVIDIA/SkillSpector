@@ -2363,6 +2363,8 @@ def _has_shell_command_word_exhaustion(
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
+        if python_source is not None and python_source.is_string_delimiter(start):
+            continue
         if start in owned_word_positions:
             continue
         if structural_quote_closers is not None and start in structural_quote_closers:
@@ -3085,6 +3087,14 @@ class _PythonSourceOwnership:
             and self._content[owner[0]] != "#"
             and position == _python_string_body(self._content, *owner)[0]
         )
+
+    def is_string_delimiter(self, position: int) -> bool:
+        """Return whether Python owns a string prefix or opening/closing quote."""
+        owner = self._owner(position)
+        if owner is None or self._content[owner[0]] == "#":
+            return False
+        start, end = _python_string_body(self._content, *owner)
+        return not start <= position < end
 
     def string_value(self, start: int, end: int) -> tuple[str, int, int] | None:
         """Return the proven string value that holds a shell word, and its span.
