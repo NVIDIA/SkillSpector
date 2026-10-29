@@ -22,7 +22,6 @@ from unittest.mock import patch
 
 import pytest
 from langchain_anthropic import ChatAnthropic
-from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_openai import ChatOpenAI
@@ -56,6 +55,7 @@ from skillspector.providers.structured_output import (
     rejects_forced_tool_call,
     rejects_sampling_controls,
 )
+from skillspector.structured_response import ResponseIssue
 
 
 class Verdict(BaseModel):
@@ -237,9 +237,11 @@ class TestAnthropicClaude55:
 
         chain = bind_structured_output(llm, Verdict, "claude-opus-5-5", provider)
 
-        # A ValueError after a response fails the analyzer instead of reading as clean.
-        with pytest.raises(OutputParserException):
+        # A refusal remains incomplete and cannot trigger formatting or blind retries.
+        with pytest.raises(StructuredOutputParseError) as error:
             chain.invoke("analyse this")
+        assert error.value.issue == ResponseIssue.REFUSED
+        assert not error.value.retryable
 
     @pytest.mark.parametrize(
         ("provider_cls", "temperature"),
@@ -315,7 +317,12 @@ class TestOpenAIStructuredOutput:
 
         assert chain.invoke("analyse this") == Verdict(ok=True)
         request = requests[0]
-        assert request["response_format"] is Verdict
+        assert request["response_format"]["type"] == "json_schema"
+        output_format = request["response_format"]["json_schema"]
+        assert output_format["name"] == "Verdict"
+        assert output_format["strict"] is True
+        assert output_format["schema"]["properties"] == Verdict.model_json_schema()["properties"]
+        assert output_format["schema"]["required"] == ["ok"]
         assert "tools" not in request and "tool_choice" not in request
         assert request["max_completion_tokens"] == 128_000
         assert "temperature" not in request and "reasoning_effort" not in request
