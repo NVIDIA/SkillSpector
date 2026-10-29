@@ -1907,16 +1907,19 @@ def _classify_directive(
     if (
         baseline is not None
         and context_start is not None
-        and _unsupported_form_actions(
-            view.text,
-            min(clause_start, context_start),
-            lookahead_end,
-            include_contextual=True,
+        and any(
+            pattern.search(view.text, min(clause_start, context_start), lookahead_end) is not None
+            for pattern in (
+                _UNAMBIGUOUS_ACTION_RE,
+                _CONTEXTUAL_ACTION_RE,
+                _PASTE_ACTION_RE,
+            )
         )
     ):
         # Even an unbound action can acquire its payload through adjacent
         # literals. Wrapper proof may repair an inert method-like header, but
         # it cannot clear a prior limit for a potentially active instruction.
+        # Ambiguous or negated action cues also retain that conservative result.
         return baseline
     payloads = _quoted_payloads(view.text, directive, scope_end)
     if not payloads:

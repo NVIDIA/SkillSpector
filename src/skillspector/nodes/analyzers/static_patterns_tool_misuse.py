@@ -1239,9 +1239,11 @@ def _next_shell_invocation_word(
     """Read one direct shell word without traversing nested substitutions."""
     cursor = start
     limit = len(content)
+    next_runtime_check = ((cursor + 4095) // 4096) * 4096
     while cursor < limit:
-        if cursor % 4096 == 0:
+        if cursor >= next_runtime_check:
             check_runtime()
+            next_runtime_check = cursor + 4096
         if content[cursor].isspace():
             cursor += 1
             continue
@@ -1261,8 +1263,9 @@ def _next_shell_invocation_word(
     word_started = False
     unquoted_characters = 0
     while cursor < limit:
-        if cursor % 4096 == 0:
+        if cursor >= next_runtime_check:
             check_runtime()
+            next_runtime_check = cursor + 4096
         character = content[cursor]
         if quote is not None:
             if character == quote:
@@ -2141,7 +2144,7 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
             yield start, parsed.end
 
 
-class _ShellOwnershipBudgetExceeded(Exception):
+class _ShellOwnershipBudgetExceededError(Exception):
     """Stop optional quote proof without swallowing the caller's cancellation."""
 
 
@@ -2150,13 +2153,10 @@ def _literal_shell_command_spans(
 ) -> dict[int, int] | None:
     """Locate exact single-quoted shell -c bodies once per lexical scope."""
     source = content[begin:end]
-    if "'" not in source or not any(
-        "c" in match[1]
-        for match in re.finditer(r"(-[A-Za-z]+)\s+(?:\\\r?\n[ \t]*)*'", source)
-    ):
+    if "'" not in source:
         return {}
     spans: list[tuple[int, int]] = []
-    # Invocation readers check runtime at least every 4096 scanned bytes.
+    # Invocation readers report periodic progress across escaped sequences.
     # Bound repeated delimiter scans proportionally to this scope, so a valid
     # literal command before deeply nested unrelated input cannot make this
     # optional ownership pass quadratic. Exhaustion publishes no proof.
@@ -2167,15 +2167,30 @@ def _literal_shell_command_spans(
         check_runtime()
         remaining_checks -= 1
         if remaining_checks < 0:
-            raise _ShellOwnershipBudgetExceeded
+            raise _ShellOwnershipBudgetExceededError
 
+    clause_starts = _shell_clause_starts(source, check_runtime)
+    next_clause_start = next(clause_starts, None)
+    clause_start = 0
+    last_selected_start = -1
     try:
-        for clause_start in _shell_clause_starts(source, check_runtime):
+        for option in re.finditer(r"(-[A-Za-z]+)\s+(?:\\\r?\n[ \t]*)*'", source):
+            if "c" not in option[1]:
+                continue
             check_runtime()
+            # Select the nearest preceding clause for full validation of its
+            # wrapper and literal body; ambiguous context retains no proof.
+            # Both iterators move forward once; unrelated clauses need no parse.
+            while next_clause_start is not None and next_clause_start <= option.start():
+                clause_start = next_clause_start
+                next_clause_start = next(clause_starts, None)
+            if clause_start == last_selected_start:
+                continue
+            last_selected_start = clause_start
             _command_string_from_clause(
                 source, clause_start, check_proof_runtime, literal_command_spans=spans
             )
-    except _ShellOwnershipBudgetExceeded:
+    except _ShellOwnershipBudgetExceededError:
         return None
     return {begin + start: begin + stop for start, stop in spans}
 

@@ -352,11 +352,70 @@ def test_literal_command_before_hostile_nesting_keeps_proof_work_bounded(
 
     monkeypatch.setattr(tm, "_skip_shell_delimited_expansion", counted)
     closers: set[int] = set()
-    assert tm._shell_quoted_candidate_limits(source, check_runtime, quote_closers=closers) == {}
-    assert closers == set()
+    tm._shell_quoted_candidate_limits(source, check_runtime, quote_closers=closers)
     assert scanned <= 8 * len(source)
     assert checks > 0
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("wrapper", ["bash", "env MODE=test bash", "sudo -n bash", "timeout 5 bash"])
+def test_literal_command_proof_selects_only_relevant_clauses(
+    wrapper: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix = "echo ready\n" * 1000
+    source = prefix + wrapper + " -c 'echo ready'\n"
+    selected: list[int] = []
+    original = tm._command_string_from_clause
+
+    def recorded(content, start, check_runtime, **kwargs):
+        selected.append(start)
+        return original(content, start, check_runtime, **kwargs)
+
+    monkeypatch.setattr(tm, "_command_string_from_clause", recorded)
+    spans = tm._literal_shell_command_spans(source, 0, len(source), lambda: None)
+
+    assert selected == [len(prefix)]
+    assert spans is not None and len(spans) == 1
+    assert source[next(iter(spans)) : next(iter(spans.values()))] == "echo ready"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "# bash -c 'echo ready'\n",
+        "echo \"bash -c 'echo ready'\"\n",
+        "echo \"$(bash -c 'echo ready')\"\n",
+        "echo -" + "c" * 100000 + " /tmp/value'\n",
+    ],
+)
+def test_literal_command_option_lookalikes_cannot_claim_a_body(source: str) -> None:
+    assert tm._literal_shell_command_spans(source, 0, len(source), lambda: None) == {}
+
+
+def test_selected_wrapper_budget_discards_previously_collected_literal_proof() -> None:
+    source = "bash -c 'echo ready'\n"
+    source += "eval " + "'part' " * 24 + '\"-c \'echo ready\'\" \"$CMD -rf /\"\n'
+    closers: set[int] = set()
+
+    assert tm._literal_shell_command_spans(source, 0, len(source), lambda: None) is None
+    assert tm._shell_quoted_candidate_limits(source, lambda: None, quote_closers=closers) == {}
+    assert closers == set()
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("escaped", ["\\\n", "\\\r\n", "\\x"])
+def test_invocation_runtime_checks_survive_escaped_offset_jumps(escaped: str) -> None:
+    source = " " + escaped * 12000 + "value"
+    checks = 0
+
+    def cancelled() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 3:
+            raise TimeoutError("escaped word deadline")
+
+    with pytest.raises(TimeoutError, match="escaped word deadline"):
+        tm._next_shell_invocation_word(source, 1, cancelled)
 
 
 def test_literal_command_proof_propagates_real_runtime_exceptions() -> None:
