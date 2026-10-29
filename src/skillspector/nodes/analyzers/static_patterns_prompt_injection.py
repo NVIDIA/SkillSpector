@@ -465,7 +465,9 @@ def _p2_comment_inner(matched_text: str) -> str:
     if text.startswith("[//]:"):
         start = text.find("(")
         end = text.rfind(")")
-        if 0 <= start < end:
+        # Only a bare ``#`` destination leaves the title as the whole hidden
+        # body; any other destination text must be validated with it.
+        if 0 <= start < end and text[5:start].strip() == "#":
             return text[start + 1 : end]
         return text
     return text
