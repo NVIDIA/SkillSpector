@@ -247,6 +247,22 @@ _VARIABLE_SHELL_ASSIGNMENT_RE = re.compile(
 )
 _SHELL_NAME_ARGUMENT_RE = re.compile(r"\bshell\s*=\s*\w+", re.IGNORECASE)
 
+# Option searches are bounded to one command before applying their suffix.
+# Whitespace may include an explicit Bash or PowerShell line continuation.
+_OPTION_COMMAND_SPACE = r"(?:[ \t]|[\\`]\r?\n)+"
+_OPTION_COMMAND_RULES = [
+    (rf"(?:chmod|chown){_OPTION_COMMAND_SPACE}", r"a\+rwx", 0.8),
+    (rf"git{_OPTION_COMMAND_SPACE}push{_OPTION_COMMAND_SPACE}", r"--force", 0.7),
+    (rf"curl{_OPTION_COMMAND_SPACE}", r"-k\b", 0.6),
+    (rf"curl{_OPTION_COMMAND_SPACE}", r"--insecure\b", 0.65),
+    (rf"wget{_OPTION_COMMAND_SPACE}", r"--no-check-certificate", 0.65),
+]
+_OPTION_COMMAND_PREFIXES = {
+    prefix + r"[\s\S]*" + option: re.compile(prefix, re.IGNORECASE)
+    for prefix, option, _ in _OPTION_COMMAND_RULES
+}
+_OPTION_COMMAND_FENCE = re.compile(r"(?m)^[ \t]*(?:`{3,}|~{3,})")
+
 # TM1: Tool Parameter Abuse — dangerous parameter values
 DIRECT_SHELL_TRUE_PATTERNS: tuple[tuple[str, float], ...] = (
     # shell=True is a classic command injection vector
@@ -304,16 +320,14 @@ TM1_CODE_PATTERNS = [
     # unmatched `-- ` tokens, and `[\w=-]*` already absorbs a long option's
     # second dash.
     (r"chmod\s+(?:-[\w=-]*[ \t]+)*[\"']?[+=]?0*[0-7]{2,3}[2367](?![0-9\w])[\"']?", 0.8),
-    (r"(?:chmod|chown)\s+[^|]*a\+rwx", 0.8),
-    # Git force operations
-    (r"git\s+push\s+[^|]*--force", 0.7),
+    *[
+        (prefix + r"[\s\S]*" + option, confidence)
+        for prefix, option, confidence in _OPTION_COMMAND_RULES
+    ],
+    # Other Git force operations
     (r"git\s+reset\s+--hard", 0.65),
     (r"git\s+clean\s+-[fd]+x", 0.7),
     (r"\bgit\s+(?:am|commit|merge|push)\b[^\n|]*--no-verify\b", 0.75),
-    # Curl/wget with unsafe parameters
-    (r"curl\s+[^|]*-k\b", 0.6),
-    (r"curl\s+[^|]*--insecure\b", 0.65),
-    (r"wget\s+[^|]*--no-check-certificate", 0.65),
     # File deletion commands (delete/remove) with explicit path argument
     # Separate from rm pattern: requires \b and a short span to a "/" to avoid
     # matching HTTP verb DELETE in REST docs or "remove" in prose
@@ -4796,11 +4810,105 @@ def _lexical_shell_has_counterevidence(
     return False
 
 
+def _option_command_end(
+    content: str,
+    start: int,
+    limit: int,
+    check_runtime: Callable[[], None],
+) -> int:
+    """Stop at an unquoted command separator, retaining balanced arguments."""
+    quote: str | None = None
+    closers: list[str] = []
+    backtick_ends: dict[int, int | None] = {}
+    i = start
+    while i < limit:
+        if i % 1024 == 0:
+            check_runtime()
+        ch = content[i]
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            elif quote != "'" and ch == "\\":
+                i += 2 if content[i + 1 : i + 3] != "\r\n" else 3
+                continue
+            elif quote == '"' and ch == "`":
+                substitution_end = _skip_backtick_substitution(
+                    content, i, limit, check_runtime, end_cache=backtick_ends
+                )
+                if substitution_end is not None:
+                    i = substitution_end
+                else:
+                    # A PowerShell backtick can escape a quote. A balanced
+                    # Bash substitution above owns both of its delimiters.
+                    i += 3 if content[i + 1 : i + 3] == "\r\n" else 2
+                continue
+        elif ch in "\\`":
+            # Backticks are also Markdown delimiters. Only a line-ending
+            # backtick proves a continuation without relying on fence labels.
+            if content[i + 1 : i + 3] == "\r\n":
+                i += 3
+                continue
+            if content[i + 1 : i + 2] == "\n" or ch == "\\":
+                i += 2
+                continue
+            substitution_end = _skip_backtick_substitution(
+                content, i, limit, check_runtime, end_cache=backtick_ends
+            )
+            if substitution_end is not None:
+                i = substitution_end
+                continue
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "(":
+            closers.append(")")
+        elif ch == ")" and closers:
+            closers.pop()
+        elif not closers and ch in "\r\n;|&":
+            break
+        i += 1
+    return min(i, limit)
+
+
+def _option_command_matches(
+    pattern: str,
+    content: str,
+    check_runtime: Callable[[], None],
+    markdown_shell: str | None,
+    markdown_delimiters: list[int],
+) -> Iterator[re.Match[str]]:
+    """Apply an unsafe-option pattern only within each candidate command."""
+    compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    fences = (
+        [match.start() for match in _OPTION_COMMAND_FENCE.finditer(content)]
+        if markdown_shell is not None
+        else []
+    )
+    covered_until = 0
+    for prefix in _OPTION_COMMAND_PREFIXES[pattern].finditer(content):
+        check_runtime()
+        if prefix.start() < covered_until:
+            continue
+        fence_index = bisect_right(fences, prefix.start())
+        limit = fences[fence_index] if fence_index < len(fences) else len(content)
+        # A command that starts inside an inline span ends at its closing
+        # delimiter. A command outside that span can use it as an argument.
+        delimiter_index = bisect_right(markdown_delimiters, prefix.start())
+        if delimiter_index % 2 and delimiter_index < len(markdown_delimiters):
+            limit = min(limit, markdown_delimiters[delimiter_index])
+        end = _option_command_end(content, prefix.end(), limit, check_runtime)
+        covered_until = end
+        match = compiled.match(content, prefix.start(), end)
+        if match is not None:
+            yield match
+
+
 def _tm1_candidates(
     content: str,
     *,
     direct_shell_only: bool = False,
     shell_content: str | None = None,
+    check_runtime: Callable[[], None] = lambda: None,
+    file_type: str = "",
 ) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
     def direct_matches(
         pattern_index: int,
@@ -4861,11 +4969,37 @@ def _tm1_candidates(
         yield from direct_candidates()
         return
 
+    option_markdown_shell = (
+        _markdown_shell_text(content, check_runtime)
+        if file_type == "markdown"
+        and any(prefix.search(content) for prefix in _OPTION_COMMAND_PREFIXES.values())
+        else None
+    )
+    option_markdown_delimiters = (
+        [
+            match.start()
+            for match in re.finditer(r"`+|~{3,}", content)
+            if option_markdown_shell[match.start()] != content[match.start()]
+        ]
+        if option_markdown_shell is not None
+        else []
+    )
+
     def ordinary_matches(
         pattern_index: int,
         pattern: str,
         confidence: float,
     ) -> Iterator[tuple[int, int, re.Match[str], float]]:
+        if pattern in _OPTION_COMMAND_PREFIXES:
+            for match in _option_command_matches(
+                pattern,
+                content,
+                check_runtime,
+                option_markdown_shell,
+                option_markdown_delimiters,
+            ):
+                yield match.start(), pattern_index, match, confidence
+            return
         if pattern == _VARIABLE_SHELL_FLAG_PATTERN:
             for match in _variable_shell_matches(content):
                 yield match.start(), pattern_index, match, confidence
@@ -5636,6 +5770,8 @@ def analyze(
         content,
         direct_shell_only=_direct_shell_only,
         shell_content=shell_content,
+        check_runtime=runtime_check,
+        file_type=file_type,
     ):
         runtime_check()
         variable_match = variable_matches.get((match_start, match_end))
