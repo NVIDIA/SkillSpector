@@ -362,12 +362,39 @@ def _is_layout_only_span(span: str, max_cosmetic_span: int = _MAX_LAYOUT_ONLY_SP
 _TABLE_DELIMITER_CELL = re.compile(r"^\s*:?-+:?\s*$")
 
 
+def _split_unescaped_pipes(text: str) -> list[str]:
+    """Split on pipes that are Markdown cell boundaries.
+
+    A pipe preceded by a backslash (``\\|``) is literal cell text, not a
+    boundary, so splitting on raw ``|`` would invent cells out of escaped
+    content. A backslash escapes the next character, so ``\\\\|`` (an
+    escaped backslash followed by a pipe) still counts as a boundary.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            current.append(text[index : index + 2])
+            index += 2
+            continue
+        if char == "|":
+            segments.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    segments.append("".join(current))
+    return segments
+
+
 def _markdown_table_cells(line: str) -> list[str] | None:
     """Return cells for an outer-pipe Markdown row, or ``None`` otherwise."""
     stripped = line.strip()
     if not (stripped.startswith("|") and stripped.endswith("|")):
         return None
-    return stripped[1:-1].split("|")
+    return _split_unescaped_pipes(stripped[1:-1])
 
 
 def _markdown_table_line_spans(content: str) -> list[tuple[int, int]]:
@@ -422,17 +449,20 @@ _TABLE_SEPARATOR_CHARS = frozenset("-:=| \t")
 def _is_table_structure_unit(unit: str) -> bool:
     """Return True when a repeated MP2 unit is table structure, not content.
 
-    A unit containing a pipe repeats cell structure by construction (the
-    repetition spans cell boundaries, as in prettier-aligned rows and
-    delimiter rows), and a unit made only of separator/padding characters
-    repeats delimiters or alignment padding. Any other unit repeats
-    substantive cell content, so it must not be exempted: a single cell
-    stuffed with ``abcdef `` repeated 1000 times has a content-only unit
-    and stays a finding even though it sits inside a proven table.
+    A unit containing an unescaped pipe repeats cell structure by
+    construction (the repetition spans cell boundaries, as in
+    prettier-aligned rows and delimiter rows), and a unit made only of
+    separator/padding characters repeats delimiters or alignment padding.
+    Any other unit repeats substantive cell content, so it must not be
+    exempted: a single cell stuffed with ``abcdef `` repeated 1000 times
+    has a content-only unit and stays a finding even though it sits
+    inside a proven table. An escaped pipe (``\\|``) is literal cell
+    text, not structure, so a unit whose pipes are all escaped is
+    content, not structure.
     """
     if not unit:
         return False
-    if "|" in unit:
+    if len(_split_unescaped_pipes(unit)) > 1:
         return True
     return all(ch in _TABLE_SEPARATOR_CHARS for ch in unit)
 
@@ -440,14 +470,16 @@ def _is_table_structure_unit(unit: str) -> bool:
 def _match_contains_stuffed_cell(span: str) -> bool:
     """Return True when one cell segment of the span repeats content itself.
 
-    Splits the span on cell boundaries and re-applies the MP2 content
-    pattern inside each segment: a segment whose own repetition unit
-    carries alphanumeric content is stuffing inside that cell, even when
-    the outer match spans the whole row. Pure separator/padding segments
-    (dashes, spaces) do not count.
+    Splits the span on unescaped cell boundaries and re-applies the MP2
+    content pattern inside each segment: a segment whose own repetition
+    unit carries alphanumeric content is stuffing inside that cell, even
+    when the outer match spans the whole row. Pure separator/padding
+    segments (dashes, spaces) do not count. Splitting on raw pipes
+    would shred escaped-pipe content into short nonrepeated pieces and
+    hide the stuffing.
     """
     content_pattern = MP2_CONTENT_PATTERNS[0][0]
-    for segment in span.split("|"):
+    for segment in _split_unescaped_pipes(span):
         for inner in re.finditer(content_pattern, segment):
             unit = inner.group(1) or ""
             if any(ch.isalnum() for ch in unit):

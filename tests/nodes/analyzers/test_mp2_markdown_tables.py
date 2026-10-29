@@ -77,6 +77,22 @@ class TestMP2MarkdownTables:
         )
         assert len(_mp2(content)) >= 1
 
+    def test_escaped_pipe_cell_stuffing_still_detected(self) -> None:
+        """The reviewer's escaped-pipe blocker case: escaped pipes are text.
+
+        Under a 24-column header/delimiter, a body line of outer pipes
+        plus ``abcdef\\|`` repeated 23 times plus ``abcdef`` has 24 raw
+        pipe segments, so a raw-pipe split wrongly proves it a table row
+        and the ``abcdef\\|`` unit looks structural. In Markdown the
+        escaped pipes are literal text inside one cell, so the repetition
+        is stuffing and must still fire.
+        """
+        header = "| " + " | ".join(f"Feature {i:<3}" for i in range(_COLUMNS)) + " |"
+        delimiter = "|" + "|".join("-" * 12 for _ in range(_COLUMNS)) + "|"
+        body = "|" + "abcdef\\|" * 23 + "abcdef" + "|"
+        content = "# Skill\n\n" + "\n".join([header, delimiter, body]) + "\n"
+        assert len(_mp2(content)) >= 1
+
     def test_repeated_short_cells_still_suppressed(self) -> None:
         """Repeated cell structure stays exempt: identical short cells."""
         row = "| " + " | ".join("yes" for _ in range(24)) + " |"
