@@ -2167,9 +2167,7 @@ def _quoted_candidate_is_complete(
     )
 
 
-def _shell_comment_start_before(
-    content: str, start: int, *, ansi_c: bool = False
-) -> int | None:
+def _shell_comment_start_before(content: str, start: int, *, ansi_c: bool = False) -> int | None:
     """Return a genuine shell comment ``#`` on the candidate's line, if any.
 
     This scans from the start of ``content`` so quote state is inherited
@@ -2279,10 +2277,7 @@ def _is_comment_candidate(
     if _SHELL_COMMENT_START_RE.search(content, line_start, start) is None:
         return False
     if python_source is None:
-        return (
-            _shell_comment_start_before(content, start, ansi_c=file_type == "shell")
-            is not None
-        )
+        return _shell_comment_start_before(content, start, ansi_c=file_type == "shell") is not None
     return python_source.comment(start) is not None
 
 
