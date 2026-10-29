@@ -267,11 +267,138 @@ def test_possessive_beside_shell_syntax_keeps_its_quote(line: str) -> None:
     assert projected[apostrophe] == "'"
 
 
+def test_complete_inline_code_before_prose_apostrophe_does_not_span_later_fence() -> None:
+    content = (
+        "- `${flow_path}` is replaced with the configuration file's directory.\n\n"
+        "```\n"
+        "copy.py -src <input> -dest <build_dir>/output.vc\n"
+        "compile (uses -file output.vc)\n"
+        "```\n"
+    )
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+
+    assert result["findings"] == []
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_complete_inline_code_does_not_hide_runtime_selected_command() -> None:
+    content = "Run `$($CMD) -rf /`; then read the reference's notes.\n"
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
 @pytest.mark.parametrize("separator", [" ", " \u2028"], ids=["space", "line-separator"])
 def test_possessive_cannot_hide_runtime_command_operands(separator: str) -> None:
     # Read as shell, the apostrophe joins the next line to $CMD's operands.
     # A Unicode line separator does not end the shell line.
     content = f"$CMD{separator}reads each reference's\nprobe' -rf /\n\n" + _OBSERVATIONS
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize("separator", [" ", " \u2028"], ids=["space", "line-separator"])
+def test_inline_runtime_command_cannot_hide_later_operands(separator: str) -> None:
+    # Markdown owns the backtick delimiters, but the shell projection retains
+    # the runtime command and must not detach its quote-joined operands.
+    content = f"`$CMD`{separator}reads each reference's\nprobe' -rf /\n\n" + _OBSERVATIONS
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "inline_command",
+    [
+        "$CMD",
+        "echo 'ready; still data' $CMD",
+        "echo 'ready | still data' $CMD",
+        r"echo ready\; $CMD",
+        r"echo ready\| $CMD",
+    ],
+)
+def test_list_marker_keeps_inline_runtime_command_as_an_argument(inline_command: str) -> None:
+    # The proven Markdown marker is the shell projection's command word, so
+    # $CMD is only its argument and cannot own the later recursive operands.
+    content = f"- `{inline_command}` reads each reference's\nprobe' -rf /\n\n" + _OBSERVATIONS
+    projected = tm._markdown_shell_text(content, lambda: None, word_apostrophes=True)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+    assert "$CMD" in projected
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert result["findings"] == []
+
+
+@pytest.mark.parametrize(
+    ("marker", "owns_command"),
+    [("- ", True), ("+ ", True), ("1. ", True), ("1) ", True), ("* ", False), ("- * ", True)],
+)
+def test_only_inert_list_marker_owns_the_command_position(marker: str, owns_command: bool) -> None:
+    # ``*`` is a shell glob that can expand to an arbitrary command word, so it
+    # keeps the runtime guard; inert markers own the command word.
+    content = f"{marker}`$CMD` reads each reference's\nprobe' -rf /\n\n" + _OBSERVATIONS
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+    if owns_command:
+        assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    else:
+        assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+        assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "inline_command",
+    [
+        "; $CMD",
+        "echo ready; $CMD",
+        "echo ready | $CMD",
+        "echo ready && $CMD",
+        "echo ready || $CMD",
+        "echo ready & $CMD",
+    ],
+)
+def test_list_inline_control_operator_retains_runtime_guard(inline_command: str) -> None:
+    content = f"- `{inline_command}` reads each reference's\nprobe' -rf /\n\n" + _OBSERVATIONS
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "- ; ",
+        "- `echo ready`; ",
+        "- `echo ready` | ",
+        "- `echo ready;` ",
+        "- `echo ready |` ",
+    ],
+    ids=[
+        "outside-span",
+        "between-spans-semicolon",
+        "between-spans-pipeline",
+        "prior-span-semicolon",
+        "prior-span-pipeline",
+    ],
+)
+def test_list_control_before_inline_command_retains_runtime_guard(prefix: str) -> None:
+    content = f"{prefix}`$CMD` reads each reference's\nprobe' -rf /\n\n" + _OBSERVATIONS
     result = static_runner.run_static_patterns_with_ledger(
         {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
     )
