@@ -22,6 +22,8 @@ def _ra1(content: str) -> list:
         "Never recommend `self-update`.",
         "You must not suggest self-update to users.",
         "Do not advise running `self-update` on the host.",
+        # Determiner plus a noun is proved object syntax.
+        "Do not recommend the suite `self-update`.",
     ],
 )
 def test_negated_recommendation_is_not_self_modification(content: str) -> None:
@@ -42,6 +44,19 @@ def test_negated_recommendation_is_not_self_modification(content: str) -> None:
         "Do not recommend it but run `self-update` now.",
         # A prohibition on an unrelated verb does not cover the action.
         "Do not hesitate: recommend `self-update` to users.",
+        # Reviewer blocker (renewed CHANGES_REQUESTED, 2026-10-29): a
+        # pronoun plus a filler adverb plus a fresh imperative is a new
+        # instruction, not the object of the negated recommendation.
+        # The gap grammar is default-deny, so unseen imperative verbs
+        # flag too, without any blacklist entry for them.
+        "Do not recommend it just use `self-update` now.",
+        "Do not recommend it just run `self-update` now.",
+        "Do not recommend it simply execute `self-update` now.",
+        "Do not recommend it only try `self-update` now.",
+        "Do not recommend it then use `self-update` now.",
+        "Do not recommend it just apply `self-update` now.",
+        "Do not recommend use `self-update` now.",
+        "Do not recommend employ `self-update` now.",
     ],
 )
 def test_affirmative_or_ungoverned_recommendation_still_flags(content: str) -> None:
