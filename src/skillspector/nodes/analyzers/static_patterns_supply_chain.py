@@ -43,9 +43,10 @@ import sys
 import time
 import tomllib
 from bisect import bisect_right
-from collections.abc import Callable, Iterator
+from collections import ChainMap
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
@@ -1977,7 +1978,7 @@ def _extract_packages_from_toml_lock(
 
 def _apply_locked_versions(
     packages: list[tuple[str, str | None, int]],
-    locked_versions: dict[str, str] | None,
+    locked_versions: Mapping[str, str] | None,
     normalize: Callable[[str], str] = _normalize_package_name,
 ) -> list[tuple[str, str | None, int]]:
     """Prefer lockfile versions for manifest dependencies without exact versions."""
@@ -2130,20 +2131,21 @@ def _collect_npm_locked_versions(
     *,
     max_files: int | None = None,
     timeout_seconds: float | None = None,
-) -> dict[str, str]:
-    """Build package -> exact version map from npm lockfiles in the project.
+) -> dict[str, Mapping[str, str]]:
+    """Resolve manifest pins within their own lockfile's installation tree.
 
-    Kept separate from the Python map: the two ecosystems share package names (``semver``,
-    ``packaging``, ``requests`` all exist in both), so a single map would resolve a PyPI
-    dependency against an npm version, and vice versa.
-
-    Bounded by the same file count and clock the Python collector is bounded by. A lockfile is
-    attacker-shaped input — a skill can ship one — and an unbounded parse next to a bounded one
-    is not half-safe, it is the way in: the cap that matters is the smallest one, and here that
-    would have been no cap at all.
+    Workspace manifests may use hoisted installs from their lock root, but unrelated
+    projects must never borrow those pins. Keep each lockfile's independent vulnerability
+    scan separate: nested installs still need auditing even when no manifest resolves to them.
     """
-    locked_versions: dict[str, str] = {}
-    depths: dict[str, int] = {}
+    locked_versions: dict[str, Mapping[str, str]] = {}
+    owners = {
+        str(Path(path).parent): len(Path(path).parent.parts)
+        for path in components
+        if _is_npm_lockfile(path)
+    }
+    component_set = set(components)
+    manifest_dirs = {str(Path(path).parent) for path in components if path.endswith("package.json")}
     started_at = time.monotonic()
     files_read = 0
     for path in components:
@@ -2153,18 +2155,95 @@ def _collect_npm_locked_versions(
             break
         if timeout_seconds is not None and time.monotonic() - started_at >= timeout_seconds:
             break
+        root = Path(path).parent
+        if (
+            Path(path).name == "package-lock.json"
+            and str(root / "npm-shrinkwrap.json") in component_set
+        ):
+            continue  # npm gives shrinkwrap precedence when both files exist.
         content = file_cache.get(path)
         if not content:
             continue
         files_read += 1
-        for name, version, _line_num, depth in _npm_lock_entries(content):
-            key = _normalize_npm_package_name(name)
-            # A manifest range names a *direct* dependency, so it resolves to the top-level
-            # install. Nested copies exist for other packages' constraints; answering with one
-            # would report a version this manifest never asked for.
-            if key not in depths or depth < depths[key]:
-                locked_versions[key] = version
-                depths[key] = depth
+        try:
+            data = json.loads(content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        installs: dict[PurePosixPath, dict[str, str]] = {}
+        projects = {PurePosixPath(".")}
+        packages = data.get("packages")
+        if isinstance(packages, dict):
+            for location, entry in packages.items():
+                relative = PurePosixPath(location)
+                if (
+                    not location
+                    or relative.is_absolute()
+                    or ".." in relative.parts
+                    or "\\" in location
+                ):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if str(root / relative) in manifest_dirs:
+                    projects.add(relative)
+                owner, separator, name = location.rpartition("node_modules/")
+                version = entry.get("version")
+                registry_name = entry.get("name")
+                if (
+                    isinstance(registry_name, str)
+                    and registry_name.strip()
+                    and registry_name != name
+                ):
+                    continue  # Alias slots must not borrow their target package's version.
+                if (
+                    separator
+                    and (not owner or owner.endswith("/"))
+                    and isinstance(version, str)
+                    and version.strip()
+                ):
+                    installs.setdefault(PurePosixPath(owner), {})[
+                        _normalize_npm_package_name(name)
+                    ] = version.strip()
+        elif isinstance(data.get("dependencies"), dict):
+            trees = {PurePosixPath("."): data["dependencies"]}
+            for entry in data["dependencies"].values():
+                version = entry.get("version") if isinstance(entry, dict) else None
+                if not isinstance(version, str) or not version.startswith("file:"):
+                    continue
+                location = version[5:]
+                relative = PurePosixPath(location)
+                if (
+                    not location
+                    or relative == PurePosixPath(".")
+                    or relative.is_absolute()
+                    or ".." in relative.parts
+                    or "\\" in location
+                    or str(root / relative) not in manifest_dirs
+                ):
+                    continue
+                # v1 records workspace links here instead of in the packages table.
+                projects.add(relative)
+                trees[relative] = entry.get("dependencies", {})
+            for project, dependencies in trees.items():
+                if isinstance(dependencies, dict):
+                    installs[project] = {
+                        _normalize_npm_package_name(name): entry["version"].strip()
+                        for name, entry in dependencies.items()
+                        if isinstance(entry, dict)
+                        and isinstance(entry.get("version"), str)
+                        and entry["version"].strip()
+                    }
+        for project in projects:
+            scope = str(root / project)
+            depth = len(root.parts)
+            if depth < owners.get(scope, -1):
+                continue
+            owners[scope] = depth
+            locked_versions[scope] = ChainMap(
+                *(installs[parent] for parent in (project, *project.parents) if parent in installs)
+            )
     return locked_versions
 
 
@@ -3110,7 +3189,7 @@ def _analyze_dependencies(
     content: str,
     file_path: str,
     locked_versions: dict[str, str] | None = None,
-    npm_locked_versions: dict[str, str] | None = None,
+    npm_locked_versions: Mapping[str, str] | None = None,
 ) -> list[AnalyzerFinding]:
     """Run SC4/SC5/SC6 checks on dependency files."""
     findings, _limitations, _packages_seen = _analyze_dependencies_detailed(
@@ -3126,7 +3205,7 @@ def _analyze_dependencies_detailed(
     content: str,
     file_path: str,
     locked_versions: dict[str, str] | None = None,
-    npm_locked_versions: dict[str, str] | None = None,
+    npm_locked_versions: Mapping[str, str] | None = None,
     *,
     max_packages: int | None = None,
     max_findings: int | None = None,
@@ -4202,7 +4281,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             content,
             path,
             locked_versions.get(_python_lock_scope(path)),
-            npm_locked_versions,
+            npm_locked_versions.get(str(Path(path).parent)),
             max_packages=min(MAX_DEPENDENCY_PACKAGES_PER_FILE, remaining_packages),
             max_findings=min(MAX_DEPENDENCY_FINDINGS_PER_FILE, remaining_dependency_findings),
             timeout_seconds=shared_remaining,

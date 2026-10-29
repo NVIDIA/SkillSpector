@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+
+import pytest
+
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_supply_chain as supply_chain
 from skillspector.nodes.analyzers.osv_client import OsvQueryLimitation, QueryBatchResults
@@ -250,3 +254,186 @@ def test_dependency_file_cap_is_aggregate_across_bundle(monkeypatch):
         and event["reason_code"] is LedgerReason.OUTPUT_LIMIT
         for event in response["inspection_ledger"]
     )
+
+
+@pytest.mark.parametrize("lock_version", [1, 2, 3])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_npm_locks_do_not_resolve_other_projects(lock_version, reverse):
+    def lock(version):
+        field = (
+            {"dependencies": {"node-forge": {"version": version}}}
+            if lock_version == 1
+            else {"packages": {"node_modules/node-forge": {"version": version}}}
+        )
+        return json.dumps({"lockfileVersion": lock_version, **field})
+
+    cache = {
+        "a/package-lock.json": lock("1.2.1"),
+        "b/package-lock.json": lock("1.4.2"),
+        "b/package.json": '{"dependencies": {"node-forge": "^1.4.2"}}',
+        "c/package.json": '{"dependencies": {"node-forge": "^1.4.2"}}',
+        "b/independent/package.json": '{"dependencies": {"node-forge": "^1.4.2"}}',
+    }
+    components = list(reversed(cache)) if reverse else list(cache)
+    resolved = supply_chain._collect_npm_locked_versions(cache, components)
+    assert resolved["a"]["node-forge"] == "1.2.1"
+    assert resolved["b"]["node-forge"] == "1.4.2"
+    assert not resolved.get("c")
+    assert not resolved.get("b/independent")
+    # Every installed version still participates in its own lockfile audit.
+    assert supply_chain._extract_packages_from_npm_lock(cache["a/package-lock.json"])[0][:2] == (
+        "node-forge",
+        "1.2.1",
+    )
+
+
+def test_npm_workspace_uses_nearest_install_and_keeps_hoisted_dependencies():
+    cache = {
+        "package-lock.json": json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"workspaces": ["packages/*"]},
+                    "packages/a": {"name": "a", "version": "1.0.0"},
+                    "packages/b": {"name": "b", "version": "1.0.0"},
+                    "node_modules/node-forge": {"version": "1.4.2"},
+                    "node_modules/@scope/helper": {"version": "2.0.0"},
+                    "packages/a/node_modules/node-forge": {"version": "1.2.1"},
+                    "node_modules/unrelated/node_modules/node-forge": {"version": "0.9.0"},
+                },
+            }
+        ),
+        "packages/a/package.json": "{}",
+        "packages/b/package.json": "{}",
+        "packages/c/package.json": "{}",
+    }
+    resolved = supply_chain._collect_npm_locked_versions(cache, list(cache))
+    assert resolved["."]["node-forge"] == "1.4.2"
+    assert dict(resolved["packages/a"]) == {"node-forge": "1.2.1", "@scope/helper": "2.0.0"}
+    assert dict(resolved["packages/b"]) == {"node-forge": "1.4.2", "@scope/helper": "2.0.0"}
+    assert not resolved.get("packages/c")
+
+
+@pytest.mark.parametrize("own_lock", ["", "{", '{"packages": {}}'])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_npm_workspace_own_lock_prevents_ancestor_resolution(own_lock, reverse):
+    cache = {
+        "package-lock.json": json.dumps(
+            {"packages": {"packages/a": {}, "node_modules/ws": {"version": "8.20.0"}}}
+        ),
+        "packages/a/package.json": '{"dependencies": {"ws": "^8.20.0"}}',
+        "packages/a/package-lock.json": own_lock,
+    }
+    components = list(reversed(cache)) if reverse else list(cache)
+    resolved = supply_chain._collect_npm_locked_versions(cache, components)
+    assert not resolved.get("packages/a")
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_npm_shrinkwrap_takes_precedence_and_keeps_both_lock_audits(reverse):
+    cache = {
+        "package-lock.json": '{"packages": {"node_modules/ws": {"version": "8.19.0"}}}',
+        "npm-shrinkwrap.json": '{"packages": {"node_modules/ws": {"version": "8.20.0"}}}',
+    }
+    components = list(reversed(cache)) if reverse else list(cache)
+    resolved = supply_chain._collect_npm_locked_versions(cache, components)
+    assert resolved["."]["ws"] == "8.20.0"
+    assert supply_chain._extract_packages_from_npm_lock(cache["package-lock.json"])[0][:2] == (
+        "ws",
+        "8.19.0",
+    )
+
+
+def test_npm_lock_collection_respects_file_and_time_bounds():
+    cache = {
+        "a/package-lock.json": '{"packages": {"node_modules/ws": {"version": "8.19.0"}}}',
+        "b/package-lock.json": '{"packages": {"node_modules/ws": {"version": "8.20.0"}}}',
+    }
+    assert not supply_chain._collect_npm_locked_versions(cache, list(cache), max_files=0)
+    assert not supply_chain._collect_npm_locked_versions(cache, list(cache), timeout_seconds=0)
+    assert list(supply_chain._collect_npm_locked_versions(cache, list(cache), max_files=1)) == ["a"]
+
+
+@pytest.mark.parametrize(
+    "location", ["../other", "/other", "folder/../../other", "folder\\..\\other"]
+)
+def test_npm_lock_paths_cannot_resolve_manifests_outside_the_project(location):
+    cache = {
+        "project/package-lock.json": json.dumps(
+            {"packages": {location: {}, "node_modules/ws": {"version": "8.20.0"}}}
+        ),
+        "other/package.json": "{}",
+    }
+    assert not supply_chain._collect_npm_locked_versions(cache, list(cache)).get("other")
+
+
+def test_npm_alias_install_does_not_pin_the_alias_registry_name():
+    content = json.dumps(
+        {"packages": {"node_modules/lodash": {"name": "node-forge", "version": "1.4.2"}}}
+    )
+    cache = {"package-lock.json": content}
+    resolved = supply_chain._collect_npm_locked_versions(cache, list(cache))
+    manifest = '{"dependencies": {"lodash": "npm:node-forge@1.4.2"}}'
+    packages = supply_chain._apply_locked_versions(
+        supply_chain._extract_packages_from_package_json(manifest),
+        resolved["."],
+        supply_chain._normalize_npm_package_name,
+    )
+    assert packages == [("lodash", None, 1)]
+    assert supply_chain._extract_packages_from_npm_lock(content) == [("node-forge", "1.4.2", 1)]
+
+
+def test_npm_v1_workspace_uses_recorded_link_and_nearest_locked_install():
+    cache = {
+        "package-lock.json": json.dumps(
+            {
+                "lockfileVersion": 1,
+                "dependencies": {
+                    "workspace-a": {
+                        "version": "file:packages/a",
+                        "dependencies": {"node-forge": {"version": "1.2.1"}},
+                    },
+                    "workspace-b": {"version": "file:packages/b"},
+                    "node-forge": {"version": "1.4.2"},
+                },
+            }
+        ),
+        "packages/a/package.json": "{}",
+        "packages/b/package.json": "{}",
+        "packages/c/package.json": "{}",
+    }
+    resolved = supply_chain._collect_npm_locked_versions(cache, list(cache))
+    assert resolved["."]["node-forge"] == "1.4.2"
+    assert resolved["packages/a"]["node-forge"] == "1.2.1"
+    assert resolved["packages/b"]["node-forge"] == "1.4.2"
+    assert not resolved.get("packages/c")
+    cache["packages/b/package-lock.json"] = "{"
+    assert not supply_chain._collect_npm_locked_versions(cache, list(cache)).get("packages/b")
+
+
+@pytest.mark.parametrize(
+    "location", ["../other", "/other", "folder/../../other", "folder\\..\\other"]
+)
+def test_npm_v1_links_cannot_resolve_manifests_outside_the_project(location):
+    cache = {
+        "project/package-lock.json": json.dumps(
+            {
+                "dependencies": {
+                    "linked": {"version": f"file:{location}"},
+                    "ws": {"version": "8.20.0"},
+                }
+            }
+        ),
+        "other/package.json": "{}",
+    }
+    assert not supply_chain._collect_npm_locked_versions(cache, list(cache)).get("other")
+
+
+def test_npm_v1_self_link_does_not_replace_the_root_install_tree():
+    cache = {
+        "package-lock.json": json.dumps(
+            {"dependencies": {"self": {"version": "file:./"}, "ws": {"version": "8.20.0"}}}
+        ),
+        "package.json": "{}",
+    }
+    assert supply_chain._collect_npm_locked_versions(cache, list(cache))["."]["ws"] == "8.20.0"
