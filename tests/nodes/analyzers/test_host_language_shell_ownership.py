@@ -233,102 +233,19 @@ def test_completed_python_word_cannot_claim_a_later_string(
     assert _python(content) is partial
 
 
-@pytest.mark.parametrize("prefix", ["f", "rf", "fr", "F"])
-@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
-def test_fstring_literal_template_braces_are_runtime_values(prefix: str, newline: str) -> None:
-    content = (
-        _OPTION_TEXT
-        + "REPORT = "
-        + prefix
-        + '"""items.map((item) => '
-        + '`${{item.name}} :: ${{item.group.name}}`)\n"""\n'
-        + _TAIL
-    ).replace("\n", newline)
-
-    assert _python(content) is False
-
-
 @pytest.mark.parametrize(
-    "word,suffix",
+    "javascript",
     [
-        ('`${{item.name}}`', ' -rf /'),
-        ('`${{item.name}} %s rm`', ' -rf /'),
-        ('`${{item.name:-$(printf rm)}}`', ' -rf /'),
-        ('`${{item.parts[selector]}}`', ' -rf /'),
-        ('`${{item.{field}}}`', ' -rf /'),
-        ('`${{item.name}}`', '{options} /'),
+        'execSync(`${{obj.cmd}}`);',
+        'run(`${{obj.cmd}}`);',
+        'execSync(`${{obj.cmd}}` + " -rf /");',
+        'const invoke = execSync; invoke(`${{obj.cmd}}` + " -rf /");',
     ],
 )
-def test_fstring_literal_projection_keeps_dynamic_commands_partial(word: str, suffix: str) -> None:
-    assert _python('REPORT = f"""' + word + suffix + '"""\n' + _TAIL) is True
-
-
-@pytest.mark.parametrize("extension", ['.format(value)', ' * count', ' + unknown', '[index]'])
-def test_fstring_literal_projection_requires_a_complete_value(extension: str) -> None:
-    content = 'REPORT = f"""`${{item.name}}`"""' + extension + '\n'
-
-    assert _python(content) is True
-
-
-@pytest.mark.parametrize("extension", [' + " -rf /"', ' " -rf /"', ' + f"{options} /"'])
-def test_fstring_literal_projection_keeps_concatenated_operands(extension: str) -> None:
-    content = 'REPORT = f"""`${{item.name}}`"""' + extension + '\n'
-
-    assert _python(content) is True
-
-
-def test_fstring_literal_projection_requires_the_value_end_within_its_bound() -> None:
-    word = '`${{item.name}}`'
-    content = (
-        'REPORT = f"""'
-        + word
-        + "x" * (tm._ROOT_GLOB_COMMAND_CHARS + 1)
-        + '""".format(value)\n'
-    )
-    start = content.index(word)
-
-    assert tm._PythonSourceOwnership(content, lambda: None).literal_word(
-        start, start + len(word)
-    ) is None
-
-
-@pytest.mark.parametrize(
-    "body,word,expected",
-    [
-        ('a{{name}}', 'a{{name}}', 'a{name}'),
-        ('a{{name}}{value}b{{name}}', 'b{{name}}', 'b{name}'),
-        ('a{{name}}{value}b{{name}}', '{{name}}{value}', None),
-        ('{f"${{nested.name}}"}', '${{nested.name}}', None),
-        ('{value:{{width}}}', '{{width}}', None),
-        ('\\n${{item.name}}', '\\n${{item.name}}', None),
-    ],
-)
-def test_fstring_constant_runs_exclude_replacement_code(
-    body: str, word: str, expected: str | None
+def test_python_constant_text_keeps_embedded_executable_javascript_partial(
+    javascript: str,
 ) -> None:
-    content = 'REPORT = f"""' + body + '"""\n'
-    start = content.index(word)
-
-    assert tm._PythonSourceOwnership(content, lambda: None).literal_word(
-        start, start + len(word)
-    ) == expected
-
-
-@pytest.mark.parametrize(
-    "expansion,expected",
-    [
-        ('${item.name}', True),
-        ('${item.group.name:-fallback}', True),
-        ('${item.parts[0]}', False),
-        ('${item.parts[selector]}', False),
-        ('${item.name:-$(printf rm)}', False),
-        ('${item.name:-`printf rm`}', False),
-        ('${item..name}', False),
-        ('${!item.name}', False),
-    ],
-)
-def test_dotted_parameters_only_select_runtime_values(expansion: str, expected: bool) -> None:
-    assert tm._is_value_parameter_expansion(expansion, 0, len(expansion)) is expected
+    assert _python('REPORT = f"""' + javascript + '"""\n') is True
 
 
 @pytest.mark.parametrize("newline", ["\r\n"], ids=["crlf"])

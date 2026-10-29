@@ -46,7 +46,6 @@ from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_tokens import PythonLiteralSpans
-from skillspector.python_tokens import python_fstring_literal_spans as _python_fstring_literal_spans
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
 from skillspector.python_tokens import python_string_body as _python_string_body
 from skillspector.security_reconstruction import validated_json_string_spans
@@ -106,14 +105,13 @@ _QUOTED_GLOB_SENTINEL = "\ue000"
 _DYNAMIC_SHELL_WORD_SENTINEL = "\ue001"
 _RUNTIME_SHELL_PARAMETER_SENTINEL = "\ue002"
 # A braced expansion head whose result depends only on parameter values: an
-# optional length prefix, a name with an optional literal subscript, a dotted
-# compound-variable name, or a numeric/special parameter, then a value operator.
+# optional length prefix, a name with an optional literal subscript or a
+# numeric/special parameter, then the closing brace or a value operator.
 # Indirection, arithmetic subscripts, substring offsets, ``@`` transformations,
 # zsh flags and ``${ cmd; }`` can evaluate code, so they do not match. The
 # documentation placeholder ``${...}`` is a bad substitution in every shell.
 _VALUE_PARAMETER_EXPANSION_HEAD_RE = re.compile(
-    r"\$\{(?:#?(?:[A-Za-z_][A-Za-z0-9_]*(?:(?:\.[A-Za-z_][A-Za-z0-9_]*)+|"
-    r"(?:\[(?:[@*]|[0-9]+)\])?)|[0-9]+|[@*#?$!-])"
+    r"\$\{(?:#?(?:[A-Za-z_][A-Za-z0-9_]*(?:\[(?:[@*]|[0-9]+)\])?|[0-9]+|[@*#?$!-])"
     r"(?:\}|:?[-=?+]|##?|%%?|/[/#%]?|\^\^?|,,?)|\.\.\.\})"
 )
 _VALUE_PARAMETER_EXPANSION_START_RE = re.compile(r"\$\{")
@@ -654,8 +652,11 @@ def _static_heredoc_header(
     cursor = start + 2
     strip_tabs = content[cursor : cursor + 1] == "-"
     cursor += strip_tabs
-    while cursor < limit and content[cursor] in " \t":
+    whitespace_limit = min(limit, cursor + _SHELL_COMMAND_WORD_CHARS)
+    while cursor < whitespace_limit and content[cursor] in " \t":
         cursor += 1
+    if cursor < limit and content[cursor] in " \t":
+        return None
     quote = content[cursor : cursor + 1]
     quoted = quote in {"'", '"'}
     cursor += quoted
@@ -2521,23 +2522,7 @@ def _has_shell_command_word_exhaustion(
             # parsed this position, so it only claims ownership.
             continue
         if parsed.limited:
-            # Python doubles literal f-string braces. Recheck only a proven
-            # constant word in that value; original offsets, later candidates,
-            # and the full string's destructive operands remain unchanged.
-            literal_word = (
-                python_source.literal_word(start, parsed.end) if python_source is not None else None
-            )
-            literal_parse = (
-                _parse_shell_command_word(literal_word, 0, check_runtime=check_runtime)
-                if literal_word is not None
-                else None
-            )
-            if (
-                literal_word is None
-                or literal_parse is None
-                or literal_parse.limited
-                or literal_parse.end != len(literal_word)
-            ) and not _quoted_candidate_is_complete(content, start, quote_limits, check_runtime):
+            if not _quoted_candidate_is_complete(content, start, quote_limits, check_runtime):
                 return True
         if (
             parsed.dynamic
@@ -3105,7 +3090,6 @@ class _PythonSourceOwnership:
         self._spans_computed = False
         self._cached_word_start = -1
         self._cached_word_end = -1
-        self._fstring_literals: dict[tuple[int, int], PythonLiteralSpans | None] = {}
 
     def _owned_spans(self) -> PythonLiteralSpans | None:
         if not self._spans_computed:
@@ -3150,44 +3134,6 @@ class _PythonSourceOwnership:
             return False
         start, end = _python_string_body(self._content, *owner)
         return not start <= position < end
-
-    def literal_word(self, start: int, end: int) -> str | None:
-        """Decode doubled braces only inside one proven f-string constant run."""
-        self._check_runtime()
-        word = self._content[start:end]
-        if (
-            end - start > _SHELL_COMMAND_WORD_CHARS
-            or "\\" in word
-            or not any(pair in word for pair in ("{{", "}}"))
-        ):
-            return None
-        owner = self._owner(start)
-        value = self.string_value(start, end)
-        # The value bound must reach its end to rule out a later formatting
-        # operator or unknown concatenation that can still change this word.
-        if (
-            owner is None
-            or value is None
-            or len(value[0]) - value[2] > _ROOT_GLOB_COMMAND_CHARS
-            or _has_runtime_command_operand_exhaustion(*value, self._check_runtime)
-        ):
-            return None
-        if owner not in self._fstring_literals:
-            self._fstring_literals[owner] = _python_fstring_literal_spans(
-                self._content, *owner, self._check_runtime
-            )
-        spans = self._fstring_literals[owner]
-        if spans is None:
-            return None
-        starts, ends = spans
-        index = bisect_right(starts, start) - 1
-        if index < 0 or end > ends[index]:
-            return None
-        # A local word boundary must not cut an escaped brace pair in half.
-        unpaired = word.replace("{{", "").replace("}}", "")
-        if "{" in unpaired or "}" in unpaired:
-            return None
-        return word.replace("{{", "{").replace("}}", "}")
 
     def string_value(self, start: int, end: int) -> tuple[str, int, int] | None:
         """Return the proven string value that holds a shell word, and its span.

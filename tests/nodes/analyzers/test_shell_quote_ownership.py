@@ -203,6 +203,30 @@ def test_unsupported_heredoc_delimiter_never_proves_a_substitution_end(header: s
     assert end_cache == {0: None}
 
 
+@pytest.mark.parametrize("separator", [" ", "\t"])
+@pytest.mark.parametrize("strip_tabs", [False, True])
+def test_heredoc_header_whitespace_accepts_exact_span_boundary(
+    separator: str, strip_tabs: bool
+) -> None:
+    prefix = "cat "
+    source = prefix + ("<<-" if strip_tabs else "<<")
+    source += separator * tm._SHELL_COMMAND_WORD_CHARS + "'END'"
+
+    assert tm._static_heredoc_header(source, len(prefix), len(source)) == (
+        ("END", strip_tabs, True), len(source)
+    )
+
+
+@pytest.mark.parametrize("separator", [" ", "\t"])
+def test_heredoc_header_whitespace_over_span_boundary_fails_closed(separator: str) -> None:
+    source = "$(cat <<" + separator * (tm._SHELL_COMMAND_WORD_CHARS + 1) + "END\n)\nEND\n)"
+    end_cache: dict[int, int | None] = {}
+
+    assert tm._static_heredoc_header(source, source.index("<<"), len(source)) is None
+    assert tm._skip_command_substitution(source, 0, len(source), end_cache=end_cache) is None
+    assert end_cache == {0: None}
+
+
 @pytest.mark.parametrize("suffix", ["", "\nEND\n)"])
 def test_pending_heredoc_cannot_close_before_its_body(suffix: str) -> None:
     source = "$(cat <<END)" + suffix
