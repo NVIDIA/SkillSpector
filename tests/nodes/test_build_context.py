@@ -24,6 +24,8 @@ import base64
 import io
 import json
 import os
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 from time import monotonic
@@ -191,7 +193,7 @@ def test_build_context_starts_and_returns_default_graph_wide_budget(tmp_path: Pa
 
     budget = result["workflow_resource_budget"]
     assert isinstance(budget, WorkflowResourceBudget)
-    assert DEFAULT_MAX_WORKFLOW_SECONDS == 600.0
+    assert DEFAULT_MAX_WORKFLOW_SECONDS == 1080.0
     assert budget.max_seconds == MAX_WORKFLOW_SECONDS
     assert budget.max_bytes == MAX_WORKFLOW_BYTES == 64 * 1024 * 1024
     assert budget.max_artifacts == MAX_WORKFLOW_ARTIFACTS == 10_000
@@ -208,12 +210,45 @@ def test_build_context_starts_and_returns_default_graph_wide_budget(tmp_path: Pa
         ("0.5", 0.5),
         ("0", DEFAULT_MAX_WORKFLOW_SECONDS),
         ("-1", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("", DEFAULT_MAX_WORKFLOW_SECONDS),
         ("nan", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("inf", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("-inf", DEFAULT_MAX_WORKFLOW_SECONDS),
         ("not-a-number", DEFAULT_MAX_WORKFLOW_SECONDS),
     ],
 )
 def test_workflow_budget_seconds_environment_parsing(value: str | None, expected: float) -> None:
     assert _workflow_max_seconds_from_environment(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, 1080.0), ("0.5", 0.5), ("1800", 1800.0), ("nan", 1080.0)],
+)
+def test_workflow_environment_reaches_graph_and_cli_budgets(
+    value: str | None, expected: float
+) -> None:
+    env = os.environ.copy()
+    name = "SKILLSPECTOR_MAX_WORKFLOW_SECONDS"
+    env.pop(name, None)
+    if value is not None:
+        env[name] = value
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json; from skillspector.state import WorkflowResourceBudget; "
+            "from skillspector.cli import _TransitiveBudget; "
+            "print(json.dumps([WorkflowResourceBudget().max_seconds, "
+            "_TransitiveBudget().max_seconds]))",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    assert json.loads(result.stdout) == [expected, expected]
 
 
 def test_build_context_reuses_supplied_stricter_transitive_budget(tmp_path: Path) -> None:

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import re
 import time
 import unicodedata
@@ -76,11 +77,33 @@ TP4_MAX_FILES = 128
 TP4_MAX_TOTAL_CODE_BYTES = 4 * 1024 * 1024
 TP4_MAX_TOTAL_INPUT_BYTES = 4 * 1024 * 1024
 TP4_MAX_FILE_CODE_BYTES = 1024 * 1024
-TP4_MAX_BATCHES = TP4_MAX_FILES
+DEFAULT_TP4_MAX_BATCHES = 256
+TP4_MAX_BATCHES_CEILING = 4096
 TP4_MAX_BATCH_INPUT_TOKENS = 32_000
 TP4_MIN_CODE_TOKENS = 64
 TP4_MAX_DECLARATION_CHARS = 16_384
 TP4_MAX_FINDINGS = 64
+
+
+def _tp4_max_batches_from_environment(value: str | None) -> int:
+    """Resolve bounded TP4 capacity without exposing untrusted environment text."""
+    if value is None or not value.strip():
+        return DEFAULT_TP4_MAX_BATCHES
+    # Normalize leading zeroes before bounding conversion of arbitrarily long input.
+    digits = value.strip().lstrip("0")
+    if re.fullmatch(r"[0-9]{1,4}", digits):
+        capacity = int(digits)
+        if 1 <= capacity <= TP4_MAX_BATCHES_CEILING:
+            return capacity
+    logger.warning(
+        "SKILLSPECTOR_TP4_MAX_BATCHES must be a decimal integer from 1 to %d; using default %d",
+        TP4_MAX_BATCHES_CEILING,
+        DEFAULT_TP4_MAX_BATCHES,
+    )
+    return DEFAULT_TP4_MAX_BATCHES
+
+
+TP4_MAX_BATCHES = _tp4_max_batches_from_environment(os.environ.get("SKILLSPECTOR_TP4_MAX_BATCHES"))
 
 _CATEGORY = "MCP Tool Poisoning"
 
@@ -1159,6 +1182,7 @@ def _tp4_finding(
 
 def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
     """Run TP4 with per-file, aggregate, token, batch, and shared-time bounds."""
+    logger.info("%s: TP4 selected batch capacity=%d", ANALYZER_ID, TP4_MAX_BATCHES)
     result = _TP4CheckOutcome()
     analyzer: _TP4Analyzer | None = None
     attempted = False
