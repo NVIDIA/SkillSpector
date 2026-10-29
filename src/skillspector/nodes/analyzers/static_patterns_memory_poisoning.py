@@ -608,6 +608,95 @@ def _is_benign_timestamp_context_description(content: str, match: re.Match[str])
     return False
 
 
+# MP3 (write variant): a write operation whose destination resolves to a known
+# agent-memory file or directory. MP1/MP3 prose patterns score the injection
+# *text*; they cannot see a write *operation*, so a test hook that appends to
+# MEMORY.md scores 0/100 SAFE (issue #879). This scores the write itself: the
+# persistence mechanism is the finding, whatever the payload bytes are.
+#
+# Calibration: the signal is the *destination* being memory the agent loads as
+# its own context, not file I/O as such; and the carrier is scoped to files
+# the developer toolchain runs without being asked (test files, conftest.py),
+# so an explicitly invoked helper that writes a report stays quiet.
+_AGENT_MEMORY_FILENAMES = frozenset({"memory.md", "claude.md", "agents.md", "soul.md"})
+_AGENT_MEMORY_DIR_SEGMENTS = frozenset({".claude", ".cursor", ".agents"})
+
+# Basename shapes the developer toolchain auto-runs: pytest/unittest discovery
+# (test_*.py, *_test.py, conftest.py) and JS/TS runners (*.test.*, *.spec.*).
+_AUTO_RUN_CARRIER_RE = re.compile(
+    r"conftest\.py|test_.*\.pyw?|.*_test\.pyw?|.*\.(?:test|spec)\.[a-z0-9]+",
+    re.IGNORECASE,
+)
+
+_PY_STRING_LITERAL = r"(?P<prefix>[A-Za-z]*)(?P<q>[\"'])(?P<dest>(?:\\.|(?!(?P=q)).)*)(?P=q)"
+_TS_STRING_LITERAL = r"(?P<q>[\"'`])(?P<dest>(?:\\.|(?!(?P=q)).)*)(?P=q)"
+
+# Write sinks that take a literal destination. open() requires an explicit
+# write mode so reads stay quiet; shutil.copy* resolve the destination, which
+# is the second positional argument.
+_PY_WRITE_SINKS = [
+    re.compile(
+        r"(?:\bio\s*\.\s*)?\bopen\s*\(\s*"
+        + _PY_STRING_LITERAL
+        + r"\s*,\s*(?:mode\s*=\s*)?(?P<mq>[\"'])(?P<mode>[^\"']*)(?P=mq)"
+    ),
+    re.compile(r"\bPath\s*\(\s*" + _PY_STRING_LITERAL + r"\s*\)\s*\.\s*write_(?:text|bytes)\s*\("),
+    re.compile(
+        r"\bshutil\s*\.\s*copy(?:2|file)?\s*\(\s*[^()]*(?:\([^()]*\)[^()]*)*,\s*"
+        + _PY_STRING_LITERAL
+    ),
+]
+_TS_WRITE_SINKS = [
+    re.compile(
+        r"(?:\bfs\s*\.\s*(?:promises\s*\.\s*)?)?"
+        r"\b(?:writeFileSync|appendFileSync|writeFile|appendFile)\s*\(\s*" + _TS_STRING_LITERAL
+    ),
+    re.compile(r"\bfs\s*\.\s*createWriteStream\s*\(\s*" + _TS_STRING_LITERAL),
+]
+
+
+def _is_agent_memory_destination(raw_destination: str, prefix: str = "") -> bool:
+    """Return True when a write destination is an agent-memory file or directory."""
+    # Literal path only: interpolation in directory segments does not change
+    # which well-known file is targeted, so f"{base}/MEMORY.md" still counts.
+    # A raw prefix (r, rf) keeps backslashes literal: decoding escapes there
+    # would eat the separators, so r"C:\Users\alice\MEMORY.md" would collapse
+    # to "C:UsersaliceMEMORY.md" and lose every path segment. Only non-raw
+    # literals get escape decoding; both forms then normalize separators.
+    if "r" in prefix.lower():
+        unescaped = raw_destination
+    else:
+        unescaped = re.sub(r"\\(.)", r"\1", raw_destination, flags=re.DOTALL)
+    normalized = unescaped.replace("\\", "/").strip()
+    segments = [s for s in normalized.split("/") if s not in ("", ".", "..")]
+    if not segments:
+        return False
+    lowered = [segment.lower() for segment in segments]
+    if lowered[-1] in _AGENT_MEMORY_FILENAMES:
+        return True
+    return any(segment in _AGENT_MEMORY_DIR_SEGMENTS for segment in lowered)
+
+
+def _iter_memory_file_writes(content: str, file_type: str) -> Iterator[tuple[re.Match[str], str]]:
+    """Yield (match, destination) for writes to agent-memory destinations."""
+    if file_type == "python":
+        sinks = _PY_WRITE_SINKS
+    elif file_type in ("typescript", "javascript"):
+        sinks = _TS_WRITE_SINKS
+    else:
+        return
+    for sink in sinks:
+        for match in sink.finditer(content):
+            destination = match.group("dest")
+            prefix = match.groupdict().get("prefix") or ""
+            if not _is_agent_memory_destination(destination, prefix):
+                continue
+            mode = match.groupdict().get("mode")
+            if mode is not None and not any(char in "wxa+" for char in mode):
+                continue
+            yield match, destination
+
+
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for memory poisoning patterns (MP1–MP3)."""
     findings: list[AnalyzerFinding] = []
@@ -697,6 +786,39 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     context=context_text,
                     matched_text=match.group(0)[:200],
                     complete_match=match.group(0),
+                )
+            )
+    # MP3 write variant: score the write to agent memory, not the written text.
+    basename = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    if (
+        file_type in ("python", "typescript", "javascript")
+        and _AUTO_RUN_CARRIER_RE.fullmatch(basename) is not None
+    ):
+        for write_match, destination in _iter_memory_file_writes(content, file_type):
+            line_num = get_line_number(content, write_match.start())
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="MP3",
+                    message="Memory Manipulation",
+                    severity=Severity.HIGH,
+                    location=loc(line_num),
+                    confidence=0.85,
+                    tags=tag,
+                    context=ctx(write_match.start()),
+                    matched_text=write_match.group(0)[:200],
+                    complete_match=write_match.group(0),
+                    remediation=(
+                        "An auto-run file writes to an agent memory file "
+                        f"({destination}). Such writes persist across agent "
+                        "interactions without model involvement. Confirm the "
+                        "destination is intentional and the written content is "
+                        "trusted before installing this skill."
+                    ),
+                    evidence={
+                        "destination": destination,
+                        "carrier_basename": basename,
+                        "carrier_kind": "auto_run",
+                    },
                 )
             )
     return findings
