@@ -954,6 +954,36 @@ def test_marker_scope_preserves_enclosing_quote_state(head: str, newline: str) -
     assert projection.limited is False
 
 
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        {"owned_source_start": 1},
+        {"source_end_is_truncated": True},
+    ],
+    ids=["ambiguous-prefix", "truncated-source"],
+)
+def test_marker_wrapper_context_requires_complete_source(bounds: dict) -> None:
+    content = "python3 -c 'print(value.strip(\"/\"))'\n" + "echo ready\n" * (
+        MAX_MARKER_LOOKAHEAD_CHARS // 10 + 1
+    )
+
+    projection = build_declared_marker_views(SecurityTextView("raw", content), **bounds)
+
+    assert projection.views == ()
+    assert projection.limited is True
+
+
+def test_unclosed_marker_wrapper_does_not_supply_quote_context() -> None:
+    content = 'python3 -c \'print(value.strip("/"))"\n' + "echo ready\n" * (
+        MAX_MARKER_LOOKAHEAD_CHARS // 10 + 1
+    )
+
+    projection = build_declared_marker_views(SecurityTextView("raw", content))
+
+    assert projection.views == ()
+    assert projection.limited is True
+
+
 @pytest.mark.parametrize("wrapper", ["{}", 'note = "{}"', "note = '''{}'''"])
 @pytest.mark.parametrize("marker", ["xyz", "x y"])
 def test_enclosing_quote_state_preserves_active_marker_checks(wrapper: str, marker: str) -> None:
