@@ -2963,6 +2963,9 @@ def _scan_multi_skill(
     if yara_dir is None and isinstance(legacy_kwargs.get("yara_rules_dir"), Path):
         yara_dir = str(legacy_kwargs["yara_rules_dir"])
     skills = detection.skills
+    # Check every discovered input before scan budgets can omit a child.
+    for skill in skills:
+        _validate_report_destination(skill.primary_path or skill.path, output)
     progress_console = (
         err_console if output is None and format is not FormatChoice.terminal else console
     )
