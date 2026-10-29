@@ -2021,7 +2021,10 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
 
 
 def _shell_quoted_candidate_limits(
-    content: str, check_runtime: Callable[[], None]
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    quote_closers: set[int] | None = None,
 ) -> dict[int, int]:
     """Prove single-line double-quote bounds by walking shell source in order.
 
@@ -2031,6 +2034,7 @@ def _shell_quoted_candidate_limits(
     unresolved syntax discard ALL ownership, retaining the conservative scan.
     """
     limits: dict[int, int] = {}
+    closers: set[int] = set()
     parameter_cache: dict[int, _ParameterExpansionEnd] = {}
     substitution_cache: dict[int, int | None] = {}
 
@@ -2052,6 +2056,7 @@ def _shell_quoted_candidate_limits(
                     cursor += 2
                     continue
                 if character == "'":
+                    closers.add(cursor)
                     quote = None
                 cursor += 1
                 continue
@@ -2063,6 +2068,7 @@ def _shell_quoted_candidate_limits(
                     cursor += 2
                     continue
             if quote == '"' and character == '"':
+                closers.add(cursor)
                 if (
                     "\n" not in content[quote_start:cursor]
                     and "\r" not in content[quote_start:cursor]
@@ -2071,6 +2077,12 @@ def _shell_quoted_candidate_limits(
                         limits[position] = cursor
                 quote = None
                 cursor += 1
+                continue
+            if quote is None and content.startswith("<<<", cursor):
+                # A here-string takes an ordinary shell word; unlike a
+                # heredoc it does not change the ownership of later lines.
+                cursor += 3
+                word_started = False
                 continue
             if character == "`" or (quote is None and content.startswith("<<", cursor)):
                 return False
@@ -2139,7 +2151,11 @@ def _shell_quoted_candidate_limits(
             cursor += 1
         return quote is None and cursor <= end
 
-    return limits if walk(0, len(content)) else {}
+    if not walk(0, len(content)):
+        return {}
+    if quote_closers is not None:
+        quote_closers.update(closers)
+    return limits
 
 
 def _quoted_candidate_is_complete(
@@ -5429,6 +5445,15 @@ def _has_bounded_parse_exhaustion(
         if file_type == "javascript" and complete_context
         else content
     )
+    quote_limits = None
+    if file_type == "shell" and complete_context:
+        # A closing delimiter in proven shell source cannot open a new
+        # command word. Nested substitutions retain their own lexical walk,
+        # so their executable candidates remain independently inspected.
+        structural_quote_closers = set()
+        quote_limits = _shell_quoted_candidate_limits(
+            content, check_runtime, quote_closers=structural_quote_closers
+        )
     # Perl ``eval BLOCK`` is recognized from its clause-initial ``eval`` and the
     # adjacent brace alone, so unlike quote ownership it needs no full context.
     if _has_shell_command_word_exhaustion(
@@ -5438,11 +5463,7 @@ def _has_bounded_parse_exhaustion(
         structural_quote_openers=structural_quote_openers,
         python_source=python_source,
         perl_eval_blocks=file_type == "perl",
-        quote_limits=(
-            _shell_quoted_candidate_limits(content, check_runtime)
-            if file_type == "shell" and complete_context
-            else None
-        ),
+        quote_limits=quote_limits,
     ):
         return True
     covered_until = 0

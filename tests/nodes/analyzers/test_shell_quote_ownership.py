@@ -27,6 +27,77 @@ def test_closed_data_quotes_do_not_consume_later_padding(source: str, padding: i
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_nested_path_quote_after_here_string_does_not_consume_later_commands(newline: str) -> None:
+    source = '''#!/bin/bash
+mapfile -t matches < <(awk 'NF {print $1}' <<<"$listing")
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+root="$work/bundle"
+cp "$(dirname "${SOURCE[0]}")/helper.sh" \\
+  "$root/helper.sh"
+chmod 700 "$root/helper.sh"
+tool="$(resolve_one "$SPEC")"
+archive="$work/archive.tbz2"
+fetch "$tool" > "$archive"
+tar -xf "$archive" -C "$root"
+files=("$tool")
+for file in first.py second.py; do
+  item="$(resolve_one "$BASE/$file")"
+  fetch "$item" > "$root/$file"
+done
+[[ ${#files[@]} -eq 1 ]] || {
+  echo "Expected one nonempty tool in the downloaded archive" >&2
+  exit 1
+}
+chmod 700 "${files[0]}"
+printf 'Created %s\\n' "$root"
+'''.replace("\n", newline)
+
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("operator", ["<<<", "<<< "])
+def test_here_string_keeps_following_quote_bounds(operator: str) -> None:
+    source = f'cat {operator}"$VALUE"\necho "waiting $(get_count) ${{DELAY}}s"\n'
+    source += "# " + "." * 6000 + "\n"
+
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        '$CMD -rf /',
+        '"$CMD" -rf /',
+        'echo "x: $($CMD -rf /)"',
+        'echo "x: $(echo "a b"; $CMD -rf /)"',
+        'sh -c "$CMD -rf /"',
+    ],
+)
+def test_here_string_and_nested_quote_closers_do_not_hide_runtime_commands(command: str) -> None:
+    source = 'cat <<<"$VALUE"\ncp "$(dirname "$SOURCE")/file" "$DEST"\n'
+    source += command + "\n# " + "." * 6000 + "\n"
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        'cat <<END\n"unowned\nEND\n',
+        'echo `date`\n',
+        'echo "unfinished\n',
+    ],
+)
+def test_unproven_source_cannot_publish_quote_closers(tail: str) -> None:
+    closers: set[int] = set()
+    source = 'cat <<<"$VALUE"\ncp "$(dirname "$SOURCE")/file" "$DEST"\n' + tail
+
+    assert tm._shell_quoted_candidate_limits(source, lambda: None, quote_closers=closers) == {}
+    assert closers == set()
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -132,7 +203,7 @@ def test_compound_adversarial_inputs_retain_security_signal(
     for prefix, command, suffix in product(prefixes, commands, suffixes):
         source = prefix + command + suffix
         with monkeypatch.context() as baseline:
-            baseline.setattr(tm, "_shell_quoted_candidate_limits", lambda *_: {})
+            baseline.setattr(tm, "_shell_quoted_candidate_limits", lambda *_, **__: {})
             was_partial = tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
         is_partial = tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
         if was_partial and not is_partial:
