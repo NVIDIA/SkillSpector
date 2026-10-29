@@ -6789,6 +6789,19 @@ def test_scan_transitive_source_scopes_identical_child_work_and_evidence(monkeyp
     )
 
 
+def test_source_aware_inventory_preserves_archive_membership() -> None:
+    rows = cli._source_aware_inventory(
+        [{"path": "guide.zip", "inspected_members": ["guide.zip!/note.md"]}],
+        source_url="https://example.com/guide",
+        source_identity="guide-source",
+        source_digest="digest",
+    )
+    assert rows[0]["path"] == cli._transitive_component_key("guide-source", "guide.zip")
+    assert rows[0]["inspected_members"] == [
+        cli._transitive_component_key("guide-source", "guide.zip!/note.md")
+    ]
+
+
 def test_cache_transitive_result_scopes_compacted_occurrence_ids() -> None:
     finding = Finding(
         rule_id="AST4",
