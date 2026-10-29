@@ -2167,7 +2167,9 @@ def _quoted_candidate_is_complete(
     )
 
 
-def _shell_comment_start_before(content: str, start: int) -> int | None:
+def _shell_comment_start_before(
+    content: str, start: int, *, ansi_c: bool = False
+) -> int | None:
     """Return a genuine shell comment ``#`` on the candidate's line, if any.
 
     This scans from the start of ``content`` so quote state is inherited
@@ -2181,6 +2183,14 @@ def _shell_comment_start_before(content: str, start: int) -> int | None:
     can prove; a genuinely unprovable fragment stays conservative because
     the caller only reaches this helper after the line-local comment idiom
     already matched on the candidate's own line.
+
+    With ``ansi_c`` (shell only), a ``$'...'`` string follows the same
+    ownership rule as the main word parser: a backslash escapes the next
+    character, so ``\\'`` inside the string does not close it and a ``#``
+    after it is still string content, not a comment start. Other
+    hash-comment languages do not share Bash ANSI-C quoting (``$'`` is a
+    variable in Perl and Ruby), so they keep the plain single-quote rule
+    and never get the ANSI-C treatment.
     """
     line_start = content.rfind("\n", 0, start) + 1
     stack: list[str | None] = [None]
@@ -2194,6 +2204,14 @@ def _shell_comment_start_before(content: str, start: int) -> int | None:
             i += 1
             continue
         top = stack[-1]
+        if top == "ansi":
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "'":
+                stack.pop()
+            i += 1
+            continue
         if top == "'":
             if ch == "'":
                 stack.pop()
@@ -2216,7 +2234,10 @@ def _shell_comment_start_before(content: str, start: int) -> int | None:
         if ch == "\\":
             i += 2
             continue
-        if ch in ("'", '"'):
+        if ch == "$" and ansi_c and content[i + 1 : i + 2] == "'":
+            stack.append("ansi")
+            i += 1
+        elif ch in ("'", '"'):
             stack.append(ch)
         elif ch == "`":
             if top == "`":
@@ -2241,6 +2262,8 @@ def _is_comment_candidate(
     content: str,
     start: int,
     python_source: _PythonSourceOwnership | None,
+    *,
+    file_type: str | None = None,
 ) -> bool:
     """Return whether a candidate position sits inside a ``#`` comment.
 
@@ -2256,7 +2279,10 @@ def _is_comment_candidate(
     if _SHELL_COMMENT_START_RE.search(content, line_start, start) is None:
         return False
     if python_source is None:
-        return _shell_comment_start_before(content, start) is not None
+        return (
+            _shell_comment_start_before(content, start, ansi_c=file_type == "shell")
+            is not None
+        )
     return python_source.comment(start) is not None
 
 
@@ -2407,7 +2433,7 @@ def _has_shell_command_word_exhaustion(
             continue
         if parsed.limited:
             if file_type in _HASH_COMMENT_FILE_TYPES and _is_comment_candidate(
-                content, start, python_source
+                content, start, python_source, file_type=file_type
             ):
                 # A comment is never executed: a backtick there is literal
                 # text, so it cannot open a command substitution that

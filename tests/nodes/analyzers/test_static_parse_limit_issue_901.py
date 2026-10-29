@@ -141,6 +141,37 @@ def test_line_local_backtick_pairing(line: str, expected: str) -> None:
     assert tm._blank_line_local_paired_backticks(line) == expected
 
 
+def test_ansi_c_escaped_quote_hash_is_not_a_comment() -> None:
+    # Review follow-up on #902 (third round): in a Bash ANSI-C string the
+    # escaped apostrophe does not close the string, so the ``#`` after it
+    # is string content, not a comment start. The substitution that follows
+    # the string still runs, so its failed printf reconstruction keeps the
+    # conservative bound. Before the fix the comment scan popped its quote
+    # at the escaped apostrophe, read the hash as a comment start, and
+    # wrongly exempted the executable substitution.
+    source = "echo $'x\\' # literal'; $(printf \"$FMT\" \"$CMD\") -rf /\n"
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is True
+
+
+def test_ansi_c_string_then_genuine_comment_exempts() -> None:
+    # The paired case: once the ANSI-C string genuinely closes, a later
+    # ``#`` on the same line is a real comment start, so the substitution
+    # after it never executes and the analysis completes.
+    source = "echo $'x\\' # literal' # real; $(printf \"$FMT\" \"$CMD\") -rf /\n"
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is False
+
+
+def test_ansi_c_comment_rule_is_shell_only() -> None:
+    # The ANSI-C ownership rule is a Bash rule: ``$'`` is a variable, not a
+    # quote, in Perl and Ruby, so the helper only applies it when the
+    # caller says shell. The same source therefore reads the hash as a
+    # comment start without the flag and as string content with it.
+    source = "echo $'x\\' # literal'; $(printf \"$FMT\" \"$CMD\") -rf /\n"
+    start = source.index("$(printf")
+    assert tm._shell_comment_start_before(source, start, ansi_c=True) is None
+    assert tm._shell_comment_start_before(source, start, ansi_c=False) == 11
+
+
 def test_issue_reproducer_scripts_reach_completed_ledger_outcome() -> None:
     for path, source in (
         ("scripts/run.sh", _COMMENT_BACKTICK_SCRIPT),
