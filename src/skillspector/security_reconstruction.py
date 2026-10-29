@@ -1246,9 +1246,14 @@ def _bounded_sentence_end(
     maximum_end: int,
     *,
     end_is_truncated: bool,
+    context_start: int | None = None,
 ) -> tuple[int, bool]:
-    for boundary_start, _ in _sentence_boundaries(text, start, min(len(text), maximum_end + 1)):
-        if boundary_start <= maximum_end:
+    # A directive can be inside a quoted string; retain that quote's state.
+    scan_start = start if context_start is None else context_start
+    for boundary_start, _ in _sentence_boundaries(
+        text, scan_start, min(len(text), maximum_end + 1)
+    ):
+        if start <= boundary_start <= maximum_end:
             return boundary_start, False
     exhausted = maximum_end < len(text) or end_is_truncated
     return maximum_end, exhausted
@@ -1836,12 +1841,18 @@ def _classify_directive(
     if directive.exhausted:
         return _DirectiveClassification(None, False, True)
 
+    clause_start = _previous_sentence_boundary(
+        view.text,
+        directive.start,
+        MAX_MARKER_LOOKAHEAD_CHARS,
+    )
     scope_cap = min(len(view.text), directive.end + MAX_MARKER_SCOPE_CHARS)
     scope_end, _ = _bounded_sentence_end(
         view.text,
         directive.end,
         scope_cap,
         end_is_truncated=end_is_truncated,
+        context_start=clause_start,
     )
     lookahead_cap = min(len(view.text), directive.end + MAX_MARKER_LOOKAHEAD_CHARS)
     lookahead_end, lookahead_exhausted = _bounded_sentence_end(
@@ -1849,13 +1860,9 @@ def _classify_directive(
         directive.end,
         lookahead_cap,
         end_is_truncated=end_is_truncated,
+        context_start=clause_start,
     )
     first_sentence_end = lookahead_end
-    clause_start = _previous_sentence_boundary(
-        view.text,
-        directive.start,
-        MAX_MARKER_LOOKAHEAD_CHARS,
-    )
     directive_clause = view.text[clause_start:first_sentence_end]
     if first_sentence_end < lookahead_cap and (
         _FORWARD_PAYLOAD_REFERENCE_RE.search(directive_clause) is not None
