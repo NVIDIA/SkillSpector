@@ -322,6 +322,53 @@ def test_transformed_shell_command_cannot_claim_original_literal_offsets(argumen
     assert tm._literal_shell_command_spans(source, 0, len(source), lambda: None) == {}
 
 
+@pytest.mark.parametrize("shape", ["parameter", "alternating", "comment", "whitespace"])
+def test_literal_command_before_hostile_nesting_keeps_proof_work_bounded(
+    shape: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repetitions = 2000
+    if shape == "parameter":
+        tail = '$(env "X=${x:- ' * repetitions + "A" + '}" echo printf)' * repetitions + " -rf *"
+    elif shape == "alternating":
+        tail = "$(env X=" + "${x:-$(echo " * repetitions + "z" + ")}" * repetitions + " echo printf) -rf /"
+    elif shape == "comment":
+        tail = "$(env X=x $(echo " * repetitions + "# no newline" + ")" * repetitions
+    else:
+        tail = "\n" * 40000 + "$CMD -rf /\n"
+    source = "bash -c 'echo ready'\n" + tail
+    scanned = 0
+    checks = 0
+    original = tm._skip_shell_delimited_expansion
+
+    def counted(content: str, start: int, limit: int, *args, **kwargs):
+        nonlocal scanned
+        result = original(content, start, limit, *args, **kwargs)
+        scanned += (limit if result is None else result) - start
+        return result
+
+    def check_runtime() -> None:
+        nonlocal checks
+        checks += 1
+
+    monkeypatch.setattr(tm, "_skip_shell_delimited_expansion", counted)
+    closers: set[int] = set()
+    assert tm._shell_quoted_candidate_limits(source, check_runtime, quote_closers=closers) == {}
+    assert closers == set()
+    assert scanned <= 8 * len(source)
+    assert checks > 0
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+def test_literal_command_proof_propagates_real_runtime_exceptions() -> None:
+    source = "bash -c 'echo ready'\n"
+
+    def cancelled() -> None:
+        raise TimeoutError("caller deadline")
+
+    with pytest.raises(TimeoutError, match="caller deadline"):
+        tm._literal_shell_command_spans(source, 0, len(source), cancelled)
+
+
 @pytest.mark.parametrize(
     "tail",
     [

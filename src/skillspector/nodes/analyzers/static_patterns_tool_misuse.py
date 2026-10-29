@@ -2141,17 +2141,42 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
             yield start, parsed.end
 
 
+class _ShellOwnershipBudgetExceeded(Exception):
+    """Stop optional quote proof without swallowing the caller's cancellation."""
+
+
 def _literal_shell_command_spans(
     content: str, begin: int, end: int, check_runtime: Callable[[], None]
-) -> dict[int, int]:
+) -> dict[int, int] | None:
     """Locate exact single-quoted shell -c bodies once per lexical scope."""
     source = content[begin:end]
+    if "'" not in source or not any(
+        "c" in match[1]
+        for match in re.finditer(r"(-[A-Za-z]+)\s+(?:\\\r?\n[ \t]*)*'", source)
+    ):
+        return {}
     spans: list[tuple[int, int]] = []
-    for clause_start in _shell_clause_starts(source, check_runtime):
+    # Invocation readers check runtime at least every 4096 scanned bytes.
+    # Bound repeated delimiter scans proportionally to this scope, so a valid
+    # literal command before deeply nested unrelated input cannot make this
+    # optional ownership pass quadratic. Exhaustion publishes no proof.
+    remaining_checks = 4 + 4 * ((len(source) + 4095) // 4096)
+
+    def check_proof_runtime() -> None:
+        nonlocal remaining_checks
         check_runtime()
-        _command_string_from_clause(
-            source, clause_start, check_runtime, literal_command_spans=spans
-        )
+        remaining_checks -= 1
+        if remaining_checks < 0:
+            raise _ShellOwnershipBudgetExceeded
+
+    try:
+        for clause_start in _shell_clause_starts(source, check_runtime):
+            check_runtime()
+            _command_string_from_clause(
+                source, clause_start, check_proof_runtime, literal_command_spans=spans
+            )
+    except _ShellOwnershipBudgetExceeded:
+        return None
     return {begin + start: begin + stop for start, stop in spans}
 
 
@@ -2185,6 +2210,8 @@ def _shell_quoted_candidate_limits(
         candidates: list[int] = []
         pending_heredocs: tuple[tuple[str, bool, bool], ...] = ()
         command_spans = _literal_shell_command_spans(content, begin, end, check_runtime)
+        if command_spans is None:
+            return False
         while cursor < end:
             if (cursor - begin) % 1024 == 0:
                 check_runtime()
@@ -2790,6 +2817,8 @@ def _command_string_from_clause(
 
     for _ in range(32):
         while cursor < len(content) and content[cursor].isspace():
+            if cursor % 4096 == 0:
+                check_runtime()
             cursor += 1
         redirection = _SHELL_REDIRECTION_PREFIX_RE.match(content, cursor)
         if redirection is not None:
