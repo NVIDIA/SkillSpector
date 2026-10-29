@@ -120,6 +120,10 @@ _CHILD_PROCESS_ENV_CALLS = frozenset(
     }
 )
 _LAUNCHER_MODULES = frozenset(name.partition(".")[0] for name in _CHILD_PROCESS_ENV_CALLS)
+# A copy the flow pass traces only to a child process stays an E2 finding, but as a
+# low-confidence LOW. The proof covers ordinary Python, not every introspection
+# trick, so a read it misses lowers the finding instead of removing it.
+_CHILD_PROCESS_PASSTHROUGH_CONFIDENCE = 0.2
 E3_CODE_PATTERNS = [
     (r"glob\s*\.\s*glob\s*\([^)]*(?:\.env|\.ssh|\.aws|\.config|credentials)", 0.8),
     (r"os\s*\.\s*walk\s*\([^)]*(?:home|~|/Users|/home)", 0.6),
@@ -634,6 +638,36 @@ def _argument_names(arguments: ast.arguments) -> set[str]:
     }
 
 
+def _annotation_expressions(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.expr | None]:
+    arguments = node.args
+    return [
+        *(
+            argument.annotation
+            for argument in (
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+                arguments.vararg,
+                arguments.kwarg,
+            )
+            if argument is not None
+        ),
+        node.returns,
+    ]
+
+
+def _type_param_expressions(type_params: Sequence[ast.type_param]) -> list[ast.expr | None]:
+    # Type parameter defaults arrived in Python 3.13.
+    return [
+        expression
+        for type_param in type_params
+        for expression in (
+            getattr(type_param, "bound", None),
+            getattr(type_param, "default_value", None),
+        )
+    ]
+
+
 class _EnvironmentFlowVisitor(ast.NodeVisitor):
     """Decide which environment mappings only ever reach a child-process ``env=``.
 
@@ -643,16 +677,16 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
     ``env = os.environ.copy()``, and a nested scope's own ``env`` cannot close the
     outer one. A binding passes through only if every use is a child-process
     ``env=`` argument or an in-place edit of the mapping; any other use keeps the
-    finding.
+    finding HIGH.
 
     The pass sees one file, so a binding only passes through by name where no
     other file can reach it: a function local, or a module global bound in a
     top-level ``if __name__ == "__main__":`` body, which importers never run. A
     launcher only counts when its root name is bound solely by an absolute import
     from ``subprocess`` or ``asyncio`` and nothing in the file writes to that
-    module, so a local ``def run`` or ``class subprocess`` gets no exemption.
+    module, so a local ``def run`` or ``class subprocess`` is never trusted.
 
-    Control flow errs toward keeping the finding. A rebinding closes only the
+    Control flow errs toward keeping the finding HIGH. A rebinding closes only the
     bindings made in its own block or in blocks nested inside it, so one inside an
     ``if``, ``try``, ``with``, ``match`` or loop body leaves the outer binding open
     next to the new one, and later uses count against both. A rebinding never
@@ -686,6 +720,7 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
                 if isinstance(statement, ast.If) and _is_main_guard(statement.test)
             }
         self._in_main_guard = False
+        self._lazy = 0
         for node in ast.walk(tree):
             if _reads_names_dynamically(node, aliases):
                 self._dynamic_reads = True
@@ -709,7 +744,13 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
                 and isinstance(node.value, ast.Name)
             ):
                 self._mutated_names.add(id(node.value))
-            elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            elif (
+                isinstance(node, ast.AugAssign)
+                and isinstance(node.op, ast.BitOr)
+                and isinstance(node.target, ast.Name)
+            ):
+                # Only ``dict.__ior__`` exists. Any other operator hands the whole
+                # mapping to the right operand's reflected method.
                 self._mutated_names.add(id(node.target))
         self._scopes: list[_Scope] = [_Scope(local_names=None)]
         self._passed_through: set[int] = set()
@@ -751,7 +792,7 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
 
     def _resolve(self, name: str, *, walrus: bool = False) -> tuple[_Scope, bool]:
         """Return the scope that owns ``name`` here, and whether this access runs later."""
-        deferred = False
+        deferred = self._lazy > 0
         innermost = True
         for scope in reversed(self._scopes):
             if walrus and scope.is_comprehension:
@@ -842,6 +883,19 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
         self._close_scope(self._scopes.pop())
         self._protected = outer_protected
 
+    def _visit_lazy(self, expressions: Sequence[ast.expr | None]) -> None:
+        """Visit expressions that run where they are defined, or only when read.
+
+        Annotations run eagerly before Python 3.14 and lazily from it on, and type
+        parameters and ``type`` alias values always run lazily, so a read here
+        counts against the bindings open now and every later one.
+        """
+        self._lazy += 1
+        for expression in expressions:
+            if expression is not None:
+                self.visit(expression)
+        self._lazy -= 1
+
     def _visit_defaults(self, arguments: ast.arguments) -> None:
         for default in (*arguments.defaults, *arguments.kw_defaults):
             if default is not None:
@@ -851,6 +905,9 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
         for decorator in node.decorator_list:
             self.visit(decorator)
         self._visit_defaults(node.args)
+        self._visit_lazy(
+            [*_type_param_expressions(node.type_params), *_annotation_expressions(node)]
+        )
         bound, declared_global = _scope_declarations(node.body)
         scope = _Scope(bound | _argument_names(node.args), declared_global, deferred=True)
         self._visit_scope(scope, node.body)
@@ -866,6 +923,7 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
         self._visit_scope(scope, [node.body])
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._visit_lazy(_type_param_expressions(node.type_params))
         for expression in (*node.decorator_list, *node.bases):
             self.visit(expression)
         for keyword in node.keywords:
@@ -885,7 +943,7 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
             name.id
             for generator in node.generators
             for name in ast.walk(generator.target)
-            if isinstance(name, ast.Name)
+            if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)
         }
         deferred = isinstance(node, ast.GeneratorExp)
         self._scopes.append(_Scope(targets, deferred=deferred, is_comprehension=True))
@@ -916,10 +974,18 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
             self._bind(target, id(node.value))
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        if node.value is None:
-            return
-        self.visit(node.value)
-        self._bind(node.target, id(node.value))
+        if node.value is not None:
+            self.visit(node.value)
+            self._bind(node.target, id(node.value))
+        elif not isinstance(node.target, ast.Name):
+            # Without a value, an attribute or subscript target still evaluates its base.
+            self.visit(node.target)
+        # A function never evaluates its local annotations; counting them anyway is safe.
+        self._visit_lazy([node.annotation])
+
+    def visit_TypeAlias(self, node: ast.TypeAlias) -> None:
+        self.visit(node.name)
+        self._visit_lazy([*_type_param_expressions(node.type_params), node.value])
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
@@ -927,7 +993,11 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.visit(node.value)
-        self.visit(node.target)
+        target = node.target
+        if isinstance(target, ast.Name) and id(target) not in self._mutated_names:
+            # The operator reads the old value before the name is rebound.
+            self.visit(ast.copy_location(ast.Name(target.id, ast.Load()), target))
+        self.visit(target)
 
     def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
         self.visit(node.iter)
@@ -983,7 +1053,8 @@ def _analyze_python_environment_reads(
     """Detect materializing or enumerating the complete ``os.environ`` mapping.
 
     A full mapping copy or enumeration is an environment-harvesting signal, unlike a
-    targeted single-key lookup or passing ``os.environ`` through to a child process.
+    targeted single-key lookup. A copy that the flow pass traces only to a child
+    process is still reported, but as a low-confidence LOW pass-through.
     Credential flows to network and execution sinks remain covered by the behavioral
     taint analyzer. AST parsing makes this check insensitive to formatting and lets it
     resolve ``os`` / ``environ`` import aliases.
@@ -1005,8 +1076,8 @@ def _analyze_python_environment_reads(
         flow.visit(tree)
         child_process_passthroughs = flow.passthrough_ids()
     except RecursionError:
-        # Too deep for the recursive flow pass: report every full read, as before
-        # the child-process exemption existed, instead of losing the whole file.
+        # Too deep for the recursive flow pass: report every full read as HIGH
+        # instead of losing the whole file.
         child_process_passthroughs = set()
     findings: list[AnalyzerFinding] = []
     emitted: set[int] = set()
@@ -1016,19 +1087,33 @@ def _analyze_python_environment_reads(
         node_id = id(node)
         if node_id in emitted:
             return
-        if node_id in child_process_passthroughs:
-            return
         emitted.add(node_id)
+        passthrough = node_id in child_process_passthroughs
         lineno = getattr(node, "lineno", 1)
         end_lineno = getattr(node, "end_lineno", None)
         matched_text = ast.get_source_segment(content, node) or "os.environ"
         findings.append(
             AnalyzerFinding(
                 rule_id="E2",
-                message="Env Variable Harvesting",
-                severity=Severity.HIGH,
+                message=(
+                    "Environment Pass-Through to Child Process"
+                    if passthrough
+                    else "Env Variable Harvesting"
+                ),
+                severity=Severity.LOW if passthrough else Severity.HIGH,
                 location=Location(file=file_path, start_line=lineno, end_line=end_lineno),
-                confidence=confidence,
+                confidence=(
+                    min(confidence, _CHILD_PROCESS_PASSTHROUGH_CONFIDENCE)
+                    if passthrough
+                    else confidence
+                ),
+                explanation=(
+                    "The copy of os.environ is only handed to a child process launched "
+                    "through subprocess or asyncio, so the child receives the environment "
+                    "the skill already runs in. No other read of the copy was found."
+                    if passthrough
+                    else None
+                ),
                 tags=tag,
                 context=get_context_from_lines(lines, lineno),
                 matched_text=matched_text[:200],

