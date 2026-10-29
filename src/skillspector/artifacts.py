@@ -67,6 +67,7 @@ class ArtifactRecord(TypedDict):
     readable_binary: NotRequired[bool]
     reason: NotRequired[str]
     inherited_exclusion_reason: NotRequired[str]
+    inspected_members: NotRequired[list[str]]
 
 
 class BundleReference(TypedDict):

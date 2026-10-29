@@ -3433,6 +3433,12 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         override = nested.inventory_overrides.get(artifact["path"])
         if override is not None and artifact["disposition"] != ArtifactDisposition.FAILED:
             artifact["disposition"], artifact["reason"] = override
+        if artifact["path"] in nested.inspected_containers:
+            artifact["inspected_members"] = nested.inspected_containers[artifact["path"]]
+            if artifact["disposition"] is ArtifactDisposition.OUT_OF_SCOPE and not artifact.get(
+                "reason"
+            ):
+                artifact["disposition"] = ArtifactDisposition.ANALYZED
     inventory_by_path = {item["path"]: item for item in artifact_inventory}
 
     recognized_containers = frozenset(nested.outer_metadata)
