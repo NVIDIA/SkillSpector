@@ -82,10 +82,131 @@ def test_here_string_and_nested_quote_closers_do_not_hide_runtime_commands(comma
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("header", ["<<END", "<<'END'", '<<"END"', "<<-END"])
+def test_complete_heredoc_keeps_later_nested_quote_ownership(header: str, newline: str) -> None:
+    source = f"cat {header}\nordinary help text\nEND\n"
+    source += '''state="$(inspect -f '{{value}}' "$NAME")" || return
+[[ "$state" == true\\|true\\|* &&
+   " ${state#*|*|} " == *' /dev '* &&
+   " ${state#*|*|} " == *' /tools '* ]] || {
+  echo "Required mounts are missing" >&2
+  return 1
+}
+output="$(detect_devices)" || return
+printf '%s\\n' "$output"
+trap 'rm -rf "$CACHE"' EXIT
+'''
+
+    assert not tm.has_bounded_parse_exhaustion(
+        source.replace("\n", newline), lambda: None, file_type="shell"
+    )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_multiple_heredocs_are_consumed_in_declaration_order(newline: str) -> None:
+    source = "cat <<'FIRST' <<-SECOND\nfirst body\nFIRST\n\tsecond body\n\tSECOND\n"
+    source += 'echo "waiting $(get_count) ${DELAY}s"\n# ' + "." * 6000 + "\n"
+
+    assert not tm.has_bounded_parse_exhaustion(
+        source.replace("\n", newline), lambda: None, file_type="shell"
+    )
+
+
+@pytest.mark.parametrize("indent", [" ", " \t", "\t "])
+def test_tab_stripping_heredoc_does_not_strip_spaces(indent: str) -> None:
+    source = f"$(cat <<-END\nbody\n{indent}END\n)"
+    end_cache: dict[int, int | None] = {}
+
+    assert tm._skip_command_substitution(source, 0, len(source), end_cache=end_cache) is None
+    assert end_cache == {0: None}
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_heredoc_body_parentheses_cannot_close_an_enclosing_substitution(newline: str) -> None:
+    source = "$(cat <<'END'\n) and an unmatched quote: \"\nEND\nprintf ok\n)"
+    source = source.replace("\n", newline)
+
+    assert tm._skip_command_substitution(source, 0, len(source), lambda: None) == len(source)
+
+
+@pytest.mark.parametrize("delimiter", ["END", "'END'", '"END"'])
+@pytest.mark.parametrize("command", ["$CMD -rf /", 'echo "$($CMD -rf /)"'])
+def test_heredoc_ownership_keeps_runtime_payloads_partial(delimiter: str, command: str) -> None:
+    source = f"cat <<{delimiter}\n{command}\nEND\n"
+    source += 'echo "waiting $(get_count) ${DELAY}s"\n'
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("delimiter", ["END", "'END'"])
+def test_heredoc_ownership_keeps_literal_destructive_findings(delimiter: str) -> None:
+    source = f"cat <<{delimiter}\nrm -rf /\nEND\necho ready\n"
+
+    assert any(finding.rule_id == "TM1" for finding in tm.analyze(source, "run.sh", "shell"))
+
+
+@pytest.mark.parametrize("header", ["<<'END-MARK'", "<<\\END", "<<$END", "<<'END", "<<"])
+def test_unsupported_heredoc_delimiter_never_proves_a_substitution_end(header: str) -> None:
+    source = f"$(cat {header}\n)\nEND\n)"
+    end_cache: dict[int, int | None] = {}
+
+    assert tm._skip_command_substitution(source, 0, len(source), end_cache=end_cache) is None
+    assert end_cache == {0: None}
+
+
+@pytest.mark.parametrize("suffix", ["", "\nEND\n)"])
+def test_pending_heredoc_cannot_close_before_its_body(suffix: str) -> None:
+    source = "$(cat <<END)" + suffix
+
+    assert tm._skip_command_substitution(source, 0, len(source), lambda: None) is None
+
+
+def test_arithmetic_shift_is_not_a_heredoc_declaration() -> None:
+    for source in ("$((1 << count))", "$(echo $((1 << count)))", "$( ((1 << count)) )"):
+        assert tm._skip_command_substitution(source, 0, len(source), lambda: None) == len(source)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_literal_shell_command_has_its_own_quote_ownership(newline: str) -> None:
+    source = """MODE=test bash -c '
+if [[ "$1 $2" == "docker exec" &&
+      "$*" != *" /bin/bash -c "* ]]; then
+  return 127
+fi
+if [[ "$1 $2" == "docker exec" && "$*" == *" ldd "* ]]; then
+  printf "%s\\n" "library found"
+fi
+command "$@"
+'
+trap 'rm -rf "$CACHE"' EXIT
+"""
+
+    assert not tm.has_bounded_parse_exhaustion(
+        source.replace("\n", newline), lambda: None, file_type="shell"
+    )
+
+
+@pytest.mark.parametrize("command", ["$CMD -rf /", 'echo "$($CMD -rf /)"', 'sh -c "$CODE"'])
+def test_literal_shell_command_ownership_keeps_unknown_commands_partial(command: str) -> None:
+    source = f"bash -c '\necho ready\n{command}\n'\n"
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("argument", ['"$SCRIPT"', "'echo '\"ready\"", "$'echo ready'"])
+def test_transformed_shell_command_cannot_claim_original_literal_offsets(argument: str) -> None:
+    source = f"bash -c {argument}\n"
+
+    assert tm._literal_shell_command_spans(source, 0, len(source), lambda: None) == {}
+
+
 @pytest.mark.parametrize(
     "tail",
     [
-        'cat <<END\n"unowned\nEND\n',
+        'cat <<END\n"unowned\n',
+        'cat <<END\ncontinued\\\nEND\n',
+        "cat <<'END-MARK'\nbody\nEND-MARK\n",
         'echo `date`\n',
         'echo "unfinished\n',
     ],
@@ -143,7 +264,7 @@ def test_fragment_cannot_prove_initial_quote_state() -> None:
 @pytest.mark.parametrize(
     "source",
     [
-        'echo "prefix $(date) suffix"\ncat <<E\n"unowned\nE\n',
+        'echo "prefix $(date) suffix"\ncat <<E\n"unowned\n',
         'echo "prefix $(date) suffix"\necho `date`\n',
         'echo "prefix $(date) suffix"\necho "unfinished\n',
     ],

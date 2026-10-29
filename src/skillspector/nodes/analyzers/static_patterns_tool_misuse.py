@@ -554,6 +554,8 @@ class _ShellDelimiterFrame:
     inherited_quote_closed: bool = False
     pending_case_clauses: int = 0
     open_case_clauses: int = 0
+    pending_heredocs: tuple[tuple[str, bool, bool], ...] = ()
+    arithmetic: bool = False
 
 
 def _is_shell_command_word_start(content: str, start: int) -> bool:
@@ -643,6 +645,74 @@ def _skip_ansi_c_quote_tail(content: str, start: int, limit: int) -> int | None:
     return None
 
 
+def _static_heredoc_header(
+    content: str, start: int, limit: int
+) -> tuple[tuple[str, bool, bool], int] | None:
+    """Read one bounded literal heredoc delimiter, without evaluating it."""
+    cursor = start + 2
+    strip_tabs = content[cursor : cursor + 1] == "-"
+    cursor += strip_tabs
+    while cursor < limit and content[cursor] in " \t":
+        cursor += 1
+    quote = content[cursor : cursor + 1]
+    quoted = quote in {"'", '"'}
+    cursor += quoted
+    name = re.match(
+        r"[A-Za-z_][A-Za-z0-9_]*",
+        content[cursor : min(limit, cursor + _SHELL_COMMAND_WORD_CHARS + 1)],
+    )
+    if name is None or len(name[0]) > _SHELL_COMMAND_WORD_CHARS:
+        return None
+    cursor += len(name[0])
+    if quoted:
+        if cursor >= limit or content[cursor] != quote:
+            return None
+        cursor += 1
+    if cursor < limit and not (content[cursor].isspace() or content[cursor] in ";|&()<>"):
+        return None
+    return (name[0], strip_tabs, quoted), cursor
+
+
+def _skip_static_heredoc_bodies(
+    content: str,
+    start: int,
+    limit: int,
+    pending: tuple[tuple[str, bool, bool], ...],
+    check_runtime: Callable[[], None] | None,
+) -> int | None:
+    """Skip ordered bodies only after their declaring command's newline.
+
+    This proves outer lexical state only. The raw scanner still inspects every
+    body, including substitutions in unquoted heredocs. Unquoted continued
+    lines need a different delimiter comparison and retain conservative state.
+    """
+    cursor = start
+    for delimiter, strip_tabs, quoted in pending:
+        while cursor < limit:
+            if check_runtime is not None:
+                check_runtime()
+            newline = content.find("\n", cursor, limit)
+            line_end = limit if newline < 0 else newline
+            if line_end > cursor and content[line_end - 1] == "\r":
+                line_end -= 1
+            line_start = cursor
+            if strip_tabs:
+                while line_start < line_end and content[line_start] == "\t":
+                    line_start += 1
+            line = content[line_start:line_end]
+            if line == delimiter:
+                cursor = limit if newline < 0 else newline + 1
+                break
+            if not quoted and (len(line) - len(line.rstrip("\\"))) % 2:
+                return None
+            if newline < 0:
+                return None
+            cursor = newline + 1
+        else:
+            return None
+    return cursor
+
+
 def _skip_shell_delimited_expansion(
     content: str,
     start: int,
@@ -662,6 +732,7 @@ def _skip_shell_delimited_expansion(
             root_kind,
             start,
             inherited_double_quote=root_inherited_double_quote,
+            arithmetic=root_kind == "command" and content.startswith("$((", start),
         )
     ]
     cursor = start + opener_width
@@ -710,6 +781,10 @@ def _skip_shell_delimited_expansion(
                 kind,
                 frame_start,
                 inherited_double_quote=inherited_double_quote,
+                arithmetic=(
+                    (kind == "paren" and (parent.arithmetic or content.startswith("((", cursor)))
+                    or (frame_start is not None and content.startswith("$((", frame_start))
+                ),
             )
         )
         cursor += width
@@ -764,6 +839,32 @@ def _skip_shell_delimited_expansion(
                 continue
             cursor += 1
             continue
+
+        if frame.kind in {"command", "paren"} and not frame.arithmetic:
+            if character == "\n" and frame.pending_heredocs:
+                body_end = _skip_static_heredoc_bodies(
+                    content, cursor + 1, limit, frame.pending_heredocs, check_runtime
+                )
+                if body_end is None:
+                    cache_failure()
+                    return None
+                frame.pending_heredocs = ()
+                frame.word_started = False
+                cursor = body_end
+                continue
+            if content.startswith("<<<", cursor):
+                cursor += 3
+                frame.word_started = False
+                continue
+            if content.startswith("<<", cursor):
+                header = _static_heredoc_header(content, cursor, limit)
+                if header is None or len(frame.pending_heredocs) == _SHELL_COMMAND_STRING_ARGUMENTS:
+                    cache_failure()
+                    return None
+                spec, cursor = header
+                frame.pending_heredocs += (spec,)
+                frame.word_started = True
+                continue
 
         # Ordinary words cannot change the delimiter stack. Consume them in
         # one bounded match rather than testing each character for every shell
@@ -876,6 +977,9 @@ def _skip_shell_delimited_expansion(
                 frame.word_started = False
                 cursor += 1
                 continue
+            if frame.pending_heredocs:
+                cache_failure()
+                return None
             endpoint = close_frame(cursor + 1)
             cursor += 1
             if endpoint is not None:
@@ -2020,6 +2124,20 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
             yield start, parsed.end
 
 
+def _literal_shell_command_spans(
+    content: str, begin: int, end: int, check_runtime: Callable[[], None]
+) -> dict[int, int]:
+    """Locate exact single-quoted shell -c bodies once per lexical scope."""
+    source = content[begin:end]
+    spans: list[tuple[int, int]] = []
+    for clause_start in _shell_clause_starts(source, check_runtime):
+        check_runtime()
+        _command_string_from_clause(
+            source, clause_start, check_runtime, literal_command_spans=spans
+        )
+    return {begin + start: begin + stop for start, stop in spans}
+
+
 def _shell_quoted_candidate_limits(
     content: str,
     check_runtime: Callable[[], None],
@@ -2030,7 +2148,8 @@ def _shell_quoted_candidate_limits(
 
     This is only an ownership refinement, never an execution or finding parser.
     Comments and single quotes cannot open double-quoted spans. Substitution
-    bodies have independent lexical state. Unsupported heredocs/backticks or
+    bodies have independent lexical state. Literal heredoc bodies cannot own
+    quotes in the surrounding command. Unsupported delimiters/backticks or
     unresolved syntax discard ALL ownership, retaining the conservative scan.
     """
     limits: dict[int, int] = {}
@@ -2047,10 +2166,24 @@ def _shell_quoted_candidate_limits(
         quote_start = begin
         ansi_c = False
         candidates: list[int] = []
+        pending_heredocs: tuple[tuple[str, bool, bool], ...] = ()
+        command_spans = _literal_shell_command_spans(content, begin, end, check_runtime)
         while cursor < end:
             if (cursor - begin) % 1024 == 0:
                 check_runtime()
             character = content[cursor]
+            if character == "\n" and pending_heredocs:
+                if quote is not None:
+                    return False
+                body_end = _skip_static_heredoc_bodies(
+                    content, cursor + 1, end, pending_heredocs, check_runtime
+                )
+                if body_end is None:
+                    return False
+                pending_heredocs = ()
+                word_started = False
+                cursor = body_end
+                continue
             if quote == "'":
                 if character == "\\" and ansi_c:
                     cursor += 2
@@ -2084,7 +2217,15 @@ def _shell_quoted_candidate_limits(
                 cursor += 3
                 word_started = False
                 continue
-            if character == "`" or (quote is None and content.startswith("<<", cursor)):
+            if quote is None and content.startswith("<<", cursor):
+                header = _static_heredoc_header(content, cursor, end)
+                if header is None or len(pending_heredocs) == _SHELL_COMMAND_STRING_ARGUMENTS:
+                    return False
+                spec, cursor = header
+                pending_heredocs += (spec,)
+                word_started = True
+                continue
+            if character == "`":
                 return False
             if quote is None and character == "#" and not word_started:
                 while cursor < end and content[cursor] not in "\r\n":
@@ -2103,6 +2244,14 @@ def _shell_quoted_candidate_limits(
                 cursor += 2
                 continue
             if quote is None and character in "'\"":
+                command_end = command_spans.get(cursor + 1) if character == "'" else None
+                if command_end is not None:
+                    if not walk(cursor + 1, command_end, depth + 1):
+                        return False
+                    closers.add(command_end)
+                    cursor = command_end + 1
+                    word_started = True
+                    continue
                 quote = character
                 ansi_c = False
                 quote_start = cursor
@@ -2149,7 +2298,7 @@ def _shell_quoted_candidate_limits(
             if quote is None:
                 word_started = not (character.isspace() or character in ";|&()<>")
             cursor += 1
-        return quote is None and cursor <= end
+        return quote is None and not pending_heredocs and cursor <= end
 
     if not walk(0, len(content)):
         return {}
@@ -2226,6 +2375,7 @@ def _has_shell_command_word_exhaustion(
             not json_string_start
             and not assignment_quote
             and not _is_shell_command_word_start(content, start)
+            and not (python_source is not None and python_source.starts_string_body(start))
         ):
             continue
         if _has_quoted_assignment_prefix(content, start):
@@ -2380,9 +2530,15 @@ def _has_shell_command_word_exhaustion(
     ):
         if command_string is None or _command_string_depth >= 8:
             return True
+        command_closers: set[int] = set()
+        command_limits = _shell_quoted_candidate_limits(
+            command_string, check_runtime, quote_closers=command_closers
+        )
         if _has_shell_command_word_exhaustion(
             command_string,
             check_runtime,
+            structural_quote_closers=command_closers,
+            quote_limits=command_limits,
             _command_string_depth=_command_string_depth + 1,
         ):
             return True
@@ -2554,14 +2710,28 @@ def _command_string_from_clause(
     check_runtime: Callable[[], None],
     *,
     perl_eval_blocks: bool = False,
+    literal_command_spans: list[tuple[int, int]] | None = None,
 ) -> tuple[bool, str | None]:
     """Resolve a bounded wrapper chain to an ``eval`` or shell command string."""
     cursor = start
     pending: str | None = None
     wrapper_seen = False
+    last_word_start = start
 
     def next_word() -> tuple[str | None, bool]:
-        nonlocal cursor
+        nonlocal cursor, last_word_start
+        last_word_start = cursor
+        while literal_command_spans is not None and last_word_start < len(content):
+            if last_word_start % 4096 == 0:
+                check_runtime()
+            if content[last_word_start].isspace():
+                last_word_start += 1
+            elif content.startswith("\\\r\n", last_word_start):
+                last_word_start += 3
+            elif content.startswith("\\\n", last_word_start):
+                last_word_start += 2
+            else:
+                break
         word, cursor, limited = _next_shell_invocation_word(content, cursor, check_runtime)
         return word, limited
 
@@ -2622,7 +2792,20 @@ def _command_string_from_clause(
                 if option.startswith("-") and not option.startswith("--"):
                     if "c" in option[1:]:
                         command_string, limited = next_word()
-                        return True, resolved_command_string(command_string, limited)
+                        resolved = resolved_command_string(command_string, limited)
+                        if (
+                            literal_command_spans is not None
+                            and resolved is not None
+                            and content[last_word_start : last_word_start + 1] == "'"
+                            and content[cursor - 1 : cursor] == "'"
+                            and cursor - last_word_start == len(resolved) + 2
+                            and content[last_word_start + 1 : cursor - 1] == resolved
+                        ):
+                            # One literal has an exact source-to-body mapping.
+                            # Concatenation, expansion and ANSI-C escapes cannot
+                            # lend their decoded offsets to the original text.
+                            literal_command_spans.append((last_word_start + 1, cursor - 1))
+                        return True, resolved
                     continue
                 if option.startswith("+") or option.startswith("--"):
                     continue
@@ -2893,6 +3076,15 @@ class _PythonSourceOwnership:
         if owner is None or self._content[owner[0]] != "#":
             return None
         return owner
+
+    def starts_string_body(self, position: int) -> bool:
+        """Return whether a candidate starts the value of a proven string token."""
+        owner = self._owner(position)
+        return (
+            owner is not None
+            and self._content[owner[0]] != "#"
+            and position == _python_string_body(self._content, *owner)[0]
+        )
 
     def string_value(self, start: int, end: int) -> tuple[str, int, int] | None:
         """Return the proven string value that holds a shell word, and its span.

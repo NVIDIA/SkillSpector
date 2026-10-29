@@ -211,15 +211,16 @@ def test_python_literals_and_comments_own_their_bytes(source: str) -> None:
 
 @pytest.mark.parametrize("target,partial", [("/", True), ("build", False)])
 @pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize("leading", ["", "\n"], ids=["body-start", "next-line"])
 def test_completed_python_word_cannot_claim_a_later_string(
-    target: str, partial: bool, newline: str
+    target: str, partial: bool, newline: str, leading: str
 ) -> None:
     # A quote in the replacement expression can lexically pair with the next
     # literal's quote. That apparent completed word must not hide a later
     # runtime-selected command, even when the literal starts with it.
     content = (
         'message = f"{\' \'.join(parts)} ready"\n'
-        f'REPORT = r"""$TOOL -rf {target}\nlabel(\'value\')\n"""\n'
+        f'REPORT = r"""{leading}$TOOL -rf {target}\nlabel(\'value\')\n"""\n'
     ).replace("\n", newline)
 
     assert _python(content) is partial
