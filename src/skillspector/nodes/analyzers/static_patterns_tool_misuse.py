@@ -2439,10 +2439,19 @@ def _has_shell_command_word_exhaustion(
     may_have_destructive_outer_operands = _may_have_destructive_outer_operands(content)
     json_openers = sorted(structural_quote_openers or ())
     complete_comments: set[tuple[int, int]] = set()
+    # Short text without shell-expansion openers cannot trigger these shell-word
+    # reconstruction or span limits. Keep its prior lazy ownership paths instead
+    # of parsing an ordinary Python module for every candidate letter.
+    python_word_source = (
+        python_source
+        if python_source is not None
+        and (len(content) > _SHELL_COMMAND_WORD_CHARS or "$" in content or "`" in content)
+        else None
+    )
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
-        if python_source is not None and python_source.is_string_delimiter(start):
+        if python_word_source is not None and python_word_source.is_string_delimiter(start):
             continue
         if start in owned_word_positions:
             continue
@@ -2456,7 +2465,9 @@ def _has_shell_command_word_exhaustion(
             not json_string_start
             and not assignment_quote
             and not _is_shell_command_word_start(content, start)
-            and not (python_source is not None and python_source.starts_string_body(start))
+            and not (
+                python_word_source is not None and python_word_source.starts_string_body(start)
+            )
         ):
             continue
         if _has_quoted_assignment_prefix(content, start):
@@ -2519,8 +2530,8 @@ def _has_shell_command_word_exhaustion(
         # Python tokens. It cannot own quotes or skip candidates beyond its
         # proven host region, even when that lexical parse itself succeeded.
         owned_end = (
-            min(parsed.end, python_source.word_end(start))
-            if python_source is not None
+            min(parsed.end, python_word_source.word_end(start))
+            if python_word_source is not None
             else parsed.end
         )
         # Comments end at a newline, and a quote after ``=`` in prose or host
@@ -2536,7 +2547,7 @@ def _has_shell_command_word_exhaustion(
             owned_word_positions.update(
                 position
                 for position in candidate_word_positions
-                if (python_source is None or position < owned_end)
+                if (python_word_source is None or position < owned_end)
                 and content[position + 1 : position + 2] not in ("$", "`")
             )
         # Only executable nested substitutions retain independent command

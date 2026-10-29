@@ -247,6 +247,20 @@ def test_python_constant_text_keeps_embedded_executable_javascript_partial(
     assert _python('REPORT = f"""' + javascript + '"""\n') is True
 
 
+@pytest.mark.parametrize("prefix", ["r", "f", "rf"])
+@pytest.mark.parametrize("quote", ['"', '"""'])
+@pytest.mark.parametrize("target,dangerous", [("/", True), ("build", False)])
+def test_short_prefixed_python_commands_keep_raw_findings(
+    prefix: str, quote: str, target: str, dangerous: bool
+) -> None:
+    content = f"COMMAND = {prefix}{quote}rm -rf {target}{quote}\n"
+
+    result = _ledger("scripts/command.py", content)
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"]) is dangerous
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
 @pytest.mark.parametrize("newline", ["\r\n"], ids=["crlf"])
 def test_python_ownership_preserves_crlf_offsets(newline: str) -> None:
     content = ('"""Module `doc."""\nFENCE = "\\n```\\n"  # it\'s fine\n' + _TAIL).replace(
