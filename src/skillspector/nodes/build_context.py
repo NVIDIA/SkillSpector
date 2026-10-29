@@ -17,6 +17,10 @@
 
 Builds flat ScanContext fields (components, file_cache, manifest, etc.)
 from a local skill directory.
+
+Known limit: nested-manifest inputs have no root primary text to
+inventory, so inline ``data:`` image URIs are neither decoded nor
+scanned; their local image files are still cached and extracted.
 """
 
 from __future__ import annotations
