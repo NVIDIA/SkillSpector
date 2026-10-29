@@ -70,14 +70,9 @@ _NESTED_SHELL_QUOTES = 'echo "entry: $item => $(readlink -f "$item")"\n'
 @pytest.mark.parametrize("fence", ["```", "~~~"])
 @pytest.mark.parametrize("language", ["bash", "sh", "shell"])
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
-def test_closed_shell_fence_owns_nested_quotes(
-    fence: str, language: str, newline: str
-) -> None:
+def test_closed_shell_fence_owns_nested_quotes(fence: str, language: str, newline: str) -> None:
     content = (
-        f"## Reader\n\n{fence}{language}\n"
-        + _NESTED_SHELL_QUOTES
-        + f"{fence}\n\n"
-        + _OBSERVATIONS
+        f"## Reader\n\n{fence}{language}\n" + _NESTED_SHELL_QUOTES + f"{fence}\n\n" + _OBSERVATIONS
     ).replace("\n", newline)
 
     result = static_runner.run_static_patterns_with_ledger(
@@ -104,9 +99,7 @@ def test_closed_shell_fence_owns_nested_quotes(
         ("> ```bash", "> ```"),
     ],
 )
-def test_unproven_fences_do_not_grant_shell_quote_ownership(
-    opening: str, closing: str
-) -> None:
+def test_unproven_fences_do_not_grant_shell_quote_ownership(opening: str, closing: str) -> None:
     content = opening + "\n" + _NESTED_SHELL_QUOTES + closing + "\n" + _OBSERVATIONS
     ranges: list[tuple[int, int]] = []
 
@@ -135,9 +128,7 @@ def test_fence_ownership_requires_complete_context_and_preserves_offsets() -> No
 
 
 @pytest.mark.parametrize("position", ["before", "inside", "after"])
-@pytest.mark.parametrize(
-    "command", ["$CMD -rf /", 'echo "$($CMD -rf /)"', "rm -rf /"]
-)
+@pytest.mark.parametrize("command", ["$CMD -rf /", 'echo "$($CMD -rf /)"', "rm -rf /"])
 def test_shell_fence_quote_ownership_preserves_destructive_checks(
     position: str, command: str
 ) -> None:

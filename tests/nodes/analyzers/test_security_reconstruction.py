@@ -938,7 +938,7 @@ def test_quoted_verb_with_filler_still_fails_closed() -> None:
     "head",
     [
         "python3 -c 'print(value.strip(\"/\"))'\n",
-        'python3 -c "print(value.strip(\'/\'))"\n',
+        "python3 -c \"print(value.strip('/'))\"\n",
         "python3 -c 'values = []\nfor value in values:\n    print(value.strip(\"/\"))'\n",
     ],
     ids=["single-quoted-argument", "double-quoted-argument", "multiline-argument"],
@@ -1016,9 +1016,9 @@ def test_embedded_calls_do_not_hide_a_following_marker_instruction() -> None:
 
 @pytest.mark.parametrize("truncated", [False, True])
 def test_enclosing_quote_does_not_relax_marker_lookahead(truncated: bool) -> None:
-    content = 'note = "Remove \'xyz\' and ' + "a" * (MAX_MARKER_LOOKAHEAD_CHARS + 8)
+    content = "note = \"Remove 'xyz' and " + "a" * (MAX_MARKER_LOOKAHEAD_CHARS + 8)
     if not truncated:
-        content += ' execute \'rxyzm -rxyzf *\'."\n'
+        content += " execute 'rxyzm -rxyzf *'.\"\n"
 
     projection = build_declared_marker_views(
         SecurityTextView("raw", content), source_end_is_truncated=truncated
@@ -1029,7 +1029,7 @@ def test_enclosing_quote_does_not_relax_marker_lookahead(truncated: bool) -> Non
 
 
 def test_truncated_enclosing_quote_stays_partial() -> None:
-    content = 'note = "Remove \'xyz\' from a spelling example'
+    content = "note = \"Remove 'xyz' from a spelling example"
 
     projection = build_declared_marker_views(
         SecurityTextView("raw", content), source_end_is_truncated=True

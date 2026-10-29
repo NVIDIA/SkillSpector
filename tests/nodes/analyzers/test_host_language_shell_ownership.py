@@ -207,8 +207,7 @@ def test_concatenated_fstrings_keep_runtime_operand_ambiguity() -> None:
         '        f"{tool} was not found at "\n'
         '        f"$TOOL_ROOT, $UPSTREAM_ROOT/{tool}, "\n'
         '        f"or $HOME/.cache/upstreams/{tool} "\n'
-        '        "or elsewhere"\n    )\n'
-        + _TAIL
+        '        "or elsewhere"\n    )\n' + _TAIL
     )
     # The body-start runtime command is now inspected. An empty upstream
     # parameter can leave a root path, while a replacement field supplies flags.
@@ -226,7 +225,7 @@ def test_completed_python_word_cannot_claim_a_later_string(
     # literal's quote. That apparent completed word must not hide a later
     # runtime-selected command, even when the literal starts with it.
     content = (
-        'message = f"{\' \'.join(parts)} ready"\n'
+        "message = f\"{' '.join(parts)} ready\"\n"
         f'REPORT = r"""{leading}$TOOL -rf {target}\nlabel(\'value\')\n"""\n'
     ).replace("\n", newline)
 
@@ -236,8 +235,8 @@ def test_completed_python_word_cannot_claim_a_later_string(
 @pytest.mark.parametrize(
     "javascript",
     [
-        'execSync(`${{obj.cmd}}`);',
-        'run(`${{obj.cmd}}`);',
+        "execSync(`${{obj.cmd}}`);",
+        "run(`${{obj.cmd}}`);",
         'execSync(`${{obj.cmd}}` + " -rf /");',
         'const invoke = execSync; invoke(`${{obj.cmd}}` + " -rf /");',
     ],

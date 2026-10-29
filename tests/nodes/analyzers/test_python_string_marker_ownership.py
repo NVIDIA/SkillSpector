@@ -188,8 +188,16 @@ def test_bounded_lookbehind_cannot_invent_marker_quote_context(quote: str, newli
     # The bounded lookbehind starts inside the first long literal. Its period
     # looks like a sentence boundary, and the closer then looks like an opener.
     content = (
-        "LABEL = " + quote + "x" * (MAX_MARKER_LOOKAHEAD_CHARS + 8) + ". summary" + quote
-        + "\nresult = value.strip() or f" + quote + "{name}" + quote + "\n"
+        "LABEL = "
+        + quote
+        + "x" * (MAX_MARKER_LOOKAHEAD_CHARS + 8)
+        + ". summary"
+        + quote
+        + "\nresult = value.strip() or f"
+        + quote
+        + "{name}"
+        + quote
+        + "\n"
         + _UNQUOTED_TAIL
     ).replace("\n", newline)
     closers = PythonStringClosers(content, lambda: None)
@@ -215,15 +223,14 @@ def test_wrapper_context_keeps_concatenated_marker_payload_partial(
 ) -> None:
     payload = f"r{marker}m -r{marker}f *"
     instruction = (
-        f'"{action.capitalize()} "{concatenation}"\'{payload}\' after remove \'{marker}\'."'
+        f"\"{action.capitalize()} \"{concatenation}\"'{payload}' after remove '{marker}'.\""
         if reverse
-        else f'"Remove \'{marker}\' and {action} "{concatenation}"\'{payload}\'."'
+        else f"\"Remove '{marker}' and {action} \"{concatenation}\"'{payload}'.\""
     )
     content = (
         'LABEL = "' + "x" * (MAX_MARKER_LOOKAHEAD_CHARS + 8) + '. summary"\n'
         'result = value.strip() or f"{name}"\n'
-        'note = ' + instruction + '\n'
-        + _UNQUOTED_TAIL
+        "note = " + instruction + "\n" + _UNQUOTED_TAIL
     )
 
     result = _ledger("scripts/check.py", content)

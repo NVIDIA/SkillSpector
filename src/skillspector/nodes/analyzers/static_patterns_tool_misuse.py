@@ -701,9 +701,7 @@ def _skip_static_heredoc_bodies(
                 line_end -= 1
             line = content[cursor:line_end]
             continued = (
-                not quoted
-                and newline >= 0
-                and (len(line) - len(line.rstrip("\\"))) % 2 == 1
+                not quoted and newline >= 0 and (len(line) - len(line.rstrip("\\"))) % 2 == 1
             )
             if continued:
                 line = line[:-1]
@@ -2341,9 +2339,9 @@ def _shell_quoted_candidate_limits(
                     # inner quotes. Do not apply this to the ksh-sensitive $"
                     # cases handled by the general parameter parser below.
                     pattern = re.match(
-                        r'\$\{[A-Za-z_][A-Za-z0-9_]*(?:#{1,2}|%{1,2})'
+                        r"\$\{[A-Za-z_][A-Za-z0-9_]*(?:#{1,2}|%{1,2})"
                         r'"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})"'
-                        r'''[^\\'"$`{}\r\n]*\}''',
+                        r"""[^\\'"$`{}\r\n]*\}""",
                         content[cursor : min(end, cursor + _SHELL_COMMAND_WORD_CHARS + 1)],
                     )
                     if pattern is not None and len(pattern[0]) <= _SHELL_COMMAND_WORD_CHARS:

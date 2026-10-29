@@ -2074,8 +2074,7 @@ def build_declared_marker_views(
             and not directive.encoded
             and not directive.is_tag
             and directive.start <= marker_quote
-            and _QUOTE_OPEN_TO_CLOSE.get(view.text[marker_quote])
-            == view.text[directive.end - 1]
+            and _QUOTE_OPEN_TO_CLOSE.get(view.text[marker_quote]) == view.text[directive.end - 1]
             and view.text[marker_quote + 1 : directive.end - 1] == directive.marker
         ):
             # A bounded lookbehind can start inside an unrelated literal.

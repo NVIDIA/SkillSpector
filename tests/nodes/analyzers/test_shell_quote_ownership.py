@@ -29,7 +29,7 @@ def test_closed_data_quotes_do_not_consume_later_padding(source: str, padding: i
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 def test_nested_path_quote_after_here_string_does_not_consume_later_commands(newline: str) -> None:
-    source = '''#!/bin/bash
+    source = """#!/bin/bash
 mapfile -t matches < <(awk 'NF {print $1}' <<<"$listing")
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -52,7 +52,7 @@ done
 }
 chmod 700 "${files[0]}"
 printf 'Created %s\\n' "$root"
-'''.replace("\n", newline)
+""".replace("\n", newline)
 
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
@@ -68,7 +68,7 @@ def test_here_string_keeps_following_quote_bounds(operator: str) -> None:
 @pytest.mark.parametrize(
     "command",
     [
-        '$CMD -rf /',
+        "$CMD -rf /",
         '"$CMD" -rf /',
         'echo "x: $($CMD -rf /)"',
         'echo "x: $(echo "a b"; $CMD -rf /)"',
@@ -86,7 +86,7 @@ def test_here_string_and_nested_quote_closers_do_not_hide_runtime_commands(comma
 @pytest.mark.parametrize("header", ["<<END", "<<'END'", '<<"END"', "<<-END"])
 def test_complete_heredoc_keeps_later_nested_quote_ownership(header: str, newline: str) -> None:
     source = f"cat {header}\nordinary help text\nEND\n"
-    source += '''state="$(inspect -f '{{value}}' "$NAME")" || return
+    source += """state="$(inspect -f '{{value}}' "$NAME")" || return
 [[ "$state" == true\\|true\\|* &&
    " ${state#*|*|} " == *' /dev '* &&
    " ${state#*|*|} " == *' /tools '* ]] || {
@@ -96,7 +96,7 @@ def test_complete_heredoc_keeps_later_nested_quote_ownership(header: str, newlin
 output="$(detect_devices)" || return
 printf '%s\\n' "$output"
 trap 'rm -rf "$CACHE"' EXIT
-'''
+"""
 
     assert not tm.has_bounded_parse_exhaustion(
         source.replace("\n", newline), lambda: None, file_type="shell"
@@ -165,9 +165,7 @@ def test_large_continued_heredoc_checks_runtime_and_keeps_raw_commands() -> None
         body, 0, len(body), (("END", False, False),), check_runtime
     ) == len(body)
     assert checks >= 40
-    assert tm.has_bounded_parse_exhaustion(
-        "cat <<END\n" + body, lambda: None, file_type="shell"
-    )
+    assert tm.has_bounded_parse_exhaustion("cat <<END\n" + body, lambda: None, file_type="shell")
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
@@ -213,7 +211,8 @@ def test_heredoc_header_whitespace_accepts_exact_span_boundary(
     source += separator * tm._SHELL_COMMAND_WORD_CHARS + "'END'"
 
     assert tm._static_heredoc_header(source, len(prefix), len(source)) == (
-        ("END", strip_tabs, True), len(source)
+        ("END", strip_tabs, True),
+        len(source),
     )
 
 
@@ -262,15 +261,13 @@ def test_simple_quoted_trim_pattern_preserves_outer_quote_ownership(
     operator: str, variable: str
 ) -> None:
     source = 'printf "%s" "${path' + operator + '"' + variable + '"/}"\n'
-    source += '''state="$(inspect -f '{{value}}' "$NAME")" || return
+    source += """state="$(inspect -f '{{value}}' "$NAME")" || return
 [[ "$state" == true\\|true\\|* && " ${state#*|*|} " == *' /dev '* ]] || return
 trap 'rm -rf "$CACHE"' EXIT
-'''
+"""
 
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
-    assert tm.has_bounded_parse_exhaustion(
-        source + "$CMD -rf /\n", lambda: None, file_type="shell"
-    )
+    assert tm.has_bounded_parse_exhaustion(source + "$CMD -rf /\n", lambda: None, file_type="shell")
 
 
 @pytest.mark.parametrize(
@@ -283,9 +280,7 @@ def test_complex_trim_patterns_cannot_claim_simple_quote_ownership(pattern: str)
 
     assert tm._shell_quoted_candidate_limits(source, lambda: None, quote_closers=closers) == {}
     assert closers == set()
-    assert tm.has_bounded_parse_exhaustion(
-        source + "$CMD -rf /\n", lambda: None, file_type="shell"
-    )
+    assert tm.has_bounded_parse_exhaustion(source + "$CMD -rf /\n", lambda: None, file_type="shell")
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
@@ -330,7 +325,13 @@ def test_literal_command_before_hostile_nesting_keeps_proof_work_bounded(
     if shape == "parameter":
         tail = '$(env "X=${x:- ' * repetitions + "A" + '}" echo printf)' * repetitions + " -rf *"
     elif shape == "alternating":
-        tail = "$(env X=" + "${x:-$(echo " * repetitions + "z" + ")}" * repetitions + " echo printf) -rf /"
+        tail = (
+            "$(env X="
+            + "${x:-$(echo " * repetitions
+            + "z"
+            + ")}" * repetitions
+            + " echo printf) -rf /"
+        )
     elif shape == "comment":
         tail = "$(env X=x $(echo " * repetitions + "# no newline" + ")" * repetitions
     else:
@@ -358,7 +359,9 @@ def test_literal_command_before_hostile_nesting_keeps_proof_work_bounded(
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
-@pytest.mark.parametrize("wrapper", ["bash", "env MODE=test bash", "sudo -n bash", "timeout 5 bash"])
+@pytest.mark.parametrize(
+    "wrapper", ["bash", "env MODE=test bash", "sudo -n bash", "timeout 5 bash"]
+)
 def test_literal_command_proof_selects_only_relevant_clauses(
     wrapper: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -394,7 +397,7 @@ def test_literal_command_option_lookalikes_cannot_claim_a_body(source: str) -> N
 
 def test_selected_wrapper_budget_discards_previously_collected_literal_proof() -> None:
     source = "bash -c 'echo ready'\n"
-    source += "eval " + "'part' " * 24 + '\"-c \'echo ready\'\" \"$CMD -rf /\"\n'
+    source += "eval " + "'part' " * 24 + '"-c \'echo ready\'" "$CMD -rf /"\n'
     closers: set[int] = set()
 
     assert tm._literal_shell_command_spans(source, 0, len(source), lambda: None) is None
@@ -432,9 +435,9 @@ def test_literal_command_proof_propagates_real_runtime_exceptions() -> None:
     "tail",
     [
         'cat <<END\n"unowned\n',
-        'cat <<END\ncontinued\\\nEND\n',
+        "cat <<END\ncontinued\\\nEND\n",
         "cat <<'END-MARK'\nbody\nEND-MARK\n",
-        'echo `date`\n',
+        "echo `date`\n",
         'echo "unfinished\n',
     ],
 )
