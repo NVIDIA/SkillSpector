@@ -41,7 +41,7 @@ import json
 import os
 import threading
 import weakref
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Mapping
 from typing import Any, NoReturn
 
 from google.auth.exceptions import RefreshError
@@ -74,7 +74,7 @@ from skillspector.providers import (
     resolve_chat_model_credentials,
     resolve_provider_credentials,
 )
-from skillspector.providers.chat_models import UnsupportedControlError
+from skillspector.providers.chat_models import UnsupportedControlError, resolve_reasoning_effort
 from skillspector.providers.gemini import GeminiProvider
 from skillspector.providers.openai import OpenAIProvider
 from skillspector.structured_response import (
@@ -425,6 +425,33 @@ class AgentCLIChatModel:
 STRUCTURED_OUTPUT_METHODS = ("function_calling", "json_schema")
 
 
+def _gateway_output_preference(llm: object, model: str) -> str | None:
+    """Use the verified gateway method without overriding reasoning or explicit choices.
+
+    The exact OpenAI-route Opus 5 model wraps JSON-schema results in argument
+    envelopes across analyzers. This shares TP4's existing workaround; aliases
+    and other providers retain their own method choices.
+    """
+    if not (
+        isinstance(llm, BaseChatOpenAI)
+        and chat_model_provider_name(llm) == "openai"
+        and model == "azure/anthropic/claude-opus-5"
+    ):
+        return None
+    if resolve_reasoning_effort() is not None:
+        return None
+    if chat_model_controls(llm).get("reasoning_effort") is not None:
+        return None
+    if any(getattr(llm, name, None) is not None for name in ("reasoning_effort", "reasoning")):
+        return None
+    for controls in (llm.model_kwargs, llm.extra_body):
+        if isinstance(controls, Mapping) and any(
+            controls.get(name) is not None for name in ("reasoning_effort", "reasoning", "thinking")
+        ):
+            return None
+    return "function_calling"
+
+
 def structured_output_kwargs(
     model: str,
     provider: object | None = None,
@@ -480,6 +507,8 @@ def bind_structured_output(
     the prompt, and a prose answer raises :class:`StructuredOutputParseError`,
     which the analyzers retry like any other malformed structured response.
     """
+    if preferred_method is None:
+        preferred_method = _gateway_output_preference(llm, model)
     kwargs = structured_output_kwargs(model, provider, preferred_method=preferred_method)
     if preserve_text is not None and not isinstance(llm, BaseChatModel):
         raise StructuredOutputParseError(

@@ -195,8 +195,12 @@ def validate_response_text(
         raise StructuredOutputParseError(
             "formatting changed assessment content", issue=ResponseIssue.FORMAT_CHANGED
         )
-    if allow_json_wrapper and set(payload) == {"json"} and isinstance(payload["json"], dict):
-        payload = payload["json"]
+    if allow_json_wrapper and len(payload) == 1:
+        # Exact gateway argument envelopes observed on completed live responses.
+        # Only a sole known wrapper may be removed; ambiguous extra data is rejected.
+        key = next(iter(payload))
+        if key in {"json", "input", "parameters"} and isinstance(payload[key], dict):
+            payload = payload[key]
     return validate_payload(payload, schema)
 
 

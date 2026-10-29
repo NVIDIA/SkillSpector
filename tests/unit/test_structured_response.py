@@ -322,9 +322,12 @@ def test_timeout_during_formatting_reports_the_exhausted_deadline(http_model, as
     assert len(requests) == 2
 
 
-def test_known_gateway_wrapper_is_unwrapped_without_forcing_tools_or_changing_reasoning(http_model):
+@pytest.mark.parametrize("wrapper", ["json", "input", "parameters"])
+def test_known_gateway_wrapper_is_unwrapped_without_forcing_tools_or_changing_reasoning(
+    http_model, wrapper
+):
     requests = http_model(
-        [('{"json": {"findings": []}}', "stop")],
+        [(json.dumps({wrapper: {"findings": []}}), "stop")],
         model="azure/anthropic/claude-opus-5",
         reasoning_effort="high",
     )
@@ -334,6 +337,30 @@ def test_known_gateway_wrapper_is_unwrapped_without_forcing_tools_or_changing_re
     assert len(requests) == 1
     assert "tool_choice" not in requests[0]
     assert requests[0]["reasoning_effort"] == "high"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "semantic_security_discovery",
+        "semantic_quality_policy",
+        "semantic_developer_intent",
+        "tp4",
+        "review",
+    ],
+)
+def test_verified_gateway_method_is_shared_by_all_five_checks(http_model, name):
+    answer = {"is_mismatch": False} if name == "tp4" else {"findings": []}
+    requests = http_model(
+        [(json.dumps(answer), "stop")], model="azure/anthropic/claude-opus-5", method=None
+    )
+    analyzer = make_analyzer(name, model="azure/anthropic/claude-opus-5")
+    analyzer.build_prompt = lambda *_args, **_kwargs: "Assess the code"
+    outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="x")])
+    assert outcome.successful and not outcome.failures
+    assert len(requests) == 1
+    assert requests[0]["tools"]
+    assert "response_format" not in requests[0]
 
 
 def test_security_discovery_really_runs_independent_pieces_together(monkeypatch):
