@@ -2284,6 +2284,14 @@ def _has_shell_command_word_exhaustion(
                 if not _quoted_candidate_is_complete(content, start, quote_limits, check_runtime):
                     return True
             continue
+        # A mis-paired quote can produce a completed word that crosses several
+        # Python tokens. It cannot own quotes or skip candidates beyond its
+        # proven host region, even when that lexical parse itself succeeded.
+        owned_end = (
+            min(parsed.end, python_source.word_end(start))
+            if python_source is not None
+            else parsed.end
+        )
         # Comments end at a newline, and a quote after ``=`` in prose or host
         # source may be mis-paired. Such a word cannot own a later line.
         confined_word = "\n" in content[start : parsed.end] and (
@@ -2297,7 +2305,8 @@ def _has_shell_command_word_exhaustion(
             owned_word_positions.update(
                 position
                 for position in candidate_word_positions
-                if content[position + 1 : position + 2] not in ("$", "`")
+                if position < owned_end
+                and content[position + 1 : position + 2] not in ("$", "`")
             )
         # Only executable nested substitutions retain independent command
         # positions. A plain dynamic data argument still owns its inner bytes;
@@ -2316,7 +2325,7 @@ def _has_shell_command_word_exhaustion(
             or not any(marker in raw_word for marker in ("$(", "`"))
             or simple_backtick_parameter
         ) and not (assignment_quote and confined_word):
-            parsed_through = max(parsed_through, parsed.end)
+            parsed_through = max(parsed_through, owned_end)
         if assignment_quote:
             # An assignment value never names the command, and main never
             # parsed this position, so it only claims ownership.
@@ -5068,6 +5077,7 @@ def _markdown_shell_text(
     *,
     complete_context: bool = True,
     word_apostrophes: bool = False,
+    shell_fence_ranges: list[tuple[int, int]] | None = None,
 ) -> str:
     """Mask Markdown delimiters while retaining code and exact source offsets.
 
@@ -5076,6 +5086,8 @@ def _markdown_shell_text(
     inside their bodies. Pair equal-length runs in linear time.
     ``word_apostrophes`` selects the prose reading, which also masks the
     possessives and contractions of plain prose lines.
+    ``shell_fence_ranges`` receives closed, explicitly labelled shell bodies
+    whose quote ownership can be checked independently of surrounding prose.
     """
     output = list(content)
     prose_apostrophes: set[int] = set()
@@ -5116,6 +5128,7 @@ def _markdown_shell_text(
     # This is a conservative projection, not a general Markdown renderer.
     # Container/HTML bodies with uncertain inline ownership remain literal.
     fence: tuple[str, int, int] | None = None
+    shell_fence_start: int | None = None
     quoted_block = False
     html_end: str | None = None
     paragraph_open = False
@@ -5209,6 +5222,9 @@ def _markdown_shell_text(
                 begin, end = closing_fence.span(1)
                 body_start = offset + len(stripped) - len(fence_body)
                 output[body_start + begin : body_start + end] = " " * (end - begin)
+                if shell_fence_start is not None and shell_fence_ranges is not None:
+                    shell_fence_ranges.append((shell_fence_start, offset))
+                shell_fence_start = None
                 fence = None
         elif quote_start or quoted_block:
             mask_inline_delimiters()
@@ -5244,6 +5260,14 @@ def _markdown_shell_text(
                 fence = (opening[1][0], len(opening[1]), column if has_list_marker else 0)
                 begin, end = opening.span(1)
                 output[offset + prefix + begin : offset + prefix + end] = " " * (end - begin)
+                if (
+                    complete_context
+                    and shell_fence_ranges is not None
+                    and not has_list_marker
+                    and not paragraph_in_list
+                    and stripped[prefix + end :].strip() in {"bash", "sh", "shell"}
+                ):
+                    shell_fence_start = offset + len(line)
             else:
                 minimum_indent = (
                     column if has_list_marker else paragraph_list_indent if paragraph_in_list else 0
@@ -5418,6 +5442,7 @@ def _has_bounded_parse_exhaustion(
     # -replace values have their own narrowly proven expression context.
     structural_quote_closers = None
     structural_quote_openers = None
+    shell_fence_ranges: list[tuple[int, int]] = []
     json_strings: list[tuple[int, int]] = []
     python_source = None
     if file_type == "perl" and complete_context:
@@ -5436,6 +5461,7 @@ def _has_bounded_parse_exhaustion(
             check_runtime,
             complete_context=complete_context,
             word_apostrophes=word_apostrophes,
+            shell_fence_ranges=shell_fence_ranges,
         )
     # Diagnostic template delimiters belong to JavaScript only when the whole
     # source proves their assertion-message owner. Destructive checks stay raw.
@@ -5454,6 +5480,19 @@ def _has_bounded_parse_exhaustion(
         quote_limits = _shell_quoted_candidate_limits(
             content, check_runtime, quote_closers=structural_quote_closers
         )
+    elif file_type == "markdown" and complete_context:
+        quote_limits = {}
+        for start, end in shell_fence_ranges:
+            check_runtime()
+            closers: set[int] = set()
+            limits = _shell_quoted_candidate_limits(
+                content[start:end], check_runtime, quote_closers=closers
+            )
+            quote_limits.update(
+                {start + position: start + limit for position, limit in limits.items()}
+            )
+            assert structural_quote_closers is not None
+            structural_quote_closers.update(start + position for position in closers)
     # Perl ``eval BLOCK`` is recognized from its clause-initial ``eval`` and the
     # adjacent brace alone, so unlike quote ownership it needs no full context.
     if _has_shell_command_word_exhaustion(

@@ -209,6 +209,22 @@ def test_python_literals_and_comments_own_their_bytes(source: str) -> None:
     assert _shell(content) is True
 
 
+@pytest.mark.parametrize("target,partial", [("/", True), ("build", False)])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_completed_python_word_cannot_claim_a_later_string(
+    target: str, partial: bool, newline: str
+) -> None:
+    # A quote in the replacement expression can lexically pair with the next
+    # literal's quote. That apparent completed word must not hide a later
+    # runtime-selected command, even when the literal starts with it.
+    content = (
+        'message = f"{\' \'.join(parts)} ready"\n'
+        f'REPORT = r"""$TOOL -rf {target}\nlabel(\'value\')\n"""\n'
+    ).replace("\n", newline)
+
+    assert _python(content) is partial
+
+
 @pytest.mark.parametrize("newline", ["\r\n"], ids=["crlf"])
 def test_python_ownership_preserves_crlf_offsets(newline: str) -> None:
     content = ('"""Module `doc."""\nFENCE = "\\n```\\n"  # it\'s fine\n' + _TAIL).replace(
