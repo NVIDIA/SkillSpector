@@ -36,6 +36,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import typer
 import yaml
+from click import unstyle
 from markdown_it import MarkdownIt
 from rich.console import Console
 from typer.testing import CliRunner
@@ -576,21 +577,35 @@ def test_cli_scan_output_to_file(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "format,registry_mode",
-    [(format, False) for format in FormatChoice] + [(FormatChoice.json, True)],
+    "format,mode",
+    [(format, "scan") for format in FormatChoice]
+    + [(FormatChoice.json, "registry"), (FormatChoice.json, "baseline")],
 )
 @pytest.mark.parametrize(
-    "alias", ["same-path", "relative-path", "parent-path", "symlink", "symlink-parent", "hard-link"]
+    "alias",
+    [
+        "same-path",
+        "relative-path",
+        "parent-path",
+        "symlink",
+        "symlink-parent",
+        "hard-link",
+        "tilde",
+    ],
 )
 def test_cli_scan_rejects_output_alias_of_input_file(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     format: FormatChoice,
-    registry_mode: bool,
+    mode: str,
     alias: str,
 ) -> None:
     """An output alias must not replace the original input with its report."""
+    registry_mode = mode == "registry"
     source = tmp_path / ("registry.json" if registry_mode else "SKILL.md")
+    if alias == "tilde":
+        (tmp_path / "~").mkdir()
+        source = tmp_path / "~" / source.name
     original = (
         b'{"servers": []}'
         if registry_mode
@@ -601,6 +616,8 @@ def test_cli_scan_rejects_output_alias_of_input_file(
     monkeypatch.chdir(tmp_path)
     if alias == "relative-path":
         output = Path(source.name)
+    elif alias == "tilde":
+        output = Path("~") / source.name
     elif alias == "parent-path":
         nested = tmp_path / "nested"
         nested.mkdir()
@@ -627,9 +644,15 @@ def test_cli_scan_rejects_output_alias_of_input_file(
     scan_input = MagicMock(
         return_value={"report_body": "Scan report", "risk_score": 0, "findings": []}
     )
-    monkeypatch.setattr(cli, "scan_registry" if registry_mode else "_scan_skill", scan_input)
+    if mode == "baseline":
+        monkeypatch.setattr(cli.graph, "invoke", scan_input)
+    else:
+        monkeypatch.setattr(cli, "scan_registry" if registry_mode else "_scan_skill", scan_input)
 
-    args = ["scan", str(source), "--no-llm", "--format", format.value, "--output", str(output)]
+    args = ["baseline" if mode == "baseline" else "scan", str(source), "--no-llm"]
+    args += ["--output", str(output)]
+    if mode != "baseline":
+        args += ["--format", format.value]
     if registry_mode:
         args.append("--mcp-registry")
     result = runner.invoke(app, args)
@@ -639,6 +662,37 @@ def test_cli_scan_rejects_output_alias_of_input_file(
     assert source.read_bytes() == original
     assert output.read_bytes() == original
     scan_input.assert_not_called()
+
+
+@pytest.mark.parametrize("command", ["scan", "baseline"])
+@pytest.mark.parametrize("manifest", ["SKILL.md", "skill.md"])
+def test_cli_rejects_output_overwriting_directory_manifest(
+    tmp_path: Path, command: str, manifest: str
+) -> None:
+    source = tmp_path / manifest
+    original = "---\nname: protected\ndescription: Say hello.\n---\n# Hello\n"
+    source.write_text(original)
+    with patch("skillspector.cli.graph.invoke") as invoke:
+        result = runner.invoke(app, [command, str(tmp_path), "--no-llm", "--output", str(source)])
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert source.read_text() == original
+    invoke.assert_not_called()
+
+
+def test_cli_baseline_preserves_local_input_with_remote_like_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source = Path("git@notes.md")
+    original = "---\nname: protected\ndescription: Say hello.\n---\n# Hello\n"
+    source.write_text(original)
+    with patch("skillspector.cli.graph.invoke") as invoke:
+        result = runner.invoke(app, ["baseline", str(source), "--no-llm", "-o", str(source)])
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert source.read_text() == original
+    invoke.assert_not_called()
 
 
 @pytest.mark.parametrize("format", list(FormatChoice))
@@ -2580,8 +2634,121 @@ def test_recursive_fail_on_findings_exits_one_below_risk_threshold(
     assert exit_info.value.exit_code == 1
 
 
+@pytest.mark.parametrize(("limit", "scanned"), [(None, 32), (1, 1), (33, 33), (40, 33)])
+@pytest.mark.parametrize("strict", [False, True])
+def test_recursive_configurable_skill_count_budget(
+    monkeypatch, tmp_path, capsys, limit, scanned, strict
+):
+    skills = [SkillDirectory(tmp_path / str(i), str(i), str(i)) for i in range(33)]
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=skills)
+    calls = []
+
+    def fake_scan(**kwargs):
+        calls.append(kwargs)
+        return _bounded_recursive_result("safe", finding_count=0)
+
+    monkeypatch.setattr(cli, "_scan_skill", fake_scan)
+    output = tmp_path / "report.json"
+    context = pytest.raises(typer.Exit) if strict and scanned < 33 else nullcontext()
+    with context as error:
+        _scan_multi_skill(
+            detection,
+            FormatChoice.json,
+            output,
+            no_llm=True,
+            max_skills=limit,
+            fail_on_incomplete=strict,
+        )
+    if strict and scanned < 33:
+        assert error.value.exit_code == 1
+    payload = json.loads(output.read_text())
+    assert len(calls) == payload["skills_scanned"] == scanned
+    assert payload["skills_omitted"] == 33 - scanned
+    assert payload["analysis_completeness"]["is_complete"] is (scanned == 33)
+    assert payload["risk_recommendation"] == ("SAFE" if scanned == 33 else "CAUTION")
+    if scanned < 33:
+        effective = 32 if limit is None else limit
+        assert (
+            f"recursive skill count budget {effective} reached"
+            in payload["analysis_completeness"]["limitations"]
+        )
+        assert "--max-skills" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc"])
+def test_cli_max_skills_rejects_invalid_count(tmp_path, monkeypatch, value):
+    monkeypatch.setattr(cli, "_scan_skill", lambda **_: pytest.fail("must not scan"))
+    result = runner.invoke(app, ["scan", str(tmp_path), "--recursive", "--max-skills", value])
+    assert result.exit_code == 2
+
+
+@pytest.mark.parametrize("recursive", [False, True])
+def test_cli_max_skills_rejects_non_collection(tmp_path, monkeypatch, recursive):
+    monkeypatch.setattr(cli, "_scan_skill", lambda **_: pytest.fail("must not scan"))
+    args = ["scan", str(tmp_path), "--max-skills", "100"]
+    if recursive:
+        args.append("--recursive")
+    result = runner.invoke(app, args)
+    assert result.exit_code == 2
+    assert "--max-skills" in result.stderr
+
+
+def test_cli_max_skills_reaches_recursive_scan(tmp_path, monkeypatch):
+    for i in range(33):
+        skill = tmp_path / f"s{i:03}"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: safe\n---\nHello\n")
+    calls = []
+
+    def fake_scan(**kwargs):
+        calls.append(kwargs)
+        return _bounded_recursive_result("safe", finding_count=0)
+
+    monkeypatch.setattr(cli, "_scan_skill", fake_scan)
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "--recursive",
+            "--max-skills",
+            "33",
+            "--no-llm",
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert len(calls) == payload["skills_scanned"] == 33
+    assert payload["skills_omitted"] == 0
+
+
+@pytest.mark.parametrize("color", [False, True])
+def test_cli_max_skills_is_documented_in_help(monkeypatch, color):
+    # Typer initializes its terminal mode at import time, so environment-only
+    # changes here do not reliably exercise the GitHub Actions rendering path.
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr("typer.rich_utils.FORCE_TERMINAL", color)
+    monkeypatch.setattr("typer.rich_utils.COLOR_SYSTEM", "standard" if color else None)
+    result = runner.invoke(app, ["scan", "--help"], color=True)
+    assert result.exit_code == 0
+    assert ("\x1b[" in result.stdout) is color
+    help_text = unstyle(result.stdout)
+    assert "--max-skills" in help_text
+    assert "32" in help_text
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_recursive_max_skills_helper_rejects_invalid_limit(tmp_path, limit):
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=[])
+    with pytest.raises(ValueError, match="positive integer"):
+        _scan_multi_skill(detection, FormatChoice.json, None, no_llm=True, max_skills=limit)
+
+
+@pytest.mark.parametrize("max_skills", [None, 100])
 def test_recursive_json_uses_one_global_public_record_budget(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, max_skills
 ) -> None:
     """Per-child report caps cannot multiply in the combined JSON document."""
     skills = [SkillDirectory(tmp_path / name, name, name) for name in ("one", "two", "three")]
@@ -2600,7 +2767,7 @@ def test_recursive_json_uses_one_global_public_record_budget(
         fake_invoke,
     )
 
-    _scan_multi_skill(detection, FormatChoice.json, output, no_llm=True)
+    _scan_multi_skill(detection, FormatChoice.json, output, no_llm=True, max_skills=max_skills)
 
     assert len(calls) == 1
     payload = json.loads(output.read_text(encoding="utf-8"))
@@ -7841,3 +8008,143 @@ def test_cli_baseline_rejects_failed_scan_before_writing(
     assert output.read_bytes() == previous
     build.assert_not_called()
     cleanup.assert_called_once_with(result)
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("plain message", "Error: plain message"),
+        ("skills[old]/demo", "Error: skills[old]/demo"),
+        ("nope[/x]", "Error: nope[/x]"),
+        ("[bold]x[/bold]", "Error: [bold]x[/bold]"),
+        (
+            "Install it with: pip install 'skillspector[mcp]'",
+            "Error: Install it with: pip install 'skillspector[mcp]'",
+        ),
+        ("emoji :smile: here", "Error: emoji :smile: here"),
+        ("C:\\Users\\", "Error: C:\\Users\\"),
+        ("first\nsecond", "Error: first\nsecond"),
+        ("esc \x1b[2J", "Error: esc \\x1b[2J"),
+    ],
+)
+def test_error_line_renders_message_literally(message: str, expected: str) -> None:
+    assert cli_module._error_line(message).plain == expected
+
+
+def test_error_line_survives_console_print() -> None:
+    buffer = StringIO()
+    Console(file=buffer, width=120).print(cli_module._error_line("a :smile: [bold]b[/bold] C:\\"))
+    assert buffer.getvalue() == "Error: a :smile: [bold]b[/bold] C:\\\n"
+
+
+@pytest.mark.parametrize("bad_input", ["skills[old]/demo", "nope[/x]"])
+def test_scan_input_error_shows_bracketed_path_literally(bad_input: str) -> None:
+    result = runner.invoke(app, ["scan", bad_input])
+    assert result.exit_code == 2
+    assert bad_input in result.output
+    assert "MarkupError" not in result.output
+
+
+def test_mcp_missing_extra_install_hint_keeps_extra_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(**_kwargs: object) -> None:
+        raise ModuleNotFoundError(
+            "The MCP server requires the optional 'mcp' dependency. "
+            "Install it with: pip install 'skillspector[mcp]'"
+        )
+
+    monkeypatch.setattr("skillspector.mcp_server.run", fake_run)
+    result = runner.invoke(app, ["mcp"])
+    assert result.exit_code != 0
+    assert "skillspector[mcp]" in result.output
+
+
+def test_warning_line_renders_message_literally() -> None:
+    message = (
+        "Transitive scan failed for https://raw.githubusercontent.com/acme/tools/main/setup[/x].sh"
+    )
+    assert cli_module._warning_line(message).plain == f"Warning: {message}"
+
+
+def test_literal_line_keeps_label_style_and_literal_path() -> None:
+    line = cli_module._literal_line("Report saved to", "green", Path("out[b].json"))
+    assert line.plain == "Report saved to: out[b].json"
+    assert line.spans[0].style == "green"
+
+
+def test_transitive_child_failure_warning_shows_bracketed_url_literally(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: d\n---\n# Demo\n\n"
+        "Run https://raw.githubusercontent.com/acme/tools/main/setup[/x].sh first.\n"
+    )
+    real_scan_for_source = cli._run_graph_scan_for_source
+    child_inputs: list[str] = []
+
+    def scan_for_source(**kwargs: Any) -> dict[str, object]:
+        if kwargs["input_path"] == str(skill):
+            return real_scan_for_source(**kwargs)
+        child_inputs.append(kwargs["input_path"])
+        raise RuntimeError("child scan failed")
+
+    monkeypatch.setattr(cli, "_run_graph_scan_for_source", scan_for_source)
+    cli._scan_skill(
+        input_path=str(skill),
+        format=FormatChoice.terminal,
+        no_llm=True,
+        baseline=None,
+        yara_rules_dir=None,
+        verbose=False,
+        show_suppressed=False,
+        transitive_enabled=True,
+        transitive_depth=1,
+        transitive_allow_prefix=None,
+        transitive_deny_prefix=None,
+    )
+    assert child_inputs, "the root should have reached a transitive child scan"
+    shown = "".join(capsys.readouterr().out.split())
+    assert "Transitivescanfailedfor" in shown
+    assert "setup[/x].sh" in shown
+
+
+def test_recursive_scan_shows_bracketed_skill_names_literally(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Detection sanitizes names, so build the directories directly to exercise the print path.
+    skills = []
+    for name in ("one[bold]x", "two"):
+        skill = tmp_path / name
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: d\n---\n# Demo\n\nSummarize the supplied text.\n"
+        )
+        skills.append(SkillDirectory(skill, name, name))
+
+    _scan_multi_skill(
+        MultiSkillDetectionResult(is_multi_skill=True, skills=skills),
+        FormatChoice.terminal,
+        None,
+        no_llm=True,
+    )
+
+    captured = capsys.readouterr()
+    shown = "".join((captured.out + captured.err).split())
+    assert "Scanningone[bold]x(one[bold]x/)" in shown
+
+
+def test_scan_report_saved_message_shows_bracketed_path_literally(tmp_path: Path) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: d\n---\n# Demo\n\nSummarize the supplied text.\n"
+    )
+    report = tmp_path / "out[b].json"
+    result = runner.invoke(
+        app, ["scan", str(skill), "--format", "json", "--no-llm", "-o", str(report)]
+    )
+    assert "out[b].json" in "".join(result.output.split())
+    assert report.exists()

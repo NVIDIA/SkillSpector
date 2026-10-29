@@ -169,6 +169,23 @@ skillspector scan ./my-skill/ --format markdown --output report.md
 skillspector scan ./my-skill/ --format sarif --output report.sarif
 ```
 
+### Recursive Collection Scanning
+
+`--recursive` scans immediate subdirectories containing `SKILL.md` as independent
+skills, with a default aggregate limit of **32 skills**. To raise or lower it:
+
+```bash
+skillspector scan ./my-skills/ --recursive --max-skills 100 --no-llm --format json
+```
+
+`--max-skills` requires a local recursive collection and a positive integer; `0`
+does not mean unlimited. Discovery, byte, finding-record, time and report-size
+budgets still apply, so increasing the count does not guarantee complete coverage.
+When the count limit is reached, the CLI names the limit and suggests adjusting it
+or scanning sub-skills separately. Omitted skills remain visible in the aggregate
+report and coverage stays incomplete. Use `--fail-on-incomplete` in CI to fail on
+incomplete coverage; the default exit policy is unchanged.
+
 ### Batch Scanning
 
 Scan entire directories of skills in parallel from `contrib/batch_scan/`:
@@ -302,9 +319,15 @@ inference gateways.
 | `openai_compatible` | `SKILLSPECTOR_COMPAT_API_KEY` + `SKILLSPECTOR_COMPAT_BASE_URL` | Any OpenAI-compatible endpoint | `llama-3.1-70b-versatile` |
 | `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | local Claude runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `codex_cli` | Disabled | Registered for compatibility; its read-only sandbox permits host-file reads | Use an HTTP API provider or another supported CLI provider |
-| `copilot_cli` | _(none — uses local CLI auth)_ | local `copilot` 1.0.103 binary | local Copilot runtime fallback, or `SKILLSPECTOR_MODEL` |
+| `copilot_cli` | _(none — uses local CLI auth)_ | local `copilot` 1.0.105 binary | local Copilot runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `gemini_cli` | _(none — uses local CLI auth)_ | local `gemini` binary | local Gemini runtime fallback, or `SKILLSPECTOR_MODEL` |
-| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` 1.18.33 binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
+| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` (verified 1.18.31–1.18.35, 1.19.0–1.19.4) binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
+
+For `openai_compatible` gateways requiring extra HTTP headers, set
+`SKILLSPECTOR_COMPAT_HEADERS='{"X-Tenant-ID":"my-tenant","X-API-Key":"gateway-key"}'`.
+It must be a JSON object with string keys and values and applies to sync and async requests.
+Unset or blank values add no headers; invalid configuration is rejected without exposing header values.
+Treat this environment variable as a secret when it contains gateway API keys.
 
 `gpt-6.1-sol`, `claude-opus-5-5`, and `claude-sonnet-5-5` remain opt-in through
 `SKILLSPECTOR_MODEL` or per-slot overrides. Promoting them to defaults requires
@@ -777,9 +800,9 @@ Issues (2)
 
 > **CLI providers** (`claude_cli`, `copilot_cli`, `gemini_cli`, `opencode_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active, except `copilot_cli` deliberately preserves only `COPILOT_GITHUB_TOKEN` (its documented headless auth) while dropping every other `COPILOT_*`, all `GITHUB_COPILOT_*`, and the `GH_TOKEN` family. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
 >
-> `opencode_cli` currently fails closed unless the installed OpenCode version is exactly `1.18.33`, the version whose configuration precedence and deny-all semantics are verified by this release.
+> `opencode_cli` currently fails closed unless the installed OpenCode version is one of the individually verified releases (`1.18.31`, `1.18.32`, `1.18.33`, `1.18.34`, `1.18.35`, `1.19.0`, `1.19.1`, `1.19.2`, `1.19.3`, `1.19.4`), whose configuration precedence and deny-all semantics are verified by this release; every other version, including prereleases, still fails closed.
 >
-> `copilot_cli` currently fails closed unless the installed Copilot CLI version is exactly `1.0.103`, the version whose tool-deny behavior is verified by this release.
+> `copilot_cli` currently fails closed unless the installed Copilot CLI version is exactly `1.0.105`, the version whose tool-deny behavior is verified by this release.
 >
 > Residual: Copilot CLI falls back to `gh auth token` when no other credential is available, so a stored gh login can still reach the child. This is inherent to Copilot auth.
 
@@ -984,6 +1007,10 @@ SC4 uses the [OSV.dev](https://osv.dev) API to check dependencies against the fu
 - **Batch queries** — all dependencies are checked in a single HTTP call.
 - **Automatic fallback** — if OSV.dev is unreachable (air-gapped/offline), a small built-in fallback list is used.
 - **Caching** — results are cached in-memory for 1 hour to avoid redundant API calls during a session.
+- **Pipenv** — reads `Pipfile` package tables and the direct/transitive packages in
+  `Pipfile.lock`, including development and custom categories. Exact lock versions
+  can resolve unpinned manifest dependencies. Malformed entries and unsupported
+  VCS/local sources are reported as incomplete dependency checks.
 
 The tool requires outbound HTTPS access to `api.osv.dev` for live vulnerability data. When that is not available, findings are limited to the static fallback list.
 

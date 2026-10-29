@@ -45,6 +45,7 @@ from skillspector.inspection_ledger import (
     RULE_SET_SCOPE,
     AnalysisCompleteness,
     finalize_ledger,
+    only_missing_reference_exceptions,
 )
 from skillspector.llm_provenance import sanitize_llm_provenance
 from skillspector.llm_utils import is_llm_available
@@ -52,6 +53,7 @@ from skillspector.logging_config import get_logger
 from skillspector.models import (
     OCCURRENCE_CODE_SNIPPET_KEY,
     OCCURRENCE_FINDING_ID_KEY,
+    OCCURRENCE_FINDING_TEXT_KEY,
     Finding,
 )
 from skillspector.nodes.analyzers import ANALYZER_MODULES
@@ -178,6 +180,9 @@ def _sanitize_finding(finding: Finding) -> Finding:
         report_snippet = occurrence.get(OCCURRENCE_CODE_SNIPPET_KEY)
         if isinstance(report_snippet, str):
             occurrence[OCCURRENCE_CODE_SNIPPET_KEY] = clean(report_snippet)
+        report_finding_text = occurrence.get(OCCURRENCE_FINDING_TEXT_KEY)
+        if isinstance(report_finding_text, str):
+            occurrence[OCCURRENCE_FINDING_TEXT_KEY] = clean(report_finding_text)
         occurrences.append(occurrence)
     return replace(
         finding,
@@ -200,11 +205,16 @@ def _finding_for_occurrence(finding: Finding, occurrence: Mapping[str, object]) 
     snippet = occurrence.get(OCCURRENCE_CODE_SNIPPET_KEY)
     if not isinstance(finding_id, str) or not finding_id:
         finding_id = finding.finding_id
+    finding_text = finding.finding
+    if OCCURRENCE_FINDING_TEXT_KEY in occurrence:
+        text = occurrence.get(OCCURRENCE_FINDING_TEXT_KEY)
+        finding_text = text if isinstance(text, str) else None
     if OCCURRENCE_CODE_SNIPPET_KEY not in occurrence:
-        return replace(finding, finding_id=finding_id)
+        return replace(finding, finding_id=finding_id, finding=finding_text)
     return replace(
         finding,
         finding_id=finding_id,
+        finding=finding_text,
         code_snippet=snippet if isinstance(snippet, str) else None,
         context=None,
     )
@@ -823,20 +833,24 @@ def _build_sarif(
     raw_status = completeness.get("status")
     requested_status = (
         raw_status
-        if isinstance(raw_status, str) and raw_status in {"complete", "partial", "failed"}
+        if isinstance(raw_status, str)
+        and raw_status in {"complete", "complete_with_caveats", "partial", "failed"}
         else None
     )
+    reference_caveat_only = only_missing_reference_exceptions(raw_ledger_exceptions)
     is_complete = (
         completeness.get("is_complete", True) is True
-        and requested_status in {None, "complete"}
+        and requested_status in {None, "complete", "complete_with_caveats"}
         and execution_successful
         and partially_inspected == 0
         and entirely_uninspected == 0
-        and ledger_exception_count == 0
+        and (ledger_exception_count == 0 or reference_caveat_only)
         and limitation_count == 0
     )
     status = (
-        "complete"
+        requested_status
+        if is_complete and requested_status == "complete_with_caveats"
+        else "complete"
         if is_complete
         else "failed"
         if not execution_successful or requested_status == "failed"
@@ -1884,7 +1898,10 @@ def report(state: SkillspectorState) -> dict[str, object]:
             limitations.append(transitive_limitation)
         analysis_completeness["limitations"] = limitations
         analysis_completeness["is_complete"] = False
-        if analysis_completeness.get("status", "complete") == "complete":
+        if analysis_completeness.get("status", "complete") in {
+            "complete",
+            "complete_with_caveats",
+        }:
             analysis_completeness["status"] = "partial"
     _attempted, _succeeded, degraded = _llm_runtime_status(llm_requested, llm_call_log)
     remaining = transitive_remaining_seconds(state)

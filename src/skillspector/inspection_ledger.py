@@ -102,6 +102,7 @@ class LedgerReason(StrEnum):
     REFERENCE_MISSING = "reference_missing"
     REFERENCE_UNRESOLVED = "reference_unresolved"
     MANIFEST_PARSE_ERROR = "manifest_parse_error"
+    DEPENDENCY_PARSE_ERROR = "dependency_parse_error"
     MANIFEST_PARSE_LIMIT = "manifest_parse_limit"
     ARTIFACT_COUNT_LIMIT = "artifact_count_limit"
     TRAVERSAL_DEPTH_LIMIT = "traversal_depth_limit"
@@ -115,6 +116,19 @@ class LedgerReason(StrEnum):
     PYTHON_SOURCE_AMBIGUOUS = "python_source_ambiguous"
     PYTHON_SOURCE_DECODE_ERROR = "python_source_decode_error"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
+
+
+def only_missing_reference_exceptions(exceptions: object) -> bool:
+    """Return whether non-empty ledger exceptions are only missing references."""
+    return (
+        isinstance(exceptions, list)
+        and bool(exceptions)
+        and all(
+            isinstance(exception, Mapping)
+            and exception.get("reason_code") == LedgerReason.REFERENCE_MISSING
+            for exception in exceptions
+        )
+    )
 
 
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
@@ -219,6 +233,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     ),
     LedgerReason.MANIFEST_PARSE_ERROR: (
         "Manifest frontmatter is malformed or uses an unsupported value shape."
+    ),
+    LedgerReason.DEPENDENCY_PARSE_ERROR: (
+        "Dependency metadata could not be parsed into supported registry coordinates."
     ),
     LedgerReason.MANIFEST_PARSE_LIMIT: (
         "Manifest frontmatter could not be completely examined within its resource limits."
@@ -1097,14 +1114,22 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
                 else f"Analyzer {status_summary['analyzer_id']} status: {status_name}."
             )
     execution_successful = not any(exception.get("fatal") for exception in ledger_exceptions)
+    reference_caveat_only = (
+        only_missing_reference_exceptions(ledger_exceptions)
+        and not limitations
+        and partially_inspected == 0
+        and entirely_uninspected == 0
+    )
     completeness_status = (
         "failed"
         if not execution_successful
+        else "complete_with_caveats"
+        if reference_caveat_only
         else "partial"
         if ledger_exceptions or limitations or partially_inspected or entirely_uninspected
         else "complete"
     )
-    is_complete = completeness_status == "complete"
+    is_complete = completeness_status in {"complete", "complete_with_caveats"}
 
     raw_references = state.get("artifact_references", [])
     public_references = (

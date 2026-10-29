@@ -457,13 +457,46 @@ def _parse_gemini_output(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# OpenCode CLI invocation  (verified against opencode 1.18.33)
+# OpenCode CLI invocation (verified against opencode 1.18.31-1.18.35 and 1.19.0-1.19.4;
+# per-version evidence beside _OPENCODE_SUPPORTED_VERSIONS)
 # ---------------------------------------------------------------------------
 
 
 _OPENCODE_AGENT_PREFIX = "skillspector-deny-all"
 _OPENCODE_DENY_ALL = json.dumps({"*": "deny"}, separators=(",", ":"))
-_OPENCODE_SUPPORTED_VERSION = "1.18.33"
+# Explicit set of individually verified CLI versions (exact triples,
+# never a range): raising a MAX would silently admit an unverified
+# patch, so each widening adds one triple with its own evidence.
+# Evidence per member: 1.18.31 (#575), 1.18.32 (#613), 1.18.33 (#665),
+# 1.18.34 (PR #713: live matrix auth + preflight + isolated run +
+# --help diff, all green), 1.18.35 + 1.19.0 (same matrix; run --help
+# byte-identical across .34/.35/1.19.0), 1.19.1-1.19.3 (same live
+# matrix with exact nonce replies; auth-list shape identical; run
+# --help byte-identical across the three, its only delta vs 1.19.0
+# being the hidden --share flag; plugin packages unchanged across
+# 1.19.0-1.19.3 in bun.lock (opencode-gitlab-auth 2.1.0,
+# opencode-poe-auth 0.0.1, @gitlab/opencode-gitlab-auth 1.3.3, same
+# integrity hashes) and no in-tree plugin source changed), 1.19.4
+# (same live matrix with exact nonce replies; auth-list, both --help
+# surfaces, plugin packages, and in-tree plugin source all unchanged
+# from 1.19.3). The gate stays
+# load-bearing, not belt-and-suspenders: the debug-config check cannot
+# tell whether the TEST_HOME / TEST_MANAGED_CONFIG_DIR hooks below
+# still apply, so each widening needs the same per-version review.
+_OPENCODE_SUPPORTED_VERSIONS = frozenset(
+    {
+        (1, 18, 31),
+        (1, 18, 32),
+        (1, 18, 33),
+        (1, 18, 34),
+        (1, 18, 35),
+        (1, 19, 0),
+        (1, 19, 1),
+        (1, 19, 2),
+        (1, 19, 3),
+        (1, 19, 4),
+    }
+)
 # Markers of a Zen free-tier refusal. Zen answers 403 to
 # any call carrying the deny-all isolation (OPENCODE_CONFIG_CONTENT or
 # OPENCODE_PERMISSION alone suffices; verified by env bisect), so free-tier
@@ -510,15 +543,35 @@ def _opencode_config(agent_name: str) -> str:
     )
 
 
-def _parse_opencode_version(raw: bytes) -> str | None:
-    """Parse an exact stable semantic version from ``opencode --version``."""
+def _parse_opencode_version(raw: bytes) -> tuple[int, int, int] | None:
+    """Parse a stable semantic version triple from ``opencode --version``.
+
+    Prereleases and unparsable output return ``None`` (fail closed).
+    """
     text = raw.decode("utf-8", errors="replace").strip()
     match = re.fullmatch(
-        r"(?:opencode(?:\s+version)?\s+)?v?(\d+\.\d+\.\d+)",
+        r"(?:opencode(?:\s+version)?\s+)?v?(\d+)\.(\d+)\.(\d+)",
         text,
         flags=re.IGNORECASE,
     )
-    return match.group(1) if match is not None else None
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def _format_opencode_version(version: tuple[int, int, int]) -> str:
+    """Render a version triple for fail-closed error messages."""
+    return f"{version[0]}.{version[1]}.{version[2]}"
+
+
+_OPENCODE_SUPPORTED_VERSIONS_TEXT = ", ".join(
+    _format_opencode_version(version) for version in sorted(_OPENCODE_SUPPORTED_VERSIONS)
+)
+
+
+def _is_supported_opencode_version(version: tuple[int, int, int] | None) -> bool:
+    """Return whether a parsed version is a verified member of the set."""
+    return version is not None and version in _OPENCODE_SUPPORTED_VERSIONS
 
 
 def _prepare_opencode_env(
@@ -588,11 +641,12 @@ def _prepare_opencode_env(
             "OPENCODE_EXPERIMENTAL_PLAN_MODE": "0",
             "OPENCODE_PERMISSION": _OPENCODE_DENY_ALL,
             "OPENCODE_PURE": "1",
-            # OpenCode 1.18.33 uses this internal override for the home paths
-            # searched for AGENTS.md, .opencode, .claude, and .agents content.
+            # Internal override for the home paths searched for
+            # AGENTS.md, .opencode, .claude, and .agents content,
+            # confirmed for every version in the window.
             "OPENCODE_TEST_HOME": isolated_home,
-            # The same pinned version uses this override instead of the
-            # platform's /etc, ProgramData, or /Library managed-config path.
+            # Same override family for the platform managed-config path
+            # (/etc, ProgramData, /Library), confirmed likewise.
             "OPENCODE_TEST_MANAGED_CONFIG_DIR": managed_config,
             "TEMP": child_tmp,
             "TMP": child_tmp,
@@ -611,7 +665,7 @@ def _preflight_opencode_policy(
     """Fail closed unless OpenCode's fully resolved sensitive config is exact.
 
     macOS MDM preferences are loaded after ``OPENCODE_CONFIG_CONTENT`` and do
-    not have a supported disable flag in OpenCode 1.18.33. Querying the final
+    not have a supported disable flag in any window version. Querying the final
     config with the exact environment and directory prevents a managed
     ``share: auto`` (or another late source) from silently reopening ambient
     capabilities before the inference process is allowed to start.
@@ -642,11 +696,12 @@ def _preflight_opencode_policy(
 
     version_raw = run_probe([binary, "--version"], "version")
     version = _parse_opencode_version(version_raw)
-    if version != _OPENCODE_SUPPORTED_VERSION:
+    if not _is_supported_opencode_version(version):
         version_text = version_raw.decode("utf-8", errors="replace").strip()
         raise AgentCLIError(
-            "OpenCode security policy is verified only for version "
-            f"{_OPENCODE_SUPPORTED_VERSION}; found {version_text[:80]!r}"
+            "OpenCode security policy is verified only for versions "
+            f"{_OPENCODE_SUPPORTED_VERSIONS_TEXT}; found "
+            f"{version_text[:80]!r}"
         )
 
     agent_name = _opencode_agent_name(argv)
@@ -684,7 +739,9 @@ def _preflight_opencode_policy(
 def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
     """Build argv for a text-only, deny-all ``opencode run`` call.
 
-    Flags chosen (verified against ``opencode`` 1.18.33 ``run --help``):
+    Flags chosen (verified against ``opencode`` 1.18.31-1.19.4 ``run --help``,
+    byte-identical across .34/.35/1.19.0 and across 1.19.1-1.19.4, whose
+    only change is the hidden ``--share`` flag):
 
     ``run``
         Non-interactive single-shot mode. With no positional message, the
@@ -740,7 +797,9 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
 def _parse_opencode_output(raw: str) -> str:
     """Extract assistant text from ``opencode run --format json`` JSONL events.
 
-    Verified against opencode 1.18.33, whose events look like::
+    Recorded against opencode 1.18.33 (``run --help`` is byte-identical
+    across 1.18.31-1.18.35/1.19.0 and across 1.19.1-1.19.4, and every member
+    carries the live nonce run recorded above), whose events look like:
 
         {"type": "step_start", ..., "part": {"type": "step-start", ...}}
         {"type": "text", ..., "part": {"type": "text", "text": "hi", ...}}
@@ -846,15 +905,14 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
                 timeout=15,
                 env=child_env,
             )
-            if (
-                version_result.returncode != 0
-                or _parse_opencode_version(version_result.stdout or b"")
-                != _OPENCODE_SUPPORTED_VERSION
+            if version_result.returncode != 0 or not _is_supported_opencode_version(
+                _parse_opencode_version(version_result.stdout or b"")
             ):
                 return (
                     False,
-                    "opencode_cli requires exactly OpenCode "
-                    f"{_OPENCODE_SUPPORTED_VERSION} for its verified deny-all policy",
+                    "opencode_cli requires OpenCode "
+                    f"{_OPENCODE_SUPPORTED_VERSIONS_TEXT} "
+                    "for its verified deny-all policy",
                 )
             result = subprocess.run(
                 [binary, "auth", "list"],
@@ -882,13 +940,13 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
 
 
 # ---------------------------------------------------------------------------
-# GitHub Copilot CLI invocation  (verified against copilot 1.0.103)
+# GitHub Copilot CLI invocation  (verified against copilot 1.0.105)
 # ---------------------------------------------------------------------------
 
 
 # Single pin both gates compare against, so a bump cannot update one
 # gate but not the other (mirrors _OPENCODE_SUPPORTED_VERSION).
-_COPILOT_SUPPORTED_VERSION = "1.0.103"
+_COPILOT_SUPPORTED_VERSION = "1.0.105"
 
 # Token variables the Copilot CLI silently accepts as credentials, in
 # preference order after COPILOT_GITHUB_TOKEN. GH_TOKEN commonly carries
@@ -985,7 +1043,7 @@ def _prepare_copilot_env(
 def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
     """Build the argv list for a non-interactive ``copilot`` call.
 
-    Flags chosen (verified against Copilot CLI 1.0.103 ``--help``):
+    Flags chosen (verified against Copilot CLI 1.0.105 ``--help``):
 
     (no ``-p``)
         With no prompt flag, the prompt is piped to stdin by run_agent_cli —
@@ -1011,8 +1069,8 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
 
     ``--disallow-temp-dir``
         Prevent automatic access to the system temporary directory
-        (verified live on 1.0.103: inference from a temp working dir
-        still answers exactly; --help surface re-verified on 1.0.103).
+        (verified live on 1.0.105: inference from a temp working dir
+        still answers exactly; --help surface re-verified on 1.0.105).
 
     Deliberately NOT included:
     - ``--allow-all*`` / ``--yolo`` — auto-approve permissions (dangerous); never use them.
@@ -1062,9 +1120,9 @@ def _parse_copilot_output(raw: str) -> str:
     """Extract the assistant reply from ``copilot -s`` plain-text output.
 
     Supported runtime is exactly ``_COPILOT_SUPPORTED_VERSION``
-    (currently 1.0.103: the version gate refuses anything else, so
+    (currently 1.0.105: the version gate refuses anything else, so
     this parser only ever runs on that release). Output shape proven
-    live on 1.0.103 (``-s`` emits only the response text; 2026-10-27
+    live on 1.0.105 (``-s`` emits only the response text; 2026-10-28
     nonce probes from both the repo and a temp working dir returned
     the exact string).
     The whole stripped output is the reply; empty output raises fail-closed
@@ -1083,7 +1141,7 @@ def _copilot_auth_check(binary: str) -> tuple[bool, str | None]:
     shared scrubbed environment (token re-injection is inference-only and
     version output does not depend on it), performs no inference, and
     completes well under 15s. Fail-closed: probe error/timeout, non-zero
-    exit, or a version other than the verified 1.0.103 all return
+    exit, or a version other than the verified 1.0.105 all return
     ``(False, reason)``.
 
     There is no status subcommand, so a passing probe means the binary runs
@@ -1133,7 +1191,7 @@ def _preflight_copilot_policy(
        runtime. Re-verifies ``[binary, --version]`` under the isolated
        child env on EVERY completion. ``argv`` is unused (CliSpec
        signature uniformity). Fail-closed: probe error/timeout,
-       non-zero exit, or a version other than the verified 1.0.103 all
+       non-zero exit, or a version other than the verified 1.0.105 all
        raise before any prompt bytes move.
     2. Temp-dir tripwire: repo-level hook sources (``.github/hooks/``,
        ``.github/agents/``, repo settings) cannot exist in the fresh
@@ -1188,7 +1246,7 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
 
     Audited behavior is the 1.0.92 release source (hook source order
     and XDG migration sets); the no-argv-off-switch premise is
-    re-verified on each pin bump, currently 1.0.103 ``--help``. As
+    re-verified on each pin bump, currently 1.0.105 ``--help``. As
     probed 2026-09-19, the CLI silently refuses inference under ANY
     redirected home, so home isolation is not a usable lever. The
     enforceable property is absence, checked here for every user

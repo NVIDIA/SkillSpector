@@ -788,6 +788,37 @@ def test_finalization_coverage_finding_does_not_require_meta_review(
     )
 
 
+def test_coverage_finding_downgrades_complete_with_caveats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coverage = Finding(
+        rule_id="AE1",
+        message="coverage",
+        finding_id="coverage-caveat",
+        severity="HIGH",
+        file="SKILL.md",
+        start_line=1,
+        tags=["coverage"],
+    )
+    monkeypatch.setattr(finalizer_module, "_reference_coverage_findings", lambda _state: [coverage])
+    monkeypatch.setattr(finalizer_module, "_size_coverage_findings", lambda *_args, **_kwargs: [])
+    result = finalize_inspection_ledger(
+        {
+            "components": ["SKILL.md"],
+            "artifact_inventory": [{"path": "SKILL.md", "disposition": "analyzed"}],
+            "artifact_references": [],
+            "findings": [],
+            "effective_finding_ids": [],
+            "meta_review_required": False,
+            "use_llm": False,
+            "inspection_ledger": [_reference_caveat(LedgerReason.REFERENCE_MISSING)],
+            "analyzer_status_events": [],
+        }
+    )
+    assert result["analysis_completeness"]["status"] == "partial"
+    assert result["analysis_completeness"]["is_complete"] is False
+
+
 def test_ae1_reports_target_specific_parser_diagnostics_for_each_reference() -> None:
     target = "scripts/helper.pl"
     event = ledger_event(

@@ -310,6 +310,7 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 | `AZURE_OPENAI_ENDPOINT` | Azure resource endpoint. | `https://example.openai.azure.com/` |
 | `SKILLSPECTOR_COMPAT_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=openai_compatible`. | `...` |
 | `SKILLSPECTOR_COMPAT_BASE_URL` | OpenAI-compatible endpoint base URL. | `https://api.groq.com/openai/v1` |
+| `SKILLSPECTOR_COMPAT_HEADERS` | Optional JSON object with string header names and values for `openai_compatible`. Applies to sync and async requests; unset or blank adds no headers. Invalid configuration is rejected without exposing header values. May contain gateway API keys, so treat it as a secret. | `{"X-Tenant-ID":"my-tenant","X-API-Key":"gateway-key"}` |
 | `SKILLSPECTOR_MODEL` | Override the active provider's bundled default model (see [README.md](../README.md) for per-provider defaults). CLI providers forward it as `--model`. | `gpt-5.2` |
 
 > **Disabled provider:** `codex_cli` remains registered for compatibility but refuses inference until a complete no-tools policy is verified.
@@ -349,9 +350,9 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
   - `openai_compatible/` — generic compatible endpoint (`SKILLSPECTOR_COMPAT_API_KEY`, `SKILLSPECTOR_COMPAT_BASE_URL`)
   - `claude_cli/` — **local `claude` binary; no API key**. Uses the CLI's own auth session (`claude auth login`). Set `SKILLSPECTOR_PROVIDER=claude_cli`.
   - `codex_cli/` — **registered but disabled**. Its read-only sandbox permits host-file reads. Select an HTTP API provider or another supported CLI provider for LLM analysis.
-  - `copilot_cli/` — **local `copilot` 1.0.103 binary; no API key**. Uses the CLI's own auth session (`copilot login`) or token env, stdin prompt transport, deny-all tool posture; fails closed on every other runtime version. Set `SKILLSPECTOR_PROVIDER=copilot_cli`.
+  - `copilot_cli/` — **local `copilot` 1.0.105 binary; no API key**. Uses the CLI's own auth session (`copilot login`) or token env, stdin prompt transport, deny-all tool posture; fails closed on every other runtime version. Set `SKILLSPECTOR_PROVIDER=copilot_cli`.
   - `gemini_cli/` — **local `gemini` binary; no API key**. Uses the CLI's own auth session. Set `SKILLSPECTOR_PROVIDER=gemini_cli`.
-  - `opencode_cli/` — **local `opencode` 1.18.33 binary; no API key**. Uses the CLI's own auth session (`opencode auth login`) and fails closed on every other runtime version because the deny-all policy is verified against that exact release. Set `SKILLSPECTOR_PROVIDER=opencode_cli`.
+  - `opencode_cli/` — **local `opencode` (verified 1.18.31–1.18.35, 1.19.0–1.19.4) binary; no API key**. Uses the CLI's own auth session (`opencode auth login`) and fails closed on every other runtime version, including prereleases, because the deny-all policy is verified against those exact releases. Set `SKILLSPECTOR_PROVIDER=opencode_cli`.
 
   CLI providers (`claude_cli`, `copilot_cli`, `gemini_cli`, `opencode_cli`) implement the optional `AgentCLICapable` interface (`is_available()` + `complete()`) defined in [providers/base.py](../src/skillspector/providers/base.py). `has_cli_capability(provider)` detects this at runtime. All subprocess calls go through the hardened helper [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py) which enforces: no shell (`shell=False`), untrusted content via stdin only, capability stripping (tools disabled / sandboxed), environment scrubbing (no API keys forwarded), per-call timeout, and fail-closed error handling.
 

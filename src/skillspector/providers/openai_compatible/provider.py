@@ -23,6 +23,9 @@ Required env vars:
     SKILLSPECTOR_COMPAT_API_KEY   — API key for the target provider
     SKILLSPECTOR_COMPAT_BASE_URL  — Base URL (e.g. https://api.groq.com/openai/v1)
 
+Optional env vars:
+    SKILLSPECTOR_COMPAT_HEADERS   — JSON object with string header names and values
+
 Some endpoints ignore both ``response_format`` and a forced ``tool_choice``
 and answer in prose.  A registry entry with ``tool_choice: auto`` binds the
 schema as a tool with ``tool_choice`` left at ``auto``; the prompt then asks
@@ -33,6 +36,7 @@ path without a registry entry.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -43,6 +47,25 @@ from skillspector.providers.chat_models import create_openai_compatible_chat_mod
 from skillspector.providers.structured_output import forced_tool_choice_supported
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
+
+
+def _resolve_compat_headers() -> dict[str, str] | None:
+    raw_headers = os.environ.get("SKILLSPECTOR_COMPAT_HEADERS", "").strip()
+    if not raw_headers:
+        return None
+
+    error_message = "SKILLSPECTOR_COMPAT_HEADERS must be a JSON object with string keys and values"
+    try:
+        headers = json.loads(raw_headers)
+    except json.JSONDecodeError:
+        raise ValueError(error_message) from None
+
+    if not isinstance(headers, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str) for key, value in headers.items()
+    ):
+        raise ValueError(error_message)
+
+    return headers
 
 
 class OpenAICompatibleProvider:
@@ -72,6 +95,7 @@ class OpenAICompatibleProvider:
             credentials=self.resolve_credentials(),
             max_tokens=max_tokens,
             timeout=timeout,
+            default_headers=_resolve_compat_headers(),
             forced_tool_choice=self.forced_tool_choice_supported(model),
         )
 
