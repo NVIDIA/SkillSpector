@@ -20,7 +20,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -2121,16 +2124,105 @@ class TestInspectionLedgerStatus:
 
 class TestResourceBounds:
     @pytest.mark.parametrize(
-        ("fence_count", "expected_calls", "is_partial"),
-        [(64, 64, False), (65, 65, False), (128, 128, False), (129, 128, True)],
+        ("value", "expected", "warns"),
+        [
+            (None, 256, False),
+            ("1", 1, False),
+            (" 145 ", 145, False),
+            ("00145", 145, False),
+            ("512", 512, False),
+            ("4096", 4096, False),
+            ("", 256, False),
+            (" \t", 256, False),
+            ("0", 256, True),
+            ("-1", 256, True),
+            ("+3", 256, True),
+            ("4097", 256, True),
+            ("1.5", 256, True),
+            ("256.0", 256, True),
+            ("1_024", 256, True),
+            ("１２", 256, True),
+            ("nan", 256, True),
+            ("inf", 256, True),
+            ("not-a-number", 256, True),
+        ],
+    )
+    def test_tp4_batch_environment_parsing(
+        self, value: str | None, expected: int, warns: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level("WARNING", logger=mcp_tool_poisoning.__name__):
+            assert mcp_tool_poisoning._tp4_max_batches_from_environment(value) == expected
+
+        warnings = [
+            record
+            for record in caplog.records
+            if record.name == mcp_tool_poisoning.__name__ and record.levelname == "WARNING"
+        ]
+        assert bool(warnings) is warns
+        if warns:
+            assert "SKILLSPECTOR_TP4_MAX_BATCHES" in warnings[0].getMessage()
+        if value == "not-a-number":
+            assert value not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("value", "expected"), [(None, 256), ("3", 3), ("512", 512), ("bad", 256)]
+    )
+    def test_tp4_batch_environment_is_bound_in_fresh_process(
+        self, tmp_path: Path, value: str | None, expected: int
+    ) -> None:
+        module_path = Path(mcp_tool_poisoning.__file__).resolve()
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(module_path.parents[3])
+        environment.pop("SKILLSPECTOR_TP4_MAX_BATCHES", None)
+        if value is not None:
+            environment["SKILLSPECTOR_TP4_MAX_BATCHES"] = value
+        process = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import json; from skillspector.nodes.analyzers import mcp_tool_poisoning as m; "
+                "print(json.dumps([m.TP4_MAX_BATCHES, m.__file__]))",
+            ],
+            cwd=tmp_path,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        limit, imported_path = json.loads(process.stdout)
+        assert limit == expected
+        assert Path(imported_path).resolve() == module_path
+
+    @pytest.mark.parametrize(
+        ("batch_limit", "fence_count", "expected_calls", "is_partial"),
+        [
+            (None, 64, 64, False),
+            (None, 65, 65, False),
+            (None, 128, 128, False),
+            (None, 129, 129, False),
+            (None, 145, 145, False),
+            (None, 255, 255, False),
+            (None, 256, 256, False),
+            (None, 257, 256, True),
+            (3, 3, 3, False),
+            (3, 4, 3, True),
+            (300, 257, 257, False),
+        ],
     )
     def test_tp4_batch_boundaries_preserve_late_findings_and_source_ranges(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        batch_limit: int | None,
         fence_count: int,
         expected_calls: int,
         is_partial: bool,
     ) -> None:
+        effective_limit = (
+            mcp_tool_poisoning.DEFAULT_TP4_MAX_BATCHES if batch_limit is None else batch_limit
+        )
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCHES", effective_limit)
         content = "".join(f"```python\nprint({index})\n```\n" for index in range(fence_count))
         responses = [{"is_mismatch": False} for _ in range(expected_calls - 1)]
         responses.append(
@@ -2169,8 +2261,10 @@ class TestResourceBounds:
             assert len(partial) == 1
             assert partial[0]["path"] == "guide.md"
             assert partial[0]["reason_code"] is LedgerReason.OUTPUT_LIMIT
-            assert partial[0]["observed_records"] == 129
-            assert partial[0]["limit_records"] == 128
+            assert partial[0]["observed_records"] == expected_calls + 1
+            assert partial[0]["limit_records"] == effective_limit
+            assert partial[0]["start_line"] is None
+            assert partial[0]["end_line"] is None
             assert result["analyzer_status_events"][0]["status"] == "degraded"
         else:
             assert partial == []
