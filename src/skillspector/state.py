@@ -269,6 +269,9 @@ class SkillspectorState(TypedDict, total=False):
     # External-model consumers use the redacted projection for sensitive local files.
     llm_file_cache: dict[str, str]
     artifact_inventory: list[ArtifactRecord]
+    # Opt-in, local-only inspection of exact artifacts from supported npm locks.
+    inspect_dependencies: bool
+    dependency_inspection: dict[str, object]
     artifact_references: list[BundleReference]
     reference_resolution: dict[str, object]
     # Retained for compatibility with the persisted workflow-state schema.
