@@ -151,6 +151,8 @@ class NestedInspectionResult:
     # Byte-recognized ZIPs at every depth, including ones stopped by a limit.
     # Expected extensions and format mismatches are not content recognition.
     recognized_zip_paths: set[str] = field(default_factory=set)
+    # Only complete bounded traversals, including every nested member read.
+    inspected_containers: dict[str, list[str]] = field(default_factory=dict)
     ledger_events: list[InspectionLedgerEvent] = field(default_factory=list)
     # Keep the actual event objects: disk and virtual paths can share both a
     # spelling and a work ID, so neither identifies which input produced it.
@@ -928,6 +930,8 @@ def _inspect_zip_bytes(
     budget: _Budget,
     result: NestedInspectionResult,
 ) -> None:
+    initial_exceptions = len(result.ledger_events)
+    member_paths: list[str] = []
     if budget.expired():
         budget.halted = True
         _time_exception(result, path=container_virtual_path, budget=budget)
@@ -1358,6 +1362,7 @@ def _inspect_zip_bytes(
             owned_parts.add(safe_name)
             result.python_source_classifications[virtual_path] = source_classification
             artifact = classify_artifact(virtual_path, member_data)
+            member_paths.append(virtual_path)
             result.artifact_inventory.append(artifact)
             result.metadata.append(
                 {
@@ -1446,8 +1451,6 @@ def _inspect_zip_bytes(
                 result=result,
             )
 
-        if not worksheet_parts:
-            return
         metadata_by_path = {str(item["path"]): item for item in result.metadata}
         inventory_by_path = {item["path"]: item for item in result.artifact_inventory}
         for worksheet in sorted(worksheet_parts):
@@ -1488,6 +1491,9 @@ def _inspect_zip_bytes(
             artifact = inventory_by_path[printer_path]
             if artifact["content_kind"] == ContentKind.BINARY:
                 artifact["readable_binary"] = True
+
+    if len(result.ledger_events) == initial_exceptions:
+        result.inspected_containers[container_virtual_path] = member_paths
 
 
 def inspect_nested_artifacts(

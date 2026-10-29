@@ -1153,6 +1153,11 @@ def _source_aware_inventory(
         entry["path"] = _transitive_component_key(
             source_identity, str(entry.get("path", "SKILL.md"))
         )
+        if isinstance(entry.get("inspected_members"), list):
+            entry["inspected_members"] = [
+                _transitive_component_key(source_identity, str(path))
+                for path in entry["inspected_members"]
+            ]
         entry["source_url"] = source_url
         entry["source_identity"] = source_identity
         entry["source_digest"] = source_digest

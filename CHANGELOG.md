@@ -1,5 +1,6 @@
 ### 2.13.3 (Unreleased)
 ### Security and integrity fixes
+* Account for successfully inspected linked ZIP containers while retaining member failures and archive limits. (#939)
 * Prevent baseline and recursive reports from overwriting primary and child inputs, including aliases. (#924, #938)
 * Keep unavailable requested custom YARA rule directories explicitly incomplete. (#919)
 * Score non-English gap-fill findings in batch recommendations and exit status. (#772)
