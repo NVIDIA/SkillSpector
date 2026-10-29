@@ -56,3 +56,30 @@ class TestMP2MarkdownTables:
         """Suppressing table rows does not hide genuine stuffing elsewhere."""
         content = "# Skill\n\n" + _wide_table() + "\n\n" + ("fill the context window " * 30) + "\n"
         assert len(_mp2(content)) >= 1
+
+    def test_single_cell_stuffing_still_detected(self) -> None:
+        """The reviewer's blocker case: repetition inside one cell still fires.
+
+        A one-column table whose single data cell repeats ``abcdef `` 1000
+        times is stuffing, not layout: the repeated unit carries content
+        and never crosses a cell boundary, so the table exemption must not
+        apply even though the row belongs to a proven table.
+        """
+        content = "| Value |\n| --- |\n| " + "abcdef " * 1000 + "|\n"
+        assert len(_mp2(content)) >= 1
+
+    def test_stuffed_cell_in_multi_column_table_still_detected(self) -> None:
+        """A stuffed cell inside a wider proven table still fires."""
+        content = (
+            "| Name | Notes | Status |\n"
+            "| --- | --- | --- |\n"
+            "| alpha | " + "abcdef " * 100 + "| ok |\n"
+        )
+        assert len(_mp2(content)) >= 1
+
+    def test_repeated_short_cells_still_suppressed(self) -> None:
+        """Repeated cell structure stays exempt: identical short cells."""
+        row = "| " + " | ".join("yes" for _ in range(24)) + " |"
+        table = "| " + " | ".join(f"Col {i}" for i in range(24)) + " |\n"
+        table += "|" + "|".join("---" for _ in range(24)) + "|\n" + row + "\n"
+        assert _mp2("# Skill\n\n" + table) == []

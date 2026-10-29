@@ -416,6 +416,45 @@ def _is_markdown_table_span(spans: list[tuple[int, int]], offset: int) -> bool:
     return any(start <= offset < end for start, end in spans)
 
 
+_TABLE_SEPARATOR_CHARS = frozenset("-:=| \t")
+
+
+def _is_table_structure_unit(unit: str) -> bool:
+    """Return True when a repeated MP2 unit is table structure, not content.
+
+    A unit containing a pipe repeats cell structure by construction (the
+    repetition spans cell boundaries, as in prettier-aligned rows and
+    delimiter rows), and a unit made only of separator/padding characters
+    repeats delimiters or alignment padding. Any other unit repeats
+    substantive cell content, so it must not be exempted: a single cell
+    stuffed with ``abcdef `` repeated 1000 times has a content-only unit
+    and stays a finding even though it sits inside a proven table.
+    """
+    if not unit:
+        return False
+    if "|" in unit:
+        return True
+    return all(ch in _TABLE_SEPARATOR_CHARS for ch in unit)
+
+
+def _match_contains_stuffed_cell(span: str) -> bool:
+    """Return True when one cell segment of the span repeats content itself.
+
+    Splits the span on cell boundaries and re-applies the MP2 content
+    pattern inside each segment: a segment whose own repetition unit
+    carries alphanumeric content is stuffing inside that cell, even when
+    the outer match spans the whole row. Pure separator/padding segments
+    (dashes, spaces) do not count.
+    """
+    content_pattern = MP2_CONTENT_PATTERNS[0][0]
+    for segment in span.split("|"):
+        for inner in re.finditer(content_pattern, segment):
+            unit = inner.group(1) or ""
+            if any(ch.isalnum() for ch in unit):
+                return True
+    return False
+
+
 def _bounded_previous_nonblank_line(content: str, offset: int) -> tuple[str, bool]:
     """Return the prior nonblank logical line and whether it was complete."""
     window_start = max(0, offset - 512)
@@ -710,6 +749,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 (pattern, confidence) not in MP2_PROSE_PATTERNS
                 and table_spans
                 and _is_markdown_table_span(table_spans, match.start())
+                and _is_table_structure_unit(match.group(1))
+                and not _match_contains_stuffed_cell(span)
             ):
                 continue
             non_ws_chars = set(span) - {" ", "\t", "\n", "\r"}
