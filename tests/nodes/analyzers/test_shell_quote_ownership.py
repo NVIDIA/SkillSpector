@@ -123,6 +123,54 @@ def test_tab_stripping_heredoc_does_not_strip_spaces(indent: str) -> None:
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    ("body", "strip_tabs", "quoted"),
+    [
+        ("ordinary \\\ncontinued\nEND\n", False, False),
+        ("E\\\nN\\\nD\n", False, False),
+        ("body\\\\\nEND\n", False, False),
+        ("E\\\\\\\nND\nEND\n", False, False),
+        ("\tE\\\nND\n", True, False),
+        ("E\\\n\tND\nEND\n", True, False),
+        ("E\\\nND\nEND\n", False, True),
+    ],
+)
+def test_heredoc_continuations_compare_logical_delimiter_lines(
+    body: str, strip_tabs: bool, quoted: bool, newline: str
+) -> None:
+    body = body.replace("\n", newline)
+    source = body + "$CMD -rf /\n"
+
+    assert tm._skip_static_heredoc_bodies(
+        source, 0, len(source), (("END", strip_tabs, quoted),), lambda: None
+    ) == len(body)
+
+
+@pytest.mark.parametrize("body", ["END", "E\\\nND", "\tE\\\nND"])
+def test_heredoc_delimiter_can_end_at_eof(body: str) -> None:
+    assert tm._skip_static_heredoc_bodies(
+        body, 0, len(body), (("END", True, False),), lambda: None
+    ) == len(body)
+
+
+def test_large_continued_heredoc_checks_runtime_and_keeps_raw_commands() -> None:
+    body = ("x" * 5000 + "\\\n") * 40 + "END\n$CMD -rf /\nEND\n"
+    checks = 0
+
+    def check_runtime() -> None:
+        nonlocal checks
+        checks += 1
+
+    assert tm._skip_static_heredoc_bodies(
+        body, 0, len(body), (("END", False, False),), check_runtime
+    ) == len(body)
+    assert checks >= 40
+    assert tm.has_bounded_parse_exhaustion(
+        "cat <<END\n" + body, lambda: None, file_type="shell"
+    )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
 def test_heredoc_body_parentheses_cannot_close_an_enclosing_substitution(newline: str) -> None:
     source = "$(cat <<'END'\n) and an unmatched quote: \"\nEND\nprintf ok\n)"
     source = source.replace("\n", newline)
@@ -162,9 +210,58 @@ def test_pending_heredoc_cannot_close_before_its_body(suffix: str) -> None:
     assert tm._skip_command_substitution(source, 0, len(source), lambda: None) is None
 
 
+def test_pending_heredoc_cannot_claim_a_plain_subshell_body() -> None:
+    source = "$(cat <<END; (printf ok\n) body\nEND\n))"
+    end_cache: dict[int, int | None] = {}
+    closers: set[int] = set()
+
+    assert tm._skip_command_substitution(source, 0, len(source), end_cache=end_cache) is None
+    assert end_cache == {0: None}
+    assert tm._shell_quoted_candidate_limits(source, lambda: None, quote_closers=closers) == {}
+    assert closers == set()
+
+
+def test_pending_heredoc_keeps_independent_command_substitution_arguments() -> None:
+    source = '$(cat <<END "$(printf ok)"\nbody\nEND\n)'
+
+    assert tm._skip_command_substitution(source, 0, len(source), lambda: None) == len(source)
+
+
 def test_arithmetic_shift_is_not_a_heredoc_declaration() -> None:
     for source in ("$((1 << count))", "$(echo $((1 << count)))", "$( ((1 << count)) )"):
         assert tm._skip_command_substitution(source, 0, len(source), lambda: None) == len(source)
+
+
+@pytest.mark.parametrize("operator", ["#", "##", "%", "%%"])
+@pytest.mark.parametrize("variable", ["$ROOT", "${ROOT}"])
+def test_simple_quoted_trim_pattern_preserves_outer_quote_ownership(
+    operator: str, variable: str
+) -> None:
+    source = 'printf "%s" "${path' + operator + '"' + variable + '"/}"\n'
+    source += '''state="$(inspect -f '{{value}}' "$NAME")" || return
+[[ "$state" == true\\|true\\|* && " ${state#*|*|} " == *' /dev '* ]] || return
+trap 'rm -rf "$CACHE"' EXIT
+'''
+
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+    assert tm.has_bounded_parse_exhaustion(
+        source + "$CMD -rf /\n", lambda: None, file_type="shell"
+    )
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ['${path#"$($CMD -rf /)"}', '${path#"$ROOT"$"suffix"}', '${path#"${ROOT:-other}"}'],
+)
+def test_complex_trim_patterns_cannot_claim_simple_quote_ownership(pattern: str) -> None:
+    source = 'printf "%s" "' + pattern + '"\n'
+    closers: set[int] = set()
+
+    assert tm._shell_quoted_candidate_limits(source, lambda: None, quote_closers=closers) == {}
+    assert closers == set()
+    assert tm.has_bounded_parse_exhaustion(
+        source + "$CMD -rf /\n", lambda: None, file_type="shell"
+    )
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
