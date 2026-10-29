@@ -1009,14 +1009,16 @@ def _prepare_copilot_env(
     per-completion version preflight: an update landing mid-scan
     fails loud on the next call, never drifts silent.
 
-    User/plugin lifecycle hooks are handled NOT by home isolation
-    (broken as above) but by the preflight audits: inference
-    refuses to run when hook material (``installed-plugins/``,
+    User/plugin lifecycle hooks from local sources are handled NOT by
+    home isolation (broken as above) but by the preflight audits:
+    inference refuses to run when hook material (``installed-plugins/``,
     ``extensions/``, ``hooks/*.json``, inline ``hooks`` in
     ``settings.json``, agent-scoped ``hooks`` in custom agent
     ``agents/*.md`` files) is present under the resolved copilot
     home, or when repo-level hook material appears in the fresh
-    temp working dir. No hook material on disk means no hooks load.
+    temp working dir. This covers local hook material only:
+    account/team-assigned plugins can be activated by the CLI after
+    startup and are the documented residual in ``_audit_copilot_home``.
     """
     env = {
         key: value
@@ -1183,7 +1185,7 @@ def _preflight_copilot_policy(
 ) -> None:
     """Reject an unverified Copilot runtime before stdin delivery.
 
-    Three checks, all before ``run_agent_cli`` writes the prompt:
+    Three local checks, all before ``run_agent_cli`` writes the prompt:
 
     1. Version: the availability probe runs once per scan, so a swapped
        or updated binary (or a direct ``complete()`` call that never
@@ -1201,6 +1203,10 @@ def _preflight_copilot_policy(
        block in ``settings.json``, and a ``hooks`` frontmatter map in
        custom agent files (``agents/*.md``, nested included) under the
        resolved copilot home all raise (see ``_audit_copilot_home``).
+
+    These checks run before the child starts and cover local material only.
+    Account/team-assigned plugin activation happens after startup and is
+    the explicit residual documented in ``_audit_copilot_home``.
     """
     _audit_tmp_cwd(tmp_cwd)
     try:
@@ -1244,9 +1250,12 @@ def _copilot_home(child_env: dict[str, str]) -> str:
 def _audit_copilot_home(child_env: dict[str, str]) -> None:
     """Refuse inference when user or plugin hook material is present.
 
-    Audited behavior is the 1.0.92 release source (hook source order
-    and XDG migration sets); the no-argv-off-switch premise is
-    re-verified on each pin bump, currently 1.0.105 ``--help``. As
+    The local hook source order and XDG migration sets were audited
+    against the 1.0.92 release source; no 1.0.93-1.0.105 release note
+    announces a change to them, and the 1.0.105 packaged runtime still
+    carries the same local plugin/hook tree names. The no-argv-off-switch
+    premise is re-verified on each pin bump, currently 1.0.105
+    ``--help``. As
     probed 2026-09-19, the CLI silently refuses inference under ANY
     redirected home, so home isolation is not a usable lever. The
     enforceable property is absence, checked here for every user
@@ -1287,18 +1296,31 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
     provider registry (``providers.json`` — any content beyond an
     empty object/array refuses, since it can route completions to a
     user-configured endpoint outside the verified auth path).
-    Machine-wide
-    policy hooks stay residual (admin-owned, unauditable); only
+    Machine-wide policy hooks and account/team-managed plugin activation
+    stay residual (admin/account-owned, not auditable locally); only
     ``--disable-builtin-mcps`` is argv-denied, so user servers are
     audited, never assumed off.
 
-    Residual risk (documented, not auditable without administrator
-    privileges): machine-wide
+    Startup activation boundary (1.0.100/1.0.101): trusted-repository
+    plugins install and update before chat, but that path is gated on
+    folder trust; this provider runs in a fresh ``mkdtemp`` cwd, never
+    passes ``--trust-folder``, and does not set ``COPILOT_ALLOW_ALL``,
+    so the cwd is untrusted and the path is inert. Team-assigned plugins
+    from Team-defined marketplaces are different: the CLI can fetch the
+    assignment from the account and install missing plugins during its
+    best-effort startup preparation, after this preflight. A local
+    preflight cannot see the account assignment or the startup download.
+    That is an explicit account/administrator-policy residual, not a
+    claim that the startup tree is hook-free.
+
+    Residual risk (documented, not auditable locally): machine-wide
     policy hooks (``/etc/github-copilot/policy.d/``, ``C:\\ProgramData\\...``,
     HKLM registry) are admin-owned, immune to ``disableAllHooks``, and
-    cannot be removed or disabled by this provider. Project-level sources
-    (``.github/hooks/``, ``.github/extensions``, repo settings) are
-    covered by ``_audit_tmp_cwd`` over the fresh temp working dir.
+    cannot be removed or disabled by this provider, and Team-assigned
+    plugins can be installed after the preflight as described above.
+    Project-level sources (``.github/hooks/``, ``.github/extensions``,
+    repo settings) are covered by ``_audit_tmp_cwd`` over the fresh temp
+    working dir.
     """
     seen: set[str] = set()
 

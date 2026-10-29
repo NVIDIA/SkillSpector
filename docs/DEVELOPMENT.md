@@ -315,8 +315,7 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 
 > **Disabled provider:** `codex_cli` remains registered for compatibility but refuses inference until a complete no-tools policy is verified.
 
-> **CLI providers** (`claude_cli`, `copilot_cli`, `gemini_cli`, `opencode_cli`): no credential env var is needed, except `copilot_cli` deliberately
-preserves only `COPILOT_GITHUB_TOKEN` (see `_prepare_copilot_env`). Authentication is managed by the agent CLI's own session. Residual: Copilot CLI falls back to `gh auth token` when no other credential is available, so a stored gh login can still reach the child. The subprocess is heavily sandboxed — see [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py).
+> **CLI providers** (`claude_cli`, `copilot_cli`, `gemini_cli`, `opencode_cli`): no credential env var is needed, except `copilot_cli` deliberately preserves only `COPILOT_GITHUB_TOKEN` (see `_prepare_copilot_env`). Authentication is managed by the agent CLI's own session. Residual: Copilot CLI falls back to `gh auth token` when no other credential is available, so a stored gh login can still reach the child. The subprocess is heavily sandboxed — see [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py).
 
 ### Live provider tests
 
@@ -359,7 +358,7 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
 - **LLM calls** ([llm_utils.py](../src/skillspector/llm_utils.py)): **`get_chat_model()`** and **`chat_completion()`** dispatch based on the active provider:
   - **HTTP providers**: resolve credentials in two tiers — active provider (`NVIDIA_INFERENCE_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` → endpoint) — against any OpenAI-compatible endpoint. `max_tokens` is auto-bound to `get_max_output_tokens(model)` from `model_info`.
   - **CLI providers** (`claude_cli`, `copilot_cli`, `gemini_cli`, `opencode_cli`): `get_chat_model()` returns an `AgentCLIChatModel` adapter backed by `provider.complete()`, so the analyzers' `.invoke()` / `.with_structured_output(schema).invoke()` calls work with no API key (structured output is produced by prompting for JSON, then Pydantic-validating). `chat_completion()` routes through `get_chat_model()` as well. `is_llm_available()` calls `provider.is_available()` instead of credential resolution.
-- **LLM analyzer base** ([llm_analyzer_base.py](../src/skillspector/nodes/llm_analyzer_base.py)): `LLMAnalyzerBase` provides per-file/per-chunk batching, token-budget-aware chunking, and a run loop for all LLM-based analyzers. `LLMMetaAnalyzer` extends it for filter/enrich (meta_analyzer node). Future semantic analyzers extend `LLMAnalyzerBase` for discovery mode.
+- **LLM analyzer base** ([llm_analyzer_base.py](../src/skillspector/llm_analyzer_base.py)): `LLMAnalyzerBase` provides per-file/per-chunk batching, token-budget-aware chunking, and a run loop for all LLM-based analyzers. `LLMMetaAnalyzer` extends it for filter/enrich (meta_analyzer node). Future semantic analyzers extend `LLMAnalyzerBase` for discovery mode.
 
 ---
 
