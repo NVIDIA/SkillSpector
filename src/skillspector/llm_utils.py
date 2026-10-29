@@ -302,6 +302,20 @@ def _complete_agent_cli(
     )
 
 
+def structured_output_instructions(schema: type) -> str:
+    """Text a CLI provider's structured call appends after the analyzer prompt.
+
+    Exposed so prompt budgeting can measure the exact bytes the transport adds.
+    """
+    schema_json = json.dumps(schema.model_json_schema(), indent=2)
+    return (
+        "\n\n"
+        "Respond with ONLY a single JSON object conforming to the JSON Schema "
+        "below. Do not wrap it in markdown code fences and do not add any prose "
+        f"before or after the JSON.\n\nJSON Schema:\n{schema_json}"
+    )
+
+
 class _StructuredAgentCLIModel:
     """Mimics ``ChatOpenAI.with_structured_output(schema)`` for a CLI provider.
 
@@ -316,13 +330,7 @@ class _StructuredAgentCLIModel:
         self._schema = schema
 
     def _augment(self, prompt: str) -> str:
-        schema_json = json.dumps(self._schema.model_json_schema(), indent=2)
-        return (
-            f"{prompt}\n\n"
-            "Respond with ONLY a single JSON object conforming to the JSON Schema "
-            "below. Do not wrap it in markdown code fences and do not add any prose "
-            f"before or after the JSON.\n\nJSON Schema:\n{schema_json}"
-        )
+        return f"{prompt}{structured_output_instructions(self._schema)}"
 
     def _complete(self, prompt: str) -> str:
         """Return provider output before structured parsing begins."""

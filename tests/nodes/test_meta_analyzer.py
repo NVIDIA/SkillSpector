@@ -823,6 +823,28 @@ class TestMetaAnalyzerPartialBatchFailure:
         assert arun_batches.await_args.args[0] == [finding_batch]
         assert result["effective_finding_ids"] == [finding.finding_id]
 
+    def test_node_sizes_batches_with_the_metadata_it_sends(self) -> None:
+        """get_batches must see the same metadata_text the prompts are built with."""
+        finding = Finding(rule_id="R1", message="m", file="a.py", start_line=1)
+        batch = Batch(file_path="a.py", content="code a", findings=[finding])
+        state = self._state([finding])
+        state["manifest"] = {"name": "demo", "description": "d" * 500}
+
+        with (
+            patch.object(LLMMetaAnalyzer, "get_batches", return_value=[batch]) as get_batches,
+            patch.object(
+                LLMMetaAnalyzer,
+                "arun_batches",
+                new_callable=AsyncMock,
+                return_value=[(batch, [_confirm("R1", "a.py", 1)])],
+            ) as arun_batches,
+        ):
+            meta_analyzer(state)
+
+        sized_with = get_batches.call_args.kwargs["metadata_text"]
+        assert sized_with
+        assert sized_with == arun_batches.await_args.kwargs["metadata_text"]
+
     def test_no_failures_still_preserve_deterministic_findings(self) -> None:
         """Even complete LLM coverage cannot suppress deterministic findings."""
         f_confirmed = Finding(rule_id="R1", message="m", file="a.py", start_line=1)
