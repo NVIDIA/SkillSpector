@@ -11,7 +11,7 @@ import zlib
 from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 
-from skillspector.artifacts import ContentKind, ReferenceKind
+from skillspector.artifacts import ArtifactDisposition, ContentKind, ReferenceKind
 from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
@@ -731,8 +731,65 @@ def _analyzer_load_error_events() -> list[InspectionLedgerEvent]:
     ]
 
 
+def _reconcile_inspected_containers(state: SkillspectorState) -> dict[str, object]:
+    """Roll descendant gaps into successfully traversed containers in linear time."""
+    raw_inventory = state.get("artifact_inventory") or []
+    if not isinstance(raw_inventory, list) or not all(
+        isinstance(item, dict) and isinstance(item.get("path"), str) for item in raw_inventory
+    ):
+        return {}
+    rows = [dict(item) for item in raw_inventory]
+    inventory = {item["path"]: item for item in rows}
+    containers = {
+        path: item["inspected_members"]
+        for path, item in inventory.items()
+        if "inspected_members" in item
+    }
+    if not containers:
+        return {}
+    completeness, _ = finalize_ledger(state)
+    incomplete = {
+        str(row["path"])
+        for row in completeness["ledger_exceptions"]
+        if row.get("reason_code") not in _REFERENCE_CAVEAT_REASONS
+    } | {
+        path
+        for path, item in inventory.items()
+        if item["disposition"] in {"partial", "failed"}
+        or (item["disposition"] == "out_of_scope" and item.get("referenced"))
+    }
+    parents: dict[str, set[str]] = {}
+    for path, members in containers.items():
+        for member in members:
+            parents.setdefault(member, set()).add(path)
+            if member not in inventory:
+                incomplete.add(path)
+    pending = list(incomplete)
+    while pending:
+        for parent in parents.get(pending.pop(), ()):
+            if parent not in incomplete:
+                incomplete.add(parent)
+                pending.append(parent)
+    incomplete_containers = containers.keys() & incomplete
+    for item in rows:
+        if item["path"] in incomplete_containers and item["disposition"] == "analyzed":
+            item["disposition"] = ArtifactDisposition.PARTIAL
+            item["reason"] = LedgerReason.ARCHIVE_MEMBER_INCOMPLETE.value
+    return {
+        "artifact_inventory": rows,
+        "artifact_references": [
+            {**reference, "disposition": inventory[reference["target_path"]]["disposition"]}
+            if reference.get("target_path") in containers
+            else reference
+            for reference in state.get("artifact_references") or []
+        ],
+    }
+
+
 def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
     """Validate full internal facts and derive the public completeness projection."""
+    container_updates = _reconcile_inspected_containers(state)
+    state = {**state, **container_updates}
     reference_findings = _reference_coverage_findings(state)
     size_findings = _size_coverage_findings(
         state,
@@ -822,12 +879,13 @@ def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
         *reference_statuses,
     ]
     completeness, effective_finding_ids = finalize_ledger(merged_state)
-    if coverage_findings and completeness["status"] == "complete":
+    if coverage_findings and completeness["status"] in {"complete", "complete_with_caveats"}:
         completeness["status"] = "partial"
         completeness["is_complete"] = False
         limitations = completeness.setdefault("limitations", [])
         limitations.append("One or more artifacts were not completely inspected.")
     return {
+        **container_updates,
         "analysis_completeness": completeness,
         "execution_successful": completeness["execution_successful"],
         "findings": coverage_findings,

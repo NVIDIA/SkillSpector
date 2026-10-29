@@ -21,6 +21,7 @@ from skillspector.artifacts import (
     _concealed_instruction_run_spans,
     _contextual_default_ignorable_boundary_spans,
     _obfuscated_instruction_matches,
+    binary_instruction_view,
     multiline_prompt_injection_view,
     prompt_injection_letter_spacing_view,
 )
@@ -1054,14 +1055,36 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                             confidence=1.0,
                         )
                     )
-                if artifact.get("content_kind") not in {
+                if artifact.get("readable_binary") or artifact.get("content_kind") not in {
                     ContentKind.BINARY,
                     ContentKind.OPAQUE,
                 }:
-                    format_density, mixed_script, first_nul_line, first_obfuscation_line = (
-                        _text_signals(content, budget)
-                    )
-                    if artifact.get("contains_nul") and first_nul_line is not None:
+                    signal_content = content
+                    binary_view = None
+                    if artifact.get("readable_binary"):
+                        binary_view = binary_instruction_view(content)[0]
+                        signal_content = binary_view.text
+                    (
+                        format_density,
+                        mixed_script,
+                        first_nul_line,
+                        first_obfuscation_line,
+                    ) = _text_signals(signal_content, budget)
+                    if first_obfuscation_line is not None and binary_view is not None:
+                        projected_start = sum(
+                            len(line)
+                            for line in signal_content.splitlines(keepends=True)[
+                                : first_obfuscation_line - 1
+                            ]
+                        )
+                        first_obfuscation_line = get_line_number(
+                            content, binary_view.source_offset(projected_start)
+                        )
+                    if (
+                        artifact.get("contains_nul")
+                        and not artifact.get("readable_binary")
+                        and first_nul_line is not None
+                    ):
                         budget.emit(
                             _finding(
                                 "AE3",
@@ -1072,7 +1095,10 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                                 line=first_nul_line,
                             )
                         )
-                    if format_density >= 0.01 or mixed_script:
+                    # Compressed binary bytes can resemble mixed-script Unicode text.
+                    if not artifact.get("readable_binary") and (
+                        format_density >= 0.01 or mixed_script
+                    ):
                         budget.emit(
                             _finding(
                                 "AE4",

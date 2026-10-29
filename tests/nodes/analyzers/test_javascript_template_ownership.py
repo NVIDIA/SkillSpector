@@ -132,3 +132,17 @@ def test_ledger_completes_benign_templates_and_preserves_dynamic_partial_result(
     dynamic_row = dynamic["inspection_ledger"][0]
     assert dynamic_row["outcome"] is LedgerOutcome.PARTIAL
     assert dynamic_row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        pytest.param("[0]", id="number"),
+        pytest.param("[null]", id="null"),
+        pytest.param("[false]", id="boolean"),
+    ],
+)
+def test_non_string_computed_member_with_template_does_not_crash(member: str) -> None:
+    source = f"items{member}(); const name = `file-${{id}}`;" + _PADDING
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript") is False

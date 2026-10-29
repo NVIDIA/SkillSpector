@@ -48,7 +48,7 @@ from .annotation import annotate_findings, is_language_compatible
 from .api_pool import ApiKey, ApiKeyPool, PooledChatModel, create_api_key_pool_from_env
 from .detection import detect_language, detect_skill_language
 from .discovery import discover_skills
-from .gap_fill import GapFillAnalyzer, GapFillFinding, GapFillResult, run_gap_fill
+from .gap_fill import GapFillAnalyzer, GapFillError, GapFillFinding, GapFillResult, run_gap_fill
 from .runner import run_one
 
 __all__ = [
@@ -60,6 +60,7 @@ __all__ = [
     "detect_skill_language",
     "discover_skills",
     "GapFillAnalyzer",
+    "GapFillError",
     "GapFillFinding",
     "GapFillResult",
     "is_language_compatible",

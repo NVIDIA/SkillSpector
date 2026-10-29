@@ -41,6 +41,21 @@ _LEADING_QUALIFIER = re.compile(
     r"instead|for|to|in|on|during|after|before)\b",
     re.IGNORECASE,
 )
+# A comma or colon can introduce a defensive instruction, but also a condition or scope.
+# Callers opting into that boundary must still reject the latter. Prepositions
+# inside an earlier independent action ("Use X for rendering:") are not scopes
+# on the prohibition; a leading "For rendering:" is.
+_CLAUSE_PREFIX_QUALIFIER = re.compile(
+    r"\b(?:unless|except|until|if|when|whenever|while|only|otherwise|else|but|however|"
+    r"instead)\b|\A[ \t]*(?:for|to|in|on|during|after|before)\b",
+    re.IGNORECASE,
+)
+_CLAUSE_MARKDOWN_PREFIX = re.compile(
+    r"\A[ \t]*(?:>[ \t]*)*"
+    r"(?:(?:[-+]|\d{1,9}[.)])[ \t]+)?(?:#{1,6}[ \t]+)?"
+)
+# Brackets and punctuation inside reference paths cannot discard a leading scope.
+_CLAUSE_PREFIX_BREAK = re.compile(rf"[{LINE_BREAK_CHARS}]|[.!?;](?=\s|\Z)")
 
 # Reversal wording is matched by stem so that every inflection ("negation",
 # "inverts", "opposites", "contrarily", ...) retains detection.
@@ -106,6 +121,7 @@ def is_directly_prohibited(
     *,
     allowed_tail: re.Pattern[str] | None = None,
     allow_yara_continuation: bool = False,
+    allow_clause_prefix: bool = False,
 ) -> bool:
     """Whether a bounded, unambiguous prohibition governs this exact action.
 
@@ -116,6 +132,9 @@ def is_directly_prohibited(
     fully match the caller's allowed_tail grammar after formatting is stripped.
     Callers may allow YARA-only continuations only when content is raw source,
     because YARA does not scan normalized or reconstructed security views.
+    A caller may opt into comma/colon prefixes only after its own matcher establishes
+    action ownership; leading conditions, scopes, quotes and reversals still
+    retain detection.
     Work per match is constant-bounded; unknown or incomplete context retains
     detection.
     """
@@ -124,6 +143,21 @@ def is_directly_prohibited(
     left = max(0, start - _CONTEXT_CHARS)
     prefix = content[left:start].translate(_MARKDOWN)
     prohibited = _DIRECT_PREFIX.search(prefix)
+    if allow_clause_prefix:
+        prefix_boundary = max(prefix.rfind(":"), prefix.rfind(","))
+        if prefix_boundary >= 0 and _DIRECT_PREFIX.fullmatch(prefix[prefix_boundary + 1 :]):
+            preceding_clause = _CLAUSE_PREFIX_BREAK.split(prefix[:prefix_boundary])[-1]
+            scope_view = _CLAUSE_MARKDOWN_PREFIX.sub("", preceding_clause, count=1)
+            if (
+                not scope_view
+                or not scope_view[0].isalpha()
+                or _CLAUSE_PREFIX_QUALIFIER.search(scope_view)
+            ):
+                return False
+            # This is a bounded boolean view; source offsets and findings stay
+            # unchanged. Retain all leading text for quote/reversal checks.
+            prefix = prefix[:prefix_boundary] + ";" + prefix[prefix_boundary + 1 :]
+            prohibited = _DIRECT_PREFIX.search(prefix)
     if prohibited is None or (left and prohibited.start() == 0):
         return False
     leading = prefix[: prohibited.start()]

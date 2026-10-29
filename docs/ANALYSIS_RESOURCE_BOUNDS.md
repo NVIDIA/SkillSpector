@@ -16,7 +16,7 @@ Values below are implementation defaults. MiB means 1,048,576 bytes.
 | Discovery time | 30 seconds | One skill bundle |
 | Canonical cached source bytes | 64 MiB | Ordinary files and expanded nested members combined |
 | Cached bytes from one filesystem artifact | 16 MiB | One artifact |
-| End-to-end workflow time | 600 seconds | One graph execution |
+| End-to-end workflow time | 1080 seconds | One graph execution |
 | Cache and context-processing time | 60 seconds | One skill bundle, within the workflow deadline |
 
 The 64 MiB ceiling accounts for the canonical raw bytes retained for analysis. Local decoded text
@@ -123,6 +123,18 @@ The finding and incomplete-analysis gates remain active until the relevant
 limitations are resolved. Evidence fields are diagnostic facts, not suppression
 instructions.
 
+### Markdown prose apostrophes
+
+In a complete Markdown file, a possessive or contraction such as `reference's`,
+`drivers'` or `don't` in a prose line is punctuation, not a shell single quote
+that stays open through the rest of the file. This applies only when every quote
+on the line is such a word apostrophe, the line has no `$`, backtick, backslash
+or double quote, and the line starts a new shell line: the previous line ends in
+a newline, not a backslash continuation or a Unicode line separator. Headings,
+block quotes, code blocks, HTML blocks, tables, lines inside a pending inline
+code span, and an apostrophe inside a quote or substitution that starts earlier
+keep the lexical reading.
+
 ### Perl literal help text
 
 For `.pl` source, the tool-misuse analyzer recognizes a narrow form of standalone
@@ -163,7 +175,14 @@ apostrophe in a comment, is charged only up to the end of that token, never to
 the code that follows. Python code that happens to use a shell wrapper name, as
 in `signal.alarm(timeout)`, is not reparsed as a shell command string. A
 runtime-selected command named in a comment takes operands only from that
-comment.
+comment. One named in a string literal takes operands only from the rest of
+that string's value: the literal's body and the bodies of literals implicitly
+or `+`-concatenated after it. A value that code can still extend or rewrite,
+with `%`, `.format` or another method call, a subscript, repetition, or a
+non-literal operand, keeps the conservative result, also after a closing
+parenthesis. An f-string replacement field among the operands may supply the
+recursive and force options, so a root target beside it also stays
+conservative.
 
 Literal payloads remain visible to every security check. A single string or
 comment that itself holds more unresolved shell text than the parser bound,
@@ -229,7 +248,7 @@ work consume the same allowance.
 | External targets | 32 | One traversal |
 | Downloaded and cached source bytes | 10 MiB | Root and dependencies combined |
 | Discovered and expanded artifacts | 10,000 | Root and dependencies combined |
-| Traversal time | 600 seconds | Root and dependencies combined |
+| Traversal time | 1080 seconds | Root and dependencies combined |
 | Reference source records | 1,024 | One extraction |
 | Reference source bytes | 1,000,000 | One extraction |
 | Raw reference candidates | 4,096 | One extraction |
@@ -263,7 +282,7 @@ removes the rejected partial checkout.
 | Retained YARA string instances | 4,096 | One matched rule |
 | Shipped-bytecode discovery entries | 10,000 | One analyzer execution |
 | Shipped-bytecode traversal depth | 64 | One analyzer execution |
-| Shipped-bytecode analysis time | 5 seconds | One analyzer execution, within the workflow deadline |
+| Shipped-bytecode active processing time | 5 seconds | One analyzer execution, within the workflow wall-clock deadline |
 | Dependency manifests | 64 | One analyzer execution |
 | Dependency packages | 256 | One manifest |
 | Dependency packages | 1,024 | One analyzer execution |
@@ -271,7 +290,7 @@ removes the rejected partial checkout.
 | Dependency analysis time | 30 seconds | One analyzer execution, within the workflow deadline |
 | OSV packages / query batches / detail requests | 256 / 4 / 64 | One dependency analysis budget |
 | OSV response bytes / retained results | 4 MiB / 256 | One dependency analysis budget |
-| TP4 source files / batches / findings | 128 / 64 / 64 | One analyzer execution |
+| TP4 source files / batches / findings | 128 / 256 / 64 | One analyzer execution |
 | TP4 source and prompt input | 4 MiB each | One analyzer execution |
 | TP4 model input | 32,000 tokens | One batch |
 | Public finding and occurrence records | 10,000 | One report |
@@ -319,12 +338,27 @@ A low score or zero findings must not be interpreted as complete coverage when
 
 ## Configuring the aggregate workflow deadline
 
-The scanner limits one complete workflow to 600 seconds by default. Set
+The scanner limits one complete workflow to 1080 seconds (18 minutes) by default. Set
 `SKILLSPECTOR_MAX_WORKFLOW_SECONDS` to a positive finite number of seconds to
 change that aggregate deadline. The setting applies to direct,
 CLI, recursive, and multi-skill scans; byte and artifact ceilings remain in
 effect. Invalid, zero, negative, infinite, or NaN values safely keep the
-600-second default.
+1080-second default. Caller-supplied budgets remain authoritative. External
+process limits, including CI job and integration timeouts, can stop a scan sooner.
+
+## Configuring the TP4 batch limit
+
+TP4 description-behavior analysis allows up to 256 review batches per analyzer
+execution by default. Set `SKILLSPECTOR_TP4_MAX_BATCHES` to a decimal integer from
+1 to 4096 to change this limit. Unset or blank values retain the default. Invalid,
+zero, negative, fractional, or out-of-range values log a warning without echoing
+the supplied text and retain the 256-batch default.
+
+This setting changes only the batch count: source-file, byte, token, finding,
+concurrency, and remaining workflow-time limits still apply. Reaching a limit
+keeps the affected work incomplete; a larger allowance does not guarantee that
+every batch will finish. Set both environment variables before starting the
+SkillSpector process; they are read when their modules are imported.
 
 ## Configuring the static analysis deadline
 

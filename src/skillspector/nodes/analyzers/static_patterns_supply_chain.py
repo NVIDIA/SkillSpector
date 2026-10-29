@@ -31,6 +31,7 @@ Node and analyze() in one module.
 from __future__ import annotations
 
 import ast
+import base64
 import codecs
 import functools
 import io
@@ -65,6 +66,7 @@ from skillspector.inspection_ledger import (
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import (
+    MAX_WORKFLOW_SECONDS,
     AnalyzerNodeResponse,
     SkillspectorState,
     transitive_note_truncation,
@@ -265,6 +267,121 @@ def _decoded_literal_xor_calls(content: str) -> list[tuple[int, str]]:
     return decoded
 
 
+_MAX_SHELL_LITERAL_CHARS = 16_384
+# Shell decoders that print a base64, base32 or hex payload. Flag runs stay
+# short and bounded, and the group is atomic, so a flag such as -dddd that
+# parses several ways cannot multiply backtracking.
+_SC3_SHELL_DECODER = (
+    r"(?>\bbase(?:64|32)(?:[ \t]{1,16}--?[A-Za-z][\w=-]{0,20}){0,3}?"
+    r"[ \t]{1,16}(?:--decode|-[A-Za-z]{0,3}d[A-Za-z]{0,3})\b"
+    r"|\bxxd(?:[ \t]{1,16}-[A-Za-z]{1,10}){0,3}?[ \t]{1,16}-(?:r|rp|pr|rps|psr|revert)\b"
+    r"|\bopenssl[ \t]{1,16}(?:base64|enc)(?:[ \t]{1,16}-[A-Za-z0-9-]{1,16}){0,4}?[ \t]{1,16}-d\b)"
+)
+# One pipeline stage. It ends at a pipe, a list operator, a newline, an
+# inline-code backtick or a backslash (so a JSON-escaped \n ends it too), but
+# keeps up to two redirections such as 2>&1 or JSON-escaped quotes. Runs are
+# possessive, so a failed match never backtracks into them.
+_SC3_PIPE_SEGMENT = r"[^|;&\n`\\]{0,256}+(?:(?:&[0-9>-]|\\['\"])[^|;&\n`\\]{0,64}+){0,2}+"
+# A shell reads its program from stdin unless -c or a script operand supplies
+# one. An interpreter counts only without a program argument:
+# `python3 -m json.tool` and `python3 "$dir/render.py"` read data. A sudo
+# option argument cannot start with "-", so each sudo word parses one way.
+_SC3_PIPE_EXECUTOR = (
+    r"\|(?!\|)&?[ \t]{0,16}"
+    r"(?:sudo(?:[ \t]{1,16}+-[A-Za-z]{1,8}+(?:[ \t]{1,16}+[\w.][\w.-]{0,31}+)?){0,4}[ \t]{1,16}+)?"
+    r"(?:(?:/[\w.-]{1,32}){0,4}/)?"
+    r"(?:(?:ba|da|z|k|a)?sh(?![\w.-])"
+    r"(?![ \t]{1,16}(?:-[A-Za-z]{1,8}[ \t]{1,16}){0,3}-[A-Za-z]{0,3}c)"
+    r"(?![ \t]{1,16}(?!-|/dev/stdin\b|[0-9]{0,2}[<>])[^\s|;&)#])"
+    r"|(?:python(?:[23](?:\.[0-9]{1,2})?)?|perl|ruby|node)(?:[ \t]{1,16}-[A-Za-z]{0,4}){0,2}"
+    r"(?=['\"]|[ \t]{0,16}(?:$|[\r;&|)`#]|[0-9]{0,2}>)))"
+)
+# eval, -c and -e run their argument whichever substitution supplies it. A bare
+# shell, interpreter or source runs only content it reads from <(...),
+# < <(...) or a here-string; given "$(...)" it runs a file path. Executor words
+# must start a word, so `deploy.sh "$(...)"` and `--source "$(...)"` do not
+# count. `.` counts only in command position, at a line start or after an
+# operator, a bracket, a backtick or a quote, so `jq . <<< ...` and
+# `tar -C . < <(...)` do not count. A backslash admits JSON-escaped quotes in
+# hook configs.
+_SC3_SUBSTITUTION_EXECUTOR = (
+    r"(?:(?<![\w.-])(?:eval|(?:ba|da|z|k|a)?sh[ \t]{1,16}-[A-Za-z]{0,3}c"
+    r"|python(?:[23](?:\.[0-9]{1,2})?)?[ \t]{1,16}-c|(?:perl|ruby|node)[ \t]{1,16}-e)"
+    r"[ \t]{1,16}\\?[\"']?(?:\$\(|`)"
+    r"|(?:(?<![\w.-])(?:source|(?:ba|da|z|k|a)?sh|python(?:[23](?:\.[0-9]{1,2})?)?|perl|ruby|node)"
+    r"|(?:^|(?<=[;&|(`'\"{]))[ \t]{0,16}\.)"
+    r"(?:[ \t]{1,16}-{1,2}[A-Za-z]{0,16}){0,2}(?:[ \t]{1,16}/dev/stdin)?"
+    r"[ \t]{1,16}(?:<<<[ \t]{0,16}\\?[\"']?(?:\$\(|`)|<(?:[ \t]{0,16}<)?\())"
+)
+# Options and the here-string operator between a decoder and an inline literal.
+_SC3_HERE_STRING = r"(?:[ \t]{1,16}-[A-Za-z0-9-]{1,16}){0,4}[ \t]{0,16}<<<[ \t]{0,16}"
+_SC3_SHELL_LITERAL = (
+    rf"(?P<quote>(?:\\?['\"])?)(?P<literal>[A-Za-z0-9+/=]{{8,{_MAX_SHELL_LITERAL_CHARS}}})"
+)
+_SC3_PIPED_LITERAL = re.compile(
+    r"\b(?:echo(?:[ \t]{1,16}-[neE]{1,3})?"
+    r"|printf(?:[ \t]{1,16}(?P<format_quote>['\"]?)%s(?:\\n)?(?P=format_quote))?)"
+    rf"[ \t]{{1,16}}{_SC3_SHELL_LITERAL}(?P=quote)"
+    rf"[ \t]{{0,16}}\|(?!\|)[ \t]{{0,16}}(?P<decoder>{_SC3_SHELL_DECODER})",
+    re.IGNORECASE,
+)
+_SC3_HERE_STRING_LITERAL = re.compile(
+    rf"(?P<decoder>{_SC3_SHELL_DECODER}){_SC3_HERE_STRING}{_SC3_SHELL_LITERAL}"
+    rf"(?![A-Za-z0-9+/=])(?P=quote)",
+    re.IGNORECASE,
+)
+_SC3_SHELL_DECODE_COMMAND = re.compile(_SC3_SHELL_DECODER, re.IGNORECASE)
+_SC3_DECODED_DATA_SINK = re.compile(
+    r"(?:[ \t]{1,16}-[A-Za-z0-9-]{1,16}){0,4}[ \t]{0,16}"
+    r"\|(?!\|)&?[ \t]{0,16}sha256sum(?=$|[\s;&|)`])"
+)
+
+
+def _decoded_shell_literal_payloads(content: str) -> list[tuple[int, str]]:
+    """Decode literal payloads fed to a shell decoder.
+
+    Only an inline echo/printf argument or a here-string is decoded, as base64,
+    base32 or (for xxd) hex; an ``openssl enc`` cipher is not applied.
+    Direct checksum consumers are exempt only in a simple shell context without
+    alias, function or dynamic-command syntax. Other flows remain conservative
+    because a saved payload can be executed later.
+    Variables, files and downloads stay opaque. Invalid UTF-8 becomes U+FFFD,
+    so a stray byte cannot hide the command. Returns ``(offset, text)`` pairs
+    in source order.
+    """
+    checksum_exemption_allowed: bool | None = None
+    decoded: list[tuple[int, str]] = []
+    for pattern in (_SC3_PIPED_LITERAL, _SC3_HERE_STRING_LITERAL):
+        for match in pattern.finditer(content):
+            if _SC3_DECODED_DATA_SINK.match(content, match.end()) is not None:
+                if checksum_exemption_allowed is None:
+                    # Normalize once: escaped or quoted words can still configure aliases.
+                    tokens = _shell_tokens(content)
+                    checksum_exemption_allowed = tokens is not None and not any(
+                        token in {"alias", "function", "eval", "source", "."}
+                        or token.startswith("sha256sum=")
+                        or any(character.isspace() or character in "()" for character in token)
+                        for token in tokens
+                    )
+                if checksum_exemption_allowed:
+                    continue
+            literal = match.group("literal")
+            decoder = match.group("decoder").lower()
+            try:
+                if decoder.startswith("xxd"):
+                    # Like xxd -r -p, ignore a trailing odd nibble.
+                    payload = bytes.fromhex(literal[: len(literal) // 2 * 2])
+                elif decoder.startswith("base32"):
+                    payload = base64.b32decode(literal + "=" * (-len(literal) % 8))
+                else:
+                    payload = base64.b64decode(literal + "=" * (-len(literal) % 4), validate=True)
+            except ValueError:
+                continue
+            decoded.append((match.start("literal"), payload.decode("utf-8", errors="replace")))
+    decoded.sort()
+    return decoded
+
+
 SC3_CODE_PATTERNS = [
     (r"exec\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
     (r"eval\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
@@ -287,6 +404,23 @@ SC3_PROSE_PATTERNS = [
     (r"decode\s+(?:this|the)\s+(?:base64|hex)\s+(?:and\s+)?(?:run|execute)", 0.8),
 ]
 SC3_PATTERNS = SC3_CODE_PATTERNS + SC3_PROSE_PATTERNS
+# Shell decode-to-execute chains run on every file type, like SC2, because
+# SKILL.md instructions and hook configs carry shell commands too.
+SC3_SHELL_PATTERNS = [
+    (
+        # A here-string literal can outgrow a pipeline stage, so it is consumed
+        # whole, and possessively, before the first stage.
+        rf"{_SC3_SHELL_DECODER}(?:{_SC3_HERE_STRING}\\?['\"]?"
+        rf"[A-Za-z0-9+/=]{{0,{_MAX_SHELL_LITERAL_CHARS}}}+)?+{_SC3_PIPE_SEGMENT}"
+        rf"(?:\|(?!\|)&?{_SC3_PIPE_SEGMENT}){{0,3}}?{_SC3_PIPE_EXECUTOR}",
+        0.9,
+    ),
+    (
+        rf"{_SC3_SUBSTITUTION_EXECUTOR}[^()`\n]{{0,{_MAX_SHELL_LITERAL_CHARS}}}?"
+        rf"{_SC3_SHELL_DECODER}",
+        0.9,
+    ),
+]
 
 # SC7: Untrusted Container Image — pulling images with signature/registry
 # verification turned off. These flags disable image trust regardless of the
@@ -1261,7 +1395,12 @@ def _extract_packages_from_requirements_detailed(
     return results, largest_omitted
 
 
-_NPM_DEPENDENCY_SECTIONS = ("dependencies", "devDependencies", "peerDependencies")
+_NPM_DEPENDENCY_SECTIONS = (
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+)
 
 
 def _package_json_line(content: str, section: str, name: str) -> int:
@@ -1338,7 +1477,9 @@ def _extract_packages_from_package_json_scan(
     in_deps = False
     for i, line in enumerate(content.splitlines(), 1):
         stripped = line.strip()
-        if re.search(r'"(?:dependencies|devDependencies|peerDependencies)"', stripped):
+        if re.search(
+            r'"(?:dependencies|devDependencies|peerDependencies|optionalDependencies)"', stripped
+        ):
             in_deps = True
             continue
         if in_deps and stripped.startswith("}"):
@@ -1373,6 +1514,9 @@ def _extract_packages_from_package_json(
         return _extract_packages_from_package_json_scan(content, limit=limit)
     if not isinstance(data, dict):
         return []
+    # npm installs an optionalDependencies entry in place of a same-name "dependencies" entry.
+    optional = data.get("optionalDependencies")
+    overridden = set(optional) if isinstance(optional, dict) else set()
     dependencies: list[tuple[str, str, str]] = []
     for section in _NPM_DEPENDENCY_SECTIONS:
         deps = data.get(section)
@@ -1380,6 +1524,8 @@ def _extract_packages_from_package_json(
             continue
         for name, spec in deps.items():
             if not isinstance(name, str) or not isinstance(spec, str):
+                continue
+            if section == "dependencies" and name in overridden:
                 continue
             dependencies.append((section, name, spec))
             if limit is not None and len(dependencies) >= max(0, limit):
@@ -1473,6 +1619,207 @@ _LOCKFILE_PACKAGE_BLOCK_RE = re.compile(
     r"(?ms)^\s*\[\[package\]\]\s*$.*?(?=^\s*\[\[package\]\]\s*$|\Z)"
 )
 
+_PIPFILE_METADATA_SECTIONS = frozenset({"source", "requires", "scripts", "pipenv"})
+_PIPFILE_KEY_RE = re.compile(r"""^[ \t]*("(?:\\.|[^"\\])*"|'[^']*'|[A-Za-z0-9_-]+)[ \t]*=""")
+_JSON_TOKEN_RE = re.compile(r'"(?:\\.|[^"\\])*"|[{}\[\]]')
+_JSON_KEY_SUFFIX_RE = re.compile(r"\s*:")
+_TOML_STRING_TOKEN_RE = re.compile(r'''"""|\x27{3}|"(?:\\.|[^"\\])*"|'[^']*'|\#.*''')
+_TOML_MULTILINE_END_RE = {
+    '"""': re.compile(r'(?<!\\)(?:\\\\)*"""'),
+    "'''": re.compile("'''"),
+}
+
+
+def _pipenv_package_lines(
+    content: str, requested: set[tuple[str, str]], *, is_lockfile: bool
+) -> dict[tuple[str, str], int]:
+    """Index package keys once, retaining separate locations for each category."""
+    locations: dict[tuple[str, str], int] = {}
+    if not requested:
+        return locations
+    if is_lockfile:
+        depth = 0
+        section = ""
+        line = 1
+        position = 0
+        for token in _JSON_TOKEN_RE.finditer(content):
+            line += content.count("\n", position, token.start())
+            position = token.start()
+            value = token.group(0)
+            if value in {"{", "["}:
+                depth += 1
+            elif value in {"}", "]"}:
+                depth -= 1
+            elif depth in {1, 2} and _JSON_KEY_SUFFIX_RE.match(content, token.end()):
+                key = json.loads(value)
+                if depth == 1:
+                    section = key
+                elif (section, key) in requested:
+                    locations[(section, key)] = line
+        return locations
+
+    section = ""
+    multiline_quote: str | None = None
+    for line_number, line in enumerate(io.StringIO(content), 1):
+        was_multiline = multiline_quote is not None
+        position = 0
+        if multiline_quote is not None:
+            closing = _TOML_MULTILINE_END_RE[multiline_quote].search(line)
+            if closing is None:
+                continue
+            multiline_quote = None
+            position = closing.end()
+        while token := _TOML_STRING_TOKEN_RE.search(line, position):
+            quote = token.group(0)
+            if quote.startswith("#"):
+                break
+            position = token.end()
+            if quote in _TOML_MULTILINE_END_RE:
+                closing = _TOML_MULTILINE_END_RE[quote].search(line, position)
+                if closing is None:
+                    multiline_quote = quote
+                    break
+                position = closing.end()
+        if was_multiline:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("["):
+            try:
+                header = tomllib.loads(stripped)
+            except tomllib.TOMLDecodeError:
+                section = ""
+                continue
+            section = next(iter(header), "")
+            children = header.get(section)
+            if isinstance(children, dict):
+                for name in children:
+                    if (section, name) in requested:
+                        locations[(section, name)] = line_number
+            continue
+        key_match = _PIPFILE_KEY_RE.match(line)
+        if key_match is None:
+            continue
+        try:
+            key = next(iter(tomllib.loads(f"{key_match.group(1)} = 0")))
+        except tomllib.TOMLDecodeError:
+            continue
+        if (section, key) in requested:
+            locations[(section, key)] = line_number
+    return locations
+
+
+def _extract_packages_from_pipenv(
+    content: str,
+    *,
+    is_lockfile: bool,
+    limit: int | None = None,
+) -> tuple[list[tuple[str, str | None, int]], list[OsvQueryLimitation]]:
+    """Extract bounded Pipenv registry dependencies without executing project code.
+
+    Pipfile uses TOML package tables; Pipfile.lock uses JSON categories containing
+    all resolved direct and transitive packages. Metadata is never a dependency.
+    Non-registry sources and malformed entries remain explicit coverage gaps.
+    """
+    entry_limit = MAX_DEPENDENCY_PACKAGES_PER_FILE if limit is None else max(0, limit)
+    if entry_limit == 0:
+        return [], []
+    try:
+        data = json.loads(content) if is_lockfile else tomllib.loads(content)
+    except (ValueError, RecursionError) as error:
+        return [], [
+            OsvQueryLimitation(
+                reason=LedgerReason.DEPENDENCY_PARSE_ERROR,
+                error_class=type(error).__name__,
+            )
+        ]
+    if not isinstance(data, dict):
+        return [], [OsvQueryLimitation(reason=LedgerReason.DEPENDENCY_PARSE_ERROR)]
+
+    results: list[tuple[str, str | None, int]] = []
+    location_keys: list[tuple[str, str]] = []
+    limitations: list[OsvQueryLimitation] = []
+    limitation_keys: set[tuple[LedgerReason, str | None]] = set()
+
+    def note(limitation: OsvQueryLimitation) -> None:
+        key = (limitation.reason, limitation.error_class)
+        if key not in limitation_keys:
+            limitations.append(limitation)
+            limitation_keys.add(key)
+
+    seen = 0
+    for section, entries in data.items():
+        if section in ({"_meta"} if is_lockfile else _PIPFILE_METADATA_SECTIONS):
+            continue
+        if not isinstance(entries, dict):
+            note(OsvQueryLimitation(reason=LedgerReason.DEPENDENCY_PARSE_ERROR))
+            continue
+        for name, entry in entries.items():
+            seen += 1
+            if seen > entry_limit:
+                note(
+                    OsvQueryLimitation(
+                        reason=LedgerReason.OUTPUT_LIMIT,
+                        observed_records=seen,
+                        limit_records=entry_limit,
+                    )
+                )
+                break
+            if len(name) > MAX_DEPENDENCY_NAME_CHARS:
+                note(
+                    OsvQueryLimitation(
+                        reason=LedgerReason.SIZE_LIMIT,
+                        observed_characters=len(name),
+                        limit_characters=MAX_DEPENDENCY_NAME_CHARS,
+                    )
+                )
+                continue
+            if isinstance(entry, dict):
+                if any(source in entry for source in ("git", "path", "file", "hg", "svn", "bzr")):
+                    note(
+                        OsvQueryLimitation(
+                            reason=LedgerReason.DEPENDENCY_PARSE_ERROR,
+                            error_class="UnsupportedDependencySource",
+                        )
+                    )
+                    continue
+                spec = entry.get("version", "" if is_lockfile else "*")
+            else:
+                spec = entry if not is_lockfile else None
+            if not isinstance(spec, str):
+                requirement = None
+            elif len(spec) > MAX_DEPENDENCY_SPEC_CHARS:
+                note(
+                    OsvQueryLimitation(
+                        reason=LedgerReason.SIZE_LIMIT,
+                        observed_characters=len(spec),
+                        limit_characters=MAX_DEPENDENCY_SPEC_CHARS,
+                    )
+                )
+                continue
+            else:
+                requirement = _extract_python_requirement(
+                    name if spec.strip() == "*" else f"{name}{spec}"
+                )
+            if requirement is None or requirement[0] != name:
+                note(OsvQueryLimitation(reason=LedgerReason.DEPENDENCY_PARSE_ERROR))
+                continue
+            if is_lockfile and requirement[1] is None:
+                note(OsvQueryLimitation(reason=LedgerReason.DEPENDENCY_PARSE_ERROR))
+                continue
+            results.append((*requirement, 1))
+            location_keys.append((section, name))
+        if seen > entry_limit:
+            break
+    locations = _pipenv_package_lines(content, set(location_keys), is_lockfile=is_lockfile)
+    return [
+        (name, version, locations.get(key, 1))
+        for (name, version, _line), key in zip(results, location_keys, strict=True)
+    ], limitations
+
+
+def _is_pipenv_lockfile(file_path: str) -> bool:
+    return Path(file_path).name.lower() == "pipfile.lock"
+
 
 def _normalize_package_name(name: str) -> str:
     """Normalize package names the same way OSV/fallback coverage does."""
@@ -1481,7 +1828,7 @@ def _normalize_package_name(name: str) -> str:
 
 def _is_python_lockfile(file_path: str) -> bool:
     lower_path = file_path.lower()
-    return "uv.lock" in lower_path or "poetry.lock" in lower_path
+    return "uv.lock" in lower_path or "poetry.lock" in lower_path or _is_pipenv_lockfile(file_path)
 
 
 def _normalize_npm_package_name(name: str) -> str:
@@ -1643,19 +1990,26 @@ def _apply_locked_versions(
     return resolved
 
 
+def _python_lock_scope(file_path: str) -> tuple[str, bool]:
+    """Associate Pipenv locks only with sibling Pipfiles, not other manifests."""
+    path = Path(file_path)
+    return str(path.parent), path.name.lower() in {"pipfile", "pipfile.lock"}
+
+
 def _collect_locked_versions(
     file_cache: dict[str, str],
     components: list[str],
     *,
+    file_path: str = "requirements.txt",
     limit: int = MAX_DEPENDENCY_PACKAGES_PER_SCAN,
 ) -> dict[str, str]:
-    """Build package -> exact version map from Python lockfiles in the project."""
+    """Build the exact version map associated with a Python manifest."""
     locked_versions, _limitations = _collect_locked_versions_detailed(
         file_cache,
         components,
         limit=limit,
     )
-    return locked_versions
+    return locked_versions.get(_python_lock_scope(file_path), {})
 
 
 def _collect_locked_versions_detailed(
@@ -1665,9 +2019,10 @@ def _collect_locked_versions_detailed(
     limit: int = MAX_DEPENDENCY_PACKAGES_PER_SCAN,
     max_files: int | None = None,
     timeout_seconds: float | None = None,
-) -> tuple[dict[str, str], list[tuple[str, OsvQueryLimitation]]]:
+) -> tuple[dict[tuple[str, bool], dict[str, str]], list[tuple[str, OsvQueryLimitation]]]:
     """Build a bounded lock map and identify any manifest whose tail was omitted."""
-    locked_versions: dict[str, str] = {}
+    locked_versions: dict[tuple[str, bool], dict[str, str]] = {}
+    ambiguous_versions: set[tuple[tuple[str, bool], str]] = set()
     limitations: list[tuple[str, OsvQueryLimitation]] = []
     packages_seen = 0
     lockfiles_seen = 0
@@ -1709,7 +2064,7 @@ def _collect_locked_versions_detailed(
             )
             break
         content = file_cache.get(path)
-        if not content:
+        if content is None or (not content and not _is_pipenv_lockfile(path)):
             continue
         remaining = max(0, limit - packages_seen)
         if remaining <= 0:
@@ -1724,11 +2079,17 @@ def _collect_locked_versions_detailed(
                 )
             )
             break
-        packages = _extract_packages_from_toml_lock(
-            content,
-            limit=remaining + 1,
-        )
-        if len(packages) > remaining:
+        if _is_pipenv_lockfile(path):
+            packages, parse_limitations = _extract_packages_from_pipenv(
+                content,
+                is_lockfile=True,
+                limit=remaining + 1,
+            )
+            limitations.extend((path, limitation) for limitation in parse_limitations)
+        else:
+            packages = _extract_packages_from_toml_lock(content, limit=remaining + 1)
+        package_limit_exceeded = len(packages) > remaining
+        if package_limit_exceeded:
             limitations.append(
                 (
                     path,
@@ -1741,10 +2102,24 @@ def _collect_locked_versions_detailed(
             )
             packages = packages[:remaining]
         packages_seen += len(packages)
+        scope = _python_lock_scope(path)
         for name, version, _line_num in packages:
             if version:
-                locked_versions[_normalize_package_name(name)] = version
-        if limitations:
+                project_versions = locked_versions.setdefault(scope, {})
+                normalized_name = _normalize_package_name(name)
+                key = scope, normalized_name
+                if key in ambiguous_versions:
+                    continue
+                previous_version = project_versions.get(normalized_name)
+                if previous_version is not None and previous_version != version:
+                    # Different categories or lockfiles can pin different versions.
+                    # Keep scanning each pin, but do not guess for an unpinned manifest.
+                    project_versions.pop(normalized_name)
+                    ambiguous_versions.add(key)
+                else:
+                    project_versions[normalized_name] = version
+        # File-local parse gaps must not prevent resolution in other projects.
+        if package_limit_exceeded:
             break
     return locked_versions, limitations
 
@@ -2127,28 +2502,54 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     )
                 )
                 break
-    if file_type in ("python", "javascript", "shell", "perl", "other"):
-        for pattern, confidence in SC3_PATTERNS:
-            matches = (
-                static_runner.iter_paragraph_matches
-                if (pattern, confidence) in SC3_PROSE_PATTERNS
-                else re.finditer
-            )
-            for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
-                line_num = line_number(match.start())
+    # Every shell decode check needs a decoder command, which most files lack.
+    has_shell_decoder = _SC3_SHELL_DECODE_COMMAND.search(content) is not None
+    if has_shell_decoder:
+        for start, command in _decoded_shell_literal_payloads(content):
+            for pattern, confidence in SC2_PATTERNS:
+                if not re.search(pattern, command, re.IGNORECASE | re.MULTILINE):
+                    continue
                 findings.append(
                     AnalyzerFinding(
-                        rule_id="SC3",
-                        message="Obfuscated Code",
+                        rule_id="SC2",
+                        message="External Script Fetching",
                         severity=Severity.HIGH,
-                        location=loc(line_num),
+                        location=loc(line_number(start)),
                         confidence=confidence,
-                        tags=tag,
-                        context=ctx(match.start()),
-                        matched_text=match.group(0)[:200],
-                        complete_match=match.group(0),
+                        tags=list(tag),
+                        context=ctx(start),
+                        matched_text=command[:200],
                     )
                 )
+                break
+    sc3_patterns = (
+        SC3_PATTERNS
+        if file_type in ("python", "javascript", "shell", "perl", "powershell", "other")
+        else []
+    )
+    if has_shell_decoder:
+        sc3_patterns = sc3_patterns + SC3_SHELL_PATTERNS
+    for pattern, confidence in sc3_patterns:
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in SC3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = line_number(match.start())
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="SC3",
+                    message="Obfuscated Code",
+                    severity=Severity.HIGH,
+                    location=loc(line_num),
+                    confidence=confidence,
+                    tags=tag,
+                    context=ctx(match.start()),
+                    matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
+                )
+            )
     # SC7: untrusted container image. Example filtering is delegated to the runner.
     for pattern, confidence in SC7_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
@@ -2759,7 +3160,14 @@ def _analyze_dependencies_detailed(
     extraction_limit = package_limit + 1
 
     if is_python_dep:
-        if "pyproject.toml" in lower_path:
+        if Path(file_path).name.lower() in {"pipfile", "pipfile.lock"}:
+            packages, parse_limitations = _extract_packages_from_pipenv(
+                content,
+                is_lockfile=_is_pipenv_lockfile(file_path),
+                limit=extraction_limit,
+            )
+            limitations.extend(parse_limitations)
+        elif "pyproject.toml" in lower_path:
             packages = _extract_packages_from_pyproject(content, limit=extraction_limit)
         elif is_lockfile:
             packages = _extract_packages_from_toml_lock(content, limit=extraction_limit)
@@ -3212,6 +3620,8 @@ _SC8_BYTECODE_SUFFIXES = (".pyc", ".pyo")
 MAX_SC8_DISCOVERED_ENTRIES = 10_000
 MAX_SC8_DIRECTORY_ENTRIES = 10_000
 MAX_SC8_TRAVERSAL_DEPTH = 64
+# Processing budget, measured with ``time.thread_time()`` so that time spent
+# waiting for the GIL behind concurrently running analyzers does not count.
 MAX_SC8_ANALYSIS_SECONDS = 5.0
 MAX_SC8_FINDINGS = 10_000
 MAX_SC8_LIMITATIONS = 256
@@ -3246,7 +3656,14 @@ def _scan_shipped_bytecode(
     timeout_seconds: float | None = None,
     max_findings: int | None = None,
 ) -> _ShippedBytecodeScanResult:
-    """Discover shipped bytecode with deterministic aggregate resource bounds."""
+    """Discover shipped bytecode with deterministic aggregate resource bounds.
+
+    Analyzers run concurrently in one process, so the walk can spend most of
+    its wall-clock time waiting for the GIL. The processing budget therefore
+    counts only this thread's CPU time. Wall-clock time is bounded by the
+    remaining workflow deadline (``timeout_seconds``), or by the full workflow
+    limit for callers outside a workflow.
+    """
     findings: list[Finding] = []
     limitations: list[_SupplementalLimitation] = []
     if not skill_path or not isinstance(skill_path, str):
@@ -3256,10 +3673,11 @@ def _scan_shipped_bytecode(
         return _ShippedBytecodeScanResult(findings, limitations)
 
     started_at = time.monotonic()
-    runtime_limit = max(0.0, MAX_SC8_ANALYSIS_SECONDS)
-    if timeout_seconds is not None:
-        runtime_limit = min(runtime_limit, max(0.0, timeout_seconds))
-    deadline = started_at + runtime_limit
+    active_started_at = time.thread_time()
+    active_limit = max(0.0, MAX_SC8_ANALYSIS_SECONDS)
+    wall_clock_limit = max(
+        0.0, MAX_WORKFLOW_SECONDS if timeout_seconds is None else timeout_seconds
+    )
     requested_finding_limit = MAX_SC8_FINDINGS if max_findings is None else max_findings
     finding_limit = max(0, min(requested_finding_limit, MAX_SC8_FINDINGS))
     discovered_entries = 0
@@ -3283,15 +3701,20 @@ def _scan_shipped_bytecode(
         )
 
     def runtime_exhausted(relative_directory: str) -> bool:
-        now = time.monotonic()
-        if now < deadline:
+        wall_clock_elapsed = max(0.0, time.monotonic() - started_at)
+        active_elapsed = max(0.0, time.thread_time() - active_started_at)
+        if wall_clock_elapsed >= wall_clock_limit:
+            observed_seconds, limit_seconds = wall_clock_elapsed, wall_clock_limit
+        elif active_elapsed >= active_limit:
+            observed_seconds, limit_seconds = active_elapsed, active_limit
+        else:
             return False
         add_limitation(
             _SupplementalLimitation(
                 path=scope_path(relative_directory),
                 reason=LedgerReason.RUNTIME_LIMIT,
-                observed_seconds=max(0.0, now - started_at),
-                limit_seconds=runtime_limit,
+                observed_seconds=observed_seconds,
+                limit_seconds=limit_seconds,
             )
         )
         return True
@@ -3490,6 +3913,7 @@ def _analyze_concealed_executables(
                 concealment_reasons.append("disguised_container")
         concealment = concealment_reasons[0]
         excluded_from_analysis = metadata.get("excluded_from_analysis") is True
+        partially_analyzed_executable = metadata.get("partially_analyzed_executable") is True
         referenced_uninspected = (
             metadata.get("inspection_limitation_reason")
             == LedgerReason.REFERENCED_UNINSPECTED.value
@@ -3502,6 +3926,8 @@ def _analyze_concealed_executables(
                     if referenced_uninspected
                     else "An excluded artifact could not be completely inspected."
                     if inspection_incomplete
+                    else "Readable text was inspected, but binary executable behavior was not analyzed."
+                    if partially_analyzed_executable
                     else "Executable content is excluded from analysis."
                     if excluded_from_analysis
                     else "Executable content is concealed inside a document, hidden, "
@@ -3527,6 +3953,9 @@ def _analyze_concealed_executables(
                     else "A resource, read, or archive-safety limit left excluded content "
                     "outside deterministic inspection coverage."
                     if inspection_incomplete
+                    else "Text-based checks covered the readable projection, but they cannot "
+                    "establish the behavior of the binary executable."
+                    if partially_analyzed_executable
                     else "An executable artifact remains available under the skill install path "
                     "but its content is outside analyzer coverage."
                     if excluded_from_analysis
@@ -3559,6 +3988,7 @@ def _analyze_concealed_executables(
                     "local_only": True,
                     "referenced": metadata.get("referenced") is True,
                     "excluded_from_analysis": excluded_from_analysis,
+                    "partially_analyzed_executable": partially_analyzed_executable,
                     "excluded_inspection_incomplete": inspection_incomplete,
                     "inherited_exclusion_reason": metadata.get("inherited_exclusion_reason"),
                     "inspection_limitation_reason": metadata.get("inspection_limitation_reason"),
@@ -3766,12 +4196,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             )
             break
         content = file_cache.get(path)
-        if not content:
+        if content is None:
             continue
         dep_findings, dependency_limitations, packages_seen = _analyze_dependencies_detailed(
             content,
             path,
-            locked_versions,
+            locked_versions.get(_python_lock_scope(path)),
             npm_locked_versions,
             max_packages=min(MAX_DEPENDENCY_PACKAGES_PER_FILE, remaining_packages),
             max_findings=min(MAX_DEPENDENCY_FINDINGS_PER_FILE, remaining_dependency_findings),

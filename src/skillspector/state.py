@@ -43,7 +43,7 @@ from skillspector.models import Finding
 
 logger = get_logger(__name__)
 
-DEFAULT_MAX_WORKFLOW_SECONDS = 600.0
+DEFAULT_MAX_WORKFLOW_SECONDS = 1080.0
 
 
 def _workflow_max_seconds_from_environment(value: str | None) -> float:
@@ -240,6 +240,8 @@ class SkillspectorState(TypedDict, total=False):
     skill_path: str | None
     # Relative identity of a wrapped/downloaded explicit file, distinct from passive assets.
     primary_file_path: str | None
+    # Local parent used only for bounded path-metadata checks on single-file scans.
+    primary_file_parent_path: str | None
     # Set/reset by resolve_input from the actual selected source. None means
     # materialization could not establish a current-skill identity; analyzers
     # must not substitute generated directory names or manifest-only aliases.
@@ -350,6 +352,9 @@ class SkillspectorState(TypedDict, total=False):
     # Report generation uses this to distinguish unavailable requested analysis from an
     # explicit static-only scan while analyzers continue to honor use_llm.
     llm_requested: bool
+    # Sanitized reason captured when caller preflight disables requested execution.
+    # Presence (including None) preserves that result without probing a new provider context.
+    llm_preflight_error: str | None
     # Explicit caller scope, recorded in public coverage accounting.
     exclude_patterns: list[str]
     # Monotonic provenance flag: content rooted beneath a hidden/local-only

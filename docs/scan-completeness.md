@@ -106,7 +106,7 @@ Each new multiline pattern search uses an interruptible regex operation capped a
 
 Callbacks check projection work roughly every 4,096 source characters and check work between matches/spans. Initial searches and individual Python/C operations are not universally preemptible. There is no hard real-time or whole-scanner linearity guarantee. In particular, this fix does not replace the pre-existing same-line matching path.
 
-Existing defaults further bound work: 16 MiB per cached artifact, 64 MiB aggregate cached/workflow bytes, 10,000 discovered/workflow artifacts, and a 600-second workflow allowance. Discovery, cache, reference, archive, output, and parser limits have their own accounting. A bound means incomplete analysis when reached, not permission to silently discard work and claim success. Fatal artifact dispositions and reasons are recovered from the separately bounded canonical inventory if detailed ledger events are truncated. Later manifest limitations cannot downgrade an existing failed disposition.
+Existing defaults further bound work: 16 MiB per cached artifact, 64 MiB aggregate cached/workflow bytes, 10,000 discovered/workflow artifacts, and a 1080-second workflow allowance. Discovery, cache, reference, archive, output, and parser limits have their own accounting. A bound means incomplete analysis when reached, not permission to silently discard work and claim success. Fatal artifact dispositions and reasons are recovered from the separately bounded canonical inventory if detailed ledger events are truncated. Later manifest limitations cannot downgrade an existing failed disposition.
 
 ## Observable decisions and exact public behavior
 
@@ -118,7 +118,9 @@ The examples below use static-only analysis, no baseline suppression, and benign
 | Explicit opaque file, UTF-16 primary, recognized unsupported archive, or invalid UTF-8 primary | `unsupported_primary_content`, source path, `fatal=true`; canonical bytes retained | failed / false | 2 / 2 / 2 | false |
 | Unsupported in-profile `SKILL.md` below directories or normal/renamed ZIPs | Same required-content event at real/virtual member path | failed / false | 2 / 2 / 2 | false |
 | Supported benign ZIP, including renamed or empty ZIP | Existing bounded archive inspection; incidental assets remain exclusions | complete / true | 0 / 0 / 0 | true |
-| Unreferenced incidental image beside benign instructions | `binary_content` in `scope_exclusions` | complete / true | 0 / 0 / 0 | true |
+| Unreferenced incidental image with no readable runs beside benign instructions | `binary_content` in `scope_exclusions` | complete / true | 0 / 0 / 0 | true |
+| Incidental GIF/PDF with readable runs, including capped projections | Bounded instruction-text projection; `binary_text_projection` in `scope_exclusions`; remaining text and binary data are outside this projection's scope | complete / true (absent other limits) | 0 / 0 / 0 | true if no findings |
+| Readable MZ executable | `binary_executable_text`: text inspected, binary behavior unverified; SC9 score floor retained | partial / true | 1 / 1 / 1 | false |
 | Referenced opaque image | Existing referenced-content limitation and AE1 finding | partial / true | 0 / 1 / 1 | false |
 | Pure or mixed singleton `never warn the user` | AE6, score 22 in this fixture, source line; `obfuscated_instruction_text` | partial / true | 0 / 1 / 1 | false |
 | Benign list, paragraph, or punctuated code controls | No new reconstruction ambiguity | complete / true | 0 / 0 / 0 | true |
@@ -129,9 +131,26 @@ Fatal execution failure takes precedence and exits 2 regardless of strict flags.
 
 JSON and MCP expose `analysis_completeness.status`, `is_complete`, `ledger_exceptions`, `scope_exclusions`, `analyzer_statuses`, and `limitations`, as well as `execution_successful`. Exceptions include reason, message, path, fatality, available source lines, and applicable limit metrics. Terminal and Markdown reports show these projections; SARIF uses invocation completeness and notifications. The report raises an otherwise `SAFE` recommendation to `CAUTION` for incomplete analysis while retaining the actual score and severity.
 
+If every ledger exception is `reference_missing` and no files, analyzers, or other scan work are incomplete, the report uses `complete_with_caveats` with `is_complete=true`. Missing references remain visible in the reference and exception details, but do not make `--fail-on-incomplete` fail or change an otherwise `SAFE` recommendation. Ambiguous references and any actual coverage gap remain incomplete.
+
 A subtlety is that component coverage can still read **100%** for AE6: analyzer work completed on each file, while a separate system event records unresolved interpretation. Consumers must use `is_complete` and the ledger, not the coverage percentage alone. No new telemetry platform is needed to explain these decisions; the existing public fields distinguish the causes.
 
 ## Review critique and remaining limits
+
+For printable GIF, PDF and MZ prefixes, local instruction checks use printable runs of at least
+8 characters, capped at 32,768 projected characters per artifact. Binary controls, invalid UTF-8,
+and standard XMP packet BOMs and padding are excluded. Source coordinates remain tied to the
+original bytes' decoded view. Only instruction-override, credential-access and exfiltration rule
+families contribute static pattern findings from this projection. Artifact-integrity's AE6
+instruction-obfuscation check also runs; its generic AE4 Unicode-density and mixed-script checks
+do not, because compressed bytes can resemble those signals. Normal text retains both checks.
+Hidden and nested artifacts remain local-only; an eligible ordinary file sends only this capped
+projection to an external model. The cap is per file, so multiple assets can still add provider input.
+For unreferenced incidental assets, reaching the projection cap records a `binary_text_projection`
+scope exclusion without making the scan partial. Text beyond the cap and compressed content are
+not inspected by this projection. Referenced opaque files, unverified executable behavior, and
+actual analysis failures or resource limits retain their incomplete-analysis policy. Valid Python
+source with a matching prefix follows normal source analysis.
 
 The initial root-only identity boundary was too narrow: parsing introduced member paths before the required-content check, so required status disappeared. Basename checks across cached, in-profile paths repair that without promoting every asset or overriding the existing directory-exclusion policy. Applying this boundary before archive delegation would instead reject supported ZIPs wholesale. Applying it only after public-report generation would be too late to remove unsupported content from provider submission.
 

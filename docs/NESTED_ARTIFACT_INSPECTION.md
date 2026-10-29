@@ -5,6 +5,11 @@ container is recognized from its bytes and internal structure rather than its fi
 Supported document containers are DOCX, XLSX, and PPTX; generic ZIP and nested ZIP-compatible
 members use the same traversal policy.
 
+Linking to a successfully inspected container does not make its binary packaging an uninspected
+artifact. Coverage retains each member's outcome: an archive read failure, resource limit, missing
+member, or later analyzer failure still prevents complete inspection. Incidental unsupported
+assets retain the existing scope exclusions, and findings in inspected members remain findings.
+
 Nested members use a stable virtual path that retains their full provenance:
 
 ```text
@@ -94,6 +99,15 @@ makes the analysis incomplete. A result that would otherwise be `SAFE` is report
 a failing gate with `--fail-on-incomplete`. Inspection exceptions and their affected outer or nested
 paths are surfaced in terminal, JSON, Markdown, and SARIF output.
 
+If a real disk path containing `!/` has the same identity as an archive member, the scan
+records `artifact_path_collision`, retains the disk bytes, and withholds the archive member.
+This fails the scan (CLI exit 2 and MCP `safe_to_install=false`). Rename the disk directory
+ending in `!` to remove the ambiguity. Non-colliding directory names ending in `!` remain valid.
+The colliding member file is withheld; distinct descendant members still receive analysis.
+Exceptions for that withheld file or a skipped duplicate descendant are reported against its
+archive container. Disk format and malformed-container errors stay on the disk file, and an
+analyzed disk descendant is not marked partial merely because the archive copy was skipped.
+
 ## SC9: Concealed Executable Artifact
 
 SC9 is a deterministic HIGH finding when executable content is concealed inside an Office document
@@ -101,3 +115,13 @@ container or a hidden/disguised artifact. Executability is established from an e
 a shebang, or archive mode bits. A benign document without executable members does not produce SC9.
 
 SC9 reports evidence and risk; it does not execute the member or prescribe an installation decision.
+
+At the scan root, visible source scripts beneath `.agents/skills/<name>/` and
+`.claude/skills/<name>/` are not treated as concealed when that skill directory
+contains a regular `SKILL.md` or `skill.md` manifest. These paths remain hidden
+and local-only: their contents are not sent to an external LLM. When LLM
+analysis is enabled, the inspection ledger records that LLM review was
+withheld, so the report does not imply that those scripts received semantic
+review. This narrow exception does not cover
+hidden skill names, hidden descendants, mismatched shebangs, unsupported script
+types, or nested client directories.
