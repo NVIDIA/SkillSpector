@@ -41,6 +41,10 @@ from skillspector.artifacts import (
     is_default_ignorable,
     security_text_views,
 )
+from skillspector.image_text import (
+    MAX_IMAGE_TEXT_CHARS,
+    has_image_magic,
+)
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
@@ -143,6 +147,7 @@ _ABSOLUTE_REPLACEMENT_START_LIMIT_EVIDENCE = "_security_absolute_replacement_sta
 _ABSOLUTE_REPLACEMENT_RECOVERY_START_EVIDENCE = "_security_absolute_replacement_recovery_start"
 _ALTERNATE_MATCHED_TEXT_EVIDENCE = "_security_alternate_matched_text"
 _VIEW_ORIGIN_TAGS = frozenset({"normalized-view", "declared-marker-view"})
+_IMAGE_TEXT_LAYER_TAG = "image-text-layer"
 _CONTEXTUAL_TRIAGE_TAG = "contextual-triage"
 _ActiveSecurityView = tuple[SecurityTextView, str]
 _ACTIVE_SECURITY_VIEW: ContextVar[_ActiveSecurityView | None] = ContextVar(
@@ -564,6 +569,55 @@ def _infer_file_type(path: str) -> str:
     idx = path.rfind(".")
     suffix = path[idx:].lower() if idx >= 0 else ""
     return FILE_TYPES.get(suffix, "other")
+
+
+def _image_extracted_text(state: Mapping[str, object], path: str) -> tuple[str, bool]:
+    """Return ``(text, truncated)`` for one image path from the build cache.
+
+    The build fills the extract-once cache for every input shape, so a
+    missing entry means the build saw the path and skipped it (deadline) or
+    it is not an image. There is no raw fallback: per-analyzer
+    re-extraction would pay the crafted-input walk again outside the
+    deadline. The caller records PARTIAL runtime_limit for magic-byte
+    misses. Identified by magic bytes, never suffix-gated, so a renamed
+    image is still covered. Images without a text layer yield
+    ``("", False)`` and keep their existing skip accounting.
+    """
+    text_cache = state.get("image_text_cache")
+    entry = _coerce_image_text_entry(text_cache.get(path)) if isinstance(text_cache, dict) else None
+    if entry is not None:
+        return entry[0], entry[1]
+    return "", False
+
+
+def _coerce_image_text_entry(value: object) -> tuple[str, bool, LedgerReason | None] | None:
+    """Return a ``(text, truncated, reason)`` triple from cache state, else None.
+
+    Tolerates lists (checkpoints serialize stored tuples as lists) and
+    legacy two-tuples written before the reason field existed.
+    """
+    if isinstance(value, (tuple, list)) and len(value) in (2, 3):
+        text, truncated = value[0], value[1]
+        reason: LedgerReason | None = None
+        if len(value) == 3 and isinstance(value[2], str):
+            try:
+                reason = LedgerReason(value[2])
+            except ValueError:
+                reason = None
+        if isinstance(text, str) and isinstance(truncated, bool):
+            return text, truncated, reason
+    return None
+
+
+def _tag_image_text_findings(path_findings: list[Finding]) -> None:
+    """Mark findings derived from extracted image text layers.
+
+    Line numbers on these findings point into the extracted text, not
+    file bytes; the tag lets JSON/SARIF readers tell them apart.
+    """
+    for finding in path_findings:
+        if _IMAGE_TEXT_LAYER_TAG not in finding.tags:
+            finding.tags.append(_IMAGE_TEXT_LAYER_TAG)
 
 
 def _is_license_basename(path: str, file_type: str) -> bool:
@@ -3162,6 +3216,10 @@ def run_static_patterns(
     """
     Run one or more pattern modules over state components/file_cache.
 
+    Test-only entry point: no production callers (no ledger channel, so
+    image truncation only affects the scanned prefix). Production reads
+    go through run_static_patterns_with_ledger, which records PARTIAL.
+
     For each path in state["components"], loads content from state["file_cache"],
     infers file_type, runs each module's analyze(content, path, file_type),
     converts all AnalyzerFindings to Finding via analyzer_finding_to_finding, returns combined list.
@@ -3220,12 +3278,22 @@ def run_static_patterns(
             continue
         if needs_python_source and path in source_classification_limitations:
             continue
+        is_image_text = False
         if path in binary_paths or (
             not raw_inventory
             and path not in readable_binary_paths
             and _is_binary_file(path, content)
         ):
-            continue
+            # Opaque binaries only expose stdlib-extracted image text; a
+            # textless one keeps the existing skip. Readable binaries never
+            # reach this branch: their bounded instruction projection scans
+            # below. (No ledger here, so truncation only affects the scanned
+            # prefix; the ledger variant records PARTIAL instead.)
+            extracted, _ = _image_extracted_text(state, path)
+            if not extracted:
+                continue
+            content = extracted
+            is_image_text = True
         remaining = MAX_FINDINGS_PER_ANALYZER - len(findings)
         if remaining <= 0:
             break
@@ -3288,6 +3356,8 @@ def run_static_patterns(
                     pattern_modules,
                     path_findings,
                 )
+        if is_image_text:
+            _tag_image_text_findings(path_findings)
         findings.extend(path_findings[:path_limit])
 
     return findings
@@ -3343,6 +3413,38 @@ def run_static_patterns_with_ledger(
             )
         else:
             artifact = inventory.get(path, {})
+        # Route stdlib-extracted image text through the same scan below;
+        # textless images keep the existing skip accounting.
+        image_scan_content: str | None = None
+        image_scan_truncated = False
+        image_cache_miss = False
+        if path not in container_paths and artifact.get("content_kind") == ContentKind.BINARY:
+            image_scan_content, image_scan_truncated = _image_extracted_text(state, path)
+            if not image_scan_content:
+                image_scan_content = None
+            if image_scan_content is None and not image_scan_truncated:
+                text_cache = state.get("image_text_cache")
+                raw_cache = state.get("raw_file_cache")
+                raw = raw_cache.get(path) if isinstance(raw_cache, dict) else None
+                image_cache_miss = (
+                    isinstance(text_cache, dict)
+                    and path not in text_cache
+                    and isinstance(raw, bytes)
+                    and has_image_magic(raw)
+                )
+        inline_scan_content: str | None = None
+        inline_scan_truncated = False
+        inline_scan_reason: LedgerReason | None = None
+        inline_cache = state.get("image_inline_text_cache")
+        inline_entry = (
+            _coerce_image_text_entry(inline_cache.get(path))
+            if isinstance(inline_cache, dict)
+            else None
+        )
+        if inline_entry is not None:
+            inline_scan_content, inline_scan_truncated, inline_scan_reason = inline_entry
+            if not inline_scan_content and not inline_scan_truncated:
+                inline_scan_content = None
         if path not in container_paths and path in source_classification_limitations:
             event = ledger_event(
                 outcome=LedgerOutcome.PARTIAL,
@@ -3374,21 +3476,45 @@ def run_static_patterns_with_ledger(
         elif (
             path not in container_paths
             and artifact.get("content_kind") == ContentKind.BINARY
+            and image_scan_content is None
             and not artifact.get("readable_binary")
         ):
-            referenced = bool(artifact.get("referenced"))
-            event = ledger_event(
-                outcome=LedgerOutcome.PARTIAL if referenced else LedgerOutcome.OUT_OF_SCOPE,
-                record_type=(
-                    LedgerRecordType.WORK_ITEM if referenced else LedgerRecordType.SCOPE_BOUNDARY
-                ),
-                phase="static",
-                analyzer_id=analyzer_id,
-                path=path,
-                reason=(LedgerReason.OPAQUE_CONTENT if referenced else LedgerReason.BINARY_CONTENT),
-            )
+            # Readable binaries fall through to the projection scan below;
+            # only opaque binaries stay on the scope branch.
+            if image_cache_miss:
+                event = ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="static",
+                    analyzer_id=analyzer_id,
+                    path=path,
+                    reason=LedgerReason.RUNTIME_LIMIT,
+                )
+            elif image_scan_truncated:
+                event = ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="static",
+                    analyzer_id=analyzer_id,
+                    path=path,
+                    reason=LedgerReason.SIZE_LIMIT,
+                )
+            else:
+                referenced = bool(artifact.get("referenced"))
+                event = ledger_event(
+                    outcome=LedgerOutcome.PARTIAL if referenced else LedgerOutcome.OUT_OF_SCOPE,
+                    record_type=(
+                        LedgerRecordType.WORK_ITEM
+                        if referenced
+                        else LedgerRecordType.SCOPE_BOUNDARY
+                    ),
+                    phase="static",
+                    analyzer_id=analyzer_id,
+                    path=path,
+                    reason=(
+                        LedgerReason.OPAQUE_CONTENT if referenced else LedgerReason.BINARY_CONTENT
+                    ),
+                )
         elif path not in container_paths:
-            content = file_cache.get(path)
+            content = image_scan_content if image_scan_content is not None else file_cache.get(path)
             if content is None:
                 event = ledger_event(
                     outcome=LedgerOutcome.FAILED,
@@ -3581,6 +3707,73 @@ def run_static_patterns_with_ledger(
                     path_findings = path_findings[:remaining]
                     resource_limit = LedgerReason.OUTPUT_LIMIT
                 findings.extend(path_findings)
+                if image_scan_content is not None:
+                    _tag_image_text_findings(path_findings)
+                # Inline data:-URI text folds into this row: a second row would
+                # share the SKILL.md work id and fail ledger accounting, so
+                # the inline outcome merges here (PARTIAL if either side is
+                # partial, emitted ids from both) and no inline row is added.
+                size_content = content
+                inline_error_class: str | None = None
+                # A decode failure has no text to scan but still loses a
+                # layer, so its reason must fold into this row too.
+                inline_reason: LedgerReason | None = inline_scan_reason
+                inline_metrics: dict[str, object] = {}
+                if inline_scan_content is not None:
+                    inline_budget = MAX_FINDINGS_PER_ANALYZER - len(findings)
+                    inline_remaining = transitive_remaining_seconds(cast(SkillspectorState, state))
+                    try:
+                        if inline_budget <= 0 or (
+                            inline_remaining is not None and inline_remaining <= 0
+                        ):
+                            inline_reason = (
+                                LedgerReason.OUTPUT_LIMIT
+                                if inline_budget <= 0
+                                else LedgerReason.RUNTIME_LIMIT
+                            )
+                        else:
+                            if inline_scan_content:
+                                inline_findings, inline_limit, inline_metrics = (
+                                    _scan_all_views_detailed(
+                                        path,
+                                        inline_scan_content,
+                                        pattern_modules,
+                                        python_ast_cache_key,
+                                        max_findings=inline_budget,
+                                        timeout_seconds=inline_remaining,
+                                        started_at=time.monotonic(),
+                                        python_ast=None,
+                                    )
+                                )
+                            else:
+                                inline_findings, inline_limit, inline_metrics = [], None, {}
+                            _tag_image_text_findings(inline_findings)
+                            findings.extend(inline_findings)
+                            path_findings.extend(inline_findings)
+                            inline_reason = (
+                                inline_limit
+                                or inline_scan_reason
+                                or (LedgerReason.SIZE_LIMIT if inline_scan_truncated else None)
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "%s: inline image-text scan error on %s: %s",
+                            analyzer_id,
+                            path,
+                            exc,
+                        )
+                        inline_error_class = type(exc).__name__
+                if inline_reason is not None and resource_limit is None:
+                    resource_limit = inline_reason
+                    resource_metrics = inline_metrics
+                    if inline_scan_content is not None:
+                        size_content = inline_scan_content
+                # An inline-scan error folds as PARTIAL, never FAILED: a
+                # FAILED row cannot carry emitted ids (ledger_event raises),
+                # which would nuke the whole analyzer on a real finding.
+                if inline_error_class is not None:
+                    resource_limit = LedgerReason.ANALYZER_RUNTIME_ERROR
+                    resource_metrics = {}
                 oversized_python = (
                     source_classification is not None
                     and source_classification is not PythonSourceClassification.NON_PYTHON
@@ -3591,10 +3784,19 @@ def run_static_patterns_with_ledger(
                     source_classification is PythonSourceClassification.AMBIGUOUS
                     and needs_python_source
                 )
-                partial = resource_limit is not None or oversized_python or ambiguous_python
+                partial = (
+                    resource_limit is not None
+                    or image_scan_truncated
+                    or oversized_python
+                    or ambiguous_python
+                )
                 partial_reason = (
                     resource_limit
-                    or (LedgerReason.SIZE_LIMIT if oversized_python else None)
+                    or (
+                        LedgerReason.SIZE_LIMIT
+                        if oversized_python or image_scan_truncated
+                        else None
+                    )
                     or LedgerReason.PYTHON_SOURCE_AMBIGUOUS
                 )
                 event = ledger_event(
@@ -3603,12 +3805,16 @@ def run_static_patterns_with_ledger(
                     analyzer_id=analyzer_id,
                     path=path,
                     reason=partial_reason if partial else None,
+                    error_class=inline_error_class,
                     emitted_finding_ids=[finding.finding_id for finding in path_findings],
                     observed_characters=(
-                        len(content) if partial_reason is LedgerReason.SIZE_LIMIT else None
+                        len(size_content) if partial_reason is LedgerReason.SIZE_LIMIT else None
                     ),
                     limit_characters=(
-                        MAX_FILE_CHARS if partial_reason is LedgerReason.SIZE_LIMIT else None
+                        MAX_IMAGE_TEXT_CHARS
+                        if partial_reason is LedgerReason.SIZE_LIMIT
+                        and (image_scan_content is not None or inline_scan_content is not None)
+                        else (MAX_FILE_CHARS if partial_reason is LedgerReason.SIZE_LIMIT else None)
                     ),
                     observed_findings=(
                         int(resource_metrics.get("observed_findings", len(path_findings)))
