@@ -1859,6 +1859,12 @@ def _classify_directive(
     if directive.exhausted:
         return _DirectiveClassification(None, False, True)
 
+    baseline = None
+    if context_start is not None:
+        baseline = _classify_directive(view, directive, end_is_truncated=end_is_truncated)
+        if baseline.active or not baseline.limited:
+            return baseline
+
     clause_start = _previous_sentence_boundary(
         view.text,
         directive.start,
@@ -1898,6 +1904,20 @@ def _classify_directive(
             end_is_truncated=end_is_truncated,
         )
         lookahead_exhausted = lookahead_exhausted or continuation_exhausted
+    if (
+        baseline is not None
+        and context_start is not None
+        and _unsupported_form_actions(
+            view.text,
+            min(clause_start, context_start),
+            lookahead_end,
+            include_contextual=True,
+        )
+    ):
+        # Even an unbound action can acquire its payload through adjacent
+        # literals. Wrapper proof may repair an inert method-like header, but
+        # it cannot clear a prior limit for a potentially active instruction.
+        return baseline
     payloads = _quoted_payloads(view.text, directive, scope_end)
     if not payloads:
         payloads = _anaphoric_payloads(view.text, directive, lookahead_end)
@@ -2047,6 +2067,7 @@ def build_declared_marker_views(
             and owned_source_start in (None, 0)
             and view.source_offset(0) == 0
             and directive.marker
+            and directive.unsupported
             and not directive.encoded
             and not directive.is_tag
             and directive.start <= marker_quote
