@@ -286,6 +286,9 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict:
 
 def _resolve_registry_addresses(deadline: float) -> list[str]:
     """Bound DNS resolution independently of the operating-system resolver."""
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise DependencyInspectionError("runtime_limit")
     code = (
         "import json,socket; "
         "rows=socket.getaddrinfo('registry.npmjs.org',443,type=socket.SOCK_STREAM); "
@@ -298,7 +301,7 @@ def _resolve_registry_addresses(deadline: float) -> list[str]:
             check=False,
             close_fds=True,
             env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
-            timeout=min(10.0, max(0.001, deadline - monotonic())),
+            timeout=min(10.0, remaining),
         )
         if result.returncode != 0 or len(result.stdout) > 4096:
             raise ValueError("registry DNS resolution failed")
@@ -306,20 +309,77 @@ def _resolve_registry_addresses(deadline: float) -> list[str]:
         if not isinstance(addresses, list) or not all(isinstance(ip, str) for ip in addresses):
             raise ValueError("invalid registry DNS result")
         return addresses
-    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        reason = "runtime_limit" if monotonic() >= deadline else "dependency_download_failed"
+        raise DependencyInspectionError(reason) from exc
+    except (OSError, ValueError) as exc:
         raise DependencyInspectionError("dependency_download_failed") from exc
 
 
 def _download_artifact(
     artifact: LockedArtifact, *, max_bytes: int, deadline: float, usage: dict[str, int]
 ) -> bytes:
-    """Pin a public registry address; keep TLS SNI and certificate verification."""
+    """Enforce the absolute acquisition deadline outside all HTTP operations."""
     ips = _resolve_registry_addresses(deadline)
     if not ips or any(not ipaddress.ip_address(address).is_global for address in ips):
         raise DependencyInspectionError("dependency_download_failed")
-    address = ips[0]
+    request = json.dumps(
+        {"url": artifact.url, "address": ips[0], "max_bytes": max_bytes, "deadline": deadline}
+    ).encode()
+    with tempfile.TemporaryFile() as output:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise DependencyInspectionError("runtime_limit")
+        try:
+            # subprocess.run kills and reaps the downloader on timeout, even if
+            # headers, a transport read, or HTTP client cleanup never returns.
+            process = subprocess.run(
+                [sys.executable, "-I", "-B", "-m", "skillspector.dependency_downloader"],
+                input=request,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+                timeout=remaining,
+                check=False,
+                close_fds=True,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            # A terminated child cannot report exact partial consumption. Charge
+            # its grant rather than letting failed acquisition renew the budget.
+            usage["bytes"] += max_bytes
+            reason = (
+                "runtime_limit"
+                if isinstance(exc, subprocess.TimeoutExpired)
+                else "dependency_download_failed"
+            )
+            raise DependencyInspectionError(reason) from exc
+        expired = monotonic() >= deadline
+        if process.returncode != 0 or expired:
+            usage["bytes"] += max_bytes
+            reason = (
+                "runtime_limit"
+                if expired
+                else {3: "runtime_limit", 4: "size_limit"}.get(
+                    process.returncode, "dependency_download_failed"
+                )
+            )
+            raise DependencyInspectionError(reason)
+        output.seek(0)
+        blob = output.read(max_bytes + 1)
+    usage["bytes"] += len(blob)
+    if len(blob) > max_bytes:
+        raise DependencyInspectionError("size_limit")
+    return blob
+
+
+def _stream_artifact(
+    url: str, address: str, *, max_bytes: int, deadline: float, usage: dict[str, int]
+) -> bytes:
+    """Download only in the timed child; retain TLS SNI and certificate checks."""
+    if monotonic() >= deadline:
+        raise DependencyInspectionError("runtime_limit")
     host = f"[{address}]" if ":" in address else address
-    path = urlsplit(artifact.url).path
+    path = urlsplit(url).path
     timeout = min(10.0, max(0.001, deadline - monotonic()))
     with httpx.Client(trust_env=False, follow_redirects=False, timeout=timeout) as client:
         with client.stream(
@@ -328,19 +388,25 @@ def _download_artifact(
             headers={"Host": REGISTRY, "Accept-Encoding": "identity"},
             extensions={"sni_hostname": REGISTRY},
         ) as response:
+            if monotonic() >= deadline:
+                raise DependencyInspectionError("runtime_limit")
             if (
                 response.status_code != 200
                 or response.headers.get("content-encoding", "identity") != "identity"
             ):
                 raise DependencyInspectionError("dependency_download_failed")
             body = bytearray()
-            for chunk in response.iter_raw(chunk_size=64 * 1024):
+            # Yield transport chunks immediately: a fixed chunk size buffers
+            # trickling bytes and can suppress deadline checks until 64 KiB.
+            for chunk in response.iter_raw():
                 usage["bytes"] += len(chunk)
                 if monotonic() >= deadline:
                     raise DependencyInspectionError("runtime_limit")
                 if len(body) + len(chunk) > max_bytes:
                     raise DependencyInspectionError("size_limit")
                 body.extend(chunk)
+    if monotonic() >= deadline:
+        raise DependencyInspectionError("runtime_limit")
     return bytes(body)
 
 

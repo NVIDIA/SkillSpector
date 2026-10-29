@@ -397,7 +397,6 @@ print(json.dumps(blocked))
 
 def test_download_pins_public_ip_without_environment_credentials(monkeypatch):
     observed = {}
-    monkeypatch.setattr(inspection, "_resolve_registry_addresses", lambda deadline: ["104.16.1.35"])
     transport = httpx.MockTransport(
         lambda request: (
             observed.update(
@@ -415,10 +414,15 @@ def test_download_pins_public_ip_without_environment_credentials(monkeypatch):
         return original_client(transport=transport, **kwargs)
 
     monkeypatch.setattr(inspection.httpx, "Client", client)
-    artifact = LockedArtifact("fixture-package", "1.0.0", "https://registry.npmjs.org/a.tgz", ())
     usage = {"bytes": 0}
     assert (
-        _download_artifact(artifact, max_bytes=10, deadline=monotonic() + 5, usage=usage)
+        inspection._stream_artifact(
+            "https://registry.npmjs.org/a.tgz",
+            "104.16.1.35",
+            max_bytes=10,
+            deadline=monotonic() + 5,
+            usage=usage,
+        )
         == b"artifact"
     )
     assert observed["url"] == "https://104.16.1.35/a.tgz"
@@ -436,14 +440,14 @@ def test_download_pins_public_ip_without_environment_credentials(monkeypatch):
     ],
 )
 def test_download_rejects_redirects_and_unexpected_transfer_encodings(monkeypatch, status, headers):
-    monkeypatch.setattr(inspection, "_resolve_registry_addresses", lambda deadline: ["104.16.1.35"])
     client = httpx.Client(
         transport=httpx.MockTransport(lambda request: httpx.Response(status, headers=headers))
     )
     monkeypatch.setattr(inspection.httpx, "Client", lambda **kwargs: client)
     with pytest.raises(DependencyInspectionError, match="dependency_download_failed"):
-        _download_artifact(
-            LockedArtifact("x", "1.0.0", "https://registry.npmjs.org/a.tgz", ()),
+        inspection._stream_artifact(
+            "https://registry.npmjs.org/a.tgz",
+            "104.16.1.35",
             max_bytes=10,
             deadline=monotonic() + 5,
             usage={"bytes": 0},
@@ -459,6 +463,287 @@ def test_private_dns_address_is_rejected_before_connecting(monkeypatch):
             deadline=monotonic() + 5,
             usage={"bytes": 0},
         )
+
+
+def test_slow_transport_times_out_before_first_buffered_chunk_and_stays_incomplete(monkeypatch):
+    clock = [0.0]
+
+    class SlowStream(httpx.SyncByteStream):
+        yielded = 0
+        closed = False
+
+        def __iter__(self):
+            for _ in range(64 * 1024):
+                clock[0] += 1.0
+                self.yielded += 1
+                yield b"x"
+
+        def close(self):
+            self.closed = True
+
+    stream = SlowStream()
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, stream=stream))
+    )
+    monkeypatch.setattr(inspection.httpx, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(inspection, "monotonic", lambda: clock[0])
+
+    def download(artifact, *, max_bytes, deadline, usage):
+        return inspection._stream_artifact(
+            artifact.url, "104.16.1.35", max_bytes=max_bytes, deadline=deadline, usage=usage
+        )
+
+    monkeypatch.setattr(inspection, "_download_artifact", download)
+    monkeypatch.setattr(inspection, "_run_worker", lambda *a: pytest.fail("unfinished download"))
+    state = scan_state({"node_modules/fixture-package": entry(package_blob())})
+    limits = replace(DependencyInspectionLimits(), seconds=3)
+    result = inspect_dependencies(state, limits=limits)
+
+    assert stream.yielded == 3 < 64 * 1024
+    assert stream.closed
+    assert state["workflow_resource_budget"].scanned_bytes == 3
+    assert result["dependency_inspection"]["status"] == "partial"
+    assert result["dependency_inspection"]["inspected_artifacts"] == 0
+    assert result["dependency_inspection"]["download_bytes_charged"] == limits.compressed_bytes
+    assert "runtime_limit" in reasons(result)
+    assert any(row.get("reason") == "runtime_limit" for row in result["artifact_inventory"])
+    completeness, _ = finalize_ledger({**state, **result})
+    assert completeness["is_complete"] is False
+
+
+@pytest.mark.parametrize("phase", ["headers", "eof", "close"])
+def test_stream_rejects_deadline_expiring_without_another_body_chunk(monkeypatch, phase):
+    clock = [0.0]
+
+    class DelayedStream(httpx.SyncByteStream):
+        closed = False
+
+        def __iter__(self):
+            if phase == "eof":
+                clock[0] = 2.0
+            elif phase == "close":
+                yield b"artifact"
+
+        def close(self):
+            self.closed = True
+            if phase == "close":
+                clock[0] = 2.0
+
+    stream = DelayedStream()
+
+    def response(request):
+        if phase == "headers":
+            clock[0] = 2.0
+        return httpx.Response(200, stream=stream)
+
+    client = httpx.Client(transport=httpx.MockTransport(response))
+    monkeypatch.setattr(inspection.httpx, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(inspection, "monotonic", lambda: clock[0])
+    usage = {"bytes": 0}
+    with pytest.raises(DependencyInspectionError, match="runtime_limit"):
+        inspection._stream_artifact(
+            "https://registry.npmjs.org/a.tgz",
+            "104.16.1.35",
+            max_bytes=10,
+            deadline=1.0,
+            usage=usage,
+        )
+    assert stream.closed
+    assert usage["bytes"] == (8 if phase == "close" else 0)
+
+
+def test_stream_does_not_open_client_after_deadline(monkeypatch):
+    monkeypatch.setattr(inspection, "monotonic", lambda: 2.0)
+    monkeypatch.setattr(inspection.httpx, "Client", lambda **k: pytest.fail("expired deadline"))
+    with pytest.raises(DependencyInspectionError, match="runtime_limit"):
+        inspection._stream_artifact(
+            "https://registry.npmjs.org/a.tgz",
+            "104.16.1.35",
+            max_bytes=10,
+            deadline=1.0,
+            usage={"bytes": 0},
+        )
+
+
+def test_downloader_timeout_includes_headers_and_uses_time_remaining_after_dns(monkeypatch):
+    clock = [10.0]
+    monkeypatch.setattr(inspection, "monotonic", lambda: clock[0])
+
+    def resolve(deadline):
+        assert deadline == 20.0
+        clock[0] += 2.0
+        return ["104.16.1.35"]
+
+    def timeout(command, **kwargs):
+        assert command == [sys.executable, "-I", "-B", "-m", "skillspector.dependency_downloader"]
+        assert json.loads(kwargs["input"]) == {
+            "url": "https://registry.npmjs.org/a.tgz",
+            "address": "104.16.1.35",
+            "max_bytes": 10,
+            "deadline": 20.0,
+        }
+        assert kwargs["timeout"] == 8.0
+        assert kwargs["close_fds"] is True
+        assert kwargs["stderr"] == subprocess.DEVNULL
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(inspection, "_resolve_registry_addresses", resolve)
+    monkeypatch.setattr(inspection.subprocess, "run", timeout)
+    usage = {"bytes": 5}
+    with pytest.raises(DependencyInspectionError, match="runtime_limit"):
+        _download_artifact(
+            LockedArtifact("x", "1.0.0", "https://registry.npmjs.org/a.tgz", ()),
+            max_bytes=10,
+            deadline=20.0,
+            usage=usage,
+        )
+    assert usage["bytes"] == 15
+
+
+@pytest.mark.parametrize(
+    "returncode,reason",
+    [(3, "runtime_limit"), (4, "size_limit"), (1, "dependency_download_failed")],
+)
+def test_downloader_failures_conservatively_charge_download_allowance(
+    monkeypatch, returncode, reason
+):
+    monkeypatch.setattr(inspection, "_resolve_registry_addresses", lambda deadline: ["104.16.1.35"])
+    monkeypatch.setattr(
+        inspection.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], returncode),
+    )
+    usage = {"bytes": 5}
+    with pytest.raises(DependencyInspectionError, match=reason):
+        _download_artifact(
+            LockedArtifact("x", "1.0.0", "https://registry.npmjs.org/a.tgz", ()),
+            max_bytes=10,
+            deadline=monotonic() + 5,
+            usage=usage,
+        )
+    assert usage["bytes"] == 15
+
+
+def test_successful_downloader_charges_only_received_bytes(monkeypatch):
+    monkeypatch.setattr(inspection, "_resolve_registry_addresses", lambda deadline: ["104.16.1.35"])
+
+    def completed(command, **kwargs):
+        kwargs["stdout"].write(b"artifact")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(inspection.subprocess, "run", completed)
+    usage = {"bytes": 5}
+    assert (
+        _download_artifact(
+            LockedArtifact("x", "1.0.0", "https://registry.npmjs.org/a.tgz", ()),
+            max_bytes=10,
+            deadline=monotonic() + 5,
+            usage=usage,
+        )
+        == b"artifact"
+    )
+    assert usage["bytes"] == 13
+
+
+@pytest.mark.parametrize("phase", ["headers", "body"])
+def test_total_download_deadline_terminates_stalled_http_process(monkeypatch, tmp_path, phase):
+    monkeypatch.setattr(inspection, "_resolve_registry_addresses", lambda deadline: ["104.16.1.35"])
+    original_run = subprocess.run
+    marker = tmp_path / "http-phase-reached"
+    code = """
+import httpx,time
+from pathlib import Path
+from skillspector import dependency_inspection as inspection
+from skillspector.dependency_downloader import main
+marker = Path(MARKER)
+phase = PHASE
+class StalledStream(httpx.SyncByteStream):
+    def __iter__(self):
+        marker.write_text("body")
+        time.sleep(60)
+        yield b"artifact"
+def response(request):
+    if phase == "headers":
+        marker.write_text("headers")
+        time.sleep(60)
+    return httpx.Response(200, stream=StalledStream())
+original_client = httpx.Client
+inspection.httpx.Client = lambda **kwargs: original_client(
+    transport=httpx.MockTransport(response), **kwargs
+)
+raise SystemExit(main())
+""".replace("MARKER", repr(str(marker))).replace("PHASE", repr(phase))
+
+    def stalled_downloader(command, **kwargs):
+        return original_run([sys.executable, "-I", "-B", "-c", code], **kwargs)
+
+    monkeypatch.setattr(inspection.subprocess, "run", stalled_downloader)
+    usage = {"bytes": 0}
+    started = monotonic()
+    with pytest.raises(DependencyInspectionError, match="runtime_limit"):
+        _download_artifact(
+            LockedArtifact("x", "1.0.0", "https://registry.npmjs.org/a.tgz", ()),
+            max_bytes=10,
+            deadline=started + 3.0,
+            usage=usage,
+        )
+    assert marker.read_text() == phase
+    assert monotonic() - started < 10
+    assert usage["bytes"] == 10
+
+
+def test_real_downloader_main_returns_raw_artifact_bytes(monkeypatch):
+    monkeypatch.setattr(inspection, "_resolve_registry_addresses", lambda deadline: ["104.16.1.35"])
+    original_run = subprocess.run
+    code = """
+import httpx
+from skillspector import dependency_inspection as inspection
+from skillspector.dependency_downloader import main
+original_client = httpx.Client
+inspection.httpx.Client = lambda **kwargs: original_client(
+    transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, stream=httpx.ByteStream(b"artifact"))
+    ), **kwargs
+)
+raise SystemExit(main())
+"""
+
+    def successful_downloader(command, **kwargs):
+        return original_run([sys.executable, "-I", "-B", "-c", code], **kwargs)
+
+    monkeypatch.setattr(inspection.subprocess, "run", successful_downloader)
+    usage = {"bytes": 0}
+    assert (
+        _download_artifact(
+            LockedArtifact("x", "1.0.0", "https://registry.npmjs.org/a.tgz", ()),
+            max_bytes=10,
+            deadline=monotonic() + 10,
+            usage=usage,
+        )
+        == b"artifact"
+    )
+    assert usage["bytes"] == 8
+
+
+def test_downloader_timeout_preserves_incomplete_shared_budget_accounting(monkeypatch):
+    blob = package_blob()
+    state = scan_state({"node_modules/fixture-package": entry(blob)})
+    monkeypatch.setattr(inspection, "_resolve_registry_addresses", lambda deadline: ["104.16.1.35"])
+
+    def timeout(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(inspection.subprocess, "run", timeout)
+    monkeypatch.setattr(inspection, "_run_worker", lambda *a: pytest.fail("unfinished download"))
+    limits = replace(DependencyInspectionLimits(), artifact_bytes=100, compressed_bytes=1000)
+    result = inspect_dependencies(state, limits=limits)
+    assert state["workflow_resource_budget"].scanned_bytes == 100
+    assert result["dependency_inspection"]["status"] == "partial"
+    assert result["dependency_inspection"]["download_bytes_charged"] == 1000
+    assert result["dependency_inspection"]["inspected_artifacts"] == 0
+    assert "runtime_limit" in reasons(result)
+    completeness, _ = finalize_ledger({**state, **result})
+    assert completeness["is_complete"] is False
 
 
 def test_cli_gates_missing_lock_and_rejects_registry_mode(tmp_path):
@@ -559,6 +844,20 @@ def test_dns_resolution_timeout_is_incomplete(monkeypatch):
     monkeypatch.setattr(inspection.subprocess, "run", timeout)
     with pytest.raises(DependencyInspectionError, match="dependency_download_failed"):
         inspection._resolve_registry_addresses(monotonic() + 1)
+
+
+def test_dns_expiring_total_deadline_reports_runtime_limit(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(inspection, "monotonic", lambda: clock[0])
+
+    def timeout(command, **kwargs):
+        assert kwargs["timeout"] == 1.0
+        clock[0] = 1.0
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(inspection.subprocess, "run", timeout)
+    with pytest.raises(DependencyInspectionError, match="runtime_limit"):
+        inspection._resolve_registry_addresses(1.0)
 
 
 def test_failed_transfers_consume_shared_workflow_allowance(monkeypatch):

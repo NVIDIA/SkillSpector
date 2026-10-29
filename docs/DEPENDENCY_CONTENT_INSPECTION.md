@@ -41,6 +41,13 @@ content encodings are rejected. Downloaded bytes must match a recorded SHA-512
 digest before the artifact reaches the inspection worker. The package's own
 `package.json` name and version must also match its locked identity.
 
+HTTP acquisition runs in a disposable downloader process. The parent enforces
+the remaining absolute dependency/workflow deadline across process startup,
+connection, TLS, response headers, body streaming, and client cleanup, killing
+and reaping the downloader on timeout. Slow streams cannot extend the deadline
+by sending bytes within each read timeout. Failed acquisition conservatively
+charges its granted download-byte allowance when exact consumption is unavailable.
+
 ## Static analysis and isolation
 
 Package code is never installed or executed. Each verified tarball is passed to
