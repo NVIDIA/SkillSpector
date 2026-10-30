@@ -60,7 +60,12 @@ from skillspector.inspection_ledger import (
 from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
 from skillspector.models import OCCURRENCE_FINDING_ID_KEY, Finding
-from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
+from skillspector.multi_skill import (
+    MultiSkillDetectionResult,
+    SkillDirectory,
+    _manifest_file,
+    detect_skills,
+)
 from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
 from skillspector.nodes.report import report, risk_severity_and_recommendation
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
