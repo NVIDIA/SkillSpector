@@ -1735,6 +1735,12 @@ def _is_literal_printf_data(word: str, check_runtime: Callable[[], None]) -> boo
 def _has_shell_comparison_overrides(content: str, check_runtime: Callable[[], None]) -> bool:
     """Refuse data ownership when source can replace the compared builtins."""
     for clause_start in _shell_clause_starts(content, check_runtime):
+        while clause_start < len(content) and content[clause_start] in " \t":
+            if clause_start % 4096 == 0:
+                check_runtime()
+            clause_start += 1
+        if clause_start == len(content) or content[clause_start] in "\r\n;|&(){}#":
+            continue
         source = content[clause_start : clause_start + _SHELL_COMMAND_WORD_CHARS + 1]
         cursor = 0
         function = False
