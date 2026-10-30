@@ -1,6 +1,17 @@
 ### 2.13.3 (Unreleased)
 ### Security and integrity fixes
+* Prevent baseline and recursive reports from overwriting primary and child inputs, including aliases. (#924, #938)
+* Keep unavailable requested custom YARA rule directories explicitly incomplete. (#919)
+* Score non-English gap-fill findings in batch recommendations and exit status. (#772)
+* Inspect CRLF-shebang Python launchers and retain PowerShell SC3/P2 coverage. (#906, #874)
 * Keep Markdown code fences from merging distinct shell lines into one marker directive. (#882)
+* Track credentials nested in urllib request headers through network sinks. (#826)
+* Inspect npx commands in JSON MCP configurations, require package-owned version pins, and recognize additional MCP credential/configuration filenames. (#776, dependency #683, #881)
+* Detect writes to agent-memory files from automatically run test carriers. (#893)
+* Detect bounded multiline walk/encrypt/write behavior while preserving stronger ransomware signatures. (#860)
+* Inspect Pipenv dependencies and locked versions with explicit declaration-coverage limits. (#765)
+* Refresh four advisory-affected dependency lockfile pins. (#915)
+* Continue artifact inspection after a local matcher timeout while retaining incomplete coverage. (#949)
 ---
 ### 2.13.1 (Unreleased)
 ### Fixes

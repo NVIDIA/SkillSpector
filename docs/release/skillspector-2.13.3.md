@@ -1,7 +1,8 @@
 # SkillSpector 2.13.3
 
 This patch release builds on the published v2.13.2 maintenance release,
-preserving its fixes, third-party dependency lock, and supported Python versions.
+preserving its fixes and supported Python versions while adding selected merged
+P0 security and scan-integrity fixes, including four dependency security updates.
 
 ## Fixes
 
@@ -25,6 +26,50 @@ preserving its fixes, third-party dependency lock, and supported Python versions
   text without treating ordinary data as unfinished shell commands. Preserve
   findings and incomplete inspection when text can reach command execution,
   syntax is ambiguous, or analysis limits are exceeded.
+
+## Security and scan integrity
+
+- [#924](https://github.com/NVIDIA/SkillSpector/pull/924) and
+  [#938](https://github.com/NVIDIA/SkillSpector/pull/938): Reject baseline and
+  recursive report destinations that would overwrite the primary input or a
+  discovered child skill's input, including file aliases.
+- [#919](https://github.com/NVIDIA/SkillSpector/pull/919): Report incomplete
+  inspection when a requested custom YARA rule directory is unavailable.
+- [#772](https://github.com/NVIDIA/SkillSpector/pull/772): Include non-English
+  gap-fill findings in contributed batch-scan scores, recommendations, and exit
+  status instead of retaining a stale SAFE verdict.
+- [#906](https://github.com/NVIDIA/SkillSpector/pull/906): Inspect extensionless
+  Python scripts with CRLF shebangs while recording interpreter uncertainty.
+- [#874](https://github.com/NVIDIA/SkillSpector/pull/874): Restore PowerShell
+  coverage for SC3 obfuscation and P2 hidden-instruction checks.
+- [#882](https://github.com/NVIDIA/SkillSpector/pull/882): Preserve shell-line
+  boundaries across Markdown code fences during marker reconstruction, keeping
+  separate command lines from being combined into a misleading directive.
+- [#826](https://github.com/NVIDIA/SkillSpector/pull/826): Follow credential reads
+  nested in `urllib` request headers into network sinks.
+- [#776](https://github.com/NVIDIA/SkillSpector/pull/776) and
+  [#881](https://github.com/NVIDIA/SkillSpector/pull/881): Inspect `npx` commands in
+  JSON MCP configurations and recognize additional Claude, Cline, and Roo Code
+  credential/configuration filenames. The required
+  [#683](https://github.com/NVIDIA/SkillSpector/pull/683) dependency accepts version
+  pins only on the relevant package operand, so an unrelated later pin cannot
+  hide an unpinned package.
+- [#893](https://github.com/NVIDIA/SkillSpector/pull/893): Detect writes to known
+  agent-memory files and directories from automatically run test carriers,
+  including supported raw Windows paths.
+- [#860](https://github.com/NVIDIA/SkillSpector/pull/860): Add a bounded,
+  lower-confidence YARA signal for nearby directory walking, encryption, and
+  binary writes across lines. Existing stronger ransomware rules are retained;
+  the new signature does not prove which files a write replaces.
+- [#765](https://github.com/NVIDIA/SkillSpector/pull/765): Extract Pipenv
+  dependencies and check locked versions, preserving incomplete coverage for
+  malformed or unsupported dependency declarations.
+- [#915](https://github.com/NVIDIA/SkillSpector/pull/915): Refresh advisory-affected
+  lockfile pins to `anyio 4.14.2`, `certifi 2026.10.19`, `langgraph-sdk 0.4.4`, and
+  `urllib3 2.8.0`, without expanding the supported Python range.
+- [#949](https://github.com/NVIDIA/SkillSpector/pull/949): Contain artifact-integrity
+  matcher timeouts so subsequent artifacts are still inspected and the timed-out
+  work remains explicitly incomplete.
 
 ## Scope and upgrading
 
