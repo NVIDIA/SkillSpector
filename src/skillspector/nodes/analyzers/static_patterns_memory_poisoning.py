@@ -359,6 +359,134 @@ def _is_layout_only_span(span: str, max_cosmetic_span: int = _MAX_LAYOUT_ONLY_SP
     return True
 
 
+_TABLE_DELIMITER_CELL = re.compile(r"^\s*:?-+:?\s*$")
+
+
+def _split_unescaped_pipes(text: str) -> list[str]:
+    """Split on pipes that are Markdown cell boundaries.
+
+    A pipe preceded by a backslash (``\\|``) is literal cell text, not a
+    boundary, so splitting on raw ``|`` would invent cells out of escaped
+    content. A backslash escapes the next character, so ``\\\\|`` (an
+    escaped backslash followed by a pipe) still counts as a boundary.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            current.append(text[index : index + 2])
+            index += 2
+            continue
+        if char == "|":
+            segments.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    segments.append("".join(current))
+    return segments
+
+
+def _markdown_table_cells(line: str) -> list[str] | None:
+    """Return cells for an outer-pipe Markdown row, or ``None`` otherwise."""
+    stripped = line.strip()
+    if not (stripped.startswith("|") and stripped.endswith("|")):
+        return None
+    return _split_unescaped_pipes(stripped[1:-1])
+
+
+def _markdown_table_line_spans(content: str) -> list[tuple[int, int]]:
+    """Return (start, end) offsets of lines belonging to a proven Markdown table.
+
+    A table is proven by a header row immediately followed by a delimiter row
+    with the same number of cells; following rows belong to the table while
+    they keep that cell count. This mirrors the proven-table rule already used
+    for the P9 / whitespace-padding analyzers: aligned table rows repeat cell
+    text and padding by construction, so the MP2 repetition pattern must not
+    treat that layout repetition as context-window stuffing.
+    """
+    lines: list[tuple[int, int, str]] = []
+    pos = 0
+    for line_break in LOGICAL_LINE_BREAK.finditer(content):
+        lines.append((pos, line_break.start(), content[pos : line_break.start()]))
+        pos = line_break.end()
+    lines.append((pos, len(content), content[pos:]))
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index + 1 < len(lines):
+        header = _markdown_table_cells(lines[index][2])
+        delimiter = _markdown_table_cells(lines[index + 1][2])
+        if (
+            header
+            and delimiter
+            and len(header) == len(delimiter)
+            and all(_TABLE_DELIMITER_CELL.fullmatch(cell) for cell in delimiter)
+        ):
+            spans.append((lines[index][0], lines[index][1]))
+            spans.append((lines[index + 1][0], lines[index + 1][1]))
+            row_index = index + 2
+            while row_index < len(lines):
+                row = _markdown_table_cells(lines[row_index][2])
+                if row is None or len(row) != len(header):
+                    break
+                spans.append((lines[row_index][0], lines[row_index][1]))
+                row_index += 1
+            index = row_index
+            continue
+        index += 1
+    return spans
+
+
+def _is_markdown_table_span(spans: list[tuple[int, int]], offset: int) -> bool:
+    return any(start <= offset < end for start, end in spans)
+
+
+_TABLE_SEPARATOR_CHARS = frozenset("-:=| \t")
+
+
+def _is_table_structure_unit(unit: str) -> bool:
+    """Return True when a repeated MP2 unit is table structure, not content.
+
+    A unit containing an unescaped pipe repeats cell structure by
+    construction (the repetition spans cell boundaries, as in
+    prettier-aligned rows and delimiter rows), and a unit made only of
+    separator/padding characters repeats delimiters or alignment padding.
+    Any other unit repeats substantive cell content, so it must not be
+    exempted: a single cell stuffed with ``abcdef `` repeated 1000 times
+    has a content-only unit and stays a finding even though it sits
+    inside a proven table. An escaped pipe (``\\|``) is literal cell
+    text, not structure, so a unit whose pipes are all escaped is
+    content, not structure.
+    """
+    if not unit:
+        return False
+    if len(_split_unescaped_pipes(unit)) > 1:
+        return True
+    return all(ch in _TABLE_SEPARATOR_CHARS for ch in unit)
+
+
+def _match_contains_stuffed_cell(span: str) -> bool:
+    """Return True when one cell segment of the span repeats content itself.
+
+    Splits the span on unescaped cell boundaries and re-applies the MP2
+    content pattern inside each segment: a segment whose own repetition
+    unit carries alphanumeric content is stuffing inside that cell, even
+    when the outer match spans the whole row. Pure separator/padding
+    segments (dashes, spaces) do not count. Splitting on raw pipes
+    would shred escaped-pipe content into short nonrepeated pieces and
+    hide the stuffing.
+    """
+    content_pattern = MP2_CONTENT_PATTERNS[0][0]
+    for segment in _split_unescaped_pipes(span):
+        for inner in re.finditer(content_pattern, segment):
+            unit = inner.group(1) or ""
+            if any(ch.isalnum() for ch in unit):
+                return True
+    return False
+
+
 def _bounded_previous_nonblank_line(content: str, offset: int) -> tuple[str, bool]:
     """Return the prior nonblank logical line and whether it was complete."""
     window_start = max(0, offset - 512)
@@ -727,6 +855,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     complete_match=match.group(0),
                 )
             )
+    table_spans = _markdown_table_line_spans(content) if file_type == "markdown" else []
     for pattern, confidence in MP2_PATTERNS:
         matches = (
             static_runner.iter_paragraph_matches
@@ -736,6 +865,14 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             span = match.group(0)
             if _is_layout_only_span(span):
+                continue
+            if (
+                (pattern, confidence) not in MP2_PROSE_PATTERNS
+                and table_spans
+                and _is_markdown_table_span(table_spans, match.start())
+                and _is_table_structure_unit(match.group(1))
+                and not _match_contains_stuffed_cell(span)
+            ):
                 continue
             non_ws_chars = set(span) - {" ", "\t", "\n", "\r"}
             if len(non_ws_chars) <= 1 and not any(c in span for c in (" ", "\t")):
