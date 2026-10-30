@@ -171,7 +171,9 @@ def http_model(monkeypatch):
                 if stop == "stop":
                     stop = "tool_calls"
             if after_response is not None:
-                after_response(len(requests))
+                intercepted = after_response(len(requests))
+                if intercepted is not None:
+                    return intercepted
             return httpx.Response(
                 200,
                 json={
@@ -319,6 +321,154 @@ def test_timeout_during_formatting_reports_the_exhausted_deadline(http_model, as
     )
     assert not outcome.successful
     assert outcome.failures[0].reason == LedgerReason.RUNTIME_LIMIT
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("failure", ["connection", 429, 503])
+def test_formatting_retries_transient_transport_without_reassessing(
+    http_model, monkeypatch, asynchronous, failure
+):
+    def interrupt_formatting(count):
+        if count == 2:
+            if failure == "connection":
+                raise httpx.ConnectError("temporary formatting connection failure")
+            return httpx.Response(failure, json={"error": {"message": "temporarily unavailable"}})
+        return None
+
+    requests = http_model(
+        [('{"findings": [],}', "stop"), ('{"findings": []}', "stop")],
+        after_response=interrupt_formatting,
+    )
+    analyzer = make_analyzer("discovery", timeout=lambda: 60.0)
+    sleep = AsyncMock() if asynchronous else MagicMock()
+    monkeypatch.setattr(
+        analyzer, "_asleep_before_retry" if asynchronous else "_sleep_before_retry", sleep
+    )
+    batches = [Batch(file_path="a.py", content="x")]
+    outcome = (
+        asyncio.run(analyzer.arun_batches_detailed(batches))
+        if asynchronous
+        else analyzer.run_batches_detailed(batches)
+    )
+    assert len(outcome.successful) == 1 and not outcome.failures
+    assert len(requests) == 3 and requests[1] == requests[2]
+    assert "Repair JSON punctuation" not in requests[0]["messages"][0]["content"]
+    assert "Repair JSON punctuation" in requests[1]["messages"][0]["content"]
+    assert sleep.call_count == 1
+    assert sum(record.get("total_tokens", 0) or 0 for record in analyzer.inference_usage) == 30
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_formatting_shares_prior_connection_retry_budget(http_model, monkeypatch, asynchronous):
+    def interrupt(count):
+        if count != 3:
+            raise httpx.ConnectError("temporary connection failure")
+
+    requests = http_model([('{"findings": [],}', "stop")], after_response=interrupt)
+    analyzer = make_analyzer("discovery", timeout=lambda: 60.0)
+    sleep = AsyncMock() if asynchronous else MagicMock()
+    monkeypatch.setattr(
+        analyzer, "_asleep_before_retry" if asynchronous else "_sleep_before_retry", sleep
+    )
+    batches = [Batch(file_path="a.py", content="x")]
+    outcome = (
+        asyncio.run(analyzer.arun_batches_detailed(batches))
+        if asynchronous
+        else analyzer.run_batches_detailed(batches)
+    )
+    assert not outcome.successful
+    assert outcome.failures[0].reason == LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+    assert len(requests) == 5 and sleep.call_count == 3
+    assert requests[0] == requests[1] == requests[2]
+    assert requests[3] == requests[4]
+    assert "Repair JSON punctuation" in requests[3]["messages"][0]["content"]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_formatting_preserves_combined_outer_attempt_cap(http_model, monkeypatch, asynchronous):
+    def interrupt(count):
+        if count >= 5:
+            raise httpx.ConnectError("temporary formatting connection failure")
+
+    requests = http_model(
+        [('{"findings": 1}', "stop")] * 3 + [('{"findings": [],}', "stop")],
+        after_response=interrupt,
+    )
+    analyzer = make_analyzer("discovery", timeout=lambda: 60.0)
+    monkeypatch.setattr(
+        analyzer,
+        "_asleep_before_retry" if asynchronous else "_sleep_before_retry",
+        AsyncMock() if asynchronous else MagicMock(),
+    )
+    batches = [Batch(file_path="a.py", content="x")]
+    outcome = (
+        asyncio.run(analyzer.arun_batches_detailed(batches))
+        if asynchronous
+        else analyzer.run_batches_detailed(batches)
+    )
+    assert not outcome.successful
+    assert outcome.failures[0].reason == LedgerReason.LLM_BATCH_FAILED
+    assert len(requests) == 7
+    assert requests[4] == requests[5] == requests[6]
+    assert "Repair JSON punctuation" in requests[4]["messages"][0]["content"]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_formatting_retry_after_cannot_exceed_shared_deadline(
+    http_model, monkeypatch, asynchronous
+):
+    def rate_limit(count):
+        if count == 2:
+            return httpx.Response(
+                429,
+                headers={"retry-after": "10"},
+                json={"error": {"message": "temporarily unavailable"}},
+            )
+        return None
+
+    requests = http_model([('{"findings": [],}', "stop")], after_response=rate_limit)
+    analyzer = make_analyzer("discovery", timeout=lambda: 1.0)
+    sleep = AsyncMock() if asynchronous else MagicMock()
+    monkeypatch.setattr(
+        analyzer, "_asleep_before_retry" if asynchronous else "_sleep_before_retry", sleep
+    )
+    batches = [Batch(file_path="a.py", content="x")]
+    outcome = (
+        asyncio.run(analyzer.arun_batches_detailed(batches))
+        if asynchronous
+        else analyzer.run_batches_detailed(batches)
+    )
+    assert not outcome.successful
+    assert outcome.failures[0].reason == LedgerReason.RUNTIME_LIMIT
+    assert outcome.failures[0].error_class == "RateLimitError"
+    assert len(requests) == 2
+    sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "answer,stop,reason",
+    [
+        ('{"findings": [],}', "stop", LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID),
+        ('{"findings": []}', "length", LedgerReason.LLM_RESPONSE_TRUNCATED),
+        ('{"findings": []}', "content_filter", LedgerReason.LLM_RESPONSE_REFUSED),
+        ('{"findings": [], "extra": true}', "stop", LedgerReason.LLM_FORMAT_CHANGED),
+    ],
+)
+def test_returned_formatting_failure_is_never_retried(
+    http_model, asynchronous, answer, stop, reason
+):
+    requests = http_model([('{"findings": [],}', "stop"), (answer, stop)])
+    analyzer = make_analyzer("discovery", timeout=lambda: 60.0)
+    batches = [Batch(file_path="a.py", content="x")]
+    outcome = (
+        asyncio.run(analyzer.arun_batches_detailed(batches))
+        if asynchronous
+        else analyzer.run_batches_detailed(batches)
+    )
+    assert not outcome.successful
+    assert outcome.failures[0].reason == reason
     assert len(requests) == 2
 
 
