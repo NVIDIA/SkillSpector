@@ -2084,7 +2084,7 @@ async def test_privileged_payload_in_referenced_reference_file_stays_install_uns
                 "              securityContext:\n"
                 "                privileged: true\n"
                 "\n"
-                "    docker run --privileged --pid=host vendor/collector:1.4\n"
+                "    docker run --privileged --pid=host vendor/collector\n"
             ),
         },
     )
