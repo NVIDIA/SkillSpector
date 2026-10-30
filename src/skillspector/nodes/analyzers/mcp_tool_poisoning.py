@@ -1502,7 +1502,9 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
         )
         analyzer = _TP4Analyzer(model, timeout=timeout)
         attempted = True
-        batch_outcome = analyzer.run_batches_detailed(batches)
+        # Fan out like the semantic analyzers do. The shared limiter still honours
+        # SKILLSPECTOR_MAX_LLM_CONCURRENCY, and results keep the batch order.
+        batch_outcome = run_async(analyzer.arun_batches_detailed(batches))
         result.inference_usage = cast(list[InferenceUsageRecord], analyzer.inference_usage)
         seen_finding_ids: set[str] = set()
         unexpected_response = False
