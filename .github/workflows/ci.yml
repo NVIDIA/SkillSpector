@@ -17,7 +17,7 @@ name: CI
 
 on:
   pull_request:
-    branches: ["main", "yashraj/v2.13.0-base"]
+    branches: ["main", "yashraj/v2.13.0-base", "yashraj/release-2.13.3"]
   push:
     branches: ["main", "yashraj/v2.13.0-base"]
 

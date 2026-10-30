@@ -375,7 +375,7 @@ def _exit_on_unsupported_llm_controls(no_llm: bool) -> None:
         return
     error = unsupported_control_error()
     if error is not None:
-        err_console.print(f"[red]Error:[/red] {error}")
+        err_console.print(_error_line(error))
         raise typer.Exit(code=2)
 
 
@@ -2812,7 +2812,7 @@ def _scan_multi_skill(
         for skill in skills:
             _validate_report_destination(skill.primary_path or skill.path, output)
     except (OSError, ValueError) as exc:
-        err_console.print(f"[red]Error:[/red] {exc}")
+        err_console.print(_error_line(exc))
         raise typer.Exit(code=2) from exc
     progress_console = (
         err_console if output is None and format is not FormatChoice.terminal else console

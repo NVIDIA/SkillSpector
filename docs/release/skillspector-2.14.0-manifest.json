@@ -1,0 +1,656 @@
+{
+  "schema_version": 1,
+  "repository": "NVIDIA/SkillSpector",
+  "version": "2.14.0",
+  "status": "draft_release_candidate",
+  "baseline": {
+    "pull_request": 958,
+    "url": "https://github.com/NVIDIA/SkillSpector/pull/958",
+    "branch": "yashraj/release-2.13.3",
+    "initial_pinned_commit": "e855b1be92ab4a16702c606f5ebff3fe8c63f6dc",
+    "remote_head_refresh_required_before_publication": true,
+    "published_ancestors": [
+      {
+        "tag": "v2.13.0",
+        "commit": "091a509b3d6ba8ff5be528966e1f43c2e68cf214",
+        "release_url": "https://github.com/NVIDIA/SkillSpector/releases/tag/v2.13.0",
+        "release_pr": 833,
+        "selection": "inherited_not_new_delta"
+      },
+      {
+        "tag": "v2.13.1",
+        "commit": "f3b25697d76256998ca9d42c198d256258d4c035",
+        "release_url": "https://github.com/NVIDIA/SkillSpector/releases/tag/v2.13.1",
+        "release_pr": 852,
+        "selection": "inherited_not_new_delta"
+      },
+      {
+        "tag": "v2.13.2",
+        "commit": "abd82935b67f765a9541013c0866c6349251dcdf",
+        "release_url": "https://github.com/NVIDIA/SkillSpector/releases/tag/v2.13.2",
+        "release_pr": 922,
+        "selection": "inherited_not_new_delta"
+      }
+    ],
+    "inherited_features": [
+      {
+        "number": 945,
+        "title": "Configurable TP4 capacity and workflow deadline",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/945",
+        "selection": "inherited_not_new_delta"
+      },
+      {
+        "number": 946,
+        "title": "Completion validation, bounded formatting recovery and asynchronous discovery",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/946",
+        "selection": "inherited_not_new_delta"
+      },
+      {
+        "number": 948,
+        "title": "Bounded shell, Python and browser-template ownership",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/948",
+        "selection": "inherited_not_new_delta"
+      },
+      {
+        "number": 683,
+        "title": "MCP package-operand version-pin ownership",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/683",
+        "upstream_commit": "cd917791d939719c22036b27134b344447637b3b",
+        "selection": "inherited_not_new_delta"
+      },
+      {
+        "number": 452,
+        "title": "Bounded HTML-comment ownership and keyword boundaries",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/452",
+        "upstream_commit": "95a52d89fa16f608f0b18ccee76b0918ea4b7eef",
+        "selection": "inherited_not_new_delta",
+        "scope": "Already-shipped HTML closers and identifier/keyword precision; distinct from the new #819 reference-comment prerequisite."
+      }
+    ],
+    "inherited_safeguards": [
+      "Python import and string-value bounds",
+      "Passive-image provenance and Office metadata handling",
+      "Quoted-version reference handling",
+      "Private atomic report and baseline output",
+      "Completion validation, bounded formatting recovery, parser deadlines and coverage accounting"
+    ],
+    "pinned_commit": "df3d072cdf3e3410e6916c0642e06540d41dc5d1",
+    "remote_head_verified_at": "2026-10-30"
+  },
+  "selection": {
+    "priority_report_dates": [
+      "2026-10-28",
+      "2026-10-29",
+      "2026-10-30"
+    ],
+    "counts": {
+      "daily_merged_priority_records": 38,
+      "new_priority_prs": 20,
+      "new_priority_p0": 6,
+      "new_priority_p1": 14,
+      "daily_already_covered_excluded": 18,
+      "required_dependency_prs": 4,
+      "requested_model_prs": 7,
+      "distinct_upstream_pr_sources_with_new_changes": 31
+    },
+    "counting_rule": "Count distinct upstream PR sources with a nonempty new delta. Partial prerequisites and model adaptations count once; their inherited portions do not count as newly applied work. The 18 daily baseline overlaps and inherited #945/#946/#948/#683 are excluded from the new-change count.",
+    "new_priority_prs": [
+      {
+        "number": 907,
+        "title": "perf(security): avoid Unicode folding for ASCII characters",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/907",
+        "upstream_commit": "4ca1d7c6cbd3afd079cfacd397944fcf014452b6",
+        "priority": "P0",
+        "priority_reason": "Preserves security normalization and detection equivalence",
+        "priority_report": "skillspector-pr-review-2026-10-28.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 864,
+        "title": "feat: support Python 3.15",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/864",
+        "upstream_commit": "ae1cdf2fdb98507cc07c21aabe3aab782041cf41",
+        "priority": "P1",
+        "priority_reason": "Supported Python runtime and dependency compatibility",
+        "priority_report": "skillspector-pr-review-2026-10-28.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 898,
+        "title": "Fix deterministic layer failing closed on ordinary lists of verb names",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/898",
+        "upstream_commit": "076127b179774c45ba4d1349e2262e144775fa32",
+        "priority": "P0",
+        "priority_reason": "Restores deterministic scan coverage for ordinary literal containers",
+        "priority_report": "skillspector-pr-review-2026-10-28.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 805,
+        "title": "fix(report): keep missing references as non-blocking caveats",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/805",
+        "upstream_commit": "ff0e77eee35efad8d70550c1c2a0e3d7561ef2a2",
+        "priority": "P0",
+        "priority_reason": "Keeps uninspected references from receiving complete verdicts",
+        "priority_report": "skillspector-pr-review-2026-10-28.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 914,
+        "title": "feat(providers): support custom OpenAI-compatible HTTP headers",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/914",
+        "upstream_commit": "e6d52ca858bc050ff03131c9cf4524414cb52a4b",
+        "priority": "P1",
+        "priority_reason": "Gateway header compatibility and credential isolation",
+        "priority_report": "skillspector-pr-review-2026-10-28.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 904,
+        "title": "perf(providers): defer chat client imports from metadata path",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/904",
+        "upstream_commit": "e5b7b3aa9bc96073d76f9bba1fe8ef2234bbdcd7",
+        "priority": "P1",
+        "priority_reason": "Provider metadata startup reliability and import compatibility",
+        "priority_report": "skillspector-pr-review-2026-10-28.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 899,
+        "title": "fix(cli): render error text literally instead of as Rich markup",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/899",
+        "upstream_commit": "f1778f55d6d8381c3955358379eff46b0a9aef0a",
+        "priority": "P1",
+        "priority_reason": "CLI diagnostic reliability and terminal output integrity",
+        "priority_report": "skillspector-pr-review-2026-10-28.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 876,
+        "title": "perf(cli): defer scan imports for version output",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/876",
+        "upstream_commit": "7c04f8b49df8c2162aa6a161e6974f5695e4ad08",
+        "priority": "P1",
+        "priority_reason": "CLI version-output availability and parsing compatibility",
+        "priority_report": "skillspector-pr-review-2026-10-28.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 851,
+        "title": "fix(report): preserve each compacted occurrence's finding text",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/851",
+        "upstream_commit": "75ed27bccf5f4bc42f0b5db176ada74b1c821db3",
+        "priority": "P1",
+        "priority_reason": "Makes compacted JSON and SARIF evidence accurate",
+        "priority_report": "skillspector-pr-review-2026-10-28.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 847,
+        "title": "feat(cli): configure the recursive skill count limit",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/847",
+        "upstream_commit": "8a77a4ee51b2ca52490dc055a2f89239b85b3ba8",
+        "priority": "P1",
+        "priority_reason": "Recursive scanning capacity with bounded incomplete coverage",
+        "priority_report": "skillspector-pr-review-2026-10-28.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 763,
+        "title": "test(batch): cover pooled model cancellation and slot recovery",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/763",
+        "upstream_commit": "d3859dcaf2a9bd5682bf74e52c2a05bf82aa39be",
+        "priority": "P1",
+        "priority_reason": "Protects shared provider slots from cancellation regressions",
+        "priority_report": "skillspector-pr-review-2026-10-28.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 713,
+        "title": "feat(providers): accept OpenCode 1.18.31-1.19.4 through an explicit verified set",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/713",
+        "upstream_commit": "0e4b1bab56d931ce576a4c208ca575e410431f29",
+        "priority": "P1",
+        "priority_reason": "OpenCode compatibility while retaining the verified runtime boundary",
+        "priority_report": "skillspector-pr-review-2026-10-28.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 622,
+        "title": "fix(analyzers): carve out structurally benign P2 header comments",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/622",
+        "upstream_commit": "d501c0d5035c2ed6385740a384d942bb05651fda",
+        "priority": "P1",
+        "priority_reason": "Reduces benign P2 header-comment noise under strict structural gates",
+        "priority_report": "skillspector-pr-review-2026-10-28.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 903,
+        "title": "fix(tm1): abstain on uppercase HTTP DELETE verbs in REST route tables",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/903",
+        "upstream_commit": "a59a3bd2d77c66b09d1d3c766a4516b3d8069cf1",
+        "priority": "P1",
+        "priority_reason": "Repairs REST-route precision while preserving macOS destructive path detection",
+        "priority_report": "skillspector-pr-review-2026-10-29.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 939,
+        "title": "fix(coverage): reconcile inspected ZIP containers and members",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/939",
+        "upstream_commit": "13ebdd250442ea27eebf523f5f3a48630ef420dc",
+        "priority": "P0",
+        "priority_reason": "Makes archive coverage reflect inspected members and preserves descendant failures",
+        "priority_report": "skillspector-pr-review-2026-10-29.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 855,
+        "title": "fix(llm): keep CLI prompts under MAX_INPUT_BYTES when batching large files",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/855",
+        "upstream_commit": "2d4398792e0232512820ca37a5a6e72039080128",
+        "priority": "P1",
+        "priority_reason": "CLI prompt-budget reliability without losing inspection coverage",
+        "priority_report": "skillspector-pr-review-2026-10-29.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 934,
+        "title": "fix(p2): keep reference destinations out of the benign-header exemption",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/934",
+        "upstream_commit": "caa1caa898c1e1325329df4878ae5ded083b98b9",
+        "priority": "P0",
+        "priority_reason": "Restores hidden-instruction detection lost through benign reference-comment titles",
+        "priority_report": "skillspector-pr-review-2026-10-29.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 943,
+        "title": "fix(pe3): ignore exact Python glab setting literals",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/943",
+        "upstream_commit": "54921c8c7c23008c8af2328d5ab492a904b6ece4",
+        "priority": "P1",
+        "priority_reason": "Removes a narrow credential-vocabulary false positive without hiding credential access",
+        "priority_report": "skillspector-pr-review-2026-10-29.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 872,
+        "title": "fix(mp2): ignore repetition inside proven Markdown tables",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/872",
+        "upstream_commit": "4ef6a65a30ac99f1fa4ae50f251f9e9ee8f62902",
+        "priority": "P0",
+        "priority_reason": "Preserves substantive context-window stuffing detection while reducing table-layout noise",
+        "priority_report": "skillspector-pr-review-2026-10-30.json",
+        "selection": "new_delta"
+      },
+      {
+        "number": 929,
+        "title": "fix(ra1): honor prohibitions on recommending a self-update",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/929",
+        "upstream_commit": "efb4e8c19a20eb468f797ecb0d685ecb5c887960",
+        "priority": "P1",
+        "priority_reason": "Removes benign recommendation-prohibition false positives while retaining affirmative RA1 instructions",
+        "priority_report": "skillspector-pr-review-2026-10-30.json",
+        "selection": "new_delta"
+      }
+    ],
+    "already_covered_excluded": [
+      {
+        "number": 949,
+        "title": "fix(artifact-integrity): contain matcher-local timeouts",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/949",
+        "upstream_commit": "9adb1a607ab0749e4377e0aba1c834b72f948107",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-30.json"
+      },
+      {
+        "number": 938,
+        "title": "fix(cli): protect recursive child inputs from report output",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/938",
+        "upstream_commit": "6498f0ea7da1616448c129f10d8c48e5260abc44",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-29.json"
+      },
+      {
+        "number": 924,
+        "title": "fix: preserve baseline input files when selecting output",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/924",
+        "upstream_commit": "6a0d0995510193b9475b4e1f8eef7a7de7b1c5c7",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-28.json"
+      },
+      {
+        "number": 919,
+        "title": "fix(yara): mark unavailable custom rule directories incomplete",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/919",
+        "upstream_commit": "85a236d2dedb837c62878a96462e01d1574205fa",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-28.json"
+      },
+      {
+        "number": 915,
+        "title": "fix(deps): refresh four advisory-affected lockfile pins",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/915",
+        "upstream_commit": "914116bf6b5a3fe2745974a9fe89b89cc6c5863e",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-28.json"
+      },
+      {
+        "number": 912,
+        "title": "fix(analyzer): bound shell quote completeness with lexical ownership",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/912",
+        "upstream_commit": "ed602e5d078f4c96afa85ed56b3682d0f53fd080",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Inherited #948 includes the lexical shell-ownership proof.",
+        "priority_report": "skillspector-pr-review-2026-10-28.json"
+      },
+      {
+        "number": 906,
+        "title": "fix(python): analyze extensionless scripts with a CRLF Python shebang",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/906",
+        "upstream_commit": "c7f7f3c5d0c4370abc59ffd86d5b423871e44e42",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-28.json"
+      },
+      {
+        "number": 893,
+        "title": "Score writes to agent-memory files as MP3 memory manipulation",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/893",
+        "upstream_commit": "2de9b3874c626d8cb8e0e1855da2b9676d3204d8",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-29.json"
+      },
+      {
+        "number": 882,
+        "title": "fix(static): stop Markdown code fence lines from merging shell lines into one marker directive",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/882",
+        "upstream_commit": "5203c3f444d65b84d41aa617f41cd5546936cf18",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-28.json"
+      },
+      {
+        "number": 881,
+        "title": "fix(as2): match MCP config files of Claude Desktop, Claude Code, Cline and Roo Code",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/881",
+        "upstream_commit": "3ae98afcce01d9be97b237f51d58b75674b9ec65",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-28.json"
+      },
+      {
+        "number": 874,
+        "title": "fix(analyzers): keep SC3 and P2 coverage for PowerShell scripts",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/874",
+        "upstream_commit": "d56c2f152e76c13c5cad77e99846af374f88cc75",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-28.json"
+      },
+      {
+        "number": 860,
+        "title": "fix(yara): detect multiline walk-encrypt-overwrite ransomware",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/860",
+        "upstream_commit": "3ca7def3472209019650d1c541bd33f4a55b6f4d",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-28.json"
+      },
+      {
+        "number": 856,
+        "title": "fix(security-discovery): fan batches out through the shared LLM limiter",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/856",
+        "upstream_commit": "e35b16c637db3de2880c8710d3f2f00be039c6bd",
+        "priority": "P1",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Inherited #946 uses asynchronous security discovery through the shared limiter; its production module matches merged #856.",
+        "priority_report": "skillspector-pr-review-2026-10-29.json"
+      },
+      {
+        "number": 845,
+        "title": "fix(llm): retry structured calls that return no result",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/845",
+        "upstream_commit": "6b0ebe1200962db5cc8eb7408368439c20a12424",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Completed-response validation in inherited #946 already rejects absent structured results.",
+        "priority_report": "skillspector-pr-review-2026-10-28.json"
+      },
+      {
+        "number": 826,
+        "title": "fix(analyzer): trace credentials nested in urllib request headers",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/826",
+        "upstream_commit": "492955f232780b1e6480daf189e63a8d1de247cd",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-28.json"
+      },
+      {
+        "number": 776,
+        "title": "fix(mcp-rug-pull): inspect npx commands in JSON configs",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/776",
+        "upstream_commit": "2b85712f68fde88b29fb2d34d6b3c4f48dbb64bd",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-28.json"
+      },
+      {
+        "number": 772,
+        "title": "fix(batch): score gap-fill findings",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/772",
+        "upstream_commit": "fdce443b0953cda823a8111c1d7ec0444a524d2b",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-29.json"
+      },
+      {
+        "number": 765,
+        "title": "Fix Pipenv dependency extraction and locked version checks",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/765",
+        "upstream_commit": "1feb2c8757540f8173ee07bc46ae511552cc8851",
+        "priority": "P0",
+        "selection": "excluded_already_covered",
+        "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
+        "priority_report": "skillspector-pr-review-2026-10-28.json"
+      }
+    ],
+    "required_dependencies": [
+      {
+        "number": 810,
+        "title": "Retain OpenCode internal authentication plugins",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/810",
+        "upstream_commit": "6145ace258b26b1253d9df5aab89a84fa0b1e3a6",
+        "selection": "required_dependency",
+        "required_by": [
+          713
+        ],
+        "include": "OAuth plugin correction and precise plugin/environment-isolation fixtures; retain deny-all permissions, pure mode and external-plugin restrictions.",
+        "source_commits": [
+          "8cc9c17a1cdd7797cd3eaeaa8d9f58e1f7f6b707",
+          "22cec466722cf4f6cc9f00bad1fa588e6639ce2b"
+        ]
+      },
+      {
+        "number": 436,
+        "title": "Lazy package graph initialization",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/436",
+        "upstream_commit": "1a5e08c4f9bd55dce061a82c1ad263fd2ddac7fa",
+        "selection": "required_dependency",
+        "required_by": [
+          904,
+          876
+        ],
+        "include": "Lazy graph export and import-order behavior required by provider metadata imports and the lightweight CLI version entry point."
+      },
+      {
+        "number": 819,
+        "title": "Bounded reference-comment destination and title ownership",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/819",
+        "selection": "required_dependency",
+        "required_by": [
+          622,
+          934
+        ],
+        "include": "Reference destination/title parsing and ownership, deadline and boundary regressions required by #622/#934.",
+        "source_commits": [
+          "1f868573e9998810db3335884966f3da5a70d916",
+          "7e031d0344670b82397e980897d01512800aed6f",
+          "df2a71bb5682cf82b203feb5588825d171858771",
+          "9f0b06ddd7fe7ba2c106a4f1a3fbdbc4cee589c1"
+        ],
+        "upstream_commit": "e29cbdef1adaa7ecf42c42746f3c095c8deae5e4"
+      },
+      {
+        "number": 662,
+        "title": "Report recursive scan errors with exit code 2",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/662",
+        "upstream_commit": "60c663d0db6ade3d332f4747a3c5ed5937bb1f8d",
+        "selection": "required_dependency",
+        "required_by": [
+          899
+        ],
+        "include": "Recursive scan exception-to-CLI-error wrapper and its regressions; preserve protected-output failures and exit code 2."
+      }
+    ],
+    "requested_model_updates": [
+      {
+        "number": 529,
+        "title": "Provider-specific structured-output policy and model metadata",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/529",
+        "upstream_commit": "83bc10cc9c60c50d8a85d422517a4072f7baed80",
+        "selection": "partial_model_delta",
+        "include": "Absent provider hints, structured-output policy helpers, registry lookup settings and Claude model metadata.",
+        "exclude_already_inherited": "llm_utils and analyzer binder edits are superseded by #958/#946 completion validation and bounded formatting recovery; retain those baseline implementations."
+      },
+      {
+        "number": 598,
+        "title": "GPT-5.6 model budget metadata",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/598",
+        "upstream_commit": "aeb657fd41448c5b28f0be851fe1f2f73058931a",
+        "selection": "partial_model_delta",
+        "include": "Missing GPT-5.6 metadata in the root fallback model registry.",
+        "exclude_already_inherited": "Bundled OpenAI GPT-5.6 registry entries are already present in the baseline."
+      },
+      {
+        "number": 650,
+        "title": "GPT-6 Sol and Luna model budgets",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/650",
+        "upstream_commit": "09555eb6954ad76ec67b9a0203c196d7970ac3c9",
+        "selection": "model_delta",
+        "include": "GPT-6 Sol and Luna budgets in OpenAI and Azure registries."
+      },
+      {
+        "number": 690,
+        "title": "GPT-6.1 Sol model budgets",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/690",
+        "upstream_commit": "35270064e42230dbc566e4134c55b5d581355db3",
+        "selection": "model_delta",
+        "include": "GPT-6.1 Sol budgets in OpenAI and Azure registries."
+      },
+      {
+        "number": 708,
+        "title": "OpenAI-compatible automatic tool-choice policy",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/708",
+        "upstream_commit": "b3346a4b4a1c8c62008cb43f650673fcc4aff849",
+        "selection": "partial_model_delta",
+        "include": "Missing spark-x2.5 metadata and OpenAI-compatible provider tool-choice/structured-output methods.",
+        "exclude_already_inherited": "The #958 binder already supports unforced tool calls; preserve it rather than reapplying that binder change."
+      },
+      {
+        "number": 806,
+        "title": "New-model compatibility, control preflight and Bedrock profile repair",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/806",
+        "upstream_commit": "b07f181d9138878c3827de0947a9fd2c6a84a66c",
+        "selection": "model_delta_with_followup",
+        "include": "Optional newer-model registries, route-specific structured output, model-name normalization, requested-control validation and suffix-free Bedrock Sonnet 4.6 with a 64000-token output cap.",
+        "followup": 824,
+        "net_scope": "Default-model advances from this PR are reverted by #824; newer models remain opt-in."
+      },
+      {
+        "number": 824,
+        "title": "Retain previous defaults and preserve MCP preflight errors",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/824",
+        "upstream_commit": "8b993d32eb66c88496eb5aa5088530ac8b9214d5",
+        "selection": "model_delta",
+        "include": "Keep OpenAI gpt-5.4 and native Anthropic Opus 4.6/Sonnet 4.6 defaults; preserve sanitized MCP provider-preflight errors."
+      }
+    ]
+  },
+  "net_model_behavior": {
+    "defaults": {
+      "openai": "gpt-5.4",
+      "openai_credential_fallback": "gpt-5.4",
+      "anthropic_analyzers": "claude-opus-4-6",
+      "anthropic_meta_analyzer": "claude-sonnet-4-6",
+      "anthropic_proxy": "claude-sonnet-4-6",
+      "azure_openai": "gpt-4o",
+      "bedrock": "us.anthropic.claude-sonnet-4-6",
+      "nv_build": "z-ai/glm-5.3",
+      "openai_compatible": "llama-3.1-70b-versatile",
+      "ollama": "llama3.1:8b"
+    },
+    "bedrock_sonnet_4_6_max_output_tokens": 64000,
+    "newer_registered_models": "Explicit opt-in; #824 retains previous OpenAI and native Anthropic defaults.",
+    "structured_output": "Keep #958 completion/recovery/binder safeguards while adding missing model and provider policy. Native Claude JSON-schema output and unforced tool-call routes follow provider capability.",
+    "requested_controls": [
+      "GPT-6.1 Sol rejects any explicit temperature and permits only low, medium, high, xhigh or max reasoning effort.",
+      "Claude 5.5 temperature handling depends on the route: native Anthropic permits 1.0; the other supported routes reject explicit temperature.",
+      "Unsupported controls fail before analysis; static-only scans do not initialize provider credentials."
+    ]
+  },
+  "known_limitations": [
+    {
+      "pr": 929,
+      "issue": 956,
+      "url": "https://github.com/NVIDIA/SkillSpector/issues/956",
+      "description": "The merged prohibition fix has a reported double-negative RA1 regression; unmerged #957 is outside this selection."
+    },
+    "Inherited #958 execution, provider-response and capacity limitations remain applicable. Earlier live acceptance does not qualify the final 2.14.0 candidate.",
+    "Exact finding baselines are scanner-version-bound and require regeneration/review."
+  ],
+  "validation": {
+    "status": "pending_final_integrated_candidate",
+    "final_candidate_commit": null,
+    "required_checks": [
+      "Source and installed-wheel regressions for the final candidate",
+      "Build, strict package metadata checks and source/package identity checks",
+      "Current hosted CI at the final candidate revision",
+      "Baseline refresh and semantic delta review if #958 advances"
+    ],
+    "claim_scope": "Focused development checks and historical #958 live results do not establish final-candidate acceptance."
+  },
+  "publication": {
+    "status": "waiting_for_baseline_integration_and_final_validation",
+    "stacked_on_pull_request": 958,
+    "stacked_on_branch": "yashraj/release-2.13.3",
+    "requirements": [
+      "Integrate #958 and refresh the pinned baseline if necessary",
+      "Complete final-candidate validation and release review before applying release:publish"
+    ],
+    "distribution": "GitHub wheel and source distribution; this workflow does not publish to PyPI."
+  }
+}

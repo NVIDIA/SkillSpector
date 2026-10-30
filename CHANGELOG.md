@@ -1,6 +1,13 @@
+### 2.14.0 (Unreleased)
+### Changes after the 2.13.3 candidate
+* Include all 20 remaining P0/P1 PRs already merged upstream from the October 28–30 daily reports: six P0 and fourteen P1 changes. The 18 changes already represented by #958 are inherited rather than selected again.
+* Add the remaining model registry, capability, and structured-output updates from #529, #598, #650, #690, #708, #806, and #824. Keep the corrected GPT-5.4 and Claude 4.6 defaults; newer models remain opt-in.
+* Include required merged prerequisites #810, #436, #819 (the previously unshipped reference-comment portion), and #662. Preserve earlier maintenance fixes and completion/recovery safeguards.
+* Support Python 3.15, safer and faster CLI/provider startup, configurable recursive limits, bounded CLI prompts, accurate reference/ZIP coverage, and the remaining detector/report fixes.
+* See [release notes](docs/release/skillspector-2.14.0.md) and [selection manifest](docs/release/skillspector-2.14.0-manifest.json) for exact source PRs, inherited exclusions, upgrade guidance, and remaining limits.
+---
 ### 2.13.3 (Unreleased)
 ### Security and integrity fixes
-* Account for successfully inspected linked ZIP containers while retaining member failures and archive limits. (#939)
 * Prevent baseline and recursive reports from overwriting primary and child inputs, including aliases. (#924, #938)
 * Keep unavailable requested custom YARA rule directories explicitly incomplete. (#919)
 * Score non-English gap-fill findings in batch recommendations and exit status. (#772)
