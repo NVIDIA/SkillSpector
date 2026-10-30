@@ -32,7 +32,7 @@ from enum import StrEnum
 from functools import partial
 from hashlib import sha256
 from pathlib import Path
-from stat import S_ISREG
+from stat import S_ISDIR
 from time import monotonic
 from typing import Annotated, cast
 from urllib.parse import quote
@@ -353,18 +353,19 @@ def _validate_report_destination(input_path: Path, output: Path | None) -> None:
         input_path = _manifest_file(input_path) or input_path
     if input_path.is_file() and output.exists() and output.samefile(input_path):
         raise ValueError("--output points to the input file. Choose a different output path.")
-    # Reject an existing non-regular output (e.g. a directory) before any
-    # scan work starts: write_text_no_follow() would refuse it only after
-    # the analysis has already consumed its tokens. lstat (no follow) keeps
-    # this consistent with the write-time refusal, which also rejects
-    # symlinks rather than following them. A missing path passes here and
-    # is still validated when the report is written.
+    # Reject an existing directory output before any scan work starts:
+    # write_text_no_follow() would refuse it only after the analysis has
+    # already consumed its tokens. Only directories are rejected here:
+    # symlinks and other non-regular paths are deliberately left to the
+    # existing downstream validation, which reports them with more
+    # specific messages (input-file alias, "must be a regular file").
+    # A missing path passes here and is still validated at write time.
     try:
         mode = os.lstat(output).st_mode
     except FileNotFoundError:
         pass
     else:
-        if not S_ISREG(mode):
+        if S_ISDIR(mode):
             raise ValueError(
                 f"--output points to a non-regular path {str(output)!r}. "
                 "Choose a regular file path for the report."
