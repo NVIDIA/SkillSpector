@@ -3275,7 +3275,7 @@ def _analyze_dependencies_detailed(
         logger.debug(
             "SC4: using static fallback for %d uncovered packages", len(uncovered_packages)
         )
-    elif uncovered_packages and not osv_findings and not was_osv_reachable():
+    elif uncovered_packages and not osv_findings and not was_osv_reachable(osv_budget):
         # OSV.dev was unreachable and fallback found nothing — surface the gap
         retain(
             [
