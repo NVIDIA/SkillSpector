@@ -7393,14 +7393,9 @@ def test_all_cli_writers_reject_symlink_destinations(tmp_path, monkeypatch, mode
     if mode != "baseline-default":
         args += ["--output", str(output)]
     result = runner.invoke(app, args)
-    if mode in {"json", "sarif", "markdown"}:
-        # 2.13.x predates #662, so recursive report write errors are not mapped to exit 2.
-        assert isinstance(result.exception, ValueError), result.output
-        assert "non-regular" in str(result.exception)
-    else:
-        assert result.exit_code == 2, result.output
-        expected_error = "must be a regular file" if mode.startswith("baseline") else "non-regular"
-        assert expected_error in result.output
+    assert result.exit_code == 2, result.output
+    expected_error = "must be a regular file" if mode.startswith("baseline") else "non-regular"
+    assert expected_error in result.output
     assert protected.read_text(encoding="utf-8") == "preserve"
     assert output.is_symlink()
 
@@ -7616,3 +7611,48 @@ def test_scan_report_saved_message_shows_bracketed_path_literally(tmp_path: Path
     )
     assert "out[b].json" in "".join(result.output.split())
     assert report.exists()
+
+
+@pytest.mark.parametrize("format_name", ["json", "sarif", "markdown", "terminal"])
+def test_cli_scan_recursive_unwritable_output_exits_two(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, format_name: str
+) -> None:
+    """A recursive report that cannot be written is an error (exit 2), as for one skill."""
+
+    skills_root = tmp_path / "multi-unwritable"
+
+    def fake_detect_skills(_: Path) -> MultiSkillDetectionResult:
+        return MultiSkillDetectionResult(
+            is_multi_skill=True,
+            has_root_skill=False,
+            skills=[
+                SkillDirectory(path=(skills_root / "alpha"), name="alpha", relative_path="alpha"),
+                SkillDirectory(path=(skills_root / "beta"), name="beta", relative_path="beta"),
+            ],
+        )
+
+    for skill in ("alpha", "beta"):
+        (skills_root / skill).mkdir(parents=True)
+
+    monkeypatch.setattr("skillspector.cli.detect_skills", fake_detect_skills)
+    monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: _bounded_recursive_result("x"))
+
+    out_file = tmp_path / "missing-directory" / "combined.out"
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(skills_root),
+            "--recursive",
+            "--format",
+            format_name,
+            "--no-llm",
+            "--output",
+            str(out_file),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert isinstance(result.exception, SystemExit)
+    assert "Error:" in result.output
+    assert not out_file.exists()
