@@ -1640,7 +1640,7 @@ class TestTP4Fallbacks:
 
         monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "json_schema")
         mcp_tool_poisoning._TP4Analyzer(model="azure/anthropic/claude-opus-5")
-        assert bindings[-1] == {"method": "json_schema"}
+        assert bindings[-1] == {"method": "json_schema", "include_raw": True, "strict": True}
 
     @pytest.mark.parametrize(
         "provider", ["openai_compatible", "nv_inference", "azure_openai", "nv_build"]
@@ -1656,7 +1656,7 @@ class TestTP4Fallbacks:
         )
         monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
         analyzer._model_for_call()
-        assert bindings == [{}, {}]
+        assert bindings == [{"include_raw": True, "strict": True}] * 2
 
     @pytest.mark.parametrize(
         "model",
@@ -1671,7 +1671,7 @@ class TestTP4Fallbacks:
     def test_opus5_tp4_exact_label_excludes_aliases(self, patch_openai_chat_model, model):
         bindings = patch_openai_chat_model()
         mcp_tool_poisoning._TP4Analyzer(model=model)
-        assert bindings == [{}]
+        assert bindings == [{"include_raw": True, "strict": True}]
 
     @pytest.mark.parametrize("effort", ["low", "medium", "high", "none"])
     def test_reasoning_env_skips_preference_on_initial_and_refreshed_models(
@@ -1686,7 +1686,7 @@ class TestTP4Fallbacks:
         )
         monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
         analyzer._model_for_call()
-        assert bindings == [{}, {}]
+        assert bindings == [{"include_raw": True, "strict": True}] * 2
 
     @pytest.mark.parametrize(
         "controls",
@@ -1709,7 +1709,7 @@ class TestTP4Fallbacks:
         )
         monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
         analyzer._model_for_call()
-        assert bindings == [{}, {}]
+        assert bindings == [{"include_raw": True, "strict": True}] * 2
 
     @pytest.mark.parametrize(
         "override,hint,expected",
@@ -1731,7 +1731,8 @@ class TestTP4Fallbacks:
         assert bindings == [
             {
                 "method": expected,
-                **({"include_raw": True} if expected == "function_calling" else {}),
+                "include_raw": True,
+                **({"strict": True} if expected == "json_schema" else {}),
             }
         ]
 
@@ -1835,7 +1836,7 @@ class TestTP4Fallbacks:
         assert len(calls) == 4
         assert result["analyzer_status_events"][0]["status"] == "degraded"
         assert any(
-            event.get("reason_code") is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+            event.get("reason_code") is LedgerReason.LLM_RESPONSE_INVALID_TOOL
             and event.get("error_class") == "ValidationError"
             for event in result["inspection_ledger"]
         )
