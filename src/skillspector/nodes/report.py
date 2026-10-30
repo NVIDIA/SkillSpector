@@ -1839,8 +1839,8 @@ def report(state: SkillspectorState) -> dict[str, object]:
             else "Workflow deadline reached before LLM availability could be confirmed."
         )
     else:
-        provider_available, provider_error = is_llm_available(
-            timeout=remaining if remaining is not None else 120
+        provider_available, provider_error = (
+            is_llm_available(timeout=remaining) if remaining is not None else is_llm_available()
         )
     runtime_available = llm_runtime_available(
         preflight_available=provider_available,

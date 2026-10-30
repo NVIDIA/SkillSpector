@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import replace
+from unittest.mock import MagicMock
 
 import pytest
 from markdown_it import MarkdownIt
