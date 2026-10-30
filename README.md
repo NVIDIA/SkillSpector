@@ -319,6 +319,7 @@ inference gateways.
 | `openai_compatible` | `SKILLSPECTOR_COMPAT_API_KEY` + `SKILLSPECTOR_COMPAT_BASE_URL` | Any OpenAI-compatible endpoint | `llama-3.1-70b-versatile` |
 | `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | local Claude runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `codex_cli` | Disabled | Registered for compatibility; its read-only sandbox permits host-file reads | Use an HTTP API provider or another supported CLI provider |
+| `copilot_cli` | _(none — uses local CLI auth)_ | local `copilot` 1.0.105 binary | local Copilot runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `gemini_cli` | _(none — uses local CLI auth)_ | local `gemini` binary | local Gemini runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` (verified 1.18.31–1.18.35, 1.19.0–1.19.4) binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
 
@@ -762,7 +763,7 @@ Issues (2)
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `gemini`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `gemini_cli`, or `opencode_cli`. Hosted providers use bundled `model_registry.yaml` defaults; CLI providers fall back to the local runtime's default model unless `SKILLSPECTOR_MODEL` is set. Defaults to `nv_build`. | Optional |
+| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `gemini`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `copilot_cli`, `gemini_cli`, or `opencode_cli`. Hosted providers use bundled `model_registry.yaml` defaults; CLI providers fall back to the local runtime's default model unless `SKILLSPECTOR_MODEL` is set. Defaults to `nv_build`. | Optional |
 | `GOOGLE_CLOUD_PROJECT` | Google Cloud project ID for the `gemini` provider. Authenticates via Google Cloud Application Default Credentials (ADC) or GKE Workload Identity. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=gemini` |
 | `GOOGLE_CLOUD_LOCATION` | Google Cloud location for the `gemini` provider endpoint (e.g. `global`, `us`, `eu`, `us-central1`). Defaults to `global`. | Optional (used when `SKILLSPECTOR_PROVIDER=gemini`) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Optional path to ADC credential/config file (e.g. Workload or Workforce Identity Federation config; exported service account keys are discouraged). For local development, use `gcloud auth application-default login`; for GKE, use Workload Identity. | Optional (used when `SKILLSPECTOR_PROVIDER=gemini`) |
@@ -799,9 +800,13 @@ Issues (2)
 
 > **Disabled provider:** `codex_cli` remains registered but cannot run LLM analysis because its read-only sandbox allows host-file reads. Existing users should select an HTTP API provider or another supported CLI provider.
 
-> **CLI providers** (`claude_cli`, `gemini_cli`, `opencode_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
+> **CLI providers** (`claude_cli`, `copilot_cli`, `gemini_cli`, `opencode_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active, except `copilot_cli` deliberately preserves only `COPILOT_GITHUB_TOKEN` (its documented headless auth) while dropping every other `COPILOT_*`, all `GITHUB_COPILOT_*`, and the `GH_TOKEN` family. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
 >
 > `opencode_cli` currently fails closed unless the installed OpenCode version is one of the individually verified releases (`1.18.31`, `1.18.32`, `1.18.33`, `1.18.34`, `1.18.35`, `1.19.0`, `1.19.1`, `1.19.2`, `1.19.3`, `1.19.4`), whose configuration precedence and deny-all semantics are verified by this release; every other version, including prereleases, still fails closed.
+>
+> `copilot_cli` currently fails closed unless the installed Copilot CLI version is exactly `1.0.105`, the version whose tool-deny behavior is verified by this release.
+>
+> Residual: Copilot CLI falls back to `gh auth token` when no other credential is available, so a stored gh login can still reach the child. This is inherent to Copilot auth.
 
 ### CLI Options
 
