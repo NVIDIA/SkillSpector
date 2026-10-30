@@ -1058,7 +1058,9 @@ def test_recursive_dot_child_static_finding_never_reaches_a_provider(
     get_chat_model = MagicMock(return_value=model)
     monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
     monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", get_chat_model)
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(
+        "skillspector.nodes.report.is_llm_available", lambda timeout=120: (True, None)
+    )
     monkeypatch.setattr(cli_module, "graph", import_module("skillspector.graph").create_graph())
     monkeypatch.setattr(cli_module, "RISK_THRESHOLD", 100)
     output = tmp_path / "recursive.json"

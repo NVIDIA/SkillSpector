@@ -45,7 +45,7 @@ async def test_run_scan_returns_structured_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """run_scan returns a JSON-serialisable verdict with the expected shape."""
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (False, "no llm"))
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
@@ -63,7 +63,7 @@ async def test_run_scan_llm_accounting_is_honest_without_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Requesting the LLM with no credentials must report it as not used."""
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (False, "no llm"))
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
@@ -226,7 +226,7 @@ async def test_all_not_applicable_semantic_pass_remains_install_eligible(
         {"analyzer_id": "semantic_developer_intent", "status": "not_applicable"},
         {"analyzer_id": "semantic_quality_policy", "status": "not_applicable"},
     ]
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (True, None))
     monkeypatch.setattr(mcp_server.graph, "ainvoke", AsyncMock(return_value=graph_result))
 
     verdict = await run_scan("fixture", use_llm=True, output_format="json")
@@ -320,7 +320,7 @@ async def test_late_provider_binding_cannot_claim_a_complete_semantic_scan(
         captured["result"] = await late_bound_graph.ainvoke(state, config=config)
         return captured["result"]  # type: ignore[return-value]
 
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (True, None))
     monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", transport_failure)
     monkeypatch.setattr(mcp_server, "graph", SimpleNamespace(ainvoke=invoke_real_graph))
 
@@ -346,7 +346,9 @@ async def test_requested_unavailable_llm_blocks_safe_to_install(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An unmet requested analysis pass cannot produce an install-safe verdict."""
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "not configured"))
+    monkeypatch.setattr(
+        mcp_server, "is_llm_available", lambda timeout=120: (False, "not configured")
+    )
     monkeypatch.setattr(
         mcp_server.graph,
         "ainvoke",
@@ -368,7 +370,9 @@ async def test_unrequested_llm_keeps_static_scan_eligible_for_safe_to_install(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Explicit static-only scans retain the normal complete low-risk safety predicate."""
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "not configured"))
+    monkeypatch.setattr(
+        mcp_server, "is_llm_available", lambda timeout=120: (False, "not configured")
+    )
     monkeypatch.setattr(
         mcp_server.graph,
         "ainvoke",
@@ -395,7 +399,7 @@ async def test_all_failed_runtime_llm_calls_block_safe_to_install(
         {"node": "semantic_security_discovery", "ok": False, "error": "transport error"},
         {"node": "semantic_quality_policy", "ok": False, "error": "invalid response"},
     ]
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (True, None))
     monkeypatch.setattr(
         mcp_server.graph,
         "ainvoke",
@@ -422,7 +426,7 @@ async def test_partial_runtime_llm_failure_blocks_safe_to_install(
         {"node": "semantic_security_discovery", "ok": True, "error": None},
         {"node": "semantic_quality_policy", "ok": False, "error": "rate limited"},
     ]
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (True, None))
     monkeypatch.setattr(
         mcp_server.graph,
         "ainvoke",
@@ -457,7 +461,7 @@ async def test_successful_runtime_llm_calls_keep_complete_scan_install_eligible(
         {"node": "semantic_quality_policy", "ok": True, "error": None},
         {"node": "meta_analyzer", "ok": True, "error": None},
     ]
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (True, None))
     monkeypatch.setattr(
         mcp_server.graph,
         "ainvoke",
@@ -500,10 +504,12 @@ async def test_unavailable_requested_llm_aligns_embedded_json_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The embedded JSON report reflects requested-but-unavailable LLM analysis."""
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "not configured"))
+    monkeypatch.setattr(
+        mcp_server, "is_llm_available", lambda timeout=120: (False, "not configured")
+    )
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (False, "not configured"),
+        lambda timeout=120: (False, "not configured"),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
 
@@ -522,10 +528,10 @@ async def test_empty_runtime_telemetry_aligns_mcp_and_embedded_json_caution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A successful preflight cannot leave the embedded report fail-open."""
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda timeout=120: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
 
@@ -575,10 +581,10 @@ async def test_malformed_runtime_telemetry_preserves_failed_meta_availability(
             "analysis_completeness": completeness,
         }
 
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda timeout=120: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", render_mixed_telemetry)
 
@@ -627,10 +633,10 @@ async def test_truthy_malformed_ok_is_not_counted_as_runtime_success(
             "analysis_completeness": completeness,
         }
 
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda timeout=120: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", render_truthy_malformed_telemetry)
 
@@ -683,10 +689,10 @@ async def test_failed_meta_analysis_aligns_mcp_and_embedded_json_availability(
             "analysis_completeness": completeness,
         }
 
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (True, None))
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (True, None),
+        lambda timeout=120: (True, None),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", render_failed_meta_analysis)
 
@@ -704,10 +710,12 @@ async def test_explicit_static_only_keeps_embedded_json_report_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Explicit static-only mode keeps its existing SAFE report and request metadata."""
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "not configured"))
+    monkeypatch.setattr(
+        mcp_server, "is_llm_available", lambda timeout=120: (False, "not configured")
+    )
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (False, "not configured"),
+        lambda timeout=120: (False, "not configured"),
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
 
@@ -724,7 +732,7 @@ async def test_run_scan_static_mode_skips_availability_with_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Static scans do not advertise availability without probing credentials."""
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (True, None))
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
@@ -746,7 +754,7 @@ async def test_run_scan_openai_fallback_builds_matching_graph_model_config(
     ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-only")
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (True, None))
     _write_skill(tmp_path)
     captured: dict[str, str] = {}
 
@@ -950,7 +958,7 @@ async def test_run_scan_rejects_local_target_when_disallowed(
     """HTTP-style scans reject local targets before the graph is invoked."""
     graph_ainvoke = AsyncMock()
     monkeypatch.setattr(mcp_server.graph, "ainvoke", graph_ainvoke)
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (False, "no llm"))
 
     with pytest.raises(ValueError, match="local targets are disabled"):
         await run_scan(str(tmp_path), allow_local_targets=False)
@@ -964,7 +972,7 @@ async def test_run_scan_rejects_file_url_when_local_targets_disallowed(
     """The same HTTP guard rejects file:// targets before any scan runs."""
     graph_ainvoke = AsyncMock()
     monkeypatch.setattr(mcp_server.graph, "ainvoke", graph_ainvoke)
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (False, "no llm"))
 
     with pytest.raises(ValueError, match="local targets are disabled"):
         await run_scan(tmp_path.as_uri(), allow_local_targets=False)
@@ -978,7 +986,7 @@ async def test_run_scan_rejects_local_yara_rules_when_targets_are_disallowed(
     """The HTTP policy covers local YARA configuration as well as scan targets."""
     graph_ainvoke = AsyncMock()
     monkeypatch.setattr(mcp_server.graph, "ainvoke", graph_ainvoke)
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (False, "no llm"))
 
     with pytest.raises(ValueError, match="local targets are disabled"):
         await run_scan(
@@ -1064,7 +1072,7 @@ async def test_run_scan_allows_remote_target_when_local_targets_disallowed(
         }
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", graph_ainvoke)
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (False, "no llm"))
 
     target = "https://example.com/skills/safe.git"
     result = await run_scan(target, allow_local_targets=False)
@@ -1089,7 +1097,7 @@ async def test_run_scan_keeps_default_local_target_compatibility(
         }
     )
     monkeypatch.setattr(mcp_server.graph, "ainvoke", graph_ainvoke)
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (False, "no llm"))
 
     result = await run_scan(str(tmp_path))
 
@@ -1215,7 +1223,7 @@ async def test_build_server_disables_local_targets_by_default(
 
     graph_ainvoke = AsyncMock()
     monkeypatch.setattr(mcp_server.graph, "ainvoke", graph_ainvoke)
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (False, "no llm"))
 
     server = mcp_server.build_server()
 
@@ -1357,7 +1365,7 @@ async def test_run_scan_redacts_preflight_reason_before_graph_and_report(
 ) -> None:
     """Provider error details cannot publish credentials or pass them into graph state."""
     captured: dict[str, object] = {}
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, reason))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (False, reason))
 
     def unexpected_probe(**_: object) -> tuple[bool, str | None]:
         raise AssertionError("report must retain the original preflight result")
@@ -1383,7 +1391,7 @@ async def test_run_scan_preflight_without_reason_keeps_generic_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A reason-less unavailable preflight still renders an honest static-only warning."""
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, None))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda timeout=120: (False, None))
     monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
 
     def unexpected_probe(**_: object) -> tuple[bool, str | None]:
