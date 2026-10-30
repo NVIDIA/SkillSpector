@@ -585,6 +585,6 @@ def test_empty_shell_clauses_do_not_repeat_command_string_parsing() -> None:
     ["BASH_ENV=setup.sh ", "export BASH_ENV=setup.sh; ", "env BASH_ENV=setup.sh "],
 )
 def test_shell_startup_code_keeps_literal_comparison_partial(startup: str) -> None:
-    source = startup + "bash -c 'test x = \"$(printf \"%s%s%s\" r m \" -rf /\")\"'"
+    source = startup + 'bash -c \'test x = "$(printf "%s%s%s" r m " -rf /")"\''
 
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
