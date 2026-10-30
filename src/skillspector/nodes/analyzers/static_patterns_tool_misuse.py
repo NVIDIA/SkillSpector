@@ -1748,7 +1748,19 @@ def _has_shell_comparison_overrides(content: str, check_runtime: Callable[[], No
                 function or re.match(r"[ \t]*(?:\([ \t]*\)|\{)", source[cursor:])
             ):
                 return True
-            if word not in {"if", "then", "elif", "else", "do", "while", "until", "!", "command", "builtin", "function"}:
+            if word not in {
+                "if",
+                "then",
+                "elif",
+                "else",
+                "do",
+                "while",
+                "until",
+                "!",
+                "command",
+                "builtin",
+                "function",
+            }:
                 break
             function = word == "function"
         else:
@@ -2788,7 +2800,7 @@ def _has_shell_command_word_exhaustion(
             if not _quoted_candidate_is_complete(content, start, quote_limits, check_runtime):
                 if printf_comparison_words is None:
                     printf_comparison_words = {}
-                    for begin, end in (() if _comparison_overrides else shell_data_ranges or ()):
+                    for begin, end in () if _comparison_overrides else shell_data_ranges or ():
                         printf_comparison_words.update(
                             (begin + position, begin + stop)
                             for position, stop in _literal_printf_comparison_words(
@@ -2922,9 +2934,7 @@ def _shell_command_strings(
         yield command_string
 
 
-def _nonempty_shell_clause_starts(
-    content: str, check_runtime: Callable[[], None]
-) -> Iterator[int]:
+def _nonempty_shell_clause_starts(content: str, check_runtime: Callable[[], None]) -> Iterator[int]:
     """Avoid reparsing the same trailing command across empty physical lines."""
     for start in _shell_clause_starts(content, check_runtime):
         while start < len(content) and content[start] in " \t":
@@ -6036,9 +6046,7 @@ def _has_bounded_parse_exhaustion(
         perl_eval_blocks=file_type == "perl",
         quote_limits=quote_limits,
         shell_data_ranges=(
-            [(0, len(content))]
-            if file_type == "shell" and complete_context
-            else shell_fence_ranges
+            [(0, len(content))] if file_type == "shell" and complete_context else shell_fence_ranges
         ),
     ):
         return True

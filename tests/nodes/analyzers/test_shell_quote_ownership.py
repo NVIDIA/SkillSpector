@@ -105,7 +105,7 @@ def test_printf_comparison_proof_applies_inside_closed_shell_fence() -> None:
         "builtin -- alias test=eval\n",
         "alias test=eval\n",
         "enable -n test\n",
-        "eval \"$setup\"\n",
+        'eval "$setup"\n',
     ],
 )
 def test_printf_comparison_rejects_locally_replaced_builtins(prefix: str) -> None:
@@ -115,7 +115,7 @@ def test_printf_comparison_rejects_locally_replaced_builtins(prefix: str) -> Non
 
 def test_printf_comparison_does_not_regain_ownership_in_child_shell() -> None:
     source = (
-        'test() { $3; }; export -f test; bash -c \'\n'
+        "test() { $3; }; export -f test; bash -c '\n"
         'test x = "$(printf "%s%s%s" r m " -rf /")"\n\'\n'
     )
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
@@ -145,7 +145,9 @@ def test_printf_comparison_retains_nested_and_following_security_checks(placemen
         if command.startswith("$"):
             assert tm.has_bounded_parse_exhaustion(candidate, lambda: None, file_type="shell")
         else:
-            assert any(finding.rule_id == "TM1" for finding in tm.analyze(candidate, "run.sh", "shell"))
+            assert any(
+                finding.rule_id == "TM1" for finding in tm.analyze(candidate, "run.sh", "shell")
+            )
 
 
 @pytest.mark.parametrize("padding", [0, 5000, 9000])
