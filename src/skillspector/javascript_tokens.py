@@ -11,6 +11,7 @@ ownership. Unsupported source keeps its original conservative shell reading.
 from __future__ import annotations
 
 import re
+from bisect import bisect_left
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -401,6 +402,7 @@ _SHELL_EXECUTION_CALLS = frozenset(
         "spawnfilesync",
         "spawnsync",
         "system",
+        "run",
     }
 )
 _SHELL_EXECUTION_MODULES = frozenset({"child_process", "execa", "shelljs", "zx"})
@@ -456,6 +458,9 @@ def javascript_template_spans(
         return None
 
     if _has_shell_execution_call(program, check_runtime):
+        return None
+
+    if _has_unproven_assertion_template_call(content, program, templates, check_runtime):
         return None
 
     # Nested template literals occur inside interpolation expressions. The
@@ -514,6 +519,50 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
             if _is_shell_execution_callee(tag) or (tag.type == "Identifier" and tag.name == "$"):
                 return True
     return False
+
+
+def _has_unproven_assertion_template_call(
+    content: str,
+    program: Any,
+    templates: list[tuple[int, int, bool]],
+    check_runtime: Callable[[], None],
+) -> bool:
+    projected = assertion_template_shell_text(content, check_runtime)
+    if "node:assert" in content and projected == content:
+        return True
+    unprojected_templates = sorted(
+        (start, end)
+        for start, end, _dynamic in templates
+        if projected[start] == content[start] or projected[end - 1] == content[end - 1]
+    )
+    template_starts = [start for start, _end in unprojected_templates]
+    for node in _walk_nodes(program, check_runtime):
+        if node.type != "CallExpression" or not _is_assertion_like_callee(node.callee):
+            continue
+        for argument in node.arguments:
+            argument_range = getattr(argument, "range", None)
+            if not isinstance(argument_range, list) or len(argument_range) != 2:
+                continue
+            argument_start, argument_end = argument_range
+            index = bisect_left(template_starts, argument_start)
+            if (
+                index < len(unprojected_templates)
+                and template_starts[index] < argument_end
+                and unprojected_templates[index][1] <= argument_end
+            ):
+                return True
+    return False
+
+
+def _is_assertion_like_callee(callee: Any) -> bool:
+    if callee.type == "Identifier":
+        return callee.name.casefold() in {"assert", "check"}
+    if callee.type != "MemberExpression":
+        return False
+    property_name = getattr(callee.property, "name", None)
+    if property_name is None:
+        property_name = getattr(callee.property, "value", None)
+    return isinstance(property_name, str) and property_name in _MESSAGE_ARGUMENTS
 
 
 def _is_shell_execution_module(module: Any) -> bool:
