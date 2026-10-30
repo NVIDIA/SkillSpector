@@ -106,10 +106,43 @@ def test_printf_comparison_proof_applies_inside_closed_shell_fence() -> None:
         "alias test=eval\n",
         "enable -n test\n",
         'eval "$setup"\n',
+        "source definitions.sh\n",
+        ". definitions.sh\n",
+        "trap 'test() { :; }' DEBUG\n",
+        "MODE=1 source definitions.sh\n",
+        "MODE=1 eval setup\n",
     ],
 )
 def test_printf_comparison_rejects_locally_replaced_builtins(prefix: str) -> None:
     source = prefix + 'test x = "$(printf "%s%s%s" r m " -rf /")"\n'
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("name", ["test", "printf", "["])
+@pytest.mark.parametrize("spacing", ["before", "inside", "both"])
+def test_printf_comparison_rejects_continued_function_declarations(
+    newline: str, name: str, spacing: str
+) -> None:
+    continuation = "\\" + newline
+    before = " " + continuation if spacing in {"before", "both"} else " "
+    inside = continuation if spacing in {"inside", "both"} else ""
+    prefix = name + before + "(" + inside + ") { :; }\n"
+
+    # The inert body cannot independently trigger the override guard.
+    assert tm._has_shell_comparison_overrides(prefix, lambda: None)
+    source = prefix + 'test x = "$(printf "%s%s%s" r m " -rf /")"\n'
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "command", ["$COMMAND", '"$COMMAND"', "$(echo command)", "${COMMAND:-test}"]
+)
+def test_printf_comparison_refuses_unknown_command_headers(command: str) -> None:
+    prefix = command + "\n"
+
+    assert tm._has_shell_comparison_overrides(prefix, lambda: None)
+    source = prefix + 'test x = "$(printf "%s\\n" "phase one")"\n'
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
@@ -131,6 +164,25 @@ def test_printf_comparison_skips_empty_clauses_without_quadratic_work() -> None:
         assert checks < 1000
 
     assert not tm.has_bounded_parse_exhaustion(source, check, file_type="shell")
+
+
+def test_printf_comparison_refuses_hostile_header_with_bounded_work() -> None:
+    source = (
+        "$(env X="
+        + "${x:-$(echo " * 4000
+        + "z"
+        + ")}" * 4000
+        + ")\n"
+        + 'test x = "$(printf "%s\\n" "phase one")"\n'
+    )
+    checks = 0
+
+    def check() -> None:
+        nonlocal checks
+        checks += 1
+        assert checks < 1000
+
+    assert tm._has_shell_comparison_overrides(source, check)
 
 
 @pytest.mark.parametrize("placement", ["nested", "following"])

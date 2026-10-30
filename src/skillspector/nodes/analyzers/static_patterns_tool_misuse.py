@@ -1740,12 +1740,33 @@ def _has_shell_comparison_overrides(content: str, check_runtime: Callable[[], No
         function = False
         for _ in range(8):
             word, cursor, limited = _next_shell_invocation_word(source, cursor, check_runtime)
-            if limited or word is None:
-                break
-            if word in {"alias", "enable", "eval", "time", "coproc"} or word.startswith("-"):
+            if (
+                limited
+                or word is None
+                or any(
+                    marker in word
+                    for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+                )
+            ):
+                # An unresolved command may replace a builtin. Stop this optional
+                # proof instead of reparsing overlapping nested command heads.
                 return True
+            if word in {
+                "alias",
+                "enable",
+                "eval",
+                "source",
+                ".",
+                "trap",
+                "time",
+                "coproc",
+            } or word.startswith("-"):
+                return True
+            if _SHELL_ASSIGNMENT_PREFIX_RE.match(word) is not None:
+                continue
             if word in {"test", "[", "printf"} and (
-                function or re.match(r"[ \t]*(?:\([ \t]*\)|\{)", source[cursor:])
+                function
+                or re.match(r"(?:[ \t]|\\\r?\n)*(?:\((?:[ \t]|\\\r?\n)*\)|\{)", source[cursor:])
             ):
                 return True
             if word not in {
