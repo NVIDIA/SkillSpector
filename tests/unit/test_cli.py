@@ -528,8 +528,9 @@ def test_cli_rejects_output_overwriting_directory_manifest(
 @pytest.mark.parametrize("primary", ["SKILL.md", "skill.md", ".aisop/workflow.aisop.json"])
 @pytest.mark.parametrize("max_skills", [1, 2])
 def test_recursive_output_preserves_child_primary_before_scanning(
-    tmp_path: Path, primary: str, max_skills: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, primary: str, max_skills: int
 ) -> None:
+    monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_SKILLS", max_skills)
     first = tmp_path / "a" / "SKILL.md"
     first.parent.mkdir()
     first.write_text("# First skill\n")
@@ -556,8 +557,6 @@ def test_recursive_output_preserves_child_primary_before_scanning(
                 "--no-llm",
                 "--format",
                 "json",
-                "--max-skills",
-                str(max_skills),
                 "--output",
                 str(source),
             ],
