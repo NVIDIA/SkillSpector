@@ -192,7 +192,7 @@ def test_multiline_prompt_matching_preserves_deadline_checks(
     assert checks == 8
 
 
-def test_multiline_regex_timeout_preserves_partial_evidence(
+def test_multiline_regex_timeout_is_scoped_to_current_artifact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     timeouts = []
@@ -201,6 +201,40 @@ def test_multiline_regex_timeout_preserves_partial_evidence(
         def finditer(self, _text, *, timeout, concurrent):
             timeouts.append(timeout)
             raise TimeoutError("regex timed out")
+
+    monkeypatch.setattr(artifact_integrity, "_MULTILINE_PROMPT_PATTERNS", (ExpiredPattern(),))
+    monkeypatch.setattr(artifact_integrity, "transitive_remaining_seconds", lambda _state: 1.0)
+    result = node(
+        {
+            "components": ["SKILL.md", "later.md"],
+            "file_cache": {
+                "SKILL.md": _letter_lines("without telling user"),
+                "later.md": "Summarize text.",
+            },
+        }
+    )
+
+    assert timeouts == [artifact_integrity._MULTILINE_PROMPT_PATTERN_SECONDS]
+    assert not result["findings"]  # Timeout is missing coverage, not a semantic finding.
+    assert [
+        (event["path"], event["outcome"], event.get("reason_code"))
+        for event in result["inspection_ledger"]
+    ] == [
+        ("SKILL.md", "partial", LedgerReason.RUNTIME_LIMIT),
+        ("later.md", "completed", None),
+    ]
+    assert (
+        result["inspection_ledger"][0]["limit_seconds"]
+        == artifact_integrity._MULTILINE_PROMPT_PATTERN_SECONDS
+    )
+
+
+def test_multiline_regex_timeout_preserves_global_terminal_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExpiredPattern:
+        def finditer(self, _text, *, timeout, concurrent):
+            raise TimeoutError("global deadline reached")
 
     monkeypatch.setattr(artifact_integrity, "_MULTILINE_PROMPT_PATTERNS", (ExpiredPattern(),))
     monkeypatch.setattr(artifact_integrity, "transitive_remaining_seconds", lambda _state: 0.01)
@@ -214,13 +248,13 @@ def test_multiline_regex_timeout_preserves_partial_evidence(
         }
     )
 
-    assert timeouts == [0.01]
-    assert not result["findings"]  # Timeout is missing coverage, not a semantic finding.
-    for event in result["inspection_ledger"]:
-        assert event["outcome"] == "partial"
-        assert event["reason_code"] == LedgerReason.RUNTIME_LIMIT
-        assert event["limit_seconds"] == 0.01
-    assert {event["path"] for event in result["inspection_ledger"]} == {"SKILL.md", "later.md"}
+    assert [
+        (event["path"], event["outcome"], event.get("reason_code"))
+        for event in result["inspection_ledger"]
+    ] == [
+        ("SKILL.md", "partial", LedgerReason.RUNTIME_LIMIT),
+        ("later.md", "partial", LedgerReason.RUNTIME_LIMIT),
+    ]
 
 
 @pytest.mark.asyncio
