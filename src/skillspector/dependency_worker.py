@@ -15,10 +15,13 @@ import re
 import sys
 import tarfile
 from dataclasses import asdict
+from hashlib import sha256
+from itertools import count
 from pathlib import PurePosixPath
 
 from skillspector.artifacts import ContentKind, classify_artifact
 from skillspector.dependency_sandbox import restrict_worker
+from skillspector.models import use_finding_id_factory
 from skillspector.nodes.analyzers import (
     static_patterns_data_exfiltration,
     static_patterns_privilege_escalation,
@@ -312,6 +315,9 @@ def main() -> None:
     try:
         import resource
 
+        # Some Python runtimes obtain UUID entropy through /dev/urandom.
+        # Seed identities before closing descriptors and denying filesystem access.
+        finding_id_seed = os.urandom(32)
         descriptor_limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
         os.closerange(3, descriptor_limit if descriptor_limit > 0 else 1_048_576)
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -334,7 +340,12 @@ def main() -> None:
         # The parent enforces wall time independently of the worker CPU limit.
         if not math.isfinite(request["limits"]["seconds"]):
             raise InspectionError("runtime_limit")
-        result = inspect_archive(request)
+        finding_ids = (
+            "finding-" + sha256(finding_id_seed + str(index).encode("ascii")).hexdigest()[:32]
+            for index in count()
+        )
+        with use_finding_id_factory(lambda: next(finding_ids)):
+            result = inspect_archive(request)
         output = json.dumps(result, ensure_ascii=True)
         if len(output) > MAX_OUTPUT_BYTES:
             raise InspectionError("output_limit")

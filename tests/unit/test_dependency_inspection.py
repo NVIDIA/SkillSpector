@@ -32,6 +32,7 @@ from skillspector.dependency_inspection import (
     inspect_dependencies,
 )
 from skillspector.inspection_ledger import finalize_ledger
+from skillspector.models import Finding, use_finding_id_factory
 from skillspector.state import WorkflowResourceBudget
 
 SUPPORTED_SANDBOX_PLATFORM = sys.platform == "linux" and platform.machine() in {
@@ -138,6 +139,17 @@ def inspection_diagnostics(result):
     }
 
     return json.dumps(details, default=str, indent=2)
+
+
+def test_finding_id_factory_restores_nested_and_ordinary_scans():
+    with use_finding_id_factory(lambda: "finding-outer"):
+        assert Finding("E2", "outer").finding_id == "finding-outer"
+        with pytest.raises(RuntimeError, match="scope exit"):
+            with use_finding_id_factory(lambda: "finding-inner"):
+                assert Finding("E2", "inner").finding_id == "finding-inner"
+                raise RuntimeError("scope exit")
+        assert Finding("E2", "restored outer").finding_id == "finding-outer"
+    assert Finding("E2", "ordinary").finding_id not in {"finding-outer", "finding-inner"}
 
 
 def test_disabled_does_not_acquire_content(monkeypatch):
@@ -413,6 +425,9 @@ def restrict_and_probe():
             blocked.append(True)
         else:
             blocked.append(False)
+    def deny_entropy(_size):
+        raise PermissionError("runtime entropy unavailable after isolation")
+    os.urandom=deny_entropy
     print("blocked="+json.dumps(blocked),file=sys.stderr)
 dependency_worker.restrict_worker=restrict_and_probe
 dependency_worker.main()
@@ -450,7 +465,7 @@ dependency_worker.main()
     )
     assert process.returncode == 0, process.stderr.decode()
     result = json.loads(process.stdout)
-    diagnostics = {"result": inspection_diagnostics(result), "stderr": process.stderr.decode()}
+    diagnostics = inspection_diagnostics(result) + "\nWorker stderr:\n" + process.stderr.decode()
     assert b"blocked=[true, true, true]" in process.stderr, diagnostics
     rules = {finding["rule_id"] for row in result.get("files", []) for finding in row["findings"]}
     assert {"E1", "E2", "SC2"} <= rules, diagnostics
