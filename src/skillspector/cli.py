@@ -641,7 +641,7 @@ def scan(
     Environment variables:
 
         SKILLSPECTOR_PROVIDER  Active LLM provider: openai | anthropic |
-                               anthropic_proxy | bedrock | nv_build |
+                               anthropic_proxy | bedrock | minimax | nv_build |
                                nv_inference | ollama | azure_openai |
                                openai_compatible | gemini | claude_cli |
                                gemini_cli | opencode_cli. Defaults to the NVIDIA path
@@ -655,6 +655,7 @@ def scan(
 
         OPENAI_API_KEY [+ OPENAI_BASE_URL]   for SKILLSPECTOR_PROVIDER=openai
         ANTHROPIC_API_KEY                    for SKILLSPECTOR_PROVIDER=anthropic
+        MINIMAX_API_KEY                      for SKILLSPECTOR_PROVIDER=minimax
         ANTHROPIC_PROXY_API_KEY +
           ANTHROPIC_PROXY_ENDPOINT_URL       for anthropic_proxy
         AWS_PROFILE (optional) + AWS_REGION  for SKILLSPECTOR_PROVIDER=bedrock
