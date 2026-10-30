@@ -45,7 +45,7 @@ from skillspector.javascript_tokens import assertion_template_shell_text
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
-from skillspector.python_tokens import PythonLiteralSpans
+from skillspector.python_tokens import PythonLiteralSpans, python_browser_template_shell_text
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
 from skillspector.python_tokens import python_string_body as _python_string_body
 from skillspector.security_reconstruction import validated_json_string_spans
@@ -91,6 +91,7 @@ _STATIC_BRACE_WORD_CHARS = 256
 _PRINTF_STATIC_CHARS = 256
 _PRINTF_STATIC_ARGUMENTS = 32
 _PRINTF_STATIC_WORD_RE = re.compile(r"[-A-Za-z0-9_./*?%]{0,64}")
+_PRINTF_QUOTED_WORD_RE = re.compile(r"[-A-Za-z0-9_./*?% \t\r\n]{0,64}")
 # A bounded ``printf`` format operand may also carry POSIX backslash escapes.
 _PRINTF_FORMAT_WORD_RE = re.compile(r"[-A-Za-z0-9_./*?%\\]{0,64}")
 # The old deterministic alphabet plus the control/high-byte values needed by
@@ -1590,31 +1591,66 @@ def _bounded_printf_word(result: str) -> str | None:
     return result
 
 
+def _has_literal_printf_arguments(inner: str) -> bool:
+    """Prove literal arguments without treating shell expansions as text."""
+    quote: str | None = None
+    cursor = 0
+    while cursor < len(inner):
+        character = inner[cursor]
+        if character == "\\" and quote != "'":
+            if cursor + 1 >= len(inner):
+                return False
+            cursor += 3 if inner.startswith("\\\r\n", cursor) else 2
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            elif quote == '"' and character in "$`":
+                return False
+        elif character in "'\"":
+            quote = character
+        elif character in "$`;|&<>()\r\n*?[]{}~#":
+            return False
+        cursor += 1
+    if quote is not None:
+        return False
+    command, _, limited = _next_shell_invocation_word(inner, 0, lambda: None)
+    return command == "printf" and not limited
+
+
 def _static_printf_substitution(
     content: str,
     start: int,
     end: int,
     *,
     backtick: bool = False,
+    quoted_result: bool = False,
 ) -> str | None:
-    """Evaluate a tiny, bounded subset of shell ``printf`` deterministically."""
+    """Evaluate bounded literal ``printf`` output, preserving its quoting."""
     inner_start = start + (1 if backtick else 2)
     inner_end = end - 1
     inner = content[inner_start:inner_end]
+    if len(inner) > _PRINTF_STATIC_CHARS:
+        return None
+    literal_result = quoted_result and not backtick and _has_literal_printf_arguments(inner)
+    if quoted_result and not backtick and not literal_result:
+        command, _, _ = _next_shell_invocation_word(inner, 0, lambda: None)
+        if command == "printf":
+            return None
     recognized, arguments = _printf_invocation_arguments(inner)
-    if (
-        not recognized
-        or len(inner) > _PRINTF_STATIC_CHARS
-        or re.search(r"[;|&<>\r\n]", inner) is not None
-    ):
+    if not recognized or (not literal_result and re.search(r"[;|&<>\r\n]", inner) is not None):
         return None
     if arguments[:1] == ["--"]:
         arguments = arguments[1:]
+    elif literal_result and arguments and arguments[0].startswith("-"):
+        # In particular, ``-v`` assigns a variable instead of producing output.
+        return None
     if not arguments or len(arguments) > _PRINTF_STATIC_ARGUMENTS + 1:
         return None
     format_word, *values = arguments
+    value_pattern = _PRINTF_QUOTED_WORD_RE if literal_result else _PRINTF_STATIC_WORD_RE
     if _PRINTF_FORMAT_WORD_RE.fullmatch(format_word) is None or any(
-        _PRINTF_STATIC_WORD_RE.fullmatch(value) is None for value in values
+        value_pattern.fullmatch(value) is None for value in values
     ):
         return None
 
@@ -1654,17 +1690,27 @@ def _static_printf_substitution(
         return None
 
     conversions = sum(segment is None for segment in segments)
+
+    def bounded_result(result: str) -> str | None:
+        if literal_result:
+            # Quoted command substitution keeps one word and strips trailing
+            # LF bytes only. Its internal whitespace never becomes shell syntax.
+            if len(result) > _PRINTF_STATIC_CHARS or "\x00" in result:
+                return None
+            return result.rstrip("\n")
+        return _bounded_printf_word(result)
+
     if conversions == 0:
-        return _bounded_printf_word("".join(segments))
+        return bounded_result("".join(segments))
     remaining = iter(values)
     output: list[str] = []
     cycles = max(1, (len(values) + conversions - 1) // conversions)
     for _ in range(cycles):
         for segment in segments:
             output.append(next(remaining, "") if segment is None else segment)
-        if sum(len(piece) for piece in output) > 64:
+        if sum(len(piece) for piece in output) > (_PRINTF_STATIC_CHARS if literal_result else 64):
             return None
-    return _bounded_printf_word("".join(output))
+    return bounded_result("".join(output))
 
 
 def _may_have_destructive_outer_operands(content: str) -> bool:
@@ -1904,6 +1950,7 @@ def _parse_shell_command_word(
     check_runtime: Callable[[], None] | None = None,
     owned_word_positions: set[int] | None = None,
     enclosing_delimiter: str | None = None,
+    quoted_printf_allowed: bool = True,
 ) -> _ShellCommandWord | None:
     runtime_check = check_runtime or (lambda: None)
     # The shell recognizes ``NAME=value`` before expansion and never runs the
@@ -1972,6 +2019,7 @@ def _parse_shell_command_word(
                         content,
                         cursor,
                         substitution_end,
+                        quoted_result=quoted_printf_allowed,
                     )
                     if static_value is None:
                         output.append("$()")
@@ -2457,6 +2505,7 @@ def _quoted_candidate_is_complete(
     start: int,
     quote_limits: dict[int, int] | None,
     check_runtime: Callable[[], None],
+    quoted_printf_allowed: bool = True,
 ) -> bool:
     """Refine a failure only inside a lexically proven shell quote.
 
@@ -2468,12 +2517,16 @@ def _quoted_candidate_is_complete(
     if end is None:
         return False
     fragment = content[start:end]
-    parsed = _parse_shell_command_word(fragment, 0, check_runtime=check_runtime)
+    parsed = _parse_shell_command_word(
+        fragment, 0, check_runtime=check_runtime, quoted_printf_allowed=quoted_printf_allowed
+    )
     if parsed is None or parsed.limited:
         return False
     return not (
         parsed.dynamic
-        and _has_runtime_command_operand_exhaustion(fragment, 0, parsed.end, check_runtime)
+        and _has_runtime_command_operand_exhaustion(
+            fragment, 0, parsed.end, check_runtime, quoted_printf_allowed=quoted_printf_allowed
+        )
     )
 
 
@@ -2487,6 +2540,8 @@ def _has_shell_command_word_exhaustion(
     perl_eval_blocks: bool = False,
     quote_limits: dict[int, int] | None = None,
     _command_string_depth: int = 0,
+    _quoted_printf_allowed: bool = True,
+    _startup_exposure: list[bool] | None = None,
 ) -> bool:
     """Find candidate command words whose deterministic parse hit a safety bound.
 
@@ -2495,6 +2550,9 @@ def _has_shell_command_word_exhaustion(
     ``perl_eval_blocks`` recognizes Perl's exception-trapping ``eval BLOCK``,
     which reparses no string.
     """
+    quoted_printf_allowed = _quoted_printf_allowed and not _shell_redefines_printf(
+        content, check_runtime
+    )
     parsed_through = 0
     # Completed words own closing quotes, never executable expansion starts.
     # Inner commands remain independent candidates; never suppress their bodies.
@@ -2550,6 +2608,7 @@ def _has_shell_command_word_exhaustion(
             enclosing_delimiter=(
                 _assignment_value_wrapper(content, start) if assignment_quote else None
             ),
+            quoted_printf_allowed=quoted_printf_allowed,
         )
         if parsed is None:
             substitution_start = (
@@ -2589,7 +2648,9 @@ def _has_shell_command_word_exhaustion(
                 # shell quote it opens cannot continue into later host code.
                 unresolved_end = min(unresolved_end, python_source.word_end(start))
             if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS:
-                if not _quoted_candidate_is_complete(content, start, quote_limits, check_runtime):
+                if not _quoted_candidate_is_complete(
+                    content, start, quote_limits, check_runtime, quoted_printf_allowed
+                ):
                     return True
             continue
         # A mis-paired quote can produce a completed word that crosses several
@@ -2639,7 +2700,9 @@ def _has_shell_command_word_exhaustion(
             # parsed this position, so it only claims ownership.
             continue
         if parsed.limited:
-            if not _quoted_candidate_is_complete(content, start, quote_limits, check_runtime):
+            if not _quoted_candidate_is_complete(
+                content, start, quote_limits, check_runtime, quoted_printf_allowed
+            ):
                 return True
         if (
             parsed.dynamic
@@ -2649,11 +2712,14 @@ def _has_shell_command_word_exhaustion(
                 start,
                 parsed.end,
                 check_runtime,
+                quoted_printf_allowed=quoted_printf_allowed,
             )
         ):
             comment = python_source.comment(start) if python_source is not None else None
             if comment is None:
-                if _quoted_candidate_is_complete(content, start, quote_limits, check_runtime):
+                if _quoted_candidate_is_complete(
+                    content, start, quote_limits, check_runtime, quoted_printf_allowed
+                ):
                     continue
                 # Host code after a Python string's closing quote is not shell
                 # text, so a command in the string takes operands only from
@@ -2665,7 +2731,9 @@ def _has_shell_command_word_exhaustion(
                     if python_source is not None
                     else None
                 )
-                if value is None or _has_runtime_command_operand_exhaustion(*value, check_runtime):
+                if value is None or _has_runtime_command_operand_exhaustion(
+                    *value, check_runtime, quoted_printf_allowed=quoted_printf_allowed
+                ):
                     return True
                 continue
             # A Python comment is prose that no shell receives, so a command
@@ -2677,14 +2745,16 @@ def _has_shell_command_word_exhaustion(
                     content[comment[0] : comment[1]],
                     check_runtime,
                     _command_string_depth=_command_string_depth,
+                    _quoted_printf_allowed=quoted_printf_allowed,
                 ):
                     return True
                 complete_comments.add(comment)
-    for command_string in _shell_command_strings(
+    for command_string, startup_context in _shell_command_strings(
         content,
         check_runtime,
         perl_eval_blocks=perl_eval_blocks,
         python_source=python_source,
+        startup_exposure=_startup_exposure,
     ):
         if command_string is None or _command_string_depth >= 8:
             return True
@@ -2698,6 +2768,8 @@ def _has_shell_command_word_exhaustion(
             structural_quote_closers=command_closers,
             quote_limits=command_limits,
             _command_string_depth=_command_string_depth + 1,
+            _quoted_printf_allowed=quoted_printf_allowed,
+            _startup_exposure=startup_context,
         ):
             return True
     return False
@@ -2708,6 +2780,8 @@ def _has_runtime_command_operand_exhaustion(
     start: int,
     word_end: int,
     check_runtime: Callable[[], None],
+    *,
+    quoted_printf_allowed: bool = True,
 ) -> bool:
     """Return whether a runtime-selected command's operands are undecidable."""
     tokens, command_end, exhausted = _bounded_shell_tokens(
@@ -2715,6 +2789,7 @@ def _has_runtime_command_operand_exhaustion(
         start,
         word_end,
         check_runtime=check_runtime,
+        quoted_printf_allowed=quoted_printf_allowed,
     )
     if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
         # Earlier prose (for example "row-first") cannot supply this
@@ -2739,16 +2814,32 @@ def _shell_command_strings(
     *,
     perl_eval_blocks: bool = False,
     python_source: _PythonSourceOwnership | None = None,
-) -> Iterator[str | None]:
+    startup_exposure: list[bool] | None = None,
+) -> Iterator[tuple[str | None, list[bool]]]:
     """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
+    nested_substitutions = startup_exposure is not None and ("$(" in content or "`" in content)
+    if startup_exposure is None:
+        startup_exposure = [False]
+    startup_work = [4 * len(content) + _ROOT_GLOB_COMMAND_CHARS]
     for clause_start in _nonempty_shell_clause_starts(content, check_runtime):
         check_runtime()
+        if not startup_exposure[0]:
+            startup_exposure[0] = _shell_clause_sets_startup(
+                content, clause_start, check_runtime, startup_work
+            )
+        starts_shell = [False]
         recognized, command_string = _command_string_from_clause(
             content,
             clause_start,
             check_runtime,
             perl_eval_blocks=perl_eval_blocks,
+            startup_exposure=startup_exposure,
+            starts_shell=starts_shell,
         )
+        if nested_substitutions and startup_exposure[0]:
+            # Quoted substitutions can launch shells outside this clause walk.
+            yield None, startup_exposure
+            return
         if not recognized:
             continue
         if python_source is not None:
@@ -2760,7 +2851,263 @@ def _shell_command_strings(
                 # ``signal.alarm(timeout)`` names no ``timeout`` command.
                 # Shell text can only be reparsed from a string literal.
                 continue
-        yield command_string
+        # eval shares this shell's settings; a child shell has its own scope.
+        # Keep exposure monotonic across eval, including settings in its body.
+        yield command_string, [False] if starts_shell[0] else startup_exposure
+
+
+def _shell_clause_sets_startup(
+    content: str,
+    start: int,
+    check_runtime: Callable[[], None],
+    remaining_work: list[int],
+) -> bool:
+    """Find explicit startup settings in bounded command-prefix syntax."""
+    source = content[start : start + _ROOT_GLOB_COMMAND_CHARS + 1]
+    cursor = 0
+    mode: str | None = None
+    setter_mode: str | None = None
+    skip_operand = False
+    read_options = True
+    read_array = False
+    printf_options = True
+    setting_namerefs = False
+
+    def startup_target(word: str) -> bool:
+        # A setter can modify an already exported variable even without a
+        # preceding export in this source. Dynamic destinations remain unknown.
+        return bool(re.fullmatch(r"(?:BASH_ENV|ENV)(?:\[.*\])?", word, re.DOTALL)) or any(
+            marker in word
+            for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+        )
+
+    for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
+        check_runtime()
+        while cursor < len(source):
+            if source.startswith("\\\r\n", cursor):
+                cursor += 3
+            elif source.startswith("\\\n", cursor):
+                cursor += 2
+            elif source[cursor] in " \t":
+                cursor += 1
+            else:
+                break
+        if cursor >= len(source) or source[cursor] in "\r\n;|&(){}#":
+            return cursor > _ROOT_GLOB_COMMAND_CHARS or skip_operand
+        word_start = cursor
+        word, cursor, limited = _next_shell_invocation_word(source, cursor, check_runtime)
+        remaining_work[0] -= cursor - word_start
+        if remaining_work[0] < 0 or limited or cursor > _ROOT_GLOB_COMMAND_CHARS:
+            # Proof work is linear in the containing source, even when clause
+            # starts overlap malformed quoted words or nested expansions.
+            return True
+        if word is None:
+            return False
+        if skip_operand:
+            skip_operand = False
+            continue
+        if mode == "setter-target":
+            if startup_target(word):
+                return True
+            mode = setter_mode
+            continue
+        if mode == "printf":
+            if any(
+                marker in word
+                for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+            ):
+                return True
+            if printf_options and word == "--":
+                printf_options = False
+                continue
+            if printf_options and word == "-v":
+                setter_mode = "printf"
+                mode = "setter-target"
+                continue
+            if printf_options and word.startswith("-v"):
+                if startup_target(word[2:]):
+                    return True
+                continue
+            # Bash's %n writes to a variable named by its argument, even without
+            # -v. Escaped percent pairs cannot introduce a conversion.
+            return re.search(r"%[-+ #0'.*0-9]*[hjlLtz]*n", word.replace("%%", "")) is not None
+        if mode == "read":
+            if read_options and word == "--":
+                read_options = False
+                continue
+            if read_options and word.startswith("-") and word != "-":
+                for index, option in enumerate(word[1:], 2):
+                    if option in "Eers":
+                        continue
+                    if option not in "adinNptu":
+                        return True  # Unsupported option arity cannot prove the target.
+                    attached = word[index:]
+                    if option == "a":
+                        read_array = True
+                        if attached:
+                            if startup_target(attached):
+                                return True
+                        else:
+                            setter_mode = "read"
+                            mode = "setter-target"
+                    else:
+                        skip_operand = not attached
+                    break
+                continue
+            read_options = False
+            if not read_array and startup_target(word):
+                return True
+            continue
+        assignment = re.fullmatch(r"(BASH_ENV|ENV)(\+?=)(.*)", word, re.DOTALL)
+        if assignment is not None and (
+            mode in {"env", "setting"} or _SHELL_ASSIGNMENT_PREFIX_RE.match(source, word_start)
+        ):
+            if assignment[2] == "+=" or assignment[3]:
+                return True
+            continue
+        if mode == "setting":
+            destination = word.partition("=")[0].removesuffix("+")
+            if startup_target(destination):
+                return True  # Exporting an unknown inherited value is unresolved.
+            if setting_namerefs and re.fullmatch(r"-[A-Za-z]*n[A-Za-z]*", word):
+                # A name reference can redirect a later assignment to a startup
+                # variable without spelling that variable at the write site.
+                return True
+            if word.startswith(("-", "+")) or re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*(?:=.*)?", word, re.DOTALL
+            ):
+                continue
+            return False
+        if mode == "env":
+            if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", word) is not None:
+                continue
+            if word in {"-i", "--ignore-environment", "--"} or re.fullmatch(
+                r"(?:--unset|--chdir)=.+", word
+            ):
+                continue
+            if word in {"-u", "--unset", "-C", "--chdir"}:
+                skip_operand = True
+                continue
+            if word.startswith("-"):
+                return True
+            mode = None
+        elif mode in {"command", "builtin"}:
+            if word == "--" or (mode == "command" and word == "-p"):
+                continue
+            if word.startswith("-"):
+                return False
+            mode = None
+        command = word.casefold().rsplit("/", 1)[-1]
+        if command in {"export", "declare", "typeset", "readonly", "local"}:
+            mode = "setting"
+            setting_namerefs = command in {"declare", "typeset", "local"}
+        elif command in {"env", "command", "builtin", "read", "printf"}:
+            mode = command
+        elif command in _SHELL_CLAUSE_PREFIX_WORDS or _SHELL_ASSIGNMENT_PREFIX_RE.match(
+            source, word_start
+        ):
+            continue
+        else:
+            return False
+    return True
+
+
+def _shell_redefines_printf(content: str, check_runtime: Callable[[], None]) -> bool:
+    """Do not widen builtin evaluation across an explicit local replacement."""
+    work = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
+    for start in _nonempty_shell_clause_starts(content, check_runtime):
+        check_runtime()
+        source = content[start : start + _ROOT_GLOB_COMMAND_CHARS + 1]
+        cursor = 0
+        wrapper: str | None = None
+        for _ in range(8):
+            word_start = cursor
+            while word_start < len(source):
+                if source.startswith("\\\r\n", word_start):
+                    word_start += 3
+                elif source.startswith("\\\n", word_start):
+                    word_start += 2
+                elif source[word_start] in " \t":
+                    word_start += 1
+                else:
+                    break
+            word, end, limited = _next_shell_invocation_word(source, cursor, check_runtime)
+            work -= end - cursor
+            cursor = end
+            if work < 0 or limited or cursor > _ROOT_GLOB_COMMAND_CHARS:
+                return True
+            if _SHELL_ASSIGNMENT_PREFIX_RE.match(source, word_start):
+                continue
+            if wrapper is not None:
+                if word == "--" or (wrapper == "command" and word == "-p"):
+                    continue
+                if word is None or word.startswith("-"):
+                    break
+                wrapper = None
+            if word in {"command", "builtin"}:
+                wrapper = word
+                continue
+            if word in _SHELL_CLAUSE_PREFIX_WORDS or word in {"if", "while", "until"}:
+                continue
+            if word in {"eval", "source", ".", "enable", "trap"}:
+                # Imported/evaluated code, handlers and builtin configuration
+                # can replace printf in this shell.
+                # Retain the earlier narrow decoder across those unknown effects.
+                return True
+            if word == "function":
+                name, end, limited = _next_shell_invocation_word(source, cursor, check_runtime)
+                work -= end - cursor
+                if limited or work < 0 or end > _ROOT_GLOB_COMMAND_CHARS or name == "printf":
+                    return True
+                break
+            if word == "alias":
+                for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
+                    while cursor < len(source) and source[cursor] in " \t":
+                        cursor += 1
+                    if cursor >= len(source) or source[cursor] in "\r\n;|&()#":
+                        break
+                    alias, end, limited = _next_shell_invocation_word(source, cursor, check_runtime)
+                    work -= end - cursor
+                    cursor = end
+                    if limited or work < 0 or cursor > _ROOT_GLOB_COMMAND_CHARS:
+                        return True
+                    if alias is None:
+                        break
+                    if alias.startswith("printf=") or any(
+                        marker in alias
+                        for marker in (
+                            _DYNAMIC_SHELL_WORD_SENTINEL,
+                            _RUNTIME_SHELL_PARAMETER_SENTINEL,
+                        )
+                    ):
+                        return True
+                else:
+                    return True
+                break
+            if word != "printf":
+                break
+            # Bash accepts line continuations around the empty parameter list.
+            for expected in "()":
+                while cursor < len(source):
+                    if source.startswith("\\\r\n", cursor):
+                        cursor += 3
+                    elif source.startswith("\\\n", cursor):
+                        cursor += 2
+                    elif source[cursor] in " \t":
+                        cursor += 1
+                    else:
+                        break
+                if cursor > _ROOT_GLOB_COMMAND_CHARS:
+                    return True
+                if cursor == len(source) or source[cursor] != expected:
+                    break
+                cursor += 1
+            else:
+                return True
+            break
+        else:
+            return True
+    return False
 
 
 def _nonempty_shell_clause_starts(content: str, check_runtime: Callable[[], None]) -> Iterator[int]:
@@ -2880,12 +3227,18 @@ def _command_string_from_clause(
     *,
     perl_eval_blocks: bool = False,
     literal_command_spans: list[tuple[int, int]] | None = None,
+    startup_exposure: list[bool] | None = None,
+    starts_shell: list[bool] | None = None,
 ) -> tuple[bool, str | None]:
     """Resolve a bounded wrapper chain to an ``eval`` or shell command string."""
     cursor = start
     pending: str | None = None
     wrapper_seen = False
     last_word_start = start
+
+    def observe_assignment(word: str) -> None:
+        if startup_exposure is not None and re.fullmatch(r"(?:BASH_ENV|ENV)=.+", word, re.DOTALL):
+            startup_exposure[0] = True
 
     def next_word() -> tuple[str | None, bool]:
         nonlocal cursor, last_word_start
@@ -2916,6 +3269,16 @@ def _command_string_from_clause(
             return None
         return word
 
+    def commandless_wrapper() -> tuple[bool, None]:
+        # env/command/builtin can end without invoking another command. A
+        # redirection or opening parenthesis may still hide a following one.
+        ended = (
+            cursor >= len(content)
+            or content[cursor] == "#"
+            or _ends_wrapped_clause(content, cursor)
+        )
+        return not ended, None
+
     for _ in range(32):
         while cursor < len(content) and content[cursor].isspace():
             if cursor % 4096 == 0:
@@ -2936,6 +3299,7 @@ def _command_string_from_clause(
         if word is None:
             return False, None
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word, re.DOTALL) is not None:
+            observe_assignment(word)
             continue
         command = word.casefold().rsplit("/", 1)[-1]
         if command in _SHELL_CLAUSE_PREFIX_WORDS:
@@ -2962,6 +3326,11 @@ def _command_string_from_clause(
                     return False, None
                 if option.startswith("-") and not option.startswith("--"):
                     if "c" in option[1:]:
+                        if starts_shell is not None:
+                            starts_shell[0] = True
+                        if startup_exposure is not None and startup_exposure[0]:
+                            # A startup file can replace the child's builtins.
+                            return True, None
                         command_string, limited = next_word()
                         resolved = resolved_command_string(command_string, limited)
                         if (
@@ -2983,7 +3352,65 @@ def _command_string_from_clause(
                 return False, None
             return True, None
 
-        if command in {"env", "command", "nohup"}:
+        if command == "env":
+            wrapper_seen = True
+            for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
+                option, limited = next_word()
+                if limited:
+                    return True, None
+                if option is None:
+                    return commandless_wrapper()
+                if option == "--":
+                    pending, limited = next_word()
+                    if limited:
+                        return True, None
+                    if pending is None:
+                        return commandless_wrapper()
+                    break
+                if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", option) is not None:
+                    observe_assignment(option)
+                    continue
+                if option in {"-i", "--ignore-environment"} or re.fullmatch(
+                    r"(?:--unset|--chdir)=.+", option
+                ):
+                    continue
+                if option in {"-u", "--unset", "-C", "--chdir"}:
+                    operand, limited = next_word()
+                    if limited or operand is None:
+                        return True, None
+                    continue
+                if option.startswith("-"):
+                    return True, None
+                pending = option
+                break
+            else:
+                return True, None
+            continue
+        if command in {"command", "builtin"}:
+            wrapper_seen = True
+            for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
+                option, limited = next_word()
+                if limited:
+                    return True, None
+                if option is None:
+                    return commandless_wrapper()
+                if option == "--":
+                    pending, limited = next_word()
+                    if limited:
+                        return True, None
+                    if pending is None:
+                        return commandless_wrapper()
+                    break
+                if command == "command" and option == "-p":
+                    continue
+                if option.startswith("-"):
+                    return False, None
+                pending = option
+                break
+            else:
+                return True, None
+            continue
+        if command == "nohup":
             wrapper_seen = True
             continue
         if command in {"sudo", "nice", "xargs"}:
@@ -3410,6 +3837,7 @@ def _bounded_shell_tokens(
     body_start: int,
     *,
     check_runtime: Callable[[], None] | None = None,
+    quoted_printf_allowed: bool = True,
 ) -> tuple[tuple[_ShellToken, ...], int, bool]:
     """Return argument words from one security-view-bounded shell command."""
     runtime_check = check_runtime or (lambda: None)
@@ -3549,6 +3977,7 @@ def _bounded_shell_tokens(
                         content,
                         cursor,
                         substitution_end,
+                        quoted_result=quoted_printf_allowed,
                     )
                     parse_limited = parse_limited or (
                         static_value is None
@@ -5842,6 +6271,8 @@ def _has_bounded_parse_exhaustion(
         if file_type == "javascript" and complete_context
         else content
     )
+    if file_type == "python" and complete_context:
+        shell_word_content = python_browser_template_shell_text(content, check_runtime)
     quote_limits = None
     if file_type == "shell" and complete_context:
         # A closing delimiter in proven shell source cannot open a new

@@ -588,3 +588,385 @@ def test_shell_startup_code_keeps_literal_comparison_partial(startup: str) -> No
     source = startup + 'bash -c \'test x = "$(printf "%s%s%s" r m " -rf /")"\''
 
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_quoted_printf_preserves_multiline_literal_value(newline: str) -> None:
+    substitution = (
+        '$(printf "%s\\n" "first named action" "second named action" \\\n'
+        '  "third named action" "fourth named action" "last named action")'
+    ).replace("\n", newline)
+    expected = "\n".join(
+        [
+            "first named action",
+            "second named action",
+            "third named action",
+            "fourth named action",
+            "last named action",
+        ]
+    )
+
+    assert (
+        tm._static_printf_substitution(substitution, 0, len(substitution), quoted_result=True)
+        == expected
+    )
+    assert tm._static_printf_substitution(substitution, 0, len(substitution)) is None
+    assert not tm.has_bounded_parse_exhaustion(
+        f'test "$observed" = "{substitution}"\n', lambda: None, file_type="shell"
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ('printf "%s\\n\\n" "a b"', "a b"),
+        ('printf "%s\\r\\n" "a b"', "a b\r"),
+        ('printf "%s" "a\nb"', "a\nb"),
+        ('printf "%s" ""', ""),
+        ('printf "%%s\\n"', "%s"),
+        ('printf -- "-%s" "a b"', "-a b"),
+        ('printf "%s%s" "a " b c', "a bc"),
+    ],
+)
+def test_quoted_printf_has_exact_command_substitution_bytes(body: str, expected: str) -> None:
+    substitution = f"$({body})"
+
+    assert (
+        tm._static_printf_substitution(substitution, 0, len(substitution), quoted_result=True)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'printf "%s" "$value"',
+        'printf "%s" "$(get_value)"',
+        'printf "%s" "`get_value`"',
+        'printf "%s" *',
+        'printf "%s" {a,b}',
+        'printf "%s" ~',
+        'printf "%s" a; echo b',
+        'printf "%s" a\necho b',
+        'printf "%s" a # omitted',
+        'printf "%q" "a b"',
+        'printf "%b" "a b"',
+        'printf "%d" 10',
+        'printf "%s\\c" "a b"',
+        'printf "%s\\0" "a b"',
+        'printf -v result "%s" "a b"',
+        'printf "%s" "unterminated',
+        'printf "%s" trailing\\',
+        'printf "%s" ' + '"x" ' * 33,
+        'printf "%s" "' + "x" * 65 + '"',
+        'printf "%s" "a b"' + " " * 256,
+    ],
+)
+def test_quoted_printf_keeps_unknown_or_over_limit_values_unresolved(body: str) -> None:
+    substitution = f"$({body})"
+
+    assert (
+        tm._static_printf_substitution(substitution, 0, len(substitution), quoted_result=True)
+        is None
+    )
+
+
+@pytest.mark.parametrize("extra", ["", "x"])
+def test_quoted_printf_output_limit_is_exact(extra: str) -> None:
+    substitution = '$(printf "' + "a" * 62 + '%s" "xx' + extra + '" xx xx xx)'
+    result = tm._static_printf_substitution(substitution, 0, len(substitution), quoted_result=True)
+
+    assert (result is not None) is (not extra)
+    if result is not None:
+        assert len(result) == tm._PRINTF_STATIC_CHARS
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '"$(printf "%s\\n" rm)" -rf /',
+        'r"$(printf "%s\\n" m)" -rf /',
+        'rm "$(printf "%s" -rf)" "$(printf "%s\\n" /)"',
+    ],
+)
+def test_quoted_printf_reconstruction_preserves_destructive_findings(source: str) -> None:
+    assert any(
+        finding.rule_id == "TM1" and finding.severity.value == "HIGH"
+        for finding in tm.analyze(source, "run.sh", "shell")
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '"$(printf "%s" "rm -rf /")"',
+        '"$(printf "%s\\n" rm)"suffix -rf /',
+    ],
+)
+def test_quoted_printf_whitespace_never_becomes_separate_shell_words(source: str) -> None:
+    parsed = tm._parse_shell_command_word(source, 0)
+
+    assert parsed is not None and not parsed.dynamic and not parsed.limited
+    assert parsed.text in {"rm -rf /", "rmsuffix"}
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '$(printf "%s\\n" "rm -rf /")',
+        '"$(printf "%s" "$command")" -rf /',
+        'bash -c "$(printf "%s" "rm -rf /")"',
+        'eval "$(printf "%s" "rm -rf /")"',
+        'test x = "$(printf "%s" "a b")"; $CMD -rf /',
+    ],
+)
+def test_quoted_printf_keeps_other_execution_paths_partial(source: str) -> None:
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "BASH_ENV=setup.sh ",
+        "ENV=setup.sh ",
+        "export BASH_ENV=setup.sh; ",
+        'export "BASH_ENV=setup.sh"; ',
+        "export BAS\\H_ENV=setup.sh; ",
+        "declare -x BASH_ENV=setup.sh; ",
+        "typeset -x ENV=setup.sh; ",
+        "readonly BASH_ENV=setup.sh; ",
+        "export BASH_ENV; ",
+        "env BASH_ENV=setup.sh ",
+        'env "ENV=setup.sh" ',
+        "/usr/bin/env BASH_ENV=setup.sh ",
+        "command -p env BASH_ENV=setup.sh ",
+        "env -C /tmp BASH_ENV=setup.sh ",
+        "env --chdir /tmp ENV=setup.sh ",
+        "env -u OTHER BASH_ENV=setup.sh ",
+        "env --unset OTHER ENV=setup.sh ",
+        "env --unset=OTHER --chdir=/tmp BASH_ENV=setup.sh ",
+        "builtin export BASH_ENV=setup.sh; ",
+        "nohup env BASH_ENV=setup.sh ",
+        "/usr/bin/nohup env ENV=setup.sh ",
+        "sudo -n env BASH_ENV=setup.sh ",
+        "timeout 10 env BASH_ENV=setup.sh ",
+        "nice -n 5 env ENV=setup.sh ",
+        "BASH_ENV+=; ",
+        "BASH_ENV= ENV=setup.sh ",
+        "BASH_ENV=setup.sh; BASH_ENV=; ",
+        "command export BASH_ENV=setup.sh; ",
+    ],
+)
+def test_explicit_shell_startup_is_unknown_independently_of_printf(setting: str) -> None:
+    assert tm.has_bounded_parse_exhaustion(
+        setting + "bash -c 'echo ready'", lambda: None, file_type="shell"
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "BASH_ENV= ",
+        "export BASH_ENV=; ",
+        "env ENV= ",
+        "env OTHER=example ",
+        "/usr/bin/env -C /tmp OTHER=example ",
+        "command -p env --unset OTHER OTHER=example ",
+        'echo "BASH_ENV=setup.sh"; ',
+        "# export BASH_ENV=setup.sh\n",
+        "printf '%s' 'ENV=setup.sh'; ",
+        "env echo BASH_ENV=setup.sh; ",
+    ],
+)
+def test_inert_startup_text_or_initial_empty_settings_do_not_add_partial(prefix: str) -> None:
+    assert not tm.has_bounded_parse_exhaustion(
+        prefix + "bash -c 'echo ready'", lambda: None, file_type="shell"
+    )
+
+
+def test_literal_child_shell_keeps_its_own_startup_settings() -> None:
+    source = "bash -c 'export BASH_ENV=setup.sh; bash -c \"echo ready\"'"
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        "printf() { echo rm; }; ",
+        "printf ( ) { echo rm; }; ",
+        "printf \\\n( \\\n) { echo rm; }; ",
+        "printf \\\r\n( \\\r\n) { echo rm; }; ",
+        "function printf { echo rm; }; ",
+        "function 'printf'() { echo rm; }; ",
+        "p\\rintf() { echo rm; }; ",
+        "helper() { echo ready; }; printf() { echo rm; }; ",
+        "printf" + " " * 8200 + "() { echo rm; }; ",
+        "shopt -s expand_aliases; alias printf='echo rm'; ",
+        "shopt -s expand_aliases; builtin alias printf='echo rm';\n",
+        "shopt -s expand_aliases; command -p alias printf='echo rm';\n",
+        "shopt -s expand_aliases; builtin -- alias printf='echo rm';\n",
+        "shopt -s expand_aliases\nX=y alias printf='echo rm'\n",
+        "alias other=echo 'printf=echo rm'; ",
+        'alias "$replacement"; ',
+    ],
+)
+def test_explicit_printf_replacement_keeps_wider_quoted_result_partial(definition: str) -> None:
+    source = definition + '"$(printf "%s" "a b")" -rf /'
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "helper() { echo ready; }; ",
+        "function helper { echo ready; }; ",
+        "echo 'printf() { echo rm; }'; ",
+        "# printf() { echo rm; }\n",
+        "alias other=echo; ",
+        "echo 'alias printf=echo'; ",
+    ],
+)
+def test_unrelated_or_inert_function_text_keeps_quoted_printf_literal(prefix: str) -> None:
+    source = prefix + 'test x = "$(printf "%s" "a b")"'
+
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "setter",
+    [
+        "set -a; read BASH_ENV",
+        "read -r first ENV",
+        "IFS= read -r BASH_ENV",
+        "builtin read -rp prompt ENV",
+        "command read -r -- BASH_ENV",
+        "read -a BASH_ENV",
+        "read -raENV",
+        "read -d ':' ENV",
+        "read -N1 BASH_ENV",
+        'read -r "$target"',
+        "printf -v BASH_ENV '%s' /tmp/startup",
+        "builtin printf -vENV '%s' /tmp/startup",
+        "command -p printf -v ENV '%s' /tmp/startup",
+        'printf -v "$target" %s /tmp/startup',
+        'printf "$option" BASH_ENV %s /tmp/startup',
+        "printf -v harmless -v ENV '%s' /tmp/startup",
+        "printf -vharmless -vBASH_ENV '%s' /tmp/startup",
+        "read -a harmless -a BASH_ENV",
+        "read -aharmless -raENV",
+        "printf '%n' BASH_ENV",
+        "printf -- '%10n' ENV",
+        "printf -v harmless '%%%n' BASH_ENV",
+        "printf '%ln' BASH_ENV",
+        "printf '%hhn' ENV",
+        "declare -n hook=BASH_ENV; hook=setup.sh",
+        "typeset -nx hook=ENV; hook=setup.sh",
+    ],
+)
+def test_startup_variable_setters_keep_child_shell_review_partial(setter: str) -> None:
+    source = setter + "; bash -c 'printf %s ready'\n"
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("name", ["BASH_ENV", "ENV", '"$name"'])
+@pytest.mark.parametrize(
+    "declaration",
+    ["local", "local -x", "builtin local -x", "local +n -x", "declare -x", "export"],
+)
+def test_local_startup_setting_keeps_function_child_partial(name: str, declaration: str) -> None:
+    source = (
+        f"run() {{ {declaration} {name}=setup.sh; "
+        'bash -c \'echo "$(printf "%s\\n" "two words")"\'; }; run\n'
+    )
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "local message=BASH_ENV",
+        "local -x message=ENV",
+        'export message="$value"',
+        "export -n message",
+    ],
+)
+def test_local_startup_name_in_value_does_not_taint_child(declaration: str) -> None:
+    source = f"run() {{ {declaration}; bash -c 'printf %s ready'; }}; run\n"
+
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("name", ["BASH_ENV", "ENV"])
+def test_local_reference_to_startup_variable_keeps_child_partial(name: str) -> None:
+    source = f"run() {{ local -n hook={name}; hook=setup.sh; bash -c 'printf %s ready'; }}; run\n"
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "source setup.sh",
+        ". setup.sh",
+        "builtin source setup.sh",
+        "command . setup.sh",
+        "eval 'printf() { echo changed; }'",
+        "builtin eval 'printf() { echo changed; }'",
+        "enable -n printf",
+        "trap 'printf() { echo changed; }' DEBUG",
+    ],
+)
+def test_imported_or_evaluated_code_cannot_prove_quoted_printf(prefix: str) -> None:
+    source = prefix + '; "$(printf "%s\\n" "two words")" -rf /\n'
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "echo source setup.sh",
+        "echo eval",
+        "echo enable trap",
+        "# source setup.sh\ntrue",
+        "helper() { echo ready; }",
+    ],
+)
+def test_inert_source_mentions_do_not_disable_quoted_printf(prefix: str) -> None:
+    source = prefix + '; echo "$(printf "%s\\n" "two words")"\n'
+
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "read -r value",
+        "read -p BASH_ENV value",
+        "read -d ENV value",
+        "read -r -i BASH_ENV value",
+        "read -rpBASH_ENV value",
+        "read -a values",
+        "printf '%s' BASH_ENV",
+        "printf -- '-v' ENV",
+        "printf -v result '%s' BASH_ENV",
+        "printf -v result -v other '%s' ENV",
+        "printf -vresult -vother '%s' BASH_ENV",
+        "read -a first -a second",
+        "read -afirst -rasecond",
+        "read -a safe BASH_ENV",
+        "read -asafe ENV",
+        "printf '%%n' BASH_ENV",
+        "printf '%%%%n' ENV",
+        "echo 'read BASH_ENV'",
+        "# printf -v ENV value\n",
+    ],
+)
+def test_startup_names_in_non_setter_operands_do_not_taint_child(prefix: str) -> None:
+    source = prefix + "; bash -c 'printf %s ready'\n"
+
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")

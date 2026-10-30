@@ -921,6 +921,354 @@ def test_oversized_javascript_does_not_gain_template_ownership() -> None:
     assert assertion_template_shell_text(source, lambda: None) == source
 
 
+# --- Escaped browser list values in Python HTML ----------------------------
+
+_BROWSER_ASSIGNMENT = """panel.innerHTML = `<section>${listMarkup(rows.map((item) => `${item.name} :: ${item.value}`))}</section>`;"""
+_BROWSER_SCRIPT = (
+    """
+const data = JSON.parse(document.getElementById('data').textContent);
+const panel = document.getElementById('panel');
+const rows = data.items;
+function escapeText(value) {
+  return String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+}
+function listMarkup(items, emptyText='None') {
+  if (!items || !items.length) {
+    return `<div class="empty">${escapeText(emptyText)}</div>`;
+  }
+  return `<ul>${items.map((item) => `<li>${escapeText(typeof item === 'string' ? item : JSON.stringify(item))}</li>`).join('')}</ul>`;
+}
+"""
+    + _BROWSER_ASSIGNMENT
+)
+
+
+def _browser_source(script: str = _BROWSER_SCRIPT, *, consumer: str | None = None) -> str:
+    encoded = script.replace("{", "{{").replace("}", "}}")
+    return (
+        "from pathlib import Path\nfrom html import escape\nimport json\n"
+        "def render(data):\n"
+        "    payload = json.dumps(data).replace('</', '<\\\\/')\n"
+        "    label = escape(data['label'])\n"
+        "    return f'''<!doctype html><html><body><p>{label}</p><div id=\"panel\"></div>"
+        '<script id="data" type="application/json">{payload}</script><script>'
+        + encoded
+        + "</script></body></html>'''\n"
+        + (consumer or "Path('page.html').write_text(render(data), encoding='utf-8')")
+        + "\n"
+    )
+
+
+def test_escaped_browser_list_projects_only_selected_backticks() -> None:
+    source = _browser_source()
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+
+    assert _python(source) is False
+    assert (
+        _ledger("scripts/page.py", source)["inspection_ledger"][0]["outcome"]
+        is LedgerOutcome.COMPLETED
+    )
+    changes = [i for i, (a, b) in enumerate(zip(source, projected, strict=True)) if a != b]
+    assert len(changes) == 2
+    assert all(source[i] == "`" and projected[i] == " " for i in changes)
+    assert projected.count("${{") == source.count("${{")
+
+
+def test_escaped_browser_list_keeps_optional_property_reads() -> None:
+    source = _browser_source(_BROWSER_SCRIPT.replace("data.items", "data?.items"))
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+
+    assert _python(source) is False
+    changes = [i for i, (a, b) in enumerate(zip(source, projected, strict=True)) if a != b]
+    assert len(changes) == 2
+    assert all(source[i] == "`" and projected[i] == " " for i in changes)
+    assert "data?.items" in projected
+
+
+def test_escaped_browser_list_keeps_literal_security_findings() -> None:
+    script = _BROWSER_SCRIPT + '\nconst commandText = "rm -rf /";\n'
+    source = _browser_source(script)
+    result = _ledger("scripts/page.py", source)
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+    # Delimiter ownership cannot complete a separate destructive shell candidate.
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+
+
+def test_escaped_browser_list_traces_local_parameters() -> None:
+    assignment = _BROWSER_ASSIGNMENT.replace("rows.map", "values.map")
+    script = _BROWSER_SCRIPT.replace(
+        _BROWSER_ASSIGNMENT,
+        "document.getElementById('filter').value = '';\nfunction renderList(values) {\n"
+        + assignment
+        + "\n}\nrenderList(rows);",
+    )
+    source = _browser_source(script)
+
+    assert _python(source) is False
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+    assert sum(a != b for a, b in zip(source, projected, strict=True)) == 2
+
+
+def test_escaped_browser_list_traces_json_object_entries() -> None:
+    script = _BROWSER_SCRIPT.replace(
+        "const rows = data.items;",
+        "const rows = Object.entries(data.items).map(([name, value]) => ({name, value}));",
+    )
+    source = _browser_source(script)
+
+    assert _python(source) is False
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+    assert sum(a != b for a, b in zip(source, projected, strict=True)) == 2
+
+
+def test_escaped_browser_list_traces_native_filter_values() -> None:
+    script = _BROWSER_SCRIPT.replace(
+        "const rows = data.items;",
+        "function matches(row) {\n"
+        "  const terms = [row.name, ...row.tags].join(' ').trim().toLowerCase();\n"
+        "  return terms.includes(data.query);\n"
+        "}\nconst rows = data.items.filter(matches);",
+    )
+    source = _browser_source(script)
+
+    assert _python(source) is False
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+    assert sum(a != b for a, b in zip(source, projected, strict=True)) == 2
+
+
+def test_tagged_browser_template_keeps_existing_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    script = _BROWSER_SCRIPT.replace(
+        "`${item.name} :: ${item.value}`", "tag`${item.name} :: ${item.value}`"
+    )
+    source = _browser_source(script)
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+    observed = _python(source)
+    monkeypatch.setattr(tm, "python_browser_template_shell_text", lambda text, check: text)
+    assert _python(source) is observed
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "execSync(rows.map((item) => `${item.name}`));"
+        ),
+        _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, "run(rows.map((item) => `${item.name}`));"),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "const invoke = execSync; invoke(`${data.command}`);"
+        ),
+        _BROWSER_SCRIPT.replace("${item.name} ::", "${run(item.name)} ::"),
+        _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, "panel.innerHTML = `${data.command}`;"),
+        _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, "escapeText = run;\n" + _BROWSER_ASSIGNMENT),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "function display(escapeText) {\n" + _BROWSER_ASSIGNMENT + "\n}"
+        ),
+        _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, "mutate(data);\n" + _BROWSER_ASSIGNMENT),
+        *[
+            _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, call + "\n" + _BROWSER_ASSIGNMENT)
+            for call in (
+                "external?.(rows);",
+                "external?.method(rows);",
+                "external.method?.(rows);",
+                "external['method']?.(rows);",
+                "external?.['method'](rows);",
+                "external?.['method']?.(rows);",
+                "(external.method)?.(rows);",
+                "external /* call */ ?. (rows);",
+                "external?.(panel);",
+            )
+        ],
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "external.map(() => data);\n" + _BROWSER_ASSIGNMENT
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "function leak(value) { external.map(() => value); }\nleak(data);\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "function invoke(strings, value) { external.map(() => value); }\ninvoke`${data}`;\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "rows.forEach((item) => external.map(() => item));\n" + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "external.map(() => panel);\n" + _BROWSER_ASSIGNMENT
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "external.map(() => document.getElementById('panel'));\n" + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "const holder = {}; holder.value = data; external.map(() => holder.value);\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "const holder = {}; holder.value = panel; external.map(() => holder.value);\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "function renderInto(panel) {\n" + _BROWSER_ASSIGNMENT + "\n}\nrenderInto(external);",
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "rows.forEach((panel) => {\n" + _BROWSER_ASSIGNMENT + "\n});"
+        ),
+        _BROWSER_SCRIPT.replace("const rows = data.items;", "const rows = {map: eval};"),
+        _BROWSER_SCRIPT.replace(
+            "const rows = data.items;", "const rows = Object.entries(external);"
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "const terms = external.toLowerCase(); terms.includes(data.query);\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "data.query.toLowerCase(data.query).includes(data.query);\n" + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            "const rows = data.items;",
+            "const rows = {[\"map\"]: document.getElementById('p').onclick};",
+        ),
+        _BROWSER_SCRIPT.replace("<li>${escapeText", '<li onclick="mutate()">${escapeText'),
+        _BROWSER_SCRIPT.replace("${listMarkup(rows.map", "${execSync(listMarkup(rows.map").replace(
+            "))}</section>", ")))}</section>"
+        ),
+    ],
+    ids=[
+        "exec",
+        "unknown-call",
+        "alias",
+        "executable-field",
+        "unescaped-output",
+        "reassign",
+        "shadow",
+        "data-escape",
+        "optional-call",
+        "optional-member-call",
+        "member-optional-call",
+        "computed-optional-call",
+        "optional-computed-member-call",
+        "optional-computed-optional-call",
+        "grouped-optional-call",
+        "commented-optional-call",
+        "optional-dom-escape",
+        "callback-escape",
+        "forwarded-data-escape",
+        "tagged-local-escape",
+        "forwarded-callback-escape",
+        "dom-receiver-escape",
+        "dom-lookup-escape",
+        "stored-data-escape",
+        "stored-dom-escape",
+        "dom-function-shadow",
+        "dom-callback-shadow",
+        "fake-map",
+        "unknown-object-entries",
+        "unknown-string-receiver",
+        "unexpected-string-argument",
+        "computed-map",
+        "formatter-handler",
+        "formatter-executed",
+    ],
+)
+def test_unproven_browser_consumers_remain_partial(script: str) -> None:
+    source = _browser_source(script)
+
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+    assert _python(source) is True
+    assert (
+        _ledger("scripts/page.py", source)["inspection_ledger"][0]["reason_code"]
+        is LedgerReason.STATIC_PARSE_LIMIT
+    )
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    [
+        "import subprocess\nsubprocess.run(render(data), shell=True)",
+        "unknown(render(data))",
+        "unknown(Path)\nPath('page.html').write_text(render(data))",
+        "unknown(json)\nPath('page.html').write_text(render(data))",
+        "p = Path('page.html')\nunknown(p)\np.write_text(render(data))",
+        "p = Path('page.html')\nunknown(p.write_text)\np.write_text(render(data))",
+        "p = Path('page.html')\nunknown(p.resolve)\np.write_text(render(data))",
+        "p = Path('page.html')\nunknown(p.parent)\np.write_text(render(data))",
+        "p = Path('page.html')\nunknown(p.resolve())\np.write_text(render(data))",
+        "Path.resolve = unknown\nPath('page.html').write_text(render(data))",
+        "(Path('page.html') / unknown).write_text(render(data))",
+        "def outer(Path):\n    def inner():\n        Path('page.html').write_text(render(data))",
+        "[Path('page.html').write_text(render(data)) for Path in commands]",
+    ],
+)
+def test_browser_html_requires_explicit_pathlib_consumers(consumer: str) -> None:
+    consumer = consumer.replace(
+        "write_text(render(data))", "write_text(render(data), encoding='utf-8')"
+    )
+    source = _browser_source(consumer=consumer)
+
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+    assert _python(source) is True
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "render(data)",
+        "render(data), encoding='utf-16'",
+        "render(data), encoding=codec",
+        "render(data), encoding='utf-8', errors='ignore'",
+        "render(data), 'utf-8', 'ignore'",
+    ],
+)
+def test_browser_html_requires_known_utf8_write(arguments: str) -> None:
+    source = _browser_source(consumer=f"Path('page.html').write_text({arguments})")
+
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+    assert _python(source) is True
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("label = escape(data['label'])", "label = data['label']"),
+        ("payload = json.dumps(data).replace('</', '<\\\\/')", "payload = json.dumps(data)"),
+        ("<p>{label}</p>", '<iframe srcdoc="{label}"></iframe>'),
+        ("function escapeText(value)", "function String(value)"),
+    ],
+)
+def test_browser_boundary_and_builtin_changes_do_not_gain_ownership(
+    before: str, after: str
+) -> None:
+    source = _browser_source().replace(before, after)
+
+    assert _python(source) is True
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+
+
+def test_browser_ownership_preserves_fragment_bounds_and_cancellation() -> None:
+    source = _browser_source()
+    assert _python(source, complete_context=False) is True
+    assert _python(source.replace("</script></body>", "</body>")) is True
+    assert _python(_browser_source("(" * 150 + _BROWSER_SCRIPT + ")" * 150)) is True
+    oversized = _browser_source("/*" + "x" * 1_100_000 + "*/" + _BROWSER_SCRIPT)
+    assert python_tokens.python_browser_template_shell_text(oversized, lambda: None) == oversized
+
+    def cancel() -> None:
+        raise TimeoutError("browser ownership deadline")
+
+    with pytest.raises(TimeoutError, match="browser ownership deadline"):
+        python_tokens.python_browser_template_shell_text(source, cancel)
+
+
 # --- Whole-scan accounting -------------------------------------------------
 
 
