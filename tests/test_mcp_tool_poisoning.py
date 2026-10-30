@@ -1807,16 +1807,20 @@ class TestTP4Fallbacks:
             for event in result["inspection_ledger"]
         )
 
-    def test_tool_refusal_stays_incomplete(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_missing_structured_result_stays_incomplete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         state = _make_state("mcp_mismatched_skill", use_llm=True)
-        structured_llm = _mock_tp4_structured_llm(monkeypatch, [None])
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", AsyncMock())
+        structured_llm = _mock_tp4_structured_llm(monkeypatch, [None] * 4)
 
         result = node(state)
 
-        assert structured_llm.calls == 1
-        assert result["analyzer_status_events"][0]["status"] == "failed"
+        assert structured_llm.calls == 4
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
         assert any(
-            event["outcome"] is LedgerOutcome.FAILED for event in result["inspection_ledger"]
+            event.get("reason_code") is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+            for event in result["inspection_ledger"]
         )
 
     def test_opus5_function_calling_refusal_stays_incomplete(

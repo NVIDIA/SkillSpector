@@ -42,6 +42,22 @@ def openai_http_endpoint(monkeypatch):
                 is_tp4 = response_format.get("json_schema", {}).get("name") == tool_name
             message = {"role": "assistant", "content": json.dumps({"findings": []})}
             finish_reason = "stop"
+            if tools and not is_tp4:
+                message = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_findings",
+                            "type": "function",
+                            "function": {
+                                "name": tools[0]["function"]["name"],
+                                "arguments": json.dumps({"findings": []}),
+                            },
+                        }
+                    ],
+                }
+                finish_reason = "tool_calls"
             if is_tp4:
                 behavior["tp4_calls"] += 1
                 mode = behavior["mode"]
