@@ -97,6 +97,12 @@ def test_printf_comparison_proof_applies_inside_closed_shell_fence() -> None:
         "function test { $3; }\n",
         "if true; then te\\st() { $3; }; fi\n",
         '{ "printf"() { $1; }; }\n',
+        "time test() { $3; }\n",
+        "coproc test() { $3; }\n",
+        "while test() { $3; }; do :; done\n",
+        "until test() { $3; }; do :; done\n",
+        "command -p alias test=eval\n",
+        "builtin -- alias test=eval\n",
         "alias test=eval\n",
         "enable -n test\n",
         "eval \"$setup\"\n",
@@ -113,6 +119,18 @@ def test_printf_comparison_does_not_regain_ownership_in_child_shell() -> None:
         'test x = "$(printf "%s%s%s" r m " -rf /")"\n\'\n'
     )
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+def test_printf_comparison_skips_empty_clauses_without_quadratic_work() -> None:
+    source = " \t\n" * 10000 + 'test x = "$(printf "%s\\n" "phase one")"\n'
+    checks = 0
+
+    def check() -> None:
+        nonlocal checks
+        checks += 1
+        assert checks < 1000
+
+    assert not tm.has_bounded_parse_exhaustion(source, check, file_type="shell")
 
 
 @pytest.mark.parametrize("placement", ["nested", "following"])

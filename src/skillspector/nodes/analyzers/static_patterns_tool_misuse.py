@@ -1734,13 +1734,7 @@ def _is_literal_printf_data(word: str, check_runtime: Callable[[], None]) -> boo
 
 def _has_shell_comparison_overrides(content: str, check_runtime: Callable[[], None]) -> bool:
     """Refuse data ownership when source can replace the compared builtins."""
-    for clause_start in _shell_clause_starts(content, check_runtime):
-        while clause_start < len(content) and content[clause_start] in " \t":
-            if clause_start % 4096 == 0:
-                check_runtime()
-            clause_start += 1
-        if clause_start == len(content) or content[clause_start] in "\r\n;|&(){}#":
-            continue
+    for clause_start in _nonempty_shell_clause_starts(content, check_runtime):
         source = content[clause_start : clause_start + _SHELL_COMMAND_WORD_CHARS + 1]
         cursor = 0
         function = False
@@ -1748,13 +1742,13 @@ def _has_shell_comparison_overrides(content: str, check_runtime: Callable[[], No
             word, cursor, limited = _next_shell_invocation_word(source, cursor, check_runtime)
             if limited or word is None:
                 break
-            if word in {"alias", "enable", "eval"}:
+            if word in {"alias", "enable", "eval", "time", "coproc"} or word.startswith("-"):
                 return True
             if word in {"test", "[", "printf"} and (
                 function or re.match(r"[ \t]*(?:\([ \t]*\)|\{)", source[cursor:])
             ):
                 return True
-            if word not in {"if", "then", "elif", "else", "do", "!", "command", "builtin", "function"}:
+            if word not in {"if", "then", "elif", "else", "do", "while", "until", "!", "command", "builtin", "function"}:
                 break
             function = word == "function"
         else:
@@ -2906,7 +2900,7 @@ def _shell_command_strings(
     python_source: _PythonSourceOwnership | None = None,
 ) -> Iterator[str | None]:
     """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
-    for clause_start in _shell_clause_starts(content, check_runtime):
+    for clause_start in _nonempty_shell_clause_starts(content, check_runtime):
         check_runtime()
         recognized, command_string = _command_string_from_clause(
             content,
@@ -2926,6 +2920,19 @@ def _shell_command_strings(
                 # Shell text can only be reparsed from a string literal.
                 continue
         yield command_string
+
+
+def _nonempty_shell_clause_starts(
+    content: str, check_runtime: Callable[[], None]
+) -> Iterator[int]:
+    """Avoid reparsing the same trailing command across empty physical lines."""
+    for start in _shell_clause_starts(content, check_runtime):
+        while start < len(content) and content[start] in " \t":
+            if start % 4096 == 0:
+                check_runtime()
+            start += 1
+        if start < len(content) and content[start] not in "\r\n;|&(){}#":
+            yield start
 
 
 def _shell_clause_starts(
