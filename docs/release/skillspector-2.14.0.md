@@ -14,6 +14,45 @@ fixes from earlier releases are inherited and are not counted as new features.
 The machine-readable selection and overlap evidence are recorded in
 [the release manifest](skillspector-2.14.0-manifest.json).
 
+## Merged PRs newly included
+
+All entries below are already merged upstream. Changes inherited from #958 and
+earlier releases are listed separately and are not counted again.
+
+| PR | Group | Merged change included in v2.14.0 |
+| --- | --- | --- |
+| [#805](https://github.com/NVIDIA/SkillSpector/pull/805) | P0 | fix(report): keep missing references as non-blocking caveats |
+| [#872](https://github.com/NVIDIA/SkillSpector/pull/872) | P0 | fix(mp2): ignore repetition inside proven Markdown tables |
+| [#898](https://github.com/NVIDIA/SkillSpector/pull/898) | P0 | Fix deterministic layer failing closed on ordinary lists of verb names |
+| [#907](https://github.com/NVIDIA/SkillSpector/pull/907) | P0 | perf(security): avoid Unicode folding for ASCII characters |
+| [#934](https://github.com/NVIDIA/SkillSpector/pull/934) | P0 | fix(p2): keep reference destinations out of the benign-header exemption |
+| [#939](https://github.com/NVIDIA/SkillSpector/pull/939) | P0 | fix(coverage): reconcile inspected ZIP containers and members |
+| [#622](https://github.com/NVIDIA/SkillSpector/pull/622) | P1 | fix(analyzers): carve out structurally benign P2 header comments |
+| [#713](https://github.com/NVIDIA/SkillSpector/pull/713) | P1 | feat(providers): accept OpenCode 1.18.31-1.19.4 through an explicit verified set |
+| [#763](https://github.com/NVIDIA/SkillSpector/pull/763) | P1 | test(batch): cover pooled model cancellation and slot recovery |
+| [#847](https://github.com/NVIDIA/SkillSpector/pull/847) | P1 | feat(cli): configure the recursive skill count limit |
+| [#851](https://github.com/NVIDIA/SkillSpector/pull/851) | P1 | fix(report): preserve each compacted occurrence's finding text |
+| [#855](https://github.com/NVIDIA/SkillSpector/pull/855) | P1 | fix(llm): keep CLI prompts under MAX_INPUT_BYTES when batching large files |
+| [#864](https://github.com/NVIDIA/SkillSpector/pull/864) | P1 | feat: support Python 3.15 |
+| [#876](https://github.com/NVIDIA/SkillSpector/pull/876) | P1 | perf(cli): defer scan imports for version output |
+| [#899](https://github.com/NVIDIA/SkillSpector/pull/899) | P1 | fix(cli): render error text literally instead of as Rich markup |
+| [#903](https://github.com/NVIDIA/SkillSpector/pull/903) | P1 | fix(tm1): abstain on uppercase HTTP DELETE verbs in REST route tables |
+| [#904](https://github.com/NVIDIA/SkillSpector/pull/904) | P1 | perf(providers): defer chat client imports from metadata path |
+| [#914](https://github.com/NVIDIA/SkillSpector/pull/914) | P1 | feat(providers): support custom OpenAI-compatible HTTP headers |
+| [#929](https://github.com/NVIDIA/SkillSpector/pull/929) | P1 | fix(ra1): honor prohibitions on recommending a self-update |
+| [#943](https://github.com/NVIDIA/SkillSpector/pull/943) | P1 | fix(pe3): ignore exact Python glab setting literals |
+| [#529](https://github.com/NVIDIA/SkillSpector/pull/529) | Model update (partial) | fix(providers): request JSON-schema structured output for models that reject forced tool calls |
+| [#598](https://github.com/NVIDIA/SkillSpector/pull/598) | Model update (partial) | feat(providers): register GPT-5.6 models (sol, terra, luna) |
+| [#650](https://github.com/NVIDIA/SkillSpector/pull/650) | Model update | feat(providers): add GPT-6 Sol and Luna budgets to OpenAI and Azure registries |
+| [#690](https://github.com/NVIDIA/SkillSpector/pull/690) | Model update | feat(providers): add GPT-6.1 Sol budget to OpenAI and Azure registries |
+| [#708](https://github.com/NVIDIA/SkillSpector/pull/708) | Model update (partial) | fix(providers): honour tool_choice: auto for openai_compatible models |
+| [#806](https://github.com/NVIDIA/SkillSpector/pull/806) | Model update | feat(providers): adopt GPT-6.1 Sol and Claude Opus 5.5 defaults with compatible structured output |
+| [#824](https://github.com/NVIDIA/SkillSpector/pull/824) | Model update | fix: retain previous defaults and preserve MCP preflight errors |
+| [#436](https://github.com/NVIDIA/SkillSpector/pull/436) | Prerequisite | fix(cli): defer graph initialization |
+| [#662](https://github.com/NVIDIA/SkillSpector/pull/662) | Prerequisite | fix(cli): exit 2 when a recursive scan cannot write its report |
+| [#810](https://github.com/NVIDIA/SkillSpector/pull/810) | Prerequisite | fix(providers): keep OpenCode's internal plugins so OAuth logins work |
+| [#819](https://github.com/NVIDIA/SkillSpector/pull/819) | Prerequisite (partial) | fix(p2): bound Markdown reference-comment findings |
+
 ## New P0 changes
 
 - Treat genuinely missing references as non-blocking caveats. Keep existing
@@ -177,10 +216,25 @@ changes already represented by #958. No merged P2 PR is present in those reports
 
 ## Validation and publication
 
-Validation of the final integrated candidate is pending. Record its source and
-installed-wheel tests, package checks, source/package comparisons, and current
-hosted CI before publication. Historical #958 results and focused development
-checks do not establish acceptance of the final 2.14.0 candidate.
+Validation is recorded on [release PR #959](https://github.com/NVIDIA/SkillSpector/pull/959).
+Final isolated CI and baseline integration remain pending.
+
+- Strict wheel/source-distribution build and metadata checks pass. All 128
+  packaged runtime/resource files match the candidate source byte for byte.
+- Twenty offline CLI scans across ten fixtures produce matching normalized
+  source/wheel reports, including retained security findings. Installed-wheel
+  model and registry checks pass all 145 cases.
+- The local unit group recorded 2,932 passes, 14 skips, and three initial
+  failures. All three isolated rechecks pass: one corrected API mock and two
+  unchanged startup controls. This is not a clean full-suite run.
+- Partial analyzer and other-source groups recorded 4,023 and 1,675 passes.
+  Three analyzer child processes exceeded their startup limits before analyzer
+  execution; one dense-directory timing check exceeded five seconds while
+  retaining every file and coverage assertion. That timing failure also occurs
+  on the #958 baseline. Limits and production code were not weakened.
+- Availability test mocks now accept the supported optional timeout argument;
+  test bodies and assertions are unchanged. Partial local runs and historical
+  #958 live results do not establish final-candidate acceptance.
 
 The release PR is stacked on `yashraj/release-2.13.3` so its diff contains the
 new delta. Publication must wait for #958's integration and the final release

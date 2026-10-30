@@ -633,7 +633,7 @@
     "Exact finding baselines are scanner-version-bound and require regeneration/review."
   ],
   "validation": {
-    "status": "pending_final_integrated_candidate",
+    "status": "awaiting_isolated_ci_and_baseline_integration",
     "final_candidate_commit": null,
     "required_checks": [
       "Source and installed-wheel regressions for the final candidate",
@@ -641,7 +641,41 @@
       "Current hosted CI at the final candidate revision",
       "Baseline refresh and semantic delta review if #958 advances"
     ],
-    "claim_scope": "Focused development checks and historical #958 live results do not establish final-candidate acceptance."
+    "claim_scope": "Focused development checks and historical #958 live results do not establish final-candidate acceptance.",
+    "validated_production_commit": "774bd450cac531a49ccc68ff876c0535d4b0ab52",
+    "source_wheel_cli": {
+      "scans": 20,
+      "fixtures": 10,
+      "all_normalized_reports_match": true
+    },
+    "installed_model_registry_tests": {
+      "passed": 145
+    },
+    "package_identity": {
+      "files_equal_to_source": 128,
+      "wheel_sha256": "3185a1b1391e054b3386797a4d04acbbd8875b822d043d2c45d5308990b8ba9d"
+    },
+    "unit_local": {
+      "passed": 2932,
+      "skipped": 14,
+      "initial_failed": 3,
+      "isolated_rechecks_passed": 3,
+      "clean_full_run": false
+    },
+    "analyzers_local_partial": {
+      "passed": 4023,
+      "skipped": 4,
+      "failed_startup_timeouts": 3,
+      "complete": false
+    },
+    "other_local_partial": {
+      "passed": 1675,
+      "failed_timing": 1,
+      "unexecuted": 2178,
+      "complete": false
+    },
+    "timing_scope": "Unchanged local startup limits and the 5-second dense-directory limit were retained. The dense-directory timing failure also reproduced on #958 with all 256-file semantic assertions passing; no speed-ratio or full acceptance claim is made.",
+    "test_adaptations": "Only optional timeout arguments were added to availability mocks; AST comparison confirms every test body and assertion is preserved."
   },
   "publication": {
     "status": "waiting_for_baseline_integration_and_final_validation",
