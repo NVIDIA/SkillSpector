@@ -1335,7 +1335,7 @@ def _parse_poetry(
     scan.check()
     try:
         parsed = tomllib.loads(content)
-    except tomllib.TOMLDecodeError:
+    except (ValueError, RecursionError):
         return
     tool = parsed.get("tool", {})
     if not isinstance(tool, dict):
@@ -1427,7 +1427,7 @@ def _parse_cargo(
     scan.check()
     try:
         parsed = tomllib.loads(content)
-    except tomllib.TOMLDecodeError:
+    except (ValueError, RecursionError):
         return
     sources = parsed.get("source", {})
     if isinstance(sources, dict):

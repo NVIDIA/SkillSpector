@@ -1498,6 +1498,7 @@ def _extract_packages_from_package_json(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract (package_name, version_or_None, line_number) from package.json content.
 
@@ -1510,7 +1511,9 @@ def _extract_packages_from_package_json(
         return []
     try:
         data = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
         return _extract_packages_from_package_json_scan(content, limit=limit)
     if not isinstance(data, dict):
         return []
@@ -1554,6 +1557,7 @@ def _extract_packages_from_pyproject(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract (package_name, version_or_None, line_number) from pyproject.toml.
 
@@ -1566,7 +1570,9 @@ def _extract_packages_from_pyproject(
         return []
     try:
         data = tomllib.loads(content)
-    except tomllib.TOMLDecodeError:
+    except (ValueError, RecursionError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
         return []
 
     specs: list[str] = []
@@ -1826,9 +1832,28 @@ def _normalize_package_name(name: str) -> str:
     return name.lower().replace("_", "-")
 
 
+def _dependency_filename(file_path: str) -> str:
+    """Return a normalized basename so documentation is not mistaken for a manifest."""
+    return file_path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _is_requirements_file(file_path: str) -> bool:
+    normalized_path = file_path.replace("\\", "/").lower()
+    path_parts = normalized_path.split("/")
+    filename = path_parts[-1]
+    if filename in {"requirements", "requirements.txt", "requirements.in"} or re.fullmatch(
+        r"requirements[-_][a-z0-9_-]+\.(?:txt|in)", filename
+    ):
+        return True
+    return "requirements" in path_parts[:-1] and bool(
+        re.fullmatch(r"[a-z0-9][a-z0-9_-]*\.(?:txt|in)", filename)
+    )
+
+
 def _is_python_lockfile(file_path: str) -> bool:
-    lower_path = file_path.lower()
-    return "uv.lock" in lower_path or "poetry.lock" in lower_path or _is_pipenv_lockfile(file_path)
+    return _dependency_filename(file_path) in {"uv.lock", "poetry.lock"} or _is_pipenv_lockfile(
+        file_path
+    )
 
 
 def _normalize_npm_package_name(name: str) -> str:
@@ -1843,8 +1868,18 @@ def _normalize_npm_package_name(name: str) -> str:
 
 
 def _is_npm_lockfile(file_path: str) -> bool:
-    lower_path = file_path.lower()
-    return lower_path.endswith(("package-lock.json", "npm-shrinkwrap.json"))
+    return _dependency_filename(file_path) in {"package-lock.json", "npm-shrinkwrap.json"}
+
+
+def _is_dependency_manifest(file_path: str) -> bool:
+    """Recognize supported manifest names, not prose files that merely mention them."""
+    filename = _dependency_filename(file_path)
+    return (
+        _is_requirements_file(file_path)
+        or filename in {"package.json", "pyproject.toml", "setup.py", "pipfile", "pipfile.lock"}
+        or _is_python_lockfile(file_path)
+        or _is_npm_lockfile(file_path)
+    )
 
 
 def _npm_lock_line_index(content: str) -> dict[str, int]:
@@ -1864,7 +1899,11 @@ def _npm_lock_line_index(content: str) -> dict[str, int]:
     return index
 
 
-def _npm_lock_entries(content: str) -> list[tuple[str, str, int, int]]:
+def _npm_lock_entries(
+    content: str,
+    *,
+    on_parse_error: Callable[[str], None] | None = None,
+) -> list[tuple[str, str, int, int]]:
     """Extract (name, version, line, depth) for every install recorded in an npm lockfile.
 
     Covers both layouts: ``lockfileVersion`` 2/3 keep every install under ``packages`` keyed by
@@ -1881,7 +1920,11 @@ def _npm_lock_entries(content: str) -> list[tuple[str, str, int, int]]:
     """
     try:
         data = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, RecursionError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
+        return []
+    except TypeError:
         return []
     if not isinstance(data, dict):
         return []
@@ -1931,12 +1974,14 @@ def _extract_packages_from_npm_lock(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract exact package versions from an npm lockfile."""
     if limit is not None and limit <= 0:
         return []
     found: list[tuple[str, str | None, int]] = [
-        (name, version, line) for name, version, line, _depth in _npm_lock_entries(content)
+        (name, version, line)
+        for name, version, line, _depth in _npm_lock_entries(content, on_parse_error=on_parse_error)
     ]
     return found if limit is None else found[:limit]
 
@@ -1945,13 +1990,16 @@ def _extract_packages_from_toml_lock(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract exact package versions from TOML lockfiles such as uv.lock and poetry.lock."""
     if limit is not None and limit <= 0:
         return []
     try:
         data = tomllib.loads(content)
-    except tomllib.TOMLDecodeError:
+    except (ValueError, RecursionError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
         return []
     packages = data.get("package")
     if not isinstance(packages, list):
@@ -2154,7 +2202,7 @@ def _collect_npm_locked_versions(
         if timeout_seconds is not None and time.monotonic() - started_at >= timeout_seconds:
             break
         content = file_cache.get(path)
-        if not content:
+        if content is None:
             continue
         files_read += 1
         for name, version, _line_num, depth in _npm_lock_entries(content):
@@ -2383,10 +2431,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
     tag = [PatternCategory.SUPPLY_CHAIN.value]
 
-    is_dep_file = any(
-        n in file_path.lower()
-        for n in ["requirements", "package.json", "pyproject.toml", "setup.py", "pipfile"]
-    )
+    is_dep_file = _is_dependency_manifest(file_path)
     if is_dep_file:
         for pattern, confidence in SC1_PATTERNS:
             matches = (
@@ -3138,14 +3183,15 @@ def _analyze_dependencies_detailed(
     limitations: list[OsvQueryLimitation] = []
     tag = [PatternCategory.SUPPLY_CHAIN.value]
 
-    lower_path = file_path.lower()
-    is_lockfile = _is_python_lockfile(lower_path)
-    is_npm_lock = _is_npm_lockfile(lower_path)
+    filename = _dependency_filename(file_path)
+    is_lockfile = _is_python_lockfile(file_path)
+    is_npm_lock = _is_npm_lockfile(file_path)
     is_python_dep = (
-        any(n in lower_path for n in ["requirements", "pyproject.toml", "setup.py", "pipfile"])
+        _is_requirements_file(file_path)
+        or filename in {"pyproject.toml", "setup.py", "pipfile", "pipfile.lock"}
         or is_lockfile
     )
-    is_npm_dep = "package.json" in lower_path or is_npm_lock
+    is_npm_dep = filename == "package.json" or is_npm_lock
 
     if not is_python_dep and not is_npm_dep:
         return findings, limitations, 0
@@ -3159,18 +3205,34 @@ def _analyze_dependencies_detailed(
     )
     extraction_limit = package_limit + 1
 
+    def record_parse_error(error_class: str) -> None:
+        limitations.append(
+            OsvQueryLimitation(
+                reason=LedgerReason.DEPENDENCY_PARSE_ERROR,
+                error_class=error_class,
+            )
+        )
+
     if is_python_dep:
-        if Path(file_path).name.lower() in {"pipfile", "pipfile.lock"}:
+        if filename in {"pipfile", "pipfile.lock"}:
             packages, parse_limitations = _extract_packages_from_pipenv(
                 content,
                 is_lockfile=_is_pipenv_lockfile(file_path),
                 limit=extraction_limit,
             )
             limitations.extend(parse_limitations)
-        elif "pyproject.toml" in lower_path:
-            packages = _extract_packages_from_pyproject(content, limit=extraction_limit)
+        elif filename == "pyproject.toml":
+            packages = _extract_packages_from_pyproject(
+                content,
+                limit=extraction_limit,
+                on_parse_error=record_parse_error,
+            )
         elif is_lockfile:
-            packages = _extract_packages_from_toml_lock(content, limit=extraction_limit)
+            packages = _extract_packages_from_toml_lock(
+                content,
+                limit=extraction_limit,
+                on_parse_error=record_parse_error,
+            )
         else:
             packages, oversized_spec = _extract_packages_from_requirements_detailed(
                 content,
@@ -3192,10 +3254,18 @@ def _analyze_dependencies_detailed(
         known_legit = _KNOWN_LEGIT_PYPI
     else:
         if is_npm_lock:
-            packages = _extract_packages_from_npm_lock(content, limit=extraction_limit)
+            packages = _extract_packages_from_npm_lock(
+                content,
+                limit=extraction_limit,
+                on_parse_error=record_parse_error,
+            )
         else:
             packages = _apply_locked_versions(
-                _extract_packages_from_package_json(content, limit=extraction_limit),
+                _extract_packages_from_package_json(
+                    content,
+                    limit=extraction_limit,
+                    on_parse_error=record_parse_error,
+                ),
                 npm_locked_versions,
                 _normalize_npm_package_name,
             )
@@ -4124,21 +4194,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     dependency_findings_seen = 0
     osv_budget = OsvQueryBudget.create(dependency_remaining_seconds())
     for path in components:
-        lower_path = path.lower()
-        is_dep_file = any(
-            n in lower_path
-            for n in [
-                "requirements",
-                "package.json",
-                "package-lock.json",
-                "npm-shrinkwrap.json",
-                "pyproject.toml",
-                "setup.py",
-                "pipfile",
-                "uv.lock",
-                "poetry.lock",
-            ]
-        )
+        is_dep_file = _is_dependency_manifest(path)
         if not is_dep_file:
             continue
         dependency_files_seen += 1
