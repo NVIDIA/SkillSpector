@@ -102,6 +102,14 @@ _P2_COMMENT_KEYWORD = (
     rf"(?:{_P2_IDENTIFIER_START}(?:system|POST|GET|send){_P2_IDENTIFIER_END}"
     r"|ignore|instructions?|transmit)"
 )
+# Reference-comment titles need a source delimiter scan, rather than a DOTALL
+# keyword expression that can backtrack past an already closed title.
+_REFERENCE_COMMENT_GAP = r"[ \t]*(?:(?:\r\n|\r|\n)[ \t]*)?"
+_REFERENCE_COMMENT_PATTERN = rf"\[//\]:{_REFERENCE_COMMENT_GAP}#"
+_REFERENCE_COMMENT_OPENING = re.compile(_REFERENCE_COMMENT_PATTERN)
+_REFERENCE_COMMENT_TITLE = re.compile(r"(?:[ \t]+|[ \t]*(?:\r\n|\r|\n)[ \t]*)\(")
+_REFERENCE_COMMENT_SPAN = re.compile(r"[\s\S]*")
+_REFERENCE_COMMENT_KEYWORD = re.compile(_P2_COMMENT_KEYWORD, re.IGNORECASE)
 P2_PATTERNS = [
     (
         # "<!-->" and "<!--->" are abrupt empty comments: the HTML tokenizer
@@ -110,7 +118,7 @@ P2_PATTERNS = [
         rf"<!--(?!-?>)(?:(?!--!?>).)*?{_P2_COMMENT_KEYWORD}(?:(?!--!?>).)*?--!?>",
         0.7,
     ),
-    (r"\[//\]:\s*#\s*\(.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?\)", 0.8),
+    (_REFERENCE_COMMENT_PATTERN, 0.8),
     (_ZERO_WIDTH_PATTERN, 0.6),
     (r"data:text/plain;base64,[A-Za-z0-9+/=]{50,}", 0.7),
 ]
@@ -281,6 +289,9 @@ def _p2_pattern_matches(
     """Yield all structured matches or the first control signal on each line."""
     if check_runtime is not None:
         check_runtime()
+    if pattern == _REFERENCE_COMMENT_PATTERN:
+        yield from _reference_comment_matches(content, check_runtime)
+        return
     compiled = re.compile(pattern, re.IGNORECASE | re.DOTALL)
     if pattern not in _SINGLE_CHARACTER_P2_PATTERNS:
         for match in compiled.finditer(content):
@@ -296,9 +307,10 @@ def _p2_pattern_matches(
         candidate = compiled.search(content, cursor)
         if candidate is None:
             return
-        if pattern == _ZERO_WIDTH_PATTERN and _zero_width_match_is_safe_emoji_zwj(
-            content,
-            candidate.start(),
+        if pattern == _ZERO_WIDTH_PATTERN and (
+            # A leading U+FEFF is a byte-order mark, not hidden text.
+            (candidate.start() == 0 and content[0] == "\ufeff")
+            or _zero_width_match_is_safe_emoji_zwj(content, candidate.start())
         ):
             cursor = candidate.end()
             continue
@@ -307,6 +319,94 @@ def _p2_pattern_matches(
         if line_break is None:
             return
         cursor = line_break.end()
+
+
+def _reference_comment_matches(
+    content: str,
+    check_runtime: Callable[[], None] | None = None,
+) -> Iterator[re.Match[str]]:
+    """Own the destination and its separated, parenthesized title.
+
+    CommonMark destinations can contain balanced parentheses, while titles
+    require intervening whitespace. Titles allow escapes and line breaks but
+    no blank lines. A keyword already inside an unfinished or malformed title
+    remains conservative evidence; later visible paragraphs cannot supply it.
+    """
+    cursor = 0
+    while cursor < len(content):
+        if check_runtime is not None:
+            check_runtime()
+        opening = _REFERENCE_COMMENT_OPENING.search(content, cursor)
+        if opening is None:
+            return
+        destination_start = opening.end() - 1
+        end = opening.end()
+        depth = 0
+        next_runtime_check = end
+        while end < len(content):
+            if check_runtime is not None and end >= next_runtime_check:
+                check_runtime()
+                next_runtime_check = end + 1024
+            char = content[end]
+            if char in " \t\r\n" or ord(char) < 32 or ord(char) == 127:
+                break
+            if char == "\\" and end + 1 < len(content) and content[end + 1] in "\\()":
+                end += 2
+                continue
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            end += 1
+        destination_valid = depth == 0 and (end == len(content) or content[end] in " \t\r\n")
+        title = _REFERENCE_COMMENT_TITLE.match(content, end) if destination_valid else None
+        if title is None:
+            if destination_valid and _REFERENCE_COMMENT_KEYWORD.search(
+                content, destination_start, end
+            ):
+                match = _REFERENCE_COMMENT_SPAN.match(content, opening.start(), end)
+                assert match is not None
+                yield match
+            cursor = max(end, opening.end())
+            continue
+        title_start = title.end()
+        end = title_start
+        closed = False
+        line_has_text = True
+        next_runtime_check = title_start
+        while end < len(content):
+            if check_runtime is not None and end >= next_runtime_check:
+                check_runtime()
+                next_runtime_check = end + 1024
+            char = content[end]
+            if char == "\\" and end + 1 < len(content) and content[end + 1] in "\\()":
+                end += 2
+                line_has_text = True
+                continue
+            if char == ")":
+                end += 1
+                closed = True
+                break
+            if char in "\r\n":
+                if not line_has_text:
+                    break
+                line_has_text = False
+                if char == "\r" and end + 1 < len(content) and content[end + 1] == "\n":
+                    end += 1
+            elif char not in " \t":
+                line_has_text = True
+            end += 1
+        if check_runtime is not None:
+            check_runtime()
+        if _REFERENCE_COMMENT_KEYWORD.search(
+            content, destination_start, end - 1 if closed else end
+        ):
+            match = _REFERENCE_COMMENT_SPAN.match(content, opening.start(), end)
+            assert match is not None
+            yield match
+        cursor = max(end, title_start)
 
 
 def _first_smuggled_tag_offset(
