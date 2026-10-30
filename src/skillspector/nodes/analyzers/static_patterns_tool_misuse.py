@@ -1590,34 +1590,8 @@ def _bounded_printf_word(result: str) -> str | None:
     return result
 
 
-def _static_printf_substitution(
-    content: str,
-    start: int,
-    end: int,
-    *,
-    backtick: bool = False,
-) -> str | None:
-    """Evaluate a tiny, bounded subset of shell ``printf`` deterministically."""
-    inner_start = start + (1 if backtick else 2)
-    inner_end = end - 1
-    inner = content[inner_start:inner_end]
-    recognized, arguments = _printf_invocation_arguments(inner)
-    if (
-        not recognized
-        or len(inner) > _PRINTF_STATIC_CHARS
-        or re.search(r"[;|&<>\r\n]", inner) is not None
-    ):
-        return None
-    if arguments[:1] == ["--"]:
-        arguments = arguments[1:]
-    if not arguments or len(arguments) > _PRINTF_STATIC_ARGUMENTS + 1:
-        return None
-    format_word, *values = arguments
-    if _PRINTF_FORMAT_WORD_RE.fullmatch(format_word) is None or any(
-        _PRINTF_STATIC_WORD_RE.fullmatch(value) is None for value in values
-    ):
-        return None
-
+def _printf_format_segments(format_word: str) -> list[str | None] | None:
+    """Read the supported literal escapes, ``%s`` and ``%%`` conversions."""
     segments: list[str | None] = []
     literal: list[str] = []
 
@@ -1652,6 +1626,39 @@ def _static_printf_substitution(
         cursor += 2
     if literal and not flush_literal():
         return None
+    return segments
+
+
+def _static_printf_substitution(
+    content: str,
+    start: int,
+    end: int,
+    *,
+    backtick: bool = False,
+) -> str | None:
+    """Evaluate a tiny, bounded subset of shell ``printf`` deterministically."""
+    inner_start = start + (1 if backtick else 2)
+    inner_end = end - 1
+    inner = content[inner_start:inner_end]
+    recognized, arguments = _printf_invocation_arguments(inner)
+    if (
+        not recognized
+        or len(inner) > _PRINTF_STATIC_CHARS
+        or re.search(r"[;|&<>\r\n]", inner) is not None
+    ):
+        return None
+    if arguments[:1] == ["--"]:
+        arguments = arguments[1:]
+    if not arguments or len(arguments) > _PRINTF_STATIC_ARGUMENTS + 1:
+        return None
+    format_word, *values = arguments
+    if _PRINTF_FORMAT_WORD_RE.fullmatch(format_word) is None or any(
+        _PRINTF_STATIC_WORD_RE.fullmatch(value) is None for value in values
+    ):
+        return None
+    segments = _printf_format_segments(format_word)
+    if segments is None:
+        return None
 
     conversions = sum(segment is None for segment in segments)
     if conversions == 0:
@@ -1665,6 +1672,140 @@ def _static_printf_substitution(
         if sum(len(piece) for piece in output) > 64:
             return None
     return _bounded_printf_word("".join(output))
+
+
+def _is_literal_printf_data(word: str, check_runtime: Callable[[], None]) -> bool:
+    """Prove bounded literal output without treating it as an executable word."""
+    if not word.startswith('"$(') or not word.endswith(')"'):
+        return False
+    inner = word[3:-2]
+    if len(inner) > _PRINTF_STATIC_CHARS or re.search(r"[$`;|&<>\x00\ue001\ue002]", inner):
+        return False
+    # Remove only actual continuations, never the newline after an escaped slash.
+    normalized: list[str] = []
+    quote: str | None = None
+    cursor = 0
+    while cursor < len(inner):
+        character = inner[cursor]
+        if character in "\r\n":
+            return False
+        if character == "\\" and quote != "'" and cursor + 1 < len(inner):
+            if inner.startswith("\\\r\n", cursor):
+                cursor += 3
+                continue
+            if inner.startswith("\\\n", cursor):
+                cursor += 2
+                continue
+            normalized.append(inner[cursor : cursor + 2])
+            cursor += 2
+            continue
+        if quote is None and character in "*?[]{}~":
+            return False
+        if character in "'\"":
+            if quote is None:
+                quote = character
+            elif character == quote:
+                quote = None
+        normalized.append(character)
+        cursor += 1
+    source = "".join(normalized).strip()
+    if quote is not None or re.match(r"printf(?=[ \t])", source) is None:
+        return False
+    recognized, arguments = _printf_invocation_arguments(source, check_runtime=check_runtime)
+    options_ended = arguments[:1] == ["--"]
+    if options_ended:
+        arguments = arguments[1:]
+    if not recognized or not arguments or len(arguments) > _PRINTF_STATIC_ARGUMENTS + 1:
+        return False
+    format_word, *values = arguments
+    if (not options_ended and format_word.startswith("-")) or (
+        _PRINTF_FORMAT_WORD_RE.fullmatch(format_word) is None
+    ):
+        return False
+    segments = _printf_format_segments(format_word)
+    if segments is None:
+        return False
+    conversions = sum(segment is None for segment in segments)
+    cycles = max(1, (len(values) + conversions - 1) // conversions) if conversions else 1
+    size = cycles * sum(len(segment) for segment in segments if segment is not None)
+    size += sum(map(len, values)) if conversions else 0
+    return size <= _PRINTF_STATIC_CHARS
+
+
+def _has_shell_comparison_overrides(content: str, check_runtime: Callable[[], None]) -> bool:
+    """Refuse data ownership when source can replace the compared builtins."""
+    for clause_start in _shell_clause_starts(content, check_runtime):
+        source = content[clause_start : clause_start + _SHELL_COMMAND_WORD_CHARS + 1]
+        cursor = 0
+        function = False
+        for _ in range(8):
+            word, cursor, limited = _next_shell_invocation_word(source, cursor, check_runtime)
+            if limited or word is None:
+                break
+            if word in {"alias", "enable", "eval"}:
+                return True
+            if word in {"test", "[", "printf"} and (
+                function or re.match(r"[ \t]*(?:\([ \t]*\)|\{)", source[cursor:])
+            ):
+                return True
+            if word not in {"if", "then", "elif", "else", "do", "!", "command", "builtin", "function"}:
+                break
+            function = word == "function"
+        else:
+            return True
+    return False
+
+
+def _literal_printf_comparison_words(
+    content: str, check_runtime: Callable[[], None]
+) -> dict[int, int]:
+    """Locate exact quoted printf operands of bounded string comparisons."""
+    result: dict[int, int] = {}
+    if "printf" not in content:
+        return result
+    for clause_start in _shell_clause_starts(content, check_runtime):
+        command = re.match(r"[ \t]*(test|\[)(?=[ \t])", content[clause_start : clause_start + 32])
+        if command is None:
+            continue
+        check_runtime()
+        source = content[clause_start : clause_start + _SHELL_COMMAND_WORD_CHARS + 1]
+        cursor = command.end()
+        operands: list[tuple[str, int, int]] = []
+        for _ in range(4 if command[1] == "[" else 3):
+            while cursor < len(source):
+                if source[cursor] in " \t":
+                    cursor += 1
+                elif source.startswith("\\\r\n", cursor):
+                    cursor += 3
+                elif source.startswith("\\\n", cursor):
+                    cursor += 2
+                else:
+                    break
+            if cursor == len(source) or source[cursor] in "\r\n;|&()#":
+                break
+            start = cursor
+            value, cursor, limited = _next_shell_invocation_word(source, cursor, check_runtime)
+            if limited or value is None or cursor > _SHELL_COMMAND_WORD_CHARS:
+                break
+            operands.append((value, start, cursor))
+        else:
+            end = cursor
+            while end < len(source) and source[end] in " \t":
+                end += 1
+            if end > _SHELL_COMMAND_WORD_CHARS or (
+                end < len(source) and source[end] not in "\r\n;|&"
+            ):
+                continue
+            if operands[1][0] not in {"=", "==", "!="} or (
+                command[1] == "[" and operands[-1][0] != "]"
+            ):
+                continue
+            for _, start, end in (operands[0], operands[2]):
+                if _is_literal_printf_data(source[start:end], check_runtime):
+                    # The quote and its substitution are independent candidates.
+                    result[clause_start + start] = clause_start + end
+                    result[clause_start + start + 1] = clause_start + end - 1
+    return result
 
 
 def _may_have_destructive_outer_operands(content: str) -> bool:
@@ -2486,6 +2627,8 @@ def _has_shell_command_word_exhaustion(
     python_source: _PythonSourceOwnership | None = None,
     perl_eval_blocks: bool = False,
     quote_limits: dict[int, int] | None = None,
+    shell_data_ranges: list[tuple[int, int]] | None = None,
+    _comparison_overrides: bool = False,
     _command_string_depth: int = 0,
 ) -> bool:
     """Find candidate command words whose deterministic parse hit a safety bound.
@@ -2505,6 +2648,9 @@ def _has_shell_command_word_exhaustion(
     may_have_destructive_outer_operands = _may_have_destructive_outer_operands(content)
     json_openers = sorted(structural_quote_openers or ())
     complete_comments: set[tuple[int, int]] = set()
+    printf_comparison_words: dict[int, int] | None = None
+    if not _comparison_overrides and "printf" in content:
+        _comparison_overrides = _has_shell_comparison_overrides(content, check_runtime)
     # Short text without shell-expansion openers cannot trigger these shell-word
     # reconstruction or span limits. Keep its prior lazy ownership paths instead
     # of parsing an ordinary Python module for every candidate letter.
@@ -2640,7 +2786,17 @@ def _has_shell_command_word_exhaustion(
             continue
         if parsed.limited:
             if not _quoted_candidate_is_complete(content, start, quote_limits, check_runtime):
-                return True
+                if printf_comparison_words is None:
+                    printf_comparison_words = {}
+                    for begin, end in (() if _comparison_overrides else shell_data_ranges or ()):
+                        printf_comparison_words.update(
+                            (begin + position, begin + stop)
+                            for position, stop in _literal_printf_comparison_words(
+                                content[begin:end], check_runtime
+                            ).items()
+                        )
+                if printf_comparison_words.get(start) != parsed.end:
+                    return True
         if (
             parsed.dynamic
             and may_have_destructive_outer_operands
@@ -2676,6 +2832,7 @@ def _has_shell_command_word_exhaustion(
                 if _has_shell_command_word_exhaustion(
                     content[comment[0] : comment[1]],
                     check_runtime,
+                    _comparison_overrides=_comparison_overrides,
                     _command_string_depth=_command_string_depth,
                 ):
                     return True
@@ -2697,6 +2854,8 @@ def _has_shell_command_word_exhaustion(
             check_runtime,
             structural_quote_closers=command_closers,
             quote_limits=command_limits,
+            shell_data_ranges=[(0, len(command_string))],
+            _comparison_overrides=_comparison_overrides,
             _command_string_depth=_command_string_depth + 1,
         ):
             return True
@@ -5863,6 +6022,11 @@ def _has_bounded_parse_exhaustion(
         python_source=python_source,
         perl_eval_blocks=file_type == "perl",
         quote_limits=quote_limits,
+        shell_data_ranges=(
+            [(0, len(content))]
+            if file_type == "shell" and complete_context
+            else shell_fence_ranges
+        ),
     ):
         return True
     covered_until = 0
