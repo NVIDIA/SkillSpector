@@ -561,7 +561,7 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
 | E1 | External Transmission | MEDIUM | Sending data to external URLs |
-| E2 | Env Variable Harvesting | HIGH | Enumerating, copying, or searching environment data to collect secrets |
+| E2 | Env Variable Harvesting | HIGH | Enumerating, copying, or searching environment data to collect secrets. A copy traced only to a child process's `env=` is reported LOW |
 | E3 | File System Enumeration | MEDIUM | Scanning directories for sensitive files |
 | E4 | Context Leakage | HIGH | Transmitting conversation context externally |
 
