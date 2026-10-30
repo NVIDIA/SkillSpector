@@ -247,11 +247,28 @@ _VARIABLE_SHELL_ASSIGNMENT_RE = re.compile(
 )
 _SHELL_NAME_ARGUMENT_RE = re.compile(r"\bshell\s*=\s*\w+", re.IGNORECASE)
 
+# Arguments preceding a keyword in the same call. Balanced parentheses up to
+# two levels deep are consumed so that a nested call in the command argument
+# (``" ".join(sys.argv[1:])``, ``"{}".format(x)``) does not end the match,
+# while an unmatched ``)`` still closes the call. A quoted string (including
+# a terminated triple-quoted one) and a ``#`` comment are each consumed as one
+# token, so a parenthesis inside them (``"echo :("``, ``# (``) is not counted.
+# An unterminated single-line quote runs to the end of the line, so no
+# character is scanned twice.
+_CALL_ARGUMENT_TOKEN = (
+    r"(?>'''(?:[^'\\]|\\.|'(?!''))*'''"
+    r'|"""(?:[^"\\]|\\.|"(?!""))*"""'
+    r"""|'(?:[^'\\\n]|\\.)*'?|"(?:[^"\\\n]|\\.)*"?|#[^\n]*|[^()])"""
+)
+_CALL_ARGUMENTS_PREFIX = (
+    rf"(?:{_CALL_ARGUMENT_TOKEN}|\((?:{_CALL_ARGUMENT_TOKEN}|\({_CALL_ARGUMENT_TOKEN}*\))*\))*"
+)
+
 # TM1: Tool Parameter Abuse — dangerous parameter values
 DIRECT_SHELL_TRUE_PATTERNS: tuple[tuple[str, float], ...] = (
     # shell=True is a classic command injection vector
-    (r"subprocess\.\w+\s*\([^)]*shell\s*=\s*True\b", 0.8),
-    (r"Popen\s*\([^)]*shell\s*=\s*True\b", 0.8),
+    (rf"subprocess\.\w+\s*\({_CALL_ARGUMENTS_PREFIX}shell\s*=\s*True\b", 0.8),
+    (rf"Popen\s*\({_CALL_ARGUMENTS_PREFIX}shell\s*=\s*True\b", 0.8),
 )
 _DIRECT_SHELL_TRUE_VALUE = re.compile(r"shell\s*=\s*True\b", re.IGNORECASE)
 TM1_CODE_PATTERNS = [
