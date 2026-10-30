@@ -37,12 +37,20 @@ from skillspector import __version__
 from skillspector.cleanup import cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
-from skillspector.inspection_ledger import LedgerReason
+from skillspector.graph_proxy import restore_package_graph_export
+from skillspector.inspection_ledger import only_missing_reference_exceptions
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.nodes.analyzers import ANALYZER_MODULES
+from skillspector.nodes.report import redact_llm_error
 from skillspector.semantic_runtime import llm_runtime_available, semantic_runtime_accounting
 from skillspector.suppression import effective_findings
+
+# Importing `skillspector.graph` above assigns the submodule to the parent
+# package's `graph` attribute, shadowing the documented lazy proxy. Restore
+# the proxy so `skillspector.graph` stays invokable when MCP is imported
+# before any other graph access.
+restore_package_graph_export()
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -135,7 +143,7 @@ async def run_scan(
         ):
             raise ValueError("this MCP transport requires an unauthenticated HTTPS target")
 
-    llm_preflight_available, _ = is_llm_available()
+    llm_preflight_available, llm_preflight_error = is_llm_available() if use_llm else (False, None)
     llm_enabled = use_llm and llm_preflight_available
 
     state: dict[str, Any] = {
@@ -145,6 +153,8 @@ async def run_scan(
         "use_llm": llm_enabled,
         "llm_requested": use_llm,
     }
+    if use_llm and not llm_preflight_available:
+        state["llm_preflight_error"] = redact_llm_error(llm_preflight_error)
     if yara_rules_dir:
         state["yara_rules_dir"] = yara_rules_dir
 
@@ -191,14 +201,9 @@ async def run_scan(
         # must keep blocking safe_to_install like any other exceptional
         # reason.
         ledger_exceptions = analysis_completeness.get("ledger_exceptions") or []
-        reference_caveat_only = (
-            bool(ledger_exceptions)
-            and not analysis_completeness.get("limitations")
-            and all(
-                exception.get("reason_code") == LedgerReason.REFERENCE_MISSING
-                for exception in ledger_exceptions
-            )
-        )
+        reference_caveat_only = only_missing_reference_exceptions(
+            ledger_exceptions
+        ) and not analysis_completeness.get("limitations")
         analysis_requirement_met = not use_llm or llm_runtime_complete
         safe_to_install = (
             risk_score <= RISK_THRESHOLD

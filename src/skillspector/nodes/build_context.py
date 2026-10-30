@@ -2827,6 +2827,11 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                     skill_dir,
                     source_path=primary_path,
                     source_text=primary_text,
+                    metadata_root=(
+                        Path(str(state["primary_file_parent_path"]))
+                        if state.get("primary_file_parent_path")
+                        else None
+                    ),
                     known_paths=sorted(
                         dict.fromkeys([*inventoried_components, *excluded_artifacts])
                     ),
@@ -2919,11 +2924,13 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 reason=(
                     LedgerReason.REFERENCE_MISSING
                     if reference["status"] == "missing"
+                    else LedgerReason.REFERENCED_UNINSPECTED
+                    if reference["status"] == "uninspected"
                     else LedgerReason.REFERENCE_UNRESOLVED
                 ),
             )
             for reference in references
-            if reference["status"] in {"missing", "ambiguous"}
+            if reference["status"] in {"missing", "ambiguous", "uninspected"}
         )
 
     referenced_paths = frozenset(
@@ -3279,6 +3286,12 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         override = nested.inventory_overrides.get(artifact["path"])
         if override is not None and artifact["disposition"] != ArtifactDisposition.FAILED:
             artifact["disposition"], artifact["reason"] = override
+        if artifact["path"] in nested.inspected_containers:
+            artifact["inspected_members"] = nested.inspected_containers[artifact["path"]]
+            if artifact["disposition"] is ArtifactDisposition.OUT_OF_SCOPE and not artifact.get(
+                "reason"
+            ):
+                artifact["disposition"] = ArtifactDisposition.ANALYZED
     inventory_by_path = {item["path"]: item for item in artifact_inventory}
 
     recognized_containers = frozenset(nested.outer_metadata)

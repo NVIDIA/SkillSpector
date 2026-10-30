@@ -57,7 +57,11 @@ from skillspector.inference_usage import (
     retained_chat_model_controls,
 )
 from skillspector.providers import registry
-from skillspector.providers.chat_models import resolve_reasoning_effort, resolve_sampling_parameters
+from skillspector.providers.chat_models import (
+    resolve_reasoning_effort,
+    resolve_sampling_parameters,
+)
+from skillspector.providers.structured_output import rejects_forced_tool_call
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -248,7 +252,7 @@ class AnthropicProxyProvider:
         effort = resolve_reasoning_effort()
         if effort is not None:
             kwargs["effort"] = effort
-        sampling_parameters = resolve_sampling_parameters()
+        sampling_parameters = resolve_sampling_parameters(model)
         kwargs.update(sampling_parameters)
         chat_model = _ChatAnthropicProxy(**kwargs)
         register_chat_model_controls(
@@ -274,3 +278,10 @@ class AnthropicProxyProvider:
         """Resolve model: ``SKILLSPECTOR_MODEL`` env > slot default > DEFAULT_MODEL."""
         user_input = os.environ.get("SKILLSPECTOR_MODEL", "").strip()
         return user_input or self.SLOT_DEFAULTS.get(slot, "") or self.DEFAULT_MODEL
+
+    def structured_output_method(self, model: str) -> str | None:
+        """``with_structured_output`` method for *model*: registry entry, then Claude name, else ``None``."""
+        declared = registry.lookup_structured_output_method(REGISTRY_PATH, model)
+        if declared:
+            return declared
+        return "json_schema" if rejects_forced_tool_call(model) else None

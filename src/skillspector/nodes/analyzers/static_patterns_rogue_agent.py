@@ -471,10 +471,71 @@ def _is_negated_safety_constraint(
         return False
     clause_start = max(line.rfind(sep, 0, local_start) for sep in ".;:")
     prefix = line[clause_start + 1 : local_start]
-    safe_gap = r"(?:(?:ever|again|directly|intentionally|explicitly|attempt\s+to|try\s+to)\s+){0,2}"
+    safe_gap = r"(?:(?:ever|again|directly|intentionally|explicitly|repeatedly|attempt\s+to|try\s+to)\s+){0,2}"
+    # A prohibition may target the recommendation itself ("Do not repeatedly
+    # recommend suite `self-update`"): the negated verb phrase, not the matched
+    # action, carries the prohibition. Allow one recommendation verb plus an
+    # object gap between the negation and the phrase, and an opening
+    # backtick when the phrase sits in a code span.
+    #
+    # The gap is a default-deny object grammar, not a blacklist. A
+    # blacklist can never prove that an unseen word is not a fresh
+    # imperative ("Do not recommend it just use `self-update`": "it",
+    # "just" and "use" all passed the old barred-word list, yet the
+    # sentence affirmatively instructs the action). The exemption
+    # therefore applies only when the gap is proved object syntax:
+    #   * empty ("Never recommend `self-update`");
+    #   * a single object pronoun ("recommend it") or determiner
+    #     ("recommend the"), which can only head an object;
+    #   * a determiner plus one word ("recommend the suite"): the
+    #     determiner proves the following word is a noun phrase, even
+    #     where that word also has a verb homonym;
+    #   * a gerund object ("advise running `self-update`");
+    #   * a single classifier noun from a closed list ("recommend
+    #     suite `self-update`").
+    # Anything else is unproved action language and gets no exemption:
+    # a pronoun followed by further words ("it just use"), an adverb
+    # plus an imperative ("just use", "simply execute"), a bare
+    # imperative ("recommend use ..."), and longer noun phrases
+    # ("the new suite") all fail the grammar and keep the finding.
+    # That errs toward flagging, which is the safe direction for RA1:
+    # a missed instruction is worse than a false-positive prohibition.
+    _pronoun = r"(?:it|them|this|that|these|those)"
+    _determiner = r"(?:the|a|an|this|that|any)"
+    _classifier = (
+        r"(?:processes|utilities|libraries|suites?|tools?|commands?|programs?|"
+        r"scripts?|features?|functions?|methods?|approaches|options?|operations?|"
+        r"systems?|modules?|packages|services|mechanisms|techniques|"
+        r"capabilities|routines?|procedures|instructions?|steps?|binaries|"
+        r"executables|applications|components)"
+    )
+    _gerund = r"[a-z]+ing"
+    _object_gap = (
+        r"(?:"
+        + _determiner
+        + r"\s+\w+\s+|"
+        + _pronoun
+        + r"\s+|"
+        + _determiner
+        + r"\s+|"
+        + _classifier
+        + r"\s+|"
+        + _gerund
+        + r"\s+)?"
+    )
+    recommendation_gap = (
+        r"(?:(?:recommend|advise|suggest|propose|encourage|urge)(?:s|d|es|ed|ing)?\s+"
+        + _object_gap
+        + r")?"
+    )
     negation = r"(?:must\s+not|do\s+not|don't|never|should\s+not)\s+"
     return (
-        re.search(negation + safe_gap + escaped + r"$", prefix + phrase, re.IGNORECASE) is not None
+        re.search(
+            negation + safe_gap + recommendation_gap + r"`?" + escaped + r"$",
+            prefix + phrase,
+            re.IGNORECASE,
+        )
+        is not None
     )
 
 

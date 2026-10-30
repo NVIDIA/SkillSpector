@@ -50,9 +50,7 @@ from __future__ import annotations
 
 import os
 from contextvars import ContextVar, Token
-from typing import NoReturn
-
-from langchain_core.language_models.chat_models import BaseChatModel
+from typing import TYPE_CHECKING, NoReturn
 
 from .base import (
     AgentCLICapable,
@@ -62,7 +60,9 @@ from .base import (
     ModelMetadataProvider,
     has_cli_capability,
 )
-from .nv_build import NvBuildProvider
+
+if TYPE_CHECKING:
+    from langchain_core.language_models.chat_models import BaseChatModel
 
 NO_LLM_API_KEY_MESSAGE = (
     "No LLM API key configured. Set the credential env var for the "
@@ -102,6 +102,13 @@ def has_provider_binding() -> bool:
     return _INJECTED_PROVIDER.get() is not None
 
 
+def _nv_build_provider() -> LLMProvider:
+    """Construct the default NVIDIA provider without importing it at package import time."""
+    from .nv_build import NvBuildProvider
+
+    return NvBuildProvider()
+
+
 def _select_active_provider() -> LLMProvider:
     """Construct the active provider based on ``SKILLSPECTOR_PROVIDER``."""
     injected_provider = _INJECTED_PROVIDER.get()
@@ -139,7 +146,7 @@ def _select_active_provider() -> LLMProvider:
 
         return OpenAICompatibleProvider()
     if name == "nv_build":
-        return NvBuildProvider()
+        return _nv_build_provider()
     if name == "claude_cli":
         from .claude_cli import ClaudeCLIProvider
 
@@ -168,7 +175,7 @@ def _select_active_provider() -> LLMProvider:
 
             return NvInferenceProvider()
         except ImportError:
-            return NvBuildProvider()
+            return _nv_build_provider()
 
     raise UnknownProviderError(
         f"Unknown SKILLSPECTOR_PROVIDER: {name!r}. "

@@ -38,12 +38,13 @@ from rich.text import Text
 
 from skillspector import __version__ as skillspector_version
 from skillspector.dependency_sources import redact_text
-from skillspector.inference_usage import sanitize_inference_usage
+from skillspector.inference_usage import looks_like_credential, sanitize_inference_usage
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
     RULE_SET_SCOPE,
     AnalysisCompleteness,
     finalize_ledger,
+    only_missing_reference_exceptions,
 )
 from skillspector.llm_provenance import sanitize_llm_provenance
 from skillspector.llm_utils import is_llm_available
@@ -51,6 +52,7 @@ from skillspector.logging_config import get_logger
 from skillspector.models import (
     OCCURRENCE_CODE_SNIPPET_KEY,
     OCCURRENCE_FINDING_ID_KEY,
+    OCCURRENCE_FINDING_TEXT_KEY,
     Finding,
 )
 from skillspector.nodes.analyzers import ANALYZER_MODULES
@@ -82,7 +84,7 @@ from skillspector.semantic_runtime import (
     semantic_runtime_ledger_event,
     successful_llm_record,
 )
-from skillspector.state import SkillspectorState
+from skillspector.state import SkillspectorState, transitive_remaining_seconds
 from skillspector.suppression import Baseline, SuppressedFinding, partition_findings
 from skillspector.terminal_text import visible_terminal_text
 
@@ -137,6 +139,18 @@ def _clean_text(value: str | None) -> str | None:
     return _CONTROL_RE.sub("", _ANSI_RE.sub("", value))
 
 
+def redact_llm_error(value: object) -> str | None:
+    """Keep actionable provider error text without report-visible credentials."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    cleaned = redact_text(_clean_text(value) or "")
+    return re.sub(
+        r"(?i)(?:(?:authorization\s*:\s*)?(?:bearer|basic)\s+)?[A-Za-z0-9_+/.-]+={0,2}",
+        lambda match: "***" if looks_like_credential(match.group(0)) else match.group(0),
+        cleaned,
+    )
+
+
 def _sanitize_finding(finding: Finding) -> Finding:
     """Clean finding text and recursively redact credentials from evidence."""
 
@@ -164,6 +178,9 @@ def _sanitize_finding(finding: Finding) -> Finding:
         report_snippet = occurrence.get(OCCURRENCE_CODE_SNIPPET_KEY)
         if isinstance(report_snippet, str):
             occurrence[OCCURRENCE_CODE_SNIPPET_KEY] = clean(report_snippet)
+        report_finding_text = occurrence.get(OCCURRENCE_FINDING_TEXT_KEY)
+        if isinstance(report_finding_text, str):
+            occurrence[OCCURRENCE_FINDING_TEXT_KEY] = clean(report_finding_text)
         occurrences.append(occurrence)
     return replace(
         finding,
@@ -185,11 +202,16 @@ def _finding_for_occurrence(finding: Finding, occurrence: Mapping[str, object]) 
     snippet = occurrence.get(OCCURRENCE_CODE_SNIPPET_KEY)
     if not isinstance(finding_id, str) or not finding_id:
         finding_id = finding.finding_id
+    finding_text = finding.finding
+    if OCCURRENCE_FINDING_TEXT_KEY in occurrence:
+        text = occurrence.get(OCCURRENCE_FINDING_TEXT_KEY)
+        finding_text = text if isinstance(text, str) else None
     if OCCURRENCE_CODE_SNIPPET_KEY not in occurrence:
-        return replace(finding, finding_id=finding_id)
+        return replace(finding, finding_id=finding_id, finding=finding_text)
     return replace(
         finding,
         finding_id=finding_id,
+        finding=finding_text,
         code_snippet=snippet if isinstance(snippet, str) else None,
         context=None,
     )
@@ -771,20 +793,24 @@ def _build_sarif(
     raw_status = completeness.get("status")
     requested_status = (
         raw_status
-        if isinstance(raw_status, str) and raw_status in {"complete", "partial", "failed"}
+        if isinstance(raw_status, str)
+        and raw_status in {"complete", "complete_with_caveats", "partial", "failed"}
         else None
     )
+    reference_caveat_only = only_missing_reference_exceptions(raw_ledger_exceptions)
     is_complete = (
         completeness.get("is_complete", True) is True
-        and requested_status in {None, "complete"}
+        and requested_status in {None, "complete", "complete_with_caveats"}
         and execution_successful
         and partially_inspected == 0
         and entirely_uninspected == 0
-        and ledger_exception_count == 0
+        and (ledger_exception_count == 0 or reference_caveat_only)
         and limitation_count == 0
     )
     status = (
-        "complete"
+        requested_status
+        if is_complete and requested_status == "complete_with_caveats"
+        else "complete"
         if is_complete
         else "failed"
         if not execution_successful or requested_status == "failed"
@@ -1277,10 +1303,18 @@ def _build_metadata(
     llm_execution_enabled: bool | None = None,
     semantic_runtime_incomplete: bool = False,
     runtime_available: bool | None = None,
+    provider_availability: tuple[bool, str | None] | None = None,
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
-    provider_available, llm_error = is_llm_available()
+    provider_available, llm_error = (
+        provider_availability
+        if provider_availability is not None
+        else is_llm_available()
+        if use_llm
+        else (False, None)
+    )
+    llm_error = redact_llm_error(llm_error)
     attempted, succeeded, call_log_degraded = _llm_runtime_status(use_llm, llm_call_log)
     # meta_analyzer's own record, independent of whether a DIFFERENT
     # LLM-backed node (a semantic_* analyzer) lost coverage to a dropped
@@ -1355,9 +1389,10 @@ def _build_metadata(
         meta["llm_calls_attempted"] = attempted
         meta["llm_calls_succeeded"] = succeeded
     if unavailable_before_execution:
+        detail = f" Reason: {llm_error}" if llm_error else ""
         meta["llm_error"] = (
             "LLM analysis was requested but unavailable during preflight; "
-            "results reflect static analysis only."
+            f"results reflect static analysis only.{detail}"
         )
     elif call_log_degraded:
         meta["llm_degraded"] = True
@@ -1415,6 +1450,7 @@ def _format_json(
     llm_execution_enabled: bool | None = None,
     semantic_runtime_incomplete: bool = False,
     runtime_available: bool | None = None,
+    provider_availability: tuple[bool, str | None] | None = None,
 ) -> str:
     """Generate JSON report string."""
     suppressed = suppressed or []
@@ -1460,6 +1496,7 @@ def _format_json(
             llm_execution_enabled,
             semantic_runtime_incomplete,
             runtime_available,
+            provider_availability,
         ),
         "execution_successful": execution_successful,
     }
@@ -1782,10 +1819,29 @@ def report(state: SkillspectorState) -> dict[str, object]:
             limitations.append(transitive_limitation)
         analysis_completeness["limitations"] = limitations
         analysis_completeness["is_complete"] = False
-        if analysis_completeness.get("status", "complete") == "complete":
+        if analysis_completeness.get("status", "complete") in {
+            "complete",
+            "complete_with_caveats",
+        }:
             analysis_completeness["status"] = "partial"
     _attempted, _succeeded, degraded = _llm_runtime_status(llm_requested, llm_call_log)
-    provider_available, provider_error = is_llm_available()
+    remaining = transitive_remaining_seconds(state)
+    if not llm_requested:
+        provider_available, provider_error = False, None
+    elif not use_llm and "llm_preflight_error" in state:
+        provider_available = False
+        provider_error = redact_llm_error(state.get("llm_preflight_error"))
+    elif remaining is not None and remaining <= 0:
+        provider_available = any(successful_llm_record(record) for record in llm_call_log)
+        provider_error = (
+            None
+            if provider_available
+            else "Workflow deadline reached before LLM availability could be confirmed."
+        )
+    else:
+        provider_available, provider_error = (
+            is_llm_available(timeout=remaining) if remaining is not None else is_llm_available()
+        )
     runtime_available = llm_runtime_available(
         preflight_available=provider_available,
         result=state,
@@ -1939,6 +1995,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             llm_execution_enabled=use_llm,
             semantic_runtime_incomplete=semantic_runtime_incomplete,
             runtime_available=runtime_available,
+            provider_availability=(provider_available, provider_error),
         )
     elif output_format == "markdown":
         report_body = _format_markdown(

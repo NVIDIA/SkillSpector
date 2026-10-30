@@ -37,8 +37,8 @@ make install-dev
   - **`SKILLSPECTOR_PROVIDER`**: Selects the active LLM provider — `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `gemini_cli`, or `opencode_cli`. Defaults to `nv_build` when unset.
   - **Provider credential**: depends on the active provider. Hosted providers use the matching variables in [.env.example](../.env.example); Ollama and CLI providers do not require an API key. See [providers/](../src/skillspector/providers/).
   - **`OPENAI_BASE_URL`**: Override the OpenAI endpoint (e.g. point at Ollama).
-  - **`SKILLSPECTOR_MODEL`**: Override default model; see [constants.py](../src/skillspector/constants.py).
-  - **`SKILLSPECTOR_TEMPERATURE`**: Optional hosted-provider sampling temperature from `0` to `1`.
+  - **`SKILLSPECTOR_MODEL`**: Override default model; see [constants.py](../src/skillspector/constants.py). OpenAI retains `gpt-5.4`; Anthropic retains `claude-opus-4-6` with `claude-sonnet-4-6` for `meta_analyzer`. Sol and Claude 5.5 remain opt-in pending the [live scanner acceptance described in the README](../README.md#llm-analysis).
+  - **`SKILLSPECTOR_TEMPERATURE`**: Optional hosted-provider sampling temperature from `0` to `1`. `gpt-6.1-sol` rejects every explicit value. `claude-opus-5-5` and `claude-sonnet-5-5` accept only `1.0` on the native Anthropic endpoint; other routes reject every explicit value. Unsupported settings on active LLM slots stop the scan before analysis. Static scans skip provider initialization and control validation.
   - **`SKILLSPECTOR_SEED`**: Optional integer seed for OpenAI-compatible and Azure OpenAI providers.
 
 - **Logging**: Internal/operational logging uses the stdlib `logging` module. User-facing output (report body, errors, progress) uses Rich `console.print()`.
@@ -300,9 +300,9 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 | `NVIDIA_INFERENCE_KEY` | Credential for `nv_build`. | `nvapi-...` |
 | `OPENAI_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=openai`. Also tier-2 fallback for non-OpenAI providers. | `sk-...` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | `http://localhost:11434/v1` |
-| `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3`; other provider/model combinations keep their endpoint defaults. | `high` |
+| `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3`; other provider/model combinations keep their endpoint defaults. `gpt-6.1-sol` accepts only `low`, `medium`, `high`, `xhigh`, or `max`; any other value stops a scan before analysis (exit code 2). | `high` |
 | `SKILLSPECTOR_OUTPUT_LANGUAGE` | Optional short, single-line language label (letters, numbers, spaces, `_`, or `-`; maximum 64 characters) for human-readable LLM finding text. Rule IDs, severity values, paths, code, and other machine-readable values remain unchanged. Unset, blank, or invalid values preserve the default output language. | `Japanese` |
-| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves provider defaults. Lower values reduce variation but do not guarantee identical output. | `0` |
+| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves provider defaults. Lower values reduce variation but do not guarantee identical output. `gpt-6.1-sol` rejects every explicit value. `claude-opus-5-5` and `claude-sonnet-5-5` accept `1.0` on the native Anthropic endpoint only ([API compatibility rule](https://platform.claude.com/docs/en/api/messages/create)). Unsupported settings on active LLM slots stop a scan before analysis (exit code 2); static scans skip provider initialization and these checks. Leave it unset to preserve the default models’ endpoint defaults. | `0` |
 | `SKILLSPECTOR_SEED` | Optional integer sampling seed for OpenAI-compatible and Azure OpenAI providers. Provider/model support is best-effort; CLI providers ignore it. | `42` |
 | `ANTHROPIC_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=anthropic`. | `sk-ant-...` |
 | `OLLAMA_BASE_URL` | Optional Ollama endpoint override. | `http://localhost:11434/v1` |
@@ -310,6 +310,7 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 | `AZURE_OPENAI_ENDPOINT` | Azure resource endpoint. | `https://example.openai.azure.com/` |
 | `SKILLSPECTOR_COMPAT_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=openai_compatible`. | `...` |
 | `SKILLSPECTOR_COMPAT_BASE_URL` | OpenAI-compatible endpoint base URL. | `https://api.groq.com/openai/v1` |
+| `SKILLSPECTOR_COMPAT_HEADERS` | Optional JSON object with string header names and values for `openai_compatible`. Applies to sync and async requests; unset or blank adds no headers. Invalid configuration is rejected without exposing header values. May contain gateway API keys, so treat it as a secret. | `{"X-Tenant-ID":"my-tenant","X-API-Key":"gateway-key"}` |
 | `SKILLSPECTOR_MODEL` | Override the active provider's bundled default model (see [README.md](../README.md) for per-provider defaults). CLI providers forward it as `--model`. | `gpt-5.2` |
 
 > **Disabled provider:** `codex_cli` remains registered for compatibility but refuses inference until a complete no-tools policy is verified.
@@ -347,7 +348,7 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
   - `claude_cli/` — **local `claude` binary; no API key**. Uses the CLI's own auth session (`claude auth login`). Set `SKILLSPECTOR_PROVIDER=claude_cli`.
   - `codex_cli/` — **registered but disabled**. Its read-only sandbox permits host-file reads. Select an HTTP API provider or another supported CLI provider for LLM analysis.
   - `gemini_cli/` — **local `gemini` binary; no API key**. Uses the CLI's own auth session. Set `SKILLSPECTOR_PROVIDER=gemini_cli`.
-  - `opencode_cli/` — **local `opencode` 1.18.31 binary; no API key**. Uses the CLI's own auth session (`opencode auth login`) and fails closed on every other runtime version because the deny-all policy is verified against that exact release. Set `SKILLSPECTOR_PROVIDER=opencode_cli`.
+  - `opencode_cli/` — **local `opencode` (verified 1.18.31–1.18.35, 1.19.0–1.19.4) binary; no API key**. Uses the CLI's own auth session (`opencode auth login`) and fails closed on every other runtime version, including prereleases, because the deny-all policy is verified against those exact releases. Set `SKILLSPECTOR_PROVIDER=opencode_cli`.
 
   CLI providers (`claude_cli`, `gemini_cli`, `opencode_cli`) implement the optional `AgentCLICapable` interface (`is_available()` + `complete()`) defined in [providers/base.py](../src/skillspector/providers/base.py). `has_cli_capability(provider)` detects this at runtime. All subprocess calls go through the hardened helper [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py) which enforces: no shell (`shell=False`), untrusted content via stdin only, capability stripping (tools disabled / sandboxed), environment scrubbing (no API keys forwarded), per-call timeout, and fail-closed error handling.
 
