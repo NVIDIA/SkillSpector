@@ -2189,6 +2189,12 @@ def _shell_comment_start_before(content: str, start: int, *, ansi_c: bool = Fals
     hash-comment languages do not share Bash ANSI-C quoting (``$'`` is a
     variable in Perl and Ruby), so they keep the plain single-quote rule
     and never get the ANSI-C treatment.
+
+    A ``${...}`` parameter expansion is skipped whole via the existing
+    bounded parser, so a ``#`` inside it (for example the default value in
+    ``${NOTE:- # literal}``) never reads as a comment start. When the
+    expansion cannot be proven (the parser returns no end), the exemption
+    is declined rather than guessed.
     """
     line_start = content.rfind("\n", 0, start) + 1
     stack: list[str | None] = [None]
@@ -2231,6 +2237,12 @@ def _shell_comment_start_before(content: str, start: int, *, ansi_c: bool = Fals
         # Command context: the base text, a $( ) substitution, or backticks.
         if ch == "\\":
             i += 2
+            continue
+        if ch == "$" and content[i + 1 : i + 2] == "{":
+            parameter_end = _skip_parameter_expansion(content, i, len(content), None)
+            if parameter_end is None:
+                return None
+            i = parameter_end
             continue
         if ch == "$" and ansi_c and content[i + 1 : i + 2] == "'":
             stack.append("ansi")

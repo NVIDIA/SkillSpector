@@ -172,6 +172,25 @@ def test_ansi_c_comment_rule_is_shell_only() -> None:
     assert tm._shell_comment_start_before(source, start, ansi_c=False) == 11
 
 
+def test_parameter_expansion_hash_is_not_a_comment() -> None:
+    # Review follow-up on #902 (fourth round): a ``#`` inside a
+    # ``${...}`` default value is literal expansion text, not a comment
+    # start, so the substitution that follows the closing brace still
+    # runs and its failed printf reconstruction keeps the conservative
+    # bound. Before the fix the comment scan read the hash inside the
+    # expansion as a comment start and wrongly exempted the substitution.
+    source = 'echo ${NOTE:- # literal}; $(printf "$FMT" "$CMD") -rf /\n'
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is True
+
+
+def test_parameter_expansion_then_genuine_comment_exempts() -> None:
+    # The paired case: once the parameter expansion genuinely closes, a
+    # later ``#`` on the same line is a real comment start, so the
+    # substitution after it never executes and the analysis completes.
+    source = 'echo ${NOTE:- # literal} # real; $(printf "$FMT" "$CMD") -rf /\n'
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is False
+
+
 def test_issue_reproducer_scripts_reach_completed_ledger_outcome() -> None:
     for path, source in (
         ("scripts/run.sh", _COMMENT_BACKTICK_SCRIPT),
