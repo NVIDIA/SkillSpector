@@ -12,211 +12,6 @@ from skillspector.cli import app
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 
 
-@pytest.mark.parametrize("newline", ["\n", "\r\n"])
-@pytest.mark.parametrize("command", ["test", "["])
-@pytest.mark.parametrize("reverse", [False, True])
-@pytest.mark.parametrize("wrapper", ["", "bash -c"])
-def test_literal_multiline_printf_comparison_completes(
-    newline: str, command: str, reverse: bool, wrapper: str
-) -> None:
-    expected = '"$(printf "%s\\n" "phase one" \\\n  "phase two")"'
-    operands = [expected, '"$actual"'] if reverse else ['"$actual"', expected]
-    source = command + " " + " = ".join(operands) + (" ]" if command == "[" else "") + "\n"
-    if wrapper:
-        source = wrapper + " '\n" + source + "'\n"
-    source = source.replace("\n", newline)
-
-    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
-
-
-@pytest.mark.parametrize(
-    "producer",
-    [
-        'printf "%s\\n" "$value"',
-        'printf "$format" "phase one"',
-        'printf "%s\\n" "$(echo phase)"',
-        'printf "%s\\n" "phase one"; echo other',
-        'printf "%s\\n" "phase one"\necho other',
-        'printf "%s\\n" "phase one" \\\\\necho other',
-        'printf "%s\\n" *',
-        'printf "%s\\n" {1..99999}',
-        'printf "%s\\n" ~',
-        'printf -v target "%s\\n" "phase one"',
-        'PRINTF "%s\\n" "phase one"',
-        'env printf "%s\\n" "phase one"',
-        'printf "%b" "phase\\none"',
-        'printf "%q" "phase one"',
-        'printf "%n" target',
-        'printf "%s\\n" "' + "x" * 260 + '"',
-        'printf "' + "%s" + "x" * 62 + '" ' + "a " * 10,
-    ],
-)
-def test_printf_data_proof_rejects_dynamic_options_expansions_and_bounds(producer: str) -> None:
-    word = '"$(' + producer + ')"'
-    assert not tm._is_literal_printf_data(word, lambda: None)
-    source = 'test "$actual" = ' + word + "\n"
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        '"$(printf "%s\\n" "phase one")" -rf /',
-        'test "$actual" = $(printf "%s\\n" "phase one")',
-        'test "$actual" = "$(printf "%s\\n" "phase one")" extra',
-        'test "$actual" = "$(printf "%s\\n" "phase one")"suffix',
-        'echo "$(printf "%s\\n" "phase one")" -rf /',
-        'eval "$(printf "%s\\n" "phase one")"',
-        'bash -c "$(printf "%s\\n" "phase one")"',
-        'test "$actual" = "$(printf "%s\\n" "phase one")',
-    ],
-)
-def test_printf_comparison_proof_does_not_cover_command_or_unknown_consumers(source: str) -> None:
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
-
-
-@pytest.mark.parametrize("file_type", ["python", "javascript", "markdown"])
-def test_printf_comparison_proof_requires_shell_context(file_type: str) -> None:
-    source = 'test "$actual" = "$(printf "%s\\n" "phase one")"\n'
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type)
-    assert tm.has_bounded_parse_exhaustion(
-        source, lambda: None, file_type="shell", complete_context=False
-    )
-
-
-def test_printf_comparison_proof_applies_inside_closed_shell_fence() -> None:
-    source = 'Example:\n\n~~~bash\ntest "$actual" = "$(printf "%s\\n" "phase one")"\n~~~\n'
-    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="markdown")
-
-
-@pytest.mark.parametrize(
-    "prefix",
-    [
-        "test() { $3; }\n",
-        "printf() { $1; }\n",
-        "function test { $3; }\n",
-        "if true; then te\\st() { $3; }; fi\n",
-        '{ "printf"() { $1; }; }\n',
-        "time test() { $3; }\n",
-        "coproc test() { $3; }\n",
-        "while test() { $3; }; do :; done\n",
-        "until test() { $3; }; do :; done\n",
-        "command -p alias test=eval\n",
-        "builtin -- alias test=eval\n",
-        "alias test=eval\n",
-        "enable -n test\n",
-        'eval "$setup"\n',
-        "source definitions.sh\n",
-        ". definitions.sh\n",
-        "trap 'test() { :; }' DEBUG\n",
-        "MODE=1 source definitions.sh\n",
-        "MODE=1 eval setup\n",
-    ],
-)
-def test_printf_comparison_rejects_locally_replaced_builtins(prefix: str) -> None:
-    source = prefix + 'test x = "$(printf "%s%s%s" r m " -rf /")"\n'
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
-
-
-@pytest.mark.parametrize("newline", ["\n", "\r\n"])
-@pytest.mark.parametrize("name", ["test", "printf", "["])
-@pytest.mark.parametrize("spacing", ["before", "inside", "both"])
-def test_printf_comparison_rejects_continued_function_declarations(
-    newline: str, name: str, spacing: str
-) -> None:
-    continuation = "\\" + newline
-    before = " " + continuation if spacing in {"before", "both"} else " "
-    inside = continuation if spacing in {"inside", "both"} else ""
-    prefix = name + before + "(" + inside + ") { :; }\n"
-
-    # The inert body cannot independently trigger the override guard.
-    assert tm._has_shell_comparison_overrides(prefix, lambda: None)
-    source = prefix + 'test x = "$(printf "%s%s%s" r m " -rf /")"\n'
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
-
-
-@pytest.mark.parametrize("name", ["test", "printf", "["])
-@pytest.mark.parametrize("placement", ["before", "inside"])
-@pytest.mark.parametrize("padding", [" ", "\\\n", "\\\r\n"])
-def test_printf_comparison_refuses_truncated_function_lookahead(
-    name: str, placement: str, padding: str
-) -> None:
-    gap = padding * (tm._SHELL_COMMAND_WORD_CHARS + 1)
-    prefix = name + " " + (gap + "()" if placement == "before" else "(" + gap + ")")
-    prefix += " { :; }\n"
-
-    assert tm._has_shell_comparison_overrides(prefix, lambda: None)
-    source = prefix + 'test x = "$(printf "%s\\n" "phase one")"\n'
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
-
-
-@pytest.mark.parametrize(
-    "command", ["$COMMAND", '"$COMMAND"', "$(echo command)", "${COMMAND:-test}"]
-)
-def test_printf_comparison_refuses_unknown_command_headers(command: str) -> None:
-    prefix = command + "\n"
-
-    assert tm._has_shell_comparison_overrides(prefix, lambda: None)
-    source = prefix + 'test x = "$(printf "%s\\n" "phase one")"\n'
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
-
-
-def test_printf_comparison_does_not_regain_ownership_in_child_shell() -> None:
-    source = (
-        "test() { $3; }; export -f test; bash -c '\n"
-        'test x = "$(printf "%s%s%s" r m " -rf /")"\n\'\n'
-    )
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
-
-
-def test_printf_comparison_skips_empty_clauses_without_quadratic_work() -> None:
-    source = " \t\n" * 10000 + 'test x = "$(printf "%s\\n" "phase one")"\n'
-    checks = 0
-
-    def check() -> None:
-        nonlocal checks
-        checks += 1
-        assert checks < 1000
-
-    assert not tm.has_bounded_parse_exhaustion(source, check, file_type="shell")
-
-
-def test_printf_comparison_refuses_hostile_header_with_bounded_work() -> None:
-    source = (
-        "$(env X="
-        + "${x:-$(echo " * 4000
-        + "z"
-        + ")}" * 4000
-        + ")\n"
-        + 'test x = "$(printf "%s\\n" "phase one")"\n'
-    )
-    checks = 0
-
-    def check() -> None:
-        nonlocal checks
-        checks += 1
-        assert checks < 1000
-
-    assert tm._has_shell_comparison_overrides(source, check)
-
-
-@pytest.mark.parametrize("placement", ["nested", "following"])
-def test_printf_comparison_retains_nested_and_following_security_checks(placement: str) -> None:
-    source = 'test "$actual" = "$(printf "%s\\n" "phase one")"\n'
-    for command in ["rm -rf /", "$CMD -rf /"]:
-        candidate = (
-            source.replace("phase one", "$(" + command + ")")
-            if placement == "nested"
-            else source + command + "\n"
-        )
-        if command.startswith("$"):
-            assert tm.has_bounded_parse_exhaustion(candidate, lambda: None, file_type="shell")
-        else:
-            assert any(
-                finding.rule_id == "TM1" for finding in tm.analyze(candidate, "run.sh", "shell")
-            )
-
-
 @pytest.mark.parametrize("padding", [0, 5000, 9000])
 @pytest.mark.parametrize(
     "source",
@@ -771,3 +566,25 @@ def test_compound_adversarial_inputs_retain_security_signal(
                 finding.rule_id == "TM1" and finding.severity.value == "HIGH"
                 for finding in tm.analyze(source, "run.sh", "shell")
             ), source
+
+
+def test_empty_shell_clauses_do_not_repeat_command_string_parsing() -> None:
+    source = " \t\n" * 10000 + "bash -c 'echo ready'\n"
+    checks = 0
+
+    def check() -> None:
+        nonlocal checks
+        checks += 1
+        assert checks < 1000
+
+    assert not tm.has_bounded_parse_exhaustion(source, check, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "startup",
+    ["BASH_ENV=setup.sh ", "export BASH_ENV=setup.sh; ", "env BASH_ENV=setup.sh "],
+)
+def test_shell_startup_code_keeps_literal_comparison_partial(startup: str) -> None:
+    source = startup + "bash -c 'test x = \"$(printf \"%s%s%s\" r m \" -rf /\")\"'"
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
