@@ -1767,7 +1767,15 @@ def _has_shell_comparison_overrides(content: str, check_runtime: Callable[[], No
             if word in {"test", "[", "printf"} and (
                 function
                 or re.match(r"(?:[ \t]|\\\r?\n)*(?:\((?:[ \t]|\\\r?\n)*\)|\{)", source[cursor:])
+                or (
+                    clause_start + len(source) < len(content)
+                    and re.fullmatch(
+                        r"(?:[ \t]|\\\r?\n)*(?:\((?:[ \t]|\\\r?\n)*)?(?:\\\r?)?",
+                        source[cursor:],
+                    )
+                )
             ):
+                # A truncated spacing/parenthesis prefix cannot rule out a definition.
                 return True
             if word not in {
                 "if",

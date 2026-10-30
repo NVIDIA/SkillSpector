@@ -135,6 +135,21 @@ def test_printf_comparison_rejects_continued_function_declarations(
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
+@pytest.mark.parametrize("name", ["test", "printf", "["])
+@pytest.mark.parametrize("placement", ["before", "inside"])
+@pytest.mark.parametrize("padding", [" ", "\\\n", "\\\r\n"])
+def test_printf_comparison_refuses_truncated_function_lookahead(
+    name: str, placement: str, padding: str
+) -> None:
+    gap = padding * (tm._SHELL_COMMAND_WORD_CHARS + 1)
+    prefix = name + " " + (gap + "()" if placement == "before" else "(" + gap + ")")
+    prefix += " { :; }\n"
+
+    assert tm._has_shell_comparison_overrides(prefix, lambda: None)
+    source = prefix + 'test x = "$(printf "%s\\n" "phase one")"\n'
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
 @pytest.mark.parametrize(
     "command", ["$COMMAND", '"$COMMAND"', "$(echo command)", "${COMMAND:-test}"]
 )
