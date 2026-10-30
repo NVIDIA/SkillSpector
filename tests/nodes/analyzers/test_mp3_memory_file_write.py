@@ -8,6 +8,10 @@ a test hook appending to MEMORY.md scored 0/100 SAFE. The write to a known
 agent-memory destination is the finding, whatever the payload bytes are.
 """
 
+import json
+import subprocess
+import sys
+
 import pytest
 
 from skillspector.models import Severity
@@ -146,3 +150,31 @@ def test_memory_file_write_from_auto_run_carrier_is_mp3(content, file_path, file
 )
 def test_memory_file_write_does_not_fire(content, file_path, file_type):
     assert mp3_writes(content, file_path, file_type) == []
+
+
+@pytest.mark.parametrize(
+    ("prefix", "file_path", "file_type"),
+    [
+        ('open("', "test_notes.py", "python"),
+        ('appendFileSync("', "notes.spec.js", "javascript"),
+        ("appendFileSync(`", "notes.test.ts", "typescript"),
+    ],
+)
+def test_unterminated_memory_destination_with_backslashes_finishes(prefix, file_path, file_type):
+    """Malformed scanned text must not trap the scanner in regex backtracking."""
+    script = (
+        "import json, sys\n"
+        "from skillspector.nodes.analyzers import static_patterns_memory_poisoning as mp\n"
+        "prefix, file_path, file_type = json.loads(sys.argv[1])\n"
+        "assert not mp.analyze(prefix + chr(92) * 48 + 'x', file_path, file_type)\n"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script, json.dumps([prefix, file_path, file_type])],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("Unterminated memory destination exceeded the scanner regression timeout")
+    assert completed.returncode == 0, completed.stderr

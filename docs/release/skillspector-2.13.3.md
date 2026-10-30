@@ -56,7 +56,8 @@ P0 security and scan-integrity fixes, including four dependency security updates
   hide an unpinned package.
 - [#893](https://github.com/NVIDIA/SkillSpector/pull/893): Detect writes to known
   agent-memory files and directories from automatically run test carriers,
-  including supported raw Windows paths.
+  including supported raw Windows paths. A release review correction prevents
+  unterminated destinations from causing excessive regular-expression backtracking.
 - [#860](https://github.com/NVIDIA/SkillSpector/pull/860): Add a bounded,
   lower-confidence YARA signal for nearby directory walking, encryption, and
   binary writes across lines. Existing stronger ransomware rules are retained;

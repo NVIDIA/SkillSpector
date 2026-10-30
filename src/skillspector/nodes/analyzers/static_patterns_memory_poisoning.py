@@ -431,8 +431,10 @@ _AUTO_RUN_CARRIER_RE = re.compile(
     re.IGNORECASE,
 )
 
-_PY_STRING_LITERAL = r"(?P<prefix>[A-Za-z]*)(?P<q>[\"'])(?P<dest>(?:\\.|(?!(?P=q)).)*)(?P=q)"
-_TS_STRING_LITERAL = r"(?P<q>[\"'`])(?P<dest>(?:\\.|(?!(?P=q)).)*)(?P=q)"
+# Keep escaped characters disjoint from ordinary characters so an unterminated
+# destination cannot trigger exponential backtracking over backslashes.
+_PY_STRING_LITERAL = r"(?P<prefix>[A-Za-z]*)(?P<q>[\"'])(?P<dest>(?:\\.|(?!(?P=q)|\\).)*)(?P=q)"
+_TS_STRING_LITERAL = r"(?P<q>[\"'`])(?P<dest>(?:\\.|(?!(?P=q)|\\).)*)(?P=q)"
 
 # Write sinks that take a literal destination. open() requires an explicit
 # write mode so reads stay quiet; shutil.copy* resolve the destination, which
