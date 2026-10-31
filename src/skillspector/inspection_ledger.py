@@ -92,6 +92,7 @@ class LedgerReason(StrEnum):
     ARCHIVE_ENCRYPTED = "archive_encrypted"
     ARCHIVE_UNSUPPORTED_COMPRESSION = "archive_unsupported_compression"
     ARCHIVE_TRUNCATED = "archive_truncated"
+    ARCHIVE_MEMBER_INCOMPLETE = "archive_member_incomplete"
     ARCHIVE_UNSAFE_MEMBER_PATH = "archive_unsafe_member_path"
     ARCHIVE_AMBIGUOUS_MEMBER_PATH = "archive_ambiguous_member_path"
     ARTIFACT_PATH_COLLISION = "artifact_path_collision"
@@ -123,6 +124,19 @@ class LedgerReason(StrEnum):
     PYTHON_SOURCE_AMBIGUOUS = "python_source_ambiguous"
     PYTHON_SOURCE_DECODE_ERROR = "python_source_decode_error"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
+
+
+def only_missing_reference_exceptions(exceptions: object) -> bool:
+    """Return whether non-empty ledger exceptions are only missing references."""
+    return (
+        isinstance(exceptions, list)
+        and bool(exceptions)
+        and all(
+            isinstance(exception, Mapping)
+            and exception.get("reason_code") == LedgerReason.REFERENCE_MISSING
+            for exception in exceptions
+        )
+    )
 
 
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
@@ -194,6 +208,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "Archive member uses an unsupported compression method."
     ),
     LedgerReason.ARCHIVE_TRUNCATED: "Archive member is truncated or unreadable.",
+    LedgerReason.ARCHIVE_MEMBER_INCOMPLETE: "Nested artifact inspection is incomplete.",
     LedgerReason.ARCHIVE_UNSAFE_MEMBER_PATH: (
         "Archive member uses an absolute, traversal, or otherwise unsafe path."
     ),
@@ -1123,14 +1138,22 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
                 else f"Analyzer {status_summary['analyzer_id']} status: {status_name}."
             )
     execution_successful = not any(exception.get("fatal") for exception in ledger_exceptions)
+    reference_caveat_only = (
+        only_missing_reference_exceptions(ledger_exceptions)
+        and not limitations
+        and partially_inspected == 0
+        and entirely_uninspected == 0
+    )
     completeness_status = (
         "failed"
         if not execution_successful
+        else "complete_with_caveats"
+        if reference_caveat_only
         else "partial"
         if ledger_exceptions or limitations or partially_inspected or entirely_uninspected
         else "complete"
     )
-    is_complete = completeness_status == "complete"
+    is_complete = completeness_status in {"complete", "complete_with_caveats"}
 
     raw_references = state.get("artifact_references", [])
     public_references = (

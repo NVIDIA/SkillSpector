@@ -22,10 +22,21 @@ confused with stock OpenAI settings.
 Required env vars:
     SKILLSPECTOR_COMPAT_API_KEY   — API key for the target provider
     SKILLSPECTOR_COMPAT_BASE_URL  — Base URL (e.g. https://api.groq.com/openai/v1)
+
+Optional env vars:
+    SKILLSPECTOR_COMPAT_HEADERS   — JSON object with string header names and values
+
+Some endpoints ignore both ``response_format`` and a forced ``tool_choice``
+and answer in prose.  A registry entry with ``tool_choice: auto`` binds the
+schema as a tool with ``tool_choice`` left at ``auto``; the prompt then asks
+for the tool call and a prose answer is retried.  Model IDs that name a Claude
+model rejecting forced tool calls (``anthropic/claude-opus-5-5``) take the same
+path without a registry entry.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -33,8 +44,28 @@ from langchain_core.language_models.chat_models import BaseChatModel
 
 from skillspector.providers import registry
 from skillspector.providers.chat_models import create_openai_compatible_chat_model
+from skillspector.providers.structured_output import forced_tool_choice_supported
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
+
+
+def _resolve_compat_headers() -> dict[str, str] | None:
+    raw_headers = os.environ.get("SKILLSPECTOR_COMPAT_HEADERS", "").strip()
+    if not raw_headers:
+        return None
+
+    error_message = "SKILLSPECTOR_COMPAT_HEADERS must be a JSON object with string keys and values"
+    try:
+        headers = json.loads(raw_headers)
+    except json.JSONDecodeError:
+        raise ValueError(error_message) from None
+
+    if not isinstance(headers, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str) for key, value in headers.items()
+    ):
+        raise ValueError(error_message)
+
+    return headers
 
 
 class OpenAICompatibleProvider:
@@ -64,6 +95,8 @@ class OpenAICompatibleProvider:
             credentials=self.resolve_credentials(),
             max_tokens=max_tokens,
             timeout=timeout,
+            default_headers=_resolve_compat_headers(),
+            forced_tool_choice=self.forced_tool_choice_supported(model),
         )
 
     def get_context_length(self, model: str) -> int | None:
@@ -76,3 +109,18 @@ class OpenAICompatibleProvider:
         """Resolve model: ``SKILLSPECTOR_MODEL`` env > slot default > ``DEFAULT_MODEL``."""
         user_input = os.environ.get("SKILLSPECTOR_MODEL", "").strip()
         return user_input or self.SLOT_DEFAULTS.get(slot, "") or self.DEFAULT_MODEL
+
+    def forced_tool_choice_supported(self, model: str) -> bool:
+        """``False`` when the registry declares ``tool_choice: auto`` for *model*.
+
+        Without a registry entry, ``False`` when *model* names a Claude model
+        that rejects a forced tool call.
+        """
+        return forced_tool_choice_supported(model, REGISTRY_PATH)
+
+    def structured_output_method(self, model: str) -> str | None:
+        """``with_structured_output`` method: registry entry, else tool calling for ``tool_choice: auto``."""
+        declared = registry.lookup_structured_output_method(REGISTRY_PATH, model)
+        if declared:
+            return declared
+        return None if self.forced_tool_choice_supported(model) else "function_calling"
