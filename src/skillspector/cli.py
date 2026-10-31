@@ -517,6 +517,13 @@ def scan(
             "sub-skill separately.",
         ),
     ] = False,
+    inspect_dependencies: Annotated[
+        bool,
+        typer.Option(
+            "--inspect-dependencies",
+            help="Statically inspect SHA-512-verified public npm artifacts from v2/v3 lockfiles. Never installs packages or executes package code.",
+        ),
+    ] = False,
     transitive_enabled: Annotated[
         bool,
         typer.Option(
@@ -641,6 +648,7 @@ def scan(
             or show_suppressed
             or yara_rules_dir is not None
             or use_shipped_baseline
+            or inspect_dependencies
             or transitive_enabled
             or transitive_allow_prefix
             or transitive_deny_prefix
@@ -650,8 +658,8 @@ def scan(
             err_console.print(
                 "[red]Error:[/red] --mcp-registry cannot be combined with "
                 "--recursive, --baseline, --show-suppressed, --yara-rules-dir, "
-                "--use-shipped-baseline, --transitive, --transitive-depth, "
-                "--transitive-allow-prefix, or --transitive-deny-prefix"
+                "--use-shipped-baseline, --inspect-dependencies, --transitive, "
+                "--transitive-depth, --transitive-allow-prefix, or --transitive-deny-prefix"
             )
             raise typer.Exit(code=2)
         if format != FormatChoice.json:
@@ -734,7 +742,12 @@ def scan(
             # escapes the combined report (e.g. an unwritable --output) exits 2,
             # not with a traceback and exit 1, which means "risk found".
             try:
-                _scan_multi_skill(
+                scan_multi_skill = (
+                    partial(_scan_multi_skill, inspect_dependencies=True)
+                    if inspect_dependencies
+                    else _scan_multi_skill
+                )
+                scan_multi_skill(
                     detection,
                     format=format,
                     output=output,
@@ -819,7 +832,10 @@ def scan(
 
     result = None
     try:
-        result = _scan_skill(
+        scan_skill = (
+            partial(_scan_skill, inspect_dependencies=True) if inspect_dependencies else _scan_skill
+        )
+        result = scan_skill(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -1512,6 +1528,7 @@ def _run_graph_scan(
     initial_inspection_ledger: list[dict[str, object]] | None = None,
     source_local_only: bool = False,
     stream_progress: bool = False,
+    inspect_dependencies: bool = False,
 ) -> dict[str, object]:
     state = _scan_state(
         input_path=input_path,
@@ -1522,6 +1539,8 @@ def _run_graph_scan(
         show_suppressed=show_suppressed,
         source_local_only=source_local_only,
     )
+    if inspect_dependencies:
+        state["inspect_dependencies"] = True
     if transitive_traversal is not None:
         state["transitive_traversal_state"] = transitive_traversal
     if initial_inspection_ledger:
@@ -1532,7 +1551,7 @@ def _run_graph_scan(
 
     analyzer_node_ids = _wired_analyzer_node_ids()
     total_analyzers = len(analyzer_node_ids)
-    total_steps = 5 + total_analyzers
+    total_steps = 6 + total_analyzers
     result = dict(state)
 
     with (
@@ -1616,11 +1635,14 @@ def _run_graph_scan_for_source(
     initial_inspection_ledger: list[dict[str, object]] | None = None,
     source_local_only: bool = False,
     stream_progress: bool = False,
+    inspect_dependencies: bool = False,
 ) -> dict[str, object]:
     """Invoke a scan without widening the legacy call contract for public sources."""
     run_graph_scan = (
         partial(_run_graph_scan, stream_progress=True) if stream_progress else _run_graph_scan
     )
+    if inspect_dependencies:
+        run_graph_scan = partial(run_graph_scan, inspect_dependencies=True)
     if initial_inspection_ledger is not None:
         if source_local_only:
             return run_graph_scan(
@@ -1962,7 +1984,13 @@ def _scan_transitive(
     yara_dir: str | None = None,
     traversal: _TransitiveTraversalState | None = None,
     source_local_only: bool = False,
+    inspect_dependencies: bool = False,
 ) -> dict[str, object]:
+    scan_child = (
+        partial(_run_graph_scan_for_source, inspect_dependencies=True)
+        if inspect_dependencies
+        else _run_graph_scan_for_source
+    )
     if max_depth <= 0:
         report_result = cast(dict[str, object], report(initial_result))
         report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
@@ -2119,7 +2147,7 @@ def _scan_transitive(
                 cached = traversal.cache.get(cache_key)
                 if cached is None:
                     traversal.record_scan()
-                    child_result = _run_graph_scan_for_source(
+                    child_result = scan_child(
                         input_path=target,
                         format=format,
                         no_llm=no_llm,
@@ -2484,6 +2512,7 @@ def _scan_skill(
     transitive_traversal: _TransitiveTraversalState | None = None,
     pre_scan_ledger_events: list[dict[str, object]] | None = None,
     source_local_only: bool = False,
+    inspect_dependencies: bool = False,
 ) -> dict[str, object]:
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     active_visited: set[str] = set()
@@ -2500,8 +2529,11 @@ def _scan_skill(
     if transitive_enabled and transitive_traversal is None:
         transitive_traversal = _TransitiveTraversalState(cache=transitive_cache or {})
     stream_progress = not verbose and err_console.is_terminal
+    run_for_source = _run_graph_scan_for_source
+    if inspect_dependencies:
+        run_for_source = partial(run_for_source, inspect_dependencies=True)
     if pre_scan_ledger_events:
-        result = _run_graph_scan_for_source(
+        result = run_for_source(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -2514,7 +2546,7 @@ def _scan_skill(
             stream_progress=stream_progress,
         )
     else:
-        result = _run_graph_scan_for_source(
+        result = run_for_source(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -2536,7 +2568,12 @@ def _scan_skill(
         active_visited.add(transitive.canonicalize_source_identity(input_path))
     except ValueError:
         pass
-    return _scan_transitive(
+    scan_transitive = (
+        partial(_scan_transitive, inspect_dependencies=True)
+        if inspect_dependencies
+        else _scan_transitive
+    )
+    return scan_transitive(
         initial_result=result,
         format=format,
         no_llm=no_llm,
@@ -2806,6 +2843,7 @@ def _scan_multi_skill(
     fail_on_incomplete: bool = False,
     fail_on_findings: bool = False,
     max_skills: int | None = None,
+    inspect_dependencies: bool = False,
     **legacy_kwargs: object,
 ) -> None:
     """Scan each detected sub-skill independently and produce a combined report."""
@@ -2893,7 +2931,12 @@ def _scan_multi_skill(
         )
         result: dict[str, object] | None = None
         try:
-            result = _scan_skill(
+            scan_skill = (
+                partial(_scan_skill, inspect_dependencies=True)
+                if inspect_dependencies
+                else _scan_skill
+            )
+            result = scan_skill(
                 input_path=str(skill.path),
                 format=format,
                 no_llm=no_llm,
