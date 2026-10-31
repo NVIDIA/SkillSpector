@@ -640,7 +640,12 @@ def _is_shell_command_word_start(content: str, start: int) -> bool:
 
 def _has_quoted_assignment_prefix(content: str, start: int) -> bool:
     """Return whether a quoted candidate starts with a shell assignment name."""
-    if start >= len(content) or content[start] not in "'\"":
+    if (
+        start >= len(content)
+        or content[start] not in "'\""
+        or start > 0
+        and content[start - 1] == "$"
+    ):
         return False
     cursor = start + 1
     if cursor >= len(content) or not (content[cursor].isalpha() or content[cursor] == "_"):
@@ -2026,6 +2031,18 @@ def _parse_shell_command_word(
     return _ShellCommandWord("".join(output), cursor, dynamic, limited)
 
 
+def _plain_quoted_assignment_word(parsed: _ShellCommandWord) -> bool:
+    """Return whether a static assignment argument cannot contain shell clauses."""
+    return (
+        not parsed.dynamic
+        and re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*=[^\s;|&()<>]*",
+            parsed.text,
+        )
+        is not None
+    )
+
+
 def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
     parsed_through = 0
     parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
@@ -2038,8 +2055,19 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
         if not _is_shell_command_word_start(content, start):
             continue
         if _has_quoted_assignment_prefix(content, start):
-            # This candidate cannot name a destructive command. Nested command
-            # substitutions remain independent candidates in the outer scan.
+            # This candidate cannot name a destructive command. Claim a static
+            # quoted word so a later quote cannot be misread as its opener.
+            # Dynamic words remain unclaimed so nested substitutions are still
+            # inspected independently by the outer scan.
+            parsed = _parse_shell_command_word(
+                content,
+                start,
+                parameter_end_cache,
+                substitution_end_cache,
+                backtick_end_cache,
+            )
+            if parsed is not None and _plain_quoted_assignment_word(parsed):
+                parsed_through = max(parsed_through, parsed.end)
             continue
         if content.startswith("$(", start):
             substitution_end = _bounded_static_substitution_end(content, start)
@@ -2084,6 +2112,15 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
         ):
             parsed_through = max(parsed_through, parsed.end)
             yield start, parsed.end
+
+
+def _has_destructive_command_string(content: str) -> bool:
+    """Return whether an executable string contains a proven destructive command."""
+    for command_start, body_start in _destructive_command_words(content):
+        tokens, _, _ = _bounded_shell_tokens(content, command_start, body_start)
+        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
+            return True
+    return False
 
 
 def _shell_quoted_candidate_limits(
@@ -2279,6 +2316,19 @@ def _has_shell_command_word_exhaustion(
         ):
             continue
         if _has_quoted_assignment_prefix(content, start):
+            # A quoted NAME=value argument cannot be the command word. Claim
+            # only a complete static word; dynamic substitutions must remain
+            # visible as independent executable candidates.
+            parsed = _parse_shell_command_word(
+                content,
+                start,
+                parameter_end_cache,
+                substitution_end_cache,
+                backtick_end_cache,
+                check_runtime=check_runtime,
+            )
+            if parsed is not None and _plain_quoted_assignment_word(parsed):
+                parsed_through = max(parsed_through, parsed.end)
             continue
         candidate_word_positions: set[int] = set()
         parsed = _parse_shell_command_word(
@@ -2420,6 +2470,8 @@ def _has_shell_command_word_exhaustion(
         python_source=python_source,
     ):
         if command_string is None or _command_string_depth >= 8:
+            return True
+        if _has_destructive_command_string(command_string):
             return True
         if _has_shell_command_word_exhaustion(
             command_string,
@@ -3618,6 +3670,12 @@ def _static_brace_expansions(word: str) -> tuple[str, ...] | None:
 
 
 def _has_recursive_force_options(tokens: tuple[_ShellToken, ...]) -> bool:
+    """Interpret options using GNU/BSD ``rm`` syntax.
+
+    Generic destructive-command paths also call this helper, but ``del`` and
+    ``erase`` use slash options rather than one-dash clusters. Runtime-selected
+    commands stay conservative because they may resolve to rm.
+    """
     try:
         options_end = next(index for index, token in enumerate(tokens) if token.text == "--")
     except StopIteration:
@@ -3630,8 +3688,14 @@ def _has_recursive_force_options(tokens: tuple[_ShellToken, ...]) -> bool:
                 option_words.extend(expanded)
                 continue
         option_words.append(token.text)
+    # A one-dash word is an rm option cluster only when every character is a
+    # supported short option. For example, ``-force`` is not ``-f`` + ``-r``:
+    # rm rejects its unsupported ``o``, ``c`` and ``e`` options before acting.
+    rm_short_options = frozenset("fIiPRrWdvx")
     short_options = [
-        word[1:] for word in option_words if re.fullmatch(r"-[A-Za-z]+", word) is not None
+        word[1:]
+        for word in option_words
+        if re.fullmatch(r"-[A-Za-z]+", word) is not None and set(word[1:]) <= rm_short_options
     ]
     recursive = "--recursive" in option_words or any(
         "r" in option or "R" in option for option in short_options
@@ -5118,6 +5182,7 @@ def _markdown_shell_text(
     *,
     complete_context: bool = True,
     word_apostrophes: bool = False,
+    hardware_apostrophe_ambiguity: list[bool] | None = None,
 ) -> str:
     """Mask Markdown delimiters while retaining code and exact source offsets.
 
@@ -5165,7 +5230,11 @@ def _markdown_shell_text(
 
     # This is a conservative projection, not a general Markdown renderer.
     # Container/HTML bodies with uncertain inline ownership remain literal.
-    fence: tuple[str, int, int] | None = None
+    fence: tuple[str, int, int, str] | None = None
+    fence_literal_apostrophes: list[int] = []
+    fence_literal_ownership = True
+    fence_has_literal_apostrophe = False
+    fence_has_nonliteral_apostrophe = False
     quoted_block = False
     html_end: str | None = None
     paragraph_open = False
@@ -5260,6 +5329,59 @@ def _markdown_shell_text(
                 body_start = offset + len(stripped) - len(fence_body)
                 output[body_start + begin : body_start + end] = " " * (end - begin)
                 fence = None
+                fence_literal_apostrophes.clear()
+                fence_literal_ownership = True
+                fence_has_literal_apostrophe = False
+                fence_has_nonliteral_apostrophe = False
+            elif fence[3] in {"tcl", "verilog", "systemverilog", "sv", "svh"}:
+                # Sized hardware literals use an apostrophe as a base marker,
+                # not a shell quote. Unsized forms are owned only in an HDL
+                # expression context; a fence label alone cannot prove that
+                # an apostrophe inside embedded shell text is a literal.
+                literal_apostrophes: set[int] = set()
+                for literal in re.finditer(
+                    r"(?<![A-Za-z0-9_])(?:[0-9]+(?P<sized>')[sS]?[bBoOdDhH]"
+                    r"[0-9a-fA-F_xXzZ?]+|(?P<unsized>')[01xXzZ])(?![A-Za-z0-9_])",
+                    stripped,
+                ):
+                    if literal["unsized"]:
+                        prefix = stripped[: literal.start()].rstrip(" \t")
+                        if (
+                            fence[3] == "tcl"
+                            or not prefix
+                            or prefix[-1] not in "=(:,{[!~&|?+-*/%"
+                            or stripped[literal.end() :].startswith("'")
+                        ):
+                            continue
+                    literal_apostrophes.add(
+                        literal.start("sized" if literal["sized"] else "unsized")
+                    )
+                has_nonliteral_apostrophe = any(
+                    character == "'" and index not in literal_apostrophes
+                    for index, character in enumerate(stripped)
+                )
+                fence_has_literal_apostrophe = fence_has_literal_apostrophe or bool(
+                    literal_apostrophes
+                )
+                fence_has_nonliteral_apostrophe = (
+                    fence_has_nonliteral_apostrophe or has_nonliteral_apostrophe
+                )
+                if (
+                    hardware_apostrophe_ambiguity is not None
+                    and fence_has_literal_apostrophe
+                    and fence_has_nonliteral_apostrophe
+                ):
+                    hardware_apostrophe_ambiguity[0] = True
+                if has_nonliteral_apostrophe:
+                    for apostrophe in fence_literal_apostrophes:
+                        output[apostrophe] = "'"
+                    fence_literal_apostrophes.clear()
+                    fence_literal_ownership = False
+                elif fence_literal_ownership:
+                    for apostrophe in literal_apostrophes:
+                        absolute_apostrophe = offset + apostrophe
+                        output[absolute_apostrophe] = " "
+                        fence_literal_apostrophes.append(absolute_apostrophe)
         elif quote_start or quoted_block:
             mask_inline_delimiters()
             quoted_block = bool(leading)
@@ -5291,8 +5413,19 @@ def _markdown_shell_text(
             opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped[prefix:])
             if opening:
                 mask_inline_delimiters()
-                fence = (opening[1][0], len(opening[1]), column if has_list_marker else 0)
                 begin, end = opening.span(1)
+                info = stripped[prefix + end :].strip()
+                language = info.split(maxsplit=1)[0].casefold() if info else ""
+                fence = (
+                    opening[1][0],
+                    len(opening[1]),
+                    column if has_list_marker else 0,
+                    language,
+                )
+                fence_literal_apostrophes.clear()
+                fence_literal_ownership = True
+                fence_has_literal_apostrophe = False
+                fence_has_nonliteral_apostrophe = False
                 output[offset + prefix + begin : offset + prefix + end] = " " * (end - begin)
             else:
                 minimum_indent = (
@@ -5481,12 +5614,16 @@ def _has_bounded_parse_exhaustion(
             json_strings = validated_json_string_spans(content, check_runtime)
             structural_quote_closers = {end - 1 for _, end in json_strings}
             structural_quote_openers = {start for start, _ in json_strings}
+        hardware_apostrophe_ambiguity = [False]
         content = _markdown_shell_text(
             content,
             check_runtime,
             complete_context=complete_context,
             word_apostrophes=word_apostrophes,
+            hardware_apostrophe_ambiguity=hardware_apostrophe_ambiguity,
         )
+        if hardware_apostrophe_ambiguity[0]:
+            return True
     # Diagnostic template delimiters belong to JavaScript only when the whole
     # source proves their assertion-message owner. Destructive checks stay raw.
     # TypeScript's postfix/type expressions need a separate lexical proof.
