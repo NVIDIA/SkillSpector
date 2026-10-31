@@ -362,6 +362,36 @@ def test_list_fence_closes_before_following_inline_documentation(opening: str, i
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
+def test_nested_list_fence_uses_container_relative_indentation() -> None:
+    content = (
+        "3. Inspect the configuration:\n"
+        "   - Check the active value:\n"
+        "     ```bash\n"
+        "     echo harmless\n"
+        "     rm -rf /\n"
+        "     ```\n"
+    )
+
+    projected = tm_module._markdown_shell_text(content, lambda: None)
+
+    assert "```" not in projected
+    assert "echo harmless" in projected
+    assert "rm -rf /" in projected
+
+
+@pytest.mark.parametrize(("relative_indent", "opens"), [(3, True), (4, False)])
+def test_list_fence_container_relative_indentation_boundary(
+    relative_indent: int, opens: bool
+) -> None:
+    indent = " " * (2 + relative_indent)
+    content = f"- Check the active value:\n{indent}```bash\n{indent}echo harmless\n{indent}```\n"
+
+    projected = tm_module._markdown_shell_text(content, lambda: None)
+
+    assert ("```" not in projected) is opens
+    assert "echo harmless" in projected
+
+
 @pytest.mark.parametrize("opening,indent", [("   ```sh", "      "), ("- - ```sh", "        ")])
 def test_deeply_indented_marker_does_not_close_fence(opening: str, indent: str) -> None:
     content = opening + "\n" + indent + "```\n" + _LITERAL_BACKTICK_COMMAND + "\n```\n"
