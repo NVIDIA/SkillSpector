@@ -104,6 +104,17 @@ class LedgerReason(StrEnum):
     REFERENCE_UNRESOLVED = "reference_unresolved"
     MANIFEST_PARSE_ERROR = "manifest_parse_error"
     DEPENDENCY_PARSE_ERROR = "dependency_parse_error"
+    DEPENDENCY_LOCKFILE_MISSING = "dependency_lockfile_missing"
+    DEPENDENCY_UNSUPPORTED_LOCKFILE = "dependency_unsupported_lockfile"
+    DEPENDENCY_LOCKFILE_MISMATCH = "dependency_lockfile_mismatch"
+    DEPENDENCY_UNSUPPORTED_SOURCE = "dependency_unsupported_source"
+    DEPENDENCY_UNSUPPORTED_CONTENT = "dependency_unsupported_content"
+    DEPENDENCY_INTEGRITY_MISSING = "dependency_integrity_missing"
+    DEPENDENCY_INTEGRITY_MISMATCH = "dependency_integrity_mismatch"
+    DEPENDENCY_IDENTITY_MISMATCH = "dependency_identity_mismatch"
+    DEPENDENCY_DOWNLOAD_FAILED = "dependency_download_failed"
+    DEPENDENCY_WORKER_FAILED = "dependency_worker_failed"
+    DEPENDENCY_SANDBOX_UNAVAILABLE = "dependency_sandbox_unavailable"
     MANIFEST_PARSE_LIMIT = "manifest_parse_limit"
     ARTIFACT_COUNT_LIMIT = "artifact_count_limit"
     TRAVERSAL_DEPTH_LIMIT = "traversal_depth_limit"
@@ -133,6 +144,17 @@ def only_missing_reference_exceptions(exceptions: object) -> bool:
 
 
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
+    LedgerReason.DEPENDENCY_LOCKFILE_MISSING: "Requested npm content inspection has no supported project lockfile.",
+    LedgerReason.DEPENDENCY_UNSUPPORTED_LOCKFILE: "Dependency content inspection requires npm lockfile version 2 or 3.",
+    LedgerReason.DEPENDENCY_LOCKFILE_MISMATCH: "Package manifest dependency declarations differ from the lockfile root.",
+    LedgerReason.DEPENDENCY_UNSUPPORTED_SOURCE: "Dependency source is outside supported public npm registry tarballs.",
+    LedgerReason.DEPENDENCY_UNSUPPORTED_CONTENT: "Dependency artifact contains a file outside supported static text analysis.",
+    LedgerReason.DEPENDENCY_INTEGRITY_MISSING: "Dependency has no supported, valid SHA-512 integrity hash.",
+    LedgerReason.DEPENDENCY_INTEGRITY_MISMATCH: "Downloaded dependency bytes do not match the lockfile integrity hash.",
+    LedgerReason.DEPENDENCY_IDENTITY_MISMATCH: "Package identity in the artifact differs from the locked name or version.",
+    LedgerReason.DEPENDENCY_DOWNLOAD_FAILED: "Locked dependency artifact could not be acquired under the network policy.",
+    LedgerReason.DEPENDENCY_WORKER_FAILED: "Dependency inspection worker failed or returned an invalid result.",
+    LedgerReason.DEPENDENCY_SANDBOX_UNAVAILABLE: "Required operating-system isolation for dependency inspection is unavailable.",
     LedgerReason.USER_EXCLUSION: "File was not inspected because of an explicit caller exclusion.",
     LedgerReason.EXCLUDED_DIRECTORY: ("Directory tree is excluded from the configured scan scope."),
     LedgerReason.HIDDEN_FILE: "Hidden file is excluded from the configured scan scope.",
@@ -372,6 +394,7 @@ class AnalysisCompleteness(TypedDict):
     limitations: NotRequired[list[str]]
     findings_before_filtering: NotRequired[int]
     findings_after_filtering: NotRequired[int]
+    dependency_inspection: NotRequired[dict[str, object]]
 
 
 def _normalize_relative_path(path: str, *, scope_boundary: bool = False) -> str:
@@ -1159,6 +1182,9 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_after_filtering": len(validated_effective),
     }
     patterns = state.get("exclude_patterns", [])
+    dependency_inspection = state.get("dependency_inspection")
+    if isinstance(dependency_inspection, dict):
+        completeness["dependency_inspection"] = dict(dependency_inspection)
     if patterns:
         completeness["exclude_patterns"] = list(patterns)
         completeness["excluded_file_count"] = sum(
