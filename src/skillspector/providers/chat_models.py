@@ -183,6 +183,7 @@ def create_openai_compatible_chat_model(
     default_headers: dict[str, str] | None = None,
     forced_tool_choice: bool = True,
     default_reasoning_effort: str | None = None,
+    chat_model_class: type[ChatOpenAI] | None = None,
 ) -> BaseChatModel | None:
     """Create ``ChatOpenAI`` for providers serving OpenAI-compatible endpoints.
 
@@ -212,7 +213,7 @@ def create_openai_compatible_chat_model(
         model, include_seed=True, reasoning_effort=reasoning_effort
     )
     kwargs.update(sampling_parameters)
-    chat_model = ChatOpenAI(**kwargs)
+    chat_model = (chat_model_class or ChatOpenAI)(**kwargs)
     register_chat_model_controls(
         chat_model,
         retained_chat_model_controls(
