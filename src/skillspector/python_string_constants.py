@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import ast
 import re
+import warnings
 from collections.abc import Callable
 from urllib.parse import urlparse
 
 from skillspector.python_ast import MAX_PYTHON_AST_SOURCE_CHARS, parse_python_source
+from skillspector.python_tokens import _PYTHON_OWNERSHIP_PARSE_LOCK
 
 _MAX_WORK = 100_000
 _MAX_DEPTH = 16
@@ -419,12 +421,14 @@ class _Constants:
             ancestor = self.parents.get(field)
             while ancestor is not None:
                 self.spend()
-                if isinstance(ancestor, ast.FormattedValue):
-                    break  # Nested fields do not supply the owning string's body text.
+                if isinstance(ancestor, (ast.FormattedValue, ast.ClassDef)):
+                    # Nested fields belong to another expression; class bodies,
+                    # defaults and comprehensions have distinct lookup rules.
+                    break
                 ancestor = self.parents.get(ancestor)
             else:
                 ancestor = None
-            if isinstance(ancestor, ast.FormattedValue):
+            if isinstance(ancestor, (ast.FormattedValue, ast.ClassDef)):
                 continue
             start = self.start(field.value) - 1
             end = self.end(field.value) + 1
@@ -462,7 +466,9 @@ def python_constant_string_fields(
     if len(content) > MAX_PYTHON_AST_SOURCE_CHARS or re.search(r"\r(?!\n)", content):
         return ()
     check_runtime()
-    parsed = parse_python_source(content, "<constant string fields>")
+    with _PYTHON_OWNERSHIP_PARSE_LOCK, warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        parsed = parse_python_source(content, "<constant string fields>")
     check_runtime()
     if parsed.tree is None:
         return ()

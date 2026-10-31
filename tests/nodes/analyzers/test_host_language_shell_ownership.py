@@ -378,10 +378,10 @@ def test_constant_checkout_proof_rejects_unknown_or_changed_bindings(
 
 
 @pytest.mark.parametrize("field", ["CHECKOUT!r", "CHECKOUT:>20", "CHECKOUT:{width}"])
-def test_constant_checkout_proof_keeps_unmodeled_field_formatting_partial(field: str) -> None:
+def test_constant_checkout_proof_rejects_unmodeled_field_formatting(field: str) -> None:
     source = _CONSTANT_CHECKOUT_SOURCE.replace("{CHECKOUT}", "{" + field + "}")
 
-    assert _python(_OPTION_TEXT + source + _TAIL) is True
+    assert python_string_constants.python_constant_string_fields(source, lambda: None) == ()
 
 
 @pytest.mark.parametrize("extension", [" % detail", ".format(detail)", "[0:]", " + detail"])
@@ -392,16 +392,19 @@ def test_constant_checkout_proof_keeps_extended_string_values_partial(extension:
 
 
 @pytest.mark.parametrize(
-    "bindings,body",
+    "checkout",
     [
-        pytest.param('OPTIONS = "-rf"\n', 'f"$TOOL {OPTIONS} /"', id="literal-options"),
-        pytest.param('OPTIONS = "-rf /"\n', 'f"$TOOL {OPTIONS}"', id="literal-root-options"),
-        pytest.param('CHECKOUT = ""\n', 'f"$TOOL /{CHECKOUT} {options}"', id="empty-component"),
+        pytest.param("-rf", id="literal-options"),
+        pytest.param("-rf /", id="literal-root-options"),
+        pytest.param("", id="empty-component"),
     ],
 )
-def test_constant_fields_do_not_hide_root_operands(bindings: str, body: str) -> None:
-    source = bindings + "def message(options):\n    return " + body + "\n"
+def test_constant_field_proof_rejects_unsafe_or_empty_components(checkout: str) -> None:
+    source = _CONSTANT_CHECKOUT_SOURCE.replace(
+        "CHECKOUT = checkout_name(REPOSITORY)", f"CHECKOUT = {checkout!r}"
+    )
 
+    assert python_string_constants.python_constant_string_fields(source, lambda: None) == ()
     assert _python(_OPTION_TEXT + source + _TAIL) is True
 
 
@@ -439,6 +442,35 @@ def test_constant_field_spans_exclude_literal_braces_and_format_specs(newline: s
     first = content.index("{CHECKOUT}")
     second = content.index("{CHECKOUT}", first + 1)
     assert [start for start, _, _ in fields] == [first, second]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '    message = f"$TOOL -rf /{CHECKOUT}"\n',
+        '    def message(self, value=f"$TOOL -rf /{CHECKOUT}"):\n        return value\n',
+        '    messages = [value for value in (f"$TOOL -rf /{CHECKOUT}",)]\n',
+    ],
+    ids=["class-body", "method-default", "comprehension-first-iterable"],
+)
+def test_constant_field_proof_refuses_class_lookup_contexts(body: str) -> None:
+    source = 'CHECKOUT = "widget"\nclass Report:\n    CHECKOUT = ""\n' + body
+
+    assert python_string_constants.python_constant_string_fields(source, lambda: None) == ()
+
+
+@pytest.mark.parametrize("warning_filter", ["always", "error"])
+def test_constant_field_proof_suppresses_source_warnings(warning_filter: str) -> None:
+    source = 'PATTERN = "\\d+"\n' + _CONSTANT_CHECKOUT_SOURCE
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter(warning_filter)
+        filters = list(warnings.filters)
+
+        fields = python_string_constants.python_constant_string_fields(source, lambda: None)
+
+        assert [value for _, _, value in fields] == ["widget", "widget"]
+        assert list(warnings.filters) == filters
+    assert caught == []
 
 
 def test_constant_field_proof_bounds_total_output_and_honors_cancellation() -> None:
