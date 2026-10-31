@@ -2270,6 +2270,138 @@ def _quoted_candidate_is_complete(
     )
 
 
+def _shell_comment_start_before(content: str, start: int, *, ansi_c: bool = False) -> int | None:
+    """Return a genuine shell comment ``#`` on the candidate's line, if any.
+
+    This scans from the start of ``content`` so quote state is inherited
+    across lines: a ``#`` on the candidate's line that sits inside a string
+    opened on an earlier line (``echo "prefix\\n # literal"; ...``) is not a
+    comment start, and the exemption is declined. A ``#`` that opens a
+    comment on an earlier line ends at that line's newline, so quotes inside
+    comment text never leak into later lines. When the initial quote state
+    cannot be proven from the source handed to the analyzer, the scan still
+    starts unquoted at the content boundary, which is the most the analyzer
+    can prove; a genuinely unprovable fragment stays conservative because
+    the caller only reaches this helper after the line-local comment idiom
+    already matched on the candidate's own line.
+
+    With ``ansi_c`` (shell only), a ``$'...'`` string follows the same
+    ownership rule as the main word parser: a backslash escapes the next
+    character, so ``\\'`` inside the string does not close it and a ``#``
+    after it is still string content, not a comment start. Other
+    hash-comment languages do not share Bash ANSI-C quoting (``$'`` is a
+    variable in Perl and Ruby), so they keep the plain single-quote rule
+    and never get the ANSI-C treatment.
+
+    A ``${...}`` parameter expansion is skipped whole via the existing
+    bounded parser, so a ``#`` inside it (for example the default value in
+    ``${NOTE:- # literal}``) never reads as a comment start. When the
+    expansion cannot be proven (the parser returns no end), the exemption
+    is declined rather than guessed.
+    """
+    line_start = content.rfind("\n", 0, start) + 1
+    stack: list[str | None] = [None]
+    i = 0
+    in_comment = False
+    while i < start:
+        ch = content[i]
+        if in_comment:
+            if ch == "\n":
+                in_comment = False
+            i += 1
+            continue
+        top = stack[-1]
+        if top == "ansi":
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "'":
+                stack.pop()
+            i += 1
+            continue
+        if top == "'":
+            if ch == "'":
+                stack.pop()
+            i += 1
+            continue
+        if top == '"':
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                stack.pop()
+            elif ch == "`":
+                stack.append("`")
+            elif ch == "$" and content[i + 1 : i + 2] == "(":
+                stack.append("sub")
+                i += 1
+            i += 1
+            continue
+        # Command context: the base text, a $( ) substitution, or backticks.
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "$" and content[i + 1 : i + 2] == "{":
+            parameter_end = _skip_parameter_expansion(content, i, len(content), None)
+            if parameter_end is None:
+                return None
+            i = parameter_end
+            continue
+        if ch == "$" and ansi_c and content[i + 1 : i + 2] == "'":
+            stack.append("ansi")
+            i += 1
+        elif ch in ("'", '"'):
+            stack.append(ch)
+        elif ch == "`":
+            if top == "`":
+                stack.pop()
+            else:
+                stack.append("`")
+        elif ch == "$" and content[i + 1 : i + 2] == "(":
+            stack.append("sub")
+            i += 1
+        elif ch == ")" and top == "sub":
+            stack.pop()
+        elif ch == "#":
+            if i == 0 or content[i - 1] in " \t\r\n;&|()<>":
+                if i >= line_start:
+                    return i
+                in_comment = True
+        i += 1
+    return None
+
+
+def _is_comment_candidate(
+    content: str,
+    start: int,
+    python_source: _PythonSourceOwnership | None,
+    *,
+    file_type: str | None = None,
+) -> bool:
+    """Return whether a candidate position sits inside a ``#`` comment.
+
+    The shell comment-start idiom is checked first so host Python source only
+    pays for proven token ownership when a ``#`` actually precedes the
+    candidate on its line. A ``#`` inside a string literal never counts: for
+    host source the comment token must be proven, and without host source
+    the candidate's line is scanned with quote state inherited from the
+    start of the source, so a ``#`` inside an already closed string, or
+    inside a string opened on an earlier line, cannot exempt a later command.
+    """
+    line_start = content.rfind("\n", 0, start) + 1
+    if _SHELL_COMMENT_START_RE.search(content, line_start, start) is None:
+        return False
+    if python_source is None:
+        return _shell_comment_start_before(content, start, ansi_c=file_type == "shell") is not None
+    return python_source.comment(start) is not None
+
+
+# File types where ``#`` opens a comment. Markdown and plain text are
+# excluded: there ``#`` starts a heading or is prose, and the conservative
+# partial result for fragmented headings is deliberate.
+_HASH_COMMENT_FILE_TYPES = frozenset({"shell", "python", "perl", "ruby", "powershell"})
+
+
 def _has_shell_command_word_exhaustion(
     content: str,
     check_runtime: Callable[[], None],
@@ -2279,6 +2411,7 @@ def _has_shell_command_word_exhaustion(
     python_source: _PythonSourceOwnership | None = None,
     perl_eval_blocks: bool = False,
     quote_limits: dict[int, int] | None = None,
+    file_type: str = "shell",
     _command_string_depth: int = 0,
 ) -> bool:
     """Find candidate command words whose deterministic parse hit a safety bound.
@@ -2422,6 +2555,15 @@ def _has_shell_command_word_exhaustion(
             # parsed this position, so it only claims ownership.
             continue
         if parsed.limited:
+            if file_type in _HASH_COMMENT_FILE_TYPES and _is_comment_candidate(
+                content, start, python_source, file_type=file_type
+            ):
+                # A comment is never executed: a backtick there is literal
+                # text, so it cannot open a command substitution that
+                # reconstructs a printf invocation (issue #901). Unresolved
+                # spans and runtime-selected operands keep their existing
+                # conservative treatment.
+                continue
             if not _quoted_candidate_is_complete(content, start, quote_limits, check_runtime):
                 return True
         if (
@@ -5176,6 +5318,41 @@ def _markdown_table_delimiter_columns(
     return len(cells)
 
 
+def _blank_line_local_paired_backticks(line: str) -> str:
+    """Blank backtick runs on one line that pair as inline-code delimiters.
+
+    Mirrors the equal-length, right-to-left pairing of the paragraph-scope
+    inline-code masking: a backtick that demonstrably delimits inline code on
+    its own line is Markdown syntax, never a shell substitution opener. Runs
+    that could only pair across lines stay visible, keeping the prose check
+    conservative, and escaped runs stay visible exactly as the masking does.
+    """
+    runs = [(match.start(), match.end()) for match in re.finditer(r"`+", line)]
+    next_by_length: dict[int, int] = {}
+    closing: dict[int, int] = {}
+    for index in range(len(runs) - 1, -1, -1):
+        length = runs[index][1] - runs[index][0]
+        if length in next_by_length:
+            closing[index] = next_by_length[length]
+        next_by_length[length] = index
+    chars = list(line)
+    index = 0
+    while index < len(runs):
+        start, end = runs[index]
+        escape_start = start
+        while escape_start > 0 and line[escape_start - 1] == "\\":
+            escape_start -= 1
+        close_index = closing.get(index)
+        if (start - escape_start) % 2 or close_index is None:
+            index += 1
+            continue
+        close_start, close_end = runs[close_index]
+        chars[start:end] = [" "] * (end - start)
+        chars[close_start:close_end] = [" "] * (close_end - close_start)
+        index = close_index + 1
+    return "".join(chars)
+
+
 def _markdown_shell_text(
     content: str,
     check_runtime: Callable[[], None],
@@ -5492,7 +5669,13 @@ def _markdown_shell_text(
                         and not runs
                         and not heading
                         and "'" in leading
-                        and _MARKDOWN_PROSE_SHELL_SYNTAX_RE.search(leading) is None
+                        # Inline-code delimiters are Markdown, not shell
+                        # syntax: judge the line with its line-local pairs
+                        # blanked, exactly as the masking pass will.
+                        and _MARKDOWN_PROSE_SHELL_SYNTAX_RE.search(
+                            _blank_line_local_paired_backticks(leading)
+                        )
+                        is None
                         and (
                             line_index == 0
                             or (
@@ -5646,6 +5829,7 @@ def _has_bounded_parse_exhaustion(
             if file_type == "shell" and complete_context
             else None
         ),
+        file_type=file_type,
     ):
         return True
     covered_until = 0
