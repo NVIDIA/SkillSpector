@@ -613,7 +613,11 @@ def _is_negated_safety_constraint(
     #   * a determiner plus one word ("recommend the suite"): the
     #     determiner proves the following word is a noun phrase, even
     #     where that word also has a verb homonym;
-    #   * a gerund object ("advise running `self-update`");
+    #   * a gerund from a closed list of verbs that perform the
+    #     action ("advise running `self-update`"). An open ``-ing``
+    #     match would also admit gerunds that negate the action
+    #     ("Never recommend skipping `self-update`"), turning a double
+    #     negative that instructs the action into an exemption;
     #   * a single classifier noun from a closed list ("recommend
     #     suite `self-update`").
     # Anything else is unproved action language and gets no exemption:
@@ -632,7 +636,10 @@ def _is_negated_safety_constraint(
         r"capabilities|routines?|procedures|instructions?|steps?|binaries|"
         r"executables|applications|components)"
     )
-    _gerund = r"[a-z]+ing"
+    _gerund = (
+        r"(?:running|using|executing|invoking|calling|applying|performing|"
+        r"triggering|starting|launching|enabling|doing)"
+    )
     _object_gap = (
         r"(?:"
         + _determiner
