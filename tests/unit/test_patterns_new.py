@@ -4013,6 +4013,18 @@ class TestSupplyChainHelpers:
             ("requests", "2.32.0", 2),
         ]
 
+    def test_extract_packages_requirements_strips_repeated_leading_bom(self) -> None:
+        # Repeated-prefix regression (review on #963): multiple leading
+        # BOMs must still extract the packages with correct line numbers,
+        # and the strip must stay a single linear prefix operation rather
+        # than a per-character slicing loop.
+        content = "\ufeff\ufeff\ufeffjinja2==2.4.1\nrequests==2.32.0\n"
+        packages = sc_mod._extract_packages_from_requirements(content)
+        assert [(name, version, line) for name, version, line in packages] == [
+            ("jinja2", "2.4.1", 1),
+            ("requests", "2.32.0", 2),
+        ]
+
     def test_pinned_version_only_accepts_exact_concrete_pins(self) -> None:
         # A vulnerability lookup asks "is THIS release affected?", which is only meaningful
         # when the manifest admits exactly one release. Everything else must yield None.

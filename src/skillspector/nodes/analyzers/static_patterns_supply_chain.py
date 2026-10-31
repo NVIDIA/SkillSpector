@@ -1380,8 +1380,10 @@ def _extract_packages_from_requirements_detailed(
     # analysis. Strip leading BOMs here, scoped to manifest parsing only:
     # decode_text() itself stays untouched because other analyzers treat
     # U+FEFF as a hidden-character injection signal in file bodies.
-    while content.startswith("\ufeff"):
-        content = content[1:]
+    # Single linear prefix strip: a per-character slicing loop here would
+    # copy ~n(n-1)/2 characters for n leading BOMs before any spec limit
+    # is checked, with no cancellation point in this preprocessing step.
+    content = content.lstrip("\ufeff")
     for line_num, line in _logical_requirement_lines(content):
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("-"):
