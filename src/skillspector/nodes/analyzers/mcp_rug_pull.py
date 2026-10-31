@@ -141,6 +141,7 @@ _RP1_DOCKER_CMD = re.compile(
 )
 
 _VERSION_PIN_RE = re.compile(r"@[\d.]+\b|==[\d.]+|:[\d.]+|@sha256:")
+_JSON_KEY_SEPARATOR = re.compile(r"[ \t\r\n]*:")
 
 # RP2: Manifest-permission pre-staging
 _PERMISSION_EXPANSION_PATTERNS = [
@@ -217,36 +218,61 @@ def _operand_has_version_pin(line_remainder: str) -> bool:
     return _VERSION_PIN_RE.search(operand_suffix) is not None
 
 
+class _ConfigObject(dict[str, object]):
+    """Keep source members alongside JSON's last-key-wins object values."""
+
+    def __init__(self, pairs: list[tuple[str, object]]) -> None:
+        super().__init__(pairs)
+        self.pairs = pairs
+        self.last_key_indices = {key: index for index, (key, _) in enumerate(pairs)}
+
+
+def _iter_json_key_positions(content: str, budget: _RugPullBudget, path: str) -> Iterator[int]:
+    """Locate keys in validated JSON, skipping entire decoded string tokens."""
+    decoder = json.JSONDecoder()
+    cursor = 0
+    while (start := content.find('"', cursor)) != -1:
+        budget.check_runtime(path)
+        _, cursor = decoder.raw_decode(content, start)
+        if _JSON_KEY_SEPARATOR.match(content, cursor) is not None:
+            yield start
+
+
 def _iter_config_commands(
     config: object, budget: _RugPullBudget, path: str, content: str
 ) -> Iterator[tuple[str, int]]:
     """Yield JSON command lines with the line of each command key."""
-    command_keys = iter(re.finditer(r'(?<!\\)"command"\s*:', content))
-    pending = [(iter(((None, config),)), None)]
+    key_positions = _iter_json_key_positions(content, budget, path)
+    pending = [(iter(((0, (None, config)),)), None, True)]
     while pending:
         budget.check_runtime(path)
-        items, owner = pending[-1]
+        items, owner, active = pending[-1]
         try:
-            key, item = next(items)
+            index, (key, item) = next(items)
         except StopIteration:
             pending.pop()
             continue
 
-        if key == "command" and owner is not None:
-            key_match = next(command_keys, None)
+        selected = active
+        key_position = 0
+        if owner is not None:
+            key_position = next(key_positions)
+            selected = active and owner.last_key_indices[key] == index
+
+        if selected and key == "command" and owner is not None:
             args = owner.get("args")
             if (
                 isinstance(item, str)
                 and isinstance(args, list)
                 and all(isinstance(argument, str) for argument in args)
             ):
-                line = _find_line(content, key_match.start()) if key_match else 1
-                yield " ".join([item, *args]), line
+                yield " ".join([item, *args]), _find_line(content, key_position)
 
-        if isinstance(item, dict):
-            pending.append((iter(item.items()), item))
+        # Shadowed members still consume their source keys, but cannot emit findings.
+        if isinstance(item, _ConfigObject):
+            pending.append((iter(enumerate(item.pairs)), item, selected))
         elif isinstance(item, list):
-            pending.append((iter((None, value) for value in item), None))
+            pending.append((iter(enumerate((None, value) for value in item)), None, selected))
 
 
 def _check_rp1_npx(
@@ -301,7 +327,7 @@ def _check_rp1(
 
         if file_path.lower().endswith(".json"):
             try:
-                config = json.loads(content)
+                config = json.loads(content, object_pairs_hook=_ConfigObject)
             except (json.JSONDecodeError, RecursionError):
                 config = None
             if config is not None:

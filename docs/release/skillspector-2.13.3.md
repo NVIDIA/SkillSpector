@@ -45,6 +45,7 @@ P0 security and scan-integrity fixes, including four dependency security updates
 - [#882](https://github.com/NVIDIA/SkillSpector/pull/882): Preserve shell-line
   boundaries across Markdown code fences during marker reconstruction, keeping
   separate command lines from being combined into a misleading directive.
+  Long rejected backtick runs are scanned linearly within the current text bound.
 - [#826](https://github.com/NVIDIA/SkillSpector/pull/826): Follow credential reads
   nested in `urllib` request headers into network sinks.
 - [#776](https://github.com/NVIDIA/SkillSpector/pull/776) and
@@ -53,7 +54,8 @@ P0 security and scan-integrity fixes, including four dependency security updates
   credential/configuration filenames. The required
   [#683](https://github.com/NVIDIA/SkillSpector/pull/683) dependency accepts version
   pins only on the relevant package operand, so an unrelated later pin cannot
-  hide an unpinned package.
+  hide an unpinned package. JSON command findings retain correct source lines
+  when keys use escapes or appear more than once.
 - [#893](https://github.com/NVIDIA/SkillSpector/pull/893): Detect writes to known
   agent-memory files and directories from automatically run test carriers,
   including supported raw Windows paths. A release review correction prevents

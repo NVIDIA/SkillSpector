@@ -1201,7 +1201,7 @@ def _previous_sentence_boundary(text: str, end: int, maximum_span: int) -> int:
     return last_end
 
 
-def _is_fence_line(text: str, cursor: int) -> bool:
+def _is_fence_line(text: str, cursor: int, end: int) -> bool:
     """Return whether the backtick run at ``cursor`` opens or closes a CommonMark fence.
 
     The run must hold at least three backticks and start its line after at most
@@ -1209,20 +1209,23 @@ def _is_fence_line(text: str, cursor: int) -> bool:
     run after text, an inline span, or an info string that carries prose stays
     an ordinary quote and keeps failing closed.
     """
-    run_end = cursor
-    while run_end < len(text) and text[run_end] == "`":
-        run_end += 1
-    if run_end - cursor < _MARKDOWN_FENCE_MIN_BACKTICKS:
-        return False
     line_start = cursor
     while line_start > 0 and cursor - line_start < 3 and text[line_start - 1] == " ":
         line_start -= 1
     if line_start > 0 and text[line_start - 1] != "\n":
         return False
-    line_end = text.find("\n", run_end)
-    return (
-        _FENCE_INFO_RE.fullmatch(text, run_end, len(text) if line_end < 0 else line_end) is not None
-    )
+    run_end = cursor
+    while run_end < end and text[run_end] == "`":
+        run_end += 1
+    if run_end - cursor < _MARKDOWN_FENCE_MIN_BACKTICKS:
+        return False
+    line_end = text.find("\n", run_end, end)
+    if line_end < 0:
+        # A clipped line cannot prove a bare fence label using unseen suffixes.
+        if end < len(text):
+            return False
+        line_end = end
+    return _FENCE_INFO_RE.fullmatch(text, run_end, line_end) is not None
 
 
 def _sentence_boundaries(
@@ -1243,7 +1246,7 @@ def _sentence_boundaries(
             check_runtime()
             next_runtime_check = cursor + 1024
         character = text[cursor]
-        if quote_close is None and character == "`" and _is_fence_line(text, cursor):
+        if quote_close is None and character == "`" and _is_fence_line(text, cursor, end):
             # A Markdown code fence line delimits a block; it does not open a
             # quote that would swallow every line break up to the next fence.
             # Any other run of backticks keeps its lexical quote reading.
