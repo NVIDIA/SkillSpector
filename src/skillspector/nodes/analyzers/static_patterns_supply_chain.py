@@ -1374,6 +1374,14 @@ def _extract_packages_from_requirements_detailed(
     largest_omitted: int | None = None
     if limit is not None and limit <= 0:
         return results, largest_omitted
+    # decode_text() decodes with plain "utf-8", which never strips a leading
+    # byte-order mark, so a BOM-prefixed requirements.txt would otherwise make
+    # the first requirement unparseable and silently drop it from SC4/OSV
+    # analysis. Strip leading BOMs here, scoped to manifest parsing only:
+    # decode_text() itself stays untouched because other analyzers treat
+    # U+FEFF as a hidden-character injection signal in file bodies.
+    while content.startswith("\ufeff"):
+        content = content[1:]
     for line_num, line in _logical_requirement_lines(content):
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("-"):
