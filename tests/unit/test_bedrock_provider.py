@@ -433,7 +433,7 @@ class TestBedrockProviderToolChoice:
         mock_session.return_value.client.return_value = MagicMock()
         provider = BedrockProvider()
 
-        provider.create_chat_model("us.anthropic.claude-fable-5-1", max_tokens=1024)
+        provider.create_chat_model("us.anthropic.claude-mythos-5-1", max_tokens=1024)
         assert mock_chat.call_args.kwargs["supports_tool_choice_values"] == ("auto",)
         assert mock_chat.call_args.kwargs["temperature"] == 0.2
 
