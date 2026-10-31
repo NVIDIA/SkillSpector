@@ -108,8 +108,17 @@ class TestClaudeModelRules:
     def test_fable_and_mythos_reject_forced_tool_calls(self, model: str) -> None:
         assert rejects_forced_tool_call(model)
 
-    def test_mythos_keeps_sampling_controls(self) -> None:
-        assert not rejects_sampling_controls("claude-mythos-5-1")
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-mythos-5-1",
+            "claude-mythos-5-1-20260901",
+            "us.anthropic.claude-mythos-5-1",
+            "azure/anthropic/claude-mythos-5-1",
+        ],
+    )
+    def test_mythos_rejects_sampling_controls(self, model: str) -> None:
+        assert rejects_sampling_controls(model)
 
     @pytest.mark.parametrize(
         "model",
