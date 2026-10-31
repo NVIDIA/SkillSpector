@@ -422,21 +422,35 @@ def test_cli_scan_output_to_file(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "format,registry_mode",
-    [(format, False) for format in FormatChoice] + [(FormatChoice.json, True)],
+    "format,mode",
+    [(format, "scan") for format in FormatChoice]
+    + [(FormatChoice.json, "registry"), (FormatChoice.json, "baseline")],
 )
 @pytest.mark.parametrize(
-    "alias", ["same-path", "relative-path", "parent-path", "symlink", "symlink-parent", "hard-link"]
+    "alias",
+    [
+        "same-path",
+        "relative-path",
+        "parent-path",
+        "symlink",
+        "symlink-parent",
+        "hard-link",
+        "tilde",
+    ],
 )
 def test_cli_scan_rejects_output_alias_of_input_file(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     format: FormatChoice,
-    registry_mode: bool,
+    mode: str,
     alias: str,
 ) -> None:
     """An output alias must not replace the original input with its report."""
+    registry_mode = mode == "registry"
     source = tmp_path / ("registry.json" if registry_mode else "SKILL.md")
+    if alias == "tilde":
+        (tmp_path / "~").mkdir()
+        source = tmp_path / "~" / source.name
     original = (
         b'{"servers": []}'
         if registry_mode
@@ -447,6 +461,8 @@ def test_cli_scan_rejects_output_alias_of_input_file(
     monkeypatch.chdir(tmp_path)
     if alias == "relative-path":
         output = Path(source.name)
+    elif alias == "tilde":
+        output = Path("~") / source.name
     elif alias == "parent-path":
         nested = tmp_path / "nested"
         nested.mkdir()
@@ -473,9 +489,15 @@ def test_cli_scan_rejects_output_alias_of_input_file(
     scan_input = MagicMock(
         return_value={"report_body": "Scan report", "risk_score": 0, "findings": []}
     )
-    monkeypatch.setattr(cli, "scan_registry" if registry_mode else "_scan_skill", scan_input)
+    if mode == "baseline":
+        monkeypatch.setattr(cli.graph, "invoke", scan_input)
+    else:
+        monkeypatch.setattr(cli, "scan_registry" if registry_mode else "_scan_skill", scan_input)
 
-    args = ["scan", str(source), "--no-llm", "--format", format.value, "--output", str(output)]
+    args = ["baseline" if mode == "baseline" else "scan", str(source), "--no-llm"]
+    args += ["--output", str(output)]
+    if mode != "baseline":
+        args += ["--format", format.value]
     if registry_mode:
         args.append("--mcp-registry")
     result = runner.invoke(app, args)
@@ -485,6 +507,121 @@ def test_cli_scan_rejects_output_alias_of_input_file(
     assert source.read_bytes() == original
     assert output.read_bytes() == original
     scan_input.assert_not_called()
+
+
+@pytest.mark.parametrize("command", ["scan", "baseline"])
+@pytest.mark.parametrize("manifest", ["SKILL.md", "skill.md"])
+def test_cli_rejects_output_overwriting_directory_manifest(
+    tmp_path: Path, command: str, manifest: str
+) -> None:
+    source = tmp_path / manifest
+    original = "---\nname: protected\ndescription: Say hello.\n---\n# Hello\n"
+    source.write_text(original)
+    with patch("skillspector.cli.graph.invoke") as invoke:
+        result = runner.invoke(app, [command, str(tmp_path), "--no-llm", "--output", str(source)])
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert source.read_text() == original
+    invoke.assert_not_called()
+
+
+@pytest.mark.parametrize("primary", ["SKILL.md", "skill.md", ".aisop/workflow.aisop.json"])
+@pytest.mark.parametrize("max_skills", [1, 2])
+def test_recursive_output_preserves_child_primary_before_scanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, primary: str, max_skills: int
+) -> None:
+    monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_SKILLS", max_skills)
+    first = tmp_path / "a" / "SKILL.md"
+    first.parent.mkdir()
+    first.write_text("# First skill\n")
+    source = tmp_path / "b" / primary
+    source.parent.mkdir(parents=True)
+    original = (
+        json.dumps(
+            [
+                {"role": "system", "content": {"protocol": "AISOP V1"}},
+                {"role": "user", "content": {"aisop": {}, "functions": {"lookup": {}}}},
+            ]
+        )
+        if primary.endswith(".json")
+        else "# Second skill\n"
+    )
+    source.write_text(original)
+    with patch("skillspector.cli._scan_skill") as scan_skill:
+        result = runner.invoke(
+            app,
+            [
+                "scan",
+                str(tmp_path),
+                "--recursive",
+                "--no-llm",
+                "--format",
+                "json",
+                "--output",
+                str(source),
+            ],
+        )
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert source.read_text() == original
+    scan_skill.assert_not_called()
+
+
+@pytest.mark.parametrize("alias", ["relative", "hard-link", "symlink", "symlink-parent"])
+@pytest.mark.parametrize("format", ["markdown", "sarif"])
+def test_recursive_output_rejects_child_primary_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alias: str, format: str
+) -> None:
+    source = tmp_path / "child" / "SKILL.md"
+    source.parent.mkdir()
+    source.write_text("# Child skill\n")
+    monkeypatch.chdir(tmp_path)
+    output = Path("report.txt")
+    try:
+        if alias == "relative":
+            output = Path("child") / ".." / "child" / source.name
+        elif alias == "hard-link":
+            os.link(source, output)
+        elif alias == "symlink":
+            output.symlink_to(source)
+        else:
+            Path("linked").symlink_to(source.parent, target_is_directory=True)
+            output = Path("linked") / source.name
+    except OSError:
+        pytest.skip("filesystem does not support this alias")
+    with patch("skillspector.cli._scan_skill") as scan_skill:
+        result = runner.invoke(
+            app,
+            [
+                "scan",
+                str(tmp_path),
+                "--recursive",
+                "--no-llm",
+                "--format",
+                format,
+                "--output",
+                str(output),
+            ],
+        )
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert source.read_text() == "# Child skill\n"
+    scan_skill.assert_not_called()
+
+
+def test_cli_baseline_preserves_local_input_with_remote_like_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source = Path("git@notes.md")
+    original = "---\nname: protected\ndescription: Say hello.\n---\n# Hello\n"
+    source.write_text(original)
+    with patch("skillspector.cli.graph.invoke") as invoke:
+        result = runner.invoke(app, ["baseline", str(source), "--no-llm", "-o", str(source)])
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert source.read_text() == original
+    invoke.assert_not_called()
 
 
 @pytest.mark.parametrize("format", list(FormatChoice))

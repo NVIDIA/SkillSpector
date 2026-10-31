@@ -382,10 +382,17 @@ _MAX_LETTER_SPACING_SECURITY_PHRASE = max(
 class _ArtifactIntegrityResourceLimitError(RuntimeError):
     """Stop attacker-controlled work while retaining a deterministic prefix."""
 
-    def __init__(self, reason: LedgerReason, metrics: dict[str, int | float]) -> None:
+    def __init__(
+        self,
+        reason: LedgerReason,
+        metrics: dict[str, int | float],
+        *,
+        terminal: bool = True,
+    ) -> None:
         super().__init__(reason.value)
         self.reason = reason
         self.metrics = metrics
+        self.terminal = terminal
 
 
 @dataclass
@@ -766,7 +773,9 @@ def _multiline_prompt_injection_line(
         budget.check_runtime()
         remaining = transitive_remaining_seconds(budget.state)
         timeout = _MULTILINE_PROMPT_PATTERN_SECONDS
+        terminal_timeout = False
         if remaining is not None:
+            terminal_timeout = remaining <= timeout
             timeout = min(timeout, max(0.0, remaining))
         started_at = time.monotonic()
         reconstruction_index = 0
@@ -802,6 +811,7 @@ def _multiline_prompt_injection_line(
                     "observed_seconds": max(0.0, time.monotonic() - started_at),
                     "limit_seconds": timeout,
                 },
+                terminal=terminal_timeout,
             ) from exc
     return get_line_number(content, first_offset) if first_offset is not None else None
 
@@ -1126,7 +1136,8 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         emitted_ids = [finding.finding_id for finding in path_findings]
         if resource_limit is not None:
             event = _partial_limit_event(path, resource_limit, emitted_ids)
-            terminal_limit = resource_limit
+            if resource_limit.terminal:
+                terminal_limit = resource_limit
         else:
             event = ledger_event(
                 analyzer_id=ANALYZER_ID,

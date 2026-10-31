@@ -22,8 +22,10 @@ Detects supply-chain rug-pull risks in agent skills:
 
 from __future__ import annotations
 
+import json
 import re
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from skillspector.inspection_ledger import (
@@ -139,6 +141,7 @@ _RP1_DOCKER_CMD = re.compile(
 )
 
 _VERSION_PIN_RE = re.compile(r"@[\d.]+\b|==[\d.]+|:[\d.]+|@sha256:")
+_JSON_KEY_SEPARATOR = re.compile(r"[ \t\r\n]*:")
 
 # RP2: Manifest-permission pre-staging
 _PERMISSION_EXPANSION_PATTERNS = [
@@ -205,6 +208,113 @@ def _get_parameters_map(
 # ---------------------------------------------------------------------------
 
 
+def _operand_has_version_pin(line_remainder: str) -> bool:
+    """Return whether a version pin is attached to the matched package operand.
+
+    Only the operand's own token counts, so a version on a later argument or on a
+    neighboring command on the same line does not pin this package.
+    """
+    operand_suffix = re.split(r"\s", line_remainder, maxsplit=1)[0]
+    return _VERSION_PIN_RE.search(operand_suffix) is not None
+
+
+class _ConfigObject(dict[str, object]):
+    """Keep source members alongside JSON's last-key-wins object values."""
+
+    def __init__(self, pairs: list[tuple[str, object]]) -> None:
+        super().__init__(pairs)
+        self.pairs = pairs
+        self.last_key_indices = {key: index for index, (key, _) in enumerate(pairs)}
+
+
+def _iter_json_key_positions(content: str, budget: _RugPullBudget, path: str) -> Iterator[int]:
+    """Locate keys in validated JSON, skipping entire decoded string tokens."""
+    decoder = json.JSONDecoder()
+    cursor = 0
+    while (start := content.find('"', cursor)) != -1:
+        budget.check_runtime(path)
+        _, cursor = decoder.raw_decode(content, start)
+        if _JSON_KEY_SEPARATOR.match(content, cursor) is not None:
+            yield start
+
+
+def _iter_config_commands(
+    config: object, budget: _RugPullBudget, path: str, content: str
+) -> Iterator[tuple[str, int]]:
+    """Yield JSON command lines with the line of each command key."""
+    key_positions = _iter_json_key_positions(content, budget, path)
+    pending = [(iter(((0, (None, config)),)), None, True)]
+    while pending:
+        budget.check_runtime(path)
+        items, owner, active = pending[-1]
+        try:
+            index, (key, item) = next(items)
+        except StopIteration:
+            pending.pop()
+            continue
+
+        selected = active
+        key_position = 0
+        if owner is not None:
+            key_position = next(key_positions)
+            selected = active and owner.last_key_indices[key] == index
+
+        if selected and key == "command" and owner is not None:
+            args = owner.get("args")
+            if (
+                isinstance(item, str)
+                and isinstance(args, list)
+                and all(isinstance(argument, str) for argument in args)
+            ):
+                yield " ".join([item, *args]), _find_line(content, key_position)
+
+        # Shadowed members still consume their source keys, but cannot emit findings.
+        if isinstance(item, _ConfigObject):
+            pending.append((iter(enumerate(item.pairs)), item, selected))
+        elif isinstance(item, list):
+            pending.append((iter(enumerate((None, value) for value in item)), None, selected))
+
+
+def _check_rp1_npx(
+    content: str,
+    file_path: str,
+    budget: _RugPullBudget,
+    line_number: int | None = None,
+) -> None:
+    """Report unpinned npx invocations in text or reconstructed config commands."""
+    for match in _RP1_NPX_CMD.finditer(content):
+        budget.check_runtime(file_path)
+        full_match = match.group(0)
+        line_end = content.find("\n", match.end())
+        if line_end == -1:
+            line_end = len(content)
+        line_remainder = content[match.end() : min(line_end, match.end() + 256)]
+        if _VERSION_PIN_RE.search(full_match) or _operand_has_version_pin(line_remainder):
+            continue
+        budget.emit(
+            Finding(
+                rule_id="RP1",
+                message=(
+                    f"MCP server referenced without pinned version: '{full_match.strip()[:200]}'."
+                ),
+                severity="MEDIUM",
+                confidence=0.70,
+                file=file_path,
+                start_line=line_number or _find_line(content, match.start()),
+                category=_CATEGORY,
+                tags=list(_TAGS),
+                matched_text=full_match[:200],
+                match_fingerprint=compute_match_fingerprint("RP1", full_match),
+                explanation=(
+                    "npx commands without a version suffix (e.g. @1.0.0) "
+                    "create a rug-pull risk if the upstream server is "
+                    "compromised and publishes a malicious update."
+                ),
+                remediation="Pin the version: npx @scope/server@1.2.3",
+            )
+        )
+
+
 def _check_rp1(
     manifest: dict,
     file_cache: dict[str, str],
@@ -213,40 +323,18 @@ def _check_rp1(
     """Detect unpinned MCP server command references in skill files."""
     for file_path, content in file_cache.items():
         budget.check_runtime(file_path)
-        # npx without @version
-        for m in _RP1_NPX_CMD.finditer(content):
-            budget.check_runtime(file_path)
-            full_match = m.group(0)
-            line_end = content.find("\n", m.end())
-            if line_end == -1:
-                line_end = len(content)
-            line_remainder = content[m.end() : min(line_end, m.end() + 256)]
-            if _VERSION_PIN_RE.search(full_match) or _VERSION_PIN_RE.search(line_remainder):
-                continue
-            line_num = _find_line(content, m.start())
-            budget.emit(
-                Finding(
-                    rule_id="RP1",
-                    message=(
-                        "MCP server referenced without pinned version: "
-                        f"'{full_match.strip()[:200]}'."
-                    ),
-                    severity="MEDIUM",
-                    confidence=0.70,
-                    file=file_path,
-                    start_line=line_num,
-                    category=_CATEGORY,
-                    tags=list(_TAGS),
-                    matched_text=full_match[:200],
-                    match_fingerprint=compute_match_fingerprint("RP1", full_match),
-                    explanation=(
-                        "npx commands without a version suffix (e.g. @1.0.0) "
-                        "create a rug-pull risk if the upstream server is "
-                        "compromised and publishes a malicious update."
-                    ),
-                    remediation="Pin the version: npx @scope/server@1.2.3",
-                )
-            )
+        _check_rp1_npx(content, file_path, budget)
+
+        if file_path.lower().endswith(".json"):
+            try:
+                config = json.loads(content, object_pairs_hook=_ConfigObject)
+            except (json.JSONDecodeError, RecursionError):
+                config = None
+            if config is not None:
+                for command_line, command_line_number in _iter_config_commands(
+                    config, budget, file_path, content
+                ):
+                    _check_rp1_npx(command_line, file_path, budget, command_line_number)
 
         # uvx without ==version
         for m in _RP1_UVX_CMD.finditer(content):
@@ -256,7 +344,7 @@ def _check_rp1(
             if line_end == -1:
                 line_end = len(content)
             line_remainder = content[m.end() : min(line_end, m.end() + 256)]
-            if _VERSION_PIN_RE.search(full_match) or _VERSION_PIN_RE.search(line_remainder):
+            if _VERSION_PIN_RE.search(full_match) or _operand_has_version_pin(line_remainder):
                 continue
             line_num = _find_line(content, m.start())
             budget.emit(
@@ -289,7 +377,7 @@ def _check_rp1(
             if line_end == -1:
                 line_end = len(content)
             line_remainder = content[m.end() : min(line_end, m.end() + 256)]
-            if _VERSION_PIN_RE.search(full_match) or _VERSION_PIN_RE.search(line_remainder):
+            if _VERSION_PIN_RE.search(full_match) or _operand_has_version_pin(line_remainder):
                 continue
             pkg = m.group(1)
             if "mcp" not in pkg.lower():

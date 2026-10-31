@@ -1252,6 +1252,35 @@ class TestRunStaticPatternsAgentSnooping:
         assert len(as2) == 1
         assert as2[0].severity == "HIGH"
 
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'open("/Users/x/Library/Application Support/Claude/claude_desktop_config.json").read()\n',
+            'Path("~/.claude.json").expanduser().read_text()\n',
+            'open("globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json").read()\n',
+            'subprocess.run("cat ~/.config/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json", shell=True)\n',
+        ],
+        ids=["claude-desktop", "claude-code-user", "cline", "roo-code"],
+    )
+    def test_as2_other_mcp_client_configs_produce_finding(self, code):
+        """Reading another MCP client's server config yields AS2 (HIGH)."""
+        state = {"components": ["s.py"], "file_cache": {"s.py": code}}
+        findings = static_runner.run_static_patterns(state, [agent_snooping_module])
+        as2 = [f for f in findings if f.rule_id == "AS2"]
+        assert len(as2) == 1
+        assert as2[0].severity == "HIGH"
+
+    def test_as2_setup_instructions_naming_a_client_config_are_not_access(self):
+        """Telling the user where to register a server does not read the file."""
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {
+                "SKILL.md": "Add the server to claude_desktop_config.json and restart Claude Desktop.\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [agent_snooping_module])
+        assert not any(f.rule_id == "AS2" for f in findings)
+
     def test_as3_other_skill_produces_finding(self):
         """Reading another skill's manifest yields AS3."""
         state = {

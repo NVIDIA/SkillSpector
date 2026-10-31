@@ -42,6 +42,22 @@ def openai_http_endpoint(monkeypatch):
                 is_tp4 = response_format.get("json_schema", {}).get("name") == tool_name
             message = {"role": "assistant", "content": json.dumps({"findings": []})}
             finish_reason = "stop"
+            if tools and not is_tp4:
+                message = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_findings",
+                            "type": "function",
+                            "function": {
+                                "name": tools[0]["function"]["name"],
+                                "arguments": json.dumps({"findings": []}),
+                            },
+                        }
+                    ],
+                }
+                finish_reason = "tool_calls"
             if is_tp4:
                 behavior["tp4_calls"] += 1
                 mode = behavior["mode"]
@@ -178,7 +194,13 @@ def test_tp4_real_http_retries_and_deadline_refresh(
         assert "response_format" not in request
         assert "Report your result by calling" not in request["messages"][0]["content"]
     if not complete:
-        assert outcome.failures[0].reason is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        assert outcome.failures[0].reason is (
+            LedgerReason.LLM_RESPONSE_INVALID_TOOL
+            if mode == "refusal" or mode.startswith("multiple-")
+            else LedgerReason.LLM_RESPONSE_INVALID_SCHEMA
+            if mode == "out-of-range"
+            else LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        )
     assert analyzer.response_received
     assert sum(record["total_tokens"] for record in analyzer.inference_usage) == 20 * attempts
 
@@ -247,7 +269,13 @@ async def test_async_real_http_tool_results_use_same_validation(
     assert bool(outcome.successful) is complete
     assert bool(outcome.failures) is not complete
     if not complete:
-        assert outcome.failures[0].reason is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        assert outcome.failures[0].reason is (
+            LedgerReason.LLM_RESPONSE_INVALID_TOOL
+            if mode == "refusal" or mode.startswith("multiple-")
+            else LedgerReason.LLM_RESPONSE_INVALID_SCHEMA
+            if mode == "out-of-range"
+            else LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        )
     assert analyzer.response_received
     assert all("response_format" not in request for request in requests)
 
