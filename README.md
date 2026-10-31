@@ -1011,6 +1011,29 @@ SC4 uses the [OSV.dev](https://osv.dev) API to check dependencies against the fu
 
 The tool requires outbound HTTPS access to `api.osv.dev` for live vulnerability data. When that is not available, findings are limited to the static fallback list.
 
+## Locked npm dependency contents (opt-in)
+
+Use `--inspect-dependencies` to statically inspect exact public npm tarballs from
+`package-lock.json` or `npm-shrinkwrap.json` v2/v3, including recorded transitive,
+development, and optional dependencies:
+
+```bash
+skillspector scan ./my-skill --inspect-dependencies --no-llm --fail-on-incomplete
+```
+
+Artifacts must match their locked SHA-512 integrity hashes. A disposable Linux
+worker inspects supported source files and decoded npm scripts without installing
+packages or executing their code. Dependency findings include package coordinates,
+an artifact digest, and source locations. Missing artifacts, unsupported sources
+or formats, unavailable isolation, and exhausted budgets remain incomplete;
+`--fail-on-incomplete` prevents them from passing the scan. Reports also show when
+inspection was not requested.
+
+This first version supports the public npm registry and Linux x86-64/AArch64
+seccomp isolation. Dependency analysis stays local and uses existing static
+data-exfiltration, privilege-escalation, and supply-chain patterns. See
+[supported content, resource limits, and coverage boundaries](docs/DEPENDENCY_CONTENT_INSPECTION.md).
+
 ## Trust model and data egress
 
 SkillSpector is defense-in-depth, not a sandbox. Know what it does and does not do before relying on it:
