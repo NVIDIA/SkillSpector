@@ -252,12 +252,13 @@ _SHELL_NAME_ARGUMENT_RE = re.compile(r"\bshell\s*=\s*\w+", re.IGNORECASE)
 # while an unmatched ``)`` still closes the call. A quoted string (including
 # a terminated triple-quoted one) and a ``#`` comment are each consumed as one
 # token, so a parenthesis inside them (``"echo :("``, ``# (``) is not counted.
+# A backslash escape, including a line continuation, stays inside its string.
 # An unterminated single-line quote runs to the end of the line, so no
 # character is scanned twice.
 _CALL_ARGUMENT_TOKEN = (
-    r"(?>'''(?:[^'\\]|\\.|'(?!''))*'''"
-    r'|"""(?:[^"\\]|\\.|"(?!""))*"""'
-    r"""|'(?:[^'\\\n]|\\.)*'?|"(?:[^"\\\n]|\\.)*"?|#[^\n]*|[^()])"""
+    r"(?>'''(?:[^'\\]|\\[\s\S]|'(?!''))*'''"
+    r'|"""(?:[^"\\]|\\[\s\S]|"(?!""))*"""'
+    r"""|'(?:[^'\\\n]|\\[\s\S])*'?|"(?:[^"\\\n]|\\[\s\S])*"?|#[^\n]*|[^()])"""
 )
 _CALL_ARGUMENTS_PREFIX = (
     rf"(?:{_CALL_ARGUMENT_TOKEN}|\((?:{_CALL_ARGUMENT_TOKEN}|\({_CALL_ARGUMENT_TOKEN}*\))*\))*"
