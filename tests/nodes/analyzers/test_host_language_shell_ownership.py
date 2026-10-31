@@ -510,8 +510,8 @@ def test_constant_field_proof_respects_bundled_standard_library_override() -> No
     assert checked == ["urllib"]
 
 
-def _constant_cutoff_source(layout: str, suffix: str, *, field_count: int = 600) -> str:
-    field = "{LONG_CONSTANT_NAME}"
+def _constant_cutoff_source(layout: str, suffix: str, *, field_count: int = 350) -> str:
+    field = "{VERY_LONG_CONSTANT_NAME}"
     if layout in {"single", "boundary"}:
         # Short continued lines bound offset work. Align the raw window with
         # a complete field, so an accidentally cut brace cannot mask the bug.
@@ -521,16 +521,20 @@ def _constant_cutoff_source(layout: str, suffix: str, *, field_count: int = 600)
             field_count = (tm._ROOT_GLOB_COMMAND_CHARS + 1 - len(padding)) // len(unit)
         literals = ['f"$TOOL' + padding + unit * field_count + '"']
     else:
-        literals = ['f"$TOOL "'] + [f'f"{field}"'] * field_count
+        # Keep the opening Python quote away from the shell candidate so it
+        # cannot independently bound the command as a short quoted wrapper.
+        literals = ['f"message: $TOOL "'] + [f'f"{field}"'] * field_count
     if suffix == "operands":
         literals.append('" -rf /"')
         extension = ""
     else:
         extension = suffix
-    joiner = " +\n        " if layout == "plus" else "\n        "
+    joiner = "\n        "
+    if layout in {"implicit", "plus"}:
+        joiner = (" +" if layout == "plus" else " ") + "\\\n        "
     return (
         _OPTION_TEXT
-        + 'LONG_CONSTANT_NAME = "x"\n'
+        + 'VERY_LONG_CONSTANT_NAME = "x"\n'
         + "def message(detail):\n    return (\n        "
         + joiner.join(literals)
         + "\n    )"
