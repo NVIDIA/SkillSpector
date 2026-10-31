@@ -65,6 +65,15 @@ class LedgerReason(StrEnum):
     SYNTAX_ERROR = "syntax_error"
     LLM_BATCH_FAILED = "llm_batch_failed"
     LLM_STRUCTURED_RESPONSE_INVALID = "llm_structured_response_invalid"
+    LLM_RESPONSE_REFUSED = "llm_response_refused"
+    LLM_RESPONSE_TRUNCATED = "llm_response_truncated"
+    LLM_RESPONSE_INCOMPLETE = "llm_response_incomplete"
+    LLM_RESPONSE_MISSING_FIELDS = "llm_response_missing_fields"
+    LLM_RESPONSE_INVALID_TOOL = "llm_response_invalid_tool"
+    LLM_RESPONSE_INVALID_SCHEMA = "llm_response_invalid_schema"
+    LLM_RESPONSE_EMPTY = "llm_response_empty"
+    LLM_RESPONSE_LIMIT = "llm_response_limit"
+    LLM_FORMAT_CHANGED = "llm_format_changed"
     LLM_CONNECTION_RETRIES_EXHAUSTED = "llm_connection_retries_exhausted"
     ANALYZER_RUNTIME_ERROR = "analyzer_runtime_error"
     ANALYZER_LOAD_ERROR = "analyzer_load_error"
@@ -101,6 +110,7 @@ class LedgerReason(StrEnum):
     REFERENCE_MISSING = "reference_missing"
     REFERENCE_UNRESOLVED = "reference_unresolved"
     MANIFEST_PARSE_ERROR = "manifest_parse_error"
+    DEPENDENCY_PARSE_ERROR = "dependency_parse_error"
     MANIFEST_PARSE_LIMIT = "manifest_parse_limit"
     ARTIFACT_COUNT_LIMIT = "artifact_count_limit"
     TRAVERSAL_DEPTH_LIMIT = "traversal_depth_limit"
@@ -137,8 +147,17 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.SYNTAX_ERROR: "Python source could not be parsed.",
     LedgerReason.LLM_BATCH_FAILED: "LLM analysis failed for this file range.",
     LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
-        "LLM returned a malformed structured response after bounded retries."
+        "LLM response could not be validated after bounded recovery."
     ),
+    LedgerReason.LLM_RESPONSE_REFUSED: "The model declined to complete this assessment.",
+    LedgerReason.LLM_RESPONSE_TRUNCATED: "The model's answer was cut short by its output limit.",
+    LedgerReason.LLM_RESPONSE_INCOMPLETE: "The model did not finish this assessment.",
+    LedgerReason.LLM_RESPONSE_MISSING_FIELDS: "The model's assessment omitted required information.",
+    LedgerReason.LLM_RESPONSE_INVALID_TOOL: "The model returned missing, unexpected, or ambiguous tool calls.",
+    LedgerReason.LLM_RESPONSE_INVALID_SCHEMA: "The model's assessment contained invalid field values.",
+    LedgerReason.LLM_RESPONSE_EMPTY: "The model returned no assessment.",
+    LedgerReason.LLM_RESPONSE_LIMIT: "The model's response exceeded processing or formatting limits.",
+    LedgerReason.LLM_FORMAT_CHANGED: "Formatting could not preserve the complete original assessment.",
     LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: (
         "Transient LLM provider failure persisted after bounded retries."
     ),
@@ -217,6 +236,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.MANIFEST_PARSE_ERROR: (
         "Manifest frontmatter is malformed or uses an unsupported value shape."
     ),
+    LedgerReason.DEPENDENCY_PARSE_ERROR: (
+        "Dependency metadata could not be parsed into supported registry coordinates."
+    ),
     LedgerReason.MANIFEST_PARSE_LIMIT: (
         "Manifest frontmatter could not be completely examined within its resource limits."
     ),
@@ -250,7 +272,19 @@ def outcome_for_llm_batch_failure(reason: LedgerReason) -> LedgerOutcome:
     """Return the terminal ledger outcome for an exhausted LLM batch."""
     return (
         LedgerOutcome.SKIPPED
-        if reason is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        if reason
+        in {
+            LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+            LedgerReason.LLM_RESPONSE_REFUSED,
+            LedgerReason.LLM_RESPONSE_TRUNCATED,
+            LedgerReason.LLM_RESPONSE_INCOMPLETE,
+            LedgerReason.LLM_RESPONSE_MISSING_FIELDS,
+            LedgerReason.LLM_RESPONSE_INVALID_TOOL,
+            LedgerReason.LLM_RESPONSE_INVALID_SCHEMA,
+            LedgerReason.LLM_RESPONSE_EMPTY,
+            LedgerReason.LLM_RESPONSE_LIMIT,
+            LedgerReason.LLM_FORMAT_CHANGED,
+        }
         else LedgerOutcome.FAILED
     )
 

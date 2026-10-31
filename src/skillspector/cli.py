@@ -60,7 +60,12 @@ from skillspector.inspection_ledger import (
 from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
 from skillspector.models import OCCURRENCE_FINDING_ID_KEY, Finding
-from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
+from skillspector.multi_skill import (
+    MultiSkillDetectionResult,
+    SkillDirectory,
+    _manifest_file,
+    detect_skills,
+)
 from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
 from skillspector.nodes.report import report, risk_severity_and_recommendation
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
@@ -348,12 +353,11 @@ def _result_body(result: dict) -> str:
 
 def _validate_report_destination(input_path: Path, output: Path | None) -> None:
     """Reject reports that would overwrite an input, including path aliases."""
-    if (
-        output is not None
-        and input_path.is_file()
-        and output.exists()
-        and output.samefile(input_path)
-    ):
+    if output is None:
+        return
+    if input_path.is_dir():
+        input_path = _manifest_file(input_path) or input_path
+    if input_path.is_file() and output.exists() and output.samefile(input_path):
         raise ValueError("--output points to the input file. Choose a different output path.")
 
 
@@ -2753,6 +2757,13 @@ def _scan_multi_skill(
     if yara_dir is None and isinstance(legacy_kwargs.get("yara_rules_dir"), Path):
         yara_dir = str(legacy_kwargs["yara_rules_dir"])
     skills = detection.skills
+    # Check every discovered input before scan budgets can omit a child.
+    try:
+        for skill in skills:
+            _validate_report_destination(skill.primary_path or skill.path, output)
+    except (OSError, ValueError) as exc:
+        err_console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
     progress_console = (
         err_console if output is None and format is not FormatChoice.terminal else console
     )
@@ -3277,6 +3288,7 @@ def baseline(
         to_stdout = str(output) == "-"
         if not to_stdout:
             require_secure_file_output()
+            _validate_report_destination(Path(input_path.strip()), output)
         if verbose:
             set_level("DEBUG")
             err_console.print("[dim]Scanning to build baseline...[/dim]")

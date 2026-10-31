@@ -64,6 +64,99 @@ _CASES = [
 ]
 
 
+_NESTED_SHELL_QUOTES = 'echo "entry: $item => $(readlink -f "$item")"\n'
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~"])
+@pytest.mark.parametrize("language", ["bash", "sh", "shell"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_closed_shell_fence_owns_nested_quotes(fence: str, language: str, newline: str) -> None:
+    content = (
+        f"## Reader\n\n{fence}{language}\n" + _NESTED_SHELL_QUOTES + f"{fence}\n\n" + _OBSERVATIONS
+    ).replace("\n", newline)
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+
+    assert result["findings"] == []
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "opening,closing",
+    [
+        ("```", "```"),
+        ("```text", "```"),
+        ("```python", "```"),
+        ("```bash title=example", "```"),
+        ("```bash", ""),
+        ("```bash", "~~~"),
+        ("````bash", "```"),
+        ("\\```bash", "```"),
+        ("```bash", "\\```"),
+        ("- ```bash", "  ```"),
+        ("> ```bash", "> ```"),
+    ],
+)
+def test_unproven_fences_do_not_grant_shell_quote_ownership(opening: str, closing: str) -> None:
+    content = opening + "\n" + _NESTED_SHELL_QUOTES + closing + "\n" + _OBSERVATIONS
+    ranges: list[tuple[int, int]] = []
+
+    projected = tm._markdown_shell_text(content, lambda: None, shell_fence_ranges=ranges)
+
+    assert len(projected) == len(content)
+    assert ranges == []
+
+
+def test_fence_ownership_requires_complete_context_and_preserves_offsets() -> None:
+    prefix = "## Reader\n\n   ```bash\n"
+    content = prefix + _NESTED_SHELL_QUOTES + "   ````\n" + _OBSERVATIONS
+    ranges: list[tuple[int, int]] = []
+    projected = tm._markdown_shell_text(content, lambda: None, shell_fence_ranges=ranges)
+
+    assert ranges == [(len(prefix), len(prefix) + len(_NESTED_SHELL_QUOTES))]
+    start, end = ranges[0]
+    assert projected[start:end] == content[start:end] == _NESTED_SHELL_QUOTES
+    assert len(projected) == len(content)
+
+    ranges.clear()
+    tm._markdown_shell_text(
+        content, lambda: None, complete_context=False, shell_fence_ranges=ranges
+    )
+    assert ranges == []
+
+
+@pytest.mark.parametrize("position", ["before", "inside", "after"])
+@pytest.mark.parametrize("command", ["$CMD -rf /", 'echo "$($CMD -rf /)"', "rm -rf /"])
+def test_shell_fence_quote_ownership_preserves_destructive_checks(
+    position: str, command: str
+) -> None:
+    inside = _NESTED_SHELL_QUOTES + (command + "\n" if position == "inside" else "")
+    content = "```bash\n" + inside + "```\n" + _OBSERVATIONS
+    if position == "before":
+        content = command + "\n" + content
+    elif position == "after":
+        content += command + "\n"
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+
+    if command == "rm -rf /":
+        assert any(finding.rule_id == "TM1" for finding in result["findings"])
+    else:
+        event = result["inspection_ledger"][0]
+        assert event["outcome"] is LedgerOutcome.PARTIAL
+        assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+def test_closed_fence_with_unclosed_shell_quote_stays_partial() -> None:
+    content = '```bash\necho "unfinished\n```\n' + _OBSERVATIONS
+
+    assert tm.has_bounded_parse_exhaustion(content, lambda: None, file_type="markdown")
+
+
 @pytest.mark.parametrize("content", _CASES)
 def test_benign_guide_has_complete_analyzer_coverage(content: str) -> None:
     result = static_runner.run_static_patterns_with_ledger(

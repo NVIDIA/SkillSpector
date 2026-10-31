@@ -2067,6 +2067,7 @@ def _bounded_parse_exhaustion(
         kwargs["python_import_check"] = lambda check: python_import_bounds.allows(
             path, content, check
         )
+        kwargs["python_stdlib_check"] = python_import_bounds.allows_stdlib
     return bool(hook(content, check_runtime, **kwargs))
 
 

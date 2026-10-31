@@ -33,11 +33,30 @@ class PythonImportBounds:
     """A per-scan summary using only the scanner's already materialized files."""
 
     def __init__(self, components: Sequence[str], file_cache: Mapping[str, str]) -> None:
+        self._components = tuple(dict.fromkeys(components))
         self._paths = tuple(
-            dict.fromkeys(path for path in components if path.lower().endswith((".py", ".pyw")))
+            path for path in self._components if path.lower().endswith((".py", ".pyw"))
         )
         self._contents = file_cache
         self._cache: dict[str, tuple[str, bool]] = {}
+        self._stdlib_cache: dict[str, bool] = {}
+
+    def allows_stdlib(self, module: str, check_runtime: Callable[[], None]) -> bool:
+        """Refuse native-library assumptions when bundled files could shadow them."""
+        check_runtime()
+        root = module.split(".", 1)[0].casefold()
+        if root not in self._stdlib_cache:
+            allowed = True
+            for path in self._components:
+                check_runtime()
+                # Include package directories and opaque extension modules;
+                # a missing readable Python body does not prove stdlib origin.
+                parts = path.replace("\\", "/").casefold().split("/")
+                if any(part == root or part.startswith(root + ".") for part in parts):
+                    allowed = False
+                    break
+            self._stdlib_cache[root] = allowed
+        return self._stdlib_cache[root]
 
     def allows(self, path: str, content: str, check_runtime: Callable[[], None]) -> bool:
         """Return a completed import proof; interrupted work is never cached."""
