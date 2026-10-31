@@ -105,25 +105,57 @@ class TestClaudeModelRules:
         assert rejects_sampling_controls(model)
 
     @pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-mythos-5-1"])
-    def test_fable_and_mythos_reject_forced_tool_calls_only(self, model: str) -> None:
+    def test_fable_and_mythos_reject_forced_tool_calls(self, model: str) -> None:
         assert rejects_forced_tool_call(model)
-        assert not rejects_sampling_controls(model)
 
     @pytest.mark.parametrize(
         "model",
         [
+            "claude-mythos-5-1",
+            "claude-mythos-5-1-20260901",
+            "us.anthropic.claude-mythos-5-1",
+            "azure/anthropic/claude-mythos-5-1",
+        ],
+    )
+    def test_mythos_rejects_sampling_controls(self, model: str) -> None:
+        assert rejects_sampling_controls(model)
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-fable-5",
+            "claude-fable-5-1",
             "claude-opus-5",
+            "claude-opus-5-20260901",
             "claude-sonnet-5",
+            "claude-haiku-5-5",
+            "claude-opus-4-7",
             "claude-opus-4-8",
-            "claude-sonnet-4-6",
             "azure/anthropic/claude-opus-5",
-            "claude-opus-5-50",
+            "anthropic.claude-haiku-5-5",
+            "vertex_ai/claude-opus-4-8@20260801",
+        ],
+    )
+    def test_models_documented_to_remove_sampling_parameters(self, model: str) -> None:
+        assert rejects_sampling_controls(model)
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "claude-opus-50",
             "gpt-6.1-sol",
         ],
     )
     def test_other_models_keep_both(self, model: str) -> None:
         assert not rejects_forced_tool_call(model)
         assert not rejects_sampling_controls(model)
+
+    @pytest.mark.parametrize("model", ["claude-opus-5", "claude-sonnet-5", "claude-opus-4-8"])
+    def test_opus_5_sonnet_5_opus_4_8_accept_forced_tool_calls(self, model: str) -> None:
+        assert not rejects_forced_tool_call(model)
 
     @pytest.mark.parametrize(
         ("model", "expected"),
