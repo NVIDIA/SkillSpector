@@ -225,6 +225,26 @@ _PE3_CREDENTIAL_TYPE_FIELD = re.compile(
 _PE3_CREDENTIAL_TYPE_NOUN = re.compile(
     r"access[ \t]+(?:credentials?|secrets?|tokens?)", re.IGNORECASE
 )
+_PE3_CREDENTIAL_TYPE_ADJECTIVE = re.compile(
+    r"(?<![\w-])(?:read-(?:only|write)|open-(?:source|access))(?![\w-])", re.IGNORECASE
+)
+# A field can contain instructions as well as labels. The OAuth action guard
+# below only binds reads to token nouns; disclosures also name credentials and
+# secrets. Check these actions anywhere in the already bounded field value.
+_PE3_CREDENTIAL_TYPE_ACTION = re.compile(
+    r"\b(?:"
+    r"read(?:s|ing)?|open(?:s|ed|ing)?|load(?:s|ed|ing)?|"
+    r"fetch(?:es|ed|ing)?|get(?:s|ting)?|got|grab(?:s|bed|bing)?|"
+    r"retriev(?:e|es|ed|ing)|obtain(?:s|ed|ing)?|collect(?:s|ed|ing)?|"
+    r"stor(?:e|es|ed|ing)|sav(?:e|es|ed|ing)|export(?:s|ed|ing)?|"
+    r"persist(?:s|ed|ing)?|cach(?:e|es|ed|ing)|retain(?:s|ed|ing)?|"
+    r"keep(?:s|ing)?|kept|past(?:e|es|ed|ing)|submit(?:s|ted|ting)?|"
+    r"attach(?:es|ed|ing)?|relay(?:s|ed|ing)?|deliver(?:s|ed|ing)?|"
+    r"put(?:s|ting)?|pass(?:es|ed|ing)?|enter(?:s|ed|ing)?|"
+    r"insert(?:s|ed|ing)?|post(?:s|ed|ing)?|writ(?:e|es|ing|ten)|wrote|"
+    r"shar(?:e|es|ed|ing)|expos(?:e|es|ed|ing)|includ(?:e|es|ed|ing)|stole(?:n)?)\b",
+    re.IGNORECASE,
+)
 _PE3_SAFE_ACCESS_TOKEN_NAVIGATION = re.compile(
     r"(?:^|>|\b(?:navigate|go)\s+to\s+)\s*settings\s*>\s*(?:ci/cd\s*>\s*)?"
     r"(?P<target>access\s+tokens?)\s*[`.)]*\s*$",
@@ -808,8 +828,14 @@ def _is_credential_type_disclosure_label(
     if not field.start("value") <= match.start() < match.end() <= field.end("value"):
         return False
     value = field.group("value")
+    # Keep adjective compounds from becoming read/open actions, including in
+    # the shared guards. Spaces preserve word boundaries and distances, and
+    # these adjective masks cannot remove a sensitive path recognized below.
+    actions = _PE3_CREDENTIAL_TYPE_ADJECTIVE.sub(lambda item: " " * len(item.group(0)), value)
     return not (
-        _PE3_TOKEN_ACTION_CONTEXT.search(value) or _PE3_TOKEN_SENSITIVE_SOURCE.search(value)
+        _PE3_CREDENTIAL_TYPE_ACTION.search(actions)
+        or _PE3_TOKEN_ACTION_CONTEXT.search(actions)
+        or _PE3_TOKEN_SENSITIVE_SOURCE.search(actions)
     )
 
 
