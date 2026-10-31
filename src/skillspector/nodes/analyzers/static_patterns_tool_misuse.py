@@ -45,6 +45,7 @@ from skillspector.javascript_tokens import assertion_template_shell_text
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
+from skillspector.python_string_constants import python_constant_string_fields
 from skillspector.python_tokens import (
     PythonLiteralSpans,
     python_browser_template_shell_text,
@@ -3504,20 +3505,42 @@ def _perl_literal_print_shell_text(
     return "".join(output)
 
 
-def _python_literal_operands(content: str, token: tuple[int, int], start: int, end: int) -> str:
+def _python_literal_operands(
+    content: str,
+    token: tuple[int, int],
+    start: int,
+    end: int,
+    constant_fields: tuple[tuple[int, int, str], ...] = (),
+) -> str:
     """Return string literal body text from ``start`` that a shell reads as operands.
 
-    Code supplies an f-string or t-string replacement field's text at runtime,
-    and that text can hold the recursive and force options. Each field also
-    counts as them, so a root target beside a field stays undecided.
+    Unknown replacement fields can hold recursive and force options. Preserve
+    that uncertainty unless the complete field has a proven plain value.
     """
     text = content[start:end]
     body_start = _python_string_body(content, *token)[0]
     if not {"f", "t"} & set(content[token[0] : body_start].lower()):
         return text
-    return _PYTHON_REPLACEMENT_FIELD_RE.sub(
-        lambda field: field[0] if field[1] is None else " -rf {", text
-    )
+
+    def unknown_fields(value: str) -> str:
+        return _PYTHON_REPLACEMENT_FIELD_RE.sub(
+            lambda field: field[0] if field[1] is None else " -rf {", value
+        )
+
+    pieces: list[str] = []
+    cursor = start
+    index = bisect_left(constant_fields, start, key=lambda field: field[0])
+    while index < len(constant_fields):
+        field_start, field_end, value = constant_fields[index]
+        if field_start >= end:
+            break
+        if field_end <= end:
+            pieces.append(unknown_fields(content[cursor:field_start]))
+            pieces.append(value)
+            cursor = field_end
+        index += 1
+    pieces.append(unknown_fields(content[cursor:end]))
+    return "".join(pieces)
 
 
 class _PythonSourceOwnership:
@@ -3540,13 +3563,16 @@ class _PythonSourceOwnership:
         content: str,
         check_runtime: Callable[[], None],
         python_import_check: Callable[[Callable[[], None]], bool] | None = None,
+        python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
     ) -> None:
         self._python_import_check = python_import_check
+        self._python_stdlib_check = python_stdlib_check
         self._content = content
         self._check_runtime = check_runtime
         self._spans: PythonLiteralSpans | None = None
         self._spans_computed = False
         self._string_value_bounds_allowed: bool | None = None
+        self._constant_fields: tuple[tuple[int, int, str], ...] | None = None
         self._cached_word_start = -1
         self._cached_word_end = -1
 
@@ -3621,6 +3647,10 @@ class _PythonSourceOwnership:
             )
         if not self._string_value_bounds_allowed:
             return None
+        if self._constant_fields is None:
+            self._constant_fields = python_constant_string_fields(
+                content, self._check_runtime, stdlib_check=self._python_stdlib_check
+            )
         body_start, body_end = _python_string_body(content, *owner)
         if start >= body_end:
             return "", 0, 0
@@ -3635,7 +3665,9 @@ class _PythonSourceOwnership:
         limit = word_end + _ROOT_GLOB_COMMAND_CHARS + 1
         pieces = [
             content[origin:word_end],
-            _python_literal_operands(content, owner, word_end, min(body_end, limit)),
+            _python_literal_operands(
+                content, owner, word_end, min(body_end, limit), self._constant_fields
+            ),
         ]
         remaining = limit - body_end
         starts, ends = spans
@@ -3667,7 +3699,9 @@ class _PythonSourceOwnership:
                 literal = (starts[index], ends[index])
                 literal_start, literal_end = _python_string_body(content, *literal)
                 pieces.append(
-                    _python_literal_operands(content, literal, literal_start, literal_end)
+                    _python_literal_operands(
+                        content, literal, literal_start, literal_end, self._constant_fields
+                    )
                 )
                 remaining -= literal_end - literal_start
                 continue
@@ -6149,6 +6183,7 @@ def has_bounded_parse_exhaustion(
     file_type: str = "shell",
     complete_context: bool = True,
     python_import_check: Callable[[Callable[[], None]], bool] | None = None,
+    python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
 ) -> bool:
     """Return whether a destructive rm command exceeded the parser's span contract."""
     exhausted = _has_bounded_parse_exhaustion(
@@ -6157,6 +6192,7 @@ def has_bounded_parse_exhaustion(
         file_type=file_type,
         complete_context=complete_context,
         python_import_check=python_import_check,
+        python_stdlib_check=python_stdlib_check,
     )
     if not exhausted or file_type != "markdown" or not complete_context:
         return exhausted
@@ -6177,6 +6213,7 @@ def _has_bounded_parse_exhaustion(
     file_type: str,
     complete_context: bool = True,
     python_import_check: Callable[[Callable[[], None]], bool] | None = None,
+    python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
     word_apostrophes: bool = False,
 ) -> bool:
     # PowerShell source can invoke another shell with an executable command
@@ -6192,7 +6229,9 @@ def _has_bounded_parse_exhaustion(
     if file_type == "python" and complete_context:
         # Only a complete module can prove Python token ownership. A fragment
         # may begin inside a string and would invert code and literal bytes.
-        python_source = _PythonSourceOwnership(content, check_runtime, python_import_check)
+        python_source = _PythonSourceOwnership(
+            content, check_runtime, python_import_check, python_stdlib_check
+        )
     if file_type == "markdown":
         if complete_context:
             json_strings = validated_json_string_spans(content, check_runtime)

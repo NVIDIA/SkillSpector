@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import threading
 import warnings
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 
-from skillspector import python_tokens
+from skillspector import python_string_constants, python_tokens
 from skillspector.graph import graph
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
@@ -213,6 +213,269 @@ def test_concatenated_fstrings_keep_runtime_operand_ambiguity() -> None:
     # parameter can leave a root path, while a replacement field supplies flags.
     # Concatenation must retain those possible operands even in report strings.
     assert _python(content) is True
+
+
+_CONSTANT_CHECKOUT_SOURCE = """\
+from urllib.parse import urlparse
+from settings import active_branch
+
+REPOSITORY = "https://example.com/tools/widget.git"
+
+def checkout_name(repository):
+    name = urlparse(repository).path.rstrip("/").rsplit("/", 1)[-1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    return name
+
+CHECKOUT = checkout_name(REPOSITORY)
+
+def message():
+    return (
+        f"$TOOL_ROOT, $UPSTREAM_ROOT/{CHECKOUT}, "
+        f"or $HOME/.cache/upstreams/{CHECKOUT} "
+        f"checked out to {active_branch}"
+    )
+"""
+
+
+@pytest.mark.parametrize("repository", ["widget", "widget/", "widget.git", "widget.git/"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_constant_checkout_fstrings_do_not_invent_runtime_options(
+    repository: str, newline: str
+) -> None:
+    source = _CONSTANT_CHECKOUT_SOURCE.replace("tools/widget.git", f"tools/{repository}")
+    # The branch remains unknown; only the checkout component has a fixed value.
+    content = (_OPTION_TEXT + "# Unicode offset: café\n" + source + _TAIL).replace("\n", newline)
+
+    assert _python(content) is False
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        pytest.param(
+            'REPOSITORY = "https://example.com/tools/widget.git"',
+            "REPOSITORY = supplied_repository",
+            id="unknown-url",
+        ),
+        pytest.param(
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            "REPOSITORY = supplied_repository\nCHECKOUT = checkout_name(REPOSITORY)",
+            id="rebound-url",
+        ),
+        pytest.param(
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            "CHECKOUT = checkout_name(REPOSITORY)\nCHECKOUT = supplied_checkout",
+            id="rebound-result",
+        ),
+        pytest.param(
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            "CHECKOUT = checkout_name(REPOSITORY)\ndel CHECKOUT",
+            id="deleted-result",
+        ),
+        pytest.param("def message():", "def message(CHECKOUT):", id="parameter-shadow"),
+        pytest.param(
+            "def message():",
+            "def message():\n    CHECKOUT = supplied_checkout",
+            id="local-shadow",
+        ),
+        pytest.param(
+            "def message():",
+            "def message():\n    global CHECKOUT\n    CHECKOUT = supplied_checkout",
+            id="global-write",
+        ),
+        pytest.param(
+            "def checkout_name(repository):",
+            "urlparse = external\n\ndef checkout_name(repository):",
+            id="rebound-import",
+        ),
+        pytest.param(
+            "def checkout_name(repository):",
+            "external(urlparse)\n\ndef checkout_name(repository):",
+            id="escaped-import",
+        ),
+        pytest.param(
+            "def checkout_name(repository):",
+            "@external\ndef checkout_name(repository):",
+            id="decorated-helper",
+        ),
+        pytest.param(
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            "checkout_name = external\nCHECKOUT = checkout_name(REPOSITORY)",
+            id="rebound-helper",
+        ),
+        pytest.param(
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            "external(checkout_name)\nCHECKOUT = checkout_name(REPOSITORY)",
+            id="escaped-helper",
+        ),
+        pytest.param(
+            "    return name",
+            "    return checkout_name(repository)",
+            id="recursive-helper",
+        ),
+        pytest.param(
+            "def message():",
+            'globals()["CHECKOUT"] = supplied_checkout\n\ndef message():',
+            id="reflective-write",
+        ),
+        pytest.param(
+            "from urllib.parse import urlparse",
+            'import sys\nsys.modules["urllib.parse"] = external\nfrom urllib.parse import urlparse',
+            id="import-registry-write",
+        ),
+        pytest.param(
+            "from urllib.parse import urlparse",
+            "import sys\nsys.meta_path.insert(0, external)\nfrom urllib.parse import urlparse",
+            id="import-meta-hook",
+        ),
+        pytest.param(
+            "from urllib.parse import urlparse",
+            "import sys\nsys.path_hooks.append(external)\nfrom urllib.parse import urlparse",
+            id="import-path-hook",
+        ),
+        pytest.param(
+            "from urllib.parse import urlparse",
+            'import sys\nsys.path_importer_cache["."] = external\nfrom urllib.parse import urlparse',
+            id="import-cache-write",
+        ),
+        pytest.param(
+            "from urllib.parse import urlparse",
+            '__builtins__["__import__"] = external\nfrom urllib.parse import urlparse',
+            id="builtin-loader-write",
+        ),
+        pytest.param(
+            "def checkout_name(repository):",
+            "def unrelated(urlparse=external(urlparse)):\n    pass\n\ndef checkout_name(repository):",
+            id="import-escape-in-shadowing-default",
+        ),
+        pytest.param(
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            "def unrelated(checkout_name=external(checkout_name)):\n    pass\n"
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            id="helper-escape-in-shadowing-default",
+        ),
+        pytest.param(
+            "def checkout_name(repository):",
+            "def unrelated(urlparse: external(urlparse)):\n    pass\n\ndef checkout_name(repository):",
+            id="import-escape-in-shadowing-annotation",
+        ),
+        pytest.param(
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            "def unrelated(checkout_name: external(checkout_name)):\n    pass\n"
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            id="helper-escape-in-shadowing-annotation",
+        ),
+    ],
+)
+def test_constant_checkout_proof_rejects_unknown_or_changed_bindings(
+    before: str, after: str
+) -> None:
+    assert before in _CONSTANT_CHECKOUT_SOURCE
+    source = _CONSTANT_CHECKOUT_SOURCE.replace(before, after, 1)
+
+    assert _python(_OPTION_TEXT + source + _TAIL) is True
+
+
+@pytest.mark.parametrize("field", ["CHECKOUT!r", "CHECKOUT:>20", "CHECKOUT:{width}"])
+def test_constant_checkout_proof_keeps_unmodeled_field_formatting_partial(field: str) -> None:
+    source = _CONSTANT_CHECKOUT_SOURCE.replace("{CHECKOUT}", "{" + field + "}")
+
+    assert _python(_OPTION_TEXT + source + _TAIL) is True
+
+
+@pytest.mark.parametrize("extension", [" % detail", ".format(detail)", "[0:]", " + detail"])
+def test_constant_checkout_proof_keeps_extended_string_values_partial(extension: str) -> None:
+    source = _CONSTANT_CHECKOUT_SOURCE.replace("    )\n", "    )" + extension + "\n")
+
+    assert _python(_OPTION_TEXT + source + _TAIL) is True
+
+
+@pytest.mark.parametrize(
+    "bindings,body",
+    [
+        pytest.param('OPTIONS = "-rf"\n', 'f"$TOOL {OPTIONS} /"', id="literal-options"),
+        pytest.param('OPTIONS = "-rf /"\n', 'f"$TOOL {OPTIONS}"', id="literal-root-options"),
+        pytest.param('CHECKOUT = ""\n', 'f"$TOOL /{CHECKOUT} {options}"', id="empty-component"),
+    ],
+)
+def test_constant_fields_do_not_hide_root_operands(bindings: str, body: str) -> None:
+    source = bindings + "def message(options):\n    return " + body + "\n"
+
+    assert _python(_OPTION_TEXT + source + _TAIL) is True
+
+
+def test_constant_checkout_proof_preserves_real_shell_findings() -> None:
+    source = (
+        _OPTION_TEXT
+        + _CONSTANT_CHECKOUT_SOURCE
+        + '\nimport subprocess\nsubprocess.run("rm -rf /", shell=True)\n'
+        + _TAIL
+    )
+
+    assert _python(source) is True
+    result = _ledger("scripts/report.py", source)
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_constant_field_spans_exclude_literal_braces_and_format_specs(newline: str) -> None:
+    content = (
+        "# Unicode offset: café\n"
+        + _CONSTANT_CHECKOUT_SOURCE.replace('f"$TOOL_ROOT', 'f"café $TOOL_ROOT')
+        + 'LITERAL = "{CHECKOUT}"\n'
+        + 'ESCAPED = f"{{CHECKOUT}}"\n'
+        + 'NESTED = f"{unknown:{CHECKOUT}}"\n'
+        + "LAMBDA = f\"{(lambda: f'{CHECKOUT},')()}\"\n"
+        + 'DEBUG = f"{CHECKOUT=}"\n'
+    ).replace("\n", newline)
+
+    fields = python_string_constants.python_constant_string_fields(content, lambda: None)
+
+    assert [(content[start:end], value) for start, end, value in fields] == [
+        ("{CHECKOUT}", "widget"),
+        ("{CHECKOUT}", "widget"),
+    ]
+    first = content.index("{CHECKOUT}")
+    second = content.index("{CHECKOUT}", first + 1)
+    assert [start for start, _, _ in fields] == [first, second]
+
+
+def test_constant_field_proof_bounds_total_output_and_honors_cancellation() -> None:
+    content = 'VALUE = "' + "x" * 4096 + '"\n' + 'f"{VALUE}"\n' * 9
+
+    assert python_string_constants.python_constant_string_fields(content, lambda: None) == ()
+
+    checks = 0
+
+    def cancel() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 4:
+            raise TimeoutError("constant fields deadline")
+
+    with pytest.raises(TimeoutError, match="constant fields deadline"):
+        python_string_constants.python_constant_string_fields(
+            _CONSTANT_CHECKOUT_SOURCE + _TAIL, cancel
+        )
+    assert checks == 4
+
+
+def test_constant_field_proof_respects_bundled_standard_library_override() -> None:
+    checked = []
+
+    def bundled_override(module: str, check_runtime: Callable[[], None]) -> bool:
+        checked.append(module)
+        check_runtime()
+        return False
+
+    assert (
+        python_string_constants.python_constant_string_fields(
+            _CONSTANT_CHECKOUT_SOURCE, lambda: None, stdlib_check=bundled_override
+        )
+        == ()
+    )
+    assert checked == ["urllib"]
 
 
 @pytest.mark.parametrize("target,partial", [("/", True), ("build", False)])
