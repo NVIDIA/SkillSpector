@@ -3713,6 +3713,10 @@ class _PythonSourceOwnership:
             if operator in _PYTHON_STRING_EXTENSION_OPERATORS:
                 return None
             break
+        if remaining <= 0 and self._constant_fields:
+            # Constant replacement can shorten the projected text. Reaching
+            # the source bound cannot prove that later operands are absent.
+            return None
         return "".join(pieces), word_start - origin, word_end - origin
 
     def word_end(self, start: int) -> int:

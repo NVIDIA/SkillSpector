@@ -510,6 +510,75 @@ def test_constant_field_proof_respects_bundled_standard_library_override() -> No
     assert checked == ["urllib"]
 
 
+def _constant_cutoff_source(layout: str, suffix: str, *, field_count: int = 600) -> str:
+    field = "{LONG_CONSTANT_NAME}"
+    if layout in {"single", "boundary"}:
+        # Short continued lines bound offset work. Align the raw window with
+        # a complete field, so an accidentally cut brace cannot mask the bug.
+        unit = field + "\\\n"
+        padding = " " * ((tm._ROOT_GLOB_COMMAND_CHARS + 1) % len(unit))
+        if layout == "boundary":
+            field_count = (tm._ROOT_GLOB_COMMAND_CHARS + 1 - len(padding)) // len(unit)
+        literals = ['f"$TOOL' + padding + unit * field_count + '"']
+    else:
+        literals = ['f"$TOOL "'] + [f'f"{field}"'] * field_count
+    if suffix == "operands":
+        literals.append('" -rf /"')
+        extension = ""
+    else:
+        extension = suffix
+    joiner = " +\n        " if layout == "plus" else "\n        "
+    return (
+        _OPTION_TEXT
+        + 'LONG_CONSTANT_NAME = "x"\n'
+        + "def message(detail):\n    return (\n        "
+        + joiner.join(literals)
+        + "\n    )"
+        + extension
+        + "\n"
+        + _TAIL
+    )
+
+
+@pytest.mark.parametrize(
+    "layout,suffix",
+    [
+        pytest.param("single", "operands", id="initial-literal"),
+        pytest.param("boundary", "operands", id="exact-source-boundary"),
+        pytest.param("implicit", "operands", id="implicit-literals"),
+        pytest.param("plus", "operands", id="plus-literals"),
+        pytest.param("single", ".format(detail)", id="initial-late-format"),
+        pytest.param("implicit", ".format(detail)", id="implicit-late-format"),
+        pytest.param("plus", " % detail", id="late-percent"),
+        pytest.param("plus", " + detail", id="late-unknown-concatenation"),
+    ],
+)
+def test_constant_field_shrinkage_cannot_hide_operand_window_cutoff(
+    layout: str, suffix: str
+) -> None:
+    source = _constant_cutoff_source(layout, suffix)
+    start = source.index("$TOOL")
+    fields = python_string_constants.python_constant_string_fields(source, lambda: None)
+    assert len(fields) >= 300
+    assert {value for _, _, value in fields} == {"x"}
+    ownership = tm._PythonSourceOwnership(source, lambda: None)
+
+    assert ownership.string_value(start, start + len("$TOOL")) is None
+    assert _python(source) is True
+
+
+@pytest.mark.parametrize("layout", ["single", "implicit", "plus"])
+def test_constant_field_shrinkage_within_operand_window_stays_complete(layout: str) -> None:
+    source = _constant_cutoff_source(layout, "", field_count=16)
+    start = source.index("$TOOL")
+    fields = python_string_constants.python_constant_string_fields(source, lambda: None)
+    assert len(fields) == 16
+    ownership = tm._PythonSourceOwnership(source, lambda: None)
+
+    assert ownership.string_value(start, start + len("$TOOL")) is not None
+    assert _python(source) is False
+
+
 @pytest.mark.parametrize("target,partial", [("/", True), ("build", False)])
 @pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
 @pytest.mark.parametrize("leading", ["", "\n"], ids=["body-start", "next-line"])
