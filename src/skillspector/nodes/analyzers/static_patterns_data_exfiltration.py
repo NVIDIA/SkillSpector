@@ -29,9 +29,11 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
 from .common import (
+    CHINESE_GAP,
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
     apply_import_aliases,
+    chinese_spaced,
     get_context,
     get_context_from_lines,
     get_line_number,
@@ -146,6 +148,38 @@ E4_PATTERNS = [
     (
         r"(?:always\s+)?include\s+(?:the\s+)?(?:full\s+)?(?:conversation|context)\s+(?:when|in)\s+(?:calling|making)\s+(?:external|api)",
         0.8,
+    ),
+    # Chinese-language equivalents (issue #953). The secrecy-only phrase
+    # "do not tell the user" never matches on its own; it matches only
+    # combined with a send verb in the same paragraph.
+    (
+        f"(?:{chinese_spaced('把')}|{chinese_spaced('将')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('对话')}|{chinese_spaced('對話')}|{chinese_spaced('聊天')}|{chinese_spaced('会话')}|{chinese_spaced('會話')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('历史')}|{chinese_spaced('歷史')}|{chinese_spaced('记录')}|{chinese_spaced('記錄')}|{chinese_spaced('内容')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('发送')}|{chinese_spaced('發送')}|{chinese_spaced('传输')}|{chinese_spaced('傳輸')}|{chinese_spaced('上传')}|{chinese_spaced('上傳')}|{chinese_spaced('导出')}|{chinese_spaced('導出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('到')}|{chinese_spaced('给')}|{chinese_spaced('至')})?",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('发送')}|{chinese_spaced('發送')}|{chinese_spaced('传输')}|{chinese_spaced('傳輸')}|{chinese_spaced('上传')}|{chinese_spaced('上傳')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('完整')}|{chinese_spaced('全部')})?{CHINESE_GAP}"
+        f"(?:{chinese_spaced('对话')}|{chinese_spaced('對話')}|{chinese_spaced('聊天')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('历史')}|{chinese_spaced('歷史')}|{chinese_spaced('记录')}|{chinese_spaced('記錄')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('发送')}|{chinese_spaced('發送')}|{chinese_spaced('传输')}|{chinese_spaced('傳輸')}|{chinese_spaced('上传')}|{chinese_spaced('上傳')}){CHINESE_GAP}"
+        f"[^。\n]{{0,40}}?(?:{chinese_spaced('不要')}|{chinese_spaced('请勿')}|{chinese_spaced('不得')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('告诉')}|{chinese_spaced('告訴')}|{chinese_spaced('通知')}|{chinese_spaced('告知')}){CHINESE_GAP}"
+        f"{chinese_spaced('用户')}",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('不要')}|{chinese_spaced('请勿')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('告诉')}|{chinese_spaced('告訴')}|{chinese_spaced('通知')}){CHINESE_GAP}"
+        f"{chinese_spaced('用户')}{CHINESE_GAP}"
+        f"[^。\n]{{0,40}}?(?:{chinese_spaced('发送')}|{chinese_spaced('發送')}|{chinese_spaced('传输')}|{chinese_spaced('傳輸')}|{chinese_spaced('上传')}|{chinese_spaced('上傳')})",
+        0.85,
     ),
 ]
 # E5: data shipped out via cloud-storage SDKs/CLIs (the cloud counterpart of E1's
