@@ -359,11 +359,32 @@ class TestExcessiveAgency:
             "model: claude-sonnet-4-6",
             "python -m claude_tools",
             "cmd --model custom-local-model",
+            "  -m, --model           Claude model to use (default: claude-3-7-sonnet-20250219)",
+            "```\n  -m, --model  Claude model to use (default: claude-3-7-sonnet-20250219)\n```",
+            "  --model, -m   claude-sonnet-4-6 (default)",
+            "  -m  --model   Claude model to use",
+            "Options for `evaluation.py`\n```\n  -m, --model  Claude model to use\n```",
         ],
     )
     def test_ea5_non_actionable_prose_and_body_keys_are_not_flagged(self, content: str) -> None:
         findings = ea_mod.analyze(content, "SKILL.md", "markdown")
         assert not any(finding.rule_id == "EA5" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "continuation",
+        [
+            pytest.param("\\", id="posix_backslash"),
+            pytest.param("`", id="powershell_backtick"),
+            pytest.param("^", id="cmd_caret"),
+        ],
+    )
+    def test_ea5_option_led_continuation_line_is_still_a_command(self, continuation: str) -> None:
+        content = f"aider {continuation}\n  -v --model claude-3-7-sonnet"
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        ea5 = [finding for finding in findings if finding.rule_id == "EA5"]
+        assert len(ea5) == 1
+        assert ea5[0].severity == Severity.HIGH
+        assert ea5[0].location.start_line == 2
 
     def test_ea5_shell_fence_is_actionable(self) -> None:
         content = "```shell\ncodex exec 'Fix the tests'\n```"
