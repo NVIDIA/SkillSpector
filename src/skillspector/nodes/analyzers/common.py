@@ -34,6 +34,26 @@ LOGICAL_LINE_BREAK = re.compile(r"\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
 LINE_BREAK_CHARS = "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
 MAX_FINDING_CONTEXT_CHARS = 1_000
 
+# Chinese-language static patterns (issue #953). Chinese has no word spaces,
+# so a phrase is matched character by character with only separators allowed
+# between characters: ordinary whitespace, the ideographic space (U+3000),
+# and invisible separators (zero-width and bidi marks, BOM). Full-width
+# punctuation (U+FF0C and friends are covered by the explicit list) and the
+# particle "de" are allowed only between phrase segments, never inside a
+# single word, so a separator cannot join two unrelated clauses into a word.
+CHINESE_SEPARATOR = r"[\s\u3000\u200b-\u200f\ufeff]*"
+CHINESE_GAP = r"[，。、；：！？\s\u3000\u200b-\u200f\ufeff的]*"
+
+
+def chinese_spaced(phrase: str) -> str:
+    """Return a regex fragment matching *phrase* with separators between characters.
+
+    *phrase* must be literal text (no regex metacharacters); every character
+    is escaped and joined with :data:`CHINESE_SEPARATOR`, so "忽略" also
+    matches "忽 略", "忽\u3000略", and "忽\u200b略".
+    """
+    return CHINESE_SEPARATOR.join(re.escape(ch) for ch in phrase)
+
 
 def make_dummy_finding(analyzer_id: str) -> Finding:
     """Create a deterministic dummy finding for a stub analyzer."""
