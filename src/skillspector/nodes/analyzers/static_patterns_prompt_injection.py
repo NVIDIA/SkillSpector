@@ -28,7 +28,13 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import LOGICAL_LINE_BREAK, SourceLocationIndex, get_context
+from .common import (
+    CHINESE_GAP,
+    LOGICAL_LINE_BREAK,
+    SourceLocationIndex,
+    chinese_spaced,
+    get_context,
+)
 from .pattern_defaults import PatternCategory
 from .whitespace_padding import (
     VERTICAL_HIGH_SEVERITY_LINES,
@@ -74,6 +80,56 @@ P1_PATTERNS = [
     (r"your\s+new\s+(?:instructions?|rules?)\s+are", 0.6),
     (r"do\s+not\s+follow\s+(?:any|your|the)\s+(?:rules?|guidelines?)", 0.9),
     (r"you\s+must\s+(?:always\s+)?ignore", 0.7),
+    # Chinese-language equivalents (issue #953). Each phrase keeps its
+    # object noun (instruction, rule) so ordinary prose that merely contains
+    # one of the verbs does not match.
+    (
+        f"{chinese_spaced('忽略')}{CHINESE_GAP}"
+        f"(?:{chinese_spaced('之前')}|{chinese_spaced('以前')}|{chinese_spaced('先前')}|{chinese_spaced('原先')})?"
+        f"{CHINESE_GAP}(?:{chinese_spaced('所有')}|{chinese_spaced('全部')})?"
+        f"{CHINESE_GAP}(?:{chinese_spaced('指令')}|{chinese_spaced('指示')})",
+        0.8,
+    ),
+    (
+        f"(?:{chinese_spaced('不要')}|{chinese_spaced('请勿')}|{chinese_spaced('不得')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('遵守')}|{chinese_spaced('遵循')}|{chinese_spaced('服从')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('用户')}{CHINESE_GAP}{chinese_spaced('给出')}{CHINESE_GAP})?"
+        f"(?:{chinese_spaced('任何')}|{chinese_spaced('所有')}|{chinese_spaced('全部')})?"
+        f"{CHINESE_GAP}(?:{chinese_spaced('规则')}|{chinese_spaced('規則')}|{chinese_spaced('指令')}|{chinese_spaced('指示')})",
+        0.9,
+    ),
+    (
+        f"(?:{chinese_spaced('忘记')}|{chinese_spaced('忘掉')}|{chinese_spaced('抛弃')}|{chinese_spaced('放弃')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('之前')}|{chinese_spaced('以前')}|{chinese_spaced('先前')})?"
+        f"{CHINESE_GAP}(?:{chinese_spaced('所有')}|{chinese_spaced('全部')})?"
+        f"{CHINESE_GAP}(?:{chinese_spaced('指令')}|{chinese_spaced('指示')})",
+        0.8,
+    ),
+    (
+        f"(?:{chinese_spaced('无视')}|{chinese_spaced('不理会')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('所有')}|{chinese_spaced('全部')})?"
+        f"{CHINESE_GAP}(?:{chinese_spaced('指令')}|{chinese_spaced('指示')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
+        0.85,
+    ),
+    (
+        f"{chinese_spaced('不再')}{CHINESE_GAP}{chinese_spaced('遵守')}{CHINESE_GAP}"
+        f"(?:{chinese_spaced('所有')}|{chinese_spaced('任何')})?"
+        f"{CHINESE_GAP}(?:{chinese_spaced('规则')}|{chinese_spaced('規則')}|{chinese_spaced('指令')})",
+        0.85,
+    ),
+    (
+        f"{chinese_spaced('绕过')}{CHINESE_GAP}"
+        f"(?:{chinese_spaced('所有')}|{chinese_spaced('全部')})?"
+        f"{CHINESE_GAP}(?:{chinese_spaced('安全')})?"
+        f"{CHINESE_GAP}(?:{chinese_spaced('限制')}|{chinese_spaced('约束')}|{chinese_spaced('防护')}|{chinese_spaced('检查')})",
+        0.9,
+    ),
+    (
+        f"(?:{chinese_spaced('推翻')}|{chinese_spaced('覆盖')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('系统')}|{chinese_spaced('系統')}|{chinese_spaced('安全')})?"
+        f"{CHINESE_GAP}(?:{chinese_spaced('指令')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
+        0.85,
+    ),
 ]
 # P2: Hidden Instructions. Build the character class from the shared P9
 # constant so hidden-instruction and padding detection cannot drift apart.
