@@ -100,6 +100,65 @@ def test_unclosed_quote_cannot_cross_a_markdown_fence():
 
 
 @pytest.mark.parametrize(
+    "fence,literal",
+    [
+        ("```", "~~~"),
+        ("~~~", "```"),
+        ("````", "```"),
+        ("~~~~", "~~~"),
+        ("```", "```literal"),
+        ("```", "    ```"),
+    ],
+)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("list_item", [False, True, "nested", "lazy"])
+def test_literal_fence_in_multiline_argument_keeps_the_unsafe_option(
+    fence, literal, newline, quote, list_item
+):
+    source = newline.join(
+        [
+            fence + "sh",
+            "curl --data " + quote + "first",
+            literal,
+            "second" + quote + " --insecure https://example.com",
+            fence,
+            "",
+        ]
+    )
+    if list_item:
+        prefix = (
+            "- examples:" + newline + "  - nested" + newline * 2 + "  Parent content." + newline * 2
+            if list_item == "nested"
+            else "- examples:" + newline + "lazy paragraph continuation" + newline * 2
+            if list_item == "lazy"
+            else "- examples:" + newline * 2
+        )
+        source = prefix + "".join("    " + line for line in source.splitlines(keepends=True))
+    findings = tm1(source)
+    assert len(findings) == 1
+    assert findings[0].location.start_line == (
+        7 if list_item == "nested" else 5 if list_item == "lazy" else 4 if list_item else 2
+    )
+    assert "--insecure" in findings[0].matched_text
+
+
+@pytest.mark.parametrize(
+    "command,option",
+    [("curl https://example.com/a", "--insecure"), ("git push origin topic", "--force")],
+)
+@pytest.mark.parametrize("literal", [";", "&"])
+@pytest.mark.parametrize("escape", ["`", "\\"])
+def test_escaped_separator_keeps_the_unsafe_option(command, option, literal, escape):
+    suffix = "b" if command.startswith("curl") else "suffix"
+    source = f"```powershell\n{command}{escape}{literal}{suffix} {option}\n```\n"
+    findings = tm1(source)
+    assert len(findings) == 1
+    assert findings[0].location.start_line == 2
+    assert option in findings[0].matched_text
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "Run `curl https://example.com`\nExplain --insecure here.",
@@ -111,9 +170,50 @@ def test_literal_argument_text_does_not_open_a_multiline_command(source):
     assert not tm1(source)
 
 
-def test_list_indented_fences_keep_their_command_locations():
-    source = '- examples:\n\n    ```sh\n    git push "topic\n    ```\n\n    ```sh\n    git push --force origin topic\n    ```\n'
-    assert {f.location.start_line for f in tm1(source)} == {8}
+@pytest.mark.parametrize("indent", ["  ", "   ", "    ", "     "])
+@pytest.mark.parametrize(
+    "prefix,expected_line",
+    [
+        ("- examples:\n\n", 8),
+        ("- examples:\n  - nested\n\n  Parent content.\n\n", 11),
+        ("- examples:\nlazy paragraph continuation\n\n", 9),
+    ],
+)
+def test_list_indented_fences_keep_their_command_locations(indent, prefix, expected_line):
+    source = prefix + "\n".join(
+        indent + line
+        for line in [
+            "```sh",
+            'git push "topic',
+            "```",
+            "",
+            "```sh",
+            "git push --force origin topic",
+            "```",
+            "",
+        ]
+    )
+    assert {f.location.start_line for f in tm1(source)} == {expected_line}
+
+
+def test_deeply_nested_list_fences_keep_their_command_locations():
+    source = '- first:\n  - second:\n    - third:\n\n        ```sh\n        git push "topic\n        ```\n\n        ```sh\n        git push --force origin topic\n        ```\n'
+    assert {f.location.start_line for f in tm1(source)} == {10}
+
+
+@pytest.mark.parametrize(
+    "prefix,indent",
+    [("", "    "), ("- examples:\n\nPlain paragraph.\n\n", "    "), ("- examples:\n\n", "      ")],
+)
+def test_indented_code_markers_remain_literal_argument_data(prefix, indent):
+    source = prefix + "\n".join(
+        indent + line
+        for line in ["curl --data 'first", "```", "second' --insecure https://example.com", ""]
+    )
+    findings = tm1(source)
+    assert len(findings) == 1
+    assert findings[0].location.start_line == prefix.count("\n") + 1
+    assert "--insecure" in findings[0].matched_text
 
 
 def test_node_retains_only_the_actual_force_push():
