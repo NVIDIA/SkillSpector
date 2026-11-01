@@ -5430,35 +5430,84 @@ def _markdown_shell_text(
     list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
     backtick_runs = re.compile(r"`+")
 
-    def mask_inline_delimiters() -> None:
-        if not complete_context:
-            runs.clear()
-            return
+    def complete_inline_code_pairs(
+        source: str,
+        delimiter_runs: list[tuple[int, int]],
+    ) -> list[tuple[tuple[int, int], tuple[int, int]]]:
         next_by_length: dict[int, int] = {}
         closing: dict[int, int] = {}
-        for index in range(len(runs) - 1, -1, -1):
+        for index in range(len(delimiter_runs) - 1, -1, -1):
             check_runtime()
-            start, end = runs[index]
+            start, end = delimiter_runs[index]
             length = end - start
             if length in next_by_length:
                 closing[index] = next_by_length[length]
             next_by_length[length] = index
+
+        pairs: list[tuple[tuple[int, int], tuple[int, int]]] = []
         index = 0
-        while index < len(runs):
+        while index < len(delimiter_runs):
             check_runtime()
-            start, end = runs[index]
+            start, end = delimiter_runs[index]
             escape_start = start
-            while escape_start > 0 and content[escape_start - 1] == "\\":
+            while escape_start > 0 and source[escape_start - 1] == "\\":
                 escape_start -= 1
             close_index = closing.get(index)
             if (start - escape_start) % 2 or close_index is None:
                 index += 1
                 continue
-            close_start, close_end = runs[close_index]
+            close_start, close_end = delimiter_runs[close_index]
+            pairs.append(((start, end), (close_start, close_end)))
+            index = close_index + 1
+        return pairs
+
+    def mask_inline_delimiters() -> None:
+        if not complete_context:
+            runs.clear()
+            return
+        for (start, end), (close_start, close_end) in complete_inline_code_pairs(content, runs):
             output[start:end] = " " * (end - start)
             output[close_start:close_end] = " " * (close_end - close_start)
-            index = close_index + 1
         runs.clear()
+
+    def prose_without_complete_inline_code(
+        text: str,
+        source_start: int,
+        *,
+        list_marker_owns_initial_command: bool,
+    ) -> tuple[str, bool]:
+        """Blank complete same-line spans and retain their runtime-command guard."""
+        line_runs = [(match.start(), match.end()) for match in backtick_runs.finditer(text)]
+        projected = list(text)
+        protects_runtime_command = False
+
+        def starts_additional_clause(source: str) -> bool:
+            return any(
+                clause_start > 0 and source[clause_start - 1] in ";|&\n"
+                for clause_start in _shell_clause_starts(source, check_runtime)
+            )
+
+        for (start, end), (close_start, close_end) in complete_inline_code_pairs(text, line_runs):
+            body = text[end:close_start]
+            remainder_start = source_start + start
+            list_marker_owns_span_command = (
+                list_marker_owns_initial_command
+                and not starts_additional_clause(text[:start])
+                and not starts_additional_clause(body)
+            )
+            if (
+                _may_have_destructive_outer_operands(
+                    content[remainder_start : remainder_start + _ROOT_GLOB_COMMAND_CHARS]
+                )
+                and (
+                    _MARKDOWN_PROSE_SHELL_SYNTAX_RE.search(body) is not None
+                    or next(_destructive_command_words(body), None) is not None
+                )
+                and not list_marker_owns_span_command
+            ):
+                protects_runtime_command = True
+            projected[start:close_end] = " " * (close_end - start)
+        return "".join(projected), protects_runtime_command
 
     # This is a conservative projection, not a general Markdown renderer.
     # Container/HTML bodies with uncertain inline ownership remain literal.
@@ -5488,6 +5537,9 @@ def _markdown_shell_text(
         column = indentation
         list_indented = False
         has_list_marker = False
+        # The first marker is the shell word that owns the command position.
+        # ``*`` is a glob, not an inert word, so it never owns it.
+        first_marker_is_glob = False
         list_markers = 0
         if indentation < 4:
             while marker := list_marker.match(stripped, prefix):
@@ -5502,6 +5554,8 @@ def _markdown_shell_text(
                     # Only a list starting at 1 can interrupt a paragraph.
                     # Other numbers may be literal text within an inline span.
                     break
+                if not has_list_marker:
+                    first_marker_is_glob = marker[0][0] == "*"
                 has_list_marker = True
                 list_markers += 1
                 column += marker.end() - prefix
@@ -5527,6 +5581,14 @@ def _markdown_shell_text(
             # Single '-' still starts an empty item; '---' remains thematic.
             separator = False
         html_open = re.match(r"<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|[!?/])", leading)
+        nested_fence_opening = (
+            MARKDOWN_FENCE_OPEN.fullmatch(stripped[prefix:])
+            if paragraph_in_list
+            and not has_list_marker
+            and not list_indented
+            and 0 <= indentation - paragraph_list_indent <= 3
+            else None
+        )
         continuing_paragraph = False
         if table_columns is not None and (
             html_end is not None
@@ -5634,6 +5696,21 @@ def _markdown_shell_text(
                 else ""
             )
             html_end = None if terminator and terminator in leading.lower() else terminator
+        elif nested_fence_opening:
+            mask_inline_delimiters()
+            begin, end = nested_fence_opening.span(1)
+            info = stripped[prefix + end :].strip()
+            fence = (
+                nested_fence_opening[1][0],
+                len(nested_fence_opening[1]),
+                paragraph_list_indent,
+                info.split(maxsplit=1)[0].casefold() if info else "",
+            )
+            fence_literal_apostrophes.clear()
+            fence_literal_ownership = True
+            fence_has_literal_apostrophe = False
+            fence_has_nonliteral_apostrophe = False
+            output[offset + prefix + begin : offset + prefix + end] = " " * (end - begin)
         elif not leading or indentation >= 4 or list_indented:
             mask_inline_delimiters()
         else:
@@ -5704,12 +5781,28 @@ def _markdown_shell_text(
                         if not cells:
                             table_columns = None
                 elif not separator and not empty_list_item:
+                    prose_leading = leading
+                    inline_runtime_guard = False
+                    if (
+                        complete_context
+                        and not runs
+                        and len(leading) <= 512
+                        and 0 <= leading.find("`") < leading.find("'")
+                    ):
+                        prose_leading, inline_runtime_guard = prose_without_complete_inline_code(
+                            leading,
+                            offset + prefix,
+                            list_marker_owns_initial_command=(
+                                has_list_marker and not first_marker_is_glob
+                            ),
+                        )
                     if (
                         complete_context
                         and not runs
                         and not heading
-                        and len(leading) <= 512
-                        and (prose := _MARKDOWN_CONTRACTION_PROSE_RE.fullmatch(leading))
+                        and not inline_runtime_guard
+                        and len(prose_leading) <= 512
+                        and (prose := _MARKDOWN_CONTRACTION_PROSE_RE.fullmatch(prose_leading))
                     ):
                         # A whole plain-language sentence, including a parsed
                         # list-item body, owns its contraction;
@@ -5723,12 +5816,13 @@ def _markdown_shell_text(
                         and complete_context
                         and not runs
                         and not heading
-                        and "'" in leading
+                        and not inline_runtime_guard
+                        and "'" in prose_leading
                         # Inline-code delimiters are Markdown, not shell
                         # syntax: judge the line with its line-local pairs
                         # blanked, exactly as the masking pass will.
                         and _MARKDOWN_PROSE_SHELL_SYNTAX_RE.search(
-                            _blank_line_local_paired_backticks(leading)
+                            _blank_line_local_paired_backticks(prose_leading)
                         )
                         is None
                         and (
@@ -5746,10 +5840,10 @@ def _markdown_shell_text(
                         # runtime-selected command can take later text as
                         # operands through it. The same block exclusions apply.
                         apostrophes: list[int] = []
-                        for word in _MARKDOWN_WORD_APOSTROPHE_RE.finditer(leading):
+                        for word in _MARKDOWN_WORD_APOSTROPHE_RE.finditer(prose_leading):
                             check_runtime()
                             apostrophes.append(offset + prefix + word.start("apostrophe"))
-                        if len(apostrophes) == leading.count("'"):
+                        if len(apostrophes) == prose_leading.count("'"):
                             prose_apostrophes.update(apostrophes)
                     for match in backtick_runs.finditer(line):
                         check_runtime()
