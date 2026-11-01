@@ -310,7 +310,7 @@ _OPTION_COMMAND_PREFIXES = {
     prefix + r"[\s\S]*" + option: re.compile(prefix, re.IGNORECASE)
     for prefix, option, _ in _OPTION_COMMAND_RULES
 }
-_OPTION_COMMAND_FENCE = re.compile(r"(?m)^[ \t]*(?:`{3,}|~{3,})")
+_OPTION_COMMAND_FENCE = re.compile(r"(?m)^[ \t]*(?P<marker>`{3,}|~{3,})")
 
 # TM1: Tool Parameter Abuse — dangerous parameter values
 DIRECT_SHELL_TRUE_PATTERNS: tuple[tuple[str, float], ...] = (
@@ -6473,6 +6473,10 @@ def _option_command_end(
             if substitution_end is not None:
                 i = substitution_end
                 continue
+            # An unpaired PowerShell backtick escapes the next character,
+            # including a separator that is literal data in this command.
+            i += 2
+            continue
         elif ch in "\"'":
             quote = ch
         elif ch == "(":
@@ -6494,8 +6498,14 @@ def _option_command_matches(
 ) -> Iterator[re.Match[str]]:
     """Apply an unsafe-option pattern only within each candidate command."""
     compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    # Only the Markdown projection proves a boundary. A different marker,
+    # shorter run or invalid closing line inside a fence remains literal data.
     fences = (
-        [match.start() for match in _OPTION_COMMAND_FENCE.finditer(content)]
+        [
+            match.start()
+            for match in _OPTION_COMMAND_FENCE.finditer(content)
+            if markdown_shell[match.start("marker")] != content[match.start("marker")]
+        ]
         if markdown_shell is not None
         else []
     )
@@ -6955,6 +6965,7 @@ def _markdown_shell_text(
     paragraph_open = False
     paragraph_in_list = False
     paragraph_list_indent = 0
+    list_content_indents: list[int] = []
     table_columns: int | None = None
     table_minimum_indent = 0
     table_delimiter_line = -1
@@ -6965,6 +6976,12 @@ def _markdown_shell_text(
         stripped = line.rstrip(LINE_BREAK_CHARS)
         leading = stripped.lstrip(" \t")
         indentation = len(stripped[: len(stripped) - len(leading)].expandtabs(4))
+        # List containers survive blank lines and restore their enclosing
+        # context after a nested item. Literal fence/HTML/quote bodies cannot
+        # establish or discard list ownership.
+        list_context = fence is None and html_end is None and not quoted_block
+        list_index = bisect_right(list_content_indents, indentation)
+        list_base = list_content_indents[list_index - 1] if list_index else 0
         # Interpret list padding in columns, preserving the original offsets.
         # More than four columns after a marker can introduce indented code.
         prefix = len(stripped) - len(leading)
@@ -6975,7 +6992,8 @@ def _markdown_shell_text(
         # ``*`` is a glob, not an inert word, so it never owns it.
         first_marker_is_glob = False
         list_markers = 0
-        if indentation < 4:
+        new_list_indents: list[int] = []
+        if 0 <= indentation - list_base < 4:
             while marker := list_marker.match(stripped, prefix):
                 check_runtime()
                 if (
@@ -7002,6 +7020,7 @@ def _markdown_shell_text(
                 if column - padding_start > 4:
                     list_indented = True
                     break
+                new_list_indents.append(column)
             leading = stripped[prefix:]
         quote_start = indentation < 4 and leading.startswith(">")
         heading = indentation < 4 and re.match(r"#{1,6}(?:[ \t]|$)", leading) is not None
@@ -7015,13 +7034,25 @@ def _markdown_shell_text(
             # Single '-' still starts an empty item; '---' remains thematic.
             separator = False
         html_open = re.match(r"<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|[!?/])", leading)
-        nested_fence_opening = (
-            MARKDOWN_FENCE_OPEN.fullmatch(stripped[prefix:])
-            if paragraph_in_list
+        lazy_list_paragraph = (
+            paragraph_open
+            and paragraph_in_list
+            and not (has_list_marker or quote_start or heading or separator or html_open)
+            and MARKDOWN_FENCE_OPEN.fullmatch(leading) is None
+        )
+        if list_context and leading and not lazy_list_paragraph:
+            del list_content_indents[list_index:]
+        if list_context and not quote_start and not html_open:
+            list_content_indents.extend(new_list_indents)
+        list_content_indent = list_content_indents[-1] if list_content_indents else None
+        list_fence = (
+            list_content_indent is not None
             and not has_list_marker
-            and not list_indented
-            and 0 <= indentation - paragraph_list_indent <= 3
-            else None
+            and 0 <= indentation - list_content_indent <= 3
+            and MARKDOWN_FENCE_OPEN.fullmatch(leading) is not None
+        )
+        nested_fence_opening = (
+            MARKDOWN_FENCE_OPEN.fullmatch(stripped[prefix:]) if list_fence else None
         )
         continuing_paragraph = False
         if table_columns is not None and (
@@ -7140,7 +7171,7 @@ def _markdown_shell_text(
             fence = (
                 nested_fence_opening[1][0],
                 len(nested_fence_opening[1]),
-                paragraph_list_indent,
+                list_content_indent,
                 info.split(maxsplit=1)[0].casefold() if info else "",
             )
             fence_literal_apostrophes.clear()
