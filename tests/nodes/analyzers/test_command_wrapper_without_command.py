@@ -136,3 +136,93 @@ def test_scan_level_redirected_wrapper_stays_partial() -> None:
     event = result["inspection_ledger"][0]
     assert event["outcome"] is LedgerOutcome.PARTIAL
     assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize("wrapper", ["timeout", "sudo", "nice", "xargs"])
+@pytest.mark.parametrize("quote", ["'", '"', '"""'])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_python_parenthesized_wrapper_name_is_complete(
+    wrapper: str, quote: str, newline: str
+) -> None:
+    content = (
+        '"""Describe a fixture beside its manifest."""\n'
+        f"WRAPPER_NAME = (\n    {quote}{wrapper}{quote}\n)\n"
+        f"def read_option(options):\n    return options.get({quote}{wrapper}{quote})\n"
+    ).replace("\n", newline)
+
+    assert not _exhausted(content, "python")
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["scripts/validate.py"], "file_cache": {"scripts/validate.py": content}},
+        [tm_module],
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'sudo -n fuser "$device" >/dev/null 2>&1 && continue\n',
+        "sudo -n true >/dev/null 2>&1\n",
+        "sudo -n true 2>&1 >/dev/null\n",
+        "sudo -n true 0<&3 3>&-\n",
+        "sudo -n true 3>&1-\n",
+        "sudo -n true &>/dev/null\n",
+        "sudo -n true &>>/dev/null\n",
+        "sudo -n -- true 2>&1\n",
+        "sudo -n -u root true 2>&1\n",
+        "sudo -u root -n true 2>&1\n",
+        "sudo --non-interactive true 2>&1\n",
+        "sudo -nS true 2>&1\n",
+        "nice -n 5 true 2>&1\n",
+        "xargs -n 1 true 2>&1\n",
+        "sudo -n sh 2>&1 -c 'echo ready'\n",
+        "eval 2>&1 'echo ready'\n",
+    ],
+)
+def test_noninteractive_sudo_and_descriptor_redirections_are_complete(source: str) -> None:
+    assert not _exhausted(source, "shell")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'sudo -n sh -c "$CMD"\n',
+        'sudo -n sh 2>&1 -c "$CMD"\n',
+        'sudo -n sh >log -c "$CMD"\n',
+        'sudo -n -- sh -c "$CMD"\n',
+        'sudo -n -u root sh -c "$CMD"\n',
+        'nice -n 5 sh -c "$CMD"\n',
+        'xargs -n 1 sh -c "$CMD"\n',
+        "sudo -n sh -c '$CMD -rf /'\n",
+        'eval 2>&1 "$CMD"\n',
+        "sudo -n $CMD -rf /\n",
+        "sudo -n >log $CMD -rf /\n",
+        "sudo -n &>log $CMD -rf /\n",
+        "sudo -n true 2>&\n",
+        "sudo -n true 0<&\n",
+        "sudo -n true 2>\n",
+        "sudo -n true >\n",
+        "sudo -n",
+        "nice -n",
+        "xargs -n",
+        "timeout",
+        'sudo -n sh -c "unterminated',
+    ],
+)
+def test_wrapper_repairs_preserve_unresolved_command_limits(source: str) -> None:
+    assert _exhausted(source, "shell")
+
+
+def test_noninteractive_sudo_keeps_destructive_finding() -> None:
+    source = "sudo -n rm -rf / 2>&1\n"
+
+    findings = tm_module.analyze(source, "scripts/run.sh", "shell")
+
+    assert any(finding.rule_id == "TM1" for finding in findings)
+
+
+@pytest.mark.parametrize("wrapper", ["sudo -n", "nice -n 1", "xargs -n 1"])
+def test_wrapper_chain_budget_stays_partial(wrapper: str) -> None:
+    source = " ".join([wrapper] * 40) + " sh -c 'echo ready'\n"
+
+    assert _exhausted(source, "shell")
