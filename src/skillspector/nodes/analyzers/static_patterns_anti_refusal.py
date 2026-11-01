@@ -79,8 +79,24 @@ AR1_PATTERNS = [
     (r"\brespond\s+to\s+(?:every|all|any)\s+(?:request|question|prompt|query|command)\b", 0.6),
     (r"\bno\s+request\s+is\s+(?:off[- ]limits|forbidden|too)\b", 0.85),
     # Chinese-language equivalents (issue #953).
+    # The refusal pattern is split into adverb-present and adverb-absent
+    # variants on purpose. A leading optional group followed by a gap that
+    # matches whitespace lets the regex engine try the gap at every
+    # whitespace position and backtrack the whole run, which is quadratic
+    # on long separator runs and blew the per-artifact runtime limit on
+    # the cross-window separator test (PR #968 CI). Each variant below
+    # starts with a required Chinese character, so non-matching text fails
+    # fast, and together they match exactly the phrases the single
+    # pattern matched.
     (
-        f"(?:{chinese_spaced('永远')}|{chinese_spaced('始终')})?{CHINESE_GAP}"
+        f"(?:{chinese_spaced('永远')}|{chinese_spaced('始终')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('不要')}|{chinese_spaced('不得')}|{chinese_spaced('不能')}|{chinese_spaced('绝不')}){CHINESE_GAP}"
+        f"{chinese_spaced('拒绝')}{CHINESE_GAP}"
+        f"(?:{chinese_spaced('任何')}|{chinese_spaced('所有')})?"
+        f"{CHINESE_GAP}(?:{chinese_spaced('请求')}|{chinese_spaced('要求')}|{chinese_spaced('用户')})",
+        0.85,
+    ),
+    (
         f"(?:{chinese_spaced('不要')}|{chinese_spaced('不得')}|{chinese_spaced('不能')}|{chinese_spaced('绝不')}){CHINESE_GAP}"
         f"{chinese_spaced('拒绝')}{CHINESE_GAP}"
         f"(?:{chinese_spaced('任何')}|{chinese_spaced('所有')})?"
