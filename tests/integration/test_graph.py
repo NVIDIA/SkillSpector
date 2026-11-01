@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from skillspector.graph import create_graph, graph
+from skillspector.providers import NO_LLM_API_KEY_MESSAGE
 
 
 def test_graph_invoke_with_output_format_json(tmp_path: Path) -> None:
@@ -179,7 +180,10 @@ def test_graph_invalid_skill_path_raises() -> None:
         )
 
 
-def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("failure_kind", ["transport", "missing_credentials"])
+def test_graph_surfaces_degraded_llm_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_kind: str
+) -> None:
     """End-to-end: use_llm requested but every LLM call fails.
 
     Proves (a) the operator.add reducer accumulates llm_call_log across the
@@ -195,6 +199,8 @@ def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.M
     (tmp_path / "run.py").write_text("import os\nos.system('ls')\n", encoding="utf-8")
 
     def boom(*_a: object, **_k: object) -> object:
+        if failure_kind == "missing_credentials":
+            raise ValueError(NO_LLM_API_KEY_MESSAGE)
         raise RuntimeError("simulated LLM transport failure")
 
     class FailingTP4Analyzer:
