@@ -70,13 +70,14 @@ from skillspector.python_ast import (
     resolve_python_source_classification,
 )
 from skillspector.python_tokens import PythonStringClosers
-from skillspector.shell_tokens import ShellStringClosers
+from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
+
 from skillspector.security_reconstruction import (
     MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
     MAX_MARKER_LOOKAHEAD_CHARS,
     build_declared_marker_views,
 )
-from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
+from skillspector.shell_tokens import ShellStringClosers
 
 from .common import (
     LINE_BREAK_CHARS,
@@ -985,7 +986,6 @@ class _CompleteSourceCache:
         check_runtime()
         self._validated = MappingProxyType(sources)
         return self._validated
-
 
 
 def _build_window_source_context(
@@ -2242,9 +2242,7 @@ def _scan_declared_marker_views(
         # View offsets are window-relative. Synthetic Markdown fence context
         # never occurs for source files, but it would not map onto source offsets.
         string_closer = (
-            None
-            if strings is None or context_prefix
-            else _window_string_closer(strings, raw_start)
+            None if strings is None or context_prefix else _window_string_closer(strings, raw_start)
         )
         for full_view in full_views:
             full_view_limited = False

@@ -49,13 +49,19 @@ from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_tokens import PythonLiteralSpans
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
 from skillspector.python_tokens import python_string_body as _python_string_body
+from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+
 from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.shell_helper_argv import reconstruct_helper_commands
 from skillspector.shell_sources import (
-    SAFE_PATH_MARKER, ShellSourceContext, ShellSourceOrigin, ShellSourceResolver,
-    ShellSourceValue, decode_env_unset_command, generated_file_is_unmodified,
+    SAFE_PATH_MARKER,
+    ShellSourceContext,
+    ShellSourceOrigin,
+    ShellSourceResolver,
+    ShellSourceValue,
+    decode_env_unset_command,
+    generated_file_is_unmodified,
 )
-from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
 from .common import (
@@ -753,7 +759,6 @@ def _static_heredoc_header(
     return (name[0], strip_tabs, quoted), cursor
 
 
-
 def _skip_static_heredoc_bodies(
     content: str,
     start: int,
@@ -797,7 +802,6 @@ def _skip_static_heredoc_bodies(
         else:
             return None
     return cursor
-
 
 
 def _skip_shell_delimited_expansion(
@@ -1092,7 +1096,6 @@ def _skip_shell_delimited_expansion(
 
     cache_failure()
     return None
-
 
 
 def _skip_parameter_expansion(
@@ -2300,7 +2303,6 @@ def _literal_shell_command_spans(
     return {begin + start: begin + stop for start, stop in spans}
 
 
-
 def _nonempty_shell_clause_starts(content: str, check_runtime: Callable[[], None]) -> Iterator[int]:
     """Avoid reparsing the same trailing command across empty physical lines."""
     for start in _shell_clause_starts(content, check_runtime):
@@ -2310,7 +2312,6 @@ def _nonempty_shell_clause_starts(content: str, check_runtime: Callable[[], None
             start += 1
         if start < len(content) and content[start] not in "\r\n;|&(){}#":
             yield start
-
 
 
 def _shell_quoted_candidate_limits(
@@ -2504,7 +2505,6 @@ def _shell_quoted_candidate_limits(
             if content[position + 1 : position + 2] not in ("$", "`")
         )
     return limits
-
 
 
 def _quoted_candidate_is_complete(
@@ -2887,7 +2887,9 @@ def _has_shell_command_word_exhaustion(
         if command_string is None or _command_string_depth >= 8:
             return True
         if _has_destructive_command_string(command_string):
-            if not inspected_source or _has_bounded_parse_exhaustion(command_string, check_runtime, file_type="shell"):
+            if not inspected_source or _has_bounded_parse_exhaustion(
+                command_string, check_runtime, file_type="shell"
+            ):
                 return True
         if _has_shell_command_word_exhaustion(
             command_string,
@@ -2939,7 +2941,8 @@ def _shell_command_string_values(
     """Yield reparsed strings with exact consumer-owned source-analysis proof."""
     single_sources = (
         {span: value for span, value in source_commands.items() if isinstance(value, str)}
-        if source_commands is not None else None
+        if source_commands is not None
+        else None
     )
     for clause_start in _nonempty_shell_clause_starts(content, check_runtime):
         check_runtime()
@@ -2963,7 +2966,11 @@ def _shell_command_string_values(
                 # ``signal.alarm(timeout)`` names no ``timeout`` command.
                 # Shell text can only be reparsed from a string literal.
                 continue
-        variants = source_commands.get(spans[0]) if source_commands is not None and len(spans) == 1 else None
+        variants = (
+            source_commands.get(spans[0])
+            if source_commands is not None and len(spans) == 1
+            else None
+        )
         if command_string is None and isinstance(variants, tuple):
             for variant in variants:
                 yield variant, True
@@ -2980,7 +2987,13 @@ def _shell_command_strings(
     source_commands: Mapping[tuple[int, int], str | tuple[str, ...]] | None = None,
 ) -> Iterator[str | None]:
     """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
-    for text, _ in _shell_command_string_values(content, check_runtime, perl_eval_blocks=perl_eval_blocks, python_source=python_source, source_commands=source_commands):
+    for text, _ in _shell_command_string_values(
+        content,
+        check_runtime,
+        perl_eval_blocks=perl_eval_blocks,
+        python_source=python_source,
+        source_commands=source_commands,
+    ):
         yield text
 
 
@@ -3107,7 +3120,11 @@ def _command_string_from_clause(
     def next_word() -> tuple[str | None, bool]:
         nonlocal cursor, last_word_start
         last_word_start = cursor
-        while (literal_command_spans is not None or source_commands is not None or command_word_spans is not None) and last_word_start < len(content):
+        while (
+            literal_command_spans is not None
+            or source_commands is not None
+            or command_word_spans is not None
+        ) and last_word_start < len(content):
             if last_word_start % 4096 == 0:
                 check_runtime()
             if content[last_word_start].isspace():
@@ -3318,7 +3335,6 @@ def _command_string_from_clause(
             continue
         return False, None
     return wrapper_seen, None
-
 
 
 def _ends_wrapped_clause(content: str, cursor: int) -> bool:
@@ -6219,7 +6235,7 @@ def _source_path_arguments_safe(value: ShellSourceValue, check_runtime: Callable
             if source.startswith("<<", cursor) and not source.startswith("<<<", cursor):
                 # This positional refinement does not own heredoc bodies.
                 return False
-            operator = re.match(r"(?:<<<|>>|>&|<&|>\||<>|>|<)", source[cursor:cursor + 3])
+            operator = re.match(r"(?:<<<|>>|>&|<&|>\||<>|>|<)", source[cursor : cursor + 3])
             if operator is None:
                 return False
             cursor += len(operator[0])
@@ -6227,7 +6243,12 @@ def _source_path_arguments_safe(value: ShellSourceValue, check_runtime: Callable
                 cursor += 1
             start = cursor
             target, cursor, limited = _next_shell_invocation_word(source, cursor, check_runtime)
-            if target is None or limited or cursor <= start or SAFE_PATH_MARKER in source[start:cursor]:
+            if (
+                target is None
+                or limited
+                or cursor <= start
+                or SAFE_PATH_MARKER in source[start:cursor]
+            ):
                 return False
             continue
         start = cursor
@@ -6236,15 +6257,23 @@ def _source_path_arguments_safe(value: ShellSourceValue, check_runtime: Callable
             return False
         raw = source[start:cursor]
         if SAFE_PATH_MARKER in raw:
-            if not command_seen or re.fullmatch(r"'[-A-Za-z0-9_./]+'", raw) is None or not raw.startswith("'/tmp/"):
+            if (
+                not command_seen
+                or re.fullmatch(r"'[-A-Za-z0-9_./]+'", raw) is None
+                or not raw.startswith("'/tmp/")
+            ):
                 return False
             seen += raw.count(SAFE_PATH_MARKER)
         if word in {"if", "then", "elif", "else", "while", "until", "do", "!"}:
             command_seen = False
-        elif not command_seen and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", raw, re.DOTALL) is None:
-            command_seen = not any(marker in word for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL))
+        elif (
+            not command_seen and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", raw, re.DOTALL) is None
+        ):
+            command_seen = not any(
+                marker in word
+                for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+            )
     return seen == len(value.safe_spans)
-
 
 
 @dataclass
@@ -6261,8 +6290,15 @@ class _PreparedSourceCommands:
             for variant in value if isinstance(value, tuple) else (value,):
                 yield span, variant
 
-    def analyze_source_commands(self, *, content: str, file_path: str, file_type: str, source_view: SecurityTextView) -> Iterator[AnalyzerFinding]:
-        if content != self.content or file_path != self.path or file_type != "shell" or source_view.text != content:
+    def analyze_source_commands(
+        self, *, content: str, file_path: str, file_type: str, source_view: SecurityTextView
+    ) -> Iterator[AnalyzerFinding]:
+        if (
+            content != self.content
+            or file_path != self.path
+            or file_type != "shell"
+            or source_view.text != content
+        ):
             self.resolver.valid = False
             return
         locations = SourceLocationIndex(content, file_path)
@@ -6270,7 +6306,10 @@ class _PreparedSourceCommands:
             self.check_runtime()
             originals = analyze(value.text, file_path, "shell", check_runtime=self.check_runtime)
             converted = [static_runner.analyzer_finding_to_finding(item) for item in originals]
-            original_by_id = {finding.finding_id: original for finding, original in zip(converted, originals, strict=True)}
+            original_by_id = {
+                finding.finding_id: original
+                for finding, original in zip(converted, originals, strict=True)
+            }
             finalized = postprocess_path_findings(value.text, converted)
             self.check_runtime()
             line, column = locations.line_and_column(start)
@@ -6290,19 +6329,34 @@ class _PreparedSourceCommands:
                         explanation=child.explanation,
                     )
                 child_line, child_column = child.start_line, child.start_column
-                original.location = Location(file_path, line, start_column=column, end_column=column + max(1, min(end - start, 128)))
+                original.location = Location(
+                    file_path,
+                    line,
+                    start_column=column,
+                    end_column=column + max(1, min(end - start, 128)),
+                )
                 original.severity = Severity(child.severity)
                 original.confidence = child.confidence
                 original.context = child.context
                 original.matched_text = child.matched_text
-                original.evidence = {key: item for key, item in child.evidence.items() if not key.startswith("_")}
+                original.evidence = {
+                    key: item for key, item in child.evidence.items() if not key.startswith("_")
+                }
                 original.evidence["reconstructed_shell_source"] = {
                     "consumer_start": start,
                     "consumer_end": end,
                     "command_sha256": sha256(value.text.encode()).hexdigest(),
                     "command_line": child_line,
                     "command_column": child_column,
-                    "origins": [{"path": origin.path, "start": origin.start, "end": origin.end, "sha256": origin.sha256} for origin in value.origins],
+                    "origins": [
+                        {
+                            "path": origin.path,
+                            "start": origin.start,
+                            "end": origin.end,
+                            "sha256": origin.sha256,
+                        }
+                        for origin in value.origins
+                    ],
                 }
                 if value.argv is not None:
                     detail = original.evidence["reconstructed_shell_source"]
@@ -6314,9 +6368,17 @@ class _PreparedSourceCommands:
         self.analyzed = True
 
     def has_bounded_parse_exhaustion(self) -> bool:
-        commands = {span: tuple(item.text for item in value) if isinstance(value, tuple) else value.text for span, value in self.values.items()} if self.analyzed and self.resolver.valid and self.resolver.work_budget[0] >= 0 else None
-        return _has_bounded_parse_exhaustion(self.content, self.check_runtime, file_type="shell", source_commands=commands)
-
+        commands = (
+            {
+                span: tuple(item.text for item in value) if isinstance(value, tuple) else value.text
+                for span, value in self.values.items()
+            }
+            if self.analyzed and self.resolver.valid and self.resolver.work_budget[0] >= 0
+            else None
+        )
+        return _has_bounded_parse_exhaustion(
+            self.content, self.check_runtime, file_type="shell", source_commands=commands
+        )
 
 
 def _generated_helper_variants(
@@ -6331,7 +6393,10 @@ def _generated_helper_variants(
     total = 0
     for generated in resolver.generated_files():
         check_runtime()
-        if not any(command is None for command in _shell_command_strings(generated.value.text, check_runtime)):
+        if not any(
+            command is None
+            for command in _shell_command_strings(generated.value.text, check_runtime)
+        ):
             continue
         directory, _, helper_name = generated.path.text.rpartition("/")
         callers = []
@@ -6353,7 +6418,9 @@ def _generated_helper_variants(
                 uncertain = True
                 break
             spans: list[tuple[int, int]] = []
-            recognized, literal = _command_string_from_clause(source, command.start, check_runtime, command_word_spans=spans)
+            recognized, literal = _command_string_from_clause(
+                source, command.start, check_runtime, command_word_spans=spans
+            )
             if not recognized or len(spans) != 1:
                 uncertain = True
                 break
@@ -6365,14 +6432,33 @@ def _generated_helper_variants(
                 uncertain = True
                 break
             caller_origin = ShellSourceOrigin(resolver.context.path, span[0], span[1], source_hash)
-            programs[span] = ShellSourceValue(program.text, "code", (*program.origins, caller_origin))
+            programs[span] = ShellSourceValue(
+                program.text, "code", (*program.origins, caller_origin)
+            )
             callers.append(command)
-        if uncertain or not callers or not generated_file_is_unmodified(resolver, generated, tuple(callers)):
+        if (
+            uncertain
+            or not callers
+            or not generated_file_is_unmodified(resolver, generated, tuple(callers))
+        ):
             continue
-        variants = reconstruct_helper_commands(generated.value.text, tuple(program.text for program in programs.values()), helper_name, _next_shell_invocation_word, check_runtime)
+        variants = reconstruct_helper_commands(
+            generated.value.text,
+            tuple(program.text for program in programs.values()),
+            helper_name,
+            _next_shell_invocation_word,
+            check_runtime,
+        )
         if variants is None:
             continue
-        origins = tuple(dict.fromkeys((*generated.value.origins, *(origin for program in programs.values() for origin in program.origins))))
+        origins = tuple(
+            dict.fromkeys(
+                (
+                    *generated.value.origins,
+                    *(origin for program in programs.values() for origin in program.origins),
+                )
+            )
+        )
         for (left, right), commands in variants.items():
             if not 0 <= left < right <= len(generated.value.text) or not commands:
                 resolver.valid = False
@@ -6381,7 +6467,9 @@ def _generated_helper_variants(
             if span in output or span in values:
                 resolver.valid = False
                 return output
-            entries = tuple(ShellSourceValue(command, "code", origins, argv=argv) for command, argv in commands)
+            entries = tuple(
+                ShellSourceValue(command, "code", origins, argv=argv) for command, argv in commands
+            )
             total += sum(len(entry.text) for entry in entries)
             if len(output) >= 128 or total > 1_000_000:
                 resolver.valid = False
@@ -6400,15 +6488,31 @@ def _generated_helper_variants(
     return output
 
 
-
-def prepare_source_analysis(*, content: str, file_path: str, file_type: str, source_context: ShellSourceContext, check_runtime: Callable[[], None]) -> _PreparedSourceCommands | None:
+def prepare_source_analysis(
+    *,
+    content: str,
+    file_path: str,
+    file_type: str,
+    source_context: ShellSourceContext,
+    check_runtime: Callable[[], None],
+) -> _PreparedSourceCommands | None:
     """Inspect commands from complete cached bundle bytes before resolving them."""
-    if file_type != "shell" or source_context.path != file_path or source_context.sources.get(file_path) != content:
+    if (
+        file_type != "shell"
+        or source_context.path != file_path
+        or source_context.sources.get(file_path) != content
+    ):
         return None
     from skillspector.shell_artifact_effects import ShellArtifactAudit
     from skillspector.shell_source_effects import source_effects_collect, source_effects_preserve
 
-    def make_resolver(*, text: str | None = None, inherited: Mapping[str, ShellSourceValue] | None = None, depth: int = 0, budget: list[int] | None = None) -> ShellSourceResolver:
+    def make_resolver(
+        *,
+        text: str | None = None,
+        inherited: Mapping[str, ShellSourceValue] | None = None,
+        depth: int = 0,
+        budget: list[int] | None = None,
+    ) -> ShellSourceResolver:
         resolver = ShellSourceResolver(
             source_context,
             _next_shell_invocation_word,
@@ -6430,7 +6534,9 @@ def prepare_source_analysis(*, content: str, file_path: str, file_type: str, sou
         active_effects: set[int] = set()
 
         def effect_source(target: ShellSourceValue, before_offset: int) -> ShellSourceValue | None:
-            if target.kind not in {"bundle_path", "safe_path"} or not 0 <= before_offset <= len(resolver.content):
+            if target.kind not in {"bundle_path", "safe_path"} or not 0 <= before_offset <= len(
+                resolver.content
+            ):
                 return None
             if target.kind == "bundle_path" and target.text in source_context.sources:
                 key = (target.text, before_offset)
@@ -6443,19 +6549,29 @@ def prepare_source_analysis(*, content: str, file_path: str, file_type: str, sou
                         return None
                     active_effects.add(before_offset)
                     try:
-                        audit = ShellArtifactAudit(source_context, _next_shell_invocation_word, check_runtime)
+                        audit = ShellArtifactAudit(
+                            source_context, _next_shell_invocation_word, check_runtime
+                        )
                         preserved = source_effects_preserve(
-                            resolver, target.text, before_offset,
-                            read_source=audit.read_source, preserve_effect=audit.preserve,
+                            resolver,
+                            target.text,
+                            before_offset,
+                            read_source=audit.read_source,
+                            preserve_effect=audit.preserve,
                             preserve_state=audit.preservation_state,
                         )
                         original = source_context.sources[target.text]
-                        origin = ShellSourceOrigin(target.text, 0, len(original), sha256(original.encode()).hexdigest())
+                        origin = ShellSourceOrigin(
+                            target.text, 0, len(original), sha256(original.encode()).hexdigest()
+                        )
                         artifact = audit.store.read(target.text) if preserved else None
                         preservation_cache[key] = (
                             ShellSourceValue(original, "code", (origin,))
-                            if artifact is not None and artifact.value is not None
-                            and artifact.value.text == original and artifact.value.origins == (origin,) else None
+                            if artifact is not None
+                            and artifact.value is not None
+                            and artifact.value.text == original
+                            and artifact.value.origins == (origin,)
+                            else None
                         )
                     finally:
                         active_effects.discard(before_offset)
@@ -6471,8 +6587,12 @@ def prepare_source_analysis(*, content: str, file_path: str, file_type: str, sou
                     return None
                 active_effects.add(before_offset)
                 try:
-                    audit = ShellArtifactAudit(source_context, _next_shell_invocation_word, check_runtime)
-                    complete = source_effects_collect(resolver, before_offset, read_source=audit.read_source, native_effect=audit)
+                    audit = ShellArtifactAudit(
+                        source_context, _next_shell_invocation_word, check_runtime
+                    )
+                    complete = source_effects_collect(
+                        resolver, before_offset, read_source=audit.read_source, native_effect=audit
+                    )
                     effect_cache[before_offset] = audit if complete else None
                 finally:
                     active_effects.discard(before_offset)
@@ -6495,7 +6615,9 @@ def prepare_source_analysis(*, content: str, file_path: str, file_type: str, sou
                     continue
                 check_runtime()
                 spans: list[tuple[int, int]] = []
-                recognized, child = _command_string_from_clause(resolver.content, command.start, check_runtime, command_word_spans=spans)
+                recognized, child = _command_string_from_clause(
+                    resolver.content, command.start, check_runtime, command_word_spans=spans
+                )
                 if not recognized:
                     continue
                 if child is None and len(spans) == 1:
@@ -6514,7 +6636,10 @@ def prepare_source_analysis(*, content: str, file_path: str, file_type: str, sou
                     if value is not None:
                         environment[binding[1]] = value
                     executable_index += 1
-                if executable_index < len(command.words) and command.words[executable_index][0].rpartition("/")[2] == "env":
+                if (
+                    executable_index < len(command.words)
+                    and command.words[executable_index][0].rpartition("/")[2] == "env"
+                ):
                     invocation = decode_env_unset_command(resolver, command.words, executable_index)
                     if invocation is None:
                         continue
@@ -6522,7 +6647,15 @@ def prepare_source_analysis(*, content: str, file_path: str, file_type: str, sou
                     for name in removed:
                         environment.pop(name, None)
                     environment.update(assigned)
-                yield make_resolver(text=child, inherited=environment, depth=depth + 1, budget=resolver.work_budget), command.start
+                yield (
+                    make_resolver(
+                        text=child,
+                        inherited=environment,
+                        depth=depth + 1,
+                        budget=resolver.work_budget,
+                    ),
+                    command.start,
+                )
 
         def executable_children(before_offset: int) -> Iterator[tuple[ShellSourceResolver, int]]:
             for left, right, stop, child_scope in resolver.executable_spans:
@@ -6536,13 +6669,27 @@ def prepare_source_analysis(*, content: str, file_path: str, file_type: str, sou
                 # Only names actually read by this child need parent values.
                 # Local reassignments and setters still invalidate inheritance
                 # in the independently collected child resolver.
-                for match in (() if child_scope else re.finditer(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})", child)):
+                for match in (
+                    ()
+                    if child_scope
+                    else re.finditer(
+                        r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})", child
+                    )
+                ):
                     name = match[1] or match[2]
                     if name not in inherited_values:
                         value = resolver._name(name, 0, left - 2)
                         if value is not None:
                             inherited_values[name] = value
-                yield make_resolver(text=child, inherited=inherited_values, depth=depth + 1, budget=resolver.work_budget), left - 2
+                yield (
+                    make_resolver(
+                        text=child,
+                        inherited=inherited_values,
+                        depth=depth + 1,
+                        budget=resolver.work_budget,
+                    ),
+                    left - 2,
+                )
 
         resolver.child_contexts = literal_children
         resolver.substitution_contexts = executable_children
@@ -6556,12 +6703,18 @@ def prepare_source_analysis(*, content: str, file_path: str, file_type: str, sou
     for command in resolver.commands:
         check_runtime()
         spans: list[tuple[int, int]] = []
-        recognized, literal = _command_string_from_clause(content, command.start, check_runtime, command_word_spans=spans)
+        recognized, literal = _command_string_from_clause(
+            content, command.start, check_runtime, command_word_spans=spans
+        )
         if not recognized or literal is not None or len(spans) != 1:
             continue
         start, end = spans[0]
         value = resolver.word(start, end)
-        if value is None or value.kind != "code" or not _source_path_arguments_safe(value, check_runtime):
+        if (
+            value is None
+            or value.kind != "code"
+            or not _source_path_arguments_safe(value, check_runtime)
+        ):
             continue
         total_chars += len(value.text)
         if len(values) >= 128 or total_chars > 1_000_000:
@@ -6571,8 +6724,11 @@ def prepare_source_analysis(*, content: str, file_path: str, file_type: str, sou
     combined: dict[tuple[int, int], ShellSourceValue | tuple[ShellSourceValue, ...]] = dict(values)
     if resolver.valid:
         combined.update(_generated_helper_variants(resolver, values, check_runtime))
-    return _PreparedSourceCommands(content, file_path, resolver, combined, check_runtime) if combined else None
-
+    return (
+        _PreparedSourceCommands(content, file_path, resolver, combined, check_runtime)
+        if combined
+        else None
+    )
 
 
 def has_bounded_parse_exhaustion(

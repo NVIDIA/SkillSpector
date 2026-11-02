@@ -12,11 +12,10 @@ Unsupported syntax or any unresolved execution path refuses the entire proof.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass, replace
 import re
 import shlex
-
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 
 ReadWord = Callable[[str, int, Callable[[], None]], tuple[str | None, int, bool]]
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -25,17 +24,59 @@ _MAX_STATES = 128
 _MAX_ARGS = 128
 _MAX_STEPS = 8192
 _SHELLS = frozenset({"bash", "/bin/bash", "sh", "/bin/sh"})
-_SPECIAL = frozenset({
-    "alias", "builtin", "declare", "enable", "eval", "export", "hash", "read",
-    "readonly", "set", "source", ".", "trap", "typeset", "unalias", "unset",
-})
-_BUILTINS = frozenset({"printf", "echo", "command", "local", "shift", "exit", "return", "true", "false", ":"})
-_SPECIAL_VARIABLES = frozenset({
-    "_", "ENV", "IFS", "PATH", "SHELLOPTS", "EUID", "UID", "PPID", "RANDOM", "SRANDOM",
-    "SECONDS", "LINENO", "OPTIND", "OPTARG", "GROUPS", "DIRSTACK", "FUNCNAME", "PIPESTATUS",
-    "CDPATH", "PWD", "OLDPWD",
-    "EPOCHSECONDS", "EPOCHREALTIME", "HISTCMD", "EXECIGNORE", "LD_PRELOAD",
-})
+_SPECIAL = frozenset(
+    {
+        "alias",
+        "builtin",
+        "declare",
+        "enable",
+        "eval",
+        "export",
+        "hash",
+        "read",
+        "readonly",
+        "set",
+        "source",
+        ".",
+        "trap",
+        "typeset",
+        "unalias",
+        "unset",
+    }
+)
+_BUILTINS = frozenset(
+    {"printf", "echo", "command", "local", "shift", "exit", "return", "true", "false", ":"}
+)
+_SPECIAL_VARIABLES = frozenset(
+    {
+        "_",
+        "ENV",
+        "IFS",
+        "PATH",
+        "SHELLOPTS",
+        "EUID",
+        "UID",
+        "PPID",
+        "RANDOM",
+        "SRANDOM",
+        "SECONDS",
+        "LINENO",
+        "OPTIND",
+        "OPTARG",
+        "GROUPS",
+        "DIRSTACK",
+        "FUNCNAME",
+        "PIPESTATUS",
+        "CDPATH",
+        "PWD",
+        "OLDPWD",
+        "EPOCHSECONDS",
+        "EPOCHREALTIME",
+        "HISTCMD",
+        "EXECIGNORE",
+        "LD_PRELOAD",
+    }
+)
 
 
 def is_managed_shell_variable(name: str) -> bool:
@@ -65,7 +106,14 @@ class _Node:
 
 
 class _Parser:
-    def __init__(self, text: str, read_word: ReadWord, tick: Callable[[], None], *, output_redirects: bool = False) -> None:
+    def __init__(
+        self,
+        text: str,
+        read_word: ReadWord,
+        tick: Callable[[], None],
+        *,
+        output_redirects: bool = False,
+    ) -> None:
         self.tokens: list[_Token] = []
         self.cursor = 0
         self.tick = tick
@@ -83,10 +131,34 @@ class _Parser:
                 stop = text.find("\n", cursor)
                 cursor = len(text) if stop < 0 else stop
                 continue
-            operator = next((item for item in (";;", "&&", "||", ">&", ">>", "<<", ";", "\n", "(", ")", "|", "&", ">", "<") if text.startswith(item, cursor)), None)
+            operator = next(
+                (
+                    item
+                    for item in (
+                        ";;",
+                        "&&",
+                        "||",
+                        ">&",
+                        ">>",
+                        "<<",
+                        ";",
+                        "\n",
+                        "(",
+                        ")",
+                        "|",
+                        "&",
+                        ">",
+                        "<",
+                    )
+                    if text.startswith(item, cursor)
+                ),
+                None,
+            )
             if operator is not None:
                 stop = cursor + len(operator)
-            elif text[cursor] in "{}" and (cursor + 1 == len(text) or text[cursor + 1] in " \t\r\n;"):
+            elif text[cursor] in "{}" and (
+                cursor + 1 == len(text) or text[cursor + 1] in " \t\r\n;"
+            ):
                 stop = cursor + 1
             else:
                 _, stop, limited = read_word(text, cursor, tick)
@@ -171,7 +243,10 @@ class _Parser:
                 while self.peek() == "|":
                     self.take()
                     patterns.append(self.take().raw)
-                if any(pattern != "*" and not re.fullmatch(r"[A-Za-z0-9_.+-]+", pattern) for pattern in patterns):
+                if any(
+                    pattern != "*" and not re.fullmatch(r"[A-Za-z0-9_.+-]+", pattern)
+                    for pattern in patterns
+                ):
                     raise _UnresolvedError
                 self.take(")")
                 labels.append(tuple(patterns))
@@ -201,7 +276,18 @@ class _Parser:
                 words.append(self.take())
             words.append(self.take("]]"))
         else:
-            while self.peek() and self.peek() not in {";", "\n", "&&", "||", ";;", "}", "|", "&", "(", ")"}:
+            while self.peek() and self.peek() not in {
+                ";",
+                "\n",
+                "&&",
+                "||",
+                ";;",
+                "}",
+                "|",
+                "&",
+                "(",
+                ")",
+            }:
                 if self.peek() in {">", ">&"} or self.output_redirects and self.peek() == ">>":
                     redirect = self.take()
                     descriptor = "1"
@@ -212,7 +298,11 @@ class _Parser:
                     destination = self.take()
                     if self.output_redirects:
                         redirects.append((descriptor + redirect.raw, destination))
-                    elif (redirect.raw, destination.raw) not in {(">", "/dev/null"), (">&", "1"), (">&", "2")}:
+                    elif (redirect.raw, destination.raw) not in {
+                        (">", "/dev/null"),
+                        (">&", "1"),
+                        (">&", "2"),
+                    }:
                         raise _UnresolvedError
                     continue
                 if self.peek() in {"<", "<<", ">>", "{"}:
@@ -231,12 +321,14 @@ class _SerializedArgv:
 @dataclass(frozen=True, slots=True)
 class _CommandText:
     """Equivalent command syntax whose exact Bash-emitted bytes are unknown."""
+
     normalized: str
 
 
 @dataclass(frozen=True, slots=True)
 class ShellHelperOutput:
     """Literal stdout or an exact file read; no archive bytes are fabricated."""
+
     text: str | None = None
     path: str | None = None
 
@@ -264,7 +356,16 @@ class _State:
     nounset: bool = False
 
     def copy(self) -> _State:
-        return _State(self.values.copy(), [scope.copy() for scope in self.scopes], self.argv, self.status, self.flow, self.output, self.errexit, self.nounset)
+        return _State(
+            self.values.copy(),
+            [scope.copy() for scope in self.scopes],
+            self.argv,
+            self.status,
+            self.flow,
+            self.output,
+            self.errexit,
+            self.nounset,
+        )
 
     def lookup(self, name: str) -> _Value:
         for scope in reversed(self.scopes):
@@ -321,7 +422,7 @@ def _word(raw: str, state: _State, tick: Callable[[], None]) -> str | _CommandTe
             if following == "\n":
                 cursor += 2
                 continue
-            if following == "\r" and raw[cursor + 2:cursor + 3] == "\n":
+            if following == "\r" and raw[cursor + 2 : cursor + 3] == "\n":
                 cursor += 3
                 continue
             if quote == '"' and following not in '$`"\\':
@@ -339,10 +440,19 @@ def _word(raw: str, state: _State, tick: Callable[[], None]) -> str | _CommandTe
                     parts.append(" ".join(state.argv))
                 cursor += 2
                 continue
-            expanded = re.match(r"\$\{([1-9][0-9]{0,2}|[A-Za-z_][A-Za-z0-9_]*)(:-([-A-Za-z0-9_.]+)|##\*/)\}", raw[cursor:])
+            expanded = re.match(
+                r"\$\{([1-9][0-9]{0,2}|[A-Za-z_][A-Za-z0-9_]*)(:-([-A-Za-z0-9_.]+)|##\*/)\}",
+                raw[cursor:],
+            )
             if expanded is not None:
                 name = expanded[1]
-                value = state.argv[int(name) - 1] if name.isdecimal() and int(name) <= len(state.argv) else None if name.isdecimal() else state.lookup(name)
+                value = (
+                    state.argv[int(name) - 1]
+                    if name.isdecimal() and int(name) <= len(state.argv)
+                    else None
+                    if name.isdecimal()
+                    else state.lookup(name)
+                )
                 if value is None:
                     unknown = True
                 elif not isinstance(value, str):
@@ -353,7 +463,10 @@ def _word(raw: str, state: _State, tick: Callable[[], None]) -> str | _CommandTe
                     parts.append(value or expanded[3])
                 cursor += expanded.end()
                 continue
-            parameter = re.match(r"\$(?:([1-9]|[A-Za-z_][A-Za-z0-9_]*)|\{([1-9][0-9]{0,2}|[A-Za-z_][A-Za-z0-9_]*)(% )?\})", raw[cursor:])
+            parameter = re.match(
+                r"\$(?:([1-9]|[A-Za-z_][A-Za-z0-9_]*)|\{([1-9][0-9]{0,2}|[A-Za-z_][A-Za-z0-9_]*)(% )?\})",
+                raw[cursor:],
+            )
             if parameter is None:
                 raise _UnresolvedError
             name = parameter[1] or parameter[2]
@@ -409,7 +522,13 @@ class _Interpreter:
             output: list[_State] = []
             for state in states:
                 self.tick()
-                if state.flow or node.connector == "&&" and state.status is False or node.connector == "||" and state.status is True:
+                if (
+                    state.flow
+                    or node.connector == "&&"
+                    and state.status is False
+                    or node.connector == "||"
+                    and state.status is True
+                ):
                     output.append(state)
                     continue
                 if node.connector in {"&&", "||"} and state.status is None:
@@ -425,7 +544,13 @@ class _Interpreter:
     def node(self, node: _Node, state: _State) -> list[_State]:
         if node.kind == "function":
             name = node.words[0].raw
-            if not self.allow_definitions or state.scopes or name in self.functions or name == self.helper_name or name in _SPECIAL | _SHELLS | _BUILTINS:
+            if (
+                not self.allow_definitions
+                or state.scopes
+                or name in self.functions
+                or name == self.helper_name
+                or name in _SPECIAL | _SHELLS | _BUILTINS
+            ):
                 raise _UnresolvedError
             self.functions[name] = node.blocks[0]
             return [state]
@@ -505,7 +630,9 @@ class _Interpreter:
             if pattern is not None and term[1].raw in {"==", "=", "!="}:
                 if isinstance(left, _CommandText):
                     raise _UnresolvedError
-                results.append(None if left is None else (pattern[1] in left) != (term[1].raw == "!="))
+                results.append(
+                    None if left is None else (pattern[1] in left) != (term[1].raw == "!=")
+                )
                 continue
             right = _word(term[2].raw, state, self.tick)
             if isinstance(left, _CommandText) or isinstance(right, _CommandText):
@@ -513,7 +640,9 @@ class _Interpreter:
             if left is None or right is None:
                 results.append(None)
             elif term[1].raw in {"-eq", "-ne"}:
-                if not re.fullmatch(r"-?(?:0|[1-9][0-9]{0,17})", left) or not re.fullmatch(r"-?(?:0|[1-9][0-9]{0,17})", right):
+                if not re.fullmatch(r"-?(?:0|[1-9][0-9]{0,17})", left) or not re.fullmatch(
+                    r"-?(?:0|[1-9][0-9]{0,17})", right
+                ):
                     raise _UnresolvedError
                 results.append((int(left) == int(right)) == (term[1].raw == "-eq"))
             else:
@@ -524,7 +653,9 @@ class _Interpreter:
         if words[0].raw == "[[":
             state.status = self.predicate(words, state)
             return [state]
-        assignments = [re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", word.raw, re.DOTALL) for word in words]
+        assignments = [
+            re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", word.raw, re.DOTALL) for word in words
+        ]
         if all(assignments):
             for assignment in assignments:
                 assert assignment is not None
@@ -586,7 +717,9 @@ class _Interpreter:
             if not self.helper or len(operands) != 2 or operands[0] != "-c" or len(words) != 3:
                 raise _UnresolvedError
             span = (words[2].start, words[2].end)
-            self.commands.setdefault(span, []).append(operands[1].normalized if isinstance(operands[1], _CommandText) else operands[1])
+            self.commands.setdefault(span, []).append(
+                operands[1].normalized if isinstance(operands[1], _CommandText) else operands[1]
+            )
             state.status = None
         elif any(isinstance(value, _CommandText) for value in operands):
             raise _UnresolvedError
@@ -615,7 +748,11 @@ class _Interpreter:
         else:
             if command == "printf":
                 format_args = operands[1:] if operands and operands[0] == "--" else operands
-                if not format_args or format_args[0].startswith("-") or re.search(r"%[^%]*n", format_args[0].replace("%%", "")):
+                if (
+                    not format_args
+                    or format_args[0].startswith("-")
+                    or re.search(r"%[^%]*n", format_args[0].replace("%%", ""))
+                ):
                     raise _UnresolvedError
             elif command != "echo":
                 raise _UnresolvedError
@@ -680,7 +817,13 @@ def reconstruct_helper_commands(
             interpreter.sequence(helper, [_State({}, [], argv)])
             for span, commands in interpreter.commands.items():
                 for command in commands:
-                    variant = (command, tuple(value.normalized if isinstance(value, _CommandText) else value for value in argv))
+                    variant = (
+                        command,
+                        tuple(
+                            value.normalized if isinstance(value, _CommandText) else value
+                            for value in argv
+                        ),
+                    )
                     if variant not in output.setdefault(span, []):
                         output[span].append(variant)
         if sum(map(len, output.values())) > _MAX_STATES:
@@ -693,7 +836,13 @@ def reconstruct_helper_commands(
 class _OutputInterpreter(_Interpreter):
     """Track stdout only for finite printf/cat helpers and proved log paths."""
 
-    def __init__(self, tick: Callable[[], None], writable_paths: frozenset[str], program: tuple[_Node, ...], written_paths: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        tick: Callable[[], None],
+        writable_paths: frozenset[str],
+        program: tuple[_Node, ...],
+        written_paths: set[str] | None = None,
+    ) -> None:
         super().__init__("", tick, helper=True)
         self.writable_paths = writable_paths
         self.tested_status: set[int] = set()
@@ -705,7 +854,11 @@ class _OutputInterpreter(_Interpreter):
                 if tested or index + 1 < len(nodes) and nodes[index + 1].connector in {"&&", "||"}:
                     self.tested_status.add(id(node))
                 for block_index, block in enumerate(node.blocks):
-                    condition = node.kind == "if" and block_index < len(node.blocks) - 1 and block_index % 2 == 0
+                    condition = (
+                        node.kind == "if"
+                        and block_index < len(node.blocks) - 1
+                        and block_index % 2 == 0
+                    )
                     collect(block, tested=tested or condition)
 
         collect(program)
@@ -738,7 +891,11 @@ class _OutputInterpreter(_Interpreter):
             else:
                 raise _UnresolvedError
         if head == "set":
-            if tuple(word.raw for word in node.words[1:]) not in {("-euo", "pipefail"), ("-Eeuo", "pipefail")} or node.redirects:
+            if (
+                tuple(word.raw for word in node.words[1:])
+                not in {("-euo", "pipefail"), ("-Eeuo", "pipefail")}
+                or node.redirects
+            ):
                 raise _UnresolvedError
             state.status = True
             state.errexit = True
@@ -751,7 +908,11 @@ class _OutputInterpreter(_Interpreter):
             template, *values = arguments
             # The format is always parsed, even for a discarded log, so a
             # variable-setting %n or escape-driven format cannot hide effects.
-            if template.startswith("-") or re.search(r"%(?!%|s)", template) or re.search(r"\\(?!n|t|\\)", template):
+            if (
+                template.startswith("-")
+                or re.search(r"%(?!%|s)", template)
+                or re.search(r"\\(?!n|t|\\)", template)
+            ):
                 raise _UnresolvedError
             if stdout:
                 if any(not isinstance(value, str) for value in values):
@@ -769,13 +930,19 @@ class _OutputInterpreter(_Interpreter):
                             output.append(values[cursor] if cursor < len(values) else "")
                             cursor += 1
                         else:
-                            output.append({"%%": "%", r"\n": "\n", r"\t": "\t", r"\\": "\\"}.get(token, token))
+                            output.append(
+                                {"%%": "%", r"\n": "\n", r"\t": "\t", r"\\": "\\"}.get(token, token)
+                            )
                 self._append(state, ShellHelperOutput(text="".join(output)))
             state.status = True
             return [state]
         if head in {"cat", "/bin/cat", "/usr/bin/cat"}:
             arguments = self.arguments(node.words[1:], state)
-            if len(arguments) != 1 or not isinstance(arguments[0], str) or not arguments[0].startswith("/"):
+            if (
+                len(arguments) != 1
+                or not isinstance(arguments[0], str)
+                or not arguments[0].startswith("/")
+            ):
                 raise _UnresolvedError
             if stdout:
                 self._append(state, ShellHelperOutput(path=arguments[0]))
@@ -786,7 +953,11 @@ class _OutputInterpreter(_Interpreter):
         return super().node(node, state)
 
     def _append(self, state: _State, value: ShellHelperOutput) -> None:
-        if len(state.output) >= _MAX_ARGS or sum(len(item.text or item.path or "") for item in (*state.output, value)) > _MAX_CHARS:
+        if (
+            len(state.output) >= _MAX_ARGS
+            or sum(len(item.text or item.path or "") for item in (*state.output, value))
+            > _MAX_CHARS
+        ):
             raise _UnresolvedError
         state.output += (value,)
 
@@ -810,10 +981,13 @@ def reconstruct_helper_output(
     Failure output cannot disappear when a caller runs with errexit disabled.
     """
     if (
-        len(helper_text) > _MAX_CHARS or "\x00" in helper_text
-        or len(argv) > _MAX_ARGS or len(environment) > _MAX_ARGS
+        len(helper_text) > _MAX_CHARS
+        or "\x00" in helper_text
+        or len(argv) > _MAX_ARGS
+        or len(environment) > _MAX_ARGS
         or any(not _NAME.fullmatch(name) or is_managed_shell_variable(name) for name in environment)
-        or sum(len(value or "") for value in (*argv, *environment.values(), *writable_paths)) > _MAX_CHARS
+        or sum(len(value or "") for value in (*argv, *environment.values(), *writable_paths))
+        > _MAX_CHARS
         or any("\x00" in (value or "") for value in (*argv, *environment.values(), *writable_paths))
     ):
         return None
@@ -831,7 +1005,9 @@ def reconstruct_helper_output(
         program = parser.sequence()
         if parser.peek():
             raise _UnresolvedError
-        states = _OutputInterpreter(tick, writable_paths, program, written_paths).sequence(program, [_State(environment.copy(), [], argv)])
+        states = _OutputInterpreter(tick, writable_paths, program, written_paths).sequence(
+            program, [_State(environment.copy(), [], argv)]
+        )
         if any(state.status is not True for state in states):
             raise _UnresolvedError
         return tuple(dict.fromkeys(state.output for state in states))

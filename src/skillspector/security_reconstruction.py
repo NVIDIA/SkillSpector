@@ -1290,7 +1290,10 @@ def _is_fence_line(text: str, cursor: int) -> bool:
 
 
 def _sentence_boundaries(
-    text: str, start: int, end: int, *,
+    text: str,
+    start: int,
+    end: int,
+    *,
     closes_owned_string: Callable[[int], bool] | None = None,
 ) -> Iterator[tuple[int, int]]:
     """Yield prose boundaries while ignoring punctuation inside balanced quotes."""

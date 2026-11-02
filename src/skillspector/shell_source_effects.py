@@ -11,14 +11,20 @@ executes a process or reads a file from the runtime filesystem.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass, field, replace
 import fnmatch
 import posixpath
 import re
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
-from skillspector.shell_helper_argv import _Node, _Parser, _Token, _UnresolvedError, is_managed_shell_variable
+from skillspector.shell_helper_argv import (
+    _Node,
+    _Parser,
+    _Token,
+    _UnresolvedError,
+    is_managed_shell_variable,
+)
 
 if TYPE_CHECKING:
     from skillspector.shell_sources import ShellSourceResolver
@@ -77,7 +83,7 @@ def _symbolic_path_matches(left: str, right: str) -> bool:
     if not right.startswith(prefix) or not right.endswith(suffix):
         return False
     end = len(right) - len(suffix)
-    digits = right[len(prefix):end] if end >= len(prefix) else ""
+    digits = right[len(prefix) : end] if end >= len(prefix) else ""
     return bool(digits) and digits.isascii() and digits.isdecimal()
 
 
@@ -115,9 +121,24 @@ class _Frame:
     asynchronous: bool = False
 
     def copy(self) -> _Frame:
-        return _Frame(self.values.copy(), self.argv, self.zero, self.cwd,
-                      self.functions.copy(), [item.copy() for item in self.scopes],
-                      self.status, self.flow, self.output, self.uncertain, self.traps.copy(), self.exported.copy(), self.errexit, self.checked, self.required_path_output, self.asynchronous)
+        return _Frame(
+            self.values.copy(),
+            self.argv,
+            self.zero,
+            self.cwd,
+            self.functions.copy(),
+            [item.copy() for item in self.scopes],
+            self.status,
+            self.flow,
+            self.output,
+            self.uncertain,
+            self.traps.copy(),
+            self.exported.copy(),
+            self.errexit,
+            self.checked,
+            self.required_path_output,
+            self.asynchronous,
+        )
 
     def lookup(self, name: str):
         for scope in reversed(self.scopes):
@@ -262,7 +283,17 @@ class _EffectsParser(_Parser):
                 words.append(self.take())
             words.append(self.take("]]"))
         else:
-            while self.peek() and self.peek() not in {";", "\n", "&&", "||", ";;", "}", "|", "&", ")"}:
+            while self.peek() and self.peek() not in {
+                ";",
+                "\n",
+                "&&",
+                "||",
+                ";;",
+                "}",
+                "|",
+                "&",
+                ")",
+            }:
                 if self.peek() in {">", ">>", ">&", "<", "<<", "<<<", "<&"}:
                     operator = self.take()
                     descriptor = "0" if operator.raw.startswith("<") else "1"
@@ -295,11 +326,22 @@ class _EffectsParser(_Parser):
             raise _UnresolvedError
         if process_inputs and len(redirects) != 1:
             raise _UnresolvedError
-        return _Node("command", tuple(words), blocks=tuple(process_inputs), redirects=tuple(redirects))
+        return _Node(
+            "command", tuple(words), blocks=tuple(process_inputs), redirects=tuple(redirects)
+        )
 
 
 class _EffectAudit:
-    def __init__(self, resolver, target, read_source, native_effect, *, preserve_only=False, preserve_state=None):
+    def __init__(
+        self,
+        resolver,
+        target,
+        read_source,
+        native_effect,
+        *,
+        preserve_only=False,
+        preserve_state=None,
+    ):
         from skillspector.shell_sources import SAFE_PATH_MARKER
 
         self.resolver = resolver
@@ -323,7 +365,12 @@ class _EffectAudit:
             raise _UnresolvedError
 
     def program(self, path, text):
-        if len(text) > 262_144 or "\x00" in text or self.path_tail in text or SHELL_PID_MARKER in text:
+        if (
+            len(text) > 262_144
+            or "\x00" in text
+            or self.path_tail in text
+            or SHELL_PID_MARKER in text
+        ):
             raise _UnresolvedError
         key = path, text
         if key in self.programs:
@@ -353,14 +400,43 @@ class _EffectAudit:
                 pending.append((cursor + 2, item))
                 cursor = stop
                 continue
-            operator = next((item for item in (";;", "&&", "||", ">&", "<&", ">>", "<<<", ";", "\n", "(", ")", "|", "&", ">", "<") if text.startswith(item, cursor)), None)
+            operator = next(
+                (
+                    item
+                    for item in (
+                        ";;",
+                        "&&",
+                        "||",
+                        ">&",
+                        "<&",
+                        ">>",
+                        "<<<",
+                        ";",
+                        "\n",
+                        "(",
+                        ")",
+                        "|",
+                        "&",
+                        ">",
+                        "<",
+                    )
+                    if text.startswith(item, cursor)
+                ),
+                None,
+            )
             if operator is not None:
                 stop = cursor + len(operator)
-            elif text[cursor] in "{}" and (cursor + 1 == len(text) or text[cursor + 1] in " \t\r\n;|&()"):
+            elif text[cursor] in "{}" and (
+                cursor + 1 == len(text) or text[cursor + 1] in " \t\r\n;|&()"
+            ):
                 stop = cursor + 1
             else:
-                removal = _QUOTED_PARAMETER_REMOVAL.match(text, cursor, min(len(text), cursor + 512))
-                if removal is not None and (removal.end() == len(text) or text[removal.end()] in " \t\r\n;|&()<>"):
+                removal = _QUOTED_PARAMETER_REMOVAL.match(
+                    text, cursor, min(len(text), cursor + 512)
+                )
+                if removal is not None and (
+                    removal.end() == len(text) or text[removal.end()] in " \t\r\n;|&()<>"
+                ):
                     # The shared multi-shell reader also models ksh's inherited
                     # quote transitions. This complete Bash value-only shape
                     # has independent inner pattern quotes. Keep its boundary
@@ -377,7 +453,7 @@ class _EffectAudit:
                     stop = self.resolver.heredoc_bodies(text, cursor, len(text), (item,), self.tick)
                     if stop is None:
                         raise _UnresolvedError
-                    last = stop - int(text[stop - 1:stop] == "\n")
+                    last = stop - int(text[stop - 1 : stop] == "\n")
                     body_end = max(cursor, text.rfind("\n", cursor, last) + 1)
                     body = text[cursor:body_end]
                     if item[1]:
@@ -403,7 +479,9 @@ class _EffectAudit:
             return None
         if value.startswith("/"):
             return posixpath.normpath(value)
-        return posixpath.normpath(posixpath.join(frame.cwd, value)) if frame.cwd is not None else None
+        return (
+            posixpath.normpath(posixpath.join(frame.cwd, value)) if frame.cwd is not None else None
+        )
 
     def disjoint(self, value):
         from skillspector.shell_sources import SAFE_PATH_MARKER
@@ -414,7 +492,11 @@ class _EffectAudit:
             # Collection delegates every known write to the authoritative
             # inventory callback; an unknown destination is still refused.
             return True
-        if value.startswith("/tmp/") and SAFE_PATH_MARKER in value.split("/")[2] and ".." not in value.split("/"):
+        if (
+            value.startswith("/tmp/")
+            and SAFE_PATH_MARKER in value.split("/")[2]
+            and ".." not in value.split("/")
+        ):
             return True
         canonical = posixpath.normpath(value)
         if canonical in {".", "/", self.target} or self.target.startswith(canonical + "/"):
@@ -426,7 +508,9 @@ class _EffectAudit:
                 if _symbolic_path_matches(canonical, target):
                     return False
                 target = posixpath.dirname(target)
-        return not _symbolic_path_matches(canonical.rpartition("/")[2], self.target.rpartition("/")[2])
+        return not _symbolic_path_matches(
+            canonical.rpartition("/")[2], self.target.rpartition("/")[2]
+        )
 
     def word(self, raw, frame, program, *, assignment=False, final_assignment=False):
         parts, quote, cursor, unknown = [], "", 0, False
@@ -477,23 +561,41 @@ class _EffectAudit:
                 # enabled inside; unsupported inherit_errexit settings refuse.
                 child.errexit = False
                 child.required_path_output = False
-                nested = self.program(program.path, raw[cursor + 2:end - 1])
+                nested = self.program(program.path, raw[cursor + 2 : end - 1])
                 nodes = self.parse(nested)
-                sole_value = cursor == 0 and end == len(raw) or cursor == 1 and raw[:1] == raw[-1:] == '"' and end == len(raw) - 1
+                sole_value = (
+                    cursor == 0
+                    and end == len(raw)
+                    or cursor == 1
+                    and raw[:1] == raw[-1:] == '"'
+                    and end == len(raw) - 1
+                )
                 if (
-                    final_assignment and frame.errexit and not frame.checked and sole_value
-                    and len(nodes) == 1 and nodes[0].kind == "command" and not nodes[0].redirects
-                    and nodes[0].words and nodes[0].words[0].raw in {"mktemp", "/bin/mktemp", "/usr/bin/mktemp"}
+                    final_assignment
+                    and frame.errexit
+                    and not frame.checked
+                    and sole_value
+                    and len(nodes) == 1
+                    and nodes[0].kind == "command"
+                    and not nodes[0].redirects
+                    and nodes[0].words
+                    and nodes[0].words[0].raw in {"mktemp", "/bin/mktemp", "/usr/bin/mktemp"}
                 ):
                     # A failed sole mktemp is the assignment's own status,
                     # so its parent cannot consume a fabricated temp path.
                     child.errexit = True
                 if (
-                    final_assignment and frame.errexit and not frame.checked and sole_value
-                    and len(nodes) == 2 and all(node.kind == "command" and not node.redirects for node in nodes)
-                    and len(nodes[0].words) == 2 and nodes[0].words[0].raw == "cd"
+                    final_assignment
+                    and frame.errexit
+                    and not frame.checked
+                    and sole_value
+                    and len(nodes) == 2
+                    and all(node.kind == "command" and not node.redirects for node in nodes)
+                    and len(nodes[0].words) == 2
+                    and nodes[0].words[0].raw == "cd"
                     and tuple(word.raw for word in nodes[1].words) == ("pwd",)
-                    and nodes[1].connector == "&&" and not {"cd", "pwd"}.intersection(frame.functions)
+                    and nodes[1].connector == "&&"
+                    and not {"cd", "pwd"}.intersection(frame.functions)
                 ):
                     # In this exact final assignment, failed cd skips pwd and
                     # fails the parent assignment. Only a successful path can
@@ -501,7 +603,10 @@ class _EffectAudit:
                     child.required_path_output = True
                 branches = self.run(nested, nodes, [child])
                 self.apply_traps(branches)
-                values = {branch.output.rstrip("\n") if branch.output is not None else None for branch in branches}
+                values = {
+                    branch.output.rstrip("\n") if branch.output is not None else None
+                    for branch in branches
+                }
                 value = next(iter(values)) if len(values) == 1 else None
                 if value is None:
                     unknown = True
@@ -510,9 +615,11 @@ class _EffectAudit:
                 cursor = end
                 continue
             if character == "$":
-                parameter = re.match(r"\$(?:([@*#?$!0-9]|[A-Za-z_][A-Za-z0-9_]*)|\{([^{}]+)\})", raw[cursor:])
+                parameter = re.match(
+                    r"\$(?:([@*#?$!0-9]|[A-Za-z_][A-Za-z0-9_]*)|\{([^{}]+)\})", raw[cursor:]
+                )
                 if parameter is None:
-                    if cursor + 1 == len(raw) or quote == '"' and raw[cursor + 1:] == '"':
+                    if cursor + 1 == len(raw) or quote == '"' and raw[cursor + 1 :] == '"':
                         parts.append("$")
                         cursor += 1
                         continue
@@ -533,7 +640,11 @@ class _EffectAudit:
                         # Embedded quoted @ can produce several argv words.
                         # Only arguments() owns the exact standalone "$@".
                         raise _UnresolvedError
-                    value = " ".join(frame.argv) if all(isinstance(item, str) for item in frame.argv) else None
+                    value = (
+                        " ".join(frame.argv)
+                        if all(isinstance(item, str) for item in frame.argv)
+                        else None
+                    )
                 elif name == "$":
                     value = SHELL_PID_MARKER
                 elif name == "!":
@@ -545,26 +656,53 @@ class _EffectAudit:
                     value = None
                 elif re.fullmatch(r"[0-9]{1,16}", name):
                     position = int(name)
-                    value = frame.zero if position == 0 else frame.argv[position - 1] if position <= len(frame.argv) else ""
+                    value = (
+                        frame.zero
+                        if position == 0
+                        else frame.argv[position - 1]
+                        if position <= len(frame.argv)
+                        else ""
+                    )
                 else:
-                    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*|[0-9]{1,16})(?::([-+?])(.*))?", name, re.DOTALL)
-                    array = re.fullmatch(r"(#?)([A-Za-z_][A-Za-z0-9_]*)\[(0|[1-9][0-9]{0,2}|@)\]", name)
+                    match = re.fullmatch(
+                        r"([A-Za-z_][A-Za-z0-9_]*|[0-9]{1,16})(?::([-+?])(.*))?", name, re.DOTALL
+                    )
+                    array = re.fullmatch(
+                        r"(#?)([A-Za-z_][A-Za-z0-9_]*)\[(0|[1-9][0-9]{0,2}|@)\]", name
+                    )
                     if array:
                         if array[1] and array[3] != "@":
                             raise _UnresolvedError
                         items = frame.lookup(array[2])
-                        value = str(len(items)) if isinstance(items, tuple) and array[1] and array[3] == "@" else items[int(array[3])] if isinstance(items, tuple) and array[3].isdecimal() and int(array[3]) < len(items) else None
+                        value = (
+                            str(len(items))
+                            if isinstance(items, tuple) and array[1] and array[3] == "@"
+                            else items[int(array[3])]
+                            if isinstance(items, tuple)
+                            and array[3].isdecimal()
+                            and int(array[3]) < len(items)
+                            else None
+                        )
                     elif match:
                         if match[1].isdecimal():
                             position = int(match[1])
-                            value = frame.zero if position == 0 else frame.argv[position - 1] if position <= len(frame.argv) else ""
+                            value = (
+                                frame.zero
+                                if position == 0
+                                else frame.argv[position - 1]
+                                if position <= len(frame.argv)
+                                else ""
+                            )
                         else:
                             value = frame.lookup(match[1])
                         unused_word = value is not None and (
-                            match[2] in {"-", "?"} and bool(value)
-                            or match[2] == "+" and not value
+                            match[2] in {"-", "?"} and bool(value) or match[2] == "+" and not value
                         )
-                        if match[2] and not unused_word and re.fullmatch(r"[-A-Za-z0-9_./]*", match[3]) is None:
+                        if (
+                            match[2]
+                            and not unused_word
+                            and re.fullmatch(r"[-A-Za-z0-9_./]*", match[3]) is None
+                        ):
                             # Parameter fallback words have their own shell
                             # expansions. Only a proven unused word may skip
                             # those effects, including diagnostic messages.
@@ -589,7 +727,11 @@ class _EffectAudit:
                     parts.append(value)
                 cursor += parameter.end()
                 continue
-            if character == "`" or not quote and (character == "~" or not assignment and character in "*?[]{}"):
+            if (
+                character == "`"
+                or not quote
+                and (character == "~" or not assignment and character in "*?[]{}")
+            ):
                 raise _UnresolvedError
             parts.append(character)
             cursor += 1
@@ -627,7 +769,13 @@ class _EffectAudit:
                 output = []
                 for frame in frames:
                     self.tick()
-                    if frame.flow or node.connector == "&&" and frame.status is False or node.connector == "||" and frame.status is True:
+                    if (
+                        frame.flow
+                        or node.connector == "&&"
+                        and frame.status is False
+                        or node.connector == "||"
+                        and frame.status is True
+                    ):
                         output.append(frame)
                         continue
                     if node.connector in {"&&", "||"} and frame.status is None:
@@ -636,7 +784,10 @@ class _EffectAudit:
                         skipped.uncertain = frame.uncertain = True
                         output.append(skipped)
                     previous_checked = frame.checked
-                    frame.checked |= index + 1 < len(nodes) and nodes[index + 1].connector in {"&&", "||"}
+                    frame.checked |= index + 1 < len(nodes) and nodes[index + 1].connector in {
+                        "&&",
+                        "||",
+                    }
                     branches = self.node(program, node, frame)
                     for branch in branches:
                         branch.checked = previous_checked
@@ -665,8 +816,10 @@ class _EffectAudit:
                 output.extend(alternatives)
                 continue
             if any(
-                branch.functions != first.functions or branch.traps != first.traps
-                or branch.exported != first.exported or len(branch.argv) != len(first.argv)
+                branch.functions != first.functions
+                or branch.traps != first.traps
+                or branch.exported != first.exported
+                or len(branch.argv) != len(first.argv)
                 or [set(scope) for scope in branch.scopes] != [set(scope) for scope in first.scopes]
                 for branch in alternatives[1:]
             ):
@@ -687,8 +840,14 @@ class _EffectAudit:
 
             joined = first.copy()
             joined.values = bindings([branch.values for branch in alternatives])
-            joined.scopes = [bindings([branch.scopes[index] for branch in alternatives]) for index in range(len(first.scopes))]
-            joined.argv = tuple(equal([branch.argv[index] for branch in alternatives]) for index in range(len(first.argv)))
+            joined.scopes = [
+                bindings([branch.scopes[index] for branch in alternatives])
+                for index in range(len(first.scopes))
+            ]
+            joined.argv = tuple(
+                equal([branch.argv[index] for branch in alternatives])
+                for index in range(len(first.argv))
+            )
             for name in ("zero", "cwd", "status", "output"):
                 setattr(joined, name, equal([getattr(branch, name) for branch in alternatives]))
             for name in ("uncertain", "checked", "asynchronous"):
@@ -700,7 +859,20 @@ class _EffectAudit:
 
     def node(self, program, node, frame):
         if node.kind == "function":
-            if node.words[0].raw in {"local", "export", "unset", "test", "source", "return", "exit", "break", "continue", "shift", "command", "trap"}:
+            if node.words[0].raw in {
+                "local",
+                "export",
+                "unset",
+                "test",
+                "source",
+                "return",
+                "exit",
+                "break",
+                "continue",
+                "shift",
+                "command",
+                "trap",
+            }:
                 raise _UnresolvedError
             frame.functions[node.words[0].raw] = _Function(program, node.words[1:])
             frame.status = True
@@ -760,9 +932,20 @@ class _EffectAudit:
             frame.status = True
             return result + [frame]
         if node.kind == "redirect":
-            redirects = tuple((operator, self.word(token.raw, frame, program)) for operator, token in node.redirects)
-            request = ShellEffectCommand((":",), {}, frame.cwd, program.path, node.redirects[0][1].start,
-                                         redirects, uncertain=frame.uncertain, fail_stop=frame.errexit and not frame.checked)
+            redirects = tuple(
+                (operator, self.word(token.raw, frame, program))
+                for operator, token in node.redirects
+            )
+            request = ShellEffectCommand(
+                (":",),
+                {},
+                frame.cwd,
+                program.path,
+                node.redirects[0][1].start,
+                redirects,
+                uncertain=frame.uncertain,
+                fail_stop=frame.errexit and not frame.checked,
+            )
             opened = self.begin_redirects(request, frame)
             previous_output = frame.output
             frame.output = ""
@@ -771,7 +954,13 @@ class _EffectAudit:
             for branch in branches:
                 output = branch.output
                 branch.output = previous_output
-                completion = replace(request, stdout=output, uncertain=branch.uncertain, child_inspected=True, child_status=branch.status)
+                completion = replace(
+                    request,
+                    stdout=output,
+                    uncertain=branch.uncertain,
+                    child_inspected=True,
+                    child_status=branch.status,
+                )
                 self.native(program, branch, completion, child=True)
             return branches
         if node.kind in {"group", "subshell", "background"}:
@@ -783,7 +972,13 @@ class _EffectAudit:
             nested.asynchronous |= node.kind == "background"
             branches = self.run(program, node.blocks[0], [nested])
             self.apply_traps(branches)
-            frame.status = True if node.kind == "background" else branches[0].status if len(branches) == 1 else None
+            frame.status = (
+                True
+                if node.kind == "background"
+                else branches[0].status
+                if len(branches) == 1
+                else None
+            )
             if node.kind != "background":
                 values = {branch.output for branch in branches}
                 frame.output = values.pop() if len(values) == 1 else None
@@ -805,7 +1000,11 @@ class _EffectAudit:
                 array = re.fullmatch(r'"\$\{([A-Za-z_][A-Za-z0-9_]*)\[@\]\}"', node.words[2].raw)
                 if array is not None and frame.lookup(array[1]) is None:
                     return self.unknown_for(program, node, frame)
-            values = self.arguments(node.words[2:], frame, program) if len(node.words) > 1 else frame.argv
+            values = (
+                self.arguments(node.words[2:], frame, program)
+                if len(node.words) > 1
+                else frame.argv
+            )
             if len(values) > 128:
                 raise _UnresolvedError
             if not values:
@@ -889,7 +1088,7 @@ class _EffectAudit:
                 return self.join(completed)
             # Include the earlier entry before another iteration. Changed
             # data becomes unknown before it can choose the next effects.
-            successor, = self.join([entry, *continuing])
+            (successor,) = self.join([entry, *continuing])
             successor.status = None
             successor.output = None
             if successor == entry and previous_effects == self.preserve_state():
@@ -913,10 +1112,24 @@ class _EffectAudit:
                     return left
                 right_frame = frame.copy()
                 right_frame.uncertain |= left is None
-                right = self.condition(raw[at + 1:], right_frame, program, depth + 1, extended=extended)
+                right = self.condition(
+                    raw[at + 1 :], right_frame, program, depth + 1, extended=extended
+                )
                 if separator == "&&":
-                    return False if left is False or right is False else True if left is True and right is True else None
-                return True if left is True or right is True else False if left is False and right is False else None
+                    return (
+                        False
+                        if left is False or right is False
+                        else True
+                        if left is True and right is True
+                        else None
+                    )
+                return (
+                    True
+                    if left is True or right is True
+                    else False
+                    if left is False and right is False
+                    else None
+                )
         if raw[:1] == ("!",):
             value = self.condition(raw[1:], frame, program, depth + 1, extended=extended)
             return None if value is None else not value
@@ -929,24 +1142,42 @@ class _EffectAudit:
             return None
         values = tuple(self.word(item, frame, program, assignment=extended) for item in raw)
         if frame.asynchronous and (
-            len(values) == 2 and values[0] not in {"-n", "-z"}
-            or len(values) == 3 and values[1] in {"-nt", "-ot", "-ef"}
+            len(values) == 2
+            and values[0] not in {"-n", "-z"}
+            or len(values) == 3
+            and values[1] in {"-nt", "-ot", "-ef"}
         ):
             # An asynchronous child may observe files after later parent
             # writes. The current artifact snapshot cannot prune its branches.
             raise _UnresolvedError
-        if len(values) == 2 and values[0] in {"-e", "-f", "-s", "-x", "-L", "-d"} and self.native_effect is not None:
+        if (
+            len(values) == 2
+            and values[0] in {"-e", "-f", "-s", "-x", "-L", "-d"}
+            and self.native_effect is not None
+        ):
             path = self.path(values[1], frame)
             if path is not None and self.conflicts_with_redirect(path):
                 raise _UnresolvedError
-            request = ShellEffectCommand(("test", *values), {}, frame.cwd, program.path, 0, uncertain=frame.uncertain)
+            request = ShellEffectCommand(
+                ("test", *values), {}, frame.cwd, program.path, 0, uncertain=frame.uncertain
+            )
             result = self.native_effect(request)
             if result is None or result.writes or result.script_path is not None:
                 return None
             return result.status
         if len(values) == 2 and values[0] in {"-n", "-z"}:
             return None if values[1] is None else bool(values[1]) == (values[0] == "-n")
-        if len(values) == 3 and values[1] in {"=", "==", "!=", "-eq", "-ne", "-gt", "-ge", "-lt", "-le"}:
+        if len(values) == 3 and values[1] in {
+            "=",
+            "==",
+            "!=",
+            "-eq",
+            "-ne",
+            "-gt",
+            "-ge",
+            "-lt",
+            "-le",
+        }:
             left, operator, right = values
             if left is None or right is None:
                 return None
@@ -960,24 +1191,44 @@ class _EffectAudit:
                 # A fully quoted RHS is literal; mixed quoted/unquoted pieces
                 # preserve quoting per character and cannot use the flattened
                 # value as either a plain string or an unqualified pattern.
-                literal = re.fullmatch(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", raw[2], re.DOTALL) is not None
-                if not literal and (any(character in raw[2] for character in "'\"\\") or any(character in right for character in "[]()|")):
+                literal = (
+                    re.fullmatch(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", raw[2], re.DOTALL) is not None
+                )
+                if not literal and (
+                    any(character in raw[2] for character in "'\"\\")
+                    or any(character in right for character in "[]()|")
+                ):
                     return None
                 matched = left == right if literal else fnmatch.fnmatchcase(left, right)
                 return matched != (operator == "!=")
-            if not re.fullmatch(r"-?(?:0|[1-9][0-9]{0,15})", left) or not re.fullmatch(r"-?(?:0|[1-9][0-9]{0,15})", right):
+            if not re.fullmatch(r"-?(?:0|[1-9][0-9]{0,15})", left) or not re.fullmatch(
+                r"-?(?:0|[1-9][0-9]{0,15})", right
+            ):
                 return None
             a, b = int(left), int(right)
-            return {"-eq": a == b, "-ne": a != b, "-gt": a > b, "-ge": a >= b, "-lt": a < b, "-le": a <= b}[operator]
+            return {
+                "-eq": a == b,
+                "-ne": a != b,
+                "-gt": a > b,
+                "-ge": a >= b,
+                "-lt": a < b,
+                "-le": a <= b,
+            }[operator]
         return None
 
     def process_input(self, program, node, frame):
         words = [token.raw for token in node.words]
-        if len(node.blocks) != 1 or tuple(operator for operator, _ in node.redirects) != ("0<process",):
+        if len(node.blocks) != 1 or tuple(operator for operator, _ in node.redirects) != (
+            "0<process",
+        ):
             raise _UnresolvedError
         if words and words[0].startswith("IFS="):
             separator = words.pop(0)[4:]
-            if not re.fullmatch(r"(['\"])[!-~]\1", separator) or separator[1] in "'\"\\$`" or words[:1] != ["read"]:
+            if (
+                not re.fullmatch(r"(['\"])[!-~]\1", separator)
+                or separator[1] in "'\"\\$`"
+                or words[:1] != ["read"]
+            ):
                 raise _UnresolvedError
         if words[:2] == ["read", "-r"]:
             names = words[2:]
@@ -985,7 +1236,12 @@ class _EffectAudit:
             names = words[2:]
         else:
             raise _UnresolvedError
-        if not names or len(names) > 128 or words[0] in frame.functions or any(not _NAME.fullmatch(name) or is_managed_shell_variable(name) for name in names):
+        if (
+            not names
+            or len(names) > 128
+            or words[0] in frame.functions
+            or any(not _NAME.fullmatch(name) or is_managed_shell_variable(name) for name in names)
+        ):
             raise _UnresolvedError
         # Process substitution runs concurrently. Restrict its effects to
         # copied functions and pure builtins, without snapshot-dependent reads.
@@ -1026,9 +1282,15 @@ class _EffectAudit:
                 if raw or closing < 0:
                     raise _UnresolvedError
                 value = self.arguments(words[1:closing], assignment_frame, program)
-                del words[:closing + 1]
+                del words[: closing + 1]
             else:
-                value = self.word(raw, assignment_frame, program, assignment=True, final_assignment=len(node.words) == 1 and not node.redirects)
+                value = self.word(
+                    raw,
+                    assignment_frame,
+                    program,
+                    assignment=True,
+                    final_assignment=len(node.words) == 1 and not node.redirects,
+                )
             if is_managed_shell_variable(name):
                 if name != "PATH" or not words or not isinstance(value, str):
                     raise _UnresolvedError
@@ -1055,7 +1317,18 @@ class _EffectAudit:
                     redirects.append((operator, value))
         if not words:
             if redirects:
-                self.native(program, frame, ShellEffectCommand((":",), environment, frame.cwd, program.path, node.redirects[0][1].start, tuple(redirects)))
+                self.native(
+                    program,
+                    frame,
+                    ShellEffectCommand(
+                        (":",),
+                        environment,
+                        frame.cwd,
+                        program.path,
+                        node.redirects[0][1].start,
+                        tuple(redirects),
+                    ),
+                )
             for name, value in prefix:
                 frame.assign(name, value)
             frame.status = None if assignment_substitution else True
@@ -1064,7 +1337,11 @@ class _EffectAudit:
         for operator, value in redirects:
             if operator in {"1>&", "2>&", "0<&"} and value in {"0", "1", "2", "-"}:
                 continue
-            if ">" in operator and value != "/dev/null" and not self.disjoint(self.path(value, frame)):
+            if (
+                ">" in operator
+                and value != "/dev/null"
+                and not self.disjoint(self.path(value, frame))
+            ):
                 raise _UnresolvedError
         raw = tuple(word.raw for word in words)
         if raw[0] in {"[[", "[", "test"}:
@@ -1073,7 +1350,9 @@ class _EffectAudit:
             closing = "]]" if raw[0] == "[[" else "]" if raw[0] == "[" else None
             if closing is not None and raw[-1] != closing:
                 raise _UnresolvedError
-            frame.status = self.condition(raw[1:-1] if closing else raw[1:], frame, program, extended=raw[0] == "[[")
+            frame.status = self.condition(
+                raw[1:-1] if closing else raw[1:], frame, program, extended=raw[0] == "[["
+            )
             return [frame]
         if raw[0] in {"local", "export", "unset"}:
             if prefix or redirects:
@@ -1081,19 +1360,31 @@ class _EffectAudit:
             local_words = words[1:]
             if raw[0] == "local" and local_words[:1] and local_words[0].raw == "-a":
                 local_words = local_words[1:]
-                if len(local_words) >= 3 and local_words[1].raw == "(" and local_words[-1].raw == ")":
+                if (
+                    len(local_words) >= 3
+                    and local_words[1].raw == "("
+                    and local_words[-1].raw == ")"
+                ):
                     assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=", local_words[0].raw)
                     if assignment is None:
                         raise _UnresolvedError
-                    frame.assign(assignment[1], self.arguments(local_words[2:-1], frame, program), local=True)
+                    frame.assign(
+                        assignment[1], self.arguments(local_words[2:-1], frame, program), local=True
+                    )
                     frame.status = True
                     return [frame]
             for token in local_words:
                 assignment = _ASSIGN.fullmatch(token.raw)
                 if assignment:
-                    name, value = assignment[1], self.word(assignment[2], frame, program, assignment=True)
+                    name, value = (
+                        assignment[1],
+                        self.word(assignment[2], frame, program, assignment=True),
+                    )
                 elif _NAME.fullmatch(token.raw):
-                    name, value = token.raw, None if raw[0] in {"local", "unset"} else frame.lookup(token.raw)
+                    name, value = (
+                        token.raw,
+                        None if raw[0] in {"local", "unset"} else frame.lookup(token.raw),
+                    )
                 else:
                     raise _UnresolvedError
                 frame.assign(name, value, local=raw[0] == "local")
@@ -1114,12 +1405,24 @@ class _EffectAudit:
             previous = frame.argv
             previous_output = frame.output
             redirect_cwd = frame.cwd
-            request = ShellEffectCommand(argv, environment, redirect_cwd, program.path, words[0].start, tuple(redirects), stdin, uncertain=frame.uncertain, fail_stop=frame.errexit and not frame.checked)
+            request = ShellEffectCommand(
+                argv,
+                environment,
+                redirect_cwd,
+                program.path,
+                words[0].start,
+                tuple(redirects),
+                stdin,
+                uncertain=frame.uncertain,
+                fail_stop=frame.errexit and not frame.checked,
+            )
             opened = self.begin_redirects(request, frame)
             frame.argv = argv[1:]
             frame.output = ""
             frame.scopes.append({})
-            branches = self.run(function.program, self.parse(function.program, function.tokens), [frame])
+            branches = self.run(
+                function.program, self.parse(function.program, function.tokens), [frame]
+            )
             self.end_redirects(opened)
             for branch in branches:
                 branch.scopes.pop()
@@ -1128,7 +1431,13 @@ class _EffectAudit:
                     branch.flow = ""
                 output = branch.output
                 branch.output = previous_output
-                completion = replace(request, stdout=output, uncertain=branch.uncertain, child_inspected=True, child_status=branch.status)
+                completion = replace(
+                    request,
+                    stdout=output,
+                    uncertain=branch.uncertain,
+                    child_inspected=True,
+                    child_status=branch.status,
+                )
                 self.native(program, branch, completion, child=True)
             return branches
         if name in {"source", "."}:
@@ -1154,13 +1463,25 @@ class _EffectAudit:
             if prefix or redirects or len(argv) > 2:
                 raise _UnresolvedError
             frame.flow = name
-            frame.status = frame.status if len(argv) == 1 else argv[1] == "0" if argv[1] in {"0", "1", "2"} else None
+            frame.status = (
+                frame.status
+                if len(argv) == 1
+                else argv[1] == "0"
+                if argv[1] in {"0", "1", "2"}
+                else None
+            )
             return [frame]
         if name == "shift":
             amount = "1" if len(argv) == 1 else argv[1] if len(argv) == 2 else None
-            if amount is None or not amount.isdecimal() or not 0 < int(amount) <= len(frame.argv) or prefix or redirects:
+            if (
+                amount is None
+                or not amount.isdecimal()
+                or not 0 < int(amount) <= len(frame.argv)
+                or prefix
+                or redirects
+            ):
                 raise _UnresolvedError
-            frame.argv = frame.argv[int(amount):]
+            frame.argv = frame.argv[int(amount) :]
             frame.status = True
             return [frame]
         if name == "command":
@@ -1177,24 +1498,69 @@ class _EffectAudit:
         if name in {"bash", "/bin/bash", "/usr/bin/bash", "sh", "/bin/sh", "/usr/bin/sh"}:
             if frame.asynchronous:
                 raise _UnresolvedError
-            if name in {"bash", "/bin/bash", "/usr/bin/bash"} and len(argv) >= 2 and argv[1] is not None and not argv[1].startswith("-"):
+            if (
+                name in {"bash", "/bin/bash", "/usr/bin/bash"}
+                and len(argv) >= 2
+                and argv[1] is not None
+                and not argv[1].startswith("-")
+            ):
                 if self.native_effect is None:
                     raise _UnresolvedError
-                request = ShellEffectCommand(argv[1:], environment, frame.cwd, program.path, words[0].start, tuple(redirects), stdin, uncertain=frame.uncertain, interpreter=name)
+                request = ShellEffectCommand(
+                    argv[1:],
+                    environment,
+                    frame.cwd,
+                    program.path,
+                    words[0].start,
+                    tuple(redirects),
+                    stdin,
+                    uncertain=frame.uncertain,
+                    interpreter=name,
+                )
                 self.native(program, frame, request)
                 return [frame]
             if "/" not in name and environment.get("PATH", self.path_tail) != self.path_tail:
                 if self.native_effect is None:
                     raise _UnresolvedError
-                identity_request = ShellEffectCommand(argv, environment, frame.cwd, program.path, words[0].start, uncertain=frame.uncertain, identity_only=True)
+                identity_request = ShellEffectCommand(
+                    argv,
+                    environment,
+                    frame.cwd,
+                    program.path,
+                    words[0].start,
+                    uncertain=frame.uncertain,
+                    identity_only=True,
+                )
                 identity = self.native_effect(identity_request)
-                if identity is None or not identity.native_identity or identity.script_path is not None or identity.writes:
+                if (
+                    identity is None
+                    or not identity.native_identity
+                    or identity.script_path is not None
+                    or identity.writes
+                ):
                     raise _UnresolvedError
             if len(argv) < 3 or argv[1] != "-c" or argv[2] is None:
                 raise _UnresolvedError
-            redirect_request = ShellEffectCommand(argv, environment, frame.cwd, program.path, words[0].start, tuple(redirects), stdin, uncertain=frame.uncertain, fail_stop=frame.errexit and not frame.checked)
+            redirect_request = ShellEffectCommand(
+                argv,
+                environment,
+                frame.cwd,
+                program.path,
+                words[0].start,
+                tuple(redirects),
+                stdin,
+                uncertain=frame.uncertain,
+                fail_stop=frame.errexit and not frame.checked,
+            )
             opened = self.begin_redirects(redirect_request, frame)
-            child = _Frame(environment, argv[4:], argv[3] if len(argv) > 3 and argv[3] is not None else name, frame.cwd, uncertain=frame.uncertain, exported=set(environment))
+            child = _Frame(
+                environment,
+                argv[4:],
+                argv[3] if len(argv) > 3 and argv[3] is not None else name,
+                frame.cwd,
+                uncertain=frame.uncertain,
+                exported=set(environment),
+            )
             nested = self.program(program.path, argv[2])
             branches = self.run(nested, self.parse(nested), [child])
             self.apply_traps(branches)
@@ -1202,11 +1568,19 @@ class _EffectAudit:
             frame.status = branches[0].status if len(branches) == 1 else None
             outputs = {branch.output for branch in branches}
             output = outputs.pop() if len(outputs) == 1 else None
-            request = replace(redirect_request, stdout=output, child_inspected=True, child_status=frame.status)
+            request = replace(
+                redirect_request, stdout=output, child_inspected=True, child_status=frame.status
+            )
             self.native(program, frame, request, child=True)
             return [frame]
         if name == "trap":
-            if prefix or redirects or len(argv) != 3 or argv[1] is None or argv[2] not in {"EXIT", "0"}:
+            if (
+                prefix
+                or redirects
+                or len(argv) != 3
+                or argv[1] is None
+                or argv[2] not in {"EXIT", "0"}
+            ):
                 raise _UnresolvedError
             if argv[1] == "-":
                 frame.traps.pop("EXIT", None)
@@ -1215,7 +1589,17 @@ class _EffectAudit:
             frame.status = True
             return [frame]
         stdout = self.printf(argv[1:]) if name == "printf" else None
-        request = ShellEffectCommand(argv, environment, frame.cwd, program.path, words[0].start, tuple(redirects), stdin, stdout, frame.uncertain)
+        request = ShellEffectCommand(
+            argv,
+            environment,
+            frame.cwd,
+            program.path,
+            words[0].start,
+            tuple(redirects),
+            stdin,
+            stdout,
+            frame.uncertain,
+        )
         self.native(program, frame, request)
         return [frame]
 
@@ -1232,7 +1616,9 @@ class _EffectAudit:
             self.tick()
             character = format_string[cursor]
             if character == "\\":
-                output.append({"n": "\n", "r": "\r", "t": "\t", "\\": "\\"}[format_string[cursor + 1]])
+                output.append(
+                    {"n": "\n", "r": "\r", "t": "\t", "\\": "\\"}[format_string[cursor + 1]]
+                )
                 cursor += 2
             elif character == "%":
                 if format_string[cursor + 1] == "%":
@@ -1288,17 +1674,30 @@ class _EffectAudit:
         if frame.asynchronous and request.redirects:
             raise _UnresolvedError
         paths = [
-            self.path(value, frame) for operator, value in request.redirects
+            self.path(value, frame)
+            for operator, value in request.redirects
             if operator in {"1>", "1>>", "2>", "2>>"} and value != "/dev/null"
         ]
-        if any(path is None or not self.disjoint(path) or self.conflicts_with_redirect(path) for path in paths):
+        if any(
+            path is None or not self.disjoint(path) or self.conflicts_with_redirect(path)
+            for path in paths
+        ):
             raise _UnresolvedError
         if paths and self.native_effect is not None:
             # Open happens before the body. Reads of the active destination
             # are separately refused because stdout is accumulated, not streamed.
-            opening = replace(request, stdout=None, child_inspected=True, child_status=None, redirect_open=True)
+            opening = replace(
+                request, stdout=None, child_inspected=True, child_status=None, redirect_open=True
+            )
             result = self.native_effect(opening)
-            if result is None or result.script_path is not None or any(not self.disjoint(path) or self.conflicts_with_redirect(path) for path in result.writes):
+            if (
+                result is None
+                or result.script_path is not None
+                or any(
+                    not self.disjoint(path) or self.conflicts_with_redirect(path)
+                    for path in result.writes
+                )
+            ):
                 raise _UnresolvedError
         self.active_redirects.extend(paths)
         return len(paths)
@@ -1319,21 +1718,48 @@ class _EffectAudit:
         args = request.argv[1:]
         if basename == "cat" and not args:
             return basename
-        if basename == "df" and len(args) == 3 and args[:2] == ("-B1", "--output=avail") and args[2] is not None and not args[2].startswith("-"):
+        if (
+            basename == "df"
+            and len(args) == 3
+            and args[:2] == ("-B1", "--output=avail")
+            and args[2] is not None
+            and not args[2].startswith("-")
+        ):
             return basename
-        if basename == "awk" and len(args) == 1 and args[0] is not None and re.fullmatch(r"[ \t]*NR[ \t]*==[ \t]*2[ \t]*\{[ \t]*print[ \t]+\$1[ \t]*;?[ \t]*\}[ \t]*", args[0]):
+        if (
+            basename == "awk"
+            and len(args) == 1
+            and args[0] is not None
+            and re.fullmatch(
+                r"[ \t]*NR[ \t]*==[ \t]*2[ \t]*\{[ \t]*print[ \t]+\$1[ \t]*;?[ \t]*\}[ \t]*",
+                args[0],
+            )
+        ):
             return basename
         return None
 
     def native(self, program, frame, request, *, child=False):
-        asynchronous_reader = self.asynchronous_reader(request) if frame.asynchronous and not child else None
+        asynchronous_reader = (
+            self.asynchronous_reader(request) if frame.asynchronous and not child else None
+        )
         if frame.asynchronous and (
-            request.interpreter is not None or request.redirects
-            or not (child and request.child_inspected) and asynchronous_reader is None and request.argv[0] not in {":", "true", "false", "printf", "echo", "set"}
+            request.interpreter is not None
+            or request.redirects
+            or not (child and request.child_inspected)
+            and asynchronous_reader is None
+            and request.argv[0] not in {":", "true", "false", "printf", "echo", "set"}
         ):
             raise _UnresolvedError
         if not request.child_inspected:
-            request = replace(request, fail_stop=(frame.errexit and not frame.checked) or (frame.required_path_output and request.interpreter is None and request.argv[0] == "cd"))
+            request = replace(
+                request,
+                fail_stop=(frame.errexit and not frame.checked)
+                or (
+                    frame.required_path_output
+                    and request.interpreter is None
+                    and request.argv[0] == "cd"
+                ),
+            )
         redirect_frame = replace(frame, cwd=request.cwd)
         argument_conflict = False
         # Reached child bodies already audited their reads. Completion only
@@ -1346,15 +1772,25 @@ class _EffectAudit:
                 break
         if argument_conflict and asynchronous_reader != "df":
             if (
-                request.child_inspected or request.interpreter is not None or self.native_effect is None
+                request.child_inspected
+                or request.interpreter is not None
+                or self.native_effect is None
                 or len(request.argv) != 4
                 or request.argv[0] not in {"df", "/bin/df", "/usr/bin/df"}
                 or request.argv[1:3] != ("-B1", "--output=avail")
                 or request.argv[3] is None
             ):
                 raise _UnresolvedError
-            identity = self.native_effect(replace(request, redirects=(), stdin=None, stdout=None, identity_only=True))
-            if identity is None or not identity.native_identity or identity.script_path is not None or identity.writes or identity.stdout is not None:
+            identity = self.native_effect(
+                replace(request, redirects=(), stdin=None, stdout=None, identity_only=True)
+            )
+            if (
+                identity is None
+                or not identity.native_identity
+                or identity.script_path is not None
+                or identity.writes
+                or identity.stdout is not None
+            ):
                 raise _UnresolvedError
             # Proven native df reads filesystem metadata, not the bytes of an
             # active output beneath that path. Its result remains unknown.
@@ -1369,12 +1805,22 @@ class _EffectAudit:
         if frame.asynchronous:
             # Proven builtin/reader identities require no mutable artifact
             # snapshot. Stdin filters and disk metadata keep unknown output.
-            result = ShellEffectResult() if asynchronous_reader is not None else self.native_default(replace(request, environment={}), frame, child=child)
+            result = (
+                ShellEffectResult()
+                if asynchronous_reader is not None
+                else self.native_default(replace(request, environment={}), frame, child=child)
+            )
             if result is not None:
                 result = replace(result, native_identity=not child)
         else:
-            result = self.native_effect(request) if self.native_effect is not None else self.native_default(request, frame, child=child)
-        if result is None or any(not self.disjoint(path) or self.conflicts_with_redirect(path) for path in result.writes):
+            result = (
+                self.native_effect(request)
+                if self.native_effect is not None
+                else self.native_default(request, frame, child=child)
+            )
+        if result is None or any(
+            not self.disjoint(path) or self.conflicts_with_redirect(path) for path in result.writes
+        ):
             raise _UnresolvedError
         if result.stdout is not None and SHELL_PID_MARKER in result.stdout:
             result = replace(result, stdout=None)
@@ -1401,18 +1847,42 @@ class _EffectAudit:
             nested = self.program(result.script_path, text)
             opened = self.begin_redirects(request, frame)
             zero = request.argv[0] if request.interpreter is not None else result.script_path
-            nested_frame = _Frame(request.environment.copy(), request.argv[1:], zero, frame.cwd, uncertain=frame.uncertain, exported=set(request.environment))
+            nested_frame = _Frame(
+                request.environment.copy(),
+                request.argv[1:],
+                zero,
+                frame.cwd,
+                uncertain=frame.uncertain,
+                exported=set(request.environment),
+            )
             branches = self.run(nested, self.parse(nested), [nested_frame])
             self.apply_traps(branches)
             self.end_redirects(opened)
             outputs = {branch.output for branch in branches}
-            result = replace(result, stdout=outputs.pop() if len(outputs) == 1 else None, status=branches[0].status if len(branches) == 1 else None)
-            completion = replace(request, stdout=result.stdout, child_inspected=True, child_status=result.status)
+            result = replace(
+                result,
+                stdout=outputs.pop() if len(outputs) == 1 else None,
+                status=branches[0].status if len(branches) == 1 else None,
+            )
+            completion = replace(
+                request, stdout=result.stdout, child_inspected=True, child_status=result.status
+            )
             result = self.native_effect(completion) if self.native_effect is not None else result
-            if result is None or result.script_path is not None or any(not self.disjoint(path) or self.conflicts_with_redirect(path) for path in result.writes):
+            if (
+                result is None
+                or result.script_path is not None
+                or any(
+                    not self.disjoint(path) or self.conflicts_with_redirect(path)
+                    for path in result.writes
+                )
+            ):
                 raise _UnresolvedError
         native_name = request.argv[0].rpartition("/")[2] if request.argv[0] is not None else ""
-        if not request.child_inspected and asynchronous_reader is None and native_name not in {":", "true", "false", "set", "cd", "pwd", "dirname"}:
+        if (
+            not request.child_inspected
+            and asynchronous_reader is None
+            and native_name not in {":", "true", "false", "set", "cd", "pwd", "dirname"}
+        ):
             # Native I/O success is not an exact status fact when a caller
             # can continue after failure. Do not prune its explicit else/||.
             result = replace(result, status=True if request.fail_stop else None)
@@ -1420,7 +1890,11 @@ class _EffectAudit:
         if request.fail_stop and result.status is False:
             frame.flow = "exit"
         if not any(operator.startswith("1>") for operator, _ in request.redirects):
-            frame.output = frame.output + result.stdout if frame.output is not None and result.stdout is not None else None
+            frame.output = (
+                frame.output + result.stdout
+                if frame.output is not None and result.stdout is not None
+                else None
+            )
 
     def native_default(self, request, frame, *, child=False):
         argv = request.argv
@@ -1430,7 +1904,11 @@ class _EffectAudit:
         if name is None:
             return None
         basename = name.rpartition("/")[2]
-        if name not in {basename, "/bin/" + basename, "/usr/bin/" + basename} or self.path_tail not in request.environment.get("PATH", self.path_tail):
+        if name not in {
+            basename,
+            "/bin/" + basename,
+            "/usr/bin/" + basename,
+        } or self.path_tail not in request.environment.get("PATH", self.path_tail):
             return None
         if request.environment.get("PATH", self.path_tail) != self.path_tail:
             # A supplied prefix can replace any native command. The callback
@@ -1439,7 +1917,14 @@ class _EffectAudit:
         args = argv[1:]
         if basename in {":", "true", "false"} and not args:
             return ShellEffectResult("", basename != "false")
-        if basename == "set" and args in {("-euo", "pipefail"), ("-Eeuo", "pipefail"), ("-e",), ("+e",), ("-a",), ("+a",)}:
+        if basename == "set" and args in {
+            ("-euo", "pipefail"),
+            ("-Eeuo", "pipefail"),
+            ("-e",),
+            ("+e",),
+            ("-a",),
+            ("+a",),
+        }:
             return ShellEffectResult("", True)
         if basename == "pwd" and not args:
             return ShellEffectResult(None if frame.cwd is None else frame.cwd + "\n", True)
@@ -1451,10 +1936,22 @@ class _EffectAudit:
                 while directory:
                     directories.add(directory)
                     directory = posixpath.dirname(directory)
-            return ShellEffectResult("", True if destination in directories else None, native_identity=True)
-        if basename == "dirname" and len(args) == 1 and args[0] is not None and not args[0].startswith("-"):
+            return ShellEffectResult(
+                "", True if destination in directories else None, native_identity=True
+            )
+        if (
+            basename == "dirname"
+            and len(args) == 1
+            and args[0] is not None
+            and not args[0].startswith("-")
+        ):
             return ShellEffectResult(posixpath.dirname(args[0]) or ".", True)
-        if basename == "mktemp" and len(args) in {1, 2} and args[-1] is not None and (len(args) == 1 or args[0] == "-d"):
+        if (
+            basename == "mktemp"
+            and len(args) in {1, 2}
+            and args[-1] is not None
+            and (len(args) == 1 or args[0] == "-d")
+        ):
             from skillspector.shell_sources import SAFE_PATH_MARKER
 
             template = args[-1]
@@ -1464,18 +1961,65 @@ class _EffectAudit:
             path = re.sub(r"X{3,}", SAFE_PATH_MARKER + str(self.temporary), template)
             return ShellEffectResult(path + "\n", True, (path,))
         if basename == "echo":
-            known = all(value is not None for value in args) and not any(value.startswith("-") or "\\" in value for value in args if value is not None)
+            known = all(value is not None for value in args) and not any(
+                value.startswith("-") or "\\" in value for value in args if value is not None
+            )
             return ShellEffectResult(" ".join(args) + "\n" if known else None, True)
         if basename == "printf":
             return ShellEffectResult(request.stdout, True)
-        if basename in {"cat", "head", "tail", "grep", "egrep", "fgrep", "cut", "wc", "stat", "sha256sum", "sha1sum", "md5sum", "cmp", "diff", "readlink", "ls", "file", "sleep", "wait", "id", "date"}:
-            return ShellEffectResult(request.stdin if basename == "cat" and not args else None, None)
-        if basename in {"rm", "unlink", "rmdir", "cp", "mv", "install", "ln", "tee", "truncate", "touch", "mkdir", "mkfifo", "chmod", "chown", "chgrp"}:
+        if basename in {
+            "cat",
+            "head",
+            "tail",
+            "grep",
+            "egrep",
+            "fgrep",
+            "cut",
+            "wc",
+            "stat",
+            "sha256sum",
+            "sha1sum",
+            "md5sum",
+            "cmp",
+            "diff",
+            "readlink",
+            "ls",
+            "file",
+            "sleep",
+            "wait",
+            "id",
+            "date",
+        }:
+            return ShellEffectResult(
+                request.stdin if basename == "cat" and not args else None, None
+            )
+        if basename in {
+            "rm",
+            "unlink",
+            "rmdir",
+            "cp",
+            "mv",
+            "install",
+            "ln",
+            "tee",
+            "truncate",
+            "touch",
+            "mkdir",
+            "mkfifo",
+            "chmod",
+            "chown",
+            "chgrp",
+        }:
             if any(value is None for value in args):
                 return None
-            if any(value.startswith("-") and not re.fullmatch(r"--?[A-Za-z]+|--", value) for value in args):
+            if any(
+                value.startswith("-") and not re.fullmatch(r"--?[A-Za-z]+|--", value)
+                for value in args
+            ):
                 return None
-            destinations = tuple(self.path(value, frame) for value in args if not value.startswith("-"))
+            destinations = tuple(
+                self.path(value, frame) for value in args if not value.startswith("-")
+            )
             if any(not self.disjoint(path) for path in destinations):
                 return None
             return ShellEffectResult(None, None, destinations)
@@ -1493,13 +2037,22 @@ def _audit_prefix(
     preserve_state: Callable[[], object] | None = None,
 ) -> bool:
     from skillspector.shell_sources import (
-        MAX_SHELL_SOURCE_CHARS, MAX_SHELL_SOURCE_FILES, SAFE_PATH_MARKER, _canonical_path,
+        MAX_SHELL_SOURCE_CHARS,
+        MAX_SHELL_SOURCE_FILES,
+        SAFE_PATH_MARKER,
+        _canonical_path,
     )
 
-    if target_path is not None and _canonical_path(target_path) != target_path or not 0 <= use_offset <= len(resolver.content):
+    if (
+        target_path is not None
+        and _canonical_path(target_path) != target_path
+        or not 0 <= use_offset <= len(resolver.content)
+    ):
         return False
     if preserve_effect is not None and (
-        target_path not in resolver.context.sources or read_source is None or native_effect is not None
+        target_path not in resolver.context.sources
+        or read_source is None
+        or native_effect is not None
     ):
         return False
     if preserve_state is not None and preserve_effect is None:
@@ -1509,19 +2062,31 @@ def _audit_prefix(
         or sum(map(len, resolver.context.sources.values())) > MAX_SHELL_SOURCE_CHARS
         or SHELL_PID_MARKER in resolver.context.path
         or any(SHELL_PID_MARKER in path for path in resolver.context.sources)
-        or any(SAFE_PATH_MARKER in source or SHELL_PID_MARKER in source for source in resolver.context.sources.values())
+        or any(
+            SAFE_PATH_MARKER in source or SHELL_PID_MARKER in source
+            for source in resolver.context.sources.values()
+        )
         or any(SHELL_PID_MARKER in value.text for value in resolver.inherited_values.values())
-        or any(is_managed_shell_variable(name) and name != "PATH" for name in resolver.inherited_values)
+        or any(
+            is_managed_shell_variable(name) and name != "PATH" for name in resolver.inherited_values
+        )
     ):
         return False
-    audit = _EffectAudit(resolver, target_path, read_source, preserve_effect if preserve_effect is not None else native_effect, preserve_only=preserve_effect is not None, preserve_state=preserve_state)
+    audit = _EffectAudit(
+        resolver,
+        target_path,
+        read_source,
+        preserve_effect if preserve_effect is not None else native_effect,
+        preserve_only=preserve_effect is not None,
+        preserve_state=preserve_state,
+    )
     try:
         program = audit.program(resolver.context.path, resolver.content)
         # A consumer boundary must coincide with a complete preceding program.
         tokens = tuple(token for token in program.tokens if token.start < use_offset)
         if tokens and tokens[-1].end > use_offset:
             token = tokens[-1]
-            prefix = resolver.content[token.start:use_offset]
+            prefix = resolver.content[token.start : use_offset]
             if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*="?\$\([ \t\r\n]*', prefix) is None:
                 return False
             # The read is the first executable piece of this assignment.
@@ -1529,7 +2094,12 @@ def _audit_prefix(
             tokens = tokens[:-1]
         values = {name: value.text for name, value in resolver.inherited_values.items()}
         values.setdefault("PATH", audit.path_tail)
-        frame = _Frame(values, (), resolver.context.path if resolver.source_identity else None, exported=set(values))
+        frame = _Frame(
+            values,
+            (),
+            resolver.context.path if resolver.source_identity else None,
+            exported=set(values),
+        )
         audit.run(program, audit.parse(program, tokens), [frame])
         return True
     except (KeyError, _UnresolvedError):
@@ -1563,7 +2133,15 @@ def source_effects_preserve(
     snapshot of every callback/source identity and write fact, whose exact
     equality proves that another iteration cannot discover different effects.
     """
-    return _audit_prefix(resolver, target_path, use_offset, read_source=read_source, native_effect=native_effect, preserve_effect=preserve_effect, preserve_state=preserve_state)
+    return _audit_prefix(
+        resolver,
+        target_path,
+        use_offset,
+        read_source=read_source,
+        native_effect=native_effect,
+        preserve_effect=preserve_effect,
+        preserve_state=preserve_state,
+    )
 
 
 def source_effects_collect(
@@ -1580,4 +2158,6 @@ def source_effects_collect(
     """
     if read_source is None or native_effect is None:
         return False
-    return _audit_prefix(resolver, None, use_offset, read_source=read_source, native_effect=native_effect)
+    return _audit_prefix(
+        resolver, None, use_offset, read_source=read_source, native_effect=native_effect
+    )

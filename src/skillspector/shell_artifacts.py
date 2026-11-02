@@ -11,9 +11,9 @@ sample command, compressor, archive member or generated program is executed.
 
 from __future__ import annotations
 
+import posixpath
 from collections.abc import Callable
 from dataclasses import dataclass
-import posixpath
 
 from skillspector.shell_sources import ShellSourceValue
 
@@ -85,9 +85,12 @@ class ShellArtifactStore:
         """
         self._check_runtime()
         return (
-            tuple(sorted(self._files.items())), frozenset(self._owned),
-            frozenset(self._owned_files), frozenset(self._unknown),
-            frozenset(self._decimal_domains), self.complete,
+            tuple(sorted(self._files.items())),
+            frozenset(self._owned),
+            frozenset(self._owned_files),
+            frozenset(self._unknown),
+            frozenset(self._decimal_domains),
+            self.complete,
         )
 
     def fork(self) -> ShellArtifactStore:
@@ -108,7 +111,11 @@ class ShellArtifactStore:
     def adopt(self, child: ShellArtifactStore) -> bool:
         """Commit only a successful direct fork; artifacts themselves are immutable."""
         self._check_runtime()
-        if child._parent is not self or child._parent_revision != self._revision or not child.complete:
+        if (
+            child._parent is not self
+            or child._parent_revision != self._revision
+            or not child.complete
+        ):
             return False
         self._files = child._files.copy()
         self._owned = child._owned.copy()
@@ -134,7 +141,11 @@ class ShellArtifactStore:
             if depth > MAX_GENERATED_DEPTH or visited > MAX_GENERATED_FILES:
                 return None
             if current.opaque_size is not None:
-                if current.value is not None or current.members or not 0 <= current.opaque_size <= MAX_GENERATED_BYTES:
+                if (
+                    current.value is not None
+                    or current.members
+                    or not 0 <= current.opaque_size <= MAX_GENERATED_BYTES
+                ):
                     return None
                 total += current.opaque_size
             elif current.value is not None:
@@ -147,7 +158,10 @@ class ShellArtifactStore:
                     self._check_runtime()
                     if (
                         _path(name, member=True) != name
-                        or any(self._within(name, other) or self._within(other, name) for other in names)
+                        or any(
+                            self._within(name, other) or self._within(other, name)
+                            for other in names
+                        )
                         or visited + len(pending) >= MAX_GENERATED_FILES
                     ):
                         return None
@@ -168,7 +182,7 @@ class ShellArtifactStore:
                 self._check_runtime()
                 if candidate.startswith(prefix) and candidate.endswith(suffix):
                     end = len(candidate) - len(suffix)
-                    digits = candidate[len(prefix):end] if end >= len(prefix) else ""
+                    digits = candidate[len(prefix) : end] if end >= len(prefix) else ""
                     if digits and digits.isascii() and digits.isdecimal():
                         return True
                 parent = posixpath.dirname(candidate)
@@ -189,7 +203,10 @@ class ShellArtifactStore:
         this invalidation; unrelated fresh trees retain their facts.
         """
         self._check_runtime()
-        if len(prefix) + len(suffix) > 4096 or _path(prefix + "0" + suffix) != prefix + "0" + suffix:
+        if (
+            len(prefix) + len(suffix) > 4096
+            or _path(prefix + "0" + suffix) != prefix + "0" + suffix
+        ):
             self.invalidate(None)
             return False
         self._decimal_domains.add((prefix, suffix))
@@ -208,8 +225,10 @@ class ShellArtifactStore:
         """Record a proven fresh directory, such as a successful mktemp -d."""
         self._check_runtime()
         key = _path(path)
-        if key is None or key in self._owned or any(
-            self._within(item, key) or self._within(key, item) for item in self._files
+        if (
+            key is None
+            or key in self._owned
+            or any(self._within(item, key) or self._within(key, item) for item in self._files)
         ):
             return False
         if any(self._within(key, item) or self._within(item, key) for item in self._unknown):
@@ -228,7 +247,9 @@ class ShellArtifactStore:
         self._check_runtime()
         key = _path(path)
         if (
-            key is None or value.kind != "code" or value.text
+            key is None
+            or value.kind != "code"
+            or value.text
             or any(self._within(item, key) or self._within(key, item) for item in self._files)
             or any(self._within(item, key) for item in self._owned)
             or any(self._within(item, key) or self._within(key, item) for item in self._unknown)
@@ -278,9 +299,18 @@ class ShellArtifactStore:
         """Distinguish known absence in an owned tree from missing evidence."""
         self._check_runtime()
         key = _path(path)
-        if key is None or not self.complete or any(self._within(key, item) or self._within(item, key) for item in self._unknown) or self._decimal_unknown(key, namespace=True):
+        if (
+            key is None
+            or not self.complete
+            or any(self._within(key, item) or self._within(item, key) for item in self._unknown)
+            or self._decimal_unknown(key, namespace=True)
+        ):
             return None
-        if key in self._files or key in self._owned or any(self._within(item, key) for item in (*self._files, *self._owned)):
+        if (
+            key in self._files
+            or key in self._owned
+            or any(self._within(item, key) for item in (*self._files, *self._owned))
+        ):
             return True
         return False if any(self._within(key, item) for item in self._owned) else None
 
@@ -332,7 +362,8 @@ class ShellArtifactStore:
         if (
             key is None
             or target is None
-            or member_prefix and _path(member_prefix, member=True) != member_prefix
+            or member_prefix
+            and _path(member_prefix, member=True) != member_prefix
             or self._within(target, key)
             or not any(self._within(key, item) for item in self._owned)
             or any(self._within(item, key) or self._within(key, item) for item in self._unknown)
@@ -341,10 +372,14 @@ class ShellArtifactStore:
             self.invalidate(destination)
             return False
         artifact = self.read(key)
-        members = ((member_prefix or posixpath.basename(key), artifact),) if artifact is not None else tuple(
-            ((member_prefix + "/" if member_prefix else "") + path[len(key) + 1 :], item)
-            for path, item in sorted(self._files.items())
-            if path.startswith(key + "/")
+        members = (
+            ((member_prefix or posixpath.basename(key), artifact),)
+            if artifact is not None
+            else tuple(
+                ((member_prefix + "/" if member_prefix else "") + path[len(key) + 1 :], item)
+                for path, item in sorted(self._files.items())
+                if path.startswith(key + "/")
+            )
         )
         if not members or any(_path(name, member=True) != name for name, _ in members):
             self.invalidate(destination)
@@ -356,13 +391,18 @@ class ShellArtifactStore:
         self._check_runtime()
         key = _path(root)
         if (
-            key is None or not self.complete
+            key is None
+            or not self.complete
             or not any(self._within(key, item) for item in self._owned)
             or any(self._within(item, key) or self._within(key, item) for item in self._unknown)
             or self._decimal_unknown(key, namespace=True)
         ):
             return None
-        return tuple((path[len(key) + 1:], artifact) for path, artifact in sorted(self._files.items()) if path.startswith(key + "/"))
+        return tuple(
+            (path[len(key) + 1 :], artifact)
+            for path, artifact in sorted(self._files.items())
+            if path.startswith(key + "/")
+        )
 
     def owns(self, path: str) -> bool:
         """Prove an exact fresh file or a path inside a fresh tree is owned.
@@ -373,8 +413,11 @@ class ShellArtifactStore:
         self._check_runtime()
         key = _path(path)
         return bool(
-            key is not None and self.complete
-            and (key in self._owned_files or any(self._within(key, parent) for parent in self._owned))
+            key is not None
+            and self.complete
+            and (
+                key in self._owned_files or any(self._within(key, parent) for parent in self._owned)
+            )
             and not any(self._within(key, unknown) for unknown in self._unknown)
             and not self._decimal_unknown(key)
             and not any(key != name and self._within(key, name) for name in self._files)

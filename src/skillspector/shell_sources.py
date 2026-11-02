@@ -3,11 +3,11 @@
 
 """Bounded values reconstructed from complete, already-loaded shell sources."""
 
+import hashlib
+import re
 from bisect import bisect_right
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-import hashlib
-import re
 
 from skillspector.shell_helper_argv import is_managed_shell_variable
 
@@ -22,7 +22,9 @@ SAFE_PATH_MARKER = "__skillspector_generated_path__"
 ReadWord = Callable[[str, int, Callable[[], None]], tuple[str | None, int, bool]]
 SubstitutionEnd = Callable[[str, int, int], int | None]
 HeredocHeader = Callable[[str, int, int], tuple[tuple[str, bool, bool], int] | None]
-HeredocBodies = Callable[[str, int, int, tuple[tuple[str, bool, bool], ...], Callable[[], None]], int | None]
+HeredocBodies = Callable[
+    [str, int, int, tuple[tuple[str, bool, bool], ...], Callable[[], None]], int | None
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,8 +117,12 @@ class ShellSourceResolver:
         self.content = context.sources.get(context.path, "") if content is None else content
         self.source_identity = source_identity
         self.inherited_values = inherited_values or {}
-        self.child_contexts: Callable[[int], Iterator[tuple["ShellSourceResolver", int]]] | None = None
-        self.substitution_contexts: Callable[[int], Iterator[tuple["ShellSourceResolver", int]]] | None = None
+        self.child_contexts: Callable[[int], Iterator[tuple[ShellSourceResolver, int]]] | None = (
+            None
+        )
+        self.substitution_contexts: (
+            Callable[[int], Iterator[tuple[ShellSourceResolver, int]]] | None
+        ) = None
         self.effect_source: Callable[[ShellSourceValue, int], ShellSourceValue | None] | None = None
         self.executable_spans: list[tuple[int, int, int, bool]] = []
         self.executable_children_complete = True
@@ -149,7 +155,9 @@ class ShellSourceResolver:
             and all(_canonical_path(path) == path for path in context.sources)
             and all(SAFE_PATH_MARKER not in source for source in context.sources.values())
         )
-        self.work_budget = work_budget or [min(MAX_SHELL_SOURCE_CHARS, 16 * len(self.content) + MAX_SHELL_VALUE_CHARS)]
+        self.work_budget = work_budget or [
+            min(MAX_SHELL_SOURCE_CHARS, 16 * len(self.content) + MAX_SHELL_VALUE_CHARS)
+        ]
         if self.valid:
             self._collect_bindings()
 
@@ -168,7 +176,9 @@ class ShellSourceResolver:
     def audit_word(self, start: int, end: int) -> ShellSourceValue | None:
         return self.word(start, end, literal_only=not self.valid)
 
-    def audit_path_values(self, start: int, end: int, command_start: int) -> tuple[ShellSourceValue, ...] | None:
+    def audit_path_values(
+        self, start: int, end: int, command_start: int
+    ) -> tuple[ShellSourceValue, ...] | None:
         """Resolve only finite literal loop filename components for write audits."""
         value = self.audit_word(start, end)
         if value is not None:
@@ -176,7 +186,9 @@ class ShellSourceResolver:
         if not self.valid:
             return None
         raw = self.content[start:end]
-        suffix = re.fullmatch(r'"(.+)/\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})"', raw)
+        suffix = re.fullmatch(
+            r'"(.+)/\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})"', raw
+        )
         if suffix is None:
             return None
         name = suffix[2] or suffix[3]
@@ -186,17 +198,26 @@ class ShellSourceResolver:
         prefix = self.word(start + suffix.start(1), start + suffix.end(1), assignment_value=True)
         if prefix is None or prefix.kind != "safe_path" or ".." in prefix.text.split("/"):
             return None
-        return tuple(ShellSourceValue(prefix.text + "/" + item, "safe_path", prefix.origins, prefix.safe_spans) for item in names)
+        return tuple(
+            ShellSourceValue(
+                prefix.text + "/" + item, "safe_path", prefix.origins, prefix.safe_spans
+            )
+            for item in names
+        )
 
     def literal_children(self, before_offset: int) -> Iterator[tuple["ShellSourceResolver", int]]:
         if self.child_contexts is not None:
             yield from self.child_contexts(before_offset)
 
-    def executable_children(self, before_offset: int) -> Iterator[tuple["ShellSourceResolver", int]]:
+    def executable_children(
+        self, before_offset: int
+    ) -> Iterator[tuple["ShellSourceResolver", int]]:
         if self.substitution_contexts is not None:
             yield from self.substitution_contexts(before_offset)
 
-    def _read_source_value(self, target: ShellSourceValue, use_offset: int) -> ShellSourceValue | None:
+    def _read_source_value(
+        self, target: ShellSourceValue, use_offset: int
+    ) -> ShellSourceValue | None:
         """Read uploaded or reconstructed bytes only after their effect proof."""
         if target.kind not in {"bundle_path", "safe_path"}:
             return None
@@ -209,15 +230,24 @@ class ShellSourceResolver:
                 if digest is None:
                     digest = hashlib.sha256(source.encode()).hexdigest()
                     self.hashes[target.text] = digest
-                return ShellSourceValue(source, "code", (ShellSourceOrigin(target.text, 0, len(source), digest),))
+                return ShellSourceValue(
+                    source, "code", (ShellSourceOrigin(target.text, 0, len(source), digest),)
+                )
         if self.effect_source is None or not self.valid:
             return None
         value = self.effect_source(target, use_offset)
-        if value is None or value.kind != "code" or not value.origins or not self._spend(len(value.text)):
+        if (
+            value is None
+            or value.kind != "code"
+            or not value.origins
+            or not self._spend(len(value.text))
+        ):
             return None
         return value
 
-    def _source_origins(self, target: ShellSourceValue, value: ShellSourceValue, start: int, end: int) -> tuple[ShellSourceOrigin, ...]:
+    def _source_origins(
+        self, target: ShellSourceValue, value: ShellSourceValue, start: int, end: int
+    ) -> tuple[ShellSourceOrigin, ...]:
         if (
             target.kind == "bundle_path"
             and self.context.sources.get(target.text) == value.text
@@ -231,7 +261,9 @@ class ShellSourceResolver:
         # offsets in reconstructed bytes do not become uploaded-file offsets.
         return value.origins
 
-    def _collect_executable_spans(self, start: int, end: int, *, heredoc: bool = False, child_scope: bool = False) -> None:
+    def _collect_executable_spans(
+        self, start: int, end: int, *, heredoc: bool = False, child_scope: bool = False
+    ) -> None:
         """Record complete command substitutions, without evaluating their data.
 
         Quoted heredocs never call this method. In expandable heredocs quotes
@@ -249,7 +281,9 @@ class ShellSourceResolver:
                 if character == "'":
                     quote = None
             elif character == "\\":
-                if cursor + 1 < end and (not heredoc and quote is None or self.content[cursor + 1] in '$`"\\\n\r'):
+                if cursor + 1 < end and (
+                    not heredoc and quote is None or self.content[cursor + 1] in '$`"\\\n\r'
+                ):
                     cursor += 2
                     continue
             elif not heredoc and character in "'\"" and (quote is None or character == quote):
@@ -301,8 +335,18 @@ class ShellSourceResolver:
                 if len(self.commands) + len(self.child_commands) >= 8192:
                     self.valid = False
                     return
-                destination = self.child_commands if child_depth or function_depth else self.commands
-                destination.append(ShellSourceCommand(words[0][1] if words else redirects[0][0], end, tuple(words), tuple(redirects), conditional or follows_operator))
+                destination = (
+                    self.child_commands if child_depth or function_depth else self.commands
+                )
+                destination.append(
+                    ShellSourceCommand(
+                        words[0][1] if words else redirects[0][0],
+                        end,
+                        tuple(words),
+                        tuple(redirects),
+                        conditional or follows_operator,
+                    )
+                )
             words.clear()
             redirects.clear()
 
@@ -326,14 +370,21 @@ class ShellSourceResolver:
                 cursor += 1
                 if character == "\n" and pending:
                     for item, (owner, child_scope) in zip(pending, pending_owners, strict=True):
-                        stop = self.heredoc_bodies(self.content, cursor, len(self.content), (item,), self.check_runtime)
+                        stop = self.heredoc_bodies(
+                            self.content, cursor, len(self.content), (item,), self.check_runtime
+                        )
                         if stop is None:
                             self.valid = False
                             return
                         if not item[2]:
-                            self._collect_executable_spans(cursor, stop, heredoc=True, child_scope=bool(child_depth or function_depth))
+                            self._collect_executable_spans(
+                                cursor,
+                                stop,
+                                heredoc=True,
+                                child_scope=bool(child_depth or function_depth),
+                            )
                         elif not item[1] and not child_scope:
-                            record_end = stop - int(self.content[stop - 1:stop] == "\n")
+                            record_end = stop - int(self.content[stop - 1 : stop] == "\n")
                             body_end = self.content.rfind("\n", cursor, record_end) + 1
                             self.literal_heredocs.append((owner, cursor, max(cursor, body_end)))
                         cursor = stop
@@ -344,7 +395,9 @@ class ShellSourceResolver:
                 # A preceding command word makes this function/array grammar,
                 # whose effects are not represented by this small source pass.
                 if len(words) == 1 and not child_depth and not function_depth and not pending:
-                    declaration = re.match(r"\([ \t]*\)[ \t\r\n]*\{(?=\s|;|$)", self.content[cursor:cursor + 4096])
+                    declaration = re.match(
+                        r"\([ \t]*\)[ \t\r\n]*\{(?=\s|;|$)", self.content[cursor : cursor + 4096]
+                    )
                     name = words[0][0]
                     if declaration is not None and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
                         self.functions.add(name)
@@ -366,7 +419,15 @@ class ShellSourceResolver:
                 child_depth -= 1
                 cursor += 1
                 continue
-            if character in "{}" and not child_depth and (cursor + 1 == len(self.content) or self.content[cursor + 1].isspace() or self.content[cursor + 1] in ";|&()<>"):
+            if (
+                character in "{}"
+                and not child_depth
+                and (
+                    cursor + 1 == len(self.content)
+                    or self.content[cursor + 1].isspace()
+                    or self.content[cursor + 1] in ";|&()<>"
+                )
+            ):
                 if not function_depth or words or pending:
                     self.valid = False
                     return
@@ -374,7 +435,9 @@ class ShellSourceResolver:
                 cursor += 1
                 continue
             if character in "<>":
-                if self.content.startswith("<<", cursor) and not self.content.startswith("<<<", cursor):
+                if self.content.startswith("<<", cursor) and not self.content.startswith(
+                    "<<<", cursor
+                ):
                     header = self.heredoc_header(self.content, cursor, len(self.content))
                     if header is None or len(pending) >= 32:
                         self.valid = False
@@ -385,7 +448,9 @@ class ShellSourceResolver:
                     pending.append(item)
                     pending_owners.append((owner, bool(child_depth or function_depth)))
                     continue
-                operator = re.match(r"(?:<<<|>>|>&|<&|>\||<>|>|<)", self.content[cursor:cursor + 3])
+                operator = re.match(
+                    r"(?:<<<|>>|>&|<&|>\||<>|>|<)", self.content[cursor : cursor + 3]
+                )
                 if operator is None:
                     self.valid = False
                     return
@@ -403,7 +468,9 @@ class ShellSourceResolver:
                     return
                 if ">" in operator[0]:
                     redirects.append((cursor, stop))
-                self._collect_executable_spans(cursor, stop, child_scope=bool(child_depth or function_depth))
+                self._collect_executable_spans(
+                    cursor, stop, child_scope=bool(child_depth or function_depth)
+                )
                 cursor = stop
                 continue
             word, stop, limited = self.read_word(self.content, cursor, self.check_runtime)
@@ -414,7 +481,9 @@ class ShellSourceResolver:
                 self.valid = False
                 return
             words.append((word, cursor, stop))
-            self._collect_executable_spans(cursor, stop, child_scope=bool(child_depth or function_depth))
+            self._collect_executable_spans(
+                cursor, stop, child_scope=bool(child_depth or function_depth)
+            )
             cursor = stop
         finish(cursor)
         if child_depth or function_depth or pending:
@@ -425,13 +494,27 @@ class ShellSourceResolver:
             self._record_command(command)
         if self.controls:
             self.valid = False
-        if self.functions & {"sed", "dirname", "pwd", "cd", "mktemp", "printf", "set", "trap", "export"}:
+        if self.functions & {
+            "sed",
+            "dirname",
+            "pwd",
+            "cd",
+            "mktemp",
+            "printf",
+            "set",
+            "trap",
+            "export",
+        }:
             self.valid = False
         for start, end in self.dynamic_callees:
             # A later loop assignment can change an earlier lexical call on its
             # next iteration. Resolve only after all invalidations are known.
             executable = self.word(start, end)
-            if executable is None or "/" not in executable.text or executable.text in self.functions:
+            if (
+                executable is None
+                or "/" not in executable.text
+                or executable.text in self.functions
+            ):
                 self.valid = False
                 break
 
@@ -442,7 +525,12 @@ class ShellSourceResolver:
             self.definite_commands.add(command.start)
             if self.errexit:
                 self.fail_stop_commands.add(command.start)
-        active_loops = {name: values for scope in self.loop_scopes if scope is not None for name, values in (scope,)}
+        active_loops = {
+            name: values
+            for scope in self.loop_scopes
+            if scope is not None
+            for name, values in (scope,)
+        }
         if active_loops:
             self.loop_components[command.start] = active_loops
         assignments: list[tuple[str, int, int]] = []
@@ -457,19 +545,31 @@ class ShellSourceResolver:
                 self.controls.append("if" if keyword == "if" else "loop")
                 self.loop_scopes.append(None)
                 if keyword == "for":
-                    if cursor + 1 >= len(words) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", words[cursor + 1][0]) is None:
+                    if (
+                        cursor + 1 >= len(words)
+                        or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", words[cursor + 1][0]) is None
+                    ):
                         self.valid = False
                         return
                     name = words[cursor + 1][0]
                     self.invalid_names.add(name)
                     if name in active_loops:
                         self.invalid_loop_names.add(name)
-                    candidates = words[cursor + 3:]
-                    if cursor + 2 < len(words) and words[cursor + 2][0] == "in" and 0 < len(candidates) <= 32:
+                    candidates = words[cursor + 3 :]
+                    if (
+                        cursor + 2 < len(words)
+                        and words[cursor + 2][0] == "in"
+                        and 0 < len(candidates) <= 32
+                    ):
                         components = []
                         for _, left, right in candidates:
                             literal = self.word(left, right, literal_only=True)
-                            if literal is None or literal.kind != "literal" or literal.text in {".", ".."} or re.fullmatch(r"[-A-Za-z0-9_.]+", literal.text) is None:
+                            if (
+                                literal is None
+                                or literal.kind != "literal"
+                                or literal.text in {".", ".."}
+                                or re.fullmatch(r"[-A-Za-z0-9_.]+", literal.text) is None
+                            ):
                                 break
                             components.append(literal.text)
                         else:
@@ -525,7 +625,9 @@ class ShellSourceResolver:
                     # use on another iteration. Keep conditional writes globally
                     # unknown until control-flow-specific histories are proved.
                     self.invalid_names.add(name)
-                self.bindings.setdefault(name, []).append((start, end, self.errexit and len(assignments) == 1, self.pipefail))
+                self.bindings.setdefault(name, []).append(
+                    (start, end, self.errexit and len(assignments) == 1, self.pipefail)
+                )
             return
         self.invalid_names.update(name for name, _, _ in assignments)
         executable = words[cursor][0]
@@ -547,12 +649,16 @@ class ShellSourceResolver:
             return
         if executable == "set":
             named_option: str | None = None
-            for option, _left, _right in words[cursor + 1:]:
+            for option, _left, _right in words[cursor + 1 :]:
                 if named_option is not None:
                     if option == "errexit":
-                        self.errexit = named_option == "-" and not command.conditional and not self.controls
+                        self.errexit = (
+                            named_option == "-" and not command.conditional and not self.controls
+                        )
                     elif option == "pipefail":
-                        self.pipefail = named_option == "-" and not command.conditional and not self.controls
+                        self.pipefail = (
+                            named_option == "-" and not command.conditional and not self.controls
+                        )
                     elif option != "nounset":
                         self.errexit = False
                         self.pipefail = False
@@ -563,7 +669,9 @@ class ShellSourceResolver:
                     self.pipefail = False
                     break
                 if "e" in option[1:]:
-                    self.errexit = not command.conditional and not self.controls and option[0] == "-"
+                    self.errexit = (
+                        not command.conditional and not self.controls and option[0] == "-"
+                    )
                 if "o" in option[1:]:
                     if not option.endswith("o"):
                         self.errexit = False
@@ -573,22 +681,61 @@ class ShellSourceResolver:
             if named_option is not None:
                 self.errexit = False
                 self.pipefail = False
-        if executable in {"case", "esac", "function", "source", ".", "eval", "alias", "unalias", "enable", "hash"}:
+        if executable in {
+            "case",
+            "esac",
+            "function",
+            "source",
+            ".",
+            "eval",
+            "alias",
+            "unalias",
+            "enable",
+            "hash",
+        }:
             self.valid = False
             return
-        if executable in {"declare", "typeset", "local", "readonly", "unset", "read", "readarray", "mapfile", "let", "getopts"} or (executable == "printf" and any(word == "-v" for word, _, _ in words[cursor + 1:])) or (executable == "wait" and any(word.startswith("-p") for word, _, _ in words[cursor + 1:])):
+        if (
+            executable
+            in {
+                "declare",
+                "typeset",
+                "local",
+                "readonly",
+                "unset",
+                "read",
+                "readarray",
+                "mapfile",
+                "let",
+                "getopts",
+            }
+            or (executable == "printf" and any(word == "-v" for word, _, _ in words[cursor + 1 :]))
+            or (
+                executable == "wait"
+                and any(word.startswith("-p") for word, _, _ in words[cursor + 1 :])
+            )
+        ):
             # Unknown nameref/array/destination grammar can affect any binding.
             self.valid = False
             return
         if executable == "printf":
-            arguments = words[cursor + 1:]
+            arguments = words[cursor + 1 :]
             if arguments and arguments[0][0] == "--":
                 arguments = arguments[1:]
-            if not arguments or any(marker in self.content[arguments[0][1]:arguments[0][2]] for marker in ("$", "`")) or re.search(r"%[-+ #0'.*0-9]*[hjlLtz]*n", arguments[0][0].replace("%%", "")) is not None or arguments[0][0].startswith("-"):
+            if (
+                not arguments
+                or any(
+                    marker in self.content[arguments[0][1] : arguments[0][2]]
+                    for marker in ("$", "`")
+                )
+                or re.search(r"%[-+ #0'.*0-9]*[hjlLtz]*n", arguments[0][0].replace("%%", ""))
+                is not None
+                or arguments[0][0].startswith("-")
+            ):
                 self.valid = False
                 return
         if executable == "export":
-            for word, start, end in words[cursor + 1:]:
+            for word, start, end in words[cursor + 1 :]:
                 match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:=.*)?", word, re.DOTALL)
                 if match is None or self.content[start:end] != word:
                     self.valid = False
@@ -598,19 +745,31 @@ class ShellSourceResolver:
                 if is_managed_shell_variable(match[1]) or match[1] == "LD_PRELOAD":
                     self.valid = False
                     return
-        if any(re.match(r"[A-Za-z_][A-Za-z0-9_]*(?:\+=|\[)", self.content[start:end]) for _, start, end in words):
+        if any(
+            re.match(r"[A-Za-z_][A-Za-z0-9_]*(?:\+=|\[)", self.content[start:end])
+            for _, start, end in words
+        ):
             self.valid = False
         if executable in {"command", "builtin"}:
             # The optional resolver does not mistake wrapped mutation for an
             # external command. The ordinary raw scanner still handles it.
             self.valid = False
         if executable == "trap":
-            values = [word for word, _, _ in words[cursor + 1:]]
-            if len(values) != 2 or values[1] not in {"EXIT", "0"} or re.fullmatch(r'rm -rf "\$[A-Za-z_][A-Za-z0-9_]*"', values[0]) is None:
+            values = [word for word, _, _ in words[cursor + 1 :]]
+            if (
+                len(values) != 2
+                or values[1] not in {"EXIT", "0"}
+                or re.fullmatch(r'rm -rf "\$[A-Za-z_][A-Za-z0-9_]*"', values[0]) is None
+            ):
                 self.valid = False
 
     def _name(self, name: str, depth: int, use: int) -> ShellSourceValue | None:
-        if not self.valid or is_managed_shell_variable(name) or name in self.invalid_names or depth >= MAX_SHELL_VALUE_DEPTH:
+        if (
+            not self.valid
+            or is_managed_shell_variable(name)
+            or name in self.invalid_names
+            or depth >= MAX_SHELL_VALUE_DEPTH
+        ):
             return None
         spans = self.bindings.get(name, ())
         index = bisect_right(spans, use, key=lambda span: span[0]) - 1
@@ -623,7 +782,14 @@ class ShellSourceResolver:
         if key in self.values:
             return self.values[key]
         self.resolving.add(key)
-        result = self.word(span[0], span[1], depth=depth + 1, assignment_value=True, fail_stop=span[2], pipefail=span[3])
+        result = self.word(
+            span[0],
+            span[1],
+            depth=depth + 1,
+            assignment_value=True,
+            fail_stop=span[2],
+            pipefail=span[3],
+        )
         self.resolving.remove(key)
         self.values[key] = result
         return result
@@ -638,16 +804,34 @@ class ShellSourceResolver:
             counts[owner] = counts.get(owner, 0) + 1
         for owner, left, right in self.literal_heredocs:
             command = commands.get(owner)
-            if command is None or owner not in self.fail_stop_commands or counts[owner] != 1 or self.heredoc_counts.get(owner) != 1 or owner in self.input_redirect_commands or len(command.words) != 1 or len(command.redirects) != 1:
+            if (
+                command is None
+                or owner not in self.fail_stop_commands
+                or counts[owner] != 1
+                or self.heredoc_counts.get(owner) != 1
+                or owner in self.input_redirect_commands
+                or len(command.words) != 1
+                or len(command.redirects) != 1
+            ):
                 continue
             head = self.word(command.words[0][1], command.words[0][2])
             if head is None or head.kind != "literal" or head.text != "cat":
                 continue
             target_start = command.redirects[0][0]
-            if re.search(r"(?<![A-Za-z0-9_>&])>[ \t]*$", self.content[command.words[0][2]:target_start]) is None:
+            if (
+                re.search(
+                    r"(?<![A-Za-z0-9_>&])>[ \t]*$", self.content[command.words[0][2] : target_start]
+                )
+                is None
+            ):
                 continue
             destination = self.word(*command.redirects[0])
-            if destination is None or destination.kind != "safe_path" or ".." in destination.text.split("/") or not re.fullmatch(r"[-A-Za-z0-9_.]+", destination.text.rpartition("/")[2]):
+            if (
+                destination is None
+                or destination.kind != "safe_path"
+                or ".." in destination.text.split("/")
+                or not re.fullmatch(r"[-A-Za-z0-9_.]+", destination.text.rpartition("/")[2])
+            ):
                 continue
             if right - left > MAX_SHELL_VALUE_CHARS or not self._spend(right - left):
                 return
@@ -655,7 +839,11 @@ class ShellSourceResolver:
             if digest is None:
                 digest = hashlib.sha256(self.content.encode()).hexdigest()
                 self.hashes[self.context.path] = digest
-            value = ShellSourceValue(self.content[left:right], "code", (ShellSourceOrigin(self.context.path, left, right, digest),))
+            value = ShellSourceValue(
+                self.content[left:right],
+                "code",
+                (ShellSourceOrigin(self.context.path, left, right, digest),),
+            )
             yield GeneratedShellFile(destination, value, left, right, command.start, command.end)
 
     def path_prefix(self, start: int, end: int) -> ShellSourceValue | None:
@@ -665,7 +853,14 @@ class ShellSourceResolver:
         if match is None:
             return None
         value = self.word(start + match.start(1), start + match.end(1), assignment_value=True)
-        return value if value is not None and value.kind == "safe_path" and ":" not in value.text and ".." not in value.text.split("/") else None
+        return (
+            value
+            if value is not None
+            and value.kind == "safe_path"
+            and ":" not in value.text
+            and ".." not in value.text.split("/")
+            else None
+        )
 
     @staticmethod
     def _join(parts: list[ShellSourceValue]) -> ShellSourceValue | None:
@@ -686,7 +881,9 @@ class ShellSourceResolver:
                 return None
             spans.extend((offset + start, offset + end) for start, end in part.safe_spans)
             offset += len(part.text)
-        kind = next((kind for kind in ("code", "safe_path", "bundle_path") if kind in kinds), "literal")
+        kind = next(
+            (kind for kind in ("code", "safe_path", "bundle_path") if kind in kinds), "literal"
+        )
         if kind == "bundle_path":
             normalized = _canonical_path(text, allow_parent=True)
             if normalized is None:
@@ -694,9 +891,24 @@ class ShellSourceResolver:
             text = normalized
         return ShellSourceValue(text, kind, tuple(origins), tuple(spans))
 
-    def word(self, start: int, end: int, *, depth: int = 0, assignment_value: bool = False, fail_stop: bool = False, literal_only: bool = False, pipefail: bool = False) -> ShellSourceValue | None:
+    def word(
+        self,
+        start: int,
+        end: int,
+        *,
+        depth: int = 0,
+        assignment_value: bool = False,
+        fail_stop: bool = False,
+        literal_only: bool = False,
+        pipefail: bool = False,
+    ) -> ShellSourceValue | None:
         spend = self.audit_spend if literal_only else self._spend
-        if (not self.valid and not (literal_only and self.lexically_valid)) or depth >= MAX_SHELL_VALUE_DEPTH or end - start > MAX_SHELL_VALUE_CHARS or not spend(end - start):
+        if (
+            (not self.valid and not (literal_only and self.lexically_valid))
+            or depth >= MAX_SHELL_VALUE_DEPTH
+            or end - start > MAX_SHELL_VALUE_CHARS
+            or not spend(end - start)
+        ):
             return None
         parts: list[ShellSourceValue] = []
         literal: list[str] = []
@@ -734,8 +946,14 @@ class ShellSourceResolver:
             elif character == "$":
                 # A dollar that cannot begin a shell expansion is literal,
                 # including the end-anchor in a quoted sed regex ("$/p").
-                following = self.content[cursor + 1:cursor + 2]
-                if not following or following not in "([{ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_@*#?$!-\"'" or quote == '"' and following in "\"'":
+                following = self.content[cursor + 1 : cursor + 2]
+                if (
+                    not following
+                    or following
+                    not in "([{ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_@*#?$!-\"'"
+                    or quote == '"'
+                    and following in "\"'"
+                ):
                     literal.append("$")
                     cursor += 1
                     continue
@@ -750,7 +968,10 @@ class ShellSourceResolver:
                         return None
                     value = self._substitution(cursor + 2, stop - 1, depth + 1, pipefail=pipefail)
                 else:
-                    name = re.match(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})", self.content[cursor:end])
+                    name = re.match(
+                        r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})",
+                        self.content[cursor:end],
+                    )
                     if name is None:
                         return None
                     stop = cursor + name.end()
@@ -763,7 +984,9 @@ class ShellSourceResolver:
                 parts.append(value)
                 cursor = stop
                 continue
-            elif character == "`" or (quote is None and (character.isspace() or character in "*?[]{}~;|&()<>") ):
+            elif character == "`" or (
+                quote is None and (character.isspace() or character in "*?[]{}~;|&()<>")
+            ):
                 return None
             else:
                 literal.append(character)
@@ -798,7 +1021,9 @@ class ShellSourceResolver:
             cursor = stop
         return None
 
-    def _substitution(self, start: int, end: int, depth: int, *, pipefail: bool = False) -> ShellSourceValue | None:
+    def _substitution(
+        self, start: int, end: int, depth: int, *, pipefail: bool = False
+    ) -> ShellSourceValue | None:
         if depth >= MAX_SHELL_VALUE_DEPTH or not self._spend(end - start):
             return None
         raw = self.content[start:end]
@@ -809,7 +1034,12 @@ class ShellSourceResolver:
             return ShellSourceValue(parent, "bundle_path")
         directory = re.fullmatch(r"cd\s+(.+?)\s*&&\s*pwd", raw, re.DOTALL)
         if directory is not None:
-            value = self.word(start + directory.start(1), start + directory.end(1), depth=depth + 1, fail_stop=True)
+            value = self.word(
+                start + directory.start(1),
+                start + directory.end(1),
+                depth=depth + 1,
+                fail_stop=True,
+            )
             return value if value is not None and value.kind == "bundle_path" else None
         words = self._words(start, end)
         if not words:
@@ -847,7 +1077,9 @@ class ShellSourceResolver:
                 return None
             if cursor >= len(words) - 1:
                 return None
-            expression = re.fullmatch(r"/\^([A-Za-z_][A-Za-z0-9_]*\(\) \{)/,/\^\}/p", values[cursor])
+            expression = re.fullmatch(
+                r"/\^([A-Za-z_][A-Za-z0-9_]*\(\) \{)/,/\^\}/p", values[cursor]
+            )
             if expression is None:
                 return None
             expressions.append((expression[1], "}"))
@@ -894,7 +1126,10 @@ def readonly_sed_program(program: str) -> bool:
         return True
     if re.fullmatch(r"/\^[A-Za-z_][A-Za-z0-9_]*\(\) \{/,/\^\}/p", program):
         return True
-    if re.fullmatch(r"/[A-Za-z_][A-Za-z0-9_]*=\$\(cat <<'[A-Za-z_][A-Za-z0-9_]*'/,/\^[A-Za-z_][A-Za-z0-9_]*\$/p", program):
+    if re.fullmatch(
+        r"/[A-Za-z_][A-Za-z0-9_]*=\$\(cat <<'[A-Za-z_][A-Za-z0-9_]*'/,/\^[A-Za-z_][A-Za-z0-9_]*\$/p",
+        program,
+    ):
         return True
     if len(program) < 4 or program[0] != "s":
         return False
@@ -918,9 +1153,7 @@ def readonly_sed_program(program: str) -> bool:
     return re.fullmatch(r"[gIp0-9]*", program[cursor:]) is not None
 
 
-def source_is_unmodified(
-    resolver: ShellSourceResolver, target_path: str, use_offset: int
-) -> bool:
+def source_is_unmodified(resolver: ShellSourceResolver, target_path: str, use_offset: int) -> bool:
     """Refuse a cached read after an explicit possible write to its source.
 
     This is an audit of inspected commands, not a promise that external programs
@@ -930,14 +1163,51 @@ def source_is_unmodified(
     """
     readers = frozenset(
         {
-            ":", "true", "false", "echo", "printf", "cat", "head", "tail",
-            "grep", "egrep", "fgrep", "cut", "wc", "stat", "test", "[", "[[",
-            "sha256sum", "sha1sum", "md5sum", "cmp", "diff", "readlink", "dirname",
-            "ls", "file", "set", "export", "trap", "exit",
-            "return", "break", "continue", "sleep", "wait", "shift", "pwd", "cd", "mktemp", "local",
+            ":",
+            "true",
+            "false",
+            "echo",
+            "printf",
+            "cat",
+            "head",
+            "tail",
+            "grep",
+            "egrep",
+            "fgrep",
+            "cut",
+            "wc",
+            "stat",
+            "test",
+            "[",
+            "[[",
+            "sha256sum",
+            "sha1sum",
+            "md5sum",
+            "cmp",
+            "diff",
+            "readlink",
+            "dirname",
+            "ls",
+            "file",
+            "set",
+            "export",
+            "trap",
+            "exit",
+            "return",
+            "break",
+            "continue",
+            "sleep",
+            "wait",
+            "shift",
+            "pwd",
+            "cd",
+            "mktemp",
+            "local",
         }
     )
-    writers = frozenset({"rm", "unlink", "rmdir", "cp", "mv", "install", "ln", "tee", "truncate", "touch", "dd"})
+    writers = frozenset(
+        {"rm", "unlink", "rmdir", "cp", "mv", "install", "ln", "tee", "truncate", "touch", "dd"}
+    )
     controls = frozenset({"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "!"})
 
     def touches(value: ShellSourceValue | None, *, subtree: bool = False) -> bool:
@@ -949,10 +1219,13 @@ def source_is_unmodified(
             prefix, suffix = value.text.rpartition("/")[2].split("$$")
             # $$ contributes only decimal digits. This fact proves a filename
             # disjoint, never a directory ancestor or executable code value.
-            return re.fullmatch(
-                re.escape(prefix) + r"[0-9]+" + re.escape(suffix),
-                target_path.rpartition("/")[2],
-            ) is not None
+            return (
+                re.fullmatch(
+                    re.escape(prefix) + r"[0-9]+" + re.escape(suffix),
+                    target_path.rpartition("/")[2],
+                )
+                is not None
+            )
         if value.kind == "safe_path":
             # Do not let a path containing a proved temporary component escape
             # that directory again through appended parent traversals.
@@ -963,12 +1236,19 @@ def source_is_unmodified(
             )
         path = _canonical_path(value.text, allow_parent=True)
         if value.kind == "bundle_path":
-            return path is None or path == "." or path == target_path or target_path.startswith(path + "/")
+            return (
+                path is None
+                or path == "."
+                or path == target_path
+                or target_path.startswith(path + "/")
+            )
         if value.kind != "literal":
             return True
         if subtree and (path is None or path == "."):
             return True
-        if path == target_path or (subtree and path is not None and target_path.startswith(path + "/")):
+        if path == target_path or (
+            subtree and path is not None and target_path.startswith(path + "/")
+        ):
             return True
         # A literal filename without source identity can still name the source
         # from a different working directory. Do not assume the current cwd.
@@ -991,7 +1271,9 @@ def source_is_unmodified(
                 continue
             child_scope = id(command) in child_ids
 
-            def resolve(left: int, right: int, *, child_scope: bool = child_scope) -> ShellSourceValue | None:
+            def resolve(
+                left: int, right: int, *, child_scope: bool = child_scope
+            ) -> ShellSourceValue | None:
                 raw = current.content[left:right]
                 pid_file = re.fullmatch(r'"(/tmp/[-A-Za-z0-9_.]*\$\$[-A-Za-z0-9_.]*)"', raw)
                 if pid_file is not None:
@@ -1004,15 +1286,23 @@ def source_is_unmodified(
 
             for left, right in command.redirects:
                 value = resolve(left, right)
-                prefix = current.content[max(command.start, left - 32):left]
+                prefix = current.content[max(command.start, left - 32) : left]
                 if (
                     re.search(r"(?:>&|<&)[ \t]*$", prefix)
                     and value is not None
                     and re.fullmatch(r"[0-9]+|-", value.text)
                 ):
                     continue
-                destinations = (value,) if value is not None else current.audit_path_values(left, right, command.start) if not child_scope else None
-                if destinations is None or any(touches(destination) for destination in destinations):
+                destinations = (
+                    (value,)
+                    if value is not None
+                    else current.audit_path_values(left, right, command.start)
+                    if not child_scope
+                    else None
+                )
+                if destinations is None or any(
+                    touches(destination) for destination in destinations
+                ):
                     return False
             words = command.words
             cursor = 0
@@ -1033,7 +1323,7 @@ def source_is_unmodified(
             if head == "for" and current.content[head_start:head_end] == "for":
                 # The iteration list is data. Its executable substitutions and
                 # any redirections still belong to the surrounding audit.
-                header = words[cursor + 1:]
+                header = words[cursor + 1 :]
                 if not header or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", header[0][0]) is None:
                     return False
                 if len(header) > 1 and header[1][0] != "in":
@@ -1055,7 +1345,7 @@ def source_is_unmodified(
                 # A bundled program or /tmp/cat may have arbitrary effects.
                 # Native semantics belong to a proved identity, not basename.
                 return False
-            arguments = words[cursor + 1:]
+            arguments = words[cursor + 1 :]
             if name == "env":
                 invocation = decode_env_unset_command(current, words, cursor)
                 if invocation is None:
@@ -1067,14 +1357,27 @@ def source_is_unmodified(
                 if (
                     command.start in child_consumers
                     and target.kind == "literal"
-                    and target.text in {
-                        prefix + shell for prefix in ("", "/bin/", "/usr/bin/")
+                    and target.text
+                    in {
+                        prefix + shell
+                        for prefix in ("", "/bin/", "/usr/bin/")
                         for shell in ("bash", "sh", "dash", "zsh", "ksh")
                     }
                 ):
                     continue
                 return False
-            if name in {"command", "builtin", "sudo", "nohup", "timeout", "nice", "exec", "eval", "source", "."}:
+            if name in {
+                "command",
+                "builtin",
+                "sudo",
+                "nohup",
+                "timeout",
+                "nice",
+                "exec",
+                "eval",
+                "source",
+                ".",
+            }:
                 # A wrapper may conceal a writer; its name is not evidence of
                 # a read-only operation. Extend only through understood argv.
                 return False
@@ -1083,10 +1386,17 @@ def source_is_unmodified(
                     return False
                 body = resolve(arguments[0][1], arguments[0][2])
                 signal = resolve(arguments[1][1], arguments[1][2])
-                if body is None or body.kind != "literal" or signal is None or signal.text not in {"EXIT", "0"}:
+                if (
+                    body is None
+                    or body.kind != "literal"
+                    or signal is None
+                    or signal.text not in {"EXIT", "0"}
+                ):
                     return False
                 deletion = re.fullmatch(r'rm -rf "\$([A-Za-z_][A-Za-z0-9_]*)"', body.text)
-                if deletion is None or touches(current._name(deletion[1], 0, command.start), subtree=True):
+                if deletion is None or touches(
+                    current._name(deletion[1], 0, command.start), subtree=True
+                ):
                     return False
                 continue
             if name in {"bash", "sh", "dash", "zsh", "ksh"}:
@@ -1149,7 +1459,8 @@ def source_is_unmodified(
                         return False
             if mutation:
                 nonrecursive_pid_removal = name == "unlink" or (
-                    name == "rm" and all(
+                    name == "rm"
+                    and all(
                         not word.startswith("-") or word in {"-f", "--force", "--"}
                         for word, _, _ in arguments
                     )
@@ -1173,7 +1484,11 @@ def source_is_unmodified(
                             continue
                         value = ShellSourceValue(value.text[3:], value.kind)
                     subtree = name in {"rm", "rmdir", "cp", "mv", "install", "ln"}
-                    if value is not None and value.kind == "audit_pid_file" and nonrecursive_pid_removal:
+                    if (
+                        value is not None
+                        and value.kind == "audit_pid_file"
+                        and nonrecursive_pid_removal
+                    ):
                         subtree = False
                     if touches(value, subtree=subtree):
                         return False
@@ -1185,7 +1500,8 @@ def source_is_unmodified(
                     # Unknown external destinations do not imply arbitrary
                     # hidden mutation; an explicit source-path escape does.
                     if value is None or (
-                        value.kind in {"bundle_path", "literal", "audit_pid_file"} and touches(value)
+                        value.kind in {"bundle_path", "literal", "audit_pid_file"}
+                        and touches(value)
                     ):
                         return False
         for child, consumer_offset in children:
@@ -1211,7 +1527,11 @@ def decode_env_unset_command(
     if not 0 <= start < len(words) or len(words) - start > 128 or not resolver.audit_spend():
         return None
     executable = resolver.audit_word(words[start][1], words[start][2])
-    if executable is None or executable.kind != "literal" or executable.text not in {"env", "/bin/env", "/usr/bin/env"}:
+    if (
+        executable is None
+        or executable.kind != "literal"
+        or executable.text not in {"env", "/bin/env", "/usr/bin/env"}
+    ):
         return None
     cursor = start + 1
     removed: list[str] = []
@@ -1222,7 +1542,11 @@ def decode_env_unset_command(
         if cursor + 1 >= len(words) or len(removed) >= 32:
             return None
         name = resolver.audit_word(words[cursor + 1][1], words[cursor + 1][2])
-        if name is None or name.kind != "literal" or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name.text) is None:
+        if (
+            name is None
+            or name.kind != "literal"
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name.text) is None
+        ):
             return None
         removed.append(name.text)
         cursor += 2
@@ -1236,9 +1560,16 @@ def decode_env_unset_command(
         if assignment is None:
             break
         name = assignment[1]
-        if is_managed_shell_variable(name) or name in execution_settings or name in environment or len(environment) >= 32:
+        if (
+            is_managed_shell_variable(name)
+            or name in execution_settings
+            or name in environment
+            or len(environment) >= 32
+        ):
             return None
-        value = resolver.word(left + assignment.end(), right, assignment_value=True, literal_only=not resolver.valid)
+        value = resolver.word(
+            left + assignment.end(), right, assignment_value=True, literal_only=not resolver.valid
+        )
         if value is None or value.kind not in {"literal", "safe_path", "bundle_path"}:
             return None
         environment[name] = value
@@ -1302,7 +1633,10 @@ def _heredoc_sed_substitution(
     if len(stages) != 2 or len(stages[0]) != 4 or len(stages[1]) != 2:
         return None
     first, second = stages
-    if [word[0] for word in first[:2]] != ["sed", "-n"] or [word[0] for word in second] != ["sed", "1d;$d"]:
+    if [word[0] for word in first[:2]] != ["sed", "-n"] or [word[0] for word in second] != [
+        "sed",
+        "1d;$d",
+    ]:
         return None
     for _, left, right in (*first[:3], *second):
         value = resolver.word(left, right, depth=depth + 1)
@@ -1362,7 +1696,13 @@ def _heredoc_sed_substitution(
     return ShellSourceValue(
         "".join(cached[left:right] for left, right in selected),
         "code",
-        tuple(dict.fromkeys(origin for left, right in selected for origin in resolver._source_origins(target, value, left, right))),
+        tuple(
+            dict.fromkeys(
+                origin
+                for left, right in selected
+                for origin in resolver._source_origins(target, value, left, right)
+            )
+        ),
     )
 
 
@@ -1391,7 +1731,11 @@ def generated_file_is_unmodified(
         return False
     target = generated.path.text
     directory, _, basename = target.rpartition("/")
-    if not directory.startswith("/tmp/") or SAFE_PATH_MARKER not in directory or ".." in target.split("/"):
+    if (
+        not directory.startswith("/tmp/")
+        or SAFE_PATH_MARKER not in directory
+        or ".." in target.split("/")
+    ):
         return False
     parent_commands = {command.start: command for command in resolver.commands}
     caller_starts = {command.start for command in callers}
@@ -1403,7 +1747,22 @@ def generated_file_is_unmodified(
     last_use = max(caller_starts)
     chmod_offsets: list[int] = []
     controls = {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "!"}
-    writers = {"rm", "unlink", "rmdir", "cp", "mv", "install", "ln", "tee", "truncate", "touch", "dd", "chmod", "chown", "chgrp"}
+    writers = {
+        "rm",
+        "unlink",
+        "rmdir",
+        "cp",
+        "mv",
+        "install",
+        "ln",
+        "tee",
+        "truncate",
+        "touch",
+        "dd",
+        "chmod",
+        "chown",
+        "chgrp",
+    }
 
     def related(value: ShellSourceValue | None, *, ancestor: bool = False) -> bool:
         if value is None:
@@ -1416,7 +1775,11 @@ def generated_file_is_unmodified(
         if ancestor and path and directory.startswith(path + "/"):
             return True
         # Literal relative paths can name the file from an inspected cwd.
-        return value.kind == "literal" and re.fullmatch(r"[-A-Za-z0-9_./]+", path) is not None and path.rpartition("/")[2] in {basename, directory.rpartition("/")[2]}
+        return (
+            value.kind == "literal"
+            and re.fullmatch(r"[-A-Za-z0-9_./]+", path) is not None
+            and path.rpartition("/")[2] in {basename, directory.rpartition("/")[2]}
+        )
 
     def visit(current: ShellSourceResolver, anchor: int, depth: int) -> bool:
         if depth > 8 or not current.lexically_valid or not current.audit_spend():
@@ -1435,17 +1798,33 @@ def generated_file_is_unmodified(
             before_use = event <= last_use
             child_scope = id(command) in child_ids
 
-            def word(left: int, right: int, *, assignment: bool = False, child_scope: bool = child_scope) -> ShellSourceValue | None:
-                if child_scope and any(marker in current.content[left:right] for marker in ("$", "`")):
+            def word(
+                left: int, right: int, *, assignment: bool = False, child_scope: bool = child_scope
+            ) -> ShellSourceValue | None:
+                if child_scope and any(
+                    marker in current.content[left:right] for marker in ("$", "`")
+                ):
                     return None
-                return current.word(left, right, assignment_value=assignment, literal_only=not current.valid)
+                return current.word(
+                    left, right, assignment_value=assignment, literal_only=not current.valid
+                )
 
             for left, right in command.redirects:
                 value = word(left, right)
-                prefix = current.content[max(command.start, left - 32):left]
-                if re.search(r"(?:>&|<&)[ \t]*$", prefix) and value is not None and re.fullmatch(r"[0-9]+|-", value.text):
+                prefix = current.content[max(command.start, left - 32) : left]
+                if (
+                    re.search(r"(?:>&|<&)[ \t]*$", prefix)
+                    and value is not None
+                    and re.fullmatch(r"[0-9]+|-", value.text)
+                ):
                     continue
-                destinations = (value,) if value is not None else current.audit_path_values(left, right, command.start) if not child_scope else None
+                destinations = (
+                    (value,)
+                    if value is not None
+                    else current.audit_path_values(left, right, command.start)
+                    if not child_scope
+                    else None
+                )
                 if destinations is None:
                     if before_use:
                         return False
@@ -1465,7 +1844,12 @@ def generated_file_is_unmodified(
                 if assignment[1] == "PATH":
                     path = current.path_prefix(left, right)
                     if related(path):
-                        if not is_parent or command.start not in caller_starts or path is None or path.text != directory:
+                        if (
+                            not is_parent
+                            or command.start not in caller_starts
+                            or path is None
+                            or path.text != directory
+                        ):
                             return False
                         path_count += 1
                     elif path is None:
@@ -1496,7 +1880,7 @@ def generated_file_is_unmodified(
             if related(head, ancestor=True):
                 return False
             name = head.text.rpartition("/")[2]
-            arguments = command.words[cursor + 1:]
+            arguments = command.words[cursor + 1 :]
             values = []
             for _, left, right in arguments:
                 assignment = re.match(r"[A-Za-z_][A-Za-z0-9_]*=", current.content[left:right])
@@ -1509,7 +1893,11 @@ def generated_file_is_unmodified(
                         # Until that invocation is included in the complete
                         # caller set, retain the conservative partial result.
                         return False
-                values.append(word(left + assignment.end(), right, assignment=True) if assignment is not None else word(left, right))
+                values.append(
+                    word(left + assignment.end(), right, assignment=True)
+                    if assignment is not None
+                    else word(left, right)
+                )
             if name == "umask":
                 return False
             if name == "chmod" and is_parent and not child_scope:
@@ -1530,13 +1918,30 @@ def generated_file_is_unmodified(
                     continue
             if name == "mkdir":
                 if all(value is not None for value in values) and all(
-                    value.text in {"-p", "--"} or (value.kind == "safe_path" and value.text != target)
-                    for value in values if value is not None
+                    value.text in {"-p", "--"}
+                    or (value.kind == "safe_path" and value.text != target)
+                    for value in values
+                    if value is not None
                 ):
                     continue
             if before_use and name in {
-                "eval", "exec", "source", ".", "sed", "env", "command", "builtin",
-                "sudo", "nohup", "timeout", "nice", "bash", "sh", "dash", "zsh", "ksh",
+                "eval",
+                "exec",
+                "source",
+                ".",
+                "sed",
+                "env",
+                "command",
+                "builtin",
+                "sudo",
+                "nohup",
+                "timeout",
+                "nice",
+                "bash",
+                "sh",
+                "dash",
+                "zsh",
+                "ksh",
             }:
                 return False
             for value in values:
@@ -1566,4 +1971,10 @@ def generated_file_is_unmodified(
             return False
     if not visit(resolver, 0, 0):
         return False
-    return all(any(generated.declaration_end < offset < use for offset in chmod_offsets) for use in caller_starts) and resolver.audit_spend()
+    return (
+        all(
+            any(generated.declaration_end < offset < use for offset in chmod_offsets)
+            for use in caller_starts
+        )
+        and resolver.audit_spend()
+    )

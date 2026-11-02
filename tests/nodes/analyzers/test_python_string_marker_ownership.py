@@ -21,16 +21,16 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
-
-from skillspector import python_tokens
 from skillspector.artifacts import SecurityTextView
 from skillspector.graph import graph
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.python_tokens import PythonStringClosers
+
+from skillspector import python_tokens
 from skillspector.nodes.analyzers import static_patterns_anti_refusal as ar_module
 from skillspector.nodes.analyzers import static_patterns_prompt_injection as pi_module
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_module
 from skillspector.nodes.analyzers import static_runner
-from skillspector.python_tokens import PythonStringClosers
 from skillspector.security_reconstruction import (
     MAX_MARKER_LOOKAHEAD_CHARS,
     build_declared_marker_views,

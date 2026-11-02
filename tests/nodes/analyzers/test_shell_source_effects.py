@@ -16,10 +16,13 @@ from skillspector.shell_sources import (
 
 def _resolver(content: str) -> ShellSourceResolver:
     return ShellSourceResolver(
-        ShellSourceContext("scripts/caller.sh", {
-            "scripts/caller.sh": content,
-            "scripts/library.sh": "helper() {\n printf ready\n}\n",
-        }),
+        ShellSourceContext(
+            "scripts/caller.sh",
+            {
+                "scripts/caller.sh": content,
+                "scripts/library.sh": "helper() {\n printf ready\n}\n",
+            },
+        ),
         tm._next_shell_invocation_word,
         lambda text, start, end: tm._skip_command_substitution(text, start, end, lambda: None),
         tm._static_heredoc_header,
@@ -28,28 +31,34 @@ def _resolver(content: str) -> ShellSourceResolver:
     )
 
 
-@pytest.mark.parametrize("command", [
-    "sed -n -e 'p' unrelated.txt -e 'w scripts/library.sh'",
-    "sed -n 'p' unrelated.txt -i scripts/library.sh",
-    "sed -n 'p' unrelated.txt -f program.sed",
-    "sed -n 'p' unrelated.txt --expression='w scripts/library.sh'",
-])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed -n -e 'p' unrelated.txt -e 'w scripts/library.sh'",
+        "sed -n 'p' unrelated.txt -i scripts/library.sh",
+        "sed -n 'p' unrelated.txt -f program.sed",
+        "sed -n 'p' unrelated.txt --expression='w scripts/library.sh'",
+    ],
+)
 def test_trailing_sed_options_cannot_hide_writes(command: str) -> None:
     resolver = _resolver(command + "\n")
     assert not source_is_unmodified(resolver, "scripts/library.sh", len(resolver.content))
 
 
-@pytest.mark.parametrize("command", [
-    "sed -n 'p' unrelated.txt",
-    "sed -n -e 'p' first.txt second.txt",
-    "sed -n -e 's/a/b/g' first.txt",
-])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed -n 'p' unrelated.txt",
+        "sed -n -e 'p' first.txt second.txt",
+        "sed -n -e 's/a/b/g' first.txt",
+    ],
+)
 def test_all_literal_sed_inputs_keep_readonly_proof(command: str) -> None:
     resolver = _resolver(command + "\n")
     assert source_is_unmodified(resolver, "scripts/library.sh", len(resolver.content))
 
 
-_GENERATED = '''set -euo pipefail
+_GENERATED = """set -euo pipefail
 tmpdir="$(mktemp -d /tmp/fixture.XXXXXX)"
 cat > "$tmpdir/helper" <<'HELPER'
 #!/bin/bash
@@ -57,13 +66,13 @@ printf ready
 HELPER
 CHMOD +x "$tmpdir/helper"
 PATH="$tmpdir:$PATH" bash -c 'helper'
-'''
+"""
 
 
 @pytest.mark.parametrize("chmod", ["chmod", "/bin/chmod", "/usr/bin/chmod"])
 def test_native_chmod_establishes_generated_executable(chmod: str) -> None:
     resolver = _resolver(_GENERATED.replace("CHMOD", chmod))
-    generated, = resolver.generated_files()
+    (generated,) = resolver.generated_files()
     caller = resolver.commands[-1]
     assert generated_file_is_unmodified(resolver, generated, (caller,))
 
@@ -71,13 +80,13 @@ def test_native_chmod_establishes_generated_executable(chmod: str) -> None:
 @pytest.mark.parametrize("chmod", ["/tmp/chmod", '"$tmpdir/chmod"'])
 def test_chmod_basename_does_not_establish_generated_executable(chmod: str) -> None:
     resolver = _resolver(_GENERATED.replace("CHMOD", chmod))
-    generated, = resolver.generated_files()
+    (generated,) = resolver.generated_files()
     assert not generated_file_is_unmodified(resolver, generated, (resolver.commands[-1],))
 
 
 def test_shadowed_chmod_cannot_establish_generated_executable() -> None:
     content = _GENERATED.replace("CHMOD", "chmod").replace(
-        'chmod +x', 'chmod() { true; }\nchmod +x'
+        "chmod +x", "chmod() { true; }\nchmod +x"
     )
     resolver = _resolver(content)
     assert not tuple(resolver.generated_files())
@@ -94,9 +103,9 @@ def test_caller_startup_settings_cannot_borrow_generated_identity(setting: str) 
 
 @pytest.mark.parametrize("mutate", [False, True])
 def test_cached_cat_source_requires_unchanged_uploaded_bytes(mutate: bool) -> None:
-    prefix = '''set -euo pipefail
+    prefix = """set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-'''
+"""
     if mutate:
         prefix += 'printf changed > "$root/scripts/library.sh"\n'
     content = prefix + 'program=$(cat "$root/scripts/library.sh")\nbash -c "$program; helper"\n'

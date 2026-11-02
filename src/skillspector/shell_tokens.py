@@ -42,7 +42,11 @@ class ShellStringClosers:
                     result.add(cursor)
                     quote = None
             elif character == "\\":
-                if quote is None or ansi_c or content[cursor + 1:cursor + 2] in {'$', '`', '"', '\\', '\n'}:
+                if (
+                    quote is None
+                    or ansi_c
+                    or content[cursor + 1 : cursor + 2] in {"$", "`", '"', "\\", "\n"}
+                ):
                     cursor += 2
                     continue
             elif character == "`" or content.startswith(("$(", "${", "$["), cursor):
@@ -75,7 +79,9 @@ class ShellStringClosers:
             if character == "\n":
                 cursor += 1
                 if pending:
-                    stop = self.heredoc_bodies(content, cursor, len(content), tuple(pending), self.check_runtime)
+                    stop = self.heredoc_bodies(
+                        content, cursor, len(content), tuple(pending), self.check_runtime
+                    )
                     if stop is None:
                         return frozenset()
                     cursor = stop

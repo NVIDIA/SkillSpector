@@ -10,12 +10,31 @@ import pytest
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.shell_artifact_effects import ShellArtifactAudit
 from skillspector.shell_artifacts import ShellArtifact
-from skillspector.shell_source_effects import SHELL_PID_MARKER, ShellEffectCommand, source_effects_preserve
-from skillspector.shell_sources import SAFE_PATH_MARKER, ShellSourceContext, ShellSourceResolver, ShellSourceValue
+from skillspector.shell_source_effects import (
+    SHELL_PID_MARKER,
+    ShellEffectCommand,
+    source_effects_preserve,
+)
+from skillspector.shell_sources import (
+    SAFE_PATH_MARKER,
+    ShellSourceContext,
+    ShellSourceResolver,
+    ShellSourceValue,
+)
 
 
 def _audit():
-    return ShellArtifactAudit(ShellSourceContext("tests/workflow.sh", {"tests/workflow.sh": "echo fixture\n", "scripts/setup.sh": "sample() { echo inspected; }\n"}), tm._next_shell_invocation_word, lambda: None)
+    return ShellArtifactAudit(
+        ShellSourceContext(
+            "tests/workflow.sh",
+            {
+                "tests/workflow.sh": "echo fixture\n",
+                "scripts/setup.sh": "sample() { echo inspected; }\n",
+            },
+        ),
+        tm._next_shell_invocation_word,
+        lambda: None,
+    )
 
 
 def _command(argv, **kwargs):
@@ -35,11 +54,16 @@ def test_preserve_callback_keeps_unknown_printf_output_out_of_generated_sources(
     assert audit.read_source("scripts/setup.sh") is not None
 
 
-@pytest.mark.parametrize("argv", [
-    ("printf", None, "data"), ("printf", "%n", None),
-    ("printf", "-v", None), ("printf", "%b", None),
-    ("/tmp/printf", "%s", None),
-])
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("printf", None, "data"),
+        ("printf", "%n", None),
+        ("printf", "-v", None),
+        ("printf", "%b", None),
+        ("/tmp/printf", "%s", None),
+    ],
+)
 def test_preserve_callback_does_not_expand_printf_code_or_identity_contract(argv) -> None:
     assert _audit().preserve(_command(argv)) is None
 
@@ -47,7 +71,9 @@ def test_preserve_callback_does_not_expand_printf_code_or_identity_contract(argv
 def test_preserve_callback_still_accounts_for_unknown_printf_destination() -> None:
     audit = _audit()
     assert audit.preserve(_command(("printf", "%s", None), redirects=(("1>", None),))) is None
-    result = audit.preserve(_command(("printf", "%s", None), redirects=(("1>", "scripts/setup.sh"),)))
+    result = audit.preserve(
+        _command(("printf", "%s", None), redirects=(("1>", "scripts/setup.sh"),))
+    )
     assert result is not None and result.writes == ("scripts/setup.sh",)
     assert audit.read_source("scripts/setup.sh") is None
 
@@ -56,24 +82,36 @@ def test_preserve_callback_still_accounts_for_unknown_printf_destination() -> No
 def test_native_readonly_sed_keeps_its_output_unknown(program: str) -> None:
     audit = _audit()
     result = audit(_command(("sed", "-n", program, "scripts/setup.sh")))
-    assert result is not None and result.writes == () and result.stdout is None and result.status is None
-    result = audit(_command(("sed", "-n", program, "scripts/setup.sh"), redirects=(("1>", "scripts/setup.sh"),)))
+    assert (
+        result is not None
+        and result.writes == ()
+        and result.stdout is None
+        and result.status is None
+    )
+    result = audit(
+        _command(
+            ("sed", "-n", program, "scripts/setup.sh"), redirects=(("1>", "scripts/setup.sh"),)
+        )
+    )
     assert result is not None and result.writes == ("scripts/setup.sh",)
     assert audit.read_source("scripts/setup.sh") is None
 
 
-@pytest.mark.parametrize("argv", [
-    ("sed", "-n", "e", "scripts/setup.sh"),
-    ("sed", "-n", "w scripts/setup.sh", "input"),
-    ("sed", "-n", "s/a/b/e", "input"),
-    ("sed", "-n", "s/a/b/w scripts/setup.sh", "input"),
-    ("sed", "-n", "p; e", "input"),
-    ("sed", "-n", "p", "-i"),
-    ("sed", "-n", "p", "input", "-e", "e"),
-    ("sed", "-n", None, "input"),
-    ("sed", "-n", "p", None),
-    ("/tmp/sed", "-n", "p", "input"),
-])
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("sed", "-n", "e", "scripts/setup.sh"),
+        ("sed", "-n", "w scripts/setup.sh", "input"),
+        ("sed", "-n", "s/a/b/e", "input"),
+        ("sed", "-n", "s/a/b/w scripts/setup.sh", "input"),
+        ("sed", "-n", "p; e", "input"),
+        ("sed", "-n", "p", "-i"),
+        ("sed", "-n", "p", "input", "-e", "e"),
+        ("sed", "-n", None, "input"),
+        ("sed", "-n", "p", None),
+        ("/tmp/sed", "-n", "p", "input"),
+    ],
+)
 def test_readonly_sed_never_exempts_code_writes_unknown_argv_or_identity(argv) -> None:
     assert _audit()(_command(argv)) is None
 
@@ -102,7 +140,7 @@ def test_mktemp_regular_file_retains_exact_ownership_without_a_directory_claim()
 @pytest.mark.parametrize("directory", [False, True])
 def test_mktemp_replaces_only_the_final_x_run(directory: bool) -> None:
     audit = _audit()
-    args = ("mktemp", *(('-d',) if directory else ()), "/tmp/literalXXX.generatedXXXXXX.netrc")
+    args = ("mktemp", *(("-d",) if directory else ()), "/tmp/literalXXX.generatedXXXXXX.netrc")
     result = audit(_command(args))
     assert result is not None
     path = result.stdout.removesuffix("\n")
@@ -112,13 +150,19 @@ def test_mktemp_replaces_only_the_final_x_run(directory: bool) -> None:
     assert (audit.store.read(path) is None) is directory
 
 
-@pytest.mark.parametrize("args", [
-    ("mktemp",), ("mktemp", "-u", "/tmp/file.XXXXXX"),
-    ("mktemp", "--suffix=.netrc", "/tmp/file.XXXXXX"),
-    ("mktemp", "/tmp/file.XX"), ("mktemp", "/tmp/file.XXXXXX.suffixX"),
-    ("mktemp", "/tmp/../file.XXXXXX"), ("mktemp", "relative.XXXXXX"),
-    ("mktemp", "/tmp/file.XXXXXX", "extra"),
-])
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("mktemp",),
+        ("mktemp", "-u", "/tmp/file.XXXXXX"),
+        ("mktemp", "--suffix=.netrc", "/tmp/file.XXXXXX"),
+        ("mktemp", "/tmp/file.XX"),
+        ("mktemp", "/tmp/file.XXXXXX.suffixX"),
+        ("mktemp", "/tmp/../file.XXXXXX"),
+        ("mktemp", "relative.XXXXXX"),
+        ("mktemp", "/tmp/file.XXXXXX", "extra"),
+    ],
+)
 def test_mktemp_file_refuses_unsupported_templates_and_modes(args: tuple[str, ...]) -> None:
     assert _audit()(_command(args)) is None
 
@@ -142,19 +186,42 @@ def test_actual_native_path_is_required_before_publishing_helper_bytes() -> None
     audit = _audit()
     assert audit(_command(("mktemp", "-d", "/tmp/native.XXXXXX"))) is not None
     directory = "/tmp/native." + SAFE_PATH_MARKER
-    assert audit(_command(("cat",), stdin="#!/bin/bash\necho known\n", redirects=(("1>", directory + "/helper"),))) is not None
+    assert (
+        audit(
+            _command(
+                ("cat",),
+                stdin="#!/bin/bash\necho known\n",
+                redirects=(("1>", directory + "/helper"),),
+            )
+        )
+        is not None
+    )
     assert audit.read_source(directory + "/helper") == "#!/bin/bash\necho known\n"
-    assert audit(_command(("/tmp/cat",), stdin="different", redirects=(("1>", directory + "/helper"),))) is None
+    assert (
+        audit(
+            _command(("/tmp/cat",), stdin="different", redirects=(("1>", directory + "/helper"),))
+        )
+        is None
+    )
     assert audit.read_source(directory + "/helper") == "#!/bin/bash\necho known\n"
 
 
 def test_path_lookup_distinguishes_generated_helper_from_native_command() -> None:
     audit = _audit()
     assert audit.store.create_empty_directory("/tmp/helpers")
-    assert audit.store.write("/tmp/helpers/bash", ShellArtifact(ShellSourceValue("echo replaced\n"), executable=True))
-    command = replace(_command(("bash", "-c", "echo safe"), identity_only=True), environment={"PATH": "/tmp/helpers:" + audit.path_tail})
+    assert audit.store.write(
+        "/tmp/helpers/bash", ShellArtifact(ShellSourceValue("echo replaced\n"), executable=True)
+    )
+    command = replace(
+        _command(("bash", "-c", "echo safe"), identity_only=True),
+        environment={"PATH": "/tmp/helpers:" + audit.path_tail},
+    )
     result = audit(command)
-    assert result is not None and not result.native_identity and result.script_path == "/tmp/helpers/bash"
+    assert (
+        result is not None
+        and not result.native_identity
+        and result.script_path == "/tmp/helpers/bash"
+    )
     result = audit(replace(command, argv=("/bin/bash", "-c", "echo safe")))
     assert result is not None and result.native_identity and result.script_path is None
     assert audit.steps == 0
@@ -162,7 +229,10 @@ def test_path_lookup_distinguishes_generated_helper_from_native_command() -> Non
 
 def test_unknown_or_unexecutable_path_entry_never_proves_native_identity() -> None:
     audit = _audit()
-    command = replace(_command(("cat",), identity_only=True), environment={"PATH": "/tmp/unknown:" + audit.path_tail})
+    command = replace(
+        _command(("cat",), identity_only=True),
+        environment={"PATH": "/tmp/unknown:" + audit.path_tail},
+    )
     assert audit(command) is None
     assert audit.store.create_empty_directory("/tmp/unknown")
     assert audit.store.write("/tmp/unknown/cat", ShellArtifact(ShellSourceValue("echo replaced\n")))
@@ -173,7 +243,9 @@ def test_unknown_or_unexecutable_path_entry_never_proves_native_identity() -> No
 def test_explicit_bash_reads_known_nonexecutable_generated_script(interpreter: str) -> None:
     audit = _audit()
     assert audit.store.create_empty_directory("/tmp/scripts")
-    assert audit.store.write("/tmp/scripts/child.sh", ShellArtifact(ShellSourceValue("printf ready\n"), executable=False))
+    assert audit.store.write(
+        "/tmp/scripts/child.sh", ShellArtifact(ShellSourceValue("printf ready\n"), executable=False)
+    )
     request = _command(("/tmp/scripts/child.sh", "argument"), interpreter=interpreter)
     result = audit(request)
     assert result is not None and result.script_path == "/tmp/scripts/child.sh"
@@ -183,15 +255,22 @@ def test_explicit_bash_reads_known_nonexecutable_generated_script(interpreter: s
     assert result is not None and result.stdout == "ready" and not result.native_identity
 
 
-@pytest.mark.parametrize("interpreter, script", [("sh", "scripts/setup.sh"), ("/tmp/bash", "scripts/setup.sh"), ("bash", "scripts/missing.sh")])
-def test_explicit_interpreter_requires_native_bash_and_known_script(interpreter: str, script: str) -> None:
+@pytest.mark.parametrize(
+    "interpreter, script",
+    [("sh", "scripts/setup.sh"), ("/tmp/bash", "scripts/setup.sh"), ("bash", "scripts/missing.sh")],
+)
+def test_explicit_interpreter_requires_native_bash_and_known_script(
+    interpreter: str, script: str
+) -> None:
     assert _audit()(_command((script,), interpreter=interpreter)) is None
 
 
 def test_explicit_bash_cannot_hide_path_shadow_or_changed_source() -> None:
     audit = _audit()
     assert audit.store.create_empty_directory("/tmp/helpers")
-    assert audit.store.write("/tmp/helpers/bash", ShellArtifact(ShellSourceValue("printf replaced\n"), executable=True))
+    assert audit.store.write(
+        "/tmp/helpers/bash", ShellArtifact(ShellSourceValue("printf replaced\n"), executable=True)
+    )
     request = _command(("scripts/setup.sh",), interpreter="bash")
     assert audit(replace(request, environment={"PATH": "/tmp/helpers:" + audit.path_tail})) is None
     audit.store.invalidate("scripts/setup.sh")
@@ -201,7 +280,13 @@ def test_explicit_bash_cannot_hide_path_shadow_or_changed_source() -> None:
 def test_unknown_conditional_write_forgets_previous_generated_source() -> None:
     audit = _audit()
     assert audit.store.write("/tmp/generated.sh", ShellArtifact(ShellSourceValue("echo old\n")))
-    result = audit(_command(("printf", "%s", "echo branch\n"), uncertain=True, redirects=(("1>", "/tmp/generated.sh"),)))
+    result = audit(
+        _command(
+            ("printf", "%s", "echo branch\n"),
+            uncertain=True,
+            redirects=(("1>", "/tmp/generated.sh"),),
+        )
+    )
     assert result is not None and result.writes == ("/tmp/generated.sh",)
     assert audit.read_source("/tmp/generated.sh") is None
 
@@ -212,12 +297,15 @@ def test_native_echo_diagnostic_has_known_effects_without_proven_output() -> Non
     assert result.stdout is None and result.status is None and result.writes == ()
 
 
-@pytest.mark.parametrize("args, expected", [
-    (("known",), "known\n"),
-    (("-n", "known"), None),
-    ((r"one\ntwo",), None),
-    ((None,), None),
-])
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        (("known",), "known\n"),
+        (("-n", "known"), None),
+        ((r"one\ntwo",), None),
+        ((None,), None),
+    ],
+)
 def test_native_echo_preserves_only_proven_generated_bytes(args, expected) -> None:
     audit = _audit()
     assert audit.store.create_empty_directory("/tmp/work")
@@ -227,11 +315,14 @@ def test_native_echo_preserves_only_proven_generated_bytes(args, expected) -> No
     assert audit.read_source("/tmp/work/output.sh") == expected
 
 
-@pytest.mark.parametrize("argv", [
-    ("df", "-B1", "--output=avail", "/tmp"),
-    ("awk", "NR == 2 {print $1}"),
-    ("awk", "NR==2{ print $1; }"),
-])
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("df", "-B1", "--output=avail", "/tmp"),
+        ("awk", "NR == 2 {print $1}"),
+        ("awk", "NR==2{ print $1; }"),
+    ],
+)
 def test_disk_space_query_pipeline_keeps_output_and_status_unknown(argv) -> None:
     audit = _audit()
     result = audit(_command(argv))
@@ -244,13 +335,16 @@ def test_disk_space_query_pipeline_keeps_output_and_status_unknown(argv) -> None
     assert audit.read_source("/tmp/work/value") is None
 
 
-@pytest.mark.parametrize("args", [
-    ('NR == 2 {print $1 > "scripts/setup.sh"}',),
-    ('NR == 2 {print $1; system("rm -rf /")}',),
-    ('NR == 2 {print $1} END {print "changed" > "scripts/setup.sh"}',),
-    ('-f', 'scripts/setup.sh'),
-    (None,),
-])
+@pytest.mark.parametrize(
+    "args",
+    [
+        ('NR == 2 {print $1 > "scripts/setup.sh"}',),
+        ('NR == 2 {print $1; system("rm -rf /")}',),
+        ('NR == 2 {print $1} END {print "changed" > "scripts/setup.sh"}',),
+        ("-f", "scripts/setup.sh"),
+        (None,),
+    ],
+)
 def test_awk_query_allowance_cannot_hide_extra_program_effects(args) -> None:
     assert _audit()(_command(("awk", *args))) is None
 
@@ -262,17 +356,32 @@ def test_source_provenance_and_executable_mode_survive_archive_roundtrip() -> No
     assert audit(_command(("mkdir", "-p", "/tmp/work/package"))) is not None
     assert audit(_command(("cp", "scripts/setup.sh", "/tmp/work/package/setup.sh"))) is not None
     assert audit(_command(("chmod", "+x", "/tmp/work/package/setup.sh"))) is not None
-    assert audit(_command(("tar", "-I", "pigz", "-cf", "/tmp/work/package.tgz", "-C", "/tmp/work", "package"))) is not None
-    assert audit(_command(("tar", "-I", "pigz", "-xf", "/tmp/work/package.tgz", "-C", "/tmp/extracted"))) is not None
+    assert (
+        audit(
+            _command(
+                ("tar", "-I", "pigz", "-cf", "/tmp/work/package.tgz", "-C", "/tmp/work", "package")
+            )
+        )
+        is not None
+    )
+    assert (
+        audit(
+            _command(("tar", "-I", "pigz", "-xf", "/tmp/work/package.tgz", "-C", "/tmp/extracted"))
+        )
+        is not None
+    )
     copied = audit.store.read("/tmp/extracted/package/setup.sh")
     assert copied is not None and copied.executable is True
     assert copied.value == audit.store.read("scripts/setup.sh").value
 
 
-@pytest.mark.parametrize("redirects", [
-    (("1>", "/tmp/first"), ("1>", "/tmp/second")),
-    (("1>", "/tmp/first"), ("2>&", "1")),
-])
+@pytest.mark.parametrize(
+    "redirects",
+    [
+        (("1>", "/tmp/first"), ("1>", "/tmp/second")),
+        (("1>", "/tmp/first"), ("2>&", "1")),
+    ],
+)
 def test_unsupported_stream_routing_cannot_publish_exact_generated_bytes(redirects) -> None:
     audit = _audit()
     result = audit(_command(("printf", "%s", "known"), redirects=redirects))
@@ -290,7 +399,14 @@ def test_known_script_execution_is_not_treated_as_an_inert_cached_file() -> None
 def test_post_child_callback_publishes_only_the_inspected_child_stdout() -> None:
     audit = _audit()
     assert audit.store.create_empty_directory("/tmp/work")
-    result = audit(_command(("scripts/setup.sh",), child_inspected=True, stdout="echo child\n", redirects=(("1>", "/tmp/work/child.sh"),)))
+    result = audit(
+        _command(
+            ("scripts/setup.sh",),
+            child_inspected=True,
+            stdout="echo child\n",
+            redirects=(("1>", "/tmp/work/child.sh"),),
+        )
+    )
     assert result is not None and result.script_path is None
     assert audit.read_source("/tmp/work/child.sh") == "echo child\n"
 
@@ -299,33 +415,49 @@ def test_native_unknown_command_is_not_accepted_just_because_path_is_standard() 
     assert _audit()(_command(("python3", "-c", "arbitrary effects"))) is None
 
 
-@pytest.mark.parametrize("assignment, expected", [("", "echo one\\n"), ("MATCH_MODE=two\n", "echo two\\n")])
-def test_generated_helper_uses_current_inherited_exported_setting(assignment: str, expected: str) -> None:
-    producer = 'set -euo pipefail\n' + assignment + 'p4 print > "$1"\n'
-    helper = '''case "$MATCH_MODE" in
+@pytest.mark.parametrize(
+    "assignment, expected", [("", "echo one\\n"), ("MATCH_MODE=two\n", "echo two\\n")]
+)
+def test_generated_helper_uses_current_inherited_exported_setting(
+    assignment: str, expected: str
+) -> None:
+    producer = "set -euo pipefail\n" + assignment + 'p4 print > "$1"\n'
+    helper = """case "$MATCH_MODE" in
 one) printf '%s' 'echo one\\n' ;;
 two) printf '%s' 'echo two\\n' ;;
 esac
-'''
+"""
     context = ShellSourceContext("producer.sh", {"producer.sh": producer})
     audit = ShellArtifactAudit(context, tm._next_shell_invocation_word, lambda: None)
     assert audit.store.create_empty_directory("/tmp/helpers")
     assert audit.store.create_empty_directory("/tmp/result")
-    assert audit.store.write("/tmp/helpers/p4", ShellArtifact(ShellSourceValue(helper), executable=True))
-    command = ShellEffectCommand(("./producer.sh", "/tmp/result/output.sh"), {"MATCH_MODE": "one", "PATH": "/tmp/helpers:" + audit.path_tail}, ".", "producer.sh", 0, fail_stop=True)
+    assert audit.store.write(
+        "/tmp/helpers/p4", ShellArtifact(ShellSourceValue(helper), executable=True)
+    )
+    command = ShellEffectCommand(
+        ("./producer.sh", "/tmp/result/output.sh"),
+        {"MATCH_MODE": "one", "PATH": "/tmp/helpers:" + audit.path_tail},
+        ".",
+        "producer.sh",
+        0,
+        fail_stop=True,
+    )
     result = audit(command)
     assert result is not None and result.script_path is None
     assert audit.read_source("/tmp/result/output.sh") == expected
 
 
-@pytest.mark.parametrize("argv", [
-    ("mv", "--target-directory=scripts", "input"),
-    ("mv", "-tscripts", "input"),
-    ("ln", "--target-directory=scripts", "input"),
-    ("ln", "-tscripts", "input"),
-    ("install", "--target-directory=scripts", "input"),
-    ("truncate", "--size=0", "scripts/setup.sh"),
-])
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("mv", "--target-directory=scripts", "input"),
+        ("mv", "-tscripts", "input"),
+        ("ln", "--target-directory=scripts", "input"),
+        ("ln", "-tscripts", "input"),
+        ("install", "--target-directory=scripts", "input"),
+        ("truncate", "--size=0", "scripts/setup.sh"),
+    ],
+)
 def test_destination_bearing_native_flags_are_not_discarded(argv) -> None:
     audit = _audit()
     assert audit(_command(argv)) is None
@@ -338,18 +470,38 @@ def test_unknown_copy_success_cannot_skip_a_failure_branch() -> None:
     assert audit.store.read("/tmp/output") is None
 
 
-@pytest.mark.parametrize("operation", [
-    "mv --target-directory=scripts input",
-    "ln --target-directory=scripts input",
-    "if cp missing /tmp/output; then :; else printf changed > scripts/setup.sh; fi",
-    "cd() { :; }; cd /tmp/other; printf changed > scripts/setup.sh",
-])
-def test_effect_callback_cannot_prove_cached_source_unchanged_after_unbounded_writer(operation) -> None:
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "mv --target-directory=scripts input",
+        "ln --target-directory=scripts input",
+        "if cp missing /tmp/output; then :; else printf changed > scripts/setup.sh; fi",
+        "cd() { :; }; cd /tmp/other; printf changed > scripts/setup.sh",
+    ],
+)
+def test_effect_callback_cannot_prove_cached_source_unchanged_after_unbounded_writer(
+    operation,
+) -> None:
     caller = operation + "\n"
-    context = ShellSourceContext("tests/caller.sh", {"tests/caller.sh": caller, "scripts/setup.sh": "echo inspected\n"})
-    resolver = ShellSourceResolver(context, tm._next_shell_invocation_word, lambda text, start, end: tm._skip_command_substitution(text, start, end, lambda: None), tm._static_heredoc_header, tm._skip_static_heredoc_bodies, lambda: None)
+    context = ShellSourceContext(
+        "tests/caller.sh", {"tests/caller.sh": caller, "scripts/setup.sh": "echo inspected\n"}
+    )
+    resolver = ShellSourceResolver(
+        context,
+        tm._next_shell_invocation_word,
+        lambda text, start, end: tm._skip_command_substitution(text, start, end, lambda: None),
+        tm._static_heredoc_header,
+        tm._skip_static_heredoc_bodies,
+        lambda: None,
+    )
     audit = ShellArtifactAudit(context, tm._next_shell_invocation_word, lambda: None)
-    assert not source_effects_preserve(resolver, "scripts/setup.sh", len(caller), read_source=audit.read_source, native_effect=audit)
+    assert not source_effects_preserve(
+        resolver,
+        "scripts/setup.sh",
+        len(caller),
+        read_source=audit.read_source,
+        native_effect=audit,
+    )
 
 
 def test_inherited_native_identity_does_not_invent_command_availability() -> None:
@@ -386,15 +538,33 @@ def test_native_archive_copy_retains_tree_names_modes_and_readonly_listing_uncer
     result = audit(_command(("cp", "-a", "/tmp/source/package", "/tmp/destination/")))
     assert result is not None and result.status is True
     assert audit.store.read("/tmp/destination/package/runner.sh") == artifact
-    assert audit(_command(("tar", "-cf", "/tmp/destination/package.tar", "-C", "/tmp/destination", "package"))) is not None
+    assert (
+        audit(
+            _command(
+                ("tar", "-cf", "/tmp/destination/package.tar", "-C", "/tmp/destination", "package")
+            )
+        )
+        is not None
+    )
     listing = audit(_command(("tar", "-tf", "/tmp/destination/package.tar")))
-    assert listing is not None and listing.status is True and listing.stdout is None and not listing.writes
+    assert (
+        listing is not None
+        and listing.status is True
+        and listing.stdout is None
+        and not listing.writes
+    )
 
 
 def test_unchecked_write_or_read_failure_cannot_publish_generated_source_bytes() -> None:
     audit = _audit()
     assert audit.store.write("/tmp/generated.sh", ShellArtifact(ShellSourceValue("echo old\n")))
-    result = audit(_command(("printf", "%s", "echo new\n"), fail_stop=False, redirects=(("1>", "/tmp/generated.sh"),)))
+    result = audit(
+        _command(
+            ("printf", "%s", "echo new\n"),
+            fail_stop=False,
+            redirects=(("1>", "/tmp/generated.sh"),),
+        )
+    )
     assert result is not None and audit.read_source("/tmp/generated.sh") is None
     read = audit(_command(("cat", "scripts/setup.sh"), fail_stop=False))
     assert read is not None and read.stdout is None and read.status is None
@@ -439,7 +609,9 @@ def test_pid_log_write_invalidates_numeric_alias_without_creating_exact_source()
 def test_pid_output_and_identity_never_become_literal_generated_facts() -> None:
     audit = _audit()
     assert audit.store.create_empty_directory("/tmp/work")
-    result = audit(_command(("printf", "%s", SHELL_PID_MARKER), redirects=(("1>", "/tmp/work/generated.sh"),)))
+    result = audit(
+        _command(("printf", "%s", SHELL_PID_MARKER), redirects=(("1>", "/tmp/work/generated.sh"),))
+    )
     assert result is not None and result.stdout is None
     assert audit.read_source("/tmp/work/generated.sh") is None
     assert audit(_command(("/tmp/helper." + SHELL_PID_MARKER,))) is None
@@ -451,7 +623,9 @@ def test_external_pid_logs_do_not_erase_an_unrelated_fresh_workspace() -> None:
     audit = _audit()
     assert audit.store.create_empty_directory("/tmp/work")
     assert audit.store.write("/tmp/work/known.sh", ShellArtifact(ShellSourceValue("echo known\n")))
-    result = audit(_command(("printf", "%s", "log"), redirects=(("1>", "/tmp/log." + SHELL_PID_MARKER),)))
+    result = audit(
+        _command(("printf", "%s", "log"), redirects=(("1>", "/tmp/log." + SHELL_PID_MARKER),))
+    )
     assert result is not None
     assert audit.read_source("/tmp/work/known.sh") == "echo known\n"
     assert audit.store.inventory("/tmp/work") is not None

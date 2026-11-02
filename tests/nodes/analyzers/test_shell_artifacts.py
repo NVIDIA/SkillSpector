@@ -5,11 +5,15 @@
 
 import pytest
 
+from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+from skillspector.shell_artifact_flow import (
+    ShellArtifactEffects,
+    ShellProducer,
+    helper_stdout_artifacts,
+)
 from skillspector.shell_artifacts import ShellArtifact, ShellArtifactStore
-from skillspector.shell_artifact_flow import ShellArtifactEffects, ShellProducer, helper_stdout_artifacts
 from skillspector.shell_helper_argv import ShellHelperOutput, reconstruct_helper_output
 from skillspector.shell_sources import ShellSourceContext, ShellSourceOrigin, ShellSourceValue
-from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 
 
 def _program(text: str = "printf '%s\\n' ready\n") -> ShellArtifact:
@@ -72,11 +76,19 @@ def test_fresh_file_owns_only_its_exact_path_and_retains_provenance() -> None:
     assert not store.write("/tmp/credential/child", _program())
 
 
-@pytest.mark.parametrize("existing, directory", [
-    ("/tmp/file", False), ("/tmp/file/child", False), ("/tmp", False),
-    ("/tmp/file", True), ("/tmp/file/child", True),
-])
-def test_fresh_file_cannot_overwrite_an_existing_file_or_directory(existing: str, directory: bool) -> None:
+@pytest.mark.parametrize(
+    "existing, directory",
+    [
+        ("/tmp/file", False),
+        ("/tmp/file/child", False),
+        ("/tmp", False),
+        ("/tmp/file", True),
+        ("/tmp/file/child", True),
+    ],
+)
+def test_fresh_file_cannot_overwrite_an_existing_file_or_directory(
+    existing: str, directory: bool
+) -> None:
     store = ShellArtifactStore(lambda: None)
     if directory:
         assert store.create_empty_directory(existing)
@@ -113,7 +125,9 @@ def test_fresh_file_decimal_invalidation_and_transactions_keep_ownership_boundar
     assert not store.owns("/tmp/second")
 
 
-def test_fresh_files_share_existing_count_and_later_byte_budgets(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fresh_files_share_existing_count_and_later_byte_budgets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr("skillspector.shell_artifacts.MAX_GENERATED_FILES", 2)
     store = ShellArtifactStore(lambda: None)
     assert store.write("uploaded", _program())
@@ -139,8 +153,12 @@ def test_copy_archive_extract_retains_the_original_program_and_origin() -> None:
     assert store.read("/tmp/extract-owned/bundle/setup.sh") == program
 
 
-@pytest.mark.parametrize("member, relative", [("setup.sh", "setup.sh"), ("bundle", "bundle/setup.sh")])
-def test_tar_file_and_directory_members_preserve_identity_and_prefix(member: str, relative: str) -> None:
+@pytest.mark.parametrize(
+    "member, relative", [("setup.sh", "setup.sh"), ("bundle", "bundle/setup.sh")]
+)
+def test_tar_file_and_directory_members_preserve_identity_and_prefix(
+    member: str, relative: str
+) -> None:
     store = ShellArtifactStore(lambda: None)
     effects = ShellArtifactEffects(store, lambda: None)
     program = ShellArtifact(_program().value, executable=True)
@@ -187,16 +205,26 @@ def test_exact_file_archive_keeps_nested_depth_bound(levels: int, complete: bool
         assert store.read(path) is None
 
 
-@pytest.mark.parametrize("limit, allowance, complete", [
-    ("MAX_GENERATED_FILES", 1, False), ("MAX_GENERATED_FILES", 2, True),
-    ("MAX_GENERATED_BYTES", 7, False), ("MAX_GENERATED_BYTES", 8, True),
-])
-def test_exact_file_archive_keeps_count_and_byte_budgets(monkeypatch: pytest.MonkeyPatch, limit: str, allowance: int, complete: bool) -> None:
+@pytest.mark.parametrize(
+    "limit, allowance, complete",
+    [
+        ("MAX_GENERATED_FILES", 1, False),
+        ("MAX_GENERATED_FILES", 2, True),
+        ("MAX_GENERATED_BYTES", 7, False),
+        ("MAX_GENERATED_BYTES", 8, True),
+    ],
+)
+def test_exact_file_archive_keeps_count_and_byte_budgets(
+    monkeypatch: pytest.MonkeyPatch, limit: str, allowance: int, complete: bool
+) -> None:
     monkeypatch.setattr("skillspector.shell_artifacts." + limit, allowance)
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/input")
     assert store.write("/tmp/input/setup.sh", _program("1234"))
-    assert store.archive("/tmp/input/setup.sh", "/tmp/package.tar", member_prefix="setup.sh") is complete
+    assert (
+        store.archive("/tmp/input/setup.sh", "/tmp/package.tar", member_prefix="setup.sh")
+        is complete
+    )
     assert (store.read("/tmp/package.tar") is not None) is complete
 
 
@@ -234,7 +262,9 @@ def test_archive_member_escape_never_establishes_generated_code(name: str) -> No
 def test_duplicate_members_refuse_ambiguous_extraction() -> None:
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/extract-owned")
-    archive = ShellArtifact(members=(("setup.sh", _program()), ("setup.sh", _program("rm -rf /\n"))))
+    archive = ShellArtifact(
+        members=(("setup.sh", _program()), ("setup.sh", _program("rm -rf /\n")))
+    )
     assert not store.write("/tmp/package.tgz", archive)
     assert not store.extract("/tmp/package.tgz", "/tmp/extract-owned")
     assert store.read("/tmp/extract-owned/setup.sh") is None
@@ -247,7 +277,9 @@ def test_extraction_requires_a_fresh_known_destination() -> None:
     assert store.read("/tmp/existing/setup.sh") is None
 
 
-@pytest.mark.parametrize("paths", [("root/file", "root/file/child"), ("root/file/child", "root/file")])
+@pytest.mark.parametrize(
+    "paths", [("root/file", "root/file/child"), ("root/file/child", "root/file")]
+)
 def test_file_directory_prefix_collisions_refuse_the_snapshot(paths: tuple[str, str]) -> None:
     store = ShellArtifactStore(lambda: None)
     assert store.write(paths[0], _program())
@@ -337,11 +369,17 @@ def test_typed_helper_archive_survives_copy_into_a_new_bundle() -> None:
     assert store.create_empty_directory("/tmp/work")
     assert store.create_empty_directory("/tmp/output")
     assert store.write("/tmp/input/tool/flash", _program("#!/bin/bash\n"))
-    assert effects.tar(("tar", "-I", "lbzip2", "-cf", "/tmp/input.tbz2", "-C", "/tmp/input", "tool"))
-    output = helper_stdout_artifacts(((ShellHelperOutput(path="/tmp/input.tbz2"),),), store, (), lambda: None)
+    assert effects.tar(
+        ("tar", "-I", "lbzip2", "-cf", "/tmp/input.tbz2", "-C", "/tmp/input", "tool")
+    )
+    output = helper_stdout_artifacts(
+        ((ShellHelperOutput(path="/tmp/input.tbz2"),),), store, (), lambda: None
+    )
     assert output is not None
     assert effects.redirect_stdout("/tmp/work/download.tbz2", output)
-    assert effects.tar(("tar", "-I", "lbzip2", "-xf", "/tmp/work/download.tbz2", "-C", "/tmp/work/bundle/tools"))
+    assert effects.tar(
+        ("tar", "-I", "lbzip2", "-xf", "/tmp/work/download.tbz2", "-C", "/tmp/work/bundle/tools")
+    )
     original = _program()
     assert store.write("scripts/setup.sh", original)
     assert effects.copy_file(("cp", "scripts/setup.sh", "/tmp/work/bundle/setup.sh"))
@@ -351,12 +389,15 @@ def test_typed_helper_archive_survives_copy_into_a_new_bundle() -> None:
     assert store.read("/tmp/output/bundle/tools/tool/flash") is not None
 
 
-@pytest.mark.parametrize("pieces", [
-    (ShellHelperOutput(text="prefix"), ShellHelperOutput(path="/tmp/archive.tgz")),
-    (ShellHelperOutput(path="/tmp/archive.tgz"), ShellHelperOutput(text="suffix")),
-    (ShellHelperOutput(path="/tmp/archive.tgz"), ShellHelperOutput(path="/tmp/archive.tgz")),
-    (ShellHelperOutput(path="/tmp/missing.tgz"),),
-])
+@pytest.mark.parametrize(
+    "pieces",
+    [
+        (ShellHelperOutput(text="prefix"), ShellHelperOutput(path="/tmp/archive.tgz")),
+        (ShellHelperOutput(path="/tmp/archive.tgz"), ShellHelperOutput(text="suffix")),
+        (ShellHelperOutput(path="/tmp/archive.tgz"), ShellHelperOutput(path="/tmp/archive.tgz")),
+        (ShellHelperOutput(path="/tmp/missing.tgz"),),
+    ],
+)
 def test_stdout_cannot_turn_a_modified_or_unknown_stream_into_an_archive(pieces) -> None:
     store = ShellArtifactStore(lambda: None)
     assert store.write("/tmp/archive.tgz", ShellArtifact(members=(("setup.sh", _program()),)))
@@ -371,17 +412,20 @@ def test_ambiguous_helper_output_invalidates_its_destination() -> None:
     assert store.read("/tmp/output") is None
 
 
-@pytest.mark.parametrize("argv", [
-    ("tar", "-I", "malicious-compressor", "-cf", "/tmp/archive", "-C", "/tmp/root", "folder"),
-    ("tar", "-cf", "/tmp/archive", "-C", "/tmp/root", "../folder"),
-    ("tar", "-xf", "/tmp/archive", "-C", "/tmp/root", "--overwrite"),
-])
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("tar", "-I", "malicious-compressor", "-cf", "/tmp/archive", "-C", "/tmp/root", "folder"),
+        ("tar", "-cf", "/tmp/archive", "-C", "/tmp/root", "../folder"),
+        ("tar", "-xf", "/tmp/archive", "-C", "/tmp/root", "--overwrite"),
+    ],
+)
 def test_unmodeled_tar_arguments_never_create_proven_code(argv) -> None:
     store = ShellArtifactStore(lambda: None)
     assert not ShellArtifactEffects(store, lambda: None).tar(argv)
 
 
-_PRODUCER = '''set -Eeuo pipefail
+_PRODUCER = """set -Eeuo pipefail
 TOOL_SPEC=//depot/tools.tbz2
 HELPER_BASE=//depot/helpers
 [[ $# -eq 1 ]] || { echo "Usage: $0 OUTPUT.tgz" >&2; exit 2; }
@@ -437,7 +481,7 @@ printf '%s\\n' "${revisions[@]}" > "$root/REVISIONS"
 tar -I pigz -cf "$output" -C "$work" bundle
 chmod 600 "$output"
 printf 'Created %s\\n' "$output"
-'''
+"""
 
 
 def _inspect_producer(program=_PRODUCER, *, modes=("one",)):
@@ -458,8 +502,13 @@ def _inspect_producer(program=_PRODUCER, *, modes=("one",)):
         assert argv[1:3] == ("print", "-q")
         return (archive,) if "tools.tbz2" in argv[3] else (_program("#!/bin/bash\n"),)
 
-    context = ShellSourceContext("scripts/producer.sh", {"scripts/producer.sh": program, "scripts/setup.sh": _program().value.text})
-    producer = ShellProducer(store, context, tm._next_shell_invocation_word, lambda: None, helper_output)
+    context = ShellSourceContext(
+        "scripts/producer.sh",
+        {"scripts/producer.sh": program, "scripts/setup.sh": _program().value.text},
+    )
+    producer = ShellProducer(
+        store, context, tm._next_shell_invocation_word, lambda: None, helper_output
+    )
     return producer.inspect(("/tmp/result/package.tgz",), {}, ("/tmp/result/package.tgz",)), store
 
 
@@ -471,48 +520,95 @@ def test_finite_producer_preserves_setup_copy_and_archive_member_prefixes() -> N
     copied = store.read("/tmp/extracted/bundle/setup.sh")
     assert copied is not None and copied.value == _program().value and copied.executable is True
     assert store.read("/tmp/extracted/bundle/tools/tool/FlashTool") is not None
-    assert all(path.startswith(("/tmp/producer.__skillspector_producer_", "/tmp/result/")) for path in result.writes)
+    assert all(
+        path.startswith(("/tmp/producer.__skillspector_producer_", "/tmp/result/"))
+        for path in result.writes
+    )
 
 
-@pytest.mark.parametrize("invocation, expected", [
-    ("printf %s changed", "changed"),
-    ("printf %s changed >/dev/null", ""),
-    ("printf %s changed >>/dev/null", ""),
-    ("emit", "changed"),
-    ("emit >/dev/null", ""),
-])
+@pytest.mark.parametrize(
+    "invocation, expected",
+    [
+        ("printf %s changed", "changed"),
+        ("printf %s changed >/dev/null", ""),
+        ("printf %s changed >>/dev/null", ""),
+        ("emit", "changed"),
+        ("emit >/dev/null", ""),
+    ],
+)
 def test_producer_capture_never_retains_discarded_stdout(invocation: str, expected: str) -> None:
-    program = 'set -euo pipefail\nemit() { printf %s changed; }\ncode="$(' + invocation + ')"\nprintf %s "$code" > "$1"\n'
+    program = (
+        'set -euo pipefail\nemit() { printf %s changed; }\ncode="$('
+        + invocation
+        + ')"\nprintf %s "$code" > "$1"\n'
+    )
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        None,
+    )
     result = producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",))
     assert result is not None
     assert store.read("/tmp/result/output.sh").value.text == expected
 
 
-@pytest.mark.parametrize("redirects", [">/dev/null > /tmp/result/extra", "> /tmp/result/extra >/dev/null"])
+@pytest.mark.parametrize(
+    "redirects", [">/dev/null > /tmp/result/extra", "> /tmp/result/extra >/dev/null"]
+)
 def test_producer_refuses_unmodeled_ordered_stdout_routes(redirects: str) -> None:
-    program = 'set -euo pipefail\ncode="$(printf %s changed ' + redirects + ')"\nprintf %s "$code" > "$1"\n'
+    program = (
+        'set -euo pipefail\ncode="$(printf %s changed '
+        + redirects
+        + ')"\nprintf %s "$code" > "$1"\n'
+    )
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        None,
+    )
     assert producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is None
 
 
-@pytest.mark.parametrize("redirects, complete", [('> "$1"', True), ('> "$1" 2>&1', False), ('2>&1 > "$1"', False)])
-def test_producer_never_claims_merged_helper_stderr_is_stdout_only(redirects: str, complete: bool) -> None:
+@pytest.mark.parametrize(
+    "redirects, complete", [('> "$1"', True), ('> "$1" 2>&1', False), ('2>&1 > "$1"', False)]
+)
+def test_producer_never_claims_merged_helper_stderr_is_stdout_only(
+    redirects: str, complete: bool
+) -> None:
     helper_text = 'printf "%s\\n" "rm -rf /" >&2\nprintf "%s\\n" "printf ready"\n'
-    program = 'set -euo pipefail\np4 print ' + redirects + '\n'
+    program = "set -euo pipefail\np4 print " + redirects + "\n"
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
 
     def helper(argv, environment):
-        variants = reconstruct_helper_output(helper_text, argv[1:], environment, frozenset(), tm._next_shell_invocation_word, lambda: None)
+        variants = reconstruct_helper_output(
+            helper_text,
+            argv[1:],
+            environment,
+            frozenset(),
+            tm._next_shell_invocation_word,
+            lambda: None,
+        )
         assert variants is not None
-        return helper_stdout_artifacts(variants, store, _program(helper_text).value.origins, lambda: None)
+        return helper_stdout_artifacts(
+            variants, store, _program(helper_text).value.origins, lambda: None
+        )
 
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, helper)
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        helper,
+    )
     result = producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",))
     assert (result is not None) is complete
     if complete:
@@ -521,12 +617,17 @@ def test_producer_never_claims_merged_helper_stderr_is_stdout_only(redirects: st
         assert store.read("/tmp/result/output.sh") is None
 
 
-@pytest.mark.parametrize("invocation, expected", [
-    ("( printf %s two )", "two"),
-    ("printf %s one; ( printf %s two ); printf %s three", "onetwothree"),
-    ("( ( printf %s two ) )", "two"),
-])
-def test_producer_capture_retains_nested_subshell_stdout_in_order(invocation: str, expected: str) -> None:
+@pytest.mark.parametrize(
+    "invocation, expected",
+    [
+        ("( printf %s two )", "two"),
+        ("printf %s one; ( printf %s two ); printf %s three", "onetwothree"),
+        ("( ( printf %s two ) )", "two"),
+    ],
+)
+def test_producer_capture_retains_nested_subshell_stdout_in_order(
+    invocation: str, expected: str
+) -> None:
     program = 'set -euo pipefail\nmode="$(' + invocation + ')"\np4 "$mode" > "$1"\n'
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
@@ -534,7 +635,13 @@ def test_producer_capture_retains_nested_subshell_stdout_in_order(invocation: st
     def helper(argv, environment):
         return (_program(argv[1]),)
 
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, helper)
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        helper,
+    )
     assert producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None
     assert store.read("/tmp/result/output.sh").value.text == expected
 
@@ -543,75 +650,152 @@ def test_producer_subshell_keeps_local_bindings_separate_from_its_output() -> No
     program = 'set -euo pipefail\nmode=outer\ncaptured="$( ( mode=two; printf %s "$mode" ) )"\nprintf "%s|%s" "$captured" "$mode" > "$1"\n'
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        None,
+    )
     assert producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None
     assert store.read("/tmp/result/output.sh").value.text == "two|outer"
 
 
-@pytest.mark.parametrize("definition, complete", [
-    ('emit() { printf %s known; }', True),
-    ('( emit() { printf %s known; } )', False),
-])
-def test_producer_subshell_function_definition_cannot_escape(definition: str, complete: bool) -> None:
-    program = 'set -euo pipefail\n' + definition + '\nmode="$(emit)"\nprintf %s "$mode" > "$1"\n'
+@pytest.mark.parametrize(
+    "definition, complete",
+    [
+        ("emit() { printf %s known; }", True),
+        ("( emit() { printf %s known; } )", False),
+    ],
+)
+def test_producer_subshell_function_definition_cannot_escape(
+    definition: str, complete: bool
+) -> None:
+    program = "set -euo pipefail\n" + definition + '\nmode="$(emit)"\nprintf %s "$mode" > "$1"\n'
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
-    assert (producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None) is complete
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        None,
+    )
+    assert (
+        producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None
+    ) is complete
     if complete:
         assert store.read("/tmp/result/output.sh").value.text == "known"
     else:
         assert store.read("/tmp/result/output.sh") is None
 
 
-@pytest.mark.parametrize("installation, complete", [
-    ('trap \'rm -rf "$temporary"\' EXIT', True),
-    ('( trap \'rm -rf "$temporary"\' EXIT )', False),
-    ('captured="$(trap \'rm -rf "$temporary"\' EXIT)"', False),
-])
-def test_producer_child_exit_trap_cannot_mutate_parent_cleanup(installation: str, complete: bool) -> None:
-    program = 'set -euo pipefail\ntemporary="$(mktemp -d /tmp/producer.XXXXXX)"\n' + installation + '\nprintf %s known > "$1"\n'
+@pytest.mark.parametrize(
+    "installation, complete",
+    [
+        ("trap 'rm -rf \"$temporary\"' EXIT", True),
+        ("( trap 'rm -rf \"$temporary\"' EXIT )", False),
+        ('captured="$(trap \'rm -rf "$temporary"\' EXIT)"', False),
+    ],
+)
+def test_producer_child_exit_trap_cannot_mutate_parent_cleanup(
+    installation: str, complete: bool
+) -> None:
+    program = (
+        'set -euo pipefail\ntemporary="$(mktemp -d /tmp/producer.XXXXXX)"\n'
+        + installation
+        + '\nprintf %s known > "$1"\n'
+    )
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
-    assert (producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None) is complete
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        None,
+    )
+    assert (
+        producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None
+    ) is complete
     if complete:
         assert store.read("/tmp/result/output.sh").value.text == "known"
     else:
         assert store.read("/tmp/result/output.sh") is None
 
 
-@pytest.mark.parametrize("change, complete", [
-    ('', True),
-    ('temporary="$sibling"', True),
-    ('temporary=/tmp/result', False),
-    ('temporary=/tmp/result\ntrap \'rm -rf "$sibling"\' EXIT', True),
-])
-def test_producer_exit_trap_uses_final_variable_and_last_installation(change: str, complete: bool) -> None:
-    program = 'set -euo pipefail\ntemporary="$(mktemp -d /tmp/producer.XXXXXX)"\nsibling="$(mktemp -d /tmp/sibling.XXXXXX)"\ntrap \'rm -rf "$temporary"\' EXIT\n' + change + '\nprintf %s known > "$1"\n'
+@pytest.mark.parametrize(
+    "change, complete",
+    [
+        ("", True),
+        ('temporary="$sibling"', True),
+        ("temporary=/tmp/result", False),
+        ("temporary=/tmp/result\ntrap 'rm -rf \"$sibling\"' EXIT", True),
+    ],
+)
+def test_producer_exit_trap_uses_final_variable_and_last_installation(
+    change: str, complete: bool
+) -> None:
+    program = (
+        'set -euo pipefail\ntemporary="$(mktemp -d /tmp/producer.XXXXXX)"\nsibling="$(mktemp -d /tmp/sibling.XXXXXX)"\ntrap \'rm -rf "$temporary"\' EXIT\n'
+        + change
+        + '\nprintf %s known > "$1"\n'
+    )
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
-    assert (producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None) is complete
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        None,
+    )
+    assert (
+        producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None
+    ) is complete
     if complete:
         assert store.read("/tmp/result/output.sh").value.text == "known"
     else:
         assert store.read("/tmp/result/output.sh") is None
 
 
-@pytest.mark.parametrize("body, declaration, operand", [
-    ('mode=bad; printf %s x', 'local mode=good; ', '"$mode"'),
-    ('items=(bad); printf %s x', 'local -a items=(); ', '"${items[0]}"'),
-    ('mapfile -t items < <(awk \'NF {print $1}\' <<<"$listing"); printf %s x', 'local -a items=(); ', '"${items[0]}"'),
-    ('for mode in bad; do printf %s x; done', 'local mode=good; ', '"$mode"'),
-])
+@pytest.mark.parametrize(
+    "body, declaration, operand",
+    [
+        ("mode=bad; printf %s x", "local mode=good; ", '"$mode"'),
+        ("items=(bad); printf %s x", "local -a items=(); ", '"${items[0]}"'),
+        (
+            "mapfile -t items < <(awk 'NF {print $1}' <<<\"$listing\"); printf %s x",
+            "local -a items=(); ",
+            '"${items[0]}"',
+        ),
+        ("for mode in bad; do printf %s x; done", "local mode=good; ", '"$mode"'),
+    ],
+)
 @pytest.mark.parametrize("local", [False, True])
-def test_capture_function_requires_mutations_to_be_declared_local(body: str, declaration: str, operand: str, local: bool) -> None:
-    program = 'set -euo pipefail\nmode=good\nitems=(good)\nlisting=bad\nchoose() { ' + (declaration if local else '') + body + '; }\ncaptured="$(choose; printf %s ' + operand + ')"\nprintf %s "$captured" > "$1"\n'
+def test_capture_function_requires_mutations_to_be_declared_local(
+    body: str, declaration: str, operand: str, local: bool
+) -> None:
+    program = (
+        "set -euo pipefail\nmode=good\nitems=(good)\nlisting=bad\nchoose() { "
+        + (declaration if local else "")
+        + body
+        + '; }\ncaptured="$(choose; printf %s '
+        + operand
+        + ')"\nprintf %s "$captured" > "$1"\n'
+    )
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
-    assert (producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None) is local
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        None,
+    )
+    assert (
+        producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None
+    ) is local
     if local:
         assert store.read("/tmp/result/output.sh").value.text == "xgood"
     else:
@@ -622,69 +806,131 @@ def test_capture_function_cannot_bypass_file_effect_guard_via_manifest_pipeline(
     program = 'set -euo pipefail\ncd /tmp/result\nemit() { find . -type f ! -name MANIFEST.sha256 -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256; }\ncaptured="$(emit)"\nprintf %s "$captured" > "$1"\n'
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        None,
+    )
     assert producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is None
     assert store.read("/tmp/result/output.sh") is None
 
 
-@pytest.mark.parametrize("index, expected", [("0", "zero"), ("8", "eight"), ("10", "ten"), ("010", None), ("08", None)])
-def test_producer_array_index_does_not_treat_shell_octal_as_decimal(index: str, expected: str | None) -> None:
-    program = 'set -euo pipefail\nitems=(zero one two three four five six seven eight nine ten)\nprintf %s "${items[' + index + ']}" > "$1"\n'
+@pytest.mark.parametrize(
+    "index, expected", [("0", "zero"), ("8", "eight"), ("10", "ten"), ("010", None), ("08", None)]
+)
+def test_producer_array_index_does_not_treat_shell_octal_as_decimal(
+    index: str, expected: str | None
+) -> None:
+    program = (
+        'set -euo pipefail\nitems=(zero one two three four five six seven eight nine ten)\nprintf %s "${items['
+        + index
+        + ']}" > "$1"\n'
+    )
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
-    assert (producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None) is (expected is not None)
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        None,
+    )
+    assert (
+        producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None
+    ) is (expected is not None)
     if expected is not None:
         assert store.read("/tmp/result/output.sh").value.text == expected
     else:
         assert store.read("/tmp/result/output.sh") is None
 
 
-@pytest.mark.parametrize("number, complete", [("0", True), ("8", True), ("10", True), ("010", False), ("08", False)])
-def test_producer_numeric_guard_refuses_unproved_arithmetic_base(number: str, complete: bool) -> None:
-    program = 'set -euo pipefail\n[[ ' + number + ' -eq ' + number + ' ]] || { exit 1; }\nprintf %s known > "$1"\n'
+@pytest.mark.parametrize(
+    "number, complete", [("0", True), ("8", True), ("10", True), ("010", False), ("08", False)]
+)
+def test_producer_numeric_guard_refuses_unproved_arithmetic_base(
+    number: str, complete: bool
+) -> None:
+    program = (
+        "set -euo pipefail\n[[ "
+        + number
+        + " -eq "
+        + number
+        + ' ]] || { exit 1; }\nprintf %s known > "$1"\n'
+    )
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
-    assert (producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None) is complete
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        None,
+    )
+    assert (
+        producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None
+    ) is complete
     if not complete:
         assert store.read("/tmp/result/output.sh") is None
 
 
-@pytest.mark.parametrize("operand, expected", [
-    ("'${#items[@]}'", "${#items[@]}"),
-    (r'"\${#items[@]}"', "${#items[@]}"),
-    ('"${#items[@]}"', "1"),
-    ('${#items[@]}', "1"),
-    ('"${items[0]}"', "two words"),
-])
-def test_producer_array_words_respect_literal_and_quoted_boundaries(operand: str, expected: str) -> None:
+@pytest.mark.parametrize(
+    "operand, expected",
+    [
+        ("'${#items[@]}'", "${#items[@]}"),
+        (r'"\${#items[@]}"', "${#items[@]}"),
+        ('"${#items[@]}"', "1"),
+        ("${#items[@]}", "1"),
+        ('"${items[0]}"', "two words"),
+    ],
+)
+def test_producer_array_words_respect_literal_and_quoted_boundaries(
+    operand: str, expected: str
+) -> None:
     program = 'set -euo pipefail\nitems=("two words")\nprintf %s ' + operand + ' > "$1"\n'
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        None,
+    )
     assert producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None
     assert store.read("/tmp/result/output.sh").value.text == expected
 
 
-@pytest.mark.parametrize("operand", ['${items[0]}', '"prefix${#items[@]}"'])
+@pytest.mark.parametrize("operand", ["${items[0]}", '"prefix${#items[@]}"'])
 def test_producer_unproved_array_splitting_or_embedding_refuses(operand: str) -> None:
     program = 'set -euo pipefail\nitems=("two words *")\nprintf %s ' + operand + ' > "$1"\n'
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        None,
+    )
     assert producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is None
     assert store.read("/tmp/result/output.sh") is None
 
 
-@pytest.mark.parametrize("listing, expected", [
-    (" first\tignored\n\tsecond rest\n \t\n", "first\nsecond\n"),
-    ("first\u00a0second\n", None),
-    ("first\u2028second\n", None),
-    ("first\rsecond\n", None),
-    ("first\r\n", None),
-])
-def test_producer_awk_fields_do_not_use_python_unicode_whitespace(listing: str, expected: str | None) -> None:
+@pytest.mark.parametrize(
+    "listing, expected",
+    [
+        (" first\tignored\n\tsecond rest\n \t\n", "first\nsecond\n"),
+        ("first\u00a0second\n", None),
+        ("first\u2028second\n", None),
+        ("first\rsecond\n", None),
+        ("first\r\n", None),
+    ],
+)
+def test_producer_awk_fields_do_not_use_python_unicode_whitespace(
+    listing: str, expected: str | None
+) -> None:
     program = 'set -euo pipefail\nlisting="$(p4 files)"\nmapfile -t rows < <(awk \'NF {print $1}\' <<<"$listing")\nprintf "%s\\n" "${rows[@]}" > "$1"\n'
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
@@ -692,7 +938,13 @@ def test_producer_awk_fields_do_not_use_python_unicode_whitespace(listing: str, 
     def helper(argv, environment):
         return (_program(listing),)
 
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, helper)
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        helper,
+    )
     result = producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",))
     assert (result is not None) is (expected is not None)
     if expected is not None:
@@ -711,8 +963,19 @@ def test_producer_helper_environment_retains_only_current_exported_names() -> No
 
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/result")
-    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, helper)
-    assert producer.inspect(("/tmp/result/output.sh",), {"EXPORTED": "original"}, ("/tmp/result/output.sh",)) is not None
+    producer = ShellProducer(
+        store,
+        ShellSourceContext("producer.sh", {"producer.sh": program}),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        helper,
+    )
+    assert (
+        producer.inspect(
+            ("/tmp/result/output.sh",), {"EXPORTED": "original"}, ("/tmp/result/output.sh",)
+        )
+        is not None
+    )
     assert environments == [{"EXPORTED": "changed"}]
     assert store.read("/tmp/result/output.sh").value.text == "changed"
 
@@ -725,31 +988,49 @@ def test_failed_zero_and_multiple_match_branches_do_not_supply_fictitious_output
     assert store.read("/tmp/result/package.tgz") is None
 
 
-@pytest.mark.parametrize("mutation", [
-    ('cp "$(dirname', 'eval "danger"\ncp "$(dirname'),
-    ('tar -I lbzip2 -xf', 'tar -P -I lbzip2 -xf'),
-    ('mkdir -p "$root/helpers"', 'mkdir -p "$root/helpers"\nln -s /outside "$root/escape"'),
-    ('local spec="$1" result', 'local spec="$1" result\ncp scripts/setup.sh /tmp/hidden-write'),
-    ('set -Eeuo pipefail', 'set +e'),
-    ('resolve_one() {', 'mapfile() { printf misleading; }\nresolve_one() {'),
-    ('resolve_one() {', 'local() { printf misleading; }\nresolve_one() {'),
-    ('umask 077', 'change_output() { output=/tmp/other.tgz; }\nchange_output\numask 077'),
-    ('resolve_one() {', 'nested() { printf misleading; }\nresolve_one() {\n nested'),
-])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        ('cp "$(dirname', 'eval "danger"\ncp "$(dirname'),
+        ("tar -I lbzip2 -xf", "tar -P -I lbzip2 -xf"),
+        ('mkdir -p "$root/helpers"', 'mkdir -p "$root/helpers"\nln -s /outside "$root/escape"'),
+        ('local spec="$1" result', 'local spec="$1" result\ncp scripts/setup.sh /tmp/hidden-write'),
+        ("set -Eeuo pipefail", "set +e"),
+        ("resolve_one() {", "mapfile() { printf misleading; }\nresolve_one() {"),
+        ("resolve_one() {", "local() { printf misleading; }\nresolve_one() {"),
+        ("umask 077", "change_output() { output=/tmp/other.tgz; }\nchange_output\numask 077"),
+        ("resolve_one() {", "nested() { printf misleading; }\nresolve_one() {\n nested"),
+    ],
+)
 def test_unmodeled_producer_effect_refuses_all_outputs(mutation) -> None:
     result, store = _inspect_producer(_PRODUCER.replace(*mutation))
     assert result is None
     assert store.read("/tmp/result/package.tgz") is None
 
 
-@pytest.mark.parametrize("name", [
-    "dirname", "awk", "find", "sort", "xargs", "sha256sum",
-    "gzip", "pigz", "bzip2", "lbzip2", "xz", "rm",
-])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "dirname",
+        "awk",
+        "find",
+        "sort",
+        "xargs",
+        "sha256sum",
+        "gzip",
+        "pigz",
+        "bzip2",
+        "lbzip2",
+        "xz",
+        "rm",
+    ],
+)
 def test_specialized_producer_operations_cannot_bypass_shadowed_native_names(name) -> None:
     # These names occur within substitutions, process substitutions, pipelines,
     # tar options or the cleanup trap rather than only as ordinary commands.
-    program = _PRODUCER.replace("resolve_one() {", name + "() { printf replaced; }\nresolve_one() {")
+    program = _PRODUCER.replace(
+        "resolve_one() {", name + "() { printf replaced; }\nresolve_one() {"
+    )
     result, store = _inspect_producer(program)
     assert result is None
     assert store.read("/tmp/result/package.tgz") is None
