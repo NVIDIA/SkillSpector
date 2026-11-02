@@ -16,9 +16,9 @@ from skillspector.powershell_tokens import powershell_source
 _TAIL = "\n# ordinary trailing documentation" * 300
 
 
-def _ledger(content: str) -> dict:
+def _ledger(content: str, path: str = "sample.ps1") -> dict:
     result = static_runner.run_static_patterns_with_ledger(
-        {"components": ["sample.ps1"], "file_cache": {"sample.ps1": content}}, [tm]
+        {"components": [path], "file_cache": {path: content}}, [tm]
     )
     return result["inspection_ledger"][0]
 
@@ -43,6 +43,8 @@ def _ledger(content: str) -> dict:
         '$path = "C:\\tools\\"\nWrite-Host "done"',
         'Write-Host "$(Write-Output \'nested value\') result"',
         'Write-Host "apostrophe \' followed by ' + 'ordinary text ' * 400 + '"',
+        'python "script.py" `\n  --input "image.yuv" `\n  --width 3840',
+        'python "script.py" `\r\n  --input "image.yuv" `\r\n  --width 3840',
     ],
 )
 def test_powershell_literal_boundaries_remain_complete(statement: str) -> None:
@@ -69,6 +71,11 @@ def test_unrelated_native_commands_do_not_invalidate_uri_ownership() -> None:
         'bash -c "r`m -rf /"',
         '$uri = "$base`?option=value"; bash -c \'$CMD -rf /\'',
         '$message = "$(bash -c \'$CMD -rf /\')"',
+        '$message = "outer $(Write-Host \"inner $(bash -c \'$CMD -rf /\')\")"',
+        '$message = @"\n$(bash -c \'$CMD -rf /\')\n"@',
+        'bash `\n -c \'$CMD -rf /\'',
+        '$CMD `\n -rf /',
+        'rm `\r\n -rf /',
         '$payload = "r`m -rf /"; Invoke-Expression $payload',
         '$payload = "r`m -rf /"',
         'Write-Host "ordinary"; $CMD -rf /',
@@ -96,6 +103,10 @@ def test_executable_shell_and_decoded_destructive_content_stay_partial(
         'Write-Host "bad `uX"',
         '$text = @"\ntext\n"@invalid',
         'Write-Host “unproven typographic delimiters”',
+        'Write-Host "mixed ”; $CMD -rf /; #"',
+        "Write-Host 'mixed ’; $CMD -rf /; #'",
+        'Write-Host "mixed “; $CMD -rf /; #"',
+        "Write-Host 'mixed ‘; $CMD -rf /; #'",
         '"$("' * 34 + ')' * 34,
     ],
 )
@@ -110,6 +121,7 @@ def test_subexpression_code_is_not_owned_as_string_data() -> None:
     assert source.owns(content.index("before"))
     assert source.owns(content.index("inner"))
     assert not source.owns(content.index("$CMD"))
+    assert content.index("Write-Output") in source.clause_starts
 
 
 def test_partial_context_cannot_claim_powershell_quotes() -> None:
@@ -157,3 +169,56 @@ def test_here_string_footer_does_not_own_following_code() -> None:
     assert source is not None
     assert not source.owns(content.index("$CMD"))
     assert source.next_boundary(0, len(content)) == content.index('@"')
+
+
+@pytest.mark.parametrize("language", ["powershell", "pwsh", "ps1", "PowerShell"])
+@pytest.mark.parametrize("marker", ["```", "~~~~"])
+def test_markdown_powershell_fences_preserve_host_quotes(language: str, marker: str) -> None:
+    content = (
+        f"# Instructions\n\n{marker}{language}\n"
+        '$uri = "$base`?option=value"\n'
+        'python "script.py" `\n  --input "image.yuv"\n'
+        f"{marker}\n\n" + "Ordinary trailing explanation.\n" * 300
+    )
+    assert _ledger(content, "SKILL.md")["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'bash -c \'$CMD -rf /\'',
+        '$message = "$(bash -c \'$CMD -rf /\')"',
+        'rm `\n -rf /',
+        '& "r`m" -rf /',
+    ],
+)
+def test_markdown_powershell_fences_keep_executable_payloads_partial(command: str) -> None:
+    content = f"# Instructions\n\n```powershell\n{command}\n```\n"
+    assert _ledger(content, "SKILL.md")["outcome"] is LedgerOutcome.PARTIAL
+
+
+def test_fence_language_and_closure_are_required_for_ownership() -> None:
+    statement = '$uri = "$base`?option=value"\n'
+    tail = "Ordinary trailing explanation.\n" * 300
+    for content in (
+        "```bash\n" + statement + "```\n" + tail,
+        "```powershell\n" + statement + tail,
+    ):
+        assert _ledger(content, "SKILL.md")["outcome"] is LedgerOutcome.PARTIAL
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_markdown_fence_offsets_preserve_following_shell_and_raw_findings(reverse: bool) -> None:
+    host = (
+        '```powershell\r\n'
+        '$uri = "$base`?option=value"\r\n```\r\n'
+    )
+    shell = "```bash\r\nbash -c '$CMD -rf /'\r\n```\r\n"
+    blocks = [host, shell] if not reverse else [shell, host]
+    content = "# 👍 instructions\r\n\r\n" + "\r\n".join(blocks)
+    assert _ledger(content, "SKILL.md")["outcome"] is LedgerOutcome.PARTIAL
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content + "\nrm -rf /\n"}},
+        [tm],
+    )
+    assert result["findings"]

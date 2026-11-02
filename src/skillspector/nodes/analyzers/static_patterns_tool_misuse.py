@@ -45,7 +45,7 @@ from skillspector.javascript_tokens import JavaScriptTemplateSpans, assertion_te
 from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
-from skillspector.powershell_tokens import PowerShellSource, powershell_source
+from skillspector.powershell_tokens import PowerShellSource, PowerShellString, powershell_source
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_tokens import PythonLiteralSpans
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
@@ -2632,6 +2632,7 @@ def _has_shell_command_word_exhaustion(
         check_runtime,
         perl_eval_blocks=perl_eval_blocks,
         python_source=python_source,
+        powershell=powershell,
     ):
         if command_string is None or _command_string_depth >= 8:
             return True
@@ -2682,9 +2683,15 @@ def _shell_command_strings(
     *,
     perl_eval_blocks: bool = False,
     python_source: _PythonSourceOwnership | None = None,
+    powershell: PowerShellSource | None = None,
 ) -> Iterator[str | None]:
     """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
-    for clause_start in _shell_clause_starts(content, check_runtime):
+    clause_starts = (
+        powershell.clause_starts
+        if powershell is not None
+        else _shell_clause_starts(content, check_runtime)
+    )
+    for clause_start in clause_starts:
         check_runtime()
         recognized, command_string = _command_string_from_clause(
             content,
@@ -5427,6 +5434,7 @@ def _markdown_shell_text(
     complete_context: bool = True,
     word_apostrophes: bool = False,
     hardware_apostrophe_ambiguity: list[bool] | None = None,
+    powershell_blocks: list[tuple[int, int]] | None = None,
 ) -> str:
     """Mask Markdown delimiters while retaining code and exact source offsets.
 
@@ -5475,6 +5483,7 @@ def _markdown_shell_text(
     # This is a conservative projection, not a general Markdown renderer.
     # Container/HTML bodies with uncertain inline ownership remain literal.
     fence: tuple[str, int, int, str] | None = None
+    fence_body_start = 0
     fence_literal_apostrophes: list[int] = []
     fence_literal_ownership = True
     fence_has_literal_apostrophe = False
@@ -5572,6 +5581,12 @@ def _markdown_shell_text(
                 begin, end = closing_fence.span(1)
                 body_start = offset + len(stripped) - len(fence_body)
                 output[body_start + begin : body_start + end] = " " * (end - begin)
+                if (
+                    powershell_blocks is not None
+                    and complete_context
+                    and fence[3] in {"powershell", "pwsh", "ps1"}
+                ):
+                    powershell_blocks.append((fence_body_start, offset))
                 fence = None
                 fence_literal_apostrophes.clear()
                 fence_literal_ownership = True
@@ -5666,6 +5681,7 @@ def _markdown_shell_text(
                     column if has_list_marker else 0,
                     language,
                 )
+                fence_body_start = offset + len(line)
                 fence_literal_apostrophes.clear()
                 fence_literal_ownership = True
                 fence_has_literal_apostrophe = False
@@ -5815,6 +5831,61 @@ def _markdown_shell_text(
     return projected
 
 
+def _fenced_powershell_source(
+    content: str,
+    blocks: list[tuple[int, int]],
+    check_runtime: Callable[[], None],
+) -> PowerShellSource | None:
+    """Keep complete PowerShell fence ownership in document coordinates."""
+    starts: list[int] = []
+    ends: list[int] = []
+    strings: list[PowerShellString] = []
+    clause_starts: set[int] = set()
+    continuations: list[tuple[int, int]] = []
+    for start, end in blocks:
+        check_runtime()
+        source = powershell_source(content[start:end], check_runtime)
+        if source is None:
+            continue
+        starts.extend(start + position for position in source.starts)
+        ends.extend(start + position for position in source.ends)
+        strings.extend(
+            PowerShellString(
+                start + string.start, start + string.end,
+                string.value, string.decoded, string.invoked,
+            )
+            for string in source.strings
+        )
+        clause_starts.update(start + position for position in source.clause_starts)
+        continuations.extend((start + begin, start + end) for begin, end in source.continuations)
+    if not starts:
+        return None
+    source = PowerShellSource(tuple(starts), tuple(ends), tuple(strings), ())
+    # Preserve the ordinary shell traversal outside the proven host spans.
+    # Add code inside PowerShell $() that POSIX string rules would miss.
+    # Host quotes cannot swallow a following Bash fence. This projection is
+    # only for locating clauses; command strings still use the original bytes.
+    projected = list(content)
+    for start, end in zip(source.starts, source.ends):
+        check_runtime()
+        projected[start:end] = [
+            character if character in "\r\n" else " " for character in content[start:end]
+        ]
+    for start in _shell_clause_starts("".join(projected), check_runtime):
+        check_runtime()
+        position = start
+        while position < len(content) and content[position] in " \t":
+            if (position - start) % 1024 == 0:
+                check_runtime()
+            position += 1
+        if not source.owns(position):
+            clause_starts.add(start)
+    return PowerShellSource(
+        source.starts, source.ends, source.strings, tuple(sorted(clause_starts)),
+        tuple(continuations),
+    )
+
+
 def has_bounded_parse_exhaustion(
     content: str,
     check_runtime: Callable[[], None],
@@ -5875,14 +5946,29 @@ def _has_bounded_parse_exhaustion(
             structural_quote_closers = {end - 1 for _, end in json_strings}
             structural_quote_openers = {start for start, _ in json_strings}
         hardware_apostrophe_ambiguity = [False]
+        powershell_blocks: list[tuple[int, int]] = []
         content = _markdown_shell_text(
             content,
             check_runtime,
             complete_context=complete_context,
             word_apostrophes=word_apostrophes,
             hardware_apostrophe_ambiguity=hardware_apostrophe_ambiguity,
+            powershell_blocks=powershell_blocks,
         )
         if hardware_apostrophe_ambiguity[0]:
+            return True
+        if powershell_blocks:
+            powershell = _fenced_powershell_source(content, powershell_blocks, check_runtime)
+    if powershell is not None and powershell.continuations:
+        projected = list(content)
+        for start, end in powershell.continuations:
+            check_runtime()
+            projected[start:end] = " " * (end - start)
+        content = "".join(projected)
+        # The continuation may have hidden destructive operands from the raw
+        # finding parser. Keep coverage partial when the logical command now
+        # exposes them; never claim those operands were fully inspected.
+        if _has_destructive_command_string(content):
             return True
     # Diagnostic template delimiters belong to JavaScript only when the whole
     # source proves their assertion-message owner. Destructive checks stay raw.

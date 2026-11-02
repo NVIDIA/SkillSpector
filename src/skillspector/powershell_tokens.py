@@ -44,6 +44,8 @@ class PowerShellSource:
     starts: tuple[int, ...]
     ends: tuple[int, ...]
     strings: tuple[PowerShellString, ...]
+    clause_starts: tuple[int, ...]
+    continuations: tuple[tuple[int, int], ...] = ()
 
     def owns(self, position: int) -> bool:
         index = bisect_right(self.starts, position) - 1
@@ -69,11 +71,16 @@ def powershell_source(
         return None
     spans: list[tuple[int, int]] = []
     strings: list[PowerShellString] = []
+    clause_starts: set[int] = {0}
+    continuations: list[tuple[int, int]] = []
     checked = -1024
 
     def check(cursor: int, depth: int) -> None:
         nonlocal checked
-        if depth > _MAX_DEPTH or len(spans) + len(strings) > _MAX_SPANS:
+        if (
+            depth > _MAX_DEPTH
+            or len(spans) + len(strings) + len(clause_starts) + len(continuations) > _MAX_SPANS
+        ):
             raise _UnprovenPowerShell
         if cursor - checked >= 1024:
             check_runtime()
@@ -113,6 +120,10 @@ def powershell_source(
         while cursor < len(content):
             check(cursor, depth)
             character = content[cursor]
+            if not here and character in "‘’“”":
+                # PowerShell also accepts mixed ASCII/typographic quote
+                # delimiters. Do not claim bytes past an unproven closer.
+                raise _UnprovenPowerShell
             closing = (
                 content.startswith(quote + "@", cursor)
                 and (cursor == 0 or content[cursor - 1] == "\n")
@@ -172,6 +183,7 @@ def powershell_source(
                 # Preserve executable subexpressions as independent code. The
                 # outer value stays dynamic, never a trusted literal command.
                 own(region_start, cursor + 2)
+                clause_starts.add(cursor + 2)
                 end = code(cursor + 2, depth + 1, closes_parenthesis=True)
                 value.append("$VALUE")
                 cursor = end
@@ -203,6 +215,7 @@ def powershell_source(
                     raise _UnprovenPowerShell
                 cursor += 2
                 own(start, cursor)
+                clause_starts.add(cursor)
                 continue
             if character == "#" and (cursor == 0 or content[cursor - 1] in " \t\r\n;|&(){}"):
                 start = cursor
@@ -210,6 +223,7 @@ def powershell_source(
                     check(cursor, depth)
                     cursor += 1
                 own(start, cursor)
+                clause_starts.add(cursor)
                 continue
             if character in "'\"":
                 cursor = quoted(cursor, depth + 1)
@@ -220,6 +234,18 @@ def powershell_source(
             if character == "`":
                 if cursor + 1 >= len(content):
                     raise _UnprovenPowerShell
+                # Only a continuation between words can be projected to
+                # spaces without changing command identity. Joining an
+                # escaped command name remains outside this lexical proof.
+                if (cursor == 0 or content[cursor - 1] in " \t") and (
+                    content.startswith("`\n", cursor)
+                    or content.startswith("`\r\n", cursor)
+                ):
+                    end = cursor + (3 if content[cursor + 1] == "\r" else 2)
+                    continuations.append((cursor, end))
+                    own(cursor, end)
+                    cursor = end
+                    continue
                 cursor += 2
                 continue
             if content.startswith("${", cursor):
@@ -229,6 +255,8 @@ def powershell_source(
                 # PowerShell accepts typographic delimiters too. Until this
                 # helper proves their exact mixed-quote rules, retain fallback.
                 raise _UnprovenPowerShell
+            if character in ";|&({\r\n":
+                clause_starts.add(cursor + 1)
             if closes_parenthesis:
                 if character == "(":
                     parentheses += 1
@@ -257,4 +285,6 @@ def powershell_source(
         tuple(start for start, _ in spans),
         tuple(end for _, end in spans),
         tuple(strings),
+        tuple(sorted(clause_starts)),
+        tuple(continuations),
     )
