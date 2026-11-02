@@ -108,6 +108,23 @@ if [[ "$unknown" == yes ]]; then printf '%s\\n' "$replacement" > "$tmpdir/depend
     assert prepared is None or not tuple(prepared.variants())
 
 
+@pytest.mark.parametrize("mutated", [False, True])
+def test_uploaded_preservation_accounts_for_each_fragment_in_a_combined_command(mutated: bool) -> None:
+    prefix = 'if [[ "$unknown" == yes ]]; then value=one; else value=two; fi\n' * 9
+    prefix += 'dependency="$root/scripts/dependency.sh"\n'
+    if mutated:
+        prefix += 'if [[ "$mutate" == yes ]]; then printf "%s" "$replacement" > "$dependency"; fi\n'
+    prefix += 'support=$(sed -n \'/^support() {/,/^}/p\' "$dependency")\n'
+    caller = _CALLER.replace("helper=$(sed", prefix + "helper=$(sed").replace('"$helper; helper"', '"$support; $helper; helper"')
+    prepared = _prepare(caller, "helper() {\n  support\n}\n", extra_sources={"scripts/dependency.sh": "support() {\n  printf ready\n}\n"})
+    if mutated:
+        assert prepared is None or not tuple(prepared.variants())
+    else:
+        assert prepared is not None
+        list(prepared.analyze_source_commands(content=caller, file_path="scripts/caller.sh", file_type="shell", source_view=SecurityTextView("raw", caller)))
+        assert not prepared.has_bounded_parse_exhaustion()
+
+
 def test_inspected_destructive_source_does_not_clear_unrelated_unknown_consumer() -> None:
     caller = _CALLER + 'bash -c "$RUNTIME_COMMAND"\n'
     prepared = _prepare(caller, "helper() {\n rm -rf /\n}\n")

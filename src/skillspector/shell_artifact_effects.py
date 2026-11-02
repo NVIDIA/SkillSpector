@@ -21,7 +21,7 @@ from skillspector.shell_artifact_flow import ShellArtifactEffects, ShellProducer
 from skillspector.shell_artifacts import ShellArtifact, ShellArtifactStore
 from skillspector.shell_helper_argv import is_managed_shell_variable, reconstruct_helper_output
 from skillspector.shell_source_effects import SHELL_PID_MARKER, ShellEffectCommand, ShellEffectResult
-from skillspector.shell_sources import SAFE_PATH_MARKER, ReadWord, ShellSourceContext, ShellSourceOrigin, ShellSourceValue
+from skillspector.shell_sources import SAFE_PATH_MARKER, ReadWord, ShellSourceContext, ShellSourceOrigin, ShellSourceValue, readonly_sed_program
 
 
 _BUILTINS = frozenset({":", "true", "false", "set", "printf", "echo", "pwd", "cd", "command", "test", "umask", "wait"})
@@ -496,6 +496,10 @@ class ShellArtifactAudit:
         elif name == "awk" and len(args) == 1 and args[0] is not None and re.fullmatch(r"[ \t]*NR[ \t]*==[ \t]*2[ \t]*\{[ \t]*print[ \t]+\$1[ \t]*;?[ \t]*\}[ \t]*", args[0]):
             # This bounded stdin filter has no file or command effects. Its
             # input is unknown; do not invent a disk-space value or success.
+            status = None
+        elif name == "sed" and len(args) == 3 and args[0] == "-n" and args[1] is not None and args[2] is not None and not args[2].startswith("-") and readonly_sed_program(args[1]):
+            # The shared grammar excludes writes and execution, including
+            # substitution flags. Output stays unknown in the effects audit.
             status = None
         elif name in {"bash", "sh"} and len(args) == 2 and args[0] == "-n" and self.read_source(self.path(args[1], command.cwd) or "") is not None:
             status = None

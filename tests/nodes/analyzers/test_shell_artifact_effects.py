@@ -52,6 +52,32 @@ def test_preserve_callback_still_accounts_for_unknown_printf_destination() -> No
     assert audit.read_source("scripts/setup.sh") is None
 
 
+@pytest.mark.parametrize("program", ["1p", "1d;$d", "/^sample() {/,/^}/p", "s/ready/done/g"])
+def test_native_readonly_sed_keeps_its_output_unknown(program: str) -> None:
+    audit = _audit()
+    result = audit(_command(("sed", "-n", program, "scripts/setup.sh")))
+    assert result is not None and result.writes == () and result.stdout is None and result.status is None
+    result = audit(_command(("sed", "-n", program, "scripts/setup.sh"), redirects=(("1>", "scripts/setup.sh"),)))
+    assert result is not None and result.writes == ("scripts/setup.sh",)
+    assert audit.read_source("scripts/setup.sh") is None
+
+
+@pytest.mark.parametrize("argv", [
+    ("sed", "-n", "e", "scripts/setup.sh"),
+    ("sed", "-n", "w scripts/setup.sh", "input"),
+    ("sed", "-n", "s/a/b/e", "input"),
+    ("sed", "-n", "s/a/b/w scripts/setup.sh", "input"),
+    ("sed", "-n", "p; e", "input"),
+    ("sed", "-n", "p", "-i"),
+    ("sed", "-n", "p", "input", "-e", "e"),
+    ("sed", "-n", None, "input"),
+    ("sed", "-n", "p", None),
+    ("/tmp/sed", "-n", "p", "input"),
+])
+def test_readonly_sed_never_exempts_code_writes_unknown_argv_or_identity(argv) -> None:
+    assert _audit()(_command(argv)) is None
+
+
 def test_mktemp_regular_file_retains_exact_ownership_without_a_directory_claim() -> None:
     audit = _audit()
     request = _command(("mktemp", "/tmp/artifactory.XXXXXX.netrc"))

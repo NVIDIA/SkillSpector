@@ -852,6 +852,38 @@ class ShellSourceResolver:
         return ShellSourceValue("".join(output).rstrip("\n"), "code", tuple(dict.fromkeys(origins)))
 
 
+def readonly_sed_program(program: str) -> bool:
+    """Recognize the bounded sed grammar shared by source effect proofs."""
+    # A substitution's w/e flags and standalone w/e commands can change
+    # files or execute code without -i. Accept only a small literal grammar.
+    if re.fullmatch(r"(?:[0-9$]+(?:,[0-9$]+)?)?[pdq](?:;[0-9$]*[pdq])*", program):
+        return True
+    if re.fullmatch(r"/\^[A-Za-z_][A-Za-z0-9_]*\(\) \{/,/\^\}/p", program):
+        return True
+    if re.fullmatch(r"/[A-Za-z_][A-Za-z0-9_]*=\$\(cat <<'[A-Za-z_][A-Za-z0-9_]*'/,/\^[A-Za-z_][A-Za-z0-9_]*\$/p", program):
+        return True
+    if len(program) < 4 or program[0] != "s":
+        return False
+    delimiter = program[1]
+    if delimiter.isalnum() or delimiter.isspace() or delimiter == "\\":
+        return False
+    cursor = 2
+    for _ in range(2):
+        while cursor < len(program):
+            if program[cursor] == "\\":
+                cursor += 2
+            elif program[cursor] == delimiter:
+                cursor += 1
+                break
+            elif program[cursor] in "\r\n":
+                return False
+            else:
+                cursor += 1
+        else:
+            return False
+    return re.fullmatch(r"[gIp0-9]*", program[cursor:]) is not None
+
+
 def source_is_unmodified(
     resolver: ShellSourceResolver, target_path: str, use_offset: int
 ) -> bool:
@@ -873,36 +905,6 @@ def source_is_unmodified(
     )
     writers = frozenset({"rm", "unlink", "rmdir", "cp", "mv", "install", "ln", "tee", "truncate", "touch", "dd"})
     controls = frozenset({"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "!"})
-
-    def readonly_sed(program: str) -> bool:
-        # A substitution's w/e flags and standalone w/e commands can change
-        # files or execute code without -i. Accept only a small literal grammar.
-        if re.fullmatch(r"(?:[0-9$]+(?:,[0-9$]+)?)?[pdq](?:;[0-9$]*[pdq])*", program):
-            return True
-        if re.fullmatch(r"/\^[A-Za-z_][A-Za-z0-9_]*\(\) \{/,/\^\}/p", program):
-            return True
-        if re.fullmatch(r"/[A-Za-z_][A-Za-z0-9_]*=\$\(cat <<'[A-Za-z_][A-Za-z0-9_]*'/,/\^[A-Za-z_][A-Za-z0-9_]*\$/p", program):
-            return True
-        if len(program) < 4 or program[0] != "s":
-            return False
-        delimiter = program[1]
-        if delimiter.isalnum() or delimiter.isspace() or delimiter == "\\":
-            return False
-        cursor = 2
-        for _ in range(2):
-            while cursor < len(program):
-                if program[cursor] == "\\":
-                    cursor += 2
-                elif program[cursor] == delimiter:
-                    cursor += 1
-                    break
-                elif program[cursor] in "\r\n":
-                    return False
-                else:
-                    cursor += 1
-            else:
-                return False
-        return re.fullmatch(r"[gIp0-9]*", program[cursor:]) is not None
 
     def touches(value: ShellSourceValue | None, *, subtree: bool = False) -> bool:
         if value is None:
@@ -1100,7 +1102,7 @@ def source_is_unmodified(
                         break
                     index += 1
                 if not programs or any(
-                    not current.audit_spend(len(program)) or not readonly_sed(program)
+                    not current.audit_spend(len(program)) or not readonly_sed_program(program)
                     for program in programs
                 ):
                     return False
