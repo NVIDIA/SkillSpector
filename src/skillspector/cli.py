@@ -691,6 +691,12 @@ def scan(
     if recursive and resolved_path.is_dir():
         detection = detect_skills(resolved_path)
         if not detection.complete:
+            if output is not None and output.exists():
+                err_console.print(
+                    "[red]Error:[/red] Cannot verify --output is separate from skill inputs. "
+                    "Choose a new output path."
+                )
+                raise typer.Exit(code=2)
             pre_scan_ledger_events = _multi_skill_limitation_events(detection)
             err_console.print(
                 "[yellow]Warning:[/yellow] Recursive skill discovery was incomplete; "
@@ -2762,7 +2768,7 @@ def _scan_multi_skill(
     # Check every discovered input before scan budgets can omit a child.
     try:
         for skill in skills:
-            _validate_report_destination(skill.primary_path or skill.path, output)
+            _validate_report_destination(skill.path, output)
     except (OSError, ValueError) as exc:
         err_console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=2) from exc
