@@ -104,6 +104,22 @@ def openai_http_endpoint(monkeypatch):
                         finish_reason = "tool_calls"
                     else:
                         message = {"role": "assistant", "content": encoded}
+            elif tools:
+                message = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_findings",
+                            "type": "function",
+                            "function": {
+                                "name": tools[0]["function"]["name"],
+                                "arguments": json.dumps({"findings": []}),
+                            },
+                        }
+                    ],
+                }
+                finish_reason = "tool_calls"
             payload = {
                 "id": "chatcmpl-loopback",
                 "object": "chat.completion",
@@ -309,6 +325,11 @@ def test_full_scanner_graph_reports_tp4_http_results(
         if event["analyzer_id"] == tp.ANALYZER_ID
     )
     assert tp4_status["status"] == ("completed" if complete else "degraded")
+    assert all(
+        event["status"] in {"completed", "not_applicable"}
+        for event in result["analyzer_status_events"]
+        if event["analyzer_id"] != tp.ANALYZER_ID
+    ), result["analyzer_status_events"]
     assert behavior["tp4_calls"] == attempts
     findings = [f for f in result["findings"] if f.rule_id == "TP4"]
     assert bool(findings) is (mode == "mismatch")
