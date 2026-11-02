@@ -91,20 +91,23 @@ def test_ownership_walk_obeys_runtime_budget() -> None:
 
 @pytest.mark.parametrize("padding", [0, 6000])
 def test_literal_trap_command_is_bounded_before_its_host_quote(padding: int) -> None:
-    source = '''cat <<'DATA'
+    source = """cat <<'DATA'
 "quoted data"
 DATA
 trap 'saved=$?; trap - EXIT; finish "$saved"; result=$?; exit "$result"' EXIT
-'''
+"""
     source += "#" * padding + "\n"
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
-@pytest.mark.parametrize("body", [
-    '$CMD -rf /',
-    'finish "$saved"; $CMD -rf /',
-    'echo "$(bash -c \'$CMD -rf /\')"',
-])
+@pytest.mark.parametrize(
+    "body",
+    [
+        "$CMD -rf /",
+        'finish "$saved"; $CMD -rf /',
+        "echo \"$(bash -c '$CMD -rf /')\"",
+    ],
+)
 def test_literal_quote_bound_does_not_hide_runtime_destructive_commands(body: str) -> None:
     # The third form is deliberately malformed shell quoting; it must also
     # retain the conservative result rather than borrow an outer delimiter.
@@ -125,7 +128,7 @@ def test_quoted_assignment_value_owns_its_closing_quote(file_type: str) -> None:
     [
         'bash -c "NAME=value; $CMD -rf /"',
         "bash -c 'NAME=value; rm -rf /'",
-        'tool "NAME=$(bash -c \'$CMD -rf /\')"',
+        "tool \"NAME=$(bash -c '$CMD -rf /')\"",
         'tool "NAME=ordinary value"; $CMD -rf /',
     ],
 )
@@ -147,18 +150,20 @@ def test_nested_command_substitutions_keep_shell_consumers_visible(depth: int) -
         "printf '%s' '$(bash -c \"$CMD -rf /\")'",
         'printf "%s" "\\$(ordinary data)"',
         'tool "NAME=$(printf %s safe)"',
-        "printf '%s' $'literal \\\' $(bash -c \"$CMD -rf /\")'",
+        "printf '%s' $'literal \\' $(bash -c \"$CMD -rf /\")'",
     ],
 )
-def test_literal_and_benign_substitution_text_is_not_an_executable_shell_string(source: str) -> None:
+def test_literal_and_benign_substitution_text_is_not_an_executable_shell_string(
+    source: str,
+) -> None:
     assert list(tm._shell_command_strings(source, lambda: None)) == []
 
 
 @pytest.mark.parametrize(
     "file_type,source",
     [
-        ("javascript", 'const message = "$(bash -c \'$CMD -rf /\')";'),
-        ("python", 'message = "$(bash -c \'$CMD -rf /\')"'),
+        ("javascript", "const message = \"$(bash -c '$CMD -rf /')\";"),
+        ("python", "message = \"$(bash -c '$CMD -rf /')\""),
     ],
 )
 def test_host_strings_do_not_acquire_shell_substitution_semantics(
@@ -235,7 +240,9 @@ def test_trap_reset_ignore_and_query_forms_have_no_executable_body(statement: st
 
 
 def test_runtime_trap_body_remains_incomplete() -> None:
-    assert tm.has_bounded_parse_exhaustion('trap "$HANDLER" EXIT\n', lambda: None, file_type="shell")
+    assert tm.has_bounded_parse_exhaustion(
+        'trap "$HANDLER" EXIT\n', lambda: None, file_type="shell"
+    )
 
 
 def test_unmatched_heredoc_data_quote_keeps_conservative_large_source_result() -> None:

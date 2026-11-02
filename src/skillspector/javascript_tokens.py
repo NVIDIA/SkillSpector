@@ -490,6 +490,7 @@ def _invalid_optional_context(
     """Optional chains cannot be assignment targets, constructors or tags."""
     if not positions:
         return False
+
     def contains(start: int, end: int) -> bool:
         index = bisect_left(positions, start)
         return index < len(positions) and positions[index] < end
@@ -644,7 +645,8 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
             # Aliasing an evaluator does not make its input ordinary text.
             return True
         if (
-            node.type == "MemberExpression" and node.computed
+            node.type == "MemberExpression"
+            and node.computed
             and getattr(node.property, "type", None) == "Literal"
             and getattr(node.property, "value", None) in {"eval", "Function"}
         ):

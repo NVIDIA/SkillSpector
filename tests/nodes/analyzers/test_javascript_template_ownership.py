@@ -152,10 +152,15 @@ def test_non_string_computed_member_with_template_does_not_crash(member: str) ->
 @pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
 @pytest.mark.parametrize("interpreter", ["#!/usr/bin/env node", "#!/usr/bin/node --no-warnings"])
 def test_node_hashbang_preserves_nested_template_ownership(interpreter: str, newline: str) -> None:
-    source = interpreter + newline + (
-        "const rows = [['a', 1]];\n"
-        'console.log(`Rows: ${rows.map(([key, value]) => `${key}=${value}`).join(", ")}`);'
-    ) + _PADDING
+    source = (
+        interpreter
+        + newline
+        + (
+            "const rows = [['a', 1]];\n"
+            'console.log(`Rows: ${rows.map(([key, value]) => `${key}=${value}`).join(", ")}`);'
+        )
+        + _PADDING
+    )
     spans = javascript_template_spans(source, lambda: None)
     assert spans is not None
     assert all(source[start] == source[end - 1] == "`" for start, end in zip(*spans, strict=True))
@@ -232,26 +237,32 @@ def test_supported_host_syntax_cannot_hide_code_execution(source: str) -> None:
     )
 
 
-@pytest.mark.parametrize("statement", [
-    "target[entry?.key] = 1;",
-    "target[entry?.key]++;",
-    "(entry?.target).value = 1;",
-    "new (entry?.Constructor)();",
-    "new Constructor(entry?.value);",
-    "(entry?.tag)`value`;",
-])
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "target[entry?.key] = 1;",
+        "target[entry?.key]++;",
+        "(entry?.target).value = 1;",
+        "new (entry?.Constructor)();",
+        "new Constructor(entry?.value);",
+        "(entry?.tag)`value`;",
+    ],
+)
 def test_independent_optional_expressions_do_not_invalidate_templates(statement: str) -> None:
     source = statement + "console.log(`Value: ${entry?.value}`);" + _PADDING
     assert javascript_template_spans(source, lambda: None) is not None
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
 
 
-@pytest.mark.parametrize("statement", [
-    "eval?.(`${command} -rf /`);",
-    "const evaluate = eval; evaluate(`${command} -rf /`);",
-    "const Evaluate = Function; new Evaluate(`${command} -rf /`);",
-    "const child = require('child_process'); child?.exec(`${command} -rf /`);",
-])
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "eval?.(`${command} -rf /`);",
+        "const evaluate = eval; evaluate(`${command} -rf /`);",
+        "const Evaluate = Function; new Evaluate(`${command} -rf /`);",
+        "const child = require('child_process'); child?.exec(`${command} -rf /`);",
+    ],
+)
 def test_unknown_executable_template_keeps_destructive_operands_partial(statement: str) -> None:
     assert tm.has_bounded_parse_exhaustion(
         statement + _PADDING, lambda: None, file_type="javascript"
@@ -261,7 +272,7 @@ def test_unknown_executable_template_keeps_destructive_operands_partial(statemen
 def test_metadata_keys_do_not_become_evaluator_references() -> None:
     content = (
         'const metadata = {eval: false, Function: "render", label: "plot"}; '
-        'console.log(`${metadata?.label}`);'
+        "console.log(`${metadata?.label}`);"
     )
     assert javascript_template_spans(content, lambda: None) is not None
 
@@ -283,10 +294,15 @@ def test_optional_chain_cancellation_propagates() -> None:
         javascript_template_spans(source, cancel)
 
 
-@pytest.mark.parametrize("member", [
-    'globalThis["eval"]', 'globalThis?.["eval"]',
-    'globalThis["Function"]', 'globalThis?.["Function"]',
-])
+@pytest.mark.parametrize(
+    "member",
+    [
+        'globalThis["eval"]',
+        'globalThis?.["eval"]',
+        'globalThis["Function"]',
+        'globalThis?.["Function"]',
+    ],
+)
 def test_computed_evaluator_aliases_cannot_own_executable_templates(member: str) -> None:
     source = f"const evaluate = {member}; evaluate(`${{command}} -rf /`);" + _PADDING
     assert javascript_template_spans(source, lambda: None) is None

@@ -2201,7 +2201,6 @@ def _skip_static_heredoc_bodies(
     return cursor
 
 
-
 def _shell_quoted_candidate_limits(
     content: str, check_runtime: Callable[[], None]
 ) -> dict[int, int]:
@@ -2562,7 +2561,10 @@ def _has_shell_command_word_exhaustion(
             if (
                 (line_start > 0 or start <= 512)
                 and not content[line_start:start].strip(" \t")
-                and re.match(r"\$(?:[A-Za-z_][A-Za-z0-9_]*:)?[A-Za-z_][A-Za-z0-9_]*[ \t]*=(?!=)", content[start:start + 512])
+                and re.match(
+                    r"\$(?:[A-Za-z_][A-Za-z0-9_]*:)?[A-Za-z_][A-Za-z0-9_]*[ \t]*=(?!=)",
+                    content[start : start + 512],
+                )
             ):
                 # A native assignment's left side is not a runtime command.
                 # Skip only that candidate; executable subexpressions in its
@@ -2595,9 +2597,11 @@ def _has_shell_command_word_exhaustion(
                 owned_word_positions=assignment_positions,
             )
             if (
-                parsed is not None and not parsed.dynamic and not parsed.limited
-                and "\n" not in content[start:parsed.end]
-                and "\r" not in content[start:parsed.end]
+                parsed is not None
+                and not parsed.dynamic
+                and not parsed.limited
+                and "\n" not in content[start : parsed.end]
+                and "\r" not in content[start : parsed.end]
             ):
                 # Spaces or punctuation inside a quoted value do not turn
                 # its closing quote into a new opener. Own only delimiters:
@@ -2653,9 +2657,7 @@ def _has_shell_command_word_exhaustion(
                 json_openers[next_json] if next_json < len(json_openers) else len(content)
             )
             if powershell is not None:
-                unresolved_end = min(
-                    unresolved_end, powershell.next_boundary(start, len(content))
-                )
+                unresolved_end = min(unresolved_end, powershell.next_boundary(start, len(content)))
             if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS and python_source is not None:
                 # Likewise, a host string or comment token owns its bytes: a
                 # shell quote it opens cannot continue into later host code.
@@ -2679,7 +2681,8 @@ def _has_shell_command_word_exhaustion(
         )
         owned_end = (
             min(parsed.end, powershell.next_boundary(start, len(content)))
-            if powershell is not None else parsed.end
+            if powershell is not None
+            else parsed.end
         )
         if not confined_word:
             # A quote that opens a runtime-selected word stays an independent
@@ -2796,8 +2799,10 @@ def _powershell_string_operands(
     if source is None:
         return {}
     return {
-        string.start: string for string in source.strings
-        if not string.invoked and source.owns(string.start)
+        string.start: string
+        for string in source.strings
+        if not string.invoked
+        and source.owns(string.start)
         and source.next_boundary(string.start, string.end) == string.end
     }
 
@@ -2919,8 +2924,9 @@ def _shell_clause_starts(
                 cursor += 2
                 continue
         elif (
-            shell_substitutions and character == "$"
-            and content[cursor + 1:cursor + 2] in {"'", '"'}
+            shell_substitutions
+            and character == "$"
+            and content[cursor + 1 : cursor + 2] in {"'", '"'}
         ):
             quote = content[cursor + 1]
             ansi_c_quote = quote == "'"
@@ -3679,7 +3685,8 @@ def _bounded_shell_tokens(
             # lines. Decoded flags remain visible to the operand checks.
             mark_quoted_word()
             append_piece(
-                native_string.value, quoted=True,
+                native_string.value,
+                quoted=True,
                 dynamic_can_be_empty="$" in native_string.value,
             )
             cursor = native_string.end
@@ -6078,8 +6085,11 @@ def _fenced_powershell_source(
         ends.extend(start + position for position in source.ends)
         strings.extend(
             PowerShellString(
-                start + string.start, start + string.end,
-                string.value, string.decoded, string.invoked,
+                start + string.start,
+                start + string.end,
+                string.value,
+                string.decoded,
+                string.invoked,
                 start + string.operand_start if string.operand_start is not None else None,
             )
             for string in source.strings
@@ -6110,7 +6120,10 @@ def _fenced_powershell_source(
         if not source.owns(position):
             clause_starts.add(start)
     return PowerShellSource(
-        source.starts, source.ends, source.strings, tuple(sorted(clause_starts)),
+        source.starts,
+        source.ends,
+        source.strings,
+        tuple(sorted(clause_starts)),
         tuple(continuations),
         tuple(invocations),
     )
@@ -6157,7 +6170,8 @@ def _has_bounded_parse_exhaustion(
     javascript_source = None
     powershell = (
         powershell_source(content, check_runtime)
-        if file_type == "powershell" and complete_context else None
+        if file_type == "powershell" and complete_context
+        else None
     )
     if file_type == "perl" and complete_context:
         content = _perl_literal_print_shell_text(content, check_runtime)
@@ -6229,7 +6243,9 @@ def _has_bounded_parse_exhaustion(
         return True
     covered_until = 0
     powershell_strings = _powershell_string_operands(powershell)
-    decoded_starts = sorted(string.start for string in powershell_strings.values() if string.decoded)
+    decoded_starts = sorted(
+        string.start for string in powershell_strings.values() if string.decoded
+    )
     for command_start, body_start in _destructive_command_words(content):
         check_runtime()
         if command_start < covered_until:
@@ -6253,7 +6269,8 @@ def _has_bounded_parse_exhaustion(
             return True
         decoded_index = bisect_left(decoded_starts, body_start)
         if (
-            decoded_index < len(decoded_starts) and decoded_starts[decoded_index] < command_end
+            decoded_index < len(decoded_starts)
+            and decoded_starts[decoded_index] < command_end
             and (_has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens))
         ):
             # Native escapes can assemble destructive flags the raw finding
@@ -6267,7 +6284,10 @@ def _has_bounded_parse_exhaustion(
             ):
                 return True
             tokens, _, _ = _bounded_shell_tokens(
-                content, start, end, check_runtime=check_runtime,
+                content,
+                start,
+                end,
+                check_runtime=check_runtime,
                 powershell_strings=powershell_strings,
             )
             skip_option_value = False
@@ -6281,16 +6301,25 @@ def _has_bounded_parse_exhaustion(
                 if (
                     option in {"-ec", "--command"}
                     or any(name.startswith(option[1:]) for name in ("command", "encodedcommand"))
-                    or re.fullmatch(r"-[abefhkmnoptuvxBCEHPTilrsO]*c[abefhkmnoptuvxBCEHPTilrsO]*", token.text)
+                    or re.fullmatch(
+                        r"-[abefhkmnoptuvxBCEHPTilrsO]*c[abefhkmnoptuvxBCEHPTilrsO]*", token.text
+                    )
                 ):
                     # Inspect actual code-selector options, not arbitrary
                     # native options containing 'c' such as -NonInteractive.
                     # Options after a script/subcommand operand are its data.
                     return True
                 skip_option_value = token.text in {"-o", "-O"} or option in {
-                    "-executionpolicy", "-ep", "-inputformat", "-if",
-                    "-outputformat", "-of", "-windowstyle", "-w",
-                    "-workingdirectory", "-wd",
+                    "-executionpolicy",
+                    "-ep",
+                    "-inputformat",
+                    "-if",
+                    "-outputformat",
+                    "-of",
+                    "-windowstyle",
+                    "-w",
+                    "-workingdirectory",
+                    "-wd",
                 }
         for string in powershell.strings:
             check_runtime()
@@ -6308,7 +6337,7 @@ def _has_bounded_parse_exhaustion(
                 newline = content.find("\n", string.operand_start, end)
                 if newline >= 0:
                     end = newline
-                command = string.value + content[string.operand_start:end]
+                command = string.value + content[string.operand_start : end]
                 if _has_destructive_command_string(command) or _has_bounded_parse_exhaustion(
                     command, check_runtime, file_type="shell", complete_context=False
                 ):

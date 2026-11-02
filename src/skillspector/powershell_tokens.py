@@ -20,8 +20,15 @@ from skillspector.python_ast import MAX_PYTHON_AST_SOURCE_CHARS
 _MAX_DEPTH = 32
 _MAX_SPANS = 65_536
 _ESCAPES = {
-    "0": "\x00", "a": "\a", "b": "\b", "e": "\x1b", "f": "\f",
-    "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+    "0": "\x00",
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
 }
 _DYNAMIC_CODE = re.compile(
     r"\b(?:Invoke-Expression|iex|InvokeScript|Set-Alias|New-Alias)\b"
@@ -65,9 +72,7 @@ class _UnprovenPowerShellError(Exception):
     pass
 
 
-def powershell_source(
-    content: str, check_runtime: Callable[[], None]
-) -> PowerShellSource | None:
+def powershell_source(content: str, check_runtime: Callable[[], None]) -> PowerShellSource | None:
     """Return only whole-source lexical proof; malformed input proves nothing."""
     if len(content) > MAX_PYTHON_AST_SOURCE_CHARS or _DYNAMIC_CODE.search(content):
         return None
@@ -82,8 +87,12 @@ def powershell_source(
         nonlocal checked
         if (
             depth > _MAX_DEPTH
-            or len(spans) + len(strings) + len(clause_starts) + len(continuations)
-            + len(invocations) > _MAX_SPANS
+            or len(spans)
+            + len(strings)
+            + len(clause_starts)
+            + len(continuations)
+            + len(invocations)
+            > _MAX_SPANS
         ):
             raise _UnprovenPowerShellError
         if cursor - checked >= 1024:
@@ -106,9 +115,7 @@ def powershell_source(
                 cursor += 1
         raise _UnprovenPowerShellError
 
-    def quoted(
-        start: int, depth: int, *, here: bool = False, invoked_context: bool = False
-    ) -> int:
+    def quoted(start: int, depth: int, *, here: bool = False, invoked_context: bool = False) -> int:
         span_start = len(spans)
         quote_at = start + int(here)
         quote = content[quote_at]
@@ -116,7 +123,7 @@ def powershell_source(
         if here:
             if content.startswith("\r\n", cursor):
                 cursor += 2
-            elif content[cursor:cursor + 1] == "\n":
+            elif content[cursor : cursor + 1] == "\n":
                 cursor += 1
             else:
                 raise _UnprovenPowerShellError
@@ -133,17 +140,20 @@ def powershell_source(
             closing = (
                 content.startswith(quote + "@", cursor)
                 and (cursor == 0 or content[cursor - 1] == "\n")
-                if here else character == quote
+                if here
+                else character == quote
             )
             if closing:
-                if not here and content[cursor:cursor + 2] == quote * 2:
+                if not here and content[cursor : cursor + 2] == quote * 2:
                     value.append(quote)
                     decoded = True
                     cursor += 2
                     continue
                 end = cursor + (2 if here else 1)
-                if here and end < len(content) and not (
-                    content[end].isspace() or content[end] in ";|&),.+-*/["
+                if (
+                    here
+                    and end < len(content)
+                    and not (content[end].isspace() or content[end] in ";|&),.+-*/[")
                 ):
                     raise _UnprovenPowerShellError
                 own(region_start, end)
@@ -166,11 +176,18 @@ def powershell_source(
                         if previous % 1024 == 0:
                             check_runtime()
                         previous -= 1
-                invoked = invoked_context or previous >= 0 and (
-                    content[previous] == "&" or (
-                        content[previous] == "." and (
-                            previous == 0 or content[previous - 1].isspace()
-                            or content[previous - 1] in ";({"
+                invoked = (
+                    invoked_context
+                    or previous >= 0
+                    and (
+                        content[previous] == "&"
+                        or (
+                            content[previous] == "."
+                            and (
+                                previous == 0
+                                or content[previous - 1].isspace()
+                                or content[previous - 1] in ";({"
+                            )
                         )
                     )
                 )
@@ -181,7 +198,7 @@ def powershell_source(
                         while suffix < len(content) and content[suffix] in " \t\r\n":
                             check(suffix, depth)
                             suffix += 1
-                        if content[suffix:suffix + 1] != ")":
+                        if content[suffix : suffix + 1] != ")":
                             # A concatenation or method call can still build
                             # the executable name. No literal-name proof.
                             operand_start = None
@@ -190,7 +207,9 @@ def powershell_source(
                     else:
                         operand_start = suffix
                 if (
-                    invoked and operand_start is not None and operand_start < len(content)
+                    invoked
+                    and operand_start is not None
+                    and operand_start < len(content)
                     and not content[operand_start].isspace()
                     and content[operand_start] not in ";|&"
                 ):
@@ -206,10 +225,10 @@ def powershell_source(
                     raise _UnprovenPowerShellError
                 escaped = content[cursor + 1]
                 if escaped == "u":
-                    if content[cursor + 2:cursor + 3] != "{":
+                    if content[cursor + 2 : cursor + 3] != "{":
                         raise _UnprovenPowerShellError
                     close = content.find("}", cursor + 3, cursor + 10)
-                    digits = content[cursor + 3:close] if close >= 0 else ""
+                    digits = content[cursor + 3 : close] if close >= 0 else ""
                     if not digits or any(c not in "0123456789abcdefABCDEF" for c in digits):
                         raise _UnprovenPowerShellError
                     number = int(digits, 16)
@@ -247,10 +266,8 @@ def powershell_source(
             check(cursor, depth)
             character = content[cursor]
             if character == "&" or (
-                character == "." and (
-                    cursor == 0 or content[cursor - 1].isspace()
-                    or content[cursor - 1] in ";({"
-                )
+                character == "."
+                and (cursor == 0 or content[cursor - 1].isspace() or content[cursor - 1] in ";({")
             ):
                 operand = cursor + 1
                 gap_comments: list[tuple[int, int]] = []
@@ -267,11 +284,11 @@ def powershell_source(
                     else:
                         break
                 opening = operand + int(content.startswith("$(", operand))
-                if content[operand:operand + 1] in {"'", '"'}:
+                if content[operand : operand + 1] in {"'", '"'}:
                     spans.extend(gap_comments)
                     cursor = quoted(operand, depth + 1, invoked_context=True)
                     continue
-                if content[opening:opening + 1] == "(":
+                if content[opening : opening + 1] == "(":
                     spans.extend(gap_comments)
                     clause_starts.add(opening + 1)
                     end = code(opening + 1, depth + 1, closes_parenthesis=True)
@@ -280,14 +297,16 @@ def powershell_source(
                     continue
                 variable_command = re.match(
                     r"\$(?:[A-Za-z_][A-Za-z0-9_:]*|\{[A-Za-z_][A-Za-z0-9_:]*\})",
-                    content[operand:operand + 512],
+                    content[operand : operand + 512],
                 )
                 if variable_command is not None:
                     spans.extend(gap_comments)
                     end = operand + variable_command.end()
-                    suffix = re.match(r"(?:\[[0-9]+\]|\.[A-Za-z_][A-Za-z0-9_]*)*", content[end:end + 512])
+                    suffix = re.match(
+                        r"(?:\[[0-9]+\]|\.[A-Za-z_][A-Za-z0-9_]*)*", content[end : end + 512]
+                    )
                     end += suffix.end()
-                    if content[end:end + 1] in {"[", ".", "("}:
+                    if content[end : end + 1] in {"[", ".", "("}:
                         # Complex executable selection needs its own value
                         # proof; a partial variable span cannot own operands.
                         raise _UnprovenPowerShellError
@@ -319,7 +338,7 @@ def powershell_source(
             if character in "'\"":
                 cursor = quoted(cursor, depth + 1)
                 continue
-            if character == "@" and content[cursor + 1:cursor + 2] in {"'", '"'}:
+            if character == "@" and content[cursor + 1 : cursor + 2] in {"'", '"'}:
                 cursor = quoted(cursor, depth + 1, here=True)
                 continue
             if character == "`":
@@ -329,8 +348,7 @@ def powershell_source(
                 # spaces without changing command identity. Joining an
                 # escaped command name remains outside this lexical proof.
                 if (cursor == 0 or content[cursor - 1] in " \t") and (
-                    content.startswith("`\n", cursor)
-                    or content.startswith("`\r\n", cursor)
+                    content.startswith("`\n", cursor) or content.startswith("`\r\n", cursor)
                 ):
                     end = cursor + (3 if content[cursor + 1] == "\r" else 2)
                     continuations.append((cursor, end))

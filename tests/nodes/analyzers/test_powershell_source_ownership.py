@@ -48,8 +48,8 @@ def _ledger(content: str, path: str = "sample.ps1") -> dict:
         '<# comment with "quotes and a backtick `\n<# nested #>\n#>\nWrite-Host "done"',
         '# comment with "quotes and a backtick `\nWrite-Host "done"',
         '$path = "C:\\tools\\"\nWrite-Host "done"',
-        'Write-Host "$(Write-Output \'nested value\') result"',
-        'Write-Host "apostrophe \' followed by ' + 'ordinary text ' * 400 + '"',
+        "Write-Host \"$(Write-Output 'nested value') result\"",
+        "Write-Host \"apostrophe ' followed by " + "ordinary text " * 400 + '"',
         'python "script.py" `\n  --input "image.yuv" `\n  --width 3840',
         'python "script.py" `\r\n  --input "image.yuv" `\r\n  --width 3840',
     ],
@@ -63,7 +63,7 @@ def test_unrelated_native_commands_do_not_invalidate_uri_ownership() -> None:
     content = (
         'Start-Process -FilePath $archiveTool -ArgumentList @("x", "-y")\n'
         '$uri = "$base`?option=value&cl=$change"\n'
-        '& $p4.Source print -q -o $destination $depotPath\n'
+        "& $p4.Source print -q -o $destination $depotPath\n"
     ) + _TAIL
     assert _ledger(content)["outcome"] is LedgerOutcome.COMPLETED
 
@@ -74,7 +74,7 @@ def test_module_and_script_extensions_use_the_same_ownership(extension: str) -> 
     assert _ledger(content, f"sample.{extension}")["outcome"] is LedgerOutcome.COMPLETED
     hostile = '& ("r`m") -rf /' + _TAIL
     assert _ledger(hostile, f"sample.{extension}")["outcome"] is LedgerOutcome.PARTIAL
-    subexpression = '@{ Value = "$(bash -c \'$CMD -rf /\')" }' + _TAIL
+    subexpression = "@{ Value = \"$(bash -c '$CMD -rf /')\" }" + _TAIL
     assert _ledger(subexpression, f"sample.{extension}")["outcome"] is LedgerOutcome.PARTIAL
 
 
@@ -105,17 +105,17 @@ def test_module_and_script_extensions_use_the_same_ownership(extension: str) -> 
         '& ("r`m".ToString()) -rf /',
         '& ("r`m")[0..1] -rf /',
         'bash -c "r`m -rf /"',
-        '$uri = "$base`?option=value"; bash -c \'$CMD -rf /\'',
-        '$message = "$(bash -c \'$CMD -rf /\')"',
-        '$message = "outer $(Write-Host \"inner $(bash -c \'$CMD -rf /\')\")"',
-        '$message = @"\n$(bash -c \'$CMD -rf /\')\n"@',
-        'bash `\n -c \'$CMD -rf /\'',
-        '$CMD `\n -rf /',
-        'rm `\r\n -rf /',
+        "$uri = \"$base`?option=value\"; bash -c '$CMD -rf /'",
+        "$message = \"$(bash -c '$CMD -rf /')\"",
+        '$message = "outer $(Write-Host "inner $(bash -c \'$CMD -rf /\')")"',
+        "$message = @\"\n$(bash -c '$CMD -rf /')\n\"@",
+        "bash `\n -c '$CMD -rf /'",
+        "$CMD `\n -rf /",
+        "rm `\r\n -rf /",
         '$payload = "r`m -rf /"; Invoke-Expression $payload',
         '$payload = "r`m -rf /"',
         'Write-Host "ordinary"; $CMD -rf /',
-        '<# apparent <# nested opener #>\n$CMD -rf /\n#>',
+        "<# apparent <# nested opener #>\n$CMD -rf /\n#>",
     ],
 )
 @pytest.mark.parametrize("tail", ["", _TAIL])
@@ -132,19 +132,19 @@ def test_executable_shell_and_decoded_destructive_content_stay_partial(
     [
         'Write-Host "unfinished',
         "$value = @'\nunfinished",
-        '<# unfinished',
+        "<# unfinished",
         'Write-Host "$(unfinished"',
         'Write-Host "bad `u{XYZ}"',
         'Write-Host "bad `u{110000}"',
         'Write-Host "bad `uX"',
         '$text = @"\ntext\n"@invalid',
-        'Write-Host “unproven typographic delimiters”',
+        "Write-Host “unproven typographic delimiters”",
         'Write-Host "mixed ”; $CMD -rf /; #"',
         "Write-Host 'mixed ’; $CMD -rf /; #'",
         'Write-Host "mixed “; $CMD -rf /; #"',
         "Write-Host 'mixed ‘; $CMD -rf /; #'",
         "b`ash -c '$CMD -rf /'",
-        '"$("' * 34 + ')' * 34,
+        '"$("' * 34 + ")" * 34,
     ],
 )
 def test_unsupported_ownership_keeps_conservative_fallback(content: str) -> None:
@@ -152,7 +152,7 @@ def test_unsupported_ownership_keeps_conservative_fallback(content: str) -> None
 
 
 def test_subexpression_code_is_not_owned_as_string_data() -> None:
-    content = 'Write-Host "before $(Write-Output \'inner\'; $CMD -rf /) after"'
+    content = "Write-Host \"before $(Write-Output 'inner'; $CMD -rf /) after\""
     source = powershell_source(content, lambda: None)
     assert source is not None
     assert source.owns(content.index("before"))
@@ -184,11 +184,10 @@ def test_source_offsets_and_decoded_values_preserve_unicode_and_crlf() -> None:
     source = powershell_source(content, lambda: None)
     assert source is not None
     target = next(string for string in source.strings if string.value.startswith("$base"))
-    assert content[target.start:target.end] == '"$base`?x=1"'
+    assert content[target.start : target.end] == '"$base`?x=1"'
     assert target.value == "$base?x=1"
     assert all(
-        end <= next_start
-        for end, next_start in zip(source.ends, source.starts[1:], strict=False)
+        end <= next_start for end, next_start in zip(source.ends, source.starts[1:], strict=False)
     )
 
 
@@ -215,7 +214,7 @@ def test_large_native_here_string_assignment_is_not_a_shell_command(name: str) -
 
 
 def test_assignment_ownership_preserves_nested_runtime_shell_consumer() -> None:
-    content = '$text = "$(bash -c \'$CMD -rf /\')"\n'
+    content = "$text = \"$(bash -c '$CMD -rf /')\"\n"
     assert _ledger(content)["outcome"] is LedgerOutcome.PARTIAL
 
 
@@ -224,18 +223,49 @@ def test_call_operator_operand_does_not_borrow_assignment_ownership() -> None:
     assert _ledger(content)["outcome"] is LedgerOutcome.PARTIAL
 
 
-@pytest.mark.parametrize("expression", ['(Write-Output "bash")', '($program)', '$(Get-Shell)', '$program', '${script:program}', '$programs[0]', '$config.Executable'])
-@pytest.mark.parametrize("option", ["-c", "-lc", "-ac", "-xc", "-C", "-CO", "-Command", "-EncodedCommand", "-o emacs -c", "-ExecutionPolicy Bypass -Command"])
-def test_expression_selected_shell_keeps_code_operands_partial(expression: str, option: str) -> None:
+@pytest.mark.parametrize(
+    "expression",
+    [
+        '(Write-Output "bash")',
+        "($program)",
+        "$(Get-Shell)",
+        "$program",
+        "${script:program}",
+        "$programs[0]",
+        "$config.Executable",
+    ],
+)
+@pytest.mark.parametrize(
+    "option",
+    [
+        "-c",
+        "-lc",
+        "-ac",
+        "-xc",
+        "-C",
+        "-CO",
+        "-Command",
+        "-EncodedCommand",
+        "-o emacs -c",
+        "-ExecutionPolicy Bypass -Command",
+    ],
+)
+def test_expression_selected_shell_keeps_code_operands_partial(
+    expression: str, option: str
+) -> None:
     content = f"& {expression} {option} '$CMD -rf /'\n"
     assert _ledger(content)["outcome"] is LedgerOutcome.PARTIAL
 
 
-@pytest.mark.parametrize("arguments", [
-    "-Change 123 -OutputPath $outputPath", "-NonInteractive",
-    "-latest -products '*' -property installationPath",
-    "files -e $pattern",
-])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "-Change 123 -OutputPath $outputPath",
+        "-NonInteractive",
+        "-latest -products '*' -property installationPath",
+        "files -e $pattern",
+    ],
+)
 def test_native_options_are_not_misread_as_shell_code_flags(arguments: str) -> None:
     assert _ledger(f"& $program {arguments}\n")["outcome"] is LedgerOutcome.COMPLETED
 
@@ -255,9 +285,9 @@ def test_markdown_powershell_fences_preserve_host_quotes(language: str, marker: 
 @pytest.mark.parametrize(
     "command",
     [
-        'bash -c \'$CMD -rf /\'',
-        '$message = "$(bash -c \'$CMD -rf /\')"',
-        'rm `\n -rf /',
+        "bash -c '$CMD -rf /'",
+        "$message = \"$(bash -c '$CMD -rf /')\"",
+        "rm `\n -rf /",
         '& "r`m" -rf /',
         '& (Write-Output "r`m") -rf /',
     ],
@@ -279,10 +309,7 @@ def test_fence_language_and_closure_are_required_for_ownership() -> None:
 
 @pytest.mark.parametrize("reverse", [False, True])
 def test_markdown_fence_offsets_preserve_following_shell_and_raw_findings(reverse: bool) -> None:
-    host = (
-        '```powershell\r\n'
-        '$uri = "$base`?option=value"\r\n```\r\n'
-    )
+    host = '```powershell\r\n$uri = "$base`?option=value"\r\n```\r\n'
     shell = "```bash\r\nbash -c '$CMD -rf /'\r\n```\r\n"
     blocks = [host, shell] if not reverse else [shell, host]
     content = "# 👍 instructions\r\n\r\n" + "\r\n".join(blocks)
