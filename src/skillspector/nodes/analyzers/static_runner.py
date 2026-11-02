@@ -70,14 +70,13 @@ from skillspector.python_ast import (
     resolve_python_source_classification,
 )
 from skillspector.python_tokens import PythonStringClosers
-from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
-
 from skillspector.security_reconstruction import (
     MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
     MAX_MARKER_LOOKAHEAD_CHARS,
     build_declared_marker_views,
 )
 from skillspector.shell_tokens import ShellStringClosers
+from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
 
 from .common import (
     LINE_BREAK_CHARS,

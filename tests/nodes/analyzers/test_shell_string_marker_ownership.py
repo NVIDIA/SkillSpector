@@ -4,9 +4,9 @@
 """Embedded literal code cannot turn its host's closer into a new quotation."""
 
 import pytest
+
 from skillspector.artifacts import SecurityTextView
 from skillspector.inspection_ledger import LedgerReason
-
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.nodes.analyzers import static_runner
 from skillspector.security_reconstruction import build_declared_marker_views

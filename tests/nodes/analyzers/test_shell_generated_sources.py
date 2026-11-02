@@ -6,9 +6,9 @@
 import shlex
 
 import pytest
-from skillspector.artifacts import SecurityTextView
 
 from skillspector import shell_sources
+from skillspector.artifacts import SecurityTextView
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.shell_helper_argv import (
     ShellHelperOutput,

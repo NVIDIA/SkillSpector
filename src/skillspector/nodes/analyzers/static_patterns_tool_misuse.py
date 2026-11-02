@@ -49,8 +49,6 @@ from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_tokens import PythonLiteralSpans
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
 from skillspector.python_tokens import python_string_body as _python_string_body
-from skillspector.state import AnalyzerNodeResponse, SkillspectorState
-
 from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.shell_helper_argv import reconstruct_helper_commands
 from skillspector.shell_sources import (
@@ -62,6 +60,7 @@ from skillspector.shell_sources import (
     decode_env_unset_command,
     generated_file_is_unmodified,
 )
+from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
 from .common import (
