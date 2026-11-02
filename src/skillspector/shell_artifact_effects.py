@@ -141,7 +141,7 @@ class ShellArtifactAudit:
             if destination is None:
                 return None
             writes.append(destination)
-            if operator.startswith("1") and not used_stdout and not command.uncertain and stdout is not None:
+            if operator.startswith("1") and not used_stdout and command.fail_stop and not command.uncertain and stdout is not None:
                 used_stdout = True
                 if not self.effects.redirect_stdout(destination, stdout, append=operator.endswith(">>")):
                     return None
@@ -170,7 +170,7 @@ class ShellArtifactAudit:
     def _producer(self, command: ShellEffectCommand, path: str) -> ShellEffectResult | None:
         # A producer is an optional proof for one explicit output, never an
         # exemption for a file name. Other known scripts use the caller's audit.
-        if command.uncertain or command.redirects or len(command.argv) != 2:
+        if command.uncertain or not command.fail_stop or command.redirects or len(command.argv) != 2:
             return None
         destination = self.path(command.argv[1], command.cwd)
         if destination is None or not self.store.owns(destination):
@@ -264,7 +264,9 @@ class ShellArtifactAudit:
             if output is not None:
                 origins = tuple(dict.fromkeys(origin for item in values for origin in item.value.origins))
                 artifacts = (ShellArtifact(ShellSourceValue(output, "code", origins)),)
-        elif name == "mktemp" and not command.uncertain and len(args) == 2 and args[0] == "-d" and args[1] is not None and re.fullmatch(r"/tmp/[-A-Za-z0-9_.]+X{3,}[-A-Za-z0-9_.]*", args[1]):
+            if not command.fail_stop:
+                output, artifacts, status = None, None, None
+        elif name == "mktemp" and command.fail_stop and not command.uncertain and len(args) == 2 and args[0] == "-d" and args[1] is not None and re.fullmatch(r"/tmp/[-A-Za-z0-9_.]+X{3,}[-A-Za-z0-9_.]*", args[1]):
             path = re.sub(r"X{3,}", SAFE_PATH_MARKER, args[1])
             if not self.store.create_empty_directory(path):
                 return None
@@ -276,8 +278,9 @@ class ShellArtifactAudit:
                 if path is None:
                     return None
                 writes.append(path)
-                if command.uncertain:
+                if command.uncertain or not command.fail_stop:
                     self.store.invalidate(path)
+                    status = None
                 elif self.store.inventory(path) is None or self.store.exists(path) is False and not self.store.create_empty_directory(path):
                     return None
             output = ""
@@ -288,8 +291,9 @@ class ShellArtifactAudit:
                 if path is None:
                     return None
                 writes.append(path)
-                if command.uncertain or artifact is None:
+                if command.uncertain or not command.fail_stop or artifact is None:
                     self.store.invalidate(path)
+                    status = None
                 elif not self.store.write(path, replace(artifact, executable=args[0] in {"+x", "700", "755"})):
                     return None
             output = ""
@@ -298,7 +302,7 @@ class ShellArtifactAudit:
             if source is None or destination is None:
                 return None
             writes.append(destination)
-            if command.uncertain:
+            if command.uncertain or not command.fail_stop:
                 self.store.invalidate(destination)
                 status = None
             elif not self.store.copy(source, destination):
@@ -315,7 +319,7 @@ class ShellArtifactAudit:
                 return None
             target = destination + "/" + posixpath.basename(source)
             writes.append(target)
-            if command.uncertain:
+            if command.uncertain or not command.fail_stop:
                 self.store.invalidate(target)
                 status = None
             elif not self.store.create_empty_directory(target):
@@ -336,7 +340,7 @@ class ShellArtifactAudit:
                 # Archive storage models files, not every directory header or
                 # implementation-specific listing detail. Do not invent stdout.
                 output = None
-            elif command.uncertain:
+            elif command.uncertain or not command.fail_stop:
                 return None
             else:
                 if len(operands) not in {4, 5} or operands[0] not in {"-cf", "-xf"} or operands[2] != "-C":

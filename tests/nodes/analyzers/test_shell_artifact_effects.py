@@ -19,6 +19,7 @@ def _audit():
 
 
 def _command(argv, **kwargs):
+    kwargs.setdefault("fail_stop", True)
     return ShellEffectCommand(argv, {}, ".", "tests/workflow.sh", 0, **kwargs)
 
 
@@ -164,3 +165,12 @@ def test_native_archive_copy_retains_tree_names_modes_and_readonly_listing_uncer
     assert audit(_command(("tar", "-cf", "/tmp/package.tar", "-C", "/tmp/destination", "package"))) is not None
     listing = audit(_command(("tar", "-tf", "/tmp/package.tar")))
     assert listing is not None and listing.status is True and listing.stdout is None and not listing.writes
+
+
+def test_unchecked_write_or_read_failure_cannot_publish_generated_source_bytes() -> None:
+    audit = _audit()
+    assert audit.store.write("/tmp/generated.sh", ShellArtifact(ShellSourceValue("echo old\n")))
+    result = audit(_command(("printf", "%s", "echo new\n"), fail_stop=False, redirects=(("1>", "/tmp/generated.sh"),)))
+    assert result is not None and audit.read_source("/tmp/generated.sh") is None
+    read = audit(_command(("cat", "scripts/setup.sh"), fail_stop=False))
+    assert read is not None and read.stdout is None and read.status is None
