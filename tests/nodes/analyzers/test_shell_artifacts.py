@@ -29,6 +29,67 @@ def test_copy_archive_extract_retains_the_original_program_and_origin() -> None:
     assert store.read("/tmp/extract-owned/bundle/setup.sh") == program
 
 
+@pytest.mark.parametrize("member, relative", [("setup.sh", "setup.sh"), ("bundle", "bundle/setup.sh")])
+def test_tar_file_and_directory_members_preserve_identity_and_prefix(member: str, relative: str) -> None:
+    store = ShellArtifactStore(lambda: None)
+    effects = ShellArtifactEffects(store, lambda: None)
+    program = ShellArtifact(_program().value, executable=True)
+    assert store.create_empty_directory("/tmp/input")
+    assert store.create_empty_directory("/tmp/output")
+    assert store.write("/tmp/input/" + relative, program)
+    assert effects.tar(("tar", "-cf", "/tmp/package.tar", "-C", "/tmp/input", member))
+    assert store.read("/tmp/package.tar").members == ((relative, program),)
+    assert effects.tar(("tar", "-xf", "/tmp/package.tar", "-C", "/tmp/output"))
+    assert store.read("/tmp/output/" + relative) is program
+
+
+@pytest.mark.parametrize("prefix", ["../setup.sh", "/setup.sh", "sub/../setup.sh", "sub\\setup.sh"])
+def test_exact_file_archive_rejects_invalid_member_prefix(prefix: str) -> None:
+    store = ShellArtifactStore(lambda: None)
+    assert store.create_empty_directory("/tmp/input")
+    assert store.write("/tmp/input/setup.sh", _program())
+    assert store.write("/tmp/package.tar", _program())
+    assert not store.archive("/tmp/input/setup.sh", "/tmp/package.tar", member_prefix=prefix)
+    assert store.read("/tmp/package.tar") is None
+
+
+@pytest.mark.parametrize("levels, complete", [(2, True), (8, True), (9, False)])
+def test_exact_file_archive_keeps_nested_depth_bound(levels: int, complete: bool) -> None:
+    store = ShellArtifactStore(lambda: None)
+    effects = ShellArtifactEffects(store, lambda: None)
+    program = _program()
+    assert store.create_empty_directory("/tmp/input")
+    assert store.write("/tmp/input/setup.sh", program)
+    member = "setup.sh"
+    for level in range(1, levels + 1):
+        path = f"/tmp/input/layer{level}.tar"
+        accepted = effects.tar(("tar", "-cf", path, "-C", "/tmp/input", member))
+        assert accepted is (complete or level < levels)
+        member = f"layer{level}.tar"
+    if complete:
+        for level in range(levels, 0, -1):
+            destination = f"/tmp/output{level}"
+            assert store.create_empty_directory(destination)
+            assert effects.tar(("tar", "-xf", path, "-C", destination))
+            path = destination + (f"/layer{level - 1}.tar" if level > 1 else "/setup.sh")
+        assert store.read(path) is program
+    else:
+        assert store.read(path) is None
+
+
+@pytest.mark.parametrize("limit, allowance, complete", [
+    ("MAX_GENERATED_FILES", 1, False), ("MAX_GENERATED_FILES", 2, True),
+    ("MAX_GENERATED_BYTES", 7, False), ("MAX_GENERATED_BYTES", 8, True),
+])
+def test_exact_file_archive_keeps_count_and_byte_budgets(monkeypatch: pytest.MonkeyPatch, limit: str, allowance: int, complete: bool) -> None:
+    monkeypatch.setattr("skillspector.shell_artifacts." + limit, allowance)
+    store = ShellArtifactStore(lambda: None)
+    assert store.create_empty_directory("/tmp/input")
+    assert store.write("/tmp/input/setup.sh", _program("1234"))
+    assert store.archive("/tmp/input/setup.sh", "/tmp/package.tar", member_prefix="setup.sh") is complete
+    assert (store.read("/tmp/package.tar") is not None) is complete
+
+
 @pytest.mark.parametrize("write_path", ["/tmp/build-owned/bundle/setup.sh", "/tmp/build-owned"])
 def test_unknown_write_before_packaging_cannot_reuse_original_bytes(write_path: str) -> None:
     store = ShellArtifactStore(lambda: None)

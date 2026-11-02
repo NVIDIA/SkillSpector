@@ -288,7 +288,7 @@ class ShellArtifactStore:
         return self.write(destination, artifact)
 
     def archive(self, root: str, destination: str, *, member_prefix: str = "") -> bool:
-        """Model tar creation from one wholly known, exclusively owned tree."""
+        """Model tar creation from one known file or exclusively owned tree."""
         self._check_runtime()
         key = _path(root)
         target = _path(destination)
@@ -303,9 +303,10 @@ class ShellArtifactStore:
         ):
             self.invalidate(destination)
             return False
-        members = tuple(
-            ((member_prefix + "/" if member_prefix else "") + path[len(key) + 1 :], artifact)
-            for path, artifact in sorted(self._files.items())
+        artifact = self.read(key)
+        members = ((member_prefix or posixpath.basename(key), artifact),) if artifact is not None else tuple(
+            ((member_prefix + "/" if member_prefix else "") + path[len(key) + 1 :], item)
+            for path, item in sorted(self._files.items())
             if path.startswith(key + "/")
         )
         if not members or any(_path(name, member=True) != name for name, _ in members):
