@@ -246,3 +246,39 @@ def test_failed_untested_predicate_stops_errexit_helper(program: str) -> None:
 ])
 def test_tested_predicate_does_not_exit_the_helper(program: str) -> None:
     assert _helper_output((), program=program) == ((ShellHelperOutput(text="ready"),),)
+
+
+@pytest.mark.parametrize("closing, complete", [("EOF\n", True), ("EOF\r\n", False)])
+def test_lf_heredoc_delimiter_does_not_silently_discard_carriage_return(closing, complete) -> None:
+    content = "literal body\n" + closing
+    end = tm._skip_static_heredoc_bodies(content, 0, len(content), (("EOF", False, True),), lambda: None)
+    assert (end == len(content)) is complete
+
+
+_ARCHIVE_CALLER = '''set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+tmpdir="$(mktemp -d /tmp/archive.XXXXXX)"
+mkdir -p "$tmpdir/tree" "$tmpdir/output"
+cp "$root/scripts/library.sh" "$tmpdir/tree/library.sh"
+tar -cf "$tmpdir/payload.tar" -C "$tmpdir" tree
+tar -xf "$tmpdir/payload.tar" -C "$tmpdir/output"
+code="$(cat "$tmpdir/output/tree/library.sh")"
+bash -c "$code; helper"
+'''
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+def test_generated_archive_source_is_inspected_with_original_provenance(dangerous: bool) -> None:
+    library = "helper() {\n  rm -rf /\n}\n" if dangerous else _LIBRARY
+    prepared = _prepare(_ARCHIVE_CALLER, library)
+    assert prepared is not None
+    findings = list(prepared.analyze_source_commands(content=_ARCHIVE_CALLER, file_path="scripts/caller.sh", file_type="shell", source_view=SecurityTextView("raw", _ARCHIVE_CALLER)))
+    assert any(finding.rule_id == "TM1" for finding in findings) is dangerous
+    assert all(value.origins and any(origin.path == "scripts/library.sh" for origin in value.origins) for _, value in prepared.variants())
+    assert not prepared.has_bounded_parse_exhaustion()
+
+
+def test_unknown_archive_member_write_cannot_reuse_the_cached_copy() -> None:
+    caller = _ARCHIVE_CALLER.replace('code="$(cat', 'ln -sf /runtime/unknown "$tmpdir/output/tree/library.sh"\ncode="$(cat')
+    prepared = _prepare(caller)
+    assert prepared is None or not tuple(prepared.variants())

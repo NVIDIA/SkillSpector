@@ -25,7 +25,7 @@ def _command(argv, **kwargs):
 def test_actual_native_path_is_required_before_publishing_helper_bytes() -> None:
     audit = _audit()
     assert audit(_command(("mktemp", "-d", "/tmp/native.XXXXXX"))) is not None
-    directory = "/tmp/native." + SAFE_PATH_MARKER + "1"
+    directory = "/tmp/native." + SAFE_PATH_MARKER
     assert audit(_command(("cat",), stdin="#!/bin/bash\necho known\n", redirects=(("1>", directory + "/helper"),))) is not None
     assert audit.read_source(directory + "/helper") == "#!/bin/bash\necho known\n"
     assert audit(_command(("/tmp/cat",), stdin="different", redirects=(("1>", directory + "/helper"),))) is None
@@ -81,7 +81,8 @@ def test_source_provenance_and_executable_mode_survive_archive_roundtrip() -> No
 ])
 def test_unsupported_stream_routing_cannot_publish_exact_generated_bytes(redirects) -> None:
     audit = _audit()
-    assert audit(_command(("printf", "%s", "known"), redirects=redirects)) is None
+    result = audit(_command(("printf", "%s", "known"), redirects=redirects))
+    assert result is not None and "/tmp/first" in result.writes
     assert audit.read_source("/tmp/first") is None
 
 
@@ -134,3 +135,31 @@ def test_effect_callback_cannot_prove_cached_source_unchanged_after_unbounded_wr
     resolver = ShellSourceResolver(context, tm._next_shell_invocation_word, lambda text, start, end: tm._skip_command_substitution(text, start, end, lambda: None), tm._static_heredoc_header, tm._skip_static_heredoc_bodies, lambda: None)
     audit = ShellArtifactAudit(context, tm._next_shell_invocation_word, lambda: None)
     assert not source_effects_preserve(resolver, "scripts/setup.sh", len(caller), read_source=audit.read_source, native_effect=audit)
+
+
+def test_inherited_native_identity_does_not_invent_command_availability() -> None:
+    audit = _audit()
+    result = audit(_command(("command", "-v", "missing-tool")))
+    assert result is not None and result.status is None and result.stdout is None
+
+
+def test_cd_distinguishes_known_input_root_from_unknown_runtime_directory() -> None:
+    audit = _audit()
+    result = audit(_command(("cd", "tests/..")))
+    assert result is not None and result.status is True
+    result = audit(_command(("cd", "/runtime/unknown")))
+    assert result is not None and result.status is None
+
+
+def test_native_archive_copy_retains_tree_names_modes_and_readonly_listing_uncertainty() -> None:
+    audit = _audit()
+    assert audit.store.create_empty_directory("/tmp/source")
+    assert audit.store.create_empty_directory("/tmp/destination")
+    artifact = ShellArtifact(ShellSourceValue("echo copied\n"), executable=True)
+    assert audit.store.write("/tmp/source/package/runner.sh", artifact)
+    result = audit(_command(("cp", "-a", "/tmp/source/package", "/tmp/destination/")))
+    assert result is not None and result.status is True
+    assert audit.store.read("/tmp/destination/package/runner.sh") == artifact
+    assert audit(_command(("tar", "-cf", "/tmp/package.tar", "-C", "/tmp/destination", "package"))) is not None
+    listing = audit(_command(("tar", "-tf", "/tmp/package.tar")))
+    assert listing is not None and listing.status is True and listing.stdout is None and not listing.writes

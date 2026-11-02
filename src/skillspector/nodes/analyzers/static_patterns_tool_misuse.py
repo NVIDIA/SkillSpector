@@ -775,8 +775,6 @@ def _skip_static_heredoc_bodies(
                 check_runtime()
             newline = content.find("\n", cursor, limit)
             line_end = limit if newline < 0 else newline
-            if line_end > cursor and content[line_end - 1] == "\r":
-                line_end -= 1
             line = content[cursor:line_end]
             continued = (
                 not quoted and newline >= 0 and (len(line) - len(line.rstrip("\\"))) % 2 == 1
@@ -6382,6 +6380,8 @@ def prepare_source_analysis(*, content: str, file_path: str, file_type: str, sou
     """Inspect commands from complete cached bundle bytes before resolving them."""
     if file_type != "shell" or source_context.path != file_path or source_context.sources.get(file_path) != content:
         return None
+    from skillspector.shell_artifact_effects import ShellArtifactAudit
+    from skillspector.shell_source_effects import source_effects_collect
 
     def make_resolver(*, text: str | None = None, inherited: Mapping[str, ShellSourceValue] | None = None, depth: int = 0, budget: list[int] | None = None) -> ShellSourceResolver:
         resolver = ShellSourceResolver(
@@ -6396,6 +6396,39 @@ def prepare_source_analysis(*, content: str, file_path: str, file_type: str, sou
             source_identity=text is None,
             work_budget=budget,
         )
+
+        # The optional effect pass proves bytes at this exact consumer prefix.
+        # Cache both success and refusal; repeated sed/cat consumers must not
+        # repeatedly walk a large workflow or reuse facts from a later state.
+        effect_cache: dict[int, ShellArtifactAudit | None] = {}
+        active_effects: set[int] = set()
+
+        def effect_source(target: ShellSourceValue, before_offset: int) -> ShellSourceValue | None:
+            if target.kind not in {"bundle_path", "safe_path"} or not 0 <= before_offset <= len(resolver.content):
+                return None
+            if before_offset not in effect_cache:
+                if len(effect_cache) >= 16 or before_offset in active_effects:
+                    return None
+                resolver.work_budget[0] -= max(1, before_offset)
+                if resolver.work_budget[0] < 0:
+                    resolver.valid = False
+                    return None
+                active_effects.add(before_offset)
+                try:
+                    audit = ShellArtifactAudit(source_context, _next_shell_invocation_word, check_runtime)
+                    complete = source_effects_collect(resolver, before_offset, read_source=audit.read_source, native_effect=audit)
+                    effect_cache[before_offset] = audit if complete else None
+                finally:
+                    active_effects.discard(before_offset)
+            audit = effect_cache[before_offset]
+            if audit is None:
+                return None
+            artifact = audit.store.read(target.text)
+            if artifact is None or artifact.value is None or not artifact.value.origins:
+                return None
+            return ShellSourceValue(artifact.value.text, "code", artifact.value.origins)
+
+        resolver.effect_source = effect_source
 
         def literal_children(before_offset: int) -> Iterator[tuple[ShellSourceResolver, int]]:
             if depth >= 8:
