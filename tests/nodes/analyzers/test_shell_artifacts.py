@@ -325,3 +325,16 @@ def test_unmodeled_producer_effect_refuses_all_outputs(mutation) -> None:
     result, store = _inspect_producer(_PRODUCER.replace(*mutation))
     assert result is None
     assert store.read("/tmp/result/package.tgz") is None
+
+
+@pytest.mark.parametrize("name", [
+    "dirname", "awk", "find", "sort", "xargs", "sha256sum",
+    "gzip", "pigz", "bzip2", "lbzip2", "xz", "rm",
+])
+def test_specialized_producer_operations_cannot_bypass_shadowed_native_names(name) -> None:
+    # These names occur within substitutions, process substitutions, pipelines,
+    # tar options or the cleanup trap rather than only as ordinary commands.
+    program = _PRODUCER.replace("resolve_one() {", name + "() { printf replaced; }\nresolve_one() {")
+    result, store = _inspect_producer(program)
+    assert result is None
+    assert store.read("/tmp/result/package.tgz") is None

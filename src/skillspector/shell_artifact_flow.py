@@ -22,6 +22,16 @@ from skillspector.shell_helper_argv import (
 from skillspector.shell_sources import ReadWord, ShellSourceContext, ShellSourceOrigin, ShellSourceValue
 
 
+# Specialized word, mapfile, manifest and tar handlers assume these native
+# identities too. A function definition must not silently replace any of them.
+_PRODUCER_NATIVE_NAMES = frozenset({
+    "printf", "cp", "tar", "mkdir", "chmod", "cat", "p4", "local", "mapfile",
+    "set", "command", "umask", "trap", "mktemp", "cd", "return", "exit", "echo",
+    "dirname", "awk", "find", "sort", "xargs", "sha256sum",
+    "gzip", "pigz", "bzip2", "lbzip2", "xz", "rm",
+})
+
+
 def helper_stdout_artifacts(
     variants: tuple[tuple[ShellHelperOutput, ...], ...],
     store: ShellArtifactStore,
@@ -397,7 +407,7 @@ class ShellProducer:
                 self.depth or self.capture_depth
                 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
                 or name in self.functions
-                or name in {"printf", "cp", "tar", "mkdir", "chmod", "cat", "p4", "local", "mapfile", "set", "command", "umask", "trap", "mktemp", "cd", "return", "exit", "echo"}
+                or name in _PRODUCER_NATIVE_NAMES
             ):
                 raise _Unresolved
             self.functions[name] = node.body
