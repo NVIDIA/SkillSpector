@@ -433,9 +433,13 @@ class TestBedrockProviderToolChoice:
         mock_session.return_value.client.return_value = MagicMock()
         provider = BedrockProvider()
 
-        provider.create_chat_model("us.anthropic.claude-fable-5-1", max_tokens=1024)
+        with pytest.raises(ValueError, match="SKILLSPECTOR_TEMPERATURE is not supported"):
+            provider.create_chat_model("us.anthropic.claude-mythos-5-1", max_tokens=1024)
+
+        monkeypatch.delenv("SKILLSPECTOR_TEMPERATURE")
+        provider.create_chat_model("us.anthropic.claude-mythos-5-1", max_tokens=1024)
         assert mock_chat.call_args.kwargs["supports_tool_choice_values"] == ("auto",)
-        assert mock_chat.call_args.kwargs["temperature"] == 0.2
+        assert "temperature" not in mock_chat.call_args.kwargs
 
         provider.create_chat_model(BEDROCK_DEFAULT_MODEL, max_tokens=1024)
         assert "supports_tool_choice_values" not in mock_chat.call_args.kwargs
