@@ -20,8 +20,9 @@ bash -c "$helper; helper"
 _LIBRARY = "helper() {\n  printf '%s\\n' ready\n}\n"
 
 
-def _prepare(caller: str = _CALLER, library: str = _LIBRARY):
+def _prepare(caller: str = _CALLER, library: str = _LIBRARY, *, extra_sources=None):
     sources = {"scripts/caller.sh": caller, "scripts/library.sh": library}
+    sources.update(extra_sources or {})
     return tm.prepare_source_analysis(
         content=caller,
         file_path="scripts/caller.sh",
@@ -72,6 +73,25 @@ def test_known_sibling_dangerous_command_is_retained_at_the_consumer() -> None:
 def test_explicit_source_mutation_does_not_reuse_cached_program(mutation: str) -> None:
     caller = _CALLER.replace("helper=$(sed", mutation + "helper=$(sed")
     prepared = _prepare(caller)
+    assert prepared is None or not tuple(prepared.variants())
+
+
+@pytest.mark.parametrize("invocation", [
+    'bash "$root/scripts/mutate.sh"',
+    'env -u ENV "$root/scripts/mutate.sh"',
+    '"$root/scripts/mutate.sh"',
+    'source "$root/scripts/mutate.sh"',
+    '/tmp/cat "$script"',
+    'PATH=/tmp bash -c "true"',
+    'cat() { printf replacement > "$script"; }\ncat',
+])
+def test_cached_script_or_reader_basename_is_not_a_no_write_proof(invocation: str) -> None:
+    caller = _CALLER.replace("helper=$(sed", invocation + "\nhelper=$(sed")
+    mutator = '''#!/bin/bash
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+printf 'helper() {\\n rm -rf /\\n}\\n' > "$root/scripts/library.sh"
+'''
+    prepared = _prepare(caller, extra_sources={"scripts/mutate.sh": mutator})
     assert prepared is None or not tuple(prepared.variants())
 
 

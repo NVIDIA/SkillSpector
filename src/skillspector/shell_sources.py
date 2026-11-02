@@ -821,9 +821,8 @@ def source_is_unmodified(
     """Refuse a cached read after an explicit possible write to its source.
 
     This is an audit of inspected commands, not a promise that external programs
-    or an unrelated process cannot change the filesystem. Source-script calls
-    alone do not imply hidden writes. Explicit redirections, file-changing
-    commands, and source-path arguments to unknown consumers do require proof.
+    or an unrelated process cannot change the filesystem. Uploaded script calls
+    still require an effect proof; their presence in the cache is not one.
     Child commands share filesystem effects even when their variables are local.
     """
     readers = frozenset(
@@ -831,7 +830,7 @@ def source_is_unmodified(
             ":", "true", "false", "echo", "printf", "cat", "head", "tail",
             "grep", "egrep", "fgrep", "cut", "wc", "stat", "test", "[", "[[",
             "sha256sum", "sha1sum", "md5sum", "cmp", "diff", "readlink", "dirname",
-            "ls", "file", "source", ".", "set", "export", "trap", "exit",
+            "ls", "file", "set", "export", "trap", "exit",
             "return", "break", "continue", "sleep", "wait", "shift", "pwd", "cd", "mktemp", "local",
         }
     )
@@ -946,7 +945,12 @@ def source_is_unmodified(
             cursor = 0
             while cursor < len(words):
                 token, left, right = words[cursor]
-                if token in controls or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", current.content[left:right]):
+                assignment = re.match(r"([A-Za-z_][A-Za-z0-9_]*)=", current.content[left:right])
+                if assignment is not None and is_managed_shell_variable(assignment[1]):
+                    # Even a single-invocation PATH override can replace a
+                    # reader or the shell which owns an inspected -c string.
+                    return False
+                if token in controls or assignment is not None:
                     cursor += 1
                     continue
                 break
@@ -970,6 +974,14 @@ def source_is_unmodified(
             if executable is None:
                 return False
             name = executable.text.rpartition("/")[2]
+            if (
+                executable.kind != "literal"
+                or name in current.functions
+                or executable.text not in {name, "/bin/" + name, "/usr/bin/" + name}
+            ):
+                # A bundled program or /tmp/cat may have arbitrary effects.
+                # Native semantics belong to a proved identity, not basename.
+                return False
             arguments = words[cursor + 1:]
             if name == "env":
                 invocation = decode_env_unset_command(current, words, cursor)
@@ -979,16 +991,17 @@ def source_is_unmodified(
                 target = resolve(words[index][1], words[index][2])
                 if target is None:
                     return False
-                if target.kind == "bundle_path" and target.text in current.context.sources:
-                    continue
                 if (
                     command.start in child_consumers
                     and target.kind == "literal"
-                    and target.text.rpartition("/")[2] in {"bash", "sh", "dash", "zsh", "ksh"}
+                    and target.text in {
+                        prefix + shell for prefix in ("", "/bin/", "/usr/bin/")
+                        for shell in ("bash", "sh", "dash", "zsh", "ksh")
+                    }
                 ):
                     continue
                 return False
-            if name in {"command", "builtin", "sudo", "nohup", "timeout", "nice", "exec", "eval"}:
+            if name in {"command", "builtin", "sudo", "nohup", "timeout", "nice", "exec", "eval", "source", "."}:
                 # A wrapper may conceal a writer; its name is not evidence of
                 # a read-only operation. Extend only through understood argv.
                 return False
@@ -1005,21 +1018,8 @@ def source_is_unmodified(
                 continue
             if name in {"bash", "sh", "dash", "zsh", "ksh"}:
                 if command.start not in child_consumers:
-                    script = False
-                    for _, left, right in arguments:
-                        value = resolve(left, right)
-                        if value is None:
-                            return False
-                        if value.kind == "literal" and value.text.startswith("-"):
-                            if value.text != "--" and not re.fullmatch(r"-[aBdefhkmnptuvx]+", value.text):
-                                return False
-                            continue
-                        script = value.kind == "bundle_path" and value.text in current.context.sources
-                        break
-                    if not script:
-                        return False
-                # Literal shell consumers are audited recursively below;
-                # executing an inspected script alone implies no hidden write.
+                    return False
+                # Only fully inspected child programs supply an effect audit.
                 continue
             mutation = name in writers
             if name == "sed":
@@ -1097,7 +1097,7 @@ def source_is_unmodified(
                         subtree = False
                     if touches(value, subtree=subtree):
                         return False
-            elif name not in readers and name != "sed" and executable.kind != "bundle_path":
+            elif name not in readers and name != "sed":
                 for _, left, right in arguments:
                     if not current.audit_spend():
                         return False
