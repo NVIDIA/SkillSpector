@@ -44,6 +44,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import BaseMessage
 from langchain_openai.chat_models.base import BaseChatOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator
+from tiktoken import registry as tiktoken_registry
 
 from skillspector.inference_usage import (
     InferenceUsageRecord,
@@ -168,6 +169,21 @@ def _require_structured_response(response: object) -> None:
 REQUEST_FRAMING_TOKENS = 256
 
 
+def _input_token_counter_key(chat_model: object) -> tuple[object, ...]:
+    """Retain the selected counter for equivalent client configurations."""
+    if not isinstance(chat_model, BaseChatOpenAI):
+        return ("conservative_utf8_bytes",)
+    custom = getattr(chat_model, "custom_get_token_ids", None)
+    if callable(custom):
+        # The selected counter retains this callable, so its identity cannot be
+        # recycled while this key is cached. Do not retain whole HTTP clients.
+        return ("configured_chat_model_tokenizer", id(custom))
+    label = getattr(chat_model, "tiktoken_model_name", None) or getattr(
+        chat_model, "model_name", None
+    )
+    return ("openai_codec", label if isinstance(label, str) else None)
+
+
 def _input_token_counter(chat_model: object) -> tuple[Callable[[str], int], str]:
     """Use a configured/recognized OpenAI codec; unknown codecs use UTF-8 bytes.
 
@@ -197,10 +213,14 @@ def _input_token_counter(chat_model: object) -> tuple[Callable[[str], int], str]
     if not isinstance(label, str):
         return byte_bound, "conservative_utf8_bytes"
     try:
-        encoding = tiktoken.encoding_for_model(label)
+        # Name lookup is a pure table lookup. Never initialize a codec here:
+        # get_encoding/encoding_for_model can download its vocabulary without a
+        # timeout, outside the shared scan deadline. Use only an existing codec.
+        encoding_name = tiktoken.encoding_name_for_model(label)
+        encoding = tiktoken_registry.ENCODINGS.get(encoding_name)
     except Exception:
-        # Recognized codecs can still fail to initialize when the cache is
-        # empty and its loader cannot reach or validate the vocabulary.
+        return byte_bound, "conservative_utf8_bytes"
+    if encoding is None:
         return byte_bound, "conservative_utf8_bytes"
 
     def recognized(text: str) -> int:
@@ -1131,6 +1151,7 @@ class LLMAnalyzerBase:
             raise
         self._require_time_remaining()
         self._token_counter, self._token_counter_source = _input_token_counter(self._llm)
+        self._call_token_counters = {_input_token_counter_key(self._llm): self._token_counter}
         # Native SDK retries cannot re-read a workflow-wide deadline between
         # attempts.  A dynamic deadline therefore uses our explicit retry loop,
         # which checks and caps every retry/backoff against remaining time.
@@ -1272,7 +1293,9 @@ class LLMAnalyzerBase:
             file_findings = findings_by_file.get(path, [])
 
             last_line = max(len(content.splitlines()), 1)
-            fixed_bytes = self._fixed_prompt_bytes(path, file_findings, last_line, **prompt_kwargs)
+            # Only the irreducible wrapper belongs in the coarse budget. The
+            # range predicate measures findings that actually occur in a chunk.
+            fixed_bytes = self._fixed_prompt_bytes(path, [], last_line, **prompt_kwargs)
             minimum = Batch(file_path=path, content="", findings=[])
             if not self._prompt_fits_budget(self.build_prompt(minimum, **prompt_kwargs)):
                 # No line split can shrink a fixed wrapper. Keep all content as
@@ -1435,7 +1458,19 @@ class LLMAnalyzerBase:
         return prompt
 
     def _count_prompt_tokens(self, prompt: str, *, chat_model: object | None = None) -> int:
-        counter = self._token_counter if chat_model is None else _input_token_counter(chat_model)[0]
+        if chat_model is None:
+            counter = self._token_counter
+        else:
+            # Reuse a chosen fallback even if another request later populates
+            # the process-wide codec registry. Equivalent refreshed HTTP clients
+            # share a counter without keeping their connection pools alive.
+            counters = getattr(self, "_call_token_counters", None)
+            if counters is None:
+                counters = self._call_token_counters = {}
+            key = _input_token_counter_key(chat_model)
+            if key not in counters:
+                counters[key] = _input_token_counter(chat_model)[0]
+            counter = counters[key]
         return counter(self._serialized_input(prompt)) + REQUEST_FRAMING_TOKENS
 
     def _prompt_fits_budget(self, prompt: str) -> bool:

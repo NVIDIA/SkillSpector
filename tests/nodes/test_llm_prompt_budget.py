@@ -116,20 +116,24 @@ def test_unknown_openai_codec_uses_conservative_bytes() -> None:
     assert counter("漢🙂") == len("漢🙂".encode())
 
 
-def test_recognized_and_explicitly_configured_codec_is_respected() -> None:
-    import tiktoken
+def test_recognized_and_explicitly_configured_codec_is_respected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from langchain_openai import ChatOpenAI
+    from tiktoken import registry
 
     model = MagicMock(spec=ChatOpenAI)
     model.custom_get_token_ids = None
     model.tiktoken_model_name = "gpt-4o"
     model.model_name = "custom-provider-deployment"
+    codec = MagicMock()
+    codec.encode.return_value = [1, 2, 3]
+    monkeypatch.setattr(registry, "ENCODINGS", {"o200k_base": codec})
     counter, source = lab._input_token_counter(model)
     text = "All source text stays data: <|endoftext|>"
     assert source == "recognized_tiktoken_codec"
-    assert counter(text) == len(
-        tiktoken.encoding_for_model("gpt-4o").encode(text, disallowed_special=())
-    )
+    assert counter(text) == 3
+    codec.encode.assert_called_once_with(text, disallowed_special=())
 
 
 def test_explicit_custom_codec_is_respected_and_failure_is_conservative() -> None:
@@ -180,7 +184,7 @@ def test_unfit_fixed_wrapper_retains_one_batch_without_per_line_refinement(
 
 
 @pytest.mark.parametrize("failure", [OSError, ValueError, RuntimeError])
-def test_codec_initialization_failure_uses_conservative_bytes(
+def test_codec_name_lookup_failure_uses_conservative_bytes(
     monkeypatch: pytest.MonkeyPatch, failure: type[Exception]
 ) -> None:
     import tiktoken
@@ -191,8 +195,129 @@ def test_codec_initialization_failure_uses_conservative_bytes(
     model.tiktoken_model_name = "gpt-4o"
     model.model_name = "recognized-model"
     loader = MagicMock(side_effect=failure("offline or invalid tokenizer vocabulary"))
-    monkeypatch.setattr(tiktoken, "encoding_for_model", loader)
+    monkeypatch.setattr(tiktoken, "encoding_name_for_model", loader)
     counter, source = lab._input_token_counter(model)
     assert source == "conservative_utf8_bytes"
     assert counter("漢🙂") == len("漢🙂".encode())
     loader.assert_called_once_with("gpt-4o")
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_codec_selection_never_loads_or_downloads_vocabulary(
+    monkeypatch: pytest.MonkeyPatch, cached: bool
+) -> None:
+    import requests
+    import tiktoken
+    from langchain_openai import ChatOpenAI
+    from tiktoken import registry
+
+    model = MagicMock(spec=ChatOpenAI)
+    model.custom_get_token_ids = None
+    model.tiktoken_model_name = "gpt-4o"
+    model.model_name = "recognized-model"
+    codec = MagicMock()
+    codec.encode.return_value = [1, 2, 3]
+    monkeypatch.setattr(registry, "ENCODINGS", {"o200k_base": codec} if cached else {})
+    loader = MagicMock(side_effect=AssertionError("Vocabulary loading/network is forbidden"))
+    for owner, name in [
+        (tiktoken, "encoding_for_model"),
+        (tiktoken, "get_encoding"),
+        (requests, "get"),
+    ]:
+        monkeypatch.setattr(owner, name, loader)
+    counter, source = lab._input_token_counter(model)
+    text = "漢🙂 source"
+    assert counter(text) == (3 if cached else len(text.encode()))
+    assert source == ("recognized_tiktoken_codec" if cached else "conservative_utf8_bytes")
+    loader.assert_not_called()
+
+
+def test_cached_only_constructor_cannot_consume_shared_deadline(
+    analyzer: lab.LLMAnalyzerBase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tiktoken
+    from langchain_openai import ChatOpenAI
+    from tiktoken import registry
+
+    model = MagicMock(spec=ChatOpenAI)
+    model.custom_get_token_ids = None
+    model.tiktoken_model_name = "gpt-4o"
+    model.model_name = "recognized-model"
+    monkeypatch.setattr(registry, "ENCODINGS", {})
+    clock = [0.0]
+
+    def unbounded_loader(_label):
+        clock[0] += 1000.0
+        return MagicMock()
+
+    loader = MagicMock(side_effect=unbounded_loader)
+    monkeypatch.setattr(tiktoken, "encoding_for_model", loader)
+    monkeypatch.setattr(lab, "get_chat_model", lambda **kwargs: model)
+    created = lab.LLMAnalyzerBase("Review all lines", "gpt-4o", timeout=lambda: 1.0 - clock[0])
+    assert created._remaining_timeout() == 1.0
+    assert created._token_counter_source == "conservative_utf8_bytes"
+    loader.assert_not_called()
+
+
+def test_selected_fallback_is_reused_for_equivalent_request_clients(
+    analyzer: lab.LLMAnalyzerBase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from langchain_openai import ChatOpenAI
+    from tiktoken import registry
+
+    def client():
+        model = MagicMock(spec=ChatOpenAI)
+        model.custom_get_token_ids = None
+        model.tiktoken_model_name = "gpt-4o"
+        model.model_name = "recognized-model"
+        return model
+
+    model = client()
+    monkeypatch.setattr(registry, "ENCODINGS", {})
+    before = analyzer._count_prompt_tokens("漢🙂 source", chat_model=model)
+    codec = MagicMock()
+    codec.encode.return_value = [1]
+    registry.ENCODINGS["o200k_base"] = codec
+    assert analyzer._count_prompt_tokens("漢🙂 source", chat_model=model) == before
+    assert analyzer._count_prompt_tokens("漢🙂 source", chat_model=client()) == before
+    codec.encode.assert_not_called()
+
+
+def test_large_aggregate_findings_do_not_create_one_request_per_line(
+    analyzer: lab.LLMAnalyzerBase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_prompt = analyzer.build_prompt
+
+    def prompt(batch: lab.Batch, **kwargs: object) -> str:
+        return (
+            original_prompt(batch) + "\nFindings:\n" + "\n".join(f.message for f in batch.findings)
+        )
+
+    monkeypatch.setattr(analyzer, "build_prompt", prompt)
+    content = "original source line\n" * 5000
+    findings = [
+        Finding(
+            rule_id="fixture",
+            message="Retained finding detail " * 60,
+            severity="HIGH",
+            file="source",
+            start_line=line,
+        )
+        for line in range(1, 5001, 80)
+    ]
+    assert sum(len(f.message) for f in findings) > 4 * analyzer._input_budget
+    batches = analyzer.get_batches(["source"], {"source": content}, findings)
+    assert len(batches) < 150, (
+        "Range-specific findings fit; aggregate metadata must not force one-line requests"
+    )
+    covered = set()
+    retained = set()
+    lines = content.splitlines(keepends=True)
+    for batch in batches:
+        end = batch.end_line or len(lines)
+        assert batch.content == "".join(lines[batch.start_line - 1 : end])
+        covered.update(range(batch.start_line, end + 1))
+        retained.update(f.finding_id for f in batch.findings)
+        analyzer._check_prompt_budget(analyzer.build_prompt(batch))
+    assert covered == set(range(1, len(lines) + 1))
+    assert retained == {f.finding_id for f in findings}
