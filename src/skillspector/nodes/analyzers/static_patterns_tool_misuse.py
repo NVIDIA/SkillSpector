@@ -2731,29 +2731,60 @@ def _shell_clause_starts(
     """Yield command-clause starts outside quotes and comments in one pass."""
     yield 0
     quote: str | None = None
+    ansi_c_quote = False
     word_started = False
     cursor = 0
-    while cursor < len(content):
+    limit = len(content)
+    frames: list[tuple[int, int, str | None, bool, bool]] = []
+    substitution_ends: dict[int, int | None] = {}
+    while cursor < limit or frames:
+        if cursor >= limit:
+            cursor, limit, quote, ansi_c_quote, word_started = frames.pop()
+            continue
         if cursor % 4096 == 0:
             check_runtime()
         character = content[cursor]
+        if quote != "'" and content.startswith("$(", cursor):
+            end = _skip_command_substitution(
+                content, cursor, limit, check_runtime, end_cache=substitution_ends
+            )
+            if end is not None:
+                # A command substitution executes even inside double quotes.
+                # Give its body an independent quote state and then resume
+                # the parent word; cached endpoints keep nested walks linear.
+                frames.append((end, limit, quote, ansi_c_quote, True))
+                cursor += 2
+                limit = end - 1
+                quote = None
+                ansi_c_quote = False
+                word_started = False
+                yield cursor
+                continue
         if quote is not None:
             if character == quote:
                 quote = None
-            elif quote == '"' and character == "\\" and cursor + 1 < len(content):
+                ansi_c_quote = False
+            elif (quote == '"' or ansi_c_quote) and character == "\\" and cursor + 1 < limit:
                 cursor += 2
                 continue
+        elif character == "$" and content[cursor + 1:cursor + 2] in {"'", '"'}:
+            quote = content[cursor + 1]
+            ansi_c_quote = quote == "'"
+            word_started = True
+            cursor += 2
+            continue
         elif character in "'\"":
             quote = character
             word_started = True
-        elif character == "\\" and cursor + 1 < len(content):
+        elif character == "\\" and cursor + 1 < limit:
             cursor += 2
             word_started = True
             continue
         elif character == "#" and not word_started:
-            newline = content.find("\n", cursor + 1)
+            newline = content.find("\n", cursor + 1, limit)
             if newline < 0:
-                return
+                cursor = limit
+                continue
             cursor = newline + 1
             word_started = False
             yield cursor

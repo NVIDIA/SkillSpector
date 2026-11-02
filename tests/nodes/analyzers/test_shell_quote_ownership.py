@@ -110,6 +110,27 @@ def test_quoted_assignment_delimiters_do_not_hide_executable_payloads(source: st
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
+@pytest.mark.parametrize("depth", [1, 8, 32])
+def test_nested_command_substitutions_keep_shell_consumers_visible(depth: int) -> None:
+    command = "bash -c '$CMD -rf /'"
+    for _ in range(depth):
+        command = f'printf "%s" "$({command})"'
+    assert tm.has_bounded_parse_exhaustion(command, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "printf '%s' '$(bash -c \"$CMD -rf /\")'",
+        'printf "%s" "\\$(ordinary data)"',
+        'tool "NAME=$(printf %s safe)"',
+        "printf '%s' $'literal \\\' $(bash -c \"$CMD -rf /\")'",
+    ],
+)
+def test_literal_and_benign_substitution_text_is_not_an_executable_shell_string(source: str) -> None:
+    assert list(tm._shell_command_strings(source, lambda: None)) == []
+
+
 def test_quoted_helper_is_completely_inspected(tmp_path: Path) -> None:
     (tmp_path / "SKILL.md").write_text(
         "---\nname: repro\ndescription: Minimal shell fixture.\n---\nRun `scripts/run.sh`.\n"
