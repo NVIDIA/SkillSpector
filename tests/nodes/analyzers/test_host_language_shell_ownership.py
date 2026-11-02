@@ -681,6 +681,14 @@ def test_unproven_node_assert_binding_or_message_is_not_projected(source: str) -
     assert _javascript(source) is _shell(source)
 
 
+def test_unproven_node_assert_template_keeps_ledger_partial() -> None:
+    result = _ledger("scripts/check.mjs", _JS_ASSERT_CALL)
+    row = result["inspection_ledger"][0]
+
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
 @pytest.mark.parametrize(
     "operand",
     [

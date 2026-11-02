@@ -680,6 +680,26 @@ def test_cli_rejects_output_overwriting_directory_manifest(
     invoke.assert_not_called()
 
 
+def test_validate_report_destination_rejects_existing_directory(tmp_path: Path) -> None:
+    """A directory output must fail before any scan work starts (issue #954)."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Hello\n")
+    with pytest.raises(ValueError, match="non-regular"):
+        cli_module._validate_report_destination(source, tmp_path)
+
+
+def test_validate_report_destination_allows_regular_and_missing_outputs(
+    tmp_path: Path,
+) -> None:
+    """Regular-file and not-yet-created outputs still pass validation."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Hello\n")
+    regular = tmp_path / "report.json"
+    regular.write_text("{}")
+    cli_module._validate_report_destination(source, regular)
+    cli_module._validate_report_destination(source, tmp_path / "new-report.json")
+
+
 @pytest.mark.parametrize("primary", ["SKILL.md", "skill.md", ".aisop/workflow.aisop.json"])
 @pytest.mark.parametrize("max_skills", [1, 2])
 def test_recursive_output_preserves_child_primary_before_scanning(

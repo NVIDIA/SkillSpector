@@ -115,8 +115,26 @@ def observe_analyzer_findings(
         _analyzer_finding_observer.reset(token)
 
 
+_finding_id_factory: ContextVar[Callable[[], str] | None] = ContextVar(
+    "skillspector_finding_id_factory", default=None
+)
+
+
+@contextmanager
+def use_finding_id_factory(factory: Callable[[], str]) -> Iterator[None]:
+    """Select a task-local identity source without changing ordinary scans."""
+    token = _finding_id_factory.set(factory)
+    try:
+        yield
+    finally:
+        _finding_id_factory.reset(token)
+
+
 def _new_finding_id() -> str:
     """Return an opaque, run-unique identity for one logical finding."""
+    factory = _finding_id_factory.get()
+    if factory is not None:
+        return factory()
     return f"finding-{uuid4().hex}"
 
 

@@ -6,6 +6,15 @@ relevant ceiling is reached, the scanner records the limitation and reports part
 
 Values below are implementation defaults. MiB means 1,048,576 bytes.
 
+## Locked npm dependency inspection
+
+`--inspect-dependencies` adds bounded acquisition and a separate static worker for
+each supported, integrity-verified locked artifact. Downloads and decompressed
+tar bytes both consume the remaining shared workflow byte budget. Worker runtime,
+memory, output, member counts, expansion, and source sizes have independent caps.
+Failures and unsupported content remain in the completeness ledger. See
+[dependency inspection limits and supported platforms](DEPENDENCY_CONTENT_INSPECTION.md).
+
 ## Bundle discovery and materialization
 
 | Resource | Ceiling | Scope |
