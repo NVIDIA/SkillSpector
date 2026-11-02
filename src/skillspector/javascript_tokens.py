@@ -686,7 +686,8 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
             for prop in node.properties:
                 if prop.type == "Property" and (
                     getattr(prop.key, "value", None) in {"eval", "Function"}
-                    or prop.computed and getattr(prop.key, "type", None) != "Literal"
+                    or prop.computed
+                    and getattr(prop.key, "type", None) != "Literal"
                 ):
                     return True
         if (
