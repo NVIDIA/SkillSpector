@@ -31,9 +31,11 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from inspect import getattr_static
 from itertools import chain
+from types import MappingProxyType
 from typing import cast
 
 from skillspector.artifacts import (
+    ArtifactDisposition,
     ContentKind,
     SecurityTextView,
     _contains_default_ignorable,
@@ -914,6 +916,77 @@ class _OccurrenceColumnResolver:
         self.next_offsets[key] = match_start + max(1, len(finding.matched_text))
 
 
+@dataclass
+class _CompleteSourceCache:
+    """Lazily bind bundled source text to complete immutable cached bytes.
+
+    Only the original artifact scan receives this context. Validation runs under
+    its deadline and is shared across subsequent artifacts in the same node.
+    Missing inventory or lossy/provider-transformed text cannot prove a source.
+    """
+
+    text: Mapping[str, str]
+    raw: Mapping[str, bytes] | None
+    inventory: object
+    _validated: Mapping[str, str] | None = None
+
+    def validated(self, check_runtime: Callable[[], None]) -> Mapping[str, str]:
+        check_runtime()
+        if self._validated is not None:
+            return self._validated
+        sources: dict[str, str] = {}
+        if not isinstance(self.inventory, list) or self.raw is None:
+            self._validated = MappingProxyType(sources)
+            return self._validated
+        # Match the bounded discovery inventory; do not silently trust a prefix
+        # when a hand-built state exceeds its contract.
+        if len(self.inventory) > 10_000:
+            self._validated = MappingProxyType(sources)
+            return self._validated
+        # An interrupted validation must not retry the same whole bundle on
+        # every subsequent shell artifact or expose a validated prefix.
+        self._validated = MappingProxyType({})
+        seen: set[str] = set()
+        for item in self.inventory:
+            check_runtime()
+            if not isinstance(item, dict) or not isinstance(path := item.get("path"), str):
+                continue
+            if path in seen:
+                sources.pop(path, None)
+                continue
+            seen.add(path)
+            content = self.text.get(path)
+            data = self.raw.get(path)
+            if (
+                not isinstance(content, str)
+                or not isinstance(data, bytes)
+                or len(content) > MAX_FILE_CHARS
+                or len(data) > 4 * MAX_FILE_CHARS
+                or item.get("content_kind") != ContentKind.TEXT
+                or item.get("disposition") != ArtifactDisposition.ANALYZED
+                or item.get("decodable") is not True
+                or item.get("contains_nul") is not False
+                or item.get("readable_binary")
+                or "inspected_members" in item
+                or item.get("reason")
+                or type(item.get("size_bytes")) is not int
+                or item["size_bytes"] != len(data)
+                or b"\x00" in data
+            ):
+                continue
+            try:
+                matches = data.decode("utf-8") == content
+            except UnicodeDecodeError:
+                matches = False
+            check_runtime()
+            if matches:
+                sources[path] = content
+        check_runtime()
+        self._validated = MappingProxyType(sources)
+        return self._validated
+
+
+
 def _build_window_source_context(
     path: str,
     content: str,
@@ -974,6 +1047,7 @@ def _scan_path(
     prepared_analyses: Mapping[int, object] | None = None,
     source_view: SecurityTextView | None = None,
     analysis_method: str = "analyze",
+    preserve_created_on_limit: bool = True,
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Run pattern modules with construction, emission, and runtime guards."""
     findings: list[Finding] = []
@@ -1042,7 +1116,7 @@ def _scan_path(
             # A list-building module may be interrupted before it can return.
             # Preserve the bounded prefix it constructed so high-severity
             # evidence is not discarded merely because the output ceiling hit.
-            if len(findings) == module_finding_start:
+            if preserve_created_on_limit and len(findings) == module_finding_start:
                 for af in finding_budget.current_created:
                     if finding_budget.emitted_findings >= finding_budget.max_findings:
                         break
@@ -2315,6 +2389,7 @@ def _scan_all_views_detailed(
     python_ast: ParsedPythonFile | None = None,
     python_source: bool | None = None,
     readable_binary: bool = False,
+    source_cache: _CompleteSourceCache | None = None,
     _oms_projected: bool = False,
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Scan bounded raw windows and return any limit with observed/limit metrics."""
@@ -2454,6 +2529,7 @@ def _scan_all_views_detailed(
     source_context: _WindowSourceContext | None = None
     whole_artifact_window = False
     prepared_analyses: dict[int, object] = {}
+    prepared_sources: dict[int, object] = {}
     deferred_output_limit: _StaticResourceLimitError | None = None
     deferred_scan_incomplete = False
     defers_mixed_output_limit = bool(
@@ -2605,6 +2681,59 @@ def _scan_all_views_detailed(
             if not defer_output_limit(resource_limit, scan_incomplete=True):
                 return limited_result(resource_limit)
 
+        # Bundled command sources are available only to this complete original
+        # artifact. Scan reconstructed commands before accepting their proof;
+        # a prior partial flag must not short-circuit these additional findings.
+        try:
+            if source_cache is not None and _infer_file_type(path) == "shell":
+                for module in modules_for_windows:
+                    prepare_source = _explicit_analysis_hook(module, "prepare_source_analysis")
+                    if prepare_source is None:
+                        continue
+                    sources = source_cache.validated(finding_budget.check_runtime)
+                    if sources.get(path) != content:
+                        continue
+                    from skillspector.shell_sources import ShellSourceContext
+
+                    finding_budget.begin_module()
+                    with observe_analyzer_findings(finding_budget.observe_creation):
+                        prepared = prepare_source(
+                            content=content,
+                            file_path=path,
+                            file_type="shell",
+                            source_context=ShellSourceContext(path, sources),
+                            check_runtime=finding_budget.check_runtime,
+                        )
+                    finding_budget.check_runtime()
+                    if prepared is None:
+                        continue
+                    source_findings, resource_limit = _scan_path(
+                        path,
+                        content,
+                        [module],
+                        finding_budget,
+                        python_source=False,
+                        prepared_analyses={id(module): prepared},
+                        analysis_method="analyze_source_commands",
+                        # Child findings are not parent-addressable until the
+                        # preparation explicitly yields their mapped version.
+                        preserve_created_on_limit=False,
+                    )
+                    unique_limit = _extend_unique_findings(
+                        findings,
+                        seen_findings,
+                        source_findings,
+                        max_findings=max_findings,
+                        coalesce=coalesce,
+                    )
+                    if unique_limit is not None:
+                        return limited_result(unique_limit)
+                    if resource_limit is not None:
+                        return limited_result(resource_limit)
+                    prepared_sources[id(module)] = prepared
+        except _StaticResourceLimitError as exc:
+            return limited_result(exc)
+
         # Window overlap cannot prove completeness for one shell command that
         # spans several otherwise ordinary windows. Run each module's bounded,
         # deadline-aware completeness hook once on the full artifact; ordinary
@@ -2612,6 +2741,18 @@ def _scan_all_views_detailed(
         # first so any concrete reconstructed evidence survives a deadline.
         try:
             for module in modules_for_windows:
+                prepared_source = prepared_sources.get(id(module))
+                source_exhaustion = (
+                    _explicit_analysis_hook(prepared_source, "has_bounded_parse_exhaustion")
+                    if prepared_source is not None
+                    else None
+                )
+                if source_exhaustion is not None:
+                    finding_budget.check_runtime()
+                    source_limited = bool(source_exhaustion())
+                    finding_budget.check_runtime()
+                    bounded_parse_limited = bounded_parse_limited or source_limited
+                    continue
                 exhaustion_hook = getattr(module, "has_bounded_parse_exhaustion", None)
                 if callable(exhaustion_hook):
                     finding_budget.check_runtime()
@@ -3189,6 +3330,7 @@ def run_static_patterns(
         and "!/" not in str(metadata.get("path", ""))
     }
     raw_inventory = state.get("artifact_inventory", [])
+    source_cache = _CompleteSourceCache(file_cache, raw_file_cache, raw_inventory)
     binary_paths = (
         {
             str(item.get("path", ""))
@@ -3264,6 +3406,7 @@ def run_static_patterns(
             python_ast=python_ast,
             python_source=python_source,
             readable_binary=path in readable_binary_paths,
+            source_cache=source_cache,
         )
         runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
         if shared_remaining is not None:
@@ -3327,6 +3470,7 @@ def run_static_patterns_with_ledger(
     findings: list[Finding] = []
     events: list[InspectionLedgerEvent] = []
     raw_inventory = state.get("artifact_inventory", [])
+    source_cache = _CompleteSourceCache(file_cache, raw_file_cache, raw_inventory)
     inventory: dict[str, dict[str, object]] = (
         {str(item.get("path", "")): item for item in raw_inventory if isinstance(item, dict)}
         if isinstance(raw_inventory, list)
@@ -3472,6 +3616,7 @@ def run_static_patterns_with_ledger(
                             python_ast=python_ast,
                             python_source=python_source,
                             readable_binary=bool(artifact.get("readable_binary")),
+                            source_cache=source_cache,
                         )
                         fully_scanned_aggregate_overflow = bool(
                             resource_limit is LedgerReason.OUTPUT_LIMIT
