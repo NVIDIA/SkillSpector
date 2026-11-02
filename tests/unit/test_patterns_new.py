@@ -386,6 +386,29 @@ class TestExcessiveAgency:
         assert ea5[0].severity == Severity.HIGH
         assert ea5[0].location.start_line == 2
 
+    @pytest.mark.parametrize(
+        ("content", "line"),
+        [
+            pytest.param("aider \\\n  --model gpt-4o --yes", 2, id="model_first_backslash"),
+            pytest.param("aider `\n  --model gpt-4o --yes", 2, id="model_first_backtick"),
+            pytest.param("aider ^\n  --model gpt-4o --yes", 2, id="model_first_caret"),
+            pytest.param("$ aider \\\n  --yes \\\n  -m gpt-4o", 3, id="later_continuation"),
+            pytest.param("claude \\\n  -p 'Fix the tests'", 2, id="claude_print"),
+            pytest.param("codex \\\n  exec 'Fix the tests'", 2, id="codex_exec"),
+        ],
+    )
+    def test_ea5_continued_line_is_read_after_its_executable(self, content: str, line: int) -> None:
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        ea5 = [finding for finding in findings if finding.rule_id == "EA5"]
+        assert len(ea5) == 1
+        assert ea5[0].severity == Severity.HIGH
+        assert ea5[0].location.start_line == line
+
+    def test_ea5_continued_line_keeps_the_script_runner_exemption(self) -> None:
+        content = "python evaluate.py \\\n  -v --model claude-3-7-sonnet"
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        assert not any(finding.rule_id == "EA5" for finding in findings)
+
     def test_ea5_shell_fence_is_actionable(self) -> None:
         content = "```shell\ncodex exec 'Fix the tests'\n```"
         findings = ea_mod.analyze(content, "SKILL.md", "markdown")

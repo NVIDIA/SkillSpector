@@ -280,8 +280,24 @@ def _is_model_switch_command(command: str) -> bool:
     return False
 
 
-def _command_span(line: str, *, continued: bool = False) -> tuple[int, int] | None:
-    """Return the model-switch command span for an actionable instruction line."""
+def _continued_executable(line: str) -> str:
+    """Return the executable a line ending in a continuation carries onto the next line."""
+    candidate = line.strip()
+    if candidate.startswith(("$", ">")):
+        candidate = candidate[1:].lstrip(" \t")
+    imperative = _EA5_IMPERATIVE_PREFIX.match(candidate)
+    if imperative is not None:
+        candidate = candidate[imperative.end() :]
+    words = candidate.strip("`").split(maxsplit=1)
+    return words[0] if words else ""
+
+
+def _command_span(line: str, *, executable: str | None = None) -> tuple[int, int] | None:
+    """Return the model-switch command span for an actionable instruction line.
+
+    ``executable`` is set when the previous line continues a command, and names
+    the executable that command started with.
+    """
     # Inline code is handled separately so surrounding prose and punctuation do
     # not become part of the command span (or create a duplicate finding).
     if "`" in line:
@@ -298,9 +314,10 @@ def _command_span(line: str, *, continued: bool = False) -> tuple[int, int] | No
     # A line that starts with an option names no executable. Help output lists
     # options this way ("-m, --model   Claude model to use"), so such a line is
     # only part of a command when the previous line continues one.
-    if not continued and _EA5_LEADING_OPTION.match(command):
+    if executable is None and _EA5_LEADING_OPTION.match(command):
         return None
-    if _is_model_switch_command(command):
+    # A continued line holds only arguments, so read it after its executable.
+    if _is_model_switch_command(command if executable is None else f"{executable} {command}"):
         start = line.find(command, leading)
         return start, start + len(command)
 
@@ -364,7 +381,7 @@ def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
     cursor = body_start
     fence_marker: str | None = None
     fence_language = ""
-    continued = False
+    continued_executable: str | None = None
     for line in content[body_start:].splitlines(keepends=True):
         line_text = line.rstrip("\r\n")
         fence = _EA5_FENCE.match(line_text)
@@ -379,7 +396,7 @@ def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
             cursor += len(line)
             # A fence line ends any command, so a continuation on the line before it
             # does not carry into the fence.
-            continued = False
+            continued_executable = None
             continue
 
         candidates: list[tuple[int, int]] = []
@@ -388,7 +405,7 @@ def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
             or fence_language in _EA5_SHELL_FENCE_LANGUAGES
             or not fence_language
         ):
-            direct = _command_span(line_text, continued=continued)
+            direct = _command_span(line_text, executable=continued_executable)
             if direct is not None:
                 candidates.append(direct)
         for inline in _EA5_INLINE_CODE.finditer(line_text):
@@ -416,7 +433,10 @@ def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
                     evidence={"selection_surface": "command"},
                 )
             )
-        continued = _EA5_LINE_CONTINUATION.search(line_text) is not None
+        if _EA5_LINE_CONTINUATION.search(line_text) is None:
+            continued_executable = None
+        elif continued_executable is None:
+            continued_executable = _continued_executable(line_text)
         cursor += len(line)
     return findings
 
