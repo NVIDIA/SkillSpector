@@ -490,7 +490,8 @@ def test_npm_locks_do_not_resolve_other_projects(lock_version, reverse):
     )
 
 
-def test_npm_workspace_uses_nearest_install_and_keeps_hoisted_dependencies():
+@pytest.mark.parametrize("manifest_name", ["package.json", "PACKAGE.JSON"])
+def test_npm_workspace_uses_nearest_install_and_keeps_hoisted_dependencies(manifest_name):
     cache = {
         "package-lock.json": json.dumps(
             {
@@ -506,9 +507,9 @@ def test_npm_workspace_uses_nearest_install_and_keeps_hoisted_dependencies():
                 },
             }
         ),
-        "packages/a/package.json": "{}",
-        "packages/b/package.json": "{}",
-        "packages/c/package.json": "{}",
+        f"packages/a/{manifest_name}": "{}",
+        f"packages/b/{manifest_name}": "{}",
+        f"packages/c/{manifest_name}": "{}",
     }
     resolved = supply_chain._collect_npm_locked_versions(cache, list(cache))
     assert resolved["."]["node-forge"] == "1.4.2"
@@ -532,16 +533,55 @@ def test_npm_workspace_own_lock_prevents_ancestor_resolution(own_lock, reverse):
     assert not resolved.get("packages/a")
 
 
-@pytest.mark.parametrize("reverse", [False, True])
-def test_npm_shrinkwrap_takes_precedence_and_keeps_both_lock_audits(reverse):
+def test_deep_npm_own_lock_keeps_parse_error_without_borrowing_parent_pin(monkeypatch):
+    seen = []
+
+    def capture_packages(packages, ecosystem, **kwargs):
+        seen.extend(packages)
+        return [[] for _ in packages]
+
+    monkeypatch.setattr(supply_chain, "query_batch", capture_packages)
     cache = {
-        "package-lock.json": '{"packages": {"node_modules/ws": {"version": "8.19.0"}}}',
-        "npm-shrinkwrap.json": '{"packages": {"node_modules/ws": {"version": "8.20.0"}}}',
+        "package-lock.json": json.dumps(
+            {"packages": {"packages/a": {}, "node_modules/ws": {"version": "8.20.0"}}}
+        ),
+        "packages/a/package.json": '{"dependencies": {"ws": "^8.20.0"}}',
+        "packages/a/package-lock.json": "[" * 20_000 + "]" * 20_000,
+    }
+    response = supply_chain.node(
+        {
+            "components": list(cache),
+            "file_cache": cache,
+            "local_file_cache": cache,
+            "manifest": {},
+            "component_metadata": [],
+        }
+    )
+
+    assert seen == [("ws", "8.20.0"), ("ws", None)]
+    assert any(
+        event["path"] == "packages/a/package-lock.json"
+        and event.get("reason_code") is LedgerReason.DEPENDENCY_PARSE_ERROR
+        and event.get("error_class") == "RecursionError"
+        for event in response["inspection_ledger"]
+    )
+
+
+@pytest.mark.parametrize(
+    "lock_names",
+    [("package-lock.json", "npm-shrinkwrap.json"), ("PACKAGE-LOCK.JSON", "NPM-SHRINKWRAP.JSON")],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_npm_shrinkwrap_takes_precedence_and_keeps_both_lock_audits(lock_names, reverse):
+    package_lock, shrinkwrap = lock_names
+    cache = {
+        package_lock: '{"packages": {"node_modules/ws": {"version": "8.19.0"}}}',
+        shrinkwrap: '{"packages": {"node_modules/ws": {"version": "8.20.0"}}}',
     }
     components = list(reversed(cache)) if reverse else list(cache)
     resolved = supply_chain._collect_npm_locked_versions(cache, components)
     assert resolved["."]["ws"] == "8.20.0"
-    assert supply_chain._extract_packages_from_npm_lock(cache["package-lock.json"])[0][:2] == (
+    assert supply_chain._extract_packages_from_npm_lock(cache[package_lock])[0][:2] == (
         "ws",
         "8.19.0",
     )

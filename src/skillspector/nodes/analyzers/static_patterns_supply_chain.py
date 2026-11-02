@@ -2203,8 +2203,16 @@ def _collect_npm_locked_versions(
         for path in components
         if _is_npm_lockfile(path)
     }
-    component_set = set(components)
-    manifest_dirs = {str(Path(path).parent) for path in components if path.endswith("package.json")}
+    shrinkwrap_dirs = {
+        str(Path(path).parent)
+        for path in components
+        if _dependency_filename(path) == "npm-shrinkwrap.json"
+    }
+    manifest_dirs = {
+        str(Path(path).parent)
+        for path in components
+        if _dependency_filename(path) == "package.json"
+    }
     started_at = time.monotonic()
     files_read = 0
     for path in components:
@@ -2215,10 +2223,7 @@ def _collect_npm_locked_versions(
         if timeout_seconds is not None and time.monotonic() - started_at >= timeout_seconds:
             break
         root = Path(path).parent
-        if (
-            Path(path).name == "package-lock.json"
-            and str(root / "npm-shrinkwrap.json") in component_set
-        ):
+        if _dependency_filename(path) == "package-lock.json" and str(root) in shrinkwrap_dirs:
             continue  # npm gives shrinkwrap precedence when both files exist.
         content = file_cache.get(path)
         if content is None:
@@ -2226,7 +2231,7 @@ def _collect_npm_locked_versions(
         files_read += 1
         try:
             data = json.loads(content)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             continue
         if not isinstance(data, dict):
             continue
