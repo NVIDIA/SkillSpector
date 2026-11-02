@@ -927,6 +927,8 @@ def scan(
 
     result = None
     try:
+        if baseline is not None:
+            _validate_report_destination(baseline, output)
         scan_skill = partial(_scan_skill, exclude_patterns=exclude) if exclude else _scan_skill
         if inspect_dependencies:
             scan_skill = partial(scan_skill, inspect_dependencies=True)
