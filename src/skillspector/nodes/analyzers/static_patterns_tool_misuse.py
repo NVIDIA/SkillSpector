@@ -2460,6 +2460,7 @@ def _has_shell_command_word_exhaustion(
             # A quoted NAME=value argument cannot be the command word. Claim
             # only a complete static word; dynamic substitutions must remain
             # visible as independent executable candidates.
+            assignment_positions: set[int] = set()
             parsed = _parse_shell_command_word(
                 content,
                 start,
@@ -2467,7 +2468,17 @@ def _has_shell_command_word_exhaustion(
                 substitution_end_cache,
                 backtick_end_cache,
                 check_runtime=check_runtime,
+                owned_word_positions=assignment_positions,
             )
+            if (
+                parsed is not None and not parsed.dynamic and not parsed.limited
+                and "\n" not in content[start:parsed.end]
+                and "\r" not in content[start:parsed.end]
+            ):
+                # Spaces or punctuation inside a quoted value do not turn
+                # its closing quote into a new opener. Own only delimiters:
+                # embedded command text remains independently inspected.
+                owned_word_positions.update(assignment_positions)
             if parsed is not None and _plain_quoted_assignment_word(parsed):
                 parsed_through = max(parsed_through, parsed.end)
             continue

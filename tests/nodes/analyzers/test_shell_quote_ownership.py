@@ -89,6 +89,27 @@ def test_ownership_walk_obeys_runtime_budget() -> None:
         tm._shell_quoted_candidate_limits('echo "$(date)"\n', cancel)
 
 
+@pytest.mark.parametrize("file_type", ["shell", "markdown"])
+def test_quoted_assignment_value_owns_its_closing_quote(file_type: str) -> None:
+    command = 'tool --field "Description=ordinary value with <placeholders>" --show\n'
+    source = command if file_type == "shell" else "```bash\n" + command + "```\n"
+    source += "\nOrdinary trailing explanation.\n" * 300
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'bash -c "NAME=value; $CMD -rf /"',
+        "bash -c 'NAME=value; rm -rf /'",
+        'tool "NAME=$(bash -c \'$CMD -rf /\')"',
+        'tool "NAME=ordinary value"; $CMD -rf /',
+    ],
+)
+def test_quoted_assignment_delimiters_do_not_hide_executable_payloads(source: str) -> None:
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
 def test_quoted_helper_is_completely_inspected(tmp_path: Path) -> None:
     (tmp_path / "SKILL.md").write_text(
         "---\nname: repro\ndescription: Minimal shell fixture.\n---\nRun `scripts/run.sh`.\n"
