@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from skillspector.models import Finding
 from skillspector.nodes.analyzers import mcp_rug_pull
 from skillspector.nodes.analyzers.mcp_rug_pull import node
@@ -80,6 +82,87 @@ class TestMcpRugPullNode:
         assert len(findings) == 1
         assert findings[0].start_line == 8
         assert findings[0].matched_text == "npx -y @upstash/context7-mcp"
+
+    @pytest.mark.parametrize(
+        ("local_key", "remote_key"),
+        [
+            (r"\u0063ommand", "command"),
+            ("command", r"\u0063ommand"),
+            (r"\u0063ommand", r"comm\u0061nd"),
+        ],
+    )
+    def test_rp1_json_config_escaped_keys_preserve_command_locations(
+        self, local_key: str, remote_key: str
+    ) -> None:
+        content = (
+            '{\n  "mcpServers": {\n    "local": {\n'
+            f'      "{local_key}": "node",\n      "args": ["server.js"]\n'
+            '    },\n    "remote": {\n'
+            f'      "{remote_key}": "npx",\n'
+            '      "args": ["-y", "@scope/remote"]\n'
+            "    }\n  }\n}"
+        )
+
+        result = node({"file_cache": {"mcp.json": content}})
+
+        findings = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+        assert [(finding.matched_text, finding.start_line) for finding in findings] == [
+            ("npx -y @scope/remote", 8)
+        ]
+
+    @pytest.mark.parametrize("first_command", ["node", "npx"])
+    def test_rp1_json_config_duplicate_command_uses_last_value_and_location(
+        self, first_command: str
+    ) -> None:
+        content = (
+            '{\n  "mcpServers": {\n    "first": {\n'
+            f'      "command": "{first_command}",\n'
+            '      "command": "npx",\n      "args": ["@scope/first"]\n'
+            '    },\n    "second": {\n      "command": "npx",\n'
+            '      "args": ["@scope/second"]\n'
+            "    }\n  }\n}"
+        )
+
+        result = node({"file_cache": {"mcp.json": content}})
+
+        findings = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+        assert [(finding.matched_text, finding.start_line) for finding in findings] == [
+            ("npx @scope/first", 5),
+            ("npx @scope/second", 9),
+        ]
+
+    def test_rp1_json_config_duplicate_server_uses_last_object_and_location(self) -> None:
+        content = (
+            '{\n  "mcpServers": {\n    "remote": {\n'
+            '      "command": "npx",\n      "args": ["@scope/discarded"]\n'
+            '    },\n    "remote": {\n      "command": "npx",\n'
+            '      "args": ["@scope/remote"]\n'
+            "    }\n  }\n}"
+        )
+
+        result = node({"file_cache": {"mcp.json": content}})
+
+        findings = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+        assert [(finding.matched_text, finding.start_line) for finding in findings] == [
+            ("npx @scope/remote", 8)
+        ]
+
+    def test_rp1_json_config_duplicate_args_keep_package_pin_and_next_location(self) -> None:
+        content = (
+            '{\n  "mcpServers": {\n    "pinned": {\n'
+            '      "command": "node",\n      "args": ["@scope/discarded"],\n'
+            '      "command": "npx",\n      "args": ["@scope/pinned@1.2.3"]\n'
+            '    },\n    "remote": {\n      "command": "npx",\n'
+            '      "args": ["@scope/remote"]\n'
+            "    }\n  }\n}"
+        )
+
+        result = node({"file_cache": {"mcp.json": content}})
+
+        findings = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+        assert [(finding.matched_text, finding.start_line) for finding in findings] == [
+            ("npx @scope/remote", 10)
+        ]
 
     def test_no_previous_manifest_skips(self) -> None:
         """Returns empty findings when previous_manifest is absent."""

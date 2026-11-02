@@ -6,15 +6,19 @@
 * Support Python 3.15, safer and faster CLI/provider startup, configurable recursive limits, bounded CLI prompts, accurate reference/ZIP coverage, and the remaining detector/report fixes.
 * See [release notes](docs/release/skillspector-2.14.0.md) and [selection manifest](docs/release/skillspector-2.14.0-manifest.json) for exact source PRs, inherited exclusions, upgrade guidance, and remaining limits.
 ---
+### Unreleased maintenance fixes
+### Fixes
+* Backport scoped `allowed-tools` grant handling from #768: recognize declarations such as `Bash(git:*)`, preserve spaces and commas inside scopes, and keep malformed grants or embedded tool names from declaring shell capability. Command restrictions remain intact in the manifest.
+---
 ### 2.13.3 (Unreleased)
 ### Security and integrity fixes
 * Prevent baseline and recursive reports from overwriting primary and child inputs, including aliases. (#924, #938)
 * Keep unavailable requested custom YARA rule directories explicitly incomplete. (#919)
 * Score non-English gap-fill findings in batch recommendations and exit status. (#772)
 * Inspect CRLF-shebang Python launchers and retain PowerShell SC3/P2 coverage. (#906, #874)
-* Keep Markdown code fences from merging distinct shell lines into one marker directive. (#882)
+* Keep Markdown code fences from merging distinct shell lines into one marker directive, without rescanning long rejected backtick runs or reading beyond the bounded scope. (#882)
 * Track credentials nested in urllib request headers through network sinks. (#826)
-* Inspect npx commands in JSON MCP configurations, require package-owned version pins, and recognize additional MCP credential/configuration filenames. (#776, dependency #683, #881)
+* Inspect npx commands in JSON MCP configurations, preserve source lines for escaped and duplicate keys, require package-owned version pins, and recognize additional MCP credential/configuration filenames. (#776, dependency #683, #881)
 * Detect writes to agent-memory files from automatically run test carriers. (#893)
 * Detect bounded multiline walk/encrypt/write behavior while preserving stronger ransomware signatures. (#860)
 * Inspect Pipenv dependencies and locked versions with explicit declaration-coverage limits. (#765)

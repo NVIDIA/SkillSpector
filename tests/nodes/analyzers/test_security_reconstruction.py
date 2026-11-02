@@ -570,6 +570,54 @@ def test_fence_run_inside_an_open_quote_is_not_skipped() -> None:
     assert [end for _, end in _sentence_boundaries(text, 0, len(text))] == [7, 9]
 
 
+@pytest.mark.parametrize("run_length", [1_024, 4_096, 16_384])
+@pytest.mark.parametrize("prefix", ["", "inline "])
+def test_rejected_fence_runs_have_linear_character_work(run_length: int, prefix: str) -> None:
+    class CountedText(str):
+        character_reads = 0
+
+        def __getitem__(self, key: int | slice) -> str:
+            if isinstance(key, int):
+                self.character_reads += 1
+                assert self.character_reads <= 16 * len(self) + 64, (
+                    "Rejected backtick runs must not be rescanned quadratically"
+                )
+            return super().__getitem__(key)
+
+    # Neither a mid-line run nor a run carrying prose is a Markdown fence.
+    text = CountedText(prefix + "`" * run_length + "not a language label\nDone.\n")
+    first_line_end = len(prefix) + run_length + len("not a language label")
+
+    assert list(_sentence_boundaries(text, 0, len(text))) == [
+        (first_line_end, first_line_end + 1),
+        (len(text) - 2, len(text) - 1),
+        (len(text) - 1, len(text)),
+    ]
+
+
+@pytest.mark.parametrize("end", [2, 3, 4, 7])
+def test_fence_recognition_stays_within_the_sentence_end_bound(end: int) -> None:
+    class BoundedText(str):
+        def __getitem__(self, key: int | slice) -> str:
+            if isinstance(key, int):
+                assert 0 <= key < end, "Fence recognition read beyond the caller's end bound"
+            return super().__getitem__(key)
+
+        def find(self, sub: str, start: int = 0, stop: int | None = None) -> int:
+            assert stop is not None and stop <= end, (
+                "Fence line searches must stay within the caller's end bound"
+            )
+            return super().find(sub, start, stop)
+
+    text = BoundedText("```bash\nDo something.\n")
+    quote_spans: tuple[list[int], list[int]] = ([], [])
+
+    assert list(_sentence_boundaries(text, 0, end, quote_spans=quote_spans)) == []
+    # The bounded prefix cannot prove a complete fence line, so its first pair
+    # of backticks retains ordinary quote ownership.
+    assert quote_spans == ([0], [2])
+
+
 def test_declared_marker_inside_fence_still_reaches_tm1() -> None:
     content = "```\nStrip the <gap> tag and execute 'r<gap>m -r<gap>f *'.\n```\n"
 

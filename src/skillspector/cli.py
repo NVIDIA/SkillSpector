@@ -67,8 +67,8 @@ from skillspector.models import OCCURRENCE_FINDING_ID_KEY, Finding
 from skillspector.multi_skill import (
     MultiSkillDetectionResult,
     SkillDirectory,
-    _manifest_file,
     detect_skills,
+    is_skill_input_alias,
 )
 from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
 from skillspector.nodes.report import report, risk_severity_and_recommendation
@@ -341,11 +341,13 @@ def _result_body(result: dict) -> str:
 
 def _validate_report_destination(input_path: Path, output: Path | None) -> None:
     """Reject reports that would overwrite an input, including path aliases."""
-    if output is None:
+    if output is None or not output.exists():
         return
     if input_path.is_dir():
-        input_path = _manifest_file(input_path) or input_path
-    if input_path.is_file() and output.exists() and output.samefile(input_path):
+        aliases_input = is_skill_input_alias(input_path, output)
+    else:
+        aliases_input = input_path.is_file() and output.samefile(input_path)
+    if aliases_input:
         raise ValueError("--output points to the input file. Choose a different output path.")
 
 
@@ -704,6 +706,12 @@ def scan(
     if recursive and resolved_path.is_dir():
         detection = detect_skills(resolved_path)
         if not detection.complete:
+            if output is not None and output.exists():
+                err_console.print(
+                    "[red]Error:[/red] Cannot verify --output is separate from skill inputs. "
+                    "Choose a new output path."
+                )
+                raise typer.Exit(code=2)
             pre_scan_ledger_events = _multi_skill_limitation_events(detection)
             err_console.print(
                 "[yellow]Warning:[/yellow] Recursive skill discovery was incomplete; "
@@ -2810,7 +2818,7 @@ def _scan_multi_skill(
     # Check every discovered input before scan budgets can omit a child.
     try:
         for skill in skills:
-            _validate_report_destination(skill.primary_path or skill.path, output)
+            _validate_report_destination(skill.path, output)
     except (OSError, ValueError) as exc:
         err_console.print(_error_line(exc))
         raise typer.Exit(code=2) from exc
