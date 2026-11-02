@@ -186,14 +186,6 @@ _BENIGN_PYTHON = [
         id="f-string-inline-code-list",
     ),
     pytest.param(
-        _OPTION_TEXT + "def message(tool):\n    return (\n"
-        '        f"{tool} was not found at "\n'
-        '        f"$TOOL_ROOT, $UPSTREAM_ROOT/{tool}, "\n'
-        '        f"or $HOME/.cache/upstreams/{tool} "\n'
-        '        "or elsewhere"\n    )\n',
-        id="concatenated-f-strings-naming-parameters",
-    ),
-    pytest.param(
         _OPTION_TEXT + 'def run():\n    """Run `$TOOL` once, then report."""\n',
         id="docstring-runtime-parameter",
     ),
@@ -207,6 +199,21 @@ def test_python_literals_and_comments_own_their_bytes(source: str) -> None:
     assert _python(content) is False
     # The same bytes read as shell text remain conservative.
     assert _shell(content) is True
+
+
+def test_concatenated_f_string_parameters_keep_quote_bounds_and_runtime_neighbors() -> None:
+    source = (
+        _OPTION_TEXT + "def message(tool):\n    return (\n"
+        '        f"{tool} was not found at "\n'
+        '        f"$TOOL_ROOT, $UPSTREAM_ROOT/{tool}, "\n'
+        '        f"or $HOME/.cache/upstreams/{tool} "\n'
+        '        "or elsewhere"\n    )\n'
+    )
+    assert _python(source + _TAIL) is False
+    # Closed single-line quotes also bound these parameter names in shell
+    # text. An executable runtime command outside them still remains partial.
+    assert _shell(source + _TAIL) is False
+    assert _shell(source + '"$CMD" -rf /\n' + _TAIL) is True
 
 
 @pytest.mark.parametrize("newline", ["\r\n"], ids=["crlf"])

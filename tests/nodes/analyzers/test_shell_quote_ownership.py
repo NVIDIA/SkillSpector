@@ -72,13 +72,31 @@ def test_fragment_cannot_prove_initial_quote_state() -> None:
 @pytest.mark.parametrize(
     "source",
     [
-        'echo "prefix $(date) suffix"\ncat <<E\n"unowned\nE\n',
+        'echo "prefix $(date) suffix"\ncat <<E\n"unowned\n',
         'echo "prefix $(date) suffix"\necho `date`\n',
         'echo "prefix $(date) suffix"\necho "unfinished\n',
     ],
 )
 def test_unsupported_or_unresolved_source_discards_all_ownership(source: str) -> None:
     assert tm._shell_quoted_candidate_limits(source, lambda: None) == {}
+
+
+@pytest.mark.parametrize(
+    "body, partial", [('"unowned\n', False), ('"$($CMD -rf /)"\n', True)]
+)
+def test_complete_heredoc_preserves_outer_quotes_and_executable_substitutions(
+    body: str, partial: bool
+) -> None:
+    source = 'echo "prefix $(date) suffix"\ncat <<E\n' + body + "E\n"
+    limits = tm._shell_quoted_candidate_limits(source, lambda: None)
+    assert limits[source.index("$(")] == source.index('"\n')
+    assert all(end < source.index("cat <<E") for end in limits.values())
+    assert (
+        tm.has_bounded_parse_exhaustion(
+            source + "# " + "." * 6000 + "\n", lambda: None, file_type="shell"
+        )
+        is partial
+    )
 
 
 def test_ownership_walk_obeys_runtime_budget() -> None:
@@ -132,7 +150,7 @@ def test_compound_adversarial_inputs_retain_security_signal(
     for prefix, command, suffix in product(prefixes, commands, suffixes):
         source = prefix + command + suffix
         with monkeypatch.context() as baseline:
-            baseline.setattr(tm, "_shell_quoted_candidate_limits", lambda *_: {})
+            baseline.setattr(tm, "_shell_quoted_candidate_limits", lambda *_, **__: {})
             was_partial = tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
         is_partial = tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
         if was_partial and not is_partial:
