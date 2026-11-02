@@ -44,7 +44,13 @@ from skillspector.artifacts import (
 from skillspector.javascript_tokens import JavaScriptTemplateSpans, assertion_template_shell_text
 from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
 from skillspector.logging_config import get_logger
-from skillspector.models import AnalyzerFinding, Finding, Location, Severity, observe_analyzer_findings
+from skillspector.models import (
+    AnalyzerFinding,
+    Finding,
+    Location,
+    Severity,
+    observe_analyzer_findings,
+)
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_tokens import PythonLiteralSpans
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans

@@ -208,7 +208,11 @@ def test_reconstructed_prefix_survives_expired_parent_emission(monkeypatch, chil
         assert any(finding.rule_id == "TM1" for finding in findings)
         now[0] = 11
         if child_reports_limit:
-            return findings, LedgerReason.RUNTIME_LIMIT, {"observed_seconds": 11, "limit_seconds": 10}
+            return (
+                findings,
+                LedgerReason.RUNTIME_LIMIT,
+                {"observed_seconds": 11, "limit_seconds": 10},
+            )
         return findings, reason, metrics
 
     monkeypatch.setattr(static_runner, "_scan_all_views_detailed", expire_after_discovery)
