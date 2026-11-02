@@ -82,6 +82,10 @@ def test_module_and_script_extensions_use_the_same_ownership(extension: str) -> 
         '& (("r`m")) -rf /',
         '& $("r`m") -rf /',
         '& ($("r`m")) -rf /',
+        '& $(("r`m")) -rf /',
+        '& (Write-Output "r`m") -rf /',
+        '. (Write-Output "r`m") -rf /',
+        '& <# command expression #> (Write-Output "r`m") -rf /',
         '. (("r`m")) -rf /',
         '& ("r" + "m") -rf /',
         '& (("r") + "m") -rf /',
@@ -211,6 +215,7 @@ def test_markdown_powershell_fences_preserve_host_quotes(language: str, marker: 
         '$message = "$(bash -c \'$CMD -rf /\')"',
         'rm `\n -rf /',
         '& "r`m" -rf /',
+        '& (Write-Output "r`m") -rf /',
     ],
 )
 def test_markdown_powershell_fences_keep_executable_payloads_partial(command: str) -> None:

@@ -47,6 +47,7 @@ class PowerShellSource:
     strings: tuple[PowerShellString, ...]
     clause_starts: tuple[int, ...]
     continuations: tuple[tuple[int, int], ...] = ()
+    invocations: tuple[tuple[int, int], ...] = ()
 
     def owns(self, position: int) -> bool:
         index = bisect_right(self.starts, position) - 1
@@ -74,13 +75,15 @@ def powershell_source(
     strings: list[PowerShellString] = []
     clause_starts: set[int] = {0}
     continuations: list[tuple[int, int]] = []
+    invocations: list[tuple[int, int]] = []
     checked = -1024
 
     def check(cursor: int, depth: int) -> None:
         nonlocal checked
         if (
             depth > _MAX_DEPTH
-            or len(spans) + len(strings) + len(clause_starts) + len(continuations) > _MAX_SPANS
+            or len(spans) + len(strings) + len(clause_starts) + len(continuations)
+            + len(invocations) > _MAX_SPANS
         ):
             raise _UnprovenPowerShell
         if cursor - checked >= 1024:
@@ -241,6 +244,34 @@ def powershell_source(
         while cursor < len(content):
             check(cursor, depth)
             character = content[cursor]
+            if character == "&" or (
+                character == "." and (
+                    cursor == 0 or content[cursor - 1].isspace()
+                    or content[cursor - 1] in ";({"
+                )
+            ):
+                operand = cursor + 1
+                gap_comments: list[tuple[int, int]] = []
+                while operand < len(content):
+                    check(operand, depth)
+                    if content[operand].isspace():
+                        operand += 1
+                    elif content.startswith("<#", operand):
+                        end = content.find("#>", operand + 2)
+                        if end < 0:
+                            raise _UnprovenPowerShell
+                        gap_comments.append((operand, end + 2))
+                        operand = end + 2
+                    else:
+                        break
+                opening = operand + int(content.startswith("$(", operand))
+                if content[opening:opening + 1] == "(":
+                    spans.extend(gap_comments)
+                    clause_starts.add(opening + 1)
+                    end = code(opening + 1, depth + 1, closes_parenthesis=True)
+                    invocations.append((operand, end))
+                    cursor = end
+                    continue
             if content.startswith("<#", cursor):
                 start = cursor
                 cursor += 2
@@ -327,4 +358,5 @@ def powershell_source(
         tuple(strings),
         tuple(sorted(clause_starts)),
         tuple(continuations),
+        tuple(invocations),
     )

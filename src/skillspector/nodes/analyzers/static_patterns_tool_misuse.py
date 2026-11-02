@@ -5853,6 +5853,7 @@ def _fenced_powershell_source(
     strings: list[PowerShellString] = []
     clause_starts: set[int] = set()
     continuations: list[tuple[int, int]] = []
+    invocations: list[tuple[int, int]] = []
     for start, end in blocks:
         check_runtime()
         source = powershell_source(content[start:end], check_runtime)
@@ -5870,7 +5871,8 @@ def _fenced_powershell_source(
         )
         clause_starts.update(start + position for position in source.clause_starts)
         continuations.extend((start + begin, start + end) for begin, end in source.continuations)
-    if not starts and not strings and not continuations:
+        invocations.extend((start + begin, start + end) for begin, end in source.invocations)
+    if not starts and not strings and not continuations and not invocations:
         return None
     source = PowerShellSource(tuple(starts), tuple(ends), tuple(strings), ())
     # Preserve the ordinary shell traversal outside the proven host spans.
@@ -5895,6 +5897,7 @@ def _fenced_powershell_source(
     return PowerShellSource(
         source.starts, source.ends, source.strings, tuple(sorted(clause_starts)),
         tuple(continuations),
+        tuple(invocations),
     )
 
 
@@ -6031,6 +6034,10 @@ def _has_bounded_parse_exhaustion(
         if exhausted or _has_unsupported_brace_expansion(tokens):
             return True
     if powershell is not None:
+        for start, end in powershell.invocations:
+            check_runtime()
+            if _has_runtime_command_operand_exhaustion(content, start, end, check_runtime):
+                return True
         for string in powershell.strings:
             check_runtime()
             # A PowerShell escape can assemble shell syntax absent from the
