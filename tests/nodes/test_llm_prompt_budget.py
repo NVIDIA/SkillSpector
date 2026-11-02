@@ -177,3 +177,22 @@ def test_unfit_fixed_wrapper_retains_one_batch_without_per_line_refinement(
     assert rendered.call_count <= 3
     with pytest.raises(lab.LLMInputBudgetError):
         analyzer._check_prompt_budget(analyzer.build_prompt(batches[0]))
+
+
+@pytest.mark.parametrize("failure", [OSError, ValueError, RuntimeError])
+def test_codec_initialization_failure_uses_conservative_bytes(
+    monkeypatch: pytest.MonkeyPatch, failure: type[Exception]
+) -> None:
+    import tiktoken
+    from langchain_openai import ChatOpenAI
+
+    model = MagicMock(spec=ChatOpenAI)
+    model.custom_get_token_ids = None
+    model.tiktoken_model_name = "gpt-4o"
+    model.model_name = "recognized-model"
+    loader = MagicMock(side_effect=failure("offline or invalid tokenizer vocabulary"))
+    monkeypatch.setattr(tiktoken, "encoding_for_model", loader)
+    counter, source = lab._input_token_counter(model)
+    assert source == "conservative_utf8_bytes"
+    assert counter("漢🙂") == len("漢🙂".encode())
+    loader.assert_called_once_with("gpt-4o")

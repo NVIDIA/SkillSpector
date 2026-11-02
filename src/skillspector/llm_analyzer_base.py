@@ -198,7 +198,9 @@ def _input_token_counter(chat_model: object) -> tuple[Callable[[str], int], str]
         return byte_bound, "conservative_utf8_bytes"
     try:
         encoding = tiktoken.encoding_for_model(label)
-    except KeyError:
+    except Exception:
+        # Recognized codecs can still fail to initialize when the cache is
+        # empty and its loader cannot reach or validate the vocabulary.
         return byte_bound, "conservative_utf8_bytes"
 
     def recognized(text: str) -> int:
