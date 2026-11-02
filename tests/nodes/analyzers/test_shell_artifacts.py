@@ -410,6 +410,24 @@ def test_producer_child_exit_trap_cannot_mutate_parent_cleanup(installation: str
         assert store.read("/tmp/result/output.sh") is None
 
 
+@pytest.mark.parametrize("change, complete", [
+    ('', True),
+    ('temporary="$sibling"', True),
+    ('temporary=/tmp/result', False),
+    ('temporary=/tmp/result\ntrap \'rm -rf "$sibling"\' EXIT', True),
+])
+def test_producer_exit_trap_uses_final_variable_and_last_installation(change: str, complete: bool) -> None:
+    program = 'set -euo pipefail\ntemporary="$(mktemp -d /tmp/producer.XXXXXX)"\nsibling="$(mktemp -d /tmp/sibling.XXXXXX)"\ntrap \'rm -rf "$temporary"\' EXIT\n' + change + '\nprintf %s known > "$1"\n'
+    store = ShellArtifactStore(lambda: None)
+    assert store.create_empty_directory("/tmp/result")
+    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
+    assert (producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is not None) is complete
+    if complete:
+        assert store.read("/tmp/result/output.sh").value.text == "known"
+    else:
+        assert store.read("/tmp/result/output.sh") is None
+
+
 @pytest.mark.parametrize("body, declaration, operand", [
     ('mode=bad; printf %s x', 'local mode=good; ', '"$mode"'),
     ('items=(bad); printf %s x', 'local -a items=(); ', '"${items[0]}"'),

@@ -293,7 +293,7 @@ class ShellProducer:
         self.effects = ShellArtifactEffects(store, check_runtime)
         self.functions: dict[str, tuple[_ProducerNode, ...]] = {}
         self.writes: set[str] = set()
-        self.cleanup: set[str] = set()
+        self.cleanup: str | None = None
         self.steps = 0
         self.depth = 0
         self.capture_depth = 0
@@ -621,7 +621,7 @@ class ShellProducer:
             if not isinstance(value, str) or self.store.inventory(value) is None:
                 raise _UnresolvedError
             self.writes.add(value)
-            self.cleanup.add(value)
+            self.cleanup = cleanup[1]
         elif name == "command" and len(arguments) == 2 and arguments[0] == "-v" and arguments[1] in {"p4", "pigz", "lbzip2"}:
             if arguments[1] == "p4" and self.helper_output is None:
                 raise _UnresolvedError
@@ -787,8 +787,15 @@ class ShellProducer:
             successful = [state for state in states if not state.stopped]
             if not successful:
                 raise _UnresolvedError
-            for path in self.cleanup:
-                self.store.invalidate(path)
+            if self.cleanup is not None:
+                for state in successful:
+                    # The quoted trap expands its variable when the shell
+                    # exits, after any later assignment or replacement trap.
+                    path = state.values.get(self.cleanup)
+                    if not isinstance(path, str) or self.store.inventory(path) is None:
+                        raise _UnresolvedError
+                    self.writes.add(path)
+                    self.store.invalidate(path)
             result = []
             for path in outputs:
                 value = self.store.read(path)
