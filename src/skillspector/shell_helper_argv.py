@@ -61,13 +61,15 @@ class _Node:
     blocks: tuple[tuple[_Node, ...], ...] = ()
     labels: tuple[tuple[str, ...], ...] = ()
     connector: str = ";"
+    redirects: tuple[tuple[str, _Token], ...] = ()
 
 
 class _Parser:
-    def __init__(self, text: str, read_word: ReadWord, tick: Callable[[], None]) -> None:
+    def __init__(self, text: str, read_word: ReadWord, tick: Callable[[], None], *, output_redirects: bool = False) -> None:
         self.tokens: list[_Token] = []
         self.cursor = 0
         self.tick = tick
+        self.output_redirects = output_redirects
         cursor = 0
         while cursor < len(text):
             tick()
@@ -193,19 +195,24 @@ class _Parser:
             self.take("}")
             return _Node("function", (name,), (body,))
         words: list[_Token] = []
+        redirects: list[tuple[str, _Token]] = []
         if self.peek() == "[[":
             while self.peek() and self.peek() != "]]":
                 words.append(self.take())
             words.append(self.take("]]"))
         else:
             while self.peek() and self.peek() not in {";", "\n", "&&", "||", ";;", "}", "|", "&", "(", ")"}:
-                if self.peek() in {">", ">&"}:
+                if self.peek() in {">", ">&"} or self.output_redirects and self.peek() == ">>":
                     redirect = self.take()
+                    descriptor = "1"
                     if words and words[-1].end == redirect.start and words[-1].raw.isdecimal():
-                        if words.pop().raw not in {"1", "2"}:
+                        descriptor = words.pop().raw
+                        if descriptor not in {"1", "2"}:
                             raise _Unresolved
-                    destination = self.take().raw
-                    if (redirect.raw, destination) not in {(">", "/dev/null"), (">&", "1"), (">&", "2")}:
+                    destination = self.take()
+                    if self.output_redirects:
+                        redirects.append((descriptor + redirect.raw, destination))
+                    elif (redirect.raw, destination.raw) not in {(">", "/dev/null"), (">&", "1"), (">&", "2")}:
                         raise _Unresolved
                     continue
                 if self.peek() in {"<", "<<", ">>", "{"}:
@@ -213,7 +220,7 @@ class _Parser:
                 words.append(self.take())
         if not words:
             raise _Unresolved
-        return _Node("command", tuple(words))
+        return _Node("command", tuple(words), redirects=tuple(redirects))
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +232,13 @@ class _SerializedArgv:
 class _CommandText:
     """Equivalent command syntax whose exact Bash-emitted bytes are unknown."""
     normalized: str
+
+
+@dataclass(frozen=True, slots=True)
+class ShellHelperOutput:
+    """Literal stdout or an exact file read; no archive bytes are fabricated."""
+    text: str | None = None
+    path: str | None = None
 
 
 _Value = str | _SerializedArgv | _CommandText | None
@@ -242,12 +256,13 @@ def _value_size(value: _Value) -> int:
 class _State:
     values: dict[str, _Value]
     scopes: list[dict[str, _Value]]
-    argv: tuple[str | _CommandText, ...]
+    argv: tuple[str | _CommandText | None, ...]
     status: bool | None = True
     flow: str = ""
+    output: tuple[ShellHelperOutput, ...] = ()
 
     def copy(self) -> _State:
-        return _State(self.values.copy(), [scope.copy() for scope in self.scopes], self.argv, self.status, self.flow)
+        return _State(self.values.copy(), [scope.copy() for scope in self.scopes], self.argv, self.status, self.flow, self.output)
 
     def lookup(self, name: str) -> _Value:
         for scope in reversed(self.scopes):
@@ -315,6 +330,27 @@ def _word(raw: str, state: _State, tick: Callable[[], None]) -> str | _CommandTe
         if character == "$":
             if quote != '"':
                 raise _Unresolved  # Unquoted expansion can split or glob.
+            if raw.startswith("$*", cursor):
+                if any(not isinstance(argument, str) for argument in state.argv):
+                    unknown = True
+                else:
+                    parts.append(" ".join(state.argv))
+                cursor += 2
+                continue
+            expanded = re.match(r"\$\{([1-9][0-9]{0,2}|[A-Za-z_][A-Za-z0-9_]*)(:-([-A-Za-z0-9_.]+)|##\*/)\}", raw[cursor:])
+            if expanded is not None:
+                name = expanded[1]
+                value = state.argv[int(name) - 1] if name.isdecimal() and int(name) <= len(state.argv) else None if name.isdecimal() else state.lookup(name)
+                if value is None:
+                    unknown = True
+                elif not isinstance(value, str):
+                    raise _Unresolved
+                elif expanded[2] == "##*/":
+                    parts.append(value.rpartition("/")[2])
+                else:
+                    parts.append(value or expanded[3])
+                cursor += expanded.end()
+                continue
             parameter = re.match(r"\$(?:([1-9]|[A-Za-z_][A-Za-z0-9_]*)|\{([1-9][0-9]{0,2}|[A-Za-z_][A-Za-z0-9_]*)(% )?\})", raw[cursor:])
             if parameter is None:
                 raise _Unresolved
@@ -460,7 +496,14 @@ class _Interpreter:
         for term in terms:
             if len(term) != 3 or term[1].raw not in {"==", "=", "!=", "-eq", "-ne"}:
                 raise _Unresolved
-            left, right = _word(term[0].raw, state, self.tick), _word(term[2].raw, state, self.tick)
+            left = _word(term[0].raw, state, self.tick)
+            pattern = re.fullmatch(r"\*([-A-Za-z0-9_.]+)\*", term[2].raw)
+            if pattern is not None and term[1].raw in {"==", "=", "!="}:
+                if isinstance(left, _CommandText):
+                    raise _Unresolved
+                results.append(None if left is None else (pattern[1] in left) != (term[1].raw == "!="))
+                continue
+            right = _word(term[2].raw, state, self.tick)
             if isinstance(left, _CommandText) or isinstance(right, _CommandText):
                 raise _Unresolved
             if left is None or right is None:
@@ -639,5 +682,129 @@ def reconstruct_helper_commands(
         if sum(map(len, output.values())) > _MAX_STATES:
             raise _Unresolved
         return {span: tuple(variants) for span, variants in output.items()}
+    except _Unresolved:
+        return None
+
+
+class _OutputInterpreter(_Interpreter):
+    """Track stdout only for finite printf/cat helpers and proved log paths."""
+
+    def __init__(self, tick: Callable[[], None], writable_paths: frozenset[str]) -> None:
+        super().__init__("", tick, helper=True)
+        self.writable_paths = writable_paths
+
+    def node(self, node: _Node, state: _State) -> list[_State]:
+        if node.kind != "command":
+            if node.kind == "function":
+                raise _Unresolved
+            return super().node(node, state)
+        if node.words[0].raw == "[[":
+            return super().node(node, state)
+        head = _word(node.words[0].raw, state, self.tick)
+        stdout = True
+        for redirect, word in node.redirects:
+            destination = _word(word.raw, state, self.tick)
+            if redirect in {"1>", "1>>", "2>", "2>>"}:
+                if destination not in self.writable_paths and destination != "/dev/null":
+                    raise _Unresolved
+                if redirect.startswith("1"):
+                    stdout = False
+            elif redirect == "1>&" and destination == "2":
+                stdout = False
+            else:
+                raise _Unresolved
+        if head == "set":
+            if tuple(word.raw for word in node.words[1:]) not in {("-euo", "pipefail"), ("-Eeuo", "pipefail")} or node.redirects:
+                raise _Unresolved
+            state.status = True
+            return [state]
+        if head == "printf":
+            arguments = [_word(word.raw, state, self.tick) for word in node.words[1:]]
+            if not arguments or not isinstance(arguments[0], str):
+                raise _Unresolved
+            template, *values = arguments
+            # The format is always parsed, even for a discarded log, so a
+            # variable-setting %n or escape-driven format cannot hide effects.
+            if template.startswith("-") or re.search(r"%(?!%|s)", template) or re.search(r"\\(?!n|t|\\)", template):
+                raise _Unresolved
+            if stdout:
+                if any(not isinstance(value, str) for value in values):
+                    raise _Unresolved
+                tokens = re.split(r"(%s|%%|\\n|\\t|\\\\)", template)
+                count = tokens.count("%s")
+                if count == 0 and values:
+                    raise _Unresolved
+                output = []
+                for index in range(0, max(1, len(values)), max(1, count)):
+                    cursor = index
+                    for token in tokens:
+                        self.tick()
+                        if token == "%s":
+                            output.append(values[cursor] if cursor < len(values) else "")
+                            cursor += 1
+                        else:
+                            output.append({"%%": "%", r"\n": "\n", r"\t": "\t", r"\\": "\\"}.get(token, token))
+                self._append(state, ShellHelperOutput(text="".join(output)))
+            state.status = True
+            return [state]
+        if head in {"cat", "/bin/cat", "/usr/bin/cat"}:
+            arguments = self.arguments(node.words[1:], state)
+            if len(arguments) != 1 or not isinstance(arguments[0], str) or not arguments[0].startswith("/"):
+                raise _Unresolved
+            if stdout:
+                self._append(state, ShellHelperOutput(path=arguments[0]))
+            state.status = True
+            return [state]
+        if node.redirects or head not in {"exit", "true", ":"}:
+            raise _Unresolved
+        return super().node(node, state)
+
+    def _append(self, state: _State, value: ShellHelperOutput) -> None:
+        if len(state.output) >= _MAX_ARGS or sum(len(item.text or item.path or "") for item in (*state.output, value)) > _MAX_CHARS:
+            raise _Unresolved
+        state.output += (value,)
+
+
+def reconstruct_helper_output(
+    helper_text: str,
+    argv: tuple[str | None, ...],
+    environment: dict[str, str | None],
+    writable_paths: frozenset[str],
+    read_word: ReadWord,
+    check_runtime: Callable[[], None],
+) -> tuple[tuple[ShellHelperOutput, ...], ...] | None:
+    """Enumerate possible successful stdout values without opening a file.
+
+    The caller must prove helper identity, ordinary shell startup, and writable
+    log ownership. A file-read piece retains its identity until the caller maps
+    it to a known artifact. Unknown arguments explore both conditional paths;
+    unsupported effects refuse the entire proof.
+    """
+    if (
+        len(helper_text) > _MAX_CHARS or "\x00" in helper_text
+        or len(argv) > _MAX_ARGS or len(environment) > _MAX_ARGS
+        or any(not _NAME.fullmatch(name) or is_managed_shell_variable(name) for name in environment)
+        or sum(len(value or "") for value in (*argv, *environment.values(), *writable_paths)) > _MAX_CHARS
+        or any("\x00" in (value or "") for value in (*argv, *environment.values(), *writable_paths))
+    ):
+        return None
+    steps = 0
+
+    def tick() -> None:
+        nonlocal steps
+        check_runtime()
+        steps += 1
+        if steps > _MAX_STEPS:
+            raise _Unresolved
+
+    try:
+        parser = _Parser(helper_text, read_word, tick, output_redirects=True)
+        program = parser.sequence()
+        if parser.peek():
+            raise _Unresolved
+        states = _OutputInterpreter(tick, writable_paths).sequence(program, [_State(environment.copy(), [], argv)])
+        if any(state.status is None for state in states):
+            raise _Unresolved
+        return tuple(dict.fromkeys(state.output for state in states if state.status is True))
     except _Unresolved:
         return None

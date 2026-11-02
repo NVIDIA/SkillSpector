@@ -7,7 +7,7 @@ import pytest
 
 from skillspector.artifacts import SecurityTextView
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
-from skillspector.shell_helper_argv import reconstruct_helper_commands
+from skillspector.shell_helper_argv import ShellHelperOutput, reconstruct_helper_commands, reconstruct_helper_output
 from skillspector.shell_sources import ShellSourceContext
 
 
@@ -165,3 +165,65 @@ fi
 @pytest.mark.parametrize("name", ["EPOCHSECONDS", "EPOCHREALTIME", "HISTCMD", "EXECIGNORE", "LD_PRELOAD"])
 def test_native_dynamic_or_execution_variables_cannot_be_fictitious_constants(name: str) -> None:
     assert _forward(f"{name}=0\nbroker -n su -s /bin/bash -c 'printf ready'\n") is None
+
+
+_OUTPUT_HELPER = '''#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$CALLS"
+case "$1" in
+  files)
+    case "${MATCH_MODE:-one}" in
+      zero) exit 0 ;;
+      two) printf '//depot/a/%s#1\\n//depot/b/%s#2\\n' "${2##*/}" "${2##*/}" ;;
+      *) printf '//depot/a/%s#2\\n' "${2##*/}" ;;
+    esac ;;
+  print)
+    if [[ "$*" == *tools.tbz2* ]]; then
+      cat "$ARCHIVE"
+    else
+      printf '#!/usr/bin/env bash\\n'
+    fi ;;
+esac
+'''
+
+
+def _helper_output(argv, *, program=_OUTPUT_HELPER, environment=None):
+    return reconstruct_helper_output(
+        program, argv,
+        environment or {"CALLS": "/tmp/owned/log", "ARCHIVE": "/tmp/owned/input.tbz2"},
+        frozenset({"/tmp/owned/log"}), tm._next_shell_invocation_word, lambda: None,
+    )
+
+
+def test_helper_stdout_preserves_archive_identity_instead_of_inventing_bytes() -> None:
+    assert _helper_output(("print", "-q", "//depot/tools.tbz2#2")) == (
+        (ShellHelperOutput(path="/tmp/owned/input.tbz2"),),
+    )
+
+
+def test_unknown_helper_argument_preserves_both_possible_outputs() -> None:
+    assert set(_helper_output(("print", "-q", None))) == {
+        (ShellHelperOutput(path="/tmp/owned/input.tbz2"),),
+        (ShellHelperOutput(text="#!/usr/bin/env bash\n"),),
+    }
+
+
+def test_helper_default_parameter_does_not_invent_an_inherited_environment_value() -> None:
+    assert set(_helper_output(("files", "//depot/tool.sh"))) == {
+        (),
+        (ShellHelperOutput(text="//depot/a/tool.sh#1\n//depot/b/tool.sh#2\n"),),
+        (ShellHelperOutput(text="//depot/a/tool.sh#2\n"),),
+    }
+
+
+@pytest.mark.parametrize("program", [
+    "printf '%n' DEST",
+    "printf '%s' literal > /tmp/unowned",
+    "/tmp/cat /tmp/owned/input.tbz2",
+    "printf '%s' \"$(touch /tmp/side-effect)\"",
+    "false; printf misleading",
+    "exec cat /tmp/owned/input.tbz2",
+    "IFS=,; printf '%s' \"$*\"",
+])
+def test_stdout_proof_refuses_unmodeled_effects(program: str) -> None:
+    assert _helper_output(("print",), program=program) is None
