@@ -398,19 +398,22 @@ def _find_nested_sources(
     type_map: dict[str, str] | None = None,
     aliases: dict[str, str] | None = None,
     check_runtime: Callable[[], None] | None = None,
-) -> list[tuple[str, ast.Call]]:
-    """Walk children to find source calls nested inside a sink call."""
-    results: list[tuple[str, ast.Call]] = []
+) -> list[tuple[str, ast.AST]]:
+    """Walk children to find source expressions nested inside a sink call."""
+    results: list[tuple[str, ast.AST]] = []
     for child in ast.walk(node):
         if check_runtime is not None:
             check_runtime()
         if child is node:
             continue
-        if not isinstance(child, ast.Call):
-            continue
-        name = resolve_call_name_typed(child, type_map, aliases)
-        if name and name in _ALL_SOURCES:
-            results.append((name, child))
+        if isinstance(child, ast.Call):
+            name = _call_source(child, type_map, aliases)
+            if name is not None:
+                results.append((name, child))
+        elif isinstance(child, ast.Subscript):
+            name = _credential_subscript(child, aliases or {})
+            if name is not None:
+                results.append((name, child))
     return results
 
 
@@ -1568,7 +1571,7 @@ class _TaintGraph:
         with the lanes it is for: in lanes 0 and 1 the most severe source
         call (the first in walk order among equals), in lane 2 the first
         source call in walk order (the one earlier releases took); or an
-        ``os.environ[...]`` subscript as the whole expression.
+        credential subscript, including one nested in a container or call.
         """
         index = self.index
         name_key = index.name_key
@@ -1609,6 +1612,14 @@ class _TaintGraph:
                 if opaque_lambdas and isinstance(child.func, ast.Lambda):
                     # An immediately called lambda yields its body's value.
                     queue.append(child.func.body)
+            elif isinstance(child, ast.Subscript):
+                source = _credential_subscript(child, self.aliases)
+                if source is not None:
+                    ranks = _LANE_RANKS[_SOURCE_INDEX[source]]
+                    for lane in _LANES:
+                        if ranks[lane] > best_rank[lane]:
+                            best[lane], best_rank[lane] = source, ranks[lane]
+                    continue
             elif isinstance(child, ast.Attribute):
                 view = index.attribute_view(child)
                 if view is not None:
@@ -2216,7 +2227,11 @@ def _analyze_python(
             aliases,
             check_runtime,
         ):
-            if src_name == "open" and _is_open_for_write(src_node):
+            if (
+                src_name == "open"
+                and isinstance(src_node, ast.Call)
+                and _is_open_for_write(src_node)
+            ):
                 continue
             rule = _pick_rule(src_name, sink_name, is_direct=True)
             src_cat = _classify(src_name, _SOURCE_CATEGORIES, "data source")

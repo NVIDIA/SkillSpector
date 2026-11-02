@@ -20,7 +20,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -29,7 +32,7 @@ import pytest
 import yaml
 from pydantic import BaseModel
 
-from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import LLMAnalyzerBase
 from skillspector.llm_utils import AgentCLIChatModel
 from skillspector.nodes.analyzers import mcp_tool_poisoning
@@ -1674,7 +1677,7 @@ class TestTP4Fallbacks:
 
         monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "json_schema")
         mcp_tool_poisoning._TP4Analyzer(model="azure/anthropic/claude-opus-5")
-        assert bindings[-1] == {"method": "json_schema"}
+        assert bindings[-1] == {"method": "json_schema", "include_raw": True, "strict": True}
 
     @pytest.mark.parametrize(
         "provider", ["openai_compatible", "nv_inference", "azure_openai", "nv_build"]
@@ -1690,7 +1693,7 @@ class TestTP4Fallbacks:
         )
         monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
         analyzer._model_for_call()
-        assert bindings == [{}, {}]
+        assert bindings == [{"include_raw": True, "strict": True}] * 2
 
     @pytest.mark.parametrize(
         "model",
@@ -1705,7 +1708,7 @@ class TestTP4Fallbacks:
     def test_opus5_tp4_exact_label_excludes_aliases(self, patch_openai_chat_model, model):
         bindings = patch_openai_chat_model()
         mcp_tool_poisoning._TP4Analyzer(model=model)
-        assert bindings == [{}]
+        assert bindings == [{"include_raw": True, "strict": True}]
 
     @pytest.mark.parametrize("effort", ["low", "medium", "high", "none"])
     def test_reasoning_env_skips_preference_on_initial_and_refreshed_models(
@@ -1720,7 +1723,7 @@ class TestTP4Fallbacks:
         )
         monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
         analyzer._model_for_call()
-        assert bindings == [{}, {}]
+        assert bindings == [{"include_raw": True, "strict": True}] * 2
 
     @pytest.mark.parametrize(
         "controls",
@@ -1743,7 +1746,7 @@ class TestTP4Fallbacks:
         )
         monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
         analyzer._model_for_call()
-        assert bindings == [{}, {}]
+        assert bindings == [{"include_raw": True, "strict": True}] * 2
 
     @pytest.mark.parametrize(
         "override,hint,expected",
@@ -1765,7 +1768,8 @@ class TestTP4Fallbacks:
         assert bindings == [
             {
                 "method": expected,
-                **({"include_raw": True} if expected == "function_calling" else {}),
+                "include_raw": True,
+                **({"strict": True} if expected == "json_schema" else {}),
             }
         ]
 
@@ -1836,14 +1840,98 @@ class TestTP4Fallbacks:
         )
 
     def test_tool_refusal_stays_incomplete(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A structured call that keeps returning None ends degraded, not fatal (#843)."""
         state = _make_state("mcp_mismatched_skill", use_llm=True)
-        structured_llm = _mock_tp4_structured_llm(monkeypatch, [None])
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", AsyncMock())
+        structured_llm = _mock_tp4_structured_llm(monkeypatch, [None, None, None, None])
 
         result = node(state)
 
-        assert structured_llm.calls == 1
-        assert result["analyzer_status_events"][0]["status"] == "failed"
+        assert structured_llm.calls == 4
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        assert [
+            (event["outcome"], event["reason_code"], event["error_class"]) for event in semantic
+        ] == [
+            (
+                LedgerOutcome.SKIPPED,
+                LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+                "ValidationError",
+            )
+        ]
+        assert result["llm_call_log"][0]["ok"] is False
+        completeness, _ = finalize_ledger(
+            {
+                "components": state["components"],
+                "findings": result["findings"],
+                "inspection_ledger": result["inspection_ledger"],
+                "analyzer_status_events": result["analyzer_status_events"],
+            }
+        )
+        assert completeness["execution_successful"] is True
+        assert completeness["is_complete"] is False
+
+    def test_missing_structured_response_is_retried(self, monkeypatch: pytest.MonkeyPatch):
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        sleep = AsyncMock()
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", sleep)
+        structured_llm = _mock_tp4_structured_llm(monkeypatch, [None, {"is_mismatch": False}])
+
+        result = node(state)
+
+        assert structured_llm.calls == 2
+        sleep.assert_called_once_with(0.5)
+        assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
+        assert result["analyzer_status_events"][0]["status"] == "completed"
+
+    def test_bedrock_forced_tool_call_answered_in_prose_is_retried(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bedrock's tool parser returns None for a reply with no tool call (#843)."""
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        from langchain_aws import ChatBedrockConverse
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        from skillspector import llm_utils
+        from skillspector.providers.bedrock import (
+            BEDROCK_DEFAULT_MODEL,
+            BEDROCK_DEFAULT_REGION,
+            BedrockProvider,
+        )
+
+        assert BedrockProvider().forced_tool_choice_supported(BEDROCK_DEFAULT_MODEL)
+        calls = []
+
+        async def answer_in_prose(*_args, **_kwargs):
+            calls.append(1)
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="refused"))])
+
+        monkeypatch.setattr(ChatBedrockConverse, "_agenerate", answer_in_prose)
+        monkeypatch.setattr(llm_utils, "get_active_provider", BedrockProvider)
+        monkeypatch.setattr(
+            "skillspector.llm_analyzer_base.get_chat_model",
+            lambda **kwargs: ChatBedrockConverse(
+                model=kwargs["model"],
+                client=MagicMock(),
+                bedrock_client=MagicMock(),
+                region_name=BEDROCK_DEFAULT_REGION,
+            ),
+        )
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", AsyncMock())
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        state["model_config"] = {"default": BEDROCK_DEFAULT_MODEL}
+
+        result = node(state)
+
+        assert len(calls) == 4
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
         assert any(
+            event.get("reason_code") is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+            and event.get("error_class") == "ValidationError"
+            for event in result["inspection_ledger"]
+        )
+        assert not any(
             event["outcome"] is LedgerOutcome.FAILED for event in result["inspection_ledger"]
         )
 
@@ -1869,7 +1957,7 @@ class TestTP4Fallbacks:
         assert len(calls) == 4
         assert result["analyzer_status_events"][0]["status"] == "degraded"
         assert any(
-            event.get("reason_code") is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+            event.get("reason_code") is LedgerReason.LLM_RESPONSE_INVALID_TOOL
             and event.get("error_class") == "ValidationError"
             for event in result["inspection_ledger"]
         )
@@ -2037,16 +2125,105 @@ class TestInspectionLedgerStatus:
 
 class TestResourceBounds:
     @pytest.mark.parametrize(
-        ("fence_count", "expected_calls", "is_partial"),
-        [(64, 64, False), (65, 65, False), (128, 128, False), (129, 128, True)],
+        ("value", "expected", "warns"),
+        [
+            (None, 256, False),
+            ("1", 1, False),
+            (" 145 ", 145, False),
+            ("00145", 145, False),
+            ("512", 512, False),
+            ("4096", 4096, False),
+            ("", 256, False),
+            (" \t", 256, False),
+            ("0", 256, True),
+            ("-1", 256, True),
+            ("+3", 256, True),
+            ("4097", 256, True),
+            ("1.5", 256, True),
+            ("256.0", 256, True),
+            ("1_024", 256, True),
+            ("１２", 256, True),
+            ("nan", 256, True),
+            ("inf", 256, True),
+            ("not-a-number", 256, True),
+        ],
+    )
+    def test_tp4_batch_environment_parsing(
+        self, value: str | None, expected: int, warns: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level("WARNING", logger=mcp_tool_poisoning.__name__):
+            assert mcp_tool_poisoning._tp4_max_batches_from_environment(value) == expected
+
+        warnings = [
+            record
+            for record in caplog.records
+            if record.name == mcp_tool_poisoning.__name__ and record.levelname == "WARNING"
+        ]
+        assert bool(warnings) is warns
+        if warns:
+            assert "SKILLSPECTOR_TP4_MAX_BATCHES" in warnings[0].getMessage()
+        if value == "not-a-number":
+            assert value not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("value", "expected"), [(None, 256), ("3", 3), ("512", 512), ("bad", 256)]
+    )
+    def test_tp4_batch_environment_is_bound_in_fresh_process(
+        self, tmp_path: Path, value: str | None, expected: int
+    ) -> None:
+        module_path = Path(mcp_tool_poisoning.__file__).resolve()
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(module_path.parents[3])
+        environment.pop("SKILLSPECTOR_TP4_MAX_BATCHES", None)
+        if value is not None:
+            environment["SKILLSPECTOR_TP4_MAX_BATCHES"] = value
+        process = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import json; from skillspector.nodes.analyzers import mcp_tool_poisoning as m; "
+                "print(json.dumps([m.TP4_MAX_BATCHES, m.__file__]))",
+            ],
+            cwd=tmp_path,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        limit, imported_path = json.loads(process.stdout)
+        assert limit == expected
+        assert Path(imported_path).resolve() == module_path
+
+    @pytest.mark.parametrize(
+        ("batch_limit", "fence_count", "expected_calls", "is_partial"),
+        [
+            (None, 64, 64, False),
+            (None, 65, 65, False),
+            (None, 128, 128, False),
+            (None, 129, 129, False),
+            (None, 145, 145, False),
+            (None, 255, 255, False),
+            (None, 256, 256, False),
+            (None, 257, 256, True),
+            (3, 3, 3, False),
+            (3, 4, 3, True),
+            (300, 257, 257, False),
+        ],
     )
     def test_tp4_batch_boundaries_preserve_late_findings_and_source_ranges(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        batch_limit: int | None,
         fence_count: int,
         expected_calls: int,
         is_partial: bool,
     ) -> None:
+        effective_limit = (
+            mcp_tool_poisoning.DEFAULT_TP4_MAX_BATCHES if batch_limit is None else batch_limit
+        )
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCHES", effective_limit)
         content = "".join(f"```python\nprint({index})\n```\n" for index in range(fence_count))
         responses = [{"is_mismatch": False} for _ in range(expected_calls - 1)]
         responses.append(
@@ -2085,8 +2262,10 @@ class TestResourceBounds:
             assert len(partial) == 1
             assert partial[0]["path"] == "guide.md"
             assert partial[0]["reason_code"] is LedgerReason.OUTPUT_LIMIT
-            assert partial[0]["observed_records"] == 129
-            assert partial[0]["limit_records"] == 128
+            assert partial[0]["observed_records"] == expected_calls + 1
+            assert partial[0]["limit_records"] == effective_limit
+            assert partial[0]["start_line"] is None
+            assert partial[0]["end_line"] is None
             assert result["analyzer_status_events"][0]["status"] == "degraded"
         else:
             assert partial == []
