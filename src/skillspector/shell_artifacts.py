@@ -68,6 +68,7 @@ class ShellArtifactStore:
         self._check_runtime = check_runtime
         self._files: dict[str, ShellArtifact] = {}
         self._owned: set[str] = set()
+        self._owned_files: set[str] = set()
         self._unknown: set[str] = set()
         self._decimal_domains: set[tuple[str, str]] = set()
         self._bytes = 0
@@ -82,6 +83,7 @@ class ShellArtifactStore:
         child = ShellArtifactStore(self._check_runtime)
         child._files = self._files.copy()
         child._owned = self._owned.copy()
+        child._owned_files = self._owned_files.copy()
         child._unknown = self._unknown.copy()
         child._decimal_domains = self._decimal_domains.copy()
         child._bytes = self._bytes
@@ -97,6 +99,7 @@ class ShellArtifactStore:
             return False
         self._files = child._files.copy()
         self._owned = child._owned.copy()
+        self._owned_files = child._owned_files.copy()
         self._unknown = child._unknown.copy()
         self._decimal_domains = child._decimal_domains.copy()
         self._bytes = child._bytes
@@ -184,6 +187,7 @@ class ShellArtifactStore:
         for path in tuple(self._files):
             if self._decimal_unknown(path):
                 size = self._size(self._files.pop(path))
+                self._owned_files.discard(path)
                 self._bytes -= size or 0
         return True
 
@@ -206,6 +210,24 @@ class ShellArtifactStore:
         self._revision += 1
         return True
 
+    def create_empty_file(self, path: str, value: ShellSourceValue) -> bool:
+        """Record a proven fresh regular file without owning its parent tree."""
+        self._check_runtime()
+        key = _path(path)
+        if (
+            key is None or value.kind != "code" or value.text
+            or any(self._within(item, key) or self._within(key, item) for item in self._files)
+            or any(self._within(item, key) for item in self._owned)
+            or any(self._within(item, key) or self._within(key, item) for item in self._unknown)
+            or self._decimal_unknown(key, namespace=True)
+        ):
+            return False
+        if not self.write(key, ShellArtifact(value, executable=False)):
+            return False
+        self._owned_files.add(key)
+        self._revision += 1
+        return True
+
     def invalidate(self, path: str | None) -> None:
         """Forget known bytes after an unknown write, alias or directory escape."""
         self._check_runtime()
@@ -214,6 +236,7 @@ class ShellArtifactStore:
         if key is None:
             self._files.clear()
             self._owned.clear()
+            self._owned_files.clear()
             self._decimal_domains.clear()
             self._bytes = 0
             self.complete = False
@@ -225,6 +248,7 @@ class ShellArtifactStore:
         for candidate in tuple(self._files):
             if self._within(candidate, key):
                 artifact = self._files.pop(candidate)
+                self._owned_files.discard(candidate)
                 size = self._size(artifact)
                 self._bytes -= size or 0
 
@@ -328,7 +352,7 @@ class ShellArtifactStore:
         return tuple((path[len(key) + 1:], artifact) for path, artifact in sorted(self._files.items()) if path.startswith(key + "/"))
 
     def owns(self, path: str) -> bool:
-        """Prove a path stays inside a fresh tree despite unrelated unknown files.
+        """Prove an exact fresh file or a path inside a fresh tree is owned.
 
         Unlike inventory(), this does not claim all descendants are known. An
         unknown path ancestor still refuses ownership because it may be an alias.
@@ -337,7 +361,7 @@ class ShellArtifactStore:
         key = _path(path)
         return bool(
             key is not None and self.complete
-            and any(self._within(key, parent) for parent in self._owned)
+            and (key in self._owned_files or any(self._within(key, parent) for parent in self._owned))
             and not any(self._within(key, unknown) for unknown in self._unknown)
             and not self._decimal_unknown(key)
             and not any(key != name and self._within(key, name) for name in self._files)

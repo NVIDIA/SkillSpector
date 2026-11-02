@@ -23,6 +23,66 @@ def _command(argv, **kwargs):
     return ShellEffectCommand(argv, {}, ".", "tests/workflow.sh", 0, **kwargs)
 
 
+def test_mktemp_regular_file_retains_exact_ownership_without_a_directory_claim() -> None:
+    audit = _audit()
+    request = _command(("mktemp", "/tmp/artifactory.XXXXXX.netrc"))
+    result = audit(request)
+    assert result is not None and result.status is True
+    path = result.stdout.removesuffix("\n")
+    artifact = audit.store.read(path)
+    assert artifact is not None and artifact.value.text == ""
+    assert artifact.value.origins == audit._origin(request)
+    assert artifact.executable is False
+    assert result.writes == (path,) and audit.store.owns(path)
+    assert not audit.store.owns("/tmp") and not audit.store.owns(path + "/child")
+    assert audit.store.inventory(path) is None
+    assert audit(_command(("cat",), stdin="credential", redirects=(("1>", path),))) is not None
+    assert audit(_command(("cat",), stdin="-suffix", redirects=(("1>>", path),))) is not None
+    assert audit.read_source(path) == "credential-suffix"
+    second = audit(request)
+    assert second is not None and second.stdout != result.stdout
+    assert audit.read_source(path) == "credential-suffix"
+
+
+@pytest.mark.parametrize("directory", [False, True])
+def test_mktemp_replaces_only_the_final_x_run(directory: bool) -> None:
+    audit = _audit()
+    args = ("mktemp", *(('-d',) if directory else ()), "/tmp/literalXXX.generatedXXXXXX.netrc")
+    result = audit(_command(args))
+    assert result is not None
+    path = result.stdout.removesuffix("\n")
+    assert path.startswith("/tmp/literalXXX.generated" + SAFE_PATH_MARKER)
+    assert path.endswith(".netrc")
+    assert audit.store.owns(path)
+    assert (audit.store.read(path) is None) is directory
+
+
+@pytest.mark.parametrize("args", [
+    ("mktemp",), ("mktemp", "-u", "/tmp/file.XXXXXX"),
+    ("mktemp", "--suffix=.netrc", "/tmp/file.XXXXXX"),
+    ("mktemp", "/tmp/file.XX"), ("mktemp", "/tmp/file.XXXXXX.suffixX"),
+    ("mktemp", "/tmp/../file.XXXXXX"), ("mktemp", "relative.XXXXXX"),
+    ("mktemp", "/tmp/file.XXXXXX", "extra"),
+])
+def test_mktemp_file_refuses_unsupported_templates_and_modes(args: tuple[str, ...]) -> None:
+    assert _audit()(_command(args)) is None
+
+
+@pytest.mark.parametrize("changes", [{"uncertain": True}, {"fail_stop": False}])
+def test_mktemp_file_requires_ordered_success(changes: dict) -> None:
+    audit = _audit()
+    assert audit(_command(("mktemp", "/tmp/file.XXXXXX"), **changes)) is None
+
+
+def test_mktemp_file_cannot_bypass_native_identity_or_invalidated_paths() -> None:
+    audit = _audit()
+    request = _command(("mktemp", "/tmp/file.XXXXXX"))
+    assert audit(replace(request, environment={"PATH": "/tmp/unknown:" + audit.path_tail})) is None
+    assert audit(replace(request, argv=("/tmp/mktemp", "/tmp/file.XXXXXX"))) is None
+    audit.store.invalidate("/tmp")
+    assert audit(request) is None
+
+
 def test_actual_native_path_is_required_before_publishing_helper_bytes() -> None:
     audit = _audit()
     assert audit(_command(("mktemp", "-d", "/tmp/native.XXXXXX"))) is not None

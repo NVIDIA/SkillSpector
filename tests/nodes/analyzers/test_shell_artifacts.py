@@ -17,6 +17,78 @@ def _program(text: str = "printf '%s\\n' ready\n") -> ShellArtifact:
     return ShellArtifact(ShellSourceValue(text, "code", (origin,)))
 
 
+def test_fresh_file_owns_only_its_exact_path_and_retains_provenance() -> None:
+    store = ShellArtifactStore(lambda: None)
+    value = _program("").value
+    assert store.create_empty_file("/tmp/credential", value)
+    assert store.read("/tmp/credential") == ShellArtifact(value, executable=False)
+    assert store.owns("/tmp/credential")
+    assert not store.owns("/tmp")
+    assert not store.owns("/tmp/credential/child")
+    assert store.exists("/tmp/credential/child") is None
+    assert store.inventory("/tmp/credential") is None
+    assert store.write("/tmp/credential", _program())
+    assert store.copy("/tmp/credential", "/tmp/copied")
+    assert not store.owns("/tmp/copied")
+    assert not store.create_empty_directory("/tmp/credential/child")
+    assert not store.write("/tmp/credential/child", _program())
+
+
+@pytest.mark.parametrize("existing, directory", [
+    ("/tmp/file", False), ("/tmp/file/child", False), ("/tmp", False),
+    ("/tmp/file", True), ("/tmp/file/child", True),
+])
+def test_fresh_file_cannot_overwrite_an_existing_file_or_directory(existing: str, directory: bool) -> None:
+    store = ShellArtifactStore(lambda: None)
+    if directory:
+        assert store.create_empty_directory(existing)
+    else:
+        assert store.write(existing, _program())
+    assert not store.create_empty_file("/tmp/file", _program("").value)
+    if not directory:
+        assert store.read(existing) == _program()
+
+
+@pytest.mark.parametrize("path", ["/tmp/file", "/tmp", None])
+def test_fresh_file_ownership_cannot_return_after_invalidation(path: str | None) -> None:
+    store = ShellArtifactStore(lambda: None)
+    assert store.create_empty_file("/tmp/file", _program("").value)
+    store.invalidate(path)
+    assert not store.owns("/tmp/file")
+    assert not store.create_empty_file("/tmp/file", _program("").value)
+    assert not store.write("/tmp/file", _program())
+
+
+def test_fresh_file_decimal_invalidation_and_transactions_keep_ownership_boundaries() -> None:
+    store = ShellArtifactStore(lambda: None)
+    child = store.fork()
+    assert child.create_empty_file("/tmp/log.123", _program("").value)
+    assert not store.owns("/tmp/log.123")
+    assert store.adopt(child)
+    assert store.owns("/tmp/log.123")
+    stale = store.fork()
+    assert stale.create_empty_file("/tmp/second", _program("").value)
+    assert store.invalidate_decimal_path("/tmp/log.", "")
+    assert not store.owns("/tmp/log.123")
+    assert not store.create_empty_file("/tmp/log.456", _program("").value)
+    assert not store.adopt(stale)
+    assert not store.owns("/tmp/second")
+
+
+def test_fresh_files_share_existing_count_and_later_byte_budgets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skillspector.shell_artifacts.MAX_GENERATED_FILES", 2)
+    store = ShellArtifactStore(lambda: None)
+    assert store.write("uploaded", _program())
+    assert store.create_empty_file("/tmp/file", _program("").value)
+    assert not store.create_empty_file("/tmp/overflow", _program("").value)
+    assert not store.owns("/tmp/overflow")
+    monkeypatch.setattr("skillspector.shell_artifacts.MAX_GENERATED_BYTES", 3)
+    store = ShellArtifactStore(lambda: None)
+    assert store.create_empty_file("/tmp/file", _program("").value)
+    assert not store.write("/tmp/file", _program("four"))
+    assert not store.owns("/tmp/file")
+
+
 def test_copy_archive_extract_retains_the_original_program_and_origin() -> None:
     store = ShellArtifactStore(lambda: None)
     program = _program()

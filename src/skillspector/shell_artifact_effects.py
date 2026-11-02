@@ -316,9 +316,23 @@ class ShellArtifactAudit:
                 artifacts = (ShellArtifact(ShellSourceValue(output, "code", origins)),)
             if not command.fail_stop:
                 output, artifacts, status = None, None, None
-        elif name == "mktemp" and command.fail_stop and not command.uncertain and len(args) == 2 and args[0] == "-d" and args[1] is not None and re.fullmatch(r"/tmp/[-A-Za-z0-9_.]+X{3,}[-A-Za-z0-9_.]*", args[1]):
-            path = re.sub(r"X{3,}", SAFE_PATH_MARKER, args[1])
-            if not self.store.create_empty_directory(path):
+        elif name == "mktemp" and command.fail_stop and not command.uncertain and (len(args) == 1 or len(args) == 2 and args[0] == "-d"):
+            template = args[-1]
+            if template is None or re.fullmatch(r"/tmp/[-A-Za-z0-9_.]+", template) is None:
+                return None
+            runs = tuple(re.finditer(r"X+", template))
+            if not runs or len(runs[-1][0]) < 3:
+                return None
+            # Native mktemp replaces only the final X run. A regular file
+            # owns its exact fresh identity, never its surrounding directory.
+            directory = len(args) == 2
+            self.temporary += 1
+            marker = SAFE_PATH_MARKER if directory else SAFE_PATH_MARKER + "_FILE_" + str(self.temporary)
+            path = template[:runs[-1].start()] + marker + template[runs[-1].end():]
+            created = self.store.create_empty_directory(path) if directory else self.store.create_empty_file(
+                path, ShellSourceValue("", "code", self._origin(command)),
+            )
+            if not created:
                 return None
             writes.append(path)
             output = path + "\n"
