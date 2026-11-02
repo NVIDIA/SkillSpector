@@ -1067,6 +1067,13 @@ def source_is_unmodified(
                     for program in programs
                 ):
                     return False
+                # GNU sed accepts options after input filenames. Every
+                # remaining word must therefore be a literal filename, not an
+                # unchecked -e/-f/-i option that changes the effect proof.
+                for _, left, right in arguments[index:]:
+                    value = resolve(left, right)
+                    if value is None or value.text.startswith("-"):
+                        return False
             if mutation:
                 nonrecursive_pid_removal = name == "unlink" or (
                     name == "rm" and all(
@@ -1395,6 +1402,8 @@ def generated_file_is_unmodified(
                         path_count += 1
                     elif path is None:
                         return False
+                elif is_managed_shell_variable(assignment[1]):
+                    return False
                 elif related(word(left + assignment.end(), right, assignment=True), ancestor=True):
                     # Assignment aliases and environment escapes would permit
                     # additional, unenumerated writes or helper invocations.
@@ -1437,7 +1446,10 @@ def generated_file_is_unmodified(
                 return False
             if name == "chmod" and is_parent and not child_scope:
                 if (
-                    command.start in resolver.fail_stop_commands
+                    head.kind == "literal"
+                    and head.text in {"chmod", "/bin/chmod", "/usr/bin/chmod"}
+                    and name not in current.functions
+                    and command.start in resolver.fail_stop_commands
                     and len(values) == 2
                     and values[0] is not None
                     and values[0].kind == "literal"
