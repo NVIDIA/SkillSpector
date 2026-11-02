@@ -234,6 +234,7 @@ def test_stdout_proof_refuses_unmodeled_effects(program: str) -> None:
     "set -euo pipefail\n[[ no == yes ]]\nprintf unreachable",
     "set -euo pipefail\ntrue && [[ no == yes ]]\nprintf unreachable",
     'set -euo pipefail\n[[ "$UNKNOWN" == yes ]]\nprintf conditional',
+    'set -euo pipefail\nprintf "%s" "$2"',
 ])
 def test_failed_untested_predicate_stops_errexit_helper(program: str) -> None:
     assert _helper_output((), program=program) is None

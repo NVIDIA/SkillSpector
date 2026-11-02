@@ -38,7 +38,12 @@ def _path(value: str, *, member: bool = False) -> str | None:
 
 @dataclass(frozen=True, slots=True)
 class ShellArtifact:
-    """Known text or an opaque archive with a fully known member inventory."""
+    """Exact text, an archive inventory, or bounded data unavailable as source.
+
+    Opaque data contributes its byte count to limits but never supplies text to
+    a cat/source reconstruction. It can occupy a known archive member without
+    inventing its contents, such as a manifest whose order depends on locale.
+    """
 
     value: ShellSourceValue | None = None
     members: tuple[tuple[str, ShellArtifact], ...] = ()

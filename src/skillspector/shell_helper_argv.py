@@ -261,9 +261,10 @@ class _State:
     flow: str = ""
     output: tuple[ShellHelperOutput, ...] = ()
     errexit: bool = False
+    nounset: bool = False
 
     def copy(self) -> _State:
-        return _State(self.values.copy(), [scope.copy() for scope in self.scopes], self.argv, self.status, self.flow, self.output, self.errexit)
+        return _State(self.values.copy(), [scope.copy() for scope in self.scopes], self.argv, self.status, self.flow, self.output, self.errexit, self.nounset)
 
     def lookup(self, name: str) -> _Value:
         for scope in reversed(self.scopes):
@@ -358,6 +359,8 @@ def _word(raw: str, state: _State, tick: Callable[[], None]) -> str | _CommandTe
             name = parameter[1] or parameter[2]
             if name.isdecimal():
                 index = int(name) - 1
+                if index >= len(state.argv) and state.nounset:
+                    raise _Unresolved
                 value = state.argv[index] if index < len(state.argv) else ""
             else:
                 value = state.lookup(name)
@@ -736,6 +739,7 @@ class _OutputInterpreter(_Interpreter):
                 raise _Unresolved
             state.status = True
             state.errexit = True
+            state.nounset = True
             return [state]
         if head == "printf":
             arguments = [_word(word.raw, state, self.tick) for word in node.words[1:]]
@@ -797,7 +801,8 @@ def reconstruct_helper_output(
     The caller must prove helper identity, ordinary shell startup, and writable
     log ownership. A file-read piece retains its identity until the caller maps
     it to a known artifact. Unknown arguments explore both conditional paths;
-    unsupported effects refuse the entire proof.
+    unsupported effects or a possibly failing path refuse the entire proof.
+    Failure output cannot disappear when a caller runs with errexit disabled.
     """
     if (
         len(helper_text) > _MAX_CHARS or "\x00" in helper_text

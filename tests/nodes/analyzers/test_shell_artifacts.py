@@ -316,6 +316,10 @@ def test_failed_zero_and_multiple_match_branches_do_not_supply_fictitious_output
     ('mkdir -p "$root/helpers"', 'mkdir -p "$root/helpers"\nln -s /outside "$root/escape"'),
     ('local spec="$1" result', 'local spec="$1" result\ncp scripts/setup.sh /tmp/hidden-write'),
     ('set -Eeuo pipefail', 'set +e'),
+    ('resolve_one() {', 'mapfile() { printf misleading; }\nresolve_one() {'),
+    ('resolve_one() {', 'local() { printf misleading; }\nresolve_one() {'),
+    ('umask 077', 'change_output() { output=/tmp/other.tgz; }\nchange_output\numask 077'),
+    ('resolve_one() {', 'nested() { printf misleading; }\nresolve_one() {\n nested'),
 ])
 def test_unmodeled_producer_effect_refuses_all_outputs(mutation) -> None:
     result, store = _inspect_producer(_PRODUCER.replace(*mutation))
