@@ -5490,14 +5490,17 @@ def _markdown_shell_text(
         for (start, end), (close_start, close_end) in complete_inline_code_pairs(text, line_runs):
             body = text[end:close_start]
             remainder_start = source_start + start
+            evidence_end = remainder_start + _ROOT_GLOB_COMMAND_CHARS
             list_marker_owns_span_command = (
                 list_marker_owns_initial_command
                 and not starts_additional_clause(text[:start])
                 and not starts_additional_clause(body)
             )
             if (
-                _may_have_destructive_outer_operands(
-                    content[remainder_start : remainder_start + _ROOT_GLOB_COMMAND_CHARS]
+                # A clipped window cannot prove that operands are absent.
+                (
+                    evidence_end < len(content)
+                    or _may_have_destructive_outer_operands(content[remainder_start:evidence_end])
                 )
                 and (
                     _MARKDOWN_PROSE_SHELL_SYNTAX_RE.search(body) is not None

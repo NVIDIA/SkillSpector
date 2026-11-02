@@ -320,6 +320,29 @@ def test_inline_runtime_command_cannot_hide_later_operands(separator: str) -> No
 
 
 @pytest.mark.parametrize(
+    ("prefix", "partial"),
+    [("", True), ("- ", False)],
+    ids=["runtime-command", "list-marker-control"],
+)
+@pytest.mark.parametrize("padding", ["pad\n" * 2300, "pad " * 2300], ids=["lines", "words"])
+def test_inline_runtime_command_operands_beyond_evidence_bound(
+    prefix: str, partial: bool, padding: str
+) -> None:
+    # The closing quote and operands lie beyond the guard's bounded lookahead,
+    # which cannot prove that they are absent.
+    content = f"{prefix}`$CMD` reads each reference's\n{padding}probe' -rf /\n\n" + _OBSERVATIONS
+    assert content.index("-rf /") > tm._ROOT_GLOB_COMMAND_CHARS
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+    if partial:
+        assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+        assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+    else:
+        assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
     "inline_command",
     [
         "$CMD",
