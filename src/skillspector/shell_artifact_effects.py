@@ -25,7 +25,7 @@ from skillspector.shell_sources import SAFE_PATH_MARKER, ReadWord, ShellSourceCo
 
 
 _BUILTINS = frozenset({":", "true", "false", "set", "printf", "echo", "pwd", "cd", "command", "test", "umask", "wait"})
-_READERS = frozenset({"head", "tail", "grep", "egrep", "fgrep", "cut", "wc", "stat", "sha256sum", "sha1sum", "md5sum", "cmp", "diff", "readlink", "ls", "file", "sleep", "id", "date", "kill"})
+_READERS = frozenset({"head", "tail", "grep", "egrep", "fgrep", "cut", "wc", "stat", "sha256sum", "sha1sum", "md5sum", "cmp", "diff", "readlink", "ls", "file", "sleep", "id", "date", "kill", "df"})
 _COMPRESSORS = frozenset({"gzip", "pigz", "bzip2", "lbzip2", "xz"})
 _WRITER_FLAGS = {
     "rm": {"-f", "-r", "-R", "-rf", "-fr", "-v", "--"},
@@ -437,6 +437,10 @@ class ShellArtifactAudit:
                 writes.append(path)
             status = None
         elif name in _READERS or name == "wait":
+            status = None
+        elif name == "awk" and len(args) == 1 and args[0] is not None and re.fullmatch(r"[ \t]*NR[ \t]*==[ \t]*2[ \t]*\{[ \t]*print[ \t]+\$1[ \t]*;?[ \t]*\}[ \t]*", args[0]):
+            # This bounded stdin filter has no file or command effects. Its
+            # input is unknown; do not invent a disk-space value or success.
             status = None
         elif name in {"bash", "sh"} and len(args) == 2 and args[0] == "-n" and self.read_source(self.path(args[1], command.cwd) or "") is not None:
             status = None

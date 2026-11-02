@@ -83,6 +83,34 @@ def test_native_echo_preserves_only_proven_generated_bytes(args, expected) -> No
     assert audit.read_source("/tmp/work/output.sh") == expected
 
 
+@pytest.mark.parametrize("argv", [
+    ("df", "-B1", "--output=avail", "/tmp"),
+    ("awk", "NR == 2 {print $1}"),
+    ("awk", "NR==2{ print $1; }"),
+])
+def test_disk_space_query_pipeline_keeps_output_and_status_unknown(argv) -> None:
+    audit = _audit()
+    result = audit(_command(argv))
+    assert result is not None and result.stdout is None and result.status is None
+    assert result.writes == () and result.native_identity
+    assert audit.store.create_empty_directory("/tmp/work")
+    assert audit.store.write("/tmp/work/value", ShellArtifact(ShellSourceValue("old\n")))
+    result = audit(_command(argv, redirects=(("1>", "/tmp/work/value"),)))
+    assert result is not None and result.writes == ("/tmp/work/value",)
+    assert audit.read_source("/tmp/work/value") is None
+
+
+@pytest.mark.parametrize("args", [
+    ('NR == 2 {print $1 > "scripts/setup.sh"}',),
+    ('NR == 2 {print $1; system("rm -rf /")}',),
+    ('NR == 2 {print $1} END {print "changed" > "scripts/setup.sh"}',),
+    ('-f', 'scripts/setup.sh'),
+    (None,),
+])
+def test_awk_query_allowance_cannot_hide_extra_program_effects(args) -> None:
+    assert _audit()(_command(("awk", *args))) is None
+
+
 def test_source_provenance_and_executable_mode_survive_archive_roundtrip() -> None:
     audit = _audit()
     assert audit.store.create_empty_directory("/tmp/work")
