@@ -6,7 +6,7 @@
 import pytest
 
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
-from skillspector.shell_source_effects import ShellEffectResult, source_effects_collect, source_effects_preserve
+from skillspector.shell_source_effects import SHELL_PID_MARKER, ShellEffectResult, source_effects_collect, source_effects_preserve
 from skillspector.shell_sources import ShellSourceContext, ShellSourceResolver
 
 
@@ -121,6 +121,57 @@ if test -e /runtime/unknown; then write_file() { :; }; fi
 write_file scripts/library.sh
 '''
     assert not _preserves(caller, _LIBRARY)
+
+
+@pytest.mark.parametrize("condition", ['safe == "safe"*', 'safe == "s"afe', 'safex != safe"*"', r'safex != safe\*', 'safe == [[:alpha:]]*'])
+def test_mixed_quoted_or_complex_patterns_cannot_skip_source_mutation(condition: str) -> None:
+    caller = f'if [[ {condition} ]]; then printf changed > scripts/library.sh; fi\n'
+    assert not _preserves(caller, _LIBRARY)
+
+
+def test_wholly_quoted_pattern_is_literal_and_simple_unquoted_pattern_stays_supported() -> None:
+    assert _preserves('if [[ safe == "safe*" ]]; then printf changed > scripts/library.sh; fi\n', _LIBRARY)
+    assert not _preserves('if [[ safe == safe* ]]; then printf changed > scripts/library.sh; fi\n', _LIBRARY)
+
+
+def test_expanded_extglob_pattern_cannot_skip_source_mutation() -> None:
+    assert not _preserves('pattern="@(safe|other)"\nif [[ safe == $pattern ]]; then printf changed > scripts/library.sh; fi\n', _LIBRARY)
+
+
+@pytest.mark.parametrize("condition", ['[[ "$$" == 123 ]]', '[[ "$$" != 123 ]]'])
+def test_pid_identity_remains_unknown_in_conditional_effects(condition: str) -> None:
+    assert not _preserves(f'if {condition}; then printf changed > scripts/library.sh; fi\n', _LIBRARY)
+
+
+def test_pid_case_selection_and_output_are_not_exact_facts() -> None:
+    assert not _preserves('case "$$" in 123) printf changed > scripts/library.sh ;; esac\n', _LIBRARY)
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        return ShellEffectResult(command.stdout, True, native_identity=True)
+
+    assert _preserves('pid="$(printf "%s" "$$")"\nprintf "%s" "$pid"\n', _LIBRARY, native_effect=callback)
+    assert requests[-1].stdout is None
+
+
+def test_pid_marker_cannot_be_injected_as_uploaded_literal() -> None:
+    assert not _preserves(f'printf "%s" "{SHELL_PID_MARKER}"\n', _LIBRARY)
+    resolver = _resolver("printf safe\n", _LIBRARY)
+    resolver.context = ShellSourceContext(resolver.context.path, {**resolver.context.sources, "scripts/" + SHELL_PID_MARKER: "printf fake\n"})
+    assert not source_effects_preserve(resolver, "scripts/library.sh", len(resolver.content))
+
+
+def test_pid_redirect_retains_a_domain_and_conflicting_numeric_reads_refuse() -> None:
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        return ShellEffectResult(command.stdout, True, native_identity=True)
+
+    assert _preserves('(printf ready) > "/tmp/log.$$"\n', _LIBRARY, native_effect=callback)
+    assert any(command.redirects == (("1>", "/tmp/log." + SHELL_PID_MARKER),) for command in requests)
+    assert not _preserves('(cat /tmp/log.123) > "/tmp/log.$$"\n', _LIBRARY, native_effect=callback)
 
 
 def test_sourced_top_level_write_is_not_treated_as_a_definition() -> None:

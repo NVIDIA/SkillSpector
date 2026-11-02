@@ -55,6 +55,7 @@ class ShellEffectResult:
 NativeEffect = Callable[[ShellEffectCommand], ShellEffectResult | None]
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _ASSIGN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)\Z", re.DOTALL)
+SHELL_PID_MARKER = "\ue102skillspector_shell_pid\ue103"
 _QUOTED_PARAMETER_REMOVAL = re.compile(
     r'"\$\{[A-Za-z_][A-Za-z0-9_]{0,127}(?:#{1,2}|%{1,2})'
     r'"\$[A-Za-z_][A-Za-z0-9_]{0,127}"[-A-Za-z0-9_./]*\}"'
@@ -62,6 +63,22 @@ _QUOTED_PARAMETER_REMOVAL = re.compile(
 _MAX_STEPS = 65_536
 _MAX_STATES = 128
 _MAX_DEPTH = 16
+
+
+def _symbolic_path_matches(left: str, right: str) -> bool:
+    """Keep a decimal PID domain distinct from an exact/fresh path."""
+    if SHELL_PID_MARKER not in left:
+        left, right = right, left
+    if SHELL_PID_MARKER not in left:
+        return left == right
+    if SHELL_PID_MARKER in right or left.count(SHELL_PID_MARKER) != 1:
+        return True
+    prefix, suffix = left.split(SHELL_PID_MARKER)
+    if not right.startswith(prefix) or not right.endswith(suffix):
+        return False
+    end = len(right) - len(suffix)
+    digits = right[len(prefix):end] if end >= len(prefix) else ""
+    return bool(digits) and digits.isascii() and digits.isdecimal()
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,7 +307,7 @@ class _EffectAudit:
             raise _Unresolved
 
     def program(self, path, text):
-        if len(text) > 262_144 or "\x00" in text or self.path_tail in text:
+        if len(text) > 262_144 or "\x00" in text or self.path_tail in text or SHELL_PID_MARKER in text:
             raise _Unresolved
         key = path, text
         if key in self.programs:
@@ -386,7 +403,14 @@ class _EffectAudit:
         canonical = posixpath.normpath(value)
         if canonical in {".", "/", self.target} or self.target.startswith(canonical + "/"):
             return False
-        return canonical.rpartition("/")[2] != self.target.rpartition("/")[2]
+        if SHELL_PID_MARKER in canonical:
+            target = self.target
+            while target:
+                self.tick()
+                if _symbolic_path_matches(canonical, target):
+                    return False
+                target = posixpath.dirname(target)
+        return not _symbolic_path_matches(canonical.rpartition("/")[2], self.target.rpartition("/")[2])
 
     def word(self, raw, frame, program, *, assignment=False, final_assignment=False):
         parts, quote, cursor, unknown = [], "", 0, False
@@ -482,7 +506,9 @@ class _EffectAudit:
                     value = "0" if frame.status is True else None
                 elif name in {"@", "*"}:
                     value = " ".join(frame.argv) if all(isinstance(item, str) for item in frame.argv) else None
-                elif name in {"$", "!"}:
+                elif name == "$":
+                    value = SHELL_PID_MARKER
+                elif name == "!":
                     value = None
                 elif name.isdecimal():
                     value = frame.argv[int(name) - 1] if int(name) <= len(frame.argv) else ""
@@ -622,6 +648,8 @@ class _EffectAudit:
             return result + self.run(program, node.blocks[-1], remaining)
         if node.kind == "case":
             value = self.word(node.words[0].raw, frame, program)
+            if value is not None and SHELL_PID_MARKER in value:
+                value = None
             result = []
             for labels, body in zip(node.labels, node.blocks, strict=True):
                 if value is None or any(fnmatch.fnmatchcase(value, label) for label in labels):
@@ -759,9 +787,16 @@ class _EffectAudit:
             left, operator, right = values
             if left is None or right is None:
                 return None
+            if SHELL_PID_MARKER in left or SHELL_PID_MARKER in right:
+                return None
             if operator in {"=", "==", "!="}:
-                # Shell [[ rhs ]] patterns are not literal equality.
-                matched = fnmatch.fnmatchcase(left, right) if raw[2][:1] not in {'"', "'"} else left == right
+                # A fully quoted RHS is literal; mixed quoted/unquoted pieces
+                # preserve quoting per character and cannot use the flattened
+                # value as either a plain string or an unqualified pattern.
+                literal = re.fullmatch(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", raw[2], re.DOTALL) is not None
+                if not literal and (any(character in raw[2] for character in "'\"\\") or any(character in right for character in "[]()|")):
+                    return None
+                matched = left == right if literal else fnmatch.fnmatchcase(left, right)
                 return matched != (operator == "!=")
             if not re.fullmatch(r"-?[0-9]{1,16}", left) or not re.fullmatch(r"-?[0-9]{1,16}", right):
                 return None
@@ -1026,7 +1061,16 @@ class _EffectAudit:
                 frame.status = None
 
     def conflicts_with_redirect(self, path):
-        return any(path == target or target.startswith(path.rstrip("/") + "/") for target in self.active_redirects)
+        for target in self.active_redirects:
+            while target:
+                self.tick()
+                if _symbolic_path_matches(path, target):
+                    return True
+                parent = posixpath.dirname(target)
+                if parent == target:
+                    break
+                target = parent
+        return False
 
     def begin_redirects(self, request, frame):
         paths = [
@@ -1068,6 +1112,8 @@ class _EffectAudit:
         result = self.native_effect(request) if self.native_effect is not None else self.native_default(request, frame, child=child)
         if result is None or any(not self.disjoint(path) or self.conflicts_with_redirect(path) for path in result.writes):
             raise _Unresolved
+        if result.stdout is not None and SHELL_PID_MARKER in result.stdout:
+            result = replace(result, stdout=None)
         if request.argv[0] == "set" and (result.native_identity or self.native_effect is None):
             if request.argv[1:] in {("-euo", "pipefail"), ("-Eeuo", "pipefail"), ("-e",)}:
                 frame.errexit = True
@@ -1188,7 +1234,10 @@ def _audit_prefix(
     if (
         len(resolver.context.sources) > MAX_SHELL_SOURCE_FILES
         or sum(map(len, resolver.context.sources.values())) > MAX_SHELL_SOURCE_CHARS
-        or any(SAFE_PATH_MARKER in source for source in resolver.context.sources.values())
+        or SHELL_PID_MARKER in resolver.context.path
+        or any(SHELL_PID_MARKER in path for path in resolver.context.sources)
+        or any(SAFE_PATH_MARKER in source or SHELL_PID_MARKER in source for source in resolver.context.sources.values())
+        or any(SHELL_PID_MARKER in value.text for value in resolver.inherited_values.values())
         or any(is_managed_shell_variable(name) and name != "PATH" for name in resolver.inherited_values)
     ):
         return False
