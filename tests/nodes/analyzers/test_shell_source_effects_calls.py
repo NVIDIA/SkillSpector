@@ -581,6 +581,34 @@ def test_pid_identity_remains_unknown_in_conditional_effects(condition: str) -> 
     assert not _preserves(f'if {condition}; then printf changed > scripts/library.sh; fi\n', _LIBRARY)
 
 
+@pytest.mark.parametrize("mode", ["", "-d "])
+@pytest.mark.parametrize("condition", [
+    '[[ "$tmp" == /tmp/example.ABCDEF ]]',
+    '[[ /tmp/example.ABCDEF == "$tmp" ]]',
+    '[ "$tmp" = /tmp/example.ABCDEF ]',
+    '[[ "$tmp" == /tmp/example.A* ]]',
+    '[[ "$tmp" != /tmp/example.ABCDEF ]]',
+])
+def test_fresh_runtime_name_cannot_prune_conditional_writes(mode: str, condition: str) -> None:
+    prefix = 'set -e\ntmp="$(mktemp ' + mode + '/tmp/example.XXXXXX)"\n'
+    assert not _preserves(prefix + f'if {condition}; then printf changed > scripts/library.sh; fi\n', _LIBRARY)
+    assert not _preserves(prefix + f'if {condition}; then :; else printf changed > scripts/library.sh; fi\n', _LIBRARY)
+    assert _preserves(prefix + f'if {condition}; then printf safe; else printf other; fi\n', _LIBRARY)
+
+
+@pytest.mark.parametrize("mode", ["", "-d "])
+def test_fresh_runtime_name_cannot_prune_case_writes(mode: str) -> None:
+    prefix = 'set -e\ntmp="$(mktemp ' + mode + '/tmp/example.XXXXXX)"\n'
+    assert not _preserves(prefix + 'case "$tmp" in /tmp/example.A*) printf changed > scripts/library.sh ;; esac\n', _LIBRARY)
+    assert _preserves(prefix + 'case "$tmp" in /tmp/example.A*) printf safe ;; *) printf other ;; esac\n', _LIBRARY)
+
+
+@pytest.mark.parametrize("expansion", ["${tmp:0:6}", "${tmp#/tmp/}", "${#tmp}"])
+def test_fresh_runtime_name_transforms_remain_unproved(expansion: str) -> None:
+    prefix = 'set -e\ntmp="$(mktemp -d /tmp/example.XXXXXX)"\n'
+    assert not _preserves(prefix + 'value="' + expansion + '"\n', _LIBRARY)
+
+
 def test_pid_case_selection_and_output_are_not_exact_facts() -> None:
     assert not _preserves('case "$$" in 123) printf changed > scripts/library.sh ;; esac\n', _LIBRARY)
     requests = []

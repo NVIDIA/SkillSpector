@@ -307,6 +307,7 @@ class _EffectAudit:
         self.read_source = read_source or resolver.context.sources.get
         self.native_effect = native_effect
         self.path_tail = SAFE_PATH_MARKER + "_PATH_TAIL"
+        self.symbolic_names = (SAFE_PATH_MARKER, SHELL_PID_MARKER)
         self.steps = 0
         self.depth = 0
         self.temporary = 0
@@ -685,7 +686,7 @@ class _EffectAudit:
             return result + self.run(program, node.blocks[-1], remaining)
         if node.kind == "case":
             value = self.word(node.words[0].raw, frame, program)
-            if value is not None and SHELL_PID_MARKER in value:
+            if value is not None and any(marker in value for marker in self.symbolic_names):
                 value = None
             result = []
             for labels, body in zip(node.labels, node.blocks, strict=True):
@@ -848,7 +849,9 @@ class _EffectAudit:
             left, operator, right = values
             if left is None or right is None:
                 return None
-            if SHELL_PID_MARKER in left or SHELL_PID_MARKER in right:
+            if any(marker in left or marker in right for marker in self.symbolic_names):
+                # Fresh-path and PID placeholders describe runtime names,
+                # not literal strings that can select a single branch.
                 return None
             if operator in {"=", "==", "!="}:
                 if not extended:
