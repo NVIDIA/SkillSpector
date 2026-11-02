@@ -795,6 +795,7 @@ def query_batch(
         provider_failed = True
         _last_query_ok = False
     except (
+        httpx.InvalidURL,
         httpx.HTTPError,
         ValueError,
         KeyError,
@@ -838,6 +839,7 @@ def is_available() -> bool:
             return isinstance(payload, dict) and isinstance(payload.get("results"), list)
     except (
         _OsvLimitReachedError,
+        httpx.InvalidURL,
         httpx.HTTPError,
         httpx.TimeoutException,
         ValueError,
