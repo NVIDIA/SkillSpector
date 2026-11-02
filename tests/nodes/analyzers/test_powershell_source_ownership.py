@@ -255,6 +255,8 @@ def test_unsupported_executable_selection_stays_partial(
         "${script:program}",
         "$programs[0]",
         "$config.Executable",
+        r"$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",
+        "$root/bin/bash",
     ],
 )
 @pytest.mark.parametrize(
@@ -290,6 +292,14 @@ def test_expression_selected_shell_keeps_code_operands_partial(
 )
 def test_native_options_are_not_misread_as_shell_code_flags(arguments: str) -> None:
     assert _ledger(f"& $program {arguments}\n")["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize("path", ["sample.ps1", "SKILL.md"])
+def test_native_path_suffix_after_variable_preserves_argument_boundaries(path: str) -> None:
+    content = r"& $env:SystemRoot\System32\bcdedit.exe /enum '{current}' 2>&1" + "\n"
+    if path == "SKILL.md":
+        content = f"# Instructions\n\n```powershell\n{content}```\n"
+    assert _ledger(content, path)["outcome"] is LedgerOutcome.COMPLETED
 
 
 @pytest.mark.parametrize("language", ["powershell", "pwsh", "ps1", "PowerShell"])

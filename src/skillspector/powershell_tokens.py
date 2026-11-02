@@ -317,7 +317,8 @@ def powershell_source(
                     spans.extend(gap_comments)
                     end = operand + variable_command.end()
                     suffix = re.match(
-                        r"(?:\[[0-9]+\]|\.[A-Za-z_][A-Za-z0-9_]*)*", content[end : end + 512]
+                        r"(?:\[[0-9]+\]|\.[A-Za-z_][A-Za-z0-9_]*|[\\/][A-Za-z0-9_.-]+)*",
+                        content[end : end + 512],
                     )
                     end += suffix.end()
                     executable_boundary(operand, end)
