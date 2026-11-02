@@ -150,7 +150,7 @@ def test_nested_executable_in_default_exclusion_blocks_install(tmp_path: Path) -
 
 
 def test_ordinary_binary_executable_cannot_remain_safe(tmp_path: Path) -> None:
-    """A visible executable excluded as binary still receives the property-based floor."""
+    """Inspecting a binary's text strings does not verify executable behavior."""
     (tmp_path / "SKILL.md").write_text("# Binary executable\n", encoding="utf-8")
     (tmp_path / "payload.exe").write_bytes(b"MZ\x00\x00binary payload")
 
@@ -163,8 +163,9 @@ def test_ordinary_binary_executable_cannot_remain_safe(tmp_path: Path) -> None:
     report = json.loads(result.output)
     issue = next(item for item in report["issues"] if item["location"]["file"] == "payload.exe")
     assert issue["id"] == "SC9"
-    assert issue["evidence"]["excluded_from_analysis"] is True
-    assert issue["evidence"]["inherited_exclusion_reason"] == "binary_content"
+    assert issue["evidence"]["excluded_from_analysis"] is False
+    assert issue["evidence"]["partially_analyzed_executable"] is True
+    assert issue["evidence"]["inherited_exclusion_reason"] == "binary_executable_text"
     assert report["risk_assessment"]["score"] >= 51
     assert report["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
 

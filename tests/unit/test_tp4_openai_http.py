@@ -104,6 +104,22 @@ def openai_http_endpoint(monkeypatch):
                         finish_reason = "tool_calls"
                     else:
                         message = {"role": "assistant", "content": encoded}
+            elif tools:
+                message = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_findings",
+                            "type": "function",
+                            "function": {
+                                "name": tools[0]["function"]["name"],
+                                "arguments": json.dumps({"findings": []}),
+                            },
+                        }
+                    ],
+                }
+                finish_reason = "tool_calls"
             payload = {
                 "id": "chatcmpl-loopback",
                 "object": "chat.completion",
@@ -178,7 +194,13 @@ def test_tp4_real_http_retries_and_deadline_refresh(
         assert "response_format" not in request
         assert "Report your result by calling" not in request["messages"][0]["content"]
     if not complete:
-        assert outcome.failures[0].reason is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        assert outcome.failures[0].reason is (
+            LedgerReason.LLM_RESPONSE_INVALID_TOOL
+            if mode == "refusal" or mode.startswith("multiple-")
+            else LedgerReason.LLM_RESPONSE_INVALID_SCHEMA
+            if mode == "out-of-range"
+            else LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        )
     assert analyzer.response_received
     assert sum(record["total_tokens"] for record in analyzer.inference_usage) == 20 * attempts
 
@@ -247,7 +269,13 @@ async def test_async_real_http_tool_results_use_same_validation(
     assert bool(outcome.successful) is complete
     assert bool(outcome.failures) is not complete
     if not complete:
-        assert outcome.failures[0].reason is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        assert outcome.failures[0].reason is (
+            LedgerReason.LLM_RESPONSE_INVALID_TOOL
+            if mode == "refusal" or mode.startswith("multiple-")
+            else LedgerReason.LLM_RESPONSE_INVALID_SCHEMA
+            if mode == "out-of-range"
+            else LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        )
     assert analyzer.response_received
     assert all("response_format" not in request for request in requests)
 
@@ -297,6 +325,11 @@ def test_full_scanner_graph_reports_tp4_http_results(
         if event["analyzer_id"] == tp.ANALYZER_ID
     )
     assert tp4_status["status"] == ("completed" if complete else "degraded")
+    assert all(
+        event["status"] in {"completed", "not_applicable"}
+        for event in result["analyzer_status_events"]
+        if event["analyzer_id"] != tp.ANALYZER_ID
+    ), result["analyzer_status_events"]
     assert behavior["tp4_calls"] == attempts
     findings = [f for f in result["findings"] if f.rule_id == "TP4"]
     assert bool(findings) is (mode == "mismatch")

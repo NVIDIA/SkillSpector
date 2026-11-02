@@ -1,5 +1,8 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
+* fix(coverage): account for successfully inspected linked ZIP containers while retaining member failures and archive limits
+* fix(static): stop Markdown code fence lines from reading as an open quote that merges consecutive shell lines into one marker directive (#868)
+* fix(ra1): treat a prohibition on recommending a self-update ("Do not recommend self-update") as the prohibition it is, not as an RA1 self-modification instruction (#928)
 * fix(analyzer): stop PowerShell comments, `<# #>` blocks, backtick line continuations and display-only `Write-Host`/`Write-Verbose`-style messages from reporting a false `static_parse_limit`; payloads for `bash -c`, `Invoke-Expression`, script blocks and call operators, subexpressions inside messages, and any source whose token ownership cannot be proven keep their existing bounded checks and partial status (#711)
 * fix(sc8): count only the bytecode walk's own CPU time against its 5 s budget, so time spent waiting behind concurrent analyzers no longer reports a static `runtime_limit` for skills that ship no bytecode (#828)
 * fix(providers): cut per-call cost of CLI-provider scans and default their LLM fan-out to 2 (#808)

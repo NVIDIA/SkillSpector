@@ -45,6 +45,7 @@ from skillspector.inspection_ledger import (
     RULE_SET_SCOPE,
     AnalysisCompleteness,
     finalize_ledger,
+    only_missing_reference_exceptions,
 )
 from skillspector.llm_provenance import sanitize_llm_provenance
 from skillspector.llm_utils import is_llm_available
@@ -52,6 +53,7 @@ from skillspector.logging_config import get_logger
 from skillspector.models import (
     OCCURRENCE_CODE_SNIPPET_KEY,
     OCCURRENCE_FINDING_ID_KEY,
+    OCCURRENCE_FINDING_TEXT_KEY,
     Finding,
 )
 from skillspector.nodes.analyzers import ANALYZER_MODULES
@@ -97,6 +99,16 @@ _RISK_RECOMMENDATION: dict[str, str] = {
     "HIGH": "DO_NOT_INSTALL",
     "CRITICAL": "DO_NOT_INSTALL",
 }
+
+
+def risk_severity_and_recommendation(score: int) -> tuple[str, str]:
+    """Map a computed score to the shared single-skill and recursive verdict."""
+    severity = "LOW"
+    for threshold, band in _RISK_SEVERITY_BANDS:
+        if score >= threshold:
+            severity = band
+            break
+    return severity, _RISK_RECOMMENDATION.get(severity, "CAUTION")
 
 
 # Scanned skill content (and LLM output that quotes it) can carry ANSI escape
@@ -168,6 +180,9 @@ def _sanitize_finding(finding: Finding) -> Finding:
         report_snippet = occurrence.get(OCCURRENCE_CODE_SNIPPET_KEY)
         if isinstance(report_snippet, str):
             occurrence[OCCURRENCE_CODE_SNIPPET_KEY] = clean(report_snippet)
+        report_finding_text = occurrence.get(OCCURRENCE_FINDING_TEXT_KEY)
+        if isinstance(report_finding_text, str):
+            occurrence[OCCURRENCE_FINDING_TEXT_KEY] = clean(report_finding_text)
         occurrences.append(occurrence)
     return replace(
         finding,
@@ -190,11 +205,16 @@ def _finding_for_occurrence(finding: Finding, occurrence: Mapping[str, object]) 
     snippet = occurrence.get(OCCURRENCE_CODE_SNIPPET_KEY)
     if not isinstance(finding_id, str) or not finding_id:
         finding_id = finding.finding_id
+    finding_text = finding.finding
+    if OCCURRENCE_FINDING_TEXT_KEY in occurrence:
+        text = occurrence.get(OCCURRENCE_FINDING_TEXT_KEY)
+        finding_text = text if isinstance(text, str) else None
     if OCCURRENCE_CODE_SNIPPET_KEY not in occurrence:
-        return replace(finding, finding_id=finding_id)
+        return replace(finding, finding_id=finding_id, finding=finding_text)
     return replace(
         finding,
         finding_id=finding_id,
+        finding=finding_text,
         code_snippet=snippet if isinstance(snippet, str) else None,
         context=None,
     )
@@ -543,7 +563,10 @@ def _risk_score_floor(finding: Finding) -> int:
     configured_floor = _RISK_SCORE_FLOORS_BY_RULE_ID.get(finding.rule_id, 0)
     if configured_floor:
         return configured_floor
-    if finding.rule_id == "SC9" and finding.evidence.get("excluded_from_analysis") is True:
+    if finding.rule_id == "SC9" and (
+        finding.evidence.get("excluded_from_analysis") is True
+        or finding.evidence.get("partially_analyzed_executable") is True
+    ):
         return 51
     if (finding.severity or "").upper() != "CRITICAL":
         return 0
@@ -643,7 +666,10 @@ def _compute_risk_score(
         default=0,
     )
     if component_metadata and any(
-        component.get("excluded_from_analysis") is True
+        (
+            component.get("excluded_from_analysis") is True
+            or component.get("partially_analyzed_executable") is True
+        )
         and component.get("allowed_exclusion") is not True
         and (
             component.get("executable") is True
@@ -654,12 +680,7 @@ def _compute_risk_score(
         score_floor = max(score_floor, 51)
     final_score = min(100, max(score_floor, int(score)))
 
-    severity_band = "LOW"
-    for threshold, band in _RISK_SEVERITY_BANDS:
-        if final_score >= threshold:
-            severity_band = band
-            break
-    recommendation = _RISK_RECOMMENDATION.get(severity_band, "CAUTION")
+    severity_band, recommendation = risk_severity_and_recommendation(final_score)
     return final_score, severity_band, recommendation
 
 
@@ -812,20 +833,24 @@ def _build_sarif(
     raw_status = completeness.get("status")
     requested_status = (
         raw_status
-        if isinstance(raw_status, str) and raw_status in {"complete", "partial", "failed"}
+        if isinstance(raw_status, str)
+        and raw_status in {"complete", "complete_with_caveats", "partial", "failed"}
         else None
     )
+    reference_caveat_only = only_missing_reference_exceptions(raw_ledger_exceptions)
     is_complete = (
         completeness.get("is_complete", True) is True
-        and requested_status in {None, "complete"}
+        and requested_status in {None, "complete", "complete_with_caveats"}
         and execution_successful
         and partially_inspected == 0
         and entirely_uninspected == 0
-        and ledger_exception_count == 0
+        and (ledger_exception_count == 0 or reference_caveat_only)
         and limitation_count == 0
     )
     status = (
-        "complete"
+        requested_status
+        if is_complete and requested_status == "complete_with_caveats"
+        else "complete"
         if is_complete
         else "failed"
         if not execution_successful or requested_status == "failed"
@@ -1032,6 +1057,9 @@ def _render_terminal_completeness(
     table.add_column("Value")
     table.add_row("Execution", "successful" if execution_successful else "failed")
     table.add_row("Status", _terminal_text(completeness.get("status", "complete")))
+    dependency_inspection = completeness.get("dependency_inspection")
+    if isinstance(dependency_inspection, dict):
+        table.add_row("Dependency contents", _terminal_text(dependency_inspection.get("status")))
     table.add_row("Coverage", _terminal_text(f"{completeness.get('coverage_percent', 100.0)}%"))
     table.add_row("Fully inspected", _terminal_text(completeness.get("fully_inspected_files", 0)))
     table.add_row(
@@ -1582,6 +1610,11 @@ def _render_markdown_completeness(
     lines.append("|--------|-------|")
     lines.append(f"| Execution | {'successful' if execution_successful else 'failed'} |")
     lines.append(f"| Status | {_markdown_cell(completeness.get('status', 'complete'))} |")
+    dependency_inspection = completeness.get("dependency_inspection")
+    if isinstance(dependency_inspection, dict):
+        lines.append(
+            f"| Dependency contents | {_markdown_cell(dependency_inspection.get('status'))} |"
+        )
     lines.append(f"| Coverage | {_markdown_cell(completeness.get('coverage_percent', 100.0))}% |")
     lines.append(
         f"| Fully inspected | {_markdown_cell(completeness.get('fully_inspected_files', 0))} |"
@@ -1873,7 +1906,10 @@ def report(state: SkillspectorState) -> dict[str, object]:
             limitations.append(transitive_limitation)
         analysis_completeness["limitations"] = limitations
         analysis_completeness["is_complete"] = False
-        if analysis_completeness.get("status", "complete") == "complete":
+        if analysis_completeness.get("status", "complete") in {
+            "complete",
+            "complete_with_caveats",
+        }:
             analysis_completeness["status"] = "partial"
     _attempted, _succeeded, degraded = _llm_runtime_status(llm_requested, llm_call_log)
     remaining = transitive_remaining_seconds(state)

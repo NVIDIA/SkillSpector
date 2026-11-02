@@ -116,7 +116,7 @@ docker run --rm \
 **Write a report to the host filesystem** by writing to the mounted directory:
 
 ```bash
-docker run --rm \
+docker run --rm --user "$(id -u):$(id -g)" \
   -v "$PWD:/scan" \
   skillspector scan ./my-skill/ --no-llm --format json --output report.json
 ```
@@ -168,6 +168,23 @@ skillspector scan ./my-skill/ --format markdown --output report.md
 # SARIF output - for CI/CD integration and IDE tooling
 skillspector scan ./my-skill/ --format sarif --output report.sarif
 ```
+
+### Recursive Collection Scanning
+
+`--recursive` scans immediate subdirectories containing `SKILL.md` as independent
+skills, with a default aggregate limit of **32 skills**. To raise or lower it:
+
+```bash
+skillspector scan ./my-skills/ --recursive --max-skills 100 --no-llm --format json
+```
+
+`--max-skills` requires a local recursive collection and a positive integer; `0`
+does not mean unlimited. Discovery, byte, finding-record, time and report-size
+budgets still apply, so increasing the count does not guarantee complete coverage.
+When the count limit is reached, the CLI names the limit and suggests adjusting it
+or scanning sub-skills separately. Omitted skills remain visible in the aggregate
+report and coverage stays incomplete. Use `--fail-on-incomplete` in CI to fail on
+incomplete coverage; the default exit policy is unchanged.
 
 ### Batch Scanning
 
@@ -227,6 +244,11 @@ valid normalized snapshots. Malformed, oversized or duplicate server identities
 are rejected. This option requires `--mcp-registry` and is separate from the
 finding-suppression `--baseline`: it never suppresses findings or changes risk
 scores, and it does not fetch or execute listed server endpoints.
+
+Registry mode rejects skill-only controls such as `--use-shipped-baseline`,
+`--transitive`, `--transitive-depth`, `--transitive-allow-prefix`, and
+`--transitive-deny-prefix` with exit code 2, including an explicitly supplied
+default depth (`--transitive-depth 1`). Omit these options for registry scans.
 
 ### Suppressing False Positives (baseline)
 
@@ -298,7 +320,13 @@ inference gateways.
 | `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | local Claude runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `codex_cli` | Disabled | Registered for compatibility; its read-only sandbox permits host-file reads | Use an HTTP API provider or another supported CLI provider |
 | `gemini_cli` | _(none — uses local CLI auth)_ | local `gemini` binary | local Gemini runtime fallback, or `SKILLSPECTOR_MODEL` |
-| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` 1.18.33 binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
+| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` (verified 1.18.31–1.18.35, 1.19.0–1.19.4) binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
+
+For `openai_compatible` gateways requiring extra HTTP headers, set
+`SKILLSPECTOR_COMPAT_HEADERS='{"X-Tenant-ID":"my-tenant","X-API-Key":"gateway-key"}'`.
+It must be a JSON object with string keys and values and applies to sync and async requests.
+Unset or blank values add no headers; invalid configuration is rejected without exposing header values.
+Treat this environment variable as a secret when it contains gateway API keys.
 
 `gpt-6.1-sol`, `claude-opus-5-5`, and `claude-sonnet-5-5` remain opt-in through
 `SKILLSPECTOR_MODEL` or per-slot overrides. Promoting them to defaults requires
@@ -743,7 +771,7 @@ Issues (2)
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
 | `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3`; other provider/model combinations keep their endpoint defaults. The value applies to every model slot, so the `anthropic` `meta_analyzer` default receives the same effort as the analyzers. `gpt-6.1-sol` accepts only `low`, `medium`, `high`, `xhigh`, or `max`; any other value stops a scan before analysis (exit code 2). | Optional |
 | `SKILLSPECTOR_OUTPUT_LANGUAGE` | Short, single-line language label (letters, numbers, spaces, `_`, or `-`; maximum 64 characters) for human-readable LLM finding text such as messages, explanations, and remediation. Rule IDs, severity values, paths, code, and other machine-readable values remain unchanged. Unset, blank, or invalid values preserve the default output language. | Optional |
-| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves the provider default. Lower values can reduce run-to-run variation but do not guarantee identical output. `gpt-6.1-sol` rejects every explicit temperature, including `1`. `claude-opus-5-5` and `claude-sonnet-5-5` accept only `1.0` on the native Anthropic endpoint ([API compatibility rule](https://platform.claude.com/docs/en/api/messages/create)); gateways, proxies, and Bedrock still reject every explicit value for these models. Unsupported settings on active LLM slots stop a scan before analysis (exit code 2). Static scans (`--no-llm`) skip provider initialization and control validation. A Bedrock application-inference-profile ARN hides the model name, so declare `sampling: rejected` for it in the model registry. | Optional |
+| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves the provider default. Lower values can reduce run-to-run variation but do not guarantee identical output. `gpt-6.1-sol` rejects every explicit temperature, including `1`. Claude Opus 4.7 and later, Sonnet 5, Fable 5, Mythos 5 and Haiku 5 models (for example `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-5-5`) accept only `1.0` on the native Anthropic endpoint ([API compatibility rule](https://platform.claude.com/docs/en/api/messages/create)); gateways, proxies, and Bedrock still reject every explicit value for these models. Unsupported settings on active LLM slots stop a scan before analysis (exit code 2). Static scans (`--no-llm`) skip provider initialization and control validation. A Bedrock application-inference-profile ARN hides the model name, so declare `sampling: rejected` for it in the model registry. | Optional |
 | `SKILLSPECTOR_SEED` | Optional integer sampling seed for OpenAI-compatible and Azure OpenAI providers. Other hosted providers and CLI providers do not receive it. Provider support remains model-dependent; `gpt-6.1-sol` receives it, but OpenAI treats `seed` as best-effort, so output can still differ between runs. | Optional |
 | `SKILLSPECTOR_COMPACT_PROMPTS` | Opt-in compact line numbering in LLM prompts: numbered lines render as `L1:`, `L2:` instead of zero-padded `L01:`, `L02:`. Accepted truthy values are `1`, `true`, and `yes` (case-insensitive; surrounding whitespace is trimmed). Unset or any other value keeps the default zero-padded format. | Optional |
 | `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
@@ -765,13 +793,15 @@ Issues (2)
 | `SKILLSPECTOR_MODEL_<SLOT>` | Override the model for one analyzer slot (for example `SKILLSPECTOR_MODEL_META_ANALYZER`). It takes precedence over `SKILLSPECTOR_MODEL`, which in turn replaces provider slot defaults such as the `anthropic` `meta_analyzer` default. See [model provenance](docs/INFERENCE_USAGE.md#model-provenance) for the full precedence. | Optional |
 | `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
 | `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
-| `SKILLSPECTOR_MAX_DEPENDENCY_SOURCE_ANALYSIS_SECONDS` | Ceiling for the dependency-source analysis pass, in seconds. Defaults to `5.0`, which is the historical value. Raise it on slow or heavily loaded machines so the same unchanged tree does not come back partially inspected, which would set `safe_to_install` to false and record `runtime_limit`. The remaining aggregate workflow time (`SKILLSPECTOR_MAX_WORKFLOW_SECONDS`, 600 seconds by default) still caps the effective value; values above that remaining time have no effect. Invalid, zero, negative, infinite, and NaN values keep the 5-second default. The setting is resolved when the module is imported, so a new process is required after changing it. See [analysis resource bounds](docs/ANALYSIS_RESOURCE_BOUNDS.md#configuring-the-dependency-source-deadline). | Optional |
+| `SKILLSPECTOR_MAX_WORKFLOW_SECONDS` | Aggregate scan deadline in seconds; defaults to `1080` (18 minutes). Accepts a positive finite number. Invalid values warn and retain the default. Set before starting the process; caller-supplied budgets and external tool timeouts still apply. | Optional |
+| `SKILLSPECTOR_TP4_MAX_BATCHES` | Maximum description-behavior review batches per TP4 analyzer execution; defaults to `256`. Accepts an integer from `1` to `4096`. Unset or blank uses the default; invalid values warn and retain it. Set before starting the process; file, byte, finding, concurrency, and workflow-time limits still apply. | Optional |
+| `SKILLSPECTOR_MAX_DEPENDENCY_SOURCE_ANALYSIS_SECONDS` | Ceiling for the dependency-source analysis pass, in seconds. Defaults to `5.0`, which is the historical value. Raise it on slow or heavily loaded machines so the same unchanged tree does not come back partially inspected, which would set `safe_to_install` to false and record `runtime_limit`. The remaining aggregate workflow time (`SKILLSPECTOR_MAX_WORKFLOW_SECONDS`, 1080 seconds by default) still caps the effective value; values above that remaining time have no effect. Invalid, zero, negative, infinite, and NaN values keep the 5-second default. The setting is resolved when the module is imported, so a new process is required after changing it. See [analysis resource bounds](docs/ANALYSIS_RESOURCE_BOUNDS.md#configuring-the-dependency-source-deadline). | Optional |
 
 > **Disabled provider:** `codex_cli` remains registered but cannot run LLM analysis because its read-only sandbox allows host-file reads. Existing users should select an HTTP API provider or another supported CLI provider.
 
 > **CLI providers** (`claude_cli`, `gemini_cli`, `opencode_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
 >
-> `opencode_cli` currently fails closed unless the installed OpenCode version is exactly `1.18.33`, the version whose configuration precedence and deny-all semantics are verified by this release.
+> `opencode_cli` currently fails closed unless the installed OpenCode version is one of the individually verified releases (`1.18.31`, `1.18.32`, `1.18.33`, `1.18.34`, `1.18.35`, `1.19.0`, `1.19.1`, `1.19.2`, `1.19.3`, `1.19.4`), whose configuration precedence and deny-all semantics are verified by this release; every other version, including prereleases, still fails closed.
 
 ### CLI Options
 
@@ -791,6 +821,17 @@ Options:
 # Generate a baseline of all current findings (see docs/SUPPRESSION.md)
 skillspector baseline <path> [-o FILE] [--no-llm] [--reason TEXT]
 ```
+
+Report files and new baselines use private permissions (0600). Existing baselines
+retain their access metadata when safely replaced; updates requiring in-place
+writes are refused. All file output uses atomic replacement. The parent directory
+must be writable; symlinked
+parents and non-regular destinations such as devices are refused. On macOS,
+ancestor directories must also be readable. File output requires POSIX no-follow
+directory operations and is unavailable on Windows. Unsupported file output fails
+before analysis. Omit `--output` for scan/batch stdout, or use
+`skillspector baseline <path> -o -` for JSON on stdout, then redirect only to a
+trusted destination. Run Docker with your user ID as above so you can read its files.
 
 ## Integrating SkillSpector
 
@@ -963,8 +1004,35 @@ SC4 uses the [OSV.dev](https://osv.dev) API to check dependencies against the fu
 - **Batch queries** — all dependencies are checked in a single HTTP call.
 - **Automatic fallback** — if OSV.dev is unreachable (air-gapped/offline), a small built-in fallback list is used.
 - **Caching** — results are cached in-memory for 1 hour to avoid redundant API calls during a session.
+- **Pipenv** — reads `Pipfile` package tables and the direct/transitive packages in
+  `Pipfile.lock`, including development and custom categories. Exact lock versions
+  can resolve unpinned manifest dependencies. Malformed entries and unsupported
+  VCS/local sources are reported as incomplete dependency checks.
 
 The tool requires outbound HTTPS access to `api.osv.dev` for live vulnerability data. When that is not available, findings are limited to the static fallback list.
+
+## Locked npm dependency contents (opt-in)
+
+Use `--inspect-dependencies` to statically inspect exact public npm tarballs from
+`package-lock.json` or `npm-shrinkwrap.json` v2/v3, including recorded transitive,
+development, and optional dependencies:
+
+```bash
+skillspector scan ./my-skill --inspect-dependencies --no-llm --fail-on-incomplete
+```
+
+Artifacts must match their locked SHA-512 integrity hashes. A disposable Linux
+worker inspects supported source files and decoded npm scripts without installing
+packages or executing their code. Dependency findings include package coordinates,
+an artifact digest, and source locations. Missing artifacts, unsupported sources
+or formats, unavailable isolation, and exhausted budgets remain incomplete;
+`--fail-on-incomplete` prevents them from passing the scan. Reports also show when
+inspection was not requested.
+
+This first version supports the public npm registry and Linux x86-64/AArch64
+seccomp isolation. Dependency analysis stays local and uses existing static
+data-exfiltration, privilege-escalation, and supply-chain patterns. See
+[supported content, resource limits, and coverage boundaries](docs/DEPENDENCY_CONTENT_INSPECTION.md).
 
 ## Trust model and data egress
 
