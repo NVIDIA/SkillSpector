@@ -20,7 +20,7 @@ import shlex
 from skillspector.shell_artifact_flow import ShellArtifactEffects, ShellProducer, helper_stdout_artifacts
 from skillspector.shell_artifacts import ShellArtifact, ShellArtifactStore
 from skillspector.shell_helper_argv import is_managed_shell_variable, reconstruct_helper_output
-from skillspector.shell_source_effects import ShellEffectCommand, ShellEffectResult
+from skillspector.shell_source_effects import SHELL_PID_MARKER, ShellEffectCommand, ShellEffectResult
 from skillspector.shell_sources import SAFE_PATH_MARKER, ReadWord, ShellSourceContext, ShellSourceOrigin, ShellSourceValue
 
 
@@ -53,7 +53,7 @@ class ShellArtifactAudit:
         self.path_tail = SAFE_PATH_MARKER + "_PATH_TAIL"
         for path, source in context.sources.items():
             check_runtime()
-            if SAFE_PATH_MARKER in source:
+            if SAFE_PATH_MARKER in source or SHELL_PID_MARKER in source or SHELL_PID_MARKER in path or SHELL_PID_MARKER in context.path:
                 self.store.invalidate(None)
                 break
             origin = ShellSourceOrigin(path, 0, len(source), hashlib.sha256(source.encode()).hexdigest())
@@ -61,7 +61,7 @@ class ShellArtifactAudit:
                 break
 
     def path(self, value: str | None, cwd: str | None) -> str | None:
-        if value is None or not value or any(item in value for item in ("\x00", "\\", ":")):
+        if value is None or not value or value.count(SHELL_PID_MARKER) > 1 or any(item in value for item in ("\x00", "\\", ":")):
             return None
         if value.startswith("/"):
             result = posixpath.normpath(value)
@@ -72,11 +72,23 @@ class ShellArtifactAudit:
         return None if result in {"..", "/"} or result.startswith("../") else result
 
     def read_source(self, path: str) -> str | None:
+        if SHELL_PID_MARKER in path:
+            return None
         artifact = self.store.read(path)
         return artifact.value.text if artifact is not None and artifact.value is not None else None
 
+    def _invalidate_path(self, path: str) -> bool:
+        if SHELL_PID_MARKER in path:
+            if path.count(SHELL_PID_MARKER) != 1:
+                return False
+            return self.store.invalidate_decimal_path(*path.split(SHELL_PID_MARKER))
+        self.store.invalidate(path)
+        return self.store.complete
+
     def identity(self, command: ShellEffectCommand, name: str) -> tuple[bool, str | None]:
         """Return native identity or an exact executable script selected by PATH."""
+        if SHELL_PID_MARKER in name:
+            return False, None
         if name in _BUILTINS:
             return True, None
         if "/" in name:
@@ -89,7 +101,7 @@ class ShellArtifactAudit:
                 return False, path
             return False, None
         path_value = command.environment.get("PATH", self.path_tail)
-        if path_value is None:
+        if path_value is None or SHELL_PID_MARKER in path_value:
             return False, None
         components = path_value.split(":")
         if not components or components[-1] != self.path_tail:
@@ -143,12 +155,13 @@ class ShellArtifactAudit:
             writes.append(destination)
             # Preexisting external paths may alias one another. Only a fresh
             # namespace can give a newly written file independent exact bytes.
-            if operator.startswith("1") and not used_stdout and command.fail_stop and not command.uncertain and stdout is not None and self.store.owns(destination):
+            if operator.startswith("1") and not used_stdout and command.fail_stop and not command.uncertain and stdout is not None and SHELL_PID_MARKER not in destination and self.store.owns(destination):
                 used_stdout = True
                 if not self.effects.redirect_stdout(destination, stdout, append=operator.endswith(">>")):
                     return None
             else:
-                self.store.invalidate(destination)
+                if not self._invalidate_path(destination):
+                    return None
         return tuple(writes)
 
     def _helper_output(self, command: ShellEffectCommand, path: str, argv: tuple[str, ...], store: ShellArtifactStore, writes: set[str], writable: frozenset[str]) -> tuple[ShellArtifact, ...] | None:
@@ -172,7 +185,7 @@ class ShellArtifactAudit:
     def _producer(self, command: ShellEffectCommand, path: str) -> ShellEffectResult | None:
         # A producer is an optional proof for one explicit output, never an
         # exemption for a file name. Other known scripts use the caller's audit.
-        if command.uncertain or not command.fail_stop or command.redirects or len(command.argv) != 2:
+        if command.uncertain or not command.fail_stop or command.redirects or len(command.argv) != 2 or any(SHELL_PID_MARKER in value for value in (*command.argv, *command.environment.values()) if isinstance(value, str)):
             return None
         destination = self.path(command.argv[1], command.cwd)
         if destination is None or not self.store.owns(destination):
@@ -250,6 +263,8 @@ class ShellArtifactAudit:
             output = None if command.cwd is None else command.cwd + "\n"
         elif name == "cd" and len(args) == 1:
             path = self.path(args[0], command.cwd)
+            if path is not None and SHELL_PID_MARKER in path:
+                path = None
             known_directory = path is not None and (path == "." or any(source.startswith(path + "/") for source in self.context.sources))
             exists = self.store.exists(path) if path is not None else None
             # Leaving the uploaded tree cannot establish a host-directory fact.
@@ -276,7 +291,7 @@ class ShellArtifactAudit:
         elif name == "cat" and not args:
             output = command.stdin
         elif name == "cat" and all(value is not None and not value.startswith("-") for value in args):
-            values = [self.store.read(self.path(value, command.cwd) or "") for value in args]
+            values = [self.store.read(self.path(value, command.cwd) or "") if SHELL_PID_MARKER not in value else None for value in args]
             artifacts = tuple(values) if len(values) == 1 and values[0] is not None else None
             output = "".join(item.value.text for item in values) if all(item is not None and item.value is not None for item in values) else None
             if output is not None:
@@ -296,8 +311,9 @@ class ShellArtifactAudit:
                 if path is None:
                     return None
                 writes.append(path)
-                if command.uncertain or not command.fail_stop:
-                    self.store.invalidate(path)
+                if command.uncertain or not command.fail_stop or SHELL_PID_MARKER in path:
+                    if not self._invalidate_path(path):
+                        return None
                     status = None
                 elif self.store.inventory(path) is None or self.store.exists(path) is False and not self.store.create_empty_directory(path):
                     return None
@@ -309,8 +325,9 @@ class ShellArtifactAudit:
                 if path is None:
                     return None
                 writes.append(path)
-                if command.uncertain or not command.fail_stop or artifact is None or not self.store.owns(path):
-                    self.store.invalidate(path)
+                if command.uncertain or not command.fail_stop or artifact is None or SHELL_PID_MARKER in path or not self.store.owns(path):
+                    if not self._invalidate_path(path):
+                        return None
                     status = None
                 elif not self.store.write(path, replace(artifact, executable=args[0] in {"+x", "700", "755"})):
                     return None
@@ -320,15 +337,16 @@ class ShellArtifactAudit:
             if source is None or destination is None:
                 return None
             writes.append(destination)
-            if command.uncertain or not command.fail_stop or not self.store.owns(destination):
-                self.store.invalidate(destination)
+            if command.uncertain or not command.fail_stop or SHELL_PID_MARKER in destination or not self.store.owns(destination):
+                if not self._invalidate_path(destination):
+                    return None
                 status = None
-            elif not self.store.copy(source, destination):
+            elif SHELL_PID_MARKER in source or not self.store.copy(source, destination):
                 # A known disjoint destination may still receive unknown data.
                 self.store.invalidate(destination)
                 status = None
             output = ""
-        elif name == "cp" and len(args) == 3 and args[0] == "-a" and args[1] is not None and not args[1].endswith(("/", "/.")):
+        elif name == "cp" and len(args) == 3 and args[0] == "-a" and all(value is not None and SHELL_PID_MARKER not in value for value in args) and not args[1].endswith(("/", "/.")):
             source, destination = self.path(args[1], command.cwd), self.path(args[2], command.cwd)
             if source is None or destination is None:
                 return None
@@ -348,7 +366,7 @@ class ShellArtifactAudit:
                     if not self.store.write(target + "/" + relative, artifact):
                         return None
             output = ""
-        elif name == "tar" and all(value is not None for value in args):
+        elif name == "tar" and all(value is not None and SHELL_PID_MARKER not in value for value in args):
             if args[:1] == ("-I",) and (len(args) < 2 or args[1] not in _COMPRESSORS or not self.identity(command, args[1])[0]):
                 return None
             operands = args[2:] if args[:1] == ("-I",) else args
@@ -378,6 +396,8 @@ class ShellArtifactAudit:
                 output = ""
         elif name == "test" and len(args) == 2 and args[0] in {"-e", "-f", "-s", "-x", "-d"}:
             path = self.path(args[1], command.cwd)
+            if path is not None and SHELL_PID_MARKER in path:
+                path = None
             artifact = self.store.read(path) if path is not None else None
             exists = self.store.exists(path) if path is not None else None
             if args[0] == "-e":
@@ -408,7 +428,8 @@ class ShellArtifactAudit:
             if not paths or any(path is None for path in paths):
                 return None
             for path in paths:
-                self.store.invalidate(path)
+                if not self._invalidate_path(path):
+                    return None
                 writes.append(path)
             status = None
         elif name in _READERS or name == "wait":
@@ -417,6 +438,8 @@ class ShellArtifactAudit:
             status = None
         else:
             return None
+        if output is not None and SHELL_PID_MARKER in output:
+            output, artifacts = None, None
         if artifacts is None and output is not None:
             artifacts = (ShellArtifact(ShellSourceValue(output, "code", self._origin(command))),)
         redirects = self._redirect(command, artifacts)

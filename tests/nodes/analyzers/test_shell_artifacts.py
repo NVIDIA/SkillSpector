@@ -412,6 +412,48 @@ def test_adopting_a_stale_producer_snapshot_cannot_erase_later_writes() -> None:
     assert store.read("later.sh") == _program()
 
 
+def test_decimal_write_domain_invalidates_numeric_aliases_and_retains_unrelated_tree() -> None:
+    store = ShellArtifactStore(lambda: None)
+    assert store.create_empty_directory("/tmp/work")
+    for path in ("/tmp/log.123", "/tmp/log.456/child", "/tmp/log.named", "/tmp/work/known.sh"):
+        assert store.write(path, _program())
+    assert store.invalidate_decimal_path("/tmp/log.", "")
+    assert store.read("/tmp/log.123") is None
+    assert store.read("/tmp/log.456/child") is None
+    assert store.read("/tmp/log.named") is not None
+    assert store.exists("/tmp/log.789") is None
+    assert not store.write("/tmp/log.789", _program())
+    assert store.inventory("/tmp/work") is not None
+
+
+def test_decimal_alias_inside_fresh_tree_is_unknown_without_erasing_disjoint_bytes() -> None:
+    store = ShellArtifactStore(lambda: None)
+    assert store.create_empty_directory("/tmp/work")
+    assert store.write("/tmp/work/log.123.sh", _program())
+    assert store.write("/tmp/work/known.sh", _program())
+    assert store.invalidate_decimal_path("/tmp/work/log.", ".sh")
+    assert store.read("/tmp/work/log.123.sh") is None
+    assert not store.owns("/tmp/work/log.456.sh")
+    assert store.owns("/tmp/work/known.sh")
+    assert store.inventory("/tmp/work") is None
+    assert not store.archive("/tmp/work", "/tmp/result.tar")
+
+
+def test_decimal_path_domains_survive_transactional_adoption() -> None:
+    store = ShellArtifactStore(lambda: None)
+    child = store.fork()
+    assert child.invalidate_decimal_path("/tmp/log.", "")
+    assert store.adopt(child)
+    assert store.exists("/tmp/log.123") is None
+    assert not store.write("/tmp/log.123", _program())
+
+
+def test_decimal_domain_bounds_and_invalid_paths_refuse_the_snapshot() -> None:
+    store = ShellArtifactStore(lambda: None)
+    assert not store.invalidate_decimal_path("/tmp/../log.", "")
+    assert not store.complete
+
+
 def test_unknown_sibling_bytes_do_not_remove_an_independent_path_ownership_proof() -> None:
     store = ShellArtifactStore(lambda: None)
     assert store.create_empty_directory("/tmp/work")

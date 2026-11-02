@@ -69,6 +69,7 @@ class ShellArtifactStore:
         self._files: dict[str, ShellArtifact] = {}
         self._owned: set[str] = set()
         self._unknown: set[str] = set()
+        self._decimal_domains: set[tuple[str, str]] = set()
         self._bytes = 0
         self.complete = True
         self._parent: ShellArtifactStore | None = None
@@ -82,6 +83,7 @@ class ShellArtifactStore:
         child._files = self._files.copy()
         child._owned = self._owned.copy()
         child._unknown = self._unknown.copy()
+        child._decimal_domains = self._decimal_domains.copy()
         child._bytes = self._bytes
         child.complete = self.complete
         child._parent = self
@@ -96,6 +98,7 @@ class ShellArtifactStore:
         self._files = child._files.copy()
         self._owned = child._owned.copy()
         self._unknown = child._unknown.copy()
+        self._decimal_domains = child._decimal_domains.copy()
         self._bytes = child._bytes
         self._revision += 1
         child._parent = None
@@ -142,6 +145,48 @@ class ShellArtifactStore:
     def _within(path: str, parent: str) -> bool:
         return path == parent or path.startswith(parent.rstrip("/") + "/")
 
+    def _decimal_unknown(self, path: str, *, namespace: bool = False) -> bool:
+        for prefix, suffix in self._decimal_domains:
+            candidate = path
+            while candidate:
+                self._check_runtime()
+                if candidate.startswith(prefix) and candidate.endswith(suffix):
+                    end = len(candidate) - len(suffix)
+                    digits = candidate[len(prefix):end] if end >= len(prefix) else ""
+                    if digits and digits.isascii() and digits.isdecimal():
+                        return True
+                parent = posixpath.dirname(candidate)
+                if parent == candidate:
+                    break
+                candidate = parent
+            if namespace and (prefix.startswith(path.rstrip("/") + "/") or path.startswith(prefix)):
+                # A complete directory inventory requires every possible
+                # descendant to be known; prefix overlap is conservative.
+                return True
+        return False
+
+    def invalidate_decimal_path(self, prefix: str, suffix: str) -> bool:
+        """Forget all names in one fixed-prefix/decimal/fixed-suffix domain.
+
+        A process id supplies a bounded path domain, never fresh ownership or
+        exact filename bytes. Existing numeric aliases and later reads share
+        this invalidation; unrelated fresh trees retain their facts.
+        """
+        self._check_runtime()
+        if len(prefix) + len(suffix) > 4096 or _path(prefix + "0" + suffix) != prefix + "0" + suffix:
+            self.invalidate(None)
+            return False
+        self._decimal_domains.add((prefix, suffix))
+        self._revision += 1
+        if len(self._decimal_domains) + len(self._unknown) > MAX_GENERATED_FILES:
+            self.invalidate(None)
+            return False
+        for path in tuple(self._files):
+            if self._decimal_unknown(path):
+                size = self._size(self._files.pop(path))
+                self._bytes -= size or 0
+        return True
+
     def create_empty_directory(self, path: str) -> bool:
         """Record a proven fresh directory, such as a successful mktemp -d."""
         self._check_runtime()
@@ -151,6 +196,8 @@ class ShellArtifactStore:
         ):
             return False
         if any(self._within(key, item) or self._within(item, key) for item in self._unknown):
+            return False
+        if self._decimal_unknown(key, namespace=True):
             return False
         if len(self._owned) >= MAX_GENERATED_FILES:
             self.complete = False
@@ -167,11 +214,12 @@ class ShellArtifactStore:
         if key is None:
             self._files.clear()
             self._owned.clear()
+            self._decimal_domains.clear()
             self._bytes = 0
             self.complete = False
             return
         self._unknown.add(key)
-        if len(self._unknown) > MAX_GENERATED_FILES:
+        if len(self._unknown) + len(self._decimal_domains) > MAX_GENERATED_FILES:
             self.invalidate(None)
             return
         for candidate in tuple(self._files):
@@ -185,7 +233,7 @@ class ShellArtifactStore:
         key = _path(path)
         if key is None or not self.complete:
             return None
-        if any(self._within(key, item) for item in self._unknown):
+        if any(self._within(key, item) for item in self._unknown) or self._decimal_unknown(key):
             return None
         return self._files.get(key)
 
@@ -193,7 +241,7 @@ class ShellArtifactStore:
         """Distinguish known absence in an owned tree from missing evidence."""
         self._check_runtime()
         key = _path(path)
-        if key is None or not self.complete or any(self._within(key, item) or self._within(item, key) for item in self._unknown):
+        if key is None or not self.complete or any(self._within(key, item) or self._within(item, key) for item in self._unknown) or self._decimal_unknown(key, namespace=True):
             return None
         if key in self._files or key in self._owned or any(self._within(item, key) for item in (*self._files, *self._owned)):
             return True
@@ -207,7 +255,7 @@ class ShellArtifactStore:
         if key is None or size is None or not self.complete:
             self.invalidate(path)
             return False
-        if any(self._within(key, item) for item in self._unknown):
+        if any(self._within(key, item) for item in self._unknown) or self._decimal_unknown(key):
             return False
         if any(
             other != key and (self._within(key, other) or self._within(other, key))
@@ -251,6 +299,7 @@ class ShellArtifactStore:
             or self._within(target, key)
             or not any(self._within(key, item) for item in self._owned)
             or any(self._within(item, key) or self._within(key, item) for item in self._unknown)
+            or self._decimal_unknown(key, namespace=True)
         ):
             self.invalidate(destination)
             return False
@@ -272,6 +321,7 @@ class ShellArtifactStore:
             key is None or not self.complete
             or not any(self._within(key, item) for item in self._owned)
             or any(self._within(item, key) or self._within(key, item) for item in self._unknown)
+            or self._decimal_unknown(key, namespace=True)
         ):
             return None
         return tuple((path[len(key) + 1:], artifact) for path, artifact in sorted(self._files.items()) if path.startswith(key + "/"))
@@ -288,6 +338,7 @@ class ShellArtifactStore:
             key is not None and self.complete
             and any(self._within(key, parent) for parent in self._owned)
             and not any(self._within(key, unknown) for unknown in self._unknown)
+            and not self._decimal_unknown(key)
             and not any(key != name and self._within(key, name) for name in self._files)
         )
 
@@ -303,6 +354,7 @@ class ShellArtifactStore:
             or not any(self._within(root, item) for item in self._owned)
             or any(self._within(path, root) for path in self._files)
             or any(self._within(path, root) or self._within(root, path) for path in self._unknown)
+            or self._decimal_unknown(root, namespace=True)
         ):
             self.invalidate(destination)
             return False

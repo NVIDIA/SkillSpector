@@ -10,7 +10,7 @@ import pytest
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.shell_artifact_effects import ShellArtifactAudit
 from skillspector.shell_artifacts import ShellArtifact
-from skillspector.shell_source_effects import ShellEffectCommand, source_effects_preserve
+from skillspector.shell_source_effects import SHELL_PID_MARKER, ShellEffectCommand, source_effects_preserve
 from skillspector.shell_sources import SAFE_PATH_MARKER, ShellSourceContext, ShellSourceResolver, ShellSourceValue
 
 
@@ -227,3 +227,38 @@ def test_unowned_external_destinations_never_acquire_independent_exact_bytes(wri
     assert result is not None and "/tmp/existing-a" in result.writes
     assert audit.read_source("/tmp/existing-a") is None
     assert audit.store.read("/tmp/existing-a") is None
+
+
+def test_pid_log_write_invalidates_numeric_alias_without_creating_exact_source() -> None:
+    audit = _audit()
+    assert audit.store.create_empty_directory("/tmp/work")
+    assert audit.store.write("/tmp/work/log.123", ShellArtifact(ShellSourceValue("echo old\n")))
+    assert audit.store.write("/tmp/work/known.sh", ShellArtifact(ShellSourceValue("echo known\n")))
+    path = "/tmp/work/log." + SHELL_PID_MARKER
+    result = audit(_command(("printf", "%s", "echo new\n"), redirects=(("1>", path),)))
+    assert result is not None and result.writes == (path,)
+    assert audit.read_source(path) is None
+    assert audit.read_source("/tmp/work/log.123") is None
+    assert audit.read_source("/tmp/work/known.sh") == "echo known\n"
+    assert audit.store.inventory("/tmp/work") is None
+
+
+def test_pid_output_and_identity_never_become_literal_generated_facts() -> None:
+    audit = _audit()
+    assert audit.store.create_empty_directory("/tmp/work")
+    result = audit(_command(("printf", "%s", SHELL_PID_MARKER), redirects=(("1>", "/tmp/work/generated.sh"),)))
+    assert result is not None and result.stdout is None
+    assert audit.read_source("/tmp/work/generated.sh") is None
+    assert audit(_command(("/tmp/helper." + SHELL_PID_MARKER,))) is None
+    directory = audit(_command(("cd", "/tmp/work/" + SHELL_PID_MARKER)))
+    assert directory is not None and directory.status is None
+
+
+def test_external_pid_logs_do_not_erase_an_unrelated_fresh_workspace() -> None:
+    audit = _audit()
+    assert audit.store.create_empty_directory("/tmp/work")
+    assert audit.store.write("/tmp/work/known.sh", ShellArtifact(ShellSourceValue("echo known\n")))
+    result = audit(_command(("printf", "%s", "log"), redirects=(("1>", "/tmp/log." + SHELL_PID_MARKER),)))
+    assert result is not None
+    assert audit.read_source("/tmp/work/known.sh") == "echo known\n"
+    assert audit.store.inventory("/tmp/work") is not None
