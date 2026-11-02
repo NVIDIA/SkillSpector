@@ -2877,7 +2877,7 @@ def _has_shell_command_word_exhaustion(
                 ):
                     return True
                 complete_comments.add(comment)
-    for command_string in _shell_command_strings(
+    for command_string, inspected_source in _shell_command_string_values(
         content,
         check_runtime,
         perl_eval_blocks=perl_eval_blocks,
@@ -2887,7 +2887,8 @@ def _has_shell_command_word_exhaustion(
         if command_string is None or _command_string_depth >= 8:
             return True
         if _has_destructive_command_string(command_string):
-            return True
+            if not inspected_source or _has_bounded_parse_exhaustion(command_string, check_runtime, file_type="shell"):
+                return True
         if _has_shell_command_word_exhaustion(
             command_string,
             check_runtime,
@@ -2927,15 +2928,15 @@ def _has_runtime_command_operand_exhaustion(
     )
 
 
-def _shell_command_strings(
+def _shell_command_string_values(
     content: str,
     check_runtime: Callable[[], None],
     *,
     perl_eval_blocks: bool = False,
     python_source: _PythonSourceOwnership | None = None,
     source_commands: Mapping[tuple[int, int], str | tuple[str, ...]] | None = None,
-) -> Iterator[str | None]:
-    """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
+) -> Iterator[tuple[str | None, bool]]:
+    """Yield reparsed strings with exact consumer-owned source-analysis proof."""
     single_sources = (
         {span: value for span, value in source_commands.items() if isinstance(value, str)}
         if source_commands is not None else None
@@ -2964,9 +2965,23 @@ def _shell_command_strings(
                 continue
         variants = source_commands.get(spans[0]) if source_commands is not None and len(spans) == 1 else None
         if command_string is None and isinstance(variants, tuple):
-            yield from variants
+            for variant in variants:
+                yield variant, True
         else:
-            yield command_string
+            yield command_string, isinstance(variants, str) and command_string == variants
+
+
+def _shell_command_strings(
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    perl_eval_blocks: bool = False,
+    python_source: _PythonSourceOwnership | None = None,
+    source_commands: Mapping[tuple[int, int], str | tuple[str, ...]] | None = None,
+) -> Iterator[str | None]:
+    """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
+    for text, _ in _shell_command_string_values(content, check_runtime, perl_eval_blocks=perl_eval_blocks, python_source=python_source, source_commands=source_commands):
+        yield text
 
 
 def _shell_clause_starts(

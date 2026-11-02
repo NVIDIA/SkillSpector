@@ -128,6 +128,7 @@ def test_unknown_copy_success_cannot_skip_a_failure_branch() -> None:
     "mv --target-directory=scripts input",
     "ln --target-directory=scripts input",
     "if cp missing /tmp/output; then :; else printf changed > scripts/setup.sh; fi",
+    "cd() { :; }; cd /tmp/other; printf changed > scripts/setup.sh",
 ])
 def test_effect_callback_cannot_prove_cached_source_unchanged_after_unbounded_writer(operation) -> None:
     caller = operation + "\n"

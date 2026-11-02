@@ -60,9 +60,27 @@ def test_known_sibling_dangerous_command_is_retained_at_the_consumer() -> None:
         source_view=SecurityTextView("raw", _CALLER),
     ))
     assert any(finding.rule_id == "TM1" for finding in findings)
+    assert not prepared.has_bounded_parse_exhaustion()
     for finding in findings:
         assert finding.location.file == "scripts/caller.sh"
         assert finding.evidence["reconstructed_shell_source"]["origins"]
+
+
+def test_inspected_destructive_source_does_not_clear_unrelated_unknown_consumer() -> None:
+    caller = _CALLER + 'bash -c "$RUNTIME_COMMAND"\n'
+    prepared = _prepare(caller, "helper() {\n rm -rf /\n}\n")
+    assert prepared is not None
+    findings = list(prepared.analyze_source_commands(content=caller, file_path="scripts/caller.sh", file_type="shell", source_view=SecurityTextView("raw", caller)))
+    assert any(finding.rule_id == "TM1" for finding in findings)
+    assert prepared.has_bounded_parse_exhaustion()
+
+
+def test_inspected_source_retains_nested_unknown_execution_limit() -> None:
+    library = 'helper() {\n rm -rf /\n bash -c "$UNKNOWN"\n}\n'
+    prepared = _prepare(library=library)
+    assert prepared is not None
+    list(prepared.analyze_source_commands(content=_CALLER, file_path="scripts/caller.sh", file_type="shell", source_view=SecurityTextView("raw", _CALLER)))
+    assert prepared.has_bounded_parse_exhaustion()
 
 
 @pytest.mark.parametrize("mutation", [

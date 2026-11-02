@@ -395,4 +395,4 @@ class ShellArtifactAudit:
         redirects = self._redirect(command, artifacts)
         if redirects is None:
             return None
-        return ShellEffectResult(output, status, tuple(dict.fromkeys((*writes, *redirects))), native_identity=True)
+        return ShellEffectResult(output, status, tuple(dict.fromkeys((*writes, *redirects))), native_identity=not command.child_inspected)
