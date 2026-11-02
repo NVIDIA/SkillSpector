@@ -805,6 +805,10 @@ class _EffectAudit:
         if len(raw) == 1:
             value = self.word(raw[0], frame, program, assignment=extended)
             return bool(value) if value is not None else None
+        if extended and len(raw) == 3 and raw[1] == "=~":
+            for operand in (raw[0], raw[2]):
+                self.word(operand, frame, program, assignment=True)
+            return None
         values = tuple(self.word(item, frame, program, assignment=extended) for item in raw)
         if len(values) == 2 and values[0] in {"-e", "-f", "-s", "-x", "-L", "-d"} and self.native_effect is not None:
             path = self.path(values[1], frame)

@@ -201,6 +201,14 @@ def test_regex_anchor_stays_literal_without_claiming_regex_truth() -> None:
     assert not _preserves('BRANCH=dev\nif ' + condition + '; then printf changed > scripts/library.sh; fi\n', _LIBRARY)
 
 
+@pytest.mark.parametrize("left, right", [
+    ('"$(printf changed > scripts/library.sh)"', 'literal'),
+    ('literal', '"$(printf changed > scripts/library.sh)"'),
+])
+def test_regex_operands_still_audit_executable_substitutions(left: str, right: str) -> None:
+    assert not _preserves('[[ ' + left + ' =~ ' + right + ' ]]\n', _LIBRARY)
+
+
 @pytest.mark.parametrize("value", ['$missing', '"$missing"', '$[1+1]'])
 def test_real_or_unsupported_dollar_expansion_does_not_become_literal(value: str) -> None:
     assert not _preserves('value=' + value + '\nprintf changed > "$value"\n', _LIBRARY)
