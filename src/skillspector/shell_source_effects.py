@@ -1141,7 +1141,7 @@ class _EffectAudit:
                     directories.add(directory)
                     directory = posixpath.dirname(directory)
             return ShellEffectResult("", True if destination in directories else None, native_identity=True)
-        if basename == "dirname" and len(args) == 1 and args[0] is not None:
+        if basename == "dirname" and len(args) == 1 and args[0] is not None and not args[0].startswith("-"):
             return ShellEffectResult(posixpath.dirname(args[0]) or ".", True)
         if basename == "mktemp" and len(args) in {1, 2} and args[-1] is not None and (len(args) == 1 or args[0] == "-d"):
             from skillspector.shell_sources import SAFE_PATH_MARKER

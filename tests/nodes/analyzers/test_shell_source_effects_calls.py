@@ -231,6 +231,10 @@ def test_checked_known_directory_does_not_skip_possible_failure_branch() -> None
     assert not _preserves('if cd scripts; then :; else printf changed > scripts/library.sh; fi\n', _LIBRARY)
 
 
+def test_dirname_option_cannot_invent_success_and_skip_mutation() -> None:
+    assert not _preserves('if dirname -z; then :; else printf changed > scripts/library.sh; fi\n', _LIBRARY)
+
+
 @pytest.mark.parametrize("statement, expected", [
     ('set -e\nroot="$(cd scripts && pwd)"\n', True),
     ('set -e\nroot="$(cd scripts && pwd; true)"\n', False),
