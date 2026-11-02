@@ -30,7 +30,7 @@ import re
 import sys
 import time
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 
@@ -2435,6 +2435,7 @@ def _has_shell_command_word_exhaustion(
     may_have_destructive_outer_operands = _may_have_destructive_outer_operands(content)
     json_openers = sorted(structural_quote_openers or ())
     complete_comments: set[tuple[int, int]] = set()
+    powershell_strings = _powershell_literal_operands(powershell)
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
@@ -2607,6 +2608,7 @@ def _has_shell_command_word_exhaustion(
                 start,
                 parsed.end,
                 check_runtime,
+                powershell_strings=powershell_strings,
             )
         ):
             comment = python_source.comment(start) if python_source is not None else None
@@ -2659,11 +2661,26 @@ def _has_shell_command_word_exhaustion(
     return False
 
 
+def _powershell_literal_operands(
+    source: PowerShellSource | None,
+) -> dict[int, PowerShellString]:
+    """Native noninterpolated strings retain one argument and their offsets."""
+    if source is None:
+        return {}
+    return {
+        string.start: string for string in source.strings
+        if not string.invoked and "$" not in string.value
+        and source.owns(string.start) and source.owns(string.end - 1)
+    }
+
+
 def _has_runtime_command_operand_exhaustion(
     content: str,
     start: int,
     word_end: int,
     check_runtime: Callable[[], None],
+    *,
+    powershell_strings: Mapping[int, PowerShellString] | None = None,
 ) -> bool:
     """Return whether a runtime-selected command's operands are undecidable."""
     tokens, command_end, exhausted = _bounded_shell_tokens(
@@ -2671,6 +2688,7 @@ def _has_runtime_command_operand_exhaustion(
         start,
         word_end,
         check_runtime=check_runtime,
+        powershell_strings=powershell_strings,
     )
     if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
         # Earlier prose (for example "row-first") cannot supply this
@@ -3397,6 +3415,7 @@ def _bounded_shell_tokens(
     body_start: int,
     *,
     check_runtime: Callable[[], None] | None = None,
+    powershell_strings: Mapping[int, PowerShellString] | None = None,
 ) -> tuple[tuple[_ShellToken, ...], int, bool]:
     """Return argument words from one security-view-bounded shell command."""
     runtime_check = check_runtime or (lambda: None)
@@ -3507,6 +3526,17 @@ def _bounded_shell_tokens(
         if (cursor - body_start) % 256 == 0:
             runtime_check()
         character = content[cursor]
+        native_string = powershell_strings.get(cursor) if powershell_strings is not None else None
+        if quote is None and native_string is not None:
+            if native_string.end > limit:
+                return tuple(tokens), limit, True
+            # PowerShell's backtick escapes belong to one native argument.
+            # They cannot open Bash command substitution or consume later
+            # lines. Decoded flags remain visible to the operand checks.
+            mark_quoted_word()
+            append_piece(native_string.value, quoted=True)
+            cursor = native_string.end
+            continue
         if quote is not None:
             if character == quote:
                 quote = None
@@ -6051,6 +6081,7 @@ def _has_bounded_parse_exhaustion(
     ):
         return True
     covered_until = 0
+    powershell_strings = _powershell_literal_operands(powershell)
     for command_start, body_start in _destructive_command_words(content):
         check_runtime()
         if command_start < covered_until:
@@ -6067,14 +6098,24 @@ def _has_bounded_parse_exhaustion(
             command_start,
             body_start,
             check_runtime=check_runtime,
+            powershell_strings=powershell_strings,
         )
         covered_until = max(covered_until, command_end)
         if exhausted or _has_unsupported_brace_expansion(tokens):
             return True
+        if powershell_strings and any(
+            string.decoded and body_start <= string.start < command_end
+            for string in powershell_strings.values()
+        ) and (_has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens)):
+            # Native escapes can assemble destructive flags the raw finding
+            # parser did not see. Keep this reconstruction explicitly partial.
+            return True
     if powershell is not None:
         for start, end in powershell.invocations:
             check_runtime()
-            if _has_runtime_command_operand_exhaustion(content, start, end, check_runtime):
+            if _has_runtime_command_operand_exhaustion(
+                content, start, end, check_runtime, powershell_strings=powershell_strings
+            ):
                 return True
         for string in powershell.strings:
             check_runtime()
