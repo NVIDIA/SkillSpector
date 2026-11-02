@@ -24,11 +24,22 @@ Framework: LLM07.
 
 from __future__ import annotations
 
+import ast
 import re
 import sys
+from bisect import bisect_right
+from collections.abc import Callable
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 
+from skillspector.artifacts import SecurityTextView
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.python_ast import (
+    MAX_PYTHON_AST_SOURCE_CHARS,
+    parse_python_source,
+    peek_python_ast,
+)
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
@@ -39,10 +50,29 @@ logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_system_prompt_leakage"
 
+_scan_python_ast_cache_key: ContextVar[str | None] = ContextVar(
+    "system_prompt_leakage_python_ast_cache_key", default=None
+)
+
+_P6_LOCAL_RETURN = re.compile(
+    r"return\s+(?:prompts?|instructions?|rules?|guidelines?|directives?)", re.IGNORECASE
+)
+
+_NESTED_PYTHON_SCOPES = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.Lambda,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+)
+
 # P6: Direct Prompt Extraction — instructions that directly reveal system prompts
 P6_PATTERNS = [
     (
-        r"(?:print|output|show|display|reveal|expose|return|echo)\s+(?:your\s+)?(?:full\s+)?(?:system\s+)?(?:prompt|instructions?|rules?|guidelines?|directives?)",
+        r"(?:print|output|show|display|reveal|expose|return|echo)\s+(?:your\s+)?(?:full\s+)?(?:system\s+)?(?:prompts?|instructions?|rules?|guidelines?|directives?)",
         0.85,
     ),
     (
@@ -262,7 +292,153 @@ def _is_benign_print_rules_taxonomy(content: str, match: re.Match[str]) -> bool:
     return False
 
 
+def _leading_name(expression: ast.expr) -> ast.Name | None:
+    """Return the name an expression starts with, such as ``rules`` in ``rules[0]``."""
+    node: ast.expr | None = expression
+    while node is not None and not isinstance(node, ast.Name):
+        start = (node.lineno, node.col_offset)
+        node = next(
+            (
+                child
+                for child in ast.iter_child_nodes(node)
+                if isinstance(child, ast.expr) and (child.lineno, child.col_offset) == start
+            ),
+            None,
+        )
+    return node
+
+
+def _python_local_return_spans(
+    content: str, file_path: str, check_runtime: Callable[[], None]
+) -> frozenset[tuple[int, int]]:
+    """Return source spans of Python ``return`` statements that return a local name.
+
+    A span runs from the ``return`` keyword to the end of the name that starts
+    the returned expression. Its source text must itself read ``return <target>``,
+    so a normalized or reconstructed reading of other text never qualifies. The
+    name must be a parameter or an assignment target of the same function, and
+    not declared ``global`` or ``nonlocal`` there. Names from enclosing scopes or
+    comprehensions, strings, comments, docstrings and source that does not parse
+    keep their findings.
+    """
+    if len(content) > MAX_PYTHON_AST_SOURCE_CHARS:
+        return frozenset()
+    check_runtime()
+    parsed = peek_python_ast(_scan_python_ast_cache_key.get(), content, file_path)
+    if parsed is None:
+        parsed = parse_python_source(content, file_path)
+    check_runtime()
+    if parsed.tree is None:
+        return frozenset()
+    # AST columns are UTF-8 byte offsets on Python's own lines, which split
+    # only at CR, LF and CRLF (str.splitlines() also splits at form feeds).
+    line_starts = [0]
+    line_starts.extend(match.end() for match in re.finditer(rb"\r\n?|\n", parsed.source_bytes))
+
+    def offset(line: int, byte_column: int) -> int:
+        byte_offset = line_starts[line - 1] + byte_column
+        non_ascii = bisect_right(parsed.non_ascii_byte_ends, byte_offset)
+        return byte_offset - parsed.non_ascii_extra_bytes[non_ascii]
+
+    spans: set[tuple[int, int]] = set()
+    visited = 0
+    for function in ast.walk(parsed.tree):
+        visited += 1
+        if visited % 1024 == 0:
+            check_runtime()
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        arguments = function.args
+        local_names = {
+            argument.arg
+            for argument in (
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+                arguments.vararg,
+                arguments.kwarg,
+            )
+            if argument is not None
+        }
+        declared: set[str] = set()
+        returns: list[tuple[ast.Return, ast.Name]] = []
+        pending: list[ast.AST] = list(function.body)
+        while pending:
+            visited += 1
+            if visited % 1024 == 0:
+                check_runtime()
+            node = pending.pop()
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                local_names.add(node.id)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                declared.update(node.names)
+            elif isinstance(node, ast.Return) and node.value is not None:
+                if (name := _leading_name(node.value)) is not None:
+                    returns.append((node, name))
+            if not isinstance(node, _NESTED_PYTHON_SCOPES):
+                pending.extend(ast.iter_child_nodes(node))
+        local_names -= declared
+        for statement, name in returns:
+            if name.id not in local_names or name.end_lineno is None or name.end_col_offset is None:
+                continue
+            start = offset(statement.lineno, statement.col_offset)
+            end = offset(name.end_lineno, name.end_col_offset)
+            if _P6_LOCAL_RETURN.fullmatch(content, start, end) is not None:
+                spans.add((start, end))
+    check_runtime()
+    return frozenset(spans)
+
+
+@dataclass
+class _PreparedAnalysis:
+    """Keep local-return proof anchored to the complete original source."""
+
+    source: str
+    check_runtime: Callable[[], None]
+    python_file: bool = False
+    _local_return_spans: dict[str, frozenset[tuple[int, int]]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    def analyze(
+        self, content: str, file_path: str, file_type: str, source_view: SecurityTextView
+    ) -> list[AnalyzerFinding]:
+        return _analyze(content, file_path, file_type, self, source_view)
+
+    def returns_local_value(
+        self, match: re.Match[str], view: SecurityTextView, file_path: str
+    ) -> bool:
+        """Return whether the match is exactly a Python return of a local name."""
+        if not self.python_file or _P6_LOCAL_RETURN.fullmatch(match.group(0)) is None:
+            return False
+        spans = self._local_return_spans.get(file_path)
+        if spans is None:
+            spans = _python_local_return_spans(self.source, file_path, self.check_runtime)
+            self._local_return_spans[file_path] = spans
+        start = view.source_offset(match.start())
+        end = view.source_offset(match.end() - 1) + 1
+        return (start, end) in spans
+
+
+def prepare_analysis(
+    content: str, file_type: str, check_runtime: Callable[[], None]
+) -> _PreparedAnalysis:
+    check_runtime()
+    return _PreparedAnalysis(content, check_runtime, file_type == "python")
+
+
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+    prepared = prepare_analysis(content, file_type, lambda: None)
+    return _analyze(content, file_path, file_type, prepared, SecurityTextView("raw", content))
+
+
+def _analyze(
+    content: str,
+    file_path: str,
+    file_type: str,
+    prepared: _PreparedAnalysis,
+    source_view: SecurityTextView,
+) -> list[AnalyzerFinding]:
     """Analyze content for system prompt leakage patterns (P6–P8)."""
     findings: list[AnalyzerFinding] = []
 
@@ -278,6 +454,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in static_runner.iter_paragraph_matches(
             pattern, content, re.IGNORECASE | re.MULTILINE
         ):
+            if prepared.returns_local_value(match, source_view, file_path):
+                continue
             if _is_benign_output_rules_heading(content, match, file_type):
                 continue
             if _is_benign_print_rules_taxonomy(content, match):
@@ -337,6 +515,10 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run system_prompt_leakage patterns and return findings."""
-    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    token = _scan_python_ast_cache_key.set(state.get("python_ast_cache_key"))
+    try:
+        response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    finally:
+        _scan_python_ast_cache_key.reset(token)
     logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
     return response
