@@ -1,3 +1,7 @@
+### Unreleased maintenance fixes
+### Fixes
+* Backport scoped `allowed-tools` grant handling from #768: recognize declarations such as `Bash(git:*)`, preserve spaces and commas inside scopes, and keep malformed grants or embedded tool names from declaring shell capability. Command restrictions remain intact in the manifest.
+---
 ### 2.13.3 (Unreleased)
 ### Security and integrity fixes
 * Prevent baseline and recursive reports from overwriting primary and child inputs, including aliases. (#924, #938)
