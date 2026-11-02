@@ -2679,18 +2679,22 @@ def _has_shell_command_word_exhaustion(
             or _SHELL_COMMENT_START_RE.search(content, content.rfind("\n", 0, start) + 1, start)
             is not None
         )
-        owned_end = (
-            min(parsed.end, powershell.next_boundary(start, len(content)))
+        ownership_boundary = (
+            powershell.next_boundary(start, len(content))
             if powershell is not None
-            else parsed.end
+            else len(content)
         )
+        owned_end = min(parsed.end, ownership_boundary)
         if not confined_word:
             # A quote that opens a runtime-selected word stays an independent
             # candidate, so a mis-paired claim cannot hide its operands.
+            # An enclosing backtick may be owned at parsed.end itself.
             owned_word_positions.update(
                 position
                 for position in candidate_word_positions
-                if position < owned_end and content[position + 1 : position + 2] not in ("$", "`")
+                if position <= parsed.end
+                and position < ownership_boundary
+                and content[position + 1 : position + 2] not in ("$", "`")
             )
         # Only executable nested substitutions retain independent command
         # positions. A plain dynamic data argument still owns its inner bytes;
