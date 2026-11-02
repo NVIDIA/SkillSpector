@@ -88,19 +88,40 @@ AR1_PATTERNS = [
     # starts with a required Chinese character, so non-matching text fails
     # fast, and together they match exactly the phrases the single
     # pattern matched.
+    #
+    # The trailing quantifier pattern is likewise split into
+    # quantifier-present and quantifier-absent variants. With the
+    # quantifier absent, the two gaps around it collapse into one
+    # distribution of the separator run, which is quadratic on a long
+    # run after a matched refusal. Each variant below has exactly one
+    # gap between required segments there, so a near miss fails in
+    # linear time.
     (
         f"(?:{chinese_spaced('永远')}|{chinese_spaced('始终')}){CHINESE_GAP}"
         f"(?:{chinese_spaced('不要')}|{chinese_spaced('不得')}|{chinese_spaced('不能')}|{chinese_spaced('绝不')}){CHINESE_GAP}"
         f"{chinese_spaced('拒绝')}{CHINESE_GAP}"
-        f"(?:{chinese_spaced('任何')}|{chinese_spaced('所有')})?"
-        f"{CHINESE_GAP}(?:{chinese_spaced('请求')}|{chinese_spaced('要求')}|{chinese_spaced('用户')})",
+        f"(?:{chinese_spaced('任何')}|{chinese_spaced('所有')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('请求')}|{chinese_spaced('要求')}|{chinese_spaced('用户')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('永远')}|{chinese_spaced('始终')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('不要')}|{chinese_spaced('不得')}|{chinese_spaced('不能')}|{chinese_spaced('绝不')}){CHINESE_GAP}"
+        f"{chinese_spaced('拒绝')}{CHINESE_GAP}"
+        f"(?:{chinese_spaced('请求')}|{chinese_spaced('要求')}|{chinese_spaced('用户')})",
         0.85,
     ),
     (
         f"(?:{chinese_spaced('不要')}|{chinese_spaced('不得')}|{chinese_spaced('不能')}|{chinese_spaced('绝不')}){CHINESE_GAP}"
         f"{chinese_spaced('拒绝')}{CHINESE_GAP}"
-        f"(?:{chinese_spaced('任何')}|{chinese_spaced('所有')})?"
-        f"{CHINESE_GAP}(?:{chinese_spaced('请求')}|{chinese_spaced('要求')}|{chinese_spaced('用户')})",
+        f"(?:{chinese_spaced('任何')}|{chinese_spaced('所有')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('请求')}|{chinese_spaced('要求')}|{chinese_spaced('用户')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('不要')}|{chinese_spaced('不得')}|{chinese_spaced('不能')}|{chinese_spaced('绝不')}){CHINESE_GAP}"
+        f"{chinese_spaced('拒绝')}{CHINESE_GAP}"
+        f"(?:{chinese_spaced('请求')}|{chinese_spaced('要求')}|{chinese_spaced('用户')})",
         0.85,
     ),
     (
@@ -133,11 +154,35 @@ AR2_PATTERNS = [
         0.8,
     ),
     (r"\b(?:do\s+not|don'?t)\s+(?:apologize|apologise|say\s+sorry)\b", 0.55),
-    # Chinese-language equivalents (issue #953).
+    # Chinese-language equivalents (issue #953). Each pattern with
+    # optional segments is split into one variant per combination of
+    # those segments, as with the P1/P6 split: a gap on either side of
+    # an optional segment lets a near miss distribute a long separator
+    # run across the gaps (quadratic for one optional, cubic for two),
+    # while each variant has exactly one gap between required segments
+    # and fails in linear time. Together the variants match exactly the
+    # phrases the single patterns matched.
     (
         f"(?:{chinese_spaced('不要')}|{chinese_spaced('请勿')}|{chinese_spaced('不得')}){CHINESE_GAP}"
-        f"(?:{chinese_spaced('给出')}|{chinese_spaced('添加')}|{chinese_spaced('包含')})?{CHINESE_GAP}"
-        f"(?:{chinese_spaced('任何')})?{CHINESE_GAP}"
+        f"(?:{chinese_spaced('给出')}|{chinese_spaced('添加')}|{chinese_spaced('包含')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('任何')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('警告')}|{chinese_spaced('免责声明')})",
+        0.8,
+    ),
+    (
+        f"(?:{chinese_spaced('不要')}|{chinese_spaced('请勿')}|{chinese_spaced('不得')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('给出')}|{chinese_spaced('添加')}|{chinese_spaced('包含')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('警告')}|{chinese_spaced('免责声明')})",
+        0.8,
+    ),
+    (
+        f"(?:{chinese_spaced('不要')}|{chinese_spaced('请勿')}|{chinese_spaced('不得')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('任何')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('警告')}|{chinese_spaced('免责声明')})",
+        0.8,
+    ),
+    (
+        f"(?:{chinese_spaced('不要')}|{chinese_spaced('请勿')}|{chinese_spaced('不得')}){CHINESE_GAP}"
         f"(?:{chinese_spaced('警告')}|{chinese_spaced('免责声明')})",
         0.8,
     ),
@@ -148,7 +193,12 @@ AR2_PATTERNS = [
     ),
     (
         f"(?:{chinese_spaced('没有')}|{chinese_spaced('无需')}){CHINESE_GAP}"
-        f"(?:{chinese_spaced('任何')})?{CHINESE_GAP}"
+        f"(?:{chinese_spaced('任何')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('警告')}|{chinese_spaced('免责声明')})",
+        0.75,
+    ),
+    (
+        f"(?:{chinese_spaced('没有')}|{chinese_spaced('无需')}){CHINESE_GAP}"
         f"(?:{chinese_spaced('警告')}|{chinese_spaced('免责声明')})",
         0.75,
     ),
@@ -186,7 +236,15 @@ AR3_PATTERNS = [
     ),
     # Chinese-language equivalents (issue #953). The unrestricted-mode
     # pattern requires an entry verb, so a feature description that merely
-    # names the mode does not match.
+    # names the mode does not match. As with AR2 above, every pattern
+    # with optional segments is split into one variant per combination
+    # of those segments, so a near miss cannot distribute a long
+    # separator run across the gaps around an absent optional segment.
+    # Together the variants match exactly the phrases the single
+    # patterns matched. The trailing optional constraint in the
+    # 不受 pattern stays optional: it follows a required noun,
+    # so a match ending at the noun succeeds at once and never
+    # backtracks over a separator run.
     (
         f"(?:{chinese_spaced('处于')}|{chinese_spaced('进入')}|{chinese_spaced('切换到')}|{chinese_spaced('开启')}){CHINESE_GAP}"
         f"(?:{chinese_spaced('无限制')}|{chinese_spaced('不受限制')}|{chinese_spaced('没有限制')}|{chinese_spaced('无任何限制')}){CHINESE_GAP}"
@@ -195,7 +253,13 @@ AR3_PATTERNS = [
     ),
     (
         f"{chinese_spaced('绕过')}{CHINESE_GAP}"
-        f"(?:{chinese_spaced('所有')}|{chinese_spaced('全部')})?{CHINESE_GAP}"
+        f"(?:{chinese_spaced('所有')}|{chinese_spaced('全部')}){CHINESE_GAP}"
+        f"{chinese_spaced('安全')}{CHINESE_GAP}"
+        f"(?:{chinese_spaced('限制')}|{chinese_spaced('约束')}|{chinese_spaced('防护')}|{chinese_spaced('政策')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
+        0.9,
+    ),
+    (
+        f"{chinese_spaced('绕过')}{CHINESE_GAP}"
         f"{chinese_spaced('安全')}{CHINESE_GAP}"
         f"(?:{chinese_spaced('限制')}|{chinese_spaced('约束')}|{chinese_spaced('防护')}|{chinese_spaced('政策')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
         0.9,
@@ -203,33 +267,73 @@ AR3_PATTERNS = [
     (
         f"(?:{chinese_spaced('你')}|{chinese_spaced('您')}){CHINESE_GAP}"
         f"(?:{chinese_spaced('没有')}|{chinese_spaced('不受')}){CHINESE_GAP}"
-        f"(?:{chinese_spaced('任何')})?{CHINESE_GAP}"
+        f"(?:{chinese_spaced('任何')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('限制')}|{chinese_spaced('约束')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
+        0.9,
+    ),
+    (
+        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('没有')}|{chinese_spaced('不受')}){CHINESE_GAP}"
         f"(?:{chinese_spaced('限制')}|{chinese_spaced('约束')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
         0.9,
     ),
     (
         f"{chinese_spaced('不受')}{CHINESE_GAP}"
-        f"(?:{chinese_spaced('任何')})?{CHINESE_GAP}"
+        f"(?:{chinese_spaced('任何')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('政策')}|{chinese_spaced('规则')}|{chinese_spaced('規則')}|{chinese_spaced('限制')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('约束')})?",
+        0.9,
+    ),
+    (
+        f"{chinese_spaced('不受')}{CHINESE_GAP}"
         f"(?:{chinese_spaced('政策')}|{chinese_spaced('规则')}|{chinese_spaced('規則')}|{chinese_spaced('限制')}){CHINESE_GAP}"
         f"(?:{chinese_spaced('约束')})?",
         0.9,
     ),
     (
         f"{chinese_spaced('忽略')}{CHINESE_GAP}"
-        f"(?:{chinese_spaced('你的')}|{chinese_spaced('您的')})?{CHINESE_GAP}"
-        f"(?:{chinese_spaced('安全')}|{chinese_spaced('内容')})?{CHINESE_GAP}"
+        f"(?:{chinese_spaced('你的')}|{chinese_spaced('您的')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('安全')}|{chinese_spaced('内容')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('政策')}|{chinese_spaced('准则')}|{chinese_spaced('规则')}|{chinese_spaced('規則')}|{chinese_spaced('限制')})",
+        0.9,
+    ),
+    (
+        f"{chinese_spaced('忽略')}{CHINESE_GAP}"
+        f"(?:{chinese_spaced('你的')}|{chinese_spaced('您的')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('政策')}|{chinese_spaced('准则')}|{chinese_spaced('规则')}|{chinese_spaced('規則')}|{chinese_spaced('限制')})",
+        0.9,
+    ),
+    (
+        f"{chinese_spaced('忽略')}{CHINESE_GAP}"
+        f"(?:{chinese_spaced('安全')}|{chinese_spaced('内容')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('政策')}|{chinese_spaced('准则')}|{chinese_spaced('规则')}|{chinese_spaced('規則')}|{chinese_spaced('限制')})",
+        0.9,
+    ),
+    (
+        f"{chinese_spaced('忽略')}{CHINESE_GAP}"
         f"(?:{chinese_spaced('政策')}|{chinese_spaced('准则')}|{chinese_spaced('规则')}|{chinese_spaced('規則')}|{chinese_spaced('限制')})",
         0.9,
     ),
     (
         f"{chinese_spaced('解除')}{CHINESE_GAP}"
-        f"(?:{chinese_spaced('所有')}|{chinese_spaced('全部')})?{CHINESE_GAP}"
+        f"(?:{chinese_spaced('所有')}|{chinese_spaced('全部')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('限制')}|{chinese_spaced('约束')}|{chinese_spaced('防护')})",
+        0.85,
+    ),
+    (
+        f"{chinese_spaced('解除')}{CHINESE_GAP}"
         f"(?:{chinese_spaced('限制')}|{chinese_spaced('约束')}|{chinese_spaced('防护')})",
         0.85,
     ),
     (
         f"(?:{chinese_spaced('开发者')}|{chinese_spaced('越狱')}|{chinese_spaced('管理员')}){CHINESE_GAP}"
-        f"{chinese_spaced('模式')}{CHINESE_GAP}(?:{chinese_spaced('已')})?{CHINESE_GAP}"
+        f"{chinese_spaced('模式')}{CHINESE_GAP}{chinese_spaced('已')}{CHINESE_GAP}"
+        f"(?:{chinese_spaced('开启')}|{chinese_spaced('启用')}|{chinese_spaced('激活')})",
+        0.75,
+    ),
+    (
+        f"(?:{chinese_spaced('开发者')}|{chinese_spaced('越狱')}|{chinese_spaced('管理员')}){CHINESE_GAP}"
+        f"{chinese_spaced('模式')}{CHINESE_GAP}"
         f"(?:{chinese_spaced('开启')}|{chinese_spaced('启用')}|{chinese_spaced('激活')})",
         0.75,
     ),
