@@ -103,6 +103,8 @@ FILE_TYPES: dict[str, str] = {
     ".bash": "shell",
     ".zsh": "shell",
     ".ps1": "powershell",
+    ".psm1": "powershell",
+    ".psd1": "powershell",
     ".json": "json",
     ".yaml": "yaml",
     ".yml": "yaml",

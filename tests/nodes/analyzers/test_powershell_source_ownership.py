@@ -61,6 +61,16 @@ def test_unrelated_native_commands_do_not_invalidate_uri_ownership() -> None:
     assert _ledger(content)["outcome"] is LedgerOutcome.COMPLETED
 
 
+@pytest.mark.parametrize("extension", ["ps1", "psm1", "PSM1", "psd1", "PSD1"])
+def test_module_and_script_extensions_use_the_same_ownership(extension: str) -> None:
+    content = '$uri = "$base`?option=value"' + _TAIL
+    assert _ledger(content, f"sample.{extension}")["outcome"] is LedgerOutcome.COMPLETED
+    hostile = '& ("r`m") -rf /' + _TAIL
+    assert _ledger(hostile, f"sample.{extension}")["outcome"] is LedgerOutcome.PARTIAL
+    subexpression = '@{ Value = "$(bash -c \'$CMD -rf /\')" }' + _TAIL
+    assert _ledger(subexpression, f"sample.{extension}")["outcome"] is LedgerOutcome.PARTIAL
+
+
 @pytest.mark.parametrize(
     "statement",
     [
@@ -68,6 +78,16 @@ def test_unrelated_native_commands_do_not_invalidate_uri_ownership() -> None:
         "& bash -lc '$CMD -rf /'",
         '& "$($CMD)" -rf /',
         '& "r`m" -rf /',
+        '& ("r`m") -rf /',
+        '& (("r`m")) -rf /',
+        '& $("r`m") -rf /',
+        '& ($("r`m")) -rf /',
+        '. (("r`m")) -rf /',
+        '& ("r" + "m") -rf /',
+        '& (("r") + "m") -rf /',
+        '& ("r`m").ToString() -rf /',
+        '& ("r`m".ToString()) -rf /',
+        '& ("r`m")[0..1] -rf /',
         'bash -c "r`m -rf /"',
         '$uri = "$base`?option=value"; bash -c \'$CMD -rf /\'',
         '$message = "$(bash -c \'$CMD -rf /\')"',
@@ -107,6 +127,7 @@ def test_executable_shell_and_decoded_destructive_content_stay_partial(
         "Write-Host 'mixed ’; $CMD -rf /; #'",
         'Write-Host "mixed “; $CMD -rf /; #"',
         "Write-Host 'mixed ‘; $CMD -rf /; #'",
+        "b`ash -c '$CMD -rf /'",
         '"$("' * 34 + ')' * 34,
     ],
 )

@@ -37,6 +37,7 @@ class PowerShellString:
     value: str
     decoded: bool
     invoked: bool
+    operand_start: int | None = None
 
 
 @dataclass(frozen=True)
@@ -144,8 +145,22 @@ def powershell_source(
                 # A quoted command name after the PowerShell call operator
                 # remains an executable candidate with its following operands.
                 previous = start - 1
+                parentheses = 0
                 while previous >= 0 and content[previous] in " \t\r\n":
+                    if previous % 1024 == 0:
+                        check_runtime()
                     previous -= 1
+                while previous >= 0 and content[previous] == "(":
+                    parentheses += 1
+                    if parentheses > _MAX_DEPTH:
+                        raise _UnprovenPowerShell
+                    previous -= 1
+                    if previous >= 0 and content[previous] == "$":
+                        previous -= 1
+                    while previous >= 0 and content[previous] in " \t\r\n":
+                        if previous % 1024 == 0:
+                            check_runtime()
+                        previous -= 1
                 invoked = previous >= 0 and (
                     content[previous] == "&" or (
                         content[previous] == "." and (
@@ -154,7 +169,30 @@ def powershell_source(
                         )
                     )
                 )
-                strings.append(PowerShellString(start, end, "".join(value), decoded, invoked))
+                operand_start: int | None = end
+                if invoked and parentheses:
+                    suffix = end
+                    for _ in range(parentheses):
+                        while suffix < len(content) and content[suffix] in " \t\r\n":
+                            check(suffix, depth)
+                            suffix += 1
+                        if content[suffix:suffix + 1] != ")":
+                            # A concatenation or method call can still build
+                            # the executable name. No literal-name proof.
+                            operand_start = None
+                            break
+                        suffix += 1
+                    else:
+                        operand_start = suffix
+                if (
+                    invoked and operand_start is not None and operand_start < len(content)
+                    and not content[operand_start].isspace()
+                    and content[operand_start] not in ";|&"
+                ):
+                    operand_start = None
+                strings.append(
+                    PowerShellString(start, end, "".join(value), decoded, invoked, operand_start)
+                )
                 if invoked:
                     del spans[span_start:]
                 return end
@@ -246,8 +284,10 @@ def powershell_source(
                     own(cursor, end)
                     cursor = end
                     continue
-                cursor += 2
-                continue
+                # Bare escaped words can name native commands (b`ash), not
+                # merely data. Until their command identity is reconstructed,
+                # keep the original conservative traversal for this source.
+                raise _UnprovenPowerShell
             if content.startswith("${", cursor):
                 cursor = variable(cursor, depth)
                 continue

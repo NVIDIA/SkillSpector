@@ -5853,12 +5853,13 @@ def _fenced_powershell_source(
             PowerShellString(
                 start + string.start, start + string.end,
                 string.value, string.decoded, string.invoked,
+                start + string.operand_start if string.operand_start is not None else None,
             )
             for string in source.strings
         )
         clause_starts.update(start + position for position in source.clause_starts)
         continuations.extend((start + begin, start + end) for begin, end in source.continuations)
-    if not starts:
+    if not starts and not strings and not continuations:
         return None
     source = PowerShellSource(tuple(starts), tuple(ends), tuple(strings), ())
     # Preserve the ordinary shell traversal outside the proven host spans.
@@ -6029,11 +6030,13 @@ def _has_bounded_parse_exhaustion(
             if string.invoked:
                 # A quoted command after & or dot-sourcing retains its actual
                 # operands. Ordinary host strings are not shell programs.
-                end = min(len(content), string.end + _ROOT_GLOB_COMMAND_CHARS)
-                newline = content.find("\n", string.end, end)
+                if string.operand_start is None:
+                    return True
+                end = min(len(content), string.operand_start + _ROOT_GLOB_COMMAND_CHARS)
+                newline = content.find("\n", string.operand_start, end)
                 if newline >= 0:
                     end = newline
-                command = string.value + content[string.end:end]
+                command = string.value + content[string.operand_start:end]
                 if _has_destructive_command_string(command) or _has_bounded_parse_exhaustion(
                     command, check_runtime, file_type="shell", complete_context=False
                 ):
