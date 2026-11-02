@@ -446,6 +446,10 @@ class _EffectAudit:
                     unknown = True
                     cursor += arithmetic.end()
                     continue
+                if not assignment and not quote:
+                    # Substitution output can split into several argv words
+                    # and expand globs, just like an unquoted parameter.
+                    raise _UnresolvedError
                 end = self.resolver.substitution_end(raw, cursor, len(raw))
                 if end is None:
                     raise _UnresolvedError
@@ -559,7 +563,7 @@ class _EffectAudit:
                     parts.append(value)
                 cursor += parameter.end()
                 continue
-            if character == "`" or not quote and not assignment and character in "*?[]~":
+            if character == "`" or not quote and (character == "~" or not assignment and character in "*?[]{}"):
                 raise _UnresolvedError
             parts.append(character)
             cursor += 1
@@ -771,31 +775,33 @@ class _EffectAudit:
             raise _UnresolvedError
         return self.command(program, node, frame)
 
-    def condition(self, raw, frame, program, depth=0):
+    def condition(self, raw, frame, program, depth=0, *, extended=True):
         self.tick()
         if depth > _MAX_DEPTH or not raw or any(item in {"(", ")"} for item in raw):
+            raise _UnresolvedError
+        if not extended and (len(raw) > 4 or any(item in {"&&", "||"} for item in raw)):
             raise _UnresolvedError
         # Bash binds ! more tightly than &&, and && more tightly than ||.
         # Split the outer logical expression before interpreting its terms.
         for separator in ("||", "&&"):
             if separator in raw:
                 at = raw.index(separator)
-                left = self.condition(raw[:at], frame, program, depth + 1)
+                left = self.condition(raw[:at], frame, program, depth + 1, extended=extended)
                 if separator == "&&" and left is False or separator == "||" and left is True:
                     return left
                 right_frame = frame.copy()
                 right_frame.uncertain |= left is None
-                right = self.condition(raw[at + 1:], right_frame, program, depth + 1)
+                right = self.condition(raw[at + 1:], right_frame, program, depth + 1, extended=extended)
                 if separator == "&&":
                     return False if left is False or right is False else True if left is True and right is True else None
                 return True if left is True or right is True else False if left is False and right is False else None
         if raw[:1] == ("!",):
-            value = self.condition(raw[1:], frame, program, depth + 1)
+            value = self.condition(raw[1:], frame, program, depth + 1, extended=extended)
             return None if value is None else not value
         if len(raw) == 1:
-            value = self.word(raw[0], frame, program, assignment=True)
+            value = self.word(raw[0], frame, program, assignment=extended)
             return bool(value) if value is not None else None
-        values = tuple(self.word(item, frame, program, assignment=True) for item in raw)
+        values = tuple(self.word(item, frame, program, assignment=extended) for item in raw)
         if len(values) == 2 and values[0] in {"-e", "-f", "-s", "-x", "-L", "-d"} and self.native_effect is not None:
             path = self.path(values[1], frame)
             if path is not None and self.conflicts_with_redirect(path):
@@ -814,6 +820,8 @@ class _EffectAudit:
             if SHELL_PID_MARKER in left or SHELL_PID_MARKER in right:
                 return None
             if operator in {"=", "==", "!="}:
+                if not extended:
+                    return (left == right) != (operator == "!=")
                 # A fully quoted RHS is literal; mixed quoted/unquoted pieces
                 # preserve quoting per character and cannot use the flattened
                 # value as either a plain string or an unqualified pattern.
@@ -893,7 +901,7 @@ class _EffectAudit:
             closing = "]]" if raw[0] == "[[" else "]" if raw[0] == "[" else None
             if closing is not None and raw[-1] != closing:
                 raise _UnresolvedError
-            frame.status = self.condition(raw[1:-1] if closing else raw[1:], frame, program)
+            frame.status = self.condition(raw[1:-1] if closing else raw[1:], frame, program, extended=raw[0] == "[[")
             return [frame]
         if raw[0] in {"local", "export", "unset"}:
             if prefix or redirects:

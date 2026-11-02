@@ -153,6 +153,42 @@ def test_exact_positional_list_still_preserves_each_argument() -> None:
     assert not _preserves(caller + 'remove scripts/library.sh /tmp/two\n', _LIBRARY)
 
 
+@pytest.mark.parametrize("opening, closing", [("[", " ]"), ("test", "")])
+def test_ordinary_test_refuses_unproved_splitting_and_globbing(opening: str, closing: str) -> None:
+    caller = "value='x y'\nif " + opening + ' $value != z' + closing + '; then :; else printf changed > scripts/library.sh; fi\n'
+    assert not _preserves(caller, _LIBRARY)
+    assert _preserves(caller.replace('$value', '"$value"'), _LIBRARY)
+    pattern = 'if ' + opening + ' safe == s*' + closing + '; then :; else printf changed > scripts/library.sh; fi\n'
+    assert not _preserves(pattern, _LIBRARY)
+
+
+def test_extended_condition_keeps_its_distinct_no_splitting_and_pattern_rules() -> None:
+    assert _preserves("value='x y'\nif [[ $value != z ]]; then :; else printf changed > scripts/library.sh; fi\n", _LIBRARY)
+    assert _preserves('if [[ safe == s* ]]; then :; else printf changed > scripts/library.sh; fi\n', _LIBRARY)
+
+
+def test_ordinary_test_substitution_output_cannot_skip_field_splitting() -> None:
+    value = "$(printf '%s' 'x y')"
+    caller = 'if [ ' + value + ' != z ]; then :; else printf changed > scripts/library.sh; fi\n'
+    assert not _preserves(caller, _LIBRARY)
+    assert _preserves(caller.replace(value, '"' + value + '"'), _LIBRARY)
+    assert not _preserves("rm $(printf '%s' 'scripts/library.sh /tmp/other')\n", _LIBRARY)
+
+
+def test_ordinary_test_brace_expansion_cannot_skip_argument_count_failure() -> None:
+    caller = 'if [ x != {x,y} ]; then :; else printf changed > scripts/library.sh; fi\n'
+    assert not _preserves(caller, _LIBRARY)
+    assert _preserves(caller.replace('{x,y}', "'{x,y}'"), _LIBRARY)
+
+
+@pytest.mark.parametrize("prefix, operand", [('value=~\n', '"$value"'), ('', '~')])
+def test_unquoted_tilde_never_becomes_literal_in_assignment_or_condition(prefix: str, operand: str) -> None:
+    caller = prefix + 'if [[ ' + operand + ' == "~" ]]; then :; else printf changed > scripts/library.sh; fi\n'
+    assert not _preserves(caller, _LIBRARY)
+    quoted = prefix.replace('=~', "='~'") + 'if [[ ' + ("'~'" if operand == '~' else operand) + ' == "~" ]]; then :; else printf changed > scripts/library.sh; fi\n'
+    assert _preserves(quoted, _LIBRARY)
+
+
 @pytest.mark.parametrize("operator", ["#", "##", "%", "%%"])
 def test_uncalled_quoted_pattern_removal_keeps_its_function_boundary(operator: str) -> None:
     library = 'unused() {\nprintf "%s\\n" "${path' + operator + '"$ROOT"/}"\n}\n'
