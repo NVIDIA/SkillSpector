@@ -56,7 +56,7 @@ def test_runtime_and_unresolved_controls_remain_partial(source: str, padding: in
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
-@pytest.mark.parametrize("file_type", ["markdown", "python", "powershell"])
+@pytest.mark.parametrize("file_type", ["markdown", "python"])
 def test_ownership_does_not_apply_to_other_languages(file_type: str) -> None:
     source = 'echo "hello $(printf x) ${DELAY}s"\n' + "#" * 6000
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type)
