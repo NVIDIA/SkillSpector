@@ -110,6 +110,26 @@ def test_preservation_join_keeps_exited_and_continuing_effects_separate() -> Non
     assert _preserves_joined(caller.replace('path=scripts/library.sh', 'path=/tmp/other'))
 
 
+def test_preservation_keeps_distinct_exited_callable_states_without_guessing() -> None:
+    caller = '''bash -c 'if [[ "$unknown" == yes ]]; then action() { printf one; }; exit 0; else action() { printf two; }; exit 0; fi'
+'''
+    assert _preserves_joined(caller)
+
+
+@pytest.mark.parametrize("trap", ['trap "action" EXIT', 'trap "printf safe" EXIT'])
+def test_distinct_exited_states_keep_each_late_exit_trap_binding(trap: str) -> None:
+    caller = '''bash -c 'action() { printf safe; }; trap "action" EXIT; if [[ "$unknown" == yes ]]; then action() { printf changed > scripts/library.sh; }; exit 0; else ''' + trap + '''; exit 0; fi'
+'''
+    assert not _preserves_joined(caller)
+    assert _preserves_joined(caller.replace('printf changed > scripts/library.sh', 'printf other'))
+
+
+@pytest.mark.parametrize("branches, preserved", [(127, True), (128, False)])
+def test_retained_exit_alternatives_keep_the_shared_state_bound(branches: int, preserved: bool) -> None:
+    caller = 'if [[ "$unknown" == yes ]]; then exit 0; fi\n' * branches
+    assert _preserves_joined(caller) is preserved
+
+
 def test_preservation_mode_requires_current_source_dependency_bytes() -> None:
     assert not _preserves_joined('source scripts/library.sh\n', read_source=lambda path: None)
     assert not _preserves_joined('unknown_helper /tmp/other\n')

@@ -650,6 +650,8 @@ class _EffectAudit:
 
     def join(self, frames):
         """Join only data facts; possible effects already reached the callback."""
+        if len(frames) > _MAX_STATES:
+            raise _UnresolvedError
         groups = {}
         for frame in frames:
             self.tick()
@@ -657,8 +659,10 @@ class _EffectAudit:
         output = []
         for alternatives in groups.values():
             first = alternatives[0]
-            if len(alternatives) == 1:
-                output.append(first)
+            if len(alternatives) == 1 or first.flow == "exit":
+                # Exited alternatives cannot call later commands, but their
+                # EXIT traps must retain each original late-bound function.
+                output.extend(alternatives)
                 continue
             if any(
                 branch.functions != first.functions or branch.traps != first.traps
