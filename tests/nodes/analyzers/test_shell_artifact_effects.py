@@ -7,11 +7,11 @@ from dataclasses import replace
 
 import pytest
 
-from skillspector import static_patterns_tool_misuse as tm
+from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.shell_artifact_effects import ShellArtifactAudit
 from skillspector.shell_artifacts import ShellArtifact
-from skillspector.shell_source_effects import ShellEffectCommand
-from skillspector.shell_sources import SAFE_PATH_MARKER, ShellSourceContext, ShellSourceValue
+from skillspector.shell_source_effects import ShellEffectCommand, source_effects_preserve
+from skillspector.shell_sources import SAFE_PATH_MARKER, ShellSourceContext, ShellSourceResolver, ShellSourceValue
 
 
 def _audit():
@@ -101,3 +101,36 @@ def test_post_child_callback_publishes_only_the_inspected_child_stdout() -> None
 
 def test_native_unknown_command_is_not_accepted_just_because_path_is_standard() -> None:
     assert _audit()(_command(("python3", "-c", "arbitrary effects"))) is None
+
+
+@pytest.mark.parametrize("argv", [
+    ("mv", "--target-directory=scripts", "input"),
+    ("mv", "-tscripts", "input"),
+    ("ln", "--target-directory=scripts", "input"),
+    ("ln", "-tscripts", "input"),
+    ("install", "--target-directory=scripts", "input"),
+    ("truncate", "--size=0", "scripts/setup.sh"),
+])
+def test_destination_bearing_native_flags_are_not_discarded(argv) -> None:
+    audit = _audit()
+    assert audit(_command(argv)) is None
+
+
+def test_unknown_copy_success_cannot_skip_a_failure_branch() -> None:
+    audit = _audit()
+    result = audit(_command(("cp", "unknown-input", "/tmp/output")))
+    assert result is not None and result.status is None
+    assert audit.store.read("/tmp/output") is None
+
+
+@pytest.mark.parametrize("operation", [
+    "mv --target-directory=scripts input",
+    "ln --target-directory=scripts input",
+    "if cp missing /tmp/output; then :; else printf changed > scripts/setup.sh; fi",
+])
+def test_effect_callback_cannot_prove_cached_source_unchanged_after_unbounded_writer(operation) -> None:
+    caller = operation + "\n"
+    context = ShellSourceContext("tests/caller.sh", {"tests/caller.sh": caller, "scripts/setup.sh": "echo inspected\n"})
+    resolver = ShellSourceResolver(context, tm._next_shell_invocation_word, lambda text, start, end: tm._skip_command_substitution(text, start, end, lambda: None), tm._static_heredoc_header, tm._skip_static_heredoc_bodies, lambda: None)
+    audit = ShellArtifactAudit(context, tm._next_shell_invocation_word, lambda: None)
+    assert not source_effects_preserve(resolver, "scripts/setup.sh", len(caller), read_source=audit.read_source, native_effect=audit)

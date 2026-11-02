@@ -27,6 +27,16 @@ from skillspector.shell_sources import SAFE_PATH_MARKER, ReadWord, ShellSourceCo
 _BUILTINS = frozenset({":", "true", "false", "set", "printf", "echo", "pwd", "cd", "command", "test", "umask", "wait"})
 _READERS = frozenset({"head", "tail", "grep", "egrep", "fgrep", "cut", "wc", "stat", "sha256sum", "sha1sum", "md5sum", "cmp", "diff", "readlink", "ls", "file", "sleep", "id", "date", "kill"})
 _COMPRESSORS = frozenset({"gzip", "pigz", "bzip2", "lbzip2", "xz"})
+_WRITER_FLAGS = {
+    "rm": {"-f", "-r", "-R", "-rf", "-fr", "-v", "--"},
+    "unlink": {"--"}, "rmdir": {"-p", "--"},
+    "touch": {"-a", "-m", "-c", "--"},
+    "mv": {"-f", "-n", "-i", "-v", "-T", "--"},
+    "ln": {"-s", "-f", "-n", "-sf", "-snf", "-sfn", "--"},
+    "install": {"-d", "--"}, "tee": {"-a", "-i", "--"},
+    "truncate": {"--"}, "mkfifo": {"--"},
+    "chown": {"-R", "-h", "-f", "--"}, "chgrp": {"-R", "-h", "-f", "--"},
+}
 
 
 class ShellArtifactAudit:
@@ -281,9 +291,11 @@ class ShellArtifactAudit:
             writes.append(destination)
             if command.uncertain:
                 self.store.invalidate(destination)
+                status = None
             elif not self.store.copy(source, destination):
                 # A known disjoint destination may still receive unknown data.
                 self.store.invalidate(destination)
+                status = None
             output = ""
         elif name == "tar" and all(value is not None for value in args):
             if args[:1] == ("-I",) and (len(args) < 2 or args[1] not in _COMPRESSORS or not self.identity(command, args[1])[0]):
@@ -314,8 +326,12 @@ class ShellArtifactAudit:
             found, selected = self.identity(command, args[1])
             status = True if found or selected is not None else None
             output = (selected or args[1]) + "\n" if status else None
-        elif name in {"rm", "unlink", "rmdir", "touch", "mv", "ln", "install", "tee", "truncate", "mkfifo", "chown", "chgrp"}:
+        elif name in _WRITER_FLAGS:
             if any(value is None for value in args):
+                return None
+            # Flags carrying paths (including attached/long option values)
+            # cannot be dropped while collecting possible write destinations.
+            if any(value.startswith("-") and value not in _WRITER_FLAGS[name] for value in args):
                 return None
             paths = [self.path(value, command.cwd) for value in args if not value.startswith("-")]
             if not paths or any(path is None for path in paths):
