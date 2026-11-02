@@ -72,9 +72,14 @@ class _UnprovenPowerShellError(Exception):
     pass
 
 
-def powershell_source(content: str, check_runtime: Callable[[], None]) -> PowerShellSource | None:
+def powershell_source(
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    unresolved_executables: list[int] | None = None,
+) -> PowerShellSource | None:
     """Return only whole-source lexical proof; malformed input proves nothing."""
-    if len(content) > MAX_PYTHON_AST_SOURCE_CHARS or _DYNAMIC_CODE.search(content):
+    if len(content) > MAX_PYTHON_AST_SOURCE_CHARS:
         return None
     spans: list[tuple[int, int]] = []
     strings: list[PowerShellString] = []
@@ -82,6 +87,14 @@ def powershell_source(content: str, check_runtime: Callable[[], None]) -> PowerS
     continuations: list[tuple[int, int]] = []
     invocations: list[tuple[int, int]] = []
     checked = -1024
+
+    def executable_boundary(start: int, end: int) -> None:
+        if end < len(content) and not (content[end].isspace() or content[end] in ";|&)}"):
+            # Falling back to shell quoting cannot establish coverage of a
+            # PowerShell method or index expression that selects executable code.
+            if unresolved_executables is not None:
+                unresolved_executables.append(start)
+            raise _UnprovenPowerShellError
 
     def check(cursor: int, depth: int) -> None:
         nonlocal checked
@@ -292,6 +305,7 @@ def powershell_source(content: str, check_runtime: Callable[[], None]) -> PowerS
                     spans.extend(gap_comments)
                     clause_starts.add(opening + 1)
                     end = code(opening + 1, depth + 1, closes_parenthesis=True)
+                    executable_boundary(operand, end)
                     invocations.append((operand, end))
                     cursor = end
                     continue
@@ -306,10 +320,7 @@ def powershell_source(content: str, check_runtime: Callable[[], None]) -> PowerS
                         r"(?:\[[0-9]+\]|\.[A-Za-z_][A-Za-z0-9_]*)*", content[end : end + 512]
                     )
                     end += suffix.end()
-                    if end < len(content) and not (content[end].isspace() or content[end] in ";|&)}"):
-                        # Complex executable selection needs its own value
-                        # proof; a partial variable span cannot own operands.
-                        raise _UnprovenPowerShellError
+                    executable_boundary(operand, end)
                     invocations.append((operand, end))
                     cursor = end
                     continue
@@ -389,6 +400,8 @@ def powershell_source(content: str, check_runtime: Callable[[], None]) -> PowerS
     except _UnprovenPowerShellError:
         return None
     check_runtime()
+    if _DYNAMIC_CODE.search(content):
+        return None
     spans.sort()
     if any(end > next_start for (_, end), (next_start, _) in zip(spans, spans[1:], strict=False)):
         return None

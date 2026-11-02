@@ -6068,6 +6068,7 @@ def _fenced_powershell_source(
     content: str,
     blocks: list[tuple[int, int]],
     check_runtime: Callable[[], None],
+    unresolved_executables: list[int],
 ) -> PowerShellSource | None:
     """Keep complete PowerShell fence ownership in document coordinates."""
     starts: list[int] = []
@@ -6078,7 +6079,11 @@ def _fenced_powershell_source(
     invocations: list[tuple[int, int]] = []
     for start, end in blocks:
         check_runtime()
-        source = powershell_source(content[start:end], check_runtime)
+        unresolved: list[int] = []
+        source = powershell_source(
+            content[start:end], check_runtime, unresolved_executables=unresolved
+        )
+        unresolved_executables.extend(start + position for position in unresolved)
         if source is None:
             continue
         starts.extend(start + position for position in source.starts)
@@ -6168,8 +6173,9 @@ def _has_bounded_parse_exhaustion(
     json_strings: list[tuple[int, int]] = []
     python_source = None
     javascript_source = None
+    unresolved_executables: list[int] = []
     powershell = (
-        powershell_source(content, check_runtime)
+        powershell_source(content, check_runtime, unresolved_executables=unresolved_executables)
         if file_type == "powershell" and complete_context
         else None
     )
@@ -6202,7 +6208,11 @@ def _has_bounded_parse_exhaustion(
         if hardware_apostrophe_ambiguity[0]:
             return True
         if powershell_blocks:
-            powershell = _fenced_powershell_source(content, powershell_blocks, check_runtime)
+            powershell = _fenced_powershell_source(
+                content, powershell_blocks, check_runtime, unresolved_executables
+            )
+    if unresolved_executables:
+        return True
     if powershell is not None and powershell.continuations:
         projected = list(content)
         for start, end in powershell.continuations:

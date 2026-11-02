@@ -230,6 +230,23 @@ def test_incomplete_executable_name_slice_cannot_claim_operand_ownership(name: s
 
 @pytest.mark.parametrize(
     "expression",
+    ["$runner.GetShell()", "$programs[$index]", "($runner).GetShell()", "($programs)[$index]"],
+)
+@pytest.mark.parametrize("path", ["sample.ps1", "SKILL.md"])
+@pytest.mark.parametrize("prefix", ["", "# Invoke-Expression is documented here\n"])
+def test_unsupported_executable_selection_stays_partial(
+    expression: str, path: str, prefix: str
+) -> None:
+    content = prefix + f"& {expression} -c '$CMD -rf /'\n"
+    if path == "SKILL.md":
+        content = f"# Instructions\n\n```powershell\n{content}```\n"
+    event = _ledger(content, path)
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "expression",
     [
         '(Write-Output "bash")',
         "($program)",
