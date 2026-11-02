@@ -642,6 +642,27 @@ def _is_shell_command_word_start(content: str, start: int) -> bool:
     return False
 
 
+def _is_shell_command_position(content: str, start: int) -> bool:
+    """Return whether ``start`` opens a line or follows a command separator."""
+    cursor = start - 1
+    while cursor >= 0 and content[cursor] in " \t":
+        cursor -= 1
+    return cursor < 0 or content[cursor] in "\n\r;|&("
+
+
+def _opens_runtime_word(content: str, start: int) -> bool:
+    """Return whether ``start`` opens a ``$`` or single-backtick word, bare or in ``"``."""
+    cursor = start + 1 if content.startswith('"', start) else start
+    if content.startswith("$", cursor):
+        return True
+    # A backtick run such as a Markdown fence never opens a substitution.
+    return (
+        content.startswith("`", cursor)
+        and not content.startswith("``", cursor)
+        and (cursor == 0 or content[cursor - 1] != "`")
+    )
+
+
 def _has_quoted_assignment_prefix(content: str, start: int) -> bool:
     """Return whether a quoted candidate starts with a shell assignment name."""
     if (
@@ -2726,6 +2747,11 @@ def _has_shell_command_word_exhaustion(
         content, check_runtime
     )
     parsed_through = 0
+    # A word that spans lines may pair a heredoc, comment or prose quote with
+    # a later command line. Main skips the candidates inside such a word, so
+    # they are still checked here, but they never change what later
+    # candidates are skipped or owned.
+    shadow_through = 0
     # Completed words own closing quotes, never executable expansion starts.
     # Inner commands remain independent candidates; never suppress their bodies.
     owned_word_positions: set[int] = set()
@@ -2768,6 +2794,7 @@ def _has_shell_command_word_exhaustion(
             )
         ):
             continue
+        shadowed = start < shadow_through
         if _has_quoted_assignment_prefix(content, start):
             # A quoted NAME=value argument cannot be the command word. Claim
             # only a complete static word; dynamic substitutions must remain
@@ -2780,8 +2807,22 @@ def _has_shell_command_word_exhaustion(
                 backtick_end_cache,
                 check_runtime=check_runtime,
             )
-            if parsed is not None and _plain_quoted_assignment_word(parsed):
+            if (
+                parsed is not None
+                and _plain_quoted_assignment_word(parsed)
+                and not shadowed
+            ):
                 parsed_through = max(parsed_through, parsed.end)
+            continue
+        # A runtime-selected command may follow any prefix word (``sudo -u
+        # root``, ``then``, ``{``, ``env A=1``), so ``$``- and backtick-led
+        # candidates keep main's word-start check; other words must open a
+        # command position.
+        if (
+            shadowed
+            and not _opens_runtime_word(content, start)
+            and not _is_shell_command_position(content, start)
+        ):
             continue
         candidate_word_positions: set[int] = set()
         parsed = _parse_shell_command_word(
@@ -2841,6 +2882,9 @@ def _has_shell_command_word_exhaustion(
                     )
                 ):
                     return True
+            if shadowed:
+                # The spanning word already closed this region's quotes.
+                continue
             # An unclosed expansion or quote can consume the rest of the
             # artifact. Once that unresolved span exceeds the command-word
             # budget, treating it as clean would turn malformed, deeply nested
@@ -2882,7 +2926,7 @@ def _has_shell_command_word_exhaustion(
             or _SHELL_COMMENT_START_RE.search(content, content.rfind("\n", 0, start) + 1, start)
             is not None
         )
-        if not confined_word:
+        if not confined_word and not shadowed:
             # A quote that opens a runtime-selected word stays an independent
             # candidate, so a mis-paired claim cannot hide its operands.
             owned_word_positions.update(
@@ -2903,12 +2947,19 @@ def _has_shell_command_word_exhaustion(
             is not None
         )
         if (
-            not parsed.dynamic
-            or "$" not in raw_word
-            or not any(marker in raw_word for marker in ("$(", "`"))
-            or simple_backtick_parameter
-        ) and not (assignment_quote and confined_word):
-            parsed_through = max(parsed_through, owned_end)
+            (
+                not parsed.dynamic
+                or "$" not in raw_word
+                or not any(marker in raw_word for marker in ("$(", "`"))
+                or simple_backtick_parameter
+            )
+            and not (assignment_quote and confined_word)
+            and not shadowed
+        ):
+            if python_source is None and ("\n" in raw_word or "\r" in raw_word):
+                shadow_through = max(shadow_through, owned_end)
+            else:
+                parsed_through = max(parsed_through, owned_end)
         if assignment_quote:
             # An assignment value never names the command, and main never
             # parsed this position, so it only claims ownership.
