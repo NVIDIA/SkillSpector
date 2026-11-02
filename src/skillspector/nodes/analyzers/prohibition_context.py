@@ -30,6 +30,39 @@ _DIRECT_PREFIX = re.compile(
     re.IGNORECASE,
 )
 _BLANK_LINE = re.compile(r"\n[ \t]*\n")
+# Chinese direct prohibitions, for the new Chinese extraction surface in
+# static_patterns_system_prompt_leakage (issue #953). This mirrors the
+# English grammar above and is deliberately narrow: only a negation that
+# immediately governs the matched action exempts it. The negation set is
+# the plain prohibitions 请勿, 请不要, 不要, 不得, 切勿, and 勿, optionally
+# preceded by an agent noun, 请, or a second-person pronoun, with only
+# space-like separators (ordinary and ideographic spaces, zero-width and
+# bidi marks) between the characters and before the action. A newline
+# between negation and action does not govern, exactly as in English.
+# Broader forms (严禁, 禁止, 不准, 不能) are not included: they are not
+# proven by the reviewer sentence and some state capability, not a direct
+# imperative prohibition.
+_CHINESE_SEP = r"[ \t\u3000\u200b-\u200f\ufeff]*"
+_CHINESE_NEGATION = rf"(?:勿|不{_CHINESE_SEP}要|不{_CHINESE_SEP}得|切{_CHINESE_SEP}勿)"
+_CHINESE_DIRECT_PREFIX = re.compile(
+    r"(?:\A|(?<=[\n\r.!?;，。！？、]))[ \t\u3000]*"
+    r"(?:[-+][ \t\u3000]+|\d+[.)][ \t\u3000]+)?"
+    rf"(?:(?:助手|助理|模型){_CHINESE_SEP})?"
+    rf"(?:请{_CHINESE_SEP})?"
+    rf"(?:(?:你|您){_CHINESE_SEP})?"
+    rf"(?P<negation>{_CHINESE_NEGATION}){_CHINESE_SEP}\Z"
+)
+_CHINESE_SENTENCE_END = re.compile(rf"[.!?;。！？{LINE_BREAK_CHARS}]")
+_CHINESE_CLAUSE_BREAK = re.compile(rf"[.!?;。！？{LINE_BREAK_CHARS}]")
+_CHINESE_LEADING_QUALIFIER = re.compile(
+    r"(?:除非|如果|假如|只有|仅当|否则|当[^，。；：！？\n]{0,20}时|在[^，。；：！？\n]{0,40}?(?:情况|条件)下)"
+)
+_CHINESE_EXCEPTION = re.compile(r"(?:除非|但是|不过|然而|除外|如果|假如|只有|仅当|否则)")
+_CHINESE_DISAVOWAL = re.compile(r"(?:忽略|无视|违背|撤销|取消|废除|不再适用|过时)")
+_CHINESE_REFERENTIAL = re.compile(r"(?:输出它|透露它|泄露它|照做|这样做|按此执行)")
+_CHINESE_FOLLOWING_OVERRIDE = re.compile(
+    r"(?:除非|但是|不过|然而|除外|否则|照做|输出它|透露它|现在就输出|立即输出|按此执行)"
+)
 _CONTRACTION = re.compile(r"(?<=\w)['’](?=\w)")
 _SENTENCE_END = re.compile(rf"[.!?;{LINE_BREAK_CHARS}]")
 _EXCEPTION = re.compile(r"\b(?:unless|except|until|but|however|instead)\b", re.IGNORECASE)
@@ -116,6 +149,70 @@ _YARA_AGENT_CONTEXT = re.compile(
 )
 
 
+def _is_chinese_directly_prohibited(
+    content: str,
+    start: int,
+    end: int,
+    allowed_tail: re.Pattern[str] | None,
+) -> bool:
+    """Whether a Chinese direct prohibition immediately governs this action.
+
+    Mirrors the English grammar in :func:`is_directly_prohibited`: the
+    negation must sit immediately before the matched action, a condition
+    or scope leading into it rejects the exemption, an exception in the
+    same clause rejects it, and a following sentence carrying an
+    exception or override marker rejects it. A negation elsewhere in
+    the sentence (for example governing a different verb) never exempts,
+    because the prefix pattern is anchored at the match start and allows
+    only space-like separators after the negation. Unknown or incomplete
+    context retains detection.
+    """
+    if not 0 <= start < end <= len(content):
+        return False
+    left = max(0, start - _CONTEXT_CHARS)
+    prefix = content[left:start].translate(_MARKDOWN)
+    prohibited = _CHINESE_DIRECT_PREFIX.search(prefix)
+    if prohibited is None or (left and prohibited.start() == 0):
+        return False
+    leading = prefix[: prohibited.start()]
+    if sum(leading.count(char) for char in "“”") % 2:
+        return False
+    if sum(leading.count(char) for char in "‘’") % 2:
+        return False
+    if _CHINESE_DISAVOWAL.search(leading):
+        return False
+    if _CHINESE_LEADING_QUALIFIER.search(_CHINESE_CLAUSE_BREAK.split(leading)[-1]):
+        return False
+    if _BLANK_LINE.search(LOGICAL_LINE_BREAK.sub("\n", prohibited.group())):
+        return False
+    raw_tail = content[end : end + _CONTEXT_CHARS]
+    tail_view = normalized_security_view(raw_tail)
+    tail = tail_view.text
+    if _CHINESE_DISAVOWAL.search(tail) or _CHINESE_REFERENTIAL.search(tail):
+        return False
+    boundary = _CHINESE_SENTENCE_END.search(tail)
+    if boundary is None and end + len(raw_tail) < len(content):
+        return False
+    if boundary is not None:
+        following_start = (
+            tail_view.source_offset(boundary.end()) if boundary.end() < len(tail) else len(raw_tail)
+        )
+        following = raw_tail[following_start:].lstrip()
+        following = _LIST_PREFIX.sub("", following, count=1)
+        following_clause = (
+            _CHINESE_SENTENCE_END.split(following, maxsplit=1)[0] if following else ""
+        )
+        if _CHINESE_FOLLOWING_OVERRIDE.search(following_clause):
+            return False
+    clause = tail[: boundary.start()] if boundary is not None else tail
+    if _CHINESE_EXCEPTION.search(clause):
+        return False
+    clean_tail = clause.translate(_MARKDOWN).strip(" \t\u3000，、；：").rstrip("])}").strip()
+    return not clean_tail or (
+        allowed_tail is not None and allowed_tail.fullmatch(clean_tail) is not None
+    )
+
+
 def is_directly_prohibited(
     content: str,
     start: int,
@@ -160,7 +257,13 @@ def is_directly_prohibited(
             # unchanged. Retain all leading text for quote/reversal checks.
             prefix = prefix[:prefix_boundary] + ";" + prefix[prefix_boundary + 1 :]
             prohibited = _DIRECT_PREFIX.search(prefix)
-    if prohibited is None or (left and prohibited.start() == 0):
+    if prohibited is None:
+        # No English prohibition governs this match; a Chinese one may.
+        # An English prohibition that exists but was rejected above (for
+        # example by allow_clause_prefix scope checks) keeps its verdict
+        # and is not overridden by a Chinese check.
+        return _is_chinese_directly_prohibited(content, start, end, allowed_tail)
+    if left and prohibited.start() == 0:
         return False
     leading = prefix[: prohibited.start()]
     quoted = _CONTRACTION.sub("", leading)
