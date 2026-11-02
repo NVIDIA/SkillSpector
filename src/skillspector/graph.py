@@ -23,6 +23,11 @@ from __future__ import annotations
 
 from typing import Any
 
+# Configure serializer warnings before LangGraph imports its serializer.
+from skillspector import _workflow_warnings as _workflow_warnings
+
+# isort: split
+
 from langgraph.graph import END, START, StateGraph
 
 from skillspector.dependency_inspection import inspect_dependencies
