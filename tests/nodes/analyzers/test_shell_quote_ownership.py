@@ -222,3 +222,8 @@ def test_compound_adversarial_inputs_retain_security_signal(
                 finding.rule_id == "TM1" and finding.severity.value == "HIGH"
                 for finding in tm.analyze(source, "run.sh", "shell")
             ), source
+
+
+def test_mixed_newline_heredoc_does_not_prove_a_false_closer() -> None:
+    source = "cat <<'EOF'\nbody\nEOF\r\necho \"quoted\"\n"
+    assert tm._shell_quoted_candidate_limits(source, lambda: None) == {}

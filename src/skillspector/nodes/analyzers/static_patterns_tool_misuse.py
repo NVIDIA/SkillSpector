@@ -2125,6 +2125,83 @@ def _has_destructive_command_string(content: str) -> bool:
     return False
 
 
+def _static_heredoc_header(
+    content: str, start: int, limit: int
+) -> tuple[tuple[str, bool, bool], int] | None:
+    """Read one bounded literal heredoc delimiter, without evaluating it."""
+    cursor = start + 2
+    strip_tabs = content[cursor : cursor + 1] == "-"
+    cursor += strip_tabs
+    whitespace_limit = min(limit, cursor + _SHELL_COMMAND_WORD_CHARS)
+    while cursor < whitespace_limit and content[cursor] in " \t":
+        cursor += 1
+    if cursor < limit and content[cursor] in " \t":
+        return None
+    quote = content[cursor : cursor + 1]
+    quoted = quote in {"'", '"'}
+    cursor += quoted
+    name = re.match(
+        r"[A-Za-z_][A-Za-z0-9_]*",
+        content[cursor : min(limit, cursor + _SHELL_COMMAND_WORD_CHARS + 1)],
+    )
+    if name is None or len(name[0]) > _SHELL_COMMAND_WORD_CHARS:
+        return None
+    cursor += len(name[0])
+    if quoted:
+        if cursor >= limit or content[cursor] != quote:
+            return None
+        cursor += 1
+    if cursor < limit and not (content[cursor].isspace() or content[cursor] in ";|&()<>"):
+        return None
+    return (name[0], strip_tabs, quoted), cursor
+
+
+def _skip_static_heredoc_bodies(
+    content: str,
+    start: int,
+    limit: int,
+    pending: tuple[tuple[str, bool, bool], ...],
+    check_runtime: Callable[[], None] | None,
+) -> int | None:
+    """Skip ordered bodies only after their declaring command's newline.
+
+    This proves outer lexical state only. The raw scanner still inspects every
+    body, including substitutions in unquoted heredocs. Delimiter comparison
+    joins unquoted continuations while retaining at most one delimiter's width.
+    """
+    cursor = start
+    for delimiter, strip_tabs, quoted in pending:
+        logical_prefix = ""
+        while cursor < limit:
+            if check_runtime is not None:
+                check_runtime()
+            newline = content.find("\n", cursor, limit)
+            line_end = limit if newline < 0 else newline
+            line = content[cursor:line_end]
+            continued = (
+                not quoted and newline >= 0 and (len(line) - len(line.rstrip("\\"))) % 2 == 1
+            )
+            if continued:
+                line = line[:-1]
+            if strip_tabs and not logical_prefix:
+                line = line.lstrip("\t")
+            # Once overlong, a logical line cannot become the delimiter. Keep
+            # a capped prefix instead of accumulating arbitrarily long bodies.
+            logical_prefix += line[: max(0, len(delimiter) + 1 - len(logical_prefix))]
+            if not continued and logical_prefix == delimiter:
+                cursor = limit if newline < 0 else newline + 1
+                break
+            if newline < 0:
+                return None
+            cursor = newline + 1
+            if not continued:
+                logical_prefix = ""
+        else:
+            return None
+    return cursor
+
+
+
 def _shell_quoted_candidate_limits(
     content: str, check_runtime: Callable[[], None]
 ) -> dict[int, int]:
