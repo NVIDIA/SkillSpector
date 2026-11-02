@@ -257,7 +257,7 @@ class ShellArtifactAudit:
             else:
                 status = None
             output = ""
-        elif name == "dirname" and len(args) == 1 and args[0] is not None:
+        elif name == "dirname" and len(args) == 1 and args[0] is not None and not args[0].startswith("-"):
             output = posixpath.dirname(args[0]) + "\n" if posixpath.dirname(args[0]) else ".\n"
         elif name == "echo" and all(value is not None and not value.startswith("-") and "\\" not in value for value in args):
             output = " ".join(args) + "\n"

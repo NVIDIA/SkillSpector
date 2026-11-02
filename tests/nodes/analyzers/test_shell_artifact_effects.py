@@ -146,6 +146,13 @@ def test_inherited_native_identity_does_not_invent_command_availability() -> Non
     assert result is not None and result.status is None and result.stdout is None
 
 
+def test_dirname_option_does_not_invent_successful_path_output() -> None:
+    audit = _audit()
+    assert audit(_command(("dirname", "-z"))) is None
+    result = audit(_command(("dirname", "scripts/setup.sh")))
+    assert result is not None and result.stdout == "scripts\n" and result.status is True
+
+
 def test_cd_distinguishes_known_input_root_from_unknown_runtime_directory() -> None:
     audit = _audit()
     result = audit(_command(("cd", "tests/..")))
