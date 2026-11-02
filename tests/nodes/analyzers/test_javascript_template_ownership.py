@@ -185,7 +185,7 @@ def test_optional_chain_projection_preserves_literal_and_unicode_offsets() -> No
     ) + _PADDING
     spans = javascript_template_spans(source, lambda: None)
     start = source.index("`literal")
-    end = source.index("`;", start) + 1
+    end = source.index("`", start + 1) + 1
     assert spans == ((start,), (end,))
 
 
@@ -201,10 +201,13 @@ def test_optional_chain_projection_preserves_literal_and_unicode_offsets() -> No
         " const value = `${input}`;\n#!/usr/bin/env node",
     ],
 )
-def test_invalid_or_unproven_host_syntax_keeps_partial_result(source: str) -> None:
-    assert (
-        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
-        is True
+def test_invalid_or_unproven_host_syntax_keeps_conservative_fallback(source: str) -> None:
+    source += _PADDING
+    assert javascript_template_spans(source, lambda: None) is None
+    # This hook reports bounded shell inspection, not JavaScript validity.
+    # Refusing ownership must leave the ordinary conservative scan unchanged.
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript") == (
+        tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="text")
     )
 
 
@@ -222,9 +225,36 @@ def test_invalid_or_unproven_host_syntax_keeps_partial_result(source: str) -> No
     ],
 )
 def test_supported_host_syntax_cannot_hide_code_execution(source: str) -> None:
-    assert (
-        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
-        is True
+    source += _PADDING
+    assert javascript_template_spans(source, lambda: None) is None
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript") == (
+        tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="text")
+    )
+
+
+@pytest.mark.parametrize("statement", [
+    "target[entry?.key] = 1;",
+    "target[entry?.key]++;",
+    "(entry?.target).value = 1;",
+    "new (entry?.Constructor)();",
+    "new Constructor(entry?.value);",
+    "(entry?.tag)`value`;",
+])
+def test_independent_optional_expressions_do_not_invalidate_templates(statement: str) -> None:
+    source = statement + "console.log(`Value: ${entry?.value}`);" + _PADDING
+    assert javascript_template_spans(source, lambda: None) is not None
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+@pytest.mark.parametrize("statement", [
+    "eval?.(`${command} -rf /`);",
+    "const evaluate = eval; evaluate(`${command} -rf /`);",
+    "const Evaluate = Function; new Evaluate(`${command} -rf /`);",
+    "const child = require('child_process'); child?.exec(`${command} -rf /`);",
+])
+def test_unknown_executable_template_keeps_destructive_operands_partial(statement: str) -> None:
+    assert tm.has_bounded_parse_exhaustion(
+        statement + _PADDING, lambda: None, file_type="javascript"
     )
 
 

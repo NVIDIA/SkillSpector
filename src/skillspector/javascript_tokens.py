@@ -411,7 +411,7 @@ _SHELL_EXECUTION_MODULES = frozenset({"child_process", "execa", "shelljs", "zx"}
 
 def _javascript_parse_text(
     content: str, check_runtime: Callable[[], None]
-) -> tuple[str, tuple[int, ...]] | None:
+) -> tuple[str, tuple[int, ...], frozenset[tuple[int, int]]] | None:
     """Adapt supported host syntax without changing any source offsets.
 
     Esprima predates hashbangs and optional chaining. Removing optional guards
@@ -424,7 +424,7 @@ def _javascript_parse_text(
             return None
         projected = "//" + content[2:]
     if "?." not in projected:
-        return projected, ()
+        return projected, (), frozenset()
 
     visited = 0
 
@@ -444,6 +444,19 @@ def _javascript_parse_text(
     check_runtime()
     output = list(projected)
     optional_positions: list[int] = []
+    parentheses: list[int] = []
+    parenthesized: set[tuple[int, int]] = set()
+    for index, token in enumerate(tokens):
+        if index % 256 == 0:
+            check_runtime()
+        if token.type != "Punctuator":
+            continue
+        if token.value == "(":
+            parentheses.append(index)
+        elif token.value == ")" and parentheses:
+            opener = parentheses.pop()
+            if opener + 1 < index:
+                parenthesized.add((tokens[opener + 1].range[0], tokens[index - 1].range[1]))
     for index, token in enumerate(tokens[:-2]):
         if index % 256 == 0:
             check_runtime()
@@ -465,32 +478,59 @@ def _javascript_parse_text(
         else:
             return None
         optional_positions.append(start)
-    return "".join(output), tuple(optional_positions)
+    return "".join(output), tuple(optional_positions), frozenset(parenthesized)
 
 
-def _invalid_optional_context(program: Any, positions: tuple[int, ...], tick: Callable[[], None]) -> bool:
+def _invalid_optional_context(
+    program: Any,
+    positions: tuple[int, ...],
+    parenthesized: frozenset[tuple[int, int]],
+    tick: Callable[[], None],
+) -> bool:
     """Optional chains cannot be assignment targets, constructors or tags."""
     if not positions:
         return False
+    def contains(start: int, end: int) -> bool:
+        index = bisect_left(positions, start)
+        return index < len(positions) and positions[index] < end
+
+    def optional_chain(target: Any) -> bool:
+        # Computed indices and call arguments are independent expressions.
+        # Parentheses also end a chain: (a?.b).c is a valid assignment target.
+        while target.type in {"MemberExpression", "CallExpression"}:
+            tick()
+            if target.type == "MemberExpression":
+                prefix = target.object
+                end = target.property.range[0]
+            else:
+                prefix = target.callee
+                end = target.arguments[0].range[0] if target.arguments else target.range[1]
+            if contains(prefix.range[1], end):
+                return True
+            if tuple(prefix.range) in parenthesized:
+                return False
+            target = prefix
+        return False
+
     for node in _walk_nodes(program, tick):
         target = None
-        constructor_end = None
         if node.type == "AssignmentExpression":
             target = node.left
         elif node.type == "UpdateExpression":
             target = node.argument
         elif node.type == "NewExpression":
             target = node.callee
-            constructor_end = node.arguments[0].range[0] if node.arguments else node.range[1]
+            end = node.arguments[0].range[0] if node.arguments else node.range[1]
+            if contains(target.range[1], end):
+                return True
+            if tuple(target.range) in parenthesized:
+                continue
         elif node.type == "TaggedTemplateExpression":
             target = node.tag
-        if target is not None:
-            start, end = target.range
-            if constructor_end is not None:
-                end = constructor_end
-            index = bisect_left(positions, start)
-            if index < len(positions) and positions[index] < end:
-                return True
+            if tuple(target.range) in parenthesized:
+                continue
+        if target is not None and optional_chain(target):
+            return True
     return False
 
 
@@ -511,7 +551,7 @@ def javascript_template_spans(
     prepared = _javascript_parse_text(content, check_runtime)
     if prepared is None:
         return None
-    parse_text, optional_positions = prepared
+    parse_text, optional_positions, parenthesized = prepared
     options = {"range": True}
     try:
         try:
@@ -521,7 +561,7 @@ def javascript_template_spans(
     except (esprima.Error, RecursionError, ValueError, TypeError):
         return None
     check_runtime()
-    if _invalid_optional_context(program, optional_positions, check_runtime):
+    if _invalid_optional_context(program, optional_positions, parenthesized, check_runtime):
         return None
 
     templates: list[tuple[int, int, bool]] = []
