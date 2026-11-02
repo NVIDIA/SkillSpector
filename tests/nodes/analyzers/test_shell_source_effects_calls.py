@@ -73,6 +73,45 @@ def test_unproved_numeric_parameter_spelling_refuses(name: str) -> None:
     assert not _preserves('value="${' + name + '}"\n', _LIBRARY)
 
 
+@pytest.mark.parametrize("condition, outcome", [
+    ("! x == x || y == y", True),
+    ("! x == x && y == y", False),
+    ("! x == y || y == x", True),
+    ("! x == y && y == x", False),
+    ("x == y && y == x || x == x", True),
+    ("! ! x == x && y == y", True),
+])
+def test_conditional_negation_binds_before_logical_operators(condition: str, outcome: bool) -> None:
+    caller = 'if [[ ' + condition + ' ]]; then printf changed > scripts/library.sh; fi\n'
+    opposite = 'if [[ ' + condition + ' ]]; then :; else printf changed > scripts/library.sh; fi\n'
+    assert _preserves(caller, _LIBRARY) is not outcome
+    assert _preserves(opposite, _LIBRARY) is outcome
+
+
+@pytest.mark.parametrize("condition", ["( x == x || y == y )", "! ( x == y )", "! " * 18 + "x == x"])
+def test_unsupported_condition_grouping_or_depth_refuses(condition: str) -> None:
+    assert not _preserves('if [[ ' + condition + ' ]]; then :; fi\n', _LIBRARY)
+
+
+@pytest.mark.parametrize("left, operator", [("x == x", "||"), ("x == y", "&&")])
+def test_skipped_conditional_operand_never_runs_substitution_effects(left: str, operator: str) -> None:
+    caller = 'if [[ ' + left + ' ' + operator + ' "$(set -e; printf changed > scripts/library.sh)" ]]; then :; fi\n'
+    assert _preserves(caller, _LIBRARY)
+
+
+@pytest.mark.parametrize("operator", ["||", "&&"])
+def test_optional_conditional_operand_cannot_publish_certain_effects(operator: str) -> None:
+    caller = '[[ "$unknown" == yes ' + operator + ' "$(set -e; printf value)" ]]\n'
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        return ShellEffectResult(stdout="value", status=True)
+
+    assert _preserves(caller, _LIBRARY, native_effect=callback)
+    assert requests and all(command.uncertain for command in requests)
+
+
 @pytest.mark.parametrize("operator", ["#", "##", "%", "%%"])
 def test_uncalled_quoted_pattern_removal_keeps_its_function_boundary(operator: str) -> None:
     library = 'unused() {\nprintf "%s\\n" "${path' + operator + '"$ROOT"/}"\n}\n'

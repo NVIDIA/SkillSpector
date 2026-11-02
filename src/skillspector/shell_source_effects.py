@@ -765,21 +765,30 @@ class _EffectAudit:
             raise _UnresolvedError
         return self.command(program, node, frame)
 
-    def condition(self, raw, frame, program):
+    def condition(self, raw, frame, program, depth=0):
+        self.tick()
+        if depth > _MAX_DEPTH or not raw or any(item in {"(", ")"} for item in raw):
+            raise _UnresolvedError
+        # Bash binds ! more tightly than &&, and && more tightly than ||.
+        # Split the outer logical expression before interpreting its terms.
+        for separator in ("||", "&&"):
+            if separator in raw:
+                at = raw.index(separator)
+                left = self.condition(raw[:at], frame, program, depth + 1)
+                if separator == "&&" and left is False or separator == "||" and left is True:
+                    return left
+                right_frame = frame.copy()
+                right_frame.uncertain |= left is None
+                right = self.condition(raw[at + 1:], right_frame, program, depth + 1)
+                if separator == "&&":
+                    return False if left is False or right is False else True if left is True and right is True else None
+                return True if left is True or right is True else False if left is False and right is False else None
         if raw[:1] == ("!",):
-            value = self.condition(raw[1:], frame, program)
+            value = self.condition(raw[1:], frame, program, depth + 1)
             return None if value is None else not value
         if len(raw) == 1:
             value = self.word(raw[0], frame, program, assignment=True)
             return bool(value) if value is not None else None
-        for separator in ("||", "&&"):
-            if separator in raw:
-                at = raw.index(separator)
-                left = self.condition(raw[:at], frame, program)
-                right = self.condition(raw[at + 1:], frame, program)
-                if separator == "&&":
-                    return False if left is False or right is False else True if left is True and right is True else None
-                return True if left is True or right is True else False if left is False and right is False else None
         values = tuple(self.word(item, frame, program, assignment=True) for item in raw)
         if len(values) == 2 and values[0] in {"-e", "-f", "-s", "-x", "-L", "-d"} and self.native_effect is not None:
             path = self.path(values[1], frame)
