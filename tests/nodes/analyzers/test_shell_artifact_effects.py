@@ -106,6 +106,25 @@ def test_native_unknown_command_is_not_accepted_just_because_path_is_standard() 
     assert _audit()(_command(("python3", "-c", "arbitrary effects"))) is None
 
 
+@pytest.mark.parametrize("assignment, expected", [("", "echo one\\n"), ("MATCH_MODE=two\n", "echo two\\n")])
+def test_generated_helper_uses_current_inherited_exported_setting(assignment: str, expected: str) -> None:
+    producer = 'set -euo pipefail\n' + assignment + 'p4 print > "$1"\n'
+    helper = '''case "$MATCH_MODE" in
+one) printf '%s' 'echo one\\n' ;;
+two) printf '%s' 'echo two\\n' ;;
+esac
+'''
+    context = ShellSourceContext("producer.sh", {"producer.sh": producer})
+    audit = ShellArtifactAudit(context, tm._next_shell_invocation_word, lambda: None)
+    assert audit.store.create_empty_directory("/tmp/helpers")
+    assert audit.store.create_empty_directory("/tmp/result")
+    assert audit.store.write("/tmp/helpers/p4", ShellArtifact(ShellSourceValue(helper), executable=True))
+    command = ShellEffectCommand(("./producer.sh", "/tmp/result/output.sh"), {"MATCH_MODE": "one", "PATH": "/tmp/helpers:" + audit.path_tail}, ".", "producer.sh", 0, fail_stop=True)
+    result = audit(command)
+    assert result is not None and result.script_path is None
+    assert audit.read_source("/tmp/result/output.sh") == expected
+
+
 @pytest.mark.parametrize("argv", [
     ("mv", "--target-directory=scripts", "input"),
     ("mv", "-tscripts", "input"),

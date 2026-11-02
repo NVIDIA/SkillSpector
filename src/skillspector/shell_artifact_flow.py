@@ -282,7 +282,7 @@ class ShellProducer:
         context: ShellSourceContext,
         read_word: ReadWord,
         check_runtime: Callable[[], None],
-        helper_output: Callable[[tuple[str, ...]], tuple[ShellArtifact, ...] | None] | None,
+        helper_output: Callable[[tuple[str, ...], dict[str, str | None]], tuple[ShellArtifact, ...] | None] | None,
     ) -> None:
         self.store = store
         self.context = context
@@ -297,6 +297,7 @@ class ShellProducer:
         self.depth = 0
         self.capture_depth = 0
         self.temporary = 0
+        self.exported: frozenset[str] = frozenset()
 
     def tick(self) -> None:
         self.check_runtime()
@@ -555,12 +556,19 @@ class ShellProducer:
         name, *arguments = argv
         destination = None
         append = False
+        discard_stdout = False
+        stdout_redirects = 0
         for redirect, target in redirects:
             if redirect == "2>&" and target == "1":
                 continue
             if redirect == "1>&" and target == "2" and diagnostics:
                 continue
-            if target == "/dev/null" and redirect in {"1>", "2>"}:
+            if redirect in {"1>", "1>>"}:
+                stdout_redirects += 1
+                if stdout_redirects > 1:
+                    raise _Unresolved
+            if target == "/dev/null" and redirect in {"1>", "1>>", "2>", "2>>"}:
+                discard_stdout |= redirect.startswith("1")
                 continue
             if redirect not in {"1>", "1>>"} or destination is not None:
                 raise _Unresolved
@@ -583,7 +591,8 @@ class ShellProducer:
                 if branch.stopped:
                     continue
                 parent = state.copy()
-                parent.output += branch.output
+                if not discard_stdout:
+                    parent.output += branch.output
                 output.append(parent)
             return output
         produced = None
@@ -646,7 +655,11 @@ class ShellProducer:
             if produced is None:
                 raise _Unresolved
         elif name == "p4" and self.helper_output is not None:
-            produced = self.helper_output(argv)
+            # Inherited names keep their export attribute after assignment,
+            # including inside the bounded capture-function scope. Ordinary
+            # locals are not implicitly exported to a helper process.
+            environment = {name: value if isinstance(value := state.values.get(name), str) else None for name in self.exported}
+            produced = self.helper_output(argv, environment)
             if not produced:
                 raise _Unresolved
         elif name in {"return", "exit"} and len(arguments) == 1 and arguments[0] in {"1", "2"} and not redirects:
@@ -661,6 +674,8 @@ class ShellProducer:
             if not self.effects.redirect_stdout(destination, produced, append=append):
                 raise _Unresolved
             self.writes.add(destination)
+            return [state]
+        if discard_stdout:
             return [state]
         output = []
         for artifact in produced:
@@ -738,6 +753,7 @@ class ShellProducer:
             source = self.context.sources.get(self.context.path)
             if source is None:
                 raise _Unresolved
+            self.exported = frozenset(environment)
             program = self.parse(source)
             if not program or program[0].kind != "command" or tuple(token.raw for token in program[0].words) not in {("set", "-euo", "pipefail"), ("set", "-Eeuo", "pipefail")}:
                 raise _Unresolved

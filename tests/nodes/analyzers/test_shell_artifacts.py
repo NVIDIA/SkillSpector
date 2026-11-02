@@ -275,7 +275,7 @@ def _inspect_producer(program=_PRODUCER, *, modes=("one",)):
     assert store.write("scripts/setup.sh", _program())
     archive = ShellArtifact(members=(("tool/FlashTool", _program("#!/bin/bash\n")),))
 
-    def helper_output(argv):
+    def helper_output(argv, environment):
         if argv[1] == "files":
             name = argv[2].rpartition("/")[2]
             candidates = {
@@ -301,6 +301,48 @@ def test_finite_producer_preserves_setup_copy_and_archive_member_prefixes() -> N
     assert copied is not None and copied.value == _program().value and copied.executable is True
     assert store.read("/tmp/extracted/bundle/tools/tool/FlashTool") is not None
     assert all(path.startswith(("/tmp/producer.__skillspector_producer_", "/tmp/result/")) for path in result.writes)
+
+
+@pytest.mark.parametrize("invocation, expected", [
+    ("printf %s changed", "changed"),
+    ("printf %s changed >/dev/null", ""),
+    ("printf %s changed >>/dev/null", ""),
+    ("emit", "changed"),
+    ("emit >/dev/null", ""),
+])
+def test_producer_capture_never_retains_discarded_stdout(invocation: str, expected: str) -> None:
+    program = 'set -euo pipefail\nemit() { printf %s changed; }\ncode="$(' + invocation + ')"\nprintf %s "$code" > "$1"\n'
+    store = ShellArtifactStore(lambda: None)
+    assert store.create_empty_directory("/tmp/result")
+    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
+    result = producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",))
+    assert result is not None
+    assert store.read("/tmp/result/output.sh").value.text == expected
+
+
+@pytest.mark.parametrize("redirects", [">/dev/null > /tmp/result/extra", "> /tmp/result/extra >/dev/null"])
+def test_producer_refuses_unmodeled_ordered_stdout_routes(redirects: str) -> None:
+    program = 'set -euo pipefail\ncode="$(printf %s changed ' + redirects + ')"\nprintf %s "$code" > "$1"\n'
+    store = ShellArtifactStore(lambda: None)
+    assert store.create_empty_directory("/tmp/result")
+    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, None)
+    assert producer.inspect(("/tmp/result/output.sh",), {}, ("/tmp/result/output.sh",)) is None
+
+
+def test_producer_helper_environment_retains_only_current_exported_names() -> None:
+    program = 'set -euo pipefail\nEXPORTED=changed\nLOCAL=private\np4 print > "$1"\n'
+    environments = []
+
+    def helper(argv, environment):
+        environments.append(environment)
+        return (_program(environment["EXPORTED"]),)
+
+    store = ShellArtifactStore(lambda: None)
+    assert store.create_empty_directory("/tmp/result")
+    producer = ShellProducer(store, ShellSourceContext("producer.sh", {"producer.sh": program}), tm._next_shell_invocation_word, lambda: None, helper)
+    assert producer.inspect(("/tmp/result/output.sh",), {"EXPORTED": "original"}, ("/tmp/result/output.sh",)) is not None
+    assert environments == [{"EXPORTED": "changed"}]
+    assert store.read("/tmp/result/output.sh").value.text == "changed"
 
 
 def test_failed_zero_and_multiple_match_branches_do_not_supply_fictitious_outputs() -> None:

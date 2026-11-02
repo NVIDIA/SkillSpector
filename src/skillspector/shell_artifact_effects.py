@@ -187,9 +187,15 @@ class ShellArtifactAudit:
         # Repeated appends remain permitted after their bytes become unknown.
         writable = frozenset(value for value in command.environment.values() if isinstance(value, str) and value.startswith("/") and self.store.owns(value))
 
-        def output(argv: tuple[str, ...]) -> tuple[ShellArtifact, ...] | None:
-            _, helper = self.identity(command, argv[0])
-            return self._helper_output(command, helper, argv, trial, helper_writes, writable) if helper is not None else None
+        def output(argv: tuple[str, ...], environment: dict[str, str | None]) -> tuple[ShellArtifact, ...] | None:
+            # The finite producer cannot mutate PATH, but inherited exported
+            # data variables may change before it launches a helper.
+            helper_environment = {**environment}
+            if "PATH" in command.environment:
+                helper_environment["PATH"] = command.environment["PATH"]
+            helper_command = replace(command, environment=helper_environment)
+            _, helper = self.identity(helper_command, argv[0])
+            return self._helper_output(helper_command, helper, argv, trial, helper_writes, writable) if helper is not None else None
 
         # Producer syntax also contains native names inside specialized forms.
         for name in ("dirname", "awk", "find", "sort", "xargs", "sha256sum", "cp", "tar", "mkdir", "chmod", "mktemp", "rm", *_COMPRESSORS):
