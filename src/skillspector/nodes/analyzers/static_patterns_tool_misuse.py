@@ -2846,6 +2846,7 @@ def _shell_command_strings(
             clause_start,
             check_runtime,
             perl_eval_blocks=perl_eval_blocks,
+            shell_traps=shell_substitutions,
         )
         if not recognized:
             continue
@@ -3002,6 +3003,7 @@ def _command_string_from_clause(
     check_runtime: Callable[[], None],
     *,
     perl_eval_blocks: bool = False,
+    shell_traps: bool = False,
 ) -> tuple[bool, str | None]:
     """Resolve a bounded wrapper chain to an ``eval`` or shell command string."""
     cursor = start
@@ -3047,6 +3049,20 @@ def _command_string_from_clause(
         command = word.casefold().rsplit("/", 1)[-1]
         if command in _SHELL_CLAUSE_PREFIX_WORDS:
             continue
+        if shell_traps and command == "trap":
+            body, limited = next_word()
+            if body == "--" and not limited:
+                body, limited = next_word()
+            if limited:
+                return True, None
+            # Reset/ignore/query forms install no executable command string.
+            if body is None or body in {"", "-", "-p", "-l"}:
+                return False, None
+            while cursor < len(content) and content[cursor] in " \t":
+                cursor += 1
+            if cursor == len(content) or content[cursor] in "\r\n;|&()#":
+                return False, None
+            return True, resolved_command_string(body, False)
         if command == "eval":
             if (
                 perl_eval_blocks

@@ -92,7 +92,7 @@ def test_ownership_walk_obeys_runtime_budget() -> None:
 @pytest.mark.parametrize("padding", [0, 6000])
 def test_literal_trap_command_is_bounded_before_its_host_quote(padding: int) -> None:
     source = '''cat <<'DATA'
-"unmatched data quote
+"quoted data"
 DATA
 trap 'saved=$?; trap - EXIT; finish "$saved"; result=$?; exit "$result"' EXIT
 '''
@@ -227,3 +227,18 @@ def test_compound_adversarial_inputs_retain_security_signal(
 def test_mixed_newline_heredoc_does_not_prove_a_false_closer() -> None:
     source = "cat <<'EOF'\nbody\nEOF\r\necho \"quoted\"\n"
     assert tm._shell_quoted_candidate_limits(source, lambda: None) == {}
+
+
+@pytest.mark.parametrize("statement", ["trap - EXIT", "trap '' EXIT", "trap -p", "trap -l"])
+def test_trap_reset_ignore_and_query_forms_have_no_executable_body(statement: str) -> None:
+    assert list(tm._shell_command_strings(statement + "\n", lambda: None)) == []
+
+
+def test_runtime_trap_body_remains_incomplete() -> None:
+    assert tm.has_bounded_parse_exhaustion('trap "$HANDLER" EXIT\n', lambda: None, file_type="shell")
+
+
+def test_unmatched_heredoc_data_quote_keeps_conservative_large_source_result() -> None:
+    # This separate limitation concerns data ownership, not trap-body parsing.
+    source = "cat <<'DATA'\n\"unmatched data quote\nDATA\n" + "#" * 6000
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
