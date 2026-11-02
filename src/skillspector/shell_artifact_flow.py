@@ -255,9 +255,10 @@ class _ProducerState:
     cwd: str | None = None
     output: tuple[ShellArtifact, ...] = ()
     stopped: bool = False
+    local_names: frozenset[str] = frozenset()
 
     def copy(self) -> "_ProducerState":
-        return _ProducerState(self.values.copy(), self.argv, self.cwd, self.output, self.stopped)
+        return _ProducerState(self.values.copy(), self.argv, self.cwd, self.output, self.stopped, self.local_names)
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,6 +297,7 @@ class ShellProducer:
         self.steps = 0
         self.depth = 0
         self.capture_depth = 0
+        self.subshell_depth = 0
         self.temporary = 0
         self.exported: frozenset[str] = frozenset()
 
@@ -316,23 +318,21 @@ class ShellProducer:
 
     def word(self, raw: str, state: _ProducerState) -> str:
         self.tick()
-        def array_length(match):
-            value = state.values.get(match[1])
+        length = re.fullmatch(r'("?)\$\{#([A-Za-z_][A-Za-z0-9_]*)\[@\]\}\1', raw)
+        if length:
+            value = state.values.get(length[2])
             if not isinstance(value, tuple):
                 raise _UnresolvedError
             return str(len(value))
-        raw = re.sub(r"\$\{#([A-Za-z_][A-Za-z0-9_]*)\[@\]\}", array_length, raw)
         if raw == "$#":
             return str(len(state.argv))
-        array = re.fullmatch(r'"?\$\{(#?)([A-Za-z_][A-Za-z0-9_]*)\[(@|[0-9]{1,3})\]\}"?', raw)
+        array = re.fullmatch(r'"\$\{([A-Za-z_][A-Za-z0-9_]*)\[(0|[1-9][0-9]{0,2})\]\}"', raw)
         if array:
-            value = state.values.get(array[2])
+            value = state.values.get(array[1])
             if not isinstance(value, tuple):
                 raise _UnresolvedError
-            if array[1] == "#" and array[3] == "@":
-                return str(len(value))
-            if not array[1] and array[3] != "@" and int(array[3]) < len(value):
-                return value[int(array[3])]
+            if int(array[2]) < len(value):
+                return value[int(array[2])]
             raise _UnresolvedError
         directory = re.fullmatch(r'"\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)(/[-A-Za-z0-9_./]+)"', raw)
         if directory:
@@ -362,7 +362,7 @@ class ShellProducer:
         return tuple(output)
 
     def assignment(self, name: str, raw: str, state: _ProducerState) -> list[_ProducerState]:
-        if is_managed_shell_variable(name):
+        if is_managed_shell_variable(name) or self.depth and name not in state.local_names:
             raise _UnresolvedError
         substitution = re.fullmatch(r'"?\$\((.*)\)"?', raw, re.DOTALL)
         if not substitution:
@@ -405,7 +405,7 @@ class ShellProducer:
         if node.kind == "function":
             name = node.words[0].raw
             if (
-                self.depth or self.capture_depth
+                self.depth or self.capture_depth or self.subshell_depth
                 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
                 or name in self.functions
                 or name in _PRODUCER_NATIVE_NAMES
@@ -414,15 +414,22 @@ class ShellProducer:
             self.functions[name] = node.body
             return [state]
         if node.kind == "subshell":
-            result = self.run(node.body, [state.copy()])
+            self.subshell_depth += 1
+            try:
+                result = self.run(node.body, [state.copy()])
+            finally:
+                self.subshell_depth -= 1
             if len(result) != 1 or result[0].stopped:
                 raise _UnresolvedError
+            # The child shares stdout, while its variable and cwd changes stay
+            # local. Its copied output already includes the preceding prefix.
+            state.output = result[0].output
             return [state]
         if node.kind == "for":
             if len(node.words) < 3 or node.words[1].raw != "in" or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", node.words[0].raw):
                 raise _UnresolvedError
             name = node.words[0].raw
-            if is_managed_shell_variable(name):
+            if is_managed_shell_variable(name) or self.depth and name not in state.local_names:
                 raise _UnresolvedError
             values = self.arguments(node.words[2:], state)
             if len(values) > 32:
@@ -475,7 +482,7 @@ class ShellProducer:
                 result &= artifact is not None and artifact.value is not None and bool(artifact.value.text)
             elif len(term) == 3 and term[1].raw == "-eq":
                 left, right = self.word(term[0].raw, state), self.word(term[2].raw, state)
-                if not re.fullmatch(r"[0-9]{1,9}", left) or not re.fullmatch(r"[0-9]{1,9}", right):
+                if not re.fullmatch(r"0|[1-9][0-9]{0,8}", left) or not re.fullmatch(r"0|[1-9][0-9]{0,8}", right):
                     raise _UnresolvedError
                 result &= int(left) == int(right)
             elif len(term) == 3 and term[1].raw == "==" and re.fullmatch(r"\*\.[A-Za-z0-9]+", term[2].raw):
@@ -499,7 +506,7 @@ class ShellProducer:
             return [state]
         array = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(\+?)=", raw[0])
         if array and raw[1:2] == ("(",) and raw[-1:] == (")",):
-            if is_managed_shell_variable(array[1]):
+            if is_managed_shell_variable(array[1]) or self.depth and array[1] not in state.local_names:
                 raise _UnresolvedError
             value = self.arguments(words[2:-1], state)
             if array[2]:
@@ -521,16 +528,20 @@ class ShellProducer:
                 if is_managed_shell_variable(raw[2][:-1]):
                     raise _UnresolvedError
                 state.values[raw[2][:-1]] = ()
+                state.local_names |= {raw[2][:-1]}
                 return [state]
             for token in words[1:]:
                 assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:=(.*))?", token.raw, re.DOTALL)
                 if not assignment or is_managed_shell_variable(assignment[1]):
                     raise _UnresolvedError
                 state.values[assignment[1]] = None if assignment[2] is None else self.word(assignment[2], state)
+                state.local_names |= {assignment[1]}
             return [state]
         if raw[0] == "mapfile":
             return self.mapfile(words, state)
         if "|" in raw:
+            if self.depth:
+                raise _UnresolvedError
             return self.manifest(words, state)
         command_words = []
         redirects = []
@@ -560,7 +571,9 @@ class ShellProducer:
         stdout_redirects = 0
         for redirect, target in redirects:
             if redirect == "2>&" and target == "1":
-                continue
+                # Helper summaries prove stdout only. Merged stderr can add
+                # executable bytes whose contents and ordering are unknown.
+                raise _UnresolvedError
             if redirect == "1>&" and target == "2" and diagnostics:
                 continue
             if redirect in {"1>", "1>>"}:
@@ -601,6 +614,8 @@ class ShellProducer:
         elif name == "umask" and arguments == ["077"] and not redirects:
             pass
         elif name == "trap" and len(arguments) == 2 and arguments[1] == "EXIT" and not redirects:
+            if self.capture_depth or self.subshell_depth:
+                raise _UnresolvedError
             cleanup = re.fullmatch(r'rm -rf "\$([A-Za-z_][A-Za-z0-9_]*)"', arguments[0])
             value = state.values.get(cleanup[1]) if cleanup else None
             if not isinstance(value, str) or self.store.inventory(value) is None:
@@ -698,12 +713,23 @@ class ShellProducer:
         if len(raw) < 10 or raw[:2] != ("mapfile", "-t") or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw[2]) or raw[3:6] != ("<", "<", "(") or raw[-1] != ")":
             raise _UnresolvedError
         name = raw[2]
-        if is_managed_shell_variable(name):
+        if is_managed_shell_variable(name) or self.depth and name not in state.local_names:
             raise _UnresolvedError
         inner = words[6:-1]
         if len(inner) == 5 and tuple(token.raw for token in inner[2:4]) == ("<<", "<") and self.arguments(inner[:2], state) == ("awk", "NF {print $1}"):
             value = self.word(inner[4].raw, state)
-            state.values[name] = tuple(line.split()[0] for line in value.splitlines() if line.split())
+            # This exact AWK program uses LF records and ASCII blank fields.
+            # Locale-sensitive characters/control bytes need their own proof;
+            # Python's Unicode whitespace rules would silently change them.
+            if any(character not in "\t\n" and not " " <= character <= "~" for character in value):
+                raise _UnresolvedError
+            rows = []
+            for line in value.split("\n"):
+                self.tick()
+                line = line.strip(" \t")
+                if line:
+                    rows.append(re.split(r"[ \t]+", line, maxsplit=1)[0])
+            state.values[name] = tuple(rows)
         else:
             argv = self.arguments(inner, state)
             if len(argv) != 7 or argv[0] != "find" or argv[2:5] != ("-type", "f", "-name") or argv[-1] != "-print" or re.fullmatch(r"[-A-Za-z0-9_.]+", argv[5]) is None:

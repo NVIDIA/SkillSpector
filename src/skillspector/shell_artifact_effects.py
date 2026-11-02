@@ -282,6 +282,10 @@ class ShellArtifactAudit:
             output = posixpath.dirname(args[0]) + "\n" if posixpath.dirname(args[0]) else ".\n"
         elif name == "echo" and all(value is not None and not value.startswith("-") and "\\" not in value for value in args):
             output = " ".join(args) + "\n"
+        elif name == "echo":
+            # Native echo only emits output. Unsupported options and escapes
+            # cannot establish exact bytes, but still have bounded effects.
+            output, status = None, None
         elif name == "printf" and all(value is not None for value in args):
             variants = reconstruct_helper_output(shlex.join(("printf", *args)), (), {}, frozenset(), self.read_word, self.check_runtime)
             artifacts = helper_stdout_artifacts(variants, self.store, self._origin(command), self.check_runtime) if variants is not None else None

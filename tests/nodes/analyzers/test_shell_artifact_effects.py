@@ -62,6 +62,27 @@ def test_unknown_conditional_write_forgets_previous_generated_source() -> None:
     assert audit.read_source("/tmp/generated.sh") is None
 
 
+def test_native_echo_diagnostic_has_known_effects_without_proven_output() -> None:
+    result = _audit()(_command(("echo", "--platform is required"), redirects=(("1>&", "2"),)))
+    assert result is not None
+    assert result.stdout is None and result.status is None and result.writes == ()
+
+
+@pytest.mark.parametrize("args, expected", [
+    (("known",), "known\n"),
+    (("-n", "known"), None),
+    ((r"one\ntwo",), None),
+    ((None,), None),
+])
+def test_native_echo_preserves_only_proven_generated_bytes(args, expected) -> None:
+    audit = _audit()
+    assert audit.store.create_empty_directory("/tmp/work")
+    assert audit.store.write("/tmp/work/output.sh", ShellArtifact(ShellSourceValue("old\n")))
+    result = audit(_command(("echo", *args), redirects=(("1>", "/tmp/work/output.sh"),)))
+    assert result is not None and result.writes == ("/tmp/work/output.sh",)
+    assert audit.read_source("/tmp/work/output.sh") == expected
+
+
 def test_source_provenance_and_executable_mode_survive_archive_roundtrip() -> None:
     audit = _audit()
     assert audit.store.create_empty_directory("/tmp/work")
