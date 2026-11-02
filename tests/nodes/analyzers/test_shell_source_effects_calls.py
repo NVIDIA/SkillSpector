@@ -29,11 +29,109 @@ def _preserves(caller: str, library: str, *, use_offset: int | None = None, **kw
     return source_effects_preserve(resolver, "scripts/library.sh", len(caller) if use_offset is None else use_offset, **kwargs)
 
 
+def _pure_preserve_effect(command):
+    if command.child_inspected:
+        return ShellEffectResult(command.stdout, command.child_status)
+    if command.argv[0] in {":", "true", "false", "printf"}:
+        return ShellEffectResult(command.stdout if command.argv[0] == "printf" else "", command.argv[0] != "false", native_identity=True)
+    return None
+
+
+def _preserves_joined(caller: str, **kwargs) -> bool:
+    resolver = _resolver(caller, _LIBRARY)
+    kwargs.setdefault("read_source", resolver.context.sources.get)
+    kwargs.setdefault("preserve_effect", _pure_preserve_effect)
+    return source_effects_preserve(resolver, "scripts/library.sh", len(caller), **kwargs)
+
+
 _LIBRARY = '''set -euo pipefail
 write_file() { local target="$1"; printf '%s' changed > "$target"; }
 main() { write_file scripts/library.sh; }
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
 '''
+
+
+def test_preservation_mode_is_explicit_and_cannot_collect_generated_facts() -> None:
+    caller = 'ignored="${!#}"\n'
+    resolver = _resolver(caller, _LIBRARY)
+    assert not _preserves(caller, _LIBRARY)
+    assert not _preserves(caller, _LIBRARY, native_effect=_pure_preserve_effect)
+    assert not _preserves(caller, _LIBRARY, preserve_effect=_pure_preserve_effect)
+    assert not _preserves_joined(caller, native_effect=_pure_preserve_effect)
+    assert not source_effects_collect(resolver, len(caller), read_source=resolver.context.sources.get, native_effect=_pure_preserve_effect)
+    assert not source_effects_preserve(resolver, "scripts/generated.sh", len(caller), read_source=resolver.context.sources.get, preserve_effect=_pure_preserve_effect)
+    assert _preserves_joined(caller)
+
+
+@pytest.mark.parametrize("consumer", [
+    '"$value"', 'printf changed > "$value"', 'source "$value"', 'bash -c "$value"',
+])
+def test_unknown_last_positional_data_cannot_supply_executable_or_path(consumer: str) -> None:
+    assert not _preserves_joined('value="${!#}"\n' + consumer + '\n')
+
+
+@pytest.mark.parametrize("expansion", ["${!unknown}", "${!items[$(printf changed > scripts/library.sh)]}"])
+def test_preservation_mode_does_not_generalize_indirect_parameter_expansion(expansion: str) -> None:
+    assert not _preserves_joined('value="' + expansion + '"\n')
+
+
+def test_preservation_joins_inert_branches_without_expanding_exact_collection() -> None:
+    caller = 'if [[ "$unknown" == yes ]]; then value=one; else value=two; fi\n' * 9
+    assert not _preserves(caller, _LIBRARY, native_effect=_pure_preserve_effect)
+    assert _preserves_joined(caller)
+    assert not _preserves_joined(caller + 'printf changed > scripts/library.sh\n')
+
+
+@pytest.mark.parametrize("left, right, preserved", [
+    ("/tmp/other", "/tmp/other", True),
+    ("scripts/library.sh", "/tmp/other", False),
+    ("/tmp/other", "scripts/library.sh", False),
+    ("scripts/library.sh", "scripts/library.sh", False),
+])
+def test_preservation_join_retains_equal_paths_and_refuses_unknown_destinations(left: str, right: str, preserved: bool) -> None:
+    caller = 'if [[ "$unknown" == yes ]]; then path=' + left + '; else path=' + right + '; fi\nprintf changed > "$path"\n'
+    assert _preserves_joined(caller) is preserved
+
+
+@pytest.mark.parametrize("branch", [
+    'writer() { :; }', 'trap ":" EXIT', 'export data', 'shift',
+])
+def test_preservation_join_refuses_conflicting_code_or_scope_identity(branch: str) -> None:
+    caller = 'check() { if [[ "$unknown" == yes ]]; then ' + branch + '; fi; }\ncheck one two\n'
+    assert not _preserves_joined(caller)
+    assert not _preserves_joined('check() { if [[ "$unknown" == yes ]]; then local data=value; fi; }\ncheck\n')
+
+
+def test_preservation_join_keeps_exited_and_continuing_effects_separate() -> None:
+    caller = 'if [[ "$unknown" == yes ]]; then exit 0; else path=scripts/library.sh; fi\nprintf changed > "$path"\n'
+    assert not _preserves_joined(caller)
+    assert _preserves_joined(caller.replace('path=scripts/library.sh', 'path=/tmp/other'))
+
+
+def test_preservation_mode_requires_current_source_dependency_bytes() -> None:
+    assert not _preserves_joined('source scripts/library.sh\n', read_source=lambda path: None)
+    assert not _preserves_joined('unknown_helper /tmp/other\n')
+
+    class UnavailableSource:
+        def __bool__(self):
+            return False
+
+        def __call__(self, path):
+            return None
+
+    assert not _preserves_joined('source scripts/library.sh\n', read_source=UnavailableSource())
+
+
+def test_preservation_callbacks_see_every_optional_write_before_join() -> None:
+    writes = set()
+
+    def callback(command):
+        writes.update(value for operator, value in command.redirects if ">" in operator)
+        return _pure_preserve_effect(command)
+
+    caller = 'if [[ "$unknown" == yes ]]; then printf one > /tmp/left; else printf two > /tmp/right; fi\n'
+    assert _preserves_joined(caller, preserve_effect=callback)
+    assert writes == {"/tmp/left", "/tmp/right"}
 
 
 def test_import_installs_definitions_without_running_main_or_uncalled_writer() -> None:

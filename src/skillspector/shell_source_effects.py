@@ -299,13 +299,14 @@ class _EffectsParser(_Parser):
 
 
 class _EffectAudit:
-    def __init__(self, resolver, target, read_source, native_effect):
+    def __init__(self, resolver, target, read_source, native_effect, *, preserve_only=False):
         from skillspector.shell_sources import SAFE_PATH_MARKER
 
         self.resolver = resolver
         self.target = target
-        self.read_source = read_source or resolver.context.sources.get
+        self.read_source = read_source if read_source is not None else resolver.context.sources.get
         self.native_effect = native_effect
+        self.preserve_only = preserve_only
         self.path_tail = SAFE_PATH_MARKER + "_PATH_TAIL"
         self.symbolic_names = (SAFE_PATH_MARKER, SHELL_PID_MARKER)
         self.steps = 0
@@ -536,6 +537,11 @@ class _EffectAudit:
                     value = SHELL_PID_MARKER
                 elif name == "!":
                     value = None
+                elif name == "!#" and self.preserve_only:
+                    # The last positional value is data, not an unevaluated
+                    # program. Its unknown value still cannot select a path,
+                    # executable, or source in the existing dispatch checks.
+                    value = None
                 elif re.fullmatch(r"[0-9]{1,16}", name):
                     position = int(name)
                     value = frame.zero if position == 0 else frame.argv[position - 1] if position <= len(frame.argv) else ""
@@ -636,10 +642,56 @@ class _EffectAudit:
                     output.extend(branches)
                 if len(output) > _MAX_STATES:
                     raise _UnresolvedError
-                frames = output
+                frames = self.join(output) if self.preserve_only else output
             return frames
         finally:
             self.depth -= 1
+
+    def join(self, frames):
+        """Join only data facts; possible effects already reached the callback."""
+        groups = {}
+        for frame in frames:
+            self.tick()
+            groups.setdefault(frame.flow, []).append(frame)
+        output = []
+        for alternatives in groups.values():
+            first = alternatives[0]
+            if len(alternatives) == 1:
+                output.append(first)
+                continue
+            if any(
+                branch.functions != first.functions or branch.traps != first.traps
+                or branch.exported != first.exported or len(branch.argv) != len(first.argv)
+                or [set(scope) for scope in branch.scopes] != [set(scope) for scope in first.scopes]
+                for branch in alternatives[1:]
+            ):
+                # Unknown code bindings or local-scope lookup order need a
+                # separate identity proof, not a fallback to native commands.
+                raise _UnresolvedError
+
+            def equal(values):
+                value = values[0]
+                return value if all(item == value for item in values[1:]) else None
+
+            def bindings(mappings):
+                result = {}
+                for name in set().union(*mappings):
+                    self.tick()
+                    result[name] = equal([mapping.get(name) for mapping in mappings])
+                return result
+
+            joined = first.copy()
+            joined.values = bindings([branch.values for branch in alternatives])
+            joined.scopes = [bindings([branch.scopes[index] for branch in alternatives]) for index in range(len(first.scopes))]
+            joined.argv = tuple(equal([branch.argv[index] for branch in alternatives]) for index in range(len(first.argv)))
+            for name in ("zero", "cwd", "status", "output"):
+                setattr(joined, name, equal([getattr(branch, name) for branch in alternatives]))
+            for name in ("uncertain", "checked", "asynchronous"):
+                setattr(joined, name, any(getattr(branch, name) for branch in alternatives))
+            for name in ("errexit", "required_path_output"):
+                setattr(joined, name, all(getattr(branch, name) for branch in alternatives))
+            output.append(joined)
+        return output
 
     def node(self, program, node, frame):
         if node.kind == "function":
@@ -1388,12 +1440,17 @@ def _audit_prefix(
     *,
     read_source: Callable[[str], str | None] | None = None,
     native_effect: NativeEffect | None = None,
+    preserve_effect: NativeEffect | None = None,
 ) -> bool:
     from skillspector.shell_sources import (
         MAX_SHELL_SOURCE_CHARS, MAX_SHELL_SOURCE_FILES, SAFE_PATH_MARKER, _canonical_path,
     )
 
     if target_path is not None and _canonical_path(target_path) != target_path or not 0 <= use_offset <= len(resolver.content):
+        return False
+    if preserve_effect is not None and (
+        target_path not in resolver.context.sources or read_source is None or native_effect is not None
+    ):
         return False
     if (
         len(resolver.context.sources) > MAX_SHELL_SOURCE_FILES
@@ -1405,7 +1462,7 @@ def _audit_prefix(
         or any(is_managed_shell_variable(name) and name != "PATH" for name in resolver.inherited_values)
     ):
         return False
-    audit = _EffectAudit(resolver, target_path, read_source, native_effect)
+    audit = _EffectAudit(resolver, target_path, read_source, preserve_effect if preserve_effect is not None else native_effect, preserve_only=preserve_effect is not None)
     try:
         program = audit.program(resolver.context.path, resolver.content)
         # A consumer boundary must coincide with a complete preceding program.
@@ -1434,6 +1491,7 @@ def source_effects_preserve(
     *,
     read_source: Callable[[str], str | None] | None = None,
     native_effect: NativeEffect | None = None,
+    preserve_effect: NativeEffect | None = None,
 ) -> bool:
     """Prove prior reached code preserves a relative cached source, or refuse.
 
@@ -1441,8 +1499,15 @@ def source_effects_preserve(
     For ``uncertain`` commands it must invalidate possible output destinations,
     never publish bytes from just one branch. ``script_path`` requires a proved
     executable identity; the returned script is then inspected in a child scope.
+
+    ``preserve_effect`` instead opts into a target-only may-effect proof for an
+    uploaded source. It requires an authoritative ``read_source`` and cannot be
+    combined with ``native_effect``. The callback must accumulate all possible
+    writes and protect current executable/source dependencies across branches;
+    a successful result authorizes original target bytes only, never generated
+    artifact facts. Unknown data and joined bindings cannot supply code or paths.
     """
-    return _audit_prefix(resolver, target_path, use_offset, read_source=read_source, native_effect=native_effect)
+    return _audit_prefix(resolver, target_path, use_offset, read_source=read_source, native_effect=native_effect, preserve_effect=preserve_effect)
 
 
 def source_effects_collect(
