@@ -23,6 +23,35 @@ def _command(argv, **kwargs):
     return ShellEffectCommand(argv, {}, ".", "tests/workflow.sh", 0, **kwargs)
 
 
+def test_preserve_callback_keeps_unknown_printf_output_out_of_generated_sources() -> None:
+    audit = _audit()
+    assert audit.store.create_empty_directory("/tmp/logs")
+    request = _command(("printf", "%s\\n", None), redirects=(("1>", "/tmp/logs/output"),))
+    assert audit(request) is None
+    result = audit.preserve(request)
+    assert result is not None and result.stdout is None and result.status is None
+    assert result.writes == ("/tmp/logs/output",)
+    assert audit.read_source("/tmp/logs/output") is None
+    assert audit.read_source("scripts/setup.sh") is not None
+
+
+@pytest.mark.parametrize("argv", [
+    ("printf", None, "data"), ("printf", "%n", None),
+    ("printf", "-v", None), ("printf", "%b", None),
+    ("/tmp/printf", "%s", None),
+])
+def test_preserve_callback_does_not_expand_printf_code_or_identity_contract(argv) -> None:
+    assert _audit().preserve(_command(argv)) is None
+
+
+def test_preserve_callback_still_accounts_for_unknown_printf_destination() -> None:
+    audit = _audit()
+    assert audit.preserve(_command(("printf", "%s", None), redirects=(("1>", None),))) is None
+    result = audit.preserve(_command(("printf", "%s", None), redirects=(("1>", "scripts/setup.sh"),)))
+    assert result is not None and result.writes == ("scripts/setup.sh",)
+    assert audit.read_source("scripts/setup.sh") is None
+
+
 def test_mktemp_regular_file_retains_exact_ownership_without_a_directory_claim() -> None:
     audit = _audit()
     request = _command(("mktemp", "/tmp/artifactory.XXXXXX.netrc"))

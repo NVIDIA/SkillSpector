@@ -68,6 +68,46 @@ def test_known_sibling_dangerous_command_is_retained_at_the_consumer() -> None:
         assert finding.evidence["reconstructed_shell_source"]["origins"]
 
 
+@pytest.mark.parametrize("destructive", [False, True])
+def test_uploaded_source_can_survive_unknown_data_and_joined_branches(destructive: bool) -> None:
+    prefix = 'value="${!#}"\nprintf "%s\\n" "$value" > /tmp/inspection-data\n'
+    prefix += 'if [[ "$unknown" == yes ]]; then value=one; else value=two; fi\n' * 9
+    caller = _CALLER.replace("helper=$(sed", prefix + "helper=$(sed")
+    library = "helper() {\n  rm -rf /\n}\n" if destructive else _LIBRARY
+    prepared = _prepare(caller, library)
+    assert prepared is not None
+    findings = list(prepared.analyze_source_commands(content=caller, file_path="scripts/caller.sh", file_type="shell", source_view=SecurityTextView("raw", caller)))
+    assert any(finding.rule_id == "TM1" for finding in findings) is destructive
+    assert not prepared.has_bounded_parse_exhaustion()
+
+
+@pytest.mark.parametrize("mutation", [
+    'if [[ "$unknown" == yes ]]; then printf changed > "$script"; fi',
+    'value="${!#}"; printf changed > "$value"',
+    'value="${!#}"; "$value"',
+    'value="${!#}"; source "$value"',
+    'printf() { echo changed > scripts/library.sh; }; printf "%s" "$unknown"',
+])
+def test_uploaded_preservation_does_not_hide_unknown_writes_or_code(mutation: str) -> None:
+    caller = _CALLER.replace("helper=$(sed", mutation + "\nhelper=$(sed")
+    prepared = _prepare(caller)
+    assert prepared is None or not tuple(prepared.variants())
+
+
+def test_uploaded_preservation_never_reuses_an_uncertain_generated_dependency() -> None:
+    prefix = '''tmpdir="$(mktemp -d /tmp/preservation.XXXXXX)"
+cat > "$tmpdir/dependency" <<'CHILD'
+printf safe
+CHILD
+chmod +x "$tmpdir/dependency"
+if [[ "$unknown" == yes ]]; then printf '%s\\n' "$replacement" > "$tmpdir/dependency"; fi
+"$tmpdir/dependency"
+'''
+    caller = _CALLER.replace("helper=$(sed", prefix + "helper=$(sed")
+    prepared = _prepare(caller)
+    assert prepared is None or not tuple(prepared.variants())
+
+
 def test_inspected_destructive_source_does_not_clear_unrelated_unknown_consumer() -> None:
     caller = _CALLER + 'bash -c "$RUNTIME_COMMAND"\n'
     prepared = _prepare(caller, "helper() {\n rm -rf /\n}\n")

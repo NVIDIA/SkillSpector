@@ -6406,7 +6406,7 @@ def prepare_source_analysis(*, content: str, file_path: str, file_type: str, sou
     if file_type != "shell" or source_context.path != file_path or source_context.sources.get(file_path) != content:
         return None
     from skillspector.shell_artifact_effects import ShellArtifactAudit
-    from skillspector.shell_source_effects import source_effects_collect
+    from skillspector.shell_source_effects import source_effects_collect, source_effects_preserve
 
     def make_resolver(*, text: str | None = None, inherited: Mapping[str, ShellSourceValue] | None = None, depth: int = 0, budget: list[int] | None = None) -> ShellSourceResolver:
         resolver = ShellSourceResolver(
@@ -6426,11 +6426,41 @@ def prepare_source_analysis(*, content: str, file_path: str, file_type: str, sou
         # Cache both success and refusal; repeated sed/cat consumers must not
         # repeatedly walk a large workflow or reuse facts from a later state.
         effect_cache: dict[int, ShellArtifactAudit | None] = {}
+        preservation_cache: dict[tuple[str, int], ShellSourceValue | None] = {}
         active_effects: set[int] = set()
 
         def effect_source(target: ShellSourceValue, before_offset: int) -> ShellSourceValue | None:
             if target.kind not in {"bundle_path", "safe_path"} or not 0 <= before_offset <= len(resolver.content):
                 return None
+            if target.kind == "bundle_path" and target.text in source_context.sources:
+                key = (target.text, before_offset)
+                if key not in preservation_cache:
+                    if len(preservation_cache) >= 16 or before_offset in active_effects:
+                        return None
+                    resolver.work_budget[0] -= max(1, before_offset)
+                    if resolver.work_budget[0] < 0:
+                        resolver.valid = False
+                        return None
+                    active_effects.add(before_offset)
+                    try:
+                        audit = ShellArtifactAudit(source_context, _next_shell_invocation_word, check_runtime)
+                        preserved = source_effects_preserve(
+                            resolver, target.text, before_offset,
+                            read_source=audit.read_source, preserve_effect=audit.preserve,
+                        )
+                        original = source_context.sources[target.text]
+                        origin = ShellSourceOrigin(target.text, 0, len(original), sha256(original.encode()).hexdigest())
+                        artifact = audit.store.read(target.text) if preserved else None
+                        preservation_cache[key] = (
+                            ShellSourceValue(original, "code", (origin,))
+                            if artifact is not None and artifact.value is not None
+                            and artifact.value.text == original and artifact.value.origins == (origin,) else None
+                        )
+                    finally:
+                        active_effects.discard(before_offset)
+                if preservation_cache[key] is not None:
+                    return preservation_cache[key]
+            # Generated targets still require exact ordered artifact facts.
             if before_offset not in effect_cache:
                 if len(effect_cache) >= 16 or before_offset in active_effects:
                     return None
