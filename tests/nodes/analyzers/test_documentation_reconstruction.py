@@ -362,6 +362,57 @@ def test_list_fence_closes_before_following_inline_documentation(opening: str, i
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
+def test_nested_list_fence_uses_container_relative_indentation() -> None:
+    content = (
+        "3. Inspect the configuration:\n"
+        "   - Check the active value:\n"
+        "     ```bash\n"
+        "     echo harmless\n"
+        "     rm -rf /\n"
+        "     ```\n"
+    )
+
+    projected = tm_module._markdown_shell_text(content, lambda: None)
+
+    assert "```" not in projected
+    assert "echo harmless" in projected
+    assert "rm -rf /" in projected
+
+
+@pytest.mark.parametrize("language", ["tcl", "verilog"])
+def test_nested_list_fence_keeps_typed_fence_quote_ownership(language: str) -> None:
+    # A nested list fence takes the same typed-fence path as a top-level fence:
+    # a shell quote in it is never owned as a hardware literal.
+    content = (
+        "3. Inspect the configuration:\n"
+        "   - Check the active value:\n"
+        f"     ```{language}\n"
+        "     // echo '1'\n"
+        "     sh -c '$CMD -rf /'\n"
+        "     ```\n"
+    )
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm_module]
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(("relative_indent", "opens"), [(3, True), (4, False)])
+def test_list_fence_container_relative_indentation_boundary(
+    relative_indent: int, opens: bool
+) -> None:
+    indent = " " * (2 + relative_indent)
+    content = f"- Check the active value:\n{indent}```bash\n{indent}echo harmless\n{indent}```\n"
+
+    projected = tm_module._markdown_shell_text(content, lambda: None)
+
+    assert ("```" not in projected) is opens
+    assert "echo harmless" in projected
+
+
 @pytest.mark.parametrize("opening,indent", [("   ```sh", "      "), ("- - ```sh", "        ")])
 def test_deeply_indented_marker_does_not_close_fence(opening: str, indent: str) -> None:
     content = opening + "\n" + indent + "```\n" + _LITERAL_BACKTICK_COMMAND + "\n```\n"
