@@ -115,6 +115,7 @@ class ShellSourceResolver:
         self.inherited_values = inherited_values or {}
         self.child_contexts: Callable[[int], Iterator[tuple["ShellSourceResolver", int]]] | None = None
         self.substitution_contexts: Callable[[int], Iterator[tuple["ShellSourceResolver", int]]] | None = None
+        self.effect_source: Callable[[ShellSourceValue, int], ShellSourceValue | None] | None = None
         self.executable_spans: list[tuple[int, int, int, bool]] = []
         self.executable_children_complete = True
         self.lexically_valid = False
@@ -190,6 +191,41 @@ class ShellSourceResolver:
     def executable_children(self, before_offset: int) -> Iterator[tuple["ShellSourceResolver", int]]:
         if self.substitution_contexts is not None:
             yield from self.substitution_contexts(before_offset)
+
+    def _read_source_value(self, target: ShellSourceValue, use_offset: int) -> ShellSourceValue | None:
+        """Read uploaded or reconstructed bytes only after their effect proof."""
+        if target.kind not in {"bundle_path", "safe_path"}:
+            return None
+        if target.kind == "bundle_path" and target.text in self.context.sources:
+            if source_is_unmodified(self, target.text, use_offset):
+                source = self.context.sources[target.text]
+                if not self._spend(len(source)):
+                    return None
+                digest = self.hashes.get(target.text)
+                if digest is None:
+                    digest = hashlib.sha256(source.encode()).hexdigest()
+                    self.hashes[target.text] = digest
+                return ShellSourceValue(source, "code", (ShellSourceOrigin(target.text, 0, len(source), digest),))
+        if self.effect_source is None or not self.valid:
+            return None
+        value = self.effect_source(target, use_offset)
+        if value is None or value.kind != "code" or not value.origins or not self._spend(len(value.text)):
+            return None
+        return value
+
+    def _source_origins(self, target: ShellSourceValue, value: ShellSourceValue, start: int, end: int) -> tuple[ShellSourceOrigin, ...]:
+        if (
+            target.kind == "bundle_path"
+            and self.context.sources.get(target.text) == value.text
+            and len(value.origins) == 1
+            and value.origins[0].path == target.text
+            and value.origins[0].start == 0
+            and value.origins[0].end == len(value.text)
+        ):
+            return (ShellSourceOrigin(target.text, start, end, value.origins[0].sha256),)
+        # Copies, transformations and archives retain the original provenance;
+        # offsets in reconstructed bytes do not become uploaded-file offsets.
+        return value.origins
 
     def _collect_executable_spans(self, start: int, end: int, *, heredoc: bool = False, child_scope: bool = False) -> None:
         """Record complete command substitutions, without evaluating their data.
@@ -760,7 +796,13 @@ class ShellSourceResolver:
                 return None
             value = re.sub(r"X+$", SAFE_PATH_MARKER, template)
             return ShellSourceValue(value, "safe_path", safe_spans=((0, len(value)),))
-        if values[:2] != ["sed", "-n"] or len(words) < 4:
+        if values[:1] == ["cat"] and len(words) == 2 and "cat" not in self.functions:
+            target = self.word(words[1][1], words[1][2], depth=depth + 1)
+            value = self._read_source_value(target, start) if target is not None else None
+            if value is None or len(value.text) > MAX_SHELL_VALUE_CHARS:
+                return None
+            return ShellSourceValue(value.text.rstrip("\n"), "code", value.origins)
+        if values[:2] != ["sed", "-n"] or len(words) < 4 or "sed" in self.functions:
             return None
         expressions: list[tuple[str, str]] = []
         cursor = 2
@@ -777,15 +819,10 @@ class ShellSourceResolver:
             expressions.append((expression[1], "}"))
             cursor += 1
         target = self.word(words[-1][1], words[-1][2], depth=depth + 1)
-        if target is None or target.kind != "bundle_path" or target.text not in self.context.sources:
+        value = self._read_source_value(target, start) if target is not None else None
+        if value is None:
             return None
-        if not source_is_unmodified(self, target.text, start):
-            return None
-        source = self.context.sources[target.text]
-        digest = self.hashes.get(target.text)
-        if digest is None:
-            digest = hashlib.sha256(source.encode()).hexdigest()
-            self.hashes[target.text] = digest
+        source = value.text
         active = [False] * len(expressions)
         output: list[str] = []
         origins: list[ShellSourceOrigin] = []
@@ -802,7 +839,7 @@ class ShellSourceResolver:
                     active[index] = True
                 if active[index]:
                     output.append(line)
-                    origins.append(ShellSourceOrigin(target.text, offset, offset + len(line), digest))
+                    origins.extend(self._source_origins(target, value, offset, offset + len(line)))
                     size += len(line)
                     if size > MAX_SHELL_VALUE_CHARS or len(origins) > 1024:
                         return None
@@ -812,7 +849,7 @@ class ShellSourceResolver:
             offset = stop
         if not output or any(active):
             return None
-        return ShellSourceValue("".join(output).rstrip("\n"), "code", tuple(origins))
+        return ShellSourceValue("".join(output).rstrip("\n"), "code", tuple(dict.fromkeys(origins)))
 
 
 def source_is_unmodified(
@@ -1242,11 +1279,12 @@ def _heredoc_sed_substitution(
     if expression is None or expression[2] != expression[3]:
         return None
     target = resolver.word(first[3][1], first[3][2], depth=depth + 1)
-    if target is None or target.kind != "bundle_path" or target.text not in resolver.context.sources:
+    if "sed" in resolver.functions:
         return None
-    if not source_is_unmodified(resolver, target.text, start):
+    value = resolver._read_source_value(target, start) if target is not None else None
+    if value is None:
         return None
-    cached = resolver.context.sources[target.text]
+    cached = value.text
     selected: list[tuple[int, int]] = []
     active = False
     offset = size = 0
@@ -1285,16 +1323,10 @@ def _heredoc_sed_substitution(
             break
     if not selected:
         return None
-    digest = resolver.hashes.get(target.text)
-    if digest is None:
-        if not resolver._spend(len(cached)):
-            return None
-        digest = hashlib.sha256(cached.encode()).hexdigest()
-        resolver.hashes[target.text] = digest
     return ShellSourceValue(
         "".join(cached[left:right] for left, right in selected),
         "code",
-        tuple(ShellSourceOrigin(target.text, left, right, digest) for left, right in selected),
+        tuple(dict.fromkeys(origin for left, right in selected for origin in resolver._source_origins(target, value, left, right))),
     )
 
 

@@ -90,3 +90,21 @@ def test_caller_startup_settings_cannot_borrow_generated_identity(setting: str) 
     )
     resolver = _resolver(content)
     assert not tuple(resolver.generated_files())
+
+
+@pytest.mark.parametrize("mutate", [False, True])
+def test_cached_cat_source_requires_unchanged_uploaded_bytes(mutate: bool) -> None:
+    prefix = '''set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+'''
+    if mutate:
+        prefix += 'printf changed > "$root/scripts/library.sh"\n'
+    content = prefix + 'program=$(cat "$root/scripts/library.sh")\nbash -c "$program; helper"\n'
+    resolver = _resolver(content)
+    value = resolver._name("program", 0, len(content))
+    if mutate:
+        assert value is None
+    else:
+        assert value is not None and value.kind == "code"
+        assert value.text == "helper() {\n printf ready\n}"
+        assert value.origins[0].path == "scripts/library.sh"
