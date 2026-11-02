@@ -390,6 +390,47 @@ def test_background_and_pipeline_allow_only_proved_pure_effects(caller: str) -> 
     assert _preserves(caller, _LIBRARY)
 
 
+@pytest.mark.parametrize("prefix", ["", "/bin/", "/usr/bin/"])
+@pytest.mark.parametrize("command", ['cat', 'df -B1 --output=avail /tmp', "awk 'NR == 2 {print $1}'"])
+def test_concurrent_stable_native_stream_readers_do_not_consult_artifact_state(prefix: str, command: str) -> None:
+    def callback(request):
+        pytest.fail("stable native stream readers must not inspect mutable artifact identity")
+
+    assert _preserves('printf input | ' + prefix + command + '\n', _LIBRARY, native_effect=callback)
+
+
+def test_concurrent_disk_metadata_does_not_read_active_log_contents() -> None:
+    caller = '( df -B1 --output=avail /tmp | awk \'NR == 2 {print $1}\' ) > /tmp/log\n'
+    assert _preserves(caller, _LIBRARY)
+
+
+@pytest.mark.parametrize("command", ['cat', 'df -B1 --output=avail /tmp', "awk 'NR == 2 {print $1}'"])
+def test_concurrent_stream_reader_requires_stable_native_path(command: str) -> None:
+    prefix = 'PATH="/tmp/replacement:$PATH" '
+    assert not _preserves('printf input | ' + prefix + command + '\n', _LIBRARY)
+    assert _preserves('printf input | ' + prefix + '/bin/' + command + '\n', _LIBRARY)
+
+
+@pytest.mark.parametrize("command", [
+    'cat scripts/library.sh',
+    '/tmp/cat',
+    'df -B1 --output=avail "$missing"',
+    "awk 'NR == 2 {print $1}' scripts/library.sh",
+    "awk 'NR == 2 {system(\"touch scripts/library.sh\")}'",
+    "awk 'NR == 2 {print $1 > \"scripts/library.sh\"}'",
+    "awk 'NR == 2 {print $1} END {print 1}'",
+    'awk -f scripts/library.sh',
+])
+def test_concurrent_reader_exception_refuses_file_operands_and_awk_effects(command: str) -> None:
+    assert not _preserves('printf input | ' + command + '\n', _LIBRARY)
+
+
+@pytest.mark.parametrize("name, args", [("cat", ""), ("df", "-B1 --output=avail /tmp"), ("awk", "'NR == 2 {print $1}'")])
+def test_concurrent_native_reader_name_does_not_bypass_function_body(name: str, args: str) -> None:
+    caller = name + '() { printf changed > scripts/library.sh; }\nprintf input | ' + name + ' ' + args + '\n'
+    assert not _preserves(caller, _LIBRARY)
+
+
 @pytest.mark.parametrize("suffix", [' &\n', ' | printf ready\n'])
 @pytest.mark.parametrize("body", [
     'if [[ -e /tmp/marker ]]; then printf changed > scripts/library.sh; fi',
@@ -748,7 +789,8 @@ def test_concurrent_effects_cannot_publish_ordered_artifact_facts(caller: str) -
         return ShellEffectResult(status=True)
 
     assert _preserves(caller, _LIBRARY, native_effect=callback)
-    assert requests and all(command.uncertain for command in requests)
+    # Pure concurrent commands now bypass mutable artifact callbacks entirely.
+    assert not requests
 
 
 def test_function_redirect_opens_in_caller_directory_before_body() -> None:

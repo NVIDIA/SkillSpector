@@ -1203,10 +1203,29 @@ class _EffectAudit:
         if count:
             del self.active_redirects[-count:]
 
+    def asynchronous_reader(self, request):
+        name = request.argv[0]
+        if name is None:
+            return None
+        basename = name.rpartition("/")[2]
+        if name not in {basename, "/bin/" + basename, "/usr/bin/" + basename}:
+            return None
+        if name == basename and request.environment.get("PATH", self.path_tail) != self.path_tail:
+            return None
+        args = request.argv[1:]
+        if basename == "cat" and not args:
+            return basename
+        if basename == "df" and len(args) == 3 and args[:2] == ("-B1", "--output=avail") and args[2] is not None and not args[2].startswith("-"):
+            return basename
+        if basename == "awk" and len(args) == 1 and args[0] is not None and re.fullmatch(r"[ \t]*NR[ \t]*==[ \t]*2[ \t]*\{[ \t]*print[ \t]+\$1[ \t]*;?[ \t]*\}[ \t]*", args[0]):
+            return basename
+        return None
+
     def native(self, program, frame, request, *, child=False):
+        asynchronous_reader = self.asynchronous_reader(request) if frame.asynchronous and not child else None
         if frame.asynchronous and (
             request.interpreter is not None or request.redirects
-            or not (child and request.child_inspected) and request.argv[0] not in {":", "true", "false", "printf", "echo", "set"}
+            or not (child and request.child_inspected) and asynchronous_reader is None and request.argv[0] not in {":", "true", "false", "printf", "echo", "set"}
         ):
             raise _UnresolvedError
         if not request.child_inspected:
@@ -1221,7 +1240,7 @@ class _EffectAudit:
             if path is not None and self.conflicts_with_redirect(path):
                 argument_conflict = True
                 break
-        if argument_conflict:
+        if argument_conflict and asynchronous_reader != "df":
             if (
                 request.child_inspected or request.interpreter is not None or self.native_effect is None
                 or len(request.argv) != 4
@@ -1244,9 +1263,9 @@ class _EffectAudit:
             if ">" in operator and value != "/dev/null" and not self.disjoint(path):
                 raise _UnresolvedError
         if frame.asynchronous:
-            # These proved shell builtins do not consult PATH. Avoid callback
-            # script lookup against files that may change after the read returns.
-            result = self.native_default(replace(request, environment={}), frame, child=child)
+            # Proven builtin/reader identities require no mutable artifact
+            # snapshot. Stdin filters and disk metadata keep unknown output.
+            result = ShellEffectResult() if asynchronous_reader is not None else self.native_default(replace(request, environment={}), frame, child=child)
             if result is not None:
                 result = replace(result, native_identity=not child)
         else:
@@ -1289,7 +1308,7 @@ class _EffectAudit:
             if result is None or result.script_path is not None or any(not self.disjoint(path) or self.conflicts_with_redirect(path) for path in result.writes):
                 raise _UnresolvedError
         native_name = request.argv[0].rpartition("/")[2] if request.argv[0] is not None else ""
-        if not request.child_inspected and native_name not in {":", "true", "false", "set", "cd", "pwd", "dirname"}:
+        if not request.child_inspected and asynchronous_reader is None and native_name not in {":", "true", "false", "set", "cd", "pwd", "dirname"}:
             # Native I/O success is not an exact status fact when a caller
             # can continue after failure. Do not prune its explicit else/||.
             result = replace(result, status=True if request.fail_stop else None)
