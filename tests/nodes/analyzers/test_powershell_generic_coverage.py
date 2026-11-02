@@ -41,9 +41,9 @@ def test_powershell_classification_preserves_generic_analyzer_coverage(
     path = f"scripts/setup.{extension}"
     assert static_runner._infer_file_type(path) == "powershell"
     findings_by_type = []
-    for path in ("scripts/setup.generic", path):
+    for candidate_path in ("scripts/setup.generic", path):
         result = static_runner.run_static_patterns_with_ledger(
-            {"components": [path], "file_cache": {path: content}},
+            {"components": [candidate_path], "file_cache": {candidate_path: content}},
             [prompt_injection, supply_chain],
         )
         findings_by_type.append(

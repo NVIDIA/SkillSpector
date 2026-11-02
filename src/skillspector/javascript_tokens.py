@@ -643,6 +643,12 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
         ):
             # Aliasing an evaluator does not make its input ordinary text.
             return True
+        if (
+            node.type == "MemberExpression" and node.computed
+            and getattr(node.property, "type", None) == "Literal"
+            and getattr(node.property, "value", None) in {"eval", "Function"}
+        ):
+            return True
         if node.type == "ImportDeclaration" and _is_shell_execution_module(
             getattr(node.source, "value", "")
         ):

@@ -61,7 +61,7 @@ class PowerShellSource:
         return self.starts[index] if index < len(self.starts) else fallback
 
 
-class _UnprovenPowerShell(Exception):
+class _UnprovenPowerShellError(Exception):
     pass
 
 
@@ -85,7 +85,7 @@ def powershell_source(
             or len(spans) + len(strings) + len(clause_starts) + len(continuations)
             + len(invocations) > _MAX_SPANS
         ):
-            raise _UnprovenPowerShell
+            raise _UnprovenPowerShellError
         if cursor - checked >= 1024:
             check_runtime()
             checked = cursor
@@ -104,7 +104,7 @@ def powershell_source(
                 return cursor + 1
             else:
                 cursor += 1
-        raise _UnprovenPowerShell
+        raise _UnprovenPowerShellError
 
     def quoted(
         start: int, depth: int, *, here: bool = False, invoked_context: bool = False
@@ -119,7 +119,7 @@ def powershell_source(
             elif content[cursor:cursor + 1] == "\n":
                 cursor += 1
             else:
-                raise _UnprovenPowerShell
+                raise _UnprovenPowerShellError
         region_start = start
         value: list[str] = []
         decoded = False
@@ -129,7 +129,7 @@ def powershell_source(
             if not here and character in "‘’“”":
                 # PowerShell also accepts mixed ASCII/typographic quote
                 # delimiters. Do not claim bytes past an unproven closer.
-                raise _UnprovenPowerShell
+                raise _UnprovenPowerShellError
             closing = (
                 content.startswith(quote + "@", cursor)
                 and (cursor == 0 or content[cursor - 1] == "\n")
@@ -145,7 +145,7 @@ def powershell_source(
                 if here and end < len(content) and not (
                     content[end].isspace() or content[end] in ";|&),.+-*/["
                 ):
-                    raise _UnprovenPowerShell
+                    raise _UnprovenPowerShellError
                 own(region_start, end)
                 # A quoted command name after the PowerShell call operator
                 # remains an executable candidate with its following operands.
@@ -158,7 +158,7 @@ def powershell_source(
                 while previous >= 0 and content[previous] == "(":
                     parentheses += 1
                     if parentheses > _MAX_DEPTH:
-                        raise _UnprovenPowerShell
+                        raise _UnprovenPowerShellError
                     previous -= 1
                     if previous >= 0 and content[previous] == "$":
                         previous -= 1
@@ -203,18 +203,18 @@ def powershell_source(
                 return end
             if quote == '"' and character == "`":
                 if cursor + 1 >= len(content):
-                    raise _UnprovenPowerShell
+                    raise _UnprovenPowerShellError
                 escaped = content[cursor + 1]
                 if escaped == "u":
                     if content[cursor + 2:cursor + 3] != "{":
-                        raise _UnprovenPowerShell
+                        raise _UnprovenPowerShellError
                     close = content.find("}", cursor + 3, cursor + 10)
                     digits = content[cursor + 3:close] if close >= 0 else ""
                     if not digits or any(c not in "0123456789abcdefABCDEF" for c in digits):
-                        raise _UnprovenPowerShell
+                        raise _UnprovenPowerShellError
                     number = int(digits, 16)
                     if number > 0x10FFFF:
-                        raise _UnprovenPowerShell
+                        raise _UnprovenPowerShellError
                     value.append(chr(number))
                     cursor = close + 1
                 else:
@@ -239,7 +239,7 @@ def powershell_source(
                 continue
             value.append(character)
             cursor += 1
-        raise _UnprovenPowerShell
+        raise _UnprovenPowerShellError
 
     def code(cursor: int, depth: int, *, closes_parenthesis: bool = False) -> int:
         parentheses = 0
@@ -261,7 +261,7 @@ def powershell_source(
                     elif content.startswith("<#", operand):
                         end = content.find("#>", operand + 2)
                         if end < 0:
-                            raise _UnprovenPowerShell
+                            raise _UnprovenPowerShellError
                         gap_comments.append((operand, end + 2))
                         operand = end + 2
                     else:
@@ -278,6 +278,16 @@ def powershell_source(
                     invocations.append((operand, end))
                     cursor = end
                     continue
+                variable_command = re.match(
+                    r"\$(?:[A-Za-z_][A-Za-z0-9_:]*|\{[A-Za-z_][A-Za-z0-9_:]*\})",
+                    content[operand:operand + 512],
+                )
+                if variable_command is not None:
+                    spans.extend(gap_comments)
+                    end = operand + variable_command.end()
+                    invocations.append((operand, end))
+                    cursor = end
+                    continue
             if content.startswith("<#", cursor):
                 start = cursor
                 cursor += 2
@@ -287,7 +297,7 @@ def powershell_source(
                     check(cursor, depth)
                     cursor += 1
                 if cursor == len(content):
-                    raise _UnprovenPowerShell
+                    raise _UnprovenPowerShellError
                 cursor += 2
                 own(start, cursor)
                 clause_starts.add(cursor)
@@ -308,7 +318,7 @@ def powershell_source(
                 continue
             if character == "`":
                 if cursor + 1 >= len(content):
-                    raise _UnprovenPowerShell
+                    raise _UnprovenPowerShellError
                 # Only a continuation between words can be projected to
                 # spaces without changing command identity. Joining an
                 # escaped command name remains outside this lexical proof.
@@ -324,39 +334,39 @@ def powershell_source(
                 # Bare escaped words can name native commands (b`ash), not
                 # merely data. Until their command identity is reconstructed,
                 # keep the original conservative traversal for this source.
-                raise _UnprovenPowerShell
+                raise _UnprovenPowerShellError
             if content.startswith("${", cursor):
                 cursor = variable(cursor, depth)
                 continue
             if character in "‘’“”":
                 # PowerShell accepts typographic delimiters too. Until this
                 # helper proves their exact mixed-quote rules, retain fallback.
-                raise _UnprovenPowerShell
+                raise _UnprovenPowerShellError
             if character in ";|&({\r\n":
                 clause_starts.add(cursor + 1)
             if closes_parenthesis:
                 if character == "(":
                     parentheses += 1
                     if parentheses + depth > _MAX_DEPTH:
-                        raise _UnprovenPowerShell
+                        raise _UnprovenPowerShellError
                 elif character == ")":
                     if not parentheses:
                         return cursor + 1
                     parentheses -= 1
             cursor += 1
         if closes_parenthesis:
-            raise _UnprovenPowerShell
+            raise _UnprovenPowerShellError
         return cursor
 
     check_runtime()
     try:
         code(0, 0)
         check(len(content), 0)
-    except _UnprovenPowerShell:
+    except _UnprovenPowerShellError:
         return None
     check_runtime()
     spans.sort()
-    if any(end > next_start for (_, end), (next_start, _) in zip(spans, spans[1:])):
+    if any(end > next_start for (_, end), (next_start, _) in zip(spans, spans[1:], strict=False)):
         return None
     return PowerShellSource(
         tuple(start for start, _ in spans),

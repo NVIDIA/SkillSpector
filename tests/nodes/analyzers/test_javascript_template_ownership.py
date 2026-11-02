@@ -267,7 +267,7 @@ def test_metadata_keys_do_not_become_evaluator_references() -> None:
 
 
 def test_optional_chain_cancellation_propagates() -> None:
-    class Cancelled(RuntimeError):
+    class CancelledError(RuntimeError):
         pass
 
     calls = 0
@@ -276,8 +276,18 @@ def test_optional_chain_cancellation_propagates() -> None:
         nonlocal calls
         calls += 1
         if calls == 2:
-            raise Cancelled
+            raise CancelledError
 
     source = "const value = entry?.label;" * 1000 + "console.log(`${value}`);"
-    with pytest.raises(Cancelled):
+    with pytest.raises(CancelledError):
         javascript_template_spans(source, cancel)
+
+
+@pytest.mark.parametrize("member", [
+    'globalThis["eval"]', 'globalThis?.["eval"]',
+    'globalThis["Function"]', 'globalThis?.["Function"]',
+])
+def test_computed_evaluator_aliases_cannot_own_executable_templates(member: str) -> None:
+    source = f"const evaluate = {member}; evaluate(`${{command}} -rf /`);" + _PADDING
+    assert javascript_template_spans(source, lambda: None) is None
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")

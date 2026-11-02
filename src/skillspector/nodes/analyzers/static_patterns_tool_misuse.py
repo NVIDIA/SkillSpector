@@ -2557,6 +2557,17 @@ def _has_shell_command_word_exhaustion(
             continue
         if powershell is not None and powershell.owns(start):
             continue
+        if powershell is not None and file_type == "powershell" and content[start] == "$":
+            line_start = content.rfind("\n", max(0, start - 512), start) + 1
+            if (
+                (line_start > 0 or start <= 512)
+                and not content[line_start:start].strip(" \t")
+                and re.match(r"\$(?:[A-Za-z_][A-Za-z0-9_]*:)?[A-Za-z_][A-Za-z0-9_]*[ \t]*=(?!=)", content[start:start + 512])
+            ):
+                # A native assignment's left side is not a runtime command.
+                # Skip only that candidate; executable subexpressions in its
+                # value remain independently visited through lexical holes.
+                continue
         if structural_quote_closers is not None and start in structural_quote_closers:
             continue
         json_string_start = structural_quote_openers is not None and (
@@ -6084,7 +6095,7 @@ def _fenced_powershell_source(
     # Host quotes cannot swallow a following Bash fence. This projection is
     # only for locating clauses; command strings still use the original bytes.
     projected = list(content)
-    for start, end in zip(source.starts, source.ends):
+    for start, end in zip(source.starts, source.ends, strict=True):
         check_runtime()
         projected[start:end] = [
             character if character in "\r\n" else " " for character in content[start:end]
@@ -6218,6 +6229,7 @@ def _has_bounded_parse_exhaustion(
         return True
     covered_until = 0
     powershell_strings = _powershell_string_operands(powershell)
+    decoded_starts = sorted(string.start for string in powershell_strings.values() if string.decoded)
     for command_start, body_start in _destructive_command_words(content):
         check_runtime()
         if command_start < covered_until:
@@ -6239,10 +6251,11 @@ def _has_bounded_parse_exhaustion(
         covered_until = max(covered_until, command_end)
         if exhausted or _has_unsupported_brace_expansion(tokens):
             return True
-        if powershell_strings and any(
-            string.decoded and body_start <= string.start < command_end
-            for string in powershell_strings.values()
-        ) and (_has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens)):
+        decoded_index = bisect_left(decoded_starts, body_start)
+        if (
+            decoded_index < len(decoded_starts) and decoded_starts[decoded_index] < command_end
+            and (_has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens))
+        ):
             # Native escapes can assemble destructive flags the raw finding
             # parser did not see. Keep this reconstruction explicitly partial.
             return True
@@ -6252,6 +6265,18 @@ def _has_bounded_parse_exhaustion(
             if _has_runtime_command_operand_exhaustion(
                 content, start, end, check_runtime, powershell_strings=powershell_strings
             ):
+                return True
+            tokens, _, _ = _bounded_shell_tokens(
+                content, start, end, check_runtime=check_runtime,
+                powershell_strings=powershell_strings,
+            )
+            if any(
+                token.text.casefold() in {"-e", "-ec", "-enc", "-encodedcommand", "-command", "--command"}
+                or re.fullmatch(r"-[a-z]*c[a-z]*", token.text.casefold())
+                for token in tokens
+            ):
+                # An expression-selected executable can be a shell. Its code
+                # operand must not borrow ordinary PowerShell string ownership.
                 return True
         for string in powershell.strings:
             check_runtime()

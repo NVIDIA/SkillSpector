@@ -7,10 +7,10 @@ from __future__ import annotations
 
 import pytest
 
+from skillspector import powershell_tokens
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.nodes.analyzers import static_runner
-from skillspector import powershell_tokens
 from skillspector.powershell_tokens import powershell_source
 
 _TAIL = "\n# ordinary trailing documentation" * 300
@@ -169,13 +169,13 @@ def test_partial_context_cannot_claim_powershell_quotes() -> None:
 
 
 def test_runtime_cancellation_propagates() -> None:
-    class Cancelled(Exception):
+    class CancelledError(Exception):
         pass
 
     def cancel() -> None:
-        raise Cancelled
+        raise CancelledError
 
-    with pytest.raises(Cancelled):
+    with pytest.raises(CancelledError):
         powershell_source('Write-Host "done"', cancel)
 
 
@@ -188,7 +188,7 @@ def test_source_offsets_and_decoded_values_preserve_unicode_and_crlf() -> None:
     assert target.value == "$base?x=1"
     assert all(
         end <= next_start
-        for end, next_start in zip(source.ends, source.starts[1:])
+        for end, next_start in zip(source.ends, source.starts[1:], strict=False)
     )
 
 
@@ -206,6 +206,29 @@ def test_here_string_footer_does_not_own_following_code() -> None:
     assert source is not None
     assert not source.owns(content.index("$CMD"))
     assert source.next_boundary(0, len(content)) == content.index('@"')
+
+
+@pytest.mark.parametrize("name", ["text", "script:text"])
+def test_large_native_here_string_assignment_is_not_a_shell_command(name: str) -> None:
+    content = f"    ${name} = @'\n" + "ordinary documentation\n" * 500 + "'@\n"
+    assert _ledger(content)["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_assignment_ownership_preserves_nested_runtime_shell_consumer() -> None:
+    content = '$text = "$(bash -c \'$CMD -rf /\')"\n'
+    assert _ledger(content)["outcome"] is LedgerOutcome.PARTIAL
+
+
+def test_call_operator_operand_does_not_borrow_assignment_ownership() -> None:
+    content = "& $CMD = @'\n" + "ordinary documentation\n" * 500 + "'@\n"
+    assert _ledger(content)["outcome"] is LedgerOutcome.PARTIAL
+
+
+@pytest.mark.parametrize("expression", ['(Write-Output "bash")', '($program)', '$(Get-Shell)', '$program', '${script:program}'])
+@pytest.mark.parametrize("option", ["-c", "-lc", "-C", "-CO", "-Command", "-EncodedCommand"])
+def test_expression_selected_shell_keeps_code_operands_partial(expression: str, option: str) -> None:
+    content = f"& {expression} {option} '$CMD -rf /'\n"
+    assert _ledger(content)["outcome"] is LedgerOutcome.PARTIAL
 
 
 @pytest.mark.parametrize("language", ["powershell", "pwsh", "ps1", "PowerShell"])
