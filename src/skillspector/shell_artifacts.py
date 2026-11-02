@@ -42,10 +42,11 @@ class ShellArtifact:
 
     value: ShellSourceValue | None = None
     members: tuple[tuple[str, ShellArtifact], ...] = ()
+    opaque_size: int | None = None
 
     @property
     def is_archive(self) -> bool:
-        return self.value is None
+        return self.value is None and self.opaque_size is None
 
 
 class ShellArtifactStore:
@@ -76,7 +77,11 @@ class ShellArtifactStore:
             visited += 1
             if depth > MAX_GENERATED_DEPTH or visited > MAX_GENERATED_FILES:
                 return None
-            if current.value is not None:
+            if current.opaque_size is not None:
+                if current.value is not None or current.members or not 0 <= current.opaque_size <= MAX_GENERATED_BYTES:
+                    return None
+                total += current.opaque_size
+            elif current.value is not None:
                 if current.members:
                     return None
                 total += len(current.value.text.encode("utf-8"))
@@ -104,7 +109,9 @@ class ShellArtifactStore:
         """Record a proven fresh directory, such as a successful mktemp -d."""
         self._check_runtime()
         key = _path(path)
-        if key is None or any(self._within(item, key) for item in self._files):
+        if key is None or key in self._owned or any(
+            self._within(item, key) or self._within(key, item) for item in self._files
+        ):
             return False
         if any(self._within(key, item) or self._within(item, key) for item in self._unknown):
             return False
@@ -143,6 +150,16 @@ class ShellArtifactStore:
             return None
         return self._files.get(key)
 
+    def exists(self, path: str) -> bool | None:
+        """Distinguish known absence in an owned tree from missing evidence."""
+        self._check_runtime()
+        key = _path(path)
+        if key is None or not self.complete or any(self._within(key, item) or self._within(item, key) for item in self._unknown):
+            return None
+        if key in self._files or key in self._owned or any(self._within(item, key) for item in (*self._files, *self._owned)):
+            return True
+        return False if any(self._within(key, item) for item in self._owned) else None
+
     def write(self, path: str, artifact: ShellArtifact) -> bool:
         """Record exact, successfully replaced bytes; reject aliases upstream."""
         self._check_runtime()
@@ -156,7 +173,7 @@ class ShellArtifactStore:
         if any(
             other != key and (self._within(key, other) or self._within(other, key))
             for other in self._files
-        ):
+        ) or any(self._within(directory, key) for directory in self._owned):
             # Native files cannot simultaneously be directory ancestors.
             # Refuse the whole snapshot instead of publishing a fictitious tree.
             self.invalidate(None)
@@ -182,7 +199,7 @@ class ShellArtifactStore:
             return False
         return self.write(destination, artifact)
 
-    def archive(self, root: str, destination: str) -> bool:
+    def archive(self, root: str, destination: str, *, member_prefix: str = "") -> bool:
         """Model tar creation from one wholly known, exclusively owned tree."""
         self._check_runtime()
         key = _path(root)
@@ -190,6 +207,7 @@ class ShellArtifactStore:
         if (
             key is None
             or target is None
+            or member_prefix and _path(member_prefix, member=True) != member_prefix
             or self._within(target, key)
             or not any(self._within(key, item) for item in self._owned)
             or any(self._within(item, key) or self._within(key, item) for item in self._unknown)
@@ -197,7 +215,7 @@ class ShellArtifactStore:
             self.invalidate(destination)
             return False
         members = tuple(
-            (path[len(key) + 1 :], artifact)
+            ((member_prefix + "/" if member_prefix else "") + path[len(key) + 1 :], artifact)
             for path, artifact in sorted(self._files.items())
             if path.startswith(key + "/")
         )
@@ -205,6 +223,18 @@ class ShellArtifactStore:
             self.invalidate(destination)
             return False
         return self.write(destination, ShellArtifact(members=members))
+
+    def inventory(self, root: str) -> tuple[tuple[str, ShellArtifact], ...] | None:
+        """Expose a complete owned tree for finite find/hash operations."""
+        self._check_runtime()
+        key = _path(root)
+        if (
+            key is None or not self.complete
+            or not any(self._within(key, item) for item in self._owned)
+            or any(self._within(item, key) or self._within(key, item) for item in self._unknown)
+        ):
+            return None
+        return tuple((path[len(key) + 1:], artifact) for path, artifact in sorted(self._files.items()) if path.startswith(key + "/"))
 
     def extract(self, source: str, destination: str) -> bool:
         """Model extraction only into a proven fresh, exclusively owned tree."""

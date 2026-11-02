@@ -260,9 +260,10 @@ class _State:
     status: bool | None = True
     flow: str = ""
     output: tuple[ShellHelperOutput, ...] = ()
+    errexit: bool = False
 
     def copy(self) -> _State:
-        return _State(self.values.copy(), [scope.copy() for scope in self.scopes], self.argv, self.status, self.flow, self.output)
+        return _State(self.values.copy(), [scope.copy() for scope in self.scopes], self.argv, self.status, self.flow, self.output, self.errexit)
 
     def lookup(self, name: str) -> _Value:
         for scope in reversed(self.scopes):
@@ -689,9 +690,21 @@ def reconstruct_helper_commands(
 class _OutputInterpreter(_Interpreter):
     """Track stdout only for finite printf/cat helpers and proved log paths."""
 
-    def __init__(self, tick: Callable[[], None], writable_paths: frozenset[str]) -> None:
+    def __init__(self, tick: Callable[[], None], writable_paths: frozenset[str], program: tuple[_Node, ...]) -> None:
         super().__init__("", tick, helper=True)
         self.writable_paths = writable_paths
+        self.tested_status: set[int] = set()
+
+        def collect(nodes: tuple[_Node, ...], *, tested: bool = False) -> None:
+            for index, node in enumerate(nodes):
+                self.tick()
+                if tested or index + 1 < len(nodes) and nodes[index + 1].connector in {"&&", "||"}:
+                    self.tested_status.add(id(node))
+                for block_index, block in enumerate(node.blocks):
+                    condition = node.kind == "if" and block_index < len(node.blocks) - 1 and block_index % 2 == 0
+                    collect(block, tested=tested or condition)
+
+        collect(program)
 
     def node(self, node: _Node, state: _State) -> list[_State]:
         if node.kind != "command":
@@ -699,7 +712,12 @@ class _OutputInterpreter(_Interpreter):
                 raise _Unresolved
             return super().node(node, state)
         if node.words[0].raw == "[[":
-            return super().node(node, state)
+            states = super().node(node, state)
+            if state.errexit and state.status is None and id(node) not in self.tested_status:
+                raise _Unresolved
+            if state.errexit and state.status is False and id(node) not in self.tested_status:
+                state.flow = "exit"
+            return states
         head = _word(node.words[0].raw, state, self.tick)
         stdout = True
         for redirect, word in node.redirects:
@@ -717,6 +735,7 @@ class _OutputInterpreter(_Interpreter):
             if tuple(word.raw for word in node.words[1:]) not in {("-euo", "pipefail"), ("-Eeuo", "pipefail")} or node.redirects:
                 raise _Unresolved
             state.status = True
+            state.errexit = True
             return [state]
         if head == "printf":
             arguments = [_word(word.raw, state, self.tick) for word in node.words[1:]]
@@ -802,9 +821,9 @@ def reconstruct_helper_output(
         program = parser.sequence()
         if parser.peek():
             raise _Unresolved
-        states = _OutputInterpreter(tick, writable_paths).sequence(program, [_State(environment.copy(), [], argv)])
-        if any(state.status is None for state in states):
+        states = _OutputInterpreter(tick, writable_paths, program).sequence(program, [_State(environment.copy(), [], argv)])
+        if any(state.status is not True for state in states):
             raise _Unresolved
-        return tuple(dict.fromkeys(state.output for state in states if state.status is True))
+        return tuple(dict.fromkeys(state.output for state in states))
     except _Unresolved:
         return None

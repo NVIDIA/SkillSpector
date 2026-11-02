@@ -222,8 +222,26 @@ def test_helper_default_parameter_does_not_invent_an_inherited_environment_value
     "/tmp/cat /tmp/owned/input.tbz2",
     "printf '%s' \"$(touch /tmp/side-effect)\"",
     "false; printf misleading",
+    "printf misleading; exit 1",
     "exec cat /tmp/owned/input.tbz2",
     "IFS=,; printf '%s' \"$*\"",
 ])
 def test_stdout_proof_refuses_unmodeled_effects(program: str) -> None:
     assert _helper_output(("print",), program=program) is None
+
+
+@pytest.mark.parametrize("program", [
+    "set -euo pipefail\n[[ no == yes ]]\nprintf unreachable",
+    "set -euo pipefail\ntrue && [[ no == yes ]]\nprintf unreachable",
+    'set -euo pipefail\n[[ "$UNKNOWN" == yes ]]\nprintf conditional',
+])
+def test_failed_untested_predicate_stops_errexit_helper(program: str) -> None:
+    assert _helper_output((), program=program) is None
+
+
+@pytest.mark.parametrize("program", [
+    "set -euo pipefail\nif [[ no == yes ]]; then printf wrong; else printf ready; fi",
+    "set -euo pipefail\n[[ no == yes ]] && printf wrong\nprintf ready",
+])
+def test_tested_predicate_does_not_exit_the_helper(program: str) -> None:
+    assert _helper_output((), program=program) == ((ShellHelperOutput(text="ready"),),)
