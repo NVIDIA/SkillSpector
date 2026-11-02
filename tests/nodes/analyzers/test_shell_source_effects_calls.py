@@ -40,6 +40,14 @@ def test_import_installs_definitions_without_running_main_or_uncalled_writer() -
     assert _preserves('source scripts/library.sh\n', _LIBRARY)
 
 
+@pytest.mark.parametrize("operator", ["#", "##", "%", "%%"])
+def test_uncalled_quoted_pattern_removal_keeps_its_function_boundary(operator: str) -> None:
+    library = 'unused() {\nprintf "%s\\n" "${path' + operator + '"$ROOT"/}"\n}\n'
+    assert _preserves('source scripts/library.sh\n', library)
+    assert not _preserves('source scripts/library.sh\n', library + 'printf changed > scripts/library.sh\n')
+    assert not _preserves('source scripts/library.sh\nunused\n', library)
+
+
 def test_sourced_main_guard_without_else_returns_success() -> None:
     assert not _preserves('if source scripts/library.sh; then printf changed > scripts/library.sh; fi\n', _LIBRARY)
 
@@ -329,6 +337,30 @@ def test_subshell_redirect_opens_before_body_and_retains_caller_directory() -> N
 
 def test_subshell_cannot_read_its_still_open_destination() -> None:
     assert not _preserves('(printf safe; source /tmp/log) > /tmp/log\n', _LIBRARY)
+
+
+def test_exit_trap_output_is_not_dropped_from_generated_source_proof() -> None:
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        return ShellEffectResult(command.stdout, command.child_status if command.child_inspected else True, native_identity=True)
+
+    caller = 'set -e\n(trap "printf extra" EXIT; printf body) > /tmp/log\n'
+    assert _preserves(caller, _LIBRARY, native_effect=callback)
+    completion = [command for command in requests if command.child_inspected and not command.redirect_open][-1]
+    assert completion.stdout is None and completion.child_status is None
+
+
+@pytest.mark.parametrize("statement", ['value="$(printf safe)"', '(printf safe)', 'printf safe &', 'printf safe | cat'])
+def test_child_shell_does_not_run_parent_exit_trap(statement: str) -> None:
+    caller = 'trap "printf changed > scripts/library.sh" EXIT\n' + statement + '\n'
+    assert _preserves(caller, _LIBRARY)
+
+
+def test_pipeline_member_retains_its_own_exit_trap_effects() -> None:
+    caller = 'emit() { trap "printf changed > scripts/library.sh" EXIT; }; emit | cat\n'
+    assert not _preserves(caller, _LIBRARY)
 
 
 def test_child_cannot_borrow_bytes_from_its_active_output_file() -> None:
