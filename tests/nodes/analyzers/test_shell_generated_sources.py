@@ -3,6 +3,8 @@
 
 """Cross-file shell reconstruction remains bound to supplied bytes and callers."""
 
+import shlex
+
 import pytest
 
 from skillspector.artifacts import SecurityTextView
@@ -156,6 +158,43 @@ def test_known_helper_arguments_reconstruct_the_actual_forwarded_program() -> No
     variants = _forward("broker -n su -s /bin/bash -c 'printf ready'")
     assert variants is not None
     assert {text for values in variants.values() for text, _ in values} == {"printf ready"}
+
+
+def _generated_forwarder(program: str) -> str:
+    return (
+        'set -euo pipefail\ntmpdir="$(mktemp -d /tmp/generated-control.XXXXXX)"\n'
+        'cat > "$tmpdir/broker" <<\'BROKER\'\n' + _FORWARDER
+        + 'BROKER\nchmod +x "$tmpdir/broker"\n'
+        + 'PATH="$tmpdir:$PATH" bash -c ' + shlex.quote(program) + '\n'
+    )
+
+
+@pytest.mark.parametrize("command, destructive", [("printf ready", False), ("rm -rf /", True)])
+def test_generated_helper_inspects_both_forwarded_body_and_literal_caller(command: str, destructive: bool) -> None:
+    program = "broker -n su -s /bin/bash -c " + shlex.quote(command)
+    caller = _generated_forwarder(program)
+    prepared = _prepare(caller)
+    assert prepared is not None
+    assert prepared.has_bounded_parse_exhaustion()
+    findings = list(prepared.analyze_source_commands(content=caller, file_path="scripts/caller.sh", file_type="shell", source_view=SecurityTextView("raw", caller)))
+    assert any(finding.rule_id == "TM1" for finding in findings) is destructive
+    assert not prepared.has_bounded_parse_exhaustion()
+    variants = tuple(prepared.variants())
+    assert any(value.text == program and value.argv is None for _, value in variants)
+    assert any(value.text == command and value.argv is not None for _, value in variants)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_proven_helper_caller_does_not_clear_other_unknown_execution(nested: bool) -> None:
+    command = 'rm -rf /; bash -c "$UNKNOWN"' if nested else 'rm -rf /'
+    caller = _generated_forwarder("broker -n su -s /bin/bash -c " + shlex.quote(command))
+    if not nested:
+        caller += 'bash -c "$UNKNOWN"\n'
+    prepared = _prepare(caller)
+    assert prepared is not None
+    findings = list(prepared.analyze_source_commands(content=caller, file_path="scripts/caller.sh", file_type="shell", source_view=SecurityTextView("raw", caller)))
+    assert any(finding.rule_id == "TM1" for finding in findings)
+    assert prepared.has_bounded_parse_exhaustion()
 
 
 def test_quoted_argv_keeps_argument_boundaries_through_helper_shift() -> None:
