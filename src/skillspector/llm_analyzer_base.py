@@ -360,6 +360,7 @@ def _safe_failed_request_diagnostic(
         "invalid_request_error": "request_rejected",
     }
     known_classes = _RETRYABLE_PROVIDER_ERROR_NAMES | {
+        "TimeoutError",
         "OpenAIContextOverflowError",
         "OpenAIAPIContextOverflowError",
         "BadRequestError",

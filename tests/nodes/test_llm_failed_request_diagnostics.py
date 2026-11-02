@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -134,3 +135,38 @@ def test_untrusted_fields_are_not_copied(bad: object) -> None:
     assert value["estimated_input_budget"] is None
     assert value["configured_output_cap"] is None
     assert CANARY not in json.dumps(value)
+
+
+@pytest.mark.parametrize(
+    "error_type", [TimeoutError, asyncio.TimeoutError], ids=["builtin", "asyncio_alias"]
+)
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_builtin_timeout_keeps_class_category_and_original_exception(
+    analyzer: lab.LLMAnalyzerBase,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error_type: type[Exception],
+    asynchronous: bool,
+) -> None:
+    error = error_type(CANARY)
+    provider = AsyncMock(side_effect=error) if asynchronous else MagicMock(side_effect=error)
+    monkeypatch.setattr(
+        lab, "_ainvoke_with_usage" if asynchronous else "_invoke_with_usage", provider
+    )
+    batch = lab.Batch(file_path="fixture", content=CANARY)
+    with caplog.at_level("WARNING"), pytest.raises(TimeoutError) as caught:
+        if asynchronous:
+            await analyzer._ainvoke_batch(batch, CANARY)
+        else:
+            analyzer._invoke_batch(batch, CANARY)
+    assert caught.value is error
+    entries = [
+        r.getMessage() for r in caplog.records if r.getMessage().startswith("LLM_REQUEST_FAILURE ")
+    ]
+    assert len(entries) == 1
+    value = json.loads(entries[0].removeprefix("LLM_REQUEST_FAILURE "))
+    assert value["error_class"] == "TimeoutError"
+    assert value["message_class"] == "timeout"
+    assert value["request_ordinal"] == 1
+    assert CANARY not in caplog.text
+    analyzer._usage_collector.mark_response_received.assert_not_called()
