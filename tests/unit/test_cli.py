@@ -918,7 +918,15 @@ def test_recursive_incomplete_hidden_discovery_preserves_existing_output(
         }
     )
     monkeypatch.setattr(cli, "_scan_skill", scan_skill)
-    args = ["scan", str(root), "--recursive", "--no-llm", "--format", "json", "--fail-on-incomplete"]
+    args = [
+        "scan",
+        str(root),
+        "--recursive",
+        "--no-llm",
+        "--format",
+        "json",
+        "--fail-on-incomplete",
+    ]
     if destination != "stdout":
         args += ["--output", str(output)]
     with patch("skillspector.cli.graph.invoke") as invoke:
@@ -938,7 +946,9 @@ def test_recursive_incomplete_hidden_discovery_preserves_existing_output(
         assert events[0]["phase"] == "multi_skill_discovery"
         assert events[0]["outcome"] == "partial"
         assert events[0]["reason_code"] == "size_limit"
-        report_text = result.stdout if destination == "stdout" else output.read_text(encoding="utf-8")
+        report_text = (
+            result.stdout if destination == "stdout" else output.read_text(encoding="utf-8")
+        )
         assert json.loads(report_text)["analysis_completeness"]["is_complete"] is False
         if destination == "stdout":
             assert not output.exists()
