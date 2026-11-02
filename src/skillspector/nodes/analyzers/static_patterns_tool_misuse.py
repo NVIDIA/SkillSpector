@@ -2816,11 +2816,7 @@ def _has_shell_command_word_exhaustion(
                 backtick_end_cache,
                 check_runtime=check_runtime,
             )
-            if (
-                parsed is not None
-                and _plain_quoted_assignment_word(parsed)
-                and not shadowed
-            ):
+            if parsed is not None and _plain_quoted_assignment_word(parsed) and not shadowed:
                 parsed_through = max(parsed_through, parsed.end)
             continue
         # A runtime-selected command may follow any prefix word (``sudo -u
