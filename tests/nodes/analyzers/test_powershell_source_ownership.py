@@ -230,7 +230,14 @@ def test_incomplete_executable_name_slice_cannot_claim_operand_ownership(name: s
 
 @pytest.mark.parametrize(
     "expression",
-    ["$runner.GetShell()", "$programs[$index]", "($runner).GetShell()", "($programs)[$index]"],
+    [
+        "$runner.GetShell()",
+        "$programs[$index]",
+        "($runner).GetShell()",
+        "($programs)[$index]",
+        "${shell-path}",
+        '"$program".GetShell()',
+    ],
 )
 @pytest.mark.parametrize("path", ["sample.ps1", "SKILL.md"])
 @pytest.mark.parametrize("prefix", ["", "# Invoke-Expression is documented here\n"])
@@ -257,6 +264,9 @@ def test_unsupported_executable_selection_stays_partial(
         "$config.Executable",
         r"$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",
         "$root/bin/bash",
+        '"$program"',
+        '"${script:program}"',
+        '"$($config.Executable)"',
     ],
 )
 @pytest.mark.parametrize(
@@ -300,6 +310,12 @@ def test_native_path_suffix_after_variable_preserves_argument_boundaries(path: s
     if path == "SKILL.md":
         content = f"# Instructions\n\n```powershell\n{content}```\n"
     assert _ledger(content, path)["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize("expression", ['"bash"', "'bash'", '"ba`sh"'])
+def test_literal_quoted_shell_command_keeps_inspectable_code(expression: str) -> None:
+    content = f"& {expression} -c 'printf safe'\n"
+    assert _ledger(content)["outcome"] is LedgerOutcome.COMPLETED
 
 
 @pytest.mark.parametrize("language", ["powershell", "pwsh", "ps1", "PowerShell"])

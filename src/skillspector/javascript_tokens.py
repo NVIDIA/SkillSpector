@@ -632,11 +632,63 @@ def _walk_nodes(value: Any, check_runtime: Callable[[], None]) -> Iterator[Any]:
 
 
 def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -> bool:
+    global_objects = {"globalThis", "global", "window", "self"}
+    computed_callables: set[str] = set()
+    aliases: dict[str, list[str]] = {}
+
+    def unknown_member(node: Any) -> bool:
+        return (
+            getattr(node, "type", None) == "MemberExpression"
+            and node.computed
+            and getattr(node.property, "type", None) != "Literal"
+        )
+
+    for node in _walk_nodes(program, check_runtime):
+        if node.type == "VariableDeclarator":
+            target, value = node.id, node.init
+        elif node.type == "AssignmentExpression" and node.operator == "=":
+            target, value = node.left, node.right
+        else:
+            continue
+        if getattr(target, "type", None) != "Identifier":
+            continue
+        if getattr(value, "type", None) == "Identifier":
+            aliases.setdefault(value.name, []).append(target.name)
+        elif unknown_member(value):
+            computed_callables.add(target.name)
+    # Overapproximate aliases across scopes and assignments. A name may have
+    # several possible values; none may hide a possible evaluator selection.
+    for names in (global_objects, computed_callables):
+        pending = list(names)
+        while pending:
+            check_runtime()
+            for alias in aliases.get(pending.pop(), ()):
+                if alias not in names:
+                    names.add(alias)
+                    pending.append(alias)
+
+    def unproven_callable(callee: Any) -> bool:
+        while getattr(callee, "type", None) == "MemberExpression":
+            check_runtime()
+            if unknown_member(callee):
+                return True
+            callee = callee.object
+        return getattr(callee, "type", None) == "Identifier" and callee.name in computed_callables
+
     literal_keys: set[int] = set()
     for node in _walk_nodes(program, check_runtime):
-        if node.type == "Property" and not node.computed and not node.shorthand:
+        if node.type == "ObjectExpression":
             # Object metadata keys are names, not references to evaluators.
-            literal_keys.add(id(node.key))
+            for prop in node.properties:
+                if prop.type == "Property" and not prop.computed and not prop.shorthand:
+                    literal_keys.add(id(prop.key))
+        if node.type == "ObjectPattern":
+            for prop in node.properties:
+                if prop.type == "Property" and (
+                    getattr(prop.key, "value", None) in {"eval", "Function"}
+                    or prop.computed and getattr(prop.key, "type", None) != "Literal"
+                ):
+                    return True
         if (
             node.type == "Identifier"
             and node.name in {"eval", "Function"}
@@ -651,11 +703,20 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
             and getattr(node.property, "value", None) in {"eval", "Function"}
         ):
             return True
+        if unknown_member(node):
+            receiver = node.object
+            while getattr(receiver, "type", None) == "MemberExpression":
+                check_runtime()
+                receiver = receiver.object
+            if getattr(receiver, "type", None) == "Identifier" and receiver.name in global_objects:
+                return True
         if node.type == "ImportDeclaration" and _is_shell_execution_module(
             getattr(node.source, "value", "")
         ):
             return True
         if node.type in {"CallExpression", "NewExpression"}:
+            if unproven_callable(node.callee):
+                return True
             if _is_shell_execution_callee(node.callee):
                 return True
             if (
@@ -667,6 +728,8 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
                 return True
         if node.type == "TaggedTemplateExpression":
             tag = node.tag
+            if unproven_callable(tag):
+                return True
             if _is_shell_execution_callee(tag) or (tag.type == "Identifier" and tag.name == "$"):
                 return True
     return False

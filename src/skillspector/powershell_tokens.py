@@ -143,6 +143,7 @@ def powershell_source(
         region_start = start
         value: list[str] = []
         decoded = False
+        dynamic = False
         while cursor < len(content):
             check(cursor, depth)
             character = content[cursor]
@@ -230,6 +231,10 @@ def powershell_source(
                 strings.append(
                     PowerShellString(start, end, "".join(value), decoded, invoked, operand_start)
                 )
+                if invoked and dynamic and operand_start is not None:
+                    invocations.append((start, operand_start))
+                if invoked_context and operand_start is None and unresolved_executables is not None:
+                    unresolved_executables.append(start)
                 if invoked:
                     del spans[span_start:]
                 return end
@@ -255,6 +260,7 @@ def powershell_source(
                 decoded = True
                 continue
             if quote == '"' and content.startswith("$(", cursor):
+                dynamic = True
                 # Preserve executable subexpressions as independent code. The
                 # outer value stays dynamic, never a trusted literal command.
                 own(region_start, cursor + 2)
@@ -265,10 +271,13 @@ def powershell_source(
                 region_start = end - 1
                 continue
             if quote == '"' and content.startswith("${", cursor):
+                dynamic = True
                 end = variable(cursor, depth)
                 value.append(content[cursor:end])
                 cursor = end
                 continue
+            if quote == '"' and character == "$":
+                dynamic = True
             value.append(character)
             cursor += 1
         raise _UnprovenPowerShellError
@@ -325,6 +334,10 @@ def powershell_source(
                     invocations.append((operand, end))
                     cursor = end
                     continue
+                if content[operand : operand + 1] == "$":
+                    if unresolved_executables is not None:
+                        unresolved_executables.append(operand)
+                    raise _UnprovenPowerShellError
             if content.startswith("<#", cursor):
                 start = cursor
                 cursor += 2

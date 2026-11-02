@@ -307,3 +307,31 @@ def test_computed_evaluator_aliases_cannot_own_executable_templates(member: str)
     source = f"const evaluate = {member}; evaluate(`${{command}} -rf /`);" + _PADDING
     assert javascript_template_spans(source, lambda: None) is None
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "const evaluate = globalThis?.['ev' + 'al']; evaluate(`${command} -rf /`);",
+        "const key = 'eval'; globalThis?.[key](`${command} -rf /`);",
+        "const root = globalThis; const other = root; other[key](`${command} -rf /`);",
+        "const evaluate = source[key]; const run = evaluate; run(`${command} -rf /`);",
+        "let run; run = source[key]; run.call(null, `${command} -rf /`);",
+        "source[key](`${command} -rf /`);",
+        "source[key].bind(null)(`${command} -rf /`);",
+        "const {eval: run} = globalThis; run(`${command} -rf /`);",
+        "const {'Function': run} = globalThis; new run(`${command} -rf /`);",
+        "const root = globalThis; const {[key]: run} = root; run(`${command} -rf /`);",
+        "const run = source[key]; run.call`${command} -rf /`;",
+        "source[key].call`${command} -rf /`;",
+    ],
+)
+def test_unresolved_computed_evaluators_cannot_own_templates(statement: str) -> None:
+    source = statement + _PADDING
+    assert javascript_template_spans(source, lambda: None) is None
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+def test_computed_data_reads_do_not_become_executable_aliases() -> None:
+    source = "const label = source[key]; console.log(`Value: ${label}`);" + _PADDING
+    assert javascript_template_spans(source, lambda: None) is not None
