@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_supply_chain as supply_chain
 from skillspector.nodes.analyzers.osv_client import OsvQueryLimitation, QueryBatchResults
@@ -21,7 +23,7 @@ from skillspector.nodes.analyzers.osv_client import OsvQueryLimitation, QueryBat
 def _capture_osv_packages(monkeypatch):
     seen = {}
 
-    def fake_query_batch(packages, ecosystem):
+    def fake_query_batch(packages, ecosystem, **_kwargs):
         seen["packages"] = packages
         seen["ecosystem"] = ecosystem
         return [[] for _ in packages]
@@ -104,6 +106,200 @@ def test_toml_lock_parser_returns_empty_for_malformed_toml():
 name = "broken"
 """
     assert supply_chain._extract_packages_from_toml_lock(content) == []
+
+
+@pytest.mark.parametrize("path", ["package.json", "package-lock.json", "npm-shrinkwrap.json"])
+@pytest.mark.parametrize("is_cached", [True, False], ids=["present-empty", "missing"])
+def test_node_distinguishes_empty_dependency_file_from_missing_cache_entry(
+    monkeypatch, path, is_cached
+):
+    monkeypatch.setattr(
+        supply_chain.static_runner,
+        "run_static_patterns_with_ledger",
+        lambda _state, _modules: {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+        },
+    )
+    file_cache = {path: ""} if is_cached else {}
+    response = supply_chain.node(
+        {
+            "components": [path],
+            "file_cache": file_cache,
+            "local_file_cache": file_cache,
+            "manifest": {},
+            "component_metadata": [],
+        }
+    )
+
+    has_parse_error = any(
+        event["reason_code"] is LedgerReason.DEPENDENCY_PARSE_ERROR
+        for event in response["inspection_ledger"]
+    )
+    assert has_parse_error is is_cached
+
+
+def test_node_treats_empty_pyproject_toml_as_valid(monkeypatch):
+    monkeypatch.setattr(
+        supply_chain.static_runner,
+        "run_static_patterns_with_ledger",
+        lambda _state, _modules: {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+        },
+    )
+    response = supply_chain.node(
+        {
+            "components": ["pyproject.toml"],
+            "file_cache": {"pyproject.toml": ""},
+            "local_file_cache": {"pyproject.toml": ""},
+            "manifest": {},
+            "component_metadata": [],
+        }
+    )
+
+    assert not any(
+        event["reason_code"] is LedgerReason.DEPENDENCY_PARSE_ERROR
+        for event in response["inspection_ledger"]
+    )
+
+
+@pytest.mark.parametrize("path", ["requirements/dev.txt", "requirements/base.txt"])
+def test_nested_requirements_manifests_retain_sc4_advisory_findings(monkeypatch, path):
+    seen = _capture_osv_packages(monkeypatch)
+    monkeypatch.setattr(supply_chain, "was_osv_reachable", lambda: True)
+    monkeypatch.setattr(
+        supply_chain.static_runner,
+        "run_static_patterns_with_ledger",
+        lambda _state, _modules: {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+        },
+    )
+    content = "pyyaml==5.3.1\n"
+    response = supply_chain.node(
+        {
+            "components": [path],
+            "file_cache": {path: content},
+            "local_file_cache": {path: content},
+            "manifest": {},
+            "component_metadata": [],
+        }
+    )
+
+    assert ("pyyaml", "5.3.1") in seen["packages"]
+    assert any(
+        finding.rule_id == "SC4" and finding.file == path and "CVE-2020-14343" in finding.message
+        for finding in response["findings"]
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "docs/pyproject.toml.md",
+        "docs/package.json.md",
+        "docs/uv.lock.md",
+        "docs/requirements/dev.txt.md",
+    ],
+)
+def test_manifest_documentation_is_not_analyzed_as_dependency_metadata(monkeypatch, path):
+    monkeypatch.setattr(
+        supply_chain.static_runner,
+        "run_static_patterns_with_ledger",
+        lambda _state, _modules: {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+        },
+    )
+    content = "This guide describes package.json and pyproject.toml files.\n"
+    response = supply_chain.node(
+        {
+            "components": [path],
+            "file_cache": {path: content},
+            "local_file_cache": {path: content},
+            "manifest": {},
+            "component_metadata": [],
+        }
+    )
+
+    assert not any(
+        event["reason_code"] is LedgerReason.DEPENDENCY_PARSE_ERROR
+        for event in response["inspection_ledger"]
+    )
+    assert not any(finding.rule_id == "SC4" for finding in response["findings"])
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("pyproject.toml", "[project]\ndependencies = ["),
+        ("package.json", '{"dependencies": {'),
+        ("package-lock.json", '{"packages": '),
+        ("npm-shrinkwrap.json", '{"dependencies": '),
+        ("uv.lock", '[[package]\nname = "broken"'),
+    ],
+)
+def test_malformed_dependency_manifests_are_reported_as_partial(path, content):
+    _findings, limitations, _packages_seen = supply_chain._analyze_dependencies_detailed(
+        content,
+        path,
+    )
+
+    assert any(item.reason is LedgerReason.DEPENDENCY_PARSE_ERROR for item in limitations)
+
+
+@pytest.mark.parametrize(
+    ("path", "prefix"),
+    [
+        ("pyproject.toml", "[project]\nname = "),
+        ("uv.lock", "version = "),
+    ],
+)
+def test_oversized_toml_integer_is_reported_as_dependency_parse_error(path, prefix):
+    content = prefix + "9" * 5_000
+
+    _findings, limitations, _packages_seen = supply_chain._analyze_dependencies_detailed(
+        content,
+        path,
+    )
+
+    assert any(item.reason is LedgerReason.DEPENDENCY_PARSE_ERROR for item in limitations)
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("pyproject.toml", "[project]\nname = 'example'\n"),
+        ("package.json", '{"name": "example"}'),
+        ("uv.lock", "version = 1\n"),
+    ],
+)
+def test_valid_dependency_free_manifests_remain_complete(path, content):
+    _findings, limitations, _packages_seen = supply_chain._analyze_dependencies_detailed(
+        content,
+        path,
+    )
+
+    assert not any(item.reason is LedgerReason.STATIC_PARSE_LIMIT for item in limitations)
+
+
+def test_malformed_package_json_keeps_line_scan_fallback(monkeypatch):
+    seen = _capture_osv_packages(monkeypatch)
+    content = '{"dependencies": {\n  "demo-package": "1.2.3"\n'
+
+    _findings, limitations, packages_seen = supply_chain._analyze_dependencies_detailed(
+        content,
+        "package.json",
+    )
+
+    assert packages_seen == 1
+    assert ("demo-package", "1.2.3") in seen["packages"]
+    assert any(item.reason is LedgerReason.DEPENDENCY_PARSE_ERROR for item in limitations)
 
 
 def test_toml_lock_parser_keeps_package_without_version():
