@@ -306,7 +306,7 @@ def powershell_source(content: str, check_runtime: Callable[[], None]) -> PowerS
                         r"(?:\[[0-9]+\]|\.[A-Za-z_][A-Za-z0-9_]*)*", content[end : end + 512]
                     )
                     end += suffix.end()
-                    if content[end : end + 1] in {"[", ".", "("}:
+                    if end < len(content) and not (content[end].isspace() or content[end] in ";|&)}"):
                         # Complex executable selection needs its own value
                         # proof; a partial variable span cannot own operands.
                         raise _UnprovenPowerShellError

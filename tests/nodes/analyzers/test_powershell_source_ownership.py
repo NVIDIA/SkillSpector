@@ -223,6 +223,11 @@ def test_call_operator_operand_does_not_borrow_assignment_ownership() -> None:
     assert _ledger(content)["outcome"] is LedgerOutcome.PARTIAL
 
 
+@pytest.mark.parametrize("name", ["x" * 513, "config." + "x" * 513, "naïve"])
+def test_incomplete_executable_name_slice_cannot_claim_operand_ownership(name: str) -> None:
+    assert powershell_source(f"& ${name} -c '$CMD -rf /'\n", lambda: None) is None
+
+
 @pytest.mark.parametrize(
     "expression",
     [
