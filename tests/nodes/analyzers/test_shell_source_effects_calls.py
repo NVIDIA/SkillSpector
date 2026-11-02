@@ -6,12 +6,12 @@
 import pytest
 
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
-from skillspector.shell_source_effects import ShellEffectResult, source_effects_preserve
+from skillspector.shell_source_effects import ShellEffectResult, source_effects_collect, source_effects_preserve
 from skillspector.shell_sources import ShellSourceContext, ShellSourceResolver
 
 
-def _preserves(caller: str, library: str, **kwargs) -> bool:
-    resolver = ShellSourceResolver(
+def _resolver(caller: str, library: str) -> ShellSourceResolver:
+    return ShellSourceResolver(
         ShellSourceContext("scripts/caller.sh", {
             "scripts/caller.sh": caller,
             "scripts/library.sh": library,
@@ -22,7 +22,11 @@ def _preserves(caller: str, library: str, **kwargs) -> bool:
         tm._skip_static_heredoc_bodies,
         lambda: None,
     )
-    return source_effects_preserve(resolver, "scripts/library.sh", len(caller), **kwargs)
+
+
+def _preserves(caller: str, library: str, *, use_offset: int | None = None, **kwargs) -> bool:
+    resolver = _resolver(caller, library)
+    return source_effects_preserve(resolver, "scripts/library.sh", len(caller) if use_offset is None else use_offset, **kwargs)
 
 
 _LIBRARY = '''set -euo pipefail
@@ -34,6 +38,33 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
 
 def test_import_installs_definitions_without_running_main_or_uncalled_writer() -> None:
     assert _preserves('source scripts/library.sh\n', _LIBRARY)
+
+
+@pytest.mark.parametrize("opener, closer", [("$(", ")"), ('"$(', ')"')])
+def test_first_assignment_substitution_audits_only_prior_effects(opener: str, closer: str) -> None:
+    caller = 'source scripts/library.sh\nhelper=' + opener + "sed -n 'p' scripts/library.sh" + closer + '\nmain\n'
+    assert _preserves(caller, _LIBRARY, use_offset=caller.index("sed -n"))
+
+
+@pytest.mark.parametrize("prefix, closer", [
+    ("source scripts/library.sh\nmain\nhelper=$(", ")"),
+    ('source scripts/library.sh\nhelper="$(printf changed > scripts/library.sh; ', ')"'),
+    ('source scripts/library.sh\nhelper="$(main)$( ', ')"'),
+])
+def test_earlier_writes_or_executable_word_pieces_cannot_disappear(prefix: str, closer: str) -> None:
+    caller = prefix + "sed -n 'p' scripts/library.sh" + closer + "\n"
+    assert not _preserves(caller, _LIBRARY, use_offset=caller.index("sed -n"))
+
+
+def test_collection_has_no_fake_unchanged_source_target() -> None:
+    caller = 'printf changed > scripts/library.sh\n'
+    resolver = _resolver(caller, _LIBRARY)
+
+    def callback(command):
+        return ShellEffectResult(command.stdout, True, ("scripts/library.sh",))
+
+    assert source_effects_collect(resolver, len(caller), read_source=resolver.context.sources.get, native_effect=callback)
+    assert not _preserves(caller, _LIBRARY, native_effect=callback)
 
 
 @pytest.mark.parametrize("call", [
@@ -99,6 +130,25 @@ wrapper
     assert not _preserves(caller, _LIBRARY)
 
 
+@pytest.mark.parametrize("modifier, initial", [("-", ""), ("+", "present")])
+def test_parameter_fallback_cannot_hide_executable_expansion(modifier: str, initial: str) -> None:
+    caller = f'x="{initial}"\nignored="${{x:{modifier}$(printf changed > scripts/library.sh)}}"\n'
+    assert not _preserves(caller, _LIBRARY)
+
+
+def test_failed_status_does_not_invent_exact_exit_code() -> None:
+    caller = '''failure() { return 2; }
+failure
+rc="$?"
+if [[ "$rc" -eq 2 ]]; then printf changed > scripts/library.sh; fi
+'''
+    assert not _preserves(caller, _LIBRARY)
+
+
+def test_unknown_cd_failure_cannot_change_the_assumed_write_directory() -> None:
+    assert not _preserves('cd /tmp/may-not-exist\nrm -rf .\n', _LIBRARY)
+
+
 def test_local_argument_binding_restores_parent_value() -> None:
     caller = '''source scripts/library.sh
 target=/tmp/parent-output
@@ -134,6 +184,41 @@ def test_unknown_branches_are_marked_for_artifact_callback() -> None:
     branches = [command for command in requests if command.argv[0] == "echo"]
     assert len(branches) == 2
     assert all(command.uncertain for command in branches)
+
+
+@pytest.mark.parametrize("caller", ["echo background &\n", "echo producer | cat\n"])
+def test_concurrent_effects_cannot_publish_ordered_artifact_facts(caller: str) -> None:
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        return ShellEffectResult(status=True)
+
+    assert _preserves(caller, _LIBRARY, native_effect=callback)
+    assert requests and all(command.uncertain for command in requests)
+
+
+def test_function_redirect_opens_in_caller_directory_before_body() -> None:
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        return ShellEffectResult(command.stdout, True, native_identity=True)
+
+    caller = 'emit() { cd /tmp/other; printf code; }; emit > /tmp/result\n'
+    assert _preserves(caller, _LIBRARY, native_effect=callback)
+    opening = next(command for command in requests if command.redirect_open)
+    completion = [command for command in requests if command.child_inspected and not command.redirect_open][-1]
+    assert opening.cwd == completion.cwd == "."
+    assert requests.index(opening) < next(index for index, command in enumerate(requests) if command.argv[0] == "cd")
+
+
+def test_child_cannot_borrow_bytes_from_its_active_output_file() -> None:
+    def callback(command):
+        return ShellEffectResult(command.stdout, True, native_identity=True)
+
+    caller = 'emit() { printf prefix; cat /tmp/result; }; emit > /tmp/result\n'
+    assert not _preserves(caller, _LIBRARY, native_effect=callback)
 
 
 def test_path_prefix_needs_native_shell_identity() -> None:
