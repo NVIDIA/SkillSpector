@@ -176,14 +176,9 @@ _CLOUD_DOWNLOAD_AWS_VALUE_OPTIONS = frozenset({"--region", "--profile", "--inclu
 _CLOUD_DOWNLOAD_SHELL_META = re.compile(r"[;&|<>(){}\[\]*?$\x60%!#~\x00-\x1f\x7f]")
 _CLOUD_DOWNLOAD_BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]*")
 _CLOUD_DOWNLOAD_CONTEXT_CHARS = 4_096
-_CLOUD_DOWNLOAD_SETUP = re.compile(
-    r"""[\\'"$\x60]|\b(?:alias|function|source|eval|trap|hash)\b"""
-    r"|(?:^|[;\r\n])[ \t]*\.[ \t]+|\([ \t\r\n]*\)"
-    r"|\b(?:PATH|path|commands)\s*(?:\+?=|\[)"
-    r"|\b(?:read|readarray|mapfile|printf|set|typeset|declare|local|export|readonly|unset)\b"
-    r"[^;\r\n]*\b(?:PATH|path|commands)\b"
+_CLOUD_DOWNLOAD_SAFE_SET = re.compile(
+    r"set[ \t]+(?:-[efu]+[ \t]+)*(?:-[efu]+|-[efu]*o[ \t]+pipefail)"
 )
-_CLOUD_DOWNLOAD_DIRECTORY_CHANGE = re.compile(r"\b(?:cd|chdir|pushd|popd)\b")
 
 
 def _is_literal_cloud_download(
@@ -207,10 +202,28 @@ def _is_literal_cloud_download(
         content, offset, ()
     ):
         return False
-    if _CLOUD_DOWNLOAD_SETUP.search(content, 0, offset):
-        # Quotes, escapes or expansions can conceal alias/setup command names.
-        # Hash tables and shell variables can also redirect executable lookup.
-        # Without evaluating that setup, retain the existing upload evidence.
+    directory_changed = False
+    for line in content[:offset].splitlines():
+        setup = line.strip(" \t\r")
+        if not setup or setup.startswith("#"):
+            continue
+        if _CLOUD_DOWNLOAD_SAFE_SET.fullmatch(setup):
+            continue
+        if "\\" in setup or _CLOUD_DOWNLOAD_SHELL_META.search(setup):
+            return False
+        setup_tokens = _shell_tokens(setup)
+        if setup_tokens == ["popd"] or (
+            setup_tokens
+            and len(setup_tokens) == 2
+            and setup_tokens[0] in {"cd", "chdir", "pushd"}
+            and setup_tokens[1]
+            and not setup_tokens[1].startswith("-")
+        ):
+            directory_changed = True
+            continue
+        # Unknown setup can load or replace the cloud command. Even an earlier
+        # download can overwrite an executable, so only the preambles above
+        # preserve this proof; do not enumerate unsafe command-loading forms.
         return False
     command = _sc2_logical_command(content, offset, line_starts)
     if command is None or "\\" in command or _CLOUD_DOWNLOAD_SHELL_META.search(command) is not None:
@@ -254,9 +267,7 @@ def _is_literal_cloud_download(
     bucket = source[len(scheme) :].split("/", 1)[0]
     if _CLOUD_DOWNLOAD_BUCKET.fullmatch(bucket) is None:
         return False
-    if not destination.startswith("/") and _CLOUD_DOWNLOAD_DIRECTORY_CHANGE.search(
-        content, 0, offset
-    ):
+    if directory_changed and not destination.startswith("/"):
         # A relative file may resolve to a stream after cd /dev (or a directory
         # stack change). Absolute destinations do not depend on this setup.
         return False

@@ -238,12 +238,102 @@ def test_directory_changes_keep_relative_destination_unproved(
 @pytest.mark.parametrize(
     "transfer", ["aws s3 cp s3://example-bucket/a", "gsutil cp gs://example-bucket/a"]
 )
-@pytest.mark.parametrize("setup", ["cd /dev", "set -eu", "read filename"])
+@pytest.mark.parametrize("setup", ["cd /dev", "set -eu", "set -euo pipefail"])
 def test_proved_file_destination_survives_unrelated_setup(transfer: str, setup: str) -> None:
     findings = data_exfiltration.analyze(
         f"{setup}\n{transfer} /tmp/public.csv\n", "download.sh", "shell"
     )
     assert not any(finding.rule_id == "E5" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        "true && . ./setup.sh",
+        "false || . ./setup.sh",
+        "if true; then . ./setup.sh; fi",
+        "for name in aws; do . ./setup.sh; done",
+        "builtin . ./setup.sh",
+        "command . ./setup.sh",
+        "autoload -Uz aws gsutil",
+        "functions -u aws gsutil",
+        "typeset -fu aws gsutil",
+        "enable -f ./plugin.so aws",
+        "prepare-environment",
+        "read filename",
+        "export LANG=C",
+        "set -- ./setup.sh",
+        "set -A path ./tools",
+    ],
+)
+@pytest.mark.parametrize(
+    "transfer",
+    [
+        "aws s3 cp s3://example-bucket/public.csv /tmp/public.csv",
+        "gsutil cp gs://example-bucket/public.csv /tmp/public.csv",
+    ],
+)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_unproved_preamble_keeps_cloud_finding(setup: str, transfer: str, newline: str) -> None:
+    findings = data_exfiltration.analyze(
+        f"{setup}{newline}{transfer}{newline}", "download.sh", "shell"
+    )
+    e5 = [finding for finding in findings if finding.rule_id == "E5"]
+    assert len(e5) == 1
+    assert e5[0].location.start_line == 2
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        "#!/bin/sh",
+        "# Public files",
+        "set -e",
+        "set -eu",
+        "set -e -u",
+        "set -o pipefail",
+        "set -euo pipefail",
+    ],
+)
+@pytest.mark.parametrize("file_type", ["shell", "markdown", "text"])
+def test_supported_preamble_preserves_download_exemption(setup: str, file_type: str) -> None:
+    findings = data_exfiltration.analyze(
+        f"{setup}\naws s3 cp s3://example-bucket/public.csv ./public.csv\n",
+        "download.sh",
+        file_type,
+    )
+    assert not any(finding.rule_id == "E5" for finding in findings)
+
+
+def test_prior_download_can_replace_a_later_cloud_executable() -> None:
+    findings = data_exfiltration.analyze(
+        "aws s3 cp s3://example-bucket/replacement /usr/local/bin/aws\n"
+        "aws s3 cp s3://example-bucket/public.csv ./public.csv\n",
+        "download.sh",
+        "shell",
+    )
+    assert [f.location.start_line for f in findings if f.rule_id == "E5"] == [2]
+
+
+def test_setup_after_download_does_not_change_earlier_finding_location() -> None:
+    findings = data_exfiltration.analyze(
+        "aws s3 cp s3://example-bucket/public.csv ./public.csv\n"
+        "true && . ./setup.sh\n"
+        "aws s3 cp s3://example-bucket/public.csv ./public.csv\n",
+        "download.sh",
+        "shell",
+    )
+    assert [f.location.start_line for f in findings if f.rule_id == "E5"] == [3]
+
+
+@pytest.mark.parametrize("offset", [4095, 4096, 4097])
+def test_preamble_proof_stays_within_context_bound(offset: int) -> None:
+    findings = data_exfiltration.analyze(
+        "#" + " " * (offset - 2) + "\naws s3 cp s3://example-bucket/public.csv ./public.csv\n",
+        "download.sh",
+        "shell",
+    )
+    assert any(f.rule_id == "E5" for f in findings) == (offset > 4096)
 
 
 def test_large_prefix_cannot_forget_an_earlier_alias() -> None:
@@ -263,6 +353,8 @@ def test_large_prefix_cannot_forget_an_earlier_alias() -> None:
     [
         ("aws s3 cp s3://example-bucket/public.csv ./public.csv\n", []),
         ("set -eu\naws s3 cp s3://example-bucket/public.csv ./public.csv\n", []),
+        ("true && . ./setup.sh\naws s3 cp s3://example-bucket/public.csv /tmp/public.csv\n", [3]),
+        ("autoload -Uz gsutil\ngsutil cp gs://example-bucket/public.csv /tmp/public.csv\n", [3]),
         (
             "hash -p ./custom-aws aws\naws s3 cp s3://example-bucket/public.csv ./public.csv\n",
             [3],

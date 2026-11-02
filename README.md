@@ -571,9 +571,11 @@ from uploads. Simple remote-to-local `cp`, AWS `sync`, and `gsutil rsync` comman
 findings. Moves, deletion options, unknown flags, dynamic operands, streams and
 compound shell commands retain conservative findings. This direction check does
 not change SDK upload detection or the CLI's exit-code policy. Direction proofs
-require the complete preceding context to fit within 4,096 characters; visible
-command redefinitions (including command hashes) or unknown shell setup also
-retain the original finding. Relative destinations after directory changes
+require the complete preceding context to fit within 4,096 characters. Only
+blank/comment lines, literal `set` flags (`-e`, `-u`, `-f`, and `-o pipefail`),
+and simple directory changes may precede a proved download. Other setup,
+including sourcing, autoloading, variable assignments, and earlier transfers,
+retains the original finding. Relative destinations after directory changes
 remain unproved; literal absolute file destinations are still eligible.
 
 ### Privilege Escalation (3 patterns)
