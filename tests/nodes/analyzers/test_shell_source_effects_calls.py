@@ -249,6 +249,60 @@ def test_disk_metadata_exception_keeps_shadow_and_write_guards(caller: str) -> N
     assert not _preserves(caller, _LIBRARY, native_effect=lambda command: ShellEffectResult(native_identity=True))
 
 
+@pytest.mark.parametrize("interpreter", ["bash", "/bin/bash", "/usr/bin/bash"])
+def test_explicit_bash_retains_script_zero_arguments_environment_and_cwd(interpreter: str) -> None:
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        if command.interpreter is not None and not command.child_inspected:
+            return ShellEffectResult(script_path="scripts/library.sh")
+        return ShellEffectResult(command.stdout, command.child_status if command.child_inspected else True, native_identity=command.interpreter is None)
+
+    caller = 'set -e\nexport CARRY=kept\ncd scripts\nPREFIX=value ' + interpreter + ' ./library.sh argument\n'
+    condition = '[[ "$0" == ./library.sh && "$1" == argument && "$CARRY" == kept && "$PREFIX" == value ]]'
+    library = 'if ' + condition + '; then printf ready; else printf changed > library.sh; fi\n'
+    assert _preserves(caller, library, native_effect=callback)
+    invocations = [command for command in requests if command.interpreter is not None]
+    assert len(invocations) == 2
+    assert all(command.argv == ("./library.sh", "argument") and command.cwd == "scripts" and command.interpreter == interpreter for command in invocations)
+    assert invocations[-1].child_inspected
+    assert not _preserves(caller, library.replace('then printf ready; else printf changed > library.sh', 'then printf changed > library.sh; else printf ready'), native_effect=callback)
+
+
+@pytest.mark.parametrize("call", ["sh scripts/library.sh", "bash -e scripts/library.sh", "bash -", 'bash "$missing"'])
+def test_explicit_script_bridge_refuses_other_interpreters_options_and_unknown_paths(call: str) -> None:
+    assert not _preserves(call + '\n', ':\n', native_effect=lambda command: None)
+
+
+def test_explicit_script_requires_an_authoritative_callback() -> None:
+    assert not _preserves('bash scripts/library.sh\n', ':\n')
+    assert not _preserves('bash scripts/library.sh\n', ':\n', native_effect=lambda command: None)
+
+
+@pytest.mark.parametrize("name, argument", [("cd", "scripts"), ("set", "-e")])
+def test_interpreted_script_name_never_changes_parent_native_state(name: str, argument: str) -> None:
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        if command.interpreter is not None and not command.child_inspected:
+            return ShellEffectResult(script_path="scripts/library.sh")
+        return ShellEffectResult(command.stdout, command.child_status if command.child_inspected else True, native_identity=command.interpreter is None)
+
+    assert _preserves('bash ' + name + ' ' + argument + '\nprintf ready\n', ':\n', native_effect=callback)
+    final = requests[-1]
+    assert final.argv == ("printf", "ready") and final.cwd == "." and not final.fail_stop
+
+
+@pytest.mark.parametrize("caller", [
+    '( bash scripts/library.sh ) > scripts/library.sh\n',
+    '( bash df -B1 --output=avail /tmp ) > /tmp/log\n',
+])
+def test_interpreted_scripts_keep_active_output_and_metadata_identity_guards(caller: str) -> None:
+    assert not _preserves(caller, ':\n', native_effect=lambda command: ShellEffectResult(native_identity=True))
+
+
 @pytest.mark.parametrize("operator", ["#", "##", "%", "%%"])
 def test_uncalled_quoted_pattern_removal_keeps_its_function_boundary(operator: str) -> None:
     library = 'unused() {\nprintf "%s\\n" "${path' + operator + '"$ROOT"/}"\n}\n'

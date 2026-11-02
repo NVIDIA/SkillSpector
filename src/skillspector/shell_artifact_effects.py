@@ -227,7 +227,20 @@ class ShellArtifactAudit:
             return None
         if any(is_managed_shell_variable(name) and name != "PATH" for name in command.environment):
             return None
-        native, script = self.identity(command, command.argv[0])
+        if command.interpreter is not None:
+            if command.interpreter not in {"bash", "/bin/bash", "/usr/bin/bash"}:
+                return None
+            native_shell, shadow = self.identity(command, command.interpreter)
+            if not native_shell or shadow is not None:
+                return None
+            script = self.path(command.argv[0], command.cwd)
+            if script is None or self.read_source(script) is None:
+                return None
+            # An explicit interpreter reads a script regardless of its mode.
+            # The script itself must never acquire native-command identity.
+            native = False
+        else:
+            native, script = self.identity(command, command.argv[0])
         if command.identity_only:
             return ShellEffectResult(native_identity=native, script_path=script) if native or script is not None else None
         self.steps += 1

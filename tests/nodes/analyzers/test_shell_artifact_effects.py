@@ -54,6 +54,35 @@ def test_unknown_or_unexecutable_path_entry_never_proves_native_identity() -> No
     assert audit(command) is None
 
 
+@pytest.mark.parametrize("interpreter", ["bash", "/bin/bash", "/usr/bin/bash"])
+def test_explicit_bash_reads_known_nonexecutable_generated_script(interpreter: str) -> None:
+    audit = _audit()
+    assert audit.store.create_empty_directory("/tmp/scripts")
+    assert audit.store.write("/tmp/scripts/child.sh", ShellArtifact(ShellSourceValue("printf ready\n"), executable=False))
+    request = _command(("/tmp/scripts/child.sh", "argument"), interpreter=interpreter)
+    result = audit(request)
+    assert result is not None and result.script_path == "/tmp/scripts/child.sh"
+    assert not result.native_identity
+    assert audit(replace(request, interpreter=None)) is None
+    result = audit(replace(request, child_inspected=True, stdout="ready", child_status=True))
+    assert result is not None and result.stdout == "ready" and not result.native_identity
+
+
+@pytest.mark.parametrize("interpreter, script", [("sh", "scripts/setup.sh"), ("/tmp/bash", "scripts/setup.sh"), ("bash", "scripts/missing.sh")])
+def test_explicit_interpreter_requires_native_bash_and_known_script(interpreter: str, script: str) -> None:
+    assert _audit()(_command((script,), interpreter=interpreter)) is None
+
+
+def test_explicit_bash_cannot_hide_path_shadow_or_changed_source() -> None:
+    audit = _audit()
+    assert audit.store.create_empty_directory("/tmp/helpers")
+    assert audit.store.write("/tmp/helpers/bash", ShellArtifact(ShellSourceValue("printf replaced\n"), executable=True))
+    request = _command(("scripts/setup.sh",), interpreter="bash")
+    assert audit(replace(request, environment={"PATH": "/tmp/helpers:" + audit.path_tail})) is None
+    audit.store.invalidate("scripts/setup.sh")
+    assert audit(request) is None
+
+
 def test_unknown_conditional_write_forgets_previous_generated_source() -> None:
     audit = _audit()
     assert audit.store.write("/tmp/generated.sh", ShellArtifact(ShellSourceValue("echo old\n")))

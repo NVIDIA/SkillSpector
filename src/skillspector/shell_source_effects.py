@@ -40,6 +40,7 @@ class ShellEffectCommand:
     child_status: bool | None = None
     redirect_open: bool = False
     fail_stop: bool = False
+    interpreter: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1011,6 +1012,12 @@ class _EffectAudit:
             frame.status = True
             return [frame]
         if name in {"bash", "/bin/bash", "/usr/bin/bash", "sh", "/bin/sh", "/usr/bin/sh"}:
+            if name in {"bash", "/bin/bash", "/usr/bin/bash"} and len(argv) >= 2 and argv[1] is not None and not argv[1].startswith("-"):
+                if self.native_effect is None:
+                    raise _UnresolvedError
+                request = ShellEffectCommand(argv[1:], environment, frame.cwd, program.path, words[0].start, tuple(redirects), stdin, uncertain=frame.uncertain, interpreter=name)
+                self.native(program, frame, request)
+                return [frame]
             if "/" not in name and environment.get("PATH", self.path_tail) != self.path_tail:
                 if self.native_effect is None:
                     raise _UnresolvedError
@@ -1145,7 +1152,7 @@ class _EffectAudit:
                 break
         if argument_conflict:
             if (
-                request.child_inspected or self.native_effect is None
+                request.child_inspected or request.interpreter is not None or self.native_effect is None
                 or len(request.argv) != 4
                 or request.argv[0] not in {"df", "/bin/df", "/usr/bin/df"}
                 or request.argv[1:3] != ("-B1", "--output=avail")
@@ -1192,7 +1199,8 @@ class _EffectAudit:
                 raise _UnresolvedError
             nested = self.program(result.script_path, text)
             opened = self.begin_redirects(request, frame)
-            nested_frame = _Frame(request.environment.copy(), request.argv[1:], result.script_path, frame.cwd, uncertain=frame.uncertain, exported=set(request.environment))
+            zero = request.argv[0] if request.interpreter is not None else result.script_path
+            nested_frame = _Frame(request.environment.copy(), request.argv[1:], zero, frame.cwd, uncertain=frame.uncertain, exported=set(request.environment))
             branches = self.run(nested, self.parse(nested), [nested_frame])
             self.apply_traps(branches)
             self.end_redirects(opened)
