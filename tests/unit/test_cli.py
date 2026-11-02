@@ -525,6 +525,186 @@ def test_cli_rejects_output_overwriting_directory_manifest(
     invoke.assert_not_called()
 
 
+_AISOP_GUARD_INPUT = json.dumps(
+    [
+        {"role": "system", "content": {"protocol": "AISOP V1"}},
+        {"role": "user", "content": {"aisop": {}, "functions": {"lookup": {}}}},
+    ]
+).encode("utf-8")
+
+
+def _protected_input_snapshot(path: Path) -> tuple[bytes, int, int]:
+    metadata = path.stat()
+    return path.read_bytes(), metadata.st_dev, metadata.st_ino
+
+
+@pytest.mark.parametrize("command", ["scan", "baseline"])
+@pytest.mark.parametrize("alias", ["same-path", "hard-link", "symlink", "symlink-parent"])
+@pytest.mark.parametrize(
+    "primary,no_llm",
+    [("workflow.aisop.json", True), (".aisop/workflow.aisop.json", False)],
+    ids=["top-level-static", "hidden-ai-requested"],
+)
+def test_cli_rejects_output_alias_of_directory_aisop(
+    tmp_path: Path, command: str, alias: str, primary: str, no_llm: bool
+) -> None:
+    skill = tmp_path / "skill"
+    source = skill / primary
+    source.parent.mkdir(parents=True)
+    source.write_bytes(_AISOP_GUARD_INPUT)
+    output = source
+    try:
+        if alias == "hard-link":
+            output = tmp_path / "report.json"
+            os.link(source, output)
+        elif alias == "symlink":
+            output = tmp_path / "report.json"
+            output.symlink_to(source)
+        elif alias == "symlink-parent":
+            linked = tmp_path / "linked"
+            linked.symlink_to(source.parent, target_is_directory=True)
+            output = linked / source.name
+    except OSError:
+        pytest.skip("filesystem does not support this alias")
+    before = _protected_input_snapshot(source)
+    output_before = _protected_input_snapshot(output)
+    output_link = output.lstat()
+    args = [command, str(skill), "--output", str(output)]
+    if no_llm:
+        args.append("--no-llm")
+    with (
+        patch("skillspector.cli._scan_skill") as scan_skill,
+        patch("skillspector.cli.graph.invoke") as invoke,
+        patch("skillspector.multi_skill._open_regular_file_no_follow") as read_candidate,
+    ):
+        result = runner.invoke(app, args)
+    assert result.exit_code == 2, result.output
+    assert "--output points to the input file" in result.output
+    assert _protected_input_snapshot(source) == before
+    assert _protected_input_snapshot(output) == output_before
+    assert (output.lstat().st_dev, output.lstat().st_ino) == (
+        output_link.st_dev,
+        output_link.st_ino,
+    )
+    scan_skill.assert_not_called()
+    invoke.assert_not_called()
+    read_candidate.assert_not_called()
+
+
+@pytest.mark.parametrize("command", ["scan", "baseline"])
+@pytest.mark.parametrize("variant", ["mixed", "multiple", "malformed", "oversized"])
+def test_cli_preserves_unselected_aisop_candidates(
+    tmp_path: Path, command: str, variant: str
+) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    source = skill / "z-workflow.aisop.json"
+    source.write_bytes(
+        b"{invalid JSON"
+        if variant == "malformed"
+        else _AISOP_GUARD_INPUT + (b" " * (256 * 1024) if variant == "oversized" else b"")
+    )
+    if variant == "mixed":
+        (skill / "SKILL.md").write_text("# Primary Markdown skill\n", encoding="utf-8")
+    if variant == "multiple":
+        (skill / "a-workflow.aisop.json").write_bytes(_AISOP_GUARD_INPUT)
+    before = {path: _protected_input_snapshot(path) for path in skill.iterdir()}
+    with (
+        patch("skillspector.cli._scan_skill") as scan_skill,
+        patch("skillspector.cli.graph.invoke") as invoke,
+        patch("skillspector.multi_skill._open_regular_file_no_follow") as read_candidate,
+    ):
+        result = runner.invoke(app, [command, str(skill), "--output", str(source)])
+    assert result.exit_code == 2, result.output
+    assert "--output points to the input file" in result.output
+    assert {path: _protected_input_snapshot(path) for path in skill.iterdir()} == before
+    scan_skill.assert_not_called()
+    invoke.assert_not_called()
+    read_candidate.assert_not_called()
+
+
+@pytest.mark.parametrize("command", ["scan", "baseline"])
+@pytest.mark.parametrize("failure", ["entry-limit", "read-error"])
+def test_cli_rejects_existing_output_when_input_discovery_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str, failure: str
+) -> None:
+    from skillspector import multi_skill
+
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    source = skill / "workflow.aisop.json"
+    source.write_bytes(_AISOP_GUARD_INPUT)
+    (skill / "notes.txt").write_text("Additional input\n", encoding="utf-8")
+    output = tmp_path / "report.json"
+    output.write_bytes(b"Previous report\n")
+    before = {path: _protected_input_snapshot(path) for path in [source, output]}
+    if failure == "entry-limit":
+        monkeypatch.setattr(multi_skill, "MAX_MULTI_SKILL_DIRECTORY_ENTRIES", 1)
+    else:
+        monkeypatch.setattr(multi_skill, "_bounded_scandir", MagicMock(side_effect=PermissionError))
+    with (
+        patch("skillspector.cli._scan_skill") as scan_skill,
+        patch("skillspector.cli.graph.invoke") as invoke,
+    ):
+        result = runner.invoke(app, [command, str(skill), "--output", str(output)])
+    assert result.exit_code == 2, result.output
+    assert "Cannot verify --output is separate from skill inputs" in result.output
+    assert {path: _protected_input_snapshot(path) for path in before} == before
+    scan_skill.assert_not_called()
+    invoke.assert_not_called()
+
+
+@pytest.mark.parametrize("command", ["scan", "baseline"])
+@pytest.mark.parametrize("destination", ["new", "existing"])
+def test_cli_aisop_allows_distinct_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str, destination: str
+) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    source = skill / "workflow.aisop.json"
+    source.write_bytes(_AISOP_GUARD_INPUT)
+    before = _protected_input_snapshot(source)
+    output = tmp_path / source.name
+    if destination == "existing":
+        output.write_text("Previous report", encoding="utf-8")
+    else:
+        monkeypatch.setattr(
+            "skillspector.multi_skill._structured_candidate_entries",
+            MagicMock(side_effect=AssertionError("new outputs must not traverse inputs")),
+        )
+    scan_skill = MagicMock(return_value={"report_body": "Scan report", "risk_score": 0})
+    invoke = MagicMock(return_value={"active_findings": [], "file_cache": {}, "risk_score": 0})
+    monkeypatch.setattr(cli, "_scan_skill", scan_skill)
+    monkeypatch.setattr(cli.graph, "invoke", invoke)
+    result = runner.invoke(app, [command, str(skill), "--no-llm", "--output", str(output)])
+    assert result.exit_code == 0, result.output
+    assert _protected_input_snapshot(source) == before
+    if command == "scan":
+        assert output.read_text(encoding="utf-8") == "Scan report"
+        scan_skill.assert_called_once()
+        invoke.assert_not_called()
+    else:
+        assert json.loads(output.read_text(encoding="utf-8"))["fingerprints"] == []
+        invoke.assert_called_once()
+        scan_skill.assert_not_called()
+
+
+def test_cli_aisop_baseline_stdout_preserves_input(tmp_path: Path) -> None:
+    source = tmp_path / "workflow.aisop.json"
+    source.write_bytes(_AISOP_GUARD_INPUT)
+    before = _protected_input_snapshot(source)
+    with patch(
+        "skillspector.cli.graph.invoke",
+        return_value={"active_findings": [], "file_cache": {}, "risk_score": 0},
+    ) as invoke:
+        result = runner.invoke(app, ["baseline", str(tmp_path), "--no-llm", "--output", "-"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["fingerprints"] == []
+    assert _protected_input_snapshot(source) == before
+    assert list(tmp_path.iterdir()) == [source]
+    invoke.assert_called_once()
+
+
 @pytest.mark.parametrize("primary", ["SKILL.md", "skill.md", ".aisop/workflow.aisop.json"])
 @pytest.mark.parametrize("max_skills", [1, 2])
 def test_recursive_output_preserves_child_primary_before_scanning(
