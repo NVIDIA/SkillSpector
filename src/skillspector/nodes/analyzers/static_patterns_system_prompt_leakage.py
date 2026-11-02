@@ -118,24 +118,98 @@ P6_PATTERNS = [
     # Chinese-language equivalents (issue #953). A bare mention of the
     # system prompt never matches; every pattern requires an extraction verb
     # (output, reveal, leak) acting on the prompt or hidden instructions.
+    # As with the P1 Chinese patterns, each pattern is split into one
+    # variant per combination of its optional segments, so a long separator
+    # run is consumed once instead of being distributed across repeated
+    # gaps. The split variants together match exactly the phrases the
+    # single patterns matched.
+    # System prompt, verbatim, output, with or without the manner segment.
     (
         f"(?:{chinese_spaced('系统提示词')}|{chinese_spaced('系統提示詞')}|{chinese_spaced('系统提示')}|{chinese_spaced('系統提示')}|{chinese_spaced('隐藏指令')}|{chinese_spaced('隱藏指令')}|{chinese_spaced('内部指令')}){CHINESE_GAP}"
-        f"(?:{chinese_spaced('原样')}|{chinese_spaced('逐字')}|{chinese_spaced('一字不差')}|{chinese_spaced('全文')})?{CHINESE_GAP}"
         f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('复制')})",
         0.85,
     ),
     (
+        f"(?:{chinese_spaced('系统提示词')}|{chinese_spaced('系統提示詞')}|{chinese_spaced('系统提示')}|{chinese_spaced('系統提示')}|{chinese_spaced('隐藏指令')}|{chinese_spaced('隱藏指令')}|{chinese_spaced('内部指令')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('原样')}|{chinese_spaced('逐字')}|{chinese_spaced('一字不差')}|{chinese_spaced('全文')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('复制')})",
+        0.85,
+    ),
+    # Verb first, all combinations of pronoun, completeness, and system segments.
+    (
         f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
-        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')})?{CHINESE_GAP}"
-        f"(?:{chinese_spaced('完整')}|{chinese_spaced('全部')})?{CHINESE_GAP}"
-        f"(?:{chinese_spaced('系统')}|{chinese_spaced('系統')})?{CHINESE_GAP}"
         f"(?:{chinese_spaced('提示词')}|{chinese_spaced('提示詞')}|{chinese_spaced('提示')}|{chinese_spaced('指令')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
         0.85,
     ),
     (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('系统')}|{chinese_spaced('系統')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('提示词')}|{chinese_spaced('提示詞')}|{chinese_spaced('提示')}|{chinese_spaced('指令')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('完整')}|{chinese_spaced('全部')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('提示词')}|{chinese_spaced('提示詞')}|{chinese_spaced('提示')}|{chinese_spaced('指令')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('完整')}|{chinese_spaced('全部')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('系统')}|{chinese_spaced('系統')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('提示词')}|{chinese_spaced('提示詞')}|{chinese_spaced('提示')}|{chinese_spaced('指令')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('提示词')}|{chinese_spaced('提示詞')}|{chinese_spaced('提示')}|{chinese_spaced('指令')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('系统')}|{chinese_spaced('系統')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('提示词')}|{chinese_spaced('提示詞')}|{chinese_spaced('提示')}|{chinese_spaced('指令')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('完整')}|{chinese_spaced('全部')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('提示词')}|{chinese_spaced('提示詞')}|{chinese_spaced('提示')}|{chinese_spaced('指令')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('完整')}|{chinese_spaced('全部')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('系统')}|{chinese_spaced('系統')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('提示词')}|{chinese_spaced('提示詞')}|{chinese_spaced('提示')}|{chinese_spaced('指令')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
+        0.85,
+    ),
+    # Reveal hidden or internal instructions, all pronoun and qualifier combinations.
+    (
         f"(?:{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('公开')}){CHINESE_GAP}"
-        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')})?{CHINESE_GAP}"
-        f"(?:{chinese_spaced('隐藏')}|{chinese_spaced('隱藏')}|{chinese_spaced('内部')})?{CHINESE_GAP}"
+        f"(?:{chinese_spaced('指令')}|{chinese_spaced('提示词')}|{chinese_spaced('提示詞')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('公开')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('隐藏')}|{chinese_spaced('隱藏')}|{chinese_spaced('内部')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('指令')}|{chinese_spaced('提示词')}|{chinese_spaced('提示詞')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('公开')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('指令')}|{chinese_spaced('提示词')}|{chinese_spaced('提示詞')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('公开')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('隐藏')}|{chinese_spaced('隱藏')}|{chinese_spaced('内部')}){CHINESE_GAP}"
         f"(?:{chinese_spaced('指令')}|{chinese_spaced('提示词')}|{chinese_spaced('提示詞')})",
         0.85,
     ),
