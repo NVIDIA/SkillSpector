@@ -151,6 +151,10 @@ def test_cd_distinguishes_known_input_root_from_unknown_runtime_directory() -> N
     assert result is not None and result.status is True
     result = audit(_command(("cd", "/runtime/unknown")))
     assert result is not None and result.status is None
+    result = audit(_command(("cd", "./..")))
+    assert result is not None and result.status is None and result.native_identity
+    result = audit(_command(("cd", "tests/.."), fail_stop=False))
+    assert result is not None and result.status is None
 
 
 def test_native_archive_copy_retains_tree_names_modes_and_readonly_listing_uncertainty() -> None:

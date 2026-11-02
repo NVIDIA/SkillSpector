@@ -240,10 +240,20 @@ class ShellArtifactAudit:
             output = ""
         elif name == "pwd" and not args:
             output = None if command.cwd is None else command.cwd + "\n"
-        elif name == "cd" and len(args) == 1 and self.path(args[0], command.cwd) is not None:
+        elif name == "cd" and len(args) == 1:
             path = self.path(args[0], command.cwd)
-            known_directory = path == "." or any(source.startswith(path + "/") for source in self.context.sources)
-            status = True if known_directory else False if self.store.read(path) is not None else self.store.exists(path)
+            known_directory = path is not None and (path == "." or any(source.startswith(path + "/") for source in self.context.sources))
+            exists = self.store.exists(path) if path is not None else None
+            # Leaving the uploaded tree cannot establish a host-directory fact.
+            # Preserve an unknown cwd in the walker so later relative effects
+            # still refuse, while an unrelated path computation can continue.
+            artifact = self.store.read(path) if path is not None else None
+            if artifact is not None or exists is False:
+                status = False
+            elif command.fail_stop and (known_directory or exists is True):
+                status = True
+            else:
+                status = None
             output = ""
         elif name == "dirname" and len(args) == 1 and args[0] is not None:
             output = posixpath.dirname(args[0]) + "\n" if posixpath.dirname(args[0]) else ".\n"
