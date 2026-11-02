@@ -1,34 +1,38 @@
 # SkillSpector 2.14.0
 
-This release candidate builds on the 2.13.3 maintenance candidate in
-[#958](https://github.com/NVIDIA/SkillSpector/pull/958), pinned at
-`df3d072cdf3e3410e6916c0642e06540d41dc5d1`; refresh the baseline pin
-before publication if that candidate advances. The new scope contains 20 merged
-PRs from the October 28–30 daily review reports: six P0 and fourteen P1 changes.
-It also includes four required prerequisites and seven requested model PRs,
-for 31 distinct upstream PR sources with new changes. Some sources contribute
-only the portions missing from the baseline.
+This candidate includes **53 distinct merged PR sources with new deltas**: **41 priority changes (19 P0, 22 P1)**, **5 required prerequisites**, and **7 model update sources**. All 31 original selections are retained. This update adds 21 priority sources (13 P0, 8 P1) and the formatter prerequisite; partial sources count only for their new portion.
 
-The changes below are additions to that baseline. Existing 2.13.3 work and
-fixes from earlier releases are inherited and are not counted as new features.
-The machine-readable selection and overlap evidence are recorded in
-[the release manifest](skillspector-2.14.0-manifest.json).
+The integrated target is `yashraj/v2.13.0-base` at `8882c8f68a3157049d6a344480d5e881d6a0ddda`, containing final #958 head `6fd523afd26a8b0099f9ea465f4b9e157cdf044d` (merge `38a1dfe93325d2f8bfcd4f8d0241eed706334915`) and #976. The maintenance baseline integration is complete.
 
-## Merged PRs newly included
+[Selection manifest](skillspector-2.14.0-manifest.json) records each source and overlap.
 
-All entries below are already merged upstream. Changes inherited from #958 and
-earlier releases are listed separately and are not counted again.
+## Merged PR sources newly included
 
 | PR | Group | Merged change included in v2.14.0 |
 | --- | --- | --- |
+| [#742](https://github.com/NVIDIA/SkillSpector/pull/742) | P0 | fix(analyzer): enforce deadlines for projected prompt matching |
+| [#773](https://github.com/NVIDIA/SkillSpector/pull/773) | P0 | fix(analyzer): report malformed dependency manifests |
+| [#801](https://github.com/NVIDIA/SkillSpector/pull/801) | P0 | fix(analyzer): recognize JavaScript template literals |
 | [#805](https://github.com/NVIDIA/SkillSpector/pull/805) | P0 | fix(report): keep missing references as non-blocking caveats |
+| [#814](https://github.com/NVIDIA/SkillSpector/pull/814) | P0 | fix(analyzer): keep checking command lines inside a word that spans lines |
+| [#848](https://github.com/NVIDIA/SkillSpector/pull/848) | P0 | fix(analyzer): keep PowerShell host syntax from inventing shell parse limits |
 | [#872](https://github.com/NVIDIA/SkillSpector/pull/872) | P0 | fix(mp2): ignore repetition inside proven Markdown tables |
 | [#898](https://github.com/NVIDIA/SkillSpector/pull/898) | P0 | Fix deterministic layer failing closed on ordinary lists of verb names |
+| [#902](https://github.com/NVIDIA/SkillSpector/pull/902) | P0 | fix(static): stop backticks/apostrophes in comments and prose from tripping static_parse_limit |
 | [#907](https://github.com/NVIDIA/SkillSpector/pull/907) | P0 | perf(security): avoid Unicode folding for ASCII characters |
+| [#916](https://github.com/NVIDIA/SkillSpector/pull/916) | P0 (partial) | fix(deps): bump uv.lock past four packages with published advisories (#910) |
 | [#934](https://github.com/NVIDIA/SkillSpector/pull/934) | P0 | fix(p2): keep reference destinations out of the benign-header exemption |
 | [#939](https://github.com/NVIDIA/SkillSpector/pull/939) | P0 | fix(coverage): reconcile inspected ZIP containers and members |
+| [#947](https://github.com/NVIDIA/SkillSpector/pull/947) | P0 | fix(scanner): tighten bounded parser ownership |
+| [#948](https://github.com/NVIDIA/SkillSpector/pull/948) | P0 (partial) | fix(static): preserve shell and browser template boundaries |
+| [#950](https://github.com/NVIDIA/SkillSpector/pull/950) | P0 | fix(markdown): preserve bounded inline and list-fence ownership |
+| [#952](https://github.com/NVIDIA/SkillSpector/pull/952) | P0 | feat(supply-chain): inspect locked npm dependency contents |
+| [#957](https://github.com/NVIDIA/SkillSpector/pull/957) | P0 | fix(ra1): keep double negatives from exempting the action |
+| [#963](https://github.com/NVIDIA/SkillSpector/pull/963) | P0 | fix(supply-chain): strip leading BOM before parsing requirements.txt |
 | [#622](https://github.com/NVIDIA/SkillSpector/pull/622) | P1 | fix(analyzers): carve out structurally benign P2 header comments |
+| [#703](https://github.com/NVIDIA/SkillSpector/pull/703) | P1 | feat(report): expose the file surface a finding landed on |
 | [#713](https://github.com/NVIDIA/SkillSpector/pull/713) | P1 | feat(providers): accept OpenCode 1.18.31-1.19.4 through an explicit verified set |
+| [#752](https://github.com/NVIDIA/SkillSpector/pull/752) | P1 | fix(yara): require a browser cookie-store path in info_stealer |
 | [#763](https://github.com/NVIDIA/SkillSpector/pull/763) | P1 | test(batch): cover pooled model cancellation and slot recovery |
 | [#847](https://github.com/NVIDIA/SkillSpector/pull/847) | P1 | feat(cli): configure the recursive skill count limit |
 | [#851](https://github.com/NVIDIA/SkillSpector/pull/851) | P1 | fix(report): preserve each compacted occurrence's finding text |
@@ -41,19 +45,50 @@ earlier releases are listed separately and are not counted again.
 | [#914](https://github.com/NVIDIA/SkillSpector/pull/914) | P1 | feat(providers): support custom OpenAI-compatible HTTP headers |
 | [#929](https://github.com/NVIDIA/SkillSpector/pull/929) | P1 | fix(ra1): honor prohibitions on recommending a self-update |
 | [#943](https://github.com/NVIDIA/SkillSpector/pull/943) | P1 | fix(pe3): ignore exact Python glab setting literals |
-| [#529](https://github.com/NVIDIA/SkillSpector/pull/529) | Model update (partial) | fix(providers): request JSON-schema structured output for models that reject forced tool calls |
-| [#598](https://github.com/NVIDIA/SkillSpector/pull/598) | Model update (partial) | feat(providers): register GPT-5.6 models (sol, terra, luna) |
-| [#650](https://github.com/NVIDIA/SkillSpector/pull/650) | Model update | feat(providers): add GPT-6 Sol and Luna budgets to OpenAI and Azure registries |
-| [#690](https://github.com/NVIDIA/SkillSpector/pull/690) | Model update | feat(providers): add GPT-6.1 Sol budget to OpenAI and Azure registries |
-| [#708](https://github.com/NVIDIA/SkillSpector/pull/708) | Model update (partial) | fix(providers): honour tool_choice: auto for openai_compatible models |
-| [#806](https://github.com/NVIDIA/SkillSpector/pull/806) | Model update | feat(providers): adopt GPT-6.1 Sol and Claude Opus 5.5 defaults with compatible structured output |
-| [#824](https://github.com/NVIDIA/SkillSpector/pull/824) | Model update | fix: retain previous defaults and preserve MCP preflight errors |
-| [#436](https://github.com/NVIDIA/SkillSpector/pull/436) | Prerequisite | fix(cli): defer graph initialization |
-| [#662](https://github.com/NVIDIA/SkillSpector/pull/662) | Prerequisite | fix(cli): exit 2 when a recursive scan cannot write its report |
-| [#810](https://github.com/NVIDIA/SkillSpector/pull/810) | Prerequisite | fix(providers): keep OpenCode's internal plugins so OAuth logins work |
-| [#819](https://github.com/NVIDIA/SkillSpector/pull/819) | Prerequisite (partial) | fix(p2): bound Markdown reference-comment findings |
+| [#955](https://github.com/NVIDIA/SkillSpector/pull/955) | P1 | fix(cli): reject non-regular report outputs before scanning |
+| [#964](https://github.com/NVIDIA/SkillSpector/pull/964) | P1 | fix(providers): reject SKILLSPECTOR_TEMPERATURE for all Claude models that drop sampling |
+| [#965](https://github.com/NVIDIA/SkillSpector/pull/965) | P1 | fix(p6): stop reporting Python returns of local names as prompt extraction |
+| [#967](https://github.com/NVIDIA/SkillSpector/pull/967) | P1 | fix(osv): fall back to static data when no_proxy breaks httpx client setup |
+| [#969](https://github.com/NVIDIA/SkillSpector/pull/969) | P1 | fix(ea5): stop reading option-listing help rows as model-switch commands |
+| [#972](https://github.com/NVIDIA/SkillSpector/pull/972) | P1 | perf: defer workflow warning imports until graph initialization |
+| [#529](https://github.com/NVIDIA/SkillSpector/pull/529) | Model update (partial) | Provider-specific structured-output policy and model metadata |
+| [#598](https://github.com/NVIDIA/SkillSpector/pull/598) | Model update (partial) | GPT-5.6 model budget metadata |
+| [#650](https://github.com/NVIDIA/SkillSpector/pull/650) | Model update | GPT-6 Sol and Luna model budgets |
+| [#690](https://github.com/NVIDIA/SkillSpector/pull/690) | Model update | GPT-6.1 Sol model budgets |
+| [#708](https://github.com/NVIDIA/SkillSpector/pull/708) | Model update (partial) | OpenAI-compatible automatic tool-choice policy |
+| [#806](https://github.com/NVIDIA/SkillSpector/pull/806) | Model update | New-model compatibility, control preflight and Bedrock profile repair |
+| [#824](https://github.com/NVIDIA/SkillSpector/pull/824) | Model update | Retain previous defaults and preserve MCP preflight errors |
+| [#810](https://github.com/NVIDIA/SkillSpector/pull/810) | Prerequisite | Retain OpenCode internal authentication plugins |
+| [#436](https://github.com/NVIDIA/SkillSpector/pull/436) | Prerequisite | Lazy package graph initialization |
+| [#819](https://github.com/NVIDIA/SkillSpector/pull/819) | Prerequisite | Bounded reference-comment destination and title ownership |
+| [#662](https://github.com/NVIDIA/SkillSpector/pull/662) | Prerequisite | Report recursive scan errors with exit code 2 |
+| [#981](https://github.com/NVIDIA/SkillSpector/pull/981) | Prerequisite (partial) | style(analyzer): format the multiline word-shadow guard |
 
-## New P0 changes
+## Additional merged priority changes in this update
+
+- [#742](https://github.com/NVIDIA/SkillSpector/pull/742): fix(analyzer): enforce deadlines for projected prompt matching.
+- [#773](https://github.com/NVIDIA/SkillSpector/pull/773): fix(analyzer): report malformed dependency manifests.
+- [#801](https://github.com/NVIDIA/SkillSpector/pull/801): fix(analyzer): recognize JavaScript template literals.
+- [#814](https://github.com/NVIDIA/SkillSpector/pull/814): fix(analyzer): keep checking command lines inside a word that spans lines.
+- [#848](https://github.com/NVIDIA/SkillSpector/pull/848): fix(analyzer): keep PowerShell host syntax from inventing shell parse limits.
+- [#902](https://github.com/NVIDIA/SkillSpector/pull/902): fix(static): stop backticks/apostrophes in comments and prose from tripping static_parse_limit.
+- [#916](https://github.com/NVIDIA/SkillSpector/pull/916): fix(deps): bump uv.lock past four packages with published advisories (#910).
+- [#947](https://github.com/NVIDIA/SkillSpector/pull/947): fix(scanner): tighten bounded parser ownership.
+- [#948](https://github.com/NVIDIA/SkillSpector/pull/948): fix(static): preserve shell and browser template boundaries.
+- [#950](https://github.com/NVIDIA/SkillSpector/pull/950): fix(markdown): preserve bounded inline and list-fence ownership.
+- [#952](https://github.com/NVIDIA/SkillSpector/pull/952): feat(supply-chain): inspect locked npm dependency contents.
+- [#957](https://github.com/NVIDIA/SkillSpector/pull/957): fix(ra1): keep double negatives from exempting the action.
+- [#963](https://github.com/NVIDIA/SkillSpector/pull/963): fix(supply-chain): strip leading BOM before parsing requirements.txt.
+- [#703](https://github.com/NVIDIA/SkillSpector/pull/703): feat(report): expose the file surface a finding landed on.
+- [#752](https://github.com/NVIDIA/SkillSpector/pull/752): fix(yara): require a browser cookie-store path in info_stealer.
+- [#955](https://github.com/NVIDIA/SkillSpector/pull/955): fix(cli): reject non-regular report outputs before scanning.
+- [#964](https://github.com/NVIDIA/SkillSpector/pull/964): fix(providers): reject SKILLSPECTOR_TEMPERATURE for all Claude models that drop sampling.
+- [#965](https://github.com/NVIDIA/SkillSpector/pull/965): fix(p6): stop reporting Python returns of local names as prompt extraction.
+- [#967](https://github.com/NVIDIA/SkillSpector/pull/967): fix(osv): fall back to static data when no_proxy breaks httpx client setup.
+- [#969](https://github.com/NVIDIA/SkillSpector/pull/969): fix(ea5): stop reading option-listing help rows as model-switch commands.
+- [#972](https://github.com/NVIDIA/SkillSpector/pull/972): perf: defer workflow warning imports until graph initialization.
+
+## Previously selected P0 changes retained
 
 - Treat genuinely missing references as non-blocking caveats. Keep existing
   but uninspected targets, symlinks, ambiguous references, and independent
@@ -74,7 +109,7 @@ earlier releases are listed separately and are not counted again.
   This correction is included together with #622 below
   ([#934](https://github.com/NVIDIA/SkillSpector/pull/934)).
 
-## New P1 changes
+## Previously selected P1 changes retained
 
 - Support Python 3.15 by extending the declared Python range to `<3.16` and
   upgrading `ormsgpack` from 1.12.2 to 1.13.0
@@ -115,8 +150,7 @@ earlier releases are listed separately and are not counted again.
 - Exempt only structurally proven benign license and metadata header comments;
   include the #934 destination-safety correction with this exemption
   ([#622](https://github.com/NVIDIA/SkillSpector/pull/622)). Recognize direct
-  prohibitions on recommending a self-update, subject to the known limitation
-  below ([#929](https://github.com/NVIDIA/SkillSpector/pull/929)).
+  prohibitions on recommending a self-update, with the double-negative correction from #957 now included ([#929](https://github.com/NVIDIA/SkillSpector/pull/929)).
 - Add mocked regression tests for cancellation, slot reuse, and one-time pool
   cleanup. This is test coverage; the production cleanup fix from #796 is
   already inherited ([#763](https://github.com/NVIDIA/SkillSpector/pull/763)).
@@ -137,6 +171,8 @@ earlier releases are listed separately and are not counted again.
 - Preserve recursive scan failures as CLI errors with exit code 2, including
   protected report-output failures, when applying the literal error-rendering
   correction ([#662](https://github.com/NVIDIA/SkillSpector/pull/662)).
+
+- Carry the required formatter-only correction from [#981](https://github.com/NVIDIA/SkillSpector/pull/981) using actual PR head `281850410f7a04838eb1a87cdf822572ca624e8a`; its merge commit is empty because the change already reached main through #916.
 
 ## Model compatibility and defaults
 
@@ -171,22 +207,22 @@ custom registries must include the corrected key to supply its budgets.
 
 GPT-6.1 Sol rejects explicit temperature and accepts reasoning effort only at
 `low`, `medium`, `high`, `xhigh`, or `max`. Claude 5.5 control handling depends on
-the route; native Anthropic accepts temperature `1.0`, while the other supported
+the route; only the official native Anthropic endpoint accepts temperature `1.0`, while the other supported
 routes reject explicit temperature. Unsupported settings fail before analysis.
 MCP reports retain sanitized provider-preflight errors, and static-only scans
 remain independent of provider credentials.
 
+The merged [#964](https://github.com/NVIDIA/SkillSpector/pull/964) broadens the normalized known-family guard to `claude-opus-4-7`, `claude-opus-4-8`, `claude-opus-5`, `claude-sonnet-5`, `claude-fable-5`, `claude-mythos-5`, `claude-haiku-5`. This does not claim support for unlisted future families.
+
 ## Already included in the baseline
 
-These items are deliberately excluded from the new-change count and bullets.
-The daily reports' 38 P0/P1 records partition into 20 selected changes and 18
-changes already represented by #958. No merged P2 PR is present in those reports.
+19 priority sources are represented by inherited maintenance work and excluded from the new-delta count. The baseline also absorbs #976 separately. Earlier #948 portions remain inherited while its new residual correction is counted once.
 
 | Existing change | Baseline representation |
 | --- | --- |
 | [#945](https://github.com/NVIDIA/SkillSpector/pull/945) | Configurable TP4 capacity and the 1,080-second workflow allowance are already in #958. |
 | [#946](https://github.com/NVIDIA/SkillSpector/pull/946) and [#845](https://github.com/NVIDIA/SkillSpector/pull/845) | Completed-response validation and bounded formatting recovery already handle absent structured results. #845 is not added again. |
-| [#948](https://github.com/NVIDIA/SkillSpector/pull/948) and [#912](https://github.com/NVIDIA/SkillSpector/pull/912) | Bounded shell, Python, and browser-template ownership already includes the lexical shell-ownership proof. |
+| [#948](https://github.com/NVIDIA/SkillSpector/pull/948) and [#912](https://github.com/NVIDIA/SkillSpector/pull/912) | Bounded shell, Python, and browser-template ownership retains the inherited lexical components; the new residual #948 correction is selected above. |
 | [#856](https://github.com/NVIDIA/SkillSpector/pull/856) | Asynchronous security discovery through the shared limiter is already present through #946; its production module matches main. |
 | [#915](https://github.com/NVIDIA/SkillSpector/pull/915), [#919](https://github.com/NVIDIA/SkillSpector/pull/919), [#924](https://github.com/NVIDIA/SkillSpector/pull/924) | Dependency security pins, unavailable custom-YARA accounting, and baseline-input output protection are already backported. |
 | [#906](https://github.com/NVIDIA/SkillSpector/pull/906), [#882](https://github.com/NVIDIA/SkillSpector/pull/882), [#874](https://github.com/NVIDIA/SkillSpector/pull/874) | CRLF Python shebangs, Markdown fence boundaries, and PowerShell SC3/P2 coverage are already backported. |
@@ -194,15 +230,14 @@ changes already represented by #958. No merged P2 PR is present in those reports
 | [#860](https://github.com/NVIDIA/SkillSpector/pull/860), [#826](https://github.com/NVIDIA/SkillSpector/pull/826), [#765](https://github.com/NVIDIA/SkillSpector/pull/765) | Multiline ransomware, nested urllib credential flows, and Pipenv dependency coverage are already backported. |
 | [#893](https://github.com/NVIDIA/SkillSpector/pull/893), [#938](https://github.com/NVIDIA/SkillSpector/pull/938), [#772](https://github.com/NVIDIA/SkillSpector/pull/772), [#949](https://github.com/NVIDIA/SkillSpector/pull/949) | Agent-memory writes, recursive input protection, gap-fill scoring, and matcher-local timeout containment are already backported. The baseline also contains the follow-up memory-write regex bound. |
 | [#452](https://github.com/NVIDIA/SkillSpector/pull/452) | Bounded HTML-comment closing and keyword ownership already shipped; the distinct reference-comment parser from #819 is a new prerequisite above. |
+| [#877](https://github.com/NVIDIA/SkillSpector/pull/877) | Fully already covered by the inherited passive-image production and regression behavior; no new delta is counted. |
+| [#976](https://github.com/NVIDIA/SkillSpector/pull/976) (original [#768](https://github.com/NVIDIA/SkillSpector/pull/768)) | Scoped allowed-tools support is absorbed through the current maintenance target base, not counted as a new selected source. |
 | Earlier releases | #958 descends from published v2.13.2 (#922), v2.13.1 (#852), and v2.13.0 (#833). Their maintenance fixes, including Python proofs, passive-image/Office handling, version metadata, and report ACL protection, are inherited. |
+
+The former double-negative RA1 limitation tracked in [#956](https://github.com/NVIDIA/SkillSpector/issues/956) is addressed by the included merged correction and regression tests from [#957](https://github.com/NVIDIA/SkillSpector/pull/957).
 
 ## Known limits and upgrading
 
-- The merged #929 has a reported double-negative regression: a sentence such as
-  `Never recommend skipping self-update` can lose its RA1 finding. This remains
-  tracked in [#956](https://github.com/NVIDIA/SkillSpector/issues/956); the
-  unmerged proposed correction [#957](https://github.com/NVIDIA/SkillSpector/pull/957)
-  is outside this selection.
 - The inherited #958 limitations still apply. Ambiguous or generated execution
   paths can remain incomplete; provider refusals, malformed responses, and
   exhausted budgets can prevent completed AI inspection. Increasing workflow
@@ -214,28 +249,13 @@ changes already represented by #958. No merged P2 PR is present in those reports
 - The GitHub release distributes a wheel and source distribution. Its workflow
   does not publish to PyPI.
 
+- Dependency-content inspection is opt-in and limited to supported public npm lockfiles and Linux seccomp workers. Unsupported or uninspected artifacts remain partial; integrity verification does not establish package safety.
+
 ## Validation and publication
 
-Validation is recorded on [release PR #959](https://github.com/NVIDIA/SkillSpector/pull/959).
-Final isolated CI and baseline integration remain pending.
+**Current update — static checks only.** For integrated source f583e0b7 before documentation-only edits, aggregate AST/internal-import checking reports 123 production modules and 443 internal imports with no errors or dynamic imports; Ruff lint and format pass across 320 files. JSON/TOML metadata, the offline no-build lock check (159 packages), and whitespace checks pass. These are static checks only.
+No local contributor tests, project imports, builds, source/wheel scans or live-provider runs were performed for this update. Carried regression tests were inspected as source; static checks do not establish runtime acceptance. Final integrated CI, runtime/package acceptance and independent release review remain publication gates.
 
-- Strict wheel/source-distribution build and metadata checks pass. All 128
-  packaged runtime/resource files match the candidate source byte for byte.
-- Twenty offline CLI scans across ten fixtures produce matching normalized
-  source/wheel reports, including retained security findings. Installed-wheel
-  model and registry checks pass all 145 cases.
-- The local unit group recorded 2,932 passes, 14 skips, and three initial
-  failures. All three isolated rechecks pass: one corrected API mock and two
-  unchanged startup controls. This is not a clean full-suite run.
-- Partial analyzer and other-source groups recorded 4,023 and 1,675 passes.
-  Three analyzer child processes exceeded their startup limits before analyzer
-  execution; one dense-directory timing check exceeded five seconds while
-  retaining every file and coverage assertion. That timing failure also occurs
-  on the #958 baseline. Limits and production code were not weakened.
-- Availability test mocks now accept the supported optional timeout argument;
-  test bodies and assertions are unchanged. Partial local runs and historical
-  #958 live results do not establish final-candidate acceptance.
+**Historical initial-candidate evidence, not validation of this update:** production commit `774bd450cac531a49ccc68ff876c0535d4b0ab52` recorded strict wheel/sdist checks and 128 matching packaged files (wheel SHA-256 `3185a1b1391e054b3386797a4d04acbbd8875b822d043d2c45d5308990b8ba9d`); 20 offline scans over 10 fixtures matched source/wheel reports; 145 installed model/registry tests passed. The local unit group recorded 2,932 passes, 14 skips and three initial failures, with all three isolated rechecks passing. Partial analyzer and other-source groups recorded 4,023 passes / four skips / three startup timeouts, and 1,675 passes / one timing failure / 2,178 unexecuted cases. The unchanged five-second dense-directory control also failed on #958 while retaining all 256-file semantic assertions. These partial runs were not a clean full-suite acceptance. Availability mocks accepted the supported timeout argument with test bodies and assertions unchanged.
 
-The release PR is stacked on `yashraj/release-2.13.3` so its diff contains the
-new delta. Publication must wait for #958's integration and the final release
-checks; the draft PR must not carry `release:publish` while those gates remain.
+The maintenance baseline is now integrated. PR #959 remains open for review. Publication is gated on final validation and release-owner review before `release:publish` is applied. Use the existing label-gated GitHub wheel/sdist workflow, which does not publish to PyPI.

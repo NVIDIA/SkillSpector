@@ -1,10 +1,11 @@
 ### 2.14.0 (Unreleased)
-### Changes after the 2.13.3 candidate
-* Include all 20 remaining P0/P1 PRs already merged upstream from the October 28–30 daily reports: six P0 and fourteen P1 changes. The 18 changes already represented by #958 are inherited rather than selected again.
-* Add the remaining model registry, capability, and structured-output updates from #529, #598, #650, #690, #708, #806, and #824. Keep the corrected GPT-5.4 and Claude 4.6 defaults; newer models remain opt-in.
-* Include required merged prerequisites #810, #436, #819 (the previously unshipped reference-comment portion), and #662. Preserve earlier maintenance fixes and completion/recovery safeguards.
-* Support Python 3.15, safer and faster CLI/provider startup, configurable recursive limits, bounded CLI prompts, accurate reference/ZIP coverage, and the remaining detector/report fixes.
-* See [release notes](docs/release/skillspector-2.14.0.md) and [selection manifest](docs/release/skillspector-2.14.0-manifest.json) for exact source PRs, inherited exclusions, upgrade guidance, and remaining limits.
+### Changes after the integrated 2.13.3 baseline
+* Include 41 merged priority sources (19 P0, 22 P1), 5 required prerequisites and seven model sources: 53 distinct sources with new deltas. Retain all 31 original selections; count inherited overlaps separately.
+* Add bounded npm content inspection, truthful malformed-manifest/BOM/fallback coverage, advisory dependency pins, parser/quote/PowerShell/Markdown ownership, interruptible matching and multiline-shadow handling.
+* Add occurrence surface metadata, cookie-store and local-return precision, safe report-output preflight, supported model-control guards, option-help precision and deferred startup warnings. The earlier RA1 double-negative gap is corrected by #957.
+* Keep GPT-5.4/Claude 4.6 defaults and opt-in newer models. Absorb final #958/#976 maintenance work; #877 is fully inherited, #948 contributes only its new residual, and #981 is a formatter prerequisite.
+* This update has static validation only; historical runtime/package/live results do not establish final-candidate acceptance. Final validation and release review remain required.
+* See [release notes](docs/release/skillspector-2.14.0.md) and [selection manifest](docs/release/skillspector-2.14.0-manifest.json) for source and overlap evidence.
 ---
 ### Unreleased maintenance fixes
 ### Fixes

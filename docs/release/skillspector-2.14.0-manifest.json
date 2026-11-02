@@ -2,11 +2,11 @@
   "schema_version": 1,
   "repository": "NVIDIA/SkillSpector",
   "version": "2.14.0",
-  "status": "draft_release_candidate",
+  "status": "release_candidate_pending_final_validation",
   "baseline": {
     "pull_request": 958,
     "url": "https://github.com/NVIDIA/SkillSpector/pull/958",
-    "branch": "yashraj/release-2.13.3",
+    "branch": "yashraj/v2.13.0-base",
     "initial_pinned_commit": "e855b1be92ab4a16702c606f5ebff3fe8c63f6dc",
     "remote_head_refresh_required_before_publication": true,
     "published_ancestors": [
@@ -49,7 +49,8 @@
         "number": 948,
         "title": "Bounded shell, Python and browser-template ownership",
         "url": "https://github.com/NVIDIA/SkillSpector/pull/948",
-        "selection": "inherited_not_new_delta"
+        "selection": "inherited_not_new_delta",
+        "scope": "Earlier browser/Python/shell components inherited; selected residual correction is counted separately once."
       },
       {
         "number": 683,
@@ -74,26 +75,50 @@
       "Private atomic report and baseline output",
       "Completion validation, bounded formatting recovery, parser deadlines and coverage accounting"
     ],
-    "pinned_commit": "df3d072cdf3e3410e6916c0642e06540d41dc5d1",
-    "remote_head_verified_at": "2026-10-30"
+    "pinned_commit": "8882c8f68a3157049d6a344480d5e881d6a0ddda",
+    "remote_head_verified_at": "2026-11-02",
+    "historical_pinned_commit": "df3d072cdf3e3410e6916c0642e06540d41dc5d1",
+    "pinned_commit_role": "Integrated maintenance target including final #958 and #976",
+    "inherited_958_head": "6fd523afd26a8b0099f9ea465f4b9e157cdf044d",
+    "inherited_958_merge_commit": "38a1dfe93325d2f8bfcd4f8d0241eed706334915",
+    "local_integration_commit": "7d496ed7e7b1b45ea02d85dc760527c0526dfd21",
+    "absorbed_maintenance_prs": [
+      {
+        "number": 976,
+        "title": "fix(lp1): backport scoped allowed-tools support to 2.13.x",
+        "priority": "P1",
+        "upstream_commit": "8882c8f68a3157049d6a344480d5e881d6a0ddda",
+        "original_upstream_pr": 768,
+        "selection": "inherited_not_new_delta",
+        "scope": "Scoped allowed-tools parser and negative controls already absorbed through target base."
+      }
+    ]
   },
   "selection": {
     "priority_report_dates": [
       "2026-10-28",
       "2026-10-29",
-      "2026-10-30"
+      "2026-10-30",
+      "2026-10-31",
+      "2026-11-01",
+      "2026-11-02"
     ],
     "counts": {
-      "daily_merged_priority_records": 38,
-      "new_priority_prs": 20,
-      "new_priority_p0": 6,
-      "new_priority_p1": 14,
-      "daily_already_covered_excluded": 18,
-      "required_dependency_prs": 4,
+      "original_selected_sources_retained": 31,
+      "original_priority_sources_retained": 20,
+      "added_priority_sources": 21,
+      "added_priority_p0": 13,
+      "added_priority_p1": 8,
+      "new_priority_prs": 41,
+      "new_priority_p0": 19,
+      "new_priority_p1": 22,
+      "already_covered_priority_sources": 19,
+      "required_dependency_prs": 5,
       "requested_model_prs": 7,
-      "distinct_upstream_pr_sources_with_new_changes": 31
+      "distinct_upstream_pr_sources_with_new_changes": 53,
+      "baseline_absorbed_maintenance_prs": 1
     },
-    "counting_rule": "Count distinct upstream PR sources with a nonempty new delta. Partial prerequisites and model adaptations count once; their inherited portions do not count as newly applied work. The 18 daily baseline overlaps and inherited #945/#946/#948/#683 are excluded from the new-change count.",
+    "counting_rule": "Count distinct sources with a nonempty selected delta exactly once. Partial #948 is new only for its residual correction; inherited #948 portions remain baseline. Already-covered sources and baseline-absorbed #976 do not count as new selections. #981 counts once as a required formatting prerequisite using its actual PR-head patch.",
     "new_priority_prs": [
       {
         "number": 907,
@@ -294,6 +319,341 @@
         "priority_reason": "Removes benign recommendation-prohibition false positives while retaining affirmative RA1 instructions",
         "priority_report": "skillspector-pr-review-2026-10-30.json",
         "selection": "new_delta"
+      },
+      {
+        "number": 952,
+        "title": "feat(supply-chain): inspect locked npm dependency contents",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/952",
+        "upstream_commit": "bd6edeae76ec1ca1136229a5b62d5fe8bf80fb24",
+        "merged_at": "2026-10-31T16:11:44Z",
+        "priority": "P0",
+        "priority_reason": "Adds bounded, isolated inspection of locked npm contents and restores the required positive threat detections",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "c656cc3b00d5d8bc3516debaa576a4b9bb70194c",
+        "integration_evidence": "integration-dependencies.json",
+        "integration_scope": [
+          "Resolved cli.py by adding only inspect_dependencies propagation to scan, recursive scan, source wrappers and transitive traversal; retained release signatures/defaults and both root-call routes.",
+          "Kept the release MCP rejection message plus new inspect flag, omitting main-only min-coverage text.",
+          "Omitted main-only exclude/exclude_patterns context and USER_EXCLUSION message/counters; these unsupported unrelated APIs are not prerequisites for dependency inspection.",
+          "Kept the release transitive cleanup structure, adding only the requested child flag forwarding.",
+          "Retained all eleven dependency ledger reasons/messages and dependency completeness output, alongside every preexisting release reason.",
+          "Trusted Ruff formatted the adapted CLI with AST identity verified."
+        ]
+      },
+      {
+        "number": 967,
+        "title": "fix(osv): fall back to static data when no_proxy breaks httpx client setup",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/967",
+        "upstream_commit": "e4d9263c3a22dd78ff3fecfe6d72bbfccebc3fac",
+        "merged_at": "2026-11-02T02:26:13Z",
+        "priority": "P1",
+        "priority_reason": "Restores dependency-scanning fallback under IPv6 proxy configuration",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "59b203ce223f64bd6e6ad03a58f318dc14fda62c",
+        "integration_evidence": "integration-dependencies.json",
+        "integration_scope": []
+      },
+      {
+        "number": 963,
+        "title": "fix(supply-chain): strip leading BOM before parsing requirements.txt",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/963",
+        "upstream_commit": "a6d638c8519ef4c5fb3853cd8f149930559ff478",
+        "merged_at": "2026-11-02T18:26:38Z",
+        "priority": "P0",
+        "priority_reason": "Restores first-line SC4 dependency coverage without quadratic prefix work",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "4bdfa07155e54316c4006bcd3939c5df84101a37",
+        "integration_evidence": "integration-dependencies.json",
+        "integration_scope": []
+      },
+      {
+        "number": 773,
+        "title": "fix(analyzer): report malformed dependency manifests",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/773",
+        "upstream_commit": "10fa82fbf270772dbf6cd418d5e06f11b5b7b569",
+        "merged_at": "2026-11-02T19:16:00Z",
+        "priority": "P0",
+        "priority_reason": "Preserves dependency advisory coverage and truthful completeness when manifest parsing fails",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "7d6773341babeefa3dbc25cdf2638f11a266e9e3",
+        "integration_evidence": "integration-dependencies.json",
+        "integration_scope": []
+      },
+      {
+        "number": 916,
+        "title": "fix(deps): bump uv.lock past four packages with published advisories (#910)",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/916",
+        "upstream_commit": "710a9c077f3c07a61772ad0455dcb1585fba8e1c",
+        "merged_at": "2026-11-02T19:51:04Z",
+        "priority": "P0",
+        "priority_reason": "Removes vulnerable TLS and runtime dependency pins",
+        "selection": "new_delta",
+        "coverage": "partial",
+        "local_integration_commit": "2767623078fd033b757356d7208cfa7deb8fa20b",
+        "integration_evidence": "integration-dependencies.json",
+        "integration_scope": [
+          "Retained only the four dependency package updates; discarded the incidental scanner quoted-assignment formatting hunk from this source commit because scanner worker/root owns #814/#981.",
+          "Lockfile auto-merge retained all release-specific root metadata, Python3.15 markers and non-target package blocks."
+        ],
+        "scope": "Four advisory-related lockfile package blocks; incidental scanner formatting is represented once by prerequisite #981."
+      },
+      {
+        "number": 947,
+        "title": "fix(scanner): tighten bounded parser ownership",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/947",
+        "upstream_commit": "3f03a96b2a2663e6d6f6412f94150f007c3499aa",
+        "merged_at": "2026-10-31T16:11:14Z",
+        "priority": "P0",
+        "priority_reason": "Preserves executable ownership and encoded offensive-tool detection while reducing documentation noise",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "19ab7a68ed8b8dde44a126fe8d74ab0ccd225bd4",
+        "integration_evidence": "integration-scanner.json",
+        "integration_scope": [
+          "Retain release _ShellOwnershipBudgetExceededError and _literal_shell_command_spans adjacent to incoming _has_destructive_command_string.",
+          "Retain release command_closers/command_limits and incoming destructive command-string recovery guard.",
+          "Retain release shell_fence_ranges/shell_fence_start while adopting typed four-field hardware fence state and ambiguity guard."
+        ]
+      },
+      {
+        "number": 902,
+        "title": "fix(static): stop backticks/apostrophes in comments and prose from tripping static_parse_limit",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/902",
+        "upstream_commit": "0d3d74632c59145dabc17a21595d5660a612a52e",
+        "merged_at": "2026-10-31T16:11:30Z",
+        "priority": "P0",
+        "priority_reason": "Prevents literal hashes from erasing incomplete destructive-command coverage",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "91b4fbf1f43734aca7ecf98112fca31ff562c7d2",
+        "integration_evidence": "integration-scanner.json",
+        "integration_scope": [
+          "Add source-file-type comment ownership while preserving release quoted_printf_allowed gate in _quoted_candidate_is_complete.",
+          "Pass file_type alongside existing release quote_limits; retain separately computed shell and Markdown fence quote ownership."
+        ]
+      },
+      {
+        "number": 801,
+        "title": "fix(analyzer): recognize JavaScript template literals",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/801",
+        "upstream_commit": "7d5bc93ee7575e727a56e89d3983e9e428a8636c",
+        "merged_at": "2026-10-31T16:12:00Z",
+        "priority": "P0",
+        "priority_reason": "JavaScript ownership changes scan completeness and must retain conservative shell execution handling",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "a45c445d5f0be56c8ee3c695f00f6ed1b2a92533",
+        "integration_evidence": "integration-scanner.json",
+        "integration_scope": [
+          "Retain release HTMLParser/browser template ownership helpers and add new Esprima template proof functions/imports.",
+          "Retain release Python import/std-library constant-string gates.",
+          "Copy only approved esprima4.0.1 package block and direct requirement metadata into existing release lock; preserve other pins and2.14.0 version.",
+          "Final audit corrected only the dependency edge owner in follow-up8fce84014a8bea592041f55c66df95747ee67c59. All existing package blocks byte-identical; only new esprima4.0.1 block and scanner requirement metadata remain."
+        ]
+      },
+      {
+        "number": 948,
+        "title": "fix(static): preserve shell and browser template boundaries",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/948",
+        "upstream_commit": "583a68c0ad57dab57723d5c185534806df25519b",
+        "merged_at": "2026-11-02T18:18:00Z",
+        "priority": "P0",
+        "priority_reason": "Lexical ownership determines security inspection completeness and preservation of raw findings",
+        "selection": "new_delta",
+        "coverage": "partial",
+        "local_integration_commit": "c1945fb3c1a54140f6c5b155ba908fc226930953",
+        "integration_evidence": "integration-scanner.json",
+        "integration_scope": [
+          "Apply only residual current948 safety changes: raw backtick-printf failure guard with902 comment ownership; yielded TM1 candidates cannot advance completed frontier after operand exhaustion; forward runtime checks.",
+          "Include exact single-line single-quote/validated JSON operand-bound recovery from merged948, retaining raw substitution conservatism.",
+          "Retain all release Python constant-string/import/std-library gates and tests, existing browser ownership, release command limits and shell_fence_ranges.",
+          "Deduplicate byte/AST-equivalent quote helper definitions and seven already inherited security-reconstruction regression tests generated by three-way overlap."
+        ],
+        "scope": "Residual quote/operand boundary and deadline corrections only; earlier browser/Python work remains inherited."
+      },
+      {
+        "number": 969,
+        "title": "fix(ea5): stop reading option-listing help rows as model-switch commands",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/969",
+        "upstream_commit": "9209ca33d2b193f241a5ce4f7039f701868738f4",
+        "merged_at": "2026-11-02T02:25:57Z",
+        "priority": "P1",
+        "priority_reason": "Removes EA5 help-listing false positives while preserving explicit command controls",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "e55430eee7968b383ef0df2b1acf9c4bd8215784",
+        "integration_evidence": "integration-scanner.json",
+        "integration_scope": [
+          "No manual source conflict resolution; three-way application retained release-specific EA5 patterns and added the approved help-row boundary."
+        ]
+      },
+      {
+        "number": 950,
+        "title": "fix(markdown): preserve bounded inline and list-fence ownership",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/950",
+        "upstream_commit": "6ce47f3bb5dcd8d47524391a0cb85cfa5316fa39",
+        "merged_at": "2026-11-02T18:22:02Z",
+        "priority": "P0",
+        "priority_reason": "Preserves incomplete inspection when destructive operands exceed bounded lookahead",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "572571d7c2bc31c52da433566c29fe143ec39d44",
+        "integration_evidence": "integration-scanner.json",
+        "integration_scope": [
+          "Retain release named-tag HTML/list-paragraph ownership and indented_code classification while adding container-relative nested fence detection.",
+          "Retain release top-level-only shell_fence_ranges proofs, typed fence state, hardware apostrophe ambiguity guard, runtime inline-span lookahead clipping guard and list-marker ownership rules."
+        ]
+      },
+      {
+        "number": 742,
+        "title": "fix(analyzer): enforce deadlines for projected prompt matching",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/742",
+        "upstream_commit": "4d65792b29d81982400c9f41c136ce37e015c157",
+        "merged_at": "2026-11-02T19:06:52Z",
+        "priority": "P0",
+        "priority_reason": "Keeps reconstructed prompt matching interruptible and correctly accounted as incomplete on timeout",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "93447431c336875cf0054aca24e16e5a25f2e761",
+        "integration_evidence": "integration-scanner.json",
+        "integration_scope": [
+          "Exact production and test blobs from merged742; pre-pick release files byte-identical to upstream first parent. Existing local-versus-terminal timeout semantics retained."
+        ]
+      },
+      {
+        "number": 814,
+        "title": "fix(analyzer): keep checking command lines inside a word that spans lines",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/814",
+        "upstream_commit": "07ffeabd49b68a23d29282dbe2b54a27ce64f85e",
+        "merged_at": "2026-11-02T19:16:29Z",
+        "priority": "P0",
+        "priority_reason": "Closes scan-completeness hiding by multiline shell words",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "91e3b8b485a56ff7bf3ccac5588f6a68a66473c8",
+        "integration_evidence": "integration-scanner.json",
+        "integration_scope": [
+          "Three-way apply preserved release Python host bounds, startup/printf context and imported proof hooks; incoming shadow candidates never advance source frontiers or quote ownership."
+        ]
+      },
+      {
+        "number": 848,
+        "title": "fix(analyzer): keep PowerShell host syntax from inventing shell parse limits",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/848",
+        "upstream_commit": "81993d0dd32b919883ab780bd212327e15b3af47",
+        "merged_at": "2026-11-02T19:16:41Z",
+        "priority": "P0",
+        "priority_reason": "Changes completeness accounting for PowerShell executable ownership",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "dd4380ac5da651612bf16da544f462d0f7479f3e",
+        "integration_evidence": "integration-scanner.json",
+        "integration_scope": [
+          "Retain full constant-field-aware release _python_literal_operands signature/body while inserting approved PowerShell segment/projection helpers.",
+          "Omit upstream CHANGELOG entry as directed; root maintains release notes. All PowerShell helper/class ASTs exactly match approved merged source."
+        ]
+      },
+      {
+        "number": 957,
+        "title": "fix(ra1): keep double negatives from exempting the action",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/957",
+        "upstream_commit": "0eca2368cfee5e9c033de8b324edccc56487c8be",
+        "merged_at": "2026-10-31T16:10:59Z",
+        "priority": "P0",
+        "priority_reason": "Restores RA1 findings hidden by double-negative recommendation grammar",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "ec6f388de551cfb4738182c6b0a31585081df2b4",
+        "integration_evidence": "integration-precision.json",
+        "integration_scope": null
+      },
+      {
+        "number": 752,
+        "title": "fix(yara): require a browser cookie-store path in info_stealer",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/752",
+        "upstream_commit": "988effaa3b1088b0c59f6a3cdc628f5060c14265",
+        "merged_at": "2026-10-31T16:12:16Z",
+        "priority": "P1",
+        "priority_reason": "Removes HIGH cookie-documentation false positives while retaining ransomware coverage",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "9a76de53c1f78b7e5bdb27713f66df04c35b25b8",
+        "integration_evidence": "integration-precision.json",
+        "integration_scope": "Replaced only decoded info_stealer rule with approved752 rule and re-encoded base64; retained all other release rules. Kept only new cookie tests from conflict, excluding unrelated main webshell tests that were context rather than752 delta."
+      },
+      {
+        "number": 955,
+        "title": "fix(cli): reject non-regular report outputs before scanning",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/955",
+        "upstream_commit": "1c94efd41a2759a3a37cab49bbdc37acdc281b80",
+        "merged_at": "2026-10-31T16:12:32Z",
+        "priority": "P1",
+        "priority_reason": "Avoids expensive scans when an existing directory cannot be used as a report output",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "b7451f0e9fe2a4c79bc546bc9074a0f059d55acf",
+        "integration_evidence": "integration-precision.json",
+        "integration_scope": "Kept all latest958AISOP output-preservation tests and added both955directory/missing/regular-output controls; release identity preflight remains ahead of added directory guard."
+      },
+      {
+        "number": 965,
+        "title": "fix(p6): stop reporting Python returns of local names as prompt extraction",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/965",
+        "upstream_commit": "3a5598bb9400325190ee4f1c5ae7bd6bbc0c93aa",
+        "merged_at": "2026-11-02T02:41:25Z",
+        "priority": "P1",
+        "priority_reason": "Reduces high-severity P6 false positives from ordinary Python local-value returns",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "645d9bc92cabe3d50d57ce8a8f8fc41753274880",
+        "integration_evidence": "integration-precision.json",
+        "integration_scope": "Ported only965AST-local-return helpers and scan-cache binding through a minimal full-original-source prepare hook supported by release runner. Retained existing release heading/taxonomy checks and P7/P8; did not import unrelated main identifier/heading/prohibition framework. Extended firstP6prompt noun to prompts? so release regex consumes the full approved plural-return control. Approved new test file unchanged."
+      },
+      {
+        "number": 964,
+        "title": "fix(providers): reject SKILLSPECTOR_TEMPERATURE for all Claude models that drop sampling",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/964",
+        "upstream_commit": "549c011b9e0629fc9bc772096c459a13fda89311",
+        "merged_at": "2026-11-02T02:41:40Z",
+        "priority": "P1",
+        "priority_reason": "Prevents raw provider failures for unsupported Claude sampling settings",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "15644cadda8ece4399d0b73c582c4d2db5c58a17",
+        "integration_evidence": "integration-precision.json",
+        "integration_scope": null
+      },
+      {
+        "number": 972,
+        "title": "perf: defer workflow warning imports until graph initialization",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/972",
+        "upstream_commit": "51f9672e571ffcb77e068db5128b230278ed97b9",
+        "merged_at": "2026-11-02T18:18:35Z",
+        "priority": "P1",
+        "priority_reason": "Avoids unnecessary LangChain startup while preserving public workflow APIs",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "5fc8bcd5ad16b9e0cee3c53711ce3e56d82238be",
+        "integration_evidence": "integration-precision.json",
+        "integration_scope": null
+      },
+      {
+        "number": 703,
+        "title": "feat(report): expose the file surface a finding landed on",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/703",
+        "upstream_commit": "290fe930764ac27503056f296c379da023ebd034",
+        "merged_at": "2026-11-02T19:15:34Z",
+        "priority": "P1",
+        "priority_reason": "Gives triage consumers accurate occurrence-level surface context",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "f583e0b73b30fe96fa8449e646a4be37c86eed08",
+        "integration_evidence": "integration-precision.json",
+        "integration_scope": null
       }
     ],
     "already_covered_excluded": [
@@ -476,6 +836,16 @@
         "selection": "excluded_already_covered",
         "baseline_representation": "Explicitly backported into the #958 maintenance candidate.",
         "priority_report": "skillspector-pr-review-2026-10-28.json"
+      },
+      {
+        "number": 877,
+        "title": "fix: admit corroborated passive documentation PNG and JPEG references",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/877",
+        "upstream_commit": "415d50751196c5e87684899164a8ebc43cedf683",
+        "selection": "excluded_already_covered",
+        "reason": "Production and regression behavior already supplied by the inherited maintenance baseline.",
+        "integration_evidence": "integration-precision.json",
+        "scope": "No new877feature delta:7/9source files exactly inherited in7d496, including JPEGvalidator/finalizer/docs/all newtests. references.py already contains approvedprovenance adapted torelease6fieldcandidate tuples andmetadata stathelper; artifacts.py differences are preexistingperformance caches/spacing work. Skipped cherry-pick rather than downgrade release APIs."
       }
     ],
     "required_dependencies": [
@@ -534,6 +904,29 @@
           899
         ],
         "include": "Recursive scan exception-to-CLI-error wrapper and its regressions; preserve protected-output failures and exit code 2."
+      },
+      {
+        "number": 981,
+        "title": "style(analyzer): format the multiline word-shadow guard",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/981",
+        "upstream_commit": "e14c450b260958ed3ebd83c94c09c4b093e3e656",
+        "merged_at": "2026-11-02T19:51:20Z",
+        "priority": "P2",
+        "priority_reason": "Formatting-only prerequisite for #814: main CI rejects the multiline quoted-assignment guard until this exact layout correction.",
+        "selection": "required_dependency",
+        "coverage": "partial",
+        "local_integration_commit": "3116f1584bac2cccbe9b15d8976eb5b05cfd9b00",
+        "integration_evidence": "integration-scanner.json",
+        "integration_scope": [
+          "Upstream merge e14c450b is empty because916 had already supplied its patch to main. Empty cherry-pick skipped.",
+          "Applied exact gh-read PR981 head281850410f7a04838eb1a87cdf822572ca624e8a patch, preserving its author/date/signoff and explicit commit provenance; complete analyzer AST unchanged."
+        ],
+        "required_by": [
+          814
+        ],
+        "source_patch_commit": "281850410f7a04838eb1a87cdf822572ca624e8a",
+        "upstream_merge_is_empty": true,
+        "scope": "Only the formatter correction from the actual PR head; merge commit already had that tree."
       }
     ],
     "requested_model_updates": [
@@ -598,7 +991,8 @@
         "selection": "model_delta",
         "include": "Keep OpenAI gpt-5.4 and native Anthropic Opus 4.6/Sonnet 4.6 defaults; preserve sanitized MCP provider-preflight errors."
       }
-    ]
+    ],
+    "current_inventory_evidence": "candidate-inventory.json"
   },
   "net_model_behavior": {
     "defaults": {
@@ -618,73 +1012,101 @@
     "structured_output": "Keep #958 completion/recovery/binder safeguards while adding missing model and provider policy. Native Claude JSON-schema output and unforced tool-call routes follow provider capability.",
     "requested_controls": [
       "GPT-6.1 Sol rejects any explicit temperature and permits only low, medium, high, xhigh or max reasoning effort.",
-      "Claude 5.5 temperature handling depends on the route: native Anthropic permits 1.0; the other supported routes reject explicit temperature.",
+      "Known rejected-sampling families: claude-opus-4-7, claude-opus-4-8, claude-opus-5, claude-sonnet-5, claude-fable-5, claude-mythos-5, claude-haiku-5. Only the official native Anthropic endpoint retains temperature=1.0 compatibility; other routes reject explicit temperature.",
       "Unsupported controls fail before analysis; static-only scans do not initialize provider credentials."
     ]
   },
   "known_limitations": [
-    {
-      "pr": 929,
-      "issue": 956,
-      "url": "https://github.com/NVIDIA/SkillSpector/issues/956",
-      "description": "The merged prohibition fix has a reported double-negative RA1 regression; unmerged #957 is outside this selection."
-    },
     "Inherited #958 execution, provider-response and capacity limitations remain applicable. Earlier live acceptance does not qualify the final 2.14.0 candidate.",
-    "Exact finding baselines are scanner-version-bound and require regeneration/review."
+    "Exact finding baselines are scanner-version-bound and require regeneration/review.",
+    "Opt-in dependency-content inspection supports integrity-verified public npm v2/v3 lockfiles and Linux seccomp workers only. Unsupported content, acquisition, isolation and budget failures remain incomplete."
   ],
   "validation": {
-    "status": "awaiting_isolated_ci_and_baseline_integration",
-    "final_candidate_commit": null,
+    "status": "current_update_static_only_runtime_acceptance_pending",
+    "final_candidate_source_commit": "f583e0b73b30fe96fa8449e646a4be37c86eed08",
+    "historical_initial_candidate": {
+      "status": "awaiting_isolated_ci_and_baseline_integration",
+      "final_candidate_commit": null,
+      "required_checks": [
+        "Source and installed-wheel regressions for the final candidate",
+        "Build, strict package metadata checks and source/package identity checks",
+        "Current hosted CI at the final candidate revision",
+        "Baseline refresh and semantic delta review if #958 advances"
+      ],
+      "claim_scope": "Focused development checks and historical #958 live results do not establish final-candidate acceptance.",
+      "validated_production_commit": "774bd450cac531a49ccc68ff876c0535d4b0ab52",
+      "source_wheel_cli": {
+        "scans": 20,
+        "fixtures": 10,
+        "all_normalized_reports_match": true
+      },
+      "installed_model_registry_tests": {
+        "passed": 145
+      },
+      "package_identity": {
+        "files_equal_to_source": 128,
+        "wheel_sha256": "3185a1b1391e054b3386797a4d04acbbd8875b822d043d2c45d5308990b8ba9d"
+      },
+      "unit_local": {
+        "passed": 2932,
+        "skipped": 14,
+        "initial_failed": 3,
+        "isolated_rechecks_passed": 3,
+        "clean_full_run": false
+      },
+      "analyzers_local_partial": {
+        "passed": 4023,
+        "skipped": 4,
+        "failed_startup_timeouts": 3,
+        "complete": false
+      },
+      "other_local_partial": {
+        "passed": 1675,
+        "failed_timing": 1,
+        "unexecuted": 2178,
+        "complete": false
+      },
+      "timing_scope": "Unchanged local startup limits and the 5-second dense-directory limit were retained. The dense-directory timing failure also reproduced on #958 with all 256-file semantic assertions passing; no speed-ratio or full acceptance claim is made.",
+      "test_adaptations": "Only optional timeout arguments were added to availability mocks; AST comparison confirms every test body and assertion is preserved."
+    },
+    "current_update": {
+      "execution_scope": "Local update workflow; hosted CI tracked separately",
+      "runtime_tests_executed": false,
+      "source_wheel_runs_executed": false,
+      "live_provider_runs_executed": false,
+      "static_summary": "For integrated source f583e0b7 before documentation-only edits, aggregate AST/internal-import checking reports 123 production modules and 443 internal imports with no errors or dynamic imports; Ruff lint and format pass across 320 files. JSON/TOML metadata, the offline no-build lock check (159 packages), and whitespace checks pass. These are static checks only.",
+      "worker_evidence": [
+        "integration-dependencies.json",
+        "integration-scanner.json",
+        "integration-precision.json"
+      ],
+      "package_evidence": "aggregate-package-proof.json",
+      "worker_evidence_scope": "Local review audit identifiers, not repository file paths. Public provenance is recorded by upstream_commit and local_integration_commit in selection entries."
+    },
+    "claim_scope": "Historical validation belongs to the earlier candidate. Current AST/Ruff/JSON/TOML/lock/whitespace checks do not establish runtime, package or live-provider acceptance.",
     "required_checks": [
-      "Source and installed-wheel regressions for the final candidate",
-      "Build, strict package metadata checks and source/package identity checks",
-      "Current hosted CI at the final candidate revision",
-      "Baseline refresh and semantic delta review if #958 advances"
-    ],
-    "claim_scope": "Focused development checks and historical #958 live results do not establish final-candidate acceptance.",
-    "validated_production_commit": "774bd450cac531a49ccc68ff876c0535d4b0ab52",
-    "source_wheel_cli": {
-      "scans": 20,
-      "fixtures": 10,
-      "all_normalized_reports_match": true
-    },
-    "installed_model_registry_tests": {
-      "passed": 145
-    },
-    "package_identity": {
-      "files_equal_to_source": 128,
-      "wheel_sha256": "3185a1b1391e054b3386797a4d04acbbd8875b822d043d2c45d5308990b8ba9d"
-    },
-    "unit_local": {
-      "passed": 2932,
-      "skipped": 14,
-      "initial_failed": 3,
-      "isolated_rechecks_passed": 3,
-      "clean_full_run": false
-    },
-    "analyzers_local_partial": {
-      "passed": 4023,
-      "skipped": 4,
-      "failed_startup_timeouts": 3,
-      "complete": false
-    },
-    "other_local_partial": {
-      "passed": 1675,
-      "failed_timing": 1,
-      "unexecuted": 2178,
-      "complete": false
-    },
-    "timing_scope": "Unchanged local startup limits and the 5-second dense-directory limit were retained. The dense-directory timing failure also reproduced on #958 with all 256-file semantic assertions passing; no speed-ratio or full acceptance claim is made.",
-    "test_adaptations": "Only optional timeout arguments were added to availability mocks; AST comparison confirms every test body and assertion is preserved."
+      "Final integrated current-head hosted CI",
+      "Final runtime/package acceptance and independent release review",
+      "Fresh baseline/head guard before publication"
+    ]
   },
   "publication": {
-    "status": "waiting_for_baseline_integration_and_final_validation",
-    "stacked_on_pull_request": 958,
-    "stacked_on_branch": "yashraj/release-2.13.3",
+    "status": "unpublished_pending_final_validation",
+    "pr_is_draft": false,
+    "base_branch": "yashraj/v2.13.0-base",
+    "release_publish_label_applied": false,
     "requirements": [
-      "Integrate #958 and refresh the pinned baseline if necessary",
-      "Complete final-candidate validation and release review before applying release:publish"
+      "Preserve ready PR status; complete final validation and release review before release:publish.",
+      "Use the normal label-gated publication workflow after release-owner approval."
     ],
     "distribution": "GitHub wheel and source distribution; this workflow does not publish to PyPI."
-  }
+  },
+  "resolved_limitations": [
+    {
+      "issue": 956,
+      "url": "https://github.com/NVIDIA/SkillSpector/issues/956",
+      "fixed_by_merged_pr": 957,
+      "scope": "The previously documented double-negative RA1 correction and its upstream regression tests are included; final candidate runtime validation remains pending."
+    }
+  ]
 }
