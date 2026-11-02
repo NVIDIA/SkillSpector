@@ -180,7 +180,13 @@ E4_PATTERNS = [
     ),
     # Chinese-language equivalents (issue #953). The secrecy-only phrase
     # "do not tell the user" never matches on its own; it matches only
-    # combined with a send verb in the same paragraph.
+    # combined with a send verb in the same paragraph. The send pattern
+    # below is split into quantifier-present and quantifier-absent
+    # variants, as with the AR2/AR3 split: with the quantifier absent,
+    # the two gaps around it let a near miss distribute a long
+    # separator run, while each variant has exactly one gap between
+    # required segments. Together they match exactly the phrases the
+    # single pattern matched.
     (
         f"(?:{chinese_spaced('把')}|{chinese_spaced('将')}){CHINESE_GAP}"
         f"(?:{chinese_spaced('对话')}|{chinese_spaced('對話')}|{chinese_spaced('聊天')}|{chinese_spaced('会话')}|{chinese_spaced('會話')}){CHINESE_GAP}"
@@ -191,7 +197,13 @@ E4_PATTERNS = [
     ),
     (
         f"(?:{chinese_spaced('发送')}|{chinese_spaced('發送')}|{chinese_spaced('传输')}|{chinese_spaced('傳輸')}|{chinese_spaced('上传')}|{chinese_spaced('上傳')}){CHINESE_GAP}"
-        f"(?:{chinese_spaced('完整')}|{chinese_spaced('全部')})?{CHINESE_GAP}"
+        f"(?:{chinese_spaced('完整')}|{chinese_spaced('全部')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('对话')}|{chinese_spaced('對話')}|{chinese_spaced('聊天')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('历史')}|{chinese_spaced('歷史')}|{chinese_spaced('记录')}|{chinese_spaced('記錄')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('发送')}|{chinese_spaced('發送')}|{chinese_spaced('传输')}|{chinese_spaced('傳輸')}|{chinese_spaced('上传')}|{chinese_spaced('上傳')}){CHINESE_GAP}"
         f"(?:{chinese_spaced('对话')}|{chinese_spaced('對話')}|{chinese_spaced('聊天')}){CHINESE_GAP}"
         f"(?:{chinese_spaced('历史')}|{chinese_spaced('歷史')}|{chinese_spaced('记录')}|{chinese_spaced('記錄')})",
         0.85,
