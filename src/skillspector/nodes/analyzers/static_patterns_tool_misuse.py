@@ -6270,14 +6270,28 @@ def _has_bounded_parse_exhaustion(
                 content, start, end, check_runtime=check_runtime,
                 powershell_strings=powershell_strings,
             )
-            if any(
-                token.text.casefold() in {"-e", "-ec", "-enc", "-encodedcommand", "-command", "--command"}
-                or re.fullmatch(r"-[a-z]*c[a-z]*", token.text.casefold())
-                for token in tokens
-            ):
-                # An expression-selected executable can be a shell. Its code
-                # operand must not borrow ordinary PowerShell string ownership.
-                return True
+            skip_option_value = False
+            for token in tokens:
+                if skip_option_value:
+                    skip_option_value = False
+                    continue
+                option = token.text.casefold()
+                if not option.startswith("-") or option == "--":
+                    break
+                if (
+                    option in {"-ec", "--command"}
+                    or any(name.startswith(option[1:]) for name in ("command", "encodedcommand"))
+                    or re.fullmatch(r"-[abefhkmnoptuvxBCEHPTilrsO]*c[abefhkmnoptuvxBCEHPTilrsO]*", token.text)
+                ):
+                    # Inspect actual code-selector options, not arbitrary
+                    # native options containing 'c' such as -NonInteractive.
+                    # Options after a script/subcommand operand are its data.
+                    return True
+                skip_option_value = token.text in {"-o", "-O"} or option in {
+                    "-executionpolicy", "-ep", "-inputformat", "-if",
+                    "-outputformat", "-of", "-windowstyle", "-w",
+                    "-workingdirectory", "-wd",
+                }
         for string in powershell.strings:
             check_runtime()
             # A PowerShell escape can assemble shell syntax absent from the

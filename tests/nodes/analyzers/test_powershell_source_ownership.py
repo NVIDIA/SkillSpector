@@ -224,11 +224,20 @@ def test_call_operator_operand_does_not_borrow_assignment_ownership() -> None:
     assert _ledger(content)["outcome"] is LedgerOutcome.PARTIAL
 
 
-@pytest.mark.parametrize("expression", ['(Write-Output "bash")', '($program)', '$(Get-Shell)', '$program', '${script:program}'])
-@pytest.mark.parametrize("option", ["-c", "-lc", "-C", "-CO", "-Command", "-EncodedCommand"])
+@pytest.mark.parametrize("expression", ['(Write-Output "bash")', '($program)', '$(Get-Shell)', '$program', '${script:program}', '$programs[0]', '$config.Executable'])
+@pytest.mark.parametrize("option", ["-c", "-lc", "-ac", "-xc", "-C", "-CO", "-Command", "-EncodedCommand", "-o emacs -c", "-ExecutionPolicy Bypass -Command"])
 def test_expression_selected_shell_keeps_code_operands_partial(expression: str, option: str) -> None:
     content = f"& {expression} {option} '$CMD -rf /'\n"
     assert _ledger(content)["outcome"] is LedgerOutcome.PARTIAL
+
+
+@pytest.mark.parametrize("arguments", [
+    "-Change 123 -OutputPath $outputPath", "-NonInteractive",
+    "-latest -products '*' -property installationPath",
+    "files -e $pattern",
+])
+def test_native_options_are_not_misread_as_shell_code_flags(arguments: str) -> None:
+    assert _ledger(f"& $program {arguments}\n")["outcome"] is LedgerOutcome.COMPLETED
 
 
 @pytest.mark.parametrize("language", ["powershell", "pwsh", "ps1", "PowerShell"])

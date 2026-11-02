@@ -285,6 +285,12 @@ def powershell_source(
                 if variable_command is not None:
                     spans.extend(gap_comments)
                     end = operand + variable_command.end()
+                    suffix = re.match(r"(?:\[[0-9]+\]|\.[A-Za-z_][A-Za-z0-9_]*)*", content[end:end + 512])
+                    end += suffix.end()
+                    if content[end:end + 1] in {"[", ".", "("}:
+                        # Complex executable selection needs its own value
+                        # proof; a partial variable span cannot own operands.
+                        raise _UnprovenPowerShellError
                     invocations.append((operand, end))
                     cursor = end
                     continue
