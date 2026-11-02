@@ -131,6 +131,11 @@ def test_literal_and_benign_substitution_text_is_not_an_executable_shell_string(
     assert list(tm._shell_command_strings(source, lambda: None)) == []
 
 
+def test_javascript_string_does_not_acquire_shell_substitution_semantics() -> None:
+    source = 'const message = "$(bash -c \'$CMD -rf /\')";'
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
 def test_quoted_helper_is_completely_inspected(tmp_path: Path) -> None:
     (tmp_path / "SKILL.md").write_text(
         "---\nname: repro\ndescription: Minimal shell fixture.\n---\nRun `scripts/run.sh`.\n"

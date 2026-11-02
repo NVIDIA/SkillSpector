@@ -2644,6 +2644,7 @@ def _has_shell_command_word_exhaustion(
         perl_eval_blocks=perl_eval_blocks,
         python_source=python_source,
         powershell=powershell,
+        shell_substitutions=file_type == "shell",
     ):
         if command_string is None or _command_string_depth >= 8:
             return True
@@ -2695,12 +2696,13 @@ def _shell_command_strings(
     perl_eval_blocks: bool = False,
     python_source: _PythonSourceOwnership | None = None,
     powershell: PowerShellSource | None = None,
+    shell_substitutions: bool = True,
 ) -> Iterator[str | None]:
     """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
     clause_starts = (
         powershell.clause_starts
         if powershell is not None
-        else _shell_clause_starts(content, check_runtime)
+        else _shell_clause_starts(content, check_runtime, shell_substitutions=shell_substitutions)
     )
     for clause_start in clause_starts:
         check_runtime()
@@ -2727,6 +2729,8 @@ def _shell_command_strings(
 def _shell_clause_starts(
     content: str,
     check_runtime: Callable[[], None],
+    *,
+    shell_substitutions: bool = False,
 ) -> Iterator[int]:
     """Yield command-clause starts outside quotes and comments in one pass."""
     yield 0
@@ -2744,7 +2748,7 @@ def _shell_clause_starts(
         if cursor % 4096 == 0:
             check_runtime()
         character = content[cursor]
-        if quote != "'" and content.startswith("$(", cursor):
+        if shell_substitutions and quote != "'" and content.startswith("$(", cursor):
             end = _skip_command_substitution(
                 content, cursor, limit, check_runtime, end_cache=substitution_ends
             )
@@ -2767,7 +2771,10 @@ def _shell_clause_starts(
             elif (quote == '"' or ansi_c_quote) and character == "\\" and cursor + 1 < limit:
                 cursor += 2
                 continue
-        elif character == "$" and content[cursor + 1:cursor + 2] in {"'", '"'}:
+        elif (
+            shell_substitutions and character == "$"
+            and content[cursor + 1:cursor + 2] in {"'", '"'}
+        ):
             quote = content[cursor + 1]
             ansi_c_quote = quote == "'"
             word_started = True
