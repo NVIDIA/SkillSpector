@@ -210,6 +210,38 @@ def test_only_final_native_mktemp_borrows_assignment_failure_guard(statement: st
     assert mktemp and all(command.fail_stop is expected for command in mktemp)
 
 
+def test_unknown_parent_directory_computation_does_not_invent_file_contents() -> None:
+    assert _preserves('set -e\nrepo="$(cd ./.. && pwd)"\nprintf ready\n', _LIBRARY)
+    assert not _preserves('set -e\nrepo="$(cd ./.. && pwd)"\nsource "$repo/library.sh"\n', _LIBRARY)
+
+
+def test_unknown_directory_success_cannot_hide_later_relative_writes() -> None:
+    assert not _preserves('cd /runtime/unknown\nprintf changed > scripts/library.sh\n', _LIBRARY)
+
+
+def test_checked_known_directory_does_not_skip_possible_failure_branch() -> None:
+    assert not _preserves('if cd scripts; then :; else printf changed > scripts/library.sh; fi\n', _LIBRARY)
+
+
+@pytest.mark.parametrize("statement, expected", [
+    ('set -e\nroot="$(cd scripts && pwd)"\n', True),
+    ('set -e\nroot="$(cd scripts && pwd; true)"\n', False),
+    ('set -e\nroot="$(cd scripts && pwd)" true\n', False),
+    ('root="$(cd scripts && pwd)"\n', False),
+])
+def test_only_final_native_path_probe_requires_success(statement: str, expected: bool) -> None:
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        output = None if command.cwd is None else command.cwd + "\n"
+        return ShellEffectResult(output if command.argv[0] == "pwd" else "", True, native_identity=True)
+
+    assert _preserves(statement, _LIBRARY, native_effect=callback)
+    cd = [command for command in requests if command.argv[0] == "cd"]
+    assert cd and all(command.fail_stop is expected for command in cd)
+
+
 def test_local_argument_binding_restores_parent_value() -> None:
     caller = '''source scripts/library.sh
 target=/tmp/parent-output

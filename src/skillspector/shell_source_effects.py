@@ -90,11 +90,12 @@ class _Frame:
     exported: set[str] = field(default_factory=set)
     errexit: bool = False
     checked: bool = False
+    required_path_output: bool = False
 
     def copy(self) -> _Frame:
         return _Frame(self.values.copy(), self.argv, self.zero, self.cwd,
                       self.functions.copy(), [item.copy() for item in self.scopes],
-                      self.status, self.flow, self.output, self.uncertain, self.traps.copy(), self.exported.copy(), self.errexit, self.checked)
+                      self.status, self.flow, self.output, self.uncertain, self.traps.copy(), self.exported.copy(), self.errexit, self.checked, self.required_path_output)
 
     def lookup(self, name: str):
         for scope in reversed(self.scopes):
@@ -403,6 +404,7 @@ class _EffectAudit:
                 # Bash command substitution clears errexit unless explicitly
                 # enabled inside; unsupported inherit_errexit settings refuse.
                 child.errexit = False
+                child.required_path_output = False
                 nested = self.program(program.path, raw[cursor + 2:end - 1])
                 nodes = self.parse(nested)
                 sole_value = cursor == 0 and end == len(raw) or cursor == 1 and raw[:1] == raw[-1:] == '"' and end == len(raw) - 1
@@ -414,6 +416,17 @@ class _EffectAudit:
                     # A failed sole mktemp is the assignment's own status,
                     # so its parent cannot consume a fabricated temp path.
                     child.errexit = True
+                if (
+                    final_assignment and frame.errexit and not frame.checked and sole_value
+                    and len(nodes) == 2 and all(node.kind == "command" and not node.redirects for node in nodes)
+                    and len(nodes[0].words) == 2 and nodes[0].words[0].raw == "cd"
+                    and tuple(word.raw for word in nodes[1].words) == ("pwd",)
+                    and nodes[1].connector == "&&" and not {"cd", "pwd"}.intersection(frame.functions)
+                ):
+                    # In this exact final assignment, failed cd skips pwd and
+                    # fails the parent assignment. Only a successful path can
+                    # reach its later consumer; no other child effects borrow it.
+                    child.required_path_output = True
                 branches = self.run(nested, nodes, [child])
                 self.apply_traps(branches)
                 values = {branch.output.rstrip("\n") if branch.output is not None else None for branch in branches}
@@ -988,7 +1001,7 @@ class _EffectAudit:
 
     def native(self, program, frame, request, *, child=False):
         if not request.child_inspected:
-            request = replace(request, fail_stop=frame.errexit and not frame.checked)
+            request = replace(request, fail_stop=(frame.errexit and not frame.checked) or (frame.required_path_output and request.argv[0] == "cd"))
         redirect_frame = replace(frame, cwd=request.cwd)
         for value in request.argv:
             path = self.path(value, redirect_frame)
@@ -1011,11 +1024,16 @@ class _EffectAudit:
             elif request.argv[1:] == ("+e",):
                 frame.errexit = False
         if request.argv[0] == "cd" and result.native_identity:
-            if len(request.argv) != 2 or result.status is not True:
+            if len(request.argv) != 2:
                 raise _Unresolved
-            frame.cwd = self.path(request.argv[1], frame)
-            if frame.cwd is None:
-                raise _Unresolved
+            if result.status is True and request.fail_stop:
+                frame.cwd = self.path(request.argv[1], frame)
+            elif result.status is not False:
+                # Unknown success may retain the old directory or change it.
+                # Pure later computations can continue with unknown output;
+                # relative reads/writes cannot claim either destination.
+                frame.cwd = None
+                result = replace(result, status=None)
         if result.script_path is not None:
             text = self.read_source(result.script_path)
             if text is None:
@@ -1072,10 +1090,7 @@ class _EffectAudit:
                 while directory:
                     directories.add(directory)
                     directory = posixpath.dirname(directory)
-            if destination not in directories:
-                return None
-            frame.cwd = destination
-            return ShellEffectResult("", True)
+            return ShellEffectResult("", True if destination in directories else None, native_identity=True)
         if basename == "dirname" and len(args) == 1 and args[0] is not None:
             return ShellEffectResult(posixpath.dirname(args[0]) or ".", True)
         if basename == "mktemp" and len(args) in {1, 2} and args[-1] is not None and (len(args) == 1 or args[0] == "-d"):
