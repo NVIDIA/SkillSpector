@@ -42,6 +42,13 @@ _LITERAL_SUBSTITUTIONS = [
     pytest.param("$(printf '%%s')", "%s", id="escaped-percent"),
 ]
 
+_QUOTED_LITERAL_SUBSTITUTIONS = [
+    pytest.param("$(printf '%s%s' 'rm -rf' ' /')", "rm -rf /", id="assembled-destructive"),
+    pytest.param("$(printf '\\040rm')", " rm", id="escape-emits-separator"),
+    pytest.param("$(printf '\\047rm')", "'rm", id="escape-emits-quote"),
+    pytest.param("$(printf '\\133\\135')", "[]", id="decoded-brackets"),
+]
+
 
 @pytest.mark.parametrize("substitution,expected", _LITERAL_SUBSTITUTIONS)
 def test_bounded_printf_is_resolved_statically(substitution: str, expected: str) -> None:
@@ -96,21 +103,63 @@ def test_rustup_machine_probe_reaches_completed_ledger_outcome() -> None:
     "substitution",
     [
         pytest.param("$(printf 'rm -rf /')", id="literal-destructive"),
-        pytest.param("$(printf '%s%s' 'rm -rf' ' /')", id="assembled-destructive"),
         pytest.param("$(printf '\\162\\155 -rf /')", id="octal-prefixed-destructive"),
-        pytest.param("$(printf '\\040rm')", id="escape-emits-separator"),
-        pytest.param("$(printf '\\047rm')", id="escape-emits-quote"),
         pytest.param("$(printf '\\400')", id="octal-overflow-nul"),
         pytest.param("$(printf '\\440')", id="octal-overflow-space"),
         pytest.param("$(printf '\\447')", id="octal-truncates-to-quote"),
         pytest.param("$(printf '\\504')", id="octal-truncates-to-dollar"),
-        pytest.param("$(printf '\\133\\135')", id="decoded-brackets"),
         pytest.param("$(printf '\\qrm')", id="unknown-escape"),
     ],
 )
 def test_destructive_or_undecidable_printf_stays_partial(substitution: str) -> None:
     source = f'echo "{substitution}"\n'
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is True
+
+
+@pytest.mark.parametrize("substitution,expected", _QUOTED_LITERAL_SUBSTITUTIONS)
+def test_quoted_printf_output_preserves_exact_bytes_and_next_argument(
+    substitution: str, expected: str
+) -> None:
+    source = f'echo "{substitution}" SENTINEL\n'
+    parsed = tm._parse_shell_command_word(source, len("echo "))
+    assert parsed is not None
+    assert parsed.text == expected
+    assert parsed.end == source.index(" SENTINEL")
+    assert not parsed.dynamic and not parsed.limited
+    following = tm._parse_shell_command_word(source, parsed.end + 1)
+    assert following is not None
+    assert following.text == "SENTINEL"
+    assert source[following.end :] == "\n"
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is False
+
+
+@pytest.mark.parametrize("substitution,_expected", _QUOTED_LITERAL_SUBSTITUTIONS)
+@pytest.mark.parametrize("consumer", ["unquoted", "eval", "bash-c"])
+def test_quoted_literal_support_does_not_complete_unmodeled_execution(
+    substitution: str, _expected: str, consumer: str
+) -> None:
+    if consumer == "unquoted":
+        source = f"{substitution} -rf /\n"
+    elif consumer == "eval":
+        source = f'eval "{substitution}"\n'
+    else:
+        source = f'bash -c "{substitution}"\n'
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is True
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '"$(printf "%s\\n" rm)" -rf /',
+        'r"$(printf "%s\\n" m)" -rf /',
+        'rm "$(printf "%s" -rf)" "$(printf "%s\\n" /)"',
+    ],
+)
+def test_quoted_printf_destructive_heads_and_operands_keep_high_finding(source: str) -> None:
+    findings = static_runner.run_static_patterns(
+        {"components": ["run.sh"], "file_cache": {"run.sh": source}}, [tm]
+    )
+    assert any(finding.rule_id == "TM1" and finding.severity == "HIGH" for finding in findings)
 
 
 @pytest.mark.parametrize(

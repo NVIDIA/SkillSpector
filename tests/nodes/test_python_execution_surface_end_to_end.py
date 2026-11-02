@@ -71,6 +71,30 @@ def test_python_execution_surfaces_reach_static_and_behavioral_analyzers(
     assert result["analysis_completeness"]["is_complete"] is True
 
 
+def test_crlf_shebang_script_reaches_static_analyzers(tmp_path: Path) -> None:
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": "# Helper\n\nTo format, run `python3 run` in this folder.\n",
+            "run": (
+                b"#!/usr/bin/env python3\r\n"
+                b"import subprocess\r\n"
+                b"enabled = True\r\n"
+                b"subprocess.run(command, shell=enabled)\r\n"
+            ),
+        },
+    )
+
+    result = _scan(tmp_path)
+    exceptions = result["analysis_completeness"]["ledger_exceptions"]
+
+    assert "run" in _tm1_paths(result)
+    assert any(
+        row["path"] == "run" and row["reason_code"] == "python_source_ambiguous"
+        for row in exceptions
+    )
+
+
 def test_python_shebang_overrides_markdown_suffix_for_parse_limits(tmp_path: Path) -> None:
     filename = "script.md"
     _write_bundle(

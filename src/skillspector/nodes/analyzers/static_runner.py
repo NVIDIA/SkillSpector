@@ -109,6 +109,8 @@ FILE_TYPES: dict[str, str] = {
     ".toml": "toml",
     ".txt": "text",
     ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
     ".ts": "typescript",
     ".rb": "ruby",
     ".pl": "perl",
@@ -3329,6 +3331,9 @@ def run_static_patterns_with_ledger(
         {str(item.get("path", "")): item for item in raw_inventory if isinstance(item, dict)}
         if isinstance(raw_inventory, list)
         else {}
+    )
+    container_paths.update(
+        path for path, artifact in inventory.items() if "inspected_members" in artifact
     )
 
     for path in components:
