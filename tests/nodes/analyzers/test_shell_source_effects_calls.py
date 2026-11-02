@@ -306,6 +306,31 @@ def test_function_redirect_opens_in_caller_directory_before_body() -> None:
     assert requests.index(opening) < next(index for index, command in enumerate(requests) if command.argv[0] == "cd")
 
 
+@pytest.mark.parametrize("opening, closing", [("(", ")"), ("{", "; }")])
+def test_compound_output_redirect_preserves_body_effects(opening: str, closing: str) -> None:
+    assert _preserves(f'{opening} printf safe {closing} > /tmp/log 2>&1\n', _LIBRARY)
+    assert not _preserves(f'{opening} printf safe {closing} > scripts/library.sh 2>&1\n', _LIBRARY)
+    assert not _preserves(f'{opening} printf changed > scripts/library.sh {closing} > /tmp/log 2>&1\n', _LIBRARY)
+
+
+def test_subshell_redirect_opens_before_body_and_retains_caller_directory() -> None:
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        return ShellEffectResult(command.stdout, True, native_identity=True)
+
+    assert _preserves('set -e\n(cd scripts; printf safe) > /tmp/log 2>&1\n', _LIBRARY, native_effect=callback)
+    opening = next(command for command in requests if command.redirect_open)
+    completion = [command for command in requests if command.child_inspected and not command.redirect_open][-1]
+    assert opening.cwd == completion.cwd == "."
+    assert requests.index(opening) < next(index for index, command in enumerate(requests) if command.argv[0] == "cd")
+
+
+def test_subshell_cannot_read_its_still_open_destination() -> None:
+    assert not _preserves('(printf safe; source /tmp/log) > /tmp/log\n', _LIBRARY)
+
+
 def test_child_cannot_borrow_bytes_from_its_active_output_file() -> None:
     def callback(command):
         return ShellEffectResult(command.stdout, True, native_identity=True)

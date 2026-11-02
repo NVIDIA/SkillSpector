@@ -138,6 +138,21 @@ class _EffectsParser(_Parser):
                 self.take()
                 continue
             node = self.node(depth)
+            if node.kind in {"group", "subshell"}:
+                redirects = []
+                while self.peek():
+                    descriptor = "1"
+                    if self.peek().isdecimal() and self.peek(1) in {">", ">>", ">&"}:
+                        if self.tokens[self.cursor].end != self.tokens[self.cursor + 1].start:
+                            break
+                        descriptor = self.take().raw
+                    elif self.peek() not in {">", ">>", ">&"}:
+                        break
+                    operator = self.take().raw
+                    destination = self.take()
+                    redirects.append((descriptor + operator, destination))
+                if redirects:
+                    node = _Node("redirect", blocks=((node,),), redirects=tuple(redirects))
             if self.peek() == "|":
                 blocks = [(node,)]
                 while self.peek() == "|":
@@ -608,6 +623,21 @@ class _EffectAudit:
                 frame.uncertain = True
             frame.status = True
             return result + [frame]
+        if node.kind == "redirect":
+            redirects = tuple((operator, self.word(token.raw, frame, program)) for operator, token in node.redirects)
+            request = ShellEffectCommand((":",), {}, frame.cwd, program.path, node.redirects[0][1].start,
+                                         redirects, uncertain=frame.uncertain, fail_stop=frame.errexit and not frame.checked)
+            opened = self.begin_redirects(request, frame)
+            previous_output = frame.output
+            frame.output = ""
+            branches = self.run(program, node.blocks[0], [frame])
+            self.end_redirects(opened)
+            for branch in branches:
+                output = branch.output
+                branch.output = previous_output
+                completion = replace(request, stdout=output, uncertain=branch.uncertain, child_inspected=True, child_status=branch.status)
+                self.native(program, branch, completion, child=True)
+            return branches
         if node.kind in {"group", "subshell", "background"}:
             if node.kind == "group":
                 return self.run(program, node.blocks[0], [frame])
