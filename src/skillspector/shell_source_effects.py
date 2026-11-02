@@ -495,6 +495,10 @@ class _EffectAudit:
             if character == "$":
                 parameter = re.match(r"\$(?:([@*#?$!0-9]|[A-Za-z_][A-Za-z0-9_]*)|\{([^{}]+)\})", raw[cursor:])
                 if parameter is None:
+                    if cursor + 1 == len(raw) or quote == '"' and raw[cursor + 1:] == '"':
+                        parts.append("$")
+                        cursor += 1
+                        continue
                     raise _UnresolvedError
                 name = parameter[1] or parameter[2]
                 if name == "BASH_SOURCE[0]":

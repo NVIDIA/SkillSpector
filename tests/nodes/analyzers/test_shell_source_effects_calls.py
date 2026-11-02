@@ -189,6 +189,23 @@ def test_unquoted_tilde_never_becomes_literal_in_assignment_or_condition(prefix:
     assert _preserves(quoted, _LIBRARY)
 
 
+@pytest.mark.parametrize("value", ['end$', '"end$"'])
+def test_terminal_dollar_is_literal_without_a_parameter_name(value: str) -> None:
+    caller = 'value=' + value + '\nif [[ "$value" == \'end$\' ]]; then :; else printf changed > scripts/library.sh; fi\n'
+    assert _preserves(caller, _LIBRARY)
+
+
+def test_regex_anchor_stays_literal_without_claiming_regex_truth() -> None:
+    condition = '[[ "$BRANCH" =~ ^[A-Za-z0-9._-]+$ ]]'
+    assert _preserves('BRANCH=dev\n' + condition + '\n', _LIBRARY)
+    assert not _preserves('BRANCH=dev\nif ' + condition + '; then printf changed > scripts/library.sh; fi\n', _LIBRARY)
+
+
+@pytest.mark.parametrize("value", ['$missing', '"$missing"', '$[1+1]'])
+def test_real_or_unsupported_dollar_expansion_does_not_become_literal(value: str) -> None:
+    assert not _preserves('value=' + value + '\nprintf changed > "$value"\n', _LIBRARY)
+
+
 @pytest.mark.parametrize("operator", ["#", "##", "%", "%%"])
 def test_uncalled_quoted_pattern_removal_keeps_its_function_boundary(operator: str) -> None:
     library = 'unused() {\nprintf "%s\\n" "${path' + operator + '"$ROOT"/}"\n}\n'
