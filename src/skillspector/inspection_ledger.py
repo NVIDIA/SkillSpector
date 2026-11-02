@@ -110,8 +110,8 @@ class LedgerReason(StrEnum):
     REFERENCE_EXTRACTION_LIMIT = "reference_extraction_limit"
     REFERENCE_MISSING = "reference_missing"
     REFERENCE_UNRESOLVED = "reference_unresolved"
-    MANIFEST_PARSE_ERROR = "manifest_parse_error"
     DEPENDENCY_PARSE_ERROR = "dependency_parse_error"
+    MANIFEST_PARSE_ERROR = "manifest_parse_error"
     DEPENDENCY_LOCKFILE_MISSING = "dependency_lockfile_missing"
     DEPENDENCY_UNSUPPORTED_LOCKFILE = "dependency_unsupported_lockfile"
     DEPENDENCY_LOCKFILE_MISMATCH = "dependency_lockfile_mismatch"
@@ -269,6 +269,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.REFERENCE_UNRESOLVED: (
         "A local path-like reference matched more than one bundled artifact"
         " and could not be resolved to a single target."
+    ),
+    LedgerReason.DEPENDENCY_PARSE_ERROR: (
+        "Dependency metadata could not be parsed into supported registry coordinates."
     ),
     LedgerReason.MANIFEST_PARSE_ERROR: (
         "Manifest frontmatter is malformed or uses an unsupported value shape."
