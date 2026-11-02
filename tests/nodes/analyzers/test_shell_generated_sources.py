@@ -7,10 +7,11 @@ import shlex
 
 import pytest
 
+from skillspector import shell_sources
 from skillspector.artifacts import SecurityTextView
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.shell_helper_argv import ShellHelperOutput, reconstruct_helper_commands, reconstruct_helper_output
-from skillspector.shell_sources import ShellSourceContext
+from skillspector.shell_sources import ShellSourceContext, ShellSourceResolver, ShellSourceValue
 
 
 _CALLER = '''set -euo pipefail
@@ -32,6 +33,154 @@ def _prepare(caller: str = _CALLER, library: str = _LIBRARY, *, extra_sources=No
         source_context=ShellSourceContext("scripts/caller.sh", sources),
         check_runtime=lambda: None,
     )
+
+
+def _value_resolver(caller: str, *, inherited=None) -> ShellSourceResolver:
+    return ShellSourceResolver(
+        ShellSourceContext("scripts/caller.sh", {"scripts/caller.sh": caller}),
+        tm._next_shell_invocation_word,
+        lambda text, start, end: tm._skip_command_substitution(text, start, end, lambda: None),
+        tm._static_heredoc_header,
+        tm._skip_static_heredoc_bodies,
+        lambda: None,
+        inherited_values=inherited,
+    )
+
+
+def _expanded_values(resolver: ShellSourceResolver, name: str):
+    token = '"$' + name + '"'
+    start = 0
+    values = []
+    while (start := resolver.content.find(token, start)) >= 0:
+        value = resolver.word(start, start + len(token))
+        values.append(None if value is None else value.text)
+        start += len(token)
+    return values
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_each_consumer_uses_its_current_assignment_without_cache_poisoning(reverse: bool) -> None:
+    caller = 'helper=first\nprintf "%s" "$helper"\nhelper=second\nprintf "%s" "$helper"\n'
+    resolver = _value_resolver(caller)
+    positions = [caller.index('"$helper"'), caller.rindex('"$helper"')]
+    if reverse:
+        positions.reverse()
+    observed = {start: resolver.word(start, start + len('"$helper"')).text for start in positions}
+    assert observed[caller.index('"$helper"')] == "first"
+    assert observed[caller.rindex('"$helper"')] == "second"
+
+
+def test_unknown_reassignment_does_not_erase_an_earlier_known_value() -> None:
+    caller = 'helper=first\nprintf "%s" "$helper"\nhelper="$runtime"\nprintf "%s" "$helper"\n'
+    assert _expanded_values(_value_resolver(caller), "helper") == ["first", None]
+
+
+def test_later_known_assignment_cannot_repair_an_earlier_unknown_value() -> None:
+    caller = 'helper="$runtime"\nprintf "%s" "$helper"\nhelper=second\nprintf "%s" "$helper"\n'
+    assert _expanded_values(_value_resolver(caller), "helper") == [None, "second"]
+
+
+def test_captured_alias_resolves_dependencies_at_its_assignment_offset() -> None:
+    caller = 'value=old\nalias="$value"\nvalue=new\nprintf "%s" "$alias"\nvalue="$alias"\nprintf "%s" "$value"\n'
+    resolver = _value_resolver(caller)
+    assert _expanded_values(resolver, "alias") == ["old", "old"]
+    assert resolver.word(caller.rindex('"$value"'), caller.rindex('"$value"') + len('"$value"')).text == "old"
+
+
+def test_pending_self_reference_and_future_definitions_remain_unknown() -> None:
+    caller = 'helper=first\nprintf "%s" "$helper"\nhelper="$helper"\nprintf "%s" "$helper"\n'
+    assert _expanded_values(_value_resolver(caller), "helper") == ["first", None, None]
+    cyclic = 'first="$second"\nsecond="$first"\nprintf "%s" "$first"\n'
+    assert _expanded_values(_value_resolver(cyclic), "first") == [None, None]
+
+
+@pytest.mark.parametrize("mutation", [
+    'if test -e /tmp/condition; then helper=second; fi',
+    'while test -e /tmp/condition; do printf "%s" "$helper"; helper=second; done',
+    'helper=second printf safe', 'export helper=second',
+])
+def test_conditional_loop_and_scoped_writes_keep_filewide_refusal(mutation: str) -> None:
+    caller = 'helper=first\nprintf "%s" "$helper"\n' + mutation + '\nprintf "%s" "$helper"\n'
+    assert all(value is None for value in _expanded_values(_value_resolver(caller), "helper"))
+
+
+@pytest.mark.parametrize("invocation", [
+    'runner=mutate\n"$runner"',
+    '"$runtime"',
+    'runner=eval\n"$runner" "helper=second"',
+    'runner=source\n"$runner" scripts/mutate.sh',
+    'runner=read\n"$runner" helper',
+    'runner=printf\n"$runner" -v helper second',
+    '"eval" "helper=second"',
+    r'e\val "helper=second"',
+])
+def test_runtime_selected_parent_mutation_cannot_preserve_captured_bindings(invocation: str) -> None:
+    caller = 'mutate() { helper=second; }\nhelper=first\nprintf "%s" "$helper"\n'
+    caller += invocation + '\nprintf "%s" "$helper"\nhelper=third\nprintf "%s" "$helper"\n'
+    assert all(value is None for value in _expanded_values(_value_resolver(caller), "helper"))
+
+
+def test_dynamic_callee_uses_final_loop_invalidations() -> None:
+    caller = 'helper=first\nrunner=/bin/true\nwhile test -e /tmp/condition; do "$runner" "helper=second"; runner=eval; done\nprintf "%s" "$helper"\n'
+    assert _expanded_values(_value_resolver(caller), "helper") == [None]
+
+
+@pytest.mark.parametrize("wrapper", ["!", "! !", "time", "! time"])
+@pytest.mark.parametrize("callee", ['"$runner"', "/bin/true"])
+def test_parent_reserved_wrappers_cannot_hide_a_mutating_callee(wrapper: str, callee: str) -> None:
+    caller = 'mutate() { helper=changed; }\nhelper=first\nrunner=mutate\n'
+    caller += wrapper + " " + callee + '\nprintf "%s" "$helper"\nhelper=third\n'
+    assert _expanded_values(_value_resolver(caller), "helper") == [None]
+
+
+@pytest.mark.parametrize("condition", ['[ "$unknown" = yes ]', '[[ "$unknown" == yes ]]'])
+def test_literal_test_command_does_not_invalidate_unchanged_binding(condition: str) -> None:
+    caller = 'helper=first\nif ' + condition + '; then printf safe; fi\nprintf "%s" "$helper"\nhelper=second\nprintf "%s" "$helper"\n'
+    assert _expanded_values(_value_resolver(caller), "helper") == ["first", "second"]
+
+
+@pytest.mark.parametrize("callee", ['"scripts/worker.sh"', '"$runner"'])
+def test_proved_external_path_call_does_not_invent_parent_variable_mutation(callee: str) -> None:
+    caller = 'helper=first\nrunner=scripts/worker.sh\n' + callee + '\nprintf "%s" "$helper"\nhelper=second\nprintf "%s" "$helper"\n'
+    assert _expanded_values(_value_resolver(caller), "helper") == ["first", "second"]
+
+
+def test_inherited_value_applies_only_before_the_first_local_assignment() -> None:
+    caller = 'printf "%s" "$helper"\nhelper=local\nprintf "%s" "$helper"\n'
+    resolver = _value_resolver(caller, inherited={"helper": ShellSourceValue("inherited")})
+    assert _expanded_values(resolver, "helper") == ["inherited", "local"]
+    pending = 'helper="$helper"\nprintf "%s" "$helper"\n'
+    assert _expanded_values(_value_resolver(pending, inherited={"helper": ShellSourceValue("inherited")}), "helper") == [None, None]
+
+
+def test_assignment_history_has_a_shared_definition_bound(monkeypatch) -> None:
+    monkeypatch.setattr(shell_sources, "MAX_SHELL_BINDING_DEFINITIONS", 2)
+    assert _value_resolver('helper=one\nhelper=two\n').valid
+    assert not _value_resolver('helper=one\nhelper=two\nhelper=three\n').valid
+
+
+def test_captured_destructive_source_retains_its_first_consumer_after_later_reassignment() -> None:
+    caller = _CALLER + 'printf changed > "$script"\nhelper=$(sed -n \'/^helper() {/,/^}/p\' "$script")\nbash -c "$helper; helper"\n'
+    prepared = _prepare(caller, "helper() {\n  rm -rf /\n}\n")
+    assert prepared is not None
+    findings = list(prepared.analyze_source_commands(content=caller, file_path="scripts/caller.sh", file_type="shell", source_view=SecurityTextView("raw", caller)))
+    destructive = [finding for finding in findings if finding.rule_id == "TM1"]
+    assert destructive
+    first = caller.index('"$helper; helper"')
+    assert {finding.evidence["reconstructed_shell_source"]["consumer_start"] for finding in destructive} == {first}
+    assert all(origin["path"] == "scripts/library.sh" for finding in destructive for origin in finding.evidence["reconstructed_shell_source"]["origins"])
+    assert prepared.has_bounded_parse_exhaustion()
+
+
+@pytest.mark.parametrize("destructive", [False, True])
+def test_captured_fragment_is_not_re_read_after_its_source_changes(destructive: bool) -> None:
+    caller = _CALLER.replace('bash -c "$helper; helper"', 'printf changed > "$script"\nbash -c "$helper; helper"')
+    library = "helper() {\n  rm -rf /\n}\n" if destructive else _LIBRARY
+    prepared = _prepare(caller, library)
+    assert prepared is not None
+    findings = list(prepared.analyze_source_commands(content=caller, file_path="scripts/caller.sh", file_type="shell", source_view=SecurityTextView("raw", caller)))
+    assert any(finding.rule_id == "TM1" for finding in findings) is destructive
+    assert not prepared.has_bounded_parse_exhaustion()
 
 
 def test_known_sibling_function_is_scanned_before_completeness_is_accepted() -> None:

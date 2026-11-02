@@ -3,6 +3,7 @@
 
 """Bounded values reconstructed from complete, already-loaded shell sources."""
 
+from bisect import bisect_right
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 import hashlib
@@ -14,6 +15,7 @@ MAX_SHELL_SOURCE_FILES = 128
 MAX_SHELL_SOURCE_CHARS = 8_000_000
 MAX_SHELL_VALUE_CHARS = 65_536
 MAX_SHELL_BINDINGS = 256
+MAX_SHELL_BINDING_DEFINITIONS = 8192
 MAX_SHELL_VALUE_DEPTH = 16
 SAFE_PATH_MARKER = "__skillspector_generated_path__"
 
@@ -83,7 +85,7 @@ def _canonical_path(path: str, *, allow_parent: bool = False) -> str | None:
 
 
 class ShellSourceResolver:
-    """Resolve unique source bindings without executing shell or reading files.
+    """Resolve ordered source bindings without executing shell or reading files.
 
     The context describes uploaded bytes. Explicit parent-scope mutation and
     unsupported source/eval effects refuse proof; it is not a claim that an
@@ -119,12 +121,14 @@ class ShellSourceResolver:
         self.executable_spans: list[tuple[int, int, int, bool]] = []
         self.executable_children_complete = True
         self.lexically_valid = False
-        self.bindings: dict[str, tuple[int, int, bool, bool] | None] = {}
-        self.values: dict[str, ShellSourceValue | None] = {}
-        self.resolving: set[str] = set()
+        self.bindings: dict[str, list[tuple[int, int, bool, bool]]] = {}
+        self.binding_definitions = 0
+        self.values: dict[tuple[str, int], ShellSourceValue | None] = {}
+        self.resolving: set[tuple[str, int]] = set()
         self.hashes: dict[str, str] = {}
         self.commands: list[ShellSourceCommand] = []
         self.child_commands: list[ShellSourceCommand] = []
+        self.dynamic_callees: list[tuple[int, int]] = []
         self.literal_heredocs: list[tuple[int, int, int]] = []
         self.heredoc_counts: dict[int, int] = {}
         self.input_redirect_commands: set[int] = set()
@@ -423,6 +427,13 @@ class ShellSourceResolver:
             self.valid = False
         if self.functions & {"sed", "dirname", "pwd", "cd", "mktemp", "printf", "set", "trap", "export"}:
             self.valid = False
+        for start, end in self.dynamic_callees:
+            # A later loop assignment can change an earlier lexical call on its
+            # next iteration. Resolve only after all invalidations are known.
+            executable = self.word(start, end)
+            if executable is None or "/" not in executable.text or executable.text in self.functions:
+                self.valid = False
+                break
 
     def _record_command(self, command: ShellSourceCommand) -> None:
         if not self.valid:
@@ -505,10 +516,30 @@ class ShellSourceResolver:
                 if len(self.bindings) >= MAX_SHELL_BINDINGS and name not in self.bindings:
                     self.valid = False
                     return
-                self.bindings[name] = None if name in self.bindings or command.conditional or self.controls else (start, end, self.errexit and len(assignments) == 1, self.pipefail)
+                self.binding_definitions += 1
+                if self.binding_definitions > MAX_SHELL_BINDING_DEFINITIONS:
+                    self.valid = False
+                    return
+                if command.conditional or self.controls:
+                    # A loop's later lexical assignment can precede an earlier
+                    # use on another iteration. Keep conditional writes globally
+                    # unknown until control-flow-specific histories are proved.
+                    self.invalid_names.add(name)
+                self.bindings.setdefault(name, []).append((start, end, self.errexit and len(assignments) == 1, self.pipefail))
             return
         self.invalid_names.update(name for name, _, _ in assignments)
         executable = words[cursor][0]
+        _, start, end = words[cursor]
+        raw_executable = self.content[start:end]
+        if raw_executable in {"!", "time"}:
+            # These reserved wrappers can invoke a mutating parent builtin.
+            self.valid = False
+            return
+        literal_executable = self.word(start, end, literal_only=True)
+        if literal_executable is None and raw_executable not in {"[", "[["}:
+            self.dynamic_callees.append((start, end))
+        elif literal_executable is not None:
+            executable = literal_executable.text
         if executable in self.functions:
             # A declared function may mutate globals; command-substitution
             # calls were consumed as child words and cannot mutate the parent.
@@ -579,19 +610,22 @@ class ShellSourceResolver:
                 self.valid = False
 
     def _name(self, name: str, depth: int, use: int) -> ShellSourceValue | None:
-        if is_managed_shell_variable(name):
+        if not self.valid or is_managed_shell_variable(name) or name in self.invalid_names or depth >= MAX_SHELL_VALUE_DEPTH:
             return None
-        if self.valid and name not in self.bindings and name not in self.invalid_names and name in self.inherited_values:
-            return self.inherited_values[name]
-        span = self.bindings.get(name)
-        if not self.valid or span is None or span[1] > use or name in self.invalid_names or name in self.resolving or depth >= MAX_SHELL_VALUE_DEPTH:
+        spans = self.bindings.get(name, ())
+        index = bisect_right(spans, use, key=lambda span: span[0]) - 1
+        if index < 0:
+            return self.inherited_values.get(name)
+        span = spans[index]
+        key = name, span[0]
+        if span[1] > use or key in self.resolving:
             return None
-        if name in self.values:
-            return self.values[name]
-        self.resolving.add(name)
+        if key in self.values:
+            return self.values[key]
+        self.resolving.add(key)
         result = self.word(span[0], span[1], depth=depth + 1, assignment_value=True, fail_stop=span[2], pipefail=span[3])
-        self.resolving.remove(name)
-        self.values[name] = result
+        self.resolving.remove(key)
+        self.values[key] = result
         return result
 
     def generated_files(self) -> Iterator[GeneratedShellFile]:
