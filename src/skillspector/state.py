@@ -43,7 +43,7 @@ from skillspector.models import Finding
 
 logger = get_logger(__name__)
 
-DEFAULT_MAX_WORKFLOW_SECONDS = 600.0
+DEFAULT_MAX_WORKFLOW_SECONDS = 1080.0
 
 
 def _workflow_max_seconds_from_environment(value: str | None) -> float:
@@ -269,6 +269,9 @@ class SkillspectorState(TypedDict, total=False):
     # External-model consumers use the redacted projection for sensitive local files.
     llm_file_cache: dict[str, str]
     artifact_inventory: list[ArtifactRecord]
+    # Opt-in, local-only inspection of exact artifacts from supported npm locks.
+    inspect_dependencies: bool
+    dependency_inspection: dict[str, object]
     artifact_references: list[BundleReference]
     reference_resolution: dict[str, object]
     # Retained for compatibility with the persisted workflow-state schema.

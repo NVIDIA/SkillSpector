@@ -771,7 +771,7 @@ Issues (2)
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
 | `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3`; other provider/model combinations keep their endpoint defaults. The value applies to every model slot, so the `anthropic` `meta_analyzer` default receives the same effort as the analyzers. `gpt-6.1-sol` accepts only `low`, `medium`, `high`, `xhigh`, or `max`; any other value stops a scan before analysis (exit code 2). | Optional |
 | `SKILLSPECTOR_OUTPUT_LANGUAGE` | Short, single-line language label (letters, numbers, spaces, `_`, or `-`; maximum 64 characters) for human-readable LLM finding text such as messages, explanations, and remediation. Rule IDs, severity values, paths, code, and other machine-readable values remain unchanged. Unset, blank, or invalid values preserve the default output language. | Optional |
-| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves the provider default. Lower values can reduce run-to-run variation but do not guarantee identical output. `gpt-6.1-sol` rejects every explicit temperature, including `1`. `claude-opus-5-5` and `claude-sonnet-5-5` accept only `1.0` on the native Anthropic endpoint ([API compatibility rule](https://platform.claude.com/docs/en/api/messages/create)); gateways, proxies, and Bedrock still reject every explicit value for these models. Unsupported settings on active LLM slots stop a scan before analysis (exit code 2). Static scans (`--no-llm`) skip provider initialization and control validation. A Bedrock application-inference-profile ARN hides the model name, so declare `sampling: rejected` for it in the model registry. | Optional |
+| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves the provider default. Lower values can reduce run-to-run variation but do not guarantee identical output. `gpt-6.1-sol` rejects every explicit temperature, including `1`. Claude Opus 4.7 and later, Sonnet 5, Fable 5, Mythos 5 and Haiku 5 models (for example `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-5-5`) accept only `1.0` on the native Anthropic endpoint ([API compatibility rule](https://platform.claude.com/docs/en/api/messages/create)); gateways, proxies, and Bedrock still reject every explicit value for these models. Unsupported settings on active LLM slots stop a scan before analysis (exit code 2). Static scans (`--no-llm`) skip provider initialization and control validation. A Bedrock application-inference-profile ARN hides the model name, so declare `sampling: rejected` for it in the model registry. | Optional |
 | `SKILLSPECTOR_SEED` | Optional integer sampling seed for OpenAI-compatible and Azure OpenAI providers. Other hosted providers and CLI providers do not receive it. Provider support remains model-dependent; `gpt-6.1-sol` receives it, but OpenAI treats `seed` as best-effort, so output can still differ between runs. | Optional |
 | `SKILLSPECTOR_COMPACT_PROMPTS` | Opt-in compact line numbering in LLM prompts: numbered lines render as `L1:`, `L2:` instead of zero-padded `L01:`, `L02:`. Accepted truthy values are `1`, `true`, and `yes` (case-insensitive; surrounding whitespace is trimmed). Unset or any other value keeps the default zero-padded format. | Optional |
 | `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
@@ -793,7 +793,9 @@ Issues (2)
 | `SKILLSPECTOR_MODEL_<SLOT>` | Override the model for one analyzer slot (for example `SKILLSPECTOR_MODEL_META_ANALYZER`). It takes precedence over `SKILLSPECTOR_MODEL`, which in turn replaces provider slot defaults such as the `anthropic` `meta_analyzer` default. See [model provenance](docs/INFERENCE_USAGE.md#model-provenance) for the full precedence. | Optional |
 | `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
 | `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
-| `SKILLSPECTOR_MAX_DEPENDENCY_SOURCE_ANALYSIS_SECONDS` | Ceiling for the dependency-source analysis pass, in seconds. Defaults to `5.0`, which is the historical value. Raise it on slow or heavily loaded machines so the same unchanged tree does not come back partially inspected, which would set `safe_to_install` to false and record `runtime_limit`. The remaining aggregate workflow time (`SKILLSPECTOR_MAX_WORKFLOW_SECONDS`, 600 seconds by default) still caps the effective value; values above that remaining time have no effect. Invalid, zero, negative, infinite, and NaN values keep the 5-second default. The setting is resolved when the module is imported, so a new process is required after changing it. See [analysis resource bounds](docs/ANALYSIS_RESOURCE_BOUNDS.md#configuring-the-dependency-source-deadline). | Optional |
+| `SKILLSPECTOR_MAX_WORKFLOW_SECONDS` | Aggregate scan deadline in seconds; defaults to `1080` (18 minutes). Accepts a positive finite number. Invalid values warn and retain the default. Set before starting the process; caller-supplied budgets and external tool timeouts still apply. | Optional |
+| `SKILLSPECTOR_TP4_MAX_BATCHES` | Maximum description-behavior review batches per TP4 analyzer execution; defaults to `256`. Accepts an integer from `1` to `4096`. Unset or blank uses the default; invalid values warn and retain it. Set before starting the process; file, byte, finding, concurrency, and workflow-time limits still apply. | Optional |
+| `SKILLSPECTOR_MAX_DEPENDENCY_SOURCE_ANALYSIS_SECONDS` | Ceiling for the dependency-source analysis pass, in seconds. Defaults to `5.0`, which is the historical value. Raise it on slow or heavily loaded machines so the same unchanged tree does not come back partially inspected, which would set `safe_to_install` to false and record `runtime_limit`. The remaining aggregate workflow time (`SKILLSPECTOR_MAX_WORKFLOW_SECONDS`, 1080 seconds by default) still caps the effective value; values above that remaining time have no effect. Invalid, zero, negative, infinite, and NaN values keep the 5-second default. The setting is resolved when the module is imported, so a new process is required after changing it. See [analysis resource bounds](docs/ANALYSIS_RESOURCE_BOUNDS.md#configuring-the-dependency-source-deadline). | Optional |
 
 > **Disabled provider:** `codex_cli` remains registered but cannot run LLM analysis because its read-only sandbox allows host-file reads. Existing users should select an HTTP API provider or another supported CLI provider.
 
@@ -1008,6 +1010,29 @@ SC4 uses the [OSV.dev](https://osv.dev) API to check dependencies against the fu
   VCS/local sources are reported as incomplete dependency checks.
 
 The tool requires outbound HTTPS access to `api.osv.dev` for live vulnerability data. When that is not available, findings are limited to the static fallback list.
+
+## Locked npm dependency contents (opt-in)
+
+Use `--inspect-dependencies` to statically inspect exact public npm tarballs from
+`package-lock.json` or `npm-shrinkwrap.json` v2/v3, including recorded transitive,
+development, and optional dependencies:
+
+```bash
+skillspector scan ./my-skill --inspect-dependencies --no-llm --fail-on-incomplete
+```
+
+Artifacts must match their locked SHA-512 integrity hashes. A disposable Linux
+worker inspects supported source files and decoded npm scripts without installing
+packages or executing their code. Dependency findings include package coordinates,
+an artifact digest, and source locations. Missing artifacts, unsupported sources
+or formats, unavailable isolation, and exhausted budgets remain incomplete;
+`--fail-on-incomplete` prevents them from passing the scan. Reports also show when
+inspection was not requested.
+
+This first version supports the public npm registry and Linux x86-64/AArch64
+seccomp isolation. Dependency analysis stays local and uses existing static
+data-exfiltration, privilege-escalation, and supply-chain patterns. See
+[supported content, resource limits, and coverage boundaries](docs/DEPENDENCY_CONTENT_INSPECTION.md).
 
 ## Trust model and data egress
 
