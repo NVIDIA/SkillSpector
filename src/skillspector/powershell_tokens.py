@@ -1,0 +1,260 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Bounded lexical ownership of PowerShell strings and comments.
+
+This does not execute PowerShell or establish command data flow. It only
+prevents host-language quoting from extending a shell word into later code.
+The caller must separately inspect string values and embedded shell calls.
+"""
+
+from __future__ import annotations
+
+import re
+from bisect import bisect_right
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from skillspector.python_ast import MAX_PYTHON_AST_SOURCE_CHARS
+
+_MAX_DEPTH = 32
+_MAX_SPANS = 65_536
+_ESCAPES = {
+    "0": "\x00", "a": "\a", "b": "\b", "e": "\x1b", "f": "\f",
+    "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+}
+_DYNAMIC_CODE = re.compile(
+    r"\b(?:Invoke-Expression|iex|InvokeScript|Set-Alias|New-Alias)\b"
+    r"|\[\s*scriptblock\s*\]\s*::\s*Create\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class PowerShellString:
+    start: int
+    end: int
+    value: str
+    decoded: bool
+    invoked: bool
+
+
+@dataclass(frozen=True)
+class PowerShellSource:
+    starts: tuple[int, ...]
+    ends: tuple[int, ...]
+    strings: tuple[PowerShellString, ...]
+
+    def owns(self, position: int) -> bool:
+        index = bisect_right(self.starts, position) - 1
+        return index >= 0 and position < self.ends[index]
+
+    def next_boundary(self, position: int, fallback: int) -> int:
+        index = bisect_right(self.starts, position) - 1
+        if index >= 0 and position < self.ends[index]:
+            return self.ends[index]
+        index += 1
+        return self.starts[index] if index < len(self.starts) else fallback
+
+
+class _UnprovenPowerShell(Exception):
+    pass
+
+
+def powershell_source(
+    content: str, check_runtime: Callable[[], None]
+) -> PowerShellSource | None:
+    """Return only whole-source lexical proof; malformed input proves nothing."""
+    if len(content) > MAX_PYTHON_AST_SOURCE_CHARS or _DYNAMIC_CODE.search(content):
+        return None
+    spans: list[tuple[int, int]] = []
+    strings: list[PowerShellString] = []
+    checked = -1024
+
+    def check(cursor: int, depth: int) -> None:
+        nonlocal checked
+        if depth > _MAX_DEPTH or len(spans) + len(strings) > _MAX_SPANS:
+            raise _UnprovenPowerShell
+        if cursor - checked >= 1024:
+            check_runtime()
+            checked = cursor
+
+    def own(start: int, end: int) -> None:
+        if start < end:
+            spans.append((start, end))
+
+    def variable(start: int, depth: int) -> int:
+        cursor = start + 2
+        while cursor < len(content):
+            check(cursor, depth)
+            if content[cursor] == "`":
+                cursor += 2
+            elif content[cursor] == "}":
+                return cursor + 1
+            else:
+                cursor += 1
+        raise _UnprovenPowerShell
+
+    def quoted(start: int, depth: int, *, here: bool = False) -> int:
+        span_start = len(spans)
+        quote_at = start + int(here)
+        quote = content[quote_at]
+        cursor = quote_at + 1
+        if here:
+            if content.startswith("\r\n", cursor):
+                cursor += 2
+            elif content[cursor:cursor + 1] == "\n":
+                cursor += 1
+            else:
+                raise _UnprovenPowerShell
+        region_start = start
+        value: list[str] = []
+        decoded = False
+        while cursor < len(content):
+            check(cursor, depth)
+            character = content[cursor]
+            closing = (
+                content.startswith(quote + "@", cursor)
+                and (cursor == 0 or content[cursor - 1] == "\n")
+                if here else character == quote
+            )
+            if closing:
+                if not here and content[cursor:cursor + 2] == quote * 2:
+                    value.append(quote)
+                    decoded = True
+                    cursor += 2
+                    continue
+                end = cursor + (2 if here else 1)
+                if here and end < len(content) and not (
+                    content[end].isspace() or content[end] in ";|&),.+-*/["
+                ):
+                    raise _UnprovenPowerShell
+                own(region_start, end)
+                # A quoted command name after the PowerShell call operator
+                # remains an executable candidate with its following operands.
+                previous = start - 1
+                while previous >= 0 and content[previous] in " \t\r\n":
+                    previous -= 1
+                invoked = previous >= 0 and (
+                    content[previous] == "&" or (
+                        content[previous] == "." and (
+                            previous == 0 or content[previous - 1].isspace()
+                            or content[previous - 1] in ";({"
+                        )
+                    )
+                )
+                strings.append(PowerShellString(start, end, "".join(value), decoded, invoked))
+                if invoked:
+                    del spans[span_start:]
+                return end
+            if quote == '"' and character == "`":
+                if cursor + 1 >= len(content):
+                    raise _UnprovenPowerShell
+                escaped = content[cursor + 1]
+                if escaped == "u":
+                    if content[cursor + 2:cursor + 3] != "{":
+                        raise _UnprovenPowerShell
+                    close = content.find("}", cursor + 3, cursor + 10)
+                    digits = content[cursor + 3:close] if close >= 0 else ""
+                    if not digits or any(c not in "0123456789abcdefABCDEF" for c in digits):
+                        raise _UnprovenPowerShell
+                    number = int(digits, 16)
+                    if number > 0x10FFFF:
+                        raise _UnprovenPowerShell
+                    value.append(chr(number))
+                    cursor = close + 1
+                else:
+                    value.append(_ESCAPES.get(escaped, escaped))
+                    cursor += 2
+                decoded = True
+                continue
+            if quote == '"' and content.startswith("$(", cursor):
+                # Preserve executable subexpressions as independent code. The
+                # outer value stays dynamic, never a trusted literal command.
+                own(region_start, cursor + 2)
+                end = code(cursor + 2, depth + 1, closes_parenthesis=True)
+                value.append("$VALUE")
+                cursor = end
+                region_start = end - 1
+                continue
+            if quote == '"' and content.startswith("${", cursor):
+                end = variable(cursor, depth)
+                value.append(content[cursor:end])
+                cursor = end
+                continue
+            value.append(character)
+            cursor += 1
+        raise _UnprovenPowerShell
+
+    def code(cursor: int, depth: int, *, closes_parenthesis: bool = False) -> int:
+        parentheses = 0
+        while cursor < len(content):
+            check(cursor, depth)
+            character = content[cursor]
+            if content.startswith("<#", cursor):
+                start = cursor
+                cursor += 2
+                # PowerShell block comments end at the FIRST #>. An apparent
+                # nested opener cannot hide code following that terminator.
+                while cursor < len(content) and not content.startswith("#>", cursor):
+                    check(cursor, depth)
+                    cursor += 1
+                if cursor == len(content):
+                    raise _UnprovenPowerShell
+                cursor += 2
+                own(start, cursor)
+                continue
+            if character == "#" and (cursor == 0 or content[cursor - 1] in " \t\r\n;|&(){}"):
+                start = cursor
+                while cursor < len(content) and content[cursor] not in "\r\n":
+                    check(cursor, depth)
+                    cursor += 1
+                own(start, cursor)
+                continue
+            if character in "'\"":
+                cursor = quoted(cursor, depth + 1)
+                continue
+            if character == "@" and content[cursor + 1:cursor + 2] in {"'", '"'}:
+                cursor = quoted(cursor, depth + 1, here=True)
+                continue
+            if character == "`":
+                if cursor + 1 >= len(content):
+                    raise _UnprovenPowerShell
+                cursor += 2
+                continue
+            if content.startswith("${", cursor):
+                cursor = variable(cursor, depth)
+                continue
+            if character in "‘’“”":
+                # PowerShell accepts typographic delimiters too. Until this
+                # helper proves their exact mixed-quote rules, retain fallback.
+                raise _UnprovenPowerShell
+            if closes_parenthesis:
+                if character == "(":
+                    parentheses += 1
+                    if parentheses + depth > _MAX_DEPTH:
+                        raise _UnprovenPowerShell
+                elif character == ")":
+                    if not parentheses:
+                        return cursor + 1
+                    parentheses -= 1
+            cursor += 1
+        if closes_parenthesis:
+            raise _UnprovenPowerShell
+        return cursor
+
+    check_runtime()
+    try:
+        code(0, 0)
+        check(len(content), 0)
+    except _UnprovenPowerShell:
+        return None
+    check_runtime()
+    spans.sort()
+    if any(end > next_start for (_, end), (next_start, _) in zip(spans, spans[1:])):
+        return None
+    return PowerShellSource(
+        tuple(start for start, _ in spans),
+        tuple(end for _, end in spans),
+        tuple(strings),
+    )

@@ -1,0 +1,159 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""PowerShell host quoting must not become an unfinished Bash command."""
+
+from __future__ import annotations
+
+import pytest
+
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+from skillspector.nodes.analyzers import static_runner
+from skillspector import powershell_tokens
+from skillspector.powershell_tokens import powershell_source
+
+_TAIL = "\n# ordinary trailing documentation" * 300
+
+
+def _ledger(content: str) -> dict:
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["sample.ps1"], "file_cache": {"sample.ps1": content}}, [tm]
+    )
+    return result["inspection_ledger"][0]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        '$uri = "$base`?option=value&cl=$change"',
+        'Write-Host "line one`nline two"',
+        'Write-Output "quoted `"value`""',
+        'Write-Output "escaped `$variable"',
+        'Write-Output "tab`tvalue"',
+        'Write-Output "line one`\nline two"',
+        'Write-Output "line one`\r\nline two"',
+        'Write-Output "literal `` backtick"',
+        'Write-Output "Unicode `u{1F44D}"',
+        "Write-Output 'don''t treat this as a shell quote'",
+        '$text = @"\nline one`nline two\n"@',
+        "$text = @'\nquotes ' and \" remain text\n'@",
+        '<# comment with "quotes and a backtick `\n<# nested #>\n#>\nWrite-Host "done"',
+        '# comment with "quotes and a backtick `\nWrite-Host "done"',
+        '$path = "C:\\tools\\"\nWrite-Host "done"',
+        'Write-Host "$(Write-Output \'nested value\') result"',
+        'Write-Host "apostrophe \' followed by ' + 'ordinary text ' * 400 + '"',
+    ],
+)
+def test_powershell_literal_boundaries_remain_complete(statement: str) -> None:
+    event = _ledger(statement + _TAIL)
+    assert event["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_unrelated_native_commands_do_not_invalidate_uri_ownership() -> None:
+    content = (
+        'Start-Process -FilePath $archiveTool -ArgumentList @("x", "-y")\n'
+        '$uri = "$base`?option=value&cl=$change"\n'
+        '& $p4.Source print -q -o $destination $depotPath\n'
+    ) + _TAIL
+    assert _ledger(content)["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "bash -c '$CMD -rf /'",
+        "& bash -lc '$CMD -rf /'",
+        '& "$($CMD)" -rf /',
+        '& "r`m" -rf /',
+        'bash -c "r`m -rf /"',
+        '$uri = "$base`?option=value"; bash -c \'$CMD -rf /\'',
+        '$message = "$(bash -c \'$CMD -rf /\')"',
+        '$payload = "r`m -rf /"; Invoke-Expression $payload',
+        '$payload = "r`m -rf /"',
+        'Write-Host "ordinary"; $CMD -rf /',
+        '<# apparent <# nested opener #>\n$CMD -rf /\n#>',
+    ],
+)
+@pytest.mark.parametrize("tail", ["", _TAIL])
+def test_executable_shell_and_decoded_destructive_content_stay_partial(
+    statement: str, tail: str
+) -> None:
+    event = _ledger(statement + tail)
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'Write-Host "unfinished',
+        "$value = @'\nunfinished",
+        '<# unfinished',
+        'Write-Host "$(unfinished"',
+        'Write-Host "bad `u{XYZ}"',
+        'Write-Host "bad `u{110000}"',
+        'Write-Host "bad `uX"',
+        '$text = @"\ntext\n"@invalid',
+        'Write-Host “unproven typographic delimiters”',
+        '"$("' * 34 + ')' * 34,
+    ],
+)
+def test_unsupported_ownership_keeps_conservative_fallback(content: str) -> None:
+    assert powershell_source(content, lambda: None) is None
+
+
+def test_subexpression_code_is_not_owned_as_string_data() -> None:
+    content = 'Write-Host "before $(Write-Output \'inner\'; $CMD -rf /) after"'
+    source = powershell_source(content, lambda: None)
+    assert source is not None
+    assert source.owns(content.index("before"))
+    assert source.owns(content.index("inner"))
+    assert not source.owns(content.index("$CMD"))
+
+
+def test_partial_context_cannot_claim_powershell_quotes() -> None:
+    content = '$uri = "$base`?option=value"' + _TAIL
+    assert tm.has_bounded_parse_exhaustion(
+        content, lambda: None, file_type="powershell", complete_context=False
+    )
+
+
+def test_runtime_cancellation_propagates() -> None:
+    class Cancelled(Exception):
+        pass
+
+    def cancel() -> None:
+        raise Cancelled
+
+    with pytest.raises(Cancelled):
+        powershell_source('Write-Host "done"', cancel)
+
+
+def test_source_offsets_and_decoded_values_preserve_unicode_and_crlf() -> None:
+    content = 'Write-Host "👍 prefix"\r\n$uri = "$base`?x=1"\r\n'
+    source = powershell_source(content, lambda: None)
+    assert source is not None
+    target = next(string for string in source.strings if string.value.startswith("$base"))
+    assert content[target.start:target.end] == '"$base`?x=1"'
+    assert target.value == "$base?x=1"
+    assert all(
+        end <= next_start
+        for end, next_start in zip(source.ends, source.starts[1:])
+    )
+
+
+def test_source_size_and_span_budgets_preserve_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(powershell_tokens, "MAX_PYTHON_AST_SOURCE_CHARS", 20)
+    assert powershell_source('Write-Host "' + "x" * 20 + '"', lambda: None) is None
+    monkeypatch.setattr(powershell_tokens, "MAX_PYTHON_AST_SOURCE_CHARS", 1000)
+    monkeypatch.setattr(powershell_tokens, "_MAX_SPANS", 2)
+    assert powershell_source('"a"; "b"; "c"', lambda: None) is None
+
+
+def test_here_string_footer_does_not_own_following_code() -> None:
+    content = '$text = @"\nliteral text\n"@\n$CMD -rf /'
+    source = powershell_source(content, lambda: None)
+    assert source is not None
+    assert not source.owns(content.index("$CMD"))
+    assert source.next_boundary(0, len(content)) == content.index('@"')

@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.javascript_tokens import javascript_template_spans
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.nodes.analyzers import static_runner
 
@@ -146,3 +147,107 @@ def test_non_string_computed_member_with_template_does_not_crash(member: str) ->
     source = f"items{member}(); const name = `file-${{id}}`;" + _PADDING
 
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript") is False
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+@pytest.mark.parametrize("interpreter", ["#!/usr/bin/env node", "#!/usr/bin/node --no-warnings"])
+def test_node_hashbang_preserves_nested_template_ownership(interpreter: str, newline: str) -> None:
+    source = interpreter + newline + (
+        "const rows = [['a', 1]];\n"
+        'console.log(`Rows: ${rows.map(([key, value]) => `${key}=${value}`).join(", ")}`);'
+    ) + _PADDING
+    spans = javascript_template_spans(source, lambda: None)
+    assert spans is not None
+    assert all(source[start] == source[end - 1] == "`" for start, end in zip(*spans, strict=True))
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript") is False
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "entry?.label",
+        "entry?.['label']",
+        "formatter?.(entry)",
+        "entry?.children?.[0]?.label",
+        "entry?.querySelector('.label').textContent",
+        "`${entry?.label}: ${entry?.children?.length}`",
+    ],
+)
+def test_optional_chain_keeps_template_boundaries(expression: str) -> None:
+    source = f"const value = {expression}; console.log(`Value: ${{value}}`);" + _PADDING
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript") is False
+
+
+def test_optional_chain_projection_preserves_literal_and_unicode_offsets() -> None:
+    source = (
+        "const emoji = '🌍'; const text = 'literal?.value'; const pattern = /\\?\\./;\n"
+        "const value = entry?.label; console.log(`literal ?. ${value}`);"
+    ) + _PADDING
+    spans = javascript_template_spans(source, lambda: None)
+    start = source.index("`literal")
+    end = source.index("`;", start) + 1
+    assert spans == ((start,), (end,))
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "entry?.label = `value ${input}`;",
+        "entry?.count++; const value = `${input}`;",
+        "new Constructor?.(`${input}`);",
+        "entry?.tag`value ${input}`;",
+        "const value = entry?.; console.log(`${input}`);",
+        "#!/bin/sh\nconst value = `${input}`;",
+        " const value = `${input}`;\n#!/usr/bin/env node",
+    ],
+)
+def test_invalid_or_unproven_host_syntax_keeps_partial_result(source: str) -> None:
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "#!/usr/bin/env node\nexec(`${command} -rf /`);",
+        "child?.exec(`${command} -rf /`);",
+        "eval?.(`${command}`);",
+        "const evaluate = eval; evaluate(`${command}`);",
+        "const Evaluate = Function; new Evaluate(`${command}`);",
+        "new Function(`${command}`);",
+        "console.log(`${child?.exec(command)}`);",
+        "const child = require('child_process'); child?.exec(`${command}`);",
+    ],
+)
+def test_supported_host_syntax_cannot_hide_code_execution(source: str) -> None:
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is True
+    )
+
+
+def test_metadata_keys_do_not_become_evaluator_references() -> None:
+    content = (
+        'const metadata = {eval: false, Function: "render", label: "plot"}; '
+        'console.log(`${metadata?.label}`);'
+    )
+    assert javascript_template_spans(content, lambda: None) is not None
+
+
+def test_optional_chain_cancellation_propagates() -> None:
+    class Cancelled(RuntimeError):
+        pass
+
+    calls = 0
+
+    def cancel() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise Cancelled
+
+    source = "const value = entry?.label;" * 1000 + "console.log(`${value}`);"
+    with pytest.raises(Cancelled):
+        javascript_template_spans(source, cancel)

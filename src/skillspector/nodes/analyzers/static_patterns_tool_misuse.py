@@ -45,6 +45,7 @@ from skillspector.javascript_tokens import JavaScriptTemplateSpans, assertion_te
 from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
+from skillspector.powershell_tokens import PowerShellSource, powershell_source
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_tokens import PythonLiteralSpans
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
@@ -2411,6 +2412,7 @@ def _has_shell_command_word_exhaustion(
     structural_quote_openers: set[int] | None = None,
     python_source: _PythonSourceOwnership | None = None,
     javascript_source: _JavaScriptTemplateOwnership | None = None,
+    powershell: PowerShellSource | None = None,
     perl_eval_blocks: bool = False,
     quote_limits: dict[int, int] | None = None,
     file_type: str = "shell",
@@ -2439,6 +2441,8 @@ def _has_shell_command_word_exhaustion(
         if start in owned_word_positions:
             continue
         if javascript_source is not None and javascript_source.owns(start):
+            continue
+        if powershell is not None and powershell.owns(start):
             continue
         if structural_quote_closers is not None and start in structural_quote_closers:
             continue
@@ -2513,6 +2517,10 @@ def _has_shell_command_word_exhaustion(
             unresolved_end = (
                 json_openers[next_json] if next_json < len(json_openers) else len(content)
             )
+            if powershell is not None:
+                unresolved_end = min(
+                    unresolved_end, powershell.next_boundary(start, len(content))
+                )
             if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS and python_source is not None:
                 # Likewise, a host string or comment token owns its bytes: a
                 # shell quote it opens cannot continue into later host code.
@@ -2534,13 +2542,17 @@ def _has_shell_command_word_exhaustion(
             or _SHELL_COMMENT_START_RE.search(content, content.rfind("\n", 0, start) + 1, start)
             is not None
         )
+        owned_end = (
+            min(parsed.end, powershell.next_boundary(start, len(content)))
+            if powershell is not None else parsed.end
+        )
         if not confined_word:
             # A quote that opens a runtime-selected word stays an independent
             # candidate, so a mis-paired claim cannot hide its operands.
             owned_word_positions.update(
                 position
                 for position in candidate_word_positions
-                if content[position + 1 : position + 2] not in ("$", "`")
+                if position < owned_end and content[position + 1 : position + 2] not in ("$", "`")
             )
         # Only executable nested substitutions retain independent command
         # positions. A plain dynamic data argument still owns its inner bytes;
@@ -2559,7 +2571,7 @@ def _has_shell_command_word_exhaustion(
             or not any(marker in raw_word for marker in ("$(", "`"))
             or simple_backtick_parameter
         ) and not (assignment_quote and confined_word):
-            parsed_through = max(parsed_through, parsed.end)
+            parsed_through = max(parsed_through, owned_end)
         if assignment_quote:
             # An assignment value never names the command, and main never
             # parsed this position, so it only claims ownership.
@@ -5842,6 +5854,10 @@ def _has_bounded_parse_exhaustion(
     json_strings: list[tuple[int, int]] = []
     python_source = None
     javascript_source = None
+    powershell = (
+        powershell_source(content, check_runtime)
+        if file_type == "powershell" and complete_context else None
+    )
     if file_type == "perl" and complete_context:
         content = _perl_literal_print_shell_text(content, check_runtime)
     if file_type == "python" and complete_context:
@@ -5885,6 +5901,7 @@ def _has_bounded_parse_exhaustion(
         structural_quote_openers=structural_quote_openers,
         python_source=python_source,
         javascript_source=javascript_source,
+        powershell=powershell,
         perl_eval_blocks=file_type == "perl",
         quote_limits=(
             _shell_quoted_candidate_limits(content, check_runtime)
@@ -5898,6 +5915,8 @@ def _has_bounded_parse_exhaustion(
     for command_start, body_start in _destructive_command_words(content):
         check_runtime()
         if command_start < covered_until:
+            continue
+        if powershell is not None and powershell.owns(command_start):
             continue
         # A recognized prose description cannot contribute parse exhaustion:
         # the same predicate below would discard it after parsing.  Short-circuit
@@ -5913,6 +5932,26 @@ def _has_bounded_parse_exhaustion(
         covered_until = max(covered_until, command_end)
         if exhausted or _has_unsupported_brace_expansion(tokens):
             return True
+    if powershell is not None:
+        for string in powershell.strings:
+            check_runtime()
+            # A PowerShell escape can assemble shell syntax absent from the
+            # original bytes. Never turn such a command into a clean result
+            # merely because the host string's boundaries are now understood.
+            if string.decoded and _has_destructive_command_string(string.value):
+                return True
+            if string.invoked:
+                # A quoted command after & or dot-sourcing retains its actual
+                # operands. Ordinary host strings are not shell programs.
+                end = min(len(content), string.end + _ROOT_GLOB_COMMAND_CHARS)
+                newline = content.find("\n", string.end, end)
+                if newline >= 0:
+                    end = newline
+                command = string.value + content[string.end:end]
+                if _has_destructive_command_string(command) or _has_bounded_parse_exhaustion(
+                    command, check_runtime, file_type="shell", complete_context=False
+                ):
+                    return True
     # A literal candidate outside a JSON string can consume it before the
     # whole-content parser reaches its structural opener. Recover each proven
     # string independently, without bypassing that parser's forward watermark

@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded lexical ownership for Node assertion template-message delimiters.
+"""Bounded JavaScript ownership for shell-completeness checks.
 
-This is not a JavaScript parser or a shell-sink/dataflow model. Only a direct
-diagnostic argument of one unaliased built-in assertion import may borrow
-ownership. Unsupported source keeps its original conservative shell reading.
+Assertion messages require a proved receiver. General template ownership also
+requires a complete syntax tree and retains conservative shell-execution checks.
+Original source bytes remain the input to security matching.
 """
 
 from __future__ import annotations
@@ -396,6 +396,7 @@ _SHELL_EXECUTION_CALLS = frozenset(
         "execfilesync",
         "execsync",
         "eval",
+        "function",
         "execa",
         "spawn",
         "spawnfile",
@@ -406,6 +407,91 @@ _SHELL_EXECUTION_CALLS = frozenset(
     }
 )
 _SHELL_EXECUTION_MODULES = frozenset({"child_process", "execa", "shelljs", "zx"})
+
+
+def _javascript_parse_text(
+    content: str, check_runtime: Callable[[], None]
+) -> tuple[str, tuple[int, ...]] | None:
+    """Adapt supported host syntax without changing any source offsets.
+
+    Esprima predates hashbangs and optional chaining. Removing optional guards
+    only overapproximates the calls inspected here; this text is never executed
+    or used to resolve values. Token ranges prevent edits to strings or regexes.
+    """
+    projected = content
+    if content.startswith("#!"):
+        if _NODE_SHEBANG.match(content) is None:
+            return None
+        projected = "//" + content[2:]
+    if "?." not in projected:
+        return projected, ()
+
+    visited = 0
+
+    def bounded_token(token: Any) -> Any:
+        nonlocal visited
+        visited += 1
+        if visited > _MAX_TOKENS:
+            raise ValueError("JavaScript token limit")
+        if visited % 256 == 0:
+            check_runtime()
+        return token
+
+    try:
+        tokens = esprima.tokenize(projected, {"range": True}, bounded_token)
+    except (esprima.Error, RecursionError, ValueError, TypeError, IndexError):
+        return None
+    check_runtime()
+    output = list(projected)
+    optional_positions: list[int] = []
+    for index, token in enumerate(tokens[:-2]):
+        if index % 256 == 0:
+            check_runtime()
+        following, member = tokens[index + 1 : index + 3]
+        if token.type != "Punctuator" or token.value != "?":
+            continue
+        start, end = token.range
+        if (
+            following.type != "Punctuator"
+            or following.value != "."
+            or following.range != [end, end + 1]
+            or projected[start : end + 1] != "?."
+        ):
+            continue
+        if member.type == "Punctuator" and member.value in {"[", "("}:
+            output[start : end + 1] = "  "
+        elif member.type in {"Identifier", "Keyword"}:
+            output[start] = " "
+        else:
+            return None
+        optional_positions.append(start)
+    return "".join(output), tuple(optional_positions)
+
+
+def _invalid_optional_context(program: Any, positions: tuple[int, ...], tick: Callable[[], None]) -> bool:
+    """Optional chains cannot be assignment targets, constructors or tags."""
+    if not positions:
+        return False
+    for node in _walk_nodes(program, tick):
+        target = None
+        constructor_end = None
+        if node.type == "AssignmentExpression":
+            target = node.left
+        elif node.type == "UpdateExpression":
+            target = node.argument
+        elif node.type == "NewExpression":
+            target = node.callee
+            constructor_end = node.arguments[0].range[0] if node.arguments else node.range[1]
+        elif node.type == "TaggedTemplateExpression":
+            target = node.tag
+        if target is not None:
+            start, end = target.range
+            if constructor_end is not None:
+                end = constructor_end
+            index = bisect_left(positions, start)
+            if index < len(positions) and positions[index] < end:
+                return True
+    return False
 
 
 def javascript_template_spans(
@@ -422,15 +508,21 @@ def javascript_template_spans(
     if "`" not in content or len(content) > MAX_PYTHON_AST_SOURCE_CHARS:
         return None
     check_runtime()
+    prepared = _javascript_parse_text(content, check_runtime)
+    if prepared is None:
+        return None
+    parse_text, optional_positions = prepared
     options = {"range": True}
     try:
         try:
-            program = esprima.parseScript(content, options)
+            program = esprima.parseScript(parse_text, options)
         except esprima.Error:
-            program = esprima.parseModule(content, options)
+            program = esprima.parseModule(parse_text, options)
     except (esprima.Error, RecursionError, ValueError, TypeError):
         return None
     check_runtime()
+    if _invalid_optional_context(program, optional_positions, check_runtime):
+        return None
 
     templates: list[tuple[int, int, bool]] = []
     for node in _walk_nodes(program, check_runtime):
@@ -499,7 +591,18 @@ def _walk_nodes(value: Any, check_runtime: Callable[[], None]) -> Iterator[Any]:
 
 
 def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -> bool:
+    literal_keys: set[int] = set()
     for node in _walk_nodes(program, check_runtime):
+        if node.type == "Property" and not node.computed and not node.shorthand:
+            # Object metadata keys are names, not references to evaluators.
+            literal_keys.add(id(node.key))
+        if (
+            node.type == "Identifier"
+            and node.name in {"eval", "Function"}
+            and id(node) not in literal_keys
+        ):
+            # Aliasing an evaluator does not make its input ordinary text.
+            return True
         if node.type == "ImportDeclaration" and _is_shell_execution_module(
             getattr(node.source, "value", "")
         ):
