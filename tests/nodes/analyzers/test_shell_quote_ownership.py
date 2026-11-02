@@ -9,7 +9,100 @@ import pytest
 from typer.testing import CliRunner
 
 from skillspector.cli import app
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+from skillspector.nodes.analyzers import static_runner
+
+
+@pytest.mark.parametrize("word", ["rm", "del", "erase", "/bin/rm"])
+@pytest.mark.parametrize(
+    ("path", "template"),
+    [
+        ("example.json", '{{"x":"a {word} b"}}'),
+        ("example.json", '["a {word} b"]'),
+        ("example.sh", 'echo "a {word} b"'),
+        ("example.sh", "echo 'a {word} b'"),
+        ("example.md", '```json\n{{"x":"a {word} b"}}\n```'),
+        ("example.md", '```bash\necho "a {word} b"\n```'),
+    ],
+)
+def test_literal_removal_words_in_complete_quotes_finish_inspection(
+    path: str, template: str, word: str
+) -> None:
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: template.format(word=word)}}, [tm]
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert not result["findings"]
+
+
+@pytest.mark.parametrize(
+    ("path", "source"),
+    [
+        ("example.json", '{"x":"a rm -rf /"}'),
+        ("example.sh", 'echo "a rm -rf /"'),
+        ("example.sh", "echo 'a rm -rf /'"),
+        ("example.sh", 'echo "a del b"; rm -rf /'),
+        ("example.sh", 'echo "a del b"; $(printf %s r m) -rf /'),
+        ("example.json", '{"x":"a del b", "y":"$CMD -rf /"}'),
+        ("example.md", '```json\n{"x":"a rm -rf /"}\n```'),
+        ("example.md", '```bash\necho "a del b"; rm -rf /\n```'),
+    ],
+)
+def test_proven_operand_boundaries_keep_destructive_findings(path: str, source: str) -> None:
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: source}}, [tm]
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+@pytest.mark.parametrize(
+    ("path", "source"),
+    [
+        ("example.json", '{"x":"a del b"'),
+        ("example.sh", 'echo "a del b\n' + "x" * (tm._SHELL_COMMAND_WORD_CHARS + 1)),
+        ("example.sh", 'echo "a del b"; $CMD -rf /'),
+        ("example.sh", 'echo "x: $(printf %s r m) -rf /"'),
+        ("example.sh", 'sh -c "a del b; $CMD -rf /"'),
+        ("example.json", '{"x":"x: $(printf %s r m) -rf /"}'),
+        ("example.sh", 'echo "a rm ' + "x" * (tm._ROOT_GLOB_COMMAND_CHARS + 1) + '"'),
+    ],
+)
+def test_quote_ownership_keeps_unresolved_commands_partial(path: str, source: str) -> None:
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: source}}, [tm]
+    )
+
+    row = result["inspection_ledger"][0]
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    ("file_type", "source"),
+    [("json", '{"x":"a del b"}'), ("shell", 'echo "a del b"')],
+)
+def test_quote_operand_boundary_requires_complete_context(file_type: str, source: str) -> None:
+    assert tm.has_bounded_parse_exhaustion(
+        source, lambda: None, file_type=file_type, complete_context=False
+    )
+
+
+def test_unresolved_operand_candidates_honor_the_analysis_deadline() -> None:
+    source = 'echo "prefix ' + "del harmless " * 1000
+    checks = 0
+
+    def check_runtime() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 10:
+            raise TimeoutError("operand scan deadline")
+
+    with pytest.raises(TimeoutError, match="operand scan deadline"):
+        tm.analyze(source, "example.sh", "shell", check_runtime=check_runtime)
 
 
 @pytest.mark.parametrize("padding", [0, 5000, 9000])

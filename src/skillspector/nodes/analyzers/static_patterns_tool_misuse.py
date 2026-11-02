@@ -2247,15 +2247,6 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
             yield start, parsed.end
 
 
-def _has_destructive_command_string(content: str) -> bool:
-    """Return whether an executable string contains a proven destructive command."""
-    for command_start, body_start in _destructive_command_words(content):
-        tokens, _, _ = _bounded_shell_tokens(content, command_start, body_start)
-        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
-            return True
-    return False
-
-
 class _ShellOwnershipBudgetExceededError(Exception):
     """Stop optional quote proof without swallowing the caller's cancellation."""
 
@@ -2307,6 +2298,15 @@ def _literal_shell_command_spans(
     return {begin + start: begin + stop for start, stop in spans}
 
 
+def _has_destructive_command_string(content: str) -> bool:
+    """Return whether an executable string contains a proven destructive command."""
+    for command_start, body_start in _destructive_command_words(content):
+        tokens, _, _ = _bounded_shell_tokens(content, command_start, body_start)
+        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
+            return True
+    return False
+
+
 def _shell_quoted_candidate_limits(
     content: str,
     check_runtime: Callable[[], None],
@@ -2355,13 +2355,24 @@ def _shell_quoted_candidate_limits(
                 word_started = False
                 cursor = body_end
                 continue
+            if quote is not None and character == quote:
+                closers.add(cursor)
+                if (
+                    not ansi_c
+                    and "\n" not in content[quote_start:cursor]
+                    and "\r" not in content[quote_start:cursor]
+                ):
+                    for position in candidates:
+                        limits[position] = cursor
+                quote = None
+                cursor += 1
+                continue
             if quote == "'":
                 if character == "\\" and ansi_c:
                     cursor += 2
                     continue
-                if character == "'":
-                    closers.add(cursor)
-                    quote = None
+                if not ansi_c and _SHELL_COMMAND_WORD_START_RE.match(content, cursor):
+                    candidates.append(cursor)
                 cursor += 1
                 continue
             if character == "\\":
@@ -2371,17 +2382,6 @@ def _shell_quoted_candidate_limits(
                         word_started = True
                     cursor += 2
                     continue
-            if quote == '"' and character == '"':
-                closers.add(cursor)
-                if (
-                    "\n" not in content[quote_start:cursor]
-                    and "\r" not in content[quote_start:cursor]
-                ):
-                    for position in candidates:
-                        limits[position] = cursor
-                quote = None
-                cursor += 1
-                continue
             if quote is None and content.startswith("<<<", cursor):
                 # A here-string takes an ordinary shell word; unlike a
                 # heredoc it does not change the ownership of later lines.
@@ -2780,6 +2780,27 @@ def _has_shell_command_word_exhaustion(
                     substitution_start,
                     substitution_end,
                     check_runtime=check_runtime,
+                ):
+                    return True
+            if content[start] == "`":
+                substitution_end = _skip_backtick_substitution(
+                    content, start, len(content), check_runtime, end_cache=backtick_end_cache
+                )
+                if (
+                    substitution_end is not None
+                    and _is_printf_substitution(
+                        content,
+                        start,
+                        substitution_end,
+                        backtick=True,
+                        check_runtime=check_runtime,
+                    )
+                    and not (
+                        file_type in _HASH_COMMENT_FILE_TYPES
+                        and _is_comment_candidate(
+                            content, start, python_source, file_type=file_type
+                        )
+                    )
                 ):
                     return True
             # An unclosed expansion or quote can consume the rest of the
@@ -5904,6 +5925,7 @@ def _tm1_candidates(
     *,
     direct_shell_only: bool = False,
     shell_content: str | None = None,
+    check_runtime: Callable[[], None],
 ) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
     def direct_matches(
         pattern_index: int,
@@ -6011,6 +6033,7 @@ def _tm1_candidates(
         seen_commands: set[tuple[int, int]] = set()
         covered_until = 0
         for command_start, body_start in _destructive_command_words(candidate_content):
+            check_runtime()
             if command_start < covered_until:
                 continue
             command_key = (command_start, body_start)
@@ -6022,12 +6045,15 @@ def _tm1_candidates(
             # character-by-character shell parse for every explanatory ``rm`` noun.
             if _is_root_glob_documentation(candidate_content, command_start, body_start):
                 continue
-            tokens, command_end, _ = _bounded_shell_tokens(
+            tokens, command_end, exhausted = _bounded_shell_tokens(
                 candidate_content,
                 command_start,
                 body_start,
+                check_runtime=check_runtime,
             )
-            covered_until = max(covered_until, command_end)
+            # An unresolved quote cannot own and hide later executable candidates.
+            if not exhausted:
+                covered_until = max(covered_until, command_end)
             command = candidate_content[command_start:command_end]
             if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
                 yield command_start, command_end, command, 0.9, False, None, None, None
@@ -6664,6 +6690,7 @@ def _has_bounded_parse_exhaustion(
     structural_quote_openers = None
     shell_fence_ranges: list[tuple[int, int]] = []
     json_strings: list[tuple[int, int]] = []
+    json_operand_spans: list[tuple[int, int]] = []
     python_source = None
     javascript_source = None
     if file_type == "perl" and complete_context:
@@ -6679,11 +6706,17 @@ def _has_bounded_parse_exhaustion(
         # Interpolated templates in files with shell calls retain conservative
         # bounds because this analyzer does not prove their data flow.
         javascript_source = _JavaScriptTemplateOwnership(content, check_runtime)
+    if file_type in {"json", "markdown"} and complete_context:
+        json_strings = validated_json_string_spans(content, check_runtime)
+        structural_quote_closers = {end - 1 for _, end in json_strings}
+        structural_quote_openers = {start for start, _ in json_strings}
+        # Raw substitution delimiters must survive Markdown's inline projection.
+        json_operand_spans = [
+            (start, end)
+            for start, end in json_strings
+            if "$(" not in content[start:end] and "`" not in content[start:end]
+        ]
     if file_type == "markdown":
-        if complete_context:
-            json_strings = validated_json_string_spans(content, check_runtime)
-            structural_quote_closers = {end - 1 for _, end in json_strings}
-            structural_quote_openers = {start for start, _ in json_strings}
         hardware_apostrophe_ambiguity = [False]
         content = _markdown_shell_text(
             content,
@@ -6741,6 +6774,7 @@ def _has_bounded_parse_exhaustion(
         file_type=file_type,
     ):
         return True
+    json_starts = [start for start, _ in json_operand_spans]
     covered_until = 0
     for command_start, body_start in _destructive_command_words(content):
         check_runtime()
@@ -6757,6 +6791,28 @@ def _has_bounded_parse_exhaustion(
             body_start,
             check_runtime=check_runtime,
         )
+        if exhausted:
+            word = content[command_start:body_start]
+            boundary = quote_limits.get(command_start) if quote_limits is not None else None
+            index = bisect_right(json_starts, command_start) - 1
+            if boundary is None and index >= 0:
+                begin, end = json_operand_spans[index]
+                if begin < command_start < body_start < end:
+                    boundary = end - 1
+            if (
+                boundary is not None
+                and not any(character in word for character in "$`'\"\\")
+                and word.casefold().rsplit("/", 1)[-1] in _DESTRUCTIVE_COMMAND_BASENAMES
+            ):
+                # A proven enclosing closer terminates operands; reconstructed
+                # command words retain their original uncertainty and bounds.
+                tokens, command_end, exhausted = _bounded_shell_tokens(
+                    content[command_start:boundary],
+                    0,
+                    body_start - command_start,
+                    check_runtime=check_runtime,
+                )
+                command_end += command_start
         covered_until = max(covered_until, command_end)
         if exhausted or _has_unsupported_brace_expansion(tokens):
             return True
@@ -6917,6 +6973,7 @@ def analyze(
         content,
         direct_shell_only=_direct_shell_only,
         shell_content=shell_content,
+        check_runtime=runtime_check,
     ):
         runtime_check()
         variable_match = variable_matches.get((match_start, match_end))
