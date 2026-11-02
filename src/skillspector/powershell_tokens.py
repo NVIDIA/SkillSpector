@@ -106,7 +106,9 @@ def powershell_source(
                 cursor += 1
         raise _UnprovenPowerShell
 
-    def quoted(start: int, depth: int, *, here: bool = False) -> int:
+    def quoted(
+        start: int, depth: int, *, here: bool = False, invoked_context: bool = False
+    ) -> int:
         span_start = len(spans)
         quote_at = start + int(here)
         quote = content[quote_at]
@@ -164,7 +166,7 @@ def powershell_source(
                         if previous % 1024 == 0:
                             check_runtime()
                         previous -= 1
-                invoked = previous >= 0 and (
+                invoked = invoked_context or previous >= 0 and (
                     content[previous] == "&" or (
                         content[previous] == "." and (
                             previous == 0 or content[previous - 1].isspace()
@@ -265,6 +267,10 @@ def powershell_source(
                     else:
                         break
                 opening = operand + int(content.startswith("$(", operand))
+                if content[operand:operand + 1] in {"'", '"'}:
+                    spans.extend(gap_comments)
+                    cursor = quoted(operand, depth + 1, invoked_context=True)
+                    continue
                 if content[opening:opening + 1] == "(":
                     spans.extend(gap_comments)
                     clause_starts.add(opening + 1)

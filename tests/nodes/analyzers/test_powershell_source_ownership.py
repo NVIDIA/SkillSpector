@@ -78,6 +78,8 @@ def test_module_and_script_extensions_use_the_same_ownership(extension: str) -> 
         "& bash -lc '$CMD -rf /'",
         '& "$($CMD)" -rf /',
         '& "r`m" -rf /',
+        '& <# comment #> "r`m" -rf /',
+        '. <# comment #> "r`m" -rf /',
         '& ("r`m") -rf /',
         '& (("r`m")) -rf /',
         '& $("r`m") -rf /',
