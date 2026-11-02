@@ -88,6 +88,24 @@ _FILE_READ_SOURCES = frozenset(
     }
 )
 
+# HTTP calls that send a request and return its response, so each is both a network
+# sink and a network source. Calls on client objects are named by the type
+# ``build_type_map`` infers, so ``s = requests.Session(); s.post(...)`` is
+# ``requests.Session.post``.
+_HTTP_CLIENT_TYPES = (
+    "requests.Session",
+    "requests.sessions.Session",
+    "requests.session",
+    "httpx.Client",
+    "httpx.AsyncClient",
+    "aiohttp.ClientSession",
+)
+_HTTP_CLIENT_METHODS = ("get", "post", "put", "patch", "delete", "request")
+_HTTP_REQUEST_CALLS = frozenset(
+    {f"{client}.{method}" for client in _HTTP_CLIENT_TYPES for method in _HTTP_CLIENT_METHODS}
+    | {"requests.request", "httpx.request", "urllib3.request", "urllib3.PoolManager.request"}
+)
+
 _NETWORK_INPUT_SOURCES = frozenset(
     {
         "requests.get",
@@ -105,6 +123,7 @@ _NETWORK_INPUT_SOURCES = frozenset(
         "socket.socket.recv",
         "socket.socket.recvfrom",
     }
+    | _HTTP_REQUEST_CALLS
 )
 
 _USER_INPUT_SOURCES = frozenset(
@@ -125,16 +144,21 @@ _NETWORK_OUTPUT_SINKS = frozenset(
         "requests.put",
         "requests.patch",
         "requests.get",
+        "requests.delete",
         "httpx.post",
         "httpx.put",
         "httpx.patch",
         "httpx.get",
+        "httpx.delete",
         "urllib.request.urlopen",
         "urllib.request.build_opener.open",
+        "http.client.HTTPConnection.request",
+        "http.client.HTTPSConnection.request",
         "socket.socket.send",
         "socket.socket.sendall",
         "socket.socket.sendto",
     }
+    | _HTTP_REQUEST_CALLS
 )
 
 _EXEC_SINKS = frozenset(
