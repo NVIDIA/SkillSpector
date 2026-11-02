@@ -299,7 +299,7 @@ class _EffectsParser(_Parser):
 
 
 class _EffectAudit:
-    def __init__(self, resolver, target, read_source, native_effect, *, preserve_only=False):
+    def __init__(self, resolver, target, read_source, native_effect, *, preserve_only=False, preserve_state=None):
         from skillspector.shell_sources import SAFE_PATH_MARKER
 
         self.resolver = resolver
@@ -307,6 +307,7 @@ class _EffectAudit:
         self.read_source = read_source if read_source is not None else resolver.context.sources.get
         self.native_effect = native_effect
         self.preserve_only = preserve_only
+        self.preserve_state = preserve_state
         self.path_tail = SAFE_PATH_MARKER + "_PATH_TAIL"
         self.symbolic_names = (SAFE_PATH_MARKER, SHELL_PID_MARKER)
         self.steps = 0
@@ -796,6 +797,10 @@ class _EffectAudit:
             return [frame]
         if node.kind == "for":
             name = node.words[0].raw
+            if self.preserve_only and len(node.words) == 3:
+                array = re.fullmatch(r'"\$\{([A-Za-z_][A-Za-z0-9_]*)\[@\]\}"', node.words[2].raw)
+                if array is not None and frame.lookup(array[1]) is None:
+                    return self.unknown_for(program, node, frame)
             values = self.arguments(node.words[2:], frame, program) if len(node.words) > 1 else frame.argv
             if len(values) > 128:
                 raise _UnresolvedError
@@ -847,6 +852,46 @@ class _EffectAudit:
                     return completed
             raise _UnresolvedError
         return self.command(program, node, frame)
+
+    def unknown_for(self, program, node, frame):
+        """Audit any finite array length without inventing its data values."""
+        if self.preserve_state is None:
+            raise _UnresolvedError
+        zero = frame.copy()
+        zero.status = True
+        completed = [zero]
+        entry = frame.copy()
+        entry.assign(node.words[0].raw, None)
+        entry.uncertain = True
+        entry.status = None
+        entry.output = None
+        for _ in range(_MAX_DEPTH):
+            self.tick()
+            previous_effects = self.preserve_state()
+            body = entry.copy()
+            body.assign(node.words[0].raw, None)
+            continuing = []
+            for branch in self.run(program, node.blocks[0], [body]):
+                if branch.flow in {"return", "exit"}:
+                    completed.append(branch)
+                elif branch.flow == "break":
+                    branch.flow = ""
+                    completed.append(branch)
+                else:
+                    if branch.flow == "continue":
+                        branch.flow = ""
+                    continuing.append(branch)
+            if not continuing:
+                return self.join(completed)
+            # Include the earlier entry before another iteration. Changed
+            # data becomes unknown before it can choose the next effects.
+            successor, = self.join([entry, *continuing])
+            successor.status = None
+            successor.output = None
+            if successor == entry and previous_effects == self.preserve_state():
+                return self.join([*completed, successor])
+            entry = successor
+        raise _UnresolvedError
 
     def condition(self, raw, frame, program, depth=0, *, extended=True):
         self.tick()
@@ -1441,6 +1486,7 @@ def _audit_prefix(
     read_source: Callable[[str], str | None] | None = None,
     native_effect: NativeEffect | None = None,
     preserve_effect: NativeEffect | None = None,
+    preserve_state: Callable[[], object] | None = None,
 ) -> bool:
     from skillspector.shell_sources import (
         MAX_SHELL_SOURCE_CHARS, MAX_SHELL_SOURCE_FILES, SAFE_PATH_MARKER, _canonical_path,
@@ -1452,6 +1498,8 @@ def _audit_prefix(
         target_path not in resolver.context.sources or read_source is None or native_effect is not None
     ):
         return False
+    if preserve_state is not None and preserve_effect is None:
+        return False
     if (
         len(resolver.context.sources) > MAX_SHELL_SOURCE_FILES
         or sum(map(len, resolver.context.sources.values())) > MAX_SHELL_SOURCE_CHARS
@@ -1462,7 +1510,7 @@ def _audit_prefix(
         or any(is_managed_shell_variable(name) and name != "PATH" for name in resolver.inherited_values)
     ):
         return False
-    audit = _EffectAudit(resolver, target_path, read_source, preserve_effect if preserve_effect is not None else native_effect, preserve_only=preserve_effect is not None)
+    audit = _EffectAudit(resolver, target_path, read_source, preserve_effect if preserve_effect is not None else native_effect, preserve_only=preserve_effect is not None, preserve_state=preserve_state)
     try:
         program = audit.program(resolver.context.path, resolver.content)
         # A consumer boundary must coincide with a complete preceding program.
@@ -1492,6 +1540,7 @@ def source_effects_preserve(
     read_source: Callable[[str], str | None] | None = None,
     native_effect: NativeEffect | None = None,
     preserve_effect: NativeEffect | None = None,
+    preserve_state: Callable[[], object] | None = None,
 ) -> bool:
     """Prove prior reached code preserves a relative cached source, or refuse.
 
@@ -1506,8 +1555,11 @@ def source_effects_preserve(
     writes and protect current executable/source dependencies across branches;
     a successful result authorizes original target bytes only, never generated
     artifact facts. Unknown data and joined bindings cannot supply code or paths.
+    Unknown array loops additionally require ``preserve_state``: an immutable
+    snapshot of every callback/source identity and write fact, whose exact
+    equality proves that another iteration cannot discover different effects.
     """
-    return _audit_prefix(resolver, target_path, use_offset, read_source=read_source, native_effect=native_effect, preserve_effect=preserve_effect)
+    return _audit_prefix(resolver, target_path, use_offset, read_source=read_source, native_effect=native_effect, preserve_effect=preserve_effect, preserve_state=preserve_state)
 
 
 def source_effects_collect(

@@ -41,6 +41,7 @@ def _preserves_joined(caller: str, **kwargs) -> bool:
     resolver = _resolver(caller, _LIBRARY)
     kwargs.setdefault("read_source", resolver.context.sources.get)
     kwargs.setdefault("preserve_effect", _pure_preserve_effect)
+    kwargs.setdefault("preserve_state", lambda: ())
     return source_effects_preserve(resolver, "scripts/library.sh", len(caller), **kwargs)
 
 
@@ -57,6 +58,7 @@ def test_preservation_mode_is_explicit_and_cannot_collect_generated_facts() -> N
     assert not _preserves(caller, _LIBRARY)
     assert not _preserves(caller, _LIBRARY, native_effect=_pure_preserve_effect)
     assert not _preserves(caller, _LIBRARY, preserve_effect=_pure_preserve_effect)
+    assert not _preserves(':\n', _LIBRARY, preserve_state=lambda: ())
     assert not _preserves_joined(caller, native_effect=_pure_preserve_effect)
     assert not source_effects_collect(resolver, len(caller), read_source=resolver.context.sources.get, native_effect=_pure_preserve_effect)
     assert not source_effects_preserve(resolver, "scripts/generated.sh", len(caller), read_source=resolver.context.sources.get, preserve_effect=_pure_preserve_effect)
@@ -132,6 +134,125 @@ def test_preservation_callbacks_see_every_optional_write_before_join() -> None:
     caller = 'if [[ "$unknown" == yes ]]; then printf one > /tmp/left; else printf two > /tmp/right; fi\n'
     assert _preserves_joined(caller, preserve_effect=callback)
     assert writes == {"/tmp/left", "/tmp/right"}
+
+
+def test_unknown_array_loop_is_preservation_only_and_audits_its_body() -> None:
+    caller = 'for item in "${items[@]}"; do printf "%s" "$item"; done\n'
+    assert not _preserves(caller, _LIBRARY, native_effect=_pure_preserve_effect)
+    assert not _preserves_joined(caller, preserve_state=None)
+    assert _preserves_joined(caller)
+    assert not _preserves_joined(caller.replace('printf "%s" "$item"', 'printf changed > scripts/library.sh'))
+
+
+@pytest.mark.parametrize("body", [
+    'printf changed > "$item"', '"$item" /tmp/other', 'source "$item"',
+    'bash -c "$item"', 'unknown_helper "$item"',
+])
+def test_unknown_array_items_cannot_supply_paths_or_code(body: str) -> None:
+    assert not _preserves_joined('for item in "${items[@]}"; do ' + body + '; done\n')
+
+
+@pytest.mark.parametrize("flow", ["break", "continue", "return", "exit"])
+def test_unknown_array_loop_does_not_erase_zero_iterations(flow: str) -> None:
+    caller = 'check() { path=scripts/library.sh; for item in "${items[@]}"; do path=/tmp/other; ' + flow + '; done; printf changed > "$path"; }\ncheck\n'
+    assert not _preserves_joined(caller)
+
+
+@pytest.mark.parametrize("flow", ["break", "continue", "return", "exit"])
+def test_unknown_array_loop_audits_writes_before_control_transfer(flow: str) -> None:
+    caller = 'check() { for item in "${items[@]}"; do printf changed > scripts/library.sh; ' + flow + '; done; }\ncheck\n'
+    assert not _preserves_joined(caller)
+    assert _preserves_joined(caller.replace('printf changed > scripts/library.sh', 'printf safe'))
+
+
+def test_unknown_array_loop_widens_before_a_possible_second_iteration() -> None:
+    caller = 'path=/tmp/other\nfor item in "${items[@]}"; do printf changed > "$path"; path=scripts/library.sh; done\n'
+    assert not _preserves_joined(caller)
+    assert _preserves_joined(caller.replace('path=scripts/library.sh', 'path=/tmp/other'))
+
+
+def test_unknown_array_loop_keeps_break_paths_out_of_later_iterations() -> None:
+    caller = 'for item in "${items[@]}"; do break; printf changed > scripts/library.sh; done\n'
+    assert _preserves_joined(caller)
+    assert not _preserves_joined(caller + 'printf changed > scripts/library.sh\n')
+
+
+@pytest.mark.parametrize("body", ['callee() { :; }', 'trap ":" EXIT', 'export changed', 'local changed=value', 'shift'])
+def test_unknown_array_loop_refuses_changing_callable_or_scope_identity(body: str) -> None:
+    caller = 'check() { for item in "${items[@]}"; do ' + body + '; done; }\ncheck one two\n'
+    assert not _preserves_joined(caller)
+
+
+def test_unknown_array_loop_callbacks_cannot_publish_one_iterations_output() -> None:
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        return _pure_preserve_effect(command)
+
+    assert _preserves_joined('for item in "${items[@]}"; do printf safe > /tmp/output; done\n', preserve_effect=callback)
+    assert requests and all(command.uncertain for command in requests)
+
+
+def test_known_array_loop_stays_exact_in_preservation_mode() -> None:
+    caller = 'items=()\nfor item in "${items[@]}"; do printf changed > scripts/library.sh; done\n'
+    assert _preserves_joined(caller, preserve_state=None)
+    assert not _preserves_joined(caller.replace('items=()', 'items=(one)'))
+
+
+def test_unknown_loop_rechecks_a_file_predicate_after_late_mutation() -> None:
+    touched = set()
+
+    def callback(command):
+        if command.argv == ("test", "-e", "/tmp/marker"):
+            return ShellEffectResult(status=bool(touched))
+        if command.argv == ("touch", "/tmp/marker"):
+            touched.add("/tmp/marker")
+            return ShellEffectResult(writes=("/tmp/marker",))
+        return _pure_preserve_effect(command)
+
+    caller = 'for item in "${items[@]}"; do if [[ -e /tmp/marker ]]; then printf changed > scripts/library.sh; fi; touch /tmp/marker; done\n'
+    assert not _preserves_joined(caller, preserve_effect=callback, preserve_state=lambda: frozenset(touched))
+    assert touched == {"/tmp/marker"}
+
+
+def test_unknown_loop_rechecks_current_helper_bytes_after_late_rewrite() -> None:
+    rewritten = set()
+
+    def callback(command):
+        if ("1>", "/tmp/helper.sh") in command.redirects:
+            rewritten.add("/tmp/helper.sh")
+        return _pure_preserve_effect(command)
+
+    def read_source(path):
+        return ":\n" if path == "/tmp/helper.sh" and not rewritten else None
+
+    caller = 'for item in "${items[@]}"; do source /tmp/helper.sh; printf changed > /tmp/helper.sh; done\n'
+    assert not _preserves_joined(caller, read_source=read_source, preserve_effect=callback, preserve_state=lambda: frozenset(rewritten))
+    assert rewritten == {"/tmp/helper.sh"}
+
+
+def test_unknown_loop_repeated_disjoint_write_can_reach_semantic_fixed_point() -> None:
+    writes = set()
+
+    def callback(command):
+        writes.update(value for operator, value in command.redirects if ">" in operator)
+        return _pure_preserve_effect(command)
+
+    caller = 'for item in "${items[@]}"; do printf safe > /tmp/log; done\n'
+    assert _preserves_joined(caller, preserve_effect=callback, preserve_state=lambda: frozenset(writes))
+    assert writes == {"/tmp/log"}
+
+
+def test_unknown_loop_refuses_unbounded_callback_state_changes() -> None:
+    calls = []
+
+    def callback(command):
+        calls.append(command)
+        return _pure_preserve_effect(command)
+
+    assert not _preserves_joined('for item in "${items[@]}"; do printf safe; done\n', preserve_effect=callback, preserve_state=lambda: len(calls))
+    assert len(calls) <= 16
 
 
 def test_import_installs_definitions_without_running_main_or_uncalled_writer() -> None:
