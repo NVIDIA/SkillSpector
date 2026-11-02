@@ -382,10 +382,17 @@ _MAX_LETTER_SPACING_SECURITY_PHRASE = max(
 class _ArtifactIntegrityResourceLimitError(RuntimeError):
     """Stop attacker-controlled work while retaining a deterministic prefix."""
 
-    def __init__(self, reason: LedgerReason, metrics: dict[str, int | float]) -> None:
+    def __init__(
+        self,
+        reason: LedgerReason,
+        metrics: dict[str, int | float],
+        *,
+        terminal: bool = True,
+    ) -> None:
         super().__init__(reason.value)
         self.reason = reason
         self.metrics = metrics
+        self.terminal = terminal
 
 
 @dataclass
@@ -760,18 +767,24 @@ def _timed_prompt_matches(
     """Apply the same interruptible matching budget to every prompt projection."""
     matching_seconds = 0.0
     matching_limit = _MULTILINE_PROMPT_PATTERN_SECONDS
+    terminal_timeout = False
     start = 0
     skip_empty = False
     while True:
         budget.check_runtime()
         remaining = transitive_remaining_seconds(budget.state)
         if remaining is not None:
-            matching_limit = min(matching_limit, matching_seconds + max(0.0, remaining))
+            workflow_limit = matching_seconds + max(0.0, remaining)
+            # A per-pattern cap ends this artifact; workflow exhaustion remains terminal.
+            if workflow_limit <= matching_limit:
+                matching_limit = workflow_limit
+                terminal_timeout = True
         timeout = matching_limit - matching_seconds
         if timeout <= 0:
             raise _ArtifactIntegrityResourceLimitError(
                 LedgerReason.RUNTIME_LIMIT,
                 {"observed_seconds": matching_seconds, "limit_seconds": matching_limit},
+                terminal=terminal_timeout,
             )
         started_at = time.thread_time()
         expired = False
@@ -1152,7 +1165,8 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         emitted_ids = [finding.finding_id for finding in path_findings]
         if resource_limit is not None:
             event = _partial_limit_event(path, resource_limit, emitted_ids)
-            terminal_limit = resource_limit
+            if resource_limit.terminal:
+                terminal_limit = resource_limit
         else:
             event = ledger_event(
                 analyzer_id=ANALYZER_ID,

@@ -57,6 +57,11 @@ def test_negated_recommendation_is_not_self_modification(content: str) -> None:
         "Do not recommend it just apply `self-update` now.",
         "Do not recommend use `self-update` now.",
         "Do not recommend employ `self-update` now.",
+        # A gerund that negates the action makes a double negative:
+        # "never recommend skipping X" instructs X.
+        "Never recommend skipping `self-update`.",
+        "Do not suggest delaying `self-update` after a failure.",
+        "Do not advise avoiding `self-update` on the host.",
     ],
 )
 def test_affirmative_or_ungoverned_recommendation_still_flags(content: str) -> None:

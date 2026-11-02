@@ -1057,6 +1057,9 @@ def _render_terminal_completeness(
     table.add_column("Value")
     table.add_row("Execution", "successful" if execution_successful else "failed")
     table.add_row("Status", _terminal_text(completeness.get("status", "complete")))
+    dependency_inspection = completeness.get("dependency_inspection")
+    if isinstance(dependency_inspection, dict):
+        table.add_row("Dependency contents", _terminal_text(dependency_inspection.get("status")))
     table.add_row("Coverage", _terminal_text(f"{completeness.get('coverage_percent', 100.0)}%"))
     table.add_row("Fully inspected", _terminal_text(completeness.get("fully_inspected_files", 0)))
     table.add_row(
@@ -1607,6 +1610,11 @@ def _render_markdown_completeness(
     lines.append("|--------|-------|")
     lines.append(f"| Execution | {'successful' if execution_successful else 'failed'} |")
     lines.append(f"| Status | {_markdown_cell(completeness.get('status', 'complete'))} |")
+    dependency_inspection = completeness.get("dependency_inspection")
+    if isinstance(dependency_inspection, dict):
+        lines.append(
+            f"| Dependency contents | {_markdown_cell(dependency_inspection.get('status'))} |"
+        )
     lines.append(f"| Coverage | {_markdown_cell(completeness.get('coverage_percent', 100.0))}% |")
     lines.append(
         f"| Fully inspected | {_markdown_cell(completeness.get('fully_inspected_files', 0))} |"
