@@ -600,7 +600,10 @@ def test_fresh_runtime_name_cannot_prune_conditional_writes(mode: str, condition
 def test_fresh_runtime_name_cannot_prune_case_writes(mode: str) -> None:
     prefix = 'set -e\ntmp="$(mktemp ' + mode + '/tmp/example.XXXXXX)"\n'
     assert not _preserves(prefix + 'case "$tmp" in /tmp/example.A*) printf changed > scripts/library.sh ;; esac\n', _LIBRARY)
-    assert _preserves(prefix + 'case "$tmp" in /tmp/example.A*) printf safe ;; *) printf other ;; esac\n', _LIBRARY)
+    # The shared case grammar still refuses slash-containing pattern labels.
+    assert not _preserves(prefix + 'case "$tmp" in /tmp/example.A*) printf safe ;; esac\n', _LIBRARY)
+    assert not _preserves(prefix + 'case "$tmp" in *) printf changed > scripts/library.sh ;; esac\n', _LIBRARY)
+    assert _preserves(prefix + 'case "$tmp" in *) printf safe ;; esac\n', _LIBRARY)
 
 
 @pytest.mark.parametrize("expansion", ["${tmp:0:6}", "${tmp#/tmp/}", "${#tmp}"])
