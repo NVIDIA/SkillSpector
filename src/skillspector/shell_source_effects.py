@@ -112,11 +112,12 @@ class _Frame:
     errexit: bool = False
     checked: bool = False
     required_path_output: bool = False
+    asynchronous: bool = False
 
     def copy(self) -> _Frame:
         return _Frame(self.values.copy(), self.argv, self.zero, self.cwd,
                       self.functions.copy(), [item.copy() for item in self.scopes],
-                      self.status, self.flow, self.output, self.uncertain, self.traps.copy(), self.exported.copy(), self.errexit, self.checked, self.required_path_output)
+                      self.status, self.flow, self.output, self.uncertain, self.traps.copy(), self.exported.copy(), self.errexit, self.checked, self.required_path_output, self.asynchronous)
 
     def lookup(self, name: str):
         for scope in reversed(self.scopes):
@@ -255,6 +256,7 @@ class _EffectsParser(_Parser):
             return super().node(depth)
         words = []
         redirects = []
+        process_inputs = []
         if self.peek() == "[[":
             while self.peek() and self.peek() != "]]":
                 words.append(self.take())
@@ -266,6 +268,15 @@ class _EffectsParser(_Parser):
                     descriptor = "0" if operator.raw.startswith("<") else "1"
                     if words and words[-1].end == operator.start and words[-1].raw.isdecimal():
                         descriptor = words.pop().raw
+                    if operator.raw == "<" and self.peek() == "<" and self.peek(1) == "(":
+                        marker = self.take("<")
+                        opening = self.take("(")
+                        if descriptor != "0" or redirects or marker.end != opening.start:
+                            raise _UnresolvedError
+                        process_inputs.append(self.sequence(frozenset({")"}), depth + 1))
+                        self.take(")")
+                        redirects.append(("0<process", marker))
+                        continue
                     destination = self.take()
                     redirects.append((descriptor + operator.raw, destination))
                 elif self.peek() == "(":
@@ -282,7 +293,9 @@ class _EffectsParser(_Parser):
                     words.append(self.take())
         if not words and not redirects:
             raise _UnresolvedError
-        return _Node("command", tuple(words), redirects=tuple(redirects))
+        if process_inputs and len(redirects) != 1:
+            raise _UnresolvedError
+        return _Node("command", tuple(words), blocks=tuple(process_inputs), redirects=tuple(redirects))
 
 
 class _EffectAudit:
@@ -709,6 +722,7 @@ class _EffectAudit:
             nested = frame.copy()
             nested.traps = {}
             nested.uncertain |= node.kind == "background"
+            nested.asynchronous |= node.kind == "background"
             branches = self.run(program, node.blocks[0], [nested])
             self.apply_traps(branches)
             frame.status = True if node.kind == "background" else branches[0].status if len(branches) == 1 else None
@@ -722,6 +736,7 @@ class _EffectAudit:
                 nested = frame.copy()
                 nested.traps = {}
                 nested.uncertain = True
+                nested.asynchronous = True
                 nested.checked = True
                 self.apply_traps(self.run(program, body, [nested]))
             frame.output, frame.status = None, None
@@ -811,6 +826,13 @@ class _EffectAudit:
                 self.word(operand, frame, program, assignment=True)
             return None
         values = tuple(self.word(item, frame, program, assignment=extended) for item in raw)
+        if frame.asynchronous and (
+            len(values) == 2 and values[0] not in {"-n", "-z"}
+            or len(values) == 3 and values[1] in {"-nt", "-ot", "-ef"}
+        ):
+            # An asynchronous child may observe files after later parent
+            # writes. The current artifact snapshot cannot prune its branches.
+            raise _UnresolvedError
         if len(values) == 2 and values[0] in {"-e", "-f", "-s", "-x", "-L", "-d"} and self.native_effect is not None:
             path = self.path(values[1], frame)
             if path is not None and self.conflicts_with_redirect(path):
@@ -845,7 +867,44 @@ class _EffectAudit:
             return {"-eq": a == b, "-ne": a != b, "-gt": a > b, "-ge": a >= b, "-lt": a < b, "-le": a <= b}[operator]
         return None
 
+    def process_input(self, program, node, frame):
+        words = [token.raw for token in node.words]
+        if len(node.blocks) != 1 or tuple(operator for operator, _ in node.redirects) != ("0<process",):
+            raise _UnresolvedError
+        if words and words[0].startswith("IFS="):
+            separator = words.pop(0)[4:]
+            if not re.fullmatch(r"(['\"])[!-~]\1", separator) or separator[1] in "'\"\\$`" or words[:1] != ["read"]:
+                raise _UnresolvedError
+        if words[:2] == ["read", "-r"]:
+            names = words[2:]
+        elif len(words) == 3 and words[:2] == ["mapfile", "-t"]:
+            names = words[2:]
+        else:
+            raise _UnresolvedError
+        if not names or len(names) > 128 or words[0] in frame.functions or any(not _NAME.fullmatch(name) or is_managed_shell_variable(name) for name in names):
+            raise _UnresolvedError
+        # Process substitution runs concurrently. Restrict its effects to
+        # copied functions and pure builtins, without snapshot-dependent reads.
+        child = frame.copy()
+        child.traps = {}
+        child.output = ""
+        child.uncertain = True
+        child.asynchronous = True
+        child.errexit = False
+        child.checked = True
+        self.apply_traps(self.run(program, node.blocks[0], [child]))
+        # A successful consumer does not prove that the producer completed.
+        # Keep values and status unknown until a separate output proof exists.
+        for name in names:
+            frame.assign(name, None)
+        frame.status = None
+        return [frame]
+
     def command(self, program, node, frame):
+        if node.blocks:
+            return self.process_input(program, node, frame)
+        if frame.asynchronous and node.redirects:
+            raise _UnresolvedError
         words = list(node.words)
         environment = {
             name: value if isinstance(value := frame.lookup(name), str) else None
@@ -969,7 +1028,7 @@ class _EffectAudit:
                 self.native(program, branch, completion, child=True)
             return branches
         if name in {"source", "."}:
-            if prefix or redirects or len(argv) < 2 or argv[1] is None:
+            if frame.asynchronous or prefix or redirects or len(argv) < 2 or argv[1] is None:
                 raise _UnresolvedError
             path = self.path(argv[1], frame)
             if path is not None and self.conflicts_with_redirect(path):
@@ -1012,6 +1071,8 @@ class _EffectAudit:
             frame.status = True
             return [frame]
         if name in {"bash", "/bin/bash", "/usr/bin/bash", "sh", "/bin/sh", "/usr/bin/sh"}:
+            if frame.asynchronous:
+                raise _UnresolvedError
             if name in {"bash", "/bin/bash", "/usr/bin/bash"} and len(argv) >= 2 and argv[1] is not None and not argv[1].startswith("-"):
                 if self.native_effect is None:
                     raise _UnresolvedError
@@ -1120,6 +1181,8 @@ class _EffectAudit:
         return False
 
     def begin_redirects(self, request, frame):
+        if frame.asynchronous and request.redirects:
+            raise _UnresolvedError
         paths = [
             self.path(value, frame) for operator, value in request.redirects
             if operator in {"1>", "1>>", "2>", "2>>"} and value != "/dev/null"
@@ -1141,6 +1204,11 @@ class _EffectAudit:
             del self.active_redirects[-count:]
 
     def native(self, program, frame, request, *, child=False):
+        if frame.asynchronous and (
+            request.interpreter is not None or request.redirects
+            or not (child and request.child_inspected) and request.argv[0] not in {":", "true", "false", "printf", "echo", "set"}
+        ):
+            raise _UnresolvedError
         if not request.child_inspected:
             request = replace(request, fail_stop=(frame.errexit and not frame.checked) or (frame.required_path_output and request.interpreter is None and request.argv[0] == "cd"))
         redirect_frame = replace(frame, cwd=request.cwd)
@@ -1175,7 +1243,14 @@ class _EffectAudit:
                 raise _UnresolvedError
             if ">" in operator and value != "/dev/null" and not self.disjoint(path):
                 raise _UnresolvedError
-        result = self.native_effect(request) if self.native_effect is not None else self.native_default(request, frame, child=child)
+        if frame.asynchronous:
+            # These proved shell builtins do not consult PATH. Avoid callback
+            # script lookup against files that may change after the read returns.
+            result = self.native_default(replace(request, environment={}), frame, child=child)
+            if result is not None:
+                result = replace(result, native_identity=not child)
+        else:
+            result = self.native_effect(request) if self.native_effect is not None else self.native_default(request, frame, child=child)
         if result is None or any(not self.disjoint(path) or self.conflicts_with_redirect(path) for path in result.writes):
             raise _UnresolvedError
         if result.stdout is not None and SHELL_PID_MARKER in result.stdout:

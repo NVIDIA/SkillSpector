@@ -328,6 +328,115 @@ def test_child_completion_still_checks_callback_writes_and_nested_redirects() ->
     assert not _preserves(caller.replace('check /tmp )', 'check /tmp > /tmp/log )'), _LIBRARY)
 
 
+@pytest.mark.parametrize("consumer", ["IFS='|' read -r first second", 'read -r value', 'mapfile -t values'])
+def test_bounded_process_input_audits_benign_producer_without_inventing_values(consumer: str) -> None:
+    assert _preserves(consumer + ' < <(printf ready)\n', _LIBRARY)
+    assert not _preserves(consumer + ' < <(printf changed > scripts/library.sh)\n', _LIBRARY)
+
+
+def test_process_input_assignments_do_not_leak_back_into_parent() -> None:
+    caller = 'kept=original\nread -r value < <(kept=changed; printf ready)\n'
+    caller += 'if [[ "$kept" == original ]]; then :; else printf changed > scripts/library.sh; fi\n'
+    assert _preserves(caller, _LIBRARY)
+    assert not _preserves('target=/tmp/safe\nread -r target < <(printf ready)\nprintf changed > "$target"\n', _LIBRARY)
+
+
+def test_process_input_refuses_file_writes_even_with_explicit_errexit() -> None:
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        return ShellEffectResult(command.stdout, True, ("/tmp/generated",))
+
+    assert not _preserves('mapfile -t lines < <(set -e; printf generated > /tmp/generated)\n', _LIBRARY, native_effect=callback)
+    assert not requests
+
+
+def test_process_input_cannot_prune_file_branch_before_parent_creates_marker() -> None:
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        return ShellEffectResult(command.stdout, False if command.argv[0] == "test" else True)
+
+    caller = 'read -r value < <(printf ready; if [[ -e /tmp/marker ]]; then printf changed > scripts/library.sh; fi)\n'
+    caller += 'printf created > /tmp/marker\n'
+    assert not _preserves(caller, _LIBRARY, native_effect=callback)
+    assert not requests
+
+
+@pytest.mark.parametrize("read", ['source scripts/helper.sh', '. scripts/helper.sh', 'bash scripts/helper.sh', 'scripts/helper.sh', 'cat scripts/helper.sh', 'command -v helper'])
+def test_process_input_refuses_source_and_command_identity_snapshot_races(read: str) -> None:
+    caller = 'read -r value < <(printf ready; ' + read + ')\nprintf changed > scripts/helper.sh\n'
+    assert not _preserves(caller, _LIBRARY, read_source={"scripts/helper.sh": ':\n'}.get)
+
+
+def test_process_input_can_use_copied_pure_function_without_artifact_callbacks() -> None:
+    caller = 'emit() { if [[ "$1" == ready ]]; then printf "%s" "$1"; fi; }\nread -r value < <(emit ready)\n'
+
+    def callback(command):
+        pytest.fail("pure process producer must not consult mutable artifact state")
+
+    assert _preserves(caller, _LIBRARY, native_effect=callback)
+
+
+def test_process_input_async_restrictions_follow_function_and_substitution_copies() -> None:
+    caller = 'emit() { value="$(cat scripts/helper.sh)"; }\nread -r value < <(emit)\n'
+    assert not _preserves(caller, _LIBRARY, read_source={"scripts/helper.sh": ':\n'}.get)
+
+
+@pytest.mark.parametrize("caller", ['printf ready &\n', 'printf ready | :\n'])
+def test_background_and_pipeline_allow_only_proved_pure_effects(caller: str) -> None:
+    assert _preserves(caller, _LIBRARY)
+
+
+@pytest.mark.parametrize("suffix", [' &\n', ' | printf ready\n'])
+@pytest.mark.parametrize("body", [
+    'if [[ -e /tmp/marker ]]; then printf changed > scripts/library.sh; fi',
+    'source scripts/helper.sh',
+    'printf changed > /tmp/generated',
+])
+def test_background_and_pipeline_cannot_reuse_mutable_file_snapshots(body: str, suffix: str) -> None:
+    caller = '( ' + body + ' )' + suffix + 'printf changed > scripts/helper.sh\n'
+    assert not _preserves(caller, _LIBRARY, read_source={"scripts/helper.sh": ':\n'}.get)
+
+
+@pytest.mark.parametrize("producer", [
+    'printf changed > "$unknown"',
+    'trap \'printf changed > scripts/library.sh\' EXIT; printf ready',
+    'cat /tmp/log',
+    'printf changed > /tmp/log',
+])
+def test_process_input_keeps_unknown_path_trap_and_active_output_guards(producer: str) -> None:
+    assert not _preserves('( read -r value < <(' + producer + ') ) > /tmp/log\n', _LIBRARY)
+
+
+def test_process_input_does_not_inherit_parent_exit_trap() -> None:
+    caller = "trap 'printf changed > scripts/library.sh' EXIT\nread -r value < <(printf ready)\n"
+    assert _preserves(caller, _LIBRARY)
+
+
+@pytest.mark.parametrize("caller", [
+    'read -d x value < <(printf ready)\n',
+    'mapfile -n 1 values < <(printf ready)\n',
+    'read() { :; }\nread -r value < <(printf ready)\n',
+    'IFS="$unknown" read -r value < <(printf ready)\n',
+    'IFS=" " read -r value < <(printf ready)\n',
+    'read -r PATH < <(printf ready)\n',
+    'read -r value < < (printf ready)\n',
+    'read -r value < <(printf ready) > /tmp/output\n',
+    'read -r value < <(printf ready) < <(printf other)\n',
+])
+def test_unsupported_process_input_forms_refuse(caller: str) -> None:
+    assert not _preserves(caller, _LIBRARY)
+
+
+@pytest.mark.parametrize("consumer", ['read -r value', 'mapfile -t values'])
+@pytest.mark.parametrize("branch", ['then printf changed > scripts/library.sh; else :', 'then :; else printf changed > scripts/library.sh'])
+def test_process_input_never_uses_producer_status_as_consumer_success(consumer: str, branch: str) -> None:
+    assert not _preserves('if ' + consumer + ' < <(false); ' + branch + '; fi\n', _LIBRARY)
+
+
 @pytest.mark.parametrize("operator", ["#", "##", "%", "%%"])
 def test_uncalled_quoted_pattern_removal_keeps_its_function_boundary(operator: str) -> None:
     library = 'unused() {\nprintf "%s\\n" "${path' + operator + '"$ROOT"/}"\n}\n'
