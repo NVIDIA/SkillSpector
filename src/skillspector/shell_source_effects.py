@@ -40,6 +40,7 @@ class ShellEffectCommand:
     child_inspected: bool = False
     child_status: bool | None = None
     redirect_open: bool = False
+    fail_stop: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,11 +88,13 @@ class _Frame:
     uncertain: bool = False
     traps: dict[str, tuple[_Program, str]] = field(default_factory=dict)
     exported: set[str] = field(default_factory=set)
+    errexit: bool = False
+    checked: bool = False
 
     def copy(self) -> _Frame:
         return _Frame(self.values.copy(), self.argv, self.zero, self.cwd,
                       self.functions.copy(), [item.copy() for item in self.scopes],
-                      self.status, self.flow, self.output, self.uncertain, self.traps.copy(), self.exported.copy())
+                      self.status, self.flow, self.output, self.uncertain, self.traps.copy(), self.exported.copy(), self.errexit, self.checked)
 
     def lookup(self, name: str):
         for scope in reversed(self.scopes):
@@ -357,7 +360,7 @@ class _EffectAudit:
             return False
         return canonical.rpartition("/")[2] != self.target.rpartition("/")[2]
 
-    def word(self, raw, frame, program, *, assignment=False):
+    def word(self, raw, frame, program, *, assignment=False, final_assignment=False):
         parts, quote, cursor, unknown = [], "", 0, False
         while cursor < len(raw):
             self.tick()
@@ -397,8 +400,21 @@ class _EffectAudit:
                     raise _Unresolved
                 child = frame.copy()
                 child.output, child.flow = "", ""
+                # Bash command substitution clears errexit unless explicitly
+                # enabled inside; unsupported inherit_errexit settings refuse.
+                child.errexit = False
                 nested = self.program(program.path, raw[cursor + 2:end - 1])
-                branches = self.run(nested, self.parse(nested), [child])
+                nodes = self.parse(nested)
+                sole_value = cursor == 0 and end == len(raw) or cursor == 1 and raw[:1] == raw[-1:] == '"' and end == len(raw) - 1
+                if (
+                    final_assignment and frame.errexit and not frame.checked and sole_value
+                    and len(nodes) == 1 and nodes[0].kind == "command" and not nodes[0].redirects
+                    and nodes[0].words and nodes[0].words[0].raw in {"mktemp", "/bin/mktemp", "/usr/bin/mktemp"}
+                ):
+                    # A failed sole mktemp is the assignment's own status,
+                    # so its parent cannot consume a fabricated temp path.
+                    child.errexit = True
+                branches = self.run(nested, nodes, [child])
                 self.apply_traps(branches)
                 values = {branch.output.rstrip("\n") if branch.output is not None else None for branch in branches}
                 value = next(iter(values)) if len(values) == 1 else None
@@ -495,7 +511,7 @@ class _EffectAudit:
         try:
             if self.depth > _MAX_DEPTH:
                 raise _Unresolved
-            for node in nodes:
+            for index, node in enumerate(nodes):
                 output = []
                 for frame in frames:
                     self.tick()
@@ -507,7 +523,12 @@ class _EffectAudit:
                         skipped.status = node.connector == "||"
                         skipped.uncertain = frame.uncertain = True
                         output.append(skipped)
-                    output.extend(self.node(program, node, frame))
+                    previous_checked = frame.checked
+                    frame.checked |= index + 1 < len(nodes) and nodes[index + 1].connector in {"&&", "||"}
+                    branches = self.node(program, node, frame)
+                    for branch in branches:
+                        branch.checked = previous_checked
+                    output.extend(branches)
                 if len(output) > _MAX_STATES:
                     raise _Unresolved
                 frames = output
@@ -532,15 +553,20 @@ class _EffectAudit:
                 raise _Unresolved
             return [frame]
         if node.kind == "negate":
+            frame.checked = True
             branches = self.run(program, node.blocks[0], [frame])
             for branch in branches:
                 branch.status = None if branch.status is None else not branch.status
             return branches
         if node.kind == "if":
             remaining, result = [frame], []
+            previous_checked = frame.checked
             for index in range(0, len(node.blocks) - 1, 2):
                 next_remaining = []
+                for condition in remaining:
+                    condition.checked = True
                 for condition in self.run(program, node.blocks[index], remaining):
+                    condition.checked = previous_checked
                     if condition.status is not False:
                         accepted = condition.copy()
                         accepted.uncertain |= condition.status is None
@@ -549,6 +575,9 @@ class _EffectAudit:
                         condition.uncertain |= condition.status is None
                         next_remaining.append(condition)
                 remaining = next_remaining
+            if not node.blocks[-1]:
+                for branch in remaining:
+                    branch.status = True
             return result + self.run(program, node.blocks[-1], remaining)
         if node.kind == "case":
             value = self.word(node.words[0].raw, frame, program)
@@ -557,11 +586,14 @@ class _EffectAudit:
                 if value is None or any(fnmatch.fnmatchcase(value, label) for label in labels):
                     branch = frame.copy()
                     branch.uncertain |= value is None
+                    if not body:
+                        branch.status = True
                     result.extend(self.run(program, body, [branch]))
                     if value is not None:
                         return result
             if value is None:
                 frame.uncertain = True
+            frame.status = True
             return result + [frame]
         if node.kind in {"group", "subshell", "background"}:
             if node.kind == "group":
@@ -580,6 +612,7 @@ class _EffectAudit:
                 # Pipeline members share files, not shell-variable changes.
                 nested = frame.copy()
                 nested.uncertain = True
+                nested.checked = True
                 self.run(program, body, [nested])
             frame.output, frame.status = None, None
             return [frame]
@@ -588,6 +621,8 @@ class _EffectAudit:
             values = self.arguments(node.words[2:], frame, program) if len(node.words) > 1 else frame.argv
             if len(values) > 128:
                 raise _Unresolved
+            if not values:
+                frame.status = True
             branches = [frame]
             for value in values:
                 for branch in branches:
@@ -599,12 +634,19 @@ class _EffectAudit:
             return branches
         if node.kind in {"while", "until"}:
             branches, completed = [frame], []
-            for _ in range(128):
+            previous_checked = frame.checked
+            for iteration in range(128):
                 pending = []
+                for branch in branches:
+                    branch.checked = True
                 for branch in self.run(program, node.blocks[0], branches):
+                    branch.checked = previous_checked
                     if branch.status is None:
                         raise _Unresolved
                     if branch.status == (node.kind == "until"):
+                        # The terminating condition is not the loop's exit
+                        # status. Retain uncertainty after any body ran.
+                        branch.status = True if iteration == 0 else None
                         completed.append(branch)
                     else:
                         pending.append(branch)
@@ -677,9 +719,11 @@ class _EffectAudit:
         }
         prefix = []
         assignment_frame = frame.copy()
+        assignment_substitution = False
         while words and (assignment := _ASSIGN.fullmatch(words[0].raw)):
             token = words.pop(0)
             name, raw = assignment.groups()
+            assignment_substitution |= "$(" in raw.replace("$((", "") or "`" in raw
             if words[:1] and words[0].raw == "(":
                 closing = next((index for index, word in enumerate(words) if word.raw == ")"), -1)
                 if raw or closing < 0:
@@ -687,7 +731,7 @@ class _EffectAudit:
                 value = self.arguments(words[1:closing], assignment_frame, program)
                 del words[:closing + 1]
             else:
-                value = self.word(raw, assignment_frame, program, assignment=True)
+                value = self.word(raw, assignment_frame, program, assignment=True, final_assignment=len(node.words) == 1 and not node.redirects)
             if is_managed_shell_variable(name):
                 if name != "PATH" or not words or not isinstance(value, str):
                     raise _Unresolved
@@ -717,6 +761,7 @@ class _EffectAudit:
                 self.native(program, frame, ShellEffectCommand((":",), environment, frame.cwd, program.path, node.redirects[0][1].start, tuple(redirects)))
             for name, value in prefix:
                 frame.assign(name, value)
+            frame.status = None if assignment_substitution else True
             return [frame]
         # Redirections happen before dispatch, including tests and builtins.
         for operator, value in redirects:
@@ -772,7 +817,7 @@ class _EffectAudit:
             previous = frame.argv
             previous_output = frame.output
             redirect_cwd = frame.cwd
-            request = ShellEffectCommand(argv, environment, redirect_cwd, program.path, words[0].start, tuple(redirects), stdin, uncertain=frame.uncertain)
+            request = ShellEffectCommand(argv, environment, redirect_cwd, program.path, words[0].start, tuple(redirects), stdin, uncertain=frame.uncertain, fail_stop=frame.errexit and not frame.checked)
             opened = self.begin_redirects(request, frame)
             frame.argv = argv[1:]
             frame.output = ""
@@ -786,8 +831,8 @@ class _EffectAudit:
                     branch.flow = ""
                 output = branch.output
                 branch.output = previous_output
-                request = ShellEffectCommand(argv, environment, redirect_cwd, program.path, words[0].start, tuple(redirects), stdin, output, branch.uncertain, child_inspected=True, child_status=branch.status)
-                self.native(program, branch, request, child=True)
+                completion = replace(request, stdout=output, uncertain=branch.uncertain, child_inspected=True, child_status=branch.status)
+                self.native(program, branch, completion, child=True)
             return branches
         if name in {"source", "."}:
             if prefix or redirects or len(argv) < 2 or argv[1] is None:
@@ -842,7 +887,7 @@ class _EffectAudit:
                     raise _Unresolved
             if len(argv) < 3 or argv[1] != "-c" or argv[2] is None:
                 raise _Unresolved
-            redirect_request = ShellEffectCommand(argv, environment, frame.cwd, program.path, words[0].start, tuple(redirects), stdin, uncertain=frame.uncertain)
+            redirect_request = ShellEffectCommand(argv, environment, frame.cwd, program.path, words[0].start, tuple(redirects), stdin, uncertain=frame.uncertain, fail_stop=frame.errexit and not frame.checked)
             opened = self.begin_redirects(redirect_request, frame)
             child = _Frame(environment, argv[4:], argv[3] if len(argv) > 3 and argv[3] is not None else name, frame.cwd, uncertain=frame.uncertain, exported=set(environment))
             nested = self.program(program.path, argv[2])
@@ -852,7 +897,7 @@ class _EffectAudit:
             frame.status = branches[0].status if len(branches) == 1 else None
             outputs = {branch.output for branch in branches}
             output = outputs.pop() if len(outputs) == 1 else None
-            request = ShellEffectCommand(argv, environment, frame.cwd, program.path, words[0].start, tuple(redirects), stdin, output, frame.uncertain, child_inspected=True, child_status=frame.status)
+            request = replace(redirect_request, stdout=output, child_inspected=True, child_status=frame.status)
             self.native(program, frame, request, child=True)
             return [frame]
         if name == "trap":
@@ -942,6 +987,8 @@ class _EffectAudit:
             del self.active_redirects[-count:]
 
     def native(self, program, frame, request, *, child=False):
+        if not request.child_inspected:
+            request = replace(request, fail_stop=frame.errexit and not frame.checked)
         redirect_frame = replace(frame, cwd=request.cwd)
         for value in request.argv:
             path = self.path(value, redirect_frame)
@@ -958,6 +1005,11 @@ class _EffectAudit:
         result = self.native_effect(request) if self.native_effect is not None else self.native_default(request, frame, child=child)
         if result is None or any(not self.disjoint(path) or self.conflicts_with_redirect(path) for path in result.writes):
             raise _Unresolved
+        if request.argv[0] == "set" and (result.native_identity or self.native_effect is None):
+            if request.argv[1:] in {("-euo", "pipefail"), ("-Eeuo", "pipefail"), ("-e",)}:
+                frame.errexit = True
+            elif request.argv[1:] == ("+e",):
+                frame.errexit = False
         if request.argv[0] == "cd" and result.native_identity:
             if len(request.argv) != 2 or result.status is not True:
                 raise _Unresolved
@@ -980,7 +1032,14 @@ class _EffectAudit:
             result = self.native_effect(completion) if self.native_effect is not None else result
             if result is None or result.script_path is not None or any(not self.disjoint(path) or self.conflicts_with_redirect(path) for path in result.writes):
                 raise _Unresolved
+        native_name = request.argv[0].rpartition("/")[2] if request.argv[0] is not None else ""
+        if not request.child_inspected and native_name not in {":", "true", "false", "set", "cd", "pwd", "dirname"}:
+            # Native I/O success is not an exact status fact when a caller
+            # can continue after failure. Do not prune its explicit else/||.
+            result = replace(result, status=True if request.fail_stop else None)
         frame.status = result.status
+        if request.fail_stop and result.status is False:
+            frame.flow = "exit"
         if not any(operator.startswith("1>") for operator, _ in request.redirects):
             frame.output = frame.output + result.stdout if frame.output is not None and result.stdout is not None else None
 

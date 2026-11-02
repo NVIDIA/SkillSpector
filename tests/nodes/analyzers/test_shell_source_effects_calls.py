@@ -40,6 +40,22 @@ def test_import_installs_definitions_without_running_main_or_uncalled_writer() -
     assert _preserves('source scripts/library.sh\n', _LIBRARY)
 
 
+def test_sourced_main_guard_without_else_returns_success() -> None:
+    assert not _preserves('if source scripts/library.sh; then printf changed > scripts/library.sh; fi\n', _LIBRARY)
+
+
+@pytest.mark.parametrize("statement", [
+    "if false; then :; fi",
+    "false; case value in other) : ;; esac",
+    "false; for item in; do :; done",
+    "false; while false; do :; done",
+    "false; until true; do :; done",
+])
+def test_empty_compound_commands_do_not_retain_false_condition_status(statement: str) -> None:
+    caller = statement + '\nif [[ "$?" == 0 ]]; then printf changed > scripts/library.sh; fi\n'
+    assert not _preserves(caller, _LIBRARY)
+
+
 @pytest.mark.parametrize("opener, closer", [("$(", ")"), ('"$(', ')"')])
 def test_first_assignment_substitution_audits_only_prior_effects(opener: str, closer: str) -> None:
     caller = 'source scripts/library.sh\nhelper=' + opener + "sed -n 'p' scripts/library.sh" + closer + '\nmain\n'
@@ -147,6 +163,51 @@ if [[ "$rc" -eq 2 ]]; then printf changed > scripts/library.sh; fi
 
 def test_unknown_cd_failure_cannot_change_the_assumed_write_directory() -> None:
     assert not _preserves('cd /tmp/may-not-exist\nrm -rf .\n', _LIBRARY)
+
+
+@pytest.mark.parametrize("caller", [
+    'false\nif plain=value; then printf changed > scripts/library.sh; fi\n',
+    'if value="$(false)"; then :; else printf changed > scripts/library.sh; fi\n',
+    'printf value > /tmp/may-fail || printf changed > scripts/library.sh\n',
+])
+def test_assignment_and_io_status_cannot_skip_reachable_writes(caller: str) -> None:
+    assert not _preserves(caller, _LIBRARY)
+
+
+@pytest.mark.parametrize("statement, expected", [
+    ('set -e\nprintf ready\n', True),
+    ('set -e\nprintf ready || :\n', False),
+    ('set -e\nif printf ready; then :; fi\n', False),
+    ('set -e\nf() { printf ready; }; if f; then :; fi\n', False),
+    ('set -e\nset +e\nprintf ready\n', False),
+])
+def test_fail_stop_context_reaches_native_artifact_callback(statement: str, expected: bool) -> None:
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        return ShellEffectResult(command.stdout, True, native_identity=not command.child_inspected)
+
+    assert _preserves(statement, _LIBRARY, native_effect=callback)
+    printf = [command for command in requests if command.argv[0] == "printf"]
+    assert printf and all(command.fail_stop is expected for command in printf)
+
+
+@pytest.mark.parametrize("statement, expected", [
+    ('set -e\ntmp="$(mktemp -d /tmp/example.XXXXXX)"\n', True),
+    ('set -e\ntmp="$(mktemp -d /tmp/example.XXXXXX; true)"\n', False),
+    ('set -e\ntmp="$(mktemp -d /tmp/example.XXXXXX)" true\n', False),
+])
+def test_only_final_native_mktemp_borrows_assignment_failure_guard(statement: str, expected: bool) -> None:
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        return ShellEffectResult("/tmp/example\n" if command.argv[0] == "mktemp" else "", True, native_identity=True)
+
+    assert _preserves(statement, _LIBRARY, native_effect=callback)
+    mktemp = [command for command in requests if command.argv[0] == "mktemp"]
+    assert mktemp and all(command.fail_stop is expected for command in mktemp)
 
 
 def test_local_argument_binding_restores_parent_value() -> None:
