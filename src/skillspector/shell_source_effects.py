@@ -1137,10 +1137,26 @@ class _EffectAudit:
         if not request.child_inspected:
             request = replace(request, fail_stop=(frame.errexit and not frame.checked) or (frame.required_path_output and request.argv[0] == "cd"))
         redirect_frame = replace(frame, cwd=request.cwd)
+        argument_conflict = False
         for value in request.argv:
             path = self.path(value, redirect_frame)
             if path is not None and self.conflicts_with_redirect(path):
+                argument_conflict = True
+                break
+        if argument_conflict:
+            if (
+                request.child_inspected or self.native_effect is None
+                or len(request.argv) != 4
+                or request.argv[0] not in {"df", "/bin/df", "/usr/bin/df"}
+                or request.argv[1:3] != ("-B1", "--output=avail")
+                or request.argv[3] is None
+            ):
                 raise _UnresolvedError
+            identity = self.native_effect(replace(request, redirects=(), stdin=None, stdout=None, identity_only=True))
+            if identity is None or not identity.native_identity or identity.script_path is not None or identity.writes or identity.stdout is not None:
+                raise _UnresolvedError
+            # Proven native df reads filesystem metadata, not the bytes of an
+            # active output beneath that path. Its result remains unknown.
         for operator, value in request.redirects:
             if operator in {"1>&", "2>&", "0<&"} and value in {"0", "1", "2", "-"}:
                 continue

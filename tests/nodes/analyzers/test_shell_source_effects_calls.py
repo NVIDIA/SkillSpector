@@ -214,6 +214,41 @@ def test_real_or_unsupported_dollar_expansion_does_not_become_literal(value: str
     assert not _preserves('value=' + value + '\nprintf changed > "$value"\n', _LIBRARY)
 
 
+@pytest.mark.parametrize("executable", ["df", "/bin/df", "/usr/bin/df"])
+def test_proven_disk_metadata_query_can_run_beside_active_log(executable: str) -> None:
+    requests = []
+
+    def callback(command):
+        requests.append(command)
+        return ShellEffectResult(native_identity=command.identity_only)
+
+    assert _preserves('( ' + executable + ' -B1 --output=avail /tmp ) > /tmp/log\n', _LIBRARY, native_effect=callback)
+    probes = [command for command in requests if command.identity_only]
+    assert len(probes) == 1 and probes[0].redirects == ()
+
+
+@pytest.mark.parametrize("proof", [
+    None,
+    ShellEffectResult(),
+    ShellEffectResult(native_identity=True, script_path="scripts/library.sh"),
+    ShellEffectResult(native_identity=True, writes=("/tmp/log",)),
+])
+def test_unknown_or_generated_disk_query_cannot_skip_active_log_reads(proof) -> None:
+    def callback(command):
+        return proof if command.identity_only else ShellEffectResult()
+
+    assert not _preserves('( df -B1 --output=avail /tmp ) > /tmp/log\n', _LIBRARY, native_effect=callback)
+
+
+@pytest.mark.parametrize("caller", [
+    'df() { cat "$3/log"; }\n( df -B1 --output=avail /tmp ) > /tmp/log\n',
+    '( df -B1 --output=avail /tmp > /tmp/log ) > /tmp/log\n',
+    '( df /tmp ) > /tmp/log\n',
+])
+def test_disk_metadata_exception_keeps_shadow_and_write_guards(caller: str) -> None:
+    assert not _preserves(caller, _LIBRARY, native_effect=lambda command: ShellEffectResult(native_identity=True))
+
+
 @pytest.mark.parametrize("operator", ["#", "##", "%", "%%"])
 def test_uncalled_quoted_pattern_removal_keeps_its_function_boundary(operator: str) -> None:
     library = 'unused() {\nprintf "%s\\n" "${path' + operator + '"$ROOT"/}"\n}\n'
