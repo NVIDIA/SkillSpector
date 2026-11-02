@@ -1246,8 +1246,11 @@ def _bounded_sentence_end(
     maximum_end: int,
     *,
     end_is_truncated: bool,
+    closes_owned_string: Callable[[int], bool] | None = None,
 ) -> tuple[int, bool]:
-    for boundary_start, _ in _sentence_boundaries(text, start, min(len(text), maximum_end + 1)):
+    for boundary_start, _ in _sentence_boundaries(
+        text, start, min(len(text), maximum_end + 1), closes_owned_string=closes_owned_string
+    ):
         if boundary_start <= maximum_end:
             return boundary_start, False
     exhausted = maximum_end < len(text) or end_is_truncated
@@ -1286,7 +1289,10 @@ def _is_fence_line(text: str, cursor: int) -> bool:
     )
 
 
-def _sentence_boundaries(text: str, start: int, end: int) -> Iterator[tuple[int, int]]:
+def _sentence_boundaries(
+    text: str, start: int, end: int, *,
+    closes_owned_string: Callable[[int], bool] | None = None,
+) -> Iterator[tuple[int, int]]:
     """Yield prose boundaries while ignoring punctuation inside balanced quotes."""
     quote_close: str | None = None
     cursor = start
@@ -1314,7 +1320,12 @@ def _sentence_boundaries(text: str, start: int, end: int) -> Iterator[tuple[int,
             and text[cursor - 1].isalnum()
             and text[cursor + 1].isalnum()
         ):
-            quote_close = _QUOTE_OPEN_TO_CLOSE[character]
+            # A scan can begin inside an embedded program/string. Its host's
+            # proven closing delimiter does not open a new prose quotation
+            # that swallows subsequent line boundaries. Existing open quotes
+            # still close normally above, and literal contents remain scanned.
+            if closes_owned_string is None or not closes_owned_string(cursor):
+                quote_close = _QUOTE_OPEN_TO_CLOSE[character]
         elif character == "\n":
             yield cursor, cursor + 1
         elif character in ".!?" and (cursor + 1 == len(text) or text[cursor + 1].isspace()):
@@ -1832,6 +1843,7 @@ def _classify_directive(
     directive: _Directive,
     *,
     end_is_truncated: bool,
+    closes_owned_string: Callable[[int], bool] | None = None,
 ) -> _DirectiveClassification:
     if directive.exhausted:
         return _DirectiveClassification(None, False, True)
@@ -1842,6 +1854,7 @@ def _classify_directive(
         directive.end,
         scope_cap,
         end_is_truncated=end_is_truncated,
+        closes_owned_string=closes_owned_string,
     )
     lookahead_cap = min(len(view.text), directive.end + MAX_MARKER_LOOKAHEAD_CHARS)
     lookahead_end, lookahead_exhausted = _bounded_sentence_end(
@@ -1849,6 +1862,7 @@ def _classify_directive(
         directive.end,
         lookahead_cap,
         end_is_truncated=end_is_truncated,
+        closes_owned_string=closes_owned_string,
     )
     first_sentence_end = lookahead_end
     clause_start = _previous_sentence_boundary(
@@ -1871,6 +1885,7 @@ def _classify_directive(
             first_sentence_end + 1,
             lookahead_cap,
             end_is_truncated=end_is_truncated,
+            closes_owned_string=closes_owned_string,
         )
         lookahead_exhausted = lookahead_exhausted or continuation_exhausted
     payloads = _quoted_payloads(view.text, directive, scope_end)
@@ -2018,6 +2033,7 @@ def build_declared_marker_views(
             view,
             directive,
             end_is_truncated=source_end_is_truncated,
+            closes_owned_string=closes_owned_string,
         )
         limited = limited or classification.limited
         if classification.active and classification.limited:

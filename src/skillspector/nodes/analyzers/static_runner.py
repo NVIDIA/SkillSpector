@@ -70,6 +70,7 @@ from skillspector.python_ast import (
     resolve_python_source_classification,
 )
 from skillspector.python_tokens import PythonStringClosers
+from skillspector.shell_tokens import ShellStringClosers
 from skillspector.security_reconstruction import (
     MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
     MAX_MARKER_LOOKAHEAD_CHARS,
@@ -2124,12 +2125,12 @@ def _restore_source_lines(
 
 
 def _window_string_closer(
-    python_strings: PythonStringClosers, window_start: int
+    strings: PythonStringClosers | ShellStringClosers, window_start: int
 ) -> Callable[[int], bool]:
     """Answer string-closer queries in one window's source coordinates."""
 
     def closes_string(offset: int) -> bool:
-        return python_strings.closes_string(window_start + offset)
+        return strings.closes_string(window_start + offset)
 
     return closes_string
 
@@ -2196,12 +2197,22 @@ def _scan_declared_marker_views(
             )
         return True
 
-    # A complete Python module proves which quotes close its string literals.
-    # The proof covers the whole artifact, so it holds in every window. It is
-    # computed only when a loose quoted directive header reaches a quote.
-    python_strings = (
+    # Ownership covers the whole artifact, so a marker scan starting inside a
+    # literal can distinguish its closing quote from a new prose quotation.
+    # Both proofs are lazy and preserve literal contents for security checks.
+    strings: PythonStringClosers | ShellStringClosers | None = (
         PythonStringClosers(content, check_runtime) if _infer_file_type(path) == "python" else None
     )
+    if _infer_file_type(path) == "shell":
+        from . import static_patterns_tool_misuse as shell_parser
+
+        strings = ShellStringClosers(
+            content,
+            shell_parser._next_shell_invocation_word,
+            shell_parser._static_heredoc_header,
+            shell_parser._skip_static_heredoc_bodies,
+            check_runtime,
+        )
 
     for owned_start, raw_start in zip(owned_starts, raw_starts, strict=True):
         check_runtime()
@@ -2229,11 +2240,11 @@ def _scan_declared_marker_views(
         across_security_views = len(full_views) > 1
         check_runtime()
         # View offsets are window-relative. Synthetic Markdown fence context
-        # never occurs for Python, but it would not map onto module offsets.
+        # never occurs for source files, but it would not map onto source offsets.
         string_closer = (
             None
-            if python_strings is None or context_prefix
-            else _window_string_closer(python_strings, raw_start)
+            if strings is None or context_prefix
+            else _window_string_closer(strings, raw_start)
         )
         for full_view in full_views:
             full_view_limited = False
