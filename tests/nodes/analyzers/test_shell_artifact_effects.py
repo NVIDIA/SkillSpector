@@ -69,8 +69,8 @@ def test_source_provenance_and_executable_mode_survive_archive_roundtrip() -> No
     assert audit(_command(("mkdir", "-p", "/tmp/work/package"))) is not None
     assert audit(_command(("cp", "scripts/setup.sh", "/tmp/work/package/setup.sh"))) is not None
     assert audit(_command(("chmod", "+x", "/tmp/work/package/setup.sh"))) is not None
-    assert audit(_command(("tar", "-I", "pigz", "-cf", "/tmp/package.tgz", "-C", "/tmp/work", "package"))) is not None
-    assert audit(_command(("tar", "-I", "pigz", "-xf", "/tmp/package.tgz", "-C", "/tmp/extracted"))) is not None
+    assert audit(_command(("tar", "-I", "pigz", "-cf", "/tmp/work/package.tgz", "-C", "/tmp/work", "package"))) is not None
+    assert audit(_command(("tar", "-I", "pigz", "-xf", "/tmp/work/package.tgz", "-C", "/tmp/extracted"))) is not None
     copied = audit.store.read("/tmp/extracted/package/setup.sh")
     assert copied is not None and copied.executable is True
     assert copied.value == audit.store.read("scripts/setup.sh").value
@@ -96,9 +96,10 @@ def test_known_script_execution_is_not_treated_as_an_inert_cached_file() -> None
 
 def test_post_child_callback_publishes_only_the_inspected_child_stdout() -> None:
     audit = _audit()
-    result = audit(_command(("scripts/setup.sh",), child_inspected=True, stdout="echo child\n", redirects=(("1>", "/tmp/child.sh"),)))
+    assert audit.store.create_empty_directory("/tmp/work")
+    result = audit(_command(("scripts/setup.sh",), child_inspected=True, stdout="echo child\n", redirects=(("1>", "/tmp/work/child.sh"),)))
     assert result is not None and result.script_path is None
-    assert audit.read_source("/tmp/child.sh") == "echo child\n"
+    assert audit.read_source("/tmp/work/child.sh") == "echo child\n"
 
 
 def test_native_unknown_command_is_not_accepted_just_because_path_is_standard() -> None:
@@ -166,8 +167,8 @@ def test_native_archive_copy_retains_tree_names_modes_and_readonly_listing_uncer
     result = audit(_command(("cp", "-a", "/tmp/source/package", "/tmp/destination/")))
     assert result is not None and result.status is True
     assert audit.store.read("/tmp/destination/package/runner.sh") == artifact
-    assert audit(_command(("tar", "-cf", "/tmp/package.tar", "-C", "/tmp/destination", "package"))) is not None
-    listing = audit(_command(("tar", "-tf", "/tmp/package.tar")))
+    assert audit(_command(("tar", "-cf", "/tmp/destination/package.tar", "-C", "/tmp/destination", "package"))) is not None
+    listing = audit(_command(("tar", "-tf", "/tmp/destination/package.tar")))
     assert listing is not None and listing.status is True and listing.stdout is None and not listing.writes
 
 
@@ -178,3 +179,25 @@ def test_unchecked_write_or_read_failure_cannot_publish_generated_source_bytes()
     assert result is not None and audit.read_source("/tmp/generated.sh") is None
     read = audit(_command(("cat", "scripts/setup.sh"), fail_stop=False))
     assert read is not None and read.stdout is None and read.status is None
+
+
+@pytest.mark.parametrize("writer", ["printf", "cp", "chmod", "tar"])
+def test_unowned_external_destinations_never_acquire_independent_exact_bytes(writer: str) -> None:
+    audit = _audit()
+    assert audit.store.create_empty_directory("/tmp/fresh")
+    assert audit.store.write("/tmp/fresh/package/setup.sh", audit.store.read("scripts/setup.sh"))
+    assert audit.store.write("/tmp/existing-a", ShellArtifact(ShellSourceValue("echo old\n")))
+    # Existing external paths can be aliases. A successful write alone cannot
+    # prove either name is an independent regular file in a fresh namespace.
+    if writer == "printf":
+        command = _command(("printf", "%s", "echo new\n"), redirects=(("1>", "/tmp/existing-a"),))
+    elif writer == "cp":
+        command = _command(("cp", "scripts/setup.sh", "/tmp/existing-a"))
+    elif writer == "chmod":
+        command = _command(("chmod", "+x", "/tmp/existing-a"))
+    else:
+        command = _command(("tar", "-cf", "/tmp/existing-a", "-C", "/tmp/fresh", "package"))
+    result = audit(command)
+    assert result is not None and "/tmp/existing-a" in result.writes
+    assert audit.read_source("/tmp/existing-a") is None
+    assert audit.store.read("/tmp/existing-a") is None

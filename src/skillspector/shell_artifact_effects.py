@@ -141,7 +141,9 @@ class ShellArtifactAudit:
             if destination is None:
                 return None
             writes.append(destination)
-            if operator.startswith("1") and not used_stdout and command.fail_stop and not command.uncertain and stdout is not None:
+            # Preexisting external paths may alias one another. Only a fresh
+            # namespace can give a newly written file independent exact bytes.
+            if operator.startswith("1") and not used_stdout and command.fail_stop and not command.uncertain and stdout is not None and self.store.owns(destination):
                 used_stdout = True
                 if not self.effects.redirect_stdout(destination, stdout, append=operator.endswith(">>")):
                     return None
@@ -301,7 +303,7 @@ class ShellArtifactAudit:
                 if path is None:
                     return None
                 writes.append(path)
-                if command.uncertain or not command.fail_stop or artifact is None:
+                if command.uncertain or not command.fail_stop or artifact is None or not self.store.owns(path):
                     self.store.invalidate(path)
                     status = None
                 elif not self.store.write(path, replace(artifact, executable=args[0] in {"+x", "700", "755"})):
@@ -312,7 +314,7 @@ class ShellArtifactAudit:
             if source is None or destination is None:
                 return None
             writes.append(destination)
-            if command.uncertain or not command.fail_stop:
+            if command.uncertain or not command.fail_stop or not self.store.owns(destination):
                 self.store.invalidate(destination)
                 status = None
             elif not self.store.copy(source, destination):
@@ -329,7 +331,7 @@ class ShellArtifactAudit:
                 return None
             target = destination + "/" + posixpath.basename(source)
             writes.append(target)
-            if command.uncertain or not command.fail_stop:
+            if command.uncertain or not command.fail_stop or not self.store.owns(destination):
                 self.store.invalidate(target)
                 status = None
             elif not self.store.create_empty_directory(target):
@@ -358,10 +360,15 @@ class ShellArtifactAudit:
                 archive, directory = self.path(operands[1], command.cwd), self.path(operands[3], command.cwd)
                 if archive is None or directory is None:
                     return None
-                normalized = (*args[:2], operands[0], archive, "-C", directory, *operands[4:]) if args[:1] == ("-I",) else (operands[0], archive, "-C", directory, *operands[4:])
-                if not self.effects.tar(("tar", *normalized)):
-                    return None
-                writes.append(archive if operands[0] == "-cf" else directory)
+                destination = archive if operands[0] == "-cf" else directory
+                if not self.store.owns(destination):
+                    self.store.invalidate(destination)
+                    status = None
+                else:
+                    normalized = (*args[:2], operands[0], archive, "-C", directory, *operands[4:]) if args[:1] == ("-I",) else (operands[0], archive, "-C", directory, *operands[4:])
+                    if not self.effects.tar(("tar", *normalized)):
+                        return None
+                writes.append(destination)
                 output = ""
         elif name == "test" and len(args) == 2 and args[0] in {"-e", "-f", "-s", "-x", "-d"}:
             path = self.path(args[1], command.cwd)
