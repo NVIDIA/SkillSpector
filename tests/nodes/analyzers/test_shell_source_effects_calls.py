@@ -112,6 +112,47 @@ def test_optional_conditional_operand_cannot_publish_certain_effects(operator: s
     assert requests and all(command.uncertain for command in requests)
 
 
+@pytest.mark.parametrize("index, preserved", [("8", False), ("10", True), ("010", False), ("08", False)])
+def test_array_indices_never_misread_bash_octal_as_decimal(index: str, preserved: bool) -> None:
+    items = [f"/tmp/output{number}" for number in range(11)]
+    items[8] = "scripts/library.sh"
+    caller = 'items=(' + ' '.join(items) + ')\nprintf changed > "${items[' + index + ']}"\n'
+    assert _preserves(caller, _LIBRARY) is preserved
+
+
+@pytest.mark.parametrize("comparison", ["010 -eq 8", "8 -eq 010", "08 -eq 8"])
+def test_nondecimal_conditional_numbers_cannot_skip_source_writes(comparison: str) -> None:
+    assert not _preserves('if [[ ' + comparison + ' ]]; then printf changed > scripts/library.sh; fi\n', _LIBRARY)
+
+
+@pytest.mark.parametrize("number, preserved", [("8", True), ("010", False), ("08", False)])
+def test_arithmetic_condition_requires_canonical_decimal(number: str, preserved: bool) -> None:
+    caller = 'if (( ' + number + ' )); then :; else printf changed > scripts/library.sh; fi\n'
+    assert _preserves(caller, _LIBRARY) is preserved
+
+
+def test_array_element_length_never_becomes_element_contents() -> None:
+    caller = 'items=(safe)\nif [[ "${#items[0]}" == safe ]]; then :; else printf changed > scripts/library.sh; fi\n'
+    assert not _preserves(caller, _LIBRARY)
+    assert _preserves('items=(safe)\nif [[ "${#items[@]}" == 1 ]]; then :; else printf changed > scripts/library.sh; fi\n', _LIBRARY)
+
+
+@pytest.mark.parametrize("operand, arguments", [
+    ('"$@x"', 'scripts/library.sh /tmp/other'),
+    ('"prefix$@"', '/tmp/other scripts/library.sh'),
+    ('"${@}x"', 'scripts/library.sh /tmp/other'),
+])
+def test_embedded_positional_list_never_flattens_distinct_write_paths(operand: str, arguments: str) -> None:
+    caller = 'remove() { rm ' + operand + '; }\nremove ' + arguments + '\n'
+    assert not _preserves(caller, _LIBRARY)
+
+
+def test_exact_positional_list_still_preserves_each_argument() -> None:
+    caller = 'remove() { rm "$@"; }\n'
+    assert _preserves(caller + 'remove /tmp/one /tmp/two\n', _LIBRARY)
+    assert not _preserves(caller + 'remove scripts/library.sh /tmp/two\n', _LIBRARY)
+
+
 @pytest.mark.parametrize("operator", ["#", "##", "%", "%%"])
 def test_uncalled_quoted_pattern_removal_keeps_its_function_boundary(operator: str) -> None:
     library = 'unused() {\nprintf "%s\\n" "${path' + operator + '"$ROOT"/}"\n}\n'

@@ -504,6 +504,10 @@ class _EffectAudit:
                     # code. It cannot justify skipping an rc==2 branch.
                     value = "0" if frame.status is True else None
                 elif name in {"@", "*"}:
+                    if name == "@" and not assignment:
+                        # Embedded quoted @ can produce several argv words.
+                        # Only arguments() owns the exact standalone "$@".
+                        raise _UnresolvedError
                     value = " ".join(frame.argv) if all(isinstance(item, str) for item in frame.argv) else None
                 elif name == "$":
                     value = SHELL_PID_MARKER
@@ -514,8 +518,10 @@ class _EffectAudit:
                     value = frame.zero if position == 0 else frame.argv[position - 1] if position <= len(frame.argv) else ""
                 else:
                     match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*|[0-9]{1,16})(?::([-+?])(.*))?", name, re.DOTALL)
-                    array = re.fullmatch(r"(#?)([A-Za-z_][A-Za-z0-9_]*)\[([0-9]+|@)\]", name)
+                    array = re.fullmatch(r"(#?)([A-Za-z_][A-Za-z0-9_]*)\[(0|[1-9][0-9]{0,2}|@)\]", name)
                     if array:
+                        if array[1] and array[3] != "@":
+                            raise _UnresolvedError
                         items = frame.lookup(array[2])
                         value = str(len(items)) if isinstance(items, tuple) and array[1] and array[3] == "@" else items[int(array[3])] if isinstance(items, tuple) and array[3].isdecimal() and int(array[3]) < len(items) else None
                     elif match:
@@ -623,7 +629,7 @@ class _EffectAudit:
             text = " ".join(token.raw for token in node.words)
             if text == "$#":
                 frame.status = bool(frame.argv)
-            elif re.fullmatch(r"[0-9]{1,16}", text):
+            elif re.fullmatch(r"0|[1-9][0-9]{0,15}", text):
                 frame.status = bool(int(text))
             else:
                 raise _UnresolvedError
@@ -816,7 +822,7 @@ class _EffectAudit:
                     return None
                 matched = left == right if literal else fnmatch.fnmatchcase(left, right)
                 return matched != (operator == "!=")
-            if not re.fullmatch(r"-?[0-9]{1,16}", left) or not re.fullmatch(r"-?[0-9]{1,16}", right):
+            if not re.fullmatch(r"-?(?:0|[1-9][0-9]{0,15})", left) or not re.fullmatch(r"-?(?:0|[1-9][0-9]{0,15})", right):
                 return None
             a, b = int(left), int(right)
             return {"-eq": a == b, "-ne": a != b, "-gt": a > b, "-ge": a >= b, "-lt": a < b, "-le": a <= b}[operator]
