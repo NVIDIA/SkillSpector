@@ -16,7 +16,7 @@ import shlex
 
 from skillspector.shell_artifacts import ShellArtifact, ShellArtifactStore
 from skillspector.shell_helper_argv import (
-    ShellHelperOutput, _Parser, _State, _Token, _Unresolved, _word,
+    ShellHelperOutput, _Parser, _State, _Token, _UnresolvedError, _word,
     is_managed_shell_variable, reconstruct_helper_output,
 )
 from skillspector.shell_sources import ReadWord, ShellSourceContext, ShellSourceOrigin, ShellSourceValue
@@ -179,14 +179,14 @@ class _ProducerParser:
     def take(self, expected: str | None = None) -> _Token:
         self.tick()
         if not self.peek() or expected is not None and self.peek() != expected:
-            raise _Unresolved
+            raise _UnresolvedError
         token = self.tokens[self.position]
         self.position += 1
         return token
 
     def sequence(self, stop: str = "", depth: int = 0) -> tuple[_ProducerNode, ...]:
         if depth > 12:
-            raise _Unresolved
+            raise _UnresolvedError
         nodes = []
         while self.peek() and self.peek() != stop:
             if self.peek() in {"\n", ";"}:
@@ -230,12 +230,12 @@ class _ProducerParser:
                 elif token in {")", "]]"}:
                     nesting -= 1
                     if nesting < 0:
-                        raise _Unresolved
+                        raise _UnresolvedError
                 if token == "{" or not nesting and token in {"&", "&&"}:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 words.append(self.take())
             if not words or nesting:
-                raise _Unresolved
+                raise _UnresolvedError
             if self.peek() == "||":
                 self.take()
                 self.take("{")
@@ -244,7 +244,7 @@ class _ProducerParser:
             else:
                 nodes.append(_ProducerNode("command", tuple(words)))
         if stop and not self.peek():
-            raise _Unresolved
+            raise _UnresolvedError
         return tuple(nodes)
 
 
@@ -303,15 +303,15 @@ class ShellProducer:
         self.check_runtime()
         self.steps += 1
         if self.steps > 16384:
-            raise _Unresolved
+            raise _UnresolvedError
 
     def parse(self, text: str) -> tuple[_ProducerNode, ...]:
         if len(text) > 131072 or "\x00" in text:
-            raise _Unresolved
+            raise _UnresolvedError
         parser = _ProducerParser(text, self.read_word, self.tick)
         program = parser.sequence()
         if parser.peek():
-            raise _Unresolved
+            raise _UnresolvedError
         return program
 
     def word(self, raw: str, state: _ProducerState) -> str:
@@ -319,7 +319,7 @@ class ShellProducer:
         def array_length(match):
             value = state.values.get(match[1])
             if not isinstance(value, tuple):
-                raise _Unresolved
+                raise _UnresolvedError
             return str(len(value))
         raw = re.sub(r"\$\{#([A-Za-z_][A-Za-z0-9_]*)\[@\]\}", array_length, raw)
         if raw == "$#":
@@ -328,22 +328,22 @@ class ShellProducer:
         if array:
             value = state.values.get(array[2])
             if not isinstance(value, tuple):
-                raise _Unresolved
+                raise _UnresolvedError
             if array[1] == "#" and array[3] == "@":
                 return str(len(value))
             if not array[1] and array[3] != "@" and int(array[3]) < len(value):
                 return value[int(array[3])]
-            raise _Unresolved
+            raise _UnresolvedError
         directory = re.fullmatch(r'"\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)(/[-A-Za-z0-9_./]+)"', raw)
         if directory:
             suffix = directory[1]
             if ".." in suffix.split("/"):
-                raise _Unresolved
+                raise _UnresolvedError
             return (self.context.path.rpartition("/")[0] or ".") + suffix
         values = {name: value if isinstance(value, str) else None for name, value in state.values.items()}
         value = _word(raw, _State(values, [], state.argv, nounset=True), self.tick)
         if not isinstance(value, str):
-            raise _Unresolved
+            raise _UnresolvedError
         return value
 
     def arguments(self, words: tuple[_Token, ...], state: _ProducerState) -> tuple[str, ...]:
@@ -353,17 +353,17 @@ class ShellProducer:
             if array:
                 value = state.values.get(array[1])
                 if not isinstance(value, tuple):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 output.extend(value)
             else:
                 output.append(self.word(token.raw, state))
         if len(output) > 128 or sum(map(len, output)) > 131072:
-            raise _Unresolved
+            raise _UnresolvedError
         return tuple(output)
 
     def assignment(self, name: str, raw: str, state: _ProducerState) -> list[_ProducerState]:
         if is_managed_shell_variable(name):
-            raise _Unresolved
+            raise _UnresolvedError
         substitution = re.fullmatch(r'"?\$\((.*)\)"?', raw, re.DOTALL)
         if not substitution:
             state.values[name] = self.word(raw, state)
@@ -378,10 +378,10 @@ class ShellProducer:
             if branch.stopped:
                 continue
             if any(item.value is None for item in branch.output):
-                raise _Unresolved
+                raise _UnresolvedError
             value = "".join(item.value.text for item in branch.output).rstrip("\n")
             if len(value) > 65536:
-                raise _Unresolved
+                raise _UnresolvedError
             child = state.copy()
             child.values[name] = value
             output.append(child)
@@ -397,7 +397,7 @@ class ShellProducer:
                 self.tick()
                 output.extend([state] if state.stopped else self.node(node, state))
             if len(output) > 128 or self.depth == 0 and len(output) > 1:
-                raise _Unresolved
+                raise _UnresolvedError
             states = output
         return states
 
@@ -410,23 +410,23 @@ class ShellProducer:
                 or name in self.functions
                 or name in _PRODUCER_NATIVE_NAMES
             ):
-                raise _Unresolved
+                raise _UnresolvedError
             self.functions[name] = node.body
             return [state]
         if node.kind == "subshell":
             result = self.run(node.body, [state.copy()])
             if len(result) != 1 or result[0].stopped:
-                raise _Unresolved
+                raise _UnresolvedError
             return [state]
         if node.kind == "for":
             if len(node.words) < 3 or node.words[1].raw != "in" or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", node.words[0].raw):
-                raise _Unresolved
+                raise _UnresolvedError
             name = node.words[0].raw
             if is_managed_shell_variable(name):
-                raise _Unresolved
+                raise _UnresolvedError
             values = self.arguments(node.words[2:], state)
             if len(values) > 32:
-                raise _Unresolved
+                raise _UnresolvedError
             states = [state]
             for value in values:
                 for branch in states:
@@ -437,13 +437,13 @@ class ShellProducer:
             # Failure branches may report/terminate only. Their status cannot
             # hide writes, definitions or a successful continuation.
             if not node.body or node.body[-1].kind != "command":
-                raise _Unresolved
+                raise _UnresolvedError
             terminal = node.body[-1].words
             if len(terminal) != 2 or terminal[0].raw not in {"exit", "return"} or terminal[1].raw not in {"1", "2"}:
-                raise _Unresolved
+                raise _UnresolvedError
             for item in node.body[:-1]:
                 if item.kind != "command" or not item.words or item.words[0].raw != "echo":
-                    raise _Unresolved
+                    raise _UnresolvedError
                 self.command(item.words, state.copy(), diagnostics=True)
             if not self.predicate(node.words, state):
                 state.stopped = True
@@ -453,7 +453,7 @@ class ShellProducer:
     def predicate(self, words: tuple[_Token, ...], state: _ProducerState) -> bool:
         raw = tuple(token.raw for token in words)
         if raw[:1] != ("[[",) or raw[-1:] != ("]]",):
-            raise _Unresolved
+            raise _UnresolvedError
         terms = []
         current = []
         for token in words[1:-1]:
@@ -468,7 +468,7 @@ class ShellProducer:
             if len(term) == 3 and term[0].raw == "!" and term[1].raw == "-e":
                 exists = self.store.exists(self.word(term[2].raw, state))
                 if exists is None:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 result &= not exists
             elif len(term) == 2 and term[0].raw == "-s":
                 artifact = self.store.read(self.word(term[1].raw, state))
@@ -476,39 +476,39 @@ class ShellProducer:
             elif len(term) == 3 and term[1].raw == "-eq":
                 left, right = self.word(term[0].raw, state), self.word(term[2].raw, state)
                 if not re.fullmatch(r"[0-9]{1,9}", left) or not re.fullmatch(r"[0-9]{1,9}", right):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 result &= int(left) == int(right)
             elif len(term) == 3 and term[1].raw == "==" and re.fullmatch(r"\*\.[A-Za-z0-9]+", term[2].raw):
                 result &= self.word(term[0].raw, state).endswith(term[2].raw[1:])
             else:
-                raise _Unresolved
+                raise _UnresolvedError
         return result
 
     def command(self, words: tuple[_Token, ...], state: _ProducerState, *, diagnostics: bool = False) -> list[_ProducerState]:
         self.tick()
         raw = tuple(token.raw for token in words)
         if not words:
-            raise _Unresolved
+            raise _UnresolvedError
         if diagnostics:
             if raw[0] != "echo" or raw[-2:] != (">&", "2"):
-                raise _Unresolved
+                raise _UnresolvedError
             for token in words[1:-2]:
                 inert = re.sub(r"\$(?:[0-9]|[A-Za-z_][A-Za-z0-9_]*|\{#?[A-Za-z_][A-Za-z0-9_]*(?:\[@\])?\})", "x", token.raw)
                 if not isinstance(_word(inert, _State({}, [], ()), self.tick), str):
-                    raise _Unresolved
+                    raise _UnresolvedError
             return [state]
         array = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(\+?)=", raw[0])
         if array and raw[1:2] == ("(",) and raw[-1:] == (")",):
             if is_managed_shell_variable(array[1]):
-                raise _Unresolved
+                raise _UnresolvedError
             value = self.arguments(words[2:-1], state)
             if array[2]:
                 previous = state.values.get(array[1])
                 if not isinstance(previous, tuple):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 value = previous + value
             if len(value) > 128:
-                raise _Unresolved
+                raise _UnresolvedError
             state.values[array[1]] = value
             return [state]
         assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", raw[0], re.DOTALL)
@@ -516,16 +516,16 @@ class ShellProducer:
             return self.assignment(assignment[1], assignment[2], state)
         if raw[0] == "local":
             if not self.depth:
-                raise _Unresolved
+                raise _UnresolvedError
             if len(words) == 5 and raw[1] == "-a" and raw[3:] == ("(", ")") and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=", raw[2]):
                 if is_managed_shell_variable(raw[2][:-1]):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 state.values[raw[2][:-1]] = ()
                 return [state]
             for token in words[1:]:
                 assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:=(.*))?", token.raw, re.DOTALL)
                 if not assignment or is_managed_shell_variable(assignment[1]):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 state.values[assignment[1]] = None if assignment[2] is None else self.word(assignment[2], state)
             return [state]
         if raw[0] == "mapfile":
@@ -542,17 +542,17 @@ class ShellProducer:
                 if command_words and command_words[-1].raw.isdecimal() and command_words[-1].end == token.start:
                     descriptor = command_words.pop().raw
                 if position + 1 >= len(words):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 redirects.append((descriptor + token.raw, self.word(words[position + 1].raw, state)))
                 position += 2
             else:
                 if token.raw in {"<", "<<", "(", ")", "[[", "]]"}:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 command_words.append(token)
                 position += 1
         argv = self.arguments(tuple(command_words), state)
         if not argv:
-            raise _Unresolved
+            raise _UnresolvedError
         name, *arguments = argv
         destination = None
         append = False
@@ -566,22 +566,22 @@ class ShellProducer:
             if redirect in {"1>", "1>>"}:
                 stdout_redirects += 1
                 if stdout_redirects > 1:
-                    raise _Unresolved
+                    raise _UnresolvedError
             if target == "/dev/null" and redirect in {"1>", "1>>", "2>", "2>>"}:
                 discard_stdout |= redirect.startswith("1")
                 continue
             if redirect not in {"1>", "1>>"} or destination is not None:
-                raise _Unresolved
+                raise _UnresolvedError
             destination = self.path(target, state)
             append = redirect == "1>>"
         if self.depth and (destination is not None or name not in {*self.functions, "p4", "printf", "return", "exit"}):
             # Capture functions may branch over helper output. They are pure
             # apart from separately audited helper logs; file effects cannot
             # leak from a failed alternative into a surviving state.
-            raise _Unresolved
+            raise _UnresolvedError
         if name in self.functions:
             if self.depth or not self.capture_depth or destination is not None:
-                raise _Unresolved
+                raise _UnresolvedError
             self.depth += 1
             child = _ProducerState(state.values.copy(), tuple(arguments), state.cwd)
             branches = self.run(self.functions[name], [child])
@@ -604,56 +604,56 @@ class ShellProducer:
             cleanup = re.fullmatch(r'rm -rf "\$([A-Za-z_][A-Za-z0-9_]*)"', arguments[0])
             value = state.values.get(cleanup[1]) if cleanup else None
             if not isinstance(value, str) or self.store.inventory(value) is None:
-                raise _Unresolved
+                raise _UnresolvedError
             self.writes.add(value)
             self.cleanup.add(value)
         elif name == "command" and len(arguments) == 2 and arguments[0] == "-v" and arguments[1] in {"p4", "pigz", "lbzip2"}:
             if arguments[1] == "p4" and self.helper_output is None:
-                raise _Unresolved
+                raise _UnresolvedError
         elif name == "mktemp" and len(arguments) == 2 and arguments[0] == "-d" and not redirects:
             if re.fullmatch(r"/tmp/[-A-Za-z0-9_.]+X{3,}", arguments[1]) is None:
-                raise _Unresolved
+                raise _UnresolvedError
             self.temporary += 1
             value = re.sub(r"X+$", f"__skillspector_producer_{self.temporary}__", arguments[1])
             if not self.store.create_empty_directory(value):
-                raise _Unresolved
+                raise _UnresolvedError
             self.writes.add(value)
             produced = (ShellArtifact(ShellSourceValue(value + "\n")),)
         elif name == "mkdir" and arguments[:1] == ["-p"] and len(arguments) >= 2 and not redirects:
             for argument in arguments[1:]:
                 path = self.path(argument, state)
                 if self.store.inventory(path) is None:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 if self.store.exists(path) is False and not self.store.create_empty_directory(path):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 self.writes.add(path)
         elif name == "cp" and not redirects:
             resolved = (name, *("--" if index == 0 and argument == "--" else self.path(argument, state, source=True) for index, argument in enumerate(arguments)))
             if not self.effects.copy_file(resolved):
-                raise _Unresolved
+                raise _UnresolvedError
             self.writes.add(resolved[-1])
         elif name == "tar" and not redirects:
             if not self.effects.tar(argv):
-                raise _Unresolved
+                raise _UnresolvedError
             mode = argv.index("-cf") if "-cf" in argv else argv.index("-xf")
             self.writes.add(argv[mode + 1] if argv[mode] == "-cf" else argv[argv.index("-C") + 1])
         elif name == "chmod" and len(arguments) == 2 and arguments[0] in {"600", "700", "+x"} and not redirects:
             path = self.path(arguments[1], state)
             artifact = self.store.read(path)
             if artifact is None or not self.store.write(path, replace(artifact, executable=arguments[0] != "600")):
-                raise _Unresolved
+                raise _UnresolvedError
             self.writes.add(path)
         elif name == "cd" and len(arguments) == 1 and not redirects:
             path = self.path(arguments[0], state)
             if self.store.inventory(path) is None:
-                raise _Unresolved
+                raise _UnresolvedError
             state.cwd = path
         elif name == "printf":
             text = " ".join(shlex.quote(argument) for argument in argv)
             outputs = reconstruct_helper_output(text, (), {}, frozenset(), self.read_word, self.check_runtime)
             produced = helper_stdout_artifacts(outputs, self.store, (), self.check_runtime) if outputs is not None else None
             if produced is None:
-                raise _Unresolved
+                raise _UnresolvedError
         elif name == "p4" and self.helper_output is not None:
             # Inherited names keep their export attribute after assignment,
             # including inside the bounded capture-function scope. Ordinary
@@ -661,18 +661,18 @@ class ShellProducer:
             environment = {name: value if isinstance(value := state.values.get(name), str) else None for name in self.exported}
             produced = self.helper_output(argv, environment)
             if not produced:
-                raise _Unresolved
+                raise _UnresolvedError
         elif name in {"return", "exit"} and len(arguments) == 1 and arguments[0] in {"1", "2"} and not redirects:
             state.stopped = True
         else:
-            raise _Unresolved
+            raise _UnresolvedError
         if produced is None:
             if destination is not None:
-                raise _Unresolved
+                raise _UnresolvedError
             return [state]
         if destination is not None:
             if not self.effects.redirect_stdout(destination, produced, append=append):
-                raise _Unresolved
+                raise _UnresolvedError
             self.writes.add(destination)
             return [state]
         if discard_stdout:
@@ -690,16 +690,16 @@ class ShellProducer:
         if source and value in self.context.sources:
             return value
         if state.cwd is None or any(part in {"", ".", ".."} for part in value.split("/")):
-            raise _Unresolved
+            raise _UnresolvedError
         return state.cwd + "/" + value
 
     def mapfile(self, words: tuple[_Token, ...], state: _ProducerState) -> list[_ProducerState]:
         raw = tuple(token.raw for token in words)
         if len(raw) < 10 or raw[:2] != ("mapfile", "-t") or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw[2]) or raw[3:6] != ("<", "<", "(") or raw[-1] != ")":
-            raise _Unresolved
+            raise _UnresolvedError
         name = raw[2]
         if is_managed_shell_variable(name):
-            raise _Unresolved
+            raise _UnresolvedError
         inner = words[6:-1]
         if len(inner) == 5 and tuple(token.raw for token in inner[2:4]) == ("<<", "<") and self.arguments(inner[:2], state) == ("awk", "NF {print $1}"):
             value = self.word(inner[4].raw, state)
@@ -707,36 +707,36 @@ class ShellProducer:
         else:
             argv = self.arguments(inner, state)
             if len(argv) != 7 or argv[0] != "find" or argv[2:5] != ("-type", "f", "-name") or argv[-1] != "-print" or re.fullmatch(r"[-A-Za-z0-9_.]+", argv[5]) is None:
-                raise _Unresolved
+                raise _UnresolvedError
             inventory = self.store.inventory(argv[1])
             if inventory is None:
-                raise _Unresolved
+                raise _UnresolvedError
             state.values[name] = tuple(argv[1] + "/" + path for path, _ in inventory if path.rpartition("/")[2] == argv[5])
         if len(state.values[name]) > 128:
-            raise _Unresolved
+            raise _UnresolvedError
         return [state]
 
     def manifest(self, words: tuple[_Token, ...], state: _ProducerState) -> list[_ProducerState]:
         argv = self.arguments(words, state)
         if argv != ("find", ".", "-type", "f", "!", "-name", "MANIFEST.sha256", "-print0", "|", "sort", "-z", "|", "xargs", "-0", "sha256sum", ">", "MANIFEST.sha256"):
-            raise _Unresolved
+            raise _UnresolvedError
         inventory = self.store.inventory(state.cwd) if state.cwd is not None else None
         if inventory is None:
-            raise _Unresolved
+            raise _UnresolvedError
         rows = []
         for path, artifact in inventory:
             self.tick()
             if path == "MANIFEST.sha256":
                 continue
             if artifact.value is None or any(character in path for character in "\\\r\n\x00"):
-                raise _Unresolved
+                raise _UnresolvedError
             rows.append(hashlib.sha256(artifact.value.text.encode()).hexdigest() + "  ./" + path + "\n")
         destination = state.cwd + "/MANIFEST.sha256"
         # sort's order depends on the runtime locale. Keep the finite file
         # inventory and byte bound, but never publish invented manifest bytes
         # as executable source or as a subsequent hash/cat input.
         if not self.store.write(destination, ShellArtifact(opaque_size=len("".join(rows).encode()))):
-            raise _Unresolved
+            raise _UnresolvedError
         self.writes.add(destination)
         return [state]
 
@@ -749,27 +749,27 @@ class ShellProducer:
                 or any(is_managed_shell_variable(name) for name in environment)
                 or any("__skillspector_producer_" in source for source in self.context.sources.values())
             ):
-                raise _Unresolved
+                raise _UnresolvedError
             source = self.context.sources.get(self.context.path)
             if source is None:
-                raise _Unresolved
+                raise _UnresolvedError
             self.exported = frozenset(environment)
             program = self.parse(source)
             if not program or program[0].kind != "command" or tuple(token.raw for token in program[0].words) not in {("set", "-euo", "pipefail"), ("set", "-Eeuo", "pipefail")}:
-                raise _Unresolved
+                raise _UnresolvedError
             states = self.run(program, [_ProducerState(environment.copy(), argv)])
             successful = [state for state in states if not state.stopped]
             if not successful:
-                raise _Unresolved
+                raise _UnresolvedError
             for path in self.cleanup:
                 self.store.invalidate(path)
             result = []
             for path in outputs:
                 value = self.store.read(path)
                 if value is None:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 result.append((path, value))
             return ShellProducerResult(tuple(result), tuple(sorted(self.writes)))
-        except _Unresolved:
+        except _UnresolvedError:
             self.store.invalidate(None)
             return None

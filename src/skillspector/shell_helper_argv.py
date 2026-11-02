@@ -43,7 +43,7 @@ def is_managed_shell_variable(name: str) -> bool:
     return name.startswith("BASH") or name in _SPECIAL_VARIABLES
 
 
-class _Unresolved(Exception):
+class _UnresolvedError(Exception):
     """The optional proof cannot account for every explicit call."""
 
 
@@ -91,7 +91,7 @@ class _Parser:
             else:
                 _, stop, limited = read_word(text, cursor, tick)
                 if limited or stop <= cursor or stop > len(text):
-                    raise _Unresolved
+                    raise _UnresolvedError
             self.tokens.append(_Token(text[cursor:stop], cursor, stop))
             cursor = stop
 
@@ -102,14 +102,14 @@ class _Parser:
     def take(self, expected: str | None = None) -> _Token:
         self.tick()
         if self.cursor >= len(self.tokens) or expected is not None and self.peek() != expected:
-            raise _Unresolved
+            raise _UnresolvedError
         token = self.tokens[self.cursor]
         self.cursor += 1
         return token
 
     def sequence(self, stops: frozenset[str] = frozenset(), depth: int = 0) -> tuple[_Node, ...]:
         if depth > 16:
-            raise _Unresolved
+            raise _UnresolvedError
         nodes: list[_Node] = []
         connector = ";"
         while self.peek() and self.peek() not in stops:
@@ -124,9 +124,9 @@ class _Parser:
                 while self.peek() == "\n":
                     self.take()
                 if not self.peek() or self.peek() in stops | {";", "&&", "||", ";;"}:
-                    raise _Unresolved
+                    raise _UnresolvedError
             elif self.peek() and self.peek() not in stops and self.peek() not in {";", "\n"}:
-                raise _Unresolved
+                raise _UnresolvedError
         return tuple(nodes)
 
     def node(self, depth: int) -> _Node:
@@ -137,10 +137,10 @@ class _Parser:
                 condition = self.sequence(frozenset({"then"}), depth + 1)
                 self.take("then")
                 if not condition:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 body = self.sequence(frozenset({"elif", "else", "fi"}), depth + 1)
                 if not body:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 blocks.extend((condition, body))
                 if self.peek() != "elif":
                     break
@@ -149,7 +149,7 @@ class _Parser:
                 self.take()
                 blocks.append(self.sequence(frozenset({"fi"}), depth + 1))
                 if not blocks[-1]:
-                    raise _Unresolved
+                    raise _UnresolvedError
             else:
                 blocks.append(())
             self.take("fi")
@@ -172,14 +172,14 @@ class _Parser:
                     self.take()
                     patterns.append(self.take().raw)
                 if any(pattern != "*" and not re.fullmatch(r"[A-Za-z0-9_.+-]+", pattern) for pattern in patterns):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 self.take(")")
                 labels.append(tuple(patterns))
                 blocks.append(self.sequence(frozenset({";;", "esac"}), depth + 1))
                 if self.peek() == ";;":
                     self.take()
                 elif self.peek() != "esac":
-                    raise _Unresolved
+                    raise _UnresolvedError
             self.take("esac")
             return _Node("case", (selector,), tuple(blocks), tuple(labels))
         if _NAME.fullmatch(self.peek()) and self.peek(1) == "(" and self.peek(2) == ")":
@@ -191,7 +191,7 @@ class _Parser:
             self.take("{")
             body = self.sequence(frozenset({"}"}), depth + 1)
             if not body:
-                raise _Unresolved
+                raise _UnresolvedError
             self.take("}")
             return _Node("function", (name,), (body,))
         words: list[_Token] = []
@@ -208,18 +208,18 @@ class _Parser:
                     if words and words[-1].end == redirect.start and words[-1].raw.isdecimal():
                         descriptor = words.pop().raw
                         if descriptor not in {"1", "2"}:
-                            raise _Unresolved
+                            raise _UnresolvedError
                     destination = self.take()
                     if self.output_redirects:
                         redirects.append((descriptor + redirect.raw, destination))
                     elif (redirect.raw, destination.raw) not in {(">", "/dev/null"), (">&", "1"), (">&", "2")}:
-                        raise _Unresolved
+                        raise _UnresolvedError
                     continue
                 if self.peek() in {"<", "<<", ">>", "{"}:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 words.append(self.take())
         if not words:
-            raise _Unresolved
+            raise _UnresolvedError
         return _Node("command", tuple(words), redirects=tuple(redirects))
 
 
@@ -274,7 +274,7 @@ class _State:
 
     def assign(self, name: str, value: _Value) -> None:
         if is_managed_shell_variable(name) or _value_size(value) > _MAX_CHARS:
-            raise _Unresolved
+            raise _UnresolvedError
         for scope in reversed(self.scopes):
             if name in scope:
                 scope[name] = value
@@ -291,7 +291,7 @@ def _word(raw: str, state: _State, tick: Callable[[], None]) -> str | _CommandTe
                 tick()
         normalized = "exec " + " ".join(shlex.quote(argument) for argument in value.arguments)
         if len(normalized) > _MAX_CHARS:
-            raise _Unresolved
+            raise _UnresolvedError
         return _CommandText(normalized)
     parts: list[str] = []
     quote = ""
@@ -316,7 +316,7 @@ def _word(raw: str, state: _State, tick: Callable[[], None]) -> str | _CommandTe
             continue
         if character == "\\":
             if cursor + 1 >= len(raw):
-                raise _Unresolved
+                raise _UnresolvedError
             following = raw[cursor + 1]
             if following == "\n":
                 cursor += 2
@@ -331,7 +331,7 @@ def _word(raw: str, state: _State, tick: Callable[[], None]) -> str | _CommandTe
             continue
         if character == "$":
             if quote != '"':
-                raise _Unresolved  # Unquoted expansion can split or glob.
+                raise _UnresolvedError  # Unquoted expansion can split or glob.
             if raw.startswith("$*", cursor):
                 if any(not isinstance(argument, str) for argument in state.argv):
                     unknown = True
@@ -346,7 +346,7 @@ def _word(raw: str, state: _State, tick: Callable[[], None]) -> str | _CommandTe
                 if value is None:
                     unknown = True
                 elif not isinstance(value, str):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 elif expanded[2] == "##*/":
                     parts.append(value.rpartition("/")[2])
                 else:
@@ -355,12 +355,12 @@ def _word(raw: str, state: _State, tick: Callable[[], None]) -> str | _CommandTe
                 continue
             parameter = re.match(r"\$(?:([1-9]|[A-Za-z_][A-Za-z0-9_]*)|\{([1-9][0-9]{0,2}|[A-Za-z_][A-Za-z0-9_]*)(% )?\})", raw[cursor:])
             if parameter is None:
-                raise _Unresolved
+                raise _UnresolvedError
             name = parameter[1] or parameter[2]
             if name.isdecimal():
                 index = int(name) - 1
                 if index >= len(state.argv) and state.nounset:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 value = state.argv[index] if index < len(state.argv) else ""
             else:
                 value = state.lookup(name)
@@ -370,10 +370,10 @@ def _word(raw: str, state: _State, tick: Callable[[], None]) -> str | _CommandTe
                 # %q chooses Bash-specific bytes. Only the exact reparse above
                 # may use an equivalent representation; comparisons, copying,
                 # case selectors and extra quote embedding cannot inspect it.
-                raise _Unresolved
+                raise _UnresolvedError
             elif isinstance(value, _CommandText):
                 if parameter[3] is not None or cursor != 1 or raw != '"' + parameter[0] + '"':
-                    raise _Unresolved
+                    raise _UnresolvedError
                 return value
             else:
                 for _ in range(0, len(value), 256):
@@ -382,14 +382,14 @@ def _word(raw: str, state: _State, tick: Callable[[], None]) -> str | _CommandTe
             cursor += parameter.end()
             continue
         if character == "`" or not quote and character in "*?[~{}":
-            raise _Unresolved
+            raise _UnresolvedError
         parts.append(character)
         cursor += 1
     if quote:
-        raise _Unresolved
+        raise _UnresolvedError
     value = "".join(parts)
     if len(value) > _MAX_CHARS or "\x00" in value:
-        raise _Unresolved
+        raise _UnresolvedError
     return None if unknown else value
 
 
@@ -418,7 +418,7 @@ class _Interpreter:
                     output.append(skipped)
                 output.extend(self.node(node, state))
             if len(output) > _MAX_STATES:
-                raise _Unresolved
+                raise _UnresolvedError
             states = output
         return states
 
@@ -426,7 +426,7 @@ class _Interpreter:
         if node.kind == "function":
             name = node.words[0].raw
             if not self.allow_definitions or state.scopes or name in self.functions or name == self.helper_name or name in _SPECIAL | _SHELLS | _BUILTINS:
-                raise _Unresolved
+                raise _UnresolvedError
             self.functions[name] = node.blocks[0]
             return [state]
         self.allow_definitions = False
@@ -452,7 +452,7 @@ class _Interpreter:
         if node.kind == "case":
             value = _word(node.words[0].raw, state, self.tick)
             if isinstance(value, _CommandText):
-                raise _Unresolved
+                raise _UnresolvedError
             output = []
             covered = False
             for labels, body in zip(node.labels, node.blocks, strict=True):
@@ -481,15 +481,15 @@ class _Interpreter:
             else:
                 value = _word(word.raw, state, self.tick)
                 if value is None:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 arguments.append(value)
         if len(arguments) > _MAX_ARGS or sum(map(_value_size, arguments)) > _MAX_CHARS:
-            raise _Unresolved
+            raise _UnresolvedError
         return tuple(arguments)
 
     def predicate(self, words: tuple[_Token, ...], state: _State) -> bool | None:
         if words[-1].raw != "]]":
-            raise _Unresolved
+            raise _UnresolvedError
         results: list[bool | None] = []
         terms: list[list[_Token]] = [[]]
         for word in words[1:-1]:
@@ -499,22 +499,22 @@ class _Interpreter:
                 terms[-1].append(word)
         for term in terms:
             if len(term) != 3 or term[1].raw not in {"==", "=", "!=", "-eq", "-ne"}:
-                raise _Unresolved
+                raise _UnresolvedError
             left = _word(term[0].raw, state, self.tick)
             pattern = re.fullmatch(r"\*([-A-Za-z0-9_.]+)\*", term[2].raw)
             if pattern is not None and term[1].raw in {"==", "=", "!="}:
                 if isinstance(left, _CommandText):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 results.append(None if left is None else (pattern[1] in left) != (term[1].raw == "!="))
                 continue
             right = _word(term[2].raw, state, self.tick)
             if isinstance(left, _CommandText) or isinstance(right, _CommandText):
-                raise _Unresolved
+                raise _UnresolvedError
             if left is None or right is None:
                 results.append(None)
             elif term[1].raw in {"-eq", "-ne"}:
                 if not re.fullmatch(r"-?(?:0|[1-9][0-9]{0,17})", left) or not re.fullmatch(r"-?(?:0|[1-9][0-9]{0,17})", right):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 results.append((int(left) == int(right)) == (term[1].raw == "-eq"))
             else:
                 results.append((left == right) != (term[1].raw == "!="))
@@ -530,39 +530,39 @@ class _Interpreter:
                 assert assignment is not None
                 value = _word(assignment[2], state, self.tick)
                 if isinstance(value, _CommandText):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 state.assign(assignment[1], value)
             state.status = True
             return [state]
         if any(assignments):
-            raise _Unresolved
+            raise _UnresolvedError
         if words[0].raw == "local":
             if not state.scopes or len(words) < 2:
-                raise _Unresolved
+                raise _UnresolvedError
             for word in words[1:]:
                 if not _NAME.fullmatch(word.raw) or is_managed_shell_variable(word.raw):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 state.scopes[-1][word.raw] = None
             state.status = True
             return [state]
         arguments = self.arguments(words, state)
         if not arguments:
-            raise _Unresolved
+            raise _UnresolvedError
         command, *operands = arguments
         if not isinstance(command, str):
-            raise _Unresolved
+            raise _UnresolvedError
         if command == "command":
             if not operands or not isinstance(operands[0], str) or operands[0].startswith("-"):
-                raise _Unresolved
+                raise _UnresolvedError
             command, *operands = operands
             bypass_function = True
         else:
             bypass_function = False
         if command in _SPECIAL:
-            raise _Unresolved
+            raise _UnresolvedError
         if command in self.functions and not bypass_function:
             if command in self.active or len(self.active) >= 8:
-                raise _Unresolved
+                raise _UnresolvedError
             self.active.append(command)
             previous_argv = state.argv
             state.argv = tuple(operands)
@@ -577,37 +577,37 @@ class _Interpreter:
             return output
         if command == self.helper_name:
             if self.helper:
-                raise _Unresolved
+                raise _UnresolvedError
             self.calls.append(tuple(operands))
             if len(self.calls) > _MAX_STATES:
-                raise _Unresolved
+                raise _UnresolvedError
             state.status = None
         elif command in _SHELLS:
             if not self.helper or len(operands) != 2 or operands[0] != "-c" or len(words) != 3:
-                raise _Unresolved
+                raise _UnresolvedError
             span = (words[2].start, words[2].end)
             self.commands.setdefault(span, []).append(operands[1].normalized if isinstance(operands[1], _CommandText) else operands[1])
             state.status = None
         elif any(isinstance(value, _CommandText) for value in operands):
-            raise _Unresolved
+            raise _UnresolvedError
         elif command == "printf" and operands and operands[0] == "-v":
             if len(operands) < 3 or not _NAME.fullmatch(operands[1]) or operands[2] != "%q ":
-                raise _Unresolved
+                raise _UnresolvedError
             state.assign(operands[1], _SerializedArgv(tuple(operands[3:] or [""])))
             state.status = True
         elif command in {"exit", "return"}:
             if len(operands) > 1 or operands and not re.fullmatch(r"[0-9]{1,3}", operands[0]):
-                raise _Unresolved
+                raise _UnresolvedError
             if command == "return" and not state.scopes:
-                raise _Unresolved
+                raise _UnresolvedError
             state.status = int(operands[0]) % 256 == 0 if operands else state.status
             state.flow = command
         elif command == "shift":
             if len(operands) > 1 or operands and not re.fullmatch(r"[0-9]{1,3}", operands[0]):
-                raise _Unresolved
+                raise _UnresolvedError
             count = int(operands[0]) if operands else 1
             if count > len(state.argv):
-                raise _Unresolved
+                raise _UnresolvedError
             state.argv = state.argv[count:]
             state.status = True
         elif command in {"true", "false", ":"}:
@@ -616,9 +616,9 @@ class _Interpreter:
             if command == "printf":
                 format_args = operands[1:] if operands and operands[0] == "--" else operands
                 if not format_args or format_args[0].startswith("-") or re.search(r"%[^%]*n", format_args[0].replace("%%", "")):
-                    raise _Unresolved
+                    raise _UnresolvedError
             elif command != "echo":
-                raise _Unresolved
+                raise _UnresolvedError
             state.status = None
         return [state]
 
@@ -656,24 +656,24 @@ def reconstruct_helper_commands(
         check_runtime()
         steps += 1
         if steps > _MAX_STEPS:
-            raise _Unresolved
+            raise _UnresolvedError
 
     try:
         helper_parser = _Parser(helper_text, read_word, tick)
         helper = helper_parser.sequence()
         if helper_parser.peek():
-            raise _Unresolved
+            raise _UnresolvedError
         invocations: list[tuple[str | _CommandText, ...]] = []
         for caller_text in caller_texts:
             parser = _Parser(caller_text, read_word, tick)
             caller = parser.sequence()
             if parser.peek():
-                raise _Unresolved
+                raise _UnresolvedError
             interpreter = _Interpreter(helper_name, tick)
             interpreter.sequence(caller, [_State({}, [], ())])
             invocations.extend(interpreter.calls)
         if not invocations or len(invocations) > _MAX_STATES:
-            raise _Unresolved
+            raise _UnresolvedError
         output: dict[tuple[int, int], list[tuple[str, tuple[str, ...]]]] = {}
         for argv in dict.fromkeys(invocations):
             interpreter = _Interpreter(helper_name, tick, helper=True)
@@ -684,9 +684,9 @@ def reconstruct_helper_commands(
                     if variant not in output.setdefault(span, []):
                         output[span].append(variant)
         if sum(map(len, output.values())) > _MAX_STATES:
-            raise _Unresolved
+            raise _UnresolvedError
         return {span: tuple(variants) for span, variants in output.items()}
-    except _Unresolved:
+    except _UnresolvedError:
         return None
 
 
@@ -713,12 +713,12 @@ class _OutputInterpreter(_Interpreter):
     def node(self, node: _Node, state: _State) -> list[_State]:
         if node.kind != "command":
             if node.kind == "function":
-                raise _Unresolved
+                raise _UnresolvedError
             return super().node(node, state)
         if node.words[0].raw == "[[":
             states = super().node(node, state)
             if state.errexit and state.status is None and id(node) not in self.tested_status:
-                raise _Unresolved
+                raise _UnresolvedError
             if state.errexit and state.status is False and id(node) not in self.tested_status:
                 state.flow = "exit"
             return states
@@ -728,7 +728,7 @@ class _OutputInterpreter(_Interpreter):
             destination = _word(word.raw, state, self.tick)
             if redirect in {"1>", "1>>", "2>", "2>>"}:
                 if destination not in self.writable_paths and destination != "/dev/null":
-                    raise _Unresolved
+                    raise _UnresolvedError
                 if destination != "/dev/null" and self.written_paths is not None:
                     self.written_paths.add(destination)
                 if redirect.startswith("1"):
@@ -736,10 +736,10 @@ class _OutputInterpreter(_Interpreter):
             elif redirect == "1>&" and destination == "2":
                 stdout = False
             else:
-                raise _Unresolved
+                raise _UnresolvedError
         if head == "set":
             if tuple(word.raw for word in node.words[1:]) not in {("-euo", "pipefail"), ("-Eeuo", "pipefail")} or node.redirects:
-                raise _Unresolved
+                raise _UnresolvedError
             state.status = True
             state.errexit = True
             state.nounset = True
@@ -747,19 +747,19 @@ class _OutputInterpreter(_Interpreter):
         if head == "printf":
             arguments = [_word(word.raw, state, self.tick) for word in node.words[1:]]
             if not arguments or not isinstance(arguments[0], str):
-                raise _Unresolved
+                raise _UnresolvedError
             template, *values = arguments
             # The format is always parsed, even for a discarded log, so a
             # variable-setting %n or escape-driven format cannot hide effects.
             if template.startswith("-") or re.search(r"%(?!%|s)", template) or re.search(r"\\(?!n|t|\\)", template):
-                raise _Unresolved
+                raise _UnresolvedError
             if stdout:
                 if any(not isinstance(value, str) for value in values):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 tokens = re.split(r"(%s|%%|\\n|\\t|\\\\)", template)
                 count = tokens.count("%s")
                 if count == 0 and values:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 output = []
                 for index in range(0, max(1, len(values)), max(1, count)):
                     cursor = index
@@ -776,18 +776,18 @@ class _OutputInterpreter(_Interpreter):
         if head in {"cat", "/bin/cat", "/usr/bin/cat"}:
             arguments = self.arguments(node.words[1:], state)
             if len(arguments) != 1 or not isinstance(arguments[0], str) or not arguments[0].startswith("/"):
-                raise _Unresolved
+                raise _UnresolvedError
             if stdout:
                 self._append(state, ShellHelperOutput(path=arguments[0]))
             state.status = True
             return [state]
         if node.redirects or head not in {"exit", "true", ":"}:
-            raise _Unresolved
+            raise _UnresolvedError
         return super().node(node, state)
 
     def _append(self, state: _State, value: ShellHelperOutput) -> None:
         if len(state.output) >= _MAX_ARGS or sum(len(item.text or item.path or "") for item in (*state.output, value)) > _MAX_CHARS:
-            raise _Unresolved
+            raise _UnresolvedError
         state.output += (value,)
 
 
@@ -824,16 +824,16 @@ def reconstruct_helper_output(
         check_runtime()
         steps += 1
         if steps > _MAX_STEPS:
-            raise _Unresolved
+            raise _UnresolvedError
 
     try:
         parser = _Parser(helper_text, read_word, tick, output_redirects=True)
         program = parser.sequence()
         if parser.peek():
-            raise _Unresolved
+            raise _UnresolvedError
         states = _OutputInterpreter(tick, writable_paths, program, written_paths).sequence(program, [_State(environment.copy(), [], argv)])
         if any(state.status is not True for state in states):
-            raise _Unresolved
+            raise _UnresolvedError
         return tuple(dict.fromkeys(state.output for state in states))
-    except _Unresolved:
+    except _UnresolvedError:
         return None
