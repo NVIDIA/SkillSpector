@@ -31,7 +31,7 @@ import sys
 import time
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 
 from skillspector.artifacts import (
@@ -44,7 +44,7 @@ from skillspector.artifacts import (
 from skillspector.javascript_tokens import JavaScriptTemplateSpans, assertion_template_shell_text
 from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
 from skillspector.logging_config import get_logger
-from skillspector.models import AnalyzerFinding, Finding, Location, Severity
+from skillspector.models import AnalyzerFinding, Finding, Location, Severity, observe_analyzer_findings
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_tokens import PythonLiteralSpans
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
@@ -6283,6 +6283,12 @@ class _PreparedSourceCommands:
     values: dict[tuple[int, int], ShellSourceValue | tuple[ShellSourceValue, ...]]
     check_runtime: Callable[[], None]
     analyzed: bool = False
+    mapped_findings: list[Finding] = field(default_factory=list)
+    emitted_findings: int = 0
+
+    def retained_source_findings(self) -> list[Finding]:
+        """Return only bounded evidence already addressed to the parent consumer."""
+        return self.mapped_findings[self.emitted_findings :]
 
     def variants(self) -> Iterator[tuple[tuple[int, int], ShellSourceValue]]:
         for span, value in self.values.items():
@@ -6290,7 +6296,13 @@ class _PreparedSourceCommands:
                 yield span, variant
 
     def analyze_source_commands(
-        self, *, content: str, file_path: str, file_type: str, source_view: SecurityTextView
+        self,
+        *,
+        content: str,
+        file_path: str,
+        file_type: str,
+        source_view: SecurityTextView,
+        finding_budget: static_runner._FindingBudget | None = None,
     ) -> Iterator[AnalyzerFinding]:
         if (
             content != self.content
@@ -6300,48 +6312,56 @@ class _PreparedSourceCommands:
         ):
             self.resolver.valid = False
             return
+        if finding_budget is None:
+            started_at = time.monotonic()
+
+            def clock() -> float:
+                self.check_runtime()
+                return time.monotonic()
+
+            finding_budget = static_runner._FindingBudget(
+                static_runner.MAX_FINDINGS_PER_ARTIFACT,
+                started_at,
+                started_at + static_runner.MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT,
+                clock,
+            )
         locations = SourceLocationIndex(content, file_path)
         for (start, end), value in self.variants():
-            self.check_runtime()
-            originals = analyze(value.text, file_path, "shell", check_runtime=self.check_runtime)
-            converted = [static_runner.analyzer_finding_to_finding(item) for item in originals]
-            original_by_id = {
-                finding.finding_id: original
-                for finding, original in zip(converted, originals, strict=True)
-            }
-            finalized = postprocess_path_findings(value.text, converted)
-            self.check_runtime()
-            line, column = locations.line_and_column(start)
-            for child in finalized:
-                original = original_by_id.get(child.finding_id)
-                if original is None:
-                    # Never accept completeness after an unfamiliar ownership
-                    # rewrite. Still retain its finding at the parent consumer.
-                    self.resolver.valid = False
-                    original = AnalyzerFinding(
-                        rule_id=child.rule_id,
-                        message=child.message,
-                        severity=Severity(child.severity),
-                        location=Location(file_path, line, start_column=column),
-                        remediation=child.remediation,
-                        tags=list(child.tags),
-                        explanation=child.explanation,
-                    )
-                child_line, child_column = child.start_line, child.start_column
-                original.location = Location(
-                    file_path,
-                    line,
-                    start_column=column,
-                    end_column=column + max(1, min(end - start, 128)),
+            finding_budget.check_runtime()
+            children, reason, metrics = static_runner._scan_all_views_detailed(
+                file_path,
+                value.text,
+                [sys.modules[__name__]],
+                None,
+                python_source=False,
+                # This text is already reconstructed. No child source cache is
+                # available, and all views charge the original artifact budget.
+                _parent_budget=finding_budget,
+            )
+            if reason is not None:
+                self.resolver.valid = False
+            if reason == static_runner.LedgerReason.RUNTIME_LIMIT:
+                finalized = cleanup_path_findings(children)
+            else:
+                finalized = postprocess_path_findings(
+                    value.text,
+                    children,
+                    started_at=finding_budget.started_at,
+                    timeout_seconds=finding_budget.deadline - finding_budget.started_at,
                 )
-                original.severity = Severity(child.severity)
-                original.confidence = child.confidence
-                original.context = child.context
-                original.matched_text = child.matched_text
-                original.evidence = {
+            line, column = locations.line_and_column(start)
+            self.mapped_findings = finalized
+            self.emitted_findings = 0
+            for child in finalized:
+                child_line, child_column = child.start_line, child.start_column
+                child.file = file_path
+                child.start_line = child.end_line = line
+                child.start_column = column
+                child.end_column = column + max(1, min(end - start, 128))
+                child.evidence = {
                     key: item for key, item in child.evidence.items() if not key.startswith("_")
                 }
-                original.evidence["reconstructed_shell_source"] = {
+                child.evidence["reconstructed_shell_source"] = {
                     "consumer_start": start,
                     "consumer_end": end,
                     "command_sha256": sha256(value.text.encode()).hexdigest(),
@@ -6358,12 +6378,43 @@ class _PreparedSourceCommands:
                     ],
                 }
                 if value.argv is not None:
-                    detail = original.evidence["reconstructed_shell_source"]
+                    detail = child.evidence["reconstructed_shell_source"]
                     detail["normalized_command_sha256"] = detail.pop("command_sha256")
                     detail["normalized_forwarded_argv"] = list(value.argv)
                 identity = f"{file_path}:{start}:{end}:{child_line}:{child_column}:{child.match_fingerprint}:{value.text}"
-                original.match_fingerprint = sha256(identity.encode()).hexdigest()
-                yield original
+                child.match_fingerprint = sha256(identity.encode()).hexdigest()
+            if reason in {
+                static_runner.LedgerReason.RUNTIME_LIMIT,
+                static_runner.LedgerReason.OUTPUT_LIMIT,
+            }:
+                raise static_runner._StaticResourceLimitError(reason, metrics)
+            for child in finalized:
+                # Child construction was already charged. Converting its
+                # mapped representation must not charge it again or discard a
+                # proven prefix when the parent deadline expires at emission.
+                with observe_analyzer_findings(lambda _: None):
+                    mapped = AnalyzerFinding(
+                        rule_id=child.rule_id,
+                        message=child.message,
+                        severity=Severity(child.severity),
+                        location=Location(
+                            file_path,
+                            line,
+                            end_line=line,
+                            start_column=column,
+                            end_column=child.end_column,
+                        ),
+                        confidence=child.confidence,
+                        remediation=child.remediation,
+                        tags=list(child.tags),
+                        explanation=child.explanation,
+                        context=child.context,
+                        matched_text=child.matched_text,
+                        evidence=child.evidence,
+                        match_fingerprint=child.match_fingerprint,
+                    )
+                yield mapped
+                self.emitted_findings += 1
         self.analyzed = True
 
     def has_bounded_parse_exhaustion(self) -> bool:

@@ -816,6 +816,7 @@ class _FindingBudget:
     created_findings: int = 0
     emitted_findings: int = 0
     current_created: list[AnalyzerFinding] = field(default_factory=list)
+    parent: _FindingBudget | None = None
 
     def _runtime_metrics(self, now: float) -> dict[str, int | float]:
         return {
@@ -847,6 +848,8 @@ class _FindingBudget:
                     "limit_findings": self.max_findings,
                 },
             )
+        if self.parent is not None:
+            self.parent.observe_creation(finding)
         self.current_created.append(finding)
 
     def observe_emission(self) -> None:
@@ -1084,6 +1087,11 @@ def _scan_path(
                         file_path=path,
                         file_type=module_file_type,
                         source_view=source_view or SecurityTextView("raw", content),
+                        **(
+                            {"finding_budget": finding_budget}
+                            if analysis_method == "analyze_source_commands"
+                            else {}
+                        ),
                     )
                 else:
                     analyze_kwargs: dict[str, object] = {
@@ -1113,6 +1121,14 @@ def _scan_path(
                     if converted is not None:
                         findings.append(converted)
         except _StaticResourceLimitError as exc:
+            if analysis_method == "analyze_source_commands" and prepared is not None:
+                # Only already-mapped consumer evidence may survive an expired
+                # child scan or emission check; child-local coordinates cannot.
+                for finding in prepared.retained_source_findings():
+                    if finding_budget.emitted_findings >= finding_budget.max_findings:
+                        break
+                    finding_budget.emitted_findings += 1
+                    findings.append(finding)
             # A list-building module may be interrupted before it can return.
             # Preserve the bounded prefix it constructed so high-severity
             # evidence is not discarded merely because the output ceiling hit.
@@ -2280,6 +2296,7 @@ def _scan_declared_marker_views(
                         started_at=finding_budget.started_at,
                         deadline=finding_budget.deadline,
                         clock=finding_budget.clock,
+                        parent=finding_budget.parent,
                     )
                     view_findings, resource_limit = _scan_view_windows(
                         path,
@@ -2399,9 +2416,19 @@ def _scan_all_views_detailed(
     readable_binary: bool = False,
     source_cache: _CompleteSourceCache | None = None,
     _oms_projected: bool = False,
+    _parent_budget: _FindingBudget | None = None,
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Scan bounded raw windows and return any limit with observed/limit metrics."""
-    started_at = time.monotonic() if started_at is None else started_at
+    clock = time.monotonic if _parent_budget is None else _parent_budget.clock
+    if _parent_budget is not None:
+        started_at = _parent_budget.started_at
+        timeout_seconds = _parent_budget.deadline - started_at
+        max_findings = min(
+            max_findings,
+            max(0, _parent_budget.max_findings - _parent_budget.created_findings),
+            max(0, _parent_budget.max_findings - _parent_budget.emitted_findings),
+        )
+    started_at = clock() if started_at is None else started_at
     if readable_binary:
         modules = [
             module
@@ -2425,6 +2452,7 @@ def _scan_all_views_detailed(
             timeout_seconds=timeout_seconds,
             started_at=started_at,
             python_source=False,
+            _parent_budget=_parent_budget,
         )
         findings = [
             finding
@@ -2452,7 +2480,7 @@ def _scan_all_views_detailed(
     runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
     if timeout_seconds is not None:
         runtime_limit = min(runtime_limit, max(0.0, timeout_seconds))
-    now = time.monotonic()
+    now = clock()
     if now >= started_at + runtime_limit:
         return (
             [],
@@ -2474,6 +2502,7 @@ def _scan_all_views_detailed(
             started_at=started_at,
             # This view is derived JSON metadata, not a Python execution surface.
             python_source=False,
+            _parent_budget=_parent_budget,
             _oms_projected=True,
         )
         for finding in findings:
@@ -2512,7 +2541,8 @@ def _scan_all_views_detailed(
         max_findings=max(0, max_findings),
         started_at=started_at,
         deadline=deadline,
-        clock=time.monotonic,
+        clock=clock,
+        parent=_parent_budget,
     )
     marker_projection_limited = False
     coalesce_hook = (
@@ -2628,7 +2658,8 @@ def _scan_all_views_detailed(
             max_findings=max(0, max_findings),
             started_at=started_at,
             deadline=deadline,
-            clock=time.monotonic,
+            clock=clock,
+            parent=_parent_budget,
         )
         try:
             finding_budget.check_runtime()
@@ -2815,7 +2846,7 @@ def _scan_all_views_detailed(
     if modules_for_windows:
         assert source_context is not None
         for owned_start, raw_start in zip(raw_owned_starts, raw_starts, strict=True):
-            now = time.monotonic()
+            now = clock()
             if now >= deadline:
                 return (
                     reconciled_prefix(),
@@ -2916,6 +2947,7 @@ def _scan_all_views_detailed(
                             started_at=started_at,
                             deadline=deadline,
                             clock=finding_budget.clock,
+                            parent=_parent_budget,
                         )
                         view_findings, resource_limit = _scan_view_windows(
                             path,
@@ -3052,6 +3084,7 @@ def _scan_all_views_detailed(
                                 started_at=started_at,
                                 deadline=deadline,
                                 clock=finding_budget.clock,
+                                parent=_parent_budget,
                             )
                             view_findings, resource_limit = _scan_view_windows(
                                 path,
@@ -3118,6 +3151,7 @@ def _scan_all_views_detailed(
                             started_at=started_at,
                             deadline=deadline,
                             clock=finding_budget.clock,
+                            parent=_parent_budget,
                         )
                         view_findings, resource_limit = _scan_view_windows(
                             path,
