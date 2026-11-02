@@ -693,10 +693,11 @@ def reconstruct_helper_commands(
 class _OutputInterpreter(_Interpreter):
     """Track stdout only for finite printf/cat helpers and proved log paths."""
 
-    def __init__(self, tick: Callable[[], None], writable_paths: frozenset[str], program: tuple[_Node, ...]) -> None:
+    def __init__(self, tick: Callable[[], None], writable_paths: frozenset[str], program: tuple[_Node, ...], written_paths: set[str] | None = None) -> None:
         super().__init__("", tick, helper=True)
         self.writable_paths = writable_paths
         self.tested_status: set[int] = set()
+        self.written_paths = written_paths
 
         def collect(nodes: tuple[_Node, ...], *, tested: bool = False) -> None:
             for index, node in enumerate(nodes):
@@ -728,6 +729,8 @@ class _OutputInterpreter(_Interpreter):
             if redirect in {"1>", "1>>", "2>", "2>>"}:
                 if destination not in self.writable_paths and destination != "/dev/null":
                     raise _Unresolved
+                if destination != "/dev/null" and self.written_paths is not None:
+                    self.written_paths.add(destination)
                 if redirect.startswith("1"):
                     stdout = False
             elif redirect == "1>&" and destination == "2":
@@ -795,6 +798,8 @@ def reconstruct_helper_output(
     writable_paths: frozenset[str],
     read_word: ReadWord,
     check_runtime: Callable[[], None],
+    *,
+    written_paths: set[str] | None = None,
 ) -> tuple[tuple[ShellHelperOutput, ...], ...] | None:
     """Enumerate possible successful stdout values without opening a file.
 
@@ -826,7 +831,7 @@ def reconstruct_helper_output(
         program = parser.sequence()
         if parser.peek():
             raise _Unresolved
-        states = _OutputInterpreter(tick, writable_paths, program).sequence(program, [_State(environment.copy(), [], argv)])
+        states = _OutputInterpreter(tick, writable_paths, program, written_paths).sequence(program, [_State(environment.copy(), [], argv)])
         if any(state.status is not True for state in states):
             raise _Unresolved
         return tuple(dict.fromkeys(state.output for state in states))

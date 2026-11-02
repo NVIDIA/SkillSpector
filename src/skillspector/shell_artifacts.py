@@ -48,6 +48,7 @@ class ShellArtifact:
     value: ShellSourceValue | None = None
     members: tuple[tuple[str, ShellArtifact], ...] = ()
     opaque_size: int | None = None
+    executable: bool | None = None
 
     @property
     def is_archive(self) -> bool:
@@ -70,6 +71,35 @@ class ShellArtifactStore:
         self._unknown: set[str] = set()
         self._bytes = 0
         self.complete = True
+        self._parent: ShellArtifactStore | None = None
+        self._revision = 0
+        self._parent_revision = 0
+
+    def fork(self) -> ShellArtifactStore:
+        """Try an optional producer proof without changing the accepted snapshot."""
+        self._check_runtime()
+        child = ShellArtifactStore(self._check_runtime)
+        child._files = self._files.copy()
+        child._owned = self._owned.copy()
+        child._unknown = self._unknown.copy()
+        child._bytes = self._bytes
+        child.complete = self.complete
+        child._parent = self
+        child._parent_revision = self._revision
+        return child
+
+    def adopt(self, child: ShellArtifactStore) -> bool:
+        """Commit only a successful direct fork; artifacts themselves are immutable."""
+        self._check_runtime()
+        if child._parent is not self or child._parent_revision != self._revision or not child.complete:
+            return False
+        self._files = child._files.copy()
+        self._owned = child._owned.copy()
+        self._unknown = child._unknown.copy()
+        self._bytes = child._bytes
+        self._revision += 1
+        child._parent = None
+        return True
 
     def _size(self, artifact: ShellArtifact) -> int | None:
         """Validate the entire inventory under one shared node/byte allowance."""
@@ -80,6 +110,8 @@ class ShellArtifactStore:
             self._check_runtime()
             current, depth = pending.pop()
             visited += 1
+            if current.executable is not None and not isinstance(current.executable, bool):
+                return None
             if depth > MAX_GENERATED_DEPTH or visited > MAX_GENERATED_FILES:
                 return None
             if current.opaque_size is not None:
@@ -124,11 +156,13 @@ class ShellArtifactStore:
             self.complete = False
             return False
         self._owned.add(key)
+        self._revision += 1
         return True
 
     def invalidate(self, path: str | None) -> None:
         """Forget known bytes after an unknown write, alias or directory escape."""
         self._check_runtime()
+        self._revision += 1
         key = _path(path) if path is not None else None
         if key is None:
             self._files.clear()
@@ -195,6 +229,7 @@ class ShellArtifactStore:
             return False
         self._files[key] = artifact
         self._bytes = self._bytes - previous_size + size
+        self._revision += 1
         return True
 
     def copy(self, source: str, destination: str) -> bool:
@@ -240,6 +275,21 @@ class ShellArtifactStore:
         ):
             return None
         return tuple((path[len(key) + 1:], artifact) for path, artifact in sorted(self._files.items()) if path.startswith(key + "/"))
+
+    def owns(self, path: str) -> bool:
+        """Prove a path stays inside a fresh tree despite unrelated unknown files.
+
+        Unlike inventory(), this does not claim all descendants are known. An
+        unknown path ancestor still refuses ownership because it may be an alias.
+        """
+        self._check_runtime()
+        key = _path(path)
+        return bool(
+            key is not None and self.complete
+            and any(self._within(key, parent) for parent in self._owned)
+            and not any(self._within(key, unknown) for unknown in self._unknown)
+            and not any(key != name and self._within(key, name) for name in self._files)
+        )
 
     def extract(self, source: str, destination: str) -> bool:
         """Model extraction only into a proven fresh, exclusively owned tree."""

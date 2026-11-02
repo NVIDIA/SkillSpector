@@ -297,7 +297,8 @@ def test_finite_producer_preserves_setup_copy_and_archive_member_prefixes() -> N
     assert result is not None
     assert store.create_empty_directory("/tmp/extracted")
     assert store.extract("/tmp/result/package.tgz", "/tmp/extracted")
-    assert store.read("/tmp/extracted/bundle/setup.sh") == _program()
+    copied = store.read("/tmp/extracted/bundle/setup.sh")
+    assert copied is not None and copied.value == _program().value and copied.executable is True
     assert store.read("/tmp/extracted/bundle/tools/tool/FlashTool") is not None
     assert all(path.startswith(("/tmp/producer.__skillspector_producer_", "/tmp/result/")) for path in result.writes)
 
@@ -338,3 +339,42 @@ def test_specialized_producer_operations_cannot_bypass_shadowed_native_names(nam
     result, store = _inspect_producer(program)
     assert result is None
     assert store.read("/tmp/result/package.tgz") is None
+
+
+def test_optional_producer_failure_cannot_invalidate_the_original_snapshot() -> None:
+    store = ShellArtifactStore(lambda: None)
+    assert store.write("scripts/setup.sh", _program())
+    child = store.fork()
+    child.invalidate(None)
+    assert not store.adopt(child)
+    assert store.read("scripts/setup.sh") == _program()
+
+
+def test_successful_snapshot_can_only_be_adopted_by_its_parent_once() -> None:
+    store = ShellArtifactStore(lambda: None)
+    child = store.fork()
+    assert child.write("generated.sh", _program())
+    assert store.read("generated.sh") is None
+    assert not ShellArtifactStore(lambda: None).adopt(child)
+    assert store.adopt(child)
+    assert store.read("generated.sh") == _program()
+    assert not store.adopt(child)
+
+
+def test_adopting_a_stale_producer_snapshot_cannot_erase_later_writes() -> None:
+    store = ShellArtifactStore(lambda: None)
+    child = store.fork()
+    assert child.write("first.sh", _program())
+    assert store.write("later.sh", _program())
+    assert not store.adopt(child)
+    assert store.read("later.sh") == _program()
+
+
+def test_unknown_sibling_bytes_do_not_remove_an_independent_path_ownership_proof() -> None:
+    store = ShellArtifactStore(lambda: None)
+    assert store.create_empty_directory("/tmp/work")
+    store.invalidate("/tmp/work/log")
+    assert store.inventory("/tmp/work") is None
+    assert store.owns("/tmp/work/output")
+    assert not store.owns("/tmp/work/log")
+    assert not store.owns("/tmp/work/log/child")

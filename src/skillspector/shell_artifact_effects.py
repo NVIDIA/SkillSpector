@@ -1,0 +1,338 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Join a bounded shell effect audit to its virtual generated-file inventory.
+
+Every fact comes from uploaded bytes or an explicitly modeled operation. Native
+identity is checked before interpreting argv; uncertain branches invalidate their
+destinations. This module never opens a sample path or executes a sample command.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import replace
+import hashlib
+import posixpath
+import re
+import shlex
+
+from skillspector.shell_artifact_flow import ShellArtifactEffects, ShellProducer, helper_stdout_artifacts
+from skillspector.shell_artifacts import ShellArtifact, ShellArtifactStore
+from skillspector.shell_helper_argv import is_managed_shell_variable, reconstruct_helper_output
+from skillspector.shell_source_effects import ShellEffectCommand, ShellEffectResult
+from skillspector.shell_sources import SAFE_PATH_MARKER, ReadWord, ShellSourceContext, ShellSourceOrigin, ShellSourceValue
+
+
+_BUILTINS = frozenset({":", "true", "false", "set", "printf", "echo", "pwd", "cd", "command", "test", "umask", "wait"})
+_READERS = frozenset({"head", "tail", "grep", "egrep", "fgrep", "cut", "wc", "stat", "sha256sum", "sha1sum", "md5sum", "cmp", "diff", "readlink", "ls", "file", "sleep", "id", "date", "kill"})
+_COMPRESSORS = frozenset({"gzip", "pigz", "bzip2", "lbzip2", "xz"})
+
+
+class ShellArtifactAudit:
+    """Stateful native-effect callback for one ordered source-preservation proof."""
+
+    def __init__(self, context: ShellSourceContext, read_word: ReadWord, check_runtime: Callable[[], None]) -> None:
+        self.context = context
+        self.read_word = read_word
+        self.check_runtime = check_runtime
+        self.store = ShellArtifactStore(check_runtime)
+        self.effects = ShellArtifactEffects(self.store, check_runtime)
+        self.temporary = 0
+        self.steps = 0
+        self.path_tail = SAFE_PATH_MARKER + "_PATH_TAIL"
+        for path, source in context.sources.items():
+            check_runtime()
+            if SAFE_PATH_MARKER in source:
+                self.store.invalidate(None)
+                break
+            origin = ShellSourceOrigin(path, 0, len(source), hashlib.sha256(source.encode()).hexdigest())
+            if not self.store.write(path, ShellArtifact(ShellSourceValue(source, "code", (origin,)))):
+                break
+
+    def path(self, value: str | None, cwd: str | None) -> str | None:
+        if value is None or not value or any(item in value for item in ("\x00", "\\", ":")):
+            return None
+        if value.startswith("/"):
+            result = posixpath.normpath(value)
+        elif cwd is not None:
+            result = posixpath.normpath(posixpath.join(cwd, value))
+        else:
+            return None
+        return None if result in {".", "..", "/"} or result.startswith("../") else result
+
+    def read_source(self, path: str) -> str | None:
+        artifact = self.store.read(path)
+        return artifact.value.text if artifact is not None and artifact.value is not None else None
+
+    def identity(self, command: ShellEffectCommand, name: str) -> tuple[bool, str | None]:
+        """Return native identity or an exact executable script selected by PATH."""
+        if name in _BUILTINS:
+            return True, None
+        if "/" in name:
+            basename = posixpath.basename(name)
+            if name in {"/bin/" + basename, "/usr/bin/" + basename}:
+                return True, None
+            path = self.path(name, command.cwd)
+            artifact = self.store.read(path) if path is not None else None
+            if artifact is not None and artifact.value is not None and (path in self.context.sources or artifact.executable is True):
+                return False, path
+            return False, None
+        path_value = command.environment.get("PATH", self.path_tail)
+        if path_value is None:
+            return False, None
+        components = path_value.split(":")
+        if not components or components[-1] != self.path_tail:
+            return False, None
+        for directory in components[:-1]:
+            directory = self.path(directory, command.cwd)
+            if directory is None or not self.store.owns(directory):
+                return False, None
+            candidate = directory + "/" + name
+            artifact = self.store.read(candidate)
+            if artifact is not None:
+                if artifact.value is not None and artifact.executable is True:
+                    return False, candidate
+                # An unknown mode/type cannot be assumed absent from PATH.
+                return False, None
+            if self.store.exists(candidate) is not False:
+                return False, None
+        return True, None
+
+    def _origin(self, command: ShellEffectCommand) -> tuple[ShellSourceOrigin, ...]:
+        source = self.context.sources.get(command.source_path)
+        if source is None:
+            artifact = self.store.read(command.source_path)
+            return artifact.value.origins if artifact is not None and artifact.value is not None else ()
+        return (ShellSourceOrigin(command.source_path, command.offset, min(len(source), command.offset + 1), hashlib.sha256(source.encode()).hexdigest()),)
+
+    def _redirect(self, command: ShellEffectCommand, stdout: tuple[ShellArtifact, ...] | None) -> tuple[str, ...] | None:
+        writes = []
+        used_stdout = False
+        file_outputs = [(operator, value) for operator, value in command.redirects if operator.startswith("1>") and operator != "1>&" and value != "/dev/null"]
+        if len(file_outputs) > 1 or file_outputs and any(operator in {"1>&", "2>&"} for operator, _ in command.redirects):
+            # Ordered descriptor duplication needs a separate stream model.
+            return None
+        for operator, value in command.redirects:
+            self.check_runtime()
+            if operator in {"1>&", "2>&", "0<&"} and value in {"0", "1", "2", "-"}:
+                continue
+            if operator == "0<":
+                continue
+            if operator not in {"1>", "1>>", "2>", "2>>"}:
+                return None
+            if value == "/dev/null":
+                continue
+            destination = self.path(value, command.cwd)
+            if destination is None:
+                return None
+            writes.append(destination)
+            if operator.startswith("1") and not used_stdout and not command.uncertain and stdout is not None:
+                used_stdout = True
+                if not self.effects.redirect_stdout(destination, stdout, append=operator.endswith(">>")):
+                    return None
+            else:
+                self.store.invalidate(destination)
+        return tuple(writes)
+
+    def _helper_output(self, command: ShellEffectCommand, path: str, argv: tuple[str, ...], store: ShellArtifactStore, writes: set[str], writable: frozenset[str]) -> tuple[ShellArtifact, ...] | None:
+        artifact = store.read(path)
+        if artifact is None or artifact.value is None:
+            return None
+        # The finite output interpreter only has these native operations. Prove
+        # their external identity under the exact helper PATH before reusing it.
+        if not self.identity(command, "cat")[0]:
+            return None
+        environment = {name: value for name, value in command.environment.items() if not is_managed_shell_variable(name)}
+        written: set[str] = set()
+        variants = reconstruct_helper_output(artifact.value.text, argv[1:], environment, writable, self.read_word, self.check_runtime, written_paths=written)
+        if variants is None:
+            return None
+        for destination in written:
+            store.invalidate(destination)
+        writes.update(written)
+        return helper_stdout_artifacts(variants, store, artifact.value.origins, self.check_runtime)
+
+    def _producer(self, command: ShellEffectCommand, path: str) -> ShellEffectResult | None:
+        # A producer is an optional proof for one explicit output, never an
+        # exemption for a file name. Other known scripts use the caller's audit.
+        if command.uncertain or command.redirects or len(command.argv) != 2:
+            return None
+        destination = self.path(command.argv[1], command.cwd)
+        if destination is None or not self.store.owns(destination):
+            return None
+        source = self.read_source(path)
+        if source is None:
+            return None
+        trial = self.store.fork()
+        helper_writes: set[str] = set()
+        # These locations were proved before entering the finite producer. Its
+        # permitted helper writes create ordinary log bytes, never path aliases.
+        # Repeated appends remain permitted after their bytes become unknown.
+        writable = frozenset(value for value in command.environment.values() if isinstance(value, str) and value.startswith("/") and self.store.owns(value))
+
+        def output(argv: tuple[str, ...]) -> tuple[ShellArtifact, ...] | None:
+            _, helper = self.identity(command, argv[0])
+            return self._helper_output(command, helper, argv, trial, helper_writes, writable) if helper is not None else None
+
+        # Producer syntax also contains native names inside specialized forms.
+        for name in ("dirname", "awk", "find", "sort", "xargs", "sha256sum", "cp", "tar", "mkdir", "chmod", "mktemp", "rm", *_COMPRESSORS):
+            if not self.identity(command, name)[0]:
+                return None
+        environment = {name: value for name, value in command.environment.items() if not is_managed_shell_variable(name)}
+        context = ShellSourceContext(path, {**self.context.sources, path: source})
+        result = ShellProducer(trial, context, self.read_word, self.check_runtime, output).inspect((destination,), environment, (destination,))
+        if result is None or not self.store.adopt(trial):
+            return None
+        return ShellEffectResult(status=True, writes=tuple(sorted(set(result.writes) | helper_writes)))
+
+    def __call__(self, command: ShellEffectCommand) -> ShellEffectResult | None:
+        self.check_runtime()
+        if not self.store.complete or not command.argv or len(command.argv) > 128 or command.argv[0] is None:
+            return None
+        if any(is_managed_shell_variable(name) and name != "PATH" for name in command.environment):
+            return None
+        native, script = self.identity(command, command.argv[0])
+        if command.identity_only:
+            return ShellEffectResult(native_identity=native, script_path=script) if native or script is not None else None
+        self.steps += 1
+        if self.steps > 65_536:
+            return None
+        if script is not None and not command.child_inspected:
+            produced = self._producer(command, script)
+            if produced is not None:
+                return produced
+            # A child requires its stdout/effects before committing redirects.
+            # The walker sends a child_inspected completion call afterward.
+            return ShellEffectResult(script_path=script)
+        if not native and not (script is not None and command.child_inspected):
+            return None
+        name = posixpath.basename(command.argv[0])
+        args = command.argv[1:]
+        output: str | None = command.stdout if command.child_inspected else None
+        artifacts: tuple[ShellArtifact, ...] | None = None
+        writes: list[str] = []
+        status: bool | None = True
+        if command.child_inspected:
+            status = command.child_status
+        elif name in {":", "true", "false"} and not args:
+            output, status = "", name != "false"
+        elif name == "set" and args in {("-euo", "pipefail"), ("-Eeuo", "pipefail"), ("-e",), ("+e",), ("-a",), ("+a",)}:
+            output = ""
+        elif name == "umask" and len(args) == 1 and args[0] in {"077", "022"}:
+            output = ""
+        elif name == "pwd" and not args:
+            output = None if command.cwd is None else command.cwd + "\n"
+        elif name == "cd" and len(args) == 1 and self.path(args[0], command.cwd) is not None:
+            output = ""
+        elif name == "dirname" and len(args) == 1 and args[0] is not None:
+            output = posixpath.dirname(args[0]) + "\n" if posixpath.dirname(args[0]) else ".\n"
+        elif name == "echo" and all(value is not None and not value.startswith("-") and "\\" not in value for value in args):
+            output = " ".join(args) + "\n"
+        elif name == "printf" and all(value is not None for value in args):
+            variants = reconstruct_helper_output(shlex.join(("printf", *args)), (), {}, frozenset(), self.read_word, self.check_runtime)
+            artifacts = helper_stdout_artifacts(variants, self.store, self._origin(command), self.check_runtime) if variants is not None else None
+            if artifacts is None or len(artifacts) != 1 or artifacts[0].value is None:
+                return None
+            output = artifacts[0].value.text
+        elif name == "cat" and not args:
+            output = command.stdin
+        elif name == "cat" and all(value is not None and not value.startswith("-") for value in args):
+            values = [self.store.read(self.path(value, command.cwd) or "") for value in args]
+            artifacts = tuple(values) if len(values) == 1 and values[0] is not None else None
+            output = "".join(item.value.text for item in values) if all(item is not None and item.value is not None for item in values) else None
+            if output is not None:
+                origins = tuple(dict.fromkeys(origin for item in values for origin in item.value.origins))
+                artifacts = (ShellArtifact(ShellSourceValue(output, "code", origins)),)
+        elif name == "mktemp" and not command.uncertain and len(args) == 2 and args[0] == "-d" and args[1] is not None and re.fullmatch(r"/tmp/[-A-Za-z0-9_.]+X{3,}[-A-Za-z0-9_.]*", args[1]):
+            self.temporary += 1
+            path = re.sub(r"X{3,}", SAFE_PATH_MARKER + str(self.temporary), args[1])
+            if not self.store.create_empty_directory(path):
+                return None
+            writes.append(path)
+            output = path + "\n"
+        elif name == "mkdir" and args[:1] == ("-p",) and len(args) > 1:
+            for value in args[1:]:
+                path = self.path(value, command.cwd)
+                if path is None:
+                    return None
+                writes.append(path)
+                if command.uncertain:
+                    self.store.invalidate(path)
+                elif self.store.inventory(path) is None or self.store.exists(path) is False and not self.store.create_empty_directory(path):
+                    return None
+            output = ""
+        elif name == "chmod" and len(args) >= 2 and args[0] in {"+x", "-x", "000", "600", "644", "700", "755"}:
+            for value in args[1:]:
+                path = self.path(value, command.cwd)
+                artifact = self.store.read(path) if path is not None else None
+                if path is None:
+                    return None
+                writes.append(path)
+                if command.uncertain or artifact is None:
+                    self.store.invalidate(path)
+                elif not self.store.write(path, replace(artifact, executable=args[0] in {"+x", "700", "755"})):
+                    return None
+            output = ""
+        elif name == "cp" and len(args) == 2 and all(value is not None and not value.startswith("-") for value in args):
+            source, destination = (self.path(value, command.cwd) for value in args)
+            if source is None or destination is None:
+                return None
+            writes.append(destination)
+            if command.uncertain:
+                self.store.invalidate(destination)
+            elif not self.store.copy(source, destination):
+                # A known disjoint destination may still receive unknown data.
+                self.store.invalidate(destination)
+            output = ""
+        elif name == "tar" and all(value is not None for value in args):
+            if args[:1] == ("-I",) and (len(args) < 2 or args[1] not in _COMPRESSORS or not self.identity(command, args[1])[0]):
+                return None
+            if command.uncertain:
+                return None
+            if not self.effects.tar(("tar", *args)):
+                return None
+            at = args.index("-cf") if "-cf" in args else args.index("-xf")
+            writes.append(args[at + 1] if args[at] == "-cf" else args[args.index("-C") + 1])
+            output = ""
+        elif name == "test" and len(args) == 2 and args[0] in {"-e", "-f", "-s", "-x", "-d"}:
+            path = self.path(args[1], command.cwd)
+            artifact = self.store.read(path) if path is not None else None
+            exists = self.store.exists(path) if path is not None else None
+            if args[0] == "-e":
+                status = exists
+            elif args[0] == "-x":
+                status = artifact.executable if artifact is not None else False if exists is False else None
+            elif args[0] == "-f":
+                status = True if artifact is not None else False if exists is False else None
+            elif args[0] == "-d":
+                status = False if artifact is not None or exists is False else exists
+            else:
+                status = bool(artifact.value.text) if artifact is not None and artifact.value is not None else False if exists is False else None
+            output = ""
+        elif name == "command" and len(args) == 2 and args[0] == "-v" and args[1] is not None:
+            found, selected = self.identity(command, args[1])
+            status = True if found or selected is not None else None
+            output = (selected or args[1]) + "\n" if status else None
+        elif name in {"rm", "unlink", "rmdir", "touch", "mv", "ln", "install", "tee", "truncate", "mkfifo", "chown", "chgrp"}:
+            if any(value is None for value in args):
+                return None
+            paths = [self.path(value, command.cwd) for value in args if not value.startswith("-")]
+            if not paths or any(path is None for path in paths):
+                return None
+            for path in paths:
+                self.store.invalidate(path)
+                writes.append(path)
+            status = None
+        elif name in _READERS or name == "wait":
+            status = None
+        elif name in {"bash", "sh"} and len(args) == 2 and args[0] == "-n" and self.read_source(self.path(args[1], command.cwd) or "") is not None:
+            status = None
+        else:
+            return None
+        if artifacts is None and output is not None:
+            artifacts = (ShellArtifact(ShellSourceValue(output, "code", self._origin(command))),)
+        redirects = self._redirect(command, artifacts)
+        if redirects is None:
+            return None
+        return ShellEffectResult(output, status, tuple(dict.fromkeys((*writes, *redirects))), native_identity=True)

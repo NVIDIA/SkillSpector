@@ -9,7 +9,7 @@ file inventory. Unknown output and unsupported argv invalidate their destination
 """
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import re
 import shlex
@@ -629,8 +629,11 @@ class ShellProducer:
             mode = argv.index("-cf") if "-cf" in argv else argv.index("-xf")
             self.writes.add(argv[mode + 1] if argv[mode] == "-cf" else argv[argv.index("-C") + 1])
         elif name == "chmod" and len(arguments) == 2 and arguments[0] in {"600", "700", "+x"} and not redirects:
-            if self.store.read(self.path(arguments[1], state)) is None:
+            path = self.path(arguments[1], state)
+            artifact = self.store.read(path)
+            if artifact is None or not self.store.write(path, replace(artifact, executable=arguments[0] != "600")):
                 raise _Unresolved
+            self.writes.add(path)
         elif name == "cd" and len(arguments) == 1 and not redirects:
             path = self.path(arguments[0], state)
             if self.store.inventory(path) is None:
