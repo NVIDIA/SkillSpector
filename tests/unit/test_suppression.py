@@ -44,6 +44,7 @@ from skillspector.suppression import (
     finding_fingerprint,
     load_baseline,
     partition_findings,
+    source_content_key,
 )
 
 SCANNER_VERSION = "test-scanner-version"
@@ -152,8 +153,8 @@ def test_transitive_fingerprint_and_baseline_are_source_aware() -> None:
     assert serialized["occurrences"][0]["source_digest"] == f"sha256:{'c' * 64}"
 
     file_cache = {
-        f"{first_identity}::skill-a/SKILL.md": SKILL_CONTENT,
-        f"{second_identity}::skill-a/SKILL.md": SKILL_CONTENT,
+        source_content_key(first_identity, "skill-a/SKILL.md"): SKILL_CONTENT,
+        source_content_key(second_identity, "skill-a/SKILL.md"): SKILL_CONTENT,
     }
     baseline = baseline_from_dict(
         build_baseline_dict([first], file_cache=file_cache, scanner_version=SCANNER_VERSION)
@@ -182,7 +183,7 @@ def test_root_glob_baseline_never_suppresses_transitive_finding() -> None:
     kept, suppressed = partition_findings(
         [child],
         baseline,
-        file_cache={f"{identity}::{child.file}": SKILL_CONTENT},
+        file_cache={source_content_key(identity, child.file): SKILL_CONTENT},
         scanner_version=SCANNER_VERSION,
     )
 
@@ -202,7 +203,7 @@ def test_transitive_exact_baseline_requires_immutable_source_provenance() -> Non
     kept, suppressed = partition_findings(
         [legacy_child],
         baseline,
-        file_cache={f"{legacy_child.source_url}::{legacy_child.file}": SKILL_CONTENT},
+        file_cache={source_content_key(legacy_child.source_url, legacy_child.file): SKILL_CONTENT},
         scanner_version=SCANNER_VERSION,
     )
 
@@ -211,7 +212,9 @@ def test_transitive_exact_baseline_requires_immutable_source_provenance() -> Non
     with pytest.raises(ValueError, match="source_identity and source_digest"):
         build_baseline_dict(
             [legacy_child],
-            file_cache={f"{legacy_child.source_url}::{legacy_child.file}": SKILL_CONTENT},
+            file_cache={
+                source_content_key(legacy_child.source_url, legacy_child.file): SKILL_CONTENT
+            },
             scanner_version=SCANNER_VERSION,
         )
 
@@ -232,6 +235,31 @@ def test_transitive_fingerprint_does_not_borrow_same_named_root_content() -> Non
             file_cache={child.file: SKILL_CONTENT},
             scanner_version=SCANNER_VERSION,
         )
+
+
+@pytest.mark.parametrize("delimiter", ["/", "::"])
+def test_transitive_fingerprint_does_not_borrow_lookalike_local_path(delimiter: str) -> None:
+    identity = f"external/{'a' * 64}"
+    child = replace(_finding(), source_identity=identity, source_digest=f"sha256:{'b' * 64}")
+    with pytest.raises(ValueError, match="source content missing"):
+        build_baseline_dict(
+            [child],
+            file_cache={f"{identity}{delimiter}{child.file}": SKILL_CONTENT},
+            scanner_version=SCANNER_VERSION,
+        )
+
+
+def test_root_lookup_does_not_normalize_a_transitive_content_key() -> None:
+    from skillspector.suppression import _component_content
+
+    key = source_content_key("scope", r"..\..\..\x")
+    assert _component_content({key: "remote content"}, './x"]') is None
+
+
+def test_source_content_key_preserves_scope_and_exact_path() -> None:
+    assert source_content_key("a/b", "c") != source_content_key("a", "b/c")
+    assert source_content_key("scope", "a\\b") != source_content_key("scope", "a/b")
+    assert source_content_key("scope", "./a") != source_content_key("scope", "a")
 
 
 def test_fingerprint_canonical_encoding_avoids_delimiter_collision() -> None:
@@ -1133,9 +1161,7 @@ def test_dump_baseline_keeps_destination_on_io_failure(
         raise error("injected I/O failure")
 
     if failure in {"write", "interrupt"}:
-        import tempfile
-
-        original = tempfile.NamedTemporaryFile
+        original = os.fdopen
 
         def failing_temporary_file(*args: object, **kwargs: object):
             temporary = original(*args, **kwargs)
@@ -1149,7 +1175,7 @@ def test_dump_baseline_keeps_destination_on_io_failure(
             temporary.write = partial_write
             return temporary
 
-        monkeypatch.setattr(tempfile, "NamedTemporaryFile", failing_temporary_file)
+        monkeypatch.setattr(os, "fdopen", failing_temporary_file)
     elif failure == "sync":
         monkeypatch.setattr(os, "fsync", fail)
     else:
@@ -1179,7 +1205,7 @@ def test_dump_baseline_preserves_existing_permissions(tmp_path: Path, mode: int)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
-def test_dump_baseline_shared_writer_preserves_inode_and_group_access(
+def test_dump_baseline_refuses_nonowner_update_without_changing_shared_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     output = tmp_path / "baseline.json"
@@ -1193,9 +1219,11 @@ def test_dump_baseline_shared_writer_preserves_inode_and_group_access(
         pytest.fail("a shared writer must not require chown")
 
     monkeypatch.setattr(os, "fchown", no_chown)
-    dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "shared"}]}, output)
+    with pytest.raises(PermissionError, match="owned by another user"):
+        dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "shared"}]}, output)
 
-    assert load_baseline(output).rules[0].reason == "shared"
+    assert output.read_text(encoding="utf-8") == "old baseline" * 200
+    assert list(tmp_path.iterdir()) == [output]
     assert (output.stat().st_uid, output.stat().st_gid, output.stat().st_ino) == (
         old.st_uid,
         old.st_gid,
@@ -1205,26 +1233,34 @@ def test_dump_baseline_shared_writer_preserves_inode_and_group_access(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
-def test_dump_baseline_owner_outside_destination_group_rewrites_in_place(
+def test_dump_baseline_refuses_update_when_group_cannot_be_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     output = tmp_path / "baseline.yaml"
     output.write_text("old baseline", encoding="utf-8")
     output.chmod(0o664)
-    groups = [gid for gid in os.getgroups() if gid != tmp_path.stat().st_gid]
-    if not groups:
-        pytest.skip("requires a supplementary group distinct from the directory group")
-    os.chown(output, -1, groups[0])
     old = output.stat()
+    original_fstat = os.fstat
+
+    def temporary_group_differs(descriptor: int):
+        current = original_fstat(descriptor)
+        if current.st_ino != old.st_ino:
+            values = list(current)
+            values[5] = old.st_gid + 1
+            return os.stat_result(values)
+        return current
+
+    monkeypatch.setattr(os, "fstat", temporary_group_differs)
 
     def denied_chown(*args: object) -> None:
         # A non-root owner cannot assign a group it is not a member of.
         raise PermissionError(errno.EPERM, "Operation not permitted")
 
     monkeypatch.setattr(os, "fchown", denied_chown)
-    dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "owner"}]}, output)
+    with pytest.raises(PermissionError, match="Cannot safely preserve baseline ownership or group"):
+        dump_baseline({"version": 2, "rules": [{"id": "TM1", "reason": "owner"}]}, output)
 
-    assert load_baseline(output).rules[0].reason == "owner"
+    assert output.read_text(encoding="utf-8") == "old baseline"
     assert (output.stat().st_gid, output.stat().st_ino) == (old.st_gid, old.st_ino)
     assert S_IMODE(output.stat().st_mode) == 0o664
     assert list(tmp_path.iterdir()) == [output]
@@ -1244,7 +1280,11 @@ def test_dump_baseline_revalidates_destination_replaced_while_opening(
 
     def swapped_open(path, flags, *args, **kwargs):
         # A cooperating writer atomically publishes once, between lstat and open.
-        if Path(path) == output and replacement.exists():
+        if (
+            Path(path).name == output.name
+            and kwargs.get("dir_fd") is not None
+            and replacement.exists()
+        ):
             os.replace(replacement, output)
         return original_open(path, flags, *args, **kwargs)
 
@@ -1268,7 +1308,7 @@ def test_dump_baseline_rejects_destination_that_keeps_changing(
 
     def swapped_open(path, flags, *args, **kwargs):
         nonlocal swaps
-        if Path(path) == output:
+        if Path(path).name == output.name and kwargs.get("dir_fd") is not None:
             swaps += 1
             replacement = tmp_path / f"replacement-{swaps}.yaml"
             replacement.write_text(f"replacement {swaps}", encoding="utf-8")
@@ -1281,45 +1321,6 @@ def test_dump_baseline_rejects_destination_that_keeps_changing(
 
     assert swaps == suppression_module._BASELINE_DESTINATION_ATTEMPTS
     assert output.read_text(encoding="utf-8") == f"replacement {swaps}"
-    assert list(tmp_path.iterdir()) == [output]
-
-
-@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
-@pytest.mark.parametrize("persistent", [False, True])
-def test_dump_baseline_shared_writer_revalidates_destination_replaced_before_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, persistent: bool
-) -> None:
-    import fcntl
-
-    output = tmp_path / "baseline.yaml"
-    output.write_text("original", encoding="utf-8")
-    output.chmod(0o664)
-    monkeypatch.setattr(os, "geteuid", lambda: output.stat().st_uid + 1)
-    original_flock = fcntl.flock
-    replaced: list[int] = []
-
-    def replacing_flock(descriptor: int, operation: int) -> None:
-        # Another writer publishes after this one opened the path, before the lock.
-        if persistent or not replaced:
-            replacement = tmp_path / f"replacement-{len(replaced)}.yaml"
-            replacement.write_text("replacement", encoding="utf-8")
-            replacement.chmod(0o664)
-            os.replace(replacement, output)
-            replaced.append(output.stat().st_ino)
-        original_flock(descriptor, operation)
-
-    monkeypatch.setattr(fcntl, "flock", replacing_flock)
-    data = {"version": 2, "rules": [{"id": "TM1", "reason": "shared"}]}
-    if persistent:
-        with pytest.raises(ValueError, match="changed before writing"):
-            dump_baseline(data, output)
-        assert len(replaced) == suppression_module._BASELINE_DESTINATION_ATTEMPTS
-        # Every validated inode was replaced before anything was written.
-        assert output.read_text(encoding="utf-8") == "replacement"
-    else:
-        dump_baseline(data, output)
-        assert load_baseline(output).rules[0].reason == "shared"
-        assert output.stat().st_ino == replaced[0]
     assert list(tmp_path.iterdir()) == [output]
 
 
@@ -1364,11 +1365,27 @@ def test_dump_baseline_preserves_read_only_destination(tmp_path: Path) -> None:
     output.write_text("existing baseline", encoding="utf-8")
     output.chmod(0o444)
 
-    with pytest.raises(PermissionError):
+    with pytest.raises(PermissionError) as error:
         dump_baseline({"version": 2}, output)
 
+    assert str(output) in str(error.value)
     assert output.read_text(encoding="utf-8") == "existing baseline"
     assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0, reason="requires unprivileged POSIX permissions"
+)
+def test_dump_baseline_parent_permission_error_names_output(tmp_path: Path) -> None:
+    output = tmp_path / "baseline.yaml"
+    tmp_path.chmod(0o555)
+    try:
+        with pytest.raises(PermissionError) as error:
+            dump_baseline({"version": 2}, output)
+        assert str(output) in str(error.value)
+        assert not output.exists()
+    finally:
+        tmp_path.chmod(0o700)
 
 
 @pytest.mark.parametrize("target_exists", [True, False])

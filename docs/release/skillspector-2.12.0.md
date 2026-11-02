@@ -52,6 +52,7 @@ The candidate also includes the previously pending Markdown-reference and runtim
 
 ## Changed
 
+- Keep referenced targets that exist but are outside the inspected inventory as `referenced_uninspected` coverage caveats; only targets proven absent are reported as `reference_missing` ([#805](https://github.com/NVIDIA/SkillSpector/pull/805)).
 - Expand GPT-family context/output-budget entries in the OpenAI and Azure registries, including correction of the OpenAI GPT-5.4 context entry. These are metadata changes only: default models and API adapters are unchanged, and Responses-only model entries do not establish compatibility with another API ([#539](https://github.com/NVIDIA/SkillSpector/pull/539)).
 - JSON findings retain each occurrence's own zero-based columns; SARIF emits one-based Unicode-codepoint columns for active and suppressed findings. Unknown occurrence columns remain unknown rather than inheriting another occurrence's location ([#584](https://github.com/NVIDIA/SkillSpector/pull/584)).
 - GHSA/OSV `MODERATE` severity maps to `MEDIUM`, correcting the previous `LOW` fallback and potentially increasing affected supply-chain risk scores ([#588](https://github.com/NVIDIA/SkillSpector/pull/588)).

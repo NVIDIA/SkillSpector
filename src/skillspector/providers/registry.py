@@ -104,7 +104,7 @@ def _lookup_token_limit(default_yaml_path: str, model: str, field: str) -> int |
 def lookup_setting(default_yaml_path: str, model: str, key: str) -> str | None:
     """Return the registry's string-valued *key* for *model*, if declared."""
     entry = _load(_resolve_path(default_yaml_path)).get(model)
-    value = entry.get(key) if entry else None
+    value = entry.get(key) if isinstance(entry, dict) else None
     return str(value) if value else None
 
 

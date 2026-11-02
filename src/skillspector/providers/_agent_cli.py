@@ -183,6 +183,15 @@ def _validate_model_label(model: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Fixed text, never derived from untrusted input. Short on purpose: it replaces
+# Claude Code's default agent prompt, which is sent again on every call.
+_CLAUDE_SYSTEM_PROMPT = (
+    "You are a non-interactive text analysis component. You have no tools. "
+    "Follow the instructions in the user message and reply only with the "
+    "requested output."
+)
+
+
 def _build_claude_argv(binary: str, model: str, max_output_tokens: int) -> list[str]:
     """Build the argv list for a capability-stripped ``claude -p`` call.
 
@@ -231,6 +240,23 @@ def _build_claude_argv(binary: str, model: str, max_output_tokens: int) -> list[
     ``--disable-slash-commands``
         Prevents skill/plugin invocations from within the sandboxed call.
 
+    ``--tools ""``
+        Removes every built-in tool definition from the model's context.
+        ``--allowed-tools ""`` only denies tool *use*; without ``--tools ""``
+        each call still carries the full tool schemas, which a scan pays for
+        once per LLM call.
+
+    ``--system-prompt <_CLAUDE_SYSTEM_PROMPT>``
+        Replaces Claude Code's default agent system prompt, which describes
+        tools and coding workflows this call cannot use. The analyzer's own
+        instructions still arrive on stdin. Together with ``--tools ""`` this
+        is most of the fixed per-call startup cost.
+
+    ``--no-session-persistence``
+        Do not write a session transcript. Each call runs in a fresh temporary
+        cwd, so without this every call leaves a new project folder under
+        ``~/.claude/projects``.
+
     Deliberately NOT included:
     - ``--dangerously-skip-permissions`` / ``--allow-dangerously-skip-permissions``
       — explicitly forbidden.
@@ -256,6 +282,11 @@ def _build_claude_argv(binary: str, model: str, max_output_tokens: int) -> list[
         "--strict-mcp-config",
         "--setting-sources=",
         "--disable-slash-commands",
+        "--tools",
+        "",
+        "--system-prompt",
+        _CLAUDE_SYSTEM_PROMPT,
+        "--no-session-persistence",
     ]
 
 
@@ -423,13 +454,46 @@ def _parse_gemini_output(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# OpenCode CLI invocation  (verified against opencode 1.18.33)
+# OpenCode CLI invocation (verified against opencode 1.18.31-1.18.35 and 1.19.0-1.19.4;
+# per-version evidence beside _OPENCODE_SUPPORTED_VERSIONS)
 # ---------------------------------------------------------------------------
 
 
 _OPENCODE_AGENT_PREFIX = "skillspector-deny-all"
 _OPENCODE_DENY_ALL = json.dumps({"*": "deny"}, separators=(",", ":"))
-_OPENCODE_SUPPORTED_VERSION = "1.18.33"
+# Explicit set of individually verified CLI versions (exact triples,
+# never a range): raising a MAX would silently admit an unverified
+# patch, so each widening adds one triple with its own evidence.
+# Evidence per member: 1.18.31 (#575), 1.18.32 (#613), 1.18.33 (#665),
+# 1.18.34 (PR #713: live matrix auth + preflight + isolated run +
+# --help diff, all green), 1.18.35 + 1.19.0 (same matrix; run --help
+# byte-identical across .34/.35/1.19.0), 1.19.1-1.19.3 (same live
+# matrix with exact nonce replies; auth-list shape identical; run
+# --help byte-identical across the three, its only delta vs 1.19.0
+# being the hidden --share flag; plugin packages unchanged across
+# 1.19.0-1.19.3 in bun.lock (opencode-gitlab-auth 2.1.0,
+# opencode-poe-auth 0.0.1, @gitlab/opencode-gitlab-auth 1.3.3, same
+# integrity hashes) and no in-tree plugin source changed), 1.19.4
+# (same live matrix with exact nonce replies; auth-list, both --help
+# surfaces, plugin packages, and in-tree plugin source all unchanged
+# from 1.19.3). The gate stays
+# load-bearing, not belt-and-suspenders: the debug-config check cannot
+# tell whether the TEST_HOME / TEST_MANAGED_CONFIG_DIR hooks below
+# still apply, so each widening needs the same per-version review.
+_OPENCODE_SUPPORTED_VERSIONS = frozenset(
+    {
+        (1, 18, 31),
+        (1, 18, 32),
+        (1, 18, 33),
+        (1, 18, 34),
+        (1, 18, 35),
+        (1, 19, 0),
+        (1, 19, 1),
+        (1, 19, 2),
+        (1, 19, 3),
+        (1, 19, 4),
+    }
+)
 # Markers of a Zen free-tier refusal. Zen answers 403 to
 # any call carrying the deny-all isolation (OPENCODE_CONFIG_CONTENT or
 # OPENCODE_PERMISSION alone suffices; verified by env bisect), so free-tier
@@ -476,15 +540,35 @@ def _opencode_config(agent_name: str) -> str:
     )
 
 
-def _parse_opencode_version(raw: bytes) -> str | None:
-    """Parse an exact stable semantic version from ``opencode --version``."""
+def _parse_opencode_version(raw: bytes) -> tuple[int, int, int] | None:
+    """Parse a stable semantic version triple from ``opencode --version``.
+
+    Prereleases and unparsable output return ``None`` (fail closed).
+    """
     text = raw.decode("utf-8", errors="replace").strip()
     match = re.fullmatch(
-        r"(?:opencode(?:\s+version)?\s+)?v?(\d+\.\d+\.\d+)",
+        r"(?:opencode(?:\s+version)?\s+)?v?(\d+)\.(\d+)\.(\d+)",
         text,
         flags=re.IGNORECASE,
     )
-    return match.group(1) if match is not None else None
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def _format_opencode_version(version: tuple[int, int, int]) -> str:
+    """Render a version triple for fail-closed error messages."""
+    return f"{version[0]}.{version[1]}.{version[2]}"
+
+
+_OPENCODE_SUPPORTED_VERSIONS_TEXT = ", ".join(
+    _format_opencode_version(version) for version in sorted(_OPENCODE_SUPPORTED_VERSIONS)
+)
+
+
+def _is_supported_opencode_version(version: tuple[int, int, int] | None) -> bool:
+    """Return whether a parsed version is a verified member of the set."""
+    return version is not None and version in _OPENCODE_SUPPORTED_VERSIONS
 
 
 def _prepare_opencode_env(
@@ -503,7 +587,10 @@ def _prepare_opencode_env(
     independently as defense in depth.
 
     The real OpenCode authentication store remains available so this CLI
-    provider can use the user's existing login. All mutable config, cache,
+    provider can use the user's existing login. OpenCode's internal plugins stay
+    enabled for the same reason: they implement the OAuth logins (ChatGPT,
+    Copilot, GitLab, ...) and register no tools. External plugins remain off
+    through ``--pure`` / ``OPENCODE_PURE``. All mutable config, cache,
     state, database, and temporary paths are redirected below the invocation's
     already-isolated temporary root.
     """
@@ -536,7 +623,6 @@ def _prepare_opencode_env(
             "OPENCODE_DISABLE_AUTOCOMPACT": "1",
             "OPENCODE_DISABLE_AUTOUPDATE": "1",
             "OPENCODE_DISABLE_CLAUDE_CODE": "1",
-            "OPENCODE_DISABLE_DEFAULT_PLUGINS": "1",
             "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
             "OPENCODE_DISABLE_LSP_DOWNLOAD": "1",
             "OPENCODE_DISABLE_MODELS_FETCH": "1",
@@ -552,11 +638,12 @@ def _prepare_opencode_env(
             "OPENCODE_EXPERIMENTAL_PLAN_MODE": "0",
             "OPENCODE_PERMISSION": _OPENCODE_DENY_ALL,
             "OPENCODE_PURE": "1",
-            # OpenCode 1.18.33 uses this internal override for the home paths
-            # searched for AGENTS.md, .opencode, .claude, and .agents content.
+            # Internal override for the home paths searched for
+            # AGENTS.md, .opencode, .claude, and .agents content,
+            # confirmed for every version in the window.
             "OPENCODE_TEST_HOME": isolated_home,
-            # The same pinned version uses this override instead of the
-            # platform's /etc, ProgramData, or /Library managed-config path.
+            # Same override family for the platform managed-config path
+            # (/etc, ProgramData, /Library), confirmed likewise.
             "OPENCODE_TEST_MANAGED_CONFIG_DIR": managed_config,
             "TEMP": child_tmp,
             "TMP": child_tmp,
@@ -575,7 +662,7 @@ def _preflight_opencode_policy(
     """Fail closed unless OpenCode's fully resolved sensitive config is exact.
 
     macOS MDM preferences are loaded after ``OPENCODE_CONFIG_CONTENT`` and do
-    not have a supported disable flag in OpenCode 1.18.33. Querying the final
+    not have a supported disable flag in any window version. Querying the final
     config with the exact environment and directory prevents a managed
     ``share: auto`` (or another late source) from silently reopening ambient
     capabilities before the inference process is allowed to start.
@@ -606,11 +693,12 @@ def _preflight_opencode_policy(
 
     version_raw = run_probe([binary, "--version"], "version")
     version = _parse_opencode_version(version_raw)
-    if version != _OPENCODE_SUPPORTED_VERSION:
+    if not _is_supported_opencode_version(version):
         version_text = version_raw.decode("utf-8", errors="replace").strip()
         raise AgentCLIError(
-            "OpenCode security policy is verified only for version "
-            f"{_OPENCODE_SUPPORTED_VERSION}; found {version_text[:80]!r}"
+            "OpenCode security policy is verified only for versions "
+            f"{_OPENCODE_SUPPORTED_VERSIONS_TEXT}; found "
+            f"{version_text[:80]!r}"
         )
 
     agent_name = _opencode_agent_name(argv)
@@ -648,7 +736,9 @@ def _preflight_opencode_policy(
 def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
     """Build argv for a text-only, deny-all ``opencode run`` call.
 
-    Flags chosen (verified against ``opencode`` 1.18.33 ``run --help``):
+    Flags chosen (verified against ``opencode`` 1.18.31-1.19.4 ``run --help``,
+    byte-identical across .34/.35/1.19.0 and across 1.19.1-1.19.4, whose
+    only change is the hidden ``--share`` flag):
 
     ``run``
         Non-interactive single-shot mode. With no positional message, the
@@ -674,7 +764,9 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
         SKILLSPECTOR_MODEL is set).
 
     The shared runner also isolates every OpenCode config/state path, disables
-    ambient instructions, skills, plugins, auto-sharing, snapshots and updates,
+    ambient instructions, skills, external plugins (the internal OAuth/provider
+    plugins stay enabled, see ``_prepare_opencode_env``), auto-sharing,
+    snapshots and updates,
     scrubs secret-bearing environment variables, delivers untrusted content
     via stdin only, and never passes ``--auto``.
 
@@ -702,7 +794,9 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
 def _parse_opencode_output(raw: str) -> str:
     """Extract assistant text from ``opencode run --format json`` JSONL events.
 
-    Verified against opencode 1.18.33, whose events look like::
+    Recorded against opencode 1.18.33 (``run --help`` is byte-identical
+    across 1.18.31-1.18.35/1.19.0 and across 1.19.1-1.19.4, and every member
+    carries the live nonce run recorded above), whose events look like:
 
         {"type": "step_start", ..., "part": {"type": "step-start", ...}}
         {"type": "text", ..., "part": {"type": "text", "text": "hi", ...}}
@@ -808,15 +902,14 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
                 timeout=15,
                 env=child_env,
             )
-            if (
-                version_result.returncode != 0
-                or _parse_opencode_version(version_result.stdout or b"")
-                != _OPENCODE_SUPPORTED_VERSION
+            if version_result.returncode != 0 or not _is_supported_opencode_version(
+                _parse_opencode_version(version_result.stdout or b"")
             ):
                 return (
                     False,
-                    "opencode_cli requires exactly OpenCode "
-                    f"{_OPENCODE_SUPPORTED_VERSION} for its verified deny-all policy",
+                    "opencode_cli requires OpenCode "
+                    f"{_OPENCODE_SUPPORTED_VERSIONS_TEXT} "
+                    "for its verified deny-all policy",
                 )
             result = subprocess.run(
                 [binary, "auth", "list"],

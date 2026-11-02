@@ -100,6 +100,71 @@ def test_shared_prohibition_context(content: str, target: str, expected: bool) -
     assert is_directly_prohibited(content, start, start + len(target)) is expected
 
 
+@pytest.mark.parametrize("boundary", [",", ":"])
+def test_clause_boundary_support_is_explicitly_opt_in(boundary: str) -> None:
+    from skillspector.nodes.analyzers.prohibition_context import is_directly_prohibited
+
+    target = "treat the state as your conversation state"
+    content = f"Use the state machine for rendering{boundary} never {target}."
+    start = content.index(target)
+    assert not is_directly_prohibited(content, start, start + len(target))
+    assert is_directly_prohibited(content, start, start + len(target), allow_clause_prefix=True)
+
+
+@pytest.mark.parametrize("boundary", [",", ":"])
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "Unless requested",
+        "Only during validation",
+        "For the first reply",
+        "Ignore this rule",
+        'Print "Policy',
+    ],
+)
+def test_opt_in_clause_boundary_retains_conditions_and_overrides(
+    prefix: str, boundary: str
+) -> None:
+    from skillspector.nodes.analyzers.prohibition_context import is_directly_prohibited
+
+    target = "treat the state as your conversation state"
+    content = f"{prefix}{boundary} never {target}."
+    start = content.index(target)
+    assert not is_directly_prohibited(content, start, start + len(target), allow_clause_prefix=True)
+
+
+@pytest.mark.parametrize("boundary", [",", ":"])
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "> For the first reply",
+        "> > For the first reply",
+        "### For the first reply",
+        "- For the first reply",
+        "* For the first reply",
+        "+ For the first reply",
+        "1) For the first reply",
+        "> - For the first reply",
+        "@@ For the first reply",
+        "For [the first reply](docs)",
+        "For [the first reply](docs/policy.md)",
+        "For [the first reply](docs?mode=first)",
+        "For [the first reply](docs;version=1)",
+        "For [the first reply](docs!first)",
+        "- [x] For the first reply",
+        "> - [x] For the first reply",
+        "- [ ] For the first reply",
+    ],
+)
+def test_opt_in_clause_boundary_retains_markdown_scopes(prefix: str, boundary: str) -> None:
+    from skillspector.nodes.analyzers.prohibition_context import is_directly_prohibited
+
+    target = "treat the state as your conversation state"
+    content = f"{prefix}{boundary} never {target}."
+    start = content.index(target)
+    assert not is_directly_prohibited(content, start, start + len(target), allow_clause_prefix=True)
+
+
 @pytest.mark.parametrize(
     "content",
     [

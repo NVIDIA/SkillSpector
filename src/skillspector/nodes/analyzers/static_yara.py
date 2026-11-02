@@ -303,7 +303,7 @@ class _RulesLockWithinDeadline:
         _RULES_LOCK.release()
 
 
-def _collect_rule_files(*dirs: Path) -> list[Path]:
+def _collect_rule_files(*dirs: Path, required_dir: Path | None = None) -> list[Path]:
     """Collect YARA files with bounded no-follow deterministic traversal."""
     files: list[Path] = []
     seen: set[Path] = set()
@@ -321,10 +321,17 @@ def _collect_rule_files(*dirs: Path) -> list[Path]:
         try:
             root_stat = root.stat(follow_symlinks=False)
         except FileNotFoundError:
-            continue
+            root_stat = None
         except OSError as exc:
             raise _YaraRuleResourceLimitError(LedgerReason.READ_ERROR, {}) from exc
-        if not stat.S_ISDIR(root_stat.st_mode):
+        if root_stat is None or not stat.S_ISDIR(root_stat.st_mode):
+            if root == required_dir:
+                logger.warning(
+                    "%s: user rules directory %s is missing or not a regular directory",
+                    ANALYZER_ID,
+                    root,
+                )
+                raise _YaraRuleResourceLimitError(LedgerReason.READ_ERROR, {})
             continue
         stack: list[tuple[Path, int]] = [(root, 0)]
         while stack:
@@ -533,7 +540,7 @@ def _compile_rules(
     """
     _enforce_rule_load_deadline()
     try:
-        compiled = yara.compile(sources=sources)
+        compiled = yara.compile(sources=sources, includes=False)
         _enforce_rule_load_deadline()
         return compiled, 0
     except yara.SyntaxError:
@@ -545,7 +552,7 @@ def _compile_rules(
     for ns, source in sources.items():
         _enforce_rule_load_deadline()
         try:
-            yara.compile(source=source)
+            yara.compile(source=source, includes=False)
             good[ns] = source
         except (yara.SyntaxError, yara.Error) as exc:
             skipped += 1
@@ -559,7 +566,7 @@ def _compile_rules(
             )
 
     _enforce_rule_load_deadline()
-    compiled = yara.compile(sources=good) if good else None
+    compiled = yara.compile(sources=good, includes=False) if good else None
     _enforce_rule_load_deadline()
     return compiled, skipped
 
@@ -601,12 +608,11 @@ def _load_rules(extra_dir: Path | None = None) -> yara.Rules | None:
         _rules_skipped_count = 0
 
         dirs = [_BUILTIN_RULES_DIR]
-        if extra_dir and extra_dir.is_dir():
+        if extra_dir is not None:
             dirs.append(extra_dir)
-        elif extra_dir:
-            logger.warning("%s: user rules directory %s does not exist", ANALYZER_ID, extra_dir)
 
-        rule_files = _collect_rule_files(*dirs)
+        # Validate the requested root during discovery, before any cache hit.
+        rule_files = _collect_rule_files(*dirs, required_dir=extra_dir)
         if not rule_files:
             logger.info("%s: no YARA rule files found", ANALYZER_ID)
             # Non-populating: discard the entry instead of leaving the previous

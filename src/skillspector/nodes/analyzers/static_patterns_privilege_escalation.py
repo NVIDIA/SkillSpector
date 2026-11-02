@@ -214,6 +214,17 @@ _BENIGN_ACCESS_REQUIREMENT_ROWS = frozenset(
         "| GTL access credential | Runner-gated job create/start/monitor/collect |",
     }
 )
+# The skill-card template's credential disclosure field, for example
+# ``**Credential Type(s):** [Other [Perforce access credentials]] <br>``.
+# Its bracketed value labels the credential a skill relies on.
+_PE3_CREDENTIAL_TYPE_FIELD = re.compile(
+    r"[ \t]*\*\*Credential\s+Type\(s\):\*\*[ \t]*(?P<value>\[[^\r\n]*\])"
+    r"[ \t]*(?:<br\s*/?>)?[ \t]*",
+    re.IGNORECASE,
+)
+_PE3_CREDENTIAL_TYPE_NOUN = re.compile(
+    r"access[ \t]+(?:credentials?|secrets?|tokens?)", re.IGNORECASE
+)
 _PE3_SAFE_ACCESS_TOKEN_NAVIGATION = re.compile(
     r"(?:^|>|\b(?:navigate|go)\s+to\s+)\s*settings\s*>\s*(?:ci/cd\s*>\s*)?"
     r"(?P<target>access\s+tokens?)\s*[`.)]*\s*$",
@@ -767,6 +778,41 @@ def _is_companion_cli_oauth_result_noun(
     )
 
 
+def _is_credential_type_disclosure_label(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> bool:
+    """Return True for an access-credential noun inside a skill-card credential label.
+
+    Skill cards must disclose the credential a skill needs, as in
+    ``**Credential Type(s):** [Other [Perforce access credentials]]``. In that
+    bracketed label ``access`` modifies the noun; it does not direct the agent
+    to read a credential. Only a determiner-free ``access credential``,
+    ``access secret``, or ``access token`` noun inside that one field is exempt.
+    An action verb or sensitive source anywhere in the label keeps the finding,
+    as does the same phrase elsewhere on the line or in any other field.
+    """
+    if file_type != "markdown":
+        return False
+    if _PE3_CREDENTIAL_TYPE_NOUN.fullmatch(match.group(0)) is None:
+        return False
+    line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
+    if line_end - line_start > _MAX_CONTEXTUAL_CLASSIFICATION_LINE_CHARS:
+        return False
+    field = _PE3_CREDENTIAL_TYPE_FIELD.fullmatch(content, line_start, line_end)
+    if field is None:
+        return False
+    if not field.start("value") <= match.start() < match.end() <= field.end("value"):
+        return False
+    value = field.group("value")
+    return not (
+        _PE3_TOKEN_ACTION_CONTEXT.search(value) or _PE3_TOKEN_SENSITIVE_SOURCE.search(value)
+    )
+
+
 def _is_qualified_benign_access_requirement(
     content: str,
     match: re.Match[str],
@@ -966,6 +1012,68 @@ def _constructed_sensitive_paths(
     return resolved
 
 
+def _python_setting_literal_spans(
+    content: str, file_path: str, python_ast: ParsedPythonFile | None
+) -> list[tuple[int, int]]:
+    """Prove exact glab setting literals, leaving interpolated strings lexical."""
+    if "KEYRING" not in content:
+        return []
+    if python_ast is None:
+        cache_key = _scan_python_ast_cache_key.get()
+        python_ast = peek_python_ast(cache_key, content, file_path)
+        if python_ast is None:
+            python_ast = peek_python_ast_any_content(cache_key, file_path)
+        if python_ast is None:
+            python_ast = parse_python_source(content, file_path)
+    if python_ast.tree is None:
+        return []
+    fragment_start = python_ast.content.find(content)
+    if fragment_start < 0:
+        return []
+
+    # Python's AST counts only universal newlines. str.splitlines() also
+    # splits literal form feeds and Unicode separators inside Python strings.
+    byte_starts = [0] + [
+        match.end() for match in re.finditer(rb"\r\n?|\n", python_ast.source_bytes)
+    ]
+
+    def character_offset(line: int, column: int | None) -> int | None:
+        if column is None or not 1 <= line <= len(byte_starts):
+            return None
+        absolute_byte = byte_starts[line - 1] + column
+        non_ascii_count = bisect_right(python_ast.non_ascii_byte_ends, absolute_byte)
+        return absolute_byte - python_ast.non_ascii_extra_bytes[non_ascii_count] - fragment_start
+
+    spans = []
+    pending: list[ast.AST] = [python_ast.tree]
+    while pending:
+        node = pending.pop()
+        # Python 3.14 template values are not setting-name string literals.
+        if isinstance(node, getattr(ast, "TemplateStr", ())):
+            continue
+        setting_literal = isinstance(node, ast.Constant) and node.value == "GLAB_USE_KEYRING"
+        # Constants in interpolated strings can cover executable expressions.
+        # Only a JoinedStr containing one literal value proves an inert name.
+        if isinstance(node, ast.JoinedStr):
+            setting_literal = (
+                len(node.values) == 1
+                and isinstance(node.values[0], ast.Constant)
+                and node.values[0].value == "GLAB_USE_KEYRING"
+            )
+            if not setting_literal:
+                continue
+        if setting_literal:
+            if not isinstance(node.end_lineno, int):
+                continue
+            start = character_offset(node.lineno, node.col_offset)
+            end = character_offset(node.end_lineno, node.end_col_offset)
+            if start is not None and end is not None and 0 <= start <= end <= len(content):
+                spans.append((start, end))
+        if not isinstance(node, ast.JoinedStr):
+            pending.extend(ast.iter_child_nodes(node))
+    return sorted(spans)
+
+
 def analyze(
     content: str,
     file_path: str,
@@ -979,6 +1087,12 @@ def analyze(
     fence_ranges = _markdown_fence_ranges(content) if file_type in {"markdown", "text"} else None
     reference_material = is_reference_material(file_path, file_type)
     ignore_pattern_file = _is_ignore_pattern_file(file_path)
+    setting_spans = (
+        _python_setting_literal_spans(content, file_path, python_ast)
+        if file_type == "python"
+        else []
+    )
+    setting_starts = [start for start, _ in setting_spans]
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
@@ -1050,11 +1164,19 @@ def analyze(
             else re.finditer
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            if match.group(0).casefold() == "keyring":
+                setting_index = bisect_right(setting_starts, match.start()) - 1
+                if setting_index >= 0 and match.end() <= setting_spans[setting_index][1]:
+                    continue
             if _is_bare_credential_store_noun(
                 content, match, file_type, fence_ranges, line_starts, line_ends
             ):
                 continue
             if ignore_pattern_file and _is_ignore_file_exclusion_entry(content, match):
+                continue
+            if _is_credential_type_disclosure_label(
+                content, match, file_type, line_starts, line_ends
+            ):
                 continue
             line_num = line_number(match.start())
             context = context_at(match.start())

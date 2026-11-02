@@ -59,7 +59,6 @@ from skillspector.providers import (
     use_provider,
 )
 from skillspector.providers.nv_build import NvBuildProvider
-from skillspector.providers.openai import OpenAIProvider
 
 _LLM_ENV_VARS = (
     "ANTHROPIC_API_KEY",
@@ -689,7 +688,7 @@ class TestGetChatModel:
 
         llm = get_chat_model()
 
-        assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
+        assert _chat_model_name(llm) == "gpt-5.4"
 
     def test_graph_model_config_matches_openai_fallback_client(
         self, monkeypatch: pytest.MonkeyPatch
@@ -699,8 +698,8 @@ class TestGetChatModel:
         model = build_model_config()["default"]
         llm = get_chat_model(model=model)
 
-        assert model == OpenAIProvider.DEFAULT_MODEL
-        assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
+        assert model == "gpt-5.4"
+        assert _chat_model_name(llm) == "gpt-5.4"
 
     def test_explicit_model_still_overrides_openai_fallback(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1035,7 +1034,8 @@ class TestStructuredOutputMethod:
         assert chain.invoke("analyse this") == Verdict(summary="ok")  # type: ignore[attr-defined]
         prompt, request = requests[0]
         assert prompt == "analyse this"
-        assert request["response_format"] is Verdict
+        assert request["response_format"]["type"] == "json_schema"
+        assert request["response_format"]["json_schema"]["strict"] is True
         assert "tools" not in request
 
     def test_cli_adapter_accepts_the_method_keyword(self) -> None:

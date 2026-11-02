@@ -8,6 +8,7 @@ import pytest
 from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
+    LedgerRecordType,
     analyzer_status_for_events,
     inspection_work_id,
     ledger_event,
@@ -66,6 +67,28 @@ def test_analyzer_status_for_events_summarizes_terminal_work() -> None:
                 "end_line": None,
             }
         ],
+    }
+
+
+def test_analyzer_status_for_scope_boundaries_has_no_planned_work() -> None:
+    """Scope-boundary records are not work assigned to the analyzer."""
+    event = ledger_event(
+        outcome=LedgerOutcome.OUT_OF_SCOPE,
+        record_type=LedgerRecordType.SCOPE_BOUNDARY,
+        phase="static",
+        analyzer_id="static_test",
+        path="assets/font.ttf",
+        reason=LedgerReason.BINARY_CONTENT,
+    )
+
+    status = analyzer_status_for_events("static_test", [event])
+
+    assert status == {
+        "analyzer_id": "static_test",
+        "status": "not_applicable",
+        "planned_work": [],
+        "reason_code": LedgerReason.NO_APPLICABLE_FILES,
+        "message": "No files matched this analyzer's applicability contract.",
     }
 
 

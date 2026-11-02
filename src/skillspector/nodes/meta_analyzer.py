@@ -97,7 +97,10 @@ class MetaAnalyzerFinding(BaseModel):
     @classmethod
     def _normalize_confidence(cls, v: object) -> float:
         # Accept 0-100 scale values from some models, then clamp into [0, 1].
-        value = float(v)  # type: ignore[arg-type]
+        try:
+            value = float(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("confidence must be numeric") from exc
         if value > 2.0:
             value = value / 100.0
         return min(1.0, max(0.0, value))
@@ -130,21 +133,17 @@ class MetaAnalyzerResult(BaseModel):
     def _parse_stringified_findings(cls, v: object) -> object:
         """LLMs sometimes return the findings array as a JSON string."""
         if isinstance(v, str):
-            try:
-                parsed = json.loads(v)
-            except (json.JSONDecodeError, TypeError):
-                return []
-            return parsed if isinstance(parsed, list) else []
+            return json.loads(v)
         return v
 
     @field_validator("overall_assessment", mode="before")
     @classmethod
     def _parse_stringified_assessment(cls, v: object) -> object:
-        """LLMs sometimes return nested objects as JSON strings."""
+        """Ignore optional prose summaries without losing valid finding verdicts."""
         if isinstance(v, str):
             try:
                 return json.loads(v)
-            except (json.JSONDecodeError, TypeError):
+            except json.JSONDecodeError:
                 return None
         return v
 
@@ -432,13 +431,22 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
         file_paths: list[str],
         file_cache: dict[str, str],
         findings: list[Finding] | None = None,
+        **prompt_kwargs: object,
     ) -> list[Batch]:
-        """Redact credential-bearing SC10 source text before provider batching."""
-        batches = super().get_batches(file_paths, file_cache, findings)
-        for batch in batches:
-            if any(finding.rule_id == "SC10" for finding in batch.findings):
-                batch.content = redact_text(batch.content)
-        return batches
+        """Redact credential-bearing SC10 source text before provider batching.
+
+        Files with an SC10 finding are redacted as a whole *before* they are split:
+        redaction can lengthen text, so the batches must be sized from what is
+        actually sent.  ``redact_text`` never spans whitespace, so line numbers stay
+        aligned with the original file.
+        """
+        sc10_files = {finding.file for finding in findings or [] if finding.rule_id == "SC10"}
+        if sc10_files:
+            file_cache = {
+                path: redact_text(text) if path in sc10_files else text
+                for path, text in file_cache.items()
+            }
+        return super().get_batches(file_paths, file_cache, findings, **prompt_kwargs)
 
     def parse_response(  # type: ignore[override]  # Base class permits custom parsed values.
         self,
@@ -858,7 +866,9 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         # and recorded as a degraded LLM call (consistent with the semantic
         # analyzers) rather than crashing the whole graph.
         analyzer = LLMMetaAnalyzer(model=model, timeout=timeout)
-        batches = analyzer.get_batches(files_with_findings, file_cache, eligible_findings)
+        batches = analyzer.get_batches(
+            files_with_findings, file_cache, eligible_findings, metadata_text=metadata_text
+        )
         batches = [batch for batch in batches if batch.findings]
         logger.debug(
             "Meta-analyzer: %d files -> %d batches (model=%s)",
