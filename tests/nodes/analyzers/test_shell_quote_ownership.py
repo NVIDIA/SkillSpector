@@ -72,7 +72,7 @@ def test_fragment_cannot_prove_initial_quote_state() -> None:
 @pytest.mark.parametrize(
     "source",
     [
-        'echo "prefix $(date) suffix"\ncat <<E\n"unowned\nE\n',
+        'echo "prefix $(date) suffix"\ncat <<E\n"unowned\n',
         'echo "prefix $(date) suffix"\necho `date`\n',
         'echo "prefix $(date) suffix"\necho "unfinished\n',
     ],
@@ -87,6 +87,29 @@ def test_ownership_walk_obeys_runtime_budget() -> None:
 
     with pytest.raises(TimeoutError, match="fixture budget"):
         tm._shell_quoted_candidate_limits('echo "$(date)"\n', cancel)
+
+
+@pytest.mark.parametrize("padding", [0, 6000])
+def test_literal_trap_command_is_bounded_before_its_host_quote(padding: int) -> None:
+    source = '''cat <<'DATA'
+"unmatched data quote
+DATA
+trap 'saved=$?; trap - EXIT; finish "$saved"; result=$?; exit "$result"' EXIT
+'''
+    source += "#" * padding + "\n"
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("body", [
+    '$CMD -rf /',
+    'finish "$saved"; $CMD -rf /',
+    'echo "$(bash -c \'$CMD -rf /\')"',
+])
+def test_literal_quote_bound_does_not_hide_runtime_destructive_commands(body: str) -> None:
+    # The third form is deliberately malformed shell quoting; it must also
+    # retain the conservative result rather than borrow an outer delimiter.
+    source = "cat <<'DATA'\nquoted data\nDATA\ntrap '" + body + "' EXIT\n" + "#" * 6000
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
 @pytest.mark.parametrize("file_type", ["shell", "markdown"])

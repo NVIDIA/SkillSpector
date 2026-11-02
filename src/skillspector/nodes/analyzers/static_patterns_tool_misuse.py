@@ -2128,11 +2128,12 @@ def _has_destructive_command_string(content: str) -> bool:
 def _shell_quoted_candidate_limits(
     content: str, check_runtime: Callable[[], None]
 ) -> dict[int, int]:
-    """Prove single-line double-quote bounds by walking shell source in order.
+    """Prove literal quote bounds by walking shell source in order.
 
     This is only an ownership refinement, never an execution or finding parser.
     Comments and single quotes cannot open double-quoted spans. Substitution
-    bodies have independent lexical state. Unsupported heredocs/backticks or
+    bodies have independent lexical state. Heredoc bodies cannot own surrounding
+    quotes. Unsupported delimiters/backticks or
     unresolved syntax discard ALL ownership, retaining the conservative scan.
     """
     limits: dict[int, int] = {}
@@ -2148,16 +2149,34 @@ def _shell_quoted_candidate_limits(
         quote_start = begin
         ansi_c = False
         candidates: list[int] = []
+        pending_heredocs: tuple[tuple[str, bool, bool], ...] = ()
         while cursor < end:
             if (cursor - begin) % 1024 == 0:
                 check_runtime()
             character = content[cursor]
+            if character == "\n" and pending_heredocs:
+                if quote is not None:
+                    return False
+                body_end = _skip_static_heredoc_bodies(
+                    content, cursor + 1, end, pending_heredocs, check_runtime
+                )
+                if body_end is None:
+                    return False
+                pending_heredocs = ()
+                word_started = False
+                cursor = body_end
+                continue
             if quote == "'":
                 if character == "\\" and ansi_c:
                     cursor += 2
                     continue
                 if character == "'":
+                    if not ansi_c:
+                        for position in candidates:
+                            limits[position] = cursor
                     quote = None
+                elif not ansi_c and _SHELL_COMMAND_WORD_START_RE.match(content, cursor):
+                    candidates.append(cursor)
                 cursor += 1
                 continue
             if character == "\\":
@@ -2177,7 +2196,21 @@ def _shell_quoted_candidate_limits(
                 quote = None
                 cursor += 1
                 continue
-            if character == "`" or (quote is None and content.startswith("<<", cursor)):
+            if quote is None and content.startswith("<<<", cursor):
+                cursor += 3
+                word_started = False
+                continue
+            if quote is None and content.startswith("<<", cursor):
+                header = _static_heredoc_header(content, cursor, end)
+                if header is None or len(pending_heredocs) >= _SHELL_COMMAND_STRING_ARGUMENTS:
+                    return False
+                spec, cursor = header
+                pending_heredocs += (spec,)
+                word_started = True
+                continue
+            if quote is None and character == "(" and pending_heredocs:
+                return False
+            if character == "`":
                 return False
             if quote is None and character == "#" and not word_started:
                 while cursor < end and content[cursor] not in "\r\n":
@@ -2242,7 +2275,7 @@ def _shell_quoted_candidate_limits(
             if quote is None:
                 word_started = not (character.isspace() or character in ";|&()<>")
             cursor += 1
-        return quote is None and cursor <= end
+        return quote is None and not pending_heredocs and cursor <= end
 
     return limits if walk(0, len(content)) else {}
 
@@ -2432,10 +2465,12 @@ def _has_shell_command_word_exhaustion(
     parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
     substitution_end_cache: dict[int, int | None] = {}
     backtick_end_cache: dict[int, int | None] = {}
-    may_have_destructive_outer_operands = _may_have_destructive_outer_operands(content)
+    powershell_strings = _powershell_string_operands(powershell)
+    may_have_destructive_outer_operands = _may_have_destructive_outer_operands(content) or any(
+        string.decoded for string in powershell_strings.values()
+    )
     json_openers = sorted(structural_quote_openers or ())
     complete_comments: set[tuple[int, int]] = set()
-    powershell_strings = _powershell_literal_operands(powershell)
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
@@ -2661,16 +2696,21 @@ def _has_shell_command_word_exhaustion(
     return False
 
 
-def _powershell_literal_operands(
+def _powershell_string_operands(
     source: PowerShellSource | None,
 ) -> dict[int, PowerShellString]:
-    """Native noninterpolated strings retain one argument and their offsets."""
+    """Native string arguments retain their boundaries and known literal text.
+
+    Embedded executable subexpressions split ownership and are excluded here.
+    Ordinary variable interpolation stays opaque, just as in shell arguments;
+    it never makes PowerShell backticks into Bash command substitution.
+    """
     if source is None:
         return {}
     return {
         string.start: string for string in source.strings
-        if not string.invoked and "$" not in string.value
-        and source.owns(string.start) and source.owns(string.end - 1)
+        if not string.invoked and source.owns(string.start)
+        and source.next_boundary(string.start, string.end) == string.end
     }
 
 
@@ -3534,7 +3574,10 @@ def _bounded_shell_tokens(
             # They cannot open Bash command substitution or consume later
             # lines. Decoded flags remain visible to the operand checks.
             mark_quoted_word()
-            append_piece(native_string.value, quoted=True)
+            append_piece(
+                native_string.value, quoted=True,
+                dynamic_can_be_empty="$" in native_string.value,
+            )
             cursor = native_string.end
             continue
         if quote is not None:
@@ -6081,7 +6124,7 @@ def _has_bounded_parse_exhaustion(
     ):
         return True
     covered_until = 0
-    powershell_strings = _powershell_literal_operands(powershell)
+    powershell_strings = _powershell_string_operands(powershell)
     for command_start, body_start in _destructive_command_words(content):
         check_runtime()
         if command_start < covered_until:
