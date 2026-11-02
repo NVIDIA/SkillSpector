@@ -6447,6 +6447,7 @@ def prepare_source_analysis(*, content: str, file_path: str, file_type: str, sou
                         preserved = source_effects_preserve(
                             resolver, target.text, before_offset,
                             read_source=audit.read_source, preserve_effect=audit.preserve,
+                            preserve_state=audit.preservation_state,
                         )
                         original = source_context.sources[target.text]
                         origin = ShellSourceOrigin(target.text, 0, len(original), sha256(original.encode()).hexdigest())

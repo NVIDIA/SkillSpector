@@ -77,6 +77,10 @@ class ShellArtifactAudit:
         artifact = self.store.read(path)
         return artifact.value.text if artifact is not None and artifact.value is not None else None
 
+    def preservation_state(self) -> tuple[object, ...]:
+        """Include fresh-name allocation alongside current artifact facts."""
+        return self.store.effect_snapshot(), self.temporary
+
     def _invalidate_path(self, path: str) -> bool:
         if SHELL_PID_MARKER in path:
             if path.count(SHELL_PID_MARKER) != 1:

@@ -17,6 +17,44 @@ def _program(text: str = "printf '%s\\n' ready\n") -> ShellArtifact:
     return ShellArtifact(ShellSourceValue(text, "code", (origin,)))
 
 
+def test_effect_snapshot_changes_with_dependency_facts_but_not_repeated_invalidation() -> None:
+    store = ShellArtifactStore(lambda: None)
+    initial = store.effect_snapshot()
+    assert store.create_empty_directory("/tmp/loop")
+    empty = store.effect_snapshot()
+    assert initial != empty
+    assert store.exists("/tmp/loop/marker") is False
+    store.invalidate("/tmp/loop/marker")
+    unknown = store.effect_snapshot()
+    assert unknown != empty and store.exists("/tmp/loop/marker") is None
+    store.invalidate("/tmp/loop/marker")
+    assert store.effect_snapshot() == unknown
+    assert store.invalidate_decimal_path("/tmp/loop/log.", "")
+    decimal = store.effect_snapshot()
+    assert decimal != unknown
+    assert store.invalidate_decimal_path("/tmp/loop/log.", "")
+    assert store.effect_snapshot() == decimal
+    store.invalidate(None)
+    assert store.effect_snapshot() != decimal
+
+
+def test_effect_snapshot_retains_prior_code_mode_and_exact_file_ownership() -> None:
+    store = ShellArtifactStore(lambda: None)
+    program = _program()
+    assert store.write("/tmp/helper", program)
+    prior = store.effect_snapshot()
+    assert store.write("/tmp/helper", ShellArtifact(program.value, executable=True))
+    executable = store.effect_snapshot()
+    assert executable != prior
+    assert store.write("/tmp/helper", _program("printf changed\n"))
+    assert store.effect_snapshot() != executable
+    left, right = ShellArtifactStore(lambda: None), ShellArtifactStore(lambda: None)
+    assert left.create_empty_file("/tmp/file", _program("").value)
+    assert right.write("/tmp/file", ShellArtifact(_program("").value, executable=False))
+    assert left.read("/tmp/file") == right.read("/tmp/file")
+    assert left.effect_snapshot() != right.effect_snapshot()
+
+
 def test_fresh_file_owns_only_its_exact_path_and_retains_provenance() -> None:
     store = ShellArtifactStore(lambda: None)
     value = _program("").value

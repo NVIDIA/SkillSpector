@@ -77,6 +77,19 @@ class ShellArtifactStore:
         self._revision = 0
         self._parent_revision = 0
 
+    def effect_snapshot(self) -> tuple[object, ...]:
+        """Capture immutable facts used by later reads, lookup, and writes.
+
+        Repeated invalidations may increment the transactional revision without
+        changing these facts. Loop convergence must compare semantic state.
+        """
+        self._check_runtime()
+        return (
+            tuple(sorted(self._files.items())), frozenset(self._owned),
+            frozenset(self._owned_files), frozenset(self._unknown),
+            frozenset(self._decimal_domains), self.complete,
+        )
+
     def fork(self) -> ShellArtifactStore:
         """Try an optional producer proof without changing the accepted snapshot."""
         self._check_runtime()
