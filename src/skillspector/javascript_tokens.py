@@ -1134,7 +1134,7 @@ def browser_escaped_list_shell_text(content: str, check_runtime: Callable[[], No
             cursor = pairs[opening] + 1
         elif (
             tokens[start].kind in {"string", "number"}
-            or value in {"true", "false", "null", "undefined"}
+            or value in {"true", "false", "null"}
             or value in env
         ):
             pass

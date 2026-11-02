@@ -1023,6 +1023,35 @@ def test_escaped_browser_list_traces_json_object_entries() -> None:
     assert sum(a != b for a, b in zip(source, projected, strict=True)) == 2
 
 
+@pytest.mark.parametrize("binding_kind", ["parameter", "local-const"])
+@pytest.mark.parametrize("receiver,partial", [("rows", False), ("external", True)])
+def test_browser_undefined_binding_requires_proven_data(
+    binding_kind: str, receiver: str, partial: bool
+) -> None:
+    assignment = _BROWSER_ASSIGNMENT.replace("rows.map", "undefined.map")
+    if binding_kind == "parameter":
+        replacement = (
+            f"function renderList(undefined) {{\n{assignment}\n}}\nrenderList({receiver});"
+        )
+    else:
+        replacement = (
+            f"function renderList() {{\nconst undefined = {receiver};\n"
+            f"{assignment}\n}}\nrenderList();"
+        )
+    source = _browser_source(_BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, replacement))
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+
+    assert _python(source) is partial
+    if partial:
+        assert projected == source
+        assert (
+            _ledger("scripts/page.py", source)["inspection_ledger"][0]["reason_code"]
+            is LedgerReason.STATIC_PARSE_LIMIT
+        )
+    else:
+        assert sum(a != b for a, b in zip(source, projected, strict=True)) == 2
+
+
 def test_escaped_browser_list_traces_native_filter_values() -> None:
     script = _BROWSER_SCRIPT.replace(
         "const rows = data.items;",
