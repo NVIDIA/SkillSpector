@@ -303,6 +303,31 @@ def test_interpreted_scripts_keep_active_output_and_metadata_identity_guards(cal
     assert not _preserves(caller, ':\n', native_effect=lambda command: ShellEffectResult(native_identity=True))
 
 
+@pytest.mark.parametrize("caller", [
+    'check() { printf ready; }\n( check /tmp ) > /tmp/log\n',
+    '( bash -c "printf ready" child /tmp ) > /tmp/log\n',
+])
+def test_audited_child_completion_does_not_reinterpret_arguments_as_file_reads(caller: str) -> None:
+    assert _preserves(caller, _LIBRARY)
+
+
+@pytest.mark.parametrize("body", ['cat "$1/log"', 'printf changed > "$1/log"'])
+def test_audited_function_body_still_refuses_active_output_reads_and_writes(body: str) -> None:
+    caller = 'check() { ' + body + '; }\n( check /tmp ) > /tmp/log\n'
+    assert not _preserves(caller, _LIBRARY)
+
+
+def test_child_completion_still_checks_callback_writes_and_nested_redirects() -> None:
+    caller = 'check() { :; }\n( check /tmp ) > /tmp/log\n'
+
+    def callback(command):
+        writes = ("/tmp/log",) if command.argv[0] == "check" and command.child_inspected else ()
+        return ShellEffectResult(command.stdout, True, writes)
+
+    assert not _preserves(caller, _LIBRARY, native_effect=callback)
+    assert not _preserves(caller.replace('check /tmp )', 'check /tmp > /tmp/log )'), _LIBRARY)
+
+
 @pytest.mark.parametrize("operator", ["#", "##", "%", "%%"])
 def test_uncalled_quoted_pattern_removal_keeps_its_function_boundary(operator: str) -> None:
     library = 'unused() {\nprintf "%s\\n" "${path' + operator + '"$ROOT"/}"\n}\n'

@@ -1142,10 +1142,13 @@ class _EffectAudit:
 
     def native(self, program, frame, request, *, child=False):
         if not request.child_inspected:
-            request = replace(request, fail_stop=(frame.errexit and not frame.checked) or (frame.required_path_output and request.argv[0] == "cd"))
+            request = replace(request, fail_stop=(frame.errexit and not frame.checked) or (frame.required_path_output and request.interpreter is None and request.argv[0] == "cd"))
         redirect_frame = replace(frame, cwd=request.cwd)
         argument_conflict = False
-        for value in request.argv:
+        # Reached child bodies already audited their reads. Completion only
+        # publishes their output; its invocation arguments are not new reads.
+        arguments = () if child and request.child_inspected else request.argv
+        for value in arguments:
             path = self.path(value, redirect_frame)
             if path is not None and self.conflicts_with_redirect(path):
                 argument_conflict = True
