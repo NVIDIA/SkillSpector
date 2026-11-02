@@ -140,8 +140,9 @@ class TestImportNoSideEffect(unittest.TestCase):
     )
     def test_import_runner_leaves_original_init_untouched(self):
         """Subprocess isolation: import runner → __init__ unchanged."""
-        repo_root = str(Path(__file__).resolve().parents[4])
-        env = {**os.environ, "PYTHONPATH": repo_root}
+        repo_root = str(Path(__file__).resolve().parents[3])
+        pythonpath = os.pathsep.join(filter(None, (repo_root, os.environ.get("PYTHONPATH"))))
+        env = {**os.environ, "PYTHONPATH": pythonpath}
         result = subprocess.run(
             [
                 sys.executable, "-X", "utf8", "-c",

@@ -127,7 +127,13 @@ class NestedInspectionResult:
     # Byte-recognized ZIPs at every depth, including ones stopped by a limit.
     # Expected extensions and format mismatches are not content recognition.
     recognized_zip_paths: set[str] = field(default_factory=set)
+    # Only complete bounded traversals, including every nested member read.
+    inspected_containers: dict[str, list[str]] = field(default_factory=dict)
     ledger_events: list[InspectionLedgerEvent] = field(default_factory=list)
+    # Keep the actual event objects: disk and virtual paths can share both a
+    # spelling and a work ID, so neither identifies which input produced it.
+    disk_container_events: list[InspectionLedgerEvent] = field(default_factory=list)
+    _active_disk_path: str | None = None
     uncompressed_bytes: int = 0
     # Exceptions can target a top-level container before a virtual artifact row
     # exists. Preserve their canonical disposition so build_context can apply
@@ -571,6 +577,8 @@ def _virtual_type(
         ".toml": "toml",
         ".txt": "text",
         ".js": "javascript",
+        ".mjs": "javascript",
+        ".cjs": "javascript",
         ".ts": "typescript",
         ".rb": "ruby",
         ".go": "go",
@@ -621,27 +629,26 @@ def _exception(
     limit_seconds: float | None = None,
 ) -> None:
     _mark_inventory_exception(result, path=path, reason=reason)
-    result.ledger_events.append(
-        ledger_event(
-            outcome=(
-                LedgerOutcome.PARTIAL
-                if reason in _PARTIAL_INVENTORY_REASONS
-                else LedgerOutcome.SKIPPED
-            ),
-            record_type=LedgerRecordType.SYSTEM,
-            phase="nested_artifact_inspection",
-            path=path,
-            reason=reason,
-            observed_bytes=observed_bytes,
-            limit_bytes=limit_bytes,
-            observed_artifacts=observed_artifacts,
-            limit_artifacts=limit_artifacts,
-            observed_depth=observed_depth,
-            limit_depth=limit_depth,
-            observed_seconds=observed_seconds,
-            limit_seconds=limit_seconds,
-        )
+    event = ledger_event(
+        outcome=(
+            LedgerOutcome.PARTIAL if reason in _PARTIAL_INVENTORY_REASONS else LedgerOutcome.SKIPPED
+        ),
+        record_type=LedgerRecordType.SYSTEM,
+        phase="nested_artifact_inspection",
+        path=path,
+        reason=reason,
+        observed_bytes=observed_bytes,
+        limit_bytes=limit_bytes,
+        observed_artifacts=observed_artifacts,
+        limit_artifacts=limit_artifacts,
+        observed_depth=observed_depth,
+        limit_depth=limit_depth,
+        observed_seconds=observed_seconds,
+        limit_seconds=limit_seconds,
     )
+    result.ledger_events.append(event)
+    if path == result._active_disk_path:
+        result.disk_container_events.append(event)
 
 
 def _time_exception(
@@ -728,6 +735,8 @@ def _inspect_zip_bytes(
     budget: _Budget,
     result: NestedInspectionResult,
 ) -> None:
+    initial_exceptions = len(result.ledger_events)
+    member_paths: list[str] = []
     if budget.expired():
         budget.halted = True
         _time_exception(result, path=container_virtual_path, budget=budget)
@@ -856,7 +865,9 @@ def _inspect_zip_bytes(
             if safe_name in seen_names or virtual_path in result.file_cache:
                 _exception(
                     result,
-                    path=virtual_path,
+                    # A different disk container may already own this path.
+                    # Attribute that skipped copy to its current container.
+                    path=virtual_path if safe_name in seen_names else container_virtual_path,
                     reason=LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH,
                 )
                 continue
@@ -1125,6 +1136,7 @@ def _inspect_zip_bytes(
             result.raw_file_cache[virtual_path] = member_data
             result.python_source_classifications[virtual_path] = source_classification
             artifact = classify_artifact(virtual_path, member_data)
+            member_paths.append(virtual_path)
             result.artifact_inventory.append(artifact)
             result.metadata.append(
                 {
@@ -1175,6 +1187,9 @@ def _inspect_zip_bytes(
                 budget=budget,
                 result=result,
             )
+
+    if len(result.ledger_events) == initial_exceptions:
+        result.inspected_containers[container_virtual_path] = member_paths
 
 
 def inspect_nested_artifacts(
@@ -1231,6 +1246,7 @@ def inspect_nested_artifacts(
         last_checked_at=started_at,
     )
     for path in dict.fromkeys(components):
+        result._active_disk_path = path
         if budget.halted:
             break
         if budget.expired():
@@ -1334,6 +1350,7 @@ def inspect_nested_artifacts(
             result=result,
         )
 
+    result._active_disk_path = None
     result.components = list(dict.fromkeys(result.components))
     result.uncompressed_bytes = budget.uncompressed_bytes
     _apply_inventory_overrides(result)

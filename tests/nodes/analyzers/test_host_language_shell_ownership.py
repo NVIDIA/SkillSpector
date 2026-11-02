@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Valid Python and Perl syntax must not exhaust the bounded shell parser.
+"""Proven host-language syntax must not exhaust the bounded shell parser.
 
 Python string and comment tokens own their bytes, and Perl ``eval BLOCK`` is
 exception handling rather than a string reparse. Neither may turn ordinary
 host source into a ``static_parse_limit`` result, while genuinely unresolved
-shell text keeps its conservative partial outcome.
+shell text keeps its conservative partial outcome. Verified Node assertion
+messages may own template delimiters without hiding executable string contents.
 """
 
 from __future__ import annotations
@@ -170,6 +171,24 @@ _BENIGN_PYTHON = [
         "# branch runs (and `command -v` is skipped).\n",
         id="comment-runtime-parameter",
     ),
+    # Markdown inline code and parameter names in report strings. Read past
+    # the closing quote, they would take the following code as operands.
+    pytest.param(
+        _OPTION_TEXT + "def report(path, detail):\n"
+        '    return [f"Inspected `{path}` and found {detail}."]\n',
+        id="f-string-inline-code",
+    ),
+    pytest.param(
+        _OPTION_TEXT
+        + "def lines(payload):\n    return [\n"
+        + "".join(f"        f\"- Field {i}: `{{payload['field_{i}']}}`\",\n" for i in range(8))
+        + "    ]\n",
+        id="f-string-inline-code-list",
+    ),
+    pytest.param(
+        _OPTION_TEXT + 'def run():\n    """Run `$TOOL` once, then report."""\n',
+        id="docstring-runtime-parameter",
+    ),
 ]
 
 
@@ -180,6 +199,66 @@ def test_python_literals_and_comments_own_their_bytes(source: str) -> None:
     assert _python(content) is False
     # The same bytes read as shell text remain conservative.
     assert _shell(content) is True
+
+
+def test_concatenated_fstrings_keep_runtime_operand_ambiguity() -> None:
+    content = (
+        _OPTION_TEXT + "def message(tool):\n    return (\n"
+        '        f"{tool} was not found at "\n'
+        '        f"$TOOL_ROOT, $UPSTREAM_ROOT/{tool}, "\n'
+        '        f"or $HOME/.cache/upstreams/{tool} "\n'
+        '        "or elsewhere"\n    )\n' + _TAIL
+    )
+    # The body-start runtime command is now inspected. An empty upstream
+    # parameter can leave a root path, while a replacement field supplies flags.
+    # Concatenation must retain those possible operands even in report strings.
+    assert _python(content) is True
+
+
+@pytest.mark.parametrize("target,partial", [("/", True), ("build", False)])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize("leading", ["", "\n"], ids=["body-start", "next-line"])
+def test_completed_python_word_cannot_claim_a_later_string(
+    target: str, partial: bool, newline: str, leading: str
+) -> None:
+    # A quote in the replacement expression can lexically pair with the next
+    # literal's quote. That apparent completed word must not hide a later
+    # runtime-selected command, even when the literal starts with it.
+    content = (
+        "message = f\"{' '.join(parts)} ready\"\n"
+        f'REPORT = r"""{leading}$TOOL -rf {target}\nlabel(\'value\')\n"""\n'
+    ).replace("\n", newline)
+
+    assert _python(content) is partial
+
+
+@pytest.mark.parametrize(
+    "javascript",
+    [
+        "execSync(`${{obj.cmd}}`);",
+        "run(`${{obj.cmd}}`);",
+        'execSync(`${{obj.cmd}}` + " -rf /");',
+        'const invoke = execSync; invoke(`${{obj.cmd}}` + " -rf /");',
+    ],
+)
+def test_python_constant_text_keeps_embedded_executable_javascript_partial(
+    javascript: str,
+) -> None:
+    assert _python('REPORT = f"""' + javascript + '"""\n') is True
+
+
+@pytest.mark.parametrize("prefix", ["r", "f", "rf"])
+@pytest.mark.parametrize("quote", ['"', '"""'])
+@pytest.mark.parametrize("target,dangerous", [("/", True), ("build", False)])
+def test_short_prefixed_python_commands_keep_raw_findings(
+    prefix: str, quote: str, target: str, dangerous: bool
+) -> None:
+    content = f"COMMAND = {prefix}{quote}rm -rf {target}{quote}\n"
+
+    result = _ledger("scripts/command.py", content)
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"]) is dangerous
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
 @pytest.mark.parametrize("newline", ["\r\n"], ids=["crlf"])
@@ -305,6 +384,88 @@ def test_runtime_command_with_destructive_operands_in_python_comment_stays_parti
     assert _python(_OPTION_TEXT + "# $TOOL -rf /\nvalue = 1\n" + _TAIL) is True
 
 
+@pytest.mark.parametrize(
+    "joiner", ["\n           ", "  # tool\n           + "], ids=["implicit", "plus"]
+)
+@pytest.mark.parametrize(
+    "operands,partial",
+    [('"-rf /"', True), ('"--force --recursive /"', True), ('"-rf build"', False)],
+    ids=["root", "long-options", "relative"],
+)
+def test_runtime_command_takes_operands_from_concatenated_python_literals(
+    joiner: str, operands: str, partial: bool
+) -> None:
+    source = f'COMMAND = (f"run `{{tool}}` "{joiner}{operands})\n'
+
+    assert _python(_OPTION_TEXT + source + _TAIL) is partial
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param('COMMAND = f"run `{tool}` -rf /"\n', id="same-literal"),
+        pytest.param('COMMAND = f"Inspected `{path}` and found %s." % detail\n', id="percent"),
+        pytest.param('COMMAND = "Inspected `$P` and found {}.".format(detail)\n', id="format"),
+        pytest.param('COMMAND = f"Inspected `{path}` and " + detail\n', id="non-literal"),
+        pytest.param('COMMAND = (f"run `{tool}` %s") % "-rf /"\n', id="parenthesized-percent"),
+        pytest.param('COMMAND = ("run $(tool) ") + "-rf /"\n', id="parenthesized-plus"),
+        pytest.param('COMMAND = "run $(tool) "[0:] + "-rf /"\n', id="subscript"),
+        pytest.param('COMMAND = f"run `{tool}` {flag} /"\n', id="replacement-field"),
+    ],
+)
+def test_runtime_command_in_python_string_keeps_undecided_operands_partial(source: str) -> None:
+    # Code can still append operands to a string that is formatted, sliced,
+    # joined with a non-literal, or followed by a method call, also after a
+    # closing parenthesis. A replacement field can supply the options for a
+    # root target.
+    assert _python(_OPTION_TEXT + source + _TAIL) is True
+
+
+@pytest.mark.parametrize(
+    "source,shell_text",
+    [
+        pytest.param('X = f"a `{b}` c"\n', "`{b}` c", id="f-string"),
+        pytest.param(
+            "X = (\"a `{b}` \"  # note\n     + \"c\" \\\n     r'''d''')\n",
+            "`{b}` cd",
+            id="concatenated",
+        ),
+        pytest.param('X = ["a `{b}` ", "c"]\n', "`{b}` ", id="list-items"),
+        pytest.param('X = "a `{b}` " if c else "d"\n', "`{b}` ", id="conditional"),
+        pytest.param('X = "a `{b}` %s" % c\n', None, id="percent"),
+        pytest.param('X = "a `{b}` ".join(c)\n', None, id="method"),
+        pytest.param('X = "a `{b}` " * c\n', None, id="repetition"),
+        pytest.param('X = "a `{b}` " + c\n', None, id="non-literal"),
+        pytest.param('X = ("a `{b}` ") % c\n', None, id="parenthesized"),
+        pytest.param('X = "a `{b}` "[c]\n', None, id="subscript"),
+        pytest.param(
+            'X = f"a `{b}` {c} {{d}}" "{e}" f"{{{g}}}"\n',
+            "`{b}`  -rf {c} {{d}}{e}{{ -rf {g}}}",
+            id="replacement-fields",
+        ),
+    ],
+)
+def test_python_string_value_joins_only_concatenated_literals(
+    source: str, shell_text: str | None
+) -> None:
+    start = source.index("`")
+    value = tm._PythonSourceOwnership(source, lambda: None).string_value(start, start + 5)
+
+    # The shell word and the operands that the rest of the value supplies.
+    assert (value if value is None else value[0][value[1] :]) == shell_text
+
+
+def test_python_closing_quote_starts_no_shell_word() -> None:
+    source = 'X = ("a "\n     "$B -rf /")\n'
+    start = source.index('"\n')
+
+    assert tm._PythonSourceOwnership(source, lambda: None).string_value(start, start + 1) == (
+        "",
+        0,
+        0,
+    )
+
+
 def test_shell_file_with_unmatched_backtick_and_long_tail_stays_partial() -> None:
     content = "#!/bin/sh\necho `date\n" + "echo ordinary line\n" * 300
 
@@ -341,6 +502,808 @@ def test_python_ownership_keeps_tool_misuse_detection() -> None:
 
     assert any(finding.rule_id == "TM1" for finding in result["findings"])
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+# --- Node assertion diagnostic templates ----------------------------------
+
+
+_JS_ASSERT_IMPORT = 'import check from "node:assert/strict";\n'
+_JS_ASSERT_CALL = 'check.equal(typeof row.name, "string", `${row.key} must be present`);\n'
+
+
+def _javascript(content: str, *, complete_context: bool = True) -> bool:
+    return tm.has_bounded_parse_exhaustion(
+        content, lambda: None, file_type="javascript", complete_context=complete_context
+    )
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        'import check from "node:assert";',
+        'import check from "node:assert/strict";',
+        "import * as check from 'node:assert';",
+        "import * as check from 'node:assert/strict';",
+    ],
+)
+def test_imported_node_assert_message_template_is_complete(declaration: str) -> None:
+    source = declaration + "\n" + _JS_ASSERT_CALL
+
+    assert _javascript(source) is False
+    assert _shell(source) is True
+
+
+@pytest.mark.parametrize(
+    "method,arguments",
+    [
+        ("ok", "valid"),
+        ("equal", "actual, expected"),
+        ("notEqual", "actual, expected"),
+        ("strictEqual", "actual, expected"),
+        ("notStrictEqual", "actual, expected"),
+        ("deepEqual", "actual, expected"),
+        ("notDeepEqual", "actual, expected"),
+        ("deepStrictEqual", "actual, expected"),
+        ("notDeepStrictEqual", "actual, expected"),
+        ("match", "actual, /value/"),
+        ("doesNotMatch", "actual, /value/"),
+        ("throws", "() => work(), undefined"),
+        ("doesNotThrow", "() => work(), undefined"),
+    ],
+)
+def test_node_assert_owns_only_its_message_argument(method: str, arguments: str) -> None:
+    source = _JS_ASSERT_IMPORT + f"check.{method}({arguments}, `${{row.key}} needs a value`);\n"
+
+    assert _javascript(source) is False
+
+
+@pytest.mark.parametrize("suffix", [".js", ".mjs", ".cjs", ".MJS"])
+def test_node_assert_message_ownership_reaches_static_ledger(suffix: str) -> None:
+    result = _ledger("scripts/check" + suffix, _JS_ASSERT_IMPORT + _JS_ASSERT_CALL)
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert not any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_node_assert_template_offsets_preserve_dangerous_neighbor(newline: str) -> None:
+    source = (
+        _JS_ASSERT_IMPORT
+        + "check.ok(ready, `café ${row.key} is ready`);\n"
+        + 'execSync("rm -rf /");\n'
+    ).replace("\n", newline)
+
+    result = _ledger("scripts/check.mjs", source)
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert any(
+        finding.rule_id == "TM1" and finding.start_line == 3 for finding in result["findings"]
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(_JS_ASSERT_CALL, id="unbound-name"),
+        pytest.param(
+            'import check from "custom-assert";\n' + _JS_ASSERT_CALL, id="non-node-import"
+        ),
+        pytest.param(
+            'import { strict as check } from "node:assert";\n' + _JS_ASSERT_CALL,
+            id="unsupported-named-import",
+        ),
+        pytest.param(_JS_ASSERT_IMPORT + "check = run;\n" + _JS_ASSERT_CALL, id="rebound"),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "function verify(check) {\n" + _JS_ASSERT_CALL + "}\n",
+            id="shadowed-parameter",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const alias = check;\n" + _JS_ASSERT_CALL, id="escaped-binding"
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const run = check.equal;\n" + _JS_ASSERT_CALL,
+            id="aliased-method",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const message = `${check}`;\n" + _JS_ASSERT_CALL,
+            id="binding-interpolated-elsewhere",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const message = `${check.equal}`;\n" + _JS_ASSERT_CALL,
+            id="method-interpolated-elsewhere",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal = run;\n" + _JS_ASSERT_CALL,
+            id="method-replacement",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + 'check["equal"] = run;\n' + _JS_ASSERT_CALL,
+            id="computed-replacement",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "Object.assign(check, { equal: run });\n" + _JS_ASSERT_CALL,
+            id="object-mutation",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + 'import alternate from "node:assert";\nalternate.equal = run;\n'
+            + _JS_ASSERT_CALL,
+            id="second-import-alias",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + 'require("node:assert/strict").equal = run;\n' + _JS_ASSERT_CALL,
+            id="require-alias",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + r'import alternate from "node:\u0061ssert";'
+            + "\nalternate.equal = run;\n"
+            + _JS_ASSERT_CALL,
+            id="escaped-module-import",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + r'require("node:\u0061ssert").equal = run;'
+            + "\n"
+            + _JS_ASSERT_CALL,
+            id="escaped-module-require",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + "const of = 1; const n = of / (check.equal = run) / divisor;\n"
+            + _JS_ASSERT_CALL,
+            id="division-after-contextual-keyword",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + "const n = holder.return / (check.equal = run) / divisor;\n"
+            + _JS_ASSERT_CALL,
+            id="division-after-keyword-property",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + 'check["equal"](a, b, `${row.key} is required`);\n',
+            id="computed-call",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check?.equal(a, b, `${row.key} is required`);\n",
+            id="optional-call",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check(a, `${row.key} is required`);\n",
+            id="unsupported-callable-assert",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(`${row.key}`, b);\n",
+            id="template-is-actual-value",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(a, b, `${row.key}`, extra);\n",
+            id="extra-argument",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(...values, `${row.key}`);\n",
+            id="spread-argument",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(a, b, tag`${row.key}`);\n",
+            id="tagged-message",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(a, b, (`${row.key}`));\n",
+            id="parenthesized-message",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + 'check.equal(a, b, `${row.key}` + " more");\n',
+            id="concatenated-message",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(a, b, message = `${row.key}`);\n",
+            id="assigned-message",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const message = `${row.key}`;\n",
+            id="unrelated-assignment",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "function message() { return `${row.key}`; }\n",
+            id="unrelated-return",
+        ),
+        pytest.param("#!/bin/sh\n" + _JS_ASSERT_IMPORT + _JS_ASSERT_CALL, id="shell-shebang"),
+        pytest.param(_JS_ASSERT_IMPORT + "check.equal(a, b, `${row.key}\n", id="unclosed-template"),
+        pytest.param(_JS_ASSERT_IMPORT + "check.equal(a, b, `${row.key`);\n", id="unclosed-field"),
+        pytest.param(_JS_ASSERT_IMPORT + _JS_ASSERT_CALL + "/* unfinished", id="unclosed-comment"),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const pattern = /unterminated\n" + _JS_ASSERT_CALL,
+            id="unclosed-regexp",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const pattern = /value/gg;\n" + _JS_ASSERT_CALL,
+            id="invalid-regexp-flags",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const pattern = /value\\\nmore/;\n" + _JS_ASSERT_CALL,
+            id="escaped-newline-in-regexp",
+        ),
+    ],
+)
+def test_unproven_node_assert_binding_or_message_is_not_projected(source: str) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert _javascript(source) is _shell(source)
+
+
+def test_unproven_node_assert_template_keeps_ledger_partial() -> None:
+    result = _ledger("scripts/check.mjs", _JS_ASSERT_CALL)
+    row = result["inspection_ledger"][0]
+
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "operand",
+    [
+        "value!",
+        "value !",
+        "value /* gap */ !",
+        "value! /* gap */",
+        "holder.value!",
+        "getValue()!",
+        "(value)!",
+        "values[0]!",
+    ],
+)
+@pytest.mark.parametrize("file_type", ["javascript", "typescript"])
+def test_postfix_non_null_assertion_cannot_hide_receiver_mutation(
+    operand: str, file_type: str
+) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = (
+        _JS_ASSERT_IMPORT
+        + f"const n = {operand} / (check.equal = run) / divisor;\n"
+        + _JS_ASSERT_CALL
+    )
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type) is True
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ["!value", "!!value", "!/value/.test(input)", "value != other", "value !== other"],
+)
+def test_prefix_negation_and_inequality_keep_assert_message_ownership(expression: str) -> None:
+    source = _JS_ASSERT_IMPORT + f"const ready = {expression};\n" + _JS_ASSERT_CALL
+
+    assert _javascript(source) is False
+    assert _shell(source) is True
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "",
+        "const n = value! / (check.equal = run) / divisor;\n",
+        "const n = factory<number> / (check.equal = run) / divisor;\n",
+    ],
+)
+def test_typescript_does_not_borrow_javascript_assert_ownership(statement: str) -> None:
+    source = _JS_ASSERT_IMPORT + statement + _JS_ASSERT_CALL
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="typescript") is True
+    result = _ledger("scripts/check.ts", source)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "prefix,message",
+    [
+        ("// check.equal = run;\n", "ready ${row.key}"),
+        ("/* check is a diagnostic receiver */\n", "ready ${row.key}"),
+        (r"""const pattern = /['"]/;""" + "\n", "ready ${row.key}"),
+        ("", r"escaped \` delimiter ${row.key}"),
+        ("", "multiple ${label} and ${row.key} values"),
+    ],
+)
+def test_node_assert_projection_changes_only_proven_delimiters(prefix: str, message: str) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = _JS_ASSERT_IMPORT + prefix + f"check.equal(a, b, `{message}`);\n"
+    opening = source.index("`", len(_JS_ASSERT_IMPORT + prefix))
+    closing = source.rindex("`")
+
+    projected = assertion_template_shell_text(source, lambda: None)
+
+    assert len(projected) == len(source)
+    assert [
+        index
+        for index, pair in enumerate(zip(source, projected, strict=True))
+        if pair[0] != pair[1]
+    ] == [
+        opening,
+        closing,
+    ]
+    assert projected[opening] == projected[closing] == " "
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "execSync(obj.cmd)",
+        "new Command(obj.cmd)",
+        "(target = obj.cmd)",
+        "counter++",
+        "++counter",
+        "obj[key]",
+        "obj?.cmd",
+        "`nested ${obj.cmd}`",
+    ],
+)
+def test_effectful_or_unproven_assert_interpolation_is_not_projected(expression: str) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = _JS_ASSERT_IMPORT + f"check.equal(a, b, `${{{expression}}} ready`);\n"
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert _javascript(source) is _shell(source)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "execSync(`${obj.cmd}`);",
+        "run(`${obj.cmd}`);",
+        "execSync(`${getCmd()}`);",
+        "execSync(`${cmd} -rf /`);",
+        "execSync(`${obj.cmd} -rf /`);",
+        'execSync(`${obj.cmd}` + " -rf /");',
+    ],
+)
+def test_node_assert_message_fix_keeps_unresolved_shell_commands_partial(statement: str) -> None:
+    source = _JS_ASSERT_IMPORT + _JS_ASSERT_CALL + statement + "\n"
+
+    assert _javascript(source) is True
+    result = _ledger("scripts/check.mjs", source)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "run(`${cmd}`);",
+        "sh`${obj.cmd}`;",
+        "sh`${obj.cmd} -rf /`;",
+        "execSync(String.raw`${obj.cmd}`);",
+        'execSync(`${cmd}` + " -rf /");',
+    ],
+)
+def test_unrecognized_template_consumers_keep_existing_behavior(statement: str) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = _JS_ASSERT_IMPORT + statement + "\n"
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert _javascript(source) is _shell(source)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "execSync(`rm -rf /`);",
+        "check.equal(a, b, `${execSync('rm -rf /')} ready`);",
+        "check.equal(a, b, `rm -rf / ${row.key}`);",
+    ],
+)
+def test_assert_template_ownership_preserves_destructive_text(statement: str) -> None:
+    result = _ledger("scripts/check.mjs", _JS_ASSERT_IMPORT + statement + "\n")
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+def test_node_assert_message_ownership_requires_complete_javascript_context() -> None:
+    source = _JS_ASSERT_IMPORT + _JS_ASSERT_CALL
+
+    assert _javascript(source, complete_context=False) is True
+    assert _shell(source) is True
+
+
+def test_node_assert_template_scan_propagates_runtime_interruptions() -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    def check_runtime() -> None:
+        raise TimeoutError("test runtime bound")
+
+    with pytest.raises(TimeoutError, match="test runtime bound"):
+        assertion_template_shell_text(_JS_ASSERT_IMPORT + _JS_ASSERT_CALL * 1000, check_runtime)
+
+
+def test_oversized_javascript_does_not_gain_template_ownership() -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = _JS_ASSERT_IMPORT + "/*" + "x" * 1_100_000 + "*/\n" + _JS_ASSERT_CALL
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+
+
+# --- Escaped browser list values in Python HTML ----------------------------
+
+_BROWSER_ASSIGNMENT = """panel.innerHTML = `<section>${listMarkup(rows.map((item) => `${item.name} :: ${item.value}`))}</section>`;"""
+_BROWSER_SCRIPT = (
+    """
+const data = JSON.parse(document.getElementById('data').textContent);
+const panel = document.getElementById('panel');
+const rows = data.items;
+function escapeText(value) {
+  return String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+}
+function listMarkup(items, emptyText='None') {
+  if (!items || !items.length) {
+    return `<div class="empty">${escapeText(emptyText)}</div>`;
+  }
+  return `<ul>${items.map((item) => `<li>${escapeText(typeof item === 'string' ? item : JSON.stringify(item))}</li>`).join('')}</ul>`;
+}
+"""
+    + _BROWSER_ASSIGNMENT
+)
+
+
+def _browser_source(script: str = _BROWSER_SCRIPT, *, consumer: str | None = None) -> str:
+    encoded = script.replace("{", "{{").replace("}", "}}")
+    return (
+        "from pathlib import Path\nfrom html import escape\nimport json\n"
+        "def render(data):\n"
+        "    payload = json.dumps(data).replace('</', '<\\\\/')\n"
+        "    label = escape(data['label'])\n"
+        "    return f'''<!doctype html><html><body><p>{label}</p><div id=\"panel\"></div>"
+        '<script id="data" type="application/json">{payload}</script><script>'
+        + encoded
+        + "</script></body></html>'''\n"
+        + (consumer or "Path('page.html').write_text(render(data), encoding='utf-8')")
+        + "\n"
+    )
+
+
+def test_escaped_browser_list_projects_only_selected_backticks() -> None:
+    source = _browser_source()
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+
+    assert _python(source) is False
+    assert (
+        _ledger("scripts/page.py", source)["inspection_ledger"][0]["outcome"]
+        is LedgerOutcome.COMPLETED
+    )
+    changes = [i for i, (a, b) in enumerate(zip(source, projected, strict=True)) if a != b]
+    assert len(changes) == 2
+    assert all(source[i] == "`" and projected[i] == " " for i in changes)
+    assert projected.count("${{") == source.count("${{")
+
+
+def test_escaped_browser_list_keeps_optional_property_reads() -> None:
+    source = _browser_source(_BROWSER_SCRIPT.replace("data.items", "data?.items"))
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+
+    assert _python(source) is False
+    changes = [i for i, (a, b) in enumerate(zip(source, projected, strict=True)) if a != b]
+    assert len(changes) == 2
+    assert all(source[i] == "`" and projected[i] == " " for i in changes)
+    assert "data?.items" in projected
+
+
+def test_escaped_browser_list_keeps_literal_security_findings() -> None:
+    script = _BROWSER_SCRIPT + '\nconst commandText = "rm -rf /";\n'
+    source = _browser_source(script)
+    result = _ledger("scripts/page.py", source)
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+    # Delimiter ownership cannot complete a separate destructive shell candidate.
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+
+
+def test_escaped_browser_list_traces_local_parameters() -> None:
+    assignment = _BROWSER_ASSIGNMENT.replace("rows.map", "values.map")
+    script = _BROWSER_SCRIPT.replace(
+        _BROWSER_ASSIGNMENT,
+        "document.getElementById('filter').value = '';\nfunction renderList(values) {\n"
+        + assignment
+        + "\n}\nrenderList(rows);",
+    )
+    source = _browser_source(script)
+
+    assert _python(source) is False
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+    assert sum(a != b for a, b in zip(source, projected, strict=True)) == 2
+
+
+def test_escaped_browser_list_traces_json_object_entries() -> None:
+    script = _BROWSER_SCRIPT.replace(
+        "const rows = data.items;",
+        "const rows = Object.entries(data.items).map(([name, value]) => ({name, value}));",
+    )
+    source = _browser_source(script)
+
+    assert _python(source) is False
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+    assert sum(a != b for a, b in zip(source, projected, strict=True)) == 2
+
+
+@pytest.mark.parametrize("binding_kind", ["parameter", "local-const"])
+@pytest.mark.parametrize("receiver,partial", [("rows", False), ("external", True)])
+def test_browser_undefined_binding_requires_proven_data(
+    binding_kind: str, receiver: str, partial: bool
+) -> None:
+    assignment = _BROWSER_ASSIGNMENT.replace("rows.map", "undefined.map")
+    if binding_kind == "parameter":
+        replacement = (
+            f"function renderList(undefined) {{\n{assignment}\n}}\nrenderList({receiver});"
+        )
+    else:
+        replacement = (
+            f"function renderList() {{\nconst undefined = {receiver};\n"
+            f"{assignment}\n}}\nrenderList();"
+        )
+    source = _browser_source(_BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, replacement))
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+
+    assert _python(source) is partial
+    if partial:
+        assert projected == source
+        assert (
+            _ledger("scripts/page.py", source)["inspection_ledger"][0]["reason_code"]
+            is LedgerReason.STATIC_PARSE_LIMIT
+        )
+    else:
+        assert sum(a != b for a, b in zip(source, projected, strict=True)) == 2
+
+
+def test_escaped_browser_list_traces_native_filter_values() -> None:
+    script = _BROWSER_SCRIPT.replace(
+        "const rows = data.items;",
+        "function matches(row) {\n"
+        "  const terms = [row.name, ...row.tags].join(' ').trim().toLowerCase();\n"
+        "  return terms.includes(data.query);\n"
+        "}\nconst rows = data.items.filter(matches);",
+    )
+    source = _browser_source(script)
+
+    assert _python(source) is False
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+    assert sum(a != b for a, b in zip(source, projected, strict=True)) == 2
+
+
+def test_tagged_browser_template_keeps_existing_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    script = _BROWSER_SCRIPT.replace(
+        "`${item.name} :: ${item.value}`", "tag`${item.name} :: ${item.value}`"
+    )
+    source = _browser_source(script)
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+    observed = _python(source)
+    monkeypatch.setattr(tm, "python_browser_template_shell_text", lambda text, check: text)
+    assert _python(source) is observed
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "execSync(rows.map((item) => `${item.name}`));"
+        ),
+        _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, "run(rows.map((item) => `${item.name}`));"),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "const invoke = execSync; invoke(`${data.command}`);"
+        ),
+        _BROWSER_SCRIPT.replace("${item.name} ::", "${run(item.name)} ::"),
+        _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, "panel.innerHTML = `${data.command}`;"),
+        _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, "escapeText = run;\n" + _BROWSER_ASSIGNMENT),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "function display(escapeText) {\n" + _BROWSER_ASSIGNMENT + "\n}"
+        ),
+        _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, "mutate(data);\n" + _BROWSER_ASSIGNMENT),
+        *[
+            _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, call + "\n" + _BROWSER_ASSIGNMENT)
+            for call in (
+                "external?.(rows);",
+                "external?.method(rows);",
+                "external.method?.(rows);",
+                "external['method']?.(rows);",
+                "external?.['method'](rows);",
+                "external?.['method']?.(rows);",
+                "(external.method)?.(rows);",
+                "external /* call */ ?. (rows);",
+                "external?.(panel);",
+            )
+        ],
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "external.map(() => data);\n" + _BROWSER_ASSIGNMENT
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "function leak(value) { external.map(() => value); }\nleak(data);\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "function invoke(strings, value) { external.map(() => value); }\ninvoke`${data}`;\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "rows.forEach((item) => external.map(() => item));\n" + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "external.map(() => panel);\n" + _BROWSER_ASSIGNMENT
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "external.map(() => document.getElementById('panel'));\n" + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "const holder = {}; holder.value = data; external.map(() => holder.value);\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "const holder = {}; holder.value = panel; external.map(() => holder.value);\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "function renderInto(panel) {\n" + _BROWSER_ASSIGNMENT + "\n}\nrenderInto(external);",
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "rows.forEach((panel) => {\n" + _BROWSER_ASSIGNMENT + "\n});"
+        ),
+        _BROWSER_SCRIPT.replace("const rows = data.items;", "const rows = {map: eval};"),
+        _BROWSER_SCRIPT.replace(
+            "const rows = data.items;", "const rows = Object.entries(external);"
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "const terms = external.toLowerCase(); terms.includes(data.query);\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "data.query.toLowerCase(data.query).includes(data.query);\n" + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            "const rows = data.items;",
+            "const rows = {[\"map\"]: document.getElementById('p').onclick};",
+        ),
+        _BROWSER_SCRIPT.replace("<li>${escapeText", '<li onclick="mutate()">${escapeText'),
+        _BROWSER_SCRIPT.replace("${listMarkup(rows.map", "${execSync(listMarkup(rows.map").replace(
+            "))}</section>", ")))}</section>"
+        ),
+    ],
+    ids=[
+        "exec",
+        "unknown-call",
+        "alias",
+        "executable-field",
+        "unescaped-output",
+        "reassign",
+        "shadow",
+        "data-escape",
+        "optional-call",
+        "optional-member-call",
+        "member-optional-call",
+        "computed-optional-call",
+        "optional-computed-member-call",
+        "optional-computed-optional-call",
+        "grouped-optional-call",
+        "commented-optional-call",
+        "optional-dom-escape",
+        "callback-escape",
+        "forwarded-data-escape",
+        "tagged-local-escape",
+        "forwarded-callback-escape",
+        "dom-receiver-escape",
+        "dom-lookup-escape",
+        "stored-data-escape",
+        "stored-dom-escape",
+        "dom-function-shadow",
+        "dom-callback-shadow",
+        "fake-map",
+        "unknown-object-entries",
+        "unknown-string-receiver",
+        "unexpected-string-argument",
+        "computed-map",
+        "formatter-handler",
+        "formatter-executed",
+    ],
+)
+def test_unproven_browser_consumers_remain_partial(script: str) -> None:
+    source = _browser_source(script)
+
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+    assert _python(source) is True
+    assert (
+        _ledger("scripts/page.py", source)["inspection_ledger"][0]["reason_code"]
+        is LedgerReason.STATIC_PARSE_LIMIT
+    )
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    [
+        "import subprocess\nsubprocess.run(render(data), shell=True)",
+        "unknown(render(data))",
+        "unknown(Path)\nPath('page.html').write_text(render(data))",
+        "unknown(json)\nPath('page.html').write_text(render(data))",
+        "p = Path('page.html')\nunknown(p)\np.write_text(render(data))",
+        "p = Path('page.html')\nunknown(p.write_text)\np.write_text(render(data))",
+        "p = Path('page.html')\nunknown(p.resolve)\np.write_text(render(data))",
+        "p = Path('page.html')\nunknown(p.parent)\np.write_text(render(data))",
+        "p = Path('page.html')\nunknown(p.resolve())\np.write_text(render(data))",
+        "Path.resolve = unknown\nPath('page.html').write_text(render(data))",
+        "(Path('page.html') / unknown).write_text(render(data))",
+        "def outer(Path):\n    def inner():\n        Path('page.html').write_text(render(data))",
+        "[Path('page.html').write_text(render(data)) for Path in commands]",
+    ],
+)
+def test_browser_html_requires_explicit_pathlib_consumers(consumer: str) -> None:
+    consumer = consumer.replace(
+        "write_text(render(data))", "write_text(render(data), encoding='utf-8')"
+    )
+    source = _browser_source(consumer=consumer)
+
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+    assert _python(source) is True
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "render(data)",
+        "render(data), encoding='utf-16'",
+        "render(data), encoding=codec",
+        "render(data), encoding='utf-8', errors='ignore'",
+        "render(data), 'utf-8', 'ignore'",
+    ],
+)
+def test_browser_html_requires_known_utf8_write(arguments: str) -> None:
+    source = _browser_source(consumer=f"Path('page.html').write_text({arguments})")
+
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+    assert _python(source) is True
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("label = escape(data['label'])", "label = data['label']"),
+        ("payload = json.dumps(data).replace('</', '<\\\\/')", "payload = json.dumps(data)"),
+        ("<p>{label}</p>", '<iframe srcdoc="{label}"></iframe>'),
+        ("function escapeText(value)", "function String(value)"),
+    ],
+)
+def test_browser_boundary_and_builtin_changes_do_not_gain_ownership(
+    before: str, after: str
+) -> None:
+    source = _browser_source().replace(before, after)
+
+    assert _python(source) is True
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+
+
+def test_browser_ownership_preserves_fragment_bounds_and_cancellation() -> None:
+    source = _browser_source()
+    assert _python(source, complete_context=False) is True
+    assert _python(source.replace("</script></body>", "</body>")) is True
+    assert _python(_browser_source("(" * 150 + _BROWSER_SCRIPT + ")" * 150)) is True
+    oversized = _browser_source("/*" + "x" * 1_100_000 + "*/" + _BROWSER_SCRIPT)
+    assert python_tokens.python_browser_template_shell_text(oversized, lambda: None) == oversized
+
+    def cancel() -> None:
+        raise TimeoutError("browser ownership deadline")
+
+    with pytest.raises(TimeoutError, match="browser ownership deadline"):
+        python_tokens.python_browser_template_shell_text(source, cancel)
 
 
 # --- Whole-scan accounting -------------------------------------------------
