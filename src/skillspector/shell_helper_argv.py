@@ -937,6 +937,9 @@ class _OutputInterpreter(_Interpreter):
             state.status = True
             return [state]
         if head in {"cat", "/bin/cat", "/usr/bin/cat"}:
+            if not stdout:
+                # Discarded reads leave no artifact for the caller to validate.
+                raise _UnresolvedError
             arguments = self.arguments(node.words[1:], state)
             if (
                 len(arguments) != 1
@@ -944,8 +947,7 @@ class _OutputInterpreter(_Interpreter):
                 or not arguments[0].startswith("/")
             ):
                 raise _UnresolvedError
-            if stdout:
-                self._append(state, ShellHelperOutput(path=arguments[0]))
+            self._append(state, ShellHelperOutput(path=arguments[0]))
             state.status = True
             return [state]
         if node.redirects or head not in {"exit", "true", ":"}:

@@ -657,10 +657,21 @@ class ShellArtifactAudit:
                 if not self._invalidate_path(destination):
                     return None
                 status = None
-            elif SHELL_PID_MARKER in source or not self.store.copy(source, destination):
-                # A known disjoint destination may still receive unknown data.
-                self.store.invalidate(destination)
-                status = None
+            else:
+                artifact = self.store.read(source)
+                previous = self.store.read(destination)
+                if artifact is not None and previous is not None:
+                    # Plain cp replaces bytes but retains an existing file's
+                    # permissions, including an unknown executable state.
+                    artifact = replace(artifact, executable=previous.executable)
+                if (
+                    SHELL_PID_MARKER in source
+                    or artifact is None
+                    or not self.store.write(destination, artifact)
+                ):
+                    # A known disjoint destination may still receive unknown data.
+                    self.store.invalidate(destination)
+                    status = None
             output = ""
         elif (
             name == "cp"

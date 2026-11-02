@@ -529,6 +529,42 @@ def test_cd_distinguishes_known_input_root_from_unknown_runtime_directory() -> N
     assert result is not None and result.status is None
 
 
+@pytest.mark.parametrize("source_mode", [False, True, None])
+@pytest.mark.parametrize("destination_mode", [False, True, None])
+def test_plain_copy_overwrite_preserves_destination_mode_and_source_provenance(
+    source_mode: bool | None, destination_mode: bool | None
+) -> None:
+    audit = _audit()
+    assert audit.store.create_empty_directory("/tmp/helpers")
+    source = replace(audit.store.read("scripts/setup.sh"), executable=source_mode)
+    assert audit.store.write("/tmp/helpers/source", source)
+    assert audit.store.write(
+        "/tmp/helpers/runner",
+        ShellArtifact(ShellSourceValue("printf old\n"), executable=destination_mode),
+    )
+    result = audit(_command(("cp", "/tmp/helpers/source", "/tmp/helpers/runner")))
+    assert result is not None and result.status is True
+    assert result.writes == ("/tmp/helpers/runner",)
+    assert audit.store.read("/tmp/helpers/runner") == replace(source, executable=destination_mode)
+    identity = audit(_command(("/tmp/helpers/runner",), identity_only=True))
+    if destination_mode is True:
+        assert identity is not None and identity.script_path == "/tmp/helpers/runner"
+        assert not identity.native_identity
+    else:
+        assert identity is None
+
+
+@pytest.mark.parametrize("source_mode", [False, True, None])
+def test_plain_copy_to_absent_destination_retains_source_mode(source_mode: bool | None) -> None:
+    audit = _audit()
+    assert audit.store.create_empty_directory("/tmp/helpers")
+    source = replace(audit.store.read("scripts/setup.sh"), executable=source_mode)
+    assert audit.store.write("/tmp/helpers/source", source)
+    result = audit(_command(("cp", "/tmp/helpers/source", "/tmp/helpers/runner")))
+    assert result is not None and result.status is True
+    assert audit.store.read("/tmp/helpers/runner") == source
+
+
 def test_native_archive_copy_retains_tree_names_modes_and_readonly_listing_uncertainty() -> None:
     audit = _audit()
     assert audit.store.create_empty_directory("/tmp/source")

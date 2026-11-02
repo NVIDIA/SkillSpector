@@ -1244,11 +1244,12 @@ def source_is_unmodified(resolver: ShellSourceResolver, target_path: str, use_of
             )
         if value.kind != "literal":
             return True
-        if subtree and (path is None or path == "."):
+        if subtree:
+            # Without a bundle/fresh-root identity, a relative directory may
+            # contain the source after a cwd change. Let the ordered effect
+            # audit establish disjointness instead of comparing spellings.
             return True
-        if path == target_path or (
-            subtree and path is not None and target_path.startswith(path + "/")
-        ):
+        if path == target_path:
             return True
         # A literal filename without source identity can still name the source
         # from a different working directory. Do not assume the current cwd.

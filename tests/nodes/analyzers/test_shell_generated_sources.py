@@ -399,6 +399,52 @@ def test_explicit_source_mutation_does_not_reuse_cached_program(mutation: str) -
 
 
 @pytest.mark.parametrize(
+    "mutation",
+    [
+        "cp -r replacement/. subdir",
+        "rm -rf subdir",
+        'destination=subdir\nrm -rf "$destination"',
+    ],
+)
+def test_relative_subtree_write_after_cd_cannot_reuse_uploaded_source(mutation: str) -> None:
+    caller = _CALLER.replace("scripts/library.sh", "scripts/subdir/library.sh")
+    caller = caller.replace("helper=$(sed", "cd scripts\n" + mutation + "\nhelper=$(sed")
+    prepared = _prepare(
+        caller,
+        extra_sources={
+            "scripts/subdir/library.sh": _LIBRARY,
+            "scripts/replacement/library.sh": "helper() {\n  rm -rf /\n}\n",
+        },
+    )
+    assert prepared is None or not tuple(prepared.variants())
+
+
+def test_ordered_cwd_proof_preserves_source_after_disjoint_relative_subtree_write() -> None:
+    caller = _CALLER.replace("scripts/library.sh", "scripts/subdir/library.sh")
+    caller = caller.replace("helper=$(sed", "cd scripts\nrm -rf cache\nhelper=$(sed")
+    prepared = _prepare(
+        caller,
+        extra_sources={"scripts/subdir/library.sh": "helper() {\n  rm -rf /\n}\n"},
+    )
+    assert prepared is not None
+    findings = list(
+        prepared.analyze_source_commands(
+            content=caller,
+            file_path="scripts/caller.sh",
+            file_type="shell",
+            source_view=SecurityTextView("raw", caller),
+        )
+    )
+    assert any(finding.rule_id == "TM1" for finding in findings)
+    assert not prepared.has_bounded_parse_exhaustion()
+    assert all(
+        origin.path == "scripts/subdir/library.sh"
+        for _, value in prepared.variants()
+        for origin in value.origins
+    )
+
+
+@pytest.mark.parametrize(
     "invocation",
     [
         'bash "$root/scripts/mutate.sh"',
@@ -589,6 +635,31 @@ def _helper_output(argv, *, program=_OUTPUT_HELPER, environment=None):
 
 def test_helper_stdout_preserves_archive_identity_instead_of_inventing_bytes() -> None:
     assert _helper_output(("print", "-q", "//depot/tools.tbz2#2")) == (
+        (ShellHelperOutput(path="/tmp/owned/input.tbz2"),),
+    )
+
+
+@pytest.mark.parametrize("head", ["cat", "/bin/cat", "/usr/bin/cat"])
+@pytest.mark.parametrize("redirect", ["> /dev/null", '>> "$CALLS"', "1>&2"])
+def test_discarded_helper_read_cannot_claim_successful_branch(head: str, redirect: str) -> None:
+    program = (
+        f'set -euo pipefail\nif {head} "$ARCHIVE" {redirect}; '
+        "then printf safe; else printf 'rm -rf /'; fi\n"
+    )
+    assert _helper_output((), program=program) is None
+
+
+@pytest.mark.parametrize("continuation", ["\nprintf safe", " && printf safe", " || printf unsafe"])
+def test_discarded_helper_read_cannot_borrow_errexit_success(continuation: str) -> None:
+    program = 'set -euo pipefail\ncat "$ARCHIVE" > /dev/null' + continuation
+    assert _helper_output((), program=program) is None
+
+
+@pytest.mark.parametrize("head", ["cat", "/bin/cat", "/usr/bin/cat"])
+@pytest.mark.parametrize("redirect", ["", "2> /dev/null"])
+def test_kept_helper_read_retains_its_required_file_identity(head: str, redirect: str) -> None:
+    program = f'set -euo pipefail\n{head} "$ARCHIVE" {redirect}\n'
+    assert _helper_output((), program=program) == (
         (ShellHelperOutput(path="/tmp/owned/input.tbz2"),),
     )
 
