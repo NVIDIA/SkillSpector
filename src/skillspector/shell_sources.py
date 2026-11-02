@@ -516,7 +516,7 @@ class ShellSourceResolver:
             return
         if executable == "set":
             named_option: str | None = None
-            for option, left, right in words[cursor + 1:]:
+            for option, _left, _right in words[cursor + 1:]:
                 if named_option is not None:
                     if option == "errexit":
                         self.errexit = named_option == "-" and not command.conditional and not self.controls
@@ -955,7 +955,7 @@ def source_is_unmodified(
                 continue
             child_scope = id(command) in child_ids
 
-            def resolve(left: int, right: int) -> ShellSourceValue | None:
+            def resolve(left: int, right: int, *, child_scope: bool = child_scope) -> ShellSourceValue | None:
                 raw = current.content[left:right]
                 pid_file = re.fullmatch(r'"(/tmp/[-A-Za-z0-9_.]*\$\$[-A-Za-z0-9_.]*)"', raw)
                 if pid_file is not None:
@@ -1399,7 +1399,7 @@ def generated_file_is_unmodified(
             before_use = event <= last_use
             child_scope = id(command) in child_ids
 
-            def word(left: int, right: int, *, assignment: bool = False) -> ShellSourceValue | None:
+            def word(left: int, right: int, *, assignment: bool = False, child_scope: bool = child_scope) -> ShellSourceValue | None:
                 if child_scope and any(marker in current.content[left:right] for marker in ("$", "`")):
                     return None
                 return current.word(left, right, assignment_value=assignment, literal_only=not current.valid)

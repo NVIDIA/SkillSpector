@@ -16,10 +16,9 @@ from dataclasses import dataclass, field, replace
 import fnmatch
 import posixpath
 import re
-import shlex
 from typing import TYPE_CHECKING
 
-from skillspector.shell_helper_argv import _Node, _Parser, _Token, _Unresolved, is_managed_shell_variable
+from skillspector.shell_helper_argv import _Node, _Parser, _Token, _UnresolvedError, is_managed_shell_variable
 
 if TYPE_CHECKING:
     from skillspector.shell_sources import ShellSourceResolver
@@ -126,10 +125,10 @@ class _Frame:
 
     def assign(self, name: str, value, *, local: bool = False) -> None:
         if not _NAME.fullmatch(name) or is_managed_shell_variable(name):
-            raise _Unresolved
+            raise _UnresolvedError
         if local:
             if not self.scopes:
-                raise _Unresolved
+                raise _UnresolvedError
             self.scopes[-1][name] = value
             return
         for scope in reversed(self.scopes):
@@ -151,7 +150,7 @@ class _EffectsParser(_Parser):
 
     def sequence(self, stops=frozenset(), depth=0):
         if depth > _MAX_DEPTH:
-            raise _Unresolved
+            raise _UnresolvedError
         nodes = []
         connector = ";"
         while self.peek() and self.peek() not in stops:
@@ -192,9 +191,9 @@ class _EffectsParser(_Parser):
                 while self.peek() == "\n":
                     self.take()
                 if not self.peek() or self.peek() in stops | {";", "&&", "||", ";;"}:
-                    raise _Unresolved
+                    raise _UnresolvedError
             elif self.peek() and self.peek() not in stops | {";", "\n"}:
-                raise _Unresolved
+                raise _UnresolvedError
         return tuple(nodes)
 
     def node(self, depth):
@@ -271,17 +270,17 @@ class _EffectsParser(_Parser):
                 elif self.peek() == "(":
                     # Only simple indexed arrays have non-command parentheses.
                     if not words or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=", words[-1].raw):
-                        raise _Unresolved
+                        raise _UnresolvedError
                     words.append(self.take())
                     while self.peek() and self.peek() != ")":
                         words.append(self.take())
                     words.append(self.take(")"))
                 elif self.peek() == "{":
-                    raise _Unresolved
+                    raise _UnresolvedError
                 else:
                     words.append(self.take())
         if not words and not redirects:
-            raise _Unresolved
+            raise _UnresolvedError
         return _Node("command", tuple(words), redirects=tuple(redirects))
 
 
@@ -304,16 +303,16 @@ class _EffectAudit:
         self.resolver.check_runtime()
         self.steps += 1
         if self.steps > _MAX_STEPS:
-            raise _Unresolved
+            raise _UnresolvedError
 
     def program(self, path, text):
         if len(text) > 262_144 or "\x00" in text or self.path_tail in text or SHELL_PID_MARKER in text:
-            raise _Unresolved
+            raise _UnresolvedError
         key = path, text
         if key in self.programs:
             return self.programs[key]
         if len(self.programs) >= 128:
-            raise _Unresolved
+            raise _UnresolvedError
         tokens, heredocs, pending = [], {}, []
         cursor = 0
         while cursor < len(text):
@@ -331,7 +330,7 @@ class _EffectAudit:
             if text.startswith("<<", cursor) and not text.startswith("<<<", cursor):
                 header = self.resolver.heredoc_header(text, cursor, len(text))
                 if header is None or len(pending) >= 32:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 item, stop = header
                 tokens.extend((_Token("<<", cursor, cursor + 2), _Token(item[0], cursor + 2, stop)))
                 pending.append((cursor + 2, item))
@@ -353,14 +352,14 @@ class _EffectAudit:
                 else:
                     _, stop, limited = self.resolver.read_word(text, cursor, self.tick)
                     if limited or stop <= cursor:
-                        raise _Unresolved
+                        raise _UnresolvedError
             tokens.append(_Token(text[cursor:stop], cursor, stop))
             cursor = stop
             if operator == "\n" and pending:
                 for owner, item in pending:
                     stop = self.resolver.heredoc_bodies(text, cursor, len(text), (item,), self.tick)
                     if stop is None:
-                        raise _Unresolved
+                        raise _UnresolvedError
                     last = stop - int(text[stop - 1:stop] == "\n")
                     body_end = max(cursor, text.rfind("\n", cursor, last) + 1)
                     body = text[cursor:body_end]
@@ -370,7 +369,7 @@ class _EffectAudit:
                     cursor = stop
                 pending.clear()
         if pending:
-            raise _Unresolved
+            raise _UnresolvedError
         program = _Program(path, text, tuple(tokens), heredocs)
         self.programs[key] = program
         return program
@@ -379,7 +378,7 @@ class _EffectAudit:
         parser = _EffectsParser(program, self.tick, tokens)
         result = parser.sequence()
         if parser.peek():
-            raise _Unresolved
+            raise _UnresolvedError
         return result
 
     def path(self, value, frame):
@@ -430,7 +429,7 @@ class _EffectAudit:
                 continue
             if character == "\\":
                 if cursor + 1 == len(raw):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 following = raw[cursor + 1]
                 if quote == '"' and following not in '$`"\\\n':
                     parts.append("\\")
@@ -442,14 +441,14 @@ class _EffectAudit:
                 if raw.startswith("$((", cursor):
                     arithmetic = re.match(r"\$\(\(([0-9 +*()-]+)\)\)", raw[cursor:])
                     if arithmetic is None:
-                        raise _Unresolved
+                        raise _UnresolvedError
                     # Constant arithmetic is irrelevant to path effects.
                     unknown = True
                     cursor += arithmetic.end()
                     continue
                 end = self.resolver.substitution_end(raw, cursor, len(raw))
                 if end is None:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 child = frame.copy()
                 child.output, child.flow = "", ""
                 child.traps = {}
@@ -492,7 +491,7 @@ class _EffectAudit:
             if character == "$":
                 parameter = re.match(r"\$(?:([@*#?$!0-9]|[A-Za-z_][A-Za-z0-9_]*)|\{([^{}]+)\})", raw[cursor:])
                 if parameter is None:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 name = parameter[1] or parameter[2]
                 if name == "BASH_SOURCE[0]":
                     value = program.path
@@ -510,49 +509,59 @@ class _EffectAudit:
                     value = SHELL_PID_MARKER
                 elif name == "!":
                     value = None
-                elif name.isdecimal():
-                    value = frame.argv[int(name) - 1] if int(name) <= len(frame.argv) else ""
+                elif re.fullmatch(r"[0-9]{1,16}", name):
+                    position = int(name)
+                    value = frame.zero if position == 0 else frame.argv[position - 1] if position <= len(frame.argv) else ""
                 else:
-                    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?::([-+?])(.*))?", name, re.DOTALL)
+                    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*|[0-9]{1,16})(?::([-+?])(.*))?", name, re.DOTALL)
                     array = re.fullmatch(r"(#?)([A-Za-z_][A-Za-z0-9_]*)\[([0-9]+|@)\]", name)
                     if array:
                         items = frame.lookup(array[2])
                         value = str(len(items)) if isinstance(items, tuple) and array[1] and array[3] == "@" else items[int(array[3])] if isinstance(items, tuple) and array[3].isdecimal() and int(array[3]) < len(items) else None
                     elif match:
-                        if match[2] and re.fullmatch(r"[-A-Za-z0-9_./]*", match[3]) is None:
+                        if match[1].isdecimal():
+                            position = int(match[1])
+                            value = frame.zero if position == 0 else frame.argv[position - 1] if position <= len(frame.argv) else ""
+                        else:
+                            value = frame.lookup(match[1])
+                        unused_word = value is not None and (
+                            match[2] in {"-", "?"} and bool(value)
+                            or match[2] == "+" and not value
+                        )
+                        if match[2] and not unused_word and re.fullmatch(r"[-A-Za-z0-9_./]*", match[3]) is None:
                             # Parameter fallback words have their own shell
-                            # expansions; they are not inert captured text.
-                            raise _Unresolved
-                        value = frame.lookup(match[1])
+                            # expansions. Only a proven unused word may skip
+                            # those effects, including diagnostic messages.
+                            raise _UnresolvedError
                         if match[2] and value is not None:
                             if match[2] == "-" and not value:
                                 value = match[3]
                             elif match[2] == "+":
                                 value = match[3] if value else ""
                             elif match[2] == "?" and not value:
-                                raise _Unresolved
+                                raise _UnresolvedError
                     else:
-                        raise _Unresolved
+                        raise _UnresolvedError
                 if not assignment and not quote:
                     # Field splitting and pathname expansion need an argv proof.
-                    raise _Unresolved
+                    raise _UnresolvedError
                 if value is None:
                     unknown = True
                 elif not isinstance(value, str):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 else:
                     parts.append(value)
                 cursor += parameter.end()
                 continue
             if character == "`" or not quote and not assignment and character in "*?[]~":
-                raise _Unresolved
+                raise _UnresolvedError
             parts.append(character)
             cursor += 1
         if quote:
-            raise _Unresolved
+            raise _UnresolvedError
         result = "".join(parts)
         if len(result) > 131_072:
-            raise _Unresolved
+            raise _UnresolvedError
         return None if unknown else result
 
     def arguments(self, words, frame, program):
@@ -565,19 +574,19 @@ class _EffectAudit:
             if array:
                 items = frame.lookup(array[1])
                 if not isinstance(items, tuple):
-                    raise _Unresolved
+                    raise _UnresolvedError
                 output.extend(items)
                 continue
             output.append(self.word(token.raw, frame, program))
         if len(output) > 128:
-            raise _Unresolved
+            raise _UnresolvedError
         return tuple(output)
 
     def run(self, program, nodes, frames):
         self.depth += 1
         try:
             if self.depth > _MAX_DEPTH:
-                raise _Unresolved
+                raise _UnresolvedError
             for index, node in enumerate(nodes):
                 output = []
                 for frame in frames:
@@ -597,7 +606,7 @@ class _EffectAudit:
                         branch.checked = previous_checked
                     output.extend(branches)
                 if len(output) > _MAX_STATES:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 frames = output
             return frames
         finally:
@@ -606,7 +615,7 @@ class _EffectAudit:
     def node(self, program, node, frame):
         if node.kind == "function":
             if node.words[0].raw in {"local", "export", "unset", "test", "source", "return", "exit", "break", "continue", "shift", "command", "trap"}:
-                raise _Unresolved
+                raise _UnresolvedError
             frame.functions[node.words[0].raw] = _Function(program, node.words[1:])
             frame.status = True
             return [frame]
@@ -617,7 +626,7 @@ class _EffectAudit:
             elif re.fullmatch(r"[0-9]{1,16}", text):
                 frame.status = bool(int(text))
             else:
-                raise _Unresolved
+                raise _UnresolvedError
             return [frame]
         if node.kind == "negate":
             frame.checked = True
@@ -706,7 +715,7 @@ class _EffectAudit:
             name = node.words[0].raw
             values = self.arguments(node.words[2:], frame, program) if len(node.words) > 1 else frame.argv
             if len(values) > 128:
-                raise _Unresolved
+                raise _UnresolvedError
             if not values:
                 frame.status = True
             branches = [frame]
@@ -716,7 +725,7 @@ class _EffectAudit:
                 branches = self.run(program, node.blocks[0], branches)
                 for branch in branches:
                     if branch.flow in {"break", "continue"}:
-                        raise _Unresolved
+                        raise _UnresolvedError
             return branches
         if node.kind in {"while", "until"}:
             branches, completed = [frame], []
@@ -728,7 +737,7 @@ class _EffectAudit:
                 for branch in self.run(program, node.blocks[0], branches):
                     branch.checked = previous_checked
                     if branch.status is None:
-                        raise _Unresolved
+                        raise _UnresolvedError
                     if branch.status == (node.kind == "until"):
                         # The terminating condition is not the loop's exit
                         # status. Retain uncertainty after any body ran.
@@ -753,7 +762,7 @@ class _EffectAudit:
                 branches = remaining
                 if not branches:
                     return completed
-            raise _Unresolved
+            raise _UnresolvedError
         return self.command(program, node, frame)
 
     def condition(self, raw, frame, program):
@@ -775,7 +784,7 @@ class _EffectAudit:
         if len(values) == 2 and values[0] in {"-e", "-f", "-s", "-x", "-L", "-d"} and self.native_effect is not None:
             path = self.path(values[1], frame)
             if path is not None and self.conflicts_with_redirect(path):
-                raise _Unresolved
+                raise _UnresolvedError
             request = ShellEffectCommand(("test", *values), {}, frame.cwd, program.path, 0, uncertain=frame.uncertain)
             result = self.native_effect(request)
             if result is None or result.writes or result.script_path is not None:
@@ -820,14 +829,14 @@ class _EffectAudit:
             if words[:1] and words[0].raw == "(":
                 closing = next((index for index, word in enumerate(words) if word.raw == ")"), -1)
                 if raw or closing < 0:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 value = self.arguments(words[1:closing], assignment_frame, program)
                 del words[:closing + 1]
             else:
                 value = self.word(raw, assignment_frame, program, assignment=True, final_assignment=len(node.words) == 1 and not node.redirects)
             if is_managed_shell_variable(name):
                 if name != "PATH" or not words or not isinstance(value, str):
-                    raise _Unresolved
+                    raise _UnresolvedError
             prefix.append((name, value))
             environment[name] = value if isinstance(value, str) else None
             if name == "PATH":
@@ -841,7 +850,7 @@ class _EffectAudit:
                 if not literal:
                     # Expandable heredocs can execute substitutions. Refuse
                     # until their distinct quote rules have an effects proof.
-                    raise _Unresolved
+                    raise _UnresolvedError
                 stdin = body
             else:
                 value = self.word(token.raw, frame, program)
@@ -861,26 +870,26 @@ class _EffectAudit:
             if operator in {"1>&", "2>&", "0<&"} and value in {"0", "1", "2", "-"}:
                 continue
             if ">" in operator and value != "/dev/null" and not self.disjoint(self.path(value, frame)):
-                raise _Unresolved
+                raise _UnresolvedError
         raw = tuple(word.raw for word in words)
         if raw[0] in {"[[", "[", "test"}:
             if prefix or redirects:
-                raise _Unresolved
+                raise _UnresolvedError
             closing = "]]" if raw[0] == "[[" else "]" if raw[0] == "[" else None
             if closing is not None and raw[-1] != closing:
-                raise _Unresolved
+                raise _UnresolvedError
             frame.status = self.condition(raw[1:-1] if closing else raw[1:], frame, program)
             return [frame]
         if raw[0] in {"local", "export", "unset"}:
             if prefix or redirects:
-                raise _Unresolved
+                raise _UnresolvedError
             local_words = words[1:]
             if raw[0] == "local" and local_words[:1] and local_words[0].raw == "-a":
                 local_words = local_words[1:]
                 if len(local_words) >= 3 and local_words[1].raw == "(" and local_words[-1].raw == ")":
                     assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=", local_words[0].raw)
                     if assignment is None:
-                        raise _Unresolved
+                        raise _UnresolvedError
                     frame.assign(assignment[1], self.arguments(local_words[2:-1], frame, program), local=True)
                     frame.status = True
                     return [frame]
@@ -891,7 +900,7 @@ class _EffectAudit:
                 elif _NAME.fullmatch(token.raw):
                     name, value = token.raw, None if raw[0] in {"local", "unset"} else frame.lookup(token.raw)
                 else:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 frame.assign(name, value, local=raw[0] == "local")
                 if raw[0] == "export":
                     frame.exported.add(name)
@@ -902,10 +911,10 @@ class _EffectAudit:
         argv = self.arguments(words, frame, program)
         name = argv[0]
         if name is None:
-            raise _Unresolved
+            raise _UnresolvedError
         if name in frame.functions:
             if prefix:
-                raise _Unresolved
+                raise _UnresolvedError
             function = frame.functions[name]
             previous = frame.argv
             previous_output = frame.output
@@ -929,13 +938,13 @@ class _EffectAudit:
             return branches
         if name in {"source", "."}:
             if prefix or redirects or len(argv) < 2 or argv[1] is None:
-                raise _Unresolved
+                raise _UnresolvedError
             path = self.path(argv[1], frame)
             if path is not None and self.conflicts_with_redirect(path):
-                raise _Unresolved
+                raise _UnresolvedError
             text = self.read_source(path) if path is not None else None
             if text is None:
-                raise _Unresolved
+                raise _UnresolvedError
             imported = self.program(path, text)
             previous = frame.argv
             if len(argv) > 2:
@@ -948,14 +957,14 @@ class _EffectAudit:
             return branches
         if name in {"return", "exit", "break", "continue"}:
             if prefix or redirects or len(argv) > 2:
-                raise _Unresolved
+                raise _UnresolvedError
             frame.flow = name
             frame.status = frame.status if len(argv) == 1 else argv[1] == "0" if argv[1] in {"0", "1", "2"} else None
             return [frame]
         if name == "shift":
             amount = "1" if len(argv) == 1 else argv[1] if len(argv) == 2 else None
             if amount is None or not amount.isdecimal() or not 0 < int(amount) <= len(frame.argv) or prefix or redirects:
-                raise _Unresolved
+                raise _UnresolvedError
             frame.argv = frame.argv[int(amount):]
             frame.status = True
             return [frame]
@@ -966,20 +975,20 @@ class _EffectAudit:
                 name = argv[0]
         if name == "printf" and len(argv) >= 4 and argv[1] == "-v":
             if prefix or redirects or argv[2] is None:
-                raise _Unresolved
+                raise _UnresolvedError
             frame.assign(argv[2], self.printf(argv[3:]))
             frame.status = True
             return [frame]
         if name in {"bash", "/bin/bash", "/usr/bin/bash", "sh", "/bin/sh", "/usr/bin/sh"}:
             if "/" not in name and environment.get("PATH", self.path_tail) != self.path_tail:
                 if self.native_effect is None:
-                    raise _Unresolved
+                    raise _UnresolvedError
                 identity_request = ShellEffectCommand(argv, environment, frame.cwd, program.path, words[0].start, uncertain=frame.uncertain, identity_only=True)
                 identity = self.native_effect(identity_request)
                 if identity is None or not identity.native_identity or identity.script_path is not None or identity.writes:
-                    raise _Unresolved
+                    raise _UnresolvedError
             if len(argv) < 3 or argv[1] != "-c" or argv[2] is None:
-                raise _Unresolved
+                raise _UnresolvedError
             redirect_request = ShellEffectCommand(argv, environment, frame.cwd, program.path, words[0].start, tuple(redirects), stdin, uncertain=frame.uncertain, fail_stop=frame.errexit and not frame.checked)
             opened = self.begin_redirects(redirect_request, frame)
             child = _Frame(environment, argv[4:], argv[3] if len(argv) > 3 and argv[3] is not None else name, frame.cwd, uncertain=frame.uncertain, exported=set(environment))
@@ -995,7 +1004,7 @@ class _EffectAudit:
             return [frame]
         if name == "trap":
             if prefix or redirects or len(argv) != 3 or argv[1] is None or argv[2] not in {"EXIT", "0"}:
-                raise _Unresolved
+                raise _UnresolvedError
             if argv[1] == "-":
                 frame.traps.pop("EXIT", None)
             else:
@@ -1009,10 +1018,10 @@ class _EffectAudit:
 
     def printf(self, arguments):
         if not arguments or arguments[0] is None:
-            raise _Unresolved
+            raise _UnresolvedError
         format_string, *values = arguments
         if re.search(r"%(?![%sq])", format_string) or re.search(r"\\(?![nrt\\])", format_string):
-            raise _Unresolved
+            raise _UnresolvedError
         if "%q" in format_string or any(value is None for value in values):
             return None
         output, cursor, argument = [], 0, 0
@@ -1040,10 +1049,10 @@ class _EffectAudit:
             elif format_string == "%s":
                 output.extend(values[argument:])
             else:
-                raise _Unresolved
+                raise _UnresolvedError
         result = "".join(output)
         if len(result) > 131_072:
-            raise _Unresolved
+            raise _UnresolvedError
         return result
 
     def apply_traps(self, frames):
@@ -1078,14 +1087,14 @@ class _EffectAudit:
             if operator in {"1>", "1>>", "2>", "2>>"} and value != "/dev/null"
         ]
         if any(path is None or not self.disjoint(path) or self.conflicts_with_redirect(path) for path in paths):
-            raise _Unresolved
+            raise _UnresolvedError
         if paths and self.native_effect is not None:
             # Open happens before the body. Reads of the active destination
             # are separately refused because stdout is accumulated, not streamed.
             opening = replace(request, stdout=None, child_inspected=True, child_status=None, redirect_open=True)
             result = self.native_effect(opening)
             if result is None or result.script_path is not None or any(not self.disjoint(path) or self.conflicts_with_redirect(path) for path in result.writes):
-                raise _Unresolved
+                raise _UnresolvedError
         self.active_redirects.extend(paths)
         return len(paths)
 
@@ -1100,18 +1109,18 @@ class _EffectAudit:
         for value in request.argv:
             path = self.path(value, redirect_frame)
             if path is not None and self.conflicts_with_redirect(path):
-                raise _Unresolved
+                raise _UnresolvedError
         for operator, value in request.redirects:
             if operator in {"1>&", "2>&", "0<&"} and value in {"0", "1", "2", "-"}:
                 continue
             path = self.path(value, redirect_frame)
             if path is not None and self.conflicts_with_redirect(path):
-                raise _Unresolved
+                raise _UnresolvedError
             if ">" in operator and value != "/dev/null" and not self.disjoint(path):
-                raise _Unresolved
+                raise _UnresolvedError
         result = self.native_effect(request) if self.native_effect is not None else self.native_default(request, frame, child=child)
         if result is None or any(not self.disjoint(path) or self.conflicts_with_redirect(path) for path in result.writes):
-            raise _Unresolved
+            raise _UnresolvedError
         if result.stdout is not None and SHELL_PID_MARKER in result.stdout:
             result = replace(result, stdout=None)
         if request.argv[0] == "set" and (result.native_identity or self.native_effect is None):
@@ -1121,7 +1130,7 @@ class _EffectAudit:
                 frame.errexit = False
         if request.argv[0] == "cd" and result.native_identity:
             if len(request.argv) != 2:
-                raise _Unresolved
+                raise _UnresolvedError
             if result.status is True and request.fail_stop:
                 frame.cwd = self.path(request.argv[1], frame)
             elif result.status is not False:
@@ -1133,7 +1142,7 @@ class _EffectAudit:
         if result.script_path is not None:
             text = self.read_source(result.script_path)
             if text is None:
-                raise _Unresolved
+                raise _UnresolvedError
             nested = self.program(result.script_path, text)
             opened = self.begin_redirects(request, frame)
             nested_frame = _Frame(request.environment.copy(), request.argv[1:], result.script_path, frame.cwd, uncertain=frame.uncertain, exported=set(request.environment))
@@ -1145,7 +1154,7 @@ class _EffectAudit:
             completion = replace(request, stdout=result.stdout, child_inspected=True, child_status=result.status)
             result = self.native_effect(completion) if self.native_effect is not None else result
             if result is None or result.script_path is not None or any(not self.disjoint(path) or self.conflicts_with_redirect(path) for path in result.writes):
-                raise _Unresolved
+                raise _UnresolvedError
         native_name = request.argv[0].rpartition("/")[2] if request.argv[0] is not None else ""
         if not request.child_inspected and native_name not in {":", "true", "false", "set", "cd", "pwd", "dirname"}:
             # Native I/O success is not an exact status fact when a caller
@@ -1259,7 +1268,7 @@ def _audit_prefix(
         frame = _Frame(values, (), resolver.context.path if resolver.source_identity else None, exported=set(values))
         audit.run(program, audit.parse(program, tokens), [frame])
         return True
-    except (KeyError, _Unresolved):
+    except (KeyError, _UnresolvedError):
         return False
 
 

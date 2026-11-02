@@ -40,6 +40,39 @@ def test_import_installs_definitions_without_running_main_or_uncalled_writer() -
     assert _preserves('source scripts/library.sh\n', _LIBRARY)
 
 
+@pytest.mark.parametrize("diagnostic", ["--board-config requires a value", "$(printf changed > scripts/library.sh)"])
+def test_present_positional_parameter_skips_its_unused_diagnostic(diagnostic: str) -> None:
+    caller = 'parse() { value="${2:?' + diagnostic + '}"; }\nparse --board-config known\n'
+    assert _preserves(caller, _LIBRARY)
+    assert not _preserves(caller + 'printf changed > scripts/library.sh\n', _LIBRARY)
+
+
+@pytest.mark.parametrize("arguments", ["--board-config", '--board-config ""', '--board-config "$unknown"'])
+def test_missing_or_unknown_positional_diagnostic_cannot_hide_effects(arguments: str) -> None:
+    caller = 'parse() { value="${2:?$(printf changed > scripts/library.sh)}"; }\nparse ' + arguments + '\n'
+    assert not _preserves(caller, _LIBRARY)
+
+
+@pytest.mark.parametrize("initial, modifier", [('value=known', '-'), ('value=known', '?'), ('value=""', '+')])
+def test_known_parameter_value_skips_only_unused_fallback(initial: str, modifier: str) -> None:
+    caller = initial + '\nresult="${value:' + modifier + '$(printf changed > scripts/library.sh)}"\n'
+    assert _preserves(caller, _LIBRARY)
+
+
+@pytest.mark.parametrize("zero", ["0", "00", "000:?missing"])
+def test_zero_parameter_never_selects_the_last_function_argument(zero: str) -> None:
+    condition = '[[ "${' + zero + '}" == "$0" ]]'
+    safe = 'check() { if ' + condition + '; then :; else printf changed > scripts/library.sh; fi; }\ncheck other\n'
+    unsafe = 'check() { if ' + condition + '; then printf changed > scripts/library.sh; fi; }\ncheck other\n'
+    assert _preserves(safe, _LIBRARY)
+    assert not _preserves(unsafe, _LIBRARY)
+
+
+@pytest.mark.parametrize("name", ["0" * 17, "١"])
+def test_unproved_numeric_parameter_spelling_refuses(name: str) -> None:
+    assert not _preserves('value="${' + name + '}"\n', _LIBRARY)
+
+
 @pytest.mark.parametrize("operator", ["#", "##", "%", "%%"])
 def test_uncalled_quoted_pattern_removal_keeps_its_function_boundary(operator: str) -> None:
     library = 'unused() {\nprintf "%s\\n" "${path' + operator + '"$ROOT"/}"\n}\n'
