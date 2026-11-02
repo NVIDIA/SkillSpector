@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 from array import array
+from bisect import bisect_right
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -70,6 +71,8 @@ _QUOTE_OPEN_TO_CLOSE: Final = {
     "“": "”",
 }
 _QUOTE_OPEN_CLASS = "'\"`‘“"
+_MARKDOWN_FENCE_MIN_BACKTICKS: Final = 3
+_FENCE_INFO_RE: Final = re.compile(r"[ \t]*[A-Za-z0-9_+#.-]*[ \t\r]*")
 _ALL_QUOTE_CHARACTERS = frozenset((*_QUOTE_OPEN_TO_CLOSE, *_QUOTE_OPEN_TO_CLOSE.values()))
 _PAYLOAD_QUOTE_OPEN_RE: Final = re.compile(rf"[{_QUOTE_OPEN_CLASS}]")
 _DIRECTIVE_PREFILTER_RE: Final = re.compile(
@@ -1177,9 +1180,14 @@ def _bounded_sentence_end(
     maximum_end: int,
     *,
     end_is_truncated: bool,
+    context_start: int | None = None,
 ) -> tuple[int, bool]:
-    for boundary_start, _ in _sentence_boundaries(text, start, min(len(text), maximum_end + 1)):
-        if boundary_start <= maximum_end:
+    # A directive can be inside a quoted string; retain that quote's state.
+    scan_start = start if context_start is None else context_start
+    for boundary_start, _ in _sentence_boundaries(
+        text, scan_start, min(len(text), maximum_end + 1)
+    ):
+        if start <= boundary_start <= maximum_end:
             return boundary_start, False
     exhausted = maximum_end < len(text) or end_is_truncated
     return maximum_end, exhausted
@@ -1193,17 +1201,66 @@ def _previous_sentence_boundary(text: str, end: int, maximum_span: int) -> int:
     return last_end
 
 
-def _sentence_boundaries(text: str, start: int, end: int) -> Iterator[tuple[int, int]]:
+def _is_fence_line(text: str, cursor: int, end: int) -> bool:
+    """Return whether the backtick run at ``cursor`` opens or closes a CommonMark fence.
+
+    The run must hold at least three backticks and start its line after at most
+    three spaces. Only a bare language label (or nothing) may follow it, so a
+    run after text, an inline span, or an info string that carries prose stays
+    an ordinary quote and keeps failing closed.
+    """
+    line_start = cursor
+    while line_start > 0 and cursor - line_start < 3 and text[line_start - 1] == " ":
+        line_start -= 1
+    if line_start > 0 and text[line_start - 1] != "\n":
+        return False
+    run_end = cursor
+    while run_end < end and text[run_end] == "`":
+        run_end += 1
+    if run_end - cursor < _MARKDOWN_FENCE_MIN_BACKTICKS:
+        return False
+    line_end = text.find("\n", run_end, end)
+    if line_end < 0:
+        # A clipped line cannot prove a bare fence label using unseen suffixes.
+        if end < len(text):
+            return False
+        line_end = end
+    return _FENCE_INFO_RE.fullmatch(text, run_end, line_end) is not None
+
+
+def _sentence_boundaries(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    quote_spans: tuple[list[int], list[int]] | None = None,
+    check_runtime: Callable[[], None] | None = None,
+) -> Iterator[tuple[int, int]]:
     """Yield prose boundaries while ignoring punctuation inside balanced quotes."""
     quote_close: str | None = None
+    quote_start = start
     cursor = start
+    next_runtime_check = start
     while cursor < end:
+        if check_runtime is not None and cursor >= next_runtime_check:
+            check_runtime()
+            next_runtime_check = cursor + 1024
         character = text[cursor]
+        if quote_close is None and character == "`" and _is_fence_line(text, cursor, end):
+            # A Markdown code fence line delimits a block; it does not open a
+            # quote that would swallow every line break up to the next fence.
+            # Any other run of backticks keeps its lexical quote reading.
+            while cursor < end and text[cursor] == "`":
+                cursor += 1
+            continue
         if quote_close is not None:
             if character == "\\" and quote_close in {"'", '"', "`"}:
                 cursor += 2
                 continue
             if character == quote_close:
+                if quote_spans is not None:
+                    quote_spans[0].append(quote_start)
+                    quote_spans[1].append(cursor + 1)
                 quote_close = None
             cursor += 1
             continue
@@ -1214,6 +1271,7 @@ def _sentence_boundaries(text: str, start: int, end: int) -> Iterator[tuple[int,
             and text[cursor - 1].isalnum()
             and text[cursor + 1].isalnum()
         ):
+            quote_start = cursor
             quote_close = _QUOTE_OPEN_TO_CLOSE[character]
         elif character == "\n":
             yield cursor, cursor + 1
@@ -1732,16 +1790,29 @@ def _classify_directive(
     directive: _Directive,
     *,
     end_is_truncated: bool,
+    context_start: int | None = None,
 ) -> _DirectiveClassification:
     if directive.exhausted:
         return _DirectiveClassification(None, False, True)
 
+    baseline = None
+    if context_start is not None:
+        baseline = _classify_directive(view, directive, end_is_truncated=end_is_truncated)
+        if baseline.active or not baseline.limited:
+            return baseline
+
+    clause_start = _previous_sentence_boundary(
+        view.text,
+        directive.start,
+        MAX_MARKER_LOOKAHEAD_CHARS,
+    )
     scope_cap = min(len(view.text), directive.end + MAX_MARKER_SCOPE_CHARS)
     scope_end, _ = _bounded_sentence_end(
         view.text,
         directive.end,
         scope_cap,
         end_is_truncated=end_is_truncated,
+        context_start=context_start,
     )
     lookahead_cap = min(len(view.text), directive.end + MAX_MARKER_LOOKAHEAD_CHARS)
     lookahead_end, lookahead_exhausted = _bounded_sentence_end(
@@ -1749,13 +1820,9 @@ def _classify_directive(
         directive.end,
         lookahead_cap,
         end_is_truncated=end_is_truncated,
+        context_start=context_start,
     )
     first_sentence_end = lookahead_end
-    clause_start = _previous_sentence_boundary(
-        view.text,
-        directive.start,
-        MAX_MARKER_LOOKAHEAD_CHARS,
-    )
     directive_clause = view.text[clause_start:first_sentence_end]
     if first_sentence_end < lookahead_cap and (
         _FORWARD_PAYLOAD_REFERENCE_RE.search(directive_clause) is not None
@@ -1773,6 +1840,23 @@ def _classify_directive(
             end_is_truncated=end_is_truncated,
         )
         lookahead_exhausted = lookahead_exhausted or continuation_exhausted
+    if (
+        baseline is not None
+        and context_start is not None
+        and any(
+            pattern.search(view.text, min(clause_start, context_start), lookahead_end) is not None
+            for pattern in (
+                _UNAMBIGUOUS_ACTION_RE,
+                _CONTEXTUAL_ACTION_RE,
+                _PASTE_ACTION_RE,
+            )
+        )
+    ):
+        # Even an unbound action can acquire its payload through adjacent
+        # literals. Wrapper proof may repair an inert method-like header, but
+        # it cannot clear a prior limit for a potentially active instruction.
+        # Ambiguous or negated action cues also retain that conservative result.
+        return baseline
     payloads = _quoted_payloads(view.text, directive, scope_end)
     if not payloads:
         payloads = _anaphoric_payloads(view.text, directive, lookahead_end)
@@ -1892,6 +1976,7 @@ def build_declared_marker_views(
     limited = False
     projection_blocked = False
     candidates: list[_ProjectionCandidate] = []
+    quote_spans: tuple[list[int], list[int]] | None = None
     for directive in _directives(
         view.text,
         check_runtime,
@@ -1914,10 +1999,50 @@ def build_declared_marker_views(
         if _verb_is_negated(view.text, directive.start, clause_start):
             continue
 
+        context_start = None
+        marker_quote = directive.end - len(directive.marker) - 2
+        if (
+            not source_end_is_truncated
+            and owned_source_start in (None, 0)
+            and view.source_offset(0) == 0
+            and directive.marker
+            and directive.unsupported
+            and not directive.encoded
+            and not directive.is_tag
+            and directive.start <= marker_quote
+            and _QUOTE_OPEN_TO_CLOSE.get(view.text[marker_quote]) == view.text[directive.end - 1]
+            and view.text[marker_quote + 1 : directive.end - 1] == directive.marker
+        ):
+            # A bounded lookbehind can start inside an unrelated literal.
+            # Only a balanced, different-quote wrapper scanned from the view's
+            # origin can supply context; a marker opened by that wrapper's
+            # own closer keeps the conservative forward-only reading.
+            if quote_spans is None:
+                quote_spans = ([], [])
+                for _ in _sentence_boundaries(
+                    view.text,
+                    0,
+                    len(view.text),
+                    quote_spans=quote_spans,
+                    check_runtime=check_runtime,
+                ):
+                    pass
+            starts, ends = quote_spans
+            index = bisect_right(starts, directive.start) - 1
+            if (
+                index >= 0
+                and starts[index] < directive.start
+                and directive.end < ends[index]
+                and directive.end - starts[index] <= MAX_MARKER_LOOKAHEAD_CHARS
+                and view.text[starts[index]] != view.text[marker_quote]
+            ):
+                context_start = starts[index]
+
         classification = _classify_directive(
             view,
             directive,
             end_is_truncated=source_end_is_truncated,
+            context_start=context_start,
         )
         limited = limited or classification.limited
         if classification.active and classification.limited:

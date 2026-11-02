@@ -1027,7 +1027,8 @@ class TestStructuredOutputMethod:
         assert chain.invoke("analyse this") == Verdict(summary="ok")  # type: ignore[attr-defined]
         prompt, request = requests[0]
         assert prompt == "analyse this"
-        assert request["response_format"] is Verdict
+        assert request["response_format"]["type"] == "json_schema"
+        assert request["response_format"]["json_schema"]["strict"] is True
         assert "tools" not in request
 
     def test_cli_adapter_accepts_the_method_keyword(self) -> None:

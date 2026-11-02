@@ -106,7 +106,7 @@ Each new multiline pattern search uses an interruptible regex operation capped a
 
 Callbacks check projection work roughly every 4,096 source characters and check work between matches/spans. Initial searches and individual Python/C operations are not universally preemptible. There is no hard real-time or whole-scanner linearity guarantee. In particular, this fix does not replace the pre-existing same-line matching path.
 
-Existing defaults further bound work: 16 MiB per cached artifact, 64 MiB aggregate cached/workflow bytes, 10,000 discovered/workflow artifacts, and a 600-second workflow allowance. Discovery, cache, reference, archive, output, and parser limits have their own accounting. A bound means incomplete analysis when reached, not permission to silently discard work and claim success. Fatal artifact dispositions and reasons are recovered from the separately bounded canonical inventory if detailed ledger events are truncated. Later manifest limitations cannot downgrade an existing failed disposition.
+Existing defaults further bound work: 16 MiB per cached artifact, 64 MiB aggregate cached/workflow bytes, 10,000 discovered/workflow artifacts, and a 1080-second workflow allowance. Discovery, cache, reference, archive, output, and parser limits have their own accounting. A bound means incomplete analysis when reached, not permission to silently discard work and claim success. Fatal artifact dispositions and reasons are recovered from the separately bounded canonical inventory if detailed ledger events are truncated. Later manifest limitations cannot downgrade an existing failed disposition.
 
 ## Observable decisions and exact public behavior
 

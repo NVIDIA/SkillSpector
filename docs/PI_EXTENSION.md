@@ -60,6 +60,10 @@ disabled: put self-contained rule files in the selected directory.
 
 Static scan is default. To use semantic LLM analysis, configure provider credentials in your shell before launching Pi, then call the tool with `noLlm=false` and a provider.
 
+This integration has a 120-second process limit, independent of the CLI's
+1080-second workflow budget. Changing `SKILLSPECTOR_MAX_WORKFLOW_SECONDS`
+does not extend the integration limit; use the CLI directly for longer scans.
+
 Example:
 
 ```text

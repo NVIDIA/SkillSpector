@@ -545,3 +545,56 @@ def test_imported_initialization_retains_bounded_fallback(monkeypatch, budget, l
     assert not PythonImportBounds(list(files), files).allows(
         "caller.py", files["caller.py"], lambda: None
     )
+
+
+@pytest.mark.parametrize(
+    "path,allowed",
+    [
+        ("helpers.py", True),
+        ("urllibish.py", True),
+        ("urllib.py", False),
+        ("vendor/urllib/parse.py", False),
+        ("vendor/urllib/__init__.py", False),
+        ("vendor/URLLIB/parse.py", False),
+        ("vendor\\urllib\\parse.py", False),
+        ("urllib.cpython-313.so", False),
+        ("urllib.pyc", False),
+    ],
+)
+def test_constant_library_proof_requires_absent_bundled_shadow(path, allowed):
+    context = PythonImportBounds(["caller.py", path], {"caller.py": ""})
+
+    assert context.allows_stdlib("urllib.parse", lambda: None) is allowed
+
+    def expired():
+        raise TimeoutError("expired")
+
+    with pytest.raises(TimeoutError, match="expired"):
+        context.allows_stdlib("urllib.parse", expired)
+
+
+@pytest.mark.parametrize("shadowed", [False, True])
+def test_full_scan_does_not_use_native_url_constants_for_bundled_replacement(shadowed):
+    source = (
+        'OPTIONS = ["--recursive", "--force"]\n'
+        "from urllib.parse import urlparse\n"
+        'REPOSITORY = "https://example.com/widget"\n'
+        "def checkout_name(repository):\n"
+        '    return urlparse(repository).path.rsplit("/", 1)[-1]\n'
+        "CHECKOUT = checkout_name(REPOSITORY)\n"
+        'MESSAGE = f"$TOOL, $ROOT/{CHECKOUT}, {unknown_options}"\n' + "value = 1\n" * 300
+    )
+    files = {"caller.py": source}
+    if shadowed:
+        files.update(
+            {
+                "urllib/__init__.py": "",
+                "urllib/parse.py": "def urlparse(value):\n    return replacement\n",
+            }
+        )
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": list(files), "file_cache": files}, [tm]
+    )
+    event = next(event for event in result["inspection_ledger"] if event["path"] == "caller.py")
+
+    assert event["outcome"] is (LedgerOutcome.PARTIAL if shadowed else LedgerOutcome.COMPLETED)

@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -41,7 +41,7 @@ MOCK_PATCH_TARGET = "skillspector.llm_analyzer_base.get_chat_model"
 def _mock_get_chat_model(*_args, **_kwargs):
     """Return a mock chat model that supports with_structured_output."""
     mock_llm = MagicMock()
-    mock_llm.with_structured_output.return_value = MagicMock()
+    mock_llm.with_structured_output.return_value = MagicMock(ainvoke=AsyncMock())
     return mock_llm
 
 
@@ -93,7 +93,7 @@ class TestSemanticSecurityDiscoveryNode:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
             return_value=[(MagicMock(), [expected_finding])],
         ):
             result = node(base_state)
@@ -134,7 +134,7 @@ class TestSemanticSecurityDiscoveryNode:
 
         submitted_batches = []
 
-        def fake_run_batches(self, batches):
+        async def fake_run_batches(self, batches):
             submitted_batches.extend(batches)
             results = [(batch, []) for batch in batches]
             self._last_batch_outcome = BatchExecutionResult(successful=results)
@@ -144,7 +144,7 @@ class TestSemanticSecurityDiscoveryNode:
             "components": ["cached.py", "unreadable.py"],
             "file_cache": {"cached.py": "print('ready')\n"},
         }
-        with patch.object(LLMAnalyzerBase, "run_batches", fake_run_batches):
+        with patch.object(LLMAnalyzerBase, "arun_batches", fake_run_batches):
             result = node(state)
 
         assert [batch.file_path for batch in submitted_batches] == ["cached.py"]
@@ -161,7 +161,7 @@ class TestSemanticSecurityDiscoveryNode:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
             return_value=[(MagicMock(), findings)],
         ):
             result = node(base_state)
@@ -200,7 +200,7 @@ class TestSemanticSecurityDiscoveryBatching:
     def test_single_file_one_batch(self, base_state) -> None:
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-        with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]) as mock_run:
+        with patch.object(LLMAnalyzerBase, "arun_batches", return_value=[]) as mock_run:
             node(base_state)
 
         mock_run.assert_called_once()
@@ -221,7 +221,7 @@ class TestSemanticSecurityDiscoveryBatching:
             "skillspector.llm_analyzer_base.get_max_input_tokens",
             return_value=50,
         ):
-            with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]) as mock_run:
+            with patch.object(LLMAnalyzerBase, "arun_batches", return_value=[]) as mock_run:
                 node(base_state)
 
         batches_arg = mock_run.call_args[0][0]
@@ -244,7 +244,7 @@ class TestUseLlmGuard:
         with patch(MOCK_PATCH_TARGET, _mock_get_chat_model):
             from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-            with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]):
+            with patch.object(LLMAnalyzerBase, "arun_batches", return_value=[]):
                 result = node(state)
         assert result["findings"] == []
 
@@ -258,8 +258,8 @@ class TestModelResolution:
     @patch(MOCK_PATCH_TARGET)
     def test_uses_analyzer_specific_model(self, mock_get_model: MagicMock) -> None:
         mock_llm = MagicMock()
-        mock_llm.with_structured_output.return_value = MagicMock()
-        mock_llm.with_structured_output.return_value.invoke = MagicMock(
+        mock_llm.with_structured_output.return_value = MagicMock(ainvoke=AsyncMock())
+        mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
             return_value=LLMAnalysisResult(findings=[])
         )
         mock_get_model.return_value = mock_llm
@@ -278,8 +278,8 @@ class TestModelResolution:
     @patch(MOCK_PATCH_TARGET)
     def test_falls_back_to_default_model(self, mock_get_model: MagicMock) -> None:
         mock_llm = MagicMock()
-        mock_llm.with_structured_output.return_value = MagicMock()
-        mock_llm.with_structured_output.return_value.invoke = MagicMock(
+        mock_llm.with_structured_output.return_value = MagicMock(ainvoke=AsyncMock())
+        mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
             return_value=LLMAnalysisResult(findings=[])
         )
         mock_get_model.return_value = mock_llm
@@ -296,8 +296,8 @@ class TestModelResolution:
         from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL
 
         mock_llm = MagicMock()
-        mock_llm.with_structured_output.return_value = MagicMock()
-        mock_llm.with_structured_output.return_value.invoke = MagicMock(
+        mock_llm.with_structured_output.return_value = MagicMock(ainvoke=AsyncMock())
+        mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
             return_value=LLMAnalysisResult(findings=[])
         )
         mock_get_model.return_value = mock_llm
@@ -336,7 +336,7 @@ class TestErrorHandling:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
             side_effect=RuntimeError("LLM service unavailable"),
         ):
             result = node(
@@ -364,7 +364,7 @@ class TestErrorHandling:
 
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-        with patch.object(LLMAnalyzerBase, "run_batches", side_effect=validation_err):
+        with patch.object(LLMAnalyzerBase, "arun_batches", side_effect=validation_err):
             result = node({"file_cache": {"SKILL.md": "# Skill"}})
         assert result["findings"] == []
 
@@ -380,7 +380,7 @@ class TestErrorHandling:
 
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-        with patch.object(LLMAnalyzerBase, "run_batches", side_effect=validation_err):
+        with patch.object(LLMAnalyzerBase, "arun_batches", side_effect=validation_err):
             result = node(
                 {
                     "components": ["cached.py", "missing.py"],
@@ -397,6 +397,51 @@ class TestErrorHandling:
             event["work_id"] for event in result["inspection_ledger"]
         }
 
+    @patch(MOCK_PATCH_TARGET)
+    def test_refused_structured_response_is_failed_not_clean(
+        self, mock_get_model: MagicMock
+    ) -> None:
+        """A refusal that leaves the JSON-schema response empty never reads as a clean scan."""
+        from langchain_core.exceptions import OutputParserException
+
+        from skillspector.llm_analyzer_base import LLMAnalyzerBase
+
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value.ainvoke.side_effect = OutputParserException(
+            "Invalid json output: "
+        )
+        mock_get_model.return_value = mock_llm
+        with patch.object(
+            LLMAnalyzerBase, "response_received", new_callable=lambda: property(lambda _: True)
+        ):
+            result = node({"file_cache": {"SKILL.md": "# Skill"}})
+
+        assert result["findings"] == []
+        assert result["analyzer_status_events"][0]["status"] == "failed"
+        assert result["llm_call_log"][0]["ok"] is False
+        assert {event["reason_code"] for event in result["inspection_ledger"]} == {
+            "llm_batch_failed"
+        }
+
+    @patch(MOCK_PATCH_TARGET)
+    def test_openai_refusal_is_failed_not_clean(self, mock_get_model: MagicMock) -> None:
+        """A structured-output refusal costs its batch and is reported, not dropped."""
+        from langchain_openai.chat_models.base import OpenAIRefusalError
+
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value.ainvoke.side_effect = OpenAIRefusalError(
+            "I can't help with that."
+        )
+        mock_get_model.return_value = mock_llm
+        result = node({"file_cache": {"SKILL.md": "# Skill"}})
+
+        assert result["findings"] == []
+        assert result["analyzer_status_events"][0]["status"] == "failed"
+        assert result["llm_call_log"][0]["ok"] is False
+        assert {event["reason_code"] for event in result["inspection_ledger"]} == {
+            "llm_batch_failed"
+        }
+
 
 # ---------------------------------------------------------------------------
 # TestLLMCallTelemetry — the llm_call_log record the report uses to detect a
@@ -409,7 +454,7 @@ class TestLLMCallTelemetry:
     def test_success_records_ok_true(self, base_state) -> None:
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-        with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]):
+        with patch.object(LLMAnalyzerBase, "arun_batches", return_value=[]):
             result = node(base_state)
         assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": True, "error": None}]
 
@@ -434,7 +479,7 @@ class TestLLMCallTelemetry:
 
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-        with patch.object(LLMAnalyzerBase, "run_batches", side_effect=validation_err):
+        with patch.object(LLMAnalyzerBase, "arun_batches", side_effect=validation_err):
             result = node({"file_cache": {"SKILL.md": "# Skill"}})
         assert result["llm_call_log"][0]["ok"] is False
 
@@ -469,7 +514,7 @@ def _make_file_aware_run_batches(responses: dict[str, LLMAnalysisResult]):
     """Return a mock run_batches that dispatches based on file_path in each batch."""
     from skillspector.llm_analyzer_base import Batch
 
-    def _run_batches(self_inner, batches: list[Batch], **_kwargs):
+    async def _run_batches(self_inner, batches: list[Batch], **_kwargs):
         results = []
         for batch in batches:
             response = responses.get(batch.file_path, LLMAnalysisResult(findings=[]))
@@ -527,7 +572,7 @@ class TestFixtureConftestMalicious:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
             _make_file_aware_run_batches(_CONFTEST_MALICIOUS_RESPONSES),
         ):
             result = node(state)
@@ -546,7 +591,7 @@ class TestFixtureConftestMalicious:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
             _make_file_aware_run_batches(_CONFTEST_MALICIOUS_RESPONSES),
         ):
             result = node(state)
@@ -564,7 +609,7 @@ class TestFixtureConftestMalicious:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
             _make_file_aware_run_batches(_CONFTEST_MALICIOUS_RESPONSES),
         ):
             result = node(state)
@@ -588,7 +633,7 @@ class TestFixtureConftestSafe:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
             return_value=[],
         ):
             result = node(state)
@@ -635,7 +680,7 @@ class TestFixtureSsd1SemanticInjection:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
             _make_file_aware_run_batches(_SSD1_RESPONSES),
         ):
             result = node(state)
@@ -687,7 +732,7 @@ class TestFixtureSsd2NovelPhrasing:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
             _make_file_aware_run_batches(_SSD2_RESPONSES),
         ):
             result = node(state)
@@ -738,7 +783,7 @@ class TestFixtureSsd3NlExfiltration:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
             _make_file_aware_run_batches(_SSD3_RESPONSES),
         ):
             result = node(state)
@@ -788,7 +833,7 @@ class TestFixtureSsd4NarrativeDeception:
 
         with patch.object(
             LLMAnalyzerBase,
-            "run_batches",
+            "arun_batches",
             _make_file_aware_run_batches(_SSD4_RESPONSES),
         ):
             result = node(state)
@@ -817,7 +862,7 @@ class TestFixtureSsdClean:
 
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-        with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]):
+        with patch.object(LLMAnalyzerBase, "arun_batches", return_value=[]):
             result = node(state)
 
         assert result["findings"] == []

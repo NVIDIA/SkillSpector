@@ -27,7 +27,7 @@ import json
 import os
 import stat
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -74,6 +74,7 @@ class SkillDirectory:
     # Frozen discovery provenance. Re-rooting a dot-prefixed child must not
     # erase the hidden ancestry that keeps its content out of external models.
     local_only: bool = False
+    primary_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,11 +306,11 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
             except OSError as exc:
                 raise _read_error("multi_skill_directory_entry") from exc
 
-            has_manifest = _has_skill_md(child, budget=budget)
-            is_structured = False
+            primary_path = _manifest_file(child)
+            has_manifest = primary_path is not None
             if not has_manifest:
-                is_structured = _is_structured_skill_bundle(child, budget=budget)
-            if not (has_manifest or is_structured):
+                primary_path = _structured_skill_bundle_path(child, budget=budget)
+            if primary_path is None:
                 continue
 
             name = _sanitize_display_component(child.name)
@@ -321,6 +322,7 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
                     name=name,
                     relative_path=_sanitize_display_component(entry.name),
                     local_only=entry.name.startswith("."),
+                    primary_path=primary_path,
                 )
             )
     except _DetectionIncompleteError as exc:
@@ -377,8 +379,8 @@ def _bounded_scandir(
     return sorted(entries, key=lambda item: item.name)
 
 
-def _is_structured_skill_bundle(child_dir: Path, *, budget: _DetectionBudget) -> bool:
-    """Classify an AISOP/AISP child from an aggregate-bounded local cache."""
+def _structured_skill_bundle_path(child_dir: Path, *, budget: _DetectionBudget) -> Path | None:
+    """Find an AISOP/AISP child's primary source in the bounded local cache."""
     component_paths, raw_cache = _structured_candidate_cache(child_dir, budget=budget)
     result = extract_structured_skill_context_from_cache(
         child_dir,
@@ -404,17 +406,15 @@ def _is_structured_skill_bundle(child_dir: Path, *, budget: _DetectionBudget) ->
             )
         )
     budget.check_runtime()
-    return result.context is not None
+    return Path(str(result.context["bundle_path"])) if result.context is not None else None
 
 
-def _structured_candidate_cache(
+def _structured_candidate_entries(
     skill_dir: Path,
     *,
     budget: _DetectionBudget,
-) -> tuple[list[str], dict[str, bytes]]:
-    """Build a small no-follow cache for structured classification."""
-    candidates: list[str] = []
-    raw_cache: dict[str, bytes] = {}
+) -> Iterator[tuple[str, os.DirEntry[str]]]:
+    """Walk eligible structured inputs under shared no-follow metadata bounds."""
     stack: list[tuple[Path, PurePosixPath, int]] = [(skill_dir, PurePosixPath("."), 0)]
 
     while stack:
@@ -457,41 +457,76 @@ def _structured_candidate_cache(
             if not _is_candidate(relative_path):
                 continue
             budget.consume_structured_candidate()
-            try:
-                size = entry.stat(follow_symlinks=False).st_size
-            except OSError as exc:
-                raise _read_error("multi_skill_structured_metadata") from exc
-            if size > MAX_STRUCTURED_DOCUMENT_BYTES:
-                raise _DetectionIncompleteError(
-                    MultiSkillDetectionLimitation(
-                        reason_code="size_limit",
-                        resource="multi_skill_structured_document_bytes",
-                        observed_bytes=size,
-                        limit_bytes=MAX_STRUCTURED_DOCUMENT_BYTES,
-                    )
-                )
-            try:
-                with _open_regular_file_no_follow(path) as source:
-                    data = source.read(MAX_STRUCTURED_DOCUMENT_BYTES + 1)
-            except (OSError, _FileOpenError, _UnsafeFileError) as exc:
-                raise _read_error("multi_skill_structured_content") from exc
-            if len(data) > MAX_STRUCTURED_DOCUMENT_BYTES:
-                raise _DetectionIncompleteError(
-                    MultiSkillDetectionLimitation(
-                        reason_code="size_limit",
-                        resource="multi_skill_structured_document_bytes",
-                        observed_bytes=len(data),
-                        limit_bytes=MAX_STRUCTURED_DOCUMENT_BYTES,
-                    )
-                )
-            budget.consume_structured_bytes(len(data))
-            candidates.append(relative_path)
-            raw_cache[relative_path] = data
+            yield relative_path, entry
 
         # Reversed push makes the next visited directory lexically smallest.
         stack.extend(reversed(child_directories))
 
+
+def _structured_candidate_cache(
+    skill_dir: Path,
+    *,
+    budget: _DetectionBudget,
+) -> tuple[list[str], dict[str, bytes]]:
+    """Build a small no-follow cache for structured classification."""
+    candidates: list[str] = []
+    raw_cache: dict[str, bytes] = {}
+    for relative_path, entry in _structured_candidate_entries(skill_dir, budget=budget):
+        try:
+            size = entry.stat(follow_symlinks=False).st_size
+        except OSError as exc:
+            raise _read_error("multi_skill_structured_metadata") from exc
+        if size > MAX_STRUCTURED_DOCUMENT_BYTES:
+            raise _DetectionIncompleteError(
+                MultiSkillDetectionLimitation(
+                    reason_code="size_limit",
+                    resource="multi_skill_structured_document_bytes",
+                    observed_bytes=size,
+                    limit_bytes=MAX_STRUCTURED_DOCUMENT_BYTES,
+                )
+            )
+        try:
+            with _open_regular_file_no_follow(Path(entry.path)) as source:
+                data = source.read(MAX_STRUCTURED_DOCUMENT_BYTES + 1)
+        except (OSError, _FileOpenError, _UnsafeFileError) as exc:
+            raise _read_error("multi_skill_structured_content") from exc
+        if len(data) > MAX_STRUCTURED_DOCUMENT_BYTES:
+            raise _DetectionIncompleteError(
+                MultiSkillDetectionLimitation(
+                    reason_code="size_limit",
+                    resource="multi_skill_structured_document_bytes",
+                    observed_bytes=len(data),
+                    limit_bytes=MAX_STRUCTURED_DOCUMENT_BYTES,
+                )
+            )
+        budget.consume_structured_bytes(len(data))
+        candidates.append(relative_path)
+        raw_cache[relative_path] = data
     return candidates, raw_cache
+
+
+def is_skill_input_alias(directory: Path, output: Path) -> bool:
+    """Compare output identity with bounded skill inputs without parsing them."""
+    started_at = time.monotonic()
+    budget = _DetectionBudget(
+        started_at=started_at,
+        deadline=started_at + MAX_MULTI_SKILL_RUNTIME_SECONDS,
+        clock=time.monotonic,
+    )
+    try:
+        output_stat = output.stat()
+        manifest = _manifest_file(directory)
+        if manifest is not None and os.path.samestat(manifest.stat(), output_stat):
+            return True
+        for _, entry in _structured_candidate_entries(directory, budget=budget):
+            if os.path.samestat(entry.stat(follow_symlinks=False), output_stat):
+                return True
+        budget.check_runtime()
+    except (OSError, _DetectionIncompleteError) as exc:
+        raise ValueError(
+            "Cannot verify --output is separate from skill inputs. Choose a new output path."
+        ) from exc
+    return False
 
 
 def _manifest_file(directory: Path) -> Path | None:

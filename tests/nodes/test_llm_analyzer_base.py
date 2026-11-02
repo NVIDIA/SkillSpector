@@ -2324,10 +2324,7 @@ class TestLedgerEventsForBatches:
         assert events[0]["outcome"] is LedgerOutcome.SKIPPED
         assert status["status"] == "degraded"
         assert events[0]["reason_code"] == LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
-        assert (
-            events[0]["message"]
-            == "LLM returned a malformed structured response after bounded retries."
-        )
+        assert events[0]["message"] == "LLM response could not be validated after bounded recovery."
 
         completeness, _ = finalize_ledger(
             {
@@ -2342,7 +2339,7 @@ class TestLedgerEventsForBatches:
             LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
         )
         assert completeness["ledger_exceptions"][0]["message"] == (
-            "LLM returned a malformed structured response after bounded retries."
+            "LLM response could not be validated after bounded recovery."
         )
         assert completeness["ledger_exceptions"][0]["fatal"] is False
         assert completeness["execution_successful"] is True

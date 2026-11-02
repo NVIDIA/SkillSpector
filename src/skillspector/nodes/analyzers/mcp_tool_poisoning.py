@@ -19,17 +19,17 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import re
 import time
 import unicodedata
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import cast
 
-from langchain_openai.chat_models.base import BaseChatOpenAI
 from pydantic import BaseModel, Field, field_validator
 
-from skillspector.inference_usage import InferenceUsageRecord, chat_model_controls
+from skillspector.inference_usage import InferenceUsageRecord
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
@@ -46,7 +46,7 @@ from skillspector.llm_analyzer_base import (
     append_output_language_instruction,
     estimate_tokens,
 )
-from skillspector.llm_utils import chat_model_provider_name
+from skillspector.llm_utils import run_async
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding, compute_match_fingerprint
 from skillspector.nodes.analyzers.static_runner import MAX_FINDINGS_PER_ANALYZER
@@ -56,7 +56,6 @@ from skillspector.nodes.analyzers.whitespace_padding import (
     padding_run_match_fingerprint,
 )
 from skillspector.providers import get_active_provider
-from skillspector.providers.chat_models import resolve_reasoning_effort
 from skillspector.state import (
     AnalyzerNodeResponse,
     LLMCallRecord,
@@ -78,11 +77,33 @@ TP4_MAX_FILES = 128
 TP4_MAX_TOTAL_CODE_BYTES = 4 * 1024 * 1024
 TP4_MAX_TOTAL_INPUT_BYTES = 4 * 1024 * 1024
 TP4_MAX_FILE_CODE_BYTES = 1024 * 1024
-TP4_MAX_BATCHES = TP4_MAX_FILES
+DEFAULT_TP4_MAX_BATCHES = 256
+TP4_MAX_BATCHES_CEILING = 4096
 TP4_MAX_BATCH_INPUT_TOKENS = 32_000
 TP4_MIN_CODE_TOKENS = 64
 TP4_MAX_DECLARATION_CHARS = 16_384
 TP4_MAX_FINDINGS = 64
+
+
+def _tp4_max_batches_from_environment(value: str | None) -> int:
+    """Resolve bounded TP4 capacity without exposing untrusted environment text."""
+    if value is None or not value.strip():
+        return DEFAULT_TP4_MAX_BATCHES
+    # Normalize leading zeroes before bounding conversion of arbitrarily long input.
+    digits = value.strip().lstrip("0")
+    if re.fullmatch(r"[0-9]{1,4}", digits):
+        capacity = int(digits)
+        if 1 <= capacity <= TP4_MAX_BATCHES_CEILING:
+            return capacity
+    logger.warning(
+        "SKILLSPECTOR_TP4_MAX_BATCHES must be a decimal integer from 1 to %d; using default %d",
+        TP4_MAX_BATCHES_CEILING,
+        DEFAULT_TP4_MAX_BATCHES,
+    )
+    return DEFAULT_TP4_MAX_BATCHES
+
+
+TP4_MAX_BATCHES = _tp4_max_batches_from_environment(os.environ.get("SKILLSPECTOR_TP4_MAX_BATCHES"))
 
 _CATEGORY = "MCP Tool Poisoning"
 
@@ -881,28 +902,6 @@ _TP4_EXECUTABLE_TYPES = frozenset(
     {"python", "javascript", "typescript", "shell", "ruby", "go", "rust"}
 )
 
-# Track the exact-label gateway workaround in the public PR:
-# https://github.com/NVIDIA/SkillSpector/pull/691
-# Dated/suffixed aliases are deliberately excluded. Only the openai route has
-# reproduced wrapper evidence; other providers retain their own method hints.
-_TP4_TOOL_OUTPUT_MODELS = frozenset({"azure/anthropic/claude-opus-5"})
-
-
-def _tp4_reasoning_configured(llm: BaseChatOpenAI) -> bool:
-    """Avoid an automatic forced tool choice when reasoning controls are set."""
-    if resolve_reasoning_effort() is not None:
-        return True
-    if chat_model_controls(llm).get("reasoning_effort") is not None:
-        return True
-    if any(getattr(llm, name, None) is not None for name in ("reasoning_effort", "reasoning")):
-        return True
-    for controls in (llm.model_kwargs, llm.extra_body):
-        if isinstance(controls, Mapping) and any(
-            controls.get(name) is not None for name in ("reasoning_effort", "reasoning", "thinking")
-        ):
-            return True
-    return False
-
 
 class _TP4AnalysisResult(BaseModel):
     """Validated response from the description-behavior mismatch check."""
@@ -926,21 +925,6 @@ class _TP4Analyzer(LLMAnalyzerBase):
     """Run TP4 through the shared structured-output analyzer lifecycle."""
 
     response_schema = _TP4AnalysisResult
-
-    def _structured_output_preference(self, llm: object) -> str | None:
-        # The OpenAI-compatible Opus 5 gateway sometimes wraps json_schema
-        # output in a {"json": ...} object instead of the requested schema.
-        # Tool calling returns the exact TP4 schema on the same gateway, but
-        # forcing a tool may conflict with configured reasoning/thinking.
-        # Explicit environment/provider method choices still take precedence.
-        if (
-            isinstance(llm, BaseChatOpenAI)
-            and chat_model_provider_name(llm) == "openai"
-            and self.model in _TP4_TOOL_OUTPUT_MODELS
-            and not _tp4_reasoning_configured(llm)
-        ):
-            return "function_calling"
-        return None
 
     def __init__(
         self,
@@ -1193,6 +1177,7 @@ def _tp4_finding(
 
 def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
     """Run TP4 with per-file, aggregate, token, batch, and shared-time bounds."""
+    logger.info("%s: TP4 selected batch capacity=%d", ANALYZER_ID, TP4_MAX_BATCHES)
     result = _TP4CheckOutcome()
     analyzer: _TP4Analyzer | None = None
     attempted = False
@@ -1517,7 +1502,9 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
         )
         analyzer = _TP4Analyzer(model, timeout=timeout)
         attempted = True
-        batch_outcome = analyzer.run_batches_detailed(batches)
+        # Fan out like the semantic analyzers do. The shared limiter still honours
+        # SKILLSPECTOR_MAX_LLM_CONCURRENCY, and results keep the batch order.
+        batch_outcome = run_async(analyzer.arun_batches_detailed(batches))
         result.inference_usage = cast(list[InferenceUsageRecord], analyzer.inference_usage)
         seen_finding_ids: set[str] = set()
         unexpected_response = False

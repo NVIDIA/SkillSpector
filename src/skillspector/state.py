@@ -43,7 +43,7 @@ from skillspector.models import Finding
 
 logger = get_logger(__name__)
 
-DEFAULT_MAX_WORKFLOW_SECONDS = 600.0
+DEFAULT_MAX_WORKFLOW_SECONDS = 1080.0
 
 
 def _workflow_max_seconds_from_environment(value: str | None) -> float:

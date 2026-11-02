@@ -52,6 +52,10 @@ the subprocess starts.
 - `output`: optional report path.
 - `noLlm`: default `true`.
 
+This integration has a 120-second process limit, independent of the CLI's
+1080-second workflow budget. Changing `SKILLSPECTOR_MAX_WORKFLOW_SECONDS`
+does not extend the integration limit; use the CLI directly for longer scans.
+
 Unlike the [Pi extension](PI_EXTENSION.md), this tool has no `provider`, `model`, `yaraRulesDir`, or `verbose` parameters: LLM-backed analysis is configured through the environment instead (see below).
 
 ## LLM-backed analysis
