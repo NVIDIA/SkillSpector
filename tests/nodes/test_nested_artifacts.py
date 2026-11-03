@@ -1805,9 +1805,15 @@ def test_tar_links_devices_sparse_and_unknown_members_are_never_followed(
     expected = (
         LedgerReason.ARCHIVE_LINK_MEMBER
         if member_type in {tarfile.SYMTYPE, tarfile.LNKTYPE}
-        else LedgerReason.OPAQUE_CONTENT
+        else LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER
     )
-    assert any(event.get("reason_code") == expected for event in result.ledger_events)
+    event = next(event for event in result.ledger_events if event.get("reason_code") == expected)
+    assert event["outcome"] == LedgerOutcome.SKIPPED
+    assert result.inventory_overrides[event["path"]] == (ArtifactDisposition.FAILED, expected)
+    if expected == LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER:
+        assert event["message"] == (
+            "Archive member uses a type or feature that is not supported for inspection."
+        )
 
 
 @pytest.mark.parametrize("tar_format", [tarfile.PAX_FORMAT, tarfile.GNU_FORMAT])
@@ -1889,6 +1895,7 @@ def test_tar_never_treats_uninspected_suffix_as_complete(tmp_path: Path, damage:
         event.get("reason_code") in {LedgerReason.ARCHIVE_TRUNCATED, LedgerReason.ARCHIVE_MALFORMED}
         for event in result.ledger_events
     )
+    assert all("ZIP" not in event["message"] for event in result.ledger_events)
 
 
 @pytest.mark.parametrize("damage", ["truncated", "crc", "junk"])
@@ -1906,6 +1913,7 @@ def test_gzip_trailer_and_suffix_are_validated(tmp_path: Path, damage: str) -> N
         event.get("reason_code") in {LedgerReason.ARCHIVE_TRUNCATED, LedgerReason.ARCHIVE_MALFORMED}
         for event in result.ledger_events
     )
+    assert all("ZIP" not in event["message"] for event in result.ledger_events)
 
 
 def test_gzip_concatenated_streams_and_padding_are_inspected(tmp_path: Path) -> None:
@@ -2105,9 +2113,17 @@ def test_pax_sparse_metadata_remains_explicitly_unsupported(
         data = _tar_metadata_bytes(tarfile.XHDTYPE) + data
     result = inspect_nested_artifacts(tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": data})
     assert not result.raw_file_cache
-    assert any(
-        event.get("reason_code") == LedgerReason.OPAQUE_CONTENT for event in result.ledger_events
+    event = next(
+        event
+        for event in result.ledger_events
+        if event.get("reason_code") == LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER
     )
+    assert event["outcome"] == LedgerOutcome.SKIPPED
+    assert result.inventory_overrides[event["path"]] == (
+        ArtifactDisposition.FAILED,
+        LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER,
+    )
+    assert "bundle.tar" not in result.inspected_containers
 
 
 @pytest.mark.parametrize("leading_control", [False, True])

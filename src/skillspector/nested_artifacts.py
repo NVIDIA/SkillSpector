@@ -210,6 +210,7 @@ _FAILED_INVENTORY_REASONS = frozenset(
         LedgerReason.ARCHIVE_MALFORMED,
         LedgerReason.ARCHIVE_TRUNCATED,
         LedgerReason.ARCHIVE_UNSUPPORTED_COMPRESSION,
+        LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER,
         LedgerReason.OPAQUE_CONTENT,
     }
 )
@@ -1447,7 +1448,7 @@ class _TarReader(io.BytesIO):
                 )
             key = self.data[separator + 1 : equals]
             if key.startswith(b"GNU.sparse.") or key == b"SCHILY.realsize":
-                raise _ArchiveInspectionError(LedgerReason.OPAQUE_CONTENT)
+                raise _ArchiveInspectionError(LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER)
             start = stop
 
 
@@ -1461,7 +1462,7 @@ class _BoundedTarInfo(tarfile.TarInfo):
         if self.size < 0:
             raise _ArchiveInspectionError(LedgerReason.ARCHIVE_MALFORMED)
         if self.type == tarfile.GNUTYPE_SPARSE:
-            raise _ArchiveInspectionError(LedgerReason.OPAQUE_CONTENT)
+            raise _ArchiveInspectionError(LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER)
         reader.metadata_depth += 1
         try:
             if reader.metadata_depth > ARCHIVE_MAX_METADATA_DEPTH:
@@ -1572,7 +1573,7 @@ def _inspect_tar_bytes(
                     info.type not in {tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.CONTTYPE}
                     or info.sparse is not None
                 ):
-                    reason = LedgerReason.OPAQUE_CONTENT
+                    reason = LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER
                 elif info.size < 0 or info.offset_data < 0 or end > len(data):
                     reason = LedgerReason.ARCHIVE_TRUNCATED
                 elif info.size > budget.max_member_bytes:

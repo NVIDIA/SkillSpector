@@ -68,9 +68,15 @@ async def test_unsupported_primary_is_incomplete_and_not_install_safe(
     assert completeness["coverage_percent"] < 100.0
     assert result["recommendation"] != "SAFE"
     exceptions = completeness["ledger_exceptions"]
-    assert any(
-        item["path"] == name and item["reason_code"] == "unsupported_primary_content"
+    primary = next(
+        item
         for item in exceptions
+        if item["path"] == name and item["reason_code"] == "unsupported_primary_content"
+    )
+    assert primary["message"] == (
+        "The requested file or primary instructions could not be interpreted. "
+        "Provide UTF-8 text, a supported ZIP, TAR, or GZIP container, "
+        "or an extracted directory instead."
     )
     assert not any(item["path"] == name for item in completeness["scope_exclusions"])
 
@@ -95,6 +101,13 @@ async def test_passive_asset_keeps_existing_reference_policy(
         assert any(
             item["path"] == "image.png" and item["reason_code"] == "binary_content"
             for item in result["analysis_completeness"]["scope_exclusions"]
+        )
+    else:
+        assert any(
+            item["path"] == "image.png"
+            and item["reason_code"] == "opaque_content"
+            and item["message"] == "Artifact contents could not be fully interpreted."
+            for item in result["analysis_completeness"]["ledger_exceptions"]
         )
 
 
@@ -153,6 +166,36 @@ async def test_supported_archives_remain_complete(
 
     assert result["analysis_completeness"]["is_complete"] is True
     assert result["safe_to_install"] is True
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+@pytest.mark.parametrize("member_type", [tarfile.FIFOTYPE, tarfile.GNUTYPE_SPARSE])
+async def test_unsupported_tar_members_keep_incomplete_reference_evidence(
+    tmp_path: Path, compressed: bool, member_type: bytes
+) -> None:
+    name = "bundle.tar.gz" if compressed else "bundle.tar"
+    info = tarfile.TarInfo("unsupported")
+    info.type = member_type
+    data = info.tobuf(format=tarfile.GNU_FORMAT) + bytes(1024)
+    (tmp_path / name).write_bytes(gzip.compress(data) if compressed else data)
+    (tmp_path / "SKILL.md").write_bytes(_SKILL + f"\nRead [archive]({name}).\n".encode())
+
+    result = await run_scan(str(tmp_path), use_llm=False)
+
+    assert result["safe_to_install"] is False
+    assert result["analysis_completeness"]["is_complete"] is False
+    assert result["recommendation"] != "SAFE"
+    assert any(
+        item["path"].startswith(name)
+        and item["reason_code"] == "archive_unsupported_member"
+        and item["message"]
+        == "Archive member uses a type or feature that is not supported for inspection."
+        and item["outcome"] == "skipped"
+        for item in result["analysis_completeness"]["ledger_exceptions"]
+    )
+    assert any(
+        issue["id"] == "AE1" and issue["severity"] == "HIGH" for issue in result["findings"]
+    )
 
 
 @pytest.mark.parametrize("extension", ["zip", "dat"])
