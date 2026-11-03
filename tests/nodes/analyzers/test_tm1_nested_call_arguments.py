@@ -49,6 +49,14 @@ def _tm1(content: str, path: str = "run.py") -> list:
             'subprocess.run("echo \\\n:(", shell=True)',
             id="open_paren_after_line_continuation_in_string",
         ),
+        pytest.param(
+            'subprocess.run("echo \\\r\n:(", shell=True)',
+            id="open_paren_after_crlf_line_continuation_in_string",
+        ),
+        pytest.param(
+            'subprocess.run("""echo \\\r\n:(""", shell=True)',
+            id="open_paren_after_crlf_line_continuation_in_triple_quoted_string",
+        ),
     ],
 )
 def test_shell_true_after_nested_call_argument_is_detected(call: str) -> None:
