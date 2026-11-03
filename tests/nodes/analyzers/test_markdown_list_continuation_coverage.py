@@ -179,3 +179,28 @@ def test_table_header_on_ordered_marker_keeps_following_cells_separate(
     assert any(f.rule_id == "TM1" and f.severity == "HIGH" for f in report["findings"]) or any(
         event["outcome"] != "completed" for event in report["inspection_ledger"]
     )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    "body",
+    ["`printf x`\n    --- | ---", "`printf 'x' | cat`.\n    --- | --- | ---"],
+)
+def test_mismatched_table_columns_keep_list_inline_ownership(body: str, newline: str) -> None:
+    source = ("10. Example:\n    " + body + "\n").replace("\n", newline)
+    assert tool._markdown_shell_text(source, lambda: None) == source.replace("`", " ")
+    assert not tool.has_bounded_parse_exhaustion(source, lambda: None, file_type="markdown")
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    "header",
+    ["`$(resolve_tool).example | ` -rf /", "`$CMD -rf /`", "`printf 'x' | cat`."],
+)
+def test_table_column_lookahead_preserves_runtime_command_gaps(
+    header: str, newline: str
+) -> None:
+    source = ("10. Example:\n    " + header + "\n    --- | ---\n").replace("\n", newline)
+    if "|" in header:
+        assert tool._markdown_shell_text(source, lambda: None) == source
+    assert tool.has_bounded_parse_exhaustion(source, lambda: None, file_type="markdown")

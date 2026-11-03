@@ -7327,10 +7327,13 @@ def _markdown_shell_text(
                 and table_columns is None
                 and not (
                     line_index + 1 < len(lines)
-                    and _markdown_table_delimiter_columns(
-                        lines[line_index + 1], paragraph_list_indent, check_runtime
+                    and (
+                        columns := _markdown_table_delimiter_columns(
+                            lines[line_index + 1], paragraph_list_indent, check_runtime
+                        )
                     )
                     is not None
+                    and len(_markdown_table_cells(stripped, prefix, check_runtime)) == columns
                 )
             )
         ):
