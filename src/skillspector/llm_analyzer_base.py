@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 from collections import defaultdict, deque
@@ -335,6 +336,101 @@ def _provider_failure_class(exc: BaseException) -> str:
     """Preserve the initiating transient exception class through wrappers."""
     cause = _transient_provider_cause(exc)
     return type(cause or exc).__name__
+
+
+def _safe_failed_request_diagnostic(
+    exc: BaseException, prompt: str, input_budget: int, output_cap: object, ordinal: int
+) -> dict[str, object]:
+    """Fixed failure fields only: never exception text, bodies, headers or source."""
+    code_classes = {
+        "context_length_exceeded": "context_overflow",
+        "input_tokens_limit_exceeded": "context_overflow",
+        "rate_limit_exceeded": "rate_limit",
+        "insufficient_quota": "quota",
+        "invalid_api_key": "authentication",
+        "model_not_found": "model_unavailable",
+        "unsupported_parameter": "unsupported_parameter",
+        "invalid_request_error": "request_rejected",
+    }
+    known_classes = _RETRYABLE_PROVIDER_ERROR_NAMES | {
+        "TimeoutError",
+        "OpenAIContextOverflowError",
+        "OpenAIAPIContextOverflowError",
+        "BadRequestError",
+        "AuthenticationError",
+        "PermissionDeniedError",
+        "NotFoundError",
+        "ValidationError",
+        "StructuredOutputParseError",
+        "TypeError",
+        "ValueError",
+    }
+    chain = _exception_chain(exc)
+    error_class = next(
+        (type(item).__name__ for item in chain if type(item).__name__ in known_classes),
+        "OtherProviderError",
+    )
+    status = next(
+        (
+            value
+            for item in chain
+            if (value := _provider_status_code(item)) is not None and 100 <= value <= 599
+        ),
+        None,
+    )
+    code = None
+    request_id = None
+    for item in chain:
+        body = getattr(item, "body", None)
+        body = body if isinstance(body, Mapping) else {}
+        error = body.get("error")
+        error = error if isinstance(error, Mapping) else {}
+        for value in (getattr(item, "code", None), body.get("code"), error.get("code")):
+            if isinstance(value, str) and value in code_classes:
+                code = value
+                break
+        # Provider-generated IDs only; arbitrary headers and messages are never copied.
+        response = getattr(item, "response", None)
+        headers = getattr(response, "headers", None)
+        headers = headers if isinstance(headers, Mapping) else {}
+        for value in (
+            getattr(item, "request_id", None),
+            headers.get("x-request-id"),
+            headers.get("request-id"),
+        ):
+            if isinstance(value, str) and re.fullmatch(r"(?:req_)?[0-9a-fA-F-]{16,96}", value):
+                request_id = value
+                break
+    message_class = code_classes.get(code, "other") if code is not None else "other"
+    if message_class == "other":
+        if error_class in {"OpenAIContextOverflowError", "OpenAIAPIContextOverflowError"}:
+            message_class = "context_overflow"
+        elif status == 429 or error_class == "RateLimitError":
+            message_class = "rate_limit"
+        elif error_class in {"APITimeoutError", "TimeoutError", "ReadTimeout", "ConnectTimeout"}:
+            message_class = "timeout"
+        elif status is not None and status >= 500:
+            message_class = "provider_unavailable"
+        elif status in {401, 403}:
+            message_class = "authentication"
+        elif status is not None and 400 <= status < 500:
+            message_class = "request_rejected"
+    return {
+        "error_class": error_class,
+        "status_code": status,
+        "provider_code": code,
+        "message_class": message_class,
+        "request_id": request_id,
+        "prompt_characters": len(prompt),
+        "prompt_bytes": len(prompt.encode("utf-8", errors="replace")),
+        "estimated_prompt_tokens": estimate_tokens(prompt),
+        "estimated_input_budget": input_budget
+        if type(input_budget) is int and input_budget > 0
+        else None,
+        "configured_output_cap": output_cap if type(output_cap) is int and output_cap > 0 else None,
+        "request_ordinal": ordinal,
+        "ordinal_scope": "analyzer_adapter_invocation",
+    }
 
 
 def _is_rate_limit_provider_error(exc: BaseException) -> bool:
@@ -964,7 +1060,16 @@ class LLMAnalyzerBase:
         self._timeout = timeout
         self._dynamic_timeout = callable(timeout)
         self._input_budget = get_max_input_tokens(model)
-        self._llm = get_chat_model(model=model, timeout=self._require_time_remaining())
+        self._request_ordinal = 0
+        self._request_ordinal_lock = threading.Lock()
+        try:
+            self._llm = get_chat_model(model=model, timeout=self._require_time_remaining())
+        except ValueError:
+            raise
+        except Exception:
+            self._require_time_remaining()
+            raise
+        self._require_time_remaining()
         # Native SDK retries cannot re-read a workflow-wide deadline between
         # attempts.  A dynamic deadline therefore uses our explicit retry loop,
         # which checks and caps every retry/backoff against remaining time.
@@ -1137,6 +1242,36 @@ class LLMAnalyzerBase:
 
     # -- Run loop -----------------------------------------------------------
 
+    def _record_failed_request(self, exc: BaseException, prompt: str, ordinal: int) -> None:
+        # Diagnostics must never replace the original provider exception or report usage.
+        try:
+            value = _safe_failed_request_diagnostic(
+                exc, prompt, self._input_budget, getattr(self._llm, "max_tokens", None), ordinal
+            )
+            logger.warning("LLM_REQUEST_FAILURE %s", json.dumps(value, sort_keys=True))
+        except Exception:
+            pass
+
+    def _invoke_with_failure_diagnostic(self, runnable: object, prompt: str) -> object:
+        with self._request_ordinal_lock:
+            self._request_ordinal += 1
+            ordinal = self._request_ordinal
+        try:
+            return _invoke_with_usage(runnable, prompt, self._usage_collector)
+        except Exception as exc:
+            self._record_failed_request(exc, prompt, ordinal)
+            raise
+
+    async def _ainvoke_with_failure_diagnostic(self, runnable: object, prompt: str) -> object:
+        with self._request_ordinal_lock:
+            self._request_ordinal += 1
+            ordinal = self._request_ordinal
+        try:
+            return await _ainvoke_with_usage(runnable, prompt, self._usage_collector)
+        except Exception as exc:
+            self._record_failed_request(exc, prompt, ordinal)
+            raise
+
     def _invoke_batch(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
         """Invoke and parse one batch synchronously."""
         logger.debug(
@@ -1148,12 +1283,12 @@ class LLMAnalyzerBase:
         llm, structured_llm = self._model_for_call()
         if structured_llm:
             try:
-                response = _invoke_with_usage(structured_llm, prompt, self._usage_collector)
+                response = self._invoke_with_failure_diagnostic(structured_llm, prompt)
                 _require_structured_response(response)
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError(getattr(exc, "issue", None)) from exc
         else:
-            response = _raw_response_text(_invoke_with_usage(llm, prompt, self._usage_collector))
+            response = _raw_response_text(self._invoke_with_failure_diagnostic(llm, prompt))
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
 
@@ -1186,7 +1321,7 @@ class LLMAnalyzerBase:
     def _format_batch(self, batch: Batch, source: str) -> tuple[Batch, list]:
         try:
             runnable, prompt = self._formatting_call(source)
-            response = _invoke_with_usage(runnable, prompt, self._usage_collector)
+            response = self._invoke_with_failure_diagnostic(runnable, prompt)
             _require_structured_response(response)
         except (StructuredOutputParseError, ValidationError) as exc:
             raise _StructuredResponseValidationError(getattr(exc, "issue", None)) from exc
@@ -1198,7 +1333,7 @@ class LLMAnalyzerBase:
     async def _aformat_batch(self, batch: Batch, source: str) -> tuple[Batch, list]:
         try:
             runnable, prompt = self._formatting_call(source)
-            response = await _ainvoke_with_usage(runnable, prompt, self._usage_collector)
+            response = await self._ainvoke_with_failure_diagnostic(runnable, prompt)
             _require_structured_response(response)
         except (StructuredOutputParseError, ValidationError) as exc:
             raise _StructuredResponseValidationError(getattr(exc, "issue", None)) from exc
@@ -1301,14 +1436,12 @@ class LLMAnalyzerBase:
         llm, structured_llm = self._model_for_call()
         if structured_llm:
             try:
-                response = await _ainvoke_with_usage(structured_llm, prompt, self._usage_collector)
+                response = await self._ainvoke_with_failure_diagnostic(structured_llm, prompt)
                 _require_structured_response(response)
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError(getattr(exc, "issue", None)) from exc
         else:
-            response = _raw_response_text(
-                await _ainvoke_with_usage(llm, prompt, self._usage_collector)
-            )
+            response = _raw_response_text(await self._ainvoke_with_failure_diagnostic(llm, prompt))
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
 
