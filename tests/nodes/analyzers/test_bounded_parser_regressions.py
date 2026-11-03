@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from types import SimpleNamespace
 
 import pytest
@@ -435,6 +436,56 @@ def test_unsupported_startup_proof_option_is_not_a_numeric_limit() -> None:
     assert diagnostic.cause is ParserCause.UNSUPPORTED_SYNTAX
     assert diagnostic.check is ParserCheck.COMMAND_STRING_RUNTIME
     assert diagnostic.measurements == {}
+
+
+@pytest.mark.parametrize("budget", [False, True])
+@pytest.mark.parametrize("nesting", [0, 1, 2])
+@pytest.mark.parametrize("repeat_eval", [False, True])
+def test_eval_retains_the_first_startup_proof_cause_and_original_carrier(
+    budget: bool, nesting: int, repeat_eval: bool
+) -> None:
+    body = (
+        "export " + " ".join(f"NAME{index}=0" for index in range(32)) if budget else "read -z VALUE"
+    )
+    for _ in range(nesting):
+        body = "eval " + shlex.quote(body)
+    carrier = "eval " + shlex.quote(body)
+    source = carrier + ("; eval 'echo ok'" if repeat_eval else "") + "; sh -c 'echo ok'"
+    result = _public_result(source, "script.sh")
+    event = result["inspection_ledger"][0]
+    diagnostic = event["parser_diagnostic"]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+    assert diagnostic["source_start_offset"] == 0
+    assert diagnostic["source_end_offset"] == len(carrier)
+    assert diagnostic["location_precision"] == "enclosing_expression"
+    assert diagnostic["full_input_checked"] is False
+    assert body not in json.dumps(diagnostic)
+    if budget:
+        assert diagnostic["cause"] is ParserCause.RESOURCE_LIMIT
+        assert diagnostic["check"] is ParserCheck.WRAPPER_ARGUMENTS
+        assert diagnostic["observed_records"] == diagnostic["limit_records"] == 32
+        assert diagnostic["observed_is_lower_bound"] is True
+    else:
+        assert diagnostic["cause"] is ParserCause.UNSUPPORTED_SYNTAX
+        assert diagnostic["check"] is ParserCheck.COMMAND_STRING_RUNTIME
+        assert "observed_records" not in diagnostic
+        assert "limit_records" not in diagnostic
+
+
+@pytest.mark.parametrize("budget", [False, True])
+@pytest.mark.parametrize("nested_eval", [False, True])
+def test_child_shell_startup_proof_cause_does_not_leak_into_outer_siblings(
+    budget: bool, nested_eval: bool
+) -> None:
+    body = (
+        "export " + " ".join(f"NAME{index}=0" for index in range(32)) if budget else "read -z VALUE"
+    )
+    if nested_eval:
+        body = "eval " + shlex.quote(body)
+    source = "sh -c " + shlex.quote(body) + "; sh -c 'echo ok'"
+    assert tm.bounded_parse_diagnostic(source, lambda: None) is None
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None) is False
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])

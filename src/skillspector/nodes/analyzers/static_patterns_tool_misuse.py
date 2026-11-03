@@ -3688,6 +3688,9 @@ def _has_shell_command_word_exhaustion(
         command_limits = _shell_quoted_candidate_limits(
             command_string, check_runtime, quote_closers=command_closers
         )
+        nested_startup_diagnostics = [
+            item.enclosed(0, len(command_string)) for item in command.startup_diagnostics[:1]
+        ]
         diagnostic = _has_shell_command_word_exhaustion(
             command_string,
             check_runtime,
@@ -3696,10 +3699,15 @@ def _has_shell_command_word_exhaustion(
             _command_string_depth=_command_string_depth + 1,
             _quoted_printf_allowed=quoted_printf_allowed,
             _startup_exposure=command.startup_context,
-            _startup_diagnostics=[
-                item.enclosed(0, len(command_string)) for item in command.startup_diagnostics[:1]
-            ],
+            _startup_diagnostics=nested_startup_diagnostics,
         )
+        if nested_startup_diagnostics and not command.startup_diagnostics:
+            # eval shares the exposure flag with its parent; retain its cause
+            # too when no command in this body needed that proof yet. A child
+            # shell's context has separate carriers and cannot affect siblings.
+            command.startup_diagnostics.append(
+                nested_startup_diagnostics[0].enclosed(command.start, command.end)
+            )
         if diagnostic is not None:
             return (
                 diagnostic.shifted(command.start)
