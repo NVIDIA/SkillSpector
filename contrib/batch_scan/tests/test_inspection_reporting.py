@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from markdown_it import MarkdownIt
+
 from contrib.batch_scan.reports import _format_json, _format_markdown, _format_terminal
 from contrib.batch_scan.runner import entry_from_result
 
@@ -61,6 +63,9 @@ def test_batch_formats_preserve_every_child_ledger_exception() -> None:
     assert [item["reason_code"] for item in exceptions] == ["read_error", "syntax_error"]
     assert payload["skills"][0]["issues"][0]["finding_id"] == "finding-batch-1"
 
-    for rendered in (_format_terminal([entry]), _format_markdown([entry])):
+    for rendered in (
+        _format_terminal([entry]),
+        MarkdownIt().enable("table").render(_format_markdown([entry])),
+    ):
         assert "read_error" in rendered
         assert "syntax_error" in rendered

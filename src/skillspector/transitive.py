@@ -36,6 +36,7 @@ _SUPPORTED_FILE_EXTENSIONS = frozenset(
     {
         ".md",
         ".py",
+        ".pyw",
         ".sh",
         ".bash",
         ".zsh",

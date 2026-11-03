@@ -1,0 +1,422 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""TM1 ownership and projection contracts split from PR #497."""
+
+from __future__ import annotations
+
+import pytest
+
+import skillspector.artifacts as artifacts_module
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_module
+from skillspector.nodes.deduplicate import deduplicate
+
+
+def _run(content: str, path: str = "run.py") -> dict:
+    return tm_module.node({"components": [path], "file_cache": {path: content}})
+
+
+def _tm1(content: str, path: str = "run.py") -> list:
+    return [finding for finding in _run(content, path)["findings"] if finding.rule_id == "TM1"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "plain subprocess.run(command, shell=True)",
+        "ig\u00adn\u03bfre and systeｍ",
+        "word\u200b\u200c boundary",
+        "\N{BLACK SUN WITH RAYS}\N{VARIATION SELECTOR-16} emoji",
+        "left\u0085\u0600right",
+        "prefix " + "ﷺ" * 100 + " suffix",
+        "a" + "\u200b" * 300 + "b",
+    ],
+)
+@pytest.mark.parametrize("max_chars", [0, 1, 7, 31, 200])
+def test_normalized_security_prefix_matches_full_projection(
+    source: str,
+    max_chars: int,
+) -> None:
+    assert hasattr(artifacts_module, "normalized_security_prefix")
+    assert (
+        artifacts_module.normalized_security_prefix(source, max_chars)
+        == artifacts_module.normalized_security_view(source).text[:max_chars]
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "plain source",
+        "😀" * 20,
+        "Cafe\u0301",
+        "☀️",
+        "\u034f",
+        "\u0085",
+        "\u0600",
+        "\u200b",
+        "ｓｕｂｐｒｏｃｅｓｓ",
+        "shell\x00=True",
+        "i g n o r e previous instructions.",
+        "i g n o r e previous instructions.\ufffd",
+        "i-g-n-o-r-e previous instructions",
+    ],
+)
+def test_derived_security_view_predicate_matches_materialized_views(source: str) -> None:
+    assert hasattr(artifacts_module, "_has_derived_security_view")
+    assert artifacts_module._has_derived_security_view(source) is (
+        len(artifacts_module.security_text_views(source)) > 1
+    )
+
+
+def test_bound_call_uses_runner_logical_line_coordinates() -> None:
+    direct = _tm1("enabled = True\n\fsubprocess.run(command, shell=True)\n")
+    bound = _tm1("enabled = True\n\fsubprocess.run(command, shell=enabled)\n")
+
+    assert len(direct) == len(bound) == 1
+    assert (direct[0].start_line, bound[0].start_line) == (3, 3)
+    assert bound[0].end_line == 3
+
+
+def test_nested_bound_call_projects_context_to_call_location() -> None:
+    findings = _tm1(
+        "true_value = True\n"
+        "def inner():\n"
+        "    # one\n"
+        "    # two\n"
+        "    # three\n"
+        "    subprocess.run(command, shell=true_value)\n"
+    )
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 6
+    assert "subprocess.run(command, shell=true_value)" in (findings[0].context or "")
+    assert "subprocess.run(command, shell=true_value)" in (findings[0].code_snippet or "")
+    assert "true_value = True" not in (findings[0].context or "")
+    assert "true_value = True" not in (findings[0].code_snippet or "")
+
+
+def test_embedded_direct_literal_text_does_not_duplicate_bound_call() -> None:
+    findings = _tm1("enabled = True\nsubprocess.run('shell=True', shell=enabled)\n")
+
+    assert len(findings) == 1
+    assert "shell=enabled" in (findings[0].matched_text or "")
+
+
+def test_normalized_expansion_slice_maps_back_to_ast_call_start() -> None:
+    confusable_name = "tru\N{CYRILLIC SMALL LETTER IE}_value"
+    prefix = "#" + "ﷺ" * 20_000 + "\n"
+    result = _run(
+        prefix
+        + f"{confusable_name} = True\n"
+        + f"subprocess.run(command, shell={confusable_name})\n",
+        "expanded.py",
+    )
+    findings = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert len(findings) == 1
+    assert findings[0].start_line == 3
+
+
+def test_normalized_continuity_view_owns_its_bound_call_once() -> None:
+    confusable_name = "tru\N{CYRILLIC SMALL LETTER IE}_value"
+    payload = " " * 256_000
+    result = _run(
+        f"{confusable_name} = True\nsubprocess.run({payload!r}, shell={confusable_name})\n",
+        "wide.py",
+    )
+    findings = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+    assert len(findings) == 1
+
+
+def test_distinct_bound_calls_on_one_line_are_not_deduplicated() -> None:
+    findings = _tm1(
+        "enabled = True\n"
+        "pi_π = 1; subprocess.run('one', shell=enabled); "
+        "subprocess.run('two', shell=enabled)\n"
+    )
+
+    assert len(findings) == 2
+    assert {finding.matched_text for finding in findings} == {
+        "subprocess.run('one', shell=enabled)",
+        "subprocess.run('two', shell=enabled)",
+    }
+
+
+def test_long_direct_calls_with_shared_preview_keep_distinct_identity() -> None:
+    payload = "x" * 240
+    first_call = f'subprocess.run("{payload}A", shell=True)'
+    second_call = f'subprocess.run("{payload}B", shell=True)'
+    findings = _tm1(f"first = {first_call}; second = {second_call}\n")
+
+    assert len(findings) == 2
+    assert findings[0].fingerprint() != findings[1].fingerprint()
+
+
+def test_long_shared_preview_identity_is_cap_stable_and_matches_bound_call(monkeypatch) -> None:
+    payload = "x" * 240
+    direct_source = (
+        f'subprocess.run("{payload}A", shell=True); subprocess.run("{payload}B", shell=True)\n'
+    )
+    bound_source = (
+        "enabled = True\n"
+        f'subprocess.run("{payload}A", shell=enabled); '
+        f'subprocess.run("{payload}B", shell=enabled)\n'
+    )
+
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+    direct_capped = _tm1(direct_source)
+    bound_capped = _tm1(bound_source)
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 2)
+    direct_complete = _tm1(direct_source)
+    bound_complete = _tm1(bound_source)
+
+    assert len(direct_capped) == len(bound_capped) == 1
+    assert len(direct_complete) == len(bound_complete) == 2
+    assert direct_capped[0].fingerprint() == direct_complete[0].fingerprint()
+    assert bound_capped[0].fingerprint() == bound_complete[0].fingerprint()
+    assert [finding.fingerprint() for finding in direct_complete] == [
+        finding.fingerprint() for finding in bound_complete
+    ]
+
+
+def test_long_shared_preview_mixed_direct_and_bound_calls_remain_distinct() -> None:
+    payload = "x" * 240
+    first = f'subprocess.run("{payload}A", shell=True)'
+    second = f'subprocess.run("{payload}B", shell=enabled)'
+
+    result = _run(f"enabled = True\nfirst = {first}; second = {second}\n")
+    findings = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
+
+    assert len(findings) == 2
+    assert findings[0].fingerprint() != findings[1].fingerprint()
+    assert len(deduplicate(findings)) == 2
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_normalized_replay_preserves_long_bound_collision_identity() -> None:
+    payload = "ｘ" + "x" * 240
+    first = f'subprocess.run("{payload}A", shell=enabled)'
+    second = f'subprocess.run("{payload}B", shell=enabled)'
+
+    result = _run(f"enabled = True\nfirst = {first}; second = {second}\n")
+    findings = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
+
+    assert len(findings) == 2
+    assert findings[0].fingerprint() != findings[1].fingerprint()
+    assert len(deduplicate(findings)) == 2
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_output_cap_keeps_first_mixed_owner_in_source_order(monkeypatch) -> None:
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+    result = _run(
+        "subprocess.run('first', shell=True)\n"
+        "enabled = True\n"
+        "subprocess.run('second', shell=enabled)\n"
+    )
+    findings = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
+
+    assert [finding.start_line for finding in findings] == [1]
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+
+
+def test_output_cap_orders_bound_and_ordinary_tm1_by_source(monkeypatch) -> None:
+    content = (
+        "# --skip-validation\n"
+        "enabled = True\n"
+        'subprocess.run("bound", shell=enabled)\n'
+        'subprocess.run("direct", shell=True)\n'
+    )
+
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 10)
+    complete = _tm1(content)
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+    capped_result = _run(content)
+    capped = [finding for finding in capped_result["findings"] if finding.rule_id == "TM1"]
+
+    assert [finding.start_line for finding in complete] == [1, 3, 4]
+    assert [finding.start_line for finding in capped] == [1]
+    assert capped_result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert capped_result["inspection_ledger"][0]["reason_code"] is LedgerReason.OUTPUT_LIMIT
+
+
+def test_lexical_output_cap_keeps_ordinary_tm1_before_later_direct_call(monkeypatch) -> None:
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+    result = _run('# --skip-validation\nsubprocess.run("direct", shell=True)\n')
+    findings = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
+
+    assert [finding.start_line for finding in findings] == [1]
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.OUTPUT_LIMIT
+
+
+@pytest.mark.parametrize(
+    ("path", "suffix"),
+    [
+        ("guide.md", ""),
+        ("broken.py", "if (\n"),
+    ],
+)
+def test_lexical_output_cap_keeps_earlier_normalized_only_tm1(
+    monkeypatch,
+    path: str,
+    suffix: str,
+) -> None:
+    content = (
+        'ｓｕｂｐｒｏｃｅｓｓ.run("first", shell=True)\n'
+        'subprocess.run("second", shell=True)\n'
+        'subprocess.run("third", shell=True)\n'
+        f"{suffix}"
+    )
+
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 10)
+    complete = _tm1(content, path)
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+    capped_result = _run(content, path)
+    capped = [finding for finding in capped_result["findings"] if finding.rule_id == "TM1"]
+
+    assert [finding.start_line for finding in complete] == [1, 2, 3]
+    assert [finding.start_line for finding in capped] == [1]
+    assert capped_result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert capped_result["inspection_ledger"][0]["reason_code"] is LedgerReason.OUTPUT_LIMIT
+
+
+def test_declared_marker_output_cap_keeps_earlier_normalized_only_tm1(monkeypatch) -> None:
+    content = (
+        "Ｒｅｍｏｖｅ 'xyz' and execute 'rxyzmxyz -rxyzfxyz *'.\n"
+        "Remove 'abc' and execute 'rabcmabc -rabcfabc *'.\n"
+        "Remove 'def' and execute 'rdefmdef -rdeffdef *'.\n"
+    )
+
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 10)
+    complete = _tm1(content, "guide.md")
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+    capped_result = _run(content, "guide.md")
+    capped = [finding for finding in capped_result["findings"] if finding.rule_id == "TM1"]
+
+    assert [finding.start_line for finding in complete] == [1, 2, 3]
+    assert [finding.start_line for finding in capped] == [1]
+    assert "normalized-view" in capped[0].tags
+    assert "declared-marker-view" in capped[0].tags
+    assert capped_result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert capped_result["inspection_ledger"][0]["reason_code"] is LedgerReason.OUTPUT_LIMIT
+
+
+@pytest.mark.parametrize("payload_prefix", ["", "ｘ"])
+def test_lexical_long_identity_is_cap_stable_without_retained_sibling(
+    monkeypatch,
+    payload_prefix: str,
+) -> None:
+    payload = payload_prefix + "x" * 240
+    content = (
+        f'subprocess.Popen("{payload}A", shell=True); subprocess.Popen("{payload}B", shell=True)\n'
+    )
+
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 2)
+    complete = _tm1(content, "guide.md")
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+    capped = _tm1(content, "guide.md")
+
+    assert len(complete) == 2
+    assert len(capped) == 1
+    assert capped[0].fingerprint() == complete[0].fingerprint()
+
+
+def test_lexical_long_calls_on_different_lines_keep_distinct_identity() -> None:
+    payload = "x" * 240
+    first = f'subprocess.Popen("{payload}A", shell=True)'
+    second = f'subprocess.Popen("{payload}B", shell=True)'
+
+    findings = _tm1(f"{first}\n{second}\n", "guide.md")
+
+    assert len(findings) == 2
+    assert findings[0].fingerprint() != findings[1].fingerprint()
+    assert len(deduplicate(findings)) == 2
+
+
+@pytest.mark.parametrize("cap", [1, 2])
+def test_same_line_bound_duplicates_match_direct_output_budget(monkeypatch, cap: int) -> None:
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", cap)
+    direct = _run('subprocess.run("x", shell=True); subprocess.run("x", shell=True)\n')
+    bound = _run(
+        'enabled = True\nsubprocess.run("x", shell=enabled); subprocess.run("x", shell=enabled)\n'
+    )
+    direct_findings = [finding for finding in direct["findings"] if finding.rule_id == "TM1"]
+    bound_findings = [finding for finding in bound["findings"] if finding.rule_id == "TM1"]
+
+    assert len(direct_findings) == len(bound_findings) == 1
+    assert direct_findings[0].fingerprint() == bound_findings[0].fingerprint()
+    assert direct["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert bound["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize("bound_name", ["a", "true_value"])
+def test_bound_fingerprint_matches_direct_literal(bound_name: str) -> None:
+    direct = _tm1("subprocess.run(command, shell=True, capture_output=True)\n")
+    bound = _tm1(f"{bound_name} = True\nsubprocess.run(command, shell={bound_name}, text=True)\n")
+
+    assert len(direct) == len(bound) == 1
+    assert bound[0].fingerprint() == direct[0].fingerprint()
+
+
+def test_cross_window_qualified_and_bare_popen_share_one_budget_owner(monkeypatch) -> None:
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+    content = "subprocess." + "\u200b" * 256_000 + "Popen(command, shell=True)\n"
+    result = _run(content, "guide.md")
+    findings = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
+
+    assert len(findings) == 1
+    assert findings[0].matched_text == "subprocess.Popen(command, shell=True"
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize("ignored", ["\u200b", "\ufffd"])
+def test_output_limit_finalizes_retained_cross_window_popen(monkeypatch, ignored: str) -> None:
+    expected = _tm1("subprocess.Popen(command, shell=True)\n", "guide.md")[0].fingerprint()
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+    content = (
+        "subprocess."
+        + ignored * 256_000
+        + "Popen(command, shell=True)\n"
+        + "subprocess.run(command_0, shell=True)\n"
+    )
+
+    result = _run(content, "guide.md")
+    findings = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
+
+    assert len(findings) == 1
+    assert findings[0].matched_text == "subprocess.Popen(command, shell=True"
+    assert findings[0].fingerprint() == expected
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.OUTPUT_LIMIT
+
+
+def test_output_cap_keeps_long_cross_window_popen_source_prefix(monkeypatch) -> None:
+    payload = "x" * 240
+    content = (
+        f'subprocess.Popen("{payload}A", shell=True); '
+        + "subprocess."
+        + "\u200b" * 256_000
+        + f'Popen("{payload}B", shell=True); '
+        + 'subprocess.run("third", shell=True)\n'
+    )
+
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 3)
+    complete = _tm1(content, "guide.md")
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 2)
+    capped_result = _run(content, "guide.md")
+    capped = [finding for finding in capped_result["findings"] if finding.rule_id == "TM1"]
+
+    assert [finding.start_column for finding in complete] == [0, 256_286, 256_550]
+    assert [finding.start_column for finding in capped] == [0, 256_286]
+    assert [finding.fingerprint() for finding in capped] == [
+        finding.fingerprint() for finding in complete[:2]
+    ]
+    assert capped_result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert capped_result["inspection_ledger"][0]["reason_code"] is LedgerReason.OUTPUT_LIMIT

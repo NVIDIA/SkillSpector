@@ -21,6 +21,7 @@ from skillspector.artifacts import (
     _concealed_instruction_run_spans,
     _contextual_default_ignorable_boundary_spans,
     _obfuscated_instruction_matches,
+    binary_instruction_view,
     multiline_prompt_injection_view,
     prompt_injection_letter_spacing_view,
 )
@@ -97,8 +98,8 @@ _IDENTIFIER_RELAXATION = str.maketrans({"_": " ", **{str(value): " " for value i
 _PROJECTED_PROMPT_PATTERNS = tuple(
     pattern for pattern, _confidence in (*COMPILED_P3_PATTERNS, *COMPILED_P4_PATTERNS)
 )
-# Removing line breaks can give the existing wildcard patterns a much longer
-# search space. Interrupt the regex itself, not just work between matches.
+# Reconstructed projections can give wildcard patterns a much longer search
+# space. Interrupt the regex itself, not just work between matches.
 _MULTILINE_PROMPT_PATTERN_SECONDS = 0.25
 _MULTILINE_PROMPT_PATTERNS = tuple(
     regex.compile(pattern.pattern, regex.ASCII | regex.IGNORECASE | regex.MULTILINE)
@@ -381,10 +382,17 @@ _MAX_LETTER_SPACING_SECURITY_PHRASE = max(
 class _ArtifactIntegrityResourceLimitError(RuntimeError):
     """Stop attacker-controlled work while retaining a deterministic prefix."""
 
-    def __init__(self, reason: LedgerReason, metrics: dict[str, int | float]) -> None:
+    def __init__(
+        self,
+        reason: LedgerReason,
+        metrics: dict[str, int | float],
+        *,
+        terminal: bool = True,
+    ) -> None:
         super().__init__(reason.value)
         self.reason = reason
         self.metrics = metrics
+        self.terminal = terminal
 
 
 @dataclass
@@ -674,9 +682,9 @@ def _projected_prompt_injection_line(
         else (view.text,)
     )
     for projected_text in projected_texts:
-        for pattern in _PROJECTED_PROMPT_PATTERNS:
-            budget.check_runtime()
-            match = pattern.search(projected_text)
+        matching_text = _multiline_prompt_matching_text(projected_text, budget)
+        for pattern in _MULTILINE_PROMPT_PATTERNS:
+            match = next(_timed_prompt_matches(pattern, matching_text, budget), None)
             if match is None:
                 continue
             reconstructed_gaps = view.reconstructed_source_spans(match.start(), match.end())
@@ -697,9 +705,9 @@ def _projected_prompt_injection_line(
         )
         candidate_offsets = tuple(point[0] for point in join_points)
         for projected_text in irregular_texts:
-            for pattern in _PROJECTED_PROMPT_PATTERNS:
-                budget.check_runtime()
-                for match in pattern.finditer(projected_text):
+            matching_text = _multiline_prompt_matching_text(projected_text, budget)
+            for pattern in _MULTILINE_PROMPT_PATTERNS:
+                for match in _timed_prompt_matches(pattern, matching_text, budget):
                     budget.check_runtime()
                     point_index = bisect_right(candidate_offsets, match.start())
                     if (
@@ -751,6 +759,57 @@ def _multiline_prompt_matching_text(text: str, budget: _ArtifactIntegrityBudget)
     return "".join(parts)
 
 
+def _timed_prompt_matches(
+    pattern: regex.Pattern[str],
+    text: str,
+    budget: _ArtifactIntegrityBudget,
+) -> Iterator[regex.Match[str]]:
+    """Apply the same interruptible matching budget to every prompt projection."""
+    matching_seconds = 0.0
+    matching_limit = _MULTILINE_PROMPT_PATTERN_SECONDS
+    terminal_timeout = False
+    start = 0
+    skip_empty = False
+    while True:
+        budget.check_runtime()
+        remaining = transitive_remaining_seconds(budget.state)
+        if remaining is not None:
+            workflow_limit = matching_seconds + max(0.0, remaining)
+            # A per-pattern cap ends this artifact; workflow exhaustion remains terminal.
+            if workflow_limit <= matching_limit:
+                matching_limit = workflow_limit
+                terminal_timeout = True
+        timeout = matching_limit - matching_seconds
+        if timeout <= 0:
+            raise _ArtifactIntegrityResourceLimitError(
+                LedgerReason.RUNTIME_LIMIT,
+                {"observed_seconds": matching_seconds, "limit_seconds": matching_limit},
+                terminal=terminal_timeout,
+            )
+        started_at = time.thread_time()
+        expired = False
+        try:
+            # Restart across yields so consumer work never uses the match budget.
+            matches = pattern.finditer(text, pos=start, timeout=timeout, concurrent=False)
+            if skip_empty:
+                next(matches, None)
+            match = next(matches, None)
+        except TimeoutError:
+            expired = True
+        finally:
+            matching_seconds += max(0.0, time.thread_time() - started_at)
+        budget.check_runtime()
+        if expired:
+            # regex counts process CPU, including native work in other threads.
+            # Retry only the same search; the thread and workflow budgets still bound it.
+            continue
+        if match is None:
+            return
+        start = match.end()
+        skip_empty = match.start() == start
+        yield match
+
+
 def _multiline_prompt_injection_line(
     content: str,
     budget: _ArtifactIntegrityBudget,
@@ -762,46 +821,27 @@ def _multiline_prompt_injection_line(
     matching_text = _multiline_prompt_matching_text(view.text, budget)
     first_offset: int | None = None
     for pattern in _MULTILINE_PROMPT_PATTERNS:
-        budget.check_runtime()
-        remaining = transitive_remaining_seconds(budget.state)
-        timeout = _MULTILINE_PROMPT_PATTERN_SECONDS
-        if remaining is not None:
-            timeout = min(timeout, max(0.0, remaining))
-        started_at = time.monotonic()
         reconstruction_index = 0
-        try:
-            # Keep this short, interruptible search on the current thread.
-            # Releasing the GIL lets another analyzer consume its wall-clock
-            # allowance and turn ordinary prose into a false timeout.
-            for match in pattern.finditer(matching_text, timeout=timeout, concurrent=False):
+        for match in _timed_prompt_matches(pattern, matching_text, budget):
+            # Matches and reconstruction spans are both ordered. Advance
+            # once per span, including ordinary matches before a spaced
+            # instruction, instead of rescanning all provenance per match.
+            while (
+                reconstruction_index < len(view.reconstructions)
+                and view.reconstructions[reconstruction_index].derived_end <= match.start() + 1
+            ):
                 budget.check_runtime()
-                # Matches and reconstruction spans are both ordered. Advance
-                # once per span, including ordinary matches before a spaced
-                # instruction, instead of rescanning all provenance per match.
-                while (
-                    reconstruction_index < len(view.reconstructions)
-                    and view.reconstructions[reconstruction_index].derived_end <= match.start() + 1
-                ):
-                    budget.check_runtime()
-                    reconstruction_index += 1
-                if reconstruction_index == len(view.reconstructions):
-                    break
-                reconstruction = view.reconstructions[reconstruction_index]
-                right = max(match.start() + 1, reconstruction.derived_start + 1)
-                if right < min(match.end(), reconstruction.derived_end):
-                    source_offset = view.source_offset(right - 1) + 1
-                    if first_offset is None or source_offset < first_offset:
-                        first_offset = source_offset
-                    # Later matches cannot precede this pattern's first gap.
-                    break
-        except TimeoutError as exc:
-            raise _ArtifactIntegrityResourceLimitError(
-                LedgerReason.RUNTIME_LIMIT,
-                {
-                    "observed_seconds": max(0.0, time.monotonic() - started_at),
-                    "limit_seconds": timeout,
-                },
-            ) from exc
+                reconstruction_index += 1
+            if reconstruction_index == len(view.reconstructions):
+                break
+            reconstruction = view.reconstructions[reconstruction_index]
+            right = max(match.start() + 1, reconstruction.derived_start + 1)
+            if right < min(match.end(), reconstruction.derived_end):
+                source_offset = view.source_offset(right - 1) + 1
+                if first_offset is None or source_offset < first_offset:
+                    first_offset = source_offset
+                # Later matches cannot precede this pattern's first gap.
+                break
     return get_line_number(content, first_offset) if first_offset is not None else None
 
 
@@ -1054,14 +1094,36 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                             confidence=1.0,
                         )
                     )
-                if artifact.get("content_kind") not in {
+                if artifact.get("readable_binary") or artifact.get("content_kind") not in {
                     ContentKind.BINARY,
                     ContentKind.OPAQUE,
                 }:
-                    format_density, mixed_script, first_nul_line, first_obfuscation_line = (
-                        _text_signals(content, budget)
-                    )
-                    if artifact.get("contains_nul") and first_nul_line is not None:
+                    signal_content = content
+                    binary_view = None
+                    if artifact.get("readable_binary"):
+                        binary_view = binary_instruction_view(content)[0]
+                        signal_content = binary_view.text
+                    (
+                        format_density,
+                        mixed_script,
+                        first_nul_line,
+                        first_obfuscation_line,
+                    ) = _text_signals(signal_content, budget)
+                    if first_obfuscation_line is not None and binary_view is not None:
+                        projected_start = sum(
+                            len(line)
+                            for line in signal_content.splitlines(keepends=True)[
+                                : first_obfuscation_line - 1
+                            ]
+                        )
+                        first_obfuscation_line = get_line_number(
+                            content, binary_view.source_offset(projected_start)
+                        )
+                    if (
+                        artifact.get("contains_nul")
+                        and not artifact.get("readable_binary")
+                        and first_nul_line is not None
+                    ):
                         budget.emit(
                             _finding(
                                 "AE3",
@@ -1072,7 +1134,10 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                                 line=first_nul_line,
                             )
                         )
-                    if format_density >= 0.01 or mixed_script:
+                    # Compressed binary bytes can resemble mixed-script Unicode text.
+                    if not artifact.get("readable_binary") and (
+                        format_density >= 0.01 or mixed_script
+                    ):
                         budget.emit(
                             _finding(
                                 "AE4",
@@ -1100,7 +1165,8 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         emitted_ids = [finding.finding_id for finding in path_findings]
         if resource_limit is not None:
             event = _partial_limit_event(path, resource_limit, emitted_ids)
-            terminal_limit = resource_limit
+            if resource_limit.terminal:
+                terminal_limit = resource_limit
         else:
             event = ledger_event(
                 analyzer_id=ANALYZER_ID,

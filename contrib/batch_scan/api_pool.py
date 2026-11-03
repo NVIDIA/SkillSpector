@@ -159,10 +159,12 @@ class ApiKeyPool:
         self._retry_successes: int = 0
         self._total_requests_served: int = 0
         self._peak_active_requests: int = 0
+        self._leases: dict[str, list[ApiKey]] = {}
+        self._cancelled_owners: set[str] = set()
 
     # -- Public API -----------------------------------------------------------
 
-    def acquire(self, timeout: float | None = None) -> ApiKey:
+    def acquire(self, timeout: float | None = None, *, owner: str | None = None) -> ApiKey:
         """Acquire a slot on the least-loaded available key.
 
         Scheduling priority:
@@ -193,6 +195,8 @@ class ApiKeyPool:
 
         with self._condition:
             while True:
+                if owner in self._cancelled_owners:
+                    raise RuntimeError("Scan worker has stopped")
                 now = time.monotonic()
 
                 # Step 1: recover rate-limited keys whose backoff has expired
@@ -208,6 +212,8 @@ class ApiKeyPool:
                     _now_active = sum(k.active_requests for k in self._keys)
                     if _now_active > self._peak_active_requests:
                         self._peak_active_requests = _now_active
+                    if owner is not None:
+                        self._leases.setdefault(owner, []).append(key)
                     logger.debug(
                         "Pool: slot on key …%s (%d/%d active)",
                         key.key[-8:],
@@ -236,7 +242,7 @@ class ApiKeyPool:
                     )
                     self._condition.wait(timeout=wait)
 
-    def try_acquire(self) -> ApiKey | None:
+    def try_acquire(self, *, owner: str | None = None) -> ApiKey | None:
         """Non-blocking acquire — returns a key immediately or ``None``.
 
         Unlike :meth:`acquire`, this never blocks.  If a slot is available
@@ -244,6 +250,8 @@ class ApiKeyPool:
         Useful in async contexts where blocking would stall the event loop.
         """
         with self._lock:
+            if owner in self._cancelled_owners:
+                raise RuntimeError("Scan worker has stopped")
             self._recover_expired_keys(time.monotonic())
             available = [k for k in self._keys if k.available]
             if not available:
@@ -255,9 +263,11 @@ class ApiKeyPool:
             _now_active = sum(k.active_requests for k in self._keys)
             if _now_active > self._peak_active_requests:
                 self._peak_active_requests = _now_active
+            if owner is not None:
+                self._leases.setdefault(owner, []).append(key)
             return key
 
-    def release(self, key: ApiKey, *, success: bool = True) -> None:
+    def release(self, key: ApiKey, *, success: bool = True, owner: str | None = None) -> None:
         """Release a slot on *key* back to the pool.
 
         Parameters
@@ -270,6 +280,15 @@ class ApiKeyPool:
             rate-limited with exponential backoff.
         """
         with self._condition:
+            if owner is not None:
+                # Manager RPC returns a copy: release the server's original lease.
+                leases = self._leases.get(owner, [])
+                for index, leased in enumerate(leases):
+                    if (leased.key, leased.base_url, leased.model) == (key.key, key.base_url, key.model):
+                        key = leases.pop(index)
+                        break
+                else:
+                    return
             key.active_requests = max(0, key.active_requests - 1)
 
             if success:
@@ -297,6 +316,14 @@ class ApiKeyPool:
                     key.consecutive_429,
                 )
 
+            self._condition.notify_all()
+
+    def release_owner(self, owner: str) -> None:
+        """Reclaim slots and wake waiters after a scan process exits or is killed."""
+        with self._condition:
+            self._cancelled_owners.add(owner)
+            for key in self._leases.pop(owner, []):
+                key.active_requests = max(0, key.active_requests - 1)
             self._condition.notify_all()
 
     def record_retry_success(self) -> None:
@@ -448,99 +475,87 @@ class PooledChatModel:
 
     # -- Internal -------------------------------------------------------------
 
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        from skillspector.llm_analyzer_base import LLMRuntimeLimitError
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LLMRuntimeLimitError("pooled request runtime limit reached")
+        return remaining
+
     def _invoke_with_retry(
-        self,
-        prompt: str,
-        *,
-        callbacks: list[object] | None = None,
+        self, prompt: str, *, callbacks: list[object] | None = None,
     ) -> object:
-        """Sync retry loop — acquire slot, call LLM, release, retry on 429."""
-        last_exception: Exception | None = None
-
+        """Share one deadline across slot waiting, requests, and key retries."""
+        deadline = time.monotonic() + self._timeout
         for attempt in range(self._max_retries + 1):
-            key = self._pool.acquire()
-            llm = self._build_llm(key)
             try:
-                if callbacks is None:
-                    result = llm.invoke(prompt)
-                else:
-                    result = llm.invoke(prompt, config={"callbacks": callbacks})
-                self._pool.release(key, success=True)
-                if attempt > 0:
-                    self._pool.record_retry_success()
-                return result
-            except Exception as exc:
-                if self._is_rate_limit(exc) and attempt < self._max_retries:
-                    self._pool.release(key, success=False)
-                    logger.debug(
-                        "PooledChatModel: rate-limited, retrying "
-                        "(attempt %d/%d)",
-                        attempt + 1,
-                        self._max_retries,
-                    )
-                    continue
-                self._pool.release(key, success=True)
-                last_exception = exc
+                key = self._pool.acquire(timeout=self._remaining(deadline))
+            except Exception:
+                self._remaining(deadline)
                 raise
-
-        raise RuntimeError(
-            f"PooledChatModel: exhausted {self._max_retries} retries "
-            "due to rate-limit errors"
-        ) from last_exception
+            rate_limited = False
+            try:
+                llm = self._build_llm(key, timeout=self._remaining(deadline))
+                result = llm.invoke(prompt) if callbacks is None else llm.invoke(
+                    prompt, config={"callbacks": callbacks}
+                )
+            except Exception as exc:
+                rate_limited = self._is_rate_limit(exc)
+                if rate_limited and attempt < self._max_retries:
+                    continue
+                raise
+            finally:
+                self._pool.release(key, success=not rate_limited)
+            if attempt > 0:
+                self._pool.record_retry_success()
+            return result
+        raise RuntimeError("PooledChatModel exhausted key retries")
 
     async def _ainvoke_with_retry(
-        self,
-        prompt: str,
-        *,
-        callbacks: list[object] | None = None,
+        self, prompt: str, *, callbacks: list[object] | None = None,
     ) -> object:
-        """Async retry loop — non-blocking acquire first, block only if full."""
+        """Bound asynchronous slot waiting without leaving an acquiring thread."""
         import asyncio
-        last_exception: Exception | None = None
 
+        deadline = time.monotonic() + self._timeout
         for attempt in range(self._max_retries + 1):
+            self._remaining(deadline)
             key = self._pool.try_acquire()
-            if key is None:
-                key = await asyncio.to_thread(self._pool.acquire)
-            llm = self._build_llm(key)
+            while key is None:
+                await asyncio.sleep(min(0.05, self._remaining(deadline)))
+                self._remaining(deadline)
+                key = self._pool.try_acquire()
+            rate_limited = False
             try:
-                if callbacks is None:
-                    result = await llm.ainvoke(prompt)
-                else:
-                    result = await llm.ainvoke(prompt, config={"callbacks": callbacks})
-                self._pool.release(key, success=True)
-                if attempt > 0:
-                    self._pool.record_retry_success()
-                return result
+                llm = self._build_llm(key, timeout=self._remaining(deadline))
+                result = await llm.ainvoke(prompt) if callbacks is None else await llm.ainvoke(
+                    prompt, config={"callbacks": callbacks}
+                )
             except Exception as exc:
-                if self._is_rate_limit(exc) and attempt < self._max_retries:
-                    self._pool.release(key, success=False)
-                    logger.debug(
-                        "PooledChatModel: rate-limited, retrying "
-                        "(attempt %d/%d)",
-                        attempt + 1,
-                        self._max_retries,
-                    )
+                rate_limited = self._is_rate_limit(exc)
+                if rate_limited and attempt < self._max_retries:
                     continue
-                self._pool.release(key, success=True)
-                last_exception = exc
                 raise
+            finally:
+                self._pool.release(key, success=not rate_limited)
+            if attempt > 0:
+                self._pool.record_retry_success()
+            return result
+        raise RuntimeError("PooledChatModel exhausted key retries")
 
-        raise RuntimeError(
-            f"PooledChatModel: exhausted {self._max_retries} retries "
-            "due to rate-limit errors"
-        ) from last_exception
-
-    def _build_llm(self, key: ApiKey):
+    def _build_llm(self, key: ApiKey, *, timeout: float | None = None):
         """Build a fresh :class:`~langchain_openai.ChatOpenAI` for *key*."""
         from langchain_openai import ChatOpenAI
         from pydantic import SecretStr
 
+        timeout = self._timeout if timeout is None else timeout
         try:
             import httpx
-            _timeout = httpx.Timeout(self._timeout, connect=8.0)
+            _timeout = httpx.Timeout(timeout, connect=min(8.0, timeout))
         except ImportError:
-            _timeout = self._timeout
+            _timeout = timeout
 
         return ChatOpenAI(
             model=key.model,
@@ -548,6 +563,7 @@ class PooledChatModel:
             api_key=SecretStr(key.key),
             max_completion_tokens=self._max_tokens,
             timeout=_timeout,
+            max_retries=0,
         )
 
     @staticmethod

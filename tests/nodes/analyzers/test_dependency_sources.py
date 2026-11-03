@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from markdown_it import MarkdownIt
 
 from skillspector.dependency_sources import analyze_dependency_sources
 from skillspector.llm_analyzer_base import Batch
@@ -1204,6 +1205,8 @@ def test_url_credentials_are_redacted_from_findings_and_all_reports(output_forma
         "output_format": output_format,
     }
     rendered = report(state)["report_body"]
+    if output_format == "markdown":
+        rendered = MarkdownIt().enable("table").render(rendered)
     for secret in (username, password, query_token):
         assert secret not in rendered
 

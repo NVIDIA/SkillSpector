@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from skillspector.semantic_runtime import (
     required_semantic_analyzer_ids,
     semantic_runtime_accounting,
@@ -88,6 +90,21 @@ def _semantic_calls(source_identity: str | None = None) -> list[dict[str, object
         {"node": analyzer_id, "ok": True, "error": None, **provenance}
         for analyzer_id in sorted(required_semantic_analyzer_ids({}))
     ]
+
+
+def test_legacy_coverage_only_findings_do_not_require_meta_call() -> None:
+    """Legacy results without the flag must ignore post-review coverage findings."""
+    result = {
+        "findings": [SimpleNamespace(tags=["coverage"])],
+        "analyzer_status_events": _semantic_statuses(),
+        "llm_call_log": _semantic_calls(),
+    }
+
+    assert semantic_runtime_accounting(
+        enabled=True,
+        result=result,
+        discovered_modules={},
+    ) == (True, True)
 
 
 def test_complete_root_and_child_telemetry_is_validated_per_source_scope() -> None:

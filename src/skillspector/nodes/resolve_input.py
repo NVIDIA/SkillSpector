@@ -56,13 +56,17 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
     workflow_budget = ensure_workflow_resource_budget(state)
 
     if input_path and isinstance(input_path, str) and input_path.strip():
-        handler = InputHandler(transitive_budget=workflow_budget)
+        handler = InputHandler(
+            transitive_budget=workflow_budget,
+            allow_git_credentials=state.get("allow_git_credentials", True),
+        )
         try:
             resolved, source_type = handler.resolve(input_path.strip())
             temp_dir = handler.temp_dir_for_cleanup()
             update: dict[str, object] = {
                 "skill_path": str(resolved),
                 "primary_file_path": handler.primary_file_path,
+                "primary_file_parent_path": handler.primary_file_parent_path,
                 "selected_source_identity": selected_source_identity_for_input(
                     input_path.strip(),
                     source_type=source_type,
@@ -87,7 +91,12 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
                 exc.truncation.code,
             )
             raise
-        except (ValueError, FileNotFoundError):
+        except BaseException:
+            # The graph fails before returning temp_dir_for_cleanup, so no caller
+            # can remove a partial download or extraction directory afterwards.
+            # BaseException, not Exception: an interrupt or a cancellation that
+            # lands after the temp directory was allocated must clean up too.
+            handler.cleanup()
             raise
 
     if skill_path and isinstance(skill_path, str) and skill_path.strip():

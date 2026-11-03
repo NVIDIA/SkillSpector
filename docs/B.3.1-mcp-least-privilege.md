@@ -121,10 +121,14 @@ to need.
 code contains `httpx.post(...)`. LP1 fires for the undeclared `network`
 capability.
 
-**Remediation:** For Agent Skills `SKILL.md`, add a tool that covers the missing
-capability to the `allowed-tools` frontmatter field. For MCP server manifests,
-add the missing capability to the `permissions` list. Otherwise, remove the code
-that requires it.
+**Remediation:** Review whether the capability is required and how the host
+runtime enforces it; runtime permissions are unknown unless separately
+verified. Remove code that does not need the capability. For Agent
+Skills `SKILL.md`, `allowed-tools` records tools preapproved for invocation; it
+is not a permission ceiling. Add a tool only when it is independently approved
+as necessary, not to silence this finding. For MCP server manifests, add the
+required capability to the `permissions` list only after reviewing the actual
+policy.
 
 ---
 
@@ -176,11 +180,13 @@ rather than deception) but still a significant transparency gap.
 `allowed-tools:` key, but the code calls `os.environ["API_KEY"]` and
 `subprocess.run(...)`.
 
-**Remediation:** Declare the skill's tool scope in the manifest type you are
-authoring. For Claude Code / Agent Skills `SKILL.md`, list the tools the skill
-may invoke in the `allowed-tools` frontmatter field (`permissions` is not part
-of the SKILL.md schema and is ignored). For MCP server manifests, add a
-`permissions` list naming the required capabilities.
+**Remediation:** Clarify the skill's intended tool scope and review how the host
+runtime enforces it; runtime permissions are unknown unless separately
+verified. For Claude Code / Agent Skills `SKILL.md`, `allowed-tools`
+records tools preapproved for invocation, not a permission ceiling; add tools
+only when independently approved as necessary, not to silence this finding
+(`permissions` is not part of the `SKILL.md` schema and is ignored). For MCP
+server manifests, use a `permissions` list naming the required capabilities.
 
 ---
 

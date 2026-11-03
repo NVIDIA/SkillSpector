@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import re
 import time
 import unicodedata
@@ -45,6 +46,7 @@ from skillspector.llm_analyzer_base import (
     append_output_language_instruction,
     estimate_tokens,
 )
+from skillspector.llm_utils import run_async
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding, compute_match_fingerprint
 from skillspector.nodes.analyzers.static_runner import MAX_FINDINGS_PER_ANALYZER
@@ -75,11 +77,33 @@ TP4_MAX_FILES = 128
 TP4_MAX_TOTAL_CODE_BYTES = 4 * 1024 * 1024
 TP4_MAX_TOTAL_INPUT_BYTES = 4 * 1024 * 1024
 TP4_MAX_FILE_CODE_BYTES = 1024 * 1024
-TP4_MAX_BATCHES = 64
+DEFAULT_TP4_MAX_BATCHES = 256
+TP4_MAX_BATCHES_CEILING = 4096
 TP4_MAX_BATCH_INPUT_TOKENS = 32_000
 TP4_MIN_CODE_TOKENS = 64
 TP4_MAX_DECLARATION_CHARS = 16_384
 TP4_MAX_FINDINGS = 64
+
+
+def _tp4_max_batches_from_environment(value: str | None) -> int:
+    """Resolve bounded TP4 capacity without exposing untrusted environment text."""
+    if value is None or not value.strip():
+        return DEFAULT_TP4_MAX_BATCHES
+    # Normalize leading zeroes before bounding conversion of arbitrarily long input.
+    digits = value.strip().lstrip("0")
+    if re.fullmatch(r"[0-9]{1,4}", digits):
+        capacity = int(digits)
+        if 1 <= capacity <= TP4_MAX_BATCHES_CEILING:
+            return capacity
+    logger.warning(
+        "SKILLSPECTOR_TP4_MAX_BATCHES must be a decimal integer from 1 to %d; using default %d",
+        TP4_MAX_BATCHES_CEILING,
+        DEFAULT_TP4_MAX_BATCHES,
+    )
+    return DEFAULT_TP4_MAX_BATCHES
+
+
+TP4_MAX_BATCHES = _tp4_max_batches_from_environment(os.environ.get("SKILLSPECTOR_TP4_MAX_BATCHES"))
 
 _CATEGORY = "MCP Tool Poisoning"
 
@@ -1126,16 +1150,21 @@ def _tp4_finding(
     actual = result.actual_behavior_summary[:1024]
     mismatched = [str(item)[:256] for item in result.mismatched_capabilities[:16]]
     mismatched_text = ", ".join(mismatched)[:2048] if mismatched else "unspecified"
+    message = (
+        f"Description-behavior mismatch: declared purpose is '{declared}' "
+        f"but code also performs: {mismatched_text}."
+    )[:4096]
+    from skillspector.nodes.analyzers.pattern_defaults import get_pattern_name
+
     return Finding(
         rule_id="TP4",
-        message=(
-            f"Description-behavior mismatch: declared purpose is '{declared}' "
-            f"but code also performs: {mismatched_text}."
-        )[:4096],
+        message=message,
         severity="HIGH" if result.confidence >= 0.7 else "MEDIUM",
         confidence=result.confidence,
         file="SKILL.md",
         category=_CATEGORY,
+        pattern=get_pattern_name("TP4"),
+        finding=message,
         tags=list(_FRAMEWORK_TAGS),
         explanation=(result.explanation[:4096] or f"Declared: {declared}. Actual: {actual}."),
         remediation=(
@@ -1153,6 +1182,7 @@ def _tp4_finding(
 
 def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
     """Run TP4 with per-file, aggregate, token, batch, and shared-time bounds."""
+    logger.info("%s: TP4 selected batch capacity=%d", ANALYZER_ID, TP4_MAX_BATCHES)
     result = _TP4CheckOutcome()
     analyzer: _TP4Analyzer | None = None
     attempted = False
@@ -1477,7 +1507,9 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
         )
         analyzer = _TP4Analyzer(model, timeout=timeout)
         attempted = True
-        batch_outcome = analyzer.run_batches_detailed(batches)
+        # Fan out like the semantic analyzers do. The shared limiter still honours
+        # SKILLSPECTOR_MAX_LLM_CONCURRENCY, and results keep the batch order.
+        batch_outcome = run_async(analyzer.arun_batches_detailed(batches))
         result.inference_usage = cast(list[InferenceUsageRecord], analyzer.inference_usage)
         seen_finding_ids: set[str] = set()
         unexpected_response = False
