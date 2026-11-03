@@ -64,6 +64,7 @@ from skillspector.python_tokens import python_literal_spans as _python_literal_s
 from skillspector.python_tokens import python_string_body as _python_string_body
 from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+from skillspector.typescript_tokens import typescript_template_spans as _typescript_template_spans
 
 from . import static_runner
 from .common import (
@@ -5850,6 +5851,16 @@ class _JavaScriptTemplateOwnership:
             cursor = segment_end
 
 
+class _TypeScriptTemplateOwnership(_JavaScriptTemplateOwnership):
+    """Lazily proven ownership of template literal bytes in complete TypeScript."""
+
+    def _owned_spans(self) -> JavaScriptTemplateSpans | None:
+        if not self._spans_computed:
+            self._spans = _typescript_template_spans(self._content, self._check_runtime)
+            self._spans_computed = True
+        return self._spans
+
+
 def _skip_command_substitution(
     content: str,
     start: int,
@@ -8837,6 +8848,10 @@ def _has_bounded_parse_exhaustion(
         diagnostic = javascript_source.unresolved_execution_diagnostic()
         if diagnostic is not None:
             return diagnostic
+    if file_type == "typescript" and complete_context:
+        # TypeScript's postfix and type expressions need a separate lexical
+        # proof; unproven source keeps its original conservative shell reading.
+        javascript_source = _TypeScriptTemplateOwnership(content, check_runtime)
     if file_type in {"json", "markdown"} and complete_context:
         json_strings = validated_json_string_spans(content, check_runtime)
         structural_quote_closers = {end - 1 for _, end in json_strings}
