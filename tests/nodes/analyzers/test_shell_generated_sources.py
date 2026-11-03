@@ -9,6 +9,12 @@ import pytest
 
 from skillspector import shell_sources
 from skillspector.artifacts import SecurityTextView
+from skillspector.inspection_ledger import (
+    ParserCause,
+    ParserCheck,
+    ParserUncheckedScope,
+    StaticParserDiagnostic,
+)
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.shell_helper_argv import (
     ShellHelperOutput,
@@ -252,6 +258,25 @@ def test_known_sibling_function_is_scanned_before_completeness_is_accepted() -> 
     assert all(origin.path == "scripts/library.sh" for origin in variants[0][1].origins)
 
 
+@pytest.mark.parametrize("opener,closer", [("", ""), ("echo $(", ")"), ("echo `", "`")])
+@pytest.mark.parametrize("multiple", [False, True])
+def test_inspected_command_carrier_keeps_source_spans_inside_substitutions(
+    opener: str, closer: str, multiple: bool
+) -> None:
+    source = opener + 'bash -c "$program"' + closer
+    start = source.index('"$program"')
+    span = (start, start + len('"$program"'))
+    variants = ("printf first", "printf second") if multiple else "printf first"
+    commands = list(
+        tm._shell_command_strings(source, lambda: None, source_commands={span: variants})
+    )
+    expected = variants if isinstance(variants, tuple) else (variants,)
+    assert tuple(command.content for command in commands) == expected
+    assert all(command.inspected_source for command in commands)
+    assert all((command.start, command.end) == span for command in commands)
+    assert all(command.diagnostic is None and not command.exact_source for command in commands)
+
+
 def test_known_sibling_dangerous_command_is_retained_at_the_consumer() -> None:
     library = "helper() {\n  rm -rf /\n}\n"
     prepared = _prepare(library=library)
@@ -492,6 +517,142 @@ def test_inspected_source_retains_nested_unknown_execution_limit() -> None:
         )
     )
     assert prepared.has_bounded_parse_exhaustion()
+    diagnostic = prepared.bounded_parse_diagnostic()
+    assert isinstance(diagnostic, StaticParserDiagnostic)
+    assert (diagnostic.start, diagnostic.end) == next(iter(prepared.values))
+    assert diagnostic.location_precision == "enclosing_expression"
+
+
+@pytest.mark.parametrize(
+    "reason,raised",
+    [
+        ("static_parse_limit", False),
+        ("runtime_limit", False),
+        ("output_limit", False),
+        ("runtime_limit", True),
+        ("output_limit", True),
+    ],
+)
+def test_child_parser_diagnostic_uses_parent_consumer_even_on_resource_limit(
+    monkeypatch, reason: str, raised: bool
+) -> None:
+    prepared = _prepare()
+    assert prepared is not None
+    metrics = tm.static_runner._StaticScanMetrics({})
+    metrics.parser_diagnostic = StaticParserDiagnostic(
+        ParserCause.RUNTIME_DEPENDENT,
+        ParserCheck.COMMAND_IDENTITY,
+        0,
+        8,
+        ParserUncheckedScope.COMMAND_ARGUMENTS,
+    )
+
+    def child_scan(*_args, **_kwargs):
+        if raised:
+            raise tm.static_runner._StaticResourceLimitError(
+                tm.static_runner.LedgerReason(reason), metrics
+            )
+        return [], tm.static_runner.LedgerReason(reason), metrics
+
+    monkeypatch.setattr(tm.static_runner, "_scan_all_views_detailed", child_scan)
+    scan = prepared.analyze_source_commands(
+        content=_CALLER,
+        file_path="scripts/caller.sh",
+        file_type="shell",
+        source_view=SecurityTextView("raw", _CALLER),
+    )
+    if reason == "static_parse_limit":
+        assert list(scan) == []
+    else:
+        with pytest.raises(tm.static_runner._StaticResourceLimitError) as caught:
+            list(scan)
+        assert caught.value.metrics.parser_diagnostic is prepared.parser_diagnostic
+    diagnostic = prepared.bounded_parse_diagnostic()
+    assert isinstance(diagnostic, StaticParserDiagnostic)
+    assert (diagnostic.start, diagnostic.end) == next(iter(prepared.values))
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+    assert diagnostic.location_precision == "enclosing_expression"
+    assert prepared.has_bounded_parse_exhaustion() is True
+
+
+@pytest.mark.parametrize("reason", ["runtime_limit", "output_limit"])
+@pytest.mark.parametrize("raised", [False, True])
+@pytest.mark.parametrize("later_diagnostic", [False, True])
+def test_later_child_limit_retains_first_cause_findings_and_measurements(
+    monkeypatch, reason: str, raised: bool, later_diagnostic: bool
+) -> None:
+    caller = _CALLER + 'bash -c "$helper; helper"\n'
+    prepared = _prepare(caller, "helper() {\n  rm -rf /\n}\n")
+    assert prepared is not None and len(prepared.values) == 2
+    first_span = next(iter(prepared.values))
+    first_metrics = tm.static_runner._StaticScanMetrics({})
+    first_metrics.parser_diagnostic = StaticParserDiagnostic(
+        ParserCause.UNSUPPORTED_SYNTAX,
+        ParserCheck.COMMAND_STRING_EFFECTS,
+        0,
+        8,
+        ParserUncheckedScope.COMMAND_STRING,
+    )
+    measurements = (
+        {"observed_seconds": 2.0, "limit_seconds": 1.0}
+        if reason == "runtime_limit"
+        else {"observed_findings": 11, "limit_findings": 10}
+    )
+    later_metrics = tm.static_runner._StaticScanMetrics(measurements)
+    if later_diagnostic:
+        later_metrics.parser_diagnostic = StaticParserDiagnostic(
+            ParserCause.RUNTIME_DEPENDENT,
+            ParserCheck.COMMAND_IDENTITY,
+            1,
+            9,
+            ParserUncheckedScope.COMMAND_ARGUMENTS,
+        )
+    calls = 0
+
+    def child_scan(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            finding = tm.Finding(
+                rule_id="TM1",
+                message="retained destructive child",
+                file="scripts/caller.sh",
+                start_line=2,
+                start_column=3,
+                severity="HIGH",
+                matched_text="rm -rf /",
+            )
+            return [finding], tm.static_runner.LedgerReason.STATIC_PARSE_LIMIT, first_metrics
+        if raised:
+            raise tm.static_runner._StaticResourceLimitError(
+                tm.static_runner.LedgerReason(reason), later_metrics
+            )
+        return [], tm.static_runner.LedgerReason(reason), later_metrics
+
+    monkeypatch.setattr(tm.static_runner, "_scan_all_views_detailed", child_scan)
+    started_at = tm.time.monotonic()
+    budget = tm.static_runner._FindingBudget(10, started_at, started_at + 10.0, lambda: started_at)
+    findings, limit = tm.static_runner._scan_path(
+        "scripts/caller.sh",
+        caller,
+        [tm],
+        budget,
+        python_source=False,
+        prepared_analyses={id(tm): prepared},
+        analysis_method="analyze_source_commands",
+        preserve_created_on_limit=False,
+    )
+    assert calls == 2
+    assert limit is not None and limit.reason == reason
+    assert dict(limit.metrics) == measurements
+    diagnostic = limit.metrics.parser_diagnostic
+    assert diagnostic is prepared.parser_diagnostic
+    assert diagnostic.cause is ParserCause.UNSUPPORTED_SYNTAX
+    assert diagnostic.check is ParserCheck.COMMAND_STRING_EFFECTS
+    assert (diagnostic.start, diagnostic.end) == first_span
+    assert diagnostic.location_precision == "enclosing_expression"
+    assert len(findings) == 1 and findings[0].rule_id == "TM1"
+    assert findings[0].evidence["reconstructed_shell_source"]["consumer_start"] == first_span[0]
 
 
 @pytest.mark.parametrize(

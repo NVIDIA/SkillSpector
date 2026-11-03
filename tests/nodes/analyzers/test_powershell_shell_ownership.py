@@ -210,3 +210,20 @@ def test_powershell_projection_honors_runtime_checks() -> None:
 
     with pytest.raises(TimeoutError):
         tm._powershell_shell_text(content, check_runtime)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "suffix", "partial"),
+    [
+        ("Write-Output", "", False),
+        ("Write-Output", " | bash", True),
+        ("$cmd = Write-Output", "", True),
+        ("Import-Module ./helpers.psm1\nWrite-Host", "", True),
+    ],
+)
+def test_native_string_boundaries_preserve_message_capture_contract(
+    prefix: str, suffix: str, partial: bool
+) -> None:
+    content = f"{prefix} '$CMD -rf /'{suffix}\n"
+
+    assert _limited(content) is partial

@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded lexical ownership for Node assertion template-message delimiters.
+"""Bounded JavaScript ownership for shell-completeness checks.
 
-This is not a JavaScript parser or a shell-sink/dataflow model. Only a direct
-diagnostic argument of one unaliased built-in assertion import may borrow
-ownership. Unsupported source keeps its original conservative shell reading.
+Assertion messages require a proved receiver. General template ownership also
+requires a complete syntax tree and retains conservative shell-execution checks.
+Original source bytes remain the input to security matching.
 """
 
 from __future__ import annotations
@@ -1481,6 +1481,7 @@ _SHELL_EXECUTION_CALLS = frozenset(
         "execfilesync",
         "execsync",
         "eval",
+        "function",
         "execa",
         "spawn",
         "spawnfile",
@@ -1493,29 +1494,165 @@ _SHELL_EXECUTION_CALLS = frozenset(
 _SHELL_EXECUTION_MODULES = frozenset({"child_process", "execa", "shelljs", "zx"})
 
 
+def _javascript_parse_text(
+    content: str, check_runtime: Callable[[], None]
+) -> tuple[str, tuple[int, ...], frozenset[tuple[int, int]]] | None:
+    """Adapt supported host syntax without changing any source offsets.
+
+    Esprima predates hashbangs and optional chaining. Removing optional guards
+    only overapproximates the calls inspected here; this text is never executed
+    or used to resolve values. Token ranges prevent edits to strings or regexes.
+    """
+    projected = content
+    if content.startswith("#!"):
+        if _NODE_SHEBANG.match(content) is None:
+            return None
+        projected = "//" + content[2:]
+    if "?." not in projected:
+        return projected, (), frozenset()
+
+    visited = 0
+
+    def bounded_token(token: Any) -> Any:
+        nonlocal visited
+        visited += 1
+        if visited > _MAX_TOKENS:
+            raise ValueError("JavaScript token limit")
+        if visited % 256 == 0:
+            check_runtime()
+        return token
+
+    try:
+        tokens = esprima.tokenize(projected, {"range": True}, bounded_token)
+    except (esprima.Error, RecursionError, ValueError, TypeError, IndexError):
+        return None
+    check_runtime()
+    output = list(projected)
+    optional_positions: list[int] = []
+    parentheses: list[int] = []
+    parenthesized: set[tuple[int, int]] = set()
+    for index, token in enumerate(tokens):
+        if index % 256 == 0:
+            check_runtime()
+        if token.type != "Punctuator":
+            continue
+        if token.value == "(":
+            parentheses.append(index)
+        elif token.value == ")" and parentheses:
+            opener = parentheses.pop()
+            if opener + 1 < index:
+                parenthesized.add((tokens[opener + 1].range[0], tokens[index - 1].range[1]))
+    for index, token in enumerate(tokens[:-2]):
+        if index % 256 == 0:
+            check_runtime()
+        following, member = tokens[index + 1 : index + 3]
+        if token.type != "Punctuator" or token.value != "?":
+            continue
+        start, end = token.range
+        if (
+            following.type != "Punctuator"
+            or following.value != "."
+            or following.range != [end, end + 1]
+            or projected[start : end + 1] != "?."
+        ):
+            continue
+        if member.type == "Punctuator" and member.value in {"[", "("}:
+            output[start : end + 1] = "  "
+        elif member.type in {"Identifier", "Keyword"}:
+            output[start] = " "
+        else:
+            return None
+        optional_positions.append(start)
+    return "".join(output), tuple(optional_positions), frozenset(parenthesized)
+
+
+def _invalid_optional_context(
+    program: Any,
+    positions: tuple[int, ...],
+    parenthesized: frozenset[tuple[int, int]],
+    tick: Callable[[], None],
+) -> bool:
+    """Optional chains cannot be assignment targets, constructors or tags."""
+    if not positions:
+        return False
+
+    def contains(start: int, end: int) -> bool:
+        index = bisect_left(positions, start)
+        return index < len(positions) and positions[index] < end
+
+    def optional_chain(target: Any) -> bool:
+        # Computed indices and call arguments are independent expressions.
+        # Parentheses also end a chain: (a?.b).c is a valid assignment target.
+        while target.type in {"MemberExpression", "CallExpression"}:
+            tick()
+            if target.type == "MemberExpression":
+                prefix = target.object
+                end = target.property.range[0]
+            else:
+                prefix = target.callee
+                end = target.arguments[0].range[0] if target.arguments else target.range[1]
+            if contains(prefix.range[1], end):
+                return True
+            if tuple(prefix.range) in parenthesized:
+                return False
+            target = prefix
+        return False
+
+    for node in _walk_nodes(program, tick):
+        target = None
+        if node.type == "AssignmentExpression":
+            target = node.left
+        elif node.type == "UpdateExpression":
+            target = node.argument
+        elif node.type == "NewExpression":
+            target = node.callee
+            end = node.arguments[0].range[0] if node.arguments else node.range[1]
+            if contains(target.range[1], end):
+                return True
+            if tuple(target.range) in parenthesized:
+                continue
+        elif node.type == "TaggedTemplateExpression":
+            target = node.tag
+            if tuple(target.range) in parenthesized:
+                continue
+        if target is not None and optional_chain(target):
+            return True
+    return False
+
+
 def javascript_template_spans(
     content: str,
     check_runtime: Callable[[], None],
+    *,
+    unresolved_executables: list[int] | None = None,
 ) -> JavaScriptTemplateSpans | None:
     """Return template literal ranges only when a complete script parses.
 
     Unsupported or malformed JavaScript returns ``None`` so callers retain
     their conservative parse bounds. A file with a template and a shell
     execution call also keeps those bounds because this parser does not
-    establish whether that template supplies the executed command.
+    establish whether that template supplies the executed command. Dynamic
+    templates in that case are reported separately through
+    ``unresolved_executables`` so a short fallback parse cannot verify them.
     """
     if "`" not in content or len(content) > MAX_PYTHON_AST_SOURCE_CHARS:
         return None
     check_runtime()
+    prepared = _javascript_parse_text(content, check_runtime)
+    if prepared is None:
+        return None
+    parse_text, optional_positions, parenthesized = prepared
     options = {"range": True}
     try:
         try:
-            program = esprima.parseScript(content, options)
+            program = esprima.parseScript(parse_text, options)
         except esprima.Error:
-            program = esprima.parseModule(content, options)
+            program = esprima.parseModule(parse_text, options)
     except (esprima.Error, RecursionError, ValueError, TypeError):
         return None
     check_runtime()
+    if _invalid_optional_context(program, optional_positions, parenthesized, check_runtime):
+        return None
 
     templates: list[tuple[int, int, bool]] = []
     for node in _walk_nodes(program, check_runtime):
@@ -1543,6 +1680,17 @@ def javascript_template_spans(
         return None
 
     if _has_shell_execution_call(program, check_runtime):
+        if unresolved_executables is not None:
+            # Refusing ownership alone is insufficient: a short template inside
+            # an argument array can look complete to the fallback shell parser.
+            # Without a value-flow proof, dynamic templates beside execution
+            # calls remain unverified regardless of surrounding source length.
+            assertion_text = assertion_template_shell_text(content, check_runtime)
+            unresolved_executables.extend(
+                start
+                for start, end, dynamic in templates
+                if dynamic and (assertion_text[start] == "`" or assertion_text[end - 1] == "`")
+            )
         return None
 
     if _has_unproven_assertion_template_call(content, program, templates, check_runtime):
@@ -1583,14 +1731,148 @@ def _walk_nodes(value: Any, check_runtime: Callable[[], None]) -> Iterator[Any]:
             pending.extend(reversed(children))
 
 
+def _callable_values(
+    value: Any, check_runtime: Callable[[], None], *, all_receivers: bool = False
+) -> Iterator[Any]:
+    """Retain every possible value selected by a bounded expression walk."""
+    pending = [value]
+    while pending:
+        check_runtime()
+        current = pending.pop()
+        kind = getattr(current, "type", None)
+        if kind == "ConditionalExpression":
+            pending.extend((current.consequent, current.alternate))
+        elif kind == "LogicalExpression":
+            pending.extend((current.left, current.right))
+        elif kind == "SequenceExpression" and current.expressions:
+            pending.append(current.expressions[-1])
+        elif kind == "AssignmentExpression" and current.operator == "=":
+            pending.append(current.right)
+        else:
+            yield current
+            if kind == "MemberExpression":
+                name = getattr(current.property, "name", None)
+                if name is None:
+                    name = getattr(current.property, "value", None)
+                if all_receivers or isinstance(name, str) and name in {"call", "apply", "bind"}:
+                    # Extracting a function helper retains its receiver's
+                    # possible behavior, including through later aliases.
+                    pending.append(current.object)
+
+
 def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -> bool:
+    global_objects = {"globalThis", "global", "window", "self"}
+    computed_callables: set[str] = set()
+    aliases: dict[str, list[str]] = {}
+
+    def unknown_member(node: Any) -> bool:
+        return (
+            getattr(node, "type", None) == "MemberExpression"
+            and node.computed
+            and getattr(node.property, "type", None) != "Literal"
+        )
+
     for node in _walk_nodes(program, check_runtime):
+        if node.type == "ObjectPattern":
+            for prop in node.properties:
+                check_runtime()
+                if prop.type != "Property":
+                    continue
+                name = getattr(prop.key, "name", None)
+                if name is None:
+                    name = getattr(prop.key, "value", None)
+                binding = prop.value
+                if binding.type == "AssignmentPattern":
+                    binding = binding.left
+                if (
+                    isinstance(name, str)
+                    and name.casefold() in _SHELL_EXECUTION_CALLS
+                    and binding.type == "Identifier"
+                ):
+                    computed_callables.add(binding.name)
+            continue
+        if node.type == "VariableDeclarator":
+            target, value = node.id, node.init
+        elif node.type == "AssignmentPattern":
+            # A missing property or argument selects the default expression.
+            target, value = node.left, node.right
+        elif node.type == "AssignmentExpression" and node.operator == "=":
+            target, value = node.left, node.right
+        else:
+            continue
+        if getattr(target, "type", None) != "Identifier":
+            continue
+        if _is_shell_execution_callee(value, check_runtime):
+            computed_callables.add(target.name)
+        for candidate in _callable_values(value, check_runtime):
+            if getattr(candidate, "type", None) == "Identifier":
+                aliases.setdefault(candidate.name, []).append(target.name)
+            if unknown_member(candidate):
+                computed_callables.add(target.name)
+    # Overapproximate aliases across scopes and assignments. A name may have
+    # several possible values; none may hide a possible evaluator selection.
+    for names in (global_objects, computed_callables):
+        pending = list(names)
+        while pending:
+            check_runtime()
+            for alias in aliases.get(pending.pop(), ()):
+                if alias not in names:
+                    names.add(alias)
+                    pending.append(alias)
+
+    def unproven_callable(callee: Any) -> bool:
+        for candidate in _callable_values(callee, check_runtime, all_receivers=True):
+            if unknown_member(candidate) or (
+                getattr(candidate, "type", None) == "Identifier"
+                and candidate.name in computed_callables
+            ):
+                return True
+        return False
+
+    literal_keys: set[int] = set()
+    for node in _walk_nodes(program, check_runtime):
+        if node.type == "ObjectExpression":
+            # Object metadata keys are names, not references to evaluators.
+            for prop in node.properties:
+                if prop.type == "Property" and not prop.computed and not prop.shorthand:
+                    literal_keys.add(id(prop.key))
+        if node.type == "ObjectPattern":
+            for prop in node.properties:
+                if prop.type == "Property" and (
+                    getattr(prop.key, "value", None) in {"eval", "Function"}
+                    or prop.computed
+                    and getattr(prop.key, "type", None) != "Literal"
+                ):
+                    return True
+        if (
+            node.type == "Identifier"
+            and node.name in {"eval", "Function"}
+            and id(node) not in literal_keys
+        ):
+            # Aliasing an evaluator does not make its input ordinary text.
+            return True
+        if (
+            node.type == "MemberExpression"
+            and node.computed
+            and getattr(node.property, "type", None) == "Literal"
+            and getattr(node.property, "value", None) in {"eval", "Function"}
+        ):
+            return True
+        if unknown_member(node):
+            receiver = node.object
+            while getattr(receiver, "type", None) == "MemberExpression":
+                check_runtime()
+                receiver = receiver.object
+            if getattr(receiver, "type", None) == "Identifier" and receiver.name in global_objects:
+                return True
         if node.type == "ImportDeclaration" and _is_shell_execution_module(
             getattr(node.source, "value", "")
         ):
             return True
         if node.type in {"CallExpression", "NewExpression"}:
-            if _is_shell_execution_callee(node.callee):
+            if unproven_callable(node.callee):
+                return True
+            if _is_shell_execution_callee(node.callee, check_runtime):
                 return True
             if (
                 node.callee.type == "Identifier"
@@ -1601,7 +1883,11 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
                 return True
         if node.type == "TaggedTemplateExpression":
             tag = node.tag
-            if _is_shell_execution_callee(tag) or (tag.type == "Identifier" and tag.name == "$"):
+            if unproven_callable(tag):
+                return True
+            if _is_shell_execution_callee(tag, check_runtime) or (
+                tag.type == "Identifier" and tag.name == "$"
+            ):
                 return True
     return False
 
@@ -1659,12 +1945,28 @@ def _is_shell_execution_module(module: Any) -> bool:
     )
 
 
-def _is_shell_execution_callee(callee: Any) -> bool:
-    if callee.type == "Identifier":
-        return callee.name.casefold() in _SHELL_EXECUTION_CALLS
-    if callee.type == "MemberExpression":
-        property_name = getattr(callee.property, "name", None)
-        if property_name is None:
-            property_name = getattr(callee.property, "value", None)
-        return isinstance(property_name, str) and property_name.casefold() in _SHELL_EXECUTION_CALLS
+def _is_shell_execution_callee(callee: Any, check_runtime: Callable[[], None]) -> bool:
+    pending = [callee]
+    while pending:
+        for candidate in _callable_values(pending.pop(), check_runtime):
+            kind = getattr(candidate, "type", None)
+            if kind == "Identifier":
+                if candidate.name.casefold() in _SHELL_EXECUTION_CALLS:
+                    return True
+                continue
+            if kind != "MemberExpression":
+                continue
+            property_name = getattr(candidate.property, "name", None)
+            if property_name is None:
+                property_name = getattr(candidate.property, "value", None)
+            if not isinstance(property_name, str):
+                continue
+            if property_name.casefold() in _SHELL_EXECUTION_CALLS:
+                return True
+            if (
+                property_name in {"apply", "construct"}
+                and candidate.object.type == "Identifier"
+                and candidate.object.name == "Reflect"
+            ):
+                return True
     return False
