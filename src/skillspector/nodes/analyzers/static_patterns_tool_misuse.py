@@ -847,6 +847,7 @@ def _skip_static_heredoc_bodies(
     joins unquoted continuations while retaining at most one delimiter's width.
     """
     cursor = start
+    expected_crlf = content[start - 2 : start] == "\r\n" if start > 0 else None
     for delimiter, strip_tabs, quoted in pending:
         logical_prefix = ""
         while cursor < limit:
@@ -854,7 +855,16 @@ def _skip_static_heredoc_bodies(
                 check_runtime()
             newline = content.find("\n", cursor, limit)
             line_end = limit if newline < 0 else newline
-            if line_end > cursor and content[line_end - 1] == "\r":
+            crlf = newline >= 0 and line_end > cursor and content[line_end - 1] == "\r"
+            if newline >= 0:
+                if expected_crlf is None:
+                    expected_crlf = crlf
+                elif crlf != expected_crlf:
+                    # Mixed physical endings cannot manufacture a delimiter.
+                    # Body-only callers establish the style on their first
+                    # complete line; uniformly CRLF bodies remain supported.
+                    return None
+            if crlf:
                 line_end -= 1
             line = content[cursor:line_end]
             continued = (

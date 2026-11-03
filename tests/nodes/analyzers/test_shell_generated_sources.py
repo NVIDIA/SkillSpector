@@ -720,9 +720,23 @@ def test_tested_predicate_does_not_exit_the_helper(program: str) -> None:
     assert _helper_output((), program=program) == ((ShellHelperOutput(text="ready"),),)
 
 
-@pytest.mark.parametrize("closing, complete", [("EOF\n", True), ("EOF\r\n", False)])
-def test_lf_heredoc_delimiter_does_not_silently_discard_carriage_return(closing, complete) -> None:
-    content = "literal body\n" + closing
+@pytest.mark.parametrize(
+    "newline, closing, complete",
+    [
+        ("\n", "EOF\n", True),
+        ("\n", "EOF\r\n", False),
+        ("\r\n", "EOF\r\n", True),
+        ("\r\n", "EOF\n", False),
+        ("\n", "EOF", True),
+        ("\n", "EOF\r", False),
+        ("\r\n", "EOF", True),
+        ("\r\n", "EOF\r", False),
+    ],
+)
+def test_lf_heredoc_delimiter_does_not_silently_discard_carriage_return(
+    newline, closing, complete
+) -> None:
+    content = "literal body" + newline + closing
     end = tm._skip_static_heredoc_bodies(
         content, 0, len(content), (("EOF", False, True),), lambda: None
     )
