@@ -2120,9 +2120,7 @@ def _python_import_bounds(
         paths.extend(
             path
             for artifact in inventory
-            if isinstance(artifact, dict)
-            and isinstance(path := artifact.get("path"), str)
-            and path
+            if isinstance(artifact, dict) and isinstance(path := artifact.get("path"), str) and path
         )
     return PythonImportBounds(paths, file_cache)
 

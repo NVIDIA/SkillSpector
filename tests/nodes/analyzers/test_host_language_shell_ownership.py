@@ -646,9 +646,7 @@ def test_constant_checkout_full_bundle_requires_native_urllib(
         pytest.param(
             "pkg.helpers", "pkg/__init__.pyc", False, True, id="missing-child-opaque-parent"
         ),
-        pytest.param(
-            "pkg.helpers", "pkg.abi3.so", False, True, id="missing-child-native-parent"
-        ),
+        pytest.param("pkg.helpers", "pkg.abi3.so", False, True, id="missing-child-native-parent"),
         pytest.param("helpers", "helpers_extra.so", False, False, id="unrelated-prefix"),
         pytest.param("helpers", "vendor/not_helpers.pyc", True, False, id="unrelated-basename"),
         pytest.param("helpers", "helpers.txt", False, False, id="non-import-artifact"),
