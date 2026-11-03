@@ -291,6 +291,116 @@ def test_uploaded_source_can_survive_unknown_data_and_joined_branches(destructiv
     assert not prepared.has_bounded_parse_exhaustion()
 
 
+@pytest.mark.parametrize("destructive", [False, True])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_mapfile_disjoint_loop_uses_ordered_effects_and_retains_findings(
+    destructive: bool, newline: str
+) -> None:
+    prefix = (
+        "tmp=$(mktemp -d /tmp/loop-snapshot.XXXXXX)\n"
+        "mapfile -t items < <(printf value)\n"
+        'for item in "${items[@]}"; do printf safe > "$tmp/log"; done\n'
+    )
+    caller = _CALLER.replace("helper=$(sed", prefix + "helper=$(sed").replace("\n", newline)
+    library = "helper() {\n  rm -rf /\n}\n" if destructive else _LIBRARY
+    resolver = _value_resolver(caller)
+    assert resolver.valid
+    assert not resolver.executable_children_complete
+    assert "items" in resolver.invalid_names
+    prepared = _prepare(caller, library)
+    assert prepared is not None
+    findings = list(
+        prepared.analyze_source_commands(
+            content=caller,
+            file_path="scripts/caller.sh",
+            file_type="shell",
+            source_view=SecurityTextView("raw", caller),
+        )
+    )
+    assert any(finding.rule_id == "TM1" for finding in findings) is destructive
+    assert not prepared.has_bounded_parse_exhaustion()
+    assert all(
+        origin.path == "scripts/library.sh"
+        for _, value in prepared.variants()
+        for origin in value.origins
+    )
+
+
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        "mapfile -C callback -t items < <(printf value)",
+        "mapfile -n 1 -t items < <(printf value)",
+        "mapfile -t items[0] < <(printf value)",
+        "mapfile -t PATH < <(printf value)",
+        "mapfile -t BASH_ENV < <(printf value)",
+        'mapfile -t "$destination" < <(printf value)',
+        "readarray -t items < <(printf value)",
+        "read -r items < <(printf value)",
+        "mapfile -t items < <(printf value)suffix",
+        "mapfile -t items < <(printf value) extra",
+        "mapfile -t items < <(printf value) > /tmp/output",
+        "mapfile -t items < <(printf value) < /tmp/input",
+        "mapfile -t items < /tmp/input < <(printf value)",
+        "mapfile -t items < <(printf value",
+        "mapfile() { :; }\nmapfile -t items < <(printf value)",
+        "alias mapfile=unknown\nmapfile -t items < <(printf value)",
+        "enable -n mapfile\nmapfile -t items < <(printf value)",
+        "builtin mapfile -t items < <(printf value)",
+        "command mapfile -t items < <(printf value)",
+        "declare -n items=script\nmapfile -t items < <(printf value)",
+    ],
+)
+def test_mapfile_bridge_refuses_unproved_destination_or_consumer(invocation: str) -> None:
+    caller = _CALLER.replace("helper=$(sed", invocation + "\nhelper=$(sed")
+    prepared = _prepare(caller)
+    assert prepared is None or not tuple(prepared.variants())
+
+
+@pytest.mark.parametrize(
+    "producer",
+    [
+        "unknown_program",
+        'printf changed > "$script"',
+        'source "$script"',
+        'cat "$script"',
+        "BASH_ENV=/tmp/startup bash -c true",
+        "printf safe; unknown_program",
+        'if [[ -e /tmp/marker ]]; then printf changed > "$script"; fi',
+        "trap 'printf changed > scripts/library.sh' EXIT; printf safe",
+    ],
+)
+def test_mapfile_bridge_never_skips_asynchronous_producer_effects(producer: str) -> None:
+    caller = _CALLER.replace(
+        "helper=$(sed", f"mapfile -t items < <({producer})\nhelper=$(sed"
+    )
+    prepared = _prepare(caller)
+    assert prepared is None or not tuple(prepared.variants())
+    raw = caller + "rm -rf /\n"
+    assert any(finding.rule_id == "TM1" for finding in tm.analyze(raw, "scripts/caller.sh", "shell"))
+
+
+@pytest.mark.parametrize("name", ["helper", "script", "root"])
+def test_mapfile_invalidates_previously_known_code_or_path(name: str) -> None:
+    caller = f'{name}=known\nprintf "%s" "${name}"\n'
+    caller += f'mapfile -t {name} < <(printf replacement)\nprintf "%s" "${name}"\n'
+    resolver = _value_resolver(caller)
+    assert resolver.valid
+    assert name in resolver.invalid_names
+    assert name in resolver.invalid_loop_names
+    assert _expanded_values(resolver, name) == [None, None]
+
+
+def test_mapfile_unknown_loop_item_cannot_supply_a_write_destination() -> None:
+    prefix = (
+        "mapfile -t items < <(printf value)\n"
+        'for item in "${items[@]}"; do printf changed > "$item"; done\n'
+    )
+    caller = _CALLER.replace("helper=$(sed", prefix + "helper=$(sed")
+    prepared = _prepare(caller)
+    assert prepared is None or not tuple(prepared.variants())
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

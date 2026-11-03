@@ -138,6 +138,7 @@ class ShellSourceResolver:
         self.literal_heredocs: list[tuple[int, int, int]] = []
         self.heredoc_counts: dict[int, int] = {}
         self.input_redirect_commands: set[int] = set()
+        self.mapfile_process_commands: set[int] = set()
         self.definite_commands: set[int] = set()
         self.fail_stop_commands: set[int] = set()
         self.functions: set[str] = set()
@@ -454,14 +455,51 @@ class ShellSourceResolver:
                 if operator is None:
                     self.valid = False
                     return
+                owner = words[0][1] if words else cursor
+                prior_input = owner in self.input_redirect_commands
                 if "<" in operator[0]:
-                    self.input_redirect_commands.add(words[0][1] if words else cursor)
+                    self.input_redirect_commands.add(owner)
                 cursor += len(operator[0])
                 while cursor < len(self.content) and self.content[cursor] in " \t":
                     cursor += 1
                 if cursor == len(self.content) or self.content[cursor] in "\r\n;|&":
                     self.valid = False
                     return
+                if operator[0] == "<" and self.content.startswith("<(", cursor):
+                    raw_words = [self.content[left:right] for _, left, right in words]
+                    if (
+                        child_depth
+                        or function_depth
+                        or prior_input
+                        or redirects
+                        or pending
+                        or len(raw_words) != 3
+                        or raw_words[:2] != ["mapfile", "-t"]
+                        or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw_words[2]) is None
+                        or is_managed_shell_variable(raw_words[2])
+                    ):
+                        self.valid = False
+                        return
+                    stop = self.substitution_end(self.content, cursor, len(self.content))
+                    if stop is None or not cursor < stop <= len(self.content):
+                        self.valid = False
+                        return
+                    following = stop
+                    while following < len(self.content) and self.content[following] in " \t":
+                        following += 1
+                    if (
+                        following < len(self.content)
+                        and self.content[following] not in "\r\n;|&"
+                    ) or not self._spend(following - cursor):
+                        self.valid = False
+                        return
+                    self.mapfile_process_commands.add(owner)
+                    # Lexical ownership is not an effects proof for this
+                    # asynchronous body. Every cached read must use the ordered
+                    # auditor, which checks the original producer and consumer.
+                    self.executable_children_complete = False
+                    cursor = stop
+                    continue
                 _, stop, limited = self.read_word(self.content, cursor, self.check_runtime)
                 if limited or stop <= cursor or not self._spend(stop - cursor):
                     self.valid = False
@@ -694,6 +732,13 @@ class ShellSourceResolver:
             "hash",
         }:
             self.valid = False
+            return
+        if executable == "mapfile" and command.start in self.mapfile_process_commands:
+            # The exact plain destination is known; its array contents are not.
+            # Invalidate older bindings too, rather than retaining captured code.
+            name = words[cursor + 2][0]
+            self.invalid_names.add(name)
+            self.invalid_loop_names.add(name)
             return
         if (
             executable
