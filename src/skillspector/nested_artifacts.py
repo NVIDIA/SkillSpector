@@ -794,6 +794,14 @@ def _record_member(
     """Publish one validated member through the same inventory and local-only route."""
     if virtual_path is None:
         virtual_path = _member_path(container_virtual_path, name, budget)
+    if virtual_path in result.file_cache:
+        result.inspected_containers.pop(container_virtual_path, None)
+        _exception(
+            result,
+            path=container_virtual_path,
+            reason=LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH,
+        )
+        return virtual_path
     nested_type = _archive_type(data)
     executable = is_executable_content(name, data, mode, complete_content=complete_content)
     source_classification = classify_python_source(name, data)
