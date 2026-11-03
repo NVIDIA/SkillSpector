@@ -229,12 +229,11 @@ def test_invalid_or_unproven_host_syntax_keeps_conservative_fallback(source: str
         "const child = require('child_process'); child?.exec(`${command}`);",
     ],
 )
-def test_supported_host_syntax_cannot_hide_code_execution(source: str) -> None:
-    source += _PADDING
+@pytest.mark.parametrize("suffix", ["", _PADDING], ids=["short", "padded"])
+def test_supported_host_syntax_cannot_hide_code_execution(source: str, suffix: str) -> None:
+    source += suffix
     assert javascript_template_spans(source, lambda: None) is None
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript") == (
-        tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="text")
-    )
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript") is True
 
 
 @pytest.mark.parametrize(

@@ -323,9 +323,18 @@ def powershell_source(
                 if content[opening : opening + 1] == "(":
                     spans.extend(gap_comments)
                     clause_starts.add(opening + 1)
+                    first_string = len(strings)
                     end = code(opening + 1, depth + 1, closes_parenthesis=True)
                     executable_boundary(operand, end)
-                    invocations.append((operand, end))
+                    # A proven literal here-string already carries this call's
+                    # operands. Dynamic values retain their own invocation.
+                    if not any(
+                        string.invoked
+                        and string.operand_start == end
+                        and content[string.start : string.start + 2] in {"@'", '@"'}
+                        for string in strings[first_string:]
+                    ):
+                        invocations.append((operand, end))
                     cursor = end
                     continue
                 variable_command = re.match(

@@ -1685,7 +1685,12 @@ def javascript_template_spans(
             # an argument array can look complete to the fallback shell parser.
             # Without a value-flow proof, dynamic templates beside execution
             # calls remain unverified regardless of surrounding source length.
-            unresolved_executables.extend(start for start, _end, dynamic in templates if dynamic)
+            assertion_text = assertion_template_shell_text(content, check_runtime)
+            unresolved_executables.extend(
+                start
+                for start, end, dynamic in templates
+                if dynamic and (assertion_text[start] == "`" or assertion_text[end - 1] == "`")
+            )
         return None
 
     if _has_unproven_assertion_template_call(content, program, templates, check_runtime):

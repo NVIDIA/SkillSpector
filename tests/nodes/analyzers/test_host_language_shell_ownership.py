@@ -874,11 +874,8 @@ def test_node_assert_message_fix_keeps_unresolved_shell_commands_partial(stateme
 @pytest.mark.parametrize(
     "statement",
     [
-        "run(`${cmd}`);",
         "sh`${obj.cmd}`;",
         "sh`${obj.cmd} -rf /`;",
-        "execSync(String.raw`${obj.cmd}`);",
-        'execSync(`${cmd}` + " -rf /");',
     ],
 )
 def test_unrecognized_template_consumers_keep_existing_behavior(statement: str) -> None:
@@ -888,6 +885,26 @@ def test_unrecognized_template_consumers_keep_existing_behavior(statement: str) 
 
     assert assertion_template_shell_text(source, lambda: None) == source
     assert _javascript(source) is _shell(source)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "run(`${cmd}`);",
+        "execSync(String.raw`${obj.cmd}`);",
+        'execSync(`${cmd}` + " -rf /");',
+    ],
+)
+@pytest.mark.parametrize("suffix", ["", _TAIL], ids=["short", "padded"])
+def test_known_template_execution_keeps_unresolved_operands_partial(
+    statement: str, suffix: str
+) -> None:
+    source = _JS_ASSERT_IMPORT + statement + "\n" + suffix
+
+    assert _javascript(source) is True
+    result = _ledger("scripts/check.mjs", source)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
 @pytest.mark.parametrize(

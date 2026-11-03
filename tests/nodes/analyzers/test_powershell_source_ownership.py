@@ -249,14 +249,14 @@ def test_here_string_escaped_physical_newline_cannot_prove_a_footer(
 
 @pytest.mark.parametrize("quote", ["'", '"'])
 @pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
-@pytest.mark.parametrize("parenthesized", [False, True])
+@pytest.mark.parametrize("parenthesized", [0, 1, 2])
 @pytest.mark.parametrize("command,partial", [("/bin/rm", True), ("/bin/echo", False)])
 @pytest.mark.parametrize("suffix", ["", _TAIL], ids=["short", "padded"])
 def test_invoked_here_string_keeps_following_operands(
-    quote: str, newline: str, parenthesized: bool, command: str, partial: bool, suffix: str
+    quote: str, newline: str, parenthesized: int, command: str, partial: bool, suffix: str
 ) -> None:
     literal = f"@{quote}\n{command}\n{quote}@".replace("\n", newline)
-    expression = f"({literal})" if parenthesized else literal
+    expression = "(" * parenthesized + literal + ")" * parenthesized
     content = f"& {expression} -rf /" + suffix
     source = powershell_source(content, lambda: None)
     assert source is not None
@@ -269,6 +269,28 @@ def test_invoked_here_string_keeps_following_operands(
     assert event["outcome"] is (LedgerOutcome.PARTIAL if partial else LedgerOutcome.COMPLETED)
     if partial:
         assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "(@'\n/bin/echo\n'@; $CMD)",
+        "(@'\n/bin/echo\n'@ + $suffix)",
+        "(@'\n/bin/echo\n'@)[0]",
+        "(@'\n/bin/echo\n'@).ToString()",
+        '(@"\n$CMD\n"@)',
+        '(@"\n$(Get-Command)\n"@)',
+        "$(if ($ready) { @'\n/bin/echo\n'@ } else { $CMD })",
+    ],
+)
+@pytest.mark.parametrize("suffix", ["", _TAIL], ids=["short", "padded"])
+def test_parenthesized_here_string_cannot_prove_runtime_selection(
+    expression: str, suffix: str
+) -> None:
+    content = f"& {expression} -rf /" + suffix
+    event = _ledger(content)
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
 @pytest.mark.parametrize("name", ["text", "script:text"])
