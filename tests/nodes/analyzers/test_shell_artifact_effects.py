@@ -381,7 +381,8 @@ def test_transferred_empty_directory_cannot_skip_a_cached_source_overwrite(
     operation: str, empty_present: bool
 ) -> None:
     caller = (
-        "set -e\nwork=$(mktemp -d)\nout=$(mktemp -d)\n"
+        "set -e\nwork=$(mktemp -d /tmp/artifact-source.XXXXXX)\n"
+        "out=$(mktemp -d /tmp/artifact-target.XXXXXX)\n"
         'mkdir -p "$work/tree"\n'
         + ('mkdir -p "$work/tree/empty"\n' if empty_present else "")
         + 'cp scripts/marker.sh "$work/tree/known"\n'
