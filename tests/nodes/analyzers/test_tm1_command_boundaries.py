@@ -236,3 +236,46 @@ assert not any(f.rule_id == 'TM1' for f in tm.analyze(source, 'commands.md', 'ma
 assert time.monotonic() - started < 5
 """
     subprocess.run([sys.executable, "-c", script], check=True, timeout=60)
+
+
+@pytest.mark.parametrize(
+    "command,option",
+    [
+        ("curl --data", "--insecure"),
+        ("curl --data", "-k"),
+        ("git push", "--force"),
+        ("wget --post-data", "--no-check-certificate"),
+        ("chmod", "a+rwx"),
+        ("chown", "a+rwx"),
+    ],
+)
+@pytest.mark.parametrize("delimiter", ["```", "````"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("quote", ["'", '"'])
+def test_complete_inline_span_in_multiline_argument_keeps_the_unsafe_option(
+    command, option, delimiter, newline, quote
+):
+    source = newline.join(
+        [
+            command + " " + quote + "first",
+            delimiter + "note" + delimiter,
+            "second" + quote + " " + option + " https://example.com",
+            "",
+        ]
+    )
+    findings = [
+        finding for finding in tm1(source) if finding.matched_text.startswith(command.split()[0])
+    ]
+    assert len(findings) == 1
+    assert findings[0].location.start_line == 1
+    assert option in findings[0].matched_text
+
+
+def test_escaped_arguments_do_not_skip_runtime_checks():
+    source = "curl " + (r"\x" * 4096) + " --insecure"
+
+    def cancel():
+        raise TimeoutError("deadline expired")
+
+    with pytest.raises(TimeoutError, match="deadline expired"):
+        tm._option_command_end(source, 5, len(source), cancel)

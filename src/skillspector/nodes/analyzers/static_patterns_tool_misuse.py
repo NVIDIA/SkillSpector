@@ -310,7 +310,6 @@ _OPTION_COMMAND_PREFIXES = {
     prefix + r"[\s\S]*" + option: re.compile(prefix, re.IGNORECASE)
     for prefix, option, _ in _OPTION_COMMAND_RULES
 }
-_OPTION_COMMAND_FENCE = re.compile(r"(?m)^[ \t]*(?P<marker>`{3,}|~{3,})")
 
 # TM1: Tool Parameter Abuse — dangerous parameter values
 DIRECT_SHELL_TRUE_PATTERNS: tuple[tuple[str, float], ...] = (
@@ -6437,9 +6436,11 @@ def _option_command_end(
     closers: list[str] = []
     backtick_ends: dict[int, int | None] = {}
     i = start
+    next_runtime_check = start
     while i < limit:
-        if i % 1024 == 0:
+        if i >= next_runtime_check:
             check_runtime()
+            next_runtime_check = i + 1024
         ch = content[i]
         if quote is not None:
             if ch == quote:
@@ -6493,29 +6494,18 @@ def _option_command_matches(
     pattern: str,
     content: str,
     check_runtime: Callable[[], None],
-    markdown_shell: str | None,
+    markdown_fences: list[int],
     markdown_delimiters: list[int],
 ) -> Iterator[re.Match[str]]:
     """Apply an unsafe-option pattern only within each candidate command."""
     compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
-    # Only the Markdown projection proves a boundary. A different marker,
-    # shorter run or invalid closing line inside a fence remains literal data.
-    fences = (
-        [
-            match.start()
-            for match in _OPTION_COMMAND_FENCE.finditer(content)
-            if markdown_shell[match.start("marker")] != content[match.start("marker")]
-        ]
-        if markdown_shell is not None
-        else []
-    )
     covered_until = 0
     for prefix in _OPTION_COMMAND_PREFIXES[pattern].finditer(content):
         check_runtime()
         if prefix.start() < covered_until:
             continue
-        fence_index = bisect_right(fences, prefix.start())
-        limit = fences[fence_index] if fence_index < len(fences) else len(content)
+        fence_index = bisect_right(markdown_fences, prefix.start())
+        limit = markdown_fences[fence_index] if fence_index < len(markdown_fences) else len(content)
         # A command that starts inside an inline span ends at its closing
         # delimiter. A command outside that span can use it as an argument.
         delimiter_index = bisect_right(markdown_delimiters, prefix.start())
@@ -6595,8 +6585,9 @@ def _tm1_candidates(
         yield from direct_candidates()
         return
 
+    option_markdown_fences: list[int] = []
     option_markdown_shell = (
-        _markdown_shell_text(content, check_runtime)
+        _markdown_shell_text(content, check_runtime, fence_boundaries=option_markdown_fences)
         if file_type == "markdown"
         and any(prefix.search(content) for prefix in _OPTION_COMMAND_PREFIXES.values())
         else None
@@ -6621,7 +6612,7 @@ def _tm1_candidates(
                 pattern,
                 content,
                 check_runtime,
-                option_markdown_shell,
+                option_markdown_fences,
                 option_markdown_delimiters,
             ):
                 yield match.start(), pattern_index, match, confidence
@@ -6851,6 +6842,7 @@ def _markdown_shell_text(
     *,
     complete_context: bool = True,
     word_apostrophes: bool = False,
+    fence_boundaries: list[int] | None = None,
     shell_fence_ranges: list[tuple[int, int]] | None = None,
     hardware_apostrophe_ambiguity: list[bool] | None = None,
 ) -> str:
@@ -6861,6 +6853,8 @@ def _markdown_shell_text(
     inside their bodies. Pair equal-length runs in linear time.
     ``word_apostrophes`` selects the prose reading, which also masks the
     possessives and contractions of plain prose lines.
+    ``fence_boundaries`` receives structural opening and closing marker offsets;
+    inline-code delimiters do not establish a fence boundary.
     ``shell_fence_ranges`` receives closed, explicitly labelled shell bodies
     whose quote ownership can be checked independently of surrounding prose.
     """
@@ -7087,6 +7081,8 @@ def _markdown_shell_text(
                 begin, end = closing_fence.span(1)
                 body_start = offset + len(stripped) - len(fence_body)
                 output[body_start + begin : body_start + end] = " " * (end - begin)
+                if fence_boundaries is not None:
+                    fence_boundaries.append(body_start + begin)
                 if shell_fence_start is not None and shell_fence_ranges is not None:
                     shell_fence_ranges.append((shell_fence_start, offset))
                 shell_fence_start = None
@@ -7167,6 +7163,8 @@ def _markdown_shell_text(
         elif nested_fence_opening:
             mask_inline_delimiters()
             begin, end = nested_fence_opening.span(1)
+            if fence_boundaries is not None:
+                fence_boundaries.append(offset + prefix + begin)
             info = stripped[prefix + end :].strip()
             fence = (
                 nested_fence_opening[1][0],
@@ -7191,6 +7189,8 @@ def _markdown_shell_text(
             if opening:
                 mask_inline_delimiters()
                 begin, end = opening.span(1)
+                if fence_boundaries is not None:
+                    fence_boundaries.append(offset + prefix + begin)
                 info = stripped[prefix + end :].strip()
                 language = info.split(maxsplit=1)[0].casefold() if info else ""
                 fence = (
