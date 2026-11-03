@@ -130,23 +130,21 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
         ("", True),
         ("work=scripts/library.sh\n", False),
         (
-            "work=scripts/library.sh\nexit 0\n"
-            "work=$(mktemp -d /tmp/fixture.XXXXXX)\n",
+            "work=scripts/library.sh\nexit 0\nwork=$(mktemp -d /tmp/fixture.XXXXXX)\n",
             False,
         ),
     ],
 )
 def test_child_exit_trap_uses_its_invocation_binding(rebind: str, preserved: bool) -> None:
-    child = (
-        "set -e\nwork=$(mktemp -d /tmp/fixture.XXXXXX)\n"
-        "trap 'rm -rf \"$work\"' EXIT\n" + rebind
-    )
+    child = "set -e\nwork=$(mktemp -d /tmp/fixture.XXXXXX)\ntrap 'rm -rf \"$work\"' EXIT\n" + rebind
     child_resolver = _resolver(child)
     assert not source_is_unmodified(child_resolver, "scripts/library.sh", len(child))
 
     caller = (
         'set -e\nroot="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"\n'
-        + "bash -c " + shlex.quote(child) + "\n"
+        + "bash -c "
+        + shlex.quote(child)
+        + "\n"
         + 'program=$(cat "$root/scripts/library.sh")\nbash -c "$program; helper"\n'
     )
     library = "helper() {\n  rm -rf /\n}\n"

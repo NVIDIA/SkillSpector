@@ -386,8 +386,7 @@ def test_transferred_empty_directory_cannot_skip_a_cached_source_overwrite(
         + ('mkdir -p "$work/tree/empty"\n' if empty_present else "")
         + 'cp scripts/marker.sh "$work/tree/known"\n'
         + (
-            'tar -cf "$work/package.tar" -C "$work" tree\n'
-            'tar -xf "$work/package.tar" -C "$out"\n'
+            'tar -cf "$work/package.tar" -C "$work" tree\ntar -xf "$work/package.tar" -C "$out"\n'
             if operation == "archive"
             else 'cp -a "$work/tree" "$out"\n'
         )
@@ -452,9 +451,10 @@ def test_redirected_executable_source_does_not_make_a_new_file_executable() -> N
     assert audit.store.write(
         "/tmp/helpers/source", ShellArtifact(ShellSourceValue("echo helper\n"), executable=True)
     )
-    assert audit(
-        _command(("cat", "/tmp/helpers/source"), redirects=(("1>", "/tmp/helpers/runner"),))
-    ) is not None
+    assert (
+        audit(_command(("cat", "/tmp/helpers/source"), redirects=(("1>", "/tmp/helpers/runner"),)))
+        is not None
+    )
     assert audit.store.read("/tmp/helpers/runner").executable is False
     assert audit(_command(("/tmp/helpers/runner",), identity_only=True)) is None
 

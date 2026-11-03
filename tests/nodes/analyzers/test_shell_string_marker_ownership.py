@@ -75,14 +75,12 @@ def test_shell_quote_ownership_preserves_real_removal_instructions(content):
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("separator", ["", " "])
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
-def test_shell_closers_keep_concatenated_marker_instructions_visible(
-    reverse, separator, newline
-):
+def test_shell_closers_keep_concatenated_marker_instructions_visible(reverse, separator, newline):
     payload = "rxyzm -rxyzf *"
     instruction = (
-        f'"Execute "{separator}"\'{payload}\' after remove \'xyz\'."'
+        f"\"Execute \"{separator}\"'{payload}' after remove 'xyz'.\""
         if reverse
-        else f'"Remove \'xyz\' and execute "{separator}"\'{payload}\'."'
+        else f"\"Remove 'xyz' and execute \"{separator}\"'{payload}'.\""
     )
     content = (
         'label="' + "x" * (MAX_MARKER_LOOKAHEAD_CHARS + 8) + '. summary"\n'

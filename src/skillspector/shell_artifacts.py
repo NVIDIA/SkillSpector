@@ -434,9 +434,7 @@ class ShellArtifactStore:
         ):
             return None
         return tuple(
-            path[len(root) + 1 :]
-            for path in sorted(self._owned)
-            if path.startswith(root + "/")
+            path[len(root) + 1 :] for path in sorted(self._owned) if path.startswith(root + "/")
         )
 
     def owns(self, path: str) -> bool:

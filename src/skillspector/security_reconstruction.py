@@ -1922,20 +1922,17 @@ def _classify_directive(
             closes_owned_string=closes_owned_string,
         )
         lookahead_exhausted = lookahead_exhausted or continuation_exhausted
-    if (
-        baseline is not None
-        and any(
-            pattern.search(
-                view.text,
-                min(clause_start, context_start) if context_start is not None else clause_start,
-                lookahead_end,
-            )
-            is not None
-            for pattern in (
-                _UNAMBIGUOUS_ACTION_RE,
-                _CONTEXTUAL_ACTION_RE,
-                _PASTE_ACTION_RE,
-            )
+    if baseline is not None and any(
+        pattern.search(
+            view.text,
+            min(clause_start, context_start) if context_start is not None else clause_start,
+            lookahead_end,
+        )
+        is not None
+        for pattern in (
+            _UNAMBIGUOUS_ACTION_RE,
+            _CONTEXTUAL_ACTION_RE,
+            _PASTE_ACTION_RE,
         )
     ):
         # Even an unbound action can acquire its payload through adjacent
