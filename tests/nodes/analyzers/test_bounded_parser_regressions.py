@@ -525,7 +525,7 @@ def test_new_limitation_inside_later_eval_keeps_its_own_cause_and_carrier(
         "export " + " ".join(f"NAME{index}=0" for index in range(32)) if budget else "read -z VALUE"
     )
     first_carrier = "eval " + shlex.quote(body)
-    consumer = "a" * 4097 + "; sh -c 'echo ok'"
+    consumer = "r" * 4097 + "; sh -c 'echo ok'"
     for _ in range(consumer_nesting + 1):
         consumer = "eval " + shlex.quote(consumer)
     source = first_carrier + "; " + consumer
