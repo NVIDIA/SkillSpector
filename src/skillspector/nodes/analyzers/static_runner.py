@@ -2109,6 +2109,24 @@ def _window_string_closer(
     return closes_string
 
 
+def _python_import_bounds(
+    state: Mapping[str, object], components: list[str], file_cache: Mapping[str, str]
+) -> PythonImportBounds:
+    # Known omitted files still affect import identity. Their absence from the
+    # analyzer work list cannot establish that an import is external.
+    paths = list(components)
+    inventory = state.get("artifact_inventory")
+    if isinstance(inventory, list):
+        paths.extend(
+            path
+            for artifact in inventory
+            if isinstance(artifact, dict)
+            and isinstance(path := artifact.get("path"), str)
+            and path
+        )
+    return PythonImportBounds(paths, file_cache)
+
+
 def _bounded_parse_exhaustion(
     module: object,
     content: str,
@@ -3257,7 +3275,7 @@ def run_static_patterns(
     file_cache = cast(
         dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
     )
-    python_import_bounds = PythonImportBounds(components, file_cache)
+    python_import_bounds = _python_import_bounds(state, components, file_cache)
     raw_file_cache = cast(Mapping[str, bytes] | None, state.get("raw_file_cache"))
     source_classifications = cast(
         Mapping[str, PythonSourceClassification | str] | None,
@@ -3392,7 +3410,7 @@ def run_static_patterns_with_ledger(
     file_cache = cast(
         dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
     )
-    python_import_bounds = PythonImportBounds(components, file_cache)
+    python_import_bounds = _python_import_bounds(state, components, file_cache)
     raw_file_cache = cast(Mapping[str, bytes] | None, state.get("raw_file_cache"))
     source_classifications = cast(
         Mapping[str, PythonSourceClassification | str] | None,
