@@ -72,6 +72,7 @@ from skillspector.python_ast import (
     may_be_python_source,
     resolve_python_source_classification,
 )
+from skillspector.python_import_bounds import PythonImportBounds
 from skillspector.python_tokens import PythonStringClosers
 from skillspector.security_reconstruction import (
     MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
@@ -836,12 +837,18 @@ def _bounded_parser_incomplete(
     complete_context: bool,
     source_start: int = 0,
     diagnostics: list[StaticParserDiagnostic] | None = None,
+    path: str = "",
+    python_import_bounds: PythonImportBounds | None = None,
 ) -> bool:
+    kwargs = {"file_type": file_type, "complete_context": complete_context}
+    if vars(module).get("USES_PYTHON_IMPORT_BOUNDS") is True and python_import_bounds is not None:
+        kwargs["python_import_check"] = lambda check: python_import_bounds.allows(
+            path, view.text, check
+        )
+        kwargs["python_stdlib_check"] = python_import_bounds.allows_stdlib
     detailed_hook = _explicit_analysis_hook(module, "bounded_parse_diagnostic")
     if detailed_hook is not None:
-        diagnostic = detailed_hook(
-            view.text, check_runtime, file_type=file_type, complete_context=complete_context
-        )
+        diagnostic = detailed_hook(view.text, check_runtime, **kwargs)
         if (
             isinstance(diagnostic, StaticParserDiagnostic)
             and diagnostics is not None
@@ -868,11 +875,7 @@ def _bounded_parser_incomplete(
             diagnostics.append(diagnostic)
         return bool(diagnostic)
     hook = getattr(module, "has_bounded_parse_exhaustion", None)
-    return (
-        bool(hook(view.text, check_runtime, file_type=file_type, complete_context=complete_context))
-        if callable(hook)
-        else False
-    )
+    return bool(hook(view.text, check_runtime, **kwargs)) if callable(hook) else False
 
 
 def _public_parser_diagnostic(
@@ -2298,6 +2301,7 @@ def _scan_declared_marker_views(
     complete_context: bool,
     prepared_analyses: Mapping[int, object] | None = None,
     parser_diagnostics: list[StaticParserDiagnostic] | None = None,
+    python_import_bounds: PythonImportBounds | None = None,
 ) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
@@ -2523,6 +2527,8 @@ def _scan_declared_marker_views(
                                 complete_context=complete_context,
                                 source_start=raw_start,
                                 diagnostics=parser_diagnostics,
+                                path=path,
+                                python_import_bounds=python_import_bounds,
                             )
                         )
 
@@ -2555,6 +2561,7 @@ def _scan_all_views_detailed(
     source_cache: _CompleteSourceCache | None = None,
     _oms_projected: bool = False,
     _parent_budget: _FindingBudget | None = None,
+    python_import_bounds: PythonImportBounds | None = None,
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Retain first parser evidence alongside every existing terminal scan result."""
     diagnostics: list[StaticParserDiagnostic] = []
@@ -2584,6 +2591,7 @@ def _scan_all_views_detailed(
             source_cache=source_cache,
             _oms_projected=_oms_projected,
             _parent_budget=_parent_budget,
+            python_import_bounds=python_import_bounds,
             parser_diagnostics=diagnostics,
         )
     except _StaticResourceLimitError as exc:
@@ -2607,6 +2615,7 @@ def _scan_all_views_with_parser_diagnostics(
     source_cache: _CompleteSourceCache | None = None,
     _oms_projected: bool = False,
     _parent_budget: _FindingBudget | None = None,
+    python_import_bounds: PythonImportBounds | None = None,
     parser_diagnostics: list[StaticParserDiagnostic],
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Scan bounded raw windows and return any limit with observed/limit metrics."""
@@ -2644,6 +2653,7 @@ def _scan_all_views_with_parser_diagnostics(
             started_at=started_at,
             python_source=False,
             _parent_budget=_parent_budget,
+            python_import_bounds=python_import_bounds,
         )
         findings = [
             finding
@@ -2695,6 +2705,7 @@ def _scan_all_views_with_parser_diagnostics(
             python_source=False,
             _parent_budget=_parent_budget,
             _oms_projected=True,
+            python_import_bounds=python_import_bounds,
         )
         for finding in findings:
             finding.start_line = finding.end_line = 1
@@ -2890,6 +2901,7 @@ def _scan_all_views_with_parser_diagnostics(
                 complete_context=whole_artifact_window,
                 prepared_analyses=prepared_analyses,
                 parser_diagnostics=parser_diagnostics,
+                python_import_bounds=python_import_bounds,
             )
             bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
@@ -3012,6 +3024,8 @@ def _scan_all_views_with_parser_diagnostics(
                             file_type=_infer_file_type(path),
                             complete_context=True,
                             diagnostics=parser_diagnostics,
+                            path=path,
+                            python_import_bounds=python_import_bounds,
                         )
                     )
         except _StaticResourceLimitError as exc:
@@ -3145,6 +3159,8 @@ def _scan_all_views_with_parser_diagnostics(
                                     complete_context=whole_artifact_window,
                                     source_start=raw_start,
                                     diagnostics=parser_diagnostics,
+                                    path=path,
+                                    python_import_bounds=python_import_bounds,
                                 )
                             )
                 except _StaticResourceLimitError as exc:
@@ -3475,6 +3491,7 @@ def _scan_all_views(
     started_at: float | None = None,
     python_ast: ParsedPythonFile | None = None,
     python_source: bool | None = None,
+    python_import_bounds: PythonImportBounds | None = None,
 ) -> list[Finding]:
     findings, _, _ = _scan_all_views_detailed(
         path,
@@ -3486,6 +3503,7 @@ def _scan_all_views(
         started_at=started_at,
         python_ast=python_ast,
         python_source=python_source,
+        python_import_bounds=python_import_bounds,
     )
     return findings
 
@@ -3567,6 +3585,7 @@ def run_static_patterns(
     file_cache = cast(
         dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
     )
+    python_import_bounds = PythonImportBounds(components, file_cache)
     raw_file_cache = cast(Mapping[str, bytes] | None, state.get("raw_file_cache"))
     source_classifications = cast(
         Mapping[str, PythonSourceClassification | str] | None,
@@ -3663,6 +3682,7 @@ def run_static_patterns(
             python_source=python_source,
             readable_binary=path in readable_binary_paths,
             source_cache=source_cache,
+            python_import_bounds=python_import_bounds,
         )
         runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
         if shared_remaining is not None:
@@ -3702,6 +3722,7 @@ def run_static_patterns_with_ledger(
     file_cache = cast(
         dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
     )
+    python_import_bounds = PythonImportBounds(components, file_cache)
     raw_file_cache = cast(Mapping[str, bytes] | None, state.get("raw_file_cache"))
     source_classifications = cast(
         Mapping[str, PythonSourceClassification | str] | None,
@@ -3874,6 +3895,7 @@ def run_static_patterns_with_ledger(
                             python_source=python_source,
                             readable_binary=bool(artifact.get("readable_binary")),
                             source_cache=source_cache,
+                            python_import_bounds=python_import_bounds,
                         )
                         path_parser_diagnostic = getattr(
                             resource_metrics, "parser_diagnostic", None
