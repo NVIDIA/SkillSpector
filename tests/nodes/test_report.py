@@ -3055,8 +3055,18 @@ def test_parser_cause_scope_and_prefix_measurements_reach_public_reports(
         "llm_requested": False,
     }
     state["analysis_completeness"], state["effective_finding_ids"] = finalize_ledger(state)
+    original_completeness = json.loads(json.dumps(state["analysis_completeness"]))
+    original_ledger = json.loads(json.dumps(state["inspection_ledger"]))
     result = report(state)
-    projected = result["analysis_completeness"]["ledger_exceptions"][0]["parser_diagnostic"]
+    assert state["analysis_completeness"] == original_completeness
+    assert state["inspection_ledger"] == original_ledger
+    projected_exception = result["analysis_completeness"]["ledger_exceptions"][0]
+    original_exception = original_completeness["ledger_exceptions"][0]
+    assert {k: v for k, v in projected_exception.items() if k != "message"} == {
+        k: v for k, v in original_exception.items() if k != "message"
+    }
+    assert description in projected_exception["message"]
+    projected = projected_exception["parser_diagnostic"]
     expected_cause = (
         "boundary_unresolved" if cause == "malformed_input" and not fully_checked else cause
     )
@@ -3081,6 +3091,8 @@ def test_parser_cause_scope_and_prefix_measurements_reach_public_reports(
     measurement = "observed 4097" if fully_checked else "observed at least 4097"
     assert measurement in notification["message"]["text"]
     assert description in notification["message"]["text"]
+    assert notification["message"]["text"] == projected_exception["message"]
+    assert notification["message"]["text"].count(description) == 1
     assert "Resource measurements not recorded" not in notification["message"]["text"]
     assert "unchecked scope: command word" in notification["message"]["text"]
     assert "location: reported source range" in notification["message"]["text"]
@@ -3091,6 +3103,7 @@ def test_parser_cause_scope_and_prefix_measurements_reach_public_reports(
         assert (
             body["analysis_completeness"]["ledger_exceptions"][0]["parser_diagnostic"] == projected
         )
+        assert body["analysis_completeness"] == result["analysis_completeness"]
         assert body["issues"][0]["id"] == "TM1"
     elif output_format in {"terminal", "markdown"}:
         body = (
@@ -3105,6 +3118,13 @@ def test_parser_cause_scope_and_prefix_measurements_reach_public_reports(
         assert "script.sh:2-3" in rendered
         assert "retained finding" in rendered
     validate_sarif_report(result["sarif_report"])
+
+    repeated = report({**state, "analysis_completeness": result["analysis_completeness"]})
+    assert repeated["analysis_completeness"] == result["analysis_completeness"]
+    repeated_notification = repeated["sarif_report"]["runs"][0]["invocations"][0][
+        "toolExecutionNotifications"
+    ][0]
+    assert repeated_notification["message"] == notification["message"]
 
     unknown_event = ledger_event(
         outcome=LedgerOutcome.PARTIAL,

@@ -169,7 +169,8 @@ def _resource_measurement_description(
 
 def _inspection_exception_message(row: Mapping[str, object]) -> str:
     """Describe only vetted parser causes and actual resource measurements."""
-    message = str(row.get("message", ""))
+    original_message = str(row.get("message", ""))
+    message = ""
     diagnostic = sanitize_parser_diagnostic(row.get("parser_diagnostic"))
     details = _resource_measurement_description(row)
     if details:
@@ -202,7 +203,7 @@ def _inspection_exception_message(row: Mapping[str, object]) -> str:
         )
         if measurements:
             message += f" Parser measurements: {measurements}."
-    return message
+    return original_message if original_message.endswith(message) else original_message + message
 
 
 def _inspection_exception_lines(row: Mapping[str, object]) -> tuple[int | None, int | None]:
@@ -2124,6 +2125,19 @@ def report(state: SkillspectorState) -> dict[str, object]:
         or transitive_truncation_reasons
     ) and risk_recommendation == "SAFE":
         risk_recommendation = "CAUTION"
+
+    raw_exceptions = analysis_completeness.get("ledger_exceptions")
+    if isinstance(raw_exceptions, list):
+        analysis_completeness = {
+            **analysis_completeness,
+            "ledger_exceptions": [
+                {**row, "message": _inspection_exception_message(row)}
+                if isinstance(row, Mapping)
+                and sanitize_parser_diagnostic(row.get("parser_diagnostic")) is not None
+                else row
+                for row in raw_exceptions
+            ],
+        }
 
     sarif_report = _build_sarif(
         reported_findings,
