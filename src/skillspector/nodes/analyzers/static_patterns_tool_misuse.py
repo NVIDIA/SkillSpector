@@ -4457,12 +4457,12 @@ def _shell_clause_starts(
             and quote != "'"
             and character == "`"
         ):
-            backtick_starts.add(cursor)
-            yield cursor
             end = _skip_backtick_substitution(
                 content, cursor, limit, check_runtime, end_cache=backtick_ends
             )
             if end is not None:
+                backtick_starts.add(cursor)
+                yield cursor
                 frames.append((end, limit, quote, ansi_c_quote, True))
                 if substitution_scopes is not None:
                     substitution_scopes.append(end)
