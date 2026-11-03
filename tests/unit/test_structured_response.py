@@ -663,8 +663,8 @@ def test_formatting_retries_transient_failures_without_reassessing(
 def test_formatting_shares_the_existing_provider_retry_budget(
     http_model, asynchronous, earlier_failures
 ):
-    failures = {index: 503 for index in range(1, earlier_failures + 1)}
-    failures.update({index: 503 for index in range(earlier_failures + 2, 6)})
+    failures = dict.fromkeys(range(1, earlier_failures + 1), 503)
+    failures.update(dict.fromkeys(range(earlier_failures + 2, 6), 503))
     requests = http_model([('{"findings": [],}', "stop")], failures=failures)
     analyzer = make_analyzer("discovery", timeout=lambda: 120.0)
     analyzer._sleep_before_retry = MagicMock()
@@ -686,7 +686,7 @@ def test_formatting_shares_the_existing_provider_retry_budget(
 def test_formatting_never_extends_the_total_invocation_budget(
     http_model, asynchronous, earlier_failures
 ):
-    failures = {index: 503 for index in range(4, 4 + earlier_failures)}
+    failures = dict.fromkeys(range(4, 4 + earlier_failures), 503)
     if earlier_failures == 2:
         failures[7] = 503
     requests = http_model(
@@ -705,8 +705,7 @@ def test_formatting_never_extends_the_total_invocation_budget(
         else LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
     )
     assert sum(
-        "Repair JSON punctuation" in request["messages"][0]["content"]
-        for request in requests
+        "Repair JSON punctuation" in request["messages"][0]["content"] for request in requests
     ) == (1 if earlier_failures == 2 else 0)
 
 
@@ -790,7 +789,7 @@ def test_formatting_preserves_deadline_and_explicit_no_retry_stops(
 def test_formatting_keeps_native_provider_retry_ownership(http_model, asynchronous, exhausted):
     requests = http_model(
         [('{"findings": [],}', "stop"), ('{"findings": []}', "stop")],
-        failures={index: 503 for index in range(2, 6 if exhausted else 3)},
+        failures=dict.fromkeys(range(2, 6 if exhausted else 3), 503),
     )
     analyzer = make_analyzer("discovery")
     analyzer._sleep_before_retry = MagicMock()
@@ -825,10 +824,12 @@ def test_formatting_backoff_cannot_restart_an_expired_deadline(http_model, async
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_exhausted_formatting_retries_preserve_a_sibling_finding(http_model, asynchronous):
-    answer = '{"findings":[{"rule_id":"SSD-1","message":"leaks data","severity":"HIGH","start_line":1}]}'
+    answer = (
+        '{"findings":[{"rule_id":"SSD-1","message":"leaks data","severity":"HIGH","start_line":1}]}'
+    )
     requests = http_model(
         [('{"findings": [],}', "stop")] * 5 + [(answer, "stop")],
-        failures={index: 503 for index in range(2, 6)},
+        failures=dict.fromkeys(range(2, 6), 503),
     )
     analyzer = make_analyzer("discovery", timeout=lambda: 120.0)
     analyzer._sleep_before_retry = MagicMock()
