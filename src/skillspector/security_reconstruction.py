@@ -1871,12 +1871,11 @@ def _classify_directive(
         return _DirectiveClassification(None, False, True)
 
     baseline = None
-    if context_start is not None:
+    if context_start is not None or closes_owned_string is not None:
         baseline = _classify_directive(
             view,
             directive,
             end_is_truncated=end_is_truncated,
-            closes_owned_string=closes_owned_string,
         )
         if baseline.active or not baseline.limited:
             return baseline
@@ -1925,9 +1924,13 @@ def _classify_directive(
         lookahead_exhausted = lookahead_exhausted or continuation_exhausted
     if (
         baseline is not None
-        and context_start is not None
         and any(
-            pattern.search(view.text, min(clause_start, context_start), lookahead_end) is not None
+            pattern.search(
+                view.text,
+                min(clause_start, context_start) if context_start is not None else clause_start,
+                lookahead_end,
+            )
+            is not None
             for pattern in (
                 _UNAMBIGUOUS_ACTION_RE,
                 _CONTEXTUAL_ACTION_RE,
@@ -1938,6 +1941,8 @@ def _classify_directive(
         # Even an unbound action can acquire its payload through adjacent
         # literals. Wrapper proof may repair an inert method-like header, but
         # it cannot clear a prior limit for a potentially active instruction.
+        # Proven host closers have the same restriction: adjacent literals can
+        # supply the payload after a closer shortens the lexical sentence.
         # Ambiguous or negated action cues also retain that conservative result.
         return baseline
     payloads = _quoted_payloads(view.text, directive, scope_end)
