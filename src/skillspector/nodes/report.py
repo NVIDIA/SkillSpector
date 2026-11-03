@@ -45,6 +45,7 @@ from skillspector.inspection_ledger import (
     RESOURCE_MEASUREMENT_UNITS,
     RULE_SET_SCOPE,
     AnalysisCompleteness,
+    ParserCause,
     finalize_ledger,
     only_missing_reference_exceptions,
     resource_measurements,
@@ -136,6 +137,20 @@ _SANITIZED_FIELDS = (
 
 _REPORT_SAFE_SOURCE_ID_RE = re.compile(r"external/[0-9a-f]{64}\Z")
 
+_PARSER_CAUSE_DESCRIPTIONS = {
+    ParserCause.RESOURCE_LIMIT: "SkillSpector reached a configured inspection limit.",
+    ParserCause.BOUNDARY_UNRESOLVED: (
+        "SkillSpector could not determine this command or code fragment's boundaries."
+    ),
+    ParserCause.MALFORMED_INPUT: (
+        "This code fragment has invalid syntax (its structure is not valid for this language)."
+    ),
+    ParserCause.UNSUPPORTED_SYNTAX: "SkillSpector cannot fully inspect this code pattern yet.",
+    ParserCause.RUNTIME_DEPENDENT: (
+        "Full inspection depends on information available only when this code runs."
+    ),
+}
+
 
 def _resource_measurement_description(
     row: Mapping[str, object], *, lower_bound: bool = False
@@ -159,12 +174,24 @@ def _inspection_exception_message(row: Mapping[str, object]) -> str:
     details = _resource_measurement_description(row)
     if details:
         message += f" Measurements: {details}."
-    elif str(row.get("reason_code", "")).endswith("_limit") and not (
-        diagnostic is not None and resource_measurements(diagnostic)
+    elif str(row.get("reason_code", "")).endswith("_limit") and (
+        diagnostic is None
+        or (
+            diagnostic["cause"] is ParserCause.RESOURCE_LIMIT
+            and not resource_measurements(diagnostic)
+        )
     ):
         message += " Resource measurements not recorded."
     if diagnostic is not None:
-        message += f" Parser cause: {diagnostic['cause']}; check: {diagnostic['check']}; location: {diagnostic['location_precision']}; unchecked scope: {diagnostic['unchecked_scope']}."
+        message += f" {_PARSER_CAUSE_DESCRIPTIONS[diagnostic['cause']]}"
+        check = diagnostic["check"].replace("_", " ")
+        scope = diagnostic["unchecked_scope"].replace("_", " ")
+        location = (
+            "reported source range"
+            if diagnostic["location_precision"] == "source_span"
+            else "enclosing expression (exact inner location unavailable)"
+        )
+        message += f" Check: {check}; location: {location}; unchecked scope: {scope}."
         message += (
             " Relevant parser input fully checked."
             if diagnostic["full_input_checked"]
