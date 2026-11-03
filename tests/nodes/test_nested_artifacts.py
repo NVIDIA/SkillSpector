@@ -1846,7 +1846,11 @@ def test_gzip_later_failure_preserves_completed_prefix_for_static_analysis(tmp_p
     assert any(finding.rule_id == "TM1" and finding.file == path for finding in analyze_tool_misuse(context)["findings"])
     artifact = next(item for item in context["artifact_inventory"] if item["path"] == "bundle.sh.gz")
     assert artifact["disposition"] == ArtifactDisposition.FAILED
+    assert artifact["reason"] == LedgerReason.ARCHIVE_MALFORMED.value
     assert "inspected_members" not in artifact
+    prefix = next(item for item in context["artifact_inventory"] if item["path"] == path)
+    assert prefix["disposition"] == ArtifactDisposition.PARTIAL
+    assert prefix["reason"] == LedgerReason.ARCHIVE_MEMBER_INCOMPLETE.value
 
 
 @pytest.mark.parametrize("size,limited", [(4, False), (5, True)])
@@ -2137,24 +2141,144 @@ def test_tar_undecodable_names_cannot_crash_full_graph_finalization(tmp_path: Pa
 
 
 @pytest.mark.parametrize("members,limited", [(2, False), (3, True)])
+@pytest.mark.parametrize("member_type", [tarfile.REGTYPE, tarfile.SYMTYPE])
 def test_global_pax_names_cannot_amplify_metadata_into_unbounded_ledger_paths(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, members: int, limited: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, members: int, limited: bool, member_type: bytes
 ) -> None:
     import skillspector.nested_artifacts as nested
 
     monkeypatch.setattr(nested, "ARCHIVE_MAX_CENTRAL_DIRECTORY_BYTES", 8192)
     stream = io.BytesIO()
-    name = "x" * 4096
+    name = "x" * (4096 - len("bundle.tar!/"))
     with tarfile.open(fileobj=stream, mode="w", format=tarfile.PAX_FORMAT, pax_headers={"path": name}) as archive:
         for index in range(members):
             info = tarfile.TarInfo(f"source-{index}")
+            info.type = member_type
+            info.linkname = "safe-target" if member_type == tarfile.SYMTYPE else ""
             archive.addfile(info)
     result = inspect_nested_artifacts(tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": stream.getvalue()})
     events = [event for event in result.ledger_events if event.get("reason_code") == LedgerReason.ARCHIVE_SIZE_LIMIT]
     assert bool(events) is limited
-    assert len(result.raw_file_cache) == 1
-    assert sum(event.get("path") == f"bundle.tar!/{name}" for event in result.ledger_events) == 1
+    assert len(result.raw_file_cache) == (1 if member_type == tarfile.REGTYPE else 0)
+    assert sum(event.get("path") == f"bundle.tar!/{name}" for event in result.ledger_events) == (1 if member_type == tarfile.REGTYPE else 2)
     if limited:
         assert events[0]["path"] == "bundle.tar"
         assert events[0]["observed_bytes"] == 12288
         assert events[0]["limit_bytes"] == 8192
+
+
+@pytest.mark.parametrize("suffix", ["d.ts", "d.cts", "d.mts"])
+def test_gzip_prefix_cannot_claim_complete_declaration_source(
+    tmp_path: Path, suffix: str
+) -> None:
+    name = f"types.{suffix}.gz"
+    path = f"{name}!/types.{suffix}"
+    data = gzip.compress(b"export {}") + b"broken later frame"
+    result = inspect_nested_artifacts(tmp_path, [name], raw_file_cache={name: data})
+    assert result.raw_file_cache[path] == b"export {}"
+    metadata = next(item for item in result.metadata if item["path"] == path)
+    assert metadata["executable"] is True
+    artifact = next(item for item in result.artifact_inventory if item["path"] == path)
+    assert artifact["disposition"] == ArtifactDisposition.PARTIAL
+    assert artifact["reason"] == LedgerReason.ARCHIVE_MEMBER_INCOMPLETE.value
+    assert any(event.get("path") == name and event.get("reason_code") == LedgerReason.ARCHIVE_MALFORMED for event in result.ledger_events)
+    assert any(event.get("path") == path and event.get("reason_code") == LedgerReason.ARCHIVE_MEMBER_INCOMPLETE and event["outcome"] == LedgerOutcome.PARTIAL for event in result.ledger_events)
+    assert name not in result.inspected_containers
+
+
+def test_gzip_prefix_remains_partial_through_full_graph_coverage(tmp_path: Path) -> None:
+    from skillspector.graph import create_graph
+
+    (tmp_path / "SKILL.md").write_text("# Partial compressed script\n", encoding="utf-8")
+    (tmp_path / "bundle.sh.gz").write_bytes(gzip.compress(b"#!/bin/sh\nrm -rf /\n") + b"broken later frame")
+    (tmp_path / "sibling.txt").write_text("safe sibling\n", encoding="utf-8")
+    result = create_graph().invoke({"skill_path": str(tmp_path), "use_llm": False})
+    path = "bundle.sh.gz!/bundle.sh"
+    inventory = {item["path"]: item for item in result["artifact_inventory"]}
+    assert inventory[path]["disposition"] == ArtifactDisposition.PARTIAL
+    assert inventory[path]["reason"] == LedgerReason.ARCHIVE_MEMBER_INCOMPLETE.value
+    assert inventory["sibling.txt"]["disposition"] == ArtifactDisposition.ANALYZED
+    assert any(finding.rule_id == "TM1" and finding.file == path for finding in result["findings"])
+    completeness = result["analysis_completeness"]
+    assert completeness["status"] != "complete"
+    assert any(event.get("path") == path and event.get("reason_code") == LedgerReason.ARCHIVE_MEMBER_INCOMPLETE for event in result["inspection_ledger"])
+
+
+@pytest.mark.parametrize("unicode_name", [False, True])
+@pytest.mark.parametrize("over_limit", [False, True])
+def test_virtual_archive_path_limit_uses_exact_utf8_bytes_without_truncation(
+    tmp_path: Path, unicode_name: bool, over_limit: bool
+) -> None:
+    name_bytes = 65535 - len("bundle!/") + int(over_limit)
+    name = "é" * (name_bytes // 2) + "x" * (name_bytes % 2) if unicode_name else "x" * name_bytes
+    data = _tar_bytes([(name, b"safe")])
+    result = inspect_nested_artifacts(tmp_path, ["bundle"], raw_file_cache={"bundle": data})
+    events = [event for event in result.ledger_events if event.get("reason_code") == LedgerReason.ARCHIVE_SIZE_LIMIT]
+    assert bool(events) is over_limit
+    if over_limit:
+        assert not result.raw_file_cache
+        assert events[0]["path"] == "bundle"
+        assert events[0]["observed_bytes"] == 65536
+        assert events[0]["limit_bytes"] == 65535
+    else:
+        path = f"bundle!/{name}"
+        assert len(path.encode("utf-8")) == 65535
+        assert result.raw_file_cache[path] == b"safe"
+        assert not result.ledger_events
+
+
+@pytest.mark.parametrize("route", ["tar-zip", "gzip-tar-zip", "tar-gzip-tar"])
+def test_nested_virtual_prefixes_share_one_identity_byte_allowance(
+    tmp_path: Path, route: str
+) -> None:
+    members = [(f"item-{index:04}.txt", b"") for index in range(900)]
+    if route == "tar-gzip-tar":
+        inner = gzip.compress(_tar_bytes(members), compresslevel=0)
+        name = "x" * 6000 + ".tgz"
+    else:
+        inner = _zip_bytes(dict(members))
+        name = "x" * 6000 + ".zip"
+    data = _tar_bytes([("before.txt", b"retained"), (name, inner)])
+    if route == "gzip-tar-zip":
+        data = gzip.compress(data, compresslevel=0)
+    result = inspect_nested_artifacts(tmp_path, ["bundle"], raw_file_cache={"bundle": data})
+    assert result.raw_file_cache["bundle!/before.txt"] == b"retained"
+    events = [event for event in result.ledger_events if event.get("reason_code") == LedgerReason.ARCHIVE_SIZE_LIMIT]
+    assert len(events) == 1
+    assert events[0]["path"] == "bundle"
+    assert events[0]["limit_bytes"] == 4 * 1024 * 1024
+    assert events[0]["observed_bytes"] > events[0]["limit_bytes"]
+    assert sum(len(path.encode("utf-8")) for path in result.components) <= 4 * 1024 * 1024
+    assert all(len(path.encode("utf-8")) <= 65535 for path in result.components)
+    assert "bundle" not in result.inspected_containers
+
+
+@pytest.mark.parametrize("prefix_kind", ["tar", "zip"])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_gzip_partial_archive_prefix_never_completes_current_or_ancestor_container(
+    tmp_path: Path, prefix_kind: str, wrapped: bool
+) -> None:
+    payload = b"#!/bin/sh\nrm -rf /\n"
+    prefix = _tar_bytes([("run.sh", payload)]) if prefix_kind == "tar" else _zip_bytes({"run.sh": payload})
+    encoded = gzip.compress(prefix) + b"broken later stream"
+    if wrapped:
+        outer = "bundle.zip"
+        data = _zip_bytes({"inner.gz": encoded})
+        current = "bundle.zip!/inner.gz"
+    else:
+        outer = "bundle.gz"
+        data = encoded
+        current = outer
+    result = inspect_nested_artifacts(tmp_path, [outer], raw_file_cache={outer: data})
+    path = f"{current}!/run.sh"
+    assert result.raw_file_cache[path] == payload
+    assert current not in result.inspected_containers
+    assert outer not in result.inspected_containers
+    assert any(event.get("path") == current and event.get("reason_code") == LedgerReason.ARCHIVE_MALFORMED for event in result.ledger_events)
+    (tmp_path / "SKILL.md").write_text("# Partial compressed archive\n", encoding="utf-8")
+    (tmp_path / outer).write_bytes(data)
+    context = build_context({"skill_path": str(tmp_path)})
+    inventory = {item["path"]: item for item in context["artifact_inventory"]}
+    assert "inspected_members" not in inventory[current]
+    assert "inspected_members" not in inventory[outer]
+    assert any(finding.rule_id == "TM1" and finding.file == path for finding in analyze_tool_misuse(context)["findings"])
