@@ -832,6 +832,7 @@ def _skip_static_heredoc_bodies(
     joins unquoted continuations while retaining at most one delimiter's width.
     """
     cursor = start
+    expected_crlf = content[start - 2 : start] == "\r\n" if start > 0 else None
     for delimiter, strip_tabs, quoted in pending:
         logical_prefix = ""
         while cursor < limit:
@@ -839,12 +840,15 @@ def _skip_static_heredoc_bodies(
                 check_runtime()
             newline = content.find("\n", cursor, limit)
             line_end = limit if newline < 0 else newline
-            crlf = line_end > cursor and content[line_end - 1] == "\r"
-            if newline >= 0 and start > 0 and crlf != (content[start - 2 : start] == "\r\n"):
-                # Mixed line endings cannot manufacture a delimiter that the
-                # declaring line did not establish. Body-only callers have
-                # no declaring newline and retain their literal CRLF support.
-                return None
+            crlf = newline >= 0 and line_end > cursor and content[line_end - 1] == "\r"
+            if newline >= 0:
+                if expected_crlf is None:
+                    expected_crlf = crlf
+                elif crlf != expected_crlf:
+                    # Mixed physical endings cannot manufacture a delimiter.
+                    # Body-only callers establish the style on their first
+                    # complete line; uniformly CRLF bodies remain supported.
+                    return None
             if crlf:
                 line_end -= 1
             line = content[cursor:line_end]
@@ -2470,13 +2474,23 @@ def _shell_quoted_candidate_limits(
                 continue
             if quote is not None and character == quote:
                 closers.add(cursor)
-                if (
-                    not ansi_c
-                    and "\n" not in content[quote_start:cursor]
-                    and "\r" not in content[quote_start:cursor]
-                ):
+                if not ansi_c:
+                    single_line = "\n" not in content[quote_start:cursor] and "\r" not in content[
+                        quote_start:cursor
+                    ]
                     for position in candidates:
-                        limits[position] = cursor
+                        if single_line or (
+                            quote == '"'
+                            and content.startswith("$(", position)
+                            and substitution_cache.get(position) == cursor
+                            and _static_printf_substitution(
+                                content, position, cursor, quoted_result=True
+                            )
+                            is not None
+                        ):
+                            # Only a proved literal printf at the quote's end
+                            # may refine a multiline substitution candidate.
+                            limits[position] = cursor
                 quote = None
                 cursor += 1
                 continue
@@ -2629,6 +2643,13 @@ def _quoted_candidate_is_complete(
     end = quote_limits.get(start) if quote_limits is not None else None
     if end is None:
         return False
+    if (
+        quoted_printf_allowed
+        and content.startswith("$(", start)
+        and _skip_command_substitution(content, start, end, check_runtime) == end
+        and _static_printf_substitution(content, start, end, quoted_result=True) is not None
+    ):
+        return True
     fragment = content[start:end]
     parsed = _parse_shell_command_word(
         fragment, 0, check_runtime=check_runtime, quoted_printf_allowed=quoted_printf_allowed
@@ -2944,7 +2965,11 @@ def _has_shell_command_word_exhaustion(
                     substitution_end,
                     check_runtime=check_runtime,
                 ):
-                    return True
+                    if not _quoted_candidate_is_complete(
+                        content, start, quote_limits, check_runtime, quoted_printf_allowed
+                    ):
+                        return True
+                    continue
             if content[start] == "`":
                 substitution_end = _skip_backtick_substitution(
                     content, start, len(content), check_runtime, end_cache=backtick_end_cache

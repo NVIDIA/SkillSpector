@@ -246,6 +246,30 @@ def test_heredoc_delimiter_can_end_at_eof(body: str) -> None:
     ) == len(body)
 
 
+@pytest.mark.parametrize(
+    "newline, closing, complete",
+    [
+        ("\n", "EOF\n", True),
+        ("\n", "EOF\r\n", False),
+        ("\r\n", "EOF\r\n", True),
+        ("\r\n", "EOF\n", False),
+        ("\n", "EOF", True),
+        ("\n", "EOF\r", False),
+        ("\r\n", "EOF", True),
+        ("\r\n", "EOF\r", False),
+    ],
+)
+def test_heredoc_delimiter_preserves_body_newline_style(
+    newline: str, closing: str, complete: bool
+) -> None:
+    content = "literal body" + newline + closing
+    end = tm._skip_static_heredoc_bodies(
+        content, 0, len(content), (("EOF", False, True),), lambda: None
+    )
+
+    assert (end == len(content)) is complete
+
+
 def test_large_continued_heredoc_checks_runtime_and_keeps_raw_commands() -> None:
     body = ("x" * 5000 + "\\\n") * 40 + "END\n$CMD -rf /\nEND\n"
     checks = 0
@@ -812,6 +836,41 @@ def test_quoted_printf_preserves_multiline_literal_value(newline: str) -> None:
     assert not tm.has_bounded_parse_exhaustion(
         f'test "$observed" = "{substitution}"\n', lambda: None, file_type="shell"
     )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    "prefix, argument, suffix, complete_context",
+    [
+        ("", '"$VALUE"', "", True),
+        ("", '"$($CMD -rf /)"', "", True),
+        ('printf() { "$CMD" "$@"; }\n', '"known value"', "", True),
+        ("", '"known value"', "$CMD -rf /\n", True),
+        ("", '"known value"', 'echo "\n' + "#" * 6000, True),
+        ("", '"known value"', "", False),
+    ],
+)
+def test_multiline_printf_quote_proof_keeps_unresolved_commands_partial(
+    prefix: str, argument: str, suffix: str, complete_context: bool, newline: str
+) -> None:
+    source = prefix + 'test x = "$(printf "%s\\n" "first value" \\\n  ' + argument + ')"\n' + suffix
+
+    assert tm.has_bounded_parse_exhaustion(
+        source.replace("\n", newline),
+        lambda: None,
+        file_type="shell",
+        complete_context=complete_context,
+    )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_multiline_printf_quote_proof_preserves_destructive_execution(newline: str) -> None:
+    source = '"$(printf "%s%s" r \\\n  m)" -rf /\n'.replace("\n", newline)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["run.sh"], "file_cache": {"run.sh": source}}, [tm]
+    )
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
 
 
 @pytest.mark.parametrize(
