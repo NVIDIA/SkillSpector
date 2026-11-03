@@ -98,6 +98,39 @@ def test_non_mapping_toml_tool_preserves_earlier_supply_chain_results(monkeypatc
     )
 
 
+def test_oversized_toml_integer_does_not_drop_existing_supply_chain_findings(monkeypatch):
+    earlier = Finding(
+        rule_id="SC5", severity="HIGH", file="requirements.txt", message="Existing risk"
+    )
+    monkeypatch.setattr(
+        supply_chain.static_runner,
+        "run_static_patterns_with_ledger",
+        lambda *_args: {
+            "findings": [earlier],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+        },
+    )
+    files = {
+        "requirements.txt": "risky-package==1.0.0\n",
+        "pyproject.toml": "[project]\nname = " + "9" * 5_000,
+    }
+
+    response = supply_chain.node({"components": list(files), "file_cache": files})
+
+    assert response["findings"] == [earlier]
+    assert not any(
+        event["outcome"] is LedgerOutcome.FAILED for event in response["inspection_ledger"]
+    )
+
+
+@pytest.mark.parametrize("path", ["pyproject.toml", ".cargo/config.toml"])
+def test_oversized_toml_integer_does_not_abort_dependency_source_scan(path):
+    content = "value = " + "9" * 5_000
+
+    assert analyze_dependency_sources([path], {path: content}) == []
+
+
 @pytest.mark.parametrize(
     ("target", "canonical", "body"),
     [

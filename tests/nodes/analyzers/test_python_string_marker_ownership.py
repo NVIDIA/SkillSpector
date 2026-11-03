@@ -182,6 +182,66 @@ def test_python_helper_with_removal_verb_at_string_end_scans_complete(content: s
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
+@pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_bounded_lookbehind_cannot_invent_marker_quote_context(quote: str, newline: str) -> None:
+    # The bounded lookbehind starts inside the first long literal. Its period
+    # looks like a sentence boundary, and the closer then looks like an opener.
+    content = (
+        "LABEL = "
+        + quote
+        + "x" * (MAX_MARKER_LOOKAHEAD_CHARS + 8)
+        + ". summary"
+        + quote
+        + "\nresult = value.strip() or f"
+        + quote
+        + "{name}"
+        + quote
+        + "\n"
+        + _UNQUOTED_TAIL
+    ).replace("\n", newline)
+    closers = PythonStringClosers(content, lambda: None)
+
+    for closer_test in (None, closers.closes_string):
+        projection = build_declared_marker_views(
+            SecurityTextView("raw", content),
+            validated_string_closer=closer_test,
+        )
+        assert projection.views == ()
+        assert projection.limited is False
+
+    result = _ledger("scripts/check.py", content, pi_module)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize("concatenation", [" ", " + "])
+@pytest.mark.parametrize("marker", ["xyz", "x y"], ids=["supported", "unsupported"])
+@pytest.mark.parametrize("action", ["execute", "call"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward-action", "reverse-action"])
+def test_wrapper_context_keeps_concatenated_marker_payload_partial(
+    concatenation: str, marker: str, action: str, reverse: bool
+) -> None:
+    payload = f"r{marker}m -r{marker}f *"
+    instruction = (
+        f"\"{action.capitalize()} \"{concatenation}\"'{payload}' after remove '{marker}'.\""
+        if reverse
+        else f"\"Remove '{marker}' and {action} \"{concatenation}\"'{payload}'.\""
+    )
+    content = (
+        'LABEL = "' + "x" * (MAX_MARKER_LOOKAHEAD_CHARS + 8) + '. summary"\n'
+        'result = value.strip() or f"{name}"\n'
+        "note = " + instruction + "\n" + _UNQUOTED_TAIL
+    )
+
+    result = _ledger("scripts/check.py", content)
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"]) or any(
+        event["reason_code"] is LedgerReason.OBFUSCATED_INSTRUCTION_TEXT
+        for event in result["inspection_ledger"]
+        if event["outcome"] is LedgerOutcome.PARTIAL
+    )
+
+
 def test_string_ownership_maps_into_later_static_windows() -> None:
     prefix = "".join(f"value_{index} = {index}\n" for index in range(24_000))
     content = prefix + _ASSERT_FLAG + _LITERAL_TAIL

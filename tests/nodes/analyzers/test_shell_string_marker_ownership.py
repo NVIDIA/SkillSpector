@@ -150,6 +150,7 @@ def test_reconstructed_commands_receive_all_security_views(command):
         assert finding.file == prepared.path
         assert finding.start_line == 2
         assert finding.start_column == 8
+        assert finding.surface == "code"
         assert detail["consumer_start"] == prepared.content.index('"$program"')
         assert detail["origins"][0]["path"] == "scripts/library.sh"
         assert detail["command_line"] == 1
@@ -198,7 +199,10 @@ def test_reconstructed_view_construction_budget_is_shared_across_variants():
 
 
 @pytest.mark.parametrize("child_reports_limit", [False, True])
-def test_reconstructed_prefix_survives_expired_parent_emission(monkeypatch, child_reports_limit):
+@pytest.mark.parametrize("command", ["rm -rf /\n", "# rm -rf /\n"])
+def test_reconstructed_prefix_survives_expired_parent_emission(
+    monkeypatch, child_reports_limit, command
+):
     now = [0]
     budget = static_runner._FindingBudget(1000, 0, 10, lambda: now[0])
     detailed = static_runner._scan_all_views_detailed
@@ -216,11 +220,12 @@ def test_reconstructed_prefix_survives_expired_parent_emission(monkeypatch, chil
         return findings, reason, metrics
 
     monkeypatch.setattr(static_runner, "_scan_all_views_detailed", expire_after_discovery)
-    prepared, findings, limit, _ = _reconstructed_scan(["rm -rf /\n"], budget=budget)
+    prepared, findings, limit, _ = _reconstructed_scan([command], budget=budget)
     assert limit is not None and limit.reason == LedgerReason.RUNTIME_LIMIT
     assert len(findings) == 1
     assert findings[0].file == prepared.path and findings[0].start_line == 2
     assert findings[0].evidence["reconstructed_shell_source"]["command_line"] == 1
+    assert findings[0].surface == "code"
     assert budget.emitted_findings == 1
 
 
