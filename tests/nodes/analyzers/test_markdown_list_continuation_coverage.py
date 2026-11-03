@@ -197,9 +197,7 @@ def test_mismatched_table_columns_keep_list_inline_ownership(body: str, newline:
     "header",
     ["`$(resolve_tool).example | ` -rf /", "`$CMD -rf /`", "`printf 'x' | cat`."],
 )
-def test_table_column_lookahead_preserves_runtime_command_gaps(
-    header: str, newline: str
-) -> None:
+def test_table_column_lookahead_preserves_runtime_command_gaps(header: str, newline: str) -> None:
     source = ("10. Example:\n    " + header + "\n    --- | ---\n").replace("\n", newline)
     if "|" in header:
         assert tool._markdown_shell_text(source, lambda: None) == source
