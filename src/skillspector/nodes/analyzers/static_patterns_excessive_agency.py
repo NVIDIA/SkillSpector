@@ -223,6 +223,9 @@ _EA5_INLINE_DIRECTIVE_PREFIX = re.compile(
 )
 _EA5_FENCE = re.compile(r"^[ \t]*(?P<marker>`{3,}|~{3,})[ \t]*(?P<language>[\w+-]*)")
 _EA5_SHELL_FENCE_LANGUAGES = {"bash", "console", "sh", "shell", "zsh"}
+_EA5_LEADING_OPTION = re.compile(r"--?[A-Za-z0-9]")
+# POSIX shell, PowerShell and CMD line continuations.
+_EA5_LINE_CONTINUATION = re.compile(r"[\\`^][ \t]*$")
 _EA5_MODEL_VALUE = re.compile(
     r"^(?:claude|gpt|gemini|deepseek|kimi|glm|minimax|mistral|llama)"
     r"(?:$|[-_./:0-9])",
@@ -277,7 +280,7 @@ def _is_model_switch_command(command: str) -> bool:
     return False
 
 
-def _command_span(line: str) -> tuple[int, int] | None:
+def _command_span(line: str, *, continued: bool = False) -> tuple[int, int] | None:
     """Return the model-switch command span for an actionable instruction line."""
     # Inline code is handled separately so surrounding prose and punctuation do
     # not become part of the command span (or create a duplicate finding).
@@ -292,6 +295,11 @@ def _command_span(line: str) -> tuple[int, int] | None:
         candidate = candidate[prompt_width:]
 
     command = candidate.strip().strip("`")
+    # A line that starts with an option names no executable. Help output lists
+    # options this way ("-m, --model   Claude model to use"), so such a line is
+    # only part of a command when the previous line continues one.
+    if not continued and _EA5_LEADING_OPTION.match(command):
+        return None
     if _is_model_switch_command(command):
         start = line.find(command, leading)
         return start, start + len(command)
@@ -356,6 +364,7 @@ def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
     cursor = body_start
     fence_marker: str | None = None
     fence_language = ""
+    continued = False
     for line in content[body_start:].splitlines(keepends=True):
         line_text = line.rstrip("\r\n")
         fence = _EA5_FENCE.match(line_text)
@@ -368,6 +377,9 @@ def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
                 fence_marker = None
                 fence_language = ""
             cursor += len(line)
+            # A fence line ends any command, so a continuation on the line before it
+            # does not carry into the fence.
+            continued = False
             continue
 
         candidates: list[tuple[int, int]] = []
@@ -376,7 +388,7 @@ def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
             or fence_language in _EA5_SHELL_FENCE_LANGUAGES
             or not fence_language
         ):
-            direct = _command_span(line_text)
+            direct = _command_span(line_text, continued=continued)
             if direct is not None:
                 candidates.append(direct)
         for inline in _EA5_INLINE_CODE.finditer(line_text):
@@ -404,6 +416,7 @@ def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
                     evidence={"selection_surface": "command"},
                 )
             )
+        continued = _EA5_LINE_CONTINUATION.search(line_text) is not None
         cursor += len(line)
     return findings
 

@@ -25,6 +25,7 @@ from langchain_core.messages import AIMessage
 from contrib.batch_scan import batch_scan, runner
 from contrib.batch_scan.gap_fill import run_gap_fill
 from skillspector import llm_analyzer_base
+from skillspector.models import Finding
 from skillspector.nodes.build_context import build_context
 
 _SECRET = "DUMMY_EXTERNAL_SECRET_NEVER_SEND"
@@ -215,6 +216,153 @@ def test_gap_fill_provider_prompt_excludes_symlink_target(
     assert entry["issues"] == []
 
 
+def test_gap_fill_findings_update_risk_report_and_exit_status(
+    batch_skill, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    skill, _ = batch_skill
+    original_result = {
+        "active_findings": [],
+        "filtered_findings": [],
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "risk_recommendation": "SAFE",
+        "component_metadata": [],
+        "has_executable_scripts": False,
+    }
+    _mock_scan(monkeypatch, lambda context: context.update(original_result))
+    findings = [
+        Finding(
+            rule_id=rule_id,
+            message=f"{rule_id} gap-fill finding",
+            severity="HIGH",
+            confidence=1.0,
+            file="SKILL.md",
+            category="Security",
+        )
+        for rule_id in ("P5", "P6", "P7")
+    ]
+    monkeypatch.setattr(runner, "run_gap_fill", lambda *args, **kwargs: findings)
+    entry, error = runner.run_one(
+        skill,
+        skill.parent,
+        use_llm=True,
+        detected_language="zh",
+        apply_gap_fill=True,
+    )
+
+    assert error is None
+    assert entry["risk_assessment"] == {
+        "score": 75,
+        "severity": "HIGH",
+        "recommendation": "DO NOT INSTALL",
+    }
+    assert entry["enhancements"]["gap_fill_findings"] == 3
+
+    monkeypatch.setattr(batch_scan, "discover_skills", lambda root: [skill])
+    monkeypatch.setattr(
+        batch_scan,
+        "_scan_skill_bounded",
+        lambda *args, **kwargs: (entry, None, skill.name),
+    )
+    monkeypatch.setattr(batch_scan, "create_api_key_pool_from_env", lambda: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["batch_scan", str(skill.parent), "--workers", "1", "-f", "markdown"],
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        batch_scan._main_impl()
+
+    assert exited.value.code == 1
+    output = capsys.readouterr().out
+    assert "75/100 HIGH" in output
+    assert "HIGH / CRITICAL Issue Details" in output
+    assert "P5" in output and "P6" in output and "P7" in output
+
+
+def test_empty_gap_fill_preserves_core_risk_assessment(
+    batch_skill, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    skill, _ = batch_skill
+    findings = [
+        Finding(
+            rule_id=rule_id,
+            message=f"{rule_id} core finding",
+            severity="MEDIUM",
+            confidence=1.0,
+            file="SKILL.md",
+            category="Security",
+        )
+        for rule_id in ("P5", "P6", "P7")
+    ]
+    original_result = {
+        "active_findings": findings,
+        "filtered_findings": findings,
+        "risk_score": 30,
+        "risk_severity": "MEDIUM",
+        "risk_recommendation": "CAUTION",
+    }
+    _mock_scan(monkeypatch, lambda context: context.update(original_result))
+    monkeypatch.setattr(runner, "run_gap_fill", lambda *args, **kwargs: [])
+
+    entry, error = runner.run_one(
+        skill,
+        skill.parent,
+        use_llm=True,
+        detected_language="zh",
+        apply_gap_fill=True,
+    )
+
+    assert error is None
+    assert entry["risk_assessment"] == {
+        "score": 30,
+        "severity": "MEDIUM",
+        "recommendation": "CAUTION",
+    }
+    assert entry["enhancements"]["gap_fill_applied"] is True
+    assert entry["enhancements"]["gap_fill_findings"] == 0
+
+
+def test_gap_fill_preserves_caution_for_incomplete_scan(
+    batch_skill, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    skill, _ = batch_skill
+    original_result = {
+        "active_findings": [],
+        "filtered_findings": [],
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "risk_recommendation": "CAUTION",
+        "component_metadata": [],
+        "has_executable_scripts": False,
+    }
+    _mock_scan(monkeypatch, lambda context: context.update(original_result))
+    finding = Finding(
+        rule_id="P5",
+        message="Low-severity gap-fill finding",
+        severity="LOW",
+        confidence=1.0,
+        file="SKILL.md",
+        category="Security",
+    )
+    monkeypatch.setattr(runner, "run_gap_fill", lambda *args, **kwargs: [finding])
+
+    entry, error = runner.run_one(
+        skill,
+        skill.parent,
+        use_llm=True,
+        detected_language="zh",
+        apply_gap_fill=True,
+    )
+
+    assert error is None
+    assert entry["risk_assessment"]["score"] > 0
+    assert entry["risk_assessment"]["severity"] == "LOW"
+    assert entry["risk_assessment"]["recommendation"] == "CAUTION"
+    assert entry["enhancements"]["gap_fill_findings"] == 1
+
+
 @pytest.mark.parametrize(
     "failure_mode", ["json", "schema", "provider", "runtime_signal", "missing_findings"]
 )
@@ -314,7 +462,7 @@ def test_gap_fill_failure_is_incomplete_and_preserves_findings(
     assert payload["batch"]["enhancements"]["gap_fill_applied"] == 0
     assert payload["batch"]["inspection_completeness"]["incomplete_skills"] == 1
     assert expected_reason in reports._format_terminal([entry])
-    assert expected_reason.replace("_", "\\_") in reports._format_markdown([entry])
+    assert expected_reason.replace("_", r"\_") in reports._format_markdown([entry])
     expected_failed_calls = 4 if failure_mode in {"json", "schema", "missing_findings"} else 1
     assert len(calls) == expected_failed_calls + int(partial_success)
     monkeypatch.setattr(

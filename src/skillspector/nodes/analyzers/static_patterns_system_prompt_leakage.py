@@ -24,11 +24,18 @@ Framework: LLM07.
 
 from __future__ import annotations
 
+import ast
 import re
 import sys
+import unicodedata
+from bisect import bisect_right
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from types import MappingProxyType
+
+import regex
 
 from skillspector.artifacts import (
     SecurityTextView,
@@ -39,7 +46,15 @@ from skillspector.artifacts import (
 )
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
-from skillspector.security_reconstruction import build_declared_marker_views
+from skillspector.python_ast import (
+    MAX_PYTHON_AST_SOURCE_CHARS,
+    parse_python_source,
+    peek_python_ast,
+)
+from skillspector.security_reconstruction import (
+    MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
+    build_declared_marker_views,
+)
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
@@ -56,14 +71,20 @@ logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_system_prompt_leakage"
 
+# Scan-scoped handle on the shared Python AST cache, published by node() so the
+# local-return check below reuses the scan's parse instead of parsing again.
+_scan_python_ast_cache_key: ContextVar[str | None] = ContextVar(
+    "system_prompt_leakage_python_ast_cache_key", default=None
+)
+
 # P6: Direct Prompt Extraction — instructions that directly reveal system prompts
 P6_PATTERNS = [
     (
-        r"(?:print|output|show|display|reveal|expose|return|echo)\s+(?:your\s+)?(?:full\s+)?(?:system\s+)?(?:prompt|instructions?|rules?|guidelines?|directives?)",
+        r"(?:print|output|show|display|reveal|expose|return|echo)\s+(?:your\s+)?(?:full\s+)?(?:system\s+)?(?:prompts?|instructions?|rules?|guidelines?|directives?)",
         0.85,
     ),
     (
-        r"(?:what\s+(?:are|is)\s+your|tell\s+me\s+your)\s+(?:system\s+)?(?:prompt|instructions?|rules?|guidelines?|directives?)",
+        r"(?:what\s+(?:are|is)\s+your|tell\s+me\s+your)\s+(?:system\s+)?(?:prompts?|instructions?|rules?|guidelines?|directives?)",
         0.8,
     ),
     (
@@ -71,7 +92,7 @@ P6_PATTERNS = [
         0.8,
     ),
     (
-        r"(?:share|disclose|leak|give\s+me)\s+(?:your\s+)?(?:internal|hidden|system|secret)\s+(?:prompt|instructions?|rules?|config)",
+        r"(?:share|disclose|leak|give\s+me)\s+(?:your\s+)?(?:internal|hidden|system|secret)\s+(?:prompts?|instructions?|rules?|config(?:uration)?s?)",
         0.85,
     ),
     (
@@ -79,18 +100,53 @@ P6_PATTERNS = [
         0.8,
     ),
     (
-        r"(?:begin|start)\s+(?:your\s+)?(?:response|output|reply)\s+with\s+(?:your\s+)?(?:system\s+)?(?:prompt|instructions?)",
+        r"(?:begin|start)\s+(?:your\s+)?(?:response|output|reply)\s+with\s+(?:your\s+)?(?:system\s+)?(?:prompts?|instructions?)",
         0.85,
     ),
     (
-        r"(?:first|before\s+anything)\s+(?:output|print|show|display)\s+(?:your\s+)?(?:full\s+)?(?:system\s+)?(?:prompt|instructions?)",
+        r"(?:first|before\s+anything)\s+(?:output|print|show|display)\s+(?:your\s+)?(?:full\s+)?(?:system\s+)?(?:prompts?|instructions?)",
         0.85,
     ),
     (
-        r"(?:verbatim|exactly|word\s+for\s+word)\s+(?:repeat|output|print)\s+(?:your\s+)?(?:system\s+)?(?:prompt|instructions?)",
+        r"(?:verbatim|exactly|word\s+for\s+word)\s+(?:repeat|output|print)\s+(?:your\s+)?(?:system\s+)?(?:prompts?|instructions?)",
         0.9,
     ),
 ]
+# These patterns finish on an extraction target noun. The other two finish
+# on "this/user" or "to/into/as", whose existing matching policy is unchanged.
+_P6_TERMINAL_TARGET_PATTERNS = frozenset(
+    pattern for index, (pattern, _) in enumerate(P6_PATTERNS) if index not in (2, 4)
+)
+_P6_QUALIFIED_TARGET = re.compile(
+    r"\b(?:your(?:\s+full)?(?:\s+system)?|system|internal|hidden|secret)\s+"
+    r"(?:prompts?|instructions?|rules?|guidelines?|directives?|config(?:uration)?s?)\Z",
+    re.IGNORECASE,
+)
+_IDENTIFIER_CONTINUATION = regex.compile(r"[\p{ID_Continue}$\u200c\u200d]")
+_MARKER_BOUNDARY_CACHE_CORE_CHARS = 8192
+_MARKER_BOUNDARY_CACHE_ENTRIES = 4
+# Restrict identifier precision to recognized source files. Markdown (including
+# fences), prose, and configuration values remain instruction-bearing content.
+_IDENTIFIER_FILE_TYPES = frozenset(
+    {"python", "javascript", "typescript", "shell", "powershell", "ruby", "perl", "go", "rust"}
+)
+# In Python source, ``return rules`` inside a function that binds ``rules``
+# returns that local value. It is a statement, not a request for the rules.
+_P6_LOCAL_RETURN = re.compile(
+    r"return\s+(?:prompts?|instructions?|rules?|guidelines?|directives?)", re.IGNORECASE
+)
+# These nodes open their own scope. A function's walk stops at them, so a name
+# bound only inside one never counts as that function's local.
+_NESTED_PYTHON_SCOPES = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.Lambda,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+)
 
 # P7: Indirect Prompt Extraction — side-channel or inference-based extraction
 P7_PATTERNS = [
@@ -598,6 +654,17 @@ def _has_reconstructed_framing(content: str, check_runtime: Callable[[], None]) 
 class _PreparedAnalysis:
     # Absolute source start -> exclusive source end for complete, approved labels.
     heading_spans: Mapping[int, int]
+    source: str
+    check_runtime: Callable[[], None]
+    code_file: bool
+    python_file: bool = False
+    _marker_boundary_cache: OrderedDict[
+        int, tuple[int, tuple[tuple[SecurityTextView, SecurityTextView], ...]]
+    ] = field(default_factory=OrderedDict, init=False, repr=False, compare=False)
+    # File path -> source spans of returns of function-local names, built on first use.
+    _local_return_spans: dict[str, frozenset[tuple[int, int]]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def analyze(
         self, content: str, file_path: str, file_type: str, source_view: SecurityTextView
@@ -619,6 +686,285 @@ class _PreparedAnalysis:
         # entire detected noun phrase lies inside the same complete source label.
         return approved_end is not None and start < end <= approved_end
 
+    def returns_local_value(
+        self, match: re.Match[str], view: SecurityTextView, file_path: str
+    ) -> bool:
+        """Return whether the match is exactly a Python return of a local name."""
+        if not self.python_file or _P6_LOCAL_RETURN.fullmatch(match.group(0)) is None:
+            return False
+        spans = self._local_return_spans.get(file_path)
+        if spans is None:
+            spans = _python_local_return_spans(self.source, file_path, self.check_runtime)
+            self._local_return_spans[file_path] = spans
+        start = view.source_offset(match.start())
+        end = view.source_offset(match.end() - 1) + 1
+        return (start, end) in spans
+
+    def _source_suffix_character(self, offset: int) -> str:
+        """Read one normalized neighbor, preserving the artifact deadline."""
+        start = offset
+        while offset < len(self.source):
+            if (offset - start) % 4096 == 0:
+                self.check_runtime()
+            if is_default_ignorable(self.source[offset]):
+                offset += 1
+                continue
+            projected = normalized_security_view(self.source[offset]).text
+            if projected:
+                return projected[0]
+            offset += 1
+        return ""
+
+    def _marker_boundary_payloads(
+        self, source_last: int
+    ) -> tuple[int, tuple[tuple[SecurityTextView, SecurityTextView], ...]]:
+        self.check_runtime()
+        core_start = source_last // _MARKER_BOUNDARY_CACHE_CORE_CHARS
+        core_start *= _MARKER_BOUNDARY_CACHE_CORE_CHARS
+        cached = self._marker_boundary_cache.get(core_start)
+        if cached is not None:
+            self._marker_boundary_cache.move_to_end(core_start)
+            return cached
+        start = max(0, core_start - MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS)
+        end = min(
+            len(self.source),
+            core_start
+            + _MARKER_BOUNDARY_CACHE_CORE_CHARS
+            + MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
+        )
+        payloads: list[tuple[SecurityTextView, SecurityTextView]] = []
+        for input_view in security_text_views(
+            self.source[start:end], check_runtime=self.check_runtime
+        ):
+            self.check_runtime()
+            owned_chars = static_runner.DECLARED_MARKER_OWNED_CHARS
+            first_owned_start = start // owned_chars * owned_chars
+            for owned_start in range(first_owned_start, end, owned_chars):
+                self.check_runtime()
+                reconstruction = build_declared_marker_views(
+                    input_view,
+                    check_runtime=self.check_runtime,
+                    owned_source_start=owned_start - start,
+                    owned_source_end=owned_start + owned_chars - start,
+                    source_end_is_truncated=end < len(self.source),
+                )
+                payloads.extend((input_view, payload) for payload in reconstruction.views)
+        cached = start, tuple(payloads)
+        if len(self._marker_boundary_cache) >= _MARKER_BOUNDARY_CACHE_ENTRIES:
+            self._marker_boundary_cache.popitem(last=False)
+        self._marker_boundary_cache[core_start] = cached
+        return cached
+
+    def _declared_marker_suffix(self, source_last: int) -> tuple[bool, str] | None:
+        """Read payload neighbors and distinguish marker omission from normalization."""
+        start, payloads = self._marker_boundary_payloads(source_last)
+        last = source_last - start
+        retained_suffix: tuple[bool, str] | None = None
+        for input_view, payload in payloads:
+            self.check_runtime()
+            offsets = payload.source_offsets
+            if offsets is None or last not in offsets:
+                continue
+            suffix = offsets.index(last) + 1
+            while suffix < len(payload.text) and is_default_ignorable(payload.text[suffix]):
+                suffix += 1
+            character = payload.text[suffix] if suffix < len(payload.text) else ""
+            input_retains_suffix = (
+                input_view.source_offsets is None or last + 1 in input_view.source_offsets
+            )
+            suffix_state = (
+                input_retains_suffix and last + 1 not in offsets,
+                normalized_security_view(character).text[:1],
+            )
+            if suffix_state[0]:
+                return suffix_state
+            if retained_suffix is None:
+                retained_suffix = suffix_state
+        return retained_suffix
+
+    def target_is_identifier_prefix(self, match: re.Match[str], view: SecurityTextView) -> bool:
+        """Unqualified target nouns must end before an identifier continuation."""
+        # Qualified English requests are instruction-bearing even in comments,
+        # docstrings and strings. They cannot be the single identifier token
+        # (such as ``return PROMPT_INJECTION_PATTERNS``) this check excludes.
+        if _P6_QUALIFIED_TARGET.search(match.group(0)) is not None:
+            return False
+        end = match.end()
+        source_last = view.source_offset(end - 1)
+        source_suffix = source_last + 1
+        # NFKC can introduce a space inside an ECMA identifier character or
+        # remove an XID mark entirely. That projected separator is not a token
+        # boundary. Marker removal is separate: the continuation must survive
+        # the reconstruction input and disappear from its payload to prove an
+        # intentionally omitted marker rather than a suffix erased by normalization.
+        if source_suffix < len(self.source):
+            character = self.source[source_suffix]
+            if not character.isascii() and _is_identifier_continuation(character):
+                marker_suffix = (
+                    self._declared_marker_suffix(source_last)
+                    if view.name.startswith("declared-marker")
+                    else None
+                )
+                removed_marker = marker_suffix is not None and marker_suffix[0]
+                origin = normalized_security_view(self.source[source_last]).text
+                if origin.casefold().endswith(view.text[end - 1].casefold()) and not removed_marker:
+                    return True
+        if end < len(view.text):
+            if _is_identifier_continuation(view.text[end]):
+                return True
+            suffix = end
+            while suffix < len(view.text) and is_default_ignorable(view.text[suffix]):
+                if (suffix - end) % 4096 == 0:
+                    self.check_runtime()
+                suffix += 1
+            if suffix < len(view.text) and _is_identifier_continuation(view.text[suffix]):
+                return True
+            # Ignorable-separator projections intentionally recover real word
+            # boundaries. A following connector still belongs to an identifier,
+            # while an ordinary next word remains a disclosure request.
+            if view.name.startswith("ignorable-separator-continuity"):
+                source_suffix = view.source_offset(end)
+                if is_default_ignorable(self.source[source_suffix]):
+                    if _is_identifier_continuation(self.source[source_suffix]):
+                        return True
+                    character = self._source_suffix_character(source_suffix)
+                    return bool(character) and (
+                        character == "$" or unicodedata.category(character) in {"Mn", "Mc", "Pc"}
+                    )
+            return False
+
+        # A complete reconstructed payload can end before a removed marker or
+        # encoded source suffix. Only a sliced view needs a source-edge check.
+        boundary_view = getattr(view, "derived_view", view)
+        if not boundary_view.right_boundary_is_fixed:
+            return False
+        # A reconstruction limit can mark a complete payload as fixed too.
+        # Its next source character can belong to an omitted marker, in either
+        # ASCII or Unicode. Use the retained payload suffix in that case.
+        if view.name.startswith("declared-marker"):
+            marker_suffix = self._declared_marker_suffix(source_last)
+            if marker_suffix is not None and marker_suffix[0]:
+                return _is_identifier_continuation(marker_suffix[1])
+        projected = normalized_security_view(self.source[source_last]).text
+        run_start = end - 1
+        while (
+            run_start > match.start()
+            and end - run_start < len(projected)
+            and view.source_offset(run_start - 1) == source_last
+        ):
+            run_start -= 1
+        consumed = view.text[run_start:end]
+        if projected.startswith(consumed) and len(consumed) < len(projected):
+            return _is_identifier_continuation(projected[len(consumed)])
+        # Decoded characters can point at the start of an entity/escape. Its
+        # internal source bytes cannot prove an identifier continuation.
+        if not projected.casefold().endswith(view.text[end - 1].casefold()):
+            return False
+        return _is_identifier_continuation(self._source_suffix_character(source_last + 1))
+
+
+def _is_identifier_continuation(character: str) -> bool:
+    # ID_Continue includes Python XID continuations and ECMA's non-XID letters
+    # and symbols, without admitting punctuation classified as Pattern_Syntax.
+    return _IDENTIFIER_CONTINUATION.fullmatch(character) is not None
+
+
+def _leading_name(expression: ast.expr) -> ast.Name | None:
+    """Return the name an expression starts with, such as ``rules`` in ``rules[0]``."""
+    node: ast.expr | None = expression
+    while node is not None and not isinstance(node, ast.Name):
+        start = (node.lineno, node.col_offset)
+        node = next(
+            (
+                child
+                for child in ast.iter_child_nodes(node)
+                if isinstance(child, ast.expr) and (child.lineno, child.col_offset) == start
+            ),
+            None,
+        )
+    return node
+
+
+def _python_local_return_spans(
+    content: str, file_path: str, check_runtime: Callable[[], None]
+) -> frozenset[tuple[int, int]]:
+    """Return source spans of Python ``return`` statements that return a local name.
+
+    A span runs from the ``return`` keyword to the end of the name that starts
+    the returned expression. Its source text must itself read ``return <target>``,
+    so a normalized or reconstructed reading of other text never qualifies. The
+    name must be a parameter or an assignment target of the same function, and
+    not declared ``global`` or ``nonlocal`` there. Names from enclosing scopes or
+    comprehensions, strings, comments, docstrings and source that does not parse
+    keep their findings.
+    """
+    if len(content) > MAX_PYTHON_AST_SOURCE_CHARS:
+        return frozenset()
+    check_runtime()
+    parsed = peek_python_ast(_scan_python_ast_cache_key.get(), content, file_path)
+    if parsed is None:
+        parsed = parse_python_source(content, file_path)
+    check_runtime()
+    if parsed.tree is None:
+        return frozenset()
+    # AST columns are UTF-8 byte offsets on Python's own lines, which split
+    # only at CR, LF and CRLF (str.splitlines() also splits at form feeds).
+    line_starts = [0]
+    line_starts.extend(match.end() for match in re.finditer(rb"\r\n?|\n", parsed.source_bytes))
+
+    def offset(line: int, byte_column: int) -> int:
+        byte_offset = line_starts[line - 1] + byte_column
+        non_ascii = bisect_right(parsed.non_ascii_byte_ends, byte_offset)
+        return byte_offset - parsed.non_ascii_extra_bytes[non_ascii]
+
+    spans: set[tuple[int, int]] = set()
+    visited = 0
+    for function in ast.walk(parsed.tree):
+        visited += 1
+        if visited % 1024 == 0:
+            check_runtime()
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        arguments = function.args
+        local_names = {
+            argument.arg
+            for argument in (
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+                arguments.vararg,
+                arguments.kwarg,
+            )
+            if argument is not None
+        }
+        declared: set[str] = set()
+        returns: list[tuple[ast.Return, ast.Name]] = []
+        pending: list[ast.AST] = list(function.body)
+        while pending:
+            visited += 1
+            if visited % 1024 == 0:
+                check_runtime()
+            node = pending.pop()
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                local_names.add(node.id)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                declared.update(node.names)
+            elif isinstance(node, ast.Return) and node.value is not None:
+                if (name := _leading_name(node.value)) is not None:
+                    returns.append((node, name))
+            if not isinstance(node, _NESTED_PYTHON_SCOPES):
+                pending.extend(ast.iter_child_nodes(node))
+        local_names -= declared
+        for statement, name in returns:
+            if name.id not in local_names or name.end_lineno is None or name.end_col_offset is None:
+                continue
+            start = offset(statement.lineno, statement.col_offset)
+            end = offset(name.end_lineno, name.end_col_offset)
+            if _P6_LOCAL_RETURN.fullmatch(content, start, end) is not None:
+                spans.add((start, end))
+    check_runtime()
+    return frozenset(spans)
+
 
 def prepare_analysis(
     content: str, file_type: str, check_runtime: Callable[[], None]
@@ -627,7 +973,13 @@ def prepare_analysis(
     spans: dict[int, int] = {}
     check_runtime()
     if file_type != "markdown" or len(content) > _MAX_HEADING_CONTEXT_CHARS:
-        return _PreparedAnalysis(MappingProxyType(spans))
+        return _PreparedAnalysis(
+            MappingProxyType(spans),
+            content,
+            check_runtime,
+            file_type in _IDENTIFIER_FILE_TYPES,
+            file_type == "python",
+        )
     offset = 0
     for index, raw_line in enumerate(content.splitlines(keepends=True)):
         if index % 128 == 0:
@@ -658,7 +1010,7 @@ def prepare_analysis(
     ):
         spans.clear()
     check_runtime()
-    return _PreparedAnalysis(MappingProxyType(spans))
+    return _PreparedAnalysis(MappingProxyType(spans), content, check_runtime, False)
 
 
 def _report_heading_target(line: str) -> tuple[int, int] | None:
@@ -758,6 +1110,14 @@ def _analyze(
         for match in static_runner.iter_paragraph_matches(
             pattern, content, re.IGNORECASE | re.MULTILINE
         ):
+            if (
+                prepared.code_file
+                and pattern in _P6_TERMINAL_TARGET_PATTERNS
+                and prepared.target_is_identifier_prefix(match, source_view)
+            ):
+                continue
+            if prepared.returns_local_value(match, source_view, file_path):
+                continue
             if is_directly_prohibited(
                 content,
                 match.start(),
@@ -827,6 +1187,10 @@ def _analyze(
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run system_prompt_leakage patterns and return findings."""
-    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    token = _scan_python_ast_cache_key.set(state.get("python_ast_cache_key"))
+    try:
+        response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    finally:
+        _scan_python_ast_cache_key.reset(token)
     logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
     return response

@@ -35,6 +35,7 @@ from skillspector.llm_analyzer_base import (
     LLMRuntimeLimitError,
     ledger_events_for_batches,
 )
+from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
 from skillspector.state import (
     AnalyzerNodeResponse,
@@ -215,7 +216,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             timeout=timeout,
         )
         batches = analyzer.get_batches(available_components, file_cache)
-        results = analyzer.run_batches(batches)
+        results = run_async(analyzer.arun_batches(batches))
         outcome = getattr(analyzer, "_last_batch_outcome", BatchExecutionResult(successful=results))
         findings = analyzer.collect_findings(outcome.successful)
         events, status = ledger_events_for_batches(ANALYZER_ID, outcome)
