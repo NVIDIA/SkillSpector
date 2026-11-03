@@ -3241,7 +3241,7 @@ def _shell_command_strings(
         startup_exposure = [False]
     substitution_scopes: list[int] = []
     backtick_starts: set[int] = set()
-    scoped_startup: list[tuple[int, list[bool]]] = []
+    scoped_startup: list[tuple[int, list[bool], int, str]] = []
     startup_work = [4 * len(content) + _ROOT_GLOB_COMMAND_CHARS]
     clause_starts = (
         powershell.clause_starts
@@ -3266,24 +3266,33 @@ def _shell_command_strings(
             scoped_startup.pop()
         for scope in substitution_scopes[len(scoped_startup) :]:
             inherited = scoped_startup[-1][1] if scoped_startup else startup_exposure
-            scoped_startup.append((scope, [inherited[0]]))
+            # Legacy closers are not shell word delimiters. Cache this body's
+            # bounded source once, so readers cannot consume its closing tick.
+            body_start = clause_start if content[scope - 1] == "`" else 0
+            body = content[body_start : scope - 1] if body_start else content
+            scoped_startup.append((scope, [inherited[0]], body_start, body))
         startup_context = scoped_startup[-1][1] if scoped_startup else startup_exposure
         if clause_start in backtick_starts:
-            # The legacy substitution body is not reconstructed here. Its
-            # child may load startup code, but a quoted/escaped data backtick
-            # never enters this lexical marker set.
+            # A legacy substitution may launch a child with startup code.
+            # Only its opener enters this lexical marker set.
             if startup_context[0]:
                 yield None, startup_context
                 return
             continue
+        body_start, body = scoped_startup[-1][2:] if scoped_startup else (0, content)
         if not startup_context[0]:
             startup_context[0] = _shell_clause_sets_startup(
-                content, clause_start, check_runtime, startup_work
+                body, clause_start - body_start, check_runtime, startup_work
             )
+        if body_start and startup_context[0] and "`" in body:
+            # Escaped nested legacy substitutions need another decoding pass;
+            # this scope walk cannot prove their child startup dependencies.
+            yield None, startup_context
+            return
         starts_shell = [False]
         recognized, command_string = _command_string_from_clause(
-            content,
-            clause_start,
+            body,
+            clause_start - body_start,
             check_runtime,
             perl_eval_blocks=perl_eval_blocks,
             shell_traps=shell_substitutions,
@@ -3605,6 +3614,7 @@ def _shell_clause_starts(
     limit = len(content)
     frames: list[tuple[int, int, str | None, bool, bool]] = []
     substitution_ends: dict[int, int | None] = {}
+    backtick_ends: dict[int, int | None] = {}
     while cursor < limit or frames:
         if cursor >= limit:
             cursor, limit, quote, ansi_c_quote, word_started = frames.pop()
@@ -3640,6 +3650,21 @@ def _shell_clause_starts(
         ):
             backtick_starts.add(cursor)
             yield cursor
+            end = _skip_backtick_substitution(
+                content, cursor, limit, check_runtime, end_cache=backtick_ends
+            )
+            if end is not None:
+                frames.append((end, limit, quote, ansi_c_quote, True))
+                if substitution_scopes is not None:
+                    substitution_scopes.append(end)
+                cursor += 1
+                limit = end - 1
+                quote = None
+                ansi_c_quote = False
+                word_started = False
+                if cursor < limit:
+                    yield cursor
+                continue
         if quote is not None:
             if character == quote:
                 quote = None

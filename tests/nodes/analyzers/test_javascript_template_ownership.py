@@ -368,6 +368,31 @@ def test_computed_data_reads_do_not_become_executable_aliases() -> None:
         "(flag ? tool.exec : format)?.call(tool, `${command} -rf /`);",
         "const first = tool.exec; (flag ? first : format)?.call(tool, `${command} -rf /`);",
         "(selected = tool.exec)?.(`${command} -rf /`);",
+        "const first = tool.exec; const invoke = first.call; "
+        "invoke.call(first, tool, `${command} -rf /`);",
+        "const first = tool.exec; const invoke = first['apply']; "
+        "invoke.call(first, tool, [`${command} -rf /`]);",
+        "const first = tool.exec; const invoke = first?.bind; "
+        "invoke.call(first, tool, `${command} -rf /`)();",
+        "const first = tool.exec; const invoke = first.call.apply; "
+        "invoke.call(first.call, first, [tool, `${command} -rf /`]);",
+        "const first = tool.exec; const invoke = flag ? first.call : format; "
+        "invoke.call(first, tool, `${command} -rf /`);",
+        "const first = tool.exec; let invoke; invoke = first.call; "
+        "invoke.call(first, tool, `${command} -rf /`);",
+        "const {render: go = tool.exec} = source; go(`${command} -rf /`);",
+        "const first = tool.exec; const {render: go = first} = source; "
+        "go(`${command} -rf /`);",
+        "const first = tool.exec; const {render: go = first.call} = source; "
+        "go.call(first, tool, `${command} -rf /`);",
+        "const {render: go = flag ? format : tool.exec} = source; "
+        "go(`${command} -rf /`);",
+        "const {nested: {render: go = tool.exec}} = source; go(`${command} -rf /`);",
+        "let go; ({render: go = tool.exec} = source); go(`${command} -rf /`);",
+        "const [go = tool.exec] = source; go(`${command} -rf /`);",
+        "function invoke(go = tool.exec) { go(`${command} -rf /`); }",
+        "function invoke({render: go = tool.exec}) { go(`${command} -rf /`); }",
+        "function invoke([go = tool.exec]) { go(`${command} -rf /`); }",
     ],
 )
 def test_execution_helpers_and_aliases_keep_dynamic_templates_unverified(statement: str) -> None:
@@ -389,9 +414,29 @@ def test_execution_helpers_and_aliases_keep_dynamic_templates_unverified(stateme
         "const label = flag ? source.exec : 'label'; console.log(`Value: ${label}`);",
         "const format = flag ? first : second; format?.call(null, `hello ${name}`);",
         "(observe(), format)?.call(null, `hello ${name}`);",
+        "const first = format; const invoke = first.call; "
+        "invoke.call(first, null, `hello ${name}`);",
+        "const first = format; const invoke = first['apply']; "
+        "invoke.call(first, null, [`hello ${name}`]);",
+        "const {render: go = format} = source; go(`hello ${name}`);",
+        "function invoke(go = format) { go(`hello ${name}`); }",
+        "const {render: label = tool.exec} = source; console.log(`Value: ${label}`);",
+        "const first = tool.exec; const label = first.call; console.log(`Value: ${label}`);",
     ],
 )
 def test_data_reads_and_ordinary_function_helpers_retain_template_ownership(statement: str) -> None:
     source = statement + _PADDING
     assert javascript_template_spans(source, lambda: None) is not None
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+def test_benign_function_helper_chain_has_bounded_traversal() -> None:
+    source = "format" + ".call" * 48 + "(null, `hello ${name}`);"
+    checks = 0
+
+    def check_runtime() -> None:
+        nonlocal checks
+        checks += 1
+        assert checks <= 1000
+
+    assert javascript_template_spans(source, check_runtime) is not None

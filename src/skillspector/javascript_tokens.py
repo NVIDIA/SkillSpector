@@ -1716,7 +1716,9 @@ def _walk_nodes(value: Any, check_runtime: Callable[[], None]) -> Iterator[Any]:
             pending.extend(reversed(children))
 
 
-def _callable_values(value: Any, check_runtime: Callable[[], None]) -> Iterator[Any]:
+def _callable_values(
+    value: Any, check_runtime: Callable[[], None], *, all_receivers: bool = False
+) -> Iterator[Any]:
     """Retain every possible value selected by a bounded expression walk."""
     pending = [value]
     while pending:
@@ -1733,6 +1735,14 @@ def _callable_values(value: Any, check_runtime: Callable[[], None]) -> Iterator[
             pending.append(current.right)
         else:
             yield current
+            if kind == "MemberExpression":
+                name = getattr(current.property, "name", None)
+                if name is None:
+                    name = getattr(current.property, "value", None)
+                if all_receivers or isinstance(name, str) and name in {"call", "apply", "bind"}:
+                    # Extracting a function helper retains its receiver's
+                    # possible behavior, including through later aliases.
+                    pending.append(current.object)
 
 
 def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -> bool:
@@ -1768,6 +1778,9 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
             continue
         if node.type == "VariableDeclarator":
             target, value = node.id, node.init
+        elif node.type == "AssignmentPattern":
+            # A missing property or argument selects the default expression.
+            target, value = node.left, node.right
         elif node.type == "AssignmentExpression" and node.operator == "=":
             target, value = node.left, node.right
         else:
@@ -1791,16 +1804,12 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
                     pending.append(alias)
 
     def unproven_callable(callee: Any) -> bool:
-        pending = [callee]
-        while pending:
-            for candidate in _callable_values(pending.pop(), check_runtime):
-                kind = getattr(candidate, "type", None)
-                if kind == "MemberExpression":
-                    if unknown_member(candidate):
-                        return True
-                    pending.append(candidate.object)
-                elif kind == "Identifier" and candidate.name in computed_callables:
-                    return True
+        for candidate in _callable_values(callee, check_runtime, all_receivers=True):
+            if unknown_member(candidate) or (
+                getattr(candidate, "type", None) == "Identifier"
+                and candidate.name in computed_callables
+            ):
+                return True
         return False
 
     literal_keys: set[int] = set()
@@ -1943,7 +1952,4 @@ def _is_shell_execution_callee(callee: Any, check_runtime: Callable[[], None]) -
                 and candidate.object.name == "Reflect"
             ):
                 return True
-            if property_name in {"call", "apply", "bind"}:
-                # Function helpers retain the original callable's behavior.
-                pending.append(candidate.object)
     return False
