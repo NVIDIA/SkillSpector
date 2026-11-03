@@ -345,6 +345,68 @@ def test_markdown_powershell_fences_keep_executable_payloads_partial(command: st
     assert _ledger(content, "SKILL.md")["outcome"] is LedgerOutcome.PARTIAL
 
 
+@pytest.mark.parametrize("language", ["powershell", "pwsh", "ps1"])
+@pytest.mark.parametrize(
+    ("command", "partial"),
+    [
+        ("Write-Output '$CMD -rf /' | bash", True),
+        ("$cmd = Write-Output '$CMD -rf /'", True),
+        ("Write-Host '$CMD -rf /' 6>&1 | bash", True),
+        ("Import-Module ./helpers.psm1\nWrite-Host '$CMD -rf /'", True),
+        ("Write-Output '$CMD -rf /'", False),
+        ("Write-Host '$CMD -rf /'", False),
+    ],
+)
+def test_fenced_powershell_values_preserve_capture_and_display_contracts(
+    language: str, command: str, partial: bool
+) -> None:
+    content = f"```{language}\n{command}\n```\n"
+    event = _ledger(content, "SKILL.md")
+
+    assert (event["outcome"] is LedgerOutcome.PARTIAL) is partial
+
+
+@pytest.mark.parametrize(
+    ("setup", "partial"),
+    [
+        ("Import-Module ./helpers.psm1", True),
+        ("function Write-Host { bash -c $args[0] }", True),
+        ("Write-Output 'ordinary setup'", False),
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_powershell_fences_do_not_reset_display_command_identity(
+    setup: str, partial: bool, reverse: bool
+) -> None:
+    blocks = [f"```powershell\n{setup}\n```\n", "```powershell\nWrite-Host '$CMD -rf /'\n```\n"]
+    if reverse:
+        blocks.reverse()
+    event = _ledger("\n".join(blocks), "SKILL.md")
+
+    assert (event["outcome"] is LedgerOutcome.PARTIAL) is partial
+
+
+@pytest.mark.parametrize("prior_fence", [False, True])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_nested_powershell_fence_owns_only_its_current_body(
+    prior_fence: bool, newline: str
+) -> None:
+    prior = "```powershell\nWrite-Host 'first'\n```\n\n" if prior_fence else "Intro.\n\n"
+    body = "  Write-Host 'second'\n"
+    content = (prior + "- Instructions\n  ```powershell\n" + body + "  ```\n").replace(
+        "\n", newline
+    )
+    blocks: list[tuple[int, int]] = []
+    tm._markdown_shell_text(content, lambda: None, powershell_blocks=blocks)
+    start = content.index(body.replace("\n", newline))
+
+    assert blocks[-1] == (start, start + len(body.replace("\n", newline)))
+    assert all(left_end <= right_start for (_, left_end), (right_start, _) in zip(blocks, blocks[1:]))
+    assert _ledger(content, "SKILL.md")["outcome"] is LedgerOutcome.COMPLETED
+    hostile = content + "\n```bash\nbash -c '$CMD -rf /'\n```\n"
+    assert _ledger(hostile, "SKILL.md")["outcome"] is LedgerOutcome.PARTIAL
+
+
 def test_fence_language_and_closure_are_required_for_ownership() -> None:
     statement = '$uri = "$base`?option=value"\n'
     tail = "Ordinary trailing explanation.\n" * 300

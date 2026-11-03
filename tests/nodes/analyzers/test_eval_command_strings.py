@@ -50,6 +50,32 @@ def test_eval_startup_settings_inside_child_do_not_escape_to_parent() -> None:
     assert not tm_module.has_bounded_parse_exhaustion(content, lambda: None, file_type="shell")
 
 
+@pytest.mark.parametrize(
+    ("content", "partial"),
+    [
+        ("echo \"$(BASH_ENV=./startup)\"; bash -c 'printf safe'", False),
+        ("echo \"$(export ENV=./startup)\"; sh -c 'printf safe'", False),
+        ("echo \"$(eval 'export BASH_ENV=./startup')\"; bash -c 'printf safe'", False),
+        ("echo \"$(BASH_ENV=./startup)\" \"$(bash -c 'printf safe')\"", False),
+        ("echo \"$(echo \"$(BASH_ENV=./startup)\"; bash -c 'printf safe')\"", False),
+        ("BASH_ENV=./startup; echo \"$(bash -c 'printf safe')\"", True),
+        ("echo \"$(BASH_ENV=./startup bash -c 'printf safe')\"", True),
+        ("echo \"$(BASH_ENV=./startup; bash -c 'printf safe')\"", True),
+        ("echo \"$(eval 'export BASH_ENV=./startup'; bash -c 'printf safe')\"", True),
+        ("echo \"$(BASH_ENV=./startup; echo \"$(bash -c 'printf safe')\")\"", True),
+        ("echo \"$(BASH_ENV=./startup; echo `bash -c 'printf safe'`)\"", True),
+        ("echo \"$(eval 'export BASH_ENV=./startup'; echo `bash -c true`)\"", True),
+        ("eval 'echo \"$(BASH_ENV=./startup; echo `bash -c true`)\"'", True),
+        ("echo \"$(BASH_ENV=./startup)\"; bash -c '$CMD -rf /'", True),
+        ("echo \"$(BASH_ENV=./startup)\"; bash -c '$(printf rm) -rf /'", True),
+    ],
+)
+def test_substitution_startup_settings_stay_in_their_lexical_scope(
+    content: str, partial: bool
+) -> None:
+    assert tm_module.has_bounded_parse_exhaustion(content, lambda: None, file_type="shell") is partial
+
+
 def test_literal_eval_with_startup_setting_keeps_destructive_finding() -> None:
     content = "ENV=prod; eval 'rm -rf /'"
 

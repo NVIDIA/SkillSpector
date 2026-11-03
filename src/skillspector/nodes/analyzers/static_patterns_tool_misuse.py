@@ -3239,18 +3239,35 @@ def _shell_command_strings(
     nested_substitutions = startup_exposure is not None and ("$(" in content or "`" in content)
     if startup_exposure is None:
         startup_exposure = [False]
+    substitution_scopes: list[int] = []
+    scoped_startup: list[tuple[int, list[bool]]] = []
     startup_work = [4 * len(content) + _ROOT_GLOB_COMMAND_CHARS]
     clause_starts = (
         powershell.clause_starts
         if powershell is not None
         else _nonempty_shell_clause_starts(
-            content, check_runtime, shell_substitutions=shell_substitutions
+            content,
+            check_runtime,
+            shell_substitutions=shell_substitutions,
+            substitution_scopes=substitution_scopes,
         )
     )
     for clause_start in clause_starts:
         check_runtime()
-        if not startup_exposure[0]:
-            startup_exposure[0] = _shell_clause_sets_startup(
+        # Substitutions inherit settings but cannot alter their parent shell.
+        # Keep each live lexical scope's mutable context so eval still updates
+        # subsequent commands in that same scope.
+        while scoped_startup and (
+            len(scoped_startup) > len(substitution_scopes)
+            or scoped_startup[-1][0] != substitution_scopes[len(scoped_startup) - 1]
+        ):
+            scoped_startup.pop()
+        for scope in substitution_scopes[len(scoped_startup) :]:
+            inherited = scoped_startup[-1][1] if scoped_startup else startup_exposure
+            scoped_startup.append((scope, [inherited[0]]))
+        startup_context = scoped_startup[-1][1] if scoped_startup else startup_exposure
+        if not startup_context[0]:
+            startup_context[0] = _shell_clause_sets_startup(
                 content, clause_start, check_runtime, startup_work
             )
         starts_shell = [False]
@@ -3260,7 +3277,7 @@ def _shell_command_strings(
             check_runtime,
             perl_eval_blocks=perl_eval_blocks,
             shell_traps=shell_substitutions,
-            startup_exposure=startup_exposure,
+            startup_exposure=startup_context,
             starts_shell=starts_shell,
         )
         if nested_substitutions and startup_exposure[0]:
@@ -3280,7 +3297,7 @@ def _shell_command_strings(
                 continue
         # eval shares this shell's settings; a child shell has its own scope.
         # Keep exposure monotonic across eval, including settings in its body.
-        yield command_string, [False] if starts_shell[0] else startup_exposure
+        yield command_string, [False] if starts_shell[0] else startup_context
 
 
 def _shell_clause_sets_startup(
@@ -3542,10 +3559,14 @@ def _nonempty_shell_clause_starts(
     check_runtime: Callable[[], None],
     *,
     shell_substitutions: bool = False,
+    substitution_scopes: list[int] | None = None,
 ) -> Iterator[int]:
     """Avoid reparsing the same trailing command across empty physical lines."""
     for start in _shell_clause_starts(
-        content, check_runtime, shell_substitutions=shell_substitutions
+        content,
+        check_runtime,
+        shell_substitutions=shell_substitutions,
+        substitution_scopes=substitution_scopes,
     ):
         while start < len(content) and content[start] in " \t":
             if start % 4096 == 0:
@@ -3560,6 +3581,7 @@ def _shell_clause_starts(
     check_runtime: Callable[[], None],
     *,
     shell_substitutions: bool = False,
+    substitution_scopes: list[int] | None = None,
 ) -> Iterator[int]:
     """Yield command-clause starts outside quotes and comments in one pass."""
     yield 0
@@ -3573,6 +3595,8 @@ def _shell_clause_starts(
     while cursor < limit or frames:
         if cursor >= limit:
             cursor, limit, quote, ansi_c_quote, word_started = frames.pop()
+            if substitution_scopes is not None:
+                substitution_scopes.pop()
             continue
         if cursor % 4096 == 0:
             check_runtime()
@@ -3586,6 +3610,8 @@ def _shell_clause_starts(
                 # Give its body an independent quote state and then resume
                 # the parent word; cached endpoints keep nested walks linear.
                 frames.append((end, limit, quote, ansi_c_quote, True))
+                if substitution_scopes is not None:
+                    substitution_scopes.append(end)
                 cursor += 2
                 limit = end - 1
                 quote = None
@@ -4462,6 +4488,7 @@ def _powershell_shell_text(
     check_runtime: Callable[[], None],
     *,
     continuations: list[int] | None = None,
+    allow_messages: bool = True,
 ) -> str:
     """Mask PowerShell comments and display-only messages, preserving offsets.
 
@@ -4491,7 +4518,7 @@ def _powershell_shell_text(
         output[position] = "\\"
         if continuations is not None:
             continuations.append(position)
-    if _POWERSHELL_COMMAND_REBINDING_RE.search(content) is None:
+    if allow_messages and _POWERSHELL_COMMAND_REBINDING_RE.search(content) is None:
         for segment in projection.segments:
             check_runtime()
             if not segment.owns_messages():
@@ -7208,6 +7235,7 @@ def _markdown_shell_text(
                 paragraph_list_indent,
                 info.split(maxsplit=1)[0].casefold() if info else "",
             )
+            fence_body_start = offset + len(line)
             fence_literal_apostrophes.clear()
             fence_literal_ownership = True
             fence_has_literal_apostrophe = False
@@ -7572,6 +7600,22 @@ def _has_bounded_parse_exhaustion(
         if hardware_apostrophe_ambiguity[0]:
             return True
         if powershell_blocks:
+            projected = list(content)
+            # Separate code fences do not establish separate runtime scopes.
+            allow_messages = _POWERSHELL_COMMAND_REBINDING_RE.search(content) is None
+            for start, end in powershell_blocks:
+                check_runtime()
+                block_continuations: list[int] = []
+                block = _powershell_shell_text(
+                    content[start:end],
+                    check_runtime,
+                    continuations=block_continuations,
+                    allow_messages=allow_messages,
+                )
+                if block_continuations and _has_destructive_command_string(block):
+                    return True
+                projected[start:end] = block
+            content = "".join(projected)
             powershell = _fenced_powershell_source(
                 content, powershell_blocks, check_runtime, unresolved_executables
             )
@@ -7741,8 +7785,7 @@ def _has_bounded_parse_exhaustion(
         for string in powershell.strings:
             check_runtime()
             if (
-                file_type == "powershell"
-                and not string.invoked
+                not string.invoked
                 and _has_bounded_parse_exhaustion(
                     string.value, check_runtime, file_type="powershell", complete_context=False
                 )

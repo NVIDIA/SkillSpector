@@ -1716,6 +1716,25 @@ def _walk_nodes(value: Any, check_runtime: Callable[[], None]) -> Iterator[Any]:
             pending.extend(reversed(children))
 
 
+def _callable_values(value: Any, check_runtime: Callable[[], None]) -> Iterator[Any]:
+    """Retain every possible value selected by a bounded expression walk."""
+    pending = [value]
+    while pending:
+        check_runtime()
+        current = pending.pop()
+        kind = getattr(current, "type", None)
+        if kind == "ConditionalExpression":
+            pending.extend((current.consequent, current.alternate))
+        elif kind == "LogicalExpression":
+            pending.extend((current.left, current.right))
+        elif kind == "SequenceExpression" and current.expressions:
+            pending.append(current.expressions[-1])
+        elif kind == "AssignmentExpression" and current.operator == "=":
+            pending.append(current.right)
+        else:
+            yield current
+
+
 def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -> bool:
     global_objects = {"globalThis", "global", "window", "self"}
     computed_callables: set[str] = set()
@@ -1729,6 +1748,24 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
         )
 
     for node in _walk_nodes(program, check_runtime):
+        if node.type == "ObjectPattern":
+            for prop in node.properties:
+                check_runtime()
+                if prop.type != "Property":
+                    continue
+                name = getattr(prop.key, "name", None)
+                if name is None:
+                    name = getattr(prop.key, "value", None)
+                binding = prop.value
+                if binding.type == "AssignmentPattern":
+                    binding = binding.left
+                if (
+                    isinstance(name, str)
+                    and name.casefold() in _SHELL_EXECUTION_CALLS
+                    and binding.type == "Identifier"
+                ):
+                    computed_callables.add(binding.name)
+            continue
         if node.type == "VariableDeclarator":
             target, value = node.id, node.init
         elif node.type == "AssignmentExpression" and node.operator == "=":
@@ -1737,10 +1774,11 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
             continue
         if getattr(target, "type", None) != "Identifier":
             continue
-        if getattr(value, "type", None) == "Identifier":
-            aliases.setdefault(value.name, []).append(target.name)
-        elif unknown_member(value):
-            computed_callables.add(target.name)
+        for candidate in _callable_values(value, check_runtime):
+            if getattr(candidate, "type", None) == "Identifier":
+                aliases.setdefault(candidate.name, []).append(target.name)
+            if unknown_member(candidate) or _is_shell_execution_callee(candidate, check_runtime):
+                computed_callables.add(target.name)
     # Overapproximate aliases across scopes and assignments. A name may have
     # several possible values; none may hide a possible evaluator selection.
     for names in (global_objects, computed_callables):
@@ -1753,12 +1791,17 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
                     pending.append(alias)
 
     def unproven_callable(callee: Any) -> bool:
-        while getattr(callee, "type", None) == "MemberExpression":
-            check_runtime()
-            if unknown_member(callee):
-                return True
-            callee = callee.object
-        return getattr(callee, "type", None) == "Identifier" and callee.name in computed_callables
+        pending = [callee]
+        while pending:
+            for candidate in _callable_values(pending.pop(), check_runtime):
+                kind = getattr(candidate, "type", None)
+                if kind == "MemberExpression":
+                    if unknown_member(candidate):
+                        return True
+                    pending.append(candidate.object)
+                elif kind == "Identifier" and candidate.name in computed_callables:
+                    return True
+        return False
 
     literal_keys: set[int] = set()
     for node in _walk_nodes(program, check_runtime):
@@ -1803,7 +1846,7 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
         if node.type in {"CallExpression", "NewExpression"}:
             if unproven_callable(node.callee):
                 return True
-            if _is_shell_execution_callee(node.callee):
+            if _is_shell_execution_callee(node.callee, check_runtime):
                 return True
             if (
                 node.callee.type == "Identifier"
@@ -1816,7 +1859,9 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
             tag = node.tag
             if unproven_callable(tag):
                 return True
-            if _is_shell_execution_callee(tag) or (tag.type == "Identifier" and tag.name == "$"):
+            if _is_shell_execution_callee(tag, check_runtime) or (
+                tag.type == "Identifier" and tag.name == "$"
+            ):
                 return True
     return False
 
@@ -1874,12 +1919,31 @@ def _is_shell_execution_module(module: Any) -> bool:
     )
 
 
-def _is_shell_execution_callee(callee: Any) -> bool:
-    if callee.type == "Identifier":
-        return callee.name.casefold() in _SHELL_EXECUTION_CALLS
-    if callee.type == "MemberExpression":
-        property_name = getattr(callee.property, "name", None)
-        if property_name is None:
-            property_name = getattr(callee.property, "value", None)
-        return isinstance(property_name, str) and property_name.casefold() in _SHELL_EXECUTION_CALLS
+def _is_shell_execution_callee(callee: Any, check_runtime: Callable[[], None]) -> bool:
+    pending = [callee]
+    while pending:
+        for candidate in _callable_values(pending.pop(), check_runtime):
+            kind = getattr(candidate, "type", None)
+            if kind == "Identifier":
+                if candidate.name.casefold() in _SHELL_EXECUTION_CALLS:
+                    return True
+                continue
+            if kind != "MemberExpression":
+                continue
+            property_name = getattr(candidate.property, "name", None)
+            if property_name is None:
+                property_name = getattr(candidate.property, "value", None)
+            if not isinstance(property_name, str):
+                continue
+            if property_name.casefold() in _SHELL_EXECUTION_CALLS:
+                return True
+            if (
+                property_name in {"apply", "construct"}
+                and candidate.object.type == "Identifier"
+                and candidate.object.name == "Reflect"
+            ):
+                return True
+            if property_name in {"call", "apply", "bind"}:
+                # Function helpers retain the original callable's behavior.
+                pending.append(candidate.object)
     return False

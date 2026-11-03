@@ -335,3 +335,63 @@ def test_unresolved_computed_evaluators_cannot_own_templates(statement: str) -> 
 def test_computed_data_reads_do_not_become_executable_aliases() -> None:
     source = "const label = source[key]; console.log(`Value: ${label}`);" + _PADDING
     assert javascript_template_spans(source, lambda: None) is not None
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "tool.exec.call(tool, `${command} -rf /`);",
+        "tool.exec?.call(tool, `${command} -rf /`);",
+        "tool.exec?.apply(tool, [`${command} -rf /`]);",
+        "tool.exec?.bind(tool, `${command} -rf /`)();",
+        "tool.exec['call']?.(tool, `${command} -rf /`);",
+        "tool['exec']?.['apply'](tool, [`${command} -rf /`]);",
+        "tool.exec.call?.call(tool.exec, tool, `${command} -rf /`);",
+        "const go = tool.exec; go?.(`${command} -rf /`);",
+        "const go = exec; const next = go; next?.(`${command} -rf /`);",
+        "let go; go = tool.exec; go.call(null, `${command} -rf /`);",
+        "const go = tool.exec.bind(tool); go?.(`${command} -rf /`);",
+        "const {exec: go} = tool; go?.(`${command} -rf /`);",
+        "const {'exec': go = fallback} = tool; go?.(`${command} -rf /`);",
+        "function invoke({exec: go}) { go?.(`${command} -rf /`); }",
+        "tool.exec.call`${command} -rf /`;",
+        "Reflect.apply(tool.exec, tool, [`${command} -rf /`]);",
+        "Reflect?.apply(tool.exec, tool, [`${command} -rf /`]);",
+        "Reflect.construct(tool.exec, [`${command} -rf /`]);",
+        "const invoke = Reflect.apply; invoke?.(tool.exec, tool, [`${command} -rf /`]);",
+        "const go = flag ? tool.exec : format; go?.(`${command} -rf /`);",
+        "const go = flag ? format : tool.exec; go?.(`${command} -rf /`);",
+        "const go = tool.exec || format; go?.(`${command} -rf /`);",
+        "const go = flag && tool.exec; go?.(`${command} -rf /`);",
+        "const go = (observe(), tool.exec); go?.(`${command} -rf /`);",
+        "const first = tool.exec; const go = flag ? first : format; go?.(`${command} -rf /`);",
+        "(flag ? tool.exec : format)?.call(tool, `${command} -rf /`);",
+        "const first = tool.exec; (flag ? first : format)?.call(tool, `${command} -rf /`);",
+        "(selected = tool.exec)?.(`${command} -rf /`);",
+    ],
+)
+def test_execution_helpers_and_aliases_keep_dynamic_templates_unverified(statement: str) -> None:
+    source = statement + _PADDING
+    assert javascript_template_spans(source, lambda: None) is None
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "format?.call(null, `hello ${name}`);",
+        "format?.apply(null, [`hello ${name}`]);",
+        "format?.bind(null, `hello ${name}`)();",
+        "format['call']?.(null, `hello ${name}`);",
+        "const config = {exec: 'label'}; console.log(config?.exec, `hello ${name}`);",
+        "const label = source.exec; console.log(`Value: ${label}`);",
+        "const {exec: label} = source; console.log(`Value: ${label}`);",
+        "const label = flag ? source.exec : 'label'; console.log(`Value: ${label}`);",
+        "const format = flag ? first : second; format?.call(null, `hello ${name}`);",
+        "(observe(), format)?.call(null, `hello ${name}`);",
+    ],
+)
+def test_data_reads_and_ordinary_function_helpers_retain_template_ownership(statement: str) -> None:
+    source = statement + _PADDING
+    assert javascript_template_spans(source, lambda: None) is not None
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
