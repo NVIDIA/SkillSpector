@@ -3037,6 +3037,7 @@ def test_parser_cause_scope_and_prefix_measurements_reach_public_reports(
         "endLine": 3,
     }
     assert "at least 4097" in notification["message"]["text"]
+    assert "Resource measurements not recorded" not in notification["message"]["text"]
     assert "unchecked scope: command_word" in notification["message"]["text"]
     if output_format == "json":
         body = json.loads(result["report_body"])
@@ -3048,5 +3049,30 @@ def test_parser_cause_scope_and_prefix_measurements_reach_public_reports(
         rendered = " ".join(result["report_body"].split())
         assert "Parser cause: resource_limit" in rendered
         assert "at least 4097" in rendered
+        assert "Resource measurements not recorded" not in rendered
         assert "script.sh:2-3" in rendered
     validate_sarif_report(result["sarif_report"])
+
+    unknown_event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        analyzer_id="static_test",
+        path="script.sh",
+        reason=LedgerReason.STATIC_PARSE_LIMIT,
+        emitted_finding_ids=[finding.finding_id],
+        parser_diagnostic={
+            key: value
+            for key, value in diagnostic.items()
+            if key not in {"observed_characters", "limit_characters"}
+        },
+    )
+    state["inspection_ledger"] = [unknown_event]
+    state["analyzer_status_events"] = [analyzer_status_for_events("static_test", [unknown_event])]
+    state.pop("analysis_completeness", None)
+    unknown_result = report(state)
+    unknown_notification = unknown_result["sarif_report"]["runs"][0]["invocations"][0][
+        "toolExecutionNotifications"
+    ][0]
+    assert "Resource measurements not recorded" in unknown_notification["message"]["text"]
+    if output_format in {"terminal", "markdown"}:
+        assert "Resource measurements not recorded" in unknown_result["report_body"]

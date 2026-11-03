@@ -155,12 +155,14 @@ def _resource_measurement_description(
 def _inspection_exception_message(row: Mapping[str, object]) -> str:
     """Describe only vetted parser causes and actual resource measurements."""
     message = str(row.get("message", ""))
+    diagnostic = sanitize_parser_diagnostic(row.get("parser_diagnostic"))
     details = _resource_measurement_description(row)
     if details:
         message += f" Measurements: {details}."
-    elif str(row.get("reason_code", "")).endswith("_limit"):
+    elif str(row.get("reason_code", "")).endswith("_limit") and not (
+        diagnostic is not None and resource_measurements(diagnostic)
+    ):
         message += " Resource measurements not recorded."
-    diagnostic = sanitize_parser_diagnostic(row.get("parser_diagnostic"))
     if diagnostic is not None:
         message += f" Parser cause: {diagnostic['cause']}; check: {diagnostic['check']}; location: {diagnostic['location_precision']}; unchecked scope: {diagnostic['unchecked_scope']}."
         message += (
