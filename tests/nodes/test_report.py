@@ -3183,9 +3183,7 @@ def test_enclosing_parser_location_does_not_claim_malformed_input_or_lose_zero()
         }
     )
 
-    assert (
-        "SkillSpector could not determine this command or code fragment's boundaries." in message
-    )
+    assert "SkillSpector could not determine this command or code fragment's boundaries." in message
     assert (
         "This code fragment has invalid syntax (its structure is not valid for this language)."
         not in message

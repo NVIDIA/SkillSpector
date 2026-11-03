@@ -3898,9 +3898,7 @@ def _shell_command_strings(
         startup_diagnostics = []
     substitution_scopes: list[int] = []
     backtick_starts: set[int] = set()
-    scoped_startup: list[
-        tuple[int, list[bool], list[StaticParserDiagnostic], int, str]
-    ] = []
+    scoped_startup: list[tuple[int, list[bool], list[StaticParserDiagnostic], int, str]] = []
     startup_work_limit = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
     startup_work = [startup_work_limit]
     clause_starts = (
@@ -4045,9 +4043,7 @@ def _shell_command_strings(
         # Keep exposure monotonic across eval, including settings in its body.
         start, end = literal_spans[-1] if literal_spans else source_span
         diagnostic = diagnostics[0] if diagnostics else None
-        if diagnostic is not None and not any(
-            diagnostic is item for item in context_diagnostics
-        ):
+        if diagnostic is not None and not any(diagnostic is item for item in context_diagnostics):
             diagnostic = diagnostic.shifted(body_start)
         yield _ShellCommandString(
             command_string,
