@@ -729,6 +729,41 @@ def test_quoted_printf_preserves_multiline_literal_value(newline: str) -> None:
     )
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    "prefix, argument, suffix, complete_context",
+    [
+        ("", '"$VALUE"', "", True),
+        ("", '"$($CMD -rf /)"', "", True),
+        ('printf() { "$CMD" "$@"; }\n', '"known value"', "", True),
+        ("", '"known value"', "$CMD -rf /\n", True),
+        ("", '"known value"', 'echo "\n' + "#" * 6000, True),
+        ("", '"known value"', "", False),
+    ],
+)
+def test_multiline_printf_quote_proof_keeps_unresolved_commands_partial(
+    prefix: str, argument: str, suffix: str, complete_context: bool, newline: str
+) -> None:
+    source = prefix + 'test x = "$(printf "%s\\n" "first value" \\\n  ' + argument + ')"\n' + suffix
+
+    assert tm.has_bounded_parse_exhaustion(
+        source.replace("\n", newline),
+        lambda: None,
+        file_type="shell",
+        complete_context=complete_context,
+    )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_multiline_printf_quote_proof_preserves_destructive_execution(newline: str) -> None:
+    source = '"$(printf "%s%s" r \\\n  m)" -rf /\n'.replace("\n", newline)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["run.sh"], "file_cache": {"run.sh": source}}, [tm]
+    )
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
 @pytest.mark.parametrize(
     ("body", "expected"),
     [
