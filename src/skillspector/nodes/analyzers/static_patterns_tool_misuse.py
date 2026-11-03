@@ -7310,7 +7310,29 @@ def _markdown_shell_text(
             fence_has_literal_apostrophe = False
             fence_has_nonliteral_apostrophe = False
             output[offset + prefix + begin : offset + prefix + end] = " " * (end - begin)
-        elif not leading or indentation >= 4 or list_indented:
+        elif (
+            not leading
+            or list_indented
+            or indentation >= 4
+            and not (
+                paragraph_in_list
+                and 0 <= indentation - paragraph_list_indent <= 3
+                # A continuation uses the proven content margin. A nested
+                # marker or a new block needs its own container proof.
+                and list_marker.match(leading) is None
+                and not leading.startswith((">", "|"))
+                and re.match(r"#{1,6}(?:[ \t]|$)", leading) is None
+                and not _markdown_block_separator(leading, check_runtime)
+                and table_columns is None
+                and not (
+                    line_index + 1 < len(lines)
+                    and _markdown_table_delimiter_columns(
+                        lines[line_index + 1], paragraph_list_indent, check_runtime
+                    )
+                    is not None
+                )
+            )
+        ):
             mask_inline_delimiters()
         else:
             # Inline code may continue within a paragraph/list item, but cannot
