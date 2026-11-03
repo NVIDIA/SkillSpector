@@ -193,9 +193,7 @@ async def test_unsupported_tar_members_keep_incomplete_reference_evidence(
         and item["outcome"] == "skipped"
         for item in result["analysis_completeness"]["ledger_exceptions"]
     )
-    assert any(
-        issue["id"] == "AE1" and issue["severity"] == "HIGH" for issue in result["findings"]
-    )
+    assert any(issue["id"] == "AE1" and issue["severity"] == "HIGH" for issue in result["findings"])
 
 
 @pytest.mark.parametrize("extension", ["zip", "dat"])
