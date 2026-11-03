@@ -1253,7 +1253,9 @@ def _bounded_sentence_end(
     # A directive can be inside a quoted string; retain that quote's state.
     scan_start = start if context_start is None else context_start
     for boundary_start, _ in _sentence_boundaries(
-        text, scan_start, min(len(text), maximum_end + 1),
+        text,
+        scan_start,
+        min(len(text), maximum_end + 1),
         closes_owned_string=closes_owned_string,
     ):
         if start <= boundary_start <= maximum_end:
@@ -1871,7 +1873,9 @@ def _classify_directive(
     baseline = None
     if context_start is not None:
         baseline = _classify_directive(
-            view, directive, end_is_truncated=end_is_truncated,
+            view,
+            directive,
+            end_is_truncated=end_is_truncated,
             closes_owned_string=closes_owned_string,
         )
         if baseline.active or not baseline.limited:
