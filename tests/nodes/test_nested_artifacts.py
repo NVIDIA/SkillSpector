@@ -1977,3 +1977,16 @@ def test_archive_clock_cancellation_propagates(tmp_path: Path, archive_kind: str
 
     with pytest.raises(asyncio.CancelledError):
         inspect_nested_artifacts(tmp_path, ["bundle"], raw_file_cache={"bundle": data}, clock=clock)
+
+
+def test_short_zip_member_never_claims_complete_declaration_source(tmp_path: Path) -> None:
+    data = bytearray(_zip_bytes({"types.d.ts": b"export {}"}))
+    local = data.index(b"PK\x03\x04")
+    central = data.index(b"PK\x01\x02")
+    struct.pack_into("<I", data, local + 22, 100)
+    struct.pack_into("<I", data, central + 24, 100)
+    result = inspect_nested_artifacts(tmp_path, ["bundle.zip"], raw_file_cache={"bundle.zip": bytes(data)})
+    assert "bundle.zip!/types.d.ts" not in result.raw_file_cache
+    assert result.file_cache["bundle.zip!/types.d.ts"] == "\x00"
+    assert any(event.get("path") == "bundle.zip!/types.d.ts" and event.get("reason_code") == LedgerReason.ARCHIVE_TRUNCATED for event in result.ledger_events)
+    assert "bundle.zip" not in result.inspected_containers

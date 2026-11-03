@@ -1146,6 +1146,21 @@ def _inspect_zip_bytes(
                 _exception(result, path=virtual_path, reason=LedgerReason.ARCHIVE_TRUNCATED)
                 continue
 
+            if len(member_data) != info.file_size:
+                _add_unreadable_component(
+                    result,
+                    virtual_path=virtual_path,
+                    outer_path=outer_path,
+                    member_path=member_path,
+                    container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    concealment_reasons=concealment_reasons,
+                    depth=depth,
+                    reason=LedgerReason.ARCHIVE_TRUNCATED,
+                    size_bytes=info.file_size,
+                )
+                _exception(result, path=virtual_path, reason=LedgerReason.ARCHIVE_TRUNCATED)
+                continue
             if len(member_data) > budget.max_member_bytes:
                 _add_unreadable_component(
                     result,
