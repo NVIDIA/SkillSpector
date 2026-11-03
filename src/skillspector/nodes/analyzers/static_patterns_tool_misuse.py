@@ -3240,6 +3240,7 @@ def _shell_command_strings(
     if startup_exposure is None:
         startup_exposure = [False]
     substitution_scopes: list[int] = []
+    backtick_starts: set[int] = set()
     scoped_startup: list[tuple[int, list[bool]]] = []
     startup_work = [4 * len(content) + _ROOT_GLOB_COMMAND_CHARS]
     clause_starts = (
@@ -3250,6 +3251,7 @@ def _shell_command_strings(
             check_runtime,
             shell_substitutions=shell_substitutions,
             substitution_scopes=substitution_scopes,
+            backtick_starts=backtick_starts,
         )
     )
     for clause_start in clause_starts:
@@ -3266,6 +3268,14 @@ def _shell_command_strings(
             inherited = scoped_startup[-1][1] if scoped_startup else startup_exposure
             scoped_startup.append((scope, [inherited[0]]))
         startup_context = scoped_startup[-1][1] if scoped_startup else startup_exposure
+        if clause_start in backtick_starts:
+            # The legacy substitution body is not reconstructed here. Its
+            # child may load startup code, but a quoted/escaped data backtick
+            # never enters this lexical marker set.
+            if startup_context[0]:
+                yield None, startup_context
+                return
+            continue
         if not startup_context[0]:
             startup_context[0] = _shell_clause_sets_startup(
                 content, clause_start, check_runtime, startup_work
@@ -3560,6 +3570,7 @@ def _nonempty_shell_clause_starts(
     *,
     shell_substitutions: bool = False,
     substitution_scopes: list[int] | None = None,
+    backtick_starts: set[int] | None = None,
 ) -> Iterator[int]:
     """Avoid reparsing the same trailing command across empty physical lines."""
     for start in _shell_clause_starts(
@@ -3567,6 +3578,7 @@ def _nonempty_shell_clause_starts(
         check_runtime,
         shell_substitutions=shell_substitutions,
         substitution_scopes=substitution_scopes,
+        backtick_starts=backtick_starts,
     ):
         while start < len(content) and content[start] in " \t":
             if start % 4096 == 0:
@@ -3582,6 +3594,7 @@ def _shell_clause_starts(
     *,
     shell_substitutions: bool = False,
     substitution_scopes: list[int] | None = None,
+    backtick_starts: set[int] | None = None,
 ) -> Iterator[int]:
     """Yield command-clause starts outside quotes and comments in one pass."""
     yield 0
@@ -3619,6 +3632,14 @@ def _shell_clause_starts(
                 word_started = False
                 yield cursor
                 continue
+        if (
+            shell_substitutions
+            and backtick_starts is not None
+            and quote != "'"
+            and character == "`"
+        ):
+            backtick_starts.add(cursor)
+            yield cursor
         if quote is not None:
             if character == quote:
                 quote = None

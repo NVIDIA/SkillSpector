@@ -401,7 +401,10 @@ def test_nested_powershell_fence_owns_only_its_current_body(
     start = content.index(body.replace("\n", newline))
 
     assert blocks[-1] == (start, start + len(body.replace("\n", newline)))
-    assert all(left_end <= right_start for (_, left_end), (right_start, _) in zip(blocks, blocks[1:]))
+    assert all(
+        left_end <= right_start
+        for (_, left_end), (right_start, _) in zip(blocks, blocks[1:], strict=False)
+    )
     assert _ledger(content, "SKILL.md")["outcome"] is LedgerOutcome.COMPLETED
     hostile = content + "\n```bash\nbash -c '$CMD -rf /'\n```\n"
     assert _ledger(hostile, "SKILL.md")["outcome"] is LedgerOutcome.PARTIAL
