@@ -488,8 +488,7 @@ class ShellSourceResolver:
                     while following < len(self.content) and self.content[following] in " \t":
                         following += 1
                     if (
-                        following < len(self.content)
-                        and self.content[following] not in "\r\n;|&"
+                        following < len(self.content) and self.content[following] not in "\r\n;|&"
                     ) or not self._spend(following - cursor):
                         self.valid = False
                         return

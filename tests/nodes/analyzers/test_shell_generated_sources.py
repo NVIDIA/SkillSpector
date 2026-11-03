@@ -371,13 +371,13 @@ def test_mapfile_bridge_refuses_unproved_destination_or_consumer(invocation: str
     ],
 )
 def test_mapfile_bridge_never_skips_asynchronous_producer_effects(producer: str) -> None:
-    caller = _CALLER.replace(
-        "helper=$(sed", f"mapfile -t items < <({producer})\nhelper=$(sed"
-    )
+    caller = _CALLER.replace("helper=$(sed", f"mapfile -t items < <({producer})\nhelper=$(sed")
     prepared = _prepare(caller)
     assert prepared is None or not tuple(prepared.variants())
     raw = caller + "rm -rf /\n"
-    assert any(finding.rule_id == "TM1" for finding in tm.analyze(raw, "scripts/caller.sh", "shell"))
+    assert any(
+        finding.rule_id == "TM1" for finding in tm.analyze(raw, "scripts/caller.sh", "shell")
+    )
 
 
 @pytest.mark.parametrize("name", ["helper", "script", "root"])
