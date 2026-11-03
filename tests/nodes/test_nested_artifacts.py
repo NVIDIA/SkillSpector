@@ -12,6 +12,7 @@ import stat
 import struct
 import tarfile
 import zipfile
+import zlib
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -74,6 +75,24 @@ def _tar_bytes(
             info.size = len(content)
             archive.addfile(info, io.BytesIO(content))
     return buffer.getvalue()
+
+
+def _gzip_with_header(
+    payload: bytes, *, name: bytes | None = None, comment: bytes | None = None,
+    extra: bytes | None = None, header_crc: bool = False,
+) -> bytes:
+    encoded = gzip.compress(payload)
+    header = bytearray(encoded[:10])
+    header[3] = (8 if name is not None else 0) | (16 if comment is not None else 0) | (4 if extra is not None else 0) | (2 if header_crc else 0)
+    if extra is not None:
+        header.extend(struct.pack("<H", len(extra)) + extra)
+    if name is not None:
+        header.extend(name + b"\x00")
+    if comment is not None:
+        header.extend(comment + b"\x00")
+    if header_crc:
+        header.extend(struct.pack("<H", zlib.crc32(header) & 0xFFFF))
+    return bytes(header) + encoded[10:]
 
 
 def _document_members(**extra: bytes) -> dict[str, bytes]:
@@ -1990,3 +2009,152 @@ def test_short_zip_member_never_claims_complete_declaration_source(tmp_path: Pat
     assert result.file_cache["bundle.zip!/types.d.ts"] == "\x00"
     assert any(event.get("path") == "bundle.zip!/types.d.ts" and event.get("reason_code") == LedgerReason.ARCHIVE_TRUNCATED for event in result.ledger_events)
     assert "bundle.zip" not in result.inspected_containers
+
+
+@pytest.mark.parametrize("field", ["name", "comment", "extra"])
+@pytest.mark.parametrize("over_limit", [False, True])
+def test_gzip_metadata_header_boundaries_are_checked_before_decompression(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, over_limit: bool
+) -> None:
+    import skillspector.nested_artifacts as nested
+
+    monkeypatch.setattr(nested, "ARCHIVE_MAX_CENTRAL_DIRECTORY_BYTES", 32)
+    # Fixed header10 plus a NUL-terminated field22 or XLEN2 + extra20.
+    length = (20 if field == "extra" else 21) + int(over_limit)
+    data = _gzip_with_header(b"safe", **{field: b"x" * length})
+    result = inspect_nested_artifacts(tmp_path, ["bundle.txt.gz"], raw_file_cache={"bundle.txt.gz": data})
+    events = [event for event in result.ledger_events if event.get("reason_code") == LedgerReason.ARCHIVE_SIZE_LIMIT]
+    assert bool(events) is over_limit
+    if over_limit:
+        assert events[0]["observed_bytes"] == 33
+        assert events[0]["limit_bytes"] == 32
+        assert not result.raw_file_cache
+    else:
+        assert result.raw_file_cache["bundle.txt.gz!/bundle.txt"] == b"safe"
+        assert not result.ledger_events
+
+
+@pytest.mark.parametrize("over_limit", [False, True])
+def test_gzip_concatenated_headers_share_one_metadata_allowance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, over_limit: bool
+) -> None:
+    import skillspector.nested_artifacts as nested
+
+    monkeypatch.setattr(nested, "ARCHIVE_MAX_CENTRAL_DIRECTORY_BYTES", 32)
+    data = _gzip_with_header(b"first\n", name=b"name0") + _gzip_with_header(b"second\n", name=b"name0" + b"x" * int(over_limit))
+    result = inspect_nested_artifacts(tmp_path, ["bundle.txt.gz"], raw_file_cache={"bundle.txt.gz": data})
+    events = [event for event in result.ledger_events if event.get("reason_code") == LedgerReason.ARCHIVE_SIZE_LIMIT]
+    assert bool(events) is over_limit
+    assert result.raw_file_cache["bundle.txt.gz!/bundle.txt"] == (b"first\n" if over_limit else b"first\nsecond\n")
+    if over_limit:
+        assert events[0]["observed_bytes"] == 33
+        assert events[0]["limit_bytes"] == 32
+        assert "bundle.txt.gz" not in result.inspected_containers
+
+
+@pytest.mark.parametrize("padding_length", [65535, 65536, 65537])
+def test_gzip_padding_is_scanned_once_per_bounded_chunk(
+    tmp_path: Path, padding_length: int
+) -> None:
+    import asyncio
+
+    data = gzip.compress(b"first\n") + bytes(padding_length) + gzip.compress(b"second\n")
+    calls = 0
+
+    def bounded_clock() -> float:
+        nonlocal calls
+        calls += 1
+        if calls > 128:
+            raise asyncio.CancelledError
+        return 0.0
+
+    result = inspect_nested_artifacts(tmp_path, ["bundle.txt.gz"], raw_file_cache={"bundle.txt.gz": data}, clock=bounded_clock)
+    assert result.raw_file_cache["bundle.txt.gz!/bundle.txt"] == b"first\nsecond\n"
+    assert not result.ledger_events
+    assert calls < 128
+
+
+@pytest.mark.parametrize("flags,tail", [(8, b"unterminated"), (16, b"unterminated"), (4, b"\x01"), (4, b"\x08\x00x"), (2, b"x")])
+def test_truncated_gzip_optional_headers_remain_explicit(
+    tmp_path: Path, flags: int, tail: bytes
+) -> None:
+    data = bytearray(gzip.compress(b"safe")[:10])
+    data[3] = flags
+    data.extend(tail)
+    result = inspect_nested_artifacts(tmp_path, ["bundle.gz"], raw_file_cache={"bundle.gz": bytes(data)})
+    assert any(event.get("reason_code") == LedgerReason.ARCHIVE_TRUNCATED for event in result.ledger_events)
+    assert not result.raw_file_cache
+
+
+@pytest.mark.parametrize("corrupt_crc", [False, True])
+def test_gzip_optional_header_crc_is_still_verified_by_zlib(
+    tmp_path: Path, corrupt_crc: bool
+) -> None:
+    data = bytearray(_gzip_with_header(b"safe", name=b"../../ignored-filename", comment=b"untrusted metadata", extra=b"extra", header_crc=True))
+    if corrupt_crc:
+        header_end = 10 + 2 + len(b"extra") + len(b"../../ignored-filename") + 1 + len(b"untrusted metadata") + 1 + 2
+        data[header_end - 1] ^= 1
+    result = inspect_nested_artifacts(tmp_path, ["bundle.txt.gz"], raw_file_cache={"bundle.txt.gz": bytes(data)})
+    if corrupt_crc:
+        assert any(event.get("reason_code") == LedgerReason.ARCHIVE_MALFORMED for event in result.ledger_events)
+        assert not result.raw_file_cache
+    else:
+        assert result.raw_file_cache["bundle.txt.gz!/bundle.txt"] == b"safe"
+        assert not result.ledger_events
+
+
+@pytest.mark.parametrize("tar_format", [tarfile.USTAR_FORMAT, tarfile.GNU_FORMAT, tarfile.PAX_FORMAT])
+def test_tar_undecodable_member_names_preserve_siblings_without_report_encoding_errors(
+    tmp_path: Path, tar_format: int
+) -> None:
+    data = _tar_bytes([("before.txt", b"safe before"), ("bad\udcff.sh", b"not admitted"), ("after.txt", b"safe after")], tar_format=tar_format)
+    result = inspect_nested_artifacts(tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": data})
+    assert result.raw_file_cache["bundle.tar!/before.txt"] == b"safe before"
+    assert result.raw_file_cache["bundle.tar!/after.txt"] == b"safe after"
+    assert all(not any(0xD800 <= ord(character) <= 0xDFFF for character in path) for path in result.components)
+    assert any(event.get("path") == "bundle.tar" and event.get("reason_code") == LedgerReason.ARCHIVE_UNSAFE_MEMBER_PATH for event in result.ledger_events)
+    assert "bundle.tar" not in result.inspected_containers
+
+
+@pytest.mark.parametrize("tar_format", [tarfile.GNU_FORMAT, tarfile.PAX_FORMAT])
+def test_valid_unicode_tar_names_keep_exact_virtual_paths(tmp_path: Path, tar_format: int) -> None:
+    name = "資料/分析-🛡.txt"
+    data = _tar_bytes([(name, b"safe")], tar_format=tar_format)
+    result = inspect_nested_artifacts(tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": data})
+    assert result.raw_file_cache[f"bundle.tar!/{name}"] == b"safe"
+    assert not result.ledger_events
+
+
+def test_tar_undecodable_names_cannot_crash_full_graph_finalization(tmp_path: Path) -> None:
+    from skillspector.graph import create_graph
+
+    (tmp_path / "SKILL.md").write_text("# Archive name safety\n", encoding="utf-8")
+    (tmp_path / "bundle.tar").write_bytes(_tar_bytes([("bad\udcff.txt", b"uninterpreted"), ("safe.txt", b"safe")]))
+    result = create_graph().invoke({"skill_path": str(tmp_path), "use_llm": False})
+    assert result["raw_file_cache"]["bundle.tar!/safe.txt"] == b"safe"
+    assert any(event.get("reason_code") == LedgerReason.ARCHIVE_UNSAFE_MEMBER_PATH for event in result["inspection_ledger"])
+    assert result["analysis_completeness"]["status"] != "complete"
+
+
+@pytest.mark.parametrize("members,limited", [(2, False), (3, True)])
+def test_global_pax_names_cannot_amplify_metadata_into_unbounded_ledger_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, members: int, limited: bool
+) -> None:
+    import skillspector.nested_artifacts as nested
+
+    monkeypatch.setattr(nested, "ARCHIVE_MAX_CENTRAL_DIRECTORY_BYTES", 8192)
+    stream = io.BytesIO()
+    name = "x" * 4096
+    with tarfile.open(fileobj=stream, mode="w", format=tarfile.PAX_FORMAT, pax_headers={"path": name}) as archive:
+        for index in range(members):
+            info = tarfile.TarInfo(f"source-{index}")
+            archive.addfile(info)
+    result = inspect_nested_artifacts(tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": stream.getvalue()})
+    events = [event for event in result.ledger_events if event.get("reason_code") == LedgerReason.ARCHIVE_SIZE_LIMIT]
+    assert bool(events) is limited
+    assert len(result.raw_file_cache) == 1
+    assert sum(event.get("path") == f"bundle.tar!/{name}" for event in result.ledger_events) == 1
+    if limited:
+        assert events[0]["path"] == "bundle.tar"
+        assert events[0]["observed_bytes"] == 12288
+        assert events[0]["limit_bytes"] == 8192

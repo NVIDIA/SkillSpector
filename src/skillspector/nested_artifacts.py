@@ -164,6 +164,7 @@ class _Budget:
     members: int = 0
     uncompressed_bytes: int = 0
     metadata_fields: int = 0
+    gzip_metadata_bytes: int = 0
     halted: bool = False
 
     def expired(self) -> bool:
@@ -393,6 +394,7 @@ def _safe_member_name(name: str) -> str | None:
     if (
         not normalized
         or "\x00" in normalized
+        or any(0xD800 <= ord(character) <= 0xDFFF for character in normalized)
         or "!/" in normalized
         or normalized.startswith(("/", "//"))
     ):
@@ -1301,6 +1303,7 @@ class _TarReader(io.BytesIO):
         self.data = data
         self.budget = budget
         self.metadata_bytes = 0
+        self.effective_metadata_bytes = 0
         self.metadata_depth = 0
 
     def read(self, size: int = -1) -> bytes:
@@ -1358,6 +1361,21 @@ class _TarReader(io.BytesIO):
             if key.startswith(b"GNU.sparse.") or key == b"SCHILY.realsize":
                 raise _ArchiveInspectionLimit(LedgerReason.OPAQUE_CONTENT)
             start = stop
+
+    def check_effective_names(self, info: tarfile.TarInfo) -> None:
+        """Bound repeated global PAX names before constructing virtual identities."""
+        _check_archive_time(self.budget)
+        observed = self.effective_metadata_bytes + sum(
+            len(value.encode("utf-8", errors="surrogatepass"))
+            for value in (info.name, info.linkname)
+        )
+        if observed > self.budget.max_central_directory_bytes:
+            raise _ArchiveInspectionLimit(
+                LedgerReason.ARCHIVE_SIZE_LIMIT,
+                observed_bytes=observed,
+                limit_bytes=self.budget.max_central_directory_bytes,
+            )
+        self.effective_metadata_bytes = observed
 
 
 class _BoundedTarInfo(tarfile.TarInfo):
@@ -1424,6 +1442,7 @@ def _inspect_tar_bytes(
         ) as archive:
             for info in archive:
                 _check_archive_time(budget)
+                reader.check_effective_names(info)
                 safe_name, name_reason = _member_name(info.name, directory=info.isdir(), seen=names)
                 if name_reason is not None:
                     _exception(result, path=f"{container_virtual_path}!/{safe_name}" if safe_name is not None else container_virtual_path, reason=name_reason)
@@ -1493,6 +1512,60 @@ def _inspect_tar_bytes(
         result.inspected_containers[container_virtual_path] = member_paths
 
 
+def _gzip_header_end(data: bytes, start: int, budget: _Budget) -> int:
+    """Preflight RFC 1952 metadata before handing any header to zlib."""
+    _check_archive_time(budget)
+
+    def consume(size: int) -> None:
+        observed = budget.gzip_metadata_bytes + size
+        if observed > budget.max_central_directory_bytes:
+            raise _ArchiveInspectionLimit(
+                LedgerReason.ARCHIVE_SIZE_LIMIT,
+                observed_bytes=observed,
+                limit_bytes=budget.max_central_directory_bytes,
+            )
+        budget.gzip_metadata_bytes = observed
+
+    if len(data) - start < 10:
+        raise _ArchiveInspectionLimit(LedgerReason.ARCHIVE_TRUNCATED)
+    consume(10)
+    if data[start : start + 2] != b"\x1f\x8b" or data[start + 2] != 8 or data[start + 3] & 0xE0:
+        raise _ArchiveInspectionLimit(LedgerReason.ARCHIVE_MALFORMED)
+    flags = data[start + 3]
+    cursor = start + 10
+    if flags & 4:
+        if len(data) - cursor < 2:
+            raise _ArchiveInspectionLimit(LedgerReason.ARCHIVE_TRUNCATED)
+        consume(2)
+        size = struct.unpack_from("<H", data, cursor)[0]
+        cursor += 2
+        if size > len(data) - cursor:
+            raise _ArchiveInspectionLimit(LedgerReason.ARCHIVE_TRUNCATED)
+        consume(size)
+        cursor += size
+    for flag in (8, 16):
+        if not flags & flag:
+            continue
+        while True:
+            _check_archive_time(budget)
+            remaining = budget.max_central_directory_bytes - budget.gzip_metadata_bytes
+            stop = min(len(data), cursor + min(65536, remaining + 1))
+            terminator = data.find(b"\x00", cursor, stop)
+            end = terminator + 1 if terminator >= 0 else stop
+            consume(end - cursor)
+            cursor = end
+            if terminator >= 0:
+                break
+            if cursor == len(data):
+                raise _ArchiveInspectionLimit(LedgerReason.ARCHIVE_TRUNCATED)
+    if flags & 2:
+        if len(data) - cursor < 2:
+            raise _ArchiveInspectionLimit(LedgerReason.ARCHIVE_TRUNCATED)
+        consume(2)
+        cursor += 2
+    return cursor
+
+
 def _inspect_gzip_bytes(
     data: bytes,
     *,
@@ -1514,14 +1587,13 @@ def _inspect_gzip_bytes(
         while cursor < len(data):
             _check_archive_time(budget)
             if data[cursor] == 0:
-                if not any(memoryview(data)[cursor : cursor + 65536]):
-                    cursor = min(len(data), cursor + 65536)
-                    continue
-                cursor += 1
+                padding = data[cursor : cursor + 65536]
+                cursor += len(padding) - len(padding.lstrip(b"\x00"))
                 continue
             if not data.startswith(b"\x1f\x8b", cursor):
                 raise _ArchiveInspectionLimit(LedgerReason.ARCHIVE_MALFORMED)
             _charge_archive_member(budget)
+            _gzip_header_end(data, cursor, budget)
             frame_start, expanded_start = cursor, len(expanded)
             decoder = zlib.decompressobj(wbits=31)
             while not decoder.eof:
