@@ -29,6 +29,7 @@ from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     analyzer_status_for_events,
+    finalize_ledger,
     ledger_event,
 )
 from skillspector.models import Finding
@@ -3021,6 +3022,7 @@ def test_parser_cause_scope_and_prefix_measurements_reach_public_reports(
         "use_llm": False,
         "llm_requested": False,
     }
+    state["analysis_completeness"], state["effective_finding_ids"] = finalize_ledger(state)
     result = report(state)
     projected = result["analysis_completeness"]["ledger_exceptions"][0]["parser_diagnostic"]
     assert projected["observed_characters"] == 4097
@@ -3046,7 +3048,12 @@ def test_parser_cause_scope_and_prefix_measurements_reach_public_reports(
         )
         assert body["issues"][0]["id"] == "TM1"
     elif output_format in {"terminal", "markdown"}:
-        rendered = " ".join(result["report_body"].split())
+        body = (
+            MarkdownIt().render(result["report_body"])
+            if output_format == "markdown"
+            else result["report_body"]
+        )
+        rendered = " ".join(body.split())
         assert "Parser cause: resource_limit" in rendered
         assert "at least 4097" in rendered
         assert "Resource measurements not recorded" not in rendered
@@ -3068,11 +3075,16 @@ def test_parser_cause_scope_and_prefix_measurements_reach_public_reports(
     )
     state["inspection_ledger"] = [unknown_event]
     state["analyzer_status_events"] = [analyzer_status_for_events("static_test", [unknown_event])]
-    state.pop("analysis_completeness", None)
+    state["analysis_completeness"], state["effective_finding_ids"] = finalize_ledger(state)
     unknown_result = report(state)
     unknown_notification = unknown_result["sarif_report"]["runs"][0]["invocations"][0][
         "toolExecutionNotifications"
     ][0]
     assert "Resource measurements not recorded" in unknown_notification["message"]["text"]
     if output_format in {"terminal", "markdown"}:
-        assert "Resource measurements not recorded" in unknown_result["report_body"]
+        body = (
+            MarkdownIt().render(unknown_result["report_body"])
+            if output_format == "markdown"
+            else unknown_result["report_body"]
+        )
+        assert "Resource measurements not recorded" in " ".join(body.split())
