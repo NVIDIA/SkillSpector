@@ -1962,13 +1962,13 @@ def test_excluded_renamed_tar_remains_local_and_executable_members_fail_closed(
     tmp_path: Path, compressed: bool
 ) -> None:
     (tmp_path / "SKILL.md").write_text("# Excluded archive\n", encoding="utf-8")
-    (tmp_path / "assets").mkdir()
+    (tmp_path / "node_modules").mkdir()
     data = _tar_bytes([("run.sh", b"#!/bin/sh\necho inspected\n")])
     if compressed:
         data = gzip.compress(data)
-    (tmp_path / "assets" / "bundle.dat").write_bytes(data)
-    context = build_context({"skill_path": str(tmp_path), "exclude_patterns": ["assets/**"]})
-    path = "assets/bundle.dat!/run.sh"
+    (tmp_path / "node_modules" / "bundle.dat").write_bytes(data)
+    context = build_context({"skill_path": str(tmp_path)})
+    path = "node_modules/bundle.dat!/run.sh"
     assert path not in context["llm_file_cache"]
     assert any(
         event.get("path") == path
