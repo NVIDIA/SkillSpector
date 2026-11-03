@@ -2231,6 +2231,8 @@ def test_report_preserves_resource_measurements_with_units(output_format: str) -
         validate_sarif_report(result["sarif_report"])
     else:
         rendered = " ".join(result["report_body"].split())
+        if output_format == "markdown":
+            rendered = rendered.replace(r"\.", ".")
         for unit in ["characters", "bytes", "findings", "artifacts", "depth", "records", "seconds"]:
             expected = f"{unit}: observed {measurements['observed_' + unit]}, limit {measurements['limit_' + unit]}"
             assert expected in rendered
@@ -2282,7 +2284,10 @@ def test_report_distinguishes_unrecorded_and_zero_resource_measurements(
         },
     }
     result = report(state)
-    assert expected in " ".join(result["report_body"].split())
+    rendered = " ".join(result["report_body"].split())
+    if output_format == "markdown":
+        rendered = rendered.replace(r"\.", ".")
+    assert expected in rendered
     if output_format == "sarif":
         notification = result["sarif_report"]["runs"][0]["invocations"][0][
             "toolExecutionNotifications"
