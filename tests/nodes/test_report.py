@@ -25,6 +25,12 @@ from unittest.mock import MagicMock
 import pytest
 from markdown_it import MarkdownIt
 
+from skillspector.inspection_ledger import (
+    LedgerOutcome,
+    LedgerReason,
+    analyzer_status_for_events,
+    ledger_event,
+)
 from skillspector.models import Finding
 from skillspector.nodes.report import (
     _DIMINISHING_WEIGHTS,
@@ -2969,3 +2975,78 @@ def test_report_active_runtime_error_takes_priority_over_stale_preflight_reason(
     assert "active provider runtime failure" in metadata["llm_error"]
     assert "stale preflight reason" not in metadata["llm_error"]
     assert metadata["llm_degraded"] is True
+
+
+@pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
+def test_parser_cause_scope_and_prefix_measurements_reach_public_reports(
+    output_format: str,
+) -> None:
+    finding = _finding("TM1", "HIGH", "retained finding", file="script.sh")
+    diagnostic = {
+        "cause": "resource_limit",
+        "check": "command_word_unquoted_characters",
+        "source_start_offset": 9,
+        "source_end_offset": 4106,
+        "start_line": 2,
+        "end_line": 3,
+        "unchecked_scope": "command_word",
+        "location_precision": "source_span",
+        "full_input_checked": False,
+        "observed_is_lower_bound": True,
+        "observed_characters": 4097,
+        "limit_characters": 4096,
+        "command": "private payload",
+        "stage": "private-stage",
+    }
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        analyzer_id="static_test",
+        path="script.sh",
+        reason=LedgerReason.STATIC_PARSE_LIMIT,
+        emitted_finding_ids=[finding.finding_id],
+        parser_diagnostic=diagnostic,
+    )
+    state: SkillspectorState = {
+        "components": ["script.sh"],
+        "findings": [finding],
+        "filtered_findings": [finding],
+        "effective_finding_ids": [finding.finding_id],
+        "inspection_ledger": [event],
+        "analyzer_status_events": [analyzer_status_for_events("static_test", [event])],
+        "component_metadata": [],
+        "manifest": {},
+        "has_executable_scripts": False,
+        "output_format": output_format,
+        "use_llm": False,
+        "llm_requested": False,
+    }
+    result = report(state)
+    projected = result["analysis_completeness"]["ledger_exceptions"][0]["parser_diagnostic"]
+    assert projected["observed_characters"] == 4097
+    assert projected["observed_is_lower_bound"] is True
+    assert result["analysis_completeness"]["is_complete"] is False
+    assert result["analysis_completeness"]["execution_successful"] is True
+    assert "private payload" not in result["report_body"]
+    assert "private-stage" not in result["report_body"]
+    invocation = result["sarif_report"]["runs"][0]["invocations"][0]
+    notification = invocation["toolExecutionNotifications"][0]
+    assert notification["properties"]["parserDiagnostic"] == projected
+    assert notification["locations"][0]["physicalLocation"]["region"] == {
+        "startLine": 2,
+        "endLine": 3,
+    }
+    assert "at least 4097" in notification["message"]["text"]
+    assert "unchecked scope: command_word" in notification["message"]["text"]
+    if output_format == "json":
+        body = json.loads(result["report_body"])
+        assert (
+            body["analysis_completeness"]["ledger_exceptions"][0]["parser_diagnostic"] == projected
+        )
+        assert body["issues"][0]["id"] == "TM1"
+    elif output_format in {"terminal", "markdown"}:
+        rendered = " ".join(result["report_body"].split())
+        assert "Parser cause: resource_limit" in rendered
+        assert "at least 4097" in rendered
+        assert "script.sh:2-3" in rendered
+    validate_sarif_report(result["sarif_report"])
