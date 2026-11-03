@@ -1191,7 +1191,6 @@ def source_is_unmodified(resolver: ShellSourceResolver, target_path: str, use_of
             "file",
             "set",
             "export",
-            "trap",
             "exit",
             "return",
             "break",
@@ -1383,23 +1382,9 @@ def source_is_unmodified(resolver: ShellSourceResolver, target_path: str, use_of
                 # a read-only operation. Extend only through understood argv.
                 return False
             if name == "trap":
-                if len(arguments) != 2:
-                    return False
-                body = resolve(arguments[0][1], arguments[0][2])
-                signal = resolve(arguments[1][1], arguments[1][2])
-                if (
-                    body is None
-                    or body.kind != "literal"
-                    or signal is None
-                    or signal.text not in {"EXIT", "0"}
-                ):
-                    return False
-                deletion = re.fullmatch(r'rm -rf "\$([A-Za-z_][A-Za-z0-9_]*)"', body.text)
-                if deletion is None or touches(
-                    current._name(deletion[1], 0, command.start), subtree=True
-                ):
-                    return False
-                continue
+                # Deferred handlers use bindings at invocation, including early
+                # exits. Only the ordered effect audit can establish those.
+                return False
             if name in {"bash", "sh", "dash", "zsh", "ksh"}:
                 if command.start not in child_consumers:
                     return False

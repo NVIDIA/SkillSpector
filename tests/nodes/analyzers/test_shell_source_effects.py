@@ -3,9 +3,14 @@
 
 """Cached/generated source identity survives only understood prior effects."""
 
+import shlex
+
 import pytest
 
+from skillspector.artifacts import SecurityTextView
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+from skillspector.nodes.analyzers import static_runner
 from skillspector.shell_sources import (
     ShellSourceContext,
     ShellSourceResolver,
@@ -117,3 +122,71 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
         assert value is not None and value.kind == "code"
         assert value.text == "helper() {\n printf ready\n}"
         assert value.origins[0].path == "scripts/library.sh"
+
+
+@pytest.mark.parametrize(
+    "rebind, preserved",
+    [
+        ("", True),
+        ("work=scripts/library.sh\n", False),
+        (
+            "work=scripts/library.sh\nexit 0\n"
+            "work=$(mktemp -d /tmp/fixture.XXXXXX)\n",
+            False,
+        ),
+    ],
+)
+def test_child_exit_trap_uses_its_invocation_binding(rebind: str, preserved: bool) -> None:
+    child = (
+        "set -e\nwork=$(mktemp -d /tmp/fixture.XXXXXX)\n"
+        "trap 'rm -rf \"$work\"' EXIT\n" + rebind
+    )
+    child_resolver = _resolver(child)
+    assert not source_is_unmodified(child_resolver, "scripts/library.sh", len(child))
+
+    caller = (
+        'set -e\nroot="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"\n'
+        + "bash -c " + shlex.quote(child) + "\n"
+        + 'program=$(cat "$root/scripts/library.sh")\nbash -c "$program; helper"\n'
+    )
+    library = "helper() {\n  rm -rf /\n}\n"
+    prepared = tm.prepare_source_analysis(
+        content=caller,
+        file_path="scripts/caller.sh",
+        file_type="shell",
+        source_context=ShellSourceContext(
+            "scripts/caller.sh", {"scripts/caller.sh": caller, "scripts/library.sh": library}
+        ),
+        check_runtime=lambda: None,
+    )
+    borrowed_library = False
+    if prepared is not None:
+        list(
+            prepared.analyze_source_commands(
+                content=caller,
+                file_path="scripts/caller.sh",
+                file_type="shell",
+                source_view=SecurityTextView("raw", caller),
+            )
+        )
+        borrowed_library = any(
+            origin.path == "scripts/library.sh"
+            for _, value in prepared.variants()
+            for origin in value.origins
+        )
+    assert borrowed_library is preserved
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {
+            "components": ["scripts/caller.sh"],
+            "file_cache": {"scripts/caller.sh": caller, "scripts/library.sh": library},
+        },
+        [tm],
+    )
+    row = result["inspection_ledger"][0]
+    if preserved:
+        assert row["outcome"] is LedgerOutcome.COMPLETED
+        assert any(finding.rule_id == "TM1" for finding in result["findings"])
+    else:
+        assert row["outcome"] is LedgerOutcome.PARTIAL
+        assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
