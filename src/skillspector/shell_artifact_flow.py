@@ -158,8 +158,15 @@ class ShellArtifactEffects:
             self.store.invalidate(destination)
             return False
         artifact = variants[0]
+        previous = self.store.read(destination)
+        executable = (
+            previous.executable
+            if previous is not None
+            else False
+            if self.store.exists(destination) is False
+            else None
+        )
         if append:
-            previous = self.store.read(destination)
             if previous is None or previous.value is None or artifact.value is None:
                 self.store.invalidate(destination)
                 return False
@@ -170,7 +177,9 @@ class ShellArtifactEffects:
                     tuple(dict.fromkeys((*previous.value.origins, *artifact.value.origins))),
                 )
             )
-        return self.store.write(destination, artifact)
+        # Redirection changes bytes, not an existing file's permissions. A new
+        # regular file starts without execute bits, independently of stdout.
+        return self.store.write(destination, replace(artifact, executable=executable))
 
     def tar(self, argv: tuple[str, ...]) -> bool:
         """Recognize only one native compressor and one explicit file/tree."""

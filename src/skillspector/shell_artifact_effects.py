@@ -684,8 +684,10 @@ class ShellArtifactAudit:
             if source is None or destination is None:
                 return None
             inventory = self.store.inventory(source)
+            directories = self.store.directory_inventory(source)
             if (
                 inventory is None
+                or directories is None
                 or self.store.exists(destination) is not True
                 or self.store.read(destination) is not None
             ):
@@ -698,6 +700,10 @@ class ShellArtifactAudit:
             elif not self.store.create_empty_directory(target):
                 return None
             else:
+                for relative in directories:
+                    if not self.store.create_empty_directory(target + "/" + relative):
+                        self.store.invalidate(target)
+                        return None
                 for relative, artifact in inventory:
                     self.check_runtime()
                     if not self.store.write(target + "/" + relative, artifact):
@@ -716,8 +722,8 @@ class ShellArtifactAudit:
             if len(operands) == 2 and operands[0] == "-tf":
                 artifact = self.store.read(self.path(operands[1], command.cwd) or "")
                 status = True if artifact is not None and artifact.is_archive else None
-                # Archive storage models files, not every directory header or
-                # implementation-specific listing detail. Do not invent stdout.
+                # The inventory does not establish header order or native
+                # listing details. Do not invent stdout from those facts.
                 output = None
             elif command.uncertain or not command.fail_stop:
                 return None

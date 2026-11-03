@@ -375,6 +375,90 @@ def test_source_provenance_and_executable_mode_survive_archive_roundtrip() -> No
     assert copied.value == audit.store.read("scripts/setup.sh").value
 
 
+@pytest.mark.parametrize("operation", ["archive", "copy"])
+@pytest.mark.parametrize("empty_present", [False, True])
+def test_transferred_empty_directory_cannot_skip_a_cached_source_overwrite(
+    operation: str, empty_present: bool
+) -> None:
+    caller = (
+        "set -e\nwork=$(mktemp -d)\nout=$(mktemp -d)\n"
+        'mkdir -p "$work/tree"\n'
+        + ('mkdir -p "$work/tree/empty"\n' if empty_present else "")
+        + 'cp scripts/marker.sh "$work/tree/known"\n'
+        + (
+            'tar -cf "$work/package.tar" -C "$work" tree\n'
+            'tar -xf "$work/package.tar" -C "$out"\n'
+            if operation == "archive"
+            else 'cp -a "$work/tree" "$out"\n'
+        )
+        + 'if test -d "$out/tree/empty"; then printf changed > scripts/setup.sh; fi\n'
+    )
+    context = ShellSourceContext(
+        "tests/caller.sh",
+        {
+            "tests/caller.sh": caller,
+            "scripts/setup.sh": "echo inspected\n",
+            "scripts/marker.sh": "echo marker\n",
+        },
+    )
+    resolver = ShellSourceResolver(
+        context,
+        tm._next_shell_invocation_word,
+        lambda text, start, end: tm._skip_command_substitution(text, start, end, lambda: None),
+        tm._static_heredoc_header,
+        tm._skip_static_heredoc_bodies,
+        lambda: None,
+    )
+    audit = ShellArtifactAudit(context, tm._next_shell_invocation_word, lambda: None)
+    assert source_effects_preserve(
+        resolver,
+        "scripts/setup.sh",
+        len(caller),
+        read_source=audit.read_source,
+        native_effect=audit,
+    ) is (not empty_present)
+
+
+@pytest.mark.parametrize("operator", ["1>", "1>>"])
+@pytest.mark.parametrize("executable", [False, True, None])
+@pytest.mark.parametrize("open_first", [False, True])
+def test_redirect_preserves_destination_mode_and_helper_identity(
+    operator: str, executable: bool | None, open_first: bool
+) -> None:
+    audit = _audit()
+    path = "/tmp/helpers/runner"
+    assert audit.store.create_empty_directory("/tmp/helpers")
+    assert audit.store.write(
+        path, ShellArtifact(ShellSourceValue("echo old\n"), executable=executable)
+    )
+    command = _command(("printf", "%s", "echo new\n"), redirects=((operator, path),))
+    if open_first:
+        assert audit(replace(command, redirect_open=True)) is not None
+        assert audit.store.read(path).executable is executable
+    assert audit(command) is not None
+    artifact = audit.store.read(path)
+    assert artifact.executable is executable
+    assert artifact.value.text == ("echo old\necho new\n" if operator == "1>>" else "echo new\n")
+    identity = audit(_command((path,), identity_only=True))
+    if executable is True:
+        assert identity is not None and identity.script_path == path
+    else:
+        assert identity is None
+
+
+def test_redirected_executable_source_does_not_make_a_new_file_executable() -> None:
+    audit = _audit()
+    assert audit.store.create_empty_directory("/tmp/helpers")
+    assert audit.store.write(
+        "/tmp/helpers/source", ShellArtifact(ShellSourceValue("echo helper\n"), executable=True)
+    )
+    assert audit(
+        _command(("cat", "/tmp/helpers/source"), redirects=(("1>", "/tmp/helpers/runner"),))
+    ) is not None
+    assert audit.store.read("/tmp/helpers/runner").executable is False
+    assert audit(_command(("/tmp/helpers/runner",), identity_only=True)) is None
+
+
 @pytest.mark.parametrize(
     "redirects",
     [

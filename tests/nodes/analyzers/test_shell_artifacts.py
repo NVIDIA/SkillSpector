@@ -153,6 +153,52 @@ def test_copy_archive_extract_retains_the_original_program_and_origin() -> None:
     assert store.read("/tmp/extract-owned/bundle/setup.sh") == program
 
 
+@pytest.mark.parametrize("with_file", [False, True])
+def test_archive_roundtrip_retains_empty_directories_and_known_absence(with_file: bool) -> None:
+    store = ShellArtifactStore(lambda: None)
+    assert store.create_empty_directory("/tmp/input")
+    assert store.create_empty_directory("/tmp/input/tree")
+    assert store.create_empty_directory("/tmp/input/tree/empty/nested")
+    assert store.create_empty_directory("/tmp/output")
+    if with_file:
+        assert store.write("/tmp/input/tree/runner", _program())
+    assert store.archive("/tmp/input/tree", "/tmp/archive", member_prefix="tree")
+    assert store.extract("/tmp/archive", "/tmp/output")
+    for relative in ("tree", "tree/empty", "tree/empty/nested"):
+        assert store.exists("/tmp/output/" + relative) is True
+        assert store.read("/tmp/output/" + relative) is None
+    assert store.exists("/tmp/output/tree/absent") is False
+    assert (store.read("/tmp/output/tree/runner") is not None) is with_file
+
+
+@pytest.mark.parametrize(
+    "directories",
+    [("../escape",), ("/absolute",), ("sub/../escape",), ("sub\\escape",), ("same", "same")],
+)
+def test_archive_directory_inventory_rejects_escapes_and_duplicates(directories) -> None:
+    store = ShellArtifactStore(lambda: None)
+    assert not store.write("archive", ShellArtifact(directories=directories))
+    assert store.read("archive") is None
+
+
+@pytest.mark.parametrize("directory", ["file", "file/child"])
+def test_archive_directory_cannot_be_a_file_or_its_descendant(directory: str) -> None:
+    store = ShellArtifactStore(lambda: None)
+    assert not store.write(
+        "archive", ShellArtifact(members=(("file", _program()),), directories=(directory,))
+    )
+
+
+def test_archive_directories_share_the_recursive_inventory_budget(monkeypatch) -> None:
+    monkeypatch.setattr("skillspector.shell_artifacts.MAX_GENERATED_FILES", 3)
+    store = ShellArtifactStore(lambda: None)
+    child = ShellArtifact(directories=("empty",))
+    assert store.write("at-limit", ShellArtifact(members=(("inner", child),)))
+    assert not store.write(
+        "over-limit", ShellArtifact(members=(("inner", child),), directories=("another",))
+    )
+
+
 @pytest.mark.parametrize(
     "member, relative", [("setup.sh", "setup.sh"), ("bundle", "bundle/setup.sh")]
 )

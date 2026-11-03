@@ -49,6 +49,7 @@ class ShellArtifact:
     members: tuple[tuple[str, ShellArtifact], ...] = ()
     opaque_size: int | None = None
     executable: bool | None = None
+    directories: tuple[str, ...] = ()
 
     @property
     def is_archive(self) -> bool:
@@ -144,20 +145,34 @@ class ShellArtifactStore:
                 if (
                     current.value is not None
                     or current.members
+                    or current.directories
                     or not 0 <= current.opaque_size <= MAX_GENERATED_BYTES
                 ):
                     return None
                 total += current.opaque_size
             elif current.value is not None:
-                if current.members:
+                if current.members or current.directories:
                     return None
                 total += len(current.value.text.encode("utf-8"))
             else:
+                directories: set[str] = set()
+                for directory in current.directories:
+                    self._check_runtime()
+                    visited += 1
+                    if (
+                        _path(directory, member=True) != directory
+                        or directory in directories
+                        or depth + 1 > MAX_GENERATED_DEPTH
+                        or visited + len(pending) > MAX_GENERATED_FILES
+                    ):
+                        return None
+                    directories.add(directory)
                 names: set[str] = set()
                 for name, child in current.members:
                     self._check_runtime()
                     if (
                         _path(name, member=True) != name
+                        or any(self._within(directory, name) for directory in directories)
                         or any(
                             self._within(name, other) or self._within(other, name)
                             for other in names
@@ -372,6 +387,12 @@ class ShellArtifactStore:
             self.invalidate(destination)
             return False
         artifact = self.read(key)
+        directories = () if artifact is not None else self.directory_inventory(key)
+        if directories is None:
+            self.invalidate(destination)
+            return False
+        if artifact is None and member_prefix:
+            directories = (member_prefix, *(member_prefix + "/" + name for name in directories))
         members = (
             ((member_prefix or posixpath.basename(key), artifact),)
             if artifact is not None
@@ -381,10 +402,10 @@ class ShellArtifactStore:
                 if path.startswith(key + "/")
             )
         )
-        if not members or any(_path(name, member=True) != name for name, _ in members):
+        if any(_path(name, member=True) != name for name, _ in members):
             self.invalidate(destination)
             return False
-        return self.write(destination, ShellArtifact(members=members))
+        return self.write(destination, ShellArtifact(members=members, directories=directories))
 
     def inventory(self, root: str) -> tuple[tuple[str, ShellArtifact], ...] | None:
         """Expose a complete owned tree for finite find/hash operations."""
@@ -402,6 +423,20 @@ class ShellArtifactStore:
             (path[len(key) + 1 :], artifact)
             for path, artifact in sorted(self._files.items())
             if path.startswith(key + "/")
+        )
+
+    def directory_inventory(self, root: str) -> tuple[str, ...] | None:
+        """Retain explicit empty descendants alongside the regular-file inventory."""
+        if (
+            self.inventory(root) is None
+            or self.exists(root) is not True
+            or self.read(root) is not None
+        ):
+            return None
+        return tuple(
+            path[len(root) + 1 :]
+            for path in sorted(self._owned)
+            if path.startswith(root + "/")
         )
 
     def owns(self, path: str) -> bool:
@@ -439,6 +474,11 @@ class ShellArtifactStore:
         ):
             self.invalidate(destination)
             return False
+        for directory in artifact.directories:
+            path = root + "/" + directory
+            if self.exists(path) is not True and not self.create_empty_directory(path):
+                self.invalidate(destination)
+                return False
         names: set[str] = set()
         for name, child in artifact.members:
             self._check_runtime()
