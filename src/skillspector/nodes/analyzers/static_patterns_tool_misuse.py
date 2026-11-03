@@ -3691,6 +3691,9 @@ def _has_shell_command_word_exhaustion(
         nested_startup_diagnostics = [
             item.enclosed(0, len(command_string)) for item in command.startup_diagnostics[:1]
         ]
+        inherited_startup_diagnostic = (
+            nested_startup_diagnostics[0] if nested_startup_diagnostics else None
+        )
         diagnostic = _has_shell_command_word_exhaustion(
             command_string,
             check_runtime,
@@ -3709,6 +3712,11 @@ def _has_shell_command_word_exhaustion(
                 nested_startup_diagnostics[0].enclosed(command.start, command.end)
             )
         if diagnostic is not None:
+            if diagnostic is inherited_startup_diagnostic:
+                # This cause already belongs to the parent's original carrier.
+                # Returning the same object at each level preserves that origin
+                # through later eval consumers, including nested ones.
+                return command.startup_diagnostics[0]
             return (
                 diagnostic.shifted(command.start)
                 if command.exact_source

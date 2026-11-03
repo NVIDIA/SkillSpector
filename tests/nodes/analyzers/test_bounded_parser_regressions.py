@@ -488,6 +488,58 @@ def test_child_shell_startup_proof_cause_does_not_leak_into_outer_siblings(
     assert tm.has_bounded_parse_exhaustion(source, lambda: None) is False
 
 
+@pytest.mark.parametrize("budget", [False, True])
+@pytest.mark.parametrize("consumer_nesting", [0, 1, 2])
+def test_later_nested_eval_consumer_keeps_the_first_proof_origin(
+    budget: bool, consumer_nesting: int
+) -> None:
+    body = (
+        "export " + " ".join(f"NAME{index}=0" for index in range(32)) if budget else "read -z VALUE"
+    )
+    first_carrier = "eval " + shlex.quote(body)
+    consumer = "sh -c 'echo ok'"
+    for _ in range(consumer_nesting + 1):
+        consumer = "eval " + shlex.quote(consumer)
+    source = first_carrier + "; " + consumer
+    diagnostic = _public_result(source, "script.sh")["inspection_ledger"][0]["parser_diagnostic"]
+    assert diagnostic["source_start_offset"] == 0
+    assert diagnostic["source_end_offset"] == len(first_carrier)
+    assert diagnostic["location_precision"] == "enclosing_expression"
+    if budget:
+        assert diagnostic["cause"] is ParserCause.RESOURCE_LIMIT
+        assert diagnostic["check"] is ParserCheck.WRAPPER_ARGUMENTS
+        assert diagnostic["observed_records"] == diagnostic["limit_records"] == 32
+        assert diagnostic["observed_is_lower_bound"] is True
+    else:
+        assert diagnostic["cause"] is ParserCause.UNSUPPORTED_SYNTAX
+        assert diagnostic["check"] is ParserCheck.COMMAND_STRING_RUNTIME
+        assert "observed_records" not in diagnostic
+
+
+@pytest.mark.parametrize("budget", [False, True])
+@pytest.mark.parametrize("consumer_nesting", [0, 1, 2])
+def test_new_limitation_inside_later_eval_keeps_its_own_cause_and_carrier(
+    budget: bool, consumer_nesting: int
+) -> None:
+    body = (
+        "export " + " ".join(f"NAME{index}=0" for index in range(32)) if budget else "read -z VALUE"
+    )
+    first_carrier = "eval " + shlex.quote(body)
+    consumer = "a" * 4097 + "; sh -c 'echo ok'"
+    for _ in range(consumer_nesting + 1):
+        consumer = "eval " + shlex.quote(consumer)
+    source = first_carrier + "; " + consumer
+    diagnostic = _public_result(source, "script.sh")["inspection_ledger"][0]["parser_diagnostic"]
+    assert diagnostic["source_start_offset"] == len(first_carrier) + 2
+    assert diagnostic["source_end_offset"] == len(source)
+    assert diagnostic["location_precision"] == "enclosing_expression"
+    assert diagnostic["cause"] is ParserCause.RESOURCE_LIMIT
+    assert diagnostic["check"] is ParserCheck.COMMAND_WORD_CHARACTERS
+    assert diagnostic["observed_characters"] == 4097
+    assert diagnostic["limit_characters"] == 4096
+    assert diagnostic["observed_is_lower_bound"] is True
+
+
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 def test_public_parser_diagnostic_keeps_raw_lines_and_no_command_text(newline: str) -> None:
     payload = "$PRIVATE_COMMAND -rf /"
