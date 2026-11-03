@@ -1452,18 +1452,15 @@ class _TarReader(io.BytesIO):
 
 
 class _BoundedTarInfo(tarfile.TarInfo):
-    @classmethod
-    def fromtarfile(cls, archive: tarfile.TarFile) -> _BoundedTarInfo:
+    def _proc_member(self, archive: tarfile.TarFile) -> _BoundedTarInfo:
+        """Guard both stdlib header readers and their metadata continuations."""
         reader = archive.fileobj
         if not isinstance(reader, _TarReader):
             raise TypeError("TAR inspection requires a bounded metadata reader")
-        block = reader.read(tarfile.BLOCKSIZE)
-        info = cls.frombuf(block, archive.encoding, archive.errors)
         _charge_archive_member(reader.budget)
-        info.offset = reader.tell() - tarfile.BLOCKSIZE
-        if info.size < 0:
+        if self.size < 0:
             raise _ArchiveInspectionError(LedgerReason.ARCHIVE_MALFORMED)
-        if info.type == tarfile.GNUTYPE_SPARSE:
+        if self.type == tarfile.GNUTYPE_SPARSE:
             raise _ArchiveInspectionError(LedgerReason.OPAQUE_CONTENT)
         reader.metadata_depth += 1
         try:
@@ -1473,9 +1470,9 @@ class _BoundedTarInfo(tarfile.TarInfo):
                     observed_depth=reader.metadata_depth,
                     limit_depth=ARCHIVE_MAX_METADATA_DEPTH,
                 )
-            if info.type in {tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE}:
-                reader.check_pax(info.size)
-            return info._proc_member(archive)
+            if self.type in {tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE}:
+                reader.check_pax(self.size)
+            return super()._proc_member(archive)
         finally:
             reader.metadata_depth -= 1
 

@@ -75,6 +75,18 @@ def _tar_bytes(members: list[tuple[str, bytes]], *, tar_format: int = tarfile.PA
     return buffer.getvalue()
 
 
+def _tar_metadata_bytes(member_type: bytes) -> bytes:
+    info = tarfile.TarInfo("metadata")
+    info.type = member_type
+    content = (
+        b"file.txt\0"
+        if member_type in {tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK}
+        else b""
+    )
+    info.size = len(content)
+    return info.tobuf() + content + bytes(-len(content) % tarfile.BLOCKSIZE)
+
+
 def _gzip_with_header(
     payload: bytes,
     *,
@@ -1827,12 +1839,23 @@ def test_pax_effective_path_cannot_escape_archive(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("controls,limited", [(31, False), (32, True)])
+@pytest.mark.parametrize(
+    "member_type",
+    [
+        tarfile.XHDTYPE,
+        tarfile.XGLTYPE,
+        tarfile.SOLARIS_XHDTYPE,
+        tarfile.GNUTYPE_LONGNAME,
+        tarfile.GNUTYPE_LONGLINK,
+    ],
+)
 def test_tar_metadata_chains_stop_before_recursive_processing(
-    tmp_path: Path, controls: int, limited: bool
+    tmp_path: Path, controls: int, limited: bool, member_type: bytes
 ) -> None:
-    control = tarfile.TarInfo("pax")
-    control.type = tarfile.XHDTYPE
-    data = control.tobuf() * controls + _tar_bytes([("file.txt", b"safe")])
+    prefix = _tar_bytes([("before.txt", b"keep")])[:1024]
+    data = (
+        prefix + _tar_metadata_bytes(member_type) * controls + _tar_bytes([("file.txt", b"safe")])
+    )
     result = inspect_nested_artifacts(tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": data})
     events = [
         event
@@ -1840,9 +1863,12 @@ def test_tar_metadata_chains_stop_before_recursive_processing(
         if event.get("reason_code") == LedgerReason.ARCHIVE_DEPTH_LIMIT
     ]
     assert bool(events) is limited
+    assert result.raw_file_cache["bundle.tar!/before.txt"] == b"keep"
     if limited:
         assert events[0]["observed_depth"] == 33
         assert events[0]["limit_depth"] == 32
+        assert "bundle.tar!/file.txt" not in result.raw_file_cache
+        assert "bundle.tar" not in result.inspected_containers
     else:
         assert result.raw_file_cache["bundle.tar!/file.txt"] == b"safe"
 
@@ -1988,12 +2014,16 @@ def test_empty_supported_archives_have_explicit_complete_inventory(
 
 
 @pytest.mark.parametrize("members,limited", [(1, False), (2, True)])
+@pytest.mark.parametrize("leading_control", [False, True])
 def test_tar_header_count_boundary_is_shared_with_nested_archives(
-    tmp_path: Path, members: int, limited: bool
+    tmp_path: Path, members: int, limited: bool, leading_control: bool
 ) -> None:
     data = _tar_bytes([(f"file-{index}", b"value") for index in range(members)])
+    if leading_control:
+        data = _tar_metadata_bytes(tarfile.XHDTYPE) + data
+    limit = 1 + int(leading_control)
     result = inspect_nested_artifacts(
-        tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": data}, max_members=1
+        tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": data}, max_members=limit
     )
     events = [
         event
@@ -2002,8 +2032,8 @@ def test_tar_header_count_boundary_is_shared_with_nested_archives(
     ]
     assert bool(events) is limited
     if limited:
-        assert events[0]["observed_artifacts"] == 2
-        assert events[0]["limit_artifacts"] == 1
+        assert events[0]["observed_artifacts"] == limit + 1
+        assert events[0]["limit_artifacts"] == limit
 
 
 @pytest.mark.parametrize("archive_kind", ["tar", "gzip"])
@@ -2061,32 +2091,38 @@ def test_gzip_stream_count_is_bounded_and_preserves_completed_streams(tmp_path: 
 @pytest.mark.parametrize(
     "sparse_key", ["GNU.sparse.map", "GNU.sparse.size", "GNU.sparse.major", "SCHILY.realsize"]
 )
+@pytest.mark.parametrize("leading_control", [False, True])
 def test_pax_sparse_metadata_remains_explicitly_unsupported(
-    tmp_path: Path, sparse_key: str
+    tmp_path: Path, sparse_key: str, leading_control: bool
 ) -> None:
     stream = io.BytesIO()
     with tarfile.open(fileobj=stream, mode="w", format=tarfile.PAX_FORMAT) as archive:
         info = tarfile.TarInfo("sparse")
         info.pax_headers = {sparse_key: "1"}
         archive.addfile(info)
-    result = inspect_nested_artifacts(
-        tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": stream.getvalue()}
-    )
+    data = stream.getvalue()
+    if leading_control:
+        data = _tar_metadata_bytes(tarfile.XHDTYPE) + data
+    result = inspect_nested_artifacts(tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": data})
     assert not result.raw_file_cache
     assert any(
         event.get("reason_code") == LedgerReason.OPAQUE_CONTENT for event in result.ledger_events
     )
 
 
-def test_pax_field_count_is_bounded_before_global_dictionary_expansion(tmp_path: Path) -> None:
+@pytest.mark.parametrize("leading_control", [False, True])
+def test_pax_field_count_is_bounded_before_global_dictionary_expansion(
+    tmp_path: Path, leading_control: bool
+) -> None:
     stream = io.BytesIO()
     with tarfile.open(fileobj=stream, mode="w", format=tarfile.PAX_FORMAT) as archive:
         info = tarfile.TarInfo("value")
         info.pax_headers = {f"vendor.field{index}": "v" for index in range(1001)}
         archive.addfile(info)
-    result = inspect_nested_artifacts(
-        tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": stream.getvalue()}
-    )
+    data = stream.getvalue()
+    if leading_control:
+        data = _tar_metadata_bytes(tarfile.XHDTYPE) + data
+    result = inspect_nested_artifacts(tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": data})
     event = next(
         event
         for event in result.ledger_events
