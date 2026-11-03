@@ -37,6 +37,7 @@ from skillspector.references import (
 )
 from skillspector.semantic_runtime import (
     has_semantic_runtime_event,
+    semantic_runtime_accounting,
     semantic_runtime_intent,
     semantic_runtime_ledger_event,
 )
@@ -613,6 +614,135 @@ def _status_paths_with_incomplete_evidence(
     return True, invalid_paths
 
 
+def _is_provider_failure(event: Mapping[str, object]) -> bool:
+    """Require concrete failed semantic work, rather than an untyped provider label."""
+    source = event.get("source_identity")
+    return (
+        event.get("reason_code") == LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+        and event.get("outcome") == LedgerOutcome.FAILED
+        and event.get("record_type") == LedgerRecordType.WORK_ITEM
+        and event.get("phase") in {"semantic", "meta"}
+        and isinstance(event.get("analyzer_id"), str)
+        and bool(event.get("analyzer_id"))
+        and (source is None or (isinstance(source, str) and bool(source)))
+    )
+
+
+def _runtime_gap_is_correlated_with_provider_failures(state: SkillspectorState) -> bool:
+    """Check whether provider failures alone explain derived runtime telemetry gaps.
+
+    Use the existing per-source runtime accounting on a private projection in
+    which only corroborated provider failures are treated as successful. Missing
+    calls, unrelated failed calls and missing required analyzers still fail that
+    accounting. The actual ledger, telemetry and execution status are untouched.
+    """
+    raw_statuses = state.get("analyzer_status_events")
+    if not isinstance(raw_statuses, list):
+        return False
+    events = {event["work_id"]: event for event in state.get("inspection_ledger", [])}
+    provider_scopes: set[tuple[object, str]] = set()
+    statuses: list[dict[str, object]] = []
+    for status in raw_statuses:
+        projected = dict(status)
+        if status.get("status") in {"failed", "degraded"}:
+            matches = [events.get(target["work_id"]) for target in status["planned_work"]]
+            if (
+                matches
+                and any(event is not None and _is_provider_failure(event) for event in matches)
+                and all(
+                    event is not None
+                    and (event["outcome"] == LedgerOutcome.COMPLETED or _is_provider_failure(event))
+                    and event.get("analyzer_id") == status.get("analyzer_id")
+                    and event.get("source_identity") == status.get("source_identity")
+                    for event in matches
+                )
+            ):
+                scope = status.get("source_identity")
+                if scope is not None and (not isinstance(scope, str) or not scope):
+                    return False
+                provider_scopes.add((scope, str(status["analyzer_id"])))
+                projected["status"] = "completed"
+        statuses.append(projected)
+    calls = state.get("llm_call_log")
+    if not provider_scopes or not isinstance(calls, list):
+        return False
+    projected_calls: list[object] = []
+    accounted: set[tuple[object, str]] = set()
+    for record in calls:
+        if not isinstance(record, Mapping):
+            return False
+        if "error" not in record or (
+            record["error"] is not None and not isinstance(record["error"], str)
+        ):
+            return False
+        scope = record.get("source_identity")
+        node = record.get("node")
+        if (scope is not None and (not isinstance(scope, str) or not scope)) or not isinstance(
+            node, str
+        ):
+            return False
+        key = (scope, node)
+        if record.get("ok") is False and key in provider_scopes:
+            accounted.add(key)
+            projected_calls.append({**record, "ok": True, "error": None})
+        else:
+            projected_calls.append(record)
+    if accounted != provider_scopes:
+        return False
+    _used, complete = semantic_runtime_accounting(
+        enabled=True,
+        result={**state, "analyzer_status_events": statuses, "llm_call_log": projected_calls},
+        discovered_modules=ANALYZER_MODULES,
+    )
+    return complete
+
+
+def _has_only_provider_failures(
+    inventory_item: Mapping[str, object] | None,
+    events: Sequence[Mapping[str, object]],
+    exceptions: Sequence[Mapping[str, object]],
+    *,
+    runtime_gap_correlated: bool,
+) -> bool:
+    """Separate execution infrastructure failures from artifact inspection failures."""
+    if (
+        not inventory_item
+        or inventory_item.get("disposition") != "analyzed"
+        or inventory_item.get("content_kind") != ContentKind.TEXT
+        or inventory_item.get("reason") is not None
+        or inventory_item.get("inherited_exclusion_reason") is not None
+        or inventory_item.get("misleading_extension") is True
+    ):
+        return False
+    incomplete = [event for event in events if event.get("outcome") != LedgerOutcome.COMPLETED]
+    provider_events = [event for event in incomplete if _is_provider_failure(event)]
+    if not provider_events:
+        return False
+    provider_sources = {event.get("source_identity") for event in provider_events}
+    allowed_reasons = {LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED}
+    if runtime_gap_correlated:
+        allowed_reasons.add(LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE)
+    return all(
+        _is_provider_failure(event)
+        or (
+            runtime_gap_correlated
+            and event.get("reason_code") == LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE
+            and event.get("record_type") == LedgerRecordType.SYSTEM
+            and event.get("outcome") == LedgerOutcome.PARTIAL
+            and event.get("phase") == "semantic_runtime"
+            and event.get("stage") == "runtime_telemetry"
+            and (
+                event.get("source_identity") is None
+                or (
+                    isinstance(event.get("source_identity"), str)
+                    and event.get("source_identity") in provider_sources
+                )
+            )
+        )
+        for event in incomplete
+    ) and all(exception.get("reason_code") in allowed_reasons for exception in exceptions)
+
+
 def _reference_coverage_findings(
     state: SkillspectorState,
 ) -> list[Finding]:
@@ -665,10 +795,13 @@ def _reference_coverage_findings(
         state.get("analyzer_status_events"), ledger_events
     )
     fatal_paths: set[str] = set()
+    exceptions_by_path: dict[str, list[Mapping[str, object]]] = {}
     canonicalization_succeeded = False
     if ledger_shape_complete and inventory_shape_complete and status_shape_complete:
         try:
             preexisting_completeness, _ = finalize_ledger(state)
+            for exception in preexisting_completeness["ledger_exceptions"]:
+                exceptions_by_path.setdefault(str(exception.get("path", "")), []).append(exception)
             fatal_paths = {
                 str(exception.get("path", ""))
                 for exception in preexisting_completeness["ledger_exceptions"]
@@ -686,6 +819,48 @@ def _reference_coverage_findings(
         and status_shape_complete
         and canonicalization_succeeded
         and not _ledger_evidence_was_truncated(ledger_events)
+    )
+    provider_evidence_complete = (
+        ledger_evidence_complete and len(ledger_events) <= MAX_INSPECTION_LEDGER_EVENTS
+    )
+    # Reference findings are created before finalization adds runtime telemetry.
+    # Include that pending cause in this private proof so a first pass cannot
+    # bypass the all-reasons check merely because the event is not stored yet.
+    pending_runtime_event = None
+    if provider_evidence_complete:
+        requested, enabled = semantic_runtime_intent(state)
+        pending_runtime_event = semantic_runtime_ledger_event(
+            requested=requested,
+            enabled=enabled,
+            result=state,
+            discovered_modules=ANALYZER_MODULES,
+        )
+        if (
+            pending_runtime_event is not None
+            and any(
+                _is_provider_failure(event)
+                for event in events_by_path.get(pending_runtime_event["path"], [])
+            )
+            and not has_semantic_runtime_event(ledger_events, pending_runtime_event)
+        ):
+            events_by_path.setdefault(pending_runtime_event["path"], []).append(
+                pending_runtime_event
+            )
+    runtime_gap_correlated = (
+        provider_evidence_complete
+        and not invalid_status_paths
+        and (
+            (
+                pending_runtime_event is not None
+                and pending_runtime_event.get("reason_code")
+                == LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE
+            )
+            or any(
+                event.get("reason_code") == LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE
+                for event in ledger_events
+            )
+        )
+        and _runtime_gap_is_correlated_with_provider_failures(state)
     )
     documentation_references = (
         _verified_documentation_image_references(state, inventory, raw_file_cache)
@@ -747,6 +922,19 @@ def _reference_coverage_findings(
             else ""
         )
         if final_disposition not in {"partial", "failed", "out_of_scope"}:
+            continue
+        if (
+            provider_evidence_complete
+            and target_path not in invalid_status_paths
+            and target_path not in duplicate_inventory_paths
+            and reference_disposition == disposition
+            and _has_only_provider_failures(
+                inventory_item,
+                target_events,
+                exceptions_by_path.get(target_path, []),
+                runtime_gap_correlated=runtime_gap_correlated,
+            )
+        ):
             continue
         documentation_reference_verified = (
             str(reference.get("reference_kind"))
