@@ -91,9 +91,7 @@ _PAYLOADS = [
 
 @pytest.mark.parametrize("payload", _PAYLOADS)
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
-@pytest.mark.parametrize(
-    "container", ["numbered", "nested", "unknown-nested", "table", "html", "fence"]
-)
+@pytest.mark.parametrize("container", ["numbered", "nested", "unknown-nested", "html", "fence"])
 def test_list_boundaries_preserve_destructive_detection_or_partial(
     payload: str, newline: str, container: str
 ) -> None:
@@ -104,9 +102,6 @@ def test_list_boundaries_preserve_destructive_detection_or_partial(
         "unknown-nested": "10. Parent:\n    - Example:\n      "
         + inline.replace("\n", "\n  ")
         + ".\n",
-        "table": "10. Example:\n    Left | Right\n    --- | ---\n    `$(resolve_tool).example | x\n    ` -rf / | y\n"
-        + payload
-        + "\n",
         "html": "10. Example:\n    <pre>\n    " + inline + "\n    </pre>\n",
         "fence": "10. Example:\n    ```sh\n    " + inline + "\n    ```\n",
     }
@@ -122,6 +117,64 @@ def test_list_boundaries_preserve_destructive_detection_or_partial(
 )
 def test_unclosed_span_cannot_borrow_list_margin_across_block_boundary(boundary: str) -> None:
     source = "10. Example:\n    `$(resolve_tool).example\n" + boundary + "\n    ` -rf /\n"
+    report = tool.node({"components": ["guide.md"], "file_cache": {"guide.md": source}})
+    assert any(f.rule_id == "TM1" and f.severity == "HIGH" for f in report["findings"]) or any(
+        event["outcome"] != "completed" for event in report["inspection_ledger"]
+    )
+
+
+_LIST_TABLE_BODIES = [
+    "Left | Right\n--- | ---\n`$(resolve_tool).example | x\n` -rf / | y\n",
+    "Left | Right\n--- | ---\n`$(resolve_tool).example | ` -rf /\n",
+    "Left | Right\n--- | ---\n`$(resolve_tool).example\n` -rf /\n",
+    "`$(resolve_tool).example | ` -rf /\n--- | ---\nleft | right\n",
+]
+
+
+def _list_table(marker: str, body: str) -> str:
+    prefix = "- Parent:\n  " if marker == "nested" else ""
+    marker = "1." if marker == "nested" else marker
+    margin = len(prefix.rsplit("\n", 1)[-1]) + len(marker) + 1
+    return (
+        prefix
+        + marker
+        + " Example:\n"
+        + "".join(" " * margin + line for line in body.splitlines(keepends=True))
+    )
+
+
+@pytest.mark.parametrize("body", _LIST_TABLE_BODIES)
+@pytest.mark.parametrize("marker", ["10.", "100.", "123456789.", "nested"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_list_relative_tables_keep_separate_cell_and_row_coverage(
+    body: str, marker: str, newline: str
+) -> None:
+    # No standalone payload: the actual cross-cell/row source must retain its gap.
+    source = ("# Résumé — 比較\n\n" + _list_table(marker, body)).replace("\n", newline)
+    assert tool._markdown_shell_text(source, lambda: None) == source
+    report = tool.node({"components": ["guide.md"], "file_cache": {"guide.md": source}})
+    assert any(f.rule_id == "TM1" and f.severity == "HIGH" for f in report["findings"]) or any(
+        event["outcome"] != "completed" for event in report["inspection_ledger"]
+    )
+
+
+@pytest.mark.parametrize("body", _LIST_TABLE_BODIES)
+@pytest.mark.parametrize("width", [2, 3])
+def test_wider_unmatched_table_ticks_keep_exact_source(body: str, width: int) -> None:
+    source = _list_table("10.", body.replace("`", "`" * width))
+    assert tool._markdown_shell_text(source, lambda: None) == source
+
+
+@pytest.mark.parametrize("body", _LIST_TABLE_BODIES)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_table_header_on_ordered_marker_keeps_following_cells_separate(
+    body: str, newline: str
+) -> None:
+    lines = body.splitlines(keepends=True)
+    source = ("10. " + lines[0] + "".join("    " + line for line in lines[1:])).replace(
+        "\n", newline
+    )
+    assert tool._markdown_shell_text(source, lambda: None) == source
     report = tool.node({"components": ["guide.md"], "file_cache": {"guide.md": source}})
     assert any(f.rule_id == "TM1" and f.severity == "HIGH" for f in report["findings"]) or any(
         event["outcome"] != "completed" for event in report["inspection_ledger"]

@@ -6914,7 +6914,8 @@ def _markdown_table_delimiter_columns(
             check_runtime()
         column += 4 - column % 4 if line[prefix] == "\t" else 1
         prefix += 1
-    if column < minimum_indent or column >= 4 or prefix == len(line):
+    # Indentation belongs to the proven container, not the absolute column.
+    if column < minimum_indent or column - minimum_indent >= 4 or prefix == len(line):
         return None
     if line[prefix] not in "|:-":
         return None
