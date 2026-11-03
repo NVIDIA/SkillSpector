@@ -1787,10 +1787,12 @@ def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -
             continue
         if getattr(target, "type", None) != "Identifier":
             continue
+        if _is_shell_execution_callee(value, check_runtime):
+            computed_callables.add(target.name)
         for candidate in _callable_values(value, check_runtime):
             if getattr(candidate, "type", None) == "Identifier":
                 aliases.setdefault(candidate.name, []).append(target.name)
-            if unknown_member(candidate) or _is_shell_execution_callee(candidate, check_runtime):
+            if unknown_member(candidate):
                 computed_callables.add(target.name)
     # Overapproximate aliases across scopes and assignments. A name may have
     # several possible values; none may hide a possible evaluator selection.

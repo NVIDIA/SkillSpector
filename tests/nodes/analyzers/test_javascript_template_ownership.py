@@ -381,12 +381,10 @@ def test_computed_data_reads_do_not_become_executable_aliases() -> None:
         "const first = tool.exec; let invoke; invoke = first.call; "
         "invoke.call(first, tool, `${command} -rf /`);",
         "const {render: go = tool.exec} = source; go(`${command} -rf /`);",
-        "const first = tool.exec; const {render: go = first} = source; "
-        "go(`${command} -rf /`);",
+        "const first = tool.exec; const {render: go = first} = source; go(`${command} -rf /`);",
         "const first = tool.exec; const {render: go = first.call} = source; "
         "go.call(first, tool, `${command} -rf /`);",
-        "const {render: go = flag ? format : tool.exec} = source; "
-        "go(`${command} -rf /`);",
+        "const {render: go = flag ? format : tool.exec} = source; go(`${command} -rf /`);",
         "const {nested: {render: go = tool.exec}} = source; go(`${command} -rf /`);",
         "let go; ({render: go = tool.exec} = source); go(`${command} -rf /`);",
         "const [go = tool.exec] = source; go(`${command} -rf /`);",
@@ -430,8 +428,10 @@ def test_data_reads_and_ordinary_function_helpers_retain_template_ownership(stat
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
 
 
-def test_benign_function_helper_chain_has_bounded_traversal() -> None:
-    source = "format" + ".call" * 48 + "(null, `hello ${name}`);"
+@pytest.mark.parametrize("extracted", [False, True])
+def test_benign_function_helper_chain_has_bounded_traversal(extracted: bool) -> None:
+    helper = "format" + ".call" * 48
+    source = (f"const invoke = {helper}; invoke" if extracted else helper) + "(`hello ${name}`);"
     checks = 0
 
     def check_runtime() -> None:
