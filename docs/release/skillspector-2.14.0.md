@@ -1,6 +1,6 @@
 # SkillSpector 2.14.0
 
-This candidate includes **53 distinct merged PR sources with new deltas**: **41 priority changes (19 P0, 22 P1)**, **5 required prerequisites**, and **7 model update sources**. All 31 original selections are retained. This update adds 21 priority sources (13 P0, 8 P1) and the formatter prerequisite; partial sources count only for their new portion.
+This candidate includes **54 distinct merged PR sources with new deltas**: **42 priority changes (19 P0, 23 P1)**, **5 required prerequisites**, and **7 model update sources**. All 31 original selections are retained. This update adds 22 priority sources (13 P0, 9 P1) and the formatter prerequisite; partial sources count only for their new portion.
 
 The integrated target is `yashraj/v2.13.0-base` at `8882c8f68a3157049d6a344480d5e881d6a0ddda`, containing final #958 head `6fd523afd26a8b0099f9ea465f4b9e157cdf044d` (merge `38a1dfe93325d2f8bfcd4f8d0241eed706334915`) and #976. The maintenance baseline integration is complete.
 
@@ -51,6 +51,7 @@ The integrated target is `yashraj/v2.13.0-base` at `8882c8f68a3157049d6a344480d5
 | [#967](https://github.com/NVIDIA/SkillSpector/pull/967) | P1 | fix(osv): fall back to static data when no_proxy breaks httpx client setup |
 | [#969](https://github.com/NVIDIA/SkillSpector/pull/969) | P1 | fix(ea5): stop reading option-listing help rows as model-switch commands |
 | [#972](https://github.com/NVIDIA/SkillSpector/pull/972) | P1 | perf: defer workflow warning imports until graph initialization |
+| [#979](https://github.com/NVIDIA/SkillSpector/pull/979) | P1 | fix(llm): retain safe diagnostics for failed requests |
 | [#529](https://github.com/NVIDIA/SkillSpector/pull/529) | Model update (partial) | Provider-specific structured-output policy and model metadata |
 | [#598](https://github.com/NVIDIA/SkillSpector/pull/598) | Model update (partial) | GPT-5.6 model budget metadata |
 | [#650](https://github.com/NVIDIA/SkillSpector/pull/650) | Model update | GPT-6 Sol and Luna model budgets |
@@ -65,6 +66,8 @@ The integrated target is `yashraj/v2.13.0-base` at `8882c8f68a3157049d6a344480d5
 | [#981](https://github.com/NVIDIA/SkillSpector/pull/981) | Prerequisite (partial) | style(analyzer): format the multiline word-shadow guard |
 
 ## Additional merged priority changes in this update
+
+The November 3 refresh adds [#979](https://github.com/NVIDIA/SkillSpector/pull/979). Failed synchronous and asynchronous model requests now retain bounded diagnostic fields such as error category, validated request ID, prompt size and request ordinal. Source text, exception messages, bodies, credentials and arbitrary headers are excluded. Original exceptions, usage accounting and inherited recovery behavior are preserved. All other merged P0/P1 and requested model changes were already selected or inherited.
 
 - [#742](https://github.com/NVIDIA/SkillSpector/pull/742): fix(analyzer): enforce deadlines for projected prompt matching.
 - [#773](https://github.com/NVIDIA/SkillSpector/pull/773): fix(analyzer): report malformed dependency manifests.
@@ -253,8 +256,9 @@ The former double-negative RA1 limitation tracked in [#956](https://github.com/N
 
 ## Validation and publication
 
-**Current update — static checks only.** For integrated source f583e0b7 before documentation-only edits, aggregate AST/internal-import checking reports 123 production modules and 443 internal imports with no errors or dynamic imports; Ruff lint and format pass across 320 files. JSON/TOML metadata, the offline no-build lock check (159 packages), and whitespace checks pass. These are static checks only.
-No local contributor tests, project imports, builds, source/wheel scans or live-provider runs were performed for this update. Carried regression tests were inspected as source; static checks do not establish runtime acceptance. Final integrated CI, runtime/package acceptance and independent release review remain publication gates.
+**November 3 update:** all 15 new failed-request diagnostic regressions and 52 focused fence/command-safety regressions pass. Wheel/source-distribution builds, strict package metadata checks, Ruff lint/format (321 files), the frozen lock check and installed dependency compatibility checks pass. All 136 packaged runtime/resource files match source bytes. These focused checks do not establish full release acceptance; no live-provider qualification is claimed.
+
+The previous candidate's hosted unit run at `1883ccf9` recorded 14,957 passes and 17 failures (27 skips, 145 deselected, four xfails). Two release-specific fence projection expectations are corrected: runtime probes confirm that only delimiters are masked, command/placeholder bytes remain visible, and both scans stay PARTIAL with STATIC_PARSE_LIMIT. The existing incomplete-outcome assertions remain intact. The other 15 failures were also reported on prior main; this does not waive their release gate. Final current-head CI, runtime/package acceptance and independent release review remain required.
 
 **Historical initial-candidate evidence, not validation of this update:** production commit `774bd450cac531a49ccc68ff876c0535d4b0ab52` recorded strict wheel/sdist checks and 128 matching packaged files (wheel SHA-256 `3185a1b1391e054b3386797a4d04acbbd8875b822d043d2c45d5308990b8ba9d`); 20 offline scans over 10 fixtures matched source/wheel reports; 145 installed model/registry tests passed. The local unit group recorded 2,932 passes, 14 skips and three initial failures, with all three isolated rechecks passing. Partial analyzer and other-source groups recorded 4,023 passes / four skips / three startup timeouts, and 1,675 passes / one timing failure / 2,178 unexecuted cases. The unchanged five-second dense-directory control also failed on #958 while retaining all 256-file semantic assertions. These partial runs were not a clean full-suite acceptance. Availability mocks accepted the supported timeout argument with test bodies and assertions unchanged.
 

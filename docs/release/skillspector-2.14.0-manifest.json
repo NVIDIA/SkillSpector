@@ -30,6 +30,13 @@
         "release_url": "https://github.com/NVIDIA/SkillSpector/releases/tag/v2.13.2",
         "release_pr": 922,
         "selection": "inherited_not_new_delta"
+      },
+      {
+        "tag": "v2.13.3",
+        "commit": "38a1dfe93325d2f8bfcd4f8d0241eed706334915",
+        "release_url": "https://github.com/NVIDIA/SkillSpector/releases/tag/v2.13.3",
+        "release_pr": 958,
+        "selection": "inherited_not_new_delta"
       }
     ],
     "inherited_features": [
@@ -76,7 +83,7 @@
       "Completion validation, bounded formatting recovery, parser deadlines and coverage accounting"
     ],
     "pinned_commit": "8882c8f68a3157049d6a344480d5e881d6a0ddda",
-    "remote_head_verified_at": "2026-11-02",
+    "remote_head_verified_at": "2026-11-03",
     "historical_pinned_commit": "df3d072cdf3e3410e6916c0642e06540d41dc5d1",
     "pinned_commit_role": "Integrated maintenance target including final #958 and #976",
     "inherited_958_head": "6fd523afd26a8b0099f9ea465f4b9e157cdf044d",
@@ -101,21 +108,22 @@
       "2026-10-30",
       "2026-10-31",
       "2026-11-01",
-      "2026-11-02"
+      "2026-11-02",
+      "2026-11-03"
     ],
     "counts": {
       "original_selected_sources_retained": 31,
       "original_priority_sources_retained": 20,
-      "added_priority_sources": 21,
+      "added_priority_sources": 22,
       "added_priority_p0": 13,
-      "added_priority_p1": 8,
-      "new_priority_prs": 41,
+      "added_priority_p1": 9,
+      "new_priority_prs": 42,
       "new_priority_p0": 19,
-      "new_priority_p1": 22,
+      "new_priority_p1": 23,
       "already_covered_priority_sources": 19,
       "required_dependency_prs": 5,
       "requested_model_prs": 7,
-      "distinct_upstream_pr_sources_with_new_changes": 53,
+      "distinct_upstream_pr_sources_with_new_changes": 54,
       "baseline_absorbed_maintenance_prs": 1
     },
     "counting_rule": "Count distinct sources with a nonempty selected delta exactly once. Partial #948 is new only for its residual correction; inherited #948 portions remain baseline. Already-covered sources and baseline-absorbed #976 do not count as new selections. #981 counts once as a required formatting prerequisite using its actual PR-head patch.",
@@ -399,7 +407,7 @@
           "Retained only the four dependency package updates; discarded the incidental scanner quoted-assignment formatting hunk from this source commit because scanner worker/root owns #814/#981.",
           "Lockfile auto-merge retained all release-specific root metadata, Python3.15 markers and non-target package blocks."
         ],
-        "scope": "Four advisory-related lockfile package blocks; incidental scanner formatting is represented once by prerequisite #981."
+        "scope": "Update missing anyio, certifi, langgraph-sdk and typing-extensions lockfile blocks; urllib3 2.8.0 is already inherited. Incidental scanner formatting is represented once by prerequisite #981."
       },
       {
         "number": 947,
@@ -654,6 +662,20 @@
         "local_integration_commit": "f583e0b73b30fe96fa8449e646a4be37c86eed08",
         "integration_evidence": "integration-precision.json",
         "integration_scope": null
+      },
+      {
+        "number": 979,
+        "title": "fix(llm): retain safe diagnostics for failed requests",
+        "url": "https://github.com/NVIDIA/SkillSpector/pull/979",
+        "upstream_commit": "5cb98c3f292ae0da1bcb33127d4e06dff05229cb",
+        "merged_at": "2026-11-03T17:20:24Z",
+        "priority": "P1",
+        "priority_reason": "Diagnoses failed model requests without exposing source or credentials",
+        "priority_report": "skillspector-pr-review-2026-11-03.json",
+        "selection": "new_delta",
+        "coverage": "picked",
+        "local_integration_commit": "113640b6f2f6c43c49fb4ba0f959012feec7bed6",
+        "integration_scope": "Add diagnostic ordinal and lock to the existing constructor; preserve inherited model construction, formatting recovery, retries, usage collection and deadline handling."
       }
     ],
     "already_covered_excluded": [
@@ -911,7 +933,6 @@
         "url": "https://github.com/NVIDIA/SkillSpector/pull/981",
         "upstream_commit": "e14c450b260958ed3ebd83c94c09c4b093e3e656",
         "merged_at": "2026-11-02T19:51:20Z",
-        "priority": "P2",
         "priority_reason": "Formatting-only prerequisite for #814: main CI rejects the multiline quoted-assignment guard until this exact layout correction.",
         "selection": "required_dependency",
         "coverage": "partial",
@@ -926,7 +947,8 @@
         ],
         "source_patch_commit": "281850410f7a04838eb1a87cdf822572ca624e8a",
         "upstream_merge_is_empty": true,
-        "scope": "Only the formatter correction from the actual PR head; merge commit already had that tree."
+        "scope": "Only the formatter correction from the actual PR head; merge commit already had that tree.",
+        "priority_source": "Formatting prerequisite; no overall priority assigned by the daily reports."
       }
     ],
     "requested_model_updates": [
@@ -992,7 +1014,7 @@
         "include": "Keep OpenAI gpt-5.4 and native Anthropic Opus 4.6/Sonnet 4.6 defaults; preserve sanitized MCP provider-preflight errors."
       }
     ],
-    "current_inventory_evidence": "candidate-inventory.json"
+    "current_inventory_evidence": "Verified merged main through 5cb98c3f292ae0da1bcb33127d4e06dff05229cb on 2026-11-03; #979 is the only newly required P0/P1 delta absent from the November 2 candidate."
   },
   "net_model_behavior": {
     "defaults": {
@@ -1022,8 +1044,8 @@
     "Opt-in dependency-content inspection supports integrity-verified public npm v2/v3 lockfiles and Linux seccomp workers only. Unsupported content, acquisition, isolation and budget failures remain incomplete."
   ],
   "validation": {
-    "status": "current_update_static_only_runtime_acceptance_pending",
-    "final_candidate_source_commit": "f583e0b73b30fe96fa8449e646a4be37c86eed08",
+    "status": "focused_update_verified_full_release_acceptance_pending",
+    "final_candidate_source_commit": "113640b6f2f6c43c49fb4ba0f959012feec7bed6",
     "historical_initial_candidate": {
       "status": "awaiting_isolated_ci_and_baseline_integration",
       "final_candidate_commit": null,
@@ -1069,7 +1091,13 @@
       "timing_scope": "Unchanged local startup limits and the 5-second dense-directory limit were retained. The dense-directory timing failure also reproduced on #958 with all 256-file semantic assertions passing; no speed-ratio or full acceptance claim is made.",
       "test_adaptations": "Only optional timeout arguments were added to availability mocks; AST comparison confirms every test body and assertion is preserved."
     },
-    "current_update": {
+    "claim_scope": "Fresh focused diagnostics, package and static checks cover their named paths only. Historical evidence and matching upstream failure names do not qualify the final release; full current-head CI and release acceptance remain required.",
+    "required_checks": [
+      "Final integrated current-head hosted CI",
+      "Final runtime/package acceptance and independent release review",
+      "Fresh baseline/head guard before publication"
+    ],
+    "previous_update_2026_11_02": {
       "execution_scope": "Local update workflow; hosted CI tracked separately",
       "runtime_tests_executed": false,
       "source_wheel_runs_executed": false,
@@ -1083,12 +1111,52 @@
       "package_evidence": "aggregate-package-proof.json",
       "worker_evidence_scope": "Local review audit identifiers, not repository file paths. Public provenance is recorded by upstream_commit and local_integration_commit in selection entries."
     },
-    "claim_scope": "Historical validation belongs to the earlier candidate. Current AST/Ruff/JSON/TOML/lock/whitespace checks do not establish runtime, package or live-provider acceptance.",
-    "required_checks": [
-      "Final integrated current-head hosted CI",
-      "Final runtime/package acceptance and independent release review",
-      "Fresh baseline/head guard before publication"
-    ]
+    "current_update": {
+      "date": "2026-11-03",
+      "runtime_tests": {
+        "failed_request_diagnostics": {
+          "passed": 15,
+          "failed": 0
+        },
+        "projection_probe": {
+          "cases": 2,
+          "outcome": "PARTIAL with STATIC_PARSE_LIMIT; command and placeholder retained"
+        },
+        "nested_fence_and_safety_regressions": {
+          "passed": 52,
+          "failed": 0,
+          "deselected": 231
+        }
+      },
+      "build": {
+        "wheel_and_sdist": "passed",
+        "twine_strict": "passed",
+        "packaged_runtime_resource_files": 136,
+        "source_bytes_equal": true,
+        "wheel_sha256": "d9f2e70d84c781b613bf988dd20150ef7d87e0a691777da1754a92e90e267dd3"
+      },
+      "live_provider_runs_executed": false,
+      "previous_head_hosted_ci": {
+        "commit": "1883ccf973b4bf48a3c320b0513d80b163d7cddb",
+        "passed": 14957,
+        "failed": 17,
+        "skipped": 27,
+        "deselected": 145,
+        "xfailed": 4,
+        "status": "failed; does not qualify the updated candidate"
+      },
+      "claim_scope": "Fresh focused checks qualify only the changed paths. Full current-head CI and final release acceptance remain required.",
+      "static": {
+        "ruff_check": "passed",
+        "ruff_format_check": "passed",
+        "files_checked": 321,
+        "uv_lock_check": "passed",
+        "uv_pip_check_locked_environment": "passed",
+        "git_diff_check": "passed"
+      },
+      "test_adaptation": "Two inherited nested-list fence tests expect delimiter masking while preserving every command/placeholder byte and their existing PARTIAL outcome assertions. Production parser behavior is unchanged.",
+      "local_run_limits": "The first broad attempt could not collect without esprima in the stale environment. After frozen dependency synchronization, a broad run was stopped during slow startup with no pass claim; the narrower diagnostics run completed successfully."
+    }
   },
   "publication": {
     "status": "unpublished_pending_final_validation",

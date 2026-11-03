@@ -1,10 +1,11 @@
 ### 2.14.0 (Unreleased)
 ### Changes after the integrated 2.13.3 baseline
-* Include 41 merged priority sources (19 P0, 22 P1), 5 required prerequisites and seven model sources: 53 distinct sources with new deltas. Retain all 31 original selections; count inherited overlaps separately.
+* Include 42 merged priority sources (19 P0, 23 P1), 5 required prerequisites and seven model sources: 54 distinct sources with new deltas. Retain all 31 original selections; count inherited overlaps separately.
 * Add bounded npm content inspection, truthful malformed-manifest/BOM/fallback coverage, advisory dependency pins, parser/quote/PowerShell/Markdown ownership, interruptible matching and multiline-shadow handling.
 * Add occurrence surface metadata, cookie-store and local-return precision, safe report-output preflight, supported model-control guards, option-help precision and deferred startup warnings. The earlier RA1 double-negative gap is corrected by #957.
 * Keep GPT-5.4/Claude 4.6 defaults and opt-in newer models. Absorb final #958/#976 maintenance work; #877 is fully inherited, #948 contributes only its new residual, and #981 is a formatter prerequisite.
-* This update has static validation only; historical runtime/package/live results do not establish final-candidate acceptance. Final validation and release review remain required.
+* Retain sanitized failed-request diagnostics for synchronous and asynchronous model calls without copying request/source content or changing exception/usage behavior. (#979)
+* Final validation and release review remain required; historical results do not establish current-candidate acceptance.
 * See [release notes](docs/release/skillspector-2.14.0.md) and [selection manifest](docs/release/skillspector-2.14.0-manifest.json) for source and overlap evidence.
 ---
 ### Unreleased maintenance fixes
