@@ -2475,9 +2475,10 @@ def _shell_quoted_candidate_limits(
             if quote is not None and character == quote:
                 closers.add(cursor)
                 if not ansi_c:
-                    single_line = "\n" not in content[quote_start:cursor] and "\r" not in content[
-                        quote_start:cursor
-                    ]
+                    single_line = (
+                        "\n" not in content[quote_start:cursor]
+                        and "\r" not in content[quote_start:cursor]
+                    )
                     for position in candidates:
                         if single_line or (
                             quote == '"'
