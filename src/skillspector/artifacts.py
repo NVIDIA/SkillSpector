@@ -68,6 +68,7 @@ class ArtifactRecord(TypedDict):
     readable_binary: NotRequired[bool]
     reason: NotRequired[str]
     inherited_exclusion_reason: NotRequired[str]
+    inspected_members: NotRequired[list[str]]
 
 
 class BundleReference(TypedDict):
@@ -696,6 +697,9 @@ def _concealed_instruction_run_spans(
 @lru_cache(maxsize=_CHARACTER_CACHE_SIZE)
 def _security_skeleton_piece(character: str) -> str:
     """Return the case-folded NFKC/confusable skeleton for one source character."""
+    # NFKC and the pinned confusable map leave ASCII unchanged.
+    if character.isascii():
+        return character.lower()
     folded = (
         unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON).casefold()
     )
@@ -707,6 +711,8 @@ def _security_skeleton_piece(character: str) -> str:
 
 def _fold_security_character(character: str) -> str:
     """Return a one-letter ASCII security skeleton, or an empty sentinel."""
+    if character.isascii():
+        return character.lower() if len(character) == 1 and character.isalpha() else ""
     folded = _security_skeleton_piece(character)
     return folded if len(folded) == 1 and folded.isascii() and folded.isalpha() else ""
 

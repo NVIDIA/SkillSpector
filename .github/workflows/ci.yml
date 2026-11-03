@@ -17,7 +17,7 @@ name: CI
 
 on:
   pull_request:
-    branches: ["main", "yashraj/v2.13.0-base"]
+    branches: ["main", "yashraj/v2.13.0-base", "yashraj/release-2.13.3"]
   push:
     branches: ["main", "yashraj/v2.13.0-base"]
 
@@ -89,6 +89,8 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
       - run: make install-dev
       - run: uv run skillspector --version
+      - name: Check isolated dependency inspection before the full suite
+        run: uv run pytest -q tests/unit/test_dependency_inspection.py
       - run: uv run make test-ci
 
   test-opencode:

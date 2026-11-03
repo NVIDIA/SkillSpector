@@ -86,10 +86,16 @@ from skillspector.llm_analyzer_base import (
     findings_in_range,
     ledger_events_for_batches,
     number_lines,
+    numbered_line_overhead_bytes,
     resolve_max_concurrency,
     resolve_output_language,
 )
-from skillspector.llm_utils import AgentCLIChatModel, StructuredOutputParseError, run_async
+from skillspector.llm_utils import (
+    AgentCLIChatModel,
+    StructuredOutputParseError,
+    _StructuredAgentCLIModel,
+    run_async,
+)
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
@@ -97,6 +103,7 @@ from skillspector.nodes.meta_analyzer import (
     MetaAnalyzerResult,
     _format_findings_for_prompt,
 )
+from skillspector.providers._agent_cli import MAX_INPUT_BYTES
 
 # ---------------------------------------------------------------------------
 # estimate_tokens
@@ -238,6 +245,60 @@ class TestChunkFileByLines:
         chunks = chunk_file_by_lines(content, max_tokens=100)
         assert len(chunks) == 1
         assert chunks[0][1] == 1
+
+    def test_max_bytes_none_is_unchanged(self) -> None:
+        content = "".join(f"x = {i}\n" for i in range(5000))
+        assert chunk_file_by_lines(content, 500) == chunk_file_by_lines(
+            content, 500, max_bytes=None
+        )
+
+    def test_chunks_respect_byte_budget_including_line_prefix(self) -> None:
+        # The token budget alone would fit every line; only the byte budget splits.
+        content = "".join("a" * 40 + "\n" for _ in range(20_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=100_000)
+        assert len(chunks) > 1
+        for text, start, _end in chunks:
+            assert len(number_lines(text, start).encode("utf-8")) <= 100_000
+
+    def test_byte_budget_covers_every_line(self) -> None:
+        content = "".join(f"line {i}\n" for i in range(20_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=50_000)
+        covered: set[int] = set()
+        for _text, start, end in chunks:
+            covered.update(range(start, end + 1))
+        assert covered == set(range(1, 20_001))
+
+    def test_multibyte_lines_counted_in_bytes(self) -> None:
+        # 300 UTF-8 bytes but only 25 estimated tokens per line.
+        content = "".join("漢" * 100 + "\n" for _ in range(5_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=200_000)
+        assert len(chunks) > 1
+        for text, start, _end in chunks:
+            assert len(number_lines(text, start).encode("utf-8")) <= 200_000
+
+    def test_single_oversized_line_is_kept_whole(self) -> None:
+        long_line = "y" * 300_000
+        content = "short\n" + long_line + "\nshort\n"
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=100_000)
+        assert any(long_line in text for text, _start, _end in chunks)
+        covered: set[int] = set()
+        for _text, start, end in chunks:
+            covered.update(range(start, end + 1))
+        assert covered == {1, 2, 3}
+
+    def test_compact_prompts_and_crlf_stay_under_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_COMPACT_PROMPTS", "1")
+        content = "".join("b" * 30 + "\r\n" for _ in range(20_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=60_000)
+        assert len(chunks) > 1
+        for text, start, _end in chunks:
+            assert len(number_lines(text, start).encode("utf-8")) <= 60_000
+
+    def test_numbered_line_overhead_bytes_matches_widest_prefix(self) -> None:
+        assert numbered_line_overhead_bytes(9) == len("L9: ")
+        assert numbered_line_overhead_bytes(19_239) == len("L19239: ")
 
 
 # ---------------------------------------------------------------------------
@@ -998,6 +1059,113 @@ class TestMetaAnalyzerResultFindingsValidator:
     def test_findings_non_list_json_rejected(self) -> None:
         with pytest.raises(ValidationError):
             MetaAnalyzerResult.model_validate({"findings": json.dumps({"a": 1})})
+
+
+# ---------------------------------------------------------------------------
+# LLMAnalyzerBase.get_batches — CLI provider input byte cap
+# ---------------------------------------------------------------------------
+
+
+class TestCliPromptByteBudget:
+    """CLI providers reject prompts over ``MAX_INPUT_BYTES`` before the CLI starts.
+
+    The token budget alone does not keep a numbered prompt under that cap: with a
+    272k-token context window (input budget 204k tokens), short lines carry a
+    line-number prefix the token estimate ignores, and multi-byte text is larger in
+    bytes than in estimated tokens.
+    """
+
+    MODEL = "nvidia/openai/gpt-oss-120b"
+    LARGE_CONTEXT_INPUT_BUDGET = int(272_000 * 0.75)
+
+    @pytest.fixture
+    def cli_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+
+    @pytest.fixture
+    def http_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+
+    def _analyzer(self) -> LLMAnalyzerBase:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._input_budget = self.LARGE_CONTEXT_INPUT_BUDGET
+        return analyzer
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_provider_batches_fit_max_input_bytes(self, cli_provider: None) -> None:
+        analyzer = self._analyzer()
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        batches = analyzer.get_batches(["big.js"], {"big.js": content})
+        assert len(batches) > 1
+        for batch in batches:
+            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_provider_batches_cover_every_line(self, cli_provider: None) -> None:
+        analyzer = self._analyzer()
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        covered: set[int] = set()
+        for batch in analyzer.get_batches(["big.js"], {"big.js": content}):
+            assert batch.end_line is not None
+            covered.update(range(batch.start_line, batch.end_line + 1))
+        assert covered == set(range(1, 150_001))
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_provider_splits_multibyte_file_under_token_budget(
+        self, cli_provider: None
+    ) -> None:
+        analyzer = self._analyzer()
+        # ~1.2 MB of UTF-8 but only ~100k estimated tokens: fits the token budget whole.
+        content = "".join("漢" * 200 + "\n" for _ in range(2_000))
+        assert estimate_tokens(content) <= self.LARGE_CONTEXT_INPUT_BUDGET
+        batches = analyzer.get_batches(["cjk.md"], {"cjk.md": content})
+        assert len(batches) > 1
+        for batch in batches:
+            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_http_provider_batching_unchanged(self, http_provider: None) -> None:
+        analyzer = self._analyzer()
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        budget = max(analyzer._input_budget - estimate_tokens("test"), 1024)
+        expected = [(s, e) for _t, s, e in chunk_file_by_lines(content, budget)]
+        batches = analyzer.get_batches(["big.js"], {"big.js": content})
+        assert [(b.start_line, b.end_line) for b in batches] == expected
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_payload_with_schema_instructions_fits_without_margin(
+        self, cli_provider: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The CLI transport appends the JSON schema after build_prompt; the budget must
+        # measure it rather than rely on the safety margin to absorb it.
+        monkeypatch.setattr("skillspector.llm_analyzer_base.PROMPT_BYTE_SAFETY_MARGIN", 0)
+        analyzer = self._analyzer()
+        structured = _StructuredAgentCLIModel(MagicMock(), LLMAnalysisResult)
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        for batch in analyzer.get_batches(["big.js"], {"big.js": content}):
+            payload = structured._augment(analyzer.build_prompt(batch))
+            assert len(payload.encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_path_with_unencodable_characters_does_not_raise(self, cli_provider: None) -> None:
+        # A non-UTF-8 file name decoded with surrogateescape; the provider encodes
+        # with errors="replace", so batching must not be stricter than the transport.
+        analyzer = self._analyzer()
+        path = "skill/\udcff.md"
+        batches = analyzer.get_batches([path], {path: "line \udcfe\n"})
+        assert [b.file_path for b in batches] == [path]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_oversized_single_line_warns_and_is_not_truncated(
+        self, cli_provider: None, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        analyzer = self._analyzer()
+        # Fewer estimated tokens than the budget, more bytes than the cap.
+        line = "漢" * (MAX_INPUT_BYTES // 3 + 10)
+        with caplog.at_level("WARNING"):
+            batches = analyzer.get_batches(["min.js"], {"min.js": line + "\n"})
+        assert any(line in batch.content for batch in batches)
+        assert "exceeds the provider input limit" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -2801,6 +2969,73 @@ class TestLLMMetaAnalyzerGetBatches:
         batches = analyzer.get_batches(["a.py"], file_cache, [])
         assert len(batches) == 1
         assert batches[0].findings == []
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_batches_fit_with_large_metadata_and_findings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        analyzer._input_budget = int(272_000 * 0.75)
+        content = "".join("m" * 40 + "\n" for _ in range(30_000))
+        findings = [self._make_finding("big.js", line=i) for i in range(1, 30_000, 100)]
+        metadata = "d" * 400_000
+        batches = analyzer.get_batches(
+            ["big.js"], {"big.js": content}, findings, metadata_text=metadata
+        )
+        for batch in batches:
+            prompt = analyzer.build_prompt(batch, metadata_text=metadata)
+            assert len(prompt.encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_sc10_redaction_cannot_push_prompt_over_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        analyzer._input_budget = int(272_000 * 0.75)
+        # Each short credential URL grows when redact_text rewrites it.
+        content = "".join("x=http://u:p@h\n" for _ in range(70_000))
+        findings = [self._make_finding("creds.py", line=1, rule_id="SC10")]
+        batches = analyzer.get_batches(["creds.py"], {"creds.py": content}, findings)
+        assert all("u:p@" not in batch.content for batch in batches)
+        for batch in batches:
+            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_sc10_redaction_keeps_lines_and_finding_aligned(self) -> None:
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        lines = [f"line {i}\n" for i in range(1, 11)]
+        lines[4] = "x=http://u:p@h?token=s3cret more\n"
+        content = "".join(lines)
+        cache = {"creds.py": content, "plain.py": "y=http://u:p@h\n"}
+        finding = self._make_finding("creds.py", line=5, rule_id="SC10")
+        batches = analyzer.get_batches(["creds.py", "plain.py"], cache, [finding])
+        creds = next(b for b in batches if b.file_path == "creds.py")
+        redacted = creds.content.splitlines()
+        assert len(redacted) == 10
+        assert redacted[3] == "line 4" and redacted[5] == "line 6"
+        assert "u:p@" not in redacted[4] and "s3cret" not in redacted[4]
+        assert creds.findings == [finding]
+        assert cache["creds.py"] == content  # the caller's cache is not mutated
+        plain = next(b for b in batches if b.file_path == "plain.py")
+        assert plain.content == "y=http://u:p@h\n"  # files without SC10 stay as they are
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_fixed_prompt_over_cap_warns_and_keeps_content(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        content = "".join(f"line {i}\n" for i in range(1, 101))
+        findings = [self._make_finding("a.py", line=1)]
+        metadata = "d" * (MAX_INPUT_BYTES + 10)
+        with caplog.at_level("WARNING"):
+            batches = analyzer.get_batches(
+                ["a.py"], {"a.py": content}, findings, metadata_text=metadata
+            )
+        assert "".join(b.content for b in batches) == content
+        assert "exceeds the provider input limit" in caplog.text
 
 
 # ---------------------------------------------------------------------------

@@ -730,6 +730,36 @@ def validated_json_string_closers(text: str, check_runtime: Callable[[], None] |
     return {end - 1 for _, end in validated_json_string_spans(text, check_runtime)}
 
 
+def _quoted_verb_in_string_sequence(text: str, match: re.Match[str]) -> bool:
+    """Return whether the fallback header's quote ends a verb in a string sequence.
+
+    The loose fallback header reads ``verb <filler> '`` as a marker opener.
+    When the removal verb is itself a quoted string literal (``'delete'``),
+    the matched quote is that literal's closing delimiter, and the literal is
+    followed by a separator and another quoted literal, the text is a sequence
+    of quoted strings (a list, tuple, or mapping), not a prose instruction:
+    reading the closing quote as a marker opener misreads ordinary code such
+    as ``['delete', 'run', 'list']`` as an obfuscated directive and fails the
+    deterministic layer closed. Matches with any filler between the verb and
+    the quote (``delete 'x'``), and quoted verbs not followed by another quoted
+    literal (``mode="omit", flag=...``), are unaffected.
+    """
+    quote_index = match.start("quote")
+    verb = re.match(_FALLBACK_REMOVAL_VERBS, text[match.start() :], re.IGNORECASE)
+    if verb is None or match.start() + verb.end() != quote_index:
+        return False
+    opener_index = match.start() - 1
+    if opener_index < 0:
+        return False
+    opener = text[opener_index]
+    if opener not in _QUOTE_OPEN_TO_CLOSE or _QUOTE_OPEN_TO_CLOSE[opener] != text[quote_index]:
+        return False
+    cursor = quote_index + 1
+    while cursor < len(text) and text[cursor] in " \t\r\n,":
+        cursor += 1
+    return cursor < len(text) and text[cursor] in _ALL_QUOTE_CHARACTERS
+
+
 def _view_string_closer(
     view: SecurityTextView, validated_string_closer: Callable[[int], bool]
 ) -> Callable[[int], bool]:
@@ -766,6 +796,8 @@ def _quoted_directives(
     for match in pattern.finditer(text):
         if check_runtime is not None:
             check_runtime()
+        if unsupported_header and _quoted_verb_in_string_sequence(text, match):
+            continue
         if match.end() - 1 in json_value_closers:
             continue
         if (

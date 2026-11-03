@@ -366,6 +366,7 @@ class TestScrubEnv:
             "SKILLSPECTOR_API_KEYS",
             "ANTHROPIC_PROXY_API_KEY",
             "SKILLSPECTOR_COMPAT_API_KEY",
+            "SKILLSPECTOR_COMPAT_HEADERS",
         ]
         if lowercase:
             secrets = [key.lower() for key in secrets]

@@ -221,7 +221,7 @@ def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.M
     # Build after configuring availability so the mocked semantic transports
     # are exercised even when the test environment has no provider credentials.
     monkeypatch.setattr(
-        import_module("skillspector.graph"), "is_llm_available", lambda: (True, None)
+        import_module("skillspector.graph"), "is_llm_available", lambda timeout=120: (True, None)
     )
     result = create_graph().invoke(
         {"skill_path": str(tmp_path), "use_llm": True, "output_format": "json"}

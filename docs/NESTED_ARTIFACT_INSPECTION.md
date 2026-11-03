@@ -5,6 +5,11 @@ container is recognized from its bytes and internal structure rather than its fi
 Supported document containers are DOCX, XLSX, and PPTX; generic ZIP and nested ZIP-compatible
 members use the same traversal policy.
 
+Linking to a successfully inspected container does not make its binary packaging an uninspected
+artifact. Coverage retains each member's outcome: an archive read failure, resource limit, missing
+member, or later analyzer failure still prevents complete inspection. Incidental unsupported
+assets retain the existing scope exclusions, and findings in inspected members remain findings.
+
 Nested members use a stable virtual path that retains their full provenance:
 
 ```text

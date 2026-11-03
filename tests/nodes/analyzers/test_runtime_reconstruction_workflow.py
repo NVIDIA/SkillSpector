@@ -46,10 +46,12 @@ def successful_llm_transport(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     factory = MagicMock(side_effect=lambda **_kwargs: ChatModel())
     monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", factory)
-    monkeypatch.setattr("skillspector.mcp_server.is_llm_available", lambda: (True, ""))
+    monkeypatch.setattr("skillspector.mcp_server.is_llm_available", lambda timeout=120: (True, ""))
     graph_module = importlib.import_module("skillspector.graph")
-    monkeypatch.setattr(graph_module, "is_llm_available", lambda: (True, ""))
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, ""))
+    monkeypatch.setattr(graph_module, "is_llm_available", lambda timeout=120: (True, ""))
+    monkeypatch.setattr(
+        "skillspector.nodes.report.is_llm_available", lambda timeout=120: (True, "")
+    )
     scan_graph = graph_module.create_graph()
     monkeypatch.setattr("skillspector.cli.graph", scan_graph)
     monkeypatch.setattr("skillspector.mcp_server.graph", scan_graph)

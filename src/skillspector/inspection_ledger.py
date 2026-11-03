@@ -92,6 +92,7 @@ class LedgerReason(StrEnum):
     ARCHIVE_ENCRYPTED = "archive_encrypted"
     ARCHIVE_UNSUPPORTED_COMPRESSION = "archive_unsupported_compression"
     ARCHIVE_TRUNCATED = "archive_truncated"
+    ARCHIVE_MEMBER_INCOMPLETE = "archive_member_incomplete"
     ARCHIVE_UNSAFE_MEMBER_PATH = "archive_unsafe_member_path"
     ARCHIVE_AMBIGUOUS_MEMBER_PATH = "archive_ambiguous_member_path"
     ARTIFACT_PATH_COLLISION = "artifact_path_collision"
@@ -109,8 +110,19 @@ class LedgerReason(StrEnum):
     REFERENCE_EXTRACTION_LIMIT = "reference_extraction_limit"
     REFERENCE_MISSING = "reference_missing"
     REFERENCE_UNRESOLVED = "reference_unresolved"
-    MANIFEST_PARSE_ERROR = "manifest_parse_error"
     DEPENDENCY_PARSE_ERROR = "dependency_parse_error"
+    MANIFEST_PARSE_ERROR = "manifest_parse_error"
+    DEPENDENCY_LOCKFILE_MISSING = "dependency_lockfile_missing"
+    DEPENDENCY_UNSUPPORTED_LOCKFILE = "dependency_unsupported_lockfile"
+    DEPENDENCY_LOCKFILE_MISMATCH = "dependency_lockfile_mismatch"
+    DEPENDENCY_UNSUPPORTED_SOURCE = "dependency_unsupported_source"
+    DEPENDENCY_UNSUPPORTED_CONTENT = "dependency_unsupported_content"
+    DEPENDENCY_INTEGRITY_MISSING = "dependency_integrity_missing"
+    DEPENDENCY_INTEGRITY_MISMATCH = "dependency_integrity_mismatch"
+    DEPENDENCY_IDENTITY_MISMATCH = "dependency_identity_mismatch"
+    DEPENDENCY_DOWNLOAD_FAILED = "dependency_download_failed"
+    DEPENDENCY_WORKER_FAILED = "dependency_worker_failed"
+    DEPENDENCY_SANDBOX_UNAVAILABLE = "dependency_sandbox_unavailable"
     MANIFEST_PARSE_LIMIT = "manifest_parse_limit"
     ARTIFACT_COUNT_LIMIT = "artifact_count_limit"
     TRAVERSAL_DEPTH_LIMIT = "traversal_depth_limit"
@@ -125,7 +137,31 @@ class LedgerReason(StrEnum):
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
 
 
+def only_missing_reference_exceptions(exceptions: object) -> bool:
+    """Return whether non-empty ledger exceptions are only missing references."""
+    return (
+        isinstance(exceptions, list)
+        and bool(exceptions)
+        and all(
+            isinstance(exception, Mapping)
+            and exception.get("reason_code") == LedgerReason.REFERENCE_MISSING
+            for exception in exceptions
+        )
+    )
+
+
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
+    LedgerReason.DEPENDENCY_LOCKFILE_MISSING: "Requested npm content inspection has no supported project lockfile.",
+    LedgerReason.DEPENDENCY_UNSUPPORTED_LOCKFILE: "Dependency content inspection requires npm lockfile version 2 or 3.",
+    LedgerReason.DEPENDENCY_LOCKFILE_MISMATCH: "Package manifest dependency declarations differ from the lockfile root.",
+    LedgerReason.DEPENDENCY_UNSUPPORTED_SOURCE: "Dependency source is outside supported public npm registry tarballs.",
+    LedgerReason.DEPENDENCY_UNSUPPORTED_CONTENT: "Dependency artifact contains a file outside supported static text analysis.",
+    LedgerReason.DEPENDENCY_INTEGRITY_MISSING: "Dependency has no supported, valid SHA-512 integrity hash.",
+    LedgerReason.DEPENDENCY_INTEGRITY_MISMATCH: "Downloaded dependency bytes do not match the lockfile integrity hash.",
+    LedgerReason.DEPENDENCY_IDENTITY_MISMATCH: "Package identity in the artifact differs from the locked name or version.",
+    LedgerReason.DEPENDENCY_DOWNLOAD_FAILED: "Locked dependency artifact could not be acquired under the network policy.",
+    LedgerReason.DEPENDENCY_WORKER_FAILED: "Dependency inspection worker failed or returned an invalid result.",
+    LedgerReason.DEPENDENCY_SANDBOX_UNAVAILABLE: "Required operating-system isolation for dependency inspection is unavailable.",
     LedgerReason.EXCLUDED_DIRECTORY: ("Directory tree is excluded from the configured scan scope."),
     LedgerReason.HIDDEN_FILE: "Hidden file is excluded from the configured scan scope.",
     LedgerReason.FILE_DISAPPEARED: ("Inventoried file disappeared before it could be inspected."),
@@ -194,6 +230,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "Archive member uses an unsupported compression method."
     ),
     LedgerReason.ARCHIVE_TRUNCATED: "Archive member is truncated or unreadable.",
+    LedgerReason.ARCHIVE_MEMBER_INCOMPLETE: "Nested artifact inspection is incomplete.",
     LedgerReason.ARCHIVE_UNSAFE_MEMBER_PATH: (
         "Archive member uses an absolute, traversal, or otherwise unsafe path."
     ),
@@ -232,6 +269,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.REFERENCE_UNRESOLVED: (
         "A local path-like reference matched more than one bundled artifact"
         " and could not be resolved to a single target."
+    ),
+    LedgerReason.DEPENDENCY_PARSE_ERROR: (
+        "Dependency metadata could not be parsed into supported registry coordinates."
     ),
     LedgerReason.MANIFEST_PARSE_ERROR: (
         "Manifest frontmatter is malformed or uses an unsupported value shape."
@@ -379,6 +419,7 @@ class AnalysisCompleteness(TypedDict):
     limitations: NotRequired[list[str]]
     findings_before_filtering: NotRequired[int]
     findings_after_filtering: NotRequired[int]
+    dependency_inspection: NotRequired[dict[str, object]]
 
 
 def _normalize_relative_path(path: str, *, scope_boundary: bool = False) -> str:
@@ -1123,14 +1164,22 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
                 else f"Analyzer {status_summary['analyzer_id']} status: {status_name}."
             )
     execution_successful = not any(exception.get("fatal") for exception in ledger_exceptions)
+    reference_caveat_only = (
+        only_missing_reference_exceptions(ledger_exceptions)
+        and not limitations
+        and partially_inspected == 0
+        and entirely_uninspected == 0
+    )
     completeness_status = (
         "failed"
         if not execution_successful
+        else "complete_with_caveats"
+        if reference_caveat_only
         else "partial"
         if ledger_exceptions or limitations or partially_inspected or entirely_uninspected
         else "complete"
     )
-    is_complete = completeness_status == "complete"
+    is_complete = completeness_status in {"complete", "complete_with_caveats"}
 
     raw_references = state.get("artifact_references", [])
     public_references = (
@@ -1157,6 +1206,9 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_before_filtering": len(findings_by_id),
         "findings_after_filtering": len(validated_effective),
     }
+    dependency_inspection = state.get("dependency_inspection")
+    if isinstance(dependency_inspection, dict):
+        completeness["dependency_inspection"] = dict(dependency_inspection)
     return completeness, validated_effective
 
 
