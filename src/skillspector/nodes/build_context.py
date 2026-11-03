@@ -74,8 +74,8 @@ from skillspector.nested_artifacts import (
     expected_container_type,
     has_binary_executable_magic,
     inspect_nested_artifacts,
-    is_executable_content,
     is_archive_content,
+    is_executable_content,
 )
 from skillspector.oms import project_oms_content
 from skillspector.python_ast import (
