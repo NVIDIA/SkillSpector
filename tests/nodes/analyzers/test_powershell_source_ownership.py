@@ -251,12 +251,13 @@ def test_here_string_escaped_physical_newline_cannot_prove_a_footer(
 @pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
 @pytest.mark.parametrize("parenthesized", [False, True])
 @pytest.mark.parametrize("command,partial", [("/bin/rm", True), ("/bin/echo", False)])
+@pytest.mark.parametrize("suffix", ["", _TAIL], ids=["short", "padded"])
 def test_invoked_here_string_keeps_following_operands(
-    quote: str, newline: str, parenthesized: bool, command: str, partial: bool
+    quote: str, newline: str, parenthesized: bool, command: str, partial: bool, suffix: str
 ) -> None:
     literal = f"@{quote}\n{command}\n{quote}@".replace("\n", newline)
     expression = f"({literal})" if parenthesized else literal
-    content = f"& {expression} -rf /" + _TAIL
+    content = f"& {expression} -rf /" + suffix
     source = powershell_source(content, lambda: None)
     assert source is not None
     string = source.strings[0]

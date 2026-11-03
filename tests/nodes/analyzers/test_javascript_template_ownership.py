@@ -393,8 +393,11 @@ def test_computed_data_reads_do_not_become_executable_aliases() -> None:
         "function invoke([go = tool.exec]) { go(`${command} -rf /`); }",
     ],
 )
-def test_execution_helpers_and_aliases_keep_dynamic_templates_unverified(statement: str) -> None:
-    source = statement + _PADDING
+@pytest.mark.parametrize("suffix", ["", _PADDING], ids=["short", "padded"])
+def test_execution_helpers_and_aliases_keep_dynamic_templates_unverified(
+    statement: str, suffix: str
+) -> None:
+    source = statement + suffix
     assert javascript_template_spans(source, lambda: None) is None
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
 
@@ -422,8 +425,11 @@ def test_execution_helpers_and_aliases_keep_dynamic_templates_unverified(stateme
         "const first = tool.exec; const label = first.call; console.log(`Value: ${label}`);",
     ],
 )
-def test_data_reads_and_ordinary_function_helpers_retain_template_ownership(statement: str) -> None:
-    source = statement + _PADDING
+@pytest.mark.parametrize("suffix", ["", _PADDING], ids=["short", "padded"])
+def test_data_reads_and_ordinary_function_helpers_retain_template_ownership(
+    statement: str, suffix: str
+) -> None:
+    source = statement + suffix
     assert javascript_template_spans(source, lambda: None) is not None
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
 

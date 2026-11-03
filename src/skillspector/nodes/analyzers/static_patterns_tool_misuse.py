@@ -2836,6 +2836,15 @@ def _has_shell_command_word_exhaustion(
     substitution_end_cache: dict[int, int | None] = {}
     backtick_end_cache: dict[int, int | None] = {}
     powershell_strings = _powershell_string_operands(powershell)
+    powershell_here_closers = (
+        {
+            string.end - 2
+            for string in powershell.strings
+            if string.invoked and content[string.start : string.start + 2] in {"@'", '@"'}
+        }
+        if powershell is not None
+        else set()
+    )
     may_have_destructive_outer_operands = _may_have_destructive_outer_operands(content) or any(
         string.decoded for string in powershell_strings.values()
     )
@@ -2860,6 +2869,10 @@ def _has_shell_command_word_exhaustion(
         if javascript_source is not None and javascript_source.owns(start):
             continue
         if powershell is not None and powershell.owns(start):
+            continue
+        if start in powershell_here_closers:
+            # This quote closes a proven host literal. Its body remains visible,
+            # and native invocation checks retain the decoded value and operands.
             continue
         if powershell is not None and file_type == "powershell" and content[start] == "$":
             line_start = content.rfind("\n", max(0, start - 512), start) + 1
@@ -4787,12 +4800,22 @@ class _JavaScriptTemplateOwnership:
         self._check_runtime = check_runtime
         self._spans: JavaScriptTemplateSpans | None = None
         self._spans_computed = False
+        self._unresolved_executables: list[int] = []
 
     def _owned_spans(self) -> JavaScriptTemplateSpans | None:
         if not self._spans_computed:
-            self._spans = _javascript_template_spans(self._content, self._check_runtime)
+            self._spans = _javascript_template_spans(
+                self._content,
+                self._check_runtime,
+                unresolved_executables=self._unresolved_executables,
+            )
             self._spans_computed = True
         return self._spans
+
+    def has_unresolved_execution(self) -> bool:
+        """Keep dynamic execution incomplete even when raw shell text is short."""
+        self._owned_spans()
+        return bool(self._unresolved_executables)
 
     def owns(self, position: int) -> bool:
         spans = self._owned_spans()
@@ -7621,6 +7644,8 @@ def _has_bounded_parse_exhaustion(
         # Interpolated templates in files with shell calls retain conservative
         # bounds because this analyzer does not prove their data flow.
         javascript_source = _JavaScriptTemplateOwnership(content, check_runtime)
+        if javascript_source.has_unresolved_execution():
+            return True
     if file_type in {"json", "markdown"} and complete_context:
         json_strings = validated_json_string_spans(content, check_runtime)
         structural_quote_closers = {end - 1 for _, end in json_strings}

@@ -1623,13 +1623,17 @@ def _invalid_optional_context(
 def javascript_template_spans(
     content: str,
     check_runtime: Callable[[], None],
+    *,
+    unresolved_executables: list[int] | None = None,
 ) -> JavaScriptTemplateSpans | None:
     """Return template literal ranges only when a complete script parses.
 
     Unsupported or malformed JavaScript returns ``None`` so callers retain
     their conservative parse bounds. A file with a template and a shell
     execution call also keeps those bounds because this parser does not
-    establish whether that template supplies the executed command.
+    establish whether that template supplies the executed command. Dynamic
+    templates in that case are reported separately through
+    ``unresolved_executables`` so a short fallback parse cannot verify them.
     """
     if "`" not in content or len(content) > MAX_PYTHON_AST_SOURCE_CHARS:
         return None
@@ -1676,6 +1680,12 @@ def javascript_template_spans(
         return None
 
     if _has_shell_execution_call(program, check_runtime):
+        if unresolved_executables is not None:
+            # Refusing ownership alone is insufficient: a short template inside
+            # an argument array can look complete to the fallback shell parser.
+            # Without a value-flow proof, dynamic templates beside execution
+            # calls remain unverified regardless of surrounding source length.
+            unresolved_executables.extend(start for start, _end, dynamic in templates if dynamic)
         return None
 
     if _has_unproven_assertion_template_call(content, program, templates, check_runtime):
