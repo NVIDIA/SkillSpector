@@ -87,6 +87,7 @@ from skillspector.shell_sources import (
     generated_file_is_unmodified,
 )
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+from skillspector.typescript_tokens import typescript_template_spans as _typescript_template_spans
 from skillspector.yaml_tokens import YamlScalar, YamlSourceSpans, yaml_source_spans
 
 from . import static_runner
@@ -6763,6 +6764,16 @@ class _JavaScriptTemplateOwnership:
             cursor = segment_end
 
 
+class _TypeScriptTemplateOwnership(_JavaScriptTemplateOwnership):
+    """Lazily proven ownership of template literal bytes in complete TypeScript."""
+
+    def _owned_spans(self) -> JavaScriptTemplateSpans | None:
+        if not self._spans_computed:
+            self._spans = _typescript_template_spans(self._content, self._check_runtime)
+            self._spans_computed = True
+        return self._spans
+
+
 def _skip_command_substitution(
     content: str,
     start: int,
@@ -12134,6 +12145,10 @@ def _has_bounded_parse_exhaustion(
         diagnostic = javascript_source.unresolved_execution_diagnostic()
         if diagnostic is not None:
             return diagnostic
+    if file_type == "typescript" and complete_context:
+        # TypeScript's postfix and type expressions need a separate lexical
+        # proof; unproven source keeps its original conservative shell reading.
+        javascript_source = _TypeScriptTemplateOwnership(content, check_runtime)
     json_projection = None
     if file_type == "json":
         if prepared_analysis is None and complete_context:
