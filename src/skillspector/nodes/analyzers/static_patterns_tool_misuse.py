@@ -7805,11 +7805,8 @@ def _has_bounded_parse_exhaustion(
                 }
         for string in powershell.strings:
             check_runtime()
-            if (
-                not string.invoked
-                and _has_bounded_parse_exhaustion(
-                    string.value, check_runtime, file_type="powershell", complete_context=False
-                )
+            if not string.invoked and _has_bounded_parse_exhaustion(
+                string.value, check_runtime, file_type="powershell", complete_context=False
             ):
                 # The projection already removed proven display-only messages.
                 # Remaining values can be captured or reach rebound commands;
