@@ -3001,9 +3001,7 @@ def _has_shell_command_word_exhaustion(
         # Python tokens. It cannot own quotes or skip candidates beyond its
         # proven host region, even when that lexical parse itself succeeded.
         ownership_boundary = min(
-            python_word_source.word_end(start)
-            if python_word_source is not None
-            else len(content),
+            python_word_source.word_end(start) if python_word_source is not None else len(content),
             powershell.next_boundary(start, len(content))
             if powershell is not None
             else len(content),
