@@ -617,6 +617,101 @@ def test_constant_checkout_full_bundle_requires_native_urllib(
         assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
+@pytest.mark.parametrize(
+    "module,opaque,readable,partial",
+    [
+        pytest.param("helpers", "helpers.pyc", False, True, id="bytecode"),
+        pytest.param("helpers", "helpers.pyo", False, True, id="legacy-bytecode"),
+        pytest.param("helpers", "helpers.cpython-313.so", False, True, id="native-abi"),
+        pytest.param("helpers", "helpers.abi3.pyd", False, True, id="native-pyd"),
+        pytest.param("helpers", "helpers.dll", False, True, id="native-dll"),
+        pytest.param("helpers", "helpers/__init__.pyc", False, True, id="bytecode-package"),
+        pytest.param("helpers", "helpers/__init__.abi3.so", False, True, id="native-package"),
+        pytest.param(
+            "helpers", "__pycache__/helpers.cpython-313.pyc", False, True, id="cached-bytecode"
+        ),
+        pytest.param("pkg.helpers", "pkg/helpers.pyc", False, True, id="nested-module"),
+        pytest.param("helpers", "helpers.pyc", True, True, id="readable-bytecode-sibling"),
+        pytest.param("helpers", "helpers.abi3.so", True, True, id="readable-native-sibling"),
+        pytest.param(
+            "pkg.helpers", "pkg/__init__.abi3.so", True, True, id="opaque-ancestor-initializer"
+        ),
+        pytest.param(
+            "pkg.helpers",
+            "pkg/__pycache__/__init__.cpython-313.pyc",
+            True,
+            True,
+            id="cached-ancestor-initializer",
+        ),
+        pytest.param("pkg.helpers", "pkg.pyd", True, True, id="opaque-ancestor-module"),
+        pytest.param(
+            "pkg.helpers", "pkg/__init__.pyc", False, True, id="missing-child-opaque-parent"
+        ),
+        pytest.param("pkg.helpers", "pkg.abi3.so", False, True, id="missing-child-native-parent"),
+        pytest.param("helpers", "helpers_extra.so", False, False, id="unrelated-prefix"),
+        pytest.param("helpers", "vendor/not_helpers.pyc", True, False, id="unrelated-basename"),
+        pytest.param("helpers", "helpers.txt", False, False, id="non-import-artifact"),
+        pytest.param("helpers", None, False, False, id="existing-external-import-limit"),
+    ],
+)
+def test_constant_checkout_full_bundle_refuses_unreadable_import_evidence(
+    module: str, opaque: str | None, readable: bool, partial: bool
+) -> None:
+    source = (
+        _OPTION_TEXT
+        + f"from {module} import output\n"
+        + _CONSTANT_CHECKOUT_SOURCE
+        + "output(message())\n"
+        + _TAIL
+    )
+    files = {"caller.py": source}
+    if readable:
+        files[module.replace(".", "/") + ".py"] = "def output(value):\n    print(value)\n"
+    components = list(files) + ([opaque] if opaque is not None else [])
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": components, "file_cache": files}, [tm]
+    )
+    event = next(event for event in result["inspection_ledger"] if event["path"] == "caller.py")
+
+    # Account for the caller separately from the unreadable artifact's own gap.
+    assert event["outcome"] is (LedgerOutcome.PARTIAL if partial else LedgerOutcome.COMPLETED)
+    if partial:
+        assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "omitted,partial",
+    [
+        ("helpers.pyc", True),
+        ("helpers.py", True),
+        ("urllib/parse.pyc", True),
+        ("helpers_extra.pyc", False),
+    ],
+)
+def test_constant_checkout_uses_known_omitted_import_inventory(omitted: str, partial: bool) -> None:
+    source = (
+        _OPTION_TEXT
+        + "from helpers import output\n"
+        + _CONSTANT_CHECKOUT_SOURCE
+        + "output(message())\n"
+        + _TAIL
+    )
+    result = static_runner.run_static_patterns_with_ledger(
+        {
+            "components": ["caller.py"],
+            "file_cache": {"caller.py": source},
+            "artifact_inventory": [{"path": omitted, "disposition": "partial"}],
+        },
+        [tm],
+    )
+    assert len(result["inspection_ledger"]) == 1
+    event = result["inspection_ledger"][0]
+    assert event["path"] == "caller.py"
+    assert event["outcome"] is (LedgerOutcome.PARTIAL if partial else LedgerOutcome.COMPLETED)
+    if partial:
+        assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
 @pytest.mark.parametrize("executor", [False, True], ids=["safe-helper", "shell-initializer"])
 @pytest.mark.parametrize(
     "initialization",
