@@ -7,7 +7,7 @@ import shlex
 
 import pytest
 
-from skillspector.artifacts import SecurityTextView
+from skillspector.artifacts import ArtifactDisposition, ContentKind, SecurityTextView
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.nodes.analyzers import static_runner
@@ -174,10 +174,23 @@ def test_child_exit_trap_uses_its_invocation_binding(rebind: str, preserved: boo
         )
     assert borrowed_library is preserved
 
+    sources = {"scripts/caller.sh": caller, "scripts/library.sh": library}
     result = static_runner.run_static_patterns_with_ledger(
         {
             "components": ["scripts/caller.sh"],
-            "file_cache": {"scripts/caller.sh": caller, "scripts/library.sh": library},
+            "file_cache": sources,
+            "raw_file_cache": {path: text.encode() for path, text in sources.items()},
+            "artifact_inventory": [
+                {
+                    "path": path,
+                    "content_kind": ContentKind.TEXT,
+                    "disposition": ArtifactDisposition.ANALYZED,
+                    "decodable": True,
+                    "contains_nul": False,
+                    "size_bytes": len(text.encode()),
+                }
+                for path, text in sources.items()
+            ],
         },
         [tm],
     )
