@@ -280,6 +280,16 @@ def _is_model_switch_command(command: str) -> bool:
     return False
 
 
+def _ends_in_continuation(line: str) -> bool:
+    """Return whether a line ends in a shell line continuation."""
+    match = _EA5_LINE_CONTINUATION.search(line)
+    if match is None:
+        return False
+    # A trailing backtick that closes a Markdown inline-code span ("Use `notes.md`")
+    # is paired with an earlier one; a PowerShell continuation backtick is not.
+    return line[match.start()] != "`" or line.count("`") % 2 == 1
+
+
 def _continued_executable(line: str) -> str:
     """Return the executable a line ending in a continuation carries onto the next line."""
     candidate = line.strip()
@@ -433,7 +443,7 @@ def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
                     evidence={"selection_surface": "command"},
                 )
             )
-        if _EA5_LINE_CONTINUATION.search(line_text) is None:
+        if not _ends_in_continuation(line_text):
             continued_executable = None
         elif continued_executable is None:
             continued_executable = _continued_executable(line_text)

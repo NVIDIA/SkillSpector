@@ -404,6 +404,14 @@ class TestExcessiveAgency:
         assert ea5[0].severity == Severity.HIGH
         assert ea5[0].location.start_line == line
 
+    def test_ea5_inline_code_closing_backtick_is_not_a_continuation(self) -> None:
+        content = "Use `notes.md`\ncodex exec 'Fix the tests'"
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        ea5 = [finding for finding in findings if finding.rule_id == "EA5"]
+        assert len(ea5) == 1
+        assert ea5[0].severity == Severity.HIGH
+        assert ea5[0].location.start_line == 2
+
     def test_ea5_continued_line_keeps_the_script_runner_exemption(self) -> None:
         content = "python evaluate.py \\\n  -v --model claude-3-7-sonnet"
         findings = ea_mod.analyze(content, "SKILL.md", "markdown")
