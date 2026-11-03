@@ -228,6 +228,12 @@ def powershell_source(
                     and content[operand_start] not in ";|&"
                 ):
                     operand_start = None
+                if here and value and value[-1] == "\n":
+                    # The physical newline before the footer belongs to the
+                    # delimiter. Preserve any preceding body or escaped newline.
+                    value.pop()
+                    if content[cursor - 2 : cursor] == "\r\n" and value and value[-1] == "\r":
+                        value.pop()
                 strings.append(
                     PowerShellString(start, end, "".join(value), decoded, invoked, operand_start)
                 )
@@ -242,6 +248,10 @@ def powershell_source(
                 if cursor + 1 >= len(content):
                     raise _UnprovenPowerShellError
                 escaped = content[cursor + 1]
+                if here and escaped in "\r\n":
+                    # An escaped physical newline does not take the native
+                    # footer-recognition path. Do not claim that boundary.
+                    raise _UnprovenPowerShellError
                 if escaped == "u":
                     if content[cursor + 2 : cursor + 3] != "{":
                         raise _UnprovenPowerShellError

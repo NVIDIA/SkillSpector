@@ -207,6 +207,69 @@ def test_here_string_footer_does_not_own_following_code() -> None:
     assert source.next_boundary(0, len(content)) == content.index('@"')
 
 
+@pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("", ""),
+        ("\n", ""),
+        ("text\n", "text"),
+        ("text\n\n", "text\n"),
+        ("text \t\n", "text \t"),
+        ("first\nlast\n", "first\nlast"),
+    ],
+)
+def test_here_string_value_excludes_only_its_footer_newline(
+    quote: str, newline: str, body: str, expected: str
+) -> None:
+    content = f"$text = @{quote}\n{body}{quote}@".replace("\n", newline)
+    source = powershell_source(content, lambda: None)
+    assert source is not None
+    assert source.strings[0].value == expected.replace("\n", newline)
+    assert content[source.strings[0].start : source.strings[0].end] == content[8:]
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_here_string_footer_keeps_an_escaped_body_newline(newline: str) -> None:
+    content = '$text = @"\ntext`n\n"@'.replace("\n", newline)
+    source = powershell_source(content, lambda: None)
+    assert source is not None
+    assert source.strings[0].value == "text\n"
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize("following", ["", "continued\n"])
+def test_here_string_escaped_physical_newline_cannot_prove_a_footer(
+    newline: str, following: str
+) -> None:
+    content = ('$text = @"\nbody`\n' + following + '"@').replace("\n", newline)
+    assert powershell_source(content, lambda: None) is None
+
+
+@pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize("parenthesized", [False, True])
+@pytest.mark.parametrize("command,partial", [("/bin/rm", True), ("/bin/echo", False)])
+def test_invoked_here_string_keeps_following_operands(
+    quote: str, newline: str, parenthesized: bool, command: str, partial: bool
+) -> None:
+    literal = f"@{quote}\n{command}\n{quote}@".replace("\n", newline)
+    expression = f"({literal})" if parenthesized else literal
+    content = f"& {expression} -rf /" + _TAIL
+    source = powershell_source(content, lambda: None)
+    assert source is not None
+    string = source.strings[0]
+    assert string.value == command
+    assert string.invoked
+    assert string.operand_start is not None
+    assert content[string.operand_start :].startswith(" -rf /")
+    event = _ledger(content)
+    assert event["outcome"] is (LedgerOutcome.PARTIAL if partial else LedgerOutcome.COMPLETED)
+    if partial:
+        assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
 @pytest.mark.parametrize("name", ["text", "script:text"])
 def test_large_native_here_string_assignment_is_not_a_shell_command(name: str) -> None:
     content = f"    ${name} = @'\n" + "ordinary documentation\n" * 500 + "'@\n"
