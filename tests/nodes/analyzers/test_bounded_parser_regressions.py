@@ -307,6 +307,59 @@ def test_complete_parser_result_stays_boolean_and_has_no_diagnostic(source: str)
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is False
 
 
+@pytest.mark.parametrize(
+    ("source", "file_type"),
+    [
+        ("tool.exec?.apply(tool, [`${command}`]);", "javascript"),
+        ("& $command -rf /", "powershell"),
+        ("& @'\n/bin/rm\n'@ -rf /\n", "powershell"),
+        ("& (@'\n/bin/rm\n'@) -rf /\n", "powershell"),
+        ("$value = '$CMD -rf /'", "powershell"),
+        ("# Example\n```powershell\n& $command -rf /\n```\n", "markdown"),
+    ],
+)
+def test_native_language_partial_paths_retain_typed_diagnostics(
+    source: str, file_type: str
+) -> None:
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type=file_type)
+    assert isinstance(diagnostic, StaticParserDiagnostic)
+    assert 0 <= diagnostic.start < diagnostic.end <= len(source)
+    assert diagnostic.full_input_checked is False
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type) is True
+
+
+@pytest.mark.parametrize("prefix", ["rm -rf ", "& $command -rf "])
+def test_native_powershell_operand_limit_keeps_its_measured_diagnostic(prefix: str) -> None:
+    source = prefix + "'" + "x" * (tm._ROOT_GLOB_COMMAND_CHARS + 1) + "'\n"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="powershell")
+    assert isinstance(diagnostic, StaticParserDiagnostic)
+    assert diagnostic.cause is ParserCause.RESOURCE_LIMIT
+    assert diagnostic.check is ParserCheck.COMMAND_ARGUMENT_CHARACTERS
+    assert diagnostic.measurements == {
+        "observed_characters": tm._ROOT_GLOB_COMMAND_CHARS + 1,
+        "limit_characters": tm._ROOT_GLOB_COMMAND_CHARS,
+    }
+    assert diagnostic.observed_is_lower_bound is True
+    assert diagnostic.full_input_checked is False
+    assert 0 <= diagnostic.start < diagnostic.end < len(source)
+
+
+@pytest.mark.parametrize("opener,closer", [("$(", ")"), ("`", "`")])
+def test_substitution_startup_diagnostic_keeps_original_source_coordinates(
+    opener: str, closer: str
+) -> None:
+    source = "echo " + opener + "read -z VALUE; sh -c 'echo ok'" + closer
+    commands = list(tm._shell_command_strings(source, lambda: None))
+    unresolved = [command for command in commands if command.content is None]
+    assert len(unresolved) == 1
+    diagnostic = unresolved[0].diagnostic
+    assert isinstance(diagnostic, StaticParserDiagnostic)
+    assert diagnostic.cause is ParserCause.UNSUPPORTED_SYNTAX
+    assert diagnostic.check is ParserCheck.COMMAND_STRING_RUNTIME
+    assert diagnostic.start == source.index("read")
+    assert diagnostic.start < diagnostic.end <= len(source) - len(closer)
+
+
 def test_command_word_limit_records_a_prefix_instead_of_an_invented_total() -> None:
     source = "r" + "a" * 20_000
     diagnostic = tm.bounded_parse_diagnostic(source, lambda: None)
@@ -427,6 +480,31 @@ def test_startup_proof_budget_is_preserved_as_a_resource_cause() -> None:
         diagnostic.measurements["observed_characters"] > diagnostic.measurements["limit_characters"]
     )
     assert diagnostic.observed_is_lower_bound is True
+
+
+def test_sliced_startup_body_reports_its_shared_work_budget(monkeypatch) -> None:
+    source = "echo `read -z VALUE; sh -c 'echo ok'`"
+    original = tm._shell_clause_sets_startup
+
+    def nearly_exhausted_body(content, start, check_runtime, remaining_work, diagnostics, **kwargs):
+        if content != source:
+            # Earlier clauses have consumed all but one shared work unit.
+            remaining_work[0] = 1
+        return original(content, start, check_runtime, remaining_work, diagnostics, **kwargs)
+
+    monkeypatch.setattr(tm, "_shell_clause_sets_startup", nearly_exhausted_body)
+    unresolved = [
+        command
+        for command in tm._shell_command_strings(source, lambda: None)
+        if command.content is None
+    ]
+    assert len(unresolved) == 1
+    diagnostic = unresolved[0].diagnostic
+    assert isinstance(diagnostic, StaticParserDiagnostic)
+    limit = 4 * len(source) + tm._ROOT_GLOB_COMMAND_CHARS
+    assert diagnostic.check is ParserCheck.STARTUP_PROOF_CHARACTERS
+    assert diagnostic.measurements == {"observed_characters": limit + 3, "limit_characters": limit}
+    assert diagnostic.start == source.index("read")
 
 
 def test_unsupported_startup_proof_option_is_not_a_numeric_limit() -> None:

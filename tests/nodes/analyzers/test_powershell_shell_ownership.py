@@ -58,9 +58,8 @@ def test_powershell_comments_and_messages_have_complete_analysis(
     content: str, newline: str
 ) -> None:
     content = content.replace("\n", newline)
-    # Each case exercises a host-syntax false positive present before #711.
-    assert tm.has_bounded_parse_exhaustion(content, lambda: None, file_type="shell") is True
-
+    # These are PowerShell regressions. Shell quote ownership can independently
+    # accept some of their strings, so shell-mode failure is not a precondition.
     result = _scan(content)
 
     assert _limited(content) is False
@@ -211,3 +210,20 @@ def test_powershell_projection_honors_runtime_checks() -> None:
 
     with pytest.raises(TimeoutError):
         tm._powershell_shell_text(content, check_runtime)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "suffix", "partial"),
+    [
+        ("Write-Output", "", False),
+        ("Write-Output", " | bash", True),
+        ("$cmd = Write-Output", "", True),
+        ("Import-Module ./helpers.psm1\nWrite-Host", "", True),
+    ],
+)
+def test_native_string_boundaries_preserve_message_capture_contract(
+    prefix: str, suffix: str, partial: bool
+) -> None:
+    content = f"{prefix} '$CMD -rf /'{suffix}\n"
+
+    assert _limited(content) is partial
