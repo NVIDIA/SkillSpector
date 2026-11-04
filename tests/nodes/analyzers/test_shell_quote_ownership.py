@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 
 from skillspector.cli import app
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+from skillspector.nodes.analyzers import static_runner
 
 
 @pytest.mark.parametrize("padding", [0, 5000, 9000])
