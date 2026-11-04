@@ -174,6 +174,53 @@ def test_javascript_local_array_predicates_are_not_extraction(
     assert p6_lines(source, "check.mjs", "javascript") == []
 
 
+@pytest.mark.parametrize("method", ["some", "every"])
+@pytest.mark.parametrize(
+    "setup",
+    [
+        "for (const value of [1]) {}",
+        "let value; for (value in {one: 1}) {}",
+        "for (const [value] of [[1]]) {}",
+        "let value; [value] = [1];",
+        "let value; ({value} = {value: 1});",
+        "let value; [value = 1] = [];",
+        "let value; [value = metadata.name] = [];",
+        "let value; ({value = metadata.name} = {});",
+        "let value; ({label: value = metadata.name} = {});",
+        "let rest; [...rest] = [1];",
+        "let rest; ({...rest} = {one: 1});",
+    ],
+)
+def test_javascript_local_binding_writes_preserve_array_predicates(method: str, setup: str) -> None:
+    source = (
+        f"function check(metadata) {{ const rules = []; {setup} return rules.{method}(Boolean); }}"
+    )
+    assert p6_lines(source, "check.mjs", "javascript") == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "function f(readSecret) { const rules = []; for (rules.some of [readSecret]) {} return rules.some(Boolean); }",
+        "function f() { const rules = []; for (rules.every in {key: 1}) {} return rules.every(Boolean); }",
+        "async function f(readSecret) { const rules = []; for await (rules.some of [readSecret]) {} return rules.some(Boolean); }",
+        "function f(readSecret) { const rules = []; [rules.some] = [readSecret]; return rules.some(Boolean); }",
+        "function f(readSecret) { const rules = []; ({method: rules.some} = {method: readSecret}); return rules.some(Boolean); }",
+        "function f(readSecret) { const rules = []; [[rules.some]] = [[readSecret]]; return rules.some(Boolean); }",
+        "function f(readSecret) { const rules = []; ({nested: {method: rules.some}} = {nested: {method: readSecret}}); return rules.some(Boolean); }",
+        "function f(readSecret) { const rules = []; [rules.some = readSecret] = []; return rules.some(Boolean); }",
+        "function f(readSecret) { const rules = []; ({method: rules.some = readSecret} = {}); return rules.some(Boolean); }",
+        "function f(readSecret) { const rules = []; [...rules.some] = [readSecret]; return rules.some(Boolean); }",
+        "function f(readSecret) { const rules = []; ({...rules.some} = {method: readSecret}); return rules.some(Boolean); }",
+        "function f(readSecret) { const rules = []; for ([rules.some] of [[readSecret]]) {} return rules.some(Boolean); }",
+        "function f(readSecret) { const rules = []; for ({method: rules.some} of [{method: readSecret}]) {} return rules.some(Boolean); }",
+    ],
+)
+def test_javascript_loop_and_pattern_member_writes_revoke_array_predicates(source: str) -> None:
+    assert leakage.parse_javascript_source(source, lambda: None) is not None
+    assert p6_lines(source, "check.mjs", "javascript")
+
+
 def test_javascript_local_array_factory_and_modern_syntax_are_proven() -> None:
     source = (
         "// Café 🚀\n"

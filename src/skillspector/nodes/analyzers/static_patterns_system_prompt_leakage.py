@@ -1253,10 +1253,25 @@ def _javascript_non_extraction_spans(
             "assignment_expression",
             "augmented_assignment_expression",
             "update_expression",
+            "for_in_statement",
         }:
             left = node.child_by_field_name("left") or node.child_by_field_name("argument")
-            if left is not None and left.type in {"member_expression", "subscript_expression"}:
-                predicate_proof = False
+            pending_targets = [left] if left is not None else []
+            while pending_targets:
+                check_runtime()
+                target = pending_targets.pop()
+                if target.type in {"member_expression", "subscript_expression"}:
+                    predicate_proof = False
+                    break
+                if target.type in {"assignment_pattern", "object_assignment_pattern"}:
+                    child = target.child_by_field_name("left")
+                elif target.type == "pair_pattern":
+                    child = target.child_by_field_name("value")
+                else:
+                    pending_targets.extend(target.named_children)
+                    continue
+                if child is not None:
+                    pending_targets.append(child)
 
     for names in (opaque_callables, local_factories):
         pending = list(names)
