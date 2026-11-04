@@ -12,7 +12,7 @@ import zlib
 from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 
-from skillspector.artifacts import ContentKind, ReferenceKind
+from skillspector.artifacts import ArtifactDisposition, ContentKind, ReferenceKind
 from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
@@ -1176,6 +1176,8 @@ def _reconcile_inspected_containers(state: SkillspectorState) -> dict[str, objec
 
 def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
     """Validate full internal facts and derive the public completeness projection."""
+    container_updates = _reconcile_inspected_containers(state)
+    state = {**state, **container_updates}
     reference_findings = _reference_coverage_findings(state)
     size_findings = _size_coverage_findings(
         state,
@@ -1271,6 +1273,7 @@ def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
         limitations = completeness.setdefault("limitations", [])
         limitations.append("One or more artifacts were not completely inspected.")
     return {
+        **container_updates,
         "analysis_completeness": completeness,
         "execution_successful": completeness["execution_successful"],
         "findings": coverage_findings,

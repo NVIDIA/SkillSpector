@@ -37,7 +37,6 @@ from skillspector import __version__
 from skillspector.cleanup import cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
-from skillspector.inspection_ledger import LedgerReason
 from skillspector.inspection_ledger import (
     format_recovery_policy_accepted,
     only_missing_reference_exceptions,
@@ -144,7 +143,7 @@ async def run_scan(
         ):
             raise ValueError("this MCP transport requires an unauthenticated HTTPS target")
 
-    llm_preflight_available, _ = is_llm_available() if use_llm else (False, None)
+    llm_preflight_available, llm_preflight_error = is_llm_available() if use_llm else (False, None)
     llm_enabled = use_llm and llm_preflight_available
 
     state: dict[str, Any] = {
@@ -153,6 +152,7 @@ async def run_scan(
         "output_format": output_format,
         "use_llm": llm_enabled,
         "llm_requested": use_llm,
+        "llm_preflight_error": redact_llm_error(llm_preflight_error),
     }
     if yara_rules_dir:
         state["yara_rules_dir"] = yara_rules_dir

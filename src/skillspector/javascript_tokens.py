@@ -12,11 +12,9 @@ from __future__ import annotations
 
 import re
 from bisect import bisect_left
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from html.parser import HTMLParser
-
-
 
 from tree_sitter import Node
 

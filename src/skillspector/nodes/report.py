@@ -50,7 +50,6 @@ from skillspector.inspection_ledger import (
     only_missing_reference_exceptions,
     resource_measurements,
     sanitize_parser_diagnostic,
-    only_missing_reference_exceptions,
 )
 from skillspector.llm_provenance import sanitize_llm_provenance
 from skillspector.llm_utils import is_llm_available
@@ -1392,10 +1391,18 @@ def _build_metadata(
     llm_execution_enabled: bool | None = None,
     semantic_runtime_incomplete: bool = False,
     runtime_available: bool | None = None,
+    provider_availability: tuple[bool, str | None] | None = None,
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
-    provider_available, llm_error = is_llm_available() if use_llm else (False, None)
+    provider_available, llm_error = (
+        provider_availability
+        if provider_availability is not None
+        else is_llm_available()
+        if use_llm
+        else (False, None)
+    )
+    llm_error = redact_llm_error(llm_error)
     attempted, succeeded, call_log_degraded = _llm_runtime_status(use_llm, llm_call_log)
     # meta_analyzer's own record, independent of whether a DIFFERENT
     # LLM-backed node (a semantic_* analyzer) lost coverage to a dropped
@@ -1470,9 +1477,10 @@ def _build_metadata(
         meta["llm_calls_attempted"] = attempted
         meta["llm_calls_succeeded"] = succeeded
     if unavailable_before_execution:
+        detail = f" Reason: {llm_error}" if llm_error else ""
         meta["llm_error"] = (
             "LLM analysis was requested but unavailable during preflight; "
-            "results reflect static analysis only."
+            f"results reflect static analysis only.{detail}"
         )
     elif call_log_degraded:
         meta["llm_degraded"] = True
@@ -1530,6 +1538,7 @@ def _format_json(
     llm_execution_enabled: bool | None = None,
     semantic_runtime_incomplete: bool = False,
     runtime_available: bool | None = None,
+    provider_availability: tuple[bool, str | None] | None = None,
 ) -> str:
     """Generate JSON report string."""
     suppressed = suppressed or []
@@ -1575,6 +1584,7 @@ def _format_json(
             llm_execution_enabled,
             semantic_runtime_incomplete,
             runtime_available,
+            provider_availability,
         ),
         "execution_successful": execution_successful,
     }
@@ -1935,9 +1945,13 @@ def report(state: SkillspectorState) -> dict[str, object]:
             analysis_completeness["status"] = "partial"
     _attempted, _succeeded, degraded = _llm_runtime_status(llm_requested, llm_call_log)
     if llm_requested and not use_llm:
-        provider_available, provider_error = False, redact_llm_error(state.get("llm_preflight_error"))
+        provider_available, provider_error = (
+            False,
+            redact_llm_error(state.get("llm_preflight_error")),
+        )
     else:
         provider_available, provider_error = is_llm_available() if llm_requested else (False, None)
+    provider_error = redact_llm_error(provider_error)
     runtime_available = llm_runtime_available(
         preflight_available=provider_available,
         result=state,
@@ -2111,6 +2125,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             llm_execution_enabled=use_llm,
             semantic_runtime_incomplete=semantic_runtime_incomplete,
             runtime_available=runtime_available,
+            provider_availability=(provider_available, provider_error),
         )
     elif output_format == "markdown":
         report_body = _format_markdown(

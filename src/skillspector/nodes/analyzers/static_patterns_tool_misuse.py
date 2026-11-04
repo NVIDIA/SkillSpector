@@ -165,6 +165,53 @@ _PERL_LITERAL_PRINT_RE = re.compile(
 )
 _PERL_QUOTE_OPERATOR_RE = re.compile(r"\b(?:q[qwxr]?|m|s|tr|y)(?:\s+\S|[^\w\s])")
 _PERL_AMBIGUOUS_SIGIL_RE = re.compile(r"[$@%&*]\s*+[{#'\"`]")
+# PowerShell accepts typographic quote characters as string delimiters, and a
+# doubled delimiter of the same class escapes one inside its string.
+_POWERSHELL_SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
+_POWERSHELL_DOUBLE_QUOTES = '"\u201c\u201d\u201e'
+_POWERSHELL_QUOTES = _POWERSHELL_SINGLE_QUOTES + _POWERSHELL_DOUBLE_QUOTES
+_POWERSHELL_TOKEN_BREAKS = frozenset(" \t\f\v\r\n;|&(){},")
+_POWERSHELL_MAX_NESTING = 32
+# Commands whose string arguments only reach the host's display streams. Their
+# arguments are messages, never code, unless a capture below redirects them.
+_POWERSHELL_STREAM_ONLY_COMMANDS = frozenset(
+    {
+        "write-host",
+        "write-verbose",
+        "write-warning",
+        "write-debug",
+        "write-information",
+        "write-progress",
+    }
+)
+# Output-stream commands emit their arguments as values. Only a top-level
+# statement's value leaves the script uncaptured by an expression in it.
+_POWERSHELL_OUTPUT_COMMANDS = frozenset({"write-output", "echo", "write"})
+# Common parameters that capture a stream into a variable. PowerShell accepts
+# any unambiguous prefix, so every prefix of these names counts.
+_POWERSHELL_CAPTURE_PARAMETERS = (
+    "outvariable",
+    "informationvariable",
+    "warningvariable",
+    "errorvariable",
+    "pipelinevariable",
+)
+_POWERSHELL_CAPTURE_PARAMETER_ALIASES = frozenset({"ov", "iv", "wv", "ev", "pv"})
+_POWERSHELL_COMMAND_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.\\:-]*")
+_POWERSHELL_PARAMETER_RE = re.compile(r"-([A-Za-z]{1,64})")
+_POWERSHELL_STATEMENT_END_RE = re.compile(r"[ \t]*+(?:[\r\n;)}#]|\Z)")
+# Source that can rebind a command name, load code that may rebind one, or run
+# a runtime-built command makes argument ownership unprovable. Matching is on
+# the raw text, so a spelling inside a string also disables message ownership.
+_POWERSHELL_COMMAND_REBINDING_RE = re.compile(
+    r"alias|function:|\b(?:function|filter|workflow)\b[^\r\n{(]*\b(?:write|echo)\b"
+    r"|\b(?:sal|nal|ipal|ipmo|ipsn|iex|icm|invoke-expression|invoke-command)\b"
+    r"|import-module|import-pssession|\busing[ \t]+module\b|#requires"
+    r"|scriptblock|psdefaultparametervalues|executioncontext|commandlookupaction"
+    r"|commandnotfoundaction|system\.management\.automation"
+    r"|&[ \t]*[$(@{'\"\u2018-\u201e]|(?:^|[\s;|&({])\.[ \t]+[^\s]",
+    re.IGNORECASE | re.MULTILINE,
+)
 # Perl's ``eval BLOCK`` runs already-compiled statements and traps exceptions.
 # Only ``eval EXPR`` (a string, variable, or quote operator) reparses source.
 _PERL_EVAL_BLOCK_RE = re.compile(r"\s*+\{")
@@ -2856,13 +2903,35 @@ def _shell_quoted_candidate_limits(
                 word_started = False
                 cursor = body_end
                 continue
+            if quote is not None and character == quote:
+                closers.add(cursor)
+                if not ansi_c:
+                    single_line = (
+                        "\n" not in content[quote_start:cursor]
+                        and "\r" not in content[quote_start:cursor]
+                    )
+                    for position in candidates:
+                        if single_line or (
+                            quote == '"'
+                            and content.startswith("$(", position)
+                            and substitution_cache.get(position) == cursor
+                            and _static_printf_substitution(
+                                content, position, cursor, quoted_result=True
+                            )
+                            is not None
+                        ):
+                            # Only a proved literal printf at the quote's end
+                            # may refine a multiline substitution candidate.
+                            limits[position] = cursor
+                quote = None
+                cursor += 1
+                continue
             if quote == "'":
                 if character == "\\" and ansi_c:
                     cursor += 2
                     continue
-                if character == "'":
-                    closers.add(cursor)
-                    quote = None
+                if not ansi_c and _SHELL_COMMAND_WORD_START_RE.match(content, cursor):
+                    candidates.append(cursor)
                 cursor += 1
                 continue
             if character == "\\":
@@ -2872,17 +2941,6 @@ def _shell_quoted_candidate_limits(
                         word_started = True
                     cursor += 2
                     continue
-            if quote == '"' and character == '"':
-                closers.add(cursor)
-                if (
-                    "\n" not in content[quote_start:cursor]
-                    and "\r" not in content[quote_start:cursor]
-                ):
-                    for position in candidates:
-                        limits[position] = cursor
-                quote = None
-                cursor += 1
-                continue
             if quote is None and content.startswith("<<<", cursor):
                 # A here-string takes an ordinary shell word; unlike a
                 # heredoc it does not change the ownership of later lines.
@@ -3017,6 +3075,13 @@ def _quoted_candidate_is_complete(
     end = quote_limits.get(start) if quote_limits is not None else None
     if end is None:
         return False
+    if (
+        quoted_printf_allowed
+        and content.startswith("$(", start)
+        and _skip_command_substitution(content, start, end, check_runtime) == end
+        and _static_printf_substitution(content, start, end, quoted_result=True) is not None
+    ):
+        return True
     fragment = content[start:end]
     parsed = _parse_shell_command_word(
         fragment, 0, check_runtime=check_runtime, quoted_printf_allowed=quoted_printf_allowed
@@ -3193,6 +3258,11 @@ def _has_shell_command_word_exhaustion(
         content, check_runtime
     )
     parsed_through = 0
+    # A word that spans lines may pair a heredoc, comment or prose quote with
+    # a later command line. Main skips the candidates inside such a word, so
+    # they are still checked here, but they never change what later
+    # candidates are skipped or owned.
+    shadow_through = 0
     # Completed words own closing quotes, never executable expansion starts.
     # Inner commands remain independent candidates; never suppress their bodies.
     owned_word_positions: set[int] = set()
@@ -3268,6 +3338,7 @@ def _has_shell_command_word_exhaustion(
             )
         ):
             continue
+        shadowed = start < shadow_through
         if _has_quoted_assignment_prefix(content, start):
             # A quoted NAME=value argument cannot be the command word. Claim
             # only a complete static word; dynamic substitutions must remain
@@ -3296,6 +3367,16 @@ def _has_shell_command_word_exhaustion(
                 owned_word_positions.update(assignment_positions)
             if parsed is not None and _plain_quoted_assignment_word(parsed) and not shadowed:
                 parsed_through = max(parsed_through, parsed.end)
+            continue
+        # A runtime-selected command may follow any prefix word (``sudo -u
+        # root``, ``then``, ``{``, ``env A=1``), so ``$``- and backtick-led
+        # candidates keep main's word-start check; other words must open a
+        # command position.
+        if (
+            shadowed
+            and not _opens_runtime_word(content, start)
+            and not _is_shell_command_position(content, start)
+        ):
             continue
         candidate_word_positions: set[int] = set()
         word_diagnostics.clear()
@@ -3402,6 +3483,12 @@ def _has_shell_command_word_exhaustion(
                 # Likewise, a host string or comment token owns its bytes: a
                 # shell quote it opens cannot continue into later host code.
                 unresolved_end = min(unresolved_end, python_source.word_end(start))
+            elif (
+                unresolved_end - start > _SHELL_COMMAND_WORD_CHARS and javascript_source is not None
+            ):
+                # Template literal delimiters and their host-language
+                # expressions cannot continue a shell word into later code.
+                unresolved_end = min(unresolved_end, javascript_source.word_end(start))
             if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS:
                 if not _quoted_candidate_is_complete(
                     content, start, quote_limits, check_runtime, quoted_printf_allowed
@@ -3441,7 +3528,7 @@ def _has_shell_command_word_exhaustion(
             or _SHELL_COMMENT_START_RE.search(content, content.rfind("\n", 0, start) + 1, start)
             is not None
         )
-        if not confined_word:
+        if not confined_word and not shadowed:
             # A quote that opens a runtime-selected word stays an independent
             # candidate, so a mis-paired claim cannot hide its operands.
             # An enclosing backtick may be owned at parsed.end itself.
@@ -3464,12 +3551,19 @@ def _has_shell_command_word_exhaustion(
             is not None
         )
         if (
-            not parsed.dynamic
-            or "$" not in raw_word
-            or not any(marker in raw_word for marker in ("$(", "`"))
-            or simple_backtick_parameter
-        ) and not (assignment_quote and confined_word):
-            parsed_through = max(parsed_through, owned_end)
+            (
+                not parsed.dynamic
+                or "$" not in raw_word
+                or not any(marker in raw_word for marker in ("$(", "`"))
+                or simple_backtick_parameter
+            )
+            and not (assignment_quote and confined_word)
+            and not shadowed
+        ):
+            if python_source is None and ("\n" in raw_word or "\r" in raw_word):
+                shadow_through = max(shadow_through, owned_end)
+            else:
+                parsed_through = max(parsed_through, owned_end)
         if assignment_quote:
             # An assignment value never names the command, and main never
             # parsed this position, so it only claims ownership.
@@ -3508,11 +3602,11 @@ def _has_shell_command_word_exhaustion(
                     content, start, quote_limits, check_runtime, quoted_printf_allowed
                 ):
                     continue
-                # A proven string value can bound this check only when the
-                # module has no recognized shell path that could execute a
-                # later transformation or concatenation. Ambiguous shell
-                # uses and locally extensible values retain the original
-                # whole-source incomplete-inspection fallback.
+                # Host code after a Python string's closing quote is not shell
+                # text, so a command in the string takes operands only from
+                # the rest of the string's value, including literals
+                # concatenated with it. A value that code can still extend,
+                # for example with ``%`` or ``.format``, stays partial.
                 value_source_range: list[int] = []
                 value = (
                     python_source.string_value(start, parsed.end, source_range=value_source_range)
@@ -8091,7 +8185,6 @@ def _markdown_shell_text(
             and list_marker.match(leading) is None
             and not _markdown_block_separator(stripped, check_runtime)
         )
-        indented_code = indentation >= 4 and not list_continuation
         # Interpret list padding in columns, preserving the original offsets.
         # More than four columns after a marker can introduce indented code.
         prefix = len(stripped) - len(leading)
@@ -8516,6 +8609,7 @@ def _markdown_shell_text(
 
 
 USES_PYTHON_IMPORT_BOUNDS = True
+
 
 def _fenced_powershell_source(
     content: str,
@@ -9285,6 +9379,7 @@ def _has_bounded_parse_exhaustion(
     structural_quote_openers = None
     shell_fence_ranges: list[tuple[int, int]] = []
     json_strings: list[tuple[int, int]] = []
+    json_operand_spans: list[tuple[int, int]] = []
     python_source = None
     javascript_source = None
     unresolved_executables: list[int] = []
@@ -11613,3 +11708,24 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     )
     logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
     return response
+
+
+def _is_shell_command_position(content: str, start: int) -> bool:
+    """Return whether ``start`` opens a line or follows a command separator."""
+    cursor = start - 1
+    while cursor >= 0 and content[cursor] in " \t":
+        cursor -= 1
+    return cursor < 0 or content[cursor] in "\n\r;|&("
+
+
+def _opens_runtime_word(content: str, start: int) -> bool:
+    """Return whether ``start`` opens a ``$`` or single-backtick word, bare or in ``"``."""
+    cursor = start + 1 if content.startswith('"', start) else start
+    if content.startswith("$", cursor):
+        return True
+    # A backtick run such as a Markdown fence never opens a substitution.
+    return (
+        content.startswith("`", cursor)
+        and not content.startswith("``", cursor)
+        and (cursor == 0 or content[cursor - 1] != "`")
+    )

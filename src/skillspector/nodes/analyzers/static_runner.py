@@ -2860,7 +2860,6 @@ def _scan_all_views_with_parser_diagnostics(
                 python_import_bounds=python_import_bounds,
                 prepared_analyses=prepared_analyses,
                 parser_diagnostics=parser_diagnostics,
-                python_import_bounds=python_import_bounds,
             )
             bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
@@ -3642,7 +3641,6 @@ def run_static_patterns(
             python_import_bounds=python_import_bounds,
             readable_binary=path in readable_binary_paths,
             source_cache=source_cache,
-            python_import_bounds=python_import_bounds,
         )
         runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
         if shared_remaining is not None:
@@ -3712,6 +3710,10 @@ def run_static_patterns_with_ledger(
         {str(item.get("path", "")): item for item in raw_inventory if isinstance(item, dict)}
         if isinstance(raw_inventory, list)
         else {}
+    )
+
+    container_paths.update(
+        path for path, artifact in inventory.items() if "inspected_members" in artifact
     )
 
     for path in components:
@@ -3853,7 +3855,6 @@ def run_static_patterns_with_ledger(
                             python_import_bounds=python_import_bounds,
                             readable_binary=bool(artifact.get("readable_binary")),
                             source_cache=source_cache,
-                            python_import_bounds=python_import_bounds,
                         )
                         path_parser_diagnostic = getattr(
                             resource_metrics, "parser_diagnostic", None

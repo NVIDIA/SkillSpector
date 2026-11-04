@@ -74,8 +74,6 @@ from skillspector.llm_utils import (
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
-from skillspector.providers import UnknownProviderError, get_active_provider, has_cli_capability
-from skillspector.providers._agent_cli import MAX_INPUT_BYTES
 from skillspector.response_recovery import (
     parse_recovery_value,
     recover_payload,

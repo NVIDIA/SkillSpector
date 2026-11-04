@@ -62,6 +62,7 @@ RULE_SET_SCOPE: Final = "rule_set"
 
 
 class LedgerReason(StrEnum):
+    ARCHIVE_MEMBER_INCOMPLETE = "archive_member_incomplete"
     """Allowlisted reasons for omitted, skipped, or failed inspection work."""
 
     EXCLUDED_DIRECTORY = "excluded_directory"
@@ -444,6 +445,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.ARCHIVE_FORMAT_MISMATCH: (
         "Artifact bytes do not match the container format implied by its filename."
     ),
+    LedgerReason.ARCHIVE_MEMBER_INCOMPLETE: "Nested artifact inspection is incomplete.",
     LedgerReason.ARCHIVE_MALFORMED: "Archive or compressed content is malformed.",
     LedgerReason.ARCHIVE_ENCRYPTED: "Archive member is encrypted and could not be inspected.",
     LedgerReason.ARCHIVE_UNSUPPORTED_COMPRESSION: (
@@ -1605,15 +1607,9 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_before_filtering": len(findings_by_id),
         "findings_after_filtering": len(validated_effective),
     }
-    patterns = state.get("exclude_patterns", [])
     dependency_inspection = state.get("dependency_inspection")
     if isinstance(dependency_inspection, dict):
         completeness["dependency_inspection"] = dict(dependency_inspection)
-    if patterns:
-        completeness["exclude_patterns"] = list(patterns)
-        completeness["excluded_file_count"] = sum(
-            item.get("reason") == LedgerReason.USER_EXCLUSION for item in inventory
-        )
     format_warnings = [
         {**row, "assessment_complete": False, "accepted_by_policy": True}
         for row in ledger_exceptions

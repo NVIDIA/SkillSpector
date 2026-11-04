@@ -1343,8 +1343,6 @@ def test_unproven_node_assert_binding_or_message_is_not_projected(source: str) -
     assert _javascript(source) is _shell(source)
 
 
-
-
 @pytest.mark.parametrize(
     "statement",
     [
