@@ -700,9 +700,7 @@ _XML_START_TAG = re.compile(
 _XML_ATTRIBUTE = re.compile(rb"\s+([^<>\s=/'\"]+)\s*=\s*([\"'])(.*?)\2", re.DOTALL)
 
 
-def _drawingml_bullet_offsets(
-    content: str, check_runtime: Callable[[], None]
-) -> frozenset[int]:
+def _drawingml_bullet_offsets(content: str, check_runtime: Callable[[], None]) -> frozenset[int]:
     """Prove literal U+200B bullet formatting without exempting XML text."""
     if (
         "\u200b" not in content
@@ -804,9 +802,7 @@ def prepare_analysis(
 ) -> _PreparedAnalysis:
     """Bind bullet ownership to complete canonical source before windowing."""
     offsets = (
-        _drawingml_bullet_offsets(content, check_runtime)
-        if file_type == "other"
-        else frozenset()
+        _drawingml_bullet_offsets(content, check_runtime) if file_type == "other" else frozenset()
     )
     return _PreparedAnalysis(offsets, check_runtime)
 
