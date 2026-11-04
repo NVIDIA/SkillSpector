@@ -2652,7 +2652,9 @@ def _scan_all_views_with_parser_diagnostics(
     projection = None if _oms_projected else project_oms_content(content)
     if projection is not None and projection.view.name != "raw":
         findings, reason, metrics = _scan_all_views_detailed(
-            path,
+            # The decoded representation is JSON regardless of the carrier's
+            # extension. Keep its string boundaries when inspecting metadata.
+            path + ".json",
             projection.view.text,
             pattern_modules,
             None,
@@ -2666,6 +2668,7 @@ def _scan_all_views_with_parser_diagnostics(
             python_import_bounds=python_import_bounds,
         )
         for finding in findings:
+            finding.file = path
             finding.start_line = finding.end_line = 1
             finding.start_column = finding.end_column = None
             finding.evidence["oms_projection"] = (

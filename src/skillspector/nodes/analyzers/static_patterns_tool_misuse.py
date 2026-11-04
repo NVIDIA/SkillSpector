@@ -3096,8 +3096,10 @@ def _quoted_candidate_is_complete(
     )
 
 
-def _shell_comment_start_before(content: str, start: int, *, ansi_c: bool = False) -> int | None:
-    """Return a genuine shell comment ``#`` on the candidate's line, if any.
+def _shell_comment_starts(
+    content: str, check_runtime: Callable[[], None], *, ansi_c: bool = False
+) -> tuple[int, ...]:
+    """Index proven shell comment starts in one bounded source traversal.
 
     This scans from the start of ``content`` so quote state is inherited
     across lines: a ``#`` on the candidate's line that sits inside a string
@@ -3125,11 +3127,12 @@ def _shell_comment_start_before(content: str, start: int, *, ansi_c: bool = Fals
     expansion cannot be proven (the parser returns no end), the exemption
     is declined rather than guessed.
     """
-    line_start = content.rfind("\n", 0, start) + 1
+    starts: list[int] = []
     stack: list[str | None] = [None]
     i = 0
     in_comment = False
-    while i < start:
+    while i < len(content):
+        check_runtime()
         ch = content[i]
         if in_comment:
             if ch == "\n":
@@ -3168,9 +3171,10 @@ def _shell_comment_start_before(content: str, start: int, *, ansi_c: bool = Fals
             i += 2
             continue
         if ch == "$" and content[i + 1 : i + 2] == "{":
-            parameter_end = _skip_parameter_expansion(content, i, len(content), None)
+            parameter_end = _skip_parameter_expansion(content, i, len(content), check_runtime)
             if parameter_end is None:
-                return None
+                # Earlier comments are proven; later ownership is unknown.
+                return tuple(starts)
             i = parameter_end
             continue
         if ch == "$" and ansi_c and content[i + 1 : i + 2] == "'":
@@ -3190,10 +3194,26 @@ def _shell_comment_start_before(content: str, start: int, *, ansi_c: bool = Fals
             stack.pop()
         elif ch == "#":
             if i == 0 or content[i - 1] in " \t\r\n;&|()<>":
-                if i >= line_start:
-                    return i
+                starts.append(i)
                 in_comment = True
         i += 1
+    return tuple(starts)
+
+
+def _shell_comment_start_before(
+    content: str,
+    start: int,
+    *,
+    ansi_c: bool = False,
+    comment_starts: tuple[int, ...] | None = None,
+) -> int | None:
+    """Find a proven comment before this candidate on the same line."""
+    if comment_starts is None:
+        comment_starts = _shell_comment_starts(content, lambda: None, ansi_c=ansi_c)
+    index = bisect_left(comment_starts, start) - 1
+    line_start = content.rfind("\n", 0, start) + 1
+    if index >= 0 and comment_starts[index] >= line_start:
+        return comment_starts[index]
     return None
 
 
@@ -3202,7 +3222,7 @@ def _is_comment_candidate(
     start: int,
     python_source: _PythonSourceOwnership | None,
     *,
-    file_type: str | None = None,
+    shell_comments: Callable[[], tuple[int, ...]],
 ) -> bool:
     """Return whether a candidate position sits inside a ``#`` comment.
 
@@ -3218,7 +3238,9 @@ def _is_comment_candidate(
     if _SHELL_COMMENT_START_RE.search(content, line_start, start) is None:
         return False
     if python_source is None:
-        return _shell_comment_start_before(content, start, ansi_c=file_type == "shell") is not None
+        return (
+            _shell_comment_start_before(content, start, comment_starts=shell_comments()) is not None
+        )
     return python_source.comment(start) is not None
 
 
@@ -3269,6 +3291,16 @@ def _has_shell_command_word_exhaustion(
     parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
     substitution_end_cache: dict[int, int | None] = {}
     backtick_end_cache: dict[int, int | None] = {}
+    shell_comment_starts: tuple[int, ...] | None = None
+
+    def shell_comments() -> tuple[int, ...]:
+        nonlocal shell_comment_starts
+        if shell_comment_starts is None:
+            shell_comment_starts = _shell_comment_starts(
+                content, check_runtime, ansi_c=file_type == "shell"
+            )
+        return shell_comment_starts
+
     powershell_strings = _powershell_string_operands(powershell)
     powershell_here_closers = (
         {
@@ -3448,7 +3480,10 @@ def _has_shell_command_word_exhaustion(
                     and not (
                         file_type in _HASH_COMMENT_FILE_TYPES
                         and _is_comment_candidate(
-                            content, start, python_source, file_type=file_type
+                            content,
+                            start,
+                            python_source,
+                            shell_comments=shell_comments,
                         )
                     )
                 ):
@@ -3570,7 +3605,10 @@ def _has_shell_command_word_exhaustion(
             continue
         if parsed.limited:
             if file_type in _HASH_COMMENT_FILE_TYPES and _is_comment_candidate(
-                content, start, python_source, file_type=file_type
+                content,
+                start,
+                python_source,
+                shell_comments=shell_comments,
             ):
                 # A comment is never executed: a backtick there is literal
                 # text, so it cannot open a command substitution that
