@@ -139,6 +139,23 @@ SC1_PROSE_PATTERNS = [
     (r"(?:don't|do\s+not)\s+(?:pin|lock|specify)\s+(?:package\s+)?versions?", 0.7),
 ]
 SC1_PATTERNS = SC1_CODE_PATTERNS + SC1_PROSE_PATTERNS
+# eval, -c and -e run their argument whichever substitution supplies it. A bare
+# shell, interpreter or source runs only content it reads from <(...),
+# < <(...) or a here-string; given "$(...)" it runs a file path. Executor words
+# must start a word, so `deploy.sh "$(...)"` and `--source "$(...)"` do not
+# count. `.` counts only in command position, at a line start or after an
+# operator, a bracket, a backtick or a quote, so `jq . <<< ...` and
+# `tar -C . < <(...)` do not count. A backslash admits JSON-escaped quotes in
+# hook configs.
+_SC3_SUBSTITUTION_EXECUTOR = (
+    r"(?:(?<![\w.-])(?:eval|(?:ba|da|z|k|a)?sh[ \t]{1,16}-[A-Za-z]{0,3}c"
+    r"|python(?:[23](?:\.[0-9]{1,2})?)?[ \t]{1,16}-c|(?:perl|ruby|node)[ \t]{1,16}-e)"
+    r"[ \t]{1,16}\\?[\"']?(?:\$\(|`)"
+    r"|(?:(?<![\w.-])(?:source|(?:ba|da|z|k|a)?sh|python(?:[23](?:\.[0-9]{1,2})?)?|perl|ruby|node)"
+    r"|(?:^|(?<=[;&|(`'\"{]))[ \t]{0,16}\.)"
+    r"(?:[ \t]{1,16}-{1,2}[A-Za-z]{0,16}){0,2}(?:[ \t]{1,16}/dev/stdin)?"
+    r"[ \t]{1,16}(?:<<<[ \t]{0,16}\\?[\"']?(?:\$\(|`)|<(?:[ \t]{0,16}<)?\())"
+)
 SC2_CODE_PATTERNS = [
     (r"curl\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh", 0.9),
     (r"wget\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh", 0.9),
@@ -151,6 +168,9 @@ SC2_CODE_PATTERNS = [
     (r"eval\s*\(\s*(?:await\s+)?fetch\s*\(", 0.9),
     (r"new\s+Function\s*\([^)]*fetch\s*\(", 0.9),
     (r"subprocess\.[^(]+\([^)]*(?:curl|wget)\s+https?://", 0.8),
+    # bash -c "$(curl ...)", bash <(curl ...), eval "$(wget ...)": the same
+    # fetch-and-run as a pipe to sh, with no pipe for the patterns above
+    (rf"{_SC3_SUBSTITUTION_EXECUTOR}[^()`\n]{{0,256}}?\b(?:curl|wget)\s+[^)`\n]{{0,256}}", 0.9),
 ]
 SC2_PROSE_PATTERNS = [
     (r"download\s+and\s+(?:run|execute)\s+(?:the\s+)?script", 0.7),
@@ -295,23 +315,6 @@ _SC3_PIPE_EXECUTOR = (
     r"(?![ \t]{1,16}(?!-|/dev/stdin\b|[0-9]{0,2}[<>])[^\s|;&)#])"
     r"|(?:python(?:[23](?:\.[0-9]{1,2})?)?|perl|ruby|node)(?:[ \t]{1,16}-[A-Za-z]{0,4}){0,2}"
     r"(?=['\"]|[ \t]{0,16}(?:$|[\r;&|)`#]|[0-9]{0,2}>)))"
-)
-# eval, -c and -e run their argument whichever substitution supplies it. A bare
-# shell, interpreter or source runs only content it reads from <(...),
-# < <(...) or a here-string; given "$(...)" it runs a file path. Executor words
-# must start a word, so `deploy.sh "$(...)"` and `--source "$(...)"` do not
-# count. `.` counts only in command position, at a line start or after an
-# operator, a bracket, a backtick or a quote, so `jq . <<< ...` and
-# `tar -C . < <(...)` do not count. A backslash admits JSON-escaped quotes in
-# hook configs.
-_SC3_SUBSTITUTION_EXECUTOR = (
-    r"(?:(?<![\w.-])(?:eval|(?:ba|da|z|k|a)?sh[ \t]{1,16}-[A-Za-z]{0,3}c"
-    r"|python(?:[23](?:\.[0-9]{1,2})?)?[ \t]{1,16}-c|(?:perl|ruby|node)[ \t]{1,16}-e)"
-    r"[ \t]{1,16}\\?[\"']?(?:\$\(|`)"
-    r"|(?:(?<![\w.-])(?:source|(?:ba|da|z|k|a)?sh|python(?:[23](?:\.[0-9]{1,2})?)?|perl|ruby|node)"
-    r"|(?:^|(?<=[;&|(`'\"{]))[ \t]{0,16}\.)"
-    r"(?:[ \t]{1,16}-{1,2}[A-Za-z]{0,16}){0,2}(?:[ \t]{1,16}/dev/stdin)?"
-    r"[ \t]{1,16}(?:<<<[ \t]{0,16}\\?[\"']?(?:\$\(|`)|<(?:[ \t]{0,16}<)?\())"
 )
 # Options and the here-string operator between a decoder and an inline literal.
 _SC3_HERE_STRING = r"(?:[ \t]{1,16}-[A-Za-z0-9-]{1,16}){0,4}[ \t]{0,16}<<<[ \t]{0,16}"
