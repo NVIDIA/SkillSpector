@@ -31,6 +31,7 @@ from skillspector.inspection_ledger import (
 from skillspector.models import Finding
 from skillspector.nodes.finalize_inspection_ledger import finalize_inspection_ledger
 from skillspector.nodes.report import report
+from skillspector.passive_bmp import is_structurally_valid_passive_bmp
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 
@@ -53,6 +54,103 @@ _VALID_PASSIVE_PNG = (
     + _png_chunk(b"IDAT", zlib.compress(b"\x00\x40\x80\xc0\xff"))
     + _png_chunk(b"IEND", b"")
 )
+
+_VALID_PASSIVE_BMP = (
+    b"BM"
+    + struct.pack("<III", 58, 0, 54)
+    + struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 0, 3780, 3780, 0, 0)
+    + b"\xc0\x80\xff\x00"
+)
+
+
+@pytest.mark.parametrize("height,image_size", [(1, 0), (-1, 0), (1, 4), (-1, 4)])
+def test_passive_bmp_supports_both_orientations_and_uncompressed_size_conventions(
+    height: int, image_size: int
+) -> None:
+    data = bytearray(_VALID_PASSIVE_BMP)
+    struct.pack_into("<i", data, 22, height)
+    struct.pack_into("<I", data, 34, image_size)
+    assert is_structurally_valid_passive_bmp(bytes(data))
+
+
+@pytest.mark.parametrize(
+    "offset,format_string,value",
+    [
+        (2, "I", 59),
+        (6, "I", 1),
+        (10, "I", 55),
+        (14, "I", 124),
+        (18, "i", 0),
+        (18, "i", 100_000),
+        (22, "i", 0),
+        (26, "H", 2),
+        (28, "H", 12),
+        (30, "I", 1),
+        (34, "I", 3),
+        (46, "I", 1),
+        (57, "B", 1),
+    ],
+)
+def test_passive_bmp_rejects_invalid_headers_pixels_and_unused_storage(
+    offset: int, format_string: str, value: int
+) -> None:
+    data = bytearray(_VALID_PASSIVE_BMP)
+    struct.pack_into("<" + format_string, data, offset, value)
+    assert not is_structurally_valid_passive_bmp(bytes(data))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _VALID_PASSIVE_BMP[:-1],
+        _VALID_PASSIVE_BMP + b"exec(payload)",
+        b"BM\nexec(payload)",
+        b"#!/bin/sh\nrm -rf /",
+        b"BM",
+    ],
+)
+def test_passive_bmp_rejects_truncated_and_mixed_content(payload: bytes) -> None:
+    assert not is_structurally_valid_passive_bmp(payload)
+
+
+@pytest.mark.parametrize("bits", [1, 4, 8, 16, 24, 32])
+def test_passive_bmp_validates_supported_pixel_and_palette_storage(bits: int) -> None:
+    colors = 1 << bits if bits <= 8 else 0
+    offset = 54 + 4 * colors
+    data = (
+        b"BM"
+        + struct.pack("<III", offset + 4, 0, offset)
+        + struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, bits, 0, 4, 0, 0, colors, 0)
+        + bytes(4 * colors + 4)
+    )
+    assert is_structurally_valid_passive_bmp(data)
+
+
+def test_passive_bmp_corroboration_requires_complete_canonical_bytes() -> None:
+    path = "assets/chart.bmp"
+    inventory = {"size_bytes": len(_VALID_PASSIVE_BMP)}
+    assert finalizer_module._has_verified_passive_raster(
+        path, inventory, {path: _VALID_PASSIVE_BMP}
+    )
+    inventory["size_bytes"] += 1
+    assert not finalizer_module._has_verified_passive_raster(
+        path, inventory, {path: _VALID_PASSIVE_BMP}
+    )
+
+
+def test_passive_bmp_core_header_and_palette_index_validation() -> None:
+    core = (
+        b"BM" + struct.pack("<III", 30, 0, 26) + struct.pack("<IHHHH", 12, 1, 1, 1, 24) + bytes(4)
+    )
+    assert is_structurally_valid_passive_bmp(core)
+    indexed = (
+        b"BM"
+        + struct.pack("<III", 62, 0, 58)
+        + struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 8, 0, 4, 0, 0, 1, 0)
+        + bytes(8)
+    )
+    assert is_structurally_valid_passive_bmp(indexed)
+    assert not is_structurally_valid_passive_bmp(indexed[:-4] + b"\x01\x00\x00\x00")
 
 
 @pytest.mark.parametrize(

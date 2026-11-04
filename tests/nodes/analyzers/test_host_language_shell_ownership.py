@@ -1301,10 +1301,6 @@ def test_node_assert_template_offsets_preserve_dangerous_neighbor(newline: str) 
             id="spread-argument",
         ),
         pytest.param(
-            _JS_ASSERT_IMPORT + "check.equal(a, b, tag`${row.key}`);\n",
-            id="tagged-message",
-        ),
-        pytest.param(
             _JS_ASSERT_IMPORT + "check.equal(a, b, (`${row.key}`));\n",
             id="parenthesized-message",
         ),
@@ -1325,8 +1321,6 @@ def test_node_assert_template_offsets_preserve_dangerous_neighbor(newline: str) 
             id="unrelated-return",
         ),
         pytest.param("#!/bin/sh\n" + _JS_ASSERT_IMPORT + _JS_ASSERT_CALL, id="shell-shebang"),
-        pytest.param(_JS_ASSERT_IMPORT + "check.equal(a, b, `${row.key}\n", id="unclosed-template"),
-        pytest.param(_JS_ASSERT_IMPORT + "check.equal(a, b, `${row.key`);\n", id="unclosed-field"),
         pytest.param(_JS_ASSERT_IMPORT + _JS_ASSERT_CALL + "/* unfinished", id="unclosed-comment"),
         pytest.param(
             _JS_ASSERT_IMPORT + "const pattern = /unterminated\n" + _JS_ASSERT_CALL,
@@ -1347,6 +1341,35 @@ def test_unproven_node_assert_binding_or_message_is_not_projected(source: str) -
 
     assert assertion_template_shell_text(source, lambda: None) == source
     assert _javascript(source) is _shell(source)
+
+
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param("check.equal(a, b, tag`${row.key}`);\n", id="tagged-message"),
+        pytest.param("check.equal(a, b, `${row.key}\n", id="unclosed-template"),
+        pytest.param("check.equal(a, b, `${row.key`);\n", id="unclosed-field"),
+    ],
+)
+def test_unresolved_assertion_templates_report_partial_inspection(statement: str) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = _JS_ASSERT_IMPORT + statement
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert _javascript(source) is True
+    row = _ledger("scripts/check.mjs", source)["inspection_ledger"][0]
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+def test_unproven_node_assert_template_keeps_ledger_partial() -> None:
+    result = _ledger("scripts/check.mjs", _JS_ASSERT_CALL)
+    row = result["inspection_ledger"][0]
+
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
 @pytest.mark.parametrize(
@@ -1486,13 +1509,16 @@ def test_node_assert_message_fix_keeps_unresolved_shell_commands_partial(stateme
         "sh`${obj.cmd} -rf /`;",
     ],
 )
-def test_unrecognized_template_consumers_keep_existing_behavior(statement: str) -> None:
+def test_unrecognized_executable_template_consumers_report_partial(statement: str) -> None:
     from skillspector.javascript_tokens import assertion_template_shell_text
 
     source = _JS_ASSERT_IMPORT + statement + "\n"
 
     assert assertion_template_shell_text(source, lambda: None) == source
-    assert _javascript(source) is _shell(source)
+    assert _javascript(source) is True
+    row = _ledger("scripts/check.mjs", source)["inspection_ledger"][0]
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
 @pytest.mark.parametrize(

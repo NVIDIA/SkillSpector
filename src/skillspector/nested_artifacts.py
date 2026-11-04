@@ -47,6 +47,7 @@ from skillspector.inspection_ledger import (
     LedgerRecordType,
     ledger_event,
 )
+from skillspector.passive_svg import is_structurally_valid_passive_svg
 from skillspector.python_ast import PythonSourceClassification, classify_python_source
 
 ARCHIVE_MAX_DEPTH = 3
@@ -757,14 +758,15 @@ def has_binary_executable_magic(data: bytes) -> bool:
 def is_executable_content(
     path: str, data: bytes, mode: int = 0, *, complete_content: bool = False
 ) -> bool:
-    """Classify content; only complete declarations may receive the inert exemption."""
+    """Classify content; exemptions require complete, bounded structure proofs."""
     suffix = Path(path).suffix.lower()
     executable_magic = data.startswith(b"#!") or has_binary_executable_magic(data)
     declaration_only = _looks_like_typescript_declaration(
         path, data, complete_content=complete_content
     )
+    passive_svg = suffix == ".svg" and complete_content and is_structurally_valid_passive_svg(data)
     return (
-        (suffix in _EXECUTABLE_SUFFIXES and not declaration_only)
+        (suffix in _EXECUTABLE_SUFFIXES and not declaration_only and not passive_svg)
         or executable_magic
         or bool(mode & 0o111)
     )
