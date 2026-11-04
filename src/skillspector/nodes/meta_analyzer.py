@@ -919,29 +919,33 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
                 ],
             )
 
-        if len(batch_results) < len(batches):
-            # Some batches never returned. A finding the LLM never saw has no
-            # verdict — keep it via the fallback path instead of letting
-            # apply_filter treat the missing confirmation as a rejection.
-            analysed_ids = {
-                finding.finding_id for batch, _ in batch_results for finding in batch.findings
-            }
-            analysed = [
-                finding for finding in eligible_findings if finding.finding_id in analysed_ids
-            ]
-            unanalysed = [
-                finding for finding in eligible_findings if finding.finding_id not in analysed_ids
-            ]
-        else:
-            analysed, unanalysed = eligible_findings, []
+        completed_work_ids = {_meta_batch_work_id(batch) for batch, _ in detailed.successful}
+        analysed_ids: set[str] = set()
+        for batch, assessments in batch_results:
+            if _meta_batch_work_id(batch) in completed_work_ids:
+                analysed_ids.update(finding.finding_id for finding in batch.findings)
+                continue
+            # Partial recovery proves only the returned item assessments, even
+            # when all submitted batches have a partial result.
+            originals = {finding.finding_id: finding for finding in batch.findings}
+            for assessment in assessments:
+                finding_id = assessment.get("finding_id")
+                if not isinstance(finding_id, str):
+                    continue
+                original = originals.get(finding_id)
+                if original is not None and _assessment_matches_finding(
+                    assessment, original, batch.file_path
+                ):
+                    analysed_ids.add(finding_id)
+        analysed = [finding for finding in eligible_findings if finding.finding_id in analysed_ids]
+        unanalysed = [
+            finding for finding in eligible_findings if finding.finding_id not in analysed_ids
+        ]
 
         filtered = analyzer.apply_filter(analysed, batch_results)
         if unanalysed:
             logger.warning(
-                "Meta-analyzer: %d/%d batches failed; keeping %d findings in %d "
-                "files unfiltered (no LLM verdict)",
-                len(batches) - len(batch_results),
-                len(batches),
+                "Meta-analyzer: keeping %d findings in %d files without a completed LLM verdict",
                 len(unanalysed),
                 len({f.file for f in unanalysed}),
             )

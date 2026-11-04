@@ -78,8 +78,12 @@ from skillspector.models import Finding
 from skillspector.providers import UnknownProviderError, get_active_provider, has_cli_capability
 from skillspector.providers._agent_cli import MAX_INPUT_BYTES
 from skillspector.providers.gemini import GeminiProvider
-from skillspector.response_recovery import parse_recovery_value
-from skillspector.structured_response import ResponseIssue, completed_response_text
+from skillspector.response_recovery import parse_recovery_value, recover_payload
+from skillspector.structured_response import (
+    ResponseIssue,
+    completed_response_text,
+    validate_payload,
+)
 
 logger = get_logger(__name__)
 
@@ -341,6 +345,7 @@ class _ProviderRetryOutcome:
     """Per-batch evidence of why the coordinator stopped retrying."""
 
     reason: LedgerReason = LedgerReason.LLM_BATCH_FAILED
+    recovery_source: str | None = None
 
 
 def _provider_failure_class(exc: BaseException) -> str:
@@ -1593,7 +1598,13 @@ class LLMAnalyzerBase:
         return None
 
     def _field_recovery_plan(
-        self, batch: Batch, original_prompt: str, source: str, items: list[BaseModel]
+        self,
+        batch: Batch,
+        original_prompt: str,
+        source: str,
+        items: list[BaseModel],
+        *,
+        local_only: bool = False,
     ) -> Generator[_RecoveryQuestion, Any, _RecoveredBatch]:
         """Recover one field at a time without depending on a provider's JSON support."""
         schema = self.response_schema
@@ -1604,6 +1615,40 @@ class LLMAnalyzerBase:
             return _RecoveredBatch(batch, [], False)
         known = self._recovery_known_items(batch)
         complete = True
+        original_items: list[dict[str, Any]] = []
+        payload = recover_payload(source)
+        if payload is not None:
+            try:
+                original = validate_payload(payload, schema)
+            except StructuredOutputParseError:
+                complete = not (payload.keys() - schema.model_fields.keys())
+            else:
+                assert isinstance(original, BaseModel)
+                items.extend(original.findings if is_list else [original])
+                return self._recovered_result(batch, items, True)
+            raw_items = payload.get("findings") if is_list else [payload]
+            if isinstance(raw_items, list) and (item_schema is LLMFinding or not is_list):
+                for raw_item in raw_items:
+                    retained: dict[str, Any] = {}
+                    if isinstance(raw_item, dict):
+                        if raw_item.keys() - item_schema.model_fields.keys():
+                            complete = False
+                        retained = {
+                            name: value
+                            for name, value in raw_item.items()
+                            if name in item_schema.model_fields
+                        }
+                        try:
+                            item_schema.model_validate(retained, strict=True)
+                        except ValidationError as exc:
+                            # Use the real model validators, including custom scalar
+                            # normalization. Missing fields do not invalidate known facts.
+                            for error in exc.errors():
+                                if error["type"] != "missing" and error["loc"]:
+                                    retained.pop(error["loc"][0], None)
+                    original_items.append(retained)
+                if len(raw_items) > FIELD_RECOVERY_MAX_FINDINGS:
+                    complete = False
         calls = 0
 
         def ask(
@@ -1613,7 +1658,7 @@ class LLMAnalyzerBase:
             identity: dict[str, Any],
         ) -> Generator[_RecoveryQuestion, Any, Any]:
             nonlocal calls, complete
-            if calls >= FIELD_RECOVERY_MAX_CALLS:
+            if local_only or calls >= FIELD_RECOVERY_MAX_CALLS:
                 return None
             instruction = (
                 "The previous answer did not follow the requested response format. "
@@ -1641,39 +1686,54 @@ class LLMAnalyzerBase:
             calls += 1
             return (yield _RecoveryQuestion(prompt, name, annotation))
 
-        if is_list and known is None:
-            count = yield from ask(
-                "finding_count",
-                int,
-                "How many distinct findings does the complete assessment contain? "
-                "Return a nonnegative integer, including every severity. Zero means the "
-                "analysis completed and found no issues, not that the answer is unknown.",
-                {},
-            )
-            if type(count) is not int or count < 0:
-                return _RecoveredBatch(batch, [], False)
-            if count > FIELD_RECOVERY_MAX_FINDINGS:
-                complete = False
-                count = FIELD_RECOVERY_MAX_FINDINGS
-        else:
-            count = len(known) if known is not None else 1
-            if count > FIELD_RECOVERY_MAX_FINDINGS:
-                complete = False
-                count = FIELD_RECOVERY_MAX_FINDINGS
-
-        values_by_item = [dict(known[index]) if known is not None else {} for index in range(count)]
-        fields = item_schema.model_fields
-        required = [
-            name
-            for name, info in fields.items()
-            if info.is_required() or name in self.recovery_required_fields
-        ]
-        # Recover identities and severity for every item before spending calls on prose.
-        required.sort(key=lambda name: name not in {"rule_id", "severity"})
-        optional = [
-            name for name, info in fields.items() if name not in required and info.annotation is str
+        values_by_item = [
+            dict(values) for values in (known if known is not None else original_items)
         ]
         try:
+            if is_list and known is None:
+                count = yield from ask(
+                    "finding_count",
+                    int,
+                    "How many distinct findings does the complete assessment contain? "
+                    "Return a nonnegative integer, including every severity. Zero means the "
+                    "analysis completed and found no issues, not that the answer is unknown.",
+                    {},
+                )
+                if type(count) is not int or count < len(original_items):
+                    complete = False
+                    count = len(original_items)
+                # Bound new field recovery, never discard already supplied facts.
+                max_items = max(FIELD_RECOVERY_MAX_FINDINGS, len(original_items))
+                if count > max_items:
+                    complete = False
+                    count = max_items
+            else:
+                count = len(known) if known is not None else 1
+                if count > FIELD_RECOVERY_MAX_FINDINGS:
+                    complete = False
+                    count = FIELD_RECOVERY_MAX_FINDINGS
+
+            values_by_item = [
+                dict(known[index])
+                if known is not None
+                else dict(original_items[index])
+                if index < len(original_items)
+                else {}
+                for index in range(count)
+            ]
+            fields = item_schema.model_fields
+            required = [
+                name
+                for name, info in fields.items()
+                if info.is_required() or name in self.recovery_required_fields
+            ]
+            # Recover identities and severity for every item before spending calls on prose.
+            required.sort(key=lambda name: name not in {"rule_id", "severity"})
+            optional = [
+                name
+                for name, info in fields.items()
+                if name not in required and info.annotation is str
+            ]
             for name in [*required, *optional]:
                 for index, values in enumerate(values_by_item):
                     if name in values:
@@ -1715,7 +1775,11 @@ class LLMAnalyzerBase:
         finally:
             # Closing the generator after a provider failure must retain known findings.
             for values in values_by_item:
-                if item_schema is LLMFinding and values.get("rule_id") in self.recovery_rule_ids:
+                if (
+                    item_schema is LLMFinding
+                    and isinstance(values.get("rule_id"), str)
+                    and values["rule_id"]
+                ):
                     if values.get("severity") in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}:
                         if "message" not in values:
                             values["message"] = (
@@ -1776,7 +1840,7 @@ class LLMAnalyzerBase:
         items: list[BaseModel] = []
         plan = self._field_recovery_plan(batch, prompt, source, items)
         answer = None
-        process_completion_only = False
+        process_completion_only = isinstance(self._llm, AgentCLIChatModel)
         while True:
             try:
                 question = plan.send(answer)
@@ -1803,7 +1867,7 @@ class LLMAnalyzerBase:
         items: list[BaseModel] = []
         plan = self._field_recovery_plan(batch, prompt, source, items)
         answer = None
-        process_completion_only = False
+        process_completion_only = isinstance(self._llm, AgentCLIChatModel)
         while True:
             try:
                 question = plan.send(answer)
@@ -1825,6 +1889,18 @@ class LLMAnalyzerBase:
             except Exception as exc:
                 plan.close()
                 return self._recovered_result(batch, items, False, exc)
+
+    def _retain_original_findings(self, batch: Batch, source: str) -> list:
+        """Keep established evidence alongside a terminal failure, without provider calls."""
+        items: list[BaseModel] = []
+        plan = self._field_recovery_plan(batch, "", source, items, local_only=True)
+        try:
+            next(plan)
+        except StopIteration:
+            return self._recovered_result(batch, items, False).values
+        finally:
+            plan.close()
+        raise AssertionError("local recovery must not request a model response")
 
     @staticmethod
     def _record_recovery(outcome: BatchExecutionResult, result: _RecoveredBatch) -> None:
@@ -1877,6 +1953,7 @@ class LLMAnalyzerBase:
                 if isinstance(cause, StructuredOutputParseError):
                     if formatting_source is None and cause.recovery_text is not None:
                         recovery_source = cause.recovery_text
+                        retry_outcome.recovery_source = recovery_source
                     if (
                         cause.issue is ResponseIssue.FORMAT_CHANGED
                         and formatting_source is not None
@@ -1892,6 +1969,12 @@ class LLMAnalyzerBase:
                     if cause.repair_text is not None and attempt < LLM_BATCH_MAX_ATTEMPTS:
                         formatting_source = cause.repair_text
                         continue
+                    if recovery_source is not None and self._retain_original_findings(
+                        batch, recovery_source
+                    ):
+                        # Recover missing fields from established evidence instead
+                        # of regenerating an assessment that could erase a finding.
+                        return self._recover_batch(batch, prompt, recovery_source)
                 if formatting_source is not None:
                     if recovery_source is not None:
                         return self._recover_batch(batch, prompt, recovery_source)
@@ -1996,6 +2079,7 @@ class LLMAnalyzerBase:
                 if isinstance(cause, StructuredOutputParseError):
                     if formatting_source is None and cause.recovery_text is not None:
                         recovery_source = cause.recovery_text
+                        retry_outcome.recovery_source = recovery_source
                     if (
                         cause.issue is ResponseIssue.FORMAT_CHANGED
                         and formatting_source is not None
@@ -2011,6 +2095,12 @@ class LLMAnalyzerBase:
                     if cause.repair_text is not None and attempt < LLM_BATCH_MAX_ATTEMPTS:
                         formatting_source = cause.repair_text
                         continue
+                    if recovery_source is not None and self._retain_original_findings(
+                        batch, recovery_source
+                    ):
+                        # Recover missing fields from established evidence instead
+                        # of regenerating an assessment that could erase a finding.
+                        return await self._arecover_batch(batch, prompt, recovery_source)
                 if formatting_source is not None:
                     if recovery_source is not None:
                         return await self._arecover_batch(batch, prompt, recovery_source)
@@ -2135,6 +2225,15 @@ class LLMAnalyzerBase:
                         reason=retry_outcome.reason,
                     )
                 )
+            if (
+                retry_outcome.recovery_source is not None
+                and outcome.failures
+                and outcome.failures[-1].batch is batch
+                and not any(recovered_batch is batch for recovered_batch, _ in outcome.recovered)
+            ):
+                retained = self._retain_original_findings(batch, retry_outcome.recovery_source)
+                if retained:
+                    outcome.recovered.append((batch, retained))
         return outcome
 
     async def arun_batches(
@@ -2225,6 +2324,14 @@ class LLMAnalyzerBase:
             if isinstance(result, _RecoveredBatch):
                 self._record_recovery(outcome, result)
                 continue
+            if (
+                isinstance(result, BaseException)
+                and not isinstance(result, (ValueError, NotImplementedError))
+                and retry_outcome.recovery_source is not None
+            ):
+                retained = self._retain_original_findings(batch, retry_outcome.recovery_source)
+                if retained:
+                    outcome.recovered.append((batch, retained))
             if isinstance(result, _StructuredResponseValidationError):
                 logger.warning(
                     "LLM response validation failed for %s (%s)",

@@ -1182,7 +1182,7 @@ def test_meta_recovery_copies_exact_finding_identities():
 
 
 @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-@pytest.mark.parametrize("has_assessment", [False, True])
+@pytest.mark.parametrize("assessment", ["missing", "valid", "unknown_id", "wrong_rule"])
 @pytest.mark.parametrize(
     "reason,expected_outcome,call_ok",
     [
@@ -1192,7 +1192,7 @@ def test_meta_recovery_copies_exact_finding_identities():
     ],
 )
 def test_meta_partial_recovery_preserves_originals_and_terminal_cause(
-    has_assessment, reason, expected_outcome, call_ok
+    assessment, reason, expected_outcome, call_ok
 ):
     first = Finding(
         rule_id="E2", message="original high", severity="HIGH", file="a.py", start_line=1
@@ -1215,8 +1215,8 @@ def test_meta_partial_recovery_preserves_originals_and_terminal_cause(
             {
                 "findings": [
                     {
-                        "finding_id": first.finding_id,
-                        "pattern_id": first.rule_id,
+                        "finding_id": "unknown" if assessment == "unknown_id" else first.finding_id,
+                        "pattern_id": "different" if assessment == "wrong_rule" else first.rule_id,
                         "start_line": first.start_line,
                         "end_line": first.end_line,
                         "is_vulnerability": True,
@@ -1226,7 +1226,7 @@ def test_meta_partial_recovery_preserves_originals_and_terminal_cause(
                         "explanation": "Recovered confirmed issue",
                     }
                 ]
-                if has_assessment
+                if assessment != "missing"
                 else [],
             }
         )
@@ -1246,8 +1246,13 @@ def test_meta_partial_recovery_preserves_originals_and_terminal_cause(
 
     assert [item.finding_id for item in result["findings"]] == [first.finding_id, second.finding_id]
     assert [item.severity for item in result["findings"]] == ["HIGH", "LOW"]
-    if has_assessment:
+    if assessment == "valid":
         assert result["findings"][0].explanation == "Recovered confirmed issue"
+        assert result["findings"][0].evidence["llm_review_outcome"] == "confirmed"
+    else:
+        assert result["findings"][0].evidence["llm_review_outcome"] == "failed"
+    assert result["findings"][1].evidence["llm_review_outcome"] == "failed"
+    assert all("llm-unconfirmed" not in item.tags for item in result["findings"])
     (event,) = result["inspection_ledger"]
     assert event["outcome"] is expected_outcome
     assert event["reason_code"] is reason

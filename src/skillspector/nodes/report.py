@@ -1972,6 +1972,14 @@ def report(state: SkillspectorState) -> dict[str, object]:
         analysis_completeness["limitations"] = limitations
         if analysis_completeness.get("policy_accepted") is True:
             analysis_completeness["policy_accepted"] = False
+            raw_warnings = analysis_completeness.get("warnings")
+            if isinstance(raw_warnings, list):
+                analysis_completeness["warnings"] = [
+                    {**warning, "accepted_by_policy": False}
+                    if isinstance(warning, Mapping)
+                    else warning
+                    for warning in raw_warnings
+                ]
         analysis_completeness["is_complete"] = False
         if analysis_completeness.get("status", "complete") in {
             "complete",

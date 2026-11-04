@@ -14,9 +14,56 @@ from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 from skillspector.structured_response import (
     MAX_RESPONSE_CHARS,
+    MAX_RESPONSE_DEPTH,
     ResponseIssue,
     StructuredOutputParseError,
+    formatting_tokens,
 )
+
+
+def recover_payload(text: str) -> dict[str, Any] | None:
+    """Recover punctuation only, retaining every original key, value and container."""
+    try:
+        tokens = formatting_tokens(text)
+        position = 0
+
+        def read_value(depth: int) -> Any:
+            nonlocal position
+            if depth > MAX_RESPONSE_DEPTH or position >= len(tokens):
+                raise ValueError("missing or over-nested value")
+            token = tokens[position]
+            position += 1
+            if token == "{":
+                result: dict[str, Any] = {}
+                while position < len(tokens) and tokens[position] != "}":
+                    key_token = tokens[position]
+                    if not key_token.startswith('"'):
+                        raise ValueError("object key is not a string")
+                    key = json.loads(key_token)
+                    if key in result:
+                        raise ValueError("duplicate object key")
+                    position += 1
+                    result[key] = read_value(depth + 1)
+                if position >= len(tokens):
+                    raise ValueError("missing object terminator")
+                position += 1
+                return result
+            if token == "[":
+                values: list[Any] = []
+                while position < len(tokens) and tokens[position] != "]":
+                    values.append(read_value(depth + 1))
+                if position >= len(tokens):
+                    raise ValueError("missing array terminator")
+                position += 1
+                return values
+            if token in {"}", "]"}:
+                raise ValueError("missing value")
+            return json.loads(token)
+
+        payload = read_value(0)
+        return payload if isinstance(payload, dict) and position == len(tokens) else None
+    except (ValueError, RecursionError):
+        return None
 
 
 def parse_recovery_value(text: str, annotation: Any, *, field_name: str | None = None) -> Any:

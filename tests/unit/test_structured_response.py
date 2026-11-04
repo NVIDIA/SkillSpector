@@ -17,14 +17,19 @@ from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 
 from skillspector.inspection_ledger import LedgerReason
-from skillspector.llm_analyzer_base import Batch, LLMAnalysisResult, LLMAnalyzerBase
+from skillspector.llm_analyzer_base import (
+    FIELD_RECOVERY_MAX_CALLS,
+    Batch,
+    LLMAnalysisResult,
+    LLMAnalyzerBase,
+)
 from skillspector.llm_utils import bind_structured_output, register_chat_model_provider
 from skillspector.nodes.analyzers.mcp_tool_poisoning import _TP4AnalysisResult, _TP4Analyzer
 from skillspector.nodes.analyzers.semantic_security_discovery import node as security_discovery
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, MetaAnalyzerResult
 from skillspector.providers import reset_provider, use_provider
 from skillspector.providers.openai import OpenAIProvider
-from skillspector.response_recovery import parse_recovery_value
+from skillspector.response_recovery import parse_recovery_value, recover_payload
 from skillspector.structured_response import (
     MAX_RESPONSE_CHARS,
     MAX_RESPONSE_DEPTH,
@@ -331,6 +336,71 @@ def test_recovery_field_parser_does_not_guess(text, annotation, field_name):
         parse_recovery_value(text, annotation, field_name=field_name)
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        '{"findings":[{"rule_id":"SSD-1","severity":"HIGH","start_line":1}],}',
+        '{"findings" [{"rule_id" "SSD-1" "severity" "HIGH" "start_line" 1}]}',
+        '```json\n{"findings":[{"rule_id":"SSD-1","severity":"HIGH","start_line":1}],}\n```',
+    ],
+)
+def test_recover_payload_preserves_original_finding_facts(source):
+    assert recover_payload(source) == {
+        "findings": [{"rule_id": "SSD-1", "severity": "HIGH", "start_line": 1}]
+    }
+
+
+def test_recover_payload_preserves_nested_order_and_scalar_types():
+    source = '{"b" [true false null 1 -2 0.5 "a\\nb"] "a" {"escaped\\u006bey" "value"}}'
+    payload = recover_payload(source)
+    assert payload == {"b": [True, False, None, 1, -2, 0.5, "a\nb"], "a": {"escapedkey": "value"}}
+    assert list(payload) == ["b", "a"]
+
+
+def test_recover_payload_treats_json_like_prose_inside_a_string_as_one_value():
+    text = 'HIGH, } ], "findings": [] is only quoted text.'
+    assert recover_payload(json.dumps({"message": text})) == {"message": text}
+
+
+def test_recover_payload_accepts_the_existing_depth_boundary():
+    source = (
+        '{"value":' + "[" * (MAX_RESPONSE_DEPTH - 1) + "0" + "]" * (MAX_RESPONSE_DEPTH - 1) + "}"
+    )
+    payload = recover_payload(source)
+    assert payload is not None
+    value = payload["value"]
+    for _ in range(MAX_RESPONSE_DEPTH - 1):
+        assert isinstance(value, list) and len(value) == 1
+        value = value[0]
+    assert value == 0
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "The severity is HIGH.",
+        "",
+        "[]",
+        '{"findings": [',
+        '{"findings": [], "findings": []}',
+        '{"a": {"x": 1, "\\u0078": 2}}',
+        '{"a" 1 "a" 2}',
+        '{"findings":}',
+        '{"a": 1, "b":}',
+        '{"findings": ["HIGH", }',
+        '{"findings": []} {"findings": []}',
+        '{"findings": []} trailing prose',
+        '{"findings": NaN}',
+        '{"findings": 1e999}',
+        '{"findings": "incomplete}',
+        '{"findings": ' + "[" * MAX_RESPONSE_DEPTH + "]" * MAX_RESPONSE_DEPTH + "}",
+        "x" * (MAX_RESPONSE_CHARS + 1),
+    ],
+)
+def test_recover_payload_rejects_ambiguous_or_unusable_originals(source):
+    assert recover_payload(source) is None
+
+
 @pytest.fixture
 def http_model(monkeypatch):
     """Actual SDK and LangChain parsing, with an in-memory HTTP transport."""
@@ -500,9 +570,157 @@ def test_formatting_cannot_turn_a_finding_into_a_clean_result(http_model):
     outcome = make_analyzer("discovery").run_batches_detailed(
         [Batch(file_path="a.py", content="x")]
     )
-    assert not outcome.successful
-    assert outcome.failures[0].reason == LedgerReason.LLM_FORMAT_CHANGED
+    assert not outcome.failures and not outcome.warnings
+    (finding,) = outcome.successful[0][1]
+    assert (finding.rule_id, finding.severity) == ("SSD-1", "HIGH")
+    assert finding.message == "leaks data"
     assert len(requests) == 2
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "original_fields,expected_confidence",
+    [
+        ({}, 0.5),
+        ({"confidence": 99}, 0.99),
+        ({"start_line": 0}, 0.5),
+        ({"confidence": "not a number"}, 0.5),
+        ({"start_line": "unknown"}, 0.5),
+    ],
+)
+def test_field_recovery_cannot_erase_original_high_when_details_remain_unknown(
+    http_model, asynchronous, original_fields, expected_confidence
+):
+    source = json.dumps(
+        {"findings": [{"rule_id": "SSD-1", "severity": "HIGH", "start_line": 1, **original_fields}]}
+    )
+    requests = http_model([(source, "stop"), ("0", "stop"), ("UNKNOWN", "stop")])
+    analyzer = make_analyzer("discovery")
+    analyzer.recovery_rule_ids = ("SSD-1",)
+    outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
+    assert not outcome.successful and not outcome.failures
+    (finding,) = outcome.recovered[0][1]
+    assert (finding.rule_id, finding.severity) == ("SSD-1", "HIGH")
+    assert finding.confidence == expected_confidence
+    assert finding.start_line == 1
+    assert finding.evidence["assessment_complete"] is False
+    assert outcome.warnings[0].reason == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+    assert 1 < len(requests) <= 1 + FIELD_RECOVERY_MAX_CALLS
+    assert "Requested field: finding_count." in requests[1]["messages"][0]["content"]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_known_high_switches_to_field_recovery_before_a_replacement_assessment(
+    http_model, asynchronous
+):
+    source = '{"findings":[{"rule_id":"SSD-1","severity":"HIGH","start_line":1}]}'
+    requests = http_model([(source, "stop"), ("0", "stop")])
+    analyzer = make_analyzer("discovery")
+    analyzer.recovery_rule_ids = ("SSD-1",)
+    outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
+
+    assert not outcome.successful and not outcome.failures
+    (finding,) = outcome.recovered[0][1]
+    assert (finding.rule_id, finding.severity) == ("SSD-1", "HIGH")
+    assert outcome.warnings[0].reason == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+    assert "Requested field: finding_count." in requests[1]["messages"][0]["content"]
+    assert all("Requested field:" in r["messages"][0]["content"] for r in requests[1:])
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_original_high_beyond_new_finding_limit_remains_visible(http_model, asynchronous):
+    source = json.dumps(
+        {
+            "findings": [
+                {
+                    "rule_id": "SSD-1",
+                    "severity": "HIGH" if index == 17 else "LOW",
+                    "start_line": index,
+                }
+                for index in range(1, 18)
+            ]
+        }
+    )
+    requests = http_model([(source, "stop"), ("0", "stop"), ("UNKNOWN", "stop")])
+    analyzer = make_analyzer("discovery")
+    analyzer.recovery_rule_ids = ("SSD-1",)
+    outcome = run_outcome(
+        analyzer, [Batch(file_path="a.py", content="x\n" * 17, end_line=17)], asynchronous
+    )
+
+    assert not outcome.successful and not outcome.failures
+    findings = outcome.recovered[0][1]
+    assert len(findings) == 17
+    assert [finding.severity for finding in findings] == ["LOW"] * 16 + ["HIGH"]
+    assert findings[-1].start_line == 17
+    assert all(finding.evidence["assessment_complete"] is False for finding in findings)
+    assert outcome.warnings[0].reason == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+    assert len(requests) <= 1 + FIELD_RECOVERY_MAX_CALLS
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_tp4_invalid_original_confidence_can_be_recovered_without_losing_mismatch(
+    http_model, asynchronous
+):
+    source = '{"is_mismatch": true, "confidence": 99}'
+    requests = http_model([(source, "stop"), ("0.9", "stop"), ("UNKNOWN", "stop")])
+    analyzer = make_analyzer("tp4")
+    analyzer.build_prompt = lambda *_args, **_kwargs: "Assess the code"
+    outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
+    assert not outcome.failures and not outcome.warnings
+    (assessment,) = outcome.successful[0][1]
+    assert assessment.is_mismatch is True
+    assert assessment.confidence == 0.9
+    assert 1 < len(requests) <= 1 + FIELD_RECOVERY_MAX_CALLS
+    assert "Requested field: confidence." in requests[1]["messages"][0]["content"]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "stop,reason",
+    [
+        ("length", LedgerReason.LLM_RESPONSE_TRUNCATED),
+        ("content_filter", LedgerReason.LLM_RESPONSE_REFUSED),
+    ],
+)
+def test_failed_formatting_retains_original_high_and_terminal_failure(
+    http_model, asynchronous, stop, reason
+):
+    source = '{"findings":[{"rule_id":"SSD-1","message":"leaks data","severity":"HIGH","start_line":1}],}'
+    requests = http_model([(source, "stop"), ('{"findings": []}', stop)])
+    analyzer = make_analyzer("discovery")
+    outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
+    assert not outcome.successful and not outcome.warnings
+    assert outcome.failures[0].reason == reason
+    (finding,) = outcome.recovered[0][1]
+    assert (finding.rule_id, finding.severity) == ("SSD-1", "HIGH")
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("failure_stage,expected_calls", [("formatting", 2), ("initial_count", 2)])
+def test_provider_failure_preserves_original_high_before_recovery_fields_finish(
+    http_model, asynchronous, failure_stage, expected_calls
+):
+    original = {"rule_id": "SSD-1", "severity": "HIGH", "start_line": 1}
+    if failure_stage == "formatting":
+        original["message"] = "Leaks data"
+    source = json.dumps({"findings": [original]})
+    if failure_stage == "formatting":
+        source = source[:-1] + ",}"
+    requests = http_model([(source, "stop")], failures={expected_calls: 401})
+    analyzer = make_analyzer("discovery")
+    analyzer.recovery_rule_ids = ("SSD-1",)
+    outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
+
+    assert not outcome.successful and not outcome.warnings
+    assert outcome.failures[0].reason == LedgerReason.LLM_BATCH_FAILED
+    (finding,) = outcome.recovered[0][1]
+    assert (finding.rule_id, finding.severity) == ("SSD-1", "HIGH")
+    assert finding.evidence["assessment_complete"] is False
+    assert len(requests) == expected_calls
+    if failure_stage == "initial_count":
+        assert "Requested field: finding_count." in requests[-1]["messages"][0]["content"]
 
 
 def test_formatting_uses_the_original_deadline(http_model):
@@ -674,25 +892,25 @@ def test_formatting_preserves_real_findings_and_source_locations(http_model, met
 
 
 @pytest.mark.parametrize(
-    "first,reason",
+    "first",
     [
-        ("{}", LedgerReason.LLM_RESPONSE_MISSING_FIELDS),
-        ('{"findings": "missing"}', LedgerReason.LLM_RESPONSE_INVALID_SCHEMA),
-        (
-            '{"findings": [], "hidden_findings": ["danger"]}',
-            LedgerReason.LLM_RESPONSE_INVALID_SCHEMA,
-        ),
-        ('{"json": {"findings": []}}', LedgerReason.LLM_RESPONSE_MISSING_FIELDS),
+        "{}",
+        '{"findings": "missing"}',
+        '{"findings": [], "hidden_findings": ["danger"]}',
+        '{"json": {"findings": []}}',
     ],
 )
-def test_missing_or_extra_assessment_data_is_not_sent_for_formatting(http_model, first, reason):
+def test_missing_or_extra_assessment_data_uses_bounded_recovery_without_formatting(
+    http_model, first
+):
     requests = http_model([(first, "stop")])
     outcome = make_analyzer("discovery").run_batches_detailed(
         [Batch(file_path="a.py", content="x")]
     )
-    assert not outcome.successful
-    assert outcome.failures[0].reason == reason
-    assert len(requests) == 4
+    assert not outcome.successful and not outcome.failures
+    assert outcome.warnings[0].reason == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+    assert 4 <= len(requests) <= 4 + FIELD_RECOVERY_MAX_CALLS
+    assert all("Requested field:" in r["messages"][0]["content"] for r in requests[4:])
     assert all("Repair JSON punctuation" not in r["messages"][0]["content"] for r in requests)
 
 
@@ -713,8 +931,12 @@ def test_a_failed_formatting_call_is_not_repeated(http_model, second, stop):
     outcome = make_analyzer("discovery").run_batches_detailed(
         [Batch(file_path="a.py", content="x")]
     )
-    assert not outcome.successful
-    assert len(outcome.failures) == 1
+    if stop == "length":
+        assert not outcome.successful
+        assert outcome.failures[0].reason == LedgerReason.LLM_RESPONSE_TRUNCATED
+    else:
+        assert outcome.successful[0][1] == []
+        assert not outcome.failures and not outcome.warnings
     assert len(requests) == 2
 
 
@@ -903,13 +1125,13 @@ def test_formatting_never_extends_the_total_invocation_budget(
     analyzer._sleep_before_retry = MagicMock()
     analyzer._asleep_before_retry = AsyncMock()
     outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
-    assert not outcome.successful
     assert len(requests) == 7
-    assert outcome.failures[0].reason == (
-        LedgerReason.LLM_BATCH_FAILED
-        if earlier_failures == 2
-        else LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
-    )
+    if earlier_failures == 2:
+        assert not outcome.successful
+        assert outcome.failures[0].reason == LedgerReason.LLM_BATCH_FAILED
+    else:
+        assert outcome.successful[0][1] == []
+        assert not outcome.failures and not outcome.warnings
     assert sum(
         "Repair JSON punctuation" in request["messages"][0]["content"] for request in requests
     ) == (1 if earlier_failures == 2 else 0)
@@ -923,7 +1145,7 @@ def test_formatting_never_extends_the_total_invocation_budget(
             '{"findings": [],}',
             '{"findings": [],}',
             "stop",
-            LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+            None,
         ),
         (
             '{"findings": [],}',
@@ -941,18 +1163,18 @@ def test_formatting_never_extends_the_total_invocation_budget(
             '{"findings": [],}',
             '{"findings": [], "extra": 1}',
             "stop",
-            LedgerReason.LLM_FORMAT_CHANGED,
+            None,
         ),
-        ('{"findings": [],}', '{"findings": []}', None, LedgerReason.LLM_FORMAT_CHANGED),
+        ('{"findings": [],}', '{"findings": []}', None, None),
         (
             '{"findings": "invalid",}',
             '{"findings": "invalid"}',
             "stop",
-            LedgerReason.LLM_RESPONSE_INVALID_SCHEMA,
+            LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED,
         ),
     ],
 )
-def test_formatting_validation_failure_still_stops_after_a_transport_retry(
+def test_formatting_recovery_after_transport_retry_preserves_original_or_terminal_cause(
     http_model, asynchronous, first, answer, stop, reason
 ):
     requests = http_model([(first, "stop"), (answer, stop)], failures={2: 503})
@@ -960,9 +1182,18 @@ def test_formatting_validation_failure_still_stops_after_a_transport_retry(
     analyzer._sleep_before_retry = MagicMock()
     analyzer._asleep_before_retry = AsyncMock()
     outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
-    assert not outcome.successful
-    assert outcome.failures[0].reason == reason
-    assert len(requests) == 3
+    if reason is None:
+        assert outcome.successful[0][1] == []
+        assert not outcome.failures and not outcome.warnings
+        assert len(requests) == 3
+    elif reason is LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED:
+        assert not outcome.successful and not outcome.failures
+        assert outcome.warnings[0].reason == reason
+        assert 3 < len(requests) <= 3 + FIELD_RECOVERY_MAX_CALLS
+    else:
+        assert not outcome.successful
+        assert outcome.failures[0].reason == reason
+        assert len(requests) == 3
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
