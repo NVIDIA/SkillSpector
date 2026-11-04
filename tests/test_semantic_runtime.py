@@ -7,7 +7,16 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+from skillspector.inspection_ledger import (
+    LedgerOutcome,
+    LedgerReason,
+    analyzer_status_for_events,
+    ledger_event,
+)
 from skillspector.semantic_runtime import (
+    format_recovery_runtime_accepted,
     required_semantic_analyzer_ids,
     semantic_runtime_accounting,
     successful_llm_record,
@@ -152,3 +161,144 @@ def test_child_call_cannot_borrow_an_unscoped_root_status() -> None:
         },
         discovered_modules={},
     ) == (True, False)
+
+
+def _format_recovery_state() -> dict:
+    analyzer = "semantic_security_discovery"
+    event = ledger_event(
+        analyzer_id=analyzer,
+        outcome=LedgerOutcome.PARTIAL,
+        phase="semantic",
+        path="SKILL.md",
+        reason=LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED,
+    )
+    statuses = [status for status in _semantic_statuses() if status["analyzer_id"] != analyzer]
+    return {
+        "use_llm": True,
+        "inspection_ledger": [event],
+        "analyzer_status_events": [*statuses, analyzer_status_for_events(analyzer, [event])],
+        "llm_call_log": _semantic_calls(),
+    }
+
+
+def test_format_policy_acceptance_does_not_claim_semantic_completion() -> None:
+    state = _format_recovery_state()
+    assert format_recovery_runtime_accepted(state, {})
+    assert semantic_runtime_accounting(enabled=True, result=state, discovered_modules={}) == (
+        True,
+        False,
+    )
+    assert state["analyzer_status_events"][-1]["status"] == "degraded"
+
+
+def test_format_recovery_remains_bound_to_its_transitive_source() -> None:
+    state = _format_recovery_state()
+    source = "external/child-digest"
+    for event in state["inspection_ledger"]:
+        event["source_identity"] = source
+        event["path"] = source + "/" + event["path"]
+    for status in state["analyzer_status_events"]:
+        status["source_identity"] = source
+        for target in status.get("planned_work", []):
+            target["path"] = source + "/" + target["path"]
+    for call in state["llm_call_log"]:
+        call["source_identity"] = source
+    state["analyzer_status_events"].extend(_semantic_statuses())
+    state["llm_call_log"].extend(_semantic_calls())
+    assert format_recovery_runtime_accepted(state, {})
+    state["inspection_ledger"][0]["source_identity"] = "external/different"
+    assert not format_recovery_runtime_accepted(state, {})
+
+
+@pytest.mark.parametrize("source", [None, "external/child-digest"])
+@pytest.mark.parametrize(
+    "mutation",
+    [None, "other_analyzer", "wrong_phase", "wrong_path", "partial", "failed", "reason"],
+)
+def test_tp4_warning_accepts_only_its_completed_static_phase(source, mutation) -> None:
+    path = "SKILL.md" if source is None else source + "/SKILL.md"
+    static = ledger_event(
+        analyzer_id="mcp_tool_poisoning_static",
+        outcome=LedgerOutcome.COMPLETED,
+        phase="static",
+        path=path,
+    )
+    semantic = ledger_event(
+        analyzer_id="mcp_tool_poisoning",
+        outcome=LedgerOutcome.PARTIAL,
+        phase="semantic",
+        path=path,
+        reason=LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED,
+    )
+    if mutation == "other_analyzer":
+        static["analyzer_id"] = "unrelated_static"
+    elif mutation == "wrong_phase":
+        static["phase"] = "semantic"
+    elif mutation == "wrong_path":
+        static["path"] = path.replace("SKILL.md", "other.py")
+    elif mutation in {"partial", "failed"}:
+        static["outcome"] = LedgerOutcome(mutation)
+    elif mutation == "reason":
+        static["reason_code"] = LedgerReason.RUNTIME_LIMIT
+    events = [static, semantic]
+    status = analyzer_status_for_events("mcp_tool_poisoning", events)
+    call = {"node": "mcp_tool_poisoning", "ok": True, "error": None}
+    if source is not None:
+        for record in [*events, status, call]:
+            record["source_identity"] = source
+    state = {
+        "use_llm": True,
+        "inspection_ledger": events,
+        "analyzer_status_events": [*_semantic_statuses(source), status],
+        "llm_call_log": [*_semantic_calls(source), call],
+    }
+    assert format_recovery_runtime_accepted(state, {}) is (mutation is None)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_status",
+        "missing_call",
+        "failed_call",
+        "other_source_call",
+        "wrong_path",
+        "duplicate_event",
+        "duplicate_target",
+        "wrong_reason",
+        "wrong_phase",
+        "wrong_status",
+        "unknown_analyzer",
+        "disabled",
+    ],
+)
+def test_format_policy_cannot_waive_unaccounted_or_unrelated_work(mutation: str) -> None:
+    state = _format_recovery_state()
+    event = state["inspection_ledger"][0]
+    status = state["analyzer_status_events"][-1]
+    call = next(call for call in state["llm_call_log"] if call["node"] == event["analyzer_id"])
+    if mutation == "missing_status":
+        state["analyzer_status_events"].pop(0)
+    elif mutation == "missing_call":
+        state["llm_call_log"].remove(call)
+    elif mutation == "failed_call":
+        call["ok"] = False
+    elif mutation == "other_source_call":
+        call["source_identity"] = "external/other"
+    elif mutation == "wrong_path":
+        event["path"] = "different.py"
+    elif mutation == "duplicate_event":
+        state["inspection_ledger"].append(dict(event))
+    elif mutation == "duplicate_target":
+        status["planned_work"].append(dict(status["planned_work"][0]))
+    elif mutation == "wrong_reason":
+        event["reason_code"] = LedgerReason.LLM_RESPONSE_REFUSED
+    elif mutation == "wrong_phase":
+        event["phase"] = "static"
+    elif mutation == "wrong_status":
+        status["status"] = "completed"
+    elif mutation == "unknown_analyzer":
+        event["analyzer_id"] = "static_patterns"
+    else:
+        state["use_llm"] = False
+    assert not format_recovery_runtime_accepted(state, {})
