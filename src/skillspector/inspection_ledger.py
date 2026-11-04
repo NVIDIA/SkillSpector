@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from hashlib import sha256
 from typing import Final, NotRequired, cast
@@ -18,6 +20,15 @@ logger = logging.getLogger(__name__)
 MAX_INSPECTION_LEDGER_EVENTS: Final = 10_000
 MAX_FINDING_OUTPUT_RECORDS: Final = 10_000
 MAX_EFFECTIVE_FINDINGS: Final = MAX_FINDING_OUTPUT_RECORDS
+RESOURCE_MEASUREMENT_UNITS: Final = (
+    "characters",
+    "bytes",
+    "findings",
+    "artifacts",
+    "depth",
+    "records",
+    "seconds",
+)
 
 
 class LedgerOutcome(StrEnum):
@@ -92,6 +103,7 @@ class LedgerReason(StrEnum):
     ARCHIVE_MALFORMED = "archive_malformed"
     ARCHIVE_ENCRYPTED = "archive_encrypted"
     ARCHIVE_UNSUPPORTED_COMPRESSION = "archive_unsupported_compression"
+    ARCHIVE_UNSUPPORTED_MEMBER = "archive_unsupported_member"
     ARCHIVE_TRUNCATED = "archive_truncated"
     ARCHIVE_MEMBER_INCOMPLETE = "archive_member_incomplete"
     ARCHIVE_UNSAFE_MEMBER_PATH = "archive_unsafe_member_path"
@@ -227,10 +239,13 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.ARCHIVE_FORMAT_MISMATCH: (
         "Artifact bytes do not match the container format implied by its filename."
     ),
-    LedgerReason.ARCHIVE_MALFORMED: "ZIP-compatible content is malformed.",
+    LedgerReason.ARCHIVE_MALFORMED: "Archive or compressed content is malformed.",
     LedgerReason.ARCHIVE_ENCRYPTED: "Archive member is encrypted and could not be inspected.",
     LedgerReason.ARCHIVE_UNSUPPORTED_COMPRESSION: (
         "Archive member uses an unsupported compression method."
+    ),
+    LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER: (
+        "Archive member uses a type or feature that is not supported for inspection."
     ),
     LedgerReason.ARCHIVE_TRUNCATED: "Archive member is truncated or unreadable.",
     LedgerReason.ARCHIVE_MEMBER_INCOMPLETE: "Nested artifact inspection is incomplete.",
@@ -259,7 +274,8 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.OPAQUE_CONTENT: "Artifact contents could not be fully interpreted.",
     LedgerReason.UNSUPPORTED_PRIMARY_CONTENT: (
         "The requested file or primary instructions could not be interpreted. "
-        "Provide UTF-8 text, a supported ZIP, or an extracted directory instead."
+        "Provide UTF-8 text, a supported ZIP, TAR, or GZIP container, "
+        "or an extracted directory instead."
     ),
     LedgerReason.REFERENCED_UNINSPECTED: ("A referenced artifact was not completely inspected."),
     LedgerReason.REFERENCE_EXTRACTION_LIMIT: (
@@ -300,7 +316,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "A transitive child scan failed before complete inspection."
     ),
     LedgerReason.STATIC_PARSE_LIMIT: (
-        "A security-relevant expression exceeded a bounded static parser's span limit."
+        "A security-relevant expression could not be fully resolved by the bounded static parser."
     ),
     LedgerReason.PYTHON_SOURCE_AMBIGUOUS: (
         "Python execution intent depends on runtime or platform-specific shebang semantics."
@@ -344,7 +360,177 @@ class PlannedWorkTarget(TypedDict):
     end_line: int | None
 
 
-class InspectionLedgerEvent(TypedDict):
+class ResourceMeasurements(TypedDict, total=False):
+    """Optional measured resource values with units encoded in their field names."""
+
+    observed_characters: int
+    limit_characters: int
+    observed_bytes: int
+    limit_bytes: int
+    observed_findings: int
+    limit_findings: int
+    observed_artifacts: int
+    limit_artifacts: int
+    observed_depth: int
+    limit_depth: int
+    observed_records: int
+    limit_records: int
+    observed_seconds: float
+    limit_seconds: float
+
+
+class ParserCause(StrEnum):
+    RESOURCE_LIMIT = "resource_limit"
+    BOUNDARY_UNRESOLVED = "boundary_unresolved"
+    MALFORMED_INPUT = "malformed_input"
+    UNSUPPORTED_SYNTAX = "unsupported_syntax"
+    RUNTIME_DEPENDENT = "runtime_dependent"
+
+
+class ParserCheck(StrEnum):
+    COMMAND_WORD_CHARACTERS = "command_word_unquoted_characters"
+    COMMAND_ARGUMENT_CHARACTERS = "command_argument_characters"
+    COMMAND_WORD_BOUNDARY = "command_word_boundary"
+    COMMAND_ARGUMENT_BOUNDARY = "command_argument_boundary"
+    COMMAND_IDENTITY = "runtime_command_identity"
+    PRINTF_INPUT_CHARACTERS = "printf_input_characters"
+    PRINTF_ARGUMENT_COUNT = "printf_argument_count"
+    PRINTF_ARGUMENT_CHARACTERS = "printf_argument_characters"
+    PRINTF_OUTPUT_CHARACTERS = "printf_output_characters"
+    PRINTF_FORMAT = "printf_format"
+    PRINTF_INVOCATION = "printf_invocation"
+    WRAPPER_DEPTH = "wrapper_depth"
+    WRAPPER_ARGUMENTS = "wrapper_arguments"
+    WRAPPER_CLAUSE_STEPS = "wrapper_clause_steps"
+    COMMAND_STRING_DEPTH = "command_string_depth"
+    COMMAND_STRING_RUNTIME = "command_string_runtime"
+    COMMAND_STRING_EFFECTS = "command_string_effects"
+    STARTUP_PROOF_CHARACTERS = "startup_proof_characters"
+    BRACE_CHARACTERS = "brace_characters"
+    BRACE_ALTERNATIVES = "brace_alternatives"
+    BRACE_PRODUCTS = "brace_products"
+    BRACE_ROUNDS = "brace_rounds"
+    BRACE_SYNTAX = "brace_syntax"
+    MARKDOWN_LITERAL_OWNERSHIP = "markdown_literal_ownership"
+    HEREDOC_HEADER = "heredoc_header"
+    HEREDOC_COUNT = "heredoc_count"
+    HEREDOC_BODY = "heredoc_body"
+    HEREDOC_GRAMMAR = "heredoc_grammar"
+    EXPANSION_BOUNDARY = "expansion_boundary"
+
+
+class ParserUncheckedScope(StrEnum):
+    COMMAND_WORD = "command_word"
+    COMMAND_ARGUMENTS = "command_arguments"
+    COMMAND_STRING = "command_string"
+    EXPRESSION = "expression"
+    REMAINING_INPUT = "remaining_input"
+
+
+@dataclass(frozen=True)
+class StaticParserDiagnostic:
+    """Internal parser evidence in the current view's character coordinates."""
+
+    cause: ParserCause
+    check: ParserCheck
+    start: int
+    end: int
+    unchecked_scope: ParserUncheckedScope
+    measurements: ResourceMeasurements = field(default_factory=ResourceMeasurements)
+    observed_is_lower_bound: bool = False
+    full_input_checked: bool = False
+    location_precision: str = "source_span"
+
+    def shifted(self, offset: int) -> StaticParserDiagnostic:
+        return replace(self, start=self.start + offset, end=self.end + offset)
+
+    def enclosed(self, start: int, end: int) -> StaticParserDiagnostic:
+        """Attribute decoded text to its carrier without inventing inner columns."""
+        return replace(self, start=start, end=end, location_precision="enclosing_expression")
+
+
+class ParserDiagnostic(ResourceMeasurements):
+    """Payload-free public explanation of a parser's first unresolved scope."""
+
+    cause: ParserCause
+    check: ParserCheck
+    source_start_offset: int
+    source_end_offset: int
+    start_line: int
+    end_line: int
+    unchecked_scope: ParserUncheckedScope
+    observed_is_lower_bound: bool
+    full_input_checked: bool
+    location_precision: str
+
+
+def sanitize_parser_diagnostic(value: object) -> ParserDiagnostic | None:
+    """Accept only known parser identifiers, source coordinates and measurements."""
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        if not all(
+            isinstance(value.get(key), str) for key in ("cause", "check", "unchecked_scope")
+        ):
+            return None
+        cause = ParserCause(value.get("cause"))
+        check = ParserCheck(value.get("check"))
+        scope = ParserUncheckedScope(value.get("unchecked_scope"))
+    except (TypeError, ValueError):
+        return None
+    offsets = [value.get("source_start_offset"), value.get("source_end_offset")]
+    lines = [value.get("start_line"), value.get("end_line")]
+    if not all(type(number) is int and 0 <= number <= (1 << 63) - 1 for number in offsets + lines):
+        return None
+    start, end = cast(list[int], offsets)
+    start_line, end_line = cast(list[int], lines)
+    if start >= end or start_line < 1 or end_line < start_line:
+        return None
+    precision = value.get("location_precision")
+    lower_bound = value.get("observed_is_lower_bound")
+    checked = value.get("full_input_checked")
+    if (
+        type(precision) is not str
+        or precision not in {"source_span", "enclosing_expression"}
+        or type(lower_bound) is not bool
+        or type(checked) is not bool
+    ):
+        return None
+    if cause is ParserCause.MALFORMED_INPUT and (not checked or precision != "source_span"):
+        cause = ParserCause.BOUNDARY_UNRESOLVED
+    result: ParserDiagnostic = {
+        "cause": cause,
+        "check": check,
+        "source_start_offset": start,
+        "source_end_offset": end,
+        "start_line": start_line,
+        "end_line": end_line,
+        "unchecked_scope": scope,
+        "observed_is_lower_bound": lower_bound,
+        "full_input_checked": checked,
+        "location_precision": precision,
+    }
+    result.update(resource_measurements(value))
+    return result
+
+
+def resource_measurements(event: Mapping[str, object]) -> ResourceMeasurements:
+    """Allow only bounded numeric diagnostics, never arbitrary graph payloads."""
+    measurements: dict[str, int | float] = {}
+    for unit in RESOURCE_MEASUREMENT_UNITS:
+        for prefix in ("observed_", "limit_"):
+            key = prefix + unit
+            value = event.get(key)
+            # Machine resource counters fit in 63 bits; larger graph values
+            # must not amplify report output through unbounded decimal text.
+            if type(value) is int and 0 <= value <= (1 << 63) - 1:
+                measurements[key] = value
+            elif unit == "seconds" and type(value) is float and math.isfinite(value) and value >= 0:
+                measurements[key] = value
+    return cast(ResourceMeasurements, measurements)
+
+
+class InspectionLedgerEvent(ResourceMeasurements):
     """Internal terminal evidence for one work item or scope boundary."""
 
     work_id: str
@@ -361,20 +547,7 @@ class InspectionLedgerEvent(TypedDict):
     message: NotRequired[str]
     error_class: NotRequired[str]
     stage: NotRequired[str]
-    observed_characters: NotRequired[int]
-    limit_characters: NotRequired[int]
-    observed_bytes: NotRequired[int]
-    limit_bytes: NotRequired[int]
-    observed_findings: NotRequired[int]
-    limit_findings: NotRequired[int]
-    observed_artifacts: NotRequired[int]
-    limit_artifacts: NotRequired[int]
-    observed_depth: NotRequired[int]
-    limit_depth: NotRequired[int]
-    observed_records: NotRequired[int]
-    limit_records: NotRequired[int]
-    observed_seconds: NotRequired[float]
-    limit_seconds: NotRequired[float]
+    parser_diagnostic: NotRequired[ParserDiagnostic]
 
 
 class AnalyzerStatusEvent(TypedDict):
@@ -390,7 +563,7 @@ class AnalyzerStatusEvent(TypedDict):
     source_digest: NotRequired[str]
 
 
-class InspectionLedgerException(TypedDict):
+class InspectionLedgerException(ResourceMeasurements):
     """Public exceptional projection derived from an internal ledger event."""
 
     outcome: LedgerOutcome
@@ -404,6 +577,7 @@ class InspectionLedgerException(TypedDict):
     analyzers: NotRequired[list[str]]
     fatal: NotRequired[bool]
     scope: NotRequired[str]
+    parser_diagnostic: NotRequired[ParserDiagnostic]
 
 
 class AnalysisCompleteness(TypedDict):
@@ -515,6 +689,7 @@ def ledger_event(
     limit_records: int | None = None,
     observed_seconds: float | None = None,
     limit_seconds: float | None = None,
+    parser_diagnostic: ParserDiagnostic | None = None,
 ) -> InspectionLedgerEvent:
     """Create one validated terminal ledger record without sensitive payloads."""
     _validate_range(start_line, end_line)
@@ -597,6 +772,9 @@ def ledger_event(
         event["observed_seconds"] = observed_seconds
     if limit_seconds is not None:
         event["limit_seconds"] = limit_seconds
+    safe_parser_diagnostic = sanitize_parser_diagnostic(parser_diagnostic)
+    if safe_parser_diagnostic is not None:
+        event["parser_diagnostic"] = safe_parser_diagnostic
     return event
 
 
@@ -739,7 +917,7 @@ def _exception_from_event(
         if outcome == LedgerOutcome.FAILED
         else LedgerReason.NO_APPLICABLE_FILES
     )
-    return _exception(
+    exception = _exception(
         outcome=outcome,
         phase=str(event["phase"]),
         reason=_reason(event.get("reason_code"), fallback),
@@ -751,6 +929,11 @@ def _exception_from_event(
         fatal=fatal,
         scope=RULE_SET_SCOPE if _is_rule_set_record(event) else None,
     )
+    exception.update(resource_measurements(event))
+    parser_diagnostic = sanitize_parser_diagnostic(event.get("parser_diagnostic"))
+    if parser_diagnostic is not None:
+        exception["parser_diagnostic"] = parser_diagnostic
+    return exception
 
 
 def _merge_exception_projection(
@@ -759,6 +942,7 @@ def _merge_exception_projection(
     """Group duplicate public rows while retaining all contributing analyzers."""
     grouped: dict[tuple[object, ...], InspectionLedgerException] = {}
     for exception in exceptions:
+        parser_diagnostic = sanitize_parser_diagnostic(exception.get("parser_diagnostic"))
         key = (
             exception["outcome"],
             exception["phase"],
@@ -771,6 +955,8 @@ def _merge_exception_projection(
             # A rule-set row and a real file's row can share a path label;
             # they must never merge into one public row.
             exception.get("scope"),
+            tuple(resource_measurements(exception).items()),
+            tuple(parser_diagnostic.items()) if parser_diagnostic else (),
         )
         existing = grouped.get(key)
         if existing is None:

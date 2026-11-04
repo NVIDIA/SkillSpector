@@ -9,10 +9,13 @@ from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
+    ParserCause,
     analyzer_status_for_events,
     inspection_work_id,
     ledger_event,
     outcome_for_llm_batch_failure,
+    resource_measurements,
+    sanitize_parser_diagnostic,
 )
 
 
@@ -182,3 +185,109 @@ def test_failed_event_includes_sanitized_failure_metadata_only_when_provided() -
 
     assert event["error_class"] == "PermissionError"
     assert event["stage"] == "read"
+
+
+@pytest.mark.parametrize(
+    "unit", ["characters", "bytes", "findings", "artifacts", "depth", "records"]
+)
+@pytest.mark.parametrize("value", [0, (1 << 53) + 1, (1 << 63) - 1])
+def test_resource_counters_preserve_zero_and_exact_integers(unit: str, value: int) -> None:
+    measurements = {f"observed_{unit}": value, f"limit_{unit}": value}
+    assert resource_measurements(measurements) == measurements
+
+
+@pytest.mark.parametrize(
+    "unit", ["characters", "bytes", "findings", "artifacts", "depth", "records"]
+)
+@pytest.mark.parametrize(
+    "value", [True, False, -1, 1.5, "12", float("nan"), float("inf"), 1 << 4096]
+)
+def test_resource_counters_reject_unsafe_or_inexact_values(unit: str, value: object) -> None:
+    assert resource_measurements({f"observed_{unit}": value, f"limit_{unit}": value}) == {}
+
+
+@pytest.mark.parametrize("value", [0, 0.0, 0.25, 1e308])
+def test_resource_seconds_preserve_finite_values_and_missing_side(value: int | float) -> None:
+    assert resource_measurements({"observed_seconds": value}) == {"observed_seconds": value}
+
+
+@pytest.mark.parametrize(
+    "value", [True, False, -0.1, "0.1", float("nan"), float("inf"), float("-inf")]
+)
+def test_resource_seconds_reject_invalid_values(value: object) -> None:
+    assert resource_measurements({"observed_seconds": value, "limit_seconds": value}) == {}
+
+
+def test_resource_measurements_never_copy_stage_or_arbitrary_payloads() -> None:
+    assert resource_measurements(
+        {"observed_bytes": 0, "limit_bytes": 4, "stage": "private-stage", "payload": "secret"}
+    ) == {"observed_bytes": 0, "limit_bytes": 4}
+
+
+def _parser_diagnostic() -> dict[str, object]:
+    return {
+        "cause": "resource_limit",
+        "check": "command_word_unquoted_characters",
+        "source_start_offset": 2,
+        "source_end_offset": 4099,
+        "start_line": 2,
+        "end_line": 2,
+        "unchecked_scope": "command_word",
+        "location_precision": "source_span",
+        "observed_is_lower_bound": True,
+        "full_input_checked": False,
+        "observed_characters": 4097,
+        "limit_characters": 4096,
+    }
+
+
+def test_parser_diagnostics_allow_only_known_identifiers_and_safe_measurements() -> None:
+    original = _parser_diagnostic()
+    original.update(
+        {"command": "private payload", "stage": "private stage", "observed_bytes": True}
+    )
+    projected = sanitize_parser_diagnostic(original)
+    assert projected is not None
+    assert projected["cause"] is ParserCause.RESOURCE_LIMIT
+    assert projected["observed_characters"] == 4097
+    assert projected["observed_is_lower_bound"] is True
+    assert "command" not in projected
+    assert "stage" not in projected
+    assert "observed_bytes" not in projected
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("cause", "untrusted cause"),
+        ("check", "untrusted check"),
+        ("unchecked_scope", "untrusted scope"),
+        ("location_precision", []),
+        ("source_start_offset", True),
+        ("source_start_offset", -1),
+        ("source_end_offset", 1),
+        ("start_line", 0),
+        ("end_line", 1),
+        ("observed_is_lower_bound", 1),
+        ("full_input_checked", "true"),
+    ],
+)
+def test_parser_diagnostics_reject_invalid_envelopes(key: str, value: object) -> None:
+    diagnostic = _parser_diagnostic()
+    diagnostic[key] = value
+    assert sanitize_parser_diagnostic(diagnostic) is None
+
+
+@pytest.mark.parametrize(
+    "precision,checked", [("source_span", False), ("enclosing_expression", True)]
+)
+def test_malformed_diagnostic_requires_complete_exact_source_evidence(
+    precision: str, checked: bool
+) -> None:
+    diagnostic = _parser_diagnostic()
+    diagnostic.update(
+        {"cause": "malformed_input", "location_precision": precision, "full_input_checked": checked}
+    )
+    projected = sanitize_parser_diagnostic(diagnostic)
+    assert projected is not None
+    assert projected["cause"] is ParserCause.BOUNDARY_UNRESOLVED

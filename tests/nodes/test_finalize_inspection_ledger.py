@@ -31,6 +31,7 @@ from skillspector.inspection_ledger import (
 from skillspector.models import Finding
 from skillspector.nodes.finalize_inspection_ledger import finalize_inspection_ledger
 from skillspector.nodes.report import report
+from skillspector.passive_bmp import is_structurally_valid_passive_bmp
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 
@@ -53,6 +54,103 @@ _VALID_PASSIVE_PNG = (
     + _png_chunk(b"IDAT", zlib.compress(b"\x00\x40\x80\xc0\xff"))
     + _png_chunk(b"IEND", b"")
 )
+
+_VALID_PASSIVE_BMP = (
+    b"BM"
+    + struct.pack("<III", 58, 0, 54)
+    + struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 0, 3780, 3780, 0, 0)
+    + b"\xc0\x80\xff\x00"
+)
+
+
+@pytest.mark.parametrize("height,image_size", [(1, 0), (-1, 0), (1, 4), (-1, 4)])
+def test_passive_bmp_supports_both_orientations_and_uncompressed_size_conventions(
+    height: int, image_size: int
+) -> None:
+    data = bytearray(_VALID_PASSIVE_BMP)
+    struct.pack_into("<i", data, 22, height)
+    struct.pack_into("<I", data, 34, image_size)
+    assert is_structurally_valid_passive_bmp(bytes(data))
+
+
+@pytest.mark.parametrize(
+    "offset,format_string,value",
+    [
+        (2, "I", 59),
+        (6, "I", 1),
+        (10, "I", 55),
+        (14, "I", 124),
+        (18, "i", 0),
+        (18, "i", 100_000),
+        (22, "i", 0),
+        (26, "H", 2),
+        (28, "H", 12),
+        (30, "I", 1),
+        (34, "I", 3),
+        (46, "I", 1),
+        (57, "B", 1),
+    ],
+)
+def test_passive_bmp_rejects_invalid_headers_pixels_and_unused_storage(
+    offset: int, format_string: str, value: int
+) -> None:
+    data = bytearray(_VALID_PASSIVE_BMP)
+    struct.pack_into("<" + format_string, data, offset, value)
+    assert not is_structurally_valid_passive_bmp(bytes(data))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _VALID_PASSIVE_BMP[:-1],
+        _VALID_PASSIVE_BMP + b"exec(payload)",
+        b"BM\nexec(payload)",
+        b"#!/bin/sh\nrm -rf /",
+        b"BM",
+    ],
+)
+def test_passive_bmp_rejects_truncated_and_mixed_content(payload: bytes) -> None:
+    assert not is_structurally_valid_passive_bmp(payload)
+
+
+@pytest.mark.parametrize("bits", [1, 4, 8, 16, 24, 32])
+def test_passive_bmp_validates_supported_pixel_and_palette_storage(bits: int) -> None:
+    colors = 1 << bits if bits <= 8 else 0
+    offset = 54 + 4 * colors
+    data = (
+        b"BM"
+        + struct.pack("<III", offset + 4, 0, offset)
+        + struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, bits, 0, 4, 0, 0, colors, 0)
+        + bytes(4 * colors + 4)
+    )
+    assert is_structurally_valid_passive_bmp(data)
+
+
+def test_passive_bmp_corroboration_requires_complete_canonical_bytes() -> None:
+    path = "assets/chart.bmp"
+    inventory = {"size_bytes": len(_VALID_PASSIVE_BMP)}
+    assert finalizer_module._has_verified_passive_raster(
+        path, inventory, {path: _VALID_PASSIVE_BMP}
+    )
+    inventory["size_bytes"] += 1
+    assert not finalizer_module._has_verified_passive_raster(
+        path, inventory, {path: _VALID_PASSIVE_BMP}
+    )
+
+
+def test_passive_bmp_core_header_and_palette_index_validation() -> None:
+    core = (
+        b"BM" + struct.pack("<III", 30, 0, 26) + struct.pack("<IHHHH", 12, 1, 1, 1, 24) + bytes(4)
+    )
+    assert is_structurally_valid_passive_bmp(core)
+    indexed = (
+        b"BM"
+        + struct.pack("<III", 62, 0, 58)
+        + struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 8, 0, 4, 0, 0, 1, 0)
+        + bytes(8)
+    )
+    assert is_structurally_valid_passive_bmp(indexed)
+    assert not is_structurally_valid_passive_bmp(indexed[:-4] + b"\x01\x00\x00\x00")
 
 
 @pytest.mark.parametrize(
@@ -124,6 +222,151 @@ def test_completed_work_is_covered_and_resolves_emitted_finding_ids() -> None:
     assert completeness["coverage_percent"] == 100.0
     assert completeness["ledger_exceptions"] == []
     assert effective_ids == [finding.finding_id]
+
+
+@pytest.mark.parametrize(
+    "unit", ["characters", "bytes", "findings", "artifacts", "depth", "records", "seconds"]
+)
+def test_resource_measurements_survive_finalization_with_findings(unit: str) -> None:
+    finding = Finding(rule_id="P1", message="retained evidence", file="SKILL.md")
+    measurements = {f"observed_{unit}": 10, f"limit_{unit}": 8}
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        analyzer_id="static_test",
+        path="SKILL.md",
+        reason=LedgerReason.RUNTIME_LIMIT,
+        emitted_finding_ids=[finding.finding_id],
+        **measurements,
+    )
+    completeness, effective_ids = finalize_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [finding],
+            "effective_finding_ids": [finding.finding_id],
+            "inspection_ledger": [event],
+            "analyzer_status_events": [analyzer_status_for_events("static_test", [event])],
+        }
+    )
+
+    exception = completeness["ledger_exceptions"][0]
+    assert {key: exception[key] for key in measurements} == measurements
+    assert exception["analyzers"] == ["static_test"]
+    assert exception["reason_code"] is LedgerReason.RUNTIME_LIMIT
+    assert completeness["status"] == "partial"
+    assert completeness["is_complete"] is False
+    assert completeness["execution_successful"] is True
+    assert effective_ids == [finding.finding_id]
+
+
+def test_exception_grouping_retains_distinct_and_unknown_resource_measurements() -> None:
+    events = []
+    statuses = []
+    for analyzer, observed in [("a", 10), ("b", 10), ("c", 11), ("d", None), ("e", 0)]:
+        event = ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            analyzer_id=analyzer,
+            path="SKILL.md",
+            reason=LedgerReason.OUTPUT_LIMIT,
+            observed_findings=observed,
+            limit_findings=8,
+        )
+        events.append(event)
+        statuses.append(analyzer_status_for_events(analyzer, [event]))
+
+    completeness, _ = finalize_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [],
+            "inspection_ledger": events,
+            "analyzer_status_events": statuses,
+        }
+    )
+
+    exceptions = completeness["ledger_exceptions"]
+    assert len(exceptions) == 4
+    assert {row.get("observed_findings"): row["analyzers"] for row in exceptions} == {
+        10: ["a", "b"],
+        11: ["c"],
+        None: ["d"],
+        0: ["e"],
+    }
+    assert all(row["limit_findings"] == 8 for row in exceptions)
+
+
+def test_finalization_discards_unsafe_measurements_without_hiding_incompleteness() -> None:
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        analyzer_id="static_test",
+        path="SKILL.md",
+        reason=LedgerReason.RUNTIME_LIMIT,
+        limit_seconds=1.0,
+        stage="private-stage",
+    )
+    event.update({"observed_seconds": float("nan"), "observed_bytes": True})
+    completeness, _ = finalize_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [],
+            "inspection_ledger": [event],
+            "analyzer_status_events": [analyzer_status_for_events("static_test", [event])],
+        }
+    )
+
+    exception = completeness["ledger_exceptions"][0]
+    assert exception["limit_seconds"] == 1.0
+    assert "observed_seconds" not in exception
+    assert "observed_bytes" not in exception
+    assert "stage" not in exception
+    assert completeness["is_complete"] is False
+    json.dumps(completeness, allow_nan=False)
+
+
+def test_parser_diagnostics_survive_projection_and_distinguish_exception_identity() -> None:
+    diagnostic = {
+        "cause": "resource_limit",
+        "check": "command_word_unquoted_characters",
+        "source_start_offset": 3,
+        "source_end_offset": 4100,
+        "start_line": 2,
+        "end_line": 2,
+        "unchecked_scope": "command_word",
+        "location_precision": "source_span",
+        "full_input_checked": False,
+        "observed_is_lower_bound": True,
+        "observed_characters": 4097,
+        "limit_characters": 4096,
+    }
+    events = []
+    statuses = []
+    for analyzer, observed in [("a", 4097), ("b", 4097), ("c", 4100)]:
+        event = ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            analyzer_id=analyzer,
+            path="script.sh",
+            reason=LedgerReason.STATIC_PARSE_LIMIT,
+            parser_diagnostic={**diagnostic, "observed_characters": observed},
+        )
+        events.append(event)
+        statuses.append(analyzer_status_for_events(analyzer, [event]))
+    completeness, _ = finalize_ledger(
+        {
+            "components": ["script.sh"],
+            "findings": [],
+            "inspection_ledger": events,
+            "analyzer_status_events": statuses,
+        }
+    )
+    exceptions = completeness["ledger_exceptions"]
+    assert len(exceptions) == 2
+    assert {
+        row["parser_diagnostic"]["observed_characters"]: row["analyzers"] for row in exceptions
+    } == {4097: ["a", "b"], 4100: ["c"]}
+    assert completeness["is_complete"] is False
+    assert completeness["execution_successful"] is True
 
 
 def test_out_of_scope_boundaries_do_not_count_as_analyzer_failures() -> None:
