@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Iterable, Mapping
 from enum import StrEnum
 from hashlib import sha256
@@ -18,6 +19,12 @@ logger = logging.getLogger(__name__)
 MAX_INSPECTION_LEDGER_EVENTS: Final = 10_000
 MAX_FINDING_OUTPUT_RECORDS: Final = 10_000
 MAX_EFFECTIVE_FINDINGS: Final = MAX_FINDING_OUTPUT_RECORDS
+# Fixed codes, counts and schema field paths only (``check=invalid_field;
+# schema=findings.0.severity:literal_error``); anything else is dropped.
+MAX_DIAGNOSTIC_CHARACTERS: Final = 512
+_DIAGNOSTIC: Final = re.compile(
+    r"[a-z0-9_]+=[A-Za-z0-9_.:*$+,-]+(?:; [a-z0-9_]+=[A-Za-z0-9_.:*$+,-]+)*"
+)
 
 
 class LedgerOutcome(StrEnum):
@@ -314,6 +321,7 @@ class InspectionLedgerEvent(TypedDict):
     reason_code: NotRequired[LedgerReason]
     message: NotRequired[str]
     error_class: NotRequired[str]
+    diagnostic: NotRequired[str]
     stage: NotRequired[str]
     observed_characters: NotRequired[int]
     limit_characters: NotRequired[int]
@@ -355,6 +363,7 @@ class InspectionLedgerException(TypedDict):
     start_line: int | None
     end_line: int | None
     error_class: NotRequired[str]
+    diagnostic: NotRequired[str]
     analyzers: NotRequired[list[str]]
     fatal: NotRequired[bool]
     scope: NotRequired[str]
@@ -438,6 +447,19 @@ def _is_meta_phase(phase: str) -> bool:
     return phase == "meta"
 
 
+def _safe_diagnostic(diagnostic: object) -> str | None:
+    """Keep a bounded diagnostic of fixed codes; drop anything that could carry content."""
+    if (
+        isinstance(diagnostic, str)
+        and len(diagnostic) <= MAX_DIAGNOSTIC_CHARACTERS
+        and _DIAGNOSTIC.fullmatch(diagnostic)
+    ):
+        return diagnostic
+    if diagnostic is not None:
+        logger.debug("Dropping a ledger diagnostic outside the fixed-code format")
+    return None
+
+
 def ledger_event(
     *,
     outcome: LedgerOutcome,
@@ -451,6 +473,7 @@ def ledger_event(
     input_finding_ids: Iterable[str] = (),
     emitted_finding_ids: Iterable[str] = (),
     error_class: str | None = None,
+    diagnostic: str | None = None,
     stage: str | None = None,
     observed_characters: int | None = None,
     limit_characters: int | None = None,
@@ -518,6 +541,9 @@ def ledger_event(
         event["message"] = REASON_MESSAGES[reason]
     if error_class is not None:
         event["error_class"] = error_class
+    safe_diagnostic = _safe_diagnostic(diagnostic)
+    if safe_diagnostic is not None:
+        event["diagnostic"] = safe_diagnostic
     if stage is not None:
         event["stage"] = stage
     if observed_characters is not None:
@@ -650,6 +676,7 @@ def _exception(
     start_line: int | None = None,
     end_line: int | None = None,
     error_class: str | None = None,
+    diagnostic: str | None = None,
     analyzers: Iterable[str] = (),
     fatal: bool,
     scope: str | None = None,
@@ -670,6 +697,9 @@ def _exception(
         exception["analyzers"] = analyzer_ids
     if error_class:
         exception["error_class"] = error_class
+    safe_diagnostic = _safe_diagnostic(diagnostic)
+    if safe_diagnostic is not None:
+        exception["diagnostic"] = safe_diagnostic
     if scope:
         exception["scope"] = scope
     return exception
@@ -698,6 +728,7 @@ def _exception_from_event(
         start_line=event.get("start_line"),
         end_line=event.get("end_line"),
         error_class=event.get("error_class"),
+        diagnostic=event.get("diagnostic"),
         analyzers=[str(event.get("analyzer_id", ""))],
         fatal=fatal,
         scope=RULE_SET_SCOPE if _is_rule_set_record(event) else None,
@@ -719,6 +750,7 @@ def _merge_exception_projection(
             exception["start_line"],
             exception["end_line"],
             exception.get("error_class"),
+            exception.get("diagnostic"),
             # A rule-set row and a real file's row can share a path label;
             # they must never merge into one public row.
             exception.get("scope"),

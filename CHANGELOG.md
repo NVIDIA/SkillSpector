@@ -1,6 +1,7 @@
 ### Unreleased maintenance fixes
 ### Fixes
 * Backport scoped `allowed-tools` grant handling from #768: recognize declarations such as `Bash(git:*)`, preserve spaces and commas inside scopes, and keep malformed grants or embedded tool names from declaring shell capability. Command restrictions remain intact in the manifest.
+* Report which check rejected a model answer. Ledger rows and logs for rejected structured responses carry a `diagnostic` built only from fixed codes (check, channel, completion label, JSON shape, schema paths and per-attempt checks), never model output.
 ---
 ### 2.13.3 (Unreleased)
 ### Security and integrity fixes

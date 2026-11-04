@@ -656,6 +656,7 @@ def _meta_ledger_response(
                 input_finding_ids=input_ids,
                 emitted_finding_ids=input_ids,
                 error_class=failure.error_class,
+                diagnostic=failure.diagnostic,
             )
         )
     if not events:

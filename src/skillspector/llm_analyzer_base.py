@@ -72,7 +72,7 @@ from skillspector.llm_utils import (
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
-from skillspector.structured_response import ResponseIssue
+from skillspector.structured_response import ResponseCheck, ResponseIssue, schema_error_paths
 
 logger = get_logger(__name__)
 
@@ -123,6 +123,8 @@ class _StructuredResponseValidationError(Exception):
 
     def __init__(self, issue: ResponseIssue | None = None) -> None:
         super().__init__("model response failed validation")
+        # The check that rejected each bounded attempt for this batch, oldest first.
+        self.attempt_checks: tuple[str, ...] = ()
         self.reason = {
             ResponseIssue.REFUSED: LedgerReason.LLM_RESPONSE_REFUSED,
             ResponseIssue.TRUNCATED: LedgerReason.LLM_RESPONSE_TRUNCATED,
@@ -135,6 +137,55 @@ class _StructuredResponseValidationError(Exception):
             ResponseIssue.FORMAT_CHANGED: LedgerReason.LLM_FORMAT_CHANGED,
         }.get(issue or ResponseIssue.INVALID_JSON, LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID)
 
+    @property
+    def check(self) -> str:
+        """Fixed code for the validation check that rejected this attempt."""
+        cause = self.__cause__
+        if isinstance(cause, StructuredOutputParseError):
+            return str(cause.check or cause.issue)
+        if isinstance(cause, ValidationError):
+            # A LangChain parser validated the arguments before our shared boundary.
+            missing = any(error.get("type") == "missing" for error in cause.errors())
+            return ResponseCheck.MISSING_FIELD if missing else ResponseCheck.INVALID_FIELD
+        return "unknown"
+
+    def diagnostic(self, schema: object) -> str | None:
+        """Describe the rejection with fixed codes and schema field paths only.
+
+        No response text, field values or keys the schema does not declare are
+        included, so the result is safe to retain in reports and logs.
+        """
+        try:
+            cause = self.__cause__
+            parts = [f"check={self.check}"]
+            schema_errors: tuple[str, ...] = ()
+            if isinstance(cause, StructuredOutputParseError):
+                parts.extend(
+                    f"{name}={value}"
+                    for name, value in (
+                        ("channel", cause.channel),
+                        ("finish", cause.finish),
+                        ("shape", cause.shape),
+                    )
+                    if value
+                )
+                schema_errors = cause.schema_errors
+            elif (
+                isinstance(cause, ValidationError)
+                and isinstance(schema, type)
+                and issubclass(schema, BaseModel)
+            ):
+                schema_errors = schema_error_paths(cause, schema)
+            if schema_errors:
+                parts.append("schema=" + ",".join(schema_errors))
+            if self.attempt_checks:
+                parts.append(f"attempts={len(self.attempt_checks)}")
+                parts.append("checks=" + ",".join(self.attempt_checks))
+            return "; ".join(parts)
+        except Exception:
+            # A diagnostic must never replace the validation failure it describes.
+            return None
+
 
 def _require_structured_response(response: object) -> None:
     """Reject a structured-output call that produced no result.
@@ -146,14 +197,18 @@ def _require_structured_response(response: object) -> None:
     schema object.
     """
     if response is None:
-        raise StructuredOutputParseError("model returned no structured response")
+        raise StructuredOutputParseError(
+            "model returned no structured response", check=ResponseCheck.NO_STRUCTURED_RESPONSE
+        )
     if (
         isinstance(response, BaseModel)
         and "findings" in type(response).model_fields
         and "findings" not in response.model_fields_set
     ):
         raise StructuredOutputParseError(
-            "response omits findings", issue=ResponseIssue.MISSING_FIELDS
+            "response omits findings",
+            issue=ResponseIssue.MISSING_FIELDS,
+            check=ResponseCheck.MISSING_FINDINGS,
         )
 
 
@@ -713,6 +768,8 @@ class BatchFailure:
     batch: Batch
     error_class: str
     reason: LedgerReason = LedgerReason.LLM_BATCH_FAILED
+    # Fixed validation codes for a rejected structured answer; never response text.
+    diagnostic: str | None = None
 
 
 @dataclass
@@ -813,6 +870,7 @@ def ledger_events_for_batches(
                         end_line=end_line,
                         reason=failure.reason,
                         error_class=failure.error_class,
+                        diagnostic=failure.diagnostic,
                     )
                 )
 
@@ -1173,7 +1231,9 @@ class LLMAnalyzerBase:
         schema_tokens = estimate_tokens(json.dumps(schema.model_json_schema()))
         if estimate_tokens(prompt) + schema_tokens > self._input_budget:
             raise StructuredOutputParseError(
-                "formatting input exceeds model budget", issue=ResponseIssue.LIMIT
+                "formatting input exceeds model budget",
+                issue=ResponseIssue.LIMIT,
+                check=ResponseCheck.FORMAT_INPUT_LIMIT,
             )
         llm, _ = self._model_for_call()
         return bind_structured_output(
@@ -1219,12 +1279,15 @@ class LLMAnalyzerBase:
         structured_retries = 0
         connection_retries = 0
         format_source: str | None = None
+        attempt_checks: list[str] = []
         for attempt in range(1, LLM_BATCH_MAX_ATTEMPTS + 1):
             try:
                 if format_source is not None:
                     return self._format_batch(batch, format_source)
                 return self._invoke_batch(batch, prompt)
             except _StructuredResponseValidationError as exc:
+                attempt_checks.append(exc.check)
+                exc.attempt_checks = tuple(attempt_checks)
                 if format_source is not None:
                     # Retry transport failures, never a returned formatting result.
                     raise
@@ -1324,12 +1387,15 @@ class LLMAnalyzerBase:
         structured_retries = 0
         connection_retries = 0
         format_source: str | None = None
+        attempt_checks: list[str] = []
         for attempt in range(1, LLM_BATCH_MAX_ATTEMPTS + 1):
             try:
                 if format_source is not None:
                     return await self._aformat_batch(batch, format_source)
                 return await self._ainvoke_batch(batch, prompt)
             except _StructuredResponseValidationError as exc:
+                attempt_checks.append(exc.check)
+                exc.attempt_checks = tuple(attempt_checks)
                 if format_source is not None:
                     # Retry transport failures, never a returned formatting result.
                     raise
@@ -1424,16 +1490,19 @@ class LLMAnalyzerBase:
                 result = self._invoke_batch_with_retries(batch, prompt, retry_outcome=retry_outcome)
                 outcome.successful.append(result)
             except _StructuredResponseValidationError as exc:
+                diagnostic = exc.diagnostic(self.response_schema)
                 logger.warning(
-                    "LLM response validation failed for %s (%s)",
+                    "LLM response validation failed for %s (%s; %s)",
                     batch.file_label,
                     exc.reason,
+                    diagnostic,
                 )
                 outcome.failures.append(
                     BatchFailure(
                         batch=batch,
                         error_class=ValidationError.__name__,
                         reason=exc.reason,
+                        diagnostic=diagnostic,
                     )
                 )
             except LLMRuntimeLimitError as exc:
@@ -1542,16 +1611,19 @@ class LLMAnalyzerBase:
         outcome = BatchExecutionResult()
         for batch, result, retry_outcome in zip(batches, results, retry_outcomes, strict=True):
             if isinstance(result, _StructuredResponseValidationError):
+                diagnostic = result.diagnostic(self.response_schema)
                 logger.warning(
-                    "LLM response validation failed for %s (%s)",
+                    "LLM response validation failed for %s (%s; %s)",
                     batch.file_label,
                     result.reason,
+                    diagnostic,
                 )
                 outcome.failures.append(
                     BatchFailure(
                         batch=batch,
                         error_class=ValidationError.__name__,
                         reason=result.reason,
+                        diagnostic=diagnostic,
                     )
                 )
                 continue

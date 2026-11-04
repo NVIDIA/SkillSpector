@@ -1802,10 +1802,15 @@ class TestTP4Fallbacks:
 
         assert structured_llm.calls == 4
         assert result["analyzer_status_events"][0]["status"] == "degraded"
-        assert any(
-            event.get("reason_code") is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        assert [
+            event.get("diagnostic")
             for event in result["inspection_ledger"]
-        )
+            if event.get("reason_code") is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        ] == [
+            # The wrapper key the model invented is never echoed; the schema path is.
+            "check=missing_field; schema=is_mismatch:missing; attempts=4; "
+            "checks=missing_field,missing_field,missing_field,missing_field"
+        ]
 
     def test_missing_structured_result_stays_incomplete(
         self, monkeypatch: pytest.MonkeyPatch
