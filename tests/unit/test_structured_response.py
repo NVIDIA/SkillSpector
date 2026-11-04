@@ -141,6 +141,8 @@ def http_model(monkeypatch):
         model="test-model",
         after_response=None,
         reasoning_effort=None,
+        failures=None,
+        failure_headers=None,
     ):
         if method is None:
             monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
@@ -151,6 +153,16 @@ def http_model(monkeypatch):
         def respond(request):
             body = json.loads(request.content)
             requests.append(body)
+            failure = (failures or {}).get(len(requests))
+            if failure is not None:
+                if isinstance(failure, Exception):
+                    raise failure
+                return httpx.Response(
+                    failure,
+                    json={"error": {"message": "temporarily unavailable"}},
+                    headers=failure_headers,
+                    request=request,
+                )
             content, stop = answers[min(len(requests) - 1, len(answers) - 1)]
             message = {"role": "assistant", "content": content}
             if body.get("tools"):
@@ -602,3 +614,233 @@ def test_responses_api_keeps_original_tool_arguments_for_validation(monkeypatch,
             assert error.value.issue == ResponseIssue.INVALID_SCHEMA
         else:
             assert runnable.invoke("Assess").findings == []
+
+
+def run_outcome(analyzer, batches, asynchronous):
+    return (
+        asyncio.run(analyzer.arun_batches_detailed(batches, max_concurrency=1))
+        if asynchronous
+        else analyzer.run_batches_detailed(batches)
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("method", ["json_schema", "function_calling"])
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ConnectError("connection lost"), httpx.ReadTimeout("timeout"), 425, 429, 503],
+)
+def test_formatting_retries_transient_failures_without_reassessing(
+    http_model, asynchronous, method, failure
+):
+    answer = '{"findings":[{"rule_id":"SSD-1","message":"leaks data","severity":"HIGH","start_line":3,"end_line":4}]}'
+    requests = http_model(
+        [(answer[:-1] + ",}", "stop"), (answer, "stop")],
+        method=method,
+        failures={2: failure},
+    )
+    analyzer = make_analyzer("discovery", timeout=lambda: 120.0)
+    analyzer._sleep_before_retry = MagicMock()
+    analyzer._asleep_before_retry = AsyncMock()
+    outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
+    assert not outcome.failures
+    finding = outcome.successful[0][1][0]
+    assert (finding.file, finding.start_line, finding.end_line, finding.severity) == (
+        "a.py",
+        3,
+        4,
+        "HIGH",
+    )
+    assert len(requests) == 3
+    assert "Repair JSON punctuation" not in requests[0]["messages"][0]["content"]
+    assert "Repair JSON punctuation" in requests[1]["messages"][0]["content"]
+    assert requests[1]["messages"] == requests[2]["messages"]
+    assert sum(record.get("total_tokens", 0) or 0 for record in analyzer.inference_usage) == 30
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("earlier_failures", range(4))
+def test_formatting_shares_the_existing_provider_retry_budget(
+    http_model, asynchronous, earlier_failures
+):
+    failures = dict.fromkeys(range(1, earlier_failures + 1), 503)
+    failures.update(dict.fromkeys(range(earlier_failures + 2, 6), 503))
+    requests = http_model([('{"findings": [],}', "stop")], failures=failures)
+    analyzer = make_analyzer("discovery", timeout=lambda: 120.0)
+    analyzer._sleep_before_retry = MagicMock()
+    analyzer._asleep_before_retry = AsyncMock()
+    outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
+    assert not outcome.successful
+    assert outcome.failures[0].reason == LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+    assert len(requests) == 5
+    assert all(
+        "Repair JSON punctuation" in request["messages"][0]["content"]
+        for request in requests[earlier_failures + 1 :]
+    )
+    sleep = analyzer._asleep_before_retry if asynchronous else analyzer._sleep_before_retry
+    assert sleep.call_count == 3
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("earlier_failures", [2, 3])
+def test_formatting_never_extends_the_total_invocation_budget(
+    http_model, asynchronous, earlier_failures
+):
+    failures = dict.fromkeys(range(4, 4 + earlier_failures), 503)
+    if earlier_failures == 2:
+        failures[7] = 503
+    requests = http_model(
+        [("{}", "stop")] * 3 + [('{"findings": [],}', "stop")] * 4,
+        failures=failures,
+    )
+    analyzer = make_analyzer("discovery", timeout=lambda: 120.0)
+    analyzer._sleep_before_retry = MagicMock()
+    analyzer._asleep_before_retry = AsyncMock()
+    outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
+    assert not outcome.successful
+    assert len(requests) == 7
+    assert outcome.failures[0].reason == (
+        LedgerReason.LLM_BATCH_FAILED
+        if earlier_failures == 2
+        else LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+    )
+    assert sum(
+        "Repair JSON punctuation" in request["messages"][0]["content"] for request in requests
+    ) == (1 if earlier_failures == 2 else 0)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "first,answer,stop,reason",
+    [
+        (
+            '{"findings": [],}',
+            '{"findings": [],}',
+            "stop",
+            LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+        ),
+        (
+            '{"findings": [],}',
+            '{"findings": []}',
+            "length",
+            LedgerReason.LLM_RESPONSE_TRUNCATED,
+        ),
+        (
+            '{"findings": [],}',
+            '{"findings": []}',
+            "content_filter",
+            LedgerReason.LLM_RESPONSE_REFUSED,
+        ),
+        (
+            '{"findings": [],}',
+            '{"findings": [], "extra": 1}',
+            "stop",
+            LedgerReason.LLM_FORMAT_CHANGED,
+        ),
+        ('{"findings": [],}', '{"findings": []}', None, LedgerReason.LLM_FORMAT_CHANGED),
+        (
+            '{"findings": "invalid",}',
+            '{"findings": "invalid"}',
+            "stop",
+            LedgerReason.LLM_RESPONSE_INVALID_SCHEMA,
+        ),
+    ],
+)
+def test_formatting_validation_failure_still_stops_after_a_transport_retry(
+    http_model, asynchronous, first, answer, stop, reason
+):
+    requests = http_model([(first, "stop"), (answer, stop)], failures={2: 503})
+    analyzer = make_analyzer("discovery", timeout=lambda: 120.0)
+    analyzer._sleep_before_retry = MagicMock()
+    analyzer._asleep_before_retry = AsyncMock()
+    outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
+    assert not outcome.successful
+    assert outcome.failures[0].reason == reason
+    assert len(requests) == 3
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "headers,reason",
+    [
+        ({"retry-after": "20"}, LedgerReason.RUNTIME_LIMIT),
+        ({"x-should-retry": "false"}, LedgerReason.LLM_BATCH_FAILED),
+    ],
+)
+def test_formatting_preserves_deadline_and_explicit_no_retry_stops(
+    http_model, asynchronous, headers, reason
+):
+    requests = http_model(
+        [('{"findings": [],}', "stop")], failures={2: 429}, failure_headers=headers
+    )
+    analyzer = make_analyzer("discovery", timeout=lambda: 10.0)
+    analyzer._sleep_before_retry = MagicMock()
+    analyzer._asleep_before_retry = AsyncMock()
+    outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
+    assert not outcome.successful
+    assert outcome.failures[0].reason == reason
+    assert len(requests) == 2
+    analyzer._sleep_before_retry.assert_not_called()
+    analyzer._asleep_before_retry.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_formatting_keeps_native_provider_retry_ownership(http_model, asynchronous, exhausted):
+    requests = http_model(
+        [('{"findings": [],}', "stop"), ('{"findings": []}', "stop")],
+        failures=dict.fromkeys(range(2, 6 if exhausted else 3), 503),
+    )
+    analyzer = make_analyzer("discovery")
+    analyzer._sleep_before_retry = MagicMock()
+    analyzer._asleep_before_retry = AsyncMock()
+    outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
+    assert len(requests) == (5 if exhausted else 3)
+    if exhausted:
+        assert not outcome.successful
+        assert outcome.failures[0].reason == LedgerReason.LLM_BATCH_FAILED
+    else:
+        assert not outcome.failures
+    analyzer._sleep_before_retry.assert_not_called()
+    analyzer._asleep_before_retry.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_formatting_backoff_cannot_restart_an_expired_deadline(http_model, asynchronous):
+    remaining = [120.0]
+    requests = http_model([('{"findings": [],}', "stop")], failures={2: 503})
+    analyzer = make_analyzer("discovery", timeout=lambda: remaining[0])
+
+    def expire(_):
+        remaining[0] = 0.0
+
+    analyzer._sleep_before_retry = MagicMock(side_effect=expire)
+    analyzer._asleep_before_retry = AsyncMock(side_effect=expire)
+    outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
+    assert not outcome.successful
+    assert outcome.failures[0].reason == LedgerReason.RUNTIME_LIMIT
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_exhausted_formatting_retries_preserve_a_sibling_finding(http_model, asynchronous):
+    answer = (
+        '{"findings":[{"rule_id":"SSD-1","message":"leaks data","severity":"HIGH","start_line":1}]}'
+    )
+    requests = http_model(
+        [('{"findings": [],}', "stop")] * 5 + [(answer, "stop")],
+        failures=dict.fromkeys(range(2, 6), 503),
+    )
+    analyzer = make_analyzer("discovery", timeout=lambda: 120.0)
+    analyzer._sleep_before_retry = MagicMock()
+    analyzer._asleep_before_retry = AsyncMock()
+    batches = [Batch(file_path=path, content="x") for path in ("a.py", "b.py")]
+    outcome = run_outcome(analyzer, batches, asynchronous)
+    assert len(outcome.failures) == 1
+    assert outcome.failures[0].batch.file_path == "a.py"
+    assert outcome.failures[0].reason == LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+    assert len(outcome.successful) == 1
+    finding = outcome.successful[0][1][0]
+    assert (finding.file, finding.severity, finding.message) == ("b.py", "HIGH", "leaks data")
+    assert len(requests) == 6
+    assert "Repair JSON punctuation" not in requests[-1]["messages"][0]["content"]
