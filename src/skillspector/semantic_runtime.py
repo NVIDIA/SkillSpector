@@ -291,7 +291,16 @@ def format_recovery_runtime_accepted(
             if len(matches) != 1:
                 return False
             event = matches[0]
-            if event.get("analyzer_id") != analyzer or any(
+            # TP4 shares its status with the same node's completed static phase.
+            own_static_work = (
+                analyzer == "mcp_tool_poisoning"
+                and event.get("analyzer_id") == "mcp_tool_poisoning_static"
+                and event.get("record_type") == LedgerRecordType.WORK_ITEM
+                and event.get("phase") == "static"
+                and event.get("path")
+                == ("SKILL.md" if scope == _ROOT_SOURCE_SCOPE else scope + "/SKILL.md")
+            )
+            if (event.get("analyzer_id") != analyzer and not own_static_work) or any(
                 event.get(field) != target.get(field)
                 for field in ("path", "start_line", "end_line")
             ):

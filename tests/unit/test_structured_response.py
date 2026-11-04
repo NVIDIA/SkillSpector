@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 from langchain_core.messages import AIMessage
-from langchain_openai import ChatOpenAI
 
 from skillspector.inspection_ledger import LedgerReason
 from skillspector.llm_analyzer_base import (
@@ -29,6 +28,7 @@ from skillspector.nodes.analyzers.mcp_tool_poisoning import _TP4AnalysisResult, 
 from skillspector.nodes.analyzers.semantic_security_discovery import node as security_discovery
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, MetaAnalyzerResult
 from skillspector.providers import reset_provider, use_provider
+from skillspector.providers.chat_models import AzureChatOpenAI, ChatOpenAI
 from skillspector.providers.openai import OpenAIProvider
 from skillspector.response_recovery import (
     parse_recovery_value,
@@ -479,6 +479,7 @@ def http_model(monkeypatch):
         reasoning_effort=None,
         failures=None,
         failure_headers=None,
+        azure=False,
     ):
         if method is None:
             monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
@@ -537,13 +538,20 @@ def http_model(monkeypatch):
         async_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
         clients.append(client)
         async_clients.append(async_client)
-        llm = ChatOpenAI(
+        model_class = AzureChatOpenAI if azure else ChatOpenAI
+        route_options = (
+            {"azure_endpoint": "https://azure.example.test", "api_version": "2024-06-01"}
+            if azure
+            else {}
+        )
+        llm = model_class(
             model=model,
             api_key="test",
             http_client=client,
             http_async_client=async_client,
             max_retries=0,
             reasoning_effort=reasoning_effort,
+            **route_options,
         )
         register_chat_model_provider(llm, "openai")
         monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", lambda **_: llm)
@@ -563,6 +571,120 @@ def make_analyzer(name, *, timeout=None, model="test-model"):
     if name == "review":
         return LLMMetaAnalyzer(model=model, timeout=timeout)
     return LLMAnalyzerBase(base_prompt="Assess the code", node=name, model=model, timeout=timeout)
+
+
+@pytest.mark.parametrize("azure", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "source,issue",
+    [
+        ("", ResponseIssue.EMPTY),
+        (
+            '{"findings": [{"severity": "HIGH"}], "findings": []}',
+            ResponseIssue.INVALID_SCHEMA,
+        ),
+    ],
+)
+def test_openai_and_azure_keep_original_arguments_before_sdk_normalization(
+    http_model, azure, asynchronous, source, issue
+):
+    requests = http_model([(source, "stop")], method="function_calling", azure=azure)
+    analyzer = make_analyzer("discovery")
+    runnable = bind_structured_output(analyzer._llm, LLMAnalysisResult, "test-model")
+    with pytest.raises(StructuredOutputParseError) as error:
+        if asynchronous:
+            asyncio.run(runnable.ainvoke("Assess"))
+        else:
+            runnable.invoke("Assess")
+    assert error.value.issue == issue
+    assert error.value.recovery_text == source
+    assert len(requests) == 1
+    assert requests[0]["tools"][0]["function"]["name"] == "LLMAnalysisResult"
+
+
+@pytest.mark.parametrize("model_class", [ChatOpenAI, AzureChatOpenAI])
+def test_wire_tool_arguments_preserve_every_choice_and_generation_metadata(model_class):
+    route_options = (
+        {"azure_endpoint": "https://azure.example.test", "api_version": "2024-06-01"}
+        if model_class is AzureChatOpenAI
+        else {}
+    )
+    model = model_class(model="test-model", api_key="test", **route_options)
+    choices = [
+        {
+            "index": index,
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": f"call-{index}",
+                        "type": "function",
+                        "function": {"name": f"response-{index}", "arguments": arguments},
+                    }
+                ],
+            },
+        }
+        for index, arguments in enumerate(["", '{"severity":"HIGH","severity":"LOW"}'])
+    ]
+    result = model._create_chat_result(
+        {
+            "choices": choices,
+            "model": "test-model",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+    )
+    assert len(result.generations) == 2
+    assert result.llm_output["token_usage"]["total_tokens"] == 15
+    for generation, choice in zip(result.generations, choices, strict=True):
+        assert generation.message.additional_kwargs["tool_calls"] == choice["message"]["tool_calls"]
+        assert generation.generation_info["finish_reason"] == "tool_calls"
+        assert generation.message.usage_metadata["total_tokens"] == 15
+
+
+def test_azure_raw_argument_preservation_keeps_native_content_filter_rejection():
+    model = AzureChatOpenAI(
+        model="test-model",
+        api_key="test",
+        azure_endpoint="https://azure.example.test",
+        api_version="2024-06-01",
+    )
+    with pytest.raises(ValueError, match="content filter"):
+        model._create_chat_result(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "content_filter",
+                        "message": {"role": "assistant", "content": ""},
+                    }
+                ]
+            }
+        )
+
+
+@pytest.mark.parametrize("model_class", [ChatOpenAI, AzureChatOpenAI])
+def test_raw_argument_preservation_leaves_normal_text_messages_unchanged(model_class):
+    route_options = (
+        {"azure_endpoint": "https://azure.example.test", "api_version": "2024-06-01"}
+        if model_class is AzureChatOpenAI
+        else {}
+    )
+    model = model_class(model="test-model", api_key="test", **route_options)
+    result = model._create_chat_result(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "HIGH", "tool_calls": None},
+                }
+            ]
+        }
+    )
+    message = result.generations[0].message
+    assert message.content == "HIGH"
+    assert "tool_calls" not in message.additional_kwargs
+    assert not message.tool_calls and not message.invalid_tool_calls
 
 
 def test_meta_recovery_prompt_names_the_allowed_categorical_values(http_model):

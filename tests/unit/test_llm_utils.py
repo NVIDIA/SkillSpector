@@ -604,8 +604,8 @@ class TestGetChatModelCLIAdapter:
         with pytest.raises(StructuredOutputParseError) as async_error:
             await runnable.ainvoke("assessment")
 
-        assert sync_error.value.recovery_text == raw
-        assert async_error.value.recovery_text == raw
+        assert sync_error.value.recovery_text == raw.strip()
+        assert async_error.value.recovery_text == raw.strip()
         assert provider.complete.call_count == 2
 
     @pytest.mark.parametrize(

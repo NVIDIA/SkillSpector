@@ -210,6 +210,51 @@ def test_format_recovery_remains_bound_to_its_transitive_source() -> None:
     assert not format_recovery_runtime_accepted(state, {})
 
 
+@pytest.mark.parametrize("source", [None, "external/child-digest"])
+@pytest.mark.parametrize(
+    "mutation",
+    [None, "other_analyzer", "wrong_phase", "wrong_path", "partial", "failed", "reason"],
+)
+def test_tp4_warning_accepts_only_its_completed_static_phase(source, mutation) -> None:
+    path = "SKILL.md" if source is None else source + "/SKILL.md"
+    static = ledger_event(
+        analyzer_id="mcp_tool_poisoning_static",
+        outcome=LedgerOutcome.COMPLETED,
+        phase="static",
+        path=path,
+    )
+    semantic = ledger_event(
+        analyzer_id="mcp_tool_poisoning",
+        outcome=LedgerOutcome.PARTIAL,
+        phase="semantic",
+        path=path,
+        reason=LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED,
+    )
+    if mutation == "other_analyzer":
+        static["analyzer_id"] = "unrelated_static"
+    elif mutation == "wrong_phase":
+        static["phase"] = "semantic"
+    elif mutation == "wrong_path":
+        static["path"] = path.replace("SKILL.md", "other.py")
+    elif mutation in {"partial", "failed"}:
+        static["outcome"] = LedgerOutcome(mutation)
+    elif mutation == "reason":
+        static["reason_code"] = LedgerReason.RUNTIME_LIMIT
+    events = [static, semantic]
+    status = analyzer_status_for_events("mcp_tool_poisoning", events)
+    call = {"node": "mcp_tool_poisoning", "ok": True, "error": None}
+    if source is not None:
+        for record in [*events, status, call]:
+            record["source_identity"] = source
+    state = {
+        "use_llm": True,
+        "inspection_ledger": events,
+        "analyzer_status_events": [*_semantic_statuses(source), status],
+        "llm_call_log": [*_semantic_calls(source), call],
+    }
+    assert format_recovery_runtime_accepted(state, {}) is (mutation is None)
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
