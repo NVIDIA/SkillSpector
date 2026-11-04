@@ -102,6 +102,14 @@ _P2_COMMENT_KEYWORD = (
     rf"(?:{_P2_IDENTIFIER_START}(?:system|POST|GET|send){_P2_IDENTIFIER_END}"
     r"|ignore|instructions?|transmit)"
 )
+# Reference-comment titles need a source delimiter scan, rather than a DOTALL
+# keyword expression that can backtrack past an already closed title.
+_REFERENCE_COMMENT_GAP = r"[ \t]*(?:(?:\r\n|\r|\n)[ \t]*)?"
+_REFERENCE_COMMENT_PATTERN = rf"\[//\]:{_REFERENCE_COMMENT_GAP}#"
+_REFERENCE_COMMENT_OPENING = re.compile(_REFERENCE_COMMENT_PATTERN)
+_REFERENCE_COMMENT_TITLE = re.compile(r"(?:[ \t]+|[ \t]*(?:\r\n|\r|\n)[ \t]*)\(")
+_REFERENCE_COMMENT_SPAN = re.compile(r"[\s\S]*")
+_REFERENCE_COMMENT_KEYWORD = re.compile(_P2_COMMENT_KEYWORD, re.IGNORECASE)
 P2_PATTERNS = [
     (
         # "<!-->" and "<!--->" are abrupt empty comments: the HTML tokenizer
@@ -110,7 +118,7 @@ P2_PATTERNS = [
         rf"<!--(?!-?>)(?:(?!--!?>).)*?{_P2_COMMENT_KEYWORD}(?:(?!--!?>).)*?--!?>",
         0.7,
     ),
-    (r"\[//\]:\s*#\s*\(.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?\)", 0.8),
+    (_REFERENCE_COMMENT_PATTERN, 0.8),
     (_ZERO_WIDTH_PATTERN, 0.6),
     (r"data:text/plain;base64,[A-Za-z0-9+/=]{50,}", 0.7),
 ]
@@ -683,6 +691,9 @@ def _p2_pattern_matches(
     """Yield all structured matches or the first control signal on each line."""
     if check_runtime is not None:
         check_runtime()
+    if pattern == _REFERENCE_COMMENT_PATTERN:
+        yield from _reference_comment_matches(content, check_runtime)
+        return
     compiled = re.compile(pattern, re.IGNORECASE | re.DOTALL)
     if pattern not in _SINGLE_CHARACTER_P2_PATTERNS:
         for match in compiled.finditer(content):
@@ -698,9 +709,10 @@ def _p2_pattern_matches(
         candidate = compiled.search(content, cursor)
         if candidate is None:
             return
-        if pattern == _ZERO_WIDTH_PATTERN and _zero_width_match_is_safe_emoji_zwj(
-            content,
-            candidate.start(),
+        if pattern == _ZERO_WIDTH_PATTERN and (
+            # A leading U+FEFF is a byte-order mark, not hidden text.
+            (candidate.start() == 0 and content[0] == "\ufeff")
+            or _zero_width_match_is_safe_emoji_zwj(content, candidate.start())
         ):
             cursor = candidate.end()
             continue
