@@ -1764,11 +1764,11 @@ def _has_shell_execution_call(
                     return True
                 if member == "construct":
                     return True
-                if origin.type == "subscript_expression" and member not in {
-                    "call",
-                    "apply",
-                    "bind",
-                }:
+                if (
+                    origin.id in callable_ids
+                    and origin.type == "subscript_expression"
+                    and member not in {"call", "apply", "bind"}
+                ):
                     index = origin.child_by_field_name("index")
                     if index is None or index.type not in {"number", "null", "true", "false"}:
                         return True

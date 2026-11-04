@@ -609,6 +609,8 @@ def test_computed_evaluator_aliases_cannot_own_executable_templates(member: str)
         "const evaluate = source[key]; const run = evaluate; run(`${command} -rf /`);",
         "let run; run = source[key]; run.call(null, `${command} -rf /`);",
         "source[key](`${command} -rf /`);",
+        "source[key].call(null, `${command} -rf /`);",
+        "const invoke = source[key].apply; invoke(null, [`${command} -rf /`]);",
         "source[key].bind(null)(`${command} -rf /`);",
         "const {eval: run} = globalThis; run(`${command} -rf /`);",
         "const {'Function': run} = globalThis; new run(`${command} -rf /`);",
@@ -617,8 +619,9 @@ def test_computed_evaluator_aliases_cannot_own_executable_templates(member: str)
         "source[key].call`${command} -rf /`;",
     ],
 )
-def test_unresolved_computed_evaluators_cannot_own_templates(statement: str) -> None:
-    source = statement + _PADDING
+@pytest.mark.parametrize("suffix", ["", _PADDING], ids=["short", "padded"])
+def test_unresolved_computed_evaluators_cannot_own_templates(statement: str, suffix: str) -> None:
+    source = statement + suffix
     assert javascript_template_spans(source, lambda: None) is None
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
 
@@ -707,6 +710,10 @@ def test_execution_helpers_and_aliases_keep_dynamic_templates_unverified(
         "const first = format; const invoke = first['apply']; "
         "invoke.call(first, null, [`hello ${name}`]);",
         "function pick() { return {label: source[key]}; } console.log(`Value: ${pick().label}`);",
+        "function label(values, key) { return values[key].replace(/ +/g, ' '); } "
+        "console.log(`Value: ${label(items, key)}`);",
+        "function label(values, key) { return values[key].split(':')[0].split(',')[0]; } "
+        "console.log(`Value: ${label(items, key)}`);",
     ],
 )
 @pytest.mark.parametrize("suffix", ["", _PADDING], ids=["short", "padded"])
