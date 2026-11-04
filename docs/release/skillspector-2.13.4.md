@@ -39,6 +39,9 @@ Integration corrections preserve malformed single-object findings, avoid repeate
 shell-comment scans, and limit decoded signature metadata ownership to parser
 boundaries while retaining checks on unknown fields and decoded payloads. The
 maintenance branch's scoped allowed-tools and output-file protections are retained.
+Markdown list fences end with their containing list, so following prose does not
+extend a shell string. Source distributions contain the runtime package and public
+package metadata.
 
 ## Scope and upgrading
 

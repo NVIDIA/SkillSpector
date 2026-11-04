@@ -91,6 +91,7 @@ Issues = "https://github.com/NVIDIA/skillspector/issues"
 exclude = [".claude/", ".cursor/", ".agents/", ".uv-cache/"]
 
 [tool.hatch.build.targets.sdist]
+include = ["/src/skillspector", "/pyproject.toml", "/README.md", "/LICENSE", "/THIRD_PARTY_NOTICES.md"]
 core-metadata-version = "2.4"
 
 [tool.hatch.build.targets.wheel]

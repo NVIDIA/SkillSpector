@@ -8305,6 +8305,17 @@ def _markdown_shell_text(
             or separator
         ):
             table_columns = None
+        if fence is not None and leading and indentation < fence[2]:
+            # A fenced block inside a list ends when its list container ends.
+            # Process this dedented line again as Markdown, rather than letting
+            # a prose apostrophe open a shell quote inside the preceding fence.
+            if (
+                powershell_blocks is not None
+                and complete_context
+                and fence[3] in {"powershell", "pwsh", "ps1"}
+            ):
+                powershell_blocks.append((fence_body_start, offset))
+            fence = None
         if html_end is not None:
             mask_inline_delimiters()
             if (html_end and html_end in leading.lower()) or (not html_end and not leading):
