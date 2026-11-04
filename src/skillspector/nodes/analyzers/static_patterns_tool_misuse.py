@@ -8817,8 +8817,6 @@ class _PreparedSourceCommands:
                 clock,
             )
         locations = SourceLocationIndex(content, file_path)
-        parent_lines = content.splitlines()
-        ambiguous_lines = any(ch in content for ch in static_runner._EXOTIC_LINE_BREAKS)
         for (start, end), value in self.variants():
             finding_budget.check_runtime()
             try:
@@ -8848,18 +8846,11 @@ class _PreparedSourceCommands:
                     timeout_seconds=finding_budget.deadline - finding_budget.started_at,
                 )
             line, column = locations.line_and_column(start)
-            parent_line = (
-                parent_lines[line - 1]
-                if not ambiguous_lines and 0 < line <= len(parent_lines)
-                else None
-            )
-            parent_surface = static_runner.infer_surface(file_path, parent_line)
             self.mapped_findings = finalized
             self.emitted_findings = 0
             for child in finalized:
                 child_line, child_column = child.start_line, child.start_column
                 child.file = file_path
-                child.surface = parent_surface
                 child.start_line = child.end_line = line
                 child.start_column = column
                 child.end_column = column + max(1, min(end - start, 128))

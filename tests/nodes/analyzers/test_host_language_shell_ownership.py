@@ -784,16 +784,16 @@ def test_refused_constant_proof_preserves_released_execution_bounds(
         python_import_check=import_check,
         python_stdlib_check=stdlib_check,
     )
-    # A refused stdlib substitution preserves lexical bounds only when the
-    # released execution and import guards still establish them.
+    # Independently proven non-root operands still complete even when the
+    # additional constant-substitution proof is refused.
     benign = _OPTION_TEXT + 'MESSAGE = "$TOOL -rf build"\n' + _TAIL
-    assert tm.has_bounded_parse_exhaustion(
+    assert not tm.has_bounded_parse_exhaustion(
         benign,
         lambda: None,
         file_type="python",
         python_import_check=import_check,
         python_stdlib_check=stdlib_check,
-    ) is (guard != "stdlib")
+    )
 
 
 def test_interrupted_constant_import_proof_does_not_cache_success() -> None:
