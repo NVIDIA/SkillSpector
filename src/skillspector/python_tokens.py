@@ -906,3 +906,318 @@ def python_string_body(content: str, start: int, end: int) -> tuple[int, int]:
         opener += 1
     width = 3 if content.startswith(content[opener] * 3, opener, end) else 1
     return opener + width, end - width
+
+
+def python_string_value_bounds_allowed(
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    allow_dynamic_subprocess: bool = True,
+) -> bool:
+    """Allow isolated string-value bounds only without a recognized shell path.
+
+    This is a module-wide syntax guard, not a claim of whole-program inertness.
+    Any recognized shell sink, escaping sink/module alias, reflection, dynamic
+    import, or ambiguous subprocess shell mode keeps the original whole-source
+    fallback. Direct subprocess calls with default/false shell mode are eligible
+    unless their literal argv names a shell. Unknown application calls
+    and nonliteral argv retain the scanner's existing interprocedural limits.
+    """
+    if len(content) > MAX_PYTHON_AST_SOURCE_CHARS:
+        return False
+    check_runtime()
+    with _PYTHON_OWNERSHIP_PARSE_LOCK, warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            tree = ast.parse(content)
+        except (SyntaxError, ValueError, RecursionError):
+            return False
+    check_runtime()
+    known_modules = {
+        name: name for name in ("os", "sys", "subprocess", "asyncio", "builtins", "importlib")
+    }
+    known_modules.update(
+        posix="os", nt="os", __builtins__="builtins", posixpath="os.path", ntpath="os.path"
+    )
+    modules = dict(known_modules)
+    imported: dict[str, tuple[str, str]] = {}
+    nodes = []
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        check_runtime()
+        nodes.append(node)
+        parents.update((child, node) for child in ast.iter_child_nodes(node))
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in known_modules:
+                    modules[alias.asname or root] = (
+                        "os.path"
+                        if alias.asname and alias.name == "os.path"
+                        else known_modules[root]
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            if any(alias.name == "*" for alias in node.names):
+                return False
+            root = (node.module or "").split(".")[0]
+            if root in known_modules:
+                if node.module != root:
+                    return False  # Module descendants may expose their shell-capable parent.
+                for alias in node.names:
+                    imported[alias.asname or alias.name] = (known_modules[root], alias.name)
+
+    reflection = {
+        "exec",
+        "eval",
+        "compile",
+        "__import__",
+        "getattr",
+        "setattr",
+        "globals",
+        "locals",
+        "vars",
+    }
+    subprocess_calls = {"run", "Popen", "call", "check_call", "check_output"}
+    subprocess_values = {
+        "CompletedProcess",
+        "CalledProcessError",
+        "SubprocessError",
+        "TimeoutExpired",
+        "PIPE",
+        "STDOUT",
+        "DEVNULL",
+    }
+    os_values = {
+        "environ",
+        "getenv",
+        "name",
+        "path",
+        "fspath",
+        "PathLike",
+        "sep",
+        "altsep",
+        "pathsep",
+        "linesep",
+        "curdir",
+        "pardir",
+        "devnull",
+        "getcwd",
+        "getcwdb",
+        "cpu_count",
+        "listdir",
+        "scandir",
+        "walk",
+        "stat",
+        "lstat",
+        "access",
+        "F_OK",
+        "R_OK",
+        "W_OK",
+        "X_OK",
+    }
+    shells = {
+        "sh",
+        "bash",
+        "dash",
+        "ksh",
+        "zsh",
+        "fish",
+        "ash",
+        "csh",
+        "tcsh",
+        "pwsh",
+        "powershell",
+        "cmd",
+        "cmd.exe",
+    }
+
+    module_names_shell = any(
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe") in shells
+        for node in nodes
+    )
+    path_calls = {
+        "abspath",
+        "basename",
+        "commonpath",
+        "commonprefix",
+        "dirname",
+        "exists",
+        "expanduser",
+        "expandvars",
+        "getatime",
+        "getctime",
+        "getmtime",
+        "getsize",
+        "isabs",
+        "isdir",
+        "isfile",
+        "islink",
+        "ismount",
+        "join",
+        "lexists",
+        "normcase",
+        "normpath",
+        "realpath",
+        "relpath",
+        "samefile",
+        "sameopenfile",
+        "samestat",
+        "split",
+        "splitdrive",
+        "splitext",
+        "splitroot",
+    }
+
+    def safe_path_call(attribute: str, node: ast.AST) -> bool:
+        parent = parents.get(node)
+        return attribute in path_calls and isinstance(parent, ast.Call) and parent.func is node
+
+    def safe_subprocess_call(node: ast.AST) -> bool:
+        if module_names_shell:
+            return False  # Indirect argv may refer to an explicit local shell literal.
+        parent = parents.get(node)
+        if not isinstance(parent, ast.Call) or parent.func is not node:
+            return False  # An assigned/passed callable can acquire later operands.
+        if len(parent.args) > 1 or any(isinstance(arg, ast.Starred) for arg in parent.args):
+            return False
+        for keyword in parent.keywords:
+            if keyword.arg is None or keyword.arg == "executable":
+                return False
+            if keyword.arg == "shell" and not (
+                isinstance(keyword.value, ast.Constant) and keyword.value.value is False
+            ):
+                return False
+        argv = (
+            parent.args[0]
+            if parent.args
+            else next((keyword.value for keyword in parent.keywords if keyword.arg == "args"), None)
+        )
+        if not allow_dynamic_subprocess and not (
+            isinstance(argv, (ast.List, ast.Tuple))
+            and argv.elts
+            and isinstance(argv.elts[0], ast.Constant)
+            and isinstance(argv.elts[0].value, str)
+        ):
+            return False  # A bundled helper can receive shell argv from its caller.
+        # A shell may accept -c after other flags or through argv concatenation.
+        # Keep the entire module conservative whenever literal argv names one;
+        # there is no need to emulate each shell's argument parser here.
+        for item in ast.walk(argv) if argv is not None else ():
+            check_runtime()
+            if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                if (
+                    item.value.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+                    in shells
+                ):
+                    return False
+                if re.search(
+                    r"(?:^|\s)(?:\S*/)?(?:sh|bash|dash|ksh|zsh|fish|ash|csh|tcsh|pwsh|powershell|cmd)(?:\.exe)?(?:\s|$)",
+                    item.value,
+                    re.IGNORECASE,
+                ):
+                    return False
+        return True
+
+    def safe_attribute(module: str, attribute: str, node: ast.AST) -> bool:
+        if module == "os":
+            if attribute == "path":
+                parent = parents.get(node)
+                # os.path is a module, not an inert value: only audited terminal
+                # path calls may use it. Unknown descendants/escapes keep fallback.
+                return (
+                    isinstance(parent, ast.Attribute)
+                    and parent.value is node
+                    and safe_path_call(parent.attr, parent)
+                )
+            return attribute in os_values
+        if module == "os.path":
+            return safe_path_call(attribute, node)
+        if module == "sys":
+            return attribute in {
+                "argv",
+                "executable",
+                "exit",
+                "path",
+                "platform",
+                "version",
+                "version_info",
+                "stdin",
+                "stdout",
+                "stderr",
+                "maxsize",
+                "byteorder",
+            }
+        if module == "subprocess":
+            return attribute in subprocess_values or (
+                attribute in subprocess_calls and safe_subprocess_call(node)
+            )
+        if module == "asyncio":
+            # Loop methods can execute shell commands through chained accesses.
+            return False
+        # builtins/importlib expose dynamic execution and module descendants.
+        return False
+
+    for node in nodes:
+        check_runtime()
+        if isinstance(node, ast.Name):
+            if node.id in reflection:
+                return False
+            if node.id in modules:
+                parent = parents.get(node)
+                if (
+                    not isinstance(parent, ast.Attribute)
+                    or parent.value is not node
+                    or not safe_attribute(modules[node.id], parent.attr, parent)
+                ):
+                    return False
+            if node.id in imported and not safe_attribute(*imported[node.id], node):
+                return False
+        elif isinstance(node, ast.Attribute):
+            # A safe first attribute does not own the rest of a chain, e.g.
+            # os.path.os.system or an event loop's subprocess_shell method.
+            if (
+                (node.attr.startswith("__") and node.attr.endswith("__"))
+                or node.attr in reflection
+                or node.attr
+                in {
+                    "system",
+                    "popen",
+                    "create_subprocess_shell",
+                    "subprocess_shell",
+                    "subprocess_exec",
+                    "__dict__",
+                    "execl",
+                    "execle",
+                    "execlp",
+                    "execlpe",
+                    "execv",
+                    "execve",
+                    "execvp",
+                    "execvpe",
+                    "spawnl",
+                    "spawnle",
+                    "spawnlp",
+                    "spawnlpe",
+                    "spawnv",
+                    "spawnve",
+                    "spawnvp",
+                    "spawnvpe",
+                    "posix_spawn",
+                    "posix_spawnp",
+                }
+            ):
+                return False
+        elif isinstance(node, ast.ImportFrom) and node.module in known_modules:
+            # Imported shell sinks are unsafe even if an alias is later rebound.
+            if known_modules[node.module] == "os" and any(
+                alias.name not in os_values for alias in node.names
+            ):
+                return False
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name in modules or node.name in imported:
+                return False
+        elif isinstance(node, ast.arg) and (node.arg in modules or node.arg in imported):
+            return False
+    return True
