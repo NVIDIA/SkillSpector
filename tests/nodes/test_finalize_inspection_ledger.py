@@ -2369,7 +2369,9 @@ def test_format_recovery_preserves_existing_missing_reference_caveat() -> None:
     assert format_recovery_policy_accepted(completeness)
     assert completeness["is_complete"] is False
     assert completeness["partially_inspected_files"] == 1
-    assert any(row["reason_code"] == "reference_missing" for row in completeness["ledger_exceptions"])
+    assert any(
+        row["reason_code"] == "reference_missing" for row in completeness["ledger_exceptions"]
+    )
     assert result["effective_finding_ids"] == state["effective_finding_ids"]
     assert result["findings"] == []
 
