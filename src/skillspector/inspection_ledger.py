@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable, Iterable, Mapping
 from enum import StrEnum
 from hashlib import sha256
@@ -18,6 +19,15 @@ logger = logging.getLogger(__name__)
 MAX_INSPECTION_LEDGER_EVENTS: Final = 10_000
 MAX_FINDING_OUTPUT_RECORDS: Final = 10_000
 MAX_EFFECTIVE_FINDINGS: Final = MAX_FINDING_OUTPUT_RECORDS
+RESOURCE_MEASUREMENT_UNITS: Final = (
+    "characters",
+    "bytes",
+    "findings",
+    "artifacts",
+    "depth",
+    "records",
+    "seconds",
+)
 
 
 class LedgerOutcome(StrEnum):
@@ -300,7 +310,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "A transitive child scan failed before complete inspection."
     ),
     LedgerReason.STATIC_PARSE_LIMIT: (
-        "A security-relevant expression exceeded a bounded static parser's span limit."
+        "A security-relevant expression could not be fully resolved by the bounded static parser."
     ),
     LedgerReason.PYTHON_SOURCE_AMBIGUOUS: (
         "Python execution intent depends on runtime or platform-specific shebang semantics."
@@ -344,7 +354,42 @@ class PlannedWorkTarget(TypedDict):
     end_line: int | None
 
 
-class InspectionLedgerEvent(TypedDict):
+class ResourceMeasurements(TypedDict, total=False):
+    """Optional measured resource values with units encoded in their field names."""
+
+    observed_characters: int
+    limit_characters: int
+    observed_bytes: int
+    limit_bytes: int
+    observed_findings: int
+    limit_findings: int
+    observed_artifacts: int
+    limit_artifacts: int
+    observed_depth: int
+    limit_depth: int
+    observed_records: int
+    limit_records: int
+    observed_seconds: float
+    limit_seconds: float
+
+
+def resource_measurements(event: Mapping[str, object]) -> ResourceMeasurements:
+    """Allow only bounded numeric diagnostics, never arbitrary graph payloads."""
+    measurements: dict[str, int | float] = {}
+    for unit in RESOURCE_MEASUREMENT_UNITS:
+        for prefix in ("observed_", "limit_"):
+            key = prefix + unit
+            value = event.get(key)
+            # Machine resource counters fit in 63 bits; larger graph values
+            # must not amplify report output through unbounded decimal text.
+            if type(value) is int and 0 <= value <= (1 << 63) - 1:
+                measurements[key] = value
+            elif unit == "seconds" and type(value) is float and math.isfinite(value) and value >= 0:
+                measurements[key] = value
+    return cast(ResourceMeasurements, measurements)
+
+
+class InspectionLedgerEvent(ResourceMeasurements):
     """Internal terminal evidence for one work item or scope boundary."""
 
     work_id: str
@@ -361,20 +406,6 @@ class InspectionLedgerEvent(TypedDict):
     message: NotRequired[str]
     error_class: NotRequired[str]
     stage: NotRequired[str]
-    observed_characters: NotRequired[int]
-    limit_characters: NotRequired[int]
-    observed_bytes: NotRequired[int]
-    limit_bytes: NotRequired[int]
-    observed_findings: NotRequired[int]
-    limit_findings: NotRequired[int]
-    observed_artifacts: NotRequired[int]
-    limit_artifacts: NotRequired[int]
-    observed_depth: NotRequired[int]
-    limit_depth: NotRequired[int]
-    observed_records: NotRequired[int]
-    limit_records: NotRequired[int]
-    observed_seconds: NotRequired[float]
-    limit_seconds: NotRequired[float]
 
 
 class AnalyzerStatusEvent(TypedDict):
@@ -390,7 +421,7 @@ class AnalyzerStatusEvent(TypedDict):
     source_digest: NotRequired[str]
 
 
-class InspectionLedgerException(TypedDict):
+class InspectionLedgerException(ResourceMeasurements):
     """Public exceptional projection derived from an internal ledger event."""
 
     outcome: LedgerOutcome
@@ -739,7 +770,7 @@ def _exception_from_event(
         if outcome == LedgerOutcome.FAILED
         else LedgerReason.NO_APPLICABLE_FILES
     )
-    return _exception(
+    exception = _exception(
         outcome=outcome,
         phase=str(event["phase"]),
         reason=_reason(event.get("reason_code"), fallback),
@@ -751,6 +782,8 @@ def _exception_from_event(
         fatal=fatal,
         scope=RULE_SET_SCOPE if _is_rule_set_record(event) else None,
     )
+    exception.update(resource_measurements(event))
+    return exception
 
 
 def _merge_exception_projection(
@@ -771,6 +804,7 @@ def _merge_exception_projection(
             # A rule-set row and a real file's row can share a path label;
             # they must never merge into one public row.
             exception.get("scope"),
+            tuple(resource_measurements(exception).items()),
         )
         existing = grouped.get(key)
         if existing is None:
