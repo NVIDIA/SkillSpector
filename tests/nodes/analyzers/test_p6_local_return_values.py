@@ -262,6 +262,7 @@ def test_javascript_non_extraction_survives_full_scanner_continuity_views() -> N
         "const box = {choose: (root, key) => ({value: root[key]})}; box.choose(root, key).value(target); function f() { const rules = []; return rules.some(Boolean); }",
         "const box = {choose(root, key) { return {value: root[key]}; }}; box.choose(root, key).value(target); function f() { const rules = []; return rules.some(Boolean); }",
         "const box = [(root, key) => ({value: root[key]})]; const choose = box[0]; choose(root, key).value(target); function f() { const rules = []; return rules.some(Boolean); }",
+        "function* select(root, key) { return {value: root[key]}; } select(root, key).next().value.value(target); function f() { const rules = []; return rules.some(Boolean); }",
         "const select = (root, key) => root[key]; select(root, key).call(null, target); function f() { const rules = []; return rules.some(Boolean); }",
         "const data = describe(key); const fn = data.value; const alias = fn; alias(target); function f() { const rules = []; return rules.some(Boolean); }",
         "let fn = fallback; fn = record[key]; fn(target); function f() { const rules = []; return rules.some(Boolean); }",

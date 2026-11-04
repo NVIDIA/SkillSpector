@@ -1207,10 +1207,11 @@ def _javascript_non_extraction_spans(
                 binding = computed_binding(node)
                 if binding is not None:
                     computed_values.add(binding)
-        if node.type == "function_declaration":
+        if node.type in {"function_declaration", "generator_function_declaration"}:
             name = node.child_by_field_name("name")
             if name is not None:
-                functions.setdefault(program.text(name), []).append(node)
+                if node.type == "function_declaration":
+                    functions.setdefault(program.text(name), []).append(node)
                 local_factories.add(program.text(name))
         if node.type == "comment":
             start, end = program.span(node)
@@ -1289,7 +1290,7 @@ def _javascript_non_extraction_spans(
                 predicate_proof = False
             if name in local_factories and not (
                 called
-                or owner.type == "function_declaration"
+                or owner.type in {"function_declaration", "generator_function_declaration"}
                 and owner.child_by_field_name("name") == reference
                 or owner.type == "variable_declarator"
                 and owner.child_by_field_name("name") == reference
