@@ -103,6 +103,10 @@ def test_oversized_toml_integer_does_not_drop_existing_supply_chain_findings(mon
         rule_id="SC5", severity="HIGH", file="requirements.txt", message="Existing risk"
     )
     monkeypatch.setattr(
+        supply_chain, "query_batch", lambda packages, *_args, **_kwargs: [[] for _ in packages]
+    )
+    monkeypatch.setattr(supply_chain, "was_osv_reachable", lambda: True)
+    monkeypatch.setattr(
         supply_chain.static_runner,
         "run_static_patterns_with_ledger",
         lambda *_args: {
