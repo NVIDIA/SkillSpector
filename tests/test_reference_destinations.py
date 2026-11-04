@@ -64,7 +64,15 @@ def test_markdown_destinations_preserve_present_and_missing_targets(
 
 @pytest.mark.parametrize(
     "target",
-    ["../outside.md", "%2e%2e/outside.md", "%2Foutside.md", "%5Coutside.md", "C%3A/file.md"],
+    [
+        "../outside.md",
+        "%2e%2e/outside.md",
+        "%2Foutside.md",
+        "%5Coutside.md",
+        "C%3A/file.md",
+        "docs/a%00.md",
+        "a%00.md",
+    ],
 )
 def test_decoded_destination_cannot_escape_bundle(tmp_path: Path, target: str) -> None:
     result = resolve_bundle_references_with_metadata(
@@ -537,3 +545,16 @@ async def test_markdown_limits_block_complete_verdict(
         report = json.loads(result["report"])
     assert report["execution_successful"] is True
     assert report["analysis_completeness"]["is_complete"] is False
+
+
+def test_double_encoded_nul_remains_a_literal_filename(tmp_path: Path) -> None:
+    target = "docs/a%00.md"
+    result = resolve_bundle_references_with_metadata(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text="Read [guide](docs/a%2500.md).",
+        known_paths=["SKILL.md", target],
+    )
+    assert result.complete
+    assert result.records[0]["status"] == "resolved"
+    assert result.records[0]["target_path"] == target

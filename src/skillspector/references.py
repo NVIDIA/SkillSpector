@@ -613,7 +613,7 @@ def _normalize_candidate(raw: str, source_path: str) -> str | None:
     # Split URI syntax before decoding so %23/%3F remain filename characters.
     # Decode exactly once, then apply containment checks to the decoded path.
     path_part = unquote(split.path).replace("\\", "/")
-    if not path_part or path_part.startswith("/"):
+    if not path_part or "\x00" in path_part or path_part.startswith("/"):
         return None
     if len(path_part) >= 2 and path_part[1] == ":":
         return None

@@ -1161,3 +1161,45 @@ def test_unknown_sibling_bytes_do_not_remove_an_independent_path_ownership_proof
     assert store.owns("/tmp/work/output")
     assert not store.owns("/tmp/work/log")
     assert not store.owns("/tmp/work/log/child")
+
+
+@pytest.mark.parametrize("source_mode", [True, False, None])
+@pytest.mark.parametrize("destination_mode", [True, False, None])
+def test_copy_replaces_bytes_without_replacing_existing_mode(source_mode, destination_mode) -> None:
+    store = ShellArtifactStore(lambda: None)
+    source = ShellArtifact(_program("rm -rf /\n").value, executable=source_mode)
+    destination = ShellArtifact(_program("printf ready\n").value, executable=destination_mode)
+    assert store.write("source.sh", source)
+    assert store.write("destination.sh", destination)
+    assert store.copy("source.sh", "destination.sh")
+    copied = store.read("destination.sh")
+    assert copied is not None
+    assert copied.value == source.value
+    assert copied.executable is destination_mode
+    assert store.copy("source.sh", "new.sh")
+    assert store.read("new.sh").executable is source_mode
+
+
+@pytest.mark.parametrize(
+    "invocation,expected",
+    [
+        ("printf '100%% ready'", "100% ready"),
+        ("printf '%%%%'", "%%"),
+        ("printf '%%%s' ready", "%ready"),
+        ("printf '%s' '%%'", "%%"),
+        (r"printf '\\'", "\\"),
+        ("printf 'trailing%'", None),
+        ("printf '%q' ready", None),
+        ("printf '%n' name >/dev/null", None),
+        ("printf '%b' ready >/dev/null", None),
+        (r"printf '\a' >/dev/null", None),
+    ],
+)
+def test_helper_output_validates_complete_format_tokens(invocation, expected) -> None:
+    output = reconstruct_helper_output(
+        invocation + "\n", (), {}, frozenset(), tm._next_shell_invocation_word, lambda: None
+    )
+    if expected is None:
+        assert output is None
+    else:
+        assert output == ((ShellHelperOutput(text=expected),),)
