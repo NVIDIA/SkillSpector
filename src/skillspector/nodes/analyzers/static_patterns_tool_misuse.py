@@ -5545,7 +5545,6 @@ class _PythonSourceOwnership:
     ) -> None:
         self._python_import_check = python_import_check
         self._python_stdlib_check = python_stdlib_check
-        self._constant_fields: tuple[tuple[int, int, str], ...] | None = None
         self._content = content
         self._check_runtime = check_runtime
         self._spans: PythonLiteralSpans | None = None

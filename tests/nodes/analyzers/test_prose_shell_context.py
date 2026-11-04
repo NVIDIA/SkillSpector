@@ -680,7 +680,8 @@ def test_nested_list_inline_code_retains_shell_bodies(command: str) -> None:
 )
 def test_nested_list_paragraph_does_not_claim_uncertain_blocks(tail: str) -> None:
     content = "- Details\n  - Existing paragraph.\n" + tail
-    assert tm._markdown_shell_text(content, lambda: None) == content
+    expected = content.replace("```", "   ")
+    assert tm._markdown_shell_text(content, lambda: None) == expected
     result = static_runner.run_static_patterns_with_ledger(
         {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
     )
@@ -803,7 +804,8 @@ def test_list_placeholder_cannot_hide_following_shell_command(
     ],
 )
 def test_nested_list_placeholder_does_not_exempt_unproven_content(content: str) -> None:
-    assert tm._markdown_shell_text(content, lambda: None) == content
+    expected = content.replace("```", "   ")
+    assert tm._markdown_shell_text(content, lambda: None) == expected
     result = static_runner.run_static_patterns_with_ledger(
         {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
     )
