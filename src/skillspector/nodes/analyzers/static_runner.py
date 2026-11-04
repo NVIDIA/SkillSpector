@@ -28,7 +28,7 @@ from array import array
 from bisect import bisect_right
 from collections.abc import Callable, Iterator, Mapping
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from inspect import getattr_static
 from itertools import chain
 from typing import cast
@@ -46,6 +46,9 @@ from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
+    ParserCause,
+    ParserDiagnostic,
+    StaticParserDiagnostic,
     analyzer_status_for_events,
     ledger_event,
 )
@@ -819,6 +822,83 @@ class _StaticScanMetrics(dict[str, int | float]):
     """Internal scan metrics with status that must never enter ledger fields."""
 
     fully_scanned_aggregate_overflow: bool = False
+    parser_diagnostic: StaticParserDiagnostic | None = None
+
+
+def _bounded_parser_incomplete(
+    module: object,
+    view: SecurityTextView,
+    check_runtime: Callable[[], None],
+    *,
+    file_type: str,
+    complete_context: bool,
+    source_start: int = 0,
+    diagnostics: list[StaticParserDiagnostic] | None = None,
+    path: str = "",
+    python_import_bounds: PythonImportBounds | None = None,
+) -> bool:
+    kwargs = {"file_type": file_type, "complete_context": complete_context}
+    if vars(module).get("USES_PYTHON_IMPORT_BOUNDS") is True and python_import_bounds is not None:
+        kwargs["python_import_check"] = lambda check: python_import_bounds.allows(
+            path, view.text, check
+        )
+        kwargs["python_stdlib_check"] = python_import_bounds.allows_stdlib
+    detailed_hook = _explicit_analysis_hook(module, "bounded_parse_diagnostic")
+    if detailed_hook is not None:
+        diagnostic = detailed_hook(view.text, check_runtime, **kwargs)
+        if (
+            isinstance(diagnostic, StaticParserDiagnostic)
+            and diagnostics is not None
+            and not diagnostics
+            and view.text
+        ):
+            begin = max(0, min(diagnostic.start, len(view.text) - 1))
+            end = max(begin + 1, min(diagnostic.end, len(view.text)))
+            source_begin = source_start + view.source_offset(begin)
+            source_end = source_start + view.source_offset(end - 1) + 1
+            derived = view.name != "raw" or view.source_offsets is not None
+            diagnostic = replace(
+                diagnostic,
+                start=source_begin,
+                end=source_end,
+                location_precision="enclosing_expression"
+                if derived or begin != diagnostic.start or end != diagnostic.end
+                else diagnostic.location_precision,
+                cause=ParserCause.BOUNDARY_UNRESOLVED
+                if derived and diagnostic.cause is ParserCause.MALFORMED_INPUT
+                else diagnostic.cause,
+                full_input_checked=diagnostic.full_input_checked and complete_context,
+            )
+            diagnostics.append(diagnostic)
+        return bool(diagnostic)
+    hook = getattr(module, "has_bounded_parse_exhaustion", None)
+    return bool(hook(view.text, check_runtime, **kwargs)) if callable(hook) else False
+
+
+def _public_parser_diagnostic(
+    content: str, diagnostic: StaticParserDiagnostic | None
+) -> ParserDiagnostic | None:
+    if diagnostic is None or not content:
+        return None
+    begin = max(0, min(diagnostic.start, len(content) - 1))
+    end = max(begin + 1, min(diagnostic.end, len(content)))
+    line_starts = logical_line_starts(content)
+    result: ParserDiagnostic = {
+        "cause": diagnostic.cause,
+        "check": diagnostic.check,
+        "source_start_offset": begin,
+        "source_end_offset": end,
+        "start_line": bisect_right(line_starts, begin),
+        "end_line": bisect_right(line_starts, end - 1),
+        "unchecked_scope": diagnostic.unchecked_scope,
+        "observed_is_lower_bound": diagnostic.observed_is_lower_bound,
+        "full_input_checked": diagnostic.full_input_checked,
+        "location_precision": diagnostic.location_precision
+        if begin == diagnostic.start and end == diagnostic.end
+        else "enclosing_expression",
+    }
+    result.update(diagnostic.measurements)
+    return result
 
 
 @dataclass
@@ -2125,28 +2205,6 @@ def _python_import_bounds(
     return PythonImportBounds(paths, file_cache)
 
 
-def _bounded_parse_exhaustion(
-    module: object,
-    content: str,
-    check_runtime: Callable[[], None],
-    *,
-    path: str,
-    file_type: str,
-    complete_context: bool,
-    python_import_bounds: PythonImportBounds | None,
-) -> bool:
-    hook = getattr(module, "has_bounded_parse_exhaustion", None)
-    if not callable(hook):
-        return False
-    kwargs = {"file_type": file_type, "complete_context": complete_context}
-    if vars(module).get("USES_PYTHON_IMPORT_BOUNDS") is True and python_import_bounds is not None:
-        kwargs["python_import_check"] = lambda check: python_import_bounds.allows(
-            path, content, check
-        )
-        kwargs["python_stdlib_check"] = python_import_bounds.allows_stdlib
-    return bool(hook(content, check_runtime, **kwargs))
-
-
 def _scan_declared_marker_views(
     path: str,
     content: str,
@@ -2160,6 +2218,7 @@ def _scan_declared_marker_views(
     defer_projected_output_limit: bool,
     complete_context: bool,
     prepared_analyses: Mapping[int, object] | None = None,
+    parser_diagnostics: list[StaticParserDiagnostic] | None = None,
     python_import_bounds: PythonImportBounds | None = None,
 ) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
@@ -2369,12 +2428,14 @@ def _scan_declared_marker_views(
                     if callable(exhaustion_hook):
                         check_runtime()
                         bounded_parse_limited = bounded_parse_limited or bool(
-                            _bounded_parse_exhaustion(
+                            _bounded_parser_incomplete(
                                 module,
-                                marker_view.text,
+                                marker_view,
                                 check_runtime,
                                 file_type=_infer_file_type(path),
                                 complete_context=complete_context,
+                                source_start=raw_start,
+                                diagnostics=parser_diagnostics,
                                 path=path,
                                 python_import_bounds=python_import_bounds,
                             )
@@ -2408,6 +2469,57 @@ def _scan_all_views_detailed(
     readable_binary: bool = False,
     _oms_projected: bool = False,
     python_import_bounds: PythonImportBounds | None = None,
+) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
+    """Retain first parser evidence alongside every existing terminal scan result."""
+    diagnostics: list[StaticParserDiagnostic] = []
+
+    def with_diagnostic(metrics: dict[str, int | float]) -> dict[str, int | float]:
+        if not diagnostics:
+            return metrics
+        enriched = _StaticScanMetrics(metrics)
+        enriched.fully_scanned_aggregate_overflow = getattr(
+            metrics, "fully_scanned_aggregate_overflow", False
+        )
+        enriched.parser_diagnostic = diagnostics[0]
+        return enriched
+
+    try:
+        findings, reason, metrics = _scan_all_views_with_parser_diagnostics(
+            path,
+            content,
+            pattern_modules,
+            python_ast_cache_key,
+            max_findings=max_findings,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            python_ast=python_ast,
+            python_source=python_source,
+            readable_binary=readable_binary,
+            _oms_projected=_oms_projected,
+            python_import_bounds=python_import_bounds,
+            parser_diagnostics=diagnostics,
+        )
+    except _StaticResourceLimitError as exc:
+        exc.metrics = with_diagnostic(exc.metrics)
+        raise
+    return findings, reason, with_diagnostic(metrics)
+
+
+def _scan_all_views_with_parser_diagnostics(
+    path: str,
+    content: str,
+    pattern_modules: list,
+    python_ast_cache_key: str | None,
+    *,
+    max_findings: int = MAX_FINDINGS_PER_ARTIFACT,
+    timeout_seconds: float | None = None,
+    started_at: float | None = None,
+    python_ast: ParsedPythonFile | None = None,
+    python_source: bool | None = None,
+    readable_binary: bool = False,
+    _oms_projected: bool = False,
+    python_import_bounds: PythonImportBounds | None = None,
+    parser_diagnostics: list[StaticParserDiagnostic],
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Scan bounded raw windows and return any limit with observed/limit metrics."""
     started_at = time.monotonic() if started_at is None else started_at
@@ -2495,6 +2607,9 @@ def _scan_all_views_detailed(
             )
             finding.evidence[_SOURCE_START_EVIDENCE] = projection.view.source_offset(0)
             finding.evidence.pop(_SOURCE_END_EVIDENCE, None)
+        diagnostic = getattr(metrics, "parser_diagnostic", None)
+        if isinstance(diagnostic, StaticParserDiagnostic):
+            parser_diagnostics.append(diagnostic.enclosed(0, len(content)))
         return findings, reason, metrics
     ast_modules = [module for module in pattern_modules if _uses_python_ast(module)]
     lexical_modules = [module for module in pattern_modules if not _uses_python_ast(module)]
@@ -2674,6 +2789,7 @@ def _scan_all_views_detailed(
                 defer_projected_output_limit=coalesce is not None,
                 complete_context=whole_artifact_window,
                 prepared_analyses=prepared_analyses,
+                parser_diagnostics=parser_diagnostics,
                 python_import_bounds=python_import_bounds,
             )
             bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
@@ -2711,12 +2827,13 @@ def _scan_all_views_detailed(
                 if callable(exhaustion_hook):
                     finding_budget.check_runtime()
                     bounded_parse_limited = bounded_parse_limited or bool(
-                        _bounded_parse_exhaustion(
+                        _bounded_parser_incomplete(
                             module,
-                            content,
+                            SecurityTextView("raw", content),
                             finding_budget.check_runtime,
                             file_type=_infer_file_type(path),
                             complete_context=True,
+                            diagnostics=parser_diagnostics,
                             path=path,
                             python_import_bounds=python_import_bounds,
                         )
@@ -2842,14 +2959,16 @@ def _scan_all_views_detailed(
                                 python_source=python_source,
                             )
                             bounded_parse_limited = bounded_parse_limited or bool(
-                                _bounded_parse_exhaustion(
+                                _bounded_parser_incomplete(
                                     module,
-                                    full_view.text,
+                                    full_view,
                                     finding_budget.check_runtime,
                                     file_type=module_file_type,
                                     # A fragment cannot prove surrounding HTML,
                                     # container, or inline delimiter ownership.
                                     complete_context=whole_artifact_window,
+                                    source_start=raw_start,
+                                    diagnostics=parser_diagnostics,
                                     path=path,
                                     python_import_bounds=python_import_bounds,
                                 )
@@ -3523,6 +3642,7 @@ def run_static_patterns_with_ledger(
                 path_findings: list[Finding]
                 resource_limit: LedgerReason | None
                 resource_metrics: dict[str, int | float]
+                path_parser_diagnostic: StaticParserDiagnostic | None = None
                 source_classification: PythonSourceClassification | None = None
                 fully_scanned_aggregate_overflow = False
                 postprocessed = False
@@ -3579,6 +3699,9 @@ def run_static_patterns_with_ledger(
                             python_source=python_source,
                             readable_binary=bool(artifact.get("readable_binary")),
                             python_import_bounds=python_import_bounds,
+                        )
+                        path_parser_diagnostic = getattr(
+                            resource_metrics, "parser_diagnostic", None
                         )
                         fully_scanned_aggregate_overflow = bool(
                             resource_limit is LedgerReason.OUTPUT_LIMIT
@@ -3671,6 +3794,9 @@ def run_static_patterns_with_ledger(
                         path_findings = []
                         resource_limit = exc.reason
                         resource_metrics = exc.metrics
+                        path_parser_diagnostic = path_parser_diagnostic or getattr(
+                            exc.metrics, "parser_diagnostic", None
+                        )
                     except Exception as exc:
                         logger.warning("%s: scan error on %s: %s", analyzer_id, path, exc)
                         event = ledger_event(
@@ -3680,6 +3806,9 @@ def run_static_patterns_with_ledger(
                             path=path,
                             reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
                             error_class=type(exc).__name__,
+                            parser_diagnostic=_public_parser_diagnostic(
+                                content, path_parser_diagnostic
+                            ),
                         )
                         events.append(event)
                         continue
@@ -3701,10 +3830,22 @@ def run_static_patterns_with_ledger(
                     source_classification is PythonSourceClassification.AMBIGUOUS
                     and needs_python_source
                 )
-                partial = resource_limit is not None or oversized_python or ambiguous_python
+                # Reconciliation can clear an aggregate OUTPUT_LIMIT after
+                # coalescing findings; it cannot resolve an earlier parser gap.
+                partial = (
+                    resource_limit is not None
+                    or oversized_python
+                    or ambiguous_python
+                    or path_parser_diagnostic is not None
+                )
                 partial_reason = (
                     resource_limit
                     or (LedgerReason.SIZE_LIMIT if oversized_python else None)
+                    or (
+                        LedgerReason.STATIC_PARSE_LIMIT
+                        if path_parser_diagnostic is not None
+                        else None
+                    )
                     or LedgerReason.PYTHON_SOURCE_AMBIGUOUS
                 )
                 event = ledger_event(
@@ -3714,6 +3855,7 @@ def run_static_patterns_with_ledger(
                     path=path,
                     reason=partial_reason if partial else None,
                     emitted_finding_ids=[finding.finding_id for finding in path_findings],
+                    parser_diagnostic=_public_parser_diagnostic(content, path_parser_diagnostic),
                     observed_characters=(
                         len(content) if partial_reason is LedgerReason.SIZE_LIMIT else None
                     ),

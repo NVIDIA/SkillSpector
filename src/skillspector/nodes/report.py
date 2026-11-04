@@ -45,10 +45,12 @@ from skillspector.inspection_ledger import (
     RESOURCE_MEASUREMENT_UNITS,
     RULE_SET_SCOPE,
     AnalysisCompleteness,
+    ParserCause,
     finalize_ledger,
     format_recovery_policy_accepted,
     only_missing_reference_exceptions,
     resource_measurements,
+    sanitize_parser_diagnostic,
 )
 from skillspector.llm_provenance import sanitize_llm_provenance
 from skillspector.llm_utils import is_llm_available
@@ -136,22 +138,81 @@ _SANITIZED_FIELDS = (
 
 _REPORT_SAFE_SOURCE_ID_RE = re.compile(r"external/[0-9a-f]{64}\Z")
 
+_PARSER_CAUSE_DESCRIPTIONS = {
+    ParserCause.RESOURCE_LIMIT: "SkillSpector reached a configured inspection limit.",
+    ParserCause.BOUNDARY_UNRESOLVED: (
+        "SkillSpector could not determine this command or code fragment's boundaries."
+    ),
+    ParserCause.MALFORMED_INPUT: (
+        "This code fragment has invalid syntax (its structure is not valid for this language)."
+    ),
+    ParserCause.UNSUPPORTED_SYNTAX: "SkillSpector cannot fully inspect this code pattern yet.",
+    ParserCause.RUNTIME_DEPENDENT: (
+        "Full inspection depends on information available only when this code runs."
+    ),
+}
 
-def _inspection_exception_message(row: Mapping[str, object]) -> str:
-    """Describe recorded resource values without inventing missing measurements."""
-    message = str(row.get("message", ""))
+
+def _resource_measurement_description(
+    row: Mapping[str, object], *, lower_bound: bool = False
+) -> str:
     measurements = resource_measurements(row)
     details: list[str] = []
     for unit in RESOURCE_MEASUREMENT_UNITS:
         if f"observed_{unit}" in measurements or f"limit_{unit}" in measurements:
             observed = measurements.get(f"observed_{unit}", "not recorded")
             limit = measurements.get(f"limit_{unit}", "not recorded")
+            if lower_bound and f"observed_{unit}" in measurements:
+                observed = f"at least {observed}"
             details.append(f"{unit}: observed {observed}, limit {limit}")
+    return "; ".join(details)
+
+
+def _inspection_exception_message(row: Mapping[str, object]) -> str:
+    """Describe only vetted parser causes and actual resource measurements."""
+    original_message = str(row.get("message", ""))
+    message = ""
+    diagnostic = sanitize_parser_diagnostic(row.get("parser_diagnostic"))
+    details = _resource_measurement_description(row)
     if details:
-        return f"{message} Measurements: {'; '.join(details)}."
-    if str(row.get("reason_code", "")).endswith("_limit"):
-        return f"{message} Resource measurements not recorded."
-    return message
+        message += f" Measurements: {details}."
+    elif str(row.get("reason_code", "")).endswith("_limit") and (
+        diagnostic is None
+        or (
+            diagnostic["cause"] is ParserCause.RESOURCE_LIMIT
+            and not resource_measurements(diagnostic)
+        )
+    ):
+        message += " Resource measurements not recorded."
+    if diagnostic is not None:
+        message += f" {_PARSER_CAUSE_DESCRIPTIONS[diagnostic['cause']]}"
+        check = diagnostic["check"].replace("_", " ")
+        scope = diagnostic["unchecked_scope"].replace("_", " ")
+        location = (
+            "reported source range"
+            if diagnostic["location_precision"] == "source_span"
+            else "enclosing expression (exact inner location unavailable)"
+        )
+        message += f" Check: {check}; location: {location}; unchecked scope: {scope}."
+        message += (
+            " Relevant parser input fully checked."
+            if diagnostic["full_input_checked"]
+            else " Relevant parser input not fully checked."
+        )
+        measurements = _resource_measurement_description(
+            diagnostic, lower_bound=diagnostic["observed_is_lower_bound"]
+        )
+        if measurements:
+            message += f" Parser measurements: {measurements}."
+    return original_message if original_message.endswith(message) else original_message + message
+
+
+def _inspection_exception_lines(row: Mapping[str, object]) -> tuple[int | None, int | None]:
+    start, end = row.get("start_line"), row.get("end_line")
+    if type(start) is int and start > 0:
+        return start, end if type(end) is int and end >= start else None
+    diagnostic = sanitize_parser_diagnostic(row.get("parser_diagnostic"))
+    return (diagnostic["start_line"], diagnostic["end_line"]) if diagnostic else (None, None)
 
 
 def _clean_text(value: str | None) -> str | None:
@@ -951,8 +1012,7 @@ def _build_sarif(
         exception: Mapping[str, object], level: Literal["error", "warning", "note"]
     ) -> SarifNotification:
         path = str(exception.get("path", ""))
-        start_line = exception.get("start_line")
-        end_line = exception.get("end_line")
+        start_line, end_line = _inspection_exception_lines(exception)
         scope = exception.get("scope")
         locations = None
         # A rule-set row's path is a label, not an artifact; giving it a
@@ -989,6 +1049,9 @@ def _build_sarif(
         for key, value in resource_measurements(exception).items():
             prefix, _, unit = key.partition("_")
             properties[prefix + unit.capitalize()] = value
+        diagnostic = sanitize_parser_diagnostic(exception.get("parser_diagnostic"))
+        if diagnostic is not None:
+            properties["parserDiagnostic"] = dict(diagnostic)
         return SarifNotification(
             message=SarifMessage(text=_inspection_exception_message(exception)),
             level=level,
@@ -1136,8 +1199,7 @@ def _render_terminal_completeness(
                 continue
             # Analyzer status rows name an analyzer rather than a file.
             location = str(row.get("path") or row.get("analyzer_id") or "")
-            start_line = row.get("start_line")
-            end_line = row.get("end_line")
+            start_line, end_line = _inspection_exception_lines(row)
             if isinstance(start_line, int):
                 location += f":{start_line}" + (f"-{end_line}" if end_line else "")
             if row.get("scope") == RULE_SET_SCOPE:
@@ -1710,8 +1772,7 @@ def _render_markdown_completeness(
                 continue
             # Analyzer status rows name an analyzer rather than a file.
             location = str(row.get("path") or row.get("analyzer_id") or "")
-            start_line = row.get("start_line")
-            end_line = row.get("end_line")
+            start_line, end_line = _inspection_exception_lines(row)
             if isinstance(start_line, int):
                 location += f":{start_line}" + (f"-{end_line}" if end_line else "")
             reason = row.get("reason_code", row.get("status", "status"))
@@ -2104,6 +2165,19 @@ def report(state: SkillspectorState) -> dict[str, object]:
         or transitive_truncation_reasons
     ) and risk_recommendation == "SAFE":
         risk_recommendation = "CAUTION"
+
+    raw_exceptions = analysis_completeness.get("ledger_exceptions")
+    if isinstance(raw_exceptions, list):
+        analysis_completeness = {
+            **analysis_completeness,
+            "ledger_exceptions": [
+                {**row, "message": _inspection_exception_message(row)}
+                if isinstance(row, Mapping)
+                and sanitize_parser_diagnostic(row.get("parser_diagnostic")) is not None
+                else row
+                for row in raw_exceptions
+            ],
+        }
 
     sarif_report = _build_sarif(
         reported_findings,

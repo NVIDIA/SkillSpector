@@ -38,6 +38,7 @@ from skillspector.nodes.report import (
     _MAX_OCCURRENCES_PER_RULE,
     _SEVERITY_POINTS,
     _compute_risk_score,
+    _inspection_exception_message,
     report,
 )
 from skillspector.sarif_models import validate_sarif_report
@@ -3045,3 +3046,217 @@ def test_report_active_runtime_error_takes_priority_over_stale_preflight_reason(
     assert "active provider runtime failure" in metadata["llm_error"]
     assert "stale preflight reason" not in metadata["llm_error"]
     assert metadata["llm_degraded"] is True
+
+
+@pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
+@pytest.mark.parametrize(
+    ("cause", "fully_checked", "description"),
+    [
+        ("resource_limit", False, "SkillSpector reached a configured inspection limit."),
+        (
+            "boundary_unresolved",
+            False,
+            "SkillSpector could not determine this command or code fragment's boundaries.",
+        ),
+        (
+            "malformed_input",
+            True,
+            "This code fragment has invalid syntax (its structure is not valid for this language).",
+        ),
+        (
+            "unsupported_syntax",
+            False,
+            "SkillSpector cannot fully inspect this code pattern yet.",
+        ),
+        (
+            "runtime_dependent",
+            False,
+            "Full inspection depends on information available only when this code runs.",
+        ),
+        (
+            "malformed_input",
+            False,
+            "SkillSpector could not determine this command or code fragment's boundaries.",
+        ),
+    ],
+)
+def test_parser_cause_scope_and_prefix_measurements_reach_public_reports(
+    output_format: str, cause: str, fully_checked: bool, description: str
+) -> None:
+    finding = _finding("TM1", "HIGH", "retained finding", file="script.sh")
+    diagnostic = {
+        "cause": cause,
+        "check": "command_word_unquoted_characters",
+        "source_start_offset": 9,
+        "source_end_offset": 4106,
+        "start_line": 2,
+        "end_line": 3,
+        "unchecked_scope": "command_word",
+        "location_precision": "source_span",
+        "full_input_checked": fully_checked,
+        "observed_is_lower_bound": not fully_checked,
+        "observed_characters": 4097,
+        "limit_characters": 4096,
+        "command": "private payload",
+        "stage": "private-stage",
+    }
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        analyzer_id="static_test",
+        path="script.sh",
+        reason=LedgerReason.STATIC_PARSE_LIMIT,
+        emitted_finding_ids=[finding.finding_id],
+        parser_diagnostic=diagnostic,
+    )
+    state: SkillspectorState = {
+        "components": ["script.sh"],
+        "findings": [finding],
+        "filtered_findings": [finding],
+        "effective_finding_ids": [finding.finding_id],
+        "inspection_ledger": [event],
+        "analyzer_status_events": [analyzer_status_for_events("static_test", [event])],
+        "component_metadata": [],
+        "manifest": {},
+        "has_executable_scripts": False,
+        "output_format": output_format,
+        "use_llm": False,
+        "llm_requested": False,
+    }
+    state["analysis_completeness"], state["effective_finding_ids"] = finalize_ledger(state)
+    original_completeness = json.loads(json.dumps(state["analysis_completeness"]))
+    original_ledger = json.loads(json.dumps(state["inspection_ledger"]))
+    result = report(state)
+    assert state["analysis_completeness"] == original_completeness
+    assert state["inspection_ledger"] == original_ledger
+    projected_exception = result["analysis_completeness"]["ledger_exceptions"][0]
+    original_exception = original_completeness["ledger_exceptions"][0]
+    assert {k: v for k, v in projected_exception.items() if k != "message"} == {
+        k: v for k, v in original_exception.items() if k != "message"
+    }
+    assert description in projected_exception["message"]
+    projected = projected_exception["parser_diagnostic"]
+    expected_cause = (
+        "boundary_unresolved" if cause == "malformed_input" and not fully_checked else cause
+    )
+    assert projected["cause"] == expected_cause
+    assert projected["check"] == "command_word_unquoted_characters"
+    assert projected["unchecked_scope"] == "command_word"
+    assert projected["source_start_offset"] == 9
+    assert projected["source_end_offset"] == 4106
+    assert projected["observed_characters"] == 4097
+    assert projected["observed_is_lower_bound"] is not fully_checked
+    assert result["analysis_completeness"]["is_complete"] is False
+    assert result["analysis_completeness"]["execution_successful"] is True
+    assert "private payload" not in result["report_body"]
+    assert "private-stage" not in result["report_body"]
+    invocation = result["sarif_report"]["runs"][0]["invocations"][0]
+    notification = invocation["toolExecutionNotifications"][0]
+    assert notification["properties"]["parserDiagnostic"] == projected
+    assert notification["locations"][0]["physicalLocation"]["region"] == {
+        "startLine": 2,
+        "endLine": 3,
+    }
+    measurement = "observed 4097" if fully_checked else "observed at least 4097"
+    assert measurement in notification["message"]["text"]
+    assert description in notification["message"]["text"]
+    assert notification["message"]["text"] == projected_exception["message"]
+    assert notification["message"]["text"].count(description) == 1
+    assert "Resource measurements not recorded" not in notification["message"]["text"]
+    assert "unchecked scope: command word" in notification["message"]["text"]
+    assert "location: reported source range" in notification["message"]["text"]
+    for identifier in (cause, "command_word_unquoted_characters", "source_span", "command_word"):
+        assert identifier not in notification["message"]["text"]
+    if output_format == "json":
+        body = json.loads(result["report_body"])
+        assert (
+            body["analysis_completeness"]["ledger_exceptions"][0]["parser_diagnostic"] == projected
+        )
+        assert body["analysis_completeness"] == result["analysis_completeness"]
+        assert body["issues"][0]["id"] == "TM1"
+    elif output_format in {"terminal", "markdown"}:
+        body = (
+            MarkdownIt().render(result["report_body"])
+            if output_format == "markdown"
+            else result["report_body"]
+        )
+        rendered = " ".join(body.split())
+        assert description in rendered
+        assert measurement in rendered
+        assert "Resource measurements not recorded" not in rendered
+        assert "script.sh:2-3" in rendered
+        assert "retained finding" in rendered
+    validate_sarif_report(result["sarif_report"])
+
+    repeated = report({**state, "analysis_completeness": result["analysis_completeness"]})
+    assert repeated["analysis_completeness"] == result["analysis_completeness"]
+    repeated_notification = repeated["sarif_report"]["runs"][0]["invocations"][0][
+        "toolExecutionNotifications"
+    ][0]
+    assert repeated_notification["message"] == notification["message"]
+
+    unknown_event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        analyzer_id="static_test",
+        path="script.sh",
+        reason=LedgerReason.STATIC_PARSE_LIMIT,
+        emitted_finding_ids=[finding.finding_id],
+        parser_diagnostic={
+            key: value
+            for key, value in diagnostic.items()
+            if key not in {"observed_characters", "limit_characters"}
+        },
+    )
+    state["inspection_ledger"] = [unknown_event]
+    state["analyzer_status_events"] = [analyzer_status_for_events("static_test", [unknown_event])]
+    state["analysis_completeness"], state["effective_finding_ids"] = finalize_ledger(state)
+    unknown_result = report(state)
+    unknown_notification = unknown_result["sarif_report"]["runs"][0]["invocations"][0][
+        "toolExecutionNotifications"
+    ][0]
+    assert description in unknown_notification["message"]["text"]
+    assert ("Resource measurements not recorded" in unknown_notification["message"]["text"]) is (
+        cause == "resource_limit"
+    )
+    assert "observed 0" not in unknown_notification["message"]["text"]
+    if output_format in {"terminal", "markdown"}:
+        body = (
+            MarkdownIt().render(unknown_result["report_body"])
+            if output_format == "markdown"
+            else unknown_result["report_body"]
+        )
+        assert ("Resource measurements not recorded" in " ".join(body.split())) is (
+            cause == "resource_limit"
+        )
+
+
+def test_enclosing_parser_location_does_not_claim_malformed_input_or_lose_zero() -> None:
+    message = _inspection_exception_message(
+        {
+            "reason_code": "static_parse_limit",
+            "parser_diagnostic": {
+                "cause": "malformed_input",
+                "check": "expansion_boundary",
+                "source_start_offset": 10,
+                "source_end_offset": 30,
+                "start_line": 2,
+                "end_line": 3,
+                "unchecked_scope": "expression",
+                "location_precision": "enclosing_expression",
+                "full_input_checked": True,
+                "observed_is_lower_bound": False,
+                "observed_characters": 0,
+                "limit_characters": 4096,
+            },
+        }
+    )
+
+    assert "SkillSpector could not determine this command or code fragment's boundaries." in message
+    assert (
+        "This code fragment has invalid syntax (its structure is not valid for this language)."
+        not in message
+    )
+    assert "enclosing expression (exact inner location unavailable)" in message
+    assert "characters: observed 0, limit 4096" in message
+    assert "not recorded" not in message

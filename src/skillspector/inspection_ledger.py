@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from hashlib import sha256
 from typing import Final, NotRequired, cast
@@ -609,6 +610,141 @@ class ResourceMeasurements(TypedDict, total=False):
     limit_seconds: float
 
 
+class ParserCause(StrEnum):
+    RESOURCE_LIMIT = "resource_limit"
+    BOUNDARY_UNRESOLVED = "boundary_unresolved"
+    MALFORMED_INPUT = "malformed_input"
+    UNSUPPORTED_SYNTAX = "unsupported_syntax"
+    RUNTIME_DEPENDENT = "runtime_dependent"
+
+
+class ParserCheck(StrEnum):
+    COMMAND_WORD_CHARACTERS = "command_word_unquoted_characters"
+    COMMAND_ARGUMENT_CHARACTERS = "command_argument_characters"
+    COMMAND_WORD_BOUNDARY = "command_word_boundary"
+    COMMAND_ARGUMENT_BOUNDARY = "command_argument_boundary"
+    COMMAND_IDENTITY = "runtime_command_identity"
+    PRINTF_INPUT_CHARACTERS = "printf_input_characters"
+    PRINTF_ARGUMENT_COUNT = "printf_argument_count"
+    PRINTF_ARGUMENT_CHARACTERS = "printf_argument_characters"
+    PRINTF_OUTPUT_CHARACTERS = "printf_output_characters"
+    PRINTF_FORMAT = "printf_format"
+    PRINTF_INVOCATION = "printf_invocation"
+    WRAPPER_DEPTH = "wrapper_depth"
+    WRAPPER_ARGUMENTS = "wrapper_arguments"
+    WRAPPER_CLAUSE_STEPS = "wrapper_clause_steps"
+    COMMAND_STRING_DEPTH = "command_string_depth"
+    COMMAND_STRING_RUNTIME = "command_string_runtime"
+    COMMAND_STRING_EFFECTS = "command_string_effects"
+    STARTUP_PROOF_CHARACTERS = "startup_proof_characters"
+    BRACE_CHARACTERS = "brace_characters"
+    BRACE_ALTERNATIVES = "brace_alternatives"
+    BRACE_PRODUCTS = "brace_products"
+    BRACE_ROUNDS = "brace_rounds"
+    BRACE_SYNTAX = "brace_syntax"
+    MARKDOWN_LITERAL_OWNERSHIP = "markdown_literal_ownership"
+    HEREDOC_HEADER = "heredoc_header"
+    HEREDOC_COUNT = "heredoc_count"
+    HEREDOC_BODY = "heredoc_body"
+    HEREDOC_GRAMMAR = "heredoc_grammar"
+    EXPANSION_BOUNDARY = "expansion_boundary"
+
+
+class ParserUncheckedScope(StrEnum):
+    COMMAND_WORD = "command_word"
+    COMMAND_ARGUMENTS = "command_arguments"
+    COMMAND_STRING = "command_string"
+    EXPRESSION = "expression"
+    REMAINING_INPUT = "remaining_input"
+
+
+@dataclass(frozen=True)
+class StaticParserDiagnostic:
+    """Internal parser evidence in the current view's character coordinates."""
+
+    cause: ParserCause
+    check: ParserCheck
+    start: int
+    end: int
+    unchecked_scope: ParserUncheckedScope
+    measurements: ResourceMeasurements = field(default_factory=ResourceMeasurements)
+    observed_is_lower_bound: bool = False
+    full_input_checked: bool = False
+    location_precision: str = "source_span"
+
+    def shifted(self, offset: int) -> StaticParserDiagnostic:
+        return replace(self, start=self.start + offset, end=self.end + offset)
+
+    def enclosed(self, start: int, end: int) -> StaticParserDiagnostic:
+        """Attribute decoded text to its carrier without inventing inner columns."""
+        return replace(self, start=start, end=end, location_precision="enclosing_expression")
+
+
+class ParserDiagnostic(ResourceMeasurements):
+    """Payload-free public explanation of a parser's first unresolved scope."""
+
+    cause: ParserCause
+    check: ParserCheck
+    source_start_offset: int
+    source_end_offset: int
+    start_line: int
+    end_line: int
+    unchecked_scope: ParserUncheckedScope
+    observed_is_lower_bound: bool
+    full_input_checked: bool
+    location_precision: str
+
+
+def sanitize_parser_diagnostic(value: object) -> ParserDiagnostic | None:
+    """Accept only known parser identifiers, source coordinates and measurements."""
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        if not all(
+            isinstance(value.get(key), str) for key in ("cause", "check", "unchecked_scope")
+        ):
+            return None
+        cause = ParserCause(value.get("cause"))
+        check = ParserCheck(value.get("check"))
+        scope = ParserUncheckedScope(value.get("unchecked_scope"))
+    except (TypeError, ValueError):
+        return None
+    offsets = [value.get("source_start_offset"), value.get("source_end_offset")]
+    lines = [value.get("start_line"), value.get("end_line")]
+    if not all(type(number) is int and 0 <= number <= (1 << 63) - 1 for number in offsets + lines):
+        return None
+    start, end = cast(list[int], offsets)
+    start_line, end_line = cast(list[int], lines)
+    if start >= end or start_line < 1 or end_line < start_line:
+        return None
+    precision = value.get("location_precision")
+    lower_bound = value.get("observed_is_lower_bound")
+    checked = value.get("full_input_checked")
+    if (
+        type(precision) is not str
+        or precision not in {"source_span", "enclosing_expression"}
+        or type(lower_bound) is not bool
+        or type(checked) is not bool
+    ):
+        return None
+    if cause is ParserCause.MALFORMED_INPUT and (not checked or precision != "source_span"):
+        cause = ParserCause.BOUNDARY_UNRESOLVED
+    result: ParserDiagnostic = {
+        "cause": cause,
+        "check": check,
+        "source_start_offset": start,
+        "source_end_offset": end,
+        "start_line": start_line,
+        "end_line": end_line,
+        "unchecked_scope": scope,
+        "observed_is_lower_bound": lower_bound,
+        "full_input_checked": checked,
+        "location_precision": precision,
+    }
+    result.update(resource_measurements(value))
+    return result
+
+
 def resource_measurements(event: Mapping[str, object]) -> ResourceMeasurements:
     """Allow only bounded numeric diagnostics, never arbitrary graph payloads."""
     measurements: dict[str, int | float] = {}
@@ -642,6 +778,7 @@ class InspectionLedgerEvent(ResourceMeasurements):
     message: NotRequired[str]
     error_class: NotRequired[str]
     stage: NotRequired[str]
+    parser_diagnostic: NotRequired[ParserDiagnostic]
 
 
 class AnalyzerStatusEvent(TypedDict):
@@ -672,6 +809,7 @@ class InspectionLedgerException(ResourceMeasurements):
     fatal: NotRequired[bool]
     scope: NotRequired[str]
     source_identity: NotRequired[str]
+    parser_diagnostic: NotRequired[ParserDiagnostic]
 
 
 class AnalysisCompleteness(TypedDict):
@@ -785,6 +923,7 @@ def ledger_event(
     limit_records: int | None = None,
     observed_seconds: float | None = None,
     limit_seconds: float | None = None,
+    parser_diagnostic: ParserDiagnostic | None = None,
 ) -> InspectionLedgerEvent:
     """Create one validated terminal ledger record without sensitive payloads."""
     _validate_range(start_line, end_line)
@@ -867,6 +1006,9 @@ def ledger_event(
         event["observed_seconds"] = observed_seconds
     if limit_seconds is not None:
         event["limit_seconds"] = limit_seconds
+    safe_parser_diagnostic = sanitize_parser_diagnostic(parser_diagnostic)
+    if safe_parser_diagnostic is not None:
+        event["parser_diagnostic"] = safe_parser_diagnostic
     return event
 
 
@@ -1025,6 +1167,9 @@ def _exception_from_event(
     source_identity = event.get("source_identity")
     if isinstance(source_identity, str) and source_identity:
         exception["source_identity"] = source_identity
+    parser_diagnostic = sanitize_parser_diagnostic(event.get("parser_diagnostic"))
+    if parser_diagnostic is not None:
+        exception["parser_diagnostic"] = parser_diagnostic
     return exception
 
 
@@ -1034,6 +1179,7 @@ def _merge_exception_projection(
     """Group duplicate public rows while retaining all contributing analyzers."""
     grouped: dict[tuple[object, ...], InspectionLedgerException] = {}
     for exception in exceptions:
+        parser_diagnostic = sanitize_parser_diagnostic(exception.get("parser_diagnostic"))
         key = (
             exception["outcome"],
             exception["phase"],
@@ -1048,6 +1194,7 @@ def _merge_exception_projection(
             exception.get("scope"),
             exception.get("source_identity"),
             tuple(resource_measurements(exception).items()),
+            tuple(parser_diagnostic.items()) if parser_diagnostic else (),
         )
         existing = grouped.get(key)
         if existing is None:
