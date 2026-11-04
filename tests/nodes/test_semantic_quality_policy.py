@@ -343,9 +343,9 @@ class TestErrorHandling:
         assert result["inference_usage"][0]["usage_source"] == "provider_response"
         assert sanitize_inference_usage(result["inference_usage"]) == []
         assert result["inspection_ledger"]
-        assert result["inspection_ledger"][0]["outcome"] == "skipped"
+        assert result["inspection_ledger"][0]["outcome"] == "partial"
         assert result["inspection_ledger"][0]["reason_code"] == (
-            LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+            LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
         )
         assert result["analyzer_status_events"][0]["status"] == "degraded"
 
