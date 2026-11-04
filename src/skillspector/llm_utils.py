@@ -83,6 +83,7 @@ from skillspector.structured_response import (
     parse_response_object,
     validate_message,
     validate_payload,
+    validate_response_text,
 )
 from skillspector.structured_response import (
     StructuredOutputParseError as StructuredOutputParseError,
@@ -242,10 +243,12 @@ def fetch_model_token_limits(model_label: str) -> tuple[int, int]:
 
 
 class _AgentCLIMessage:
-    """Minimal stand-in for a LangChain message: exposes ``.content``."""
+    """A response returned after the CLI provider's completion call succeeds."""
 
     def __init__(self, content: str) -> None:
         self.content = content
+        # CLI text transports expose process completion, not a model stop reason.
+        self.response_metadata = {"status": "completed", "completion_source": "cli_process"}
 
 
 def _extract_json_object(raw: str) -> dict:
@@ -351,7 +354,29 @@ class _StructuredAgentCLIModel:
 
     def invoke(self, prompt: str) -> object:
         raw = self._complete(prompt)
-        return validate_payload(_extract_json_object(raw), self._schema)
+        return self._parse(raw)
+
+    def _parse(self, raw: str) -> object:
+        try:
+            payload = _extract_json_object(raw)
+        except StructuredOutputParseError as exc:
+            if exc.issue in {
+                ResponseIssue.INVALID_JSON,
+                ResponseIssue.INVALID_SCHEMA,
+                ResponseIssue.EMPTY,
+            }:
+                try:
+                    validate_response_text(raw, self._schema, completed=True)
+                except StructuredOutputParseError as parse_error:
+                    if parse_error.issue == ResponseIssue.LIMIT:
+                        raise
+                    exc.recovery_text = parse_error.recovery_text
+            raise
+        try:
+            return validate_payload(payload, self._schema)
+        except StructuredOutputParseError as exc:
+            exc.recovery_text = raw.strip()
+            raise
 
     async def ainvoke(self, prompt: str) -> object:
         return await asyncio.to_thread(self.invoke, prompt)
@@ -364,7 +389,7 @@ class _StructuredAgentCLIModel:
         """Mark this invocation after transport success and before parsing."""
         raw = self._complete(prompt)
         collector.mark_response_received()
-        return validate_payload(_extract_json_object(raw), self._schema)
+        return self._parse(raw)
 
     async def ainvoke_with_usage(
         self,
