@@ -8,11 +8,13 @@ import json
 import pytest
 
 from skillspector.graph import graph
-from tests.nodes.test_finalize_inspection_ledger import _VALID_PASSIVE_PNG
+from tests.nodes.test_finalize_inspection_ledger import _VALID_PASSIVE_BMP, _VALID_PASSIVE_PNG
 from tests.test_passive_jpeg import _jpeg
 
 
-@pytest.mark.parametrize("suffix,payload", [("png", _VALID_PASSIVE_PNG), ("jpg", _jpeg())])
+@pytest.mark.parametrize(
+    "suffix,payload", [("png", _VALID_PASSIVE_PNG), ("jpg", _jpeg()), ("bmp", _VALID_PASSIVE_BMP)]
+)
 @pytest.mark.parametrize(
     "role", ["caption", "rendered", "quoted", "mixed", "trailing", "executable"]
 )
