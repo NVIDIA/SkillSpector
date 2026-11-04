@@ -45,6 +45,11 @@ _HTML_CONTEXT_START = re.compile(
     r"<!--|<\?|<!\[CDATA\[|<![A-Z]|</?([A-Za-z][A-Za-z0-9-]*)(?=[\s/>])",
     re.IGNORECASE,
 )
+# Only a complete, strict JSON VERSION field is proven metadata. Never
+# suppress numeric paths or other quoted references by value alone.
+_JSON_VERSION_FIELD = re.compile(
+    r'^[ \t]*"VERSION"[ \t]*:[ \t]*"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)"[ \t]*,?[ \t]*$'
+)
 _QUOTED_OR_CODE_PATH = re.compile(
     r"(?:`|'|\")((?:\./)?(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?:`|'|\")"
 )
@@ -308,6 +313,7 @@ def _candidate_strings(
         if clock() >= deadline:
             return candidates, ("runtime",)
         stripped_line = line.rstrip("\r\n")
+        json_version_match = _JSON_VERSION_FIELD.fullmatch(stripped_line)
         source_offset += len(line)
         following_line_blank = source_offset == len(text) or bool(
             re.match(r"[ \t]{0,3}(?:\r?\n|\Z)", text[source_offset : source_offset + 5])
@@ -444,7 +450,16 @@ def _candidate_strings(
             )
             if pattern_index == 0:
                 markdown_destination_span = (match.start, match.end)
-            if not inside_destination and not redundant_image_label:
+            is_json_version_metadata = (
+                reference_kind is ReferenceKind.QUOTED_OR_CODE
+                and json_version_match is not None
+                and (match.start, match.end) == json_version_match.span("version")
+            )
+            if (
+                not inside_destination
+                and not redundant_image_label
+                and not is_json_version_metadata
+            ):
                 key = (line_number, match.start, raw)
                 if key not in seen:
                     seen.add(key)
