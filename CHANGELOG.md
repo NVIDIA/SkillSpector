@@ -1,6 +1,10 @@
 ### Unreleased maintenance fixes
 ### Fixes
 * Backport scoped `allowed-tools` grant handling from #768: recognize declarations such as `Bash(git:*)`, preserve spaces and commas inside scopes, and keep malformed grants or embedded tool names from declaring shell capability. Command restrictions remain intact in the manifest.
+* Stop backtick words in Python docstrings from marking files partially inspected (`static_parse_limit`) after the 2.13.3 shell-ownership backport. A docstring or other bare string statement is discarded, so its own body bounds a command named in it, unless the module reads docstrings back through `__doc__` or `getdoc`. The string-value guard also treats non-executing `os` calls (such as `os.makedirs` and `os.kill`) and name attributes (such as `type(error).__name__`) as inert; shell sinks, reflection and object escapes keep the whole-source fallback.
+* Ask Claude models reached through OpenAI-compatible gateways for exactly one JSON object when the schema is bound as `json_schema`. Gateways can serve that format through a tool Claude may skip, and a prose answer is rejected as `llm_structured_response_invalid`. Validation is unchanged.
+* Report which check rejected a model answer. Ledger rows and logs for rejected structured responses carry a `diagnostic` built only from fixed codes (check, channel, completion label, JSON shape, schema paths and per-attempt checks), never model output.
+* Retain up to 64 OSV advisories per locked package (was 16), so a dependency such as `filelock` with 17 advisories no longer leaves `poetry.lock` partial with `output_limit`. Per-scan detail and result budgets are unchanged.
 ---
 ### 2.13.3 (Unreleased)
 ### Security and integrity fixes

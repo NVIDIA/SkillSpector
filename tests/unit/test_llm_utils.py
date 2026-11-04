@@ -1031,6 +1031,59 @@ class TestStructuredOutputMethod:
         assert request["response_format"]["json_schema"]["strict"] is True
         assert "tools" not in request
 
+    @pytest.mark.parametrize(
+        "model",
+        ["aws/anthropic/bedrock-claude-sonnet-5-5", "aws/anthropic/bedrock-claude-opus-5-5"],
+    )
+    def test_gateway_claude_json_schema_asks_for_one_json_object(
+        self, monkeypatch: pytest.MonkeyPatch, model: str
+    ) -> None:
+        """A gateway can serve ``json_schema`` through a tool Claude may skip, so ask for the object."""
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        llm, requests = _stub_chat_openai(
+            monkeypatch,
+            [
+                AIMessage(
+                    content="The file looks fine.", response_metadata={"finish_reason": "stop"}
+                ),
+                AIMessage(
+                    content='{"summary": "ok"}',
+                    additional_kwargs={"parsed": Verdict(summary="ok")},
+                    response_metadata={"finish_reason": "stop"},
+                ),
+            ],
+        )
+        chain = bind_structured_output(llm, Verdict, model, provider=_PlainProvider())
+        with pytest.raises(StructuredOutputParseError):
+            chain.invoke("analyse this")  # type: ignore[attr-defined]
+        assert chain.invoke("analyse this") == Verdict(summary="ok")  # type: ignore[attr-defined]
+        for prompt, request in requests:
+            assert prompt.startswith("analyse this\n\n")
+            assert "exactly one JSON object that matches the required Verdict schema" in prompt
+            assert request["response_format"]["type"] == "json_schema"
+            assert request["response_format"]["json_schema"]["strict"] is True
+            assert "tools" not in request
+
+    @pytest.mark.parametrize(
+        ("model", "method", "expected"),
+        [
+            ("aws/anthropic/bedrock-claude-sonnet-5-5", None, True),
+            ("aws/anthropic/bedrock-claude-sonnet-5-5", "json_schema", True),
+            ("azure/anthropic/claude-opus-5", None, True),
+            ("aws/anthropic/bedrock-claude-sonnet-5-5", "function_calling", False),
+            ("gpt-5.4", None, False),
+            ("anthropic/claude-x/gpt-5.4", None, False),
+        ],
+    )
+    def test_json_object_instruction_is_limited_to_gateway_claude_json_schema(
+        self, monkeypatch: pytest.MonkeyPatch, model: str, method: str | None, expected: bool
+    ) -> None:
+        from skillspector.llm_utils import _gateway_claude_json_schema
+
+        llm, _ = _stub_chat_openai(monkeypatch, [])
+        assert _gateway_claude_json_schema(llm, model, method) is expected
+        assert _gateway_claude_json_schema(_RecordingLLM(), model, method) is False
+
     def test_cli_adapter_accepts_the_method_keyword(self) -> None:
         from skillspector.llm_utils import AgentCLIChatModel
 

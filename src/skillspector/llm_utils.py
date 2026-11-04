@@ -50,7 +50,7 @@ from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_openai.chat_models.base import BaseChatOpenAI
 from openai import ContentFilterFinishReasonError, LengthFinishReasonError, pydantic_function_tool
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from skillspector.inference_usage import (
     InferenceUsageCollector,
@@ -75,8 +75,10 @@ from skillspector.providers.chat_models import resolve_reasoning_effort
 from skillspector.providers.openai import OpenAIProvider
 from skillspector.structured_response import (
     MAX_RESPONSE_CHARS,
+    ResponseCheck,
     ResponseIssue,
     parse_response_object,
+    schema_error_paths,
     validate_message,
     validate_payload,
 )
@@ -213,7 +215,11 @@ def _extract_json_object(raw: str) -> dict:
     (fail-closed) when no JSON object can be parsed.
     """
     if len(raw) > MAX_RESPONSE_CHARS:
-        raise StructuredOutputParseError("response exceeds size limit", issue=ResponseIssue.LIMIT)
+        raise StructuredOutputParseError(
+            "response exceeds size limit",
+            issue=ResponseIssue.LIMIT,
+            check=ResponseCheck.SIZE_LIMIT,
+        )
     text = raw.strip()
     if text.startswith("```"):
         # Drop the opening fence line (``` or ```json) and any closing fence.
@@ -234,7 +240,9 @@ def _extract_json_object(raw: str) -> dict:
         except StructuredOutputParseError as exc:
             if exc.issue != ResponseIssue.INVALID_JSON:
                 raise
-    raise StructuredOutputParseError("could not extract a JSON object from CLI response")
+    raise StructuredOutputParseError(
+        "could not extract a JSON object from CLI response", check=ResponseCheck.CLI_JSON_MISSING
+    )
 
 
 def _complete_agent_cli(
@@ -470,7 +478,9 @@ def bind_structured_output(
     kwargs = structured_output_kwargs(model, provider, preferred_method=preferred_method)
     if preserve_text is not None and not isinstance(llm, BaseChatModel):
         raise StructuredOutputParseError(
-            "provider cannot verify lossless formatting", issue=ResponseIssue.FORMAT_CHANGED
+            "provider cannot verify lossless formatting",
+            issue=ResponseIssue.FORMAT_CHANGED,
+            check=ResponseCheck.FORMAT_UNSUPPORTED,
         )
     unforced = _binds_unforced_tool_call(llm, kwargs.get("method"))
     include_raw = isinstance(llm, BaseChatModel)
@@ -499,7 +509,9 @@ def bind_structured_output(
         def check(result: object) -> object:
             if not isinstance(result, dict) or result.get("raw") is None:
                 raise StructuredOutputParseError(
-                    "model returned no response", issue=ResponseIssue.EMPTY
+                    "model returned no response",
+                    issue=ResponseIssue.EMPTY,
+                    check=ResponseCheck.NO_RESPONSE,
                 )
             return validate_message(
                 result["raw"],
@@ -542,6 +554,13 @@ def bind_structured_output(
                 )
                 | checked
             )
+        if _gateway_claude_json_schema(llm, model, kwargs.get("method")):
+            return (
+                RunnableLambda(
+                    lambda prompt: f"{prompt}\n\n{_JSON_OBJECT_INSTRUCTION.format(tool=tool)}"
+                )
+                | checked
+            )
         return checked
     if unforced:
         return _require_tool_call(structured, schema, include_raw=include_raw)
@@ -574,6 +593,22 @@ _TOOL_CALL_INSTRUCTION = (
     "Report your result by calling the {tool} tool exactly once. Do not answer in prose."
 )
 
+# OpenAI-compatible gateways can serve Claude's ``json_schema`` answer through a tool the
+# model is not forced to call, so a prose answer leaves no JSON object to validate.
+_JSON_OBJECT_INSTRUCTION = (
+    "Return your result as exactly one JSON object that matches the required {tool} "
+    "schema. Do not add prose or Markdown code fences before or after it."
+)
+
+
+def _gateway_claude_json_schema(llm: object, model: str, method: str | None) -> bool:
+    """``True`` when an OpenAI-protocol client asks a Claude *model* for ``json_schema``."""
+    return (
+        isinstance(llm, BaseChatOpenAI)
+        and method in (None, "json_schema")
+        and "claude-" in model.rpartition("/")[2].lower()
+    )
+
 
 def _require_tool_call(
     structured: Runnable, schema: type, *, include_raw: bool = False
@@ -595,6 +630,15 @@ def _require_tool_call(
     )
 
 
+def _schema_errors(error: BaseException, schema: type) -> tuple[str, ...]:
+    """Schema paths for a parser's Pydantic failure, or none for other parser errors."""
+    cause = error if isinstance(error, ValidationError) else error.__cause__
+    if isinstance(cause, ValidationError) and isinstance(schema, type):
+        if issubclass(schema, BaseModel):
+            return schema_error_paths(cause, schema)
+    return ()
+
+
 def _validate_tool_call_result(
     structured: Runnable, schema: type, *, include_raw: bool = False
 ) -> Runnable:
@@ -610,7 +654,10 @@ def _validate_tool_call_result(
     def _check(result: object) -> object:
         if include_raw:
             if not isinstance(result, dict):
-                raise StructuredOutputParseError(f"model returned invalid {tool} tool output")
+                raise StructuredOutputParseError(
+                    f"model returned invalid {tool} tool output",
+                    check=ResponseCheck.TOOL_OUTPUT_INVALID,
+                )
             raw = result.get("raw")
             calls = getattr(raw, "tool_calls", None)
             if (
@@ -620,17 +667,21 @@ def _validate_tool_call_result(
                 or getattr(raw, "invalid_tool_calls", None)
             ):
                 raise StructuredOutputParseError(
-                    f"model must return exactly one valid {tool} tool call"
+                    f"model must return exactly one valid {tool} tool call",
+                    check=ResponseCheck.TOOL_CALL_COUNT,
                 )
             error = result.get("parsing_error")
             if error is not None:
                 raise StructuredOutputParseError(
-                    f"model returned invalid {tool} tool arguments"
+                    f"model returned invalid {tool} tool arguments",
+                    check=ResponseCheck.TOOL_ARGUMENTS_INVALID,
+                    schema_errors=_schema_errors(error, schema),
                 ) from error
             result = result.get("parsed")
         if result is None:
             raise StructuredOutputParseError(
-                f"model answered in prose instead of calling the {tool} tool"
+                f"model answered in prose instead of calling the {tool} tool",
+                check=ResponseCheck.TOOL_CALL_MISSING,
             )
         return result
 
@@ -639,7 +690,9 @@ def _validate_tool_call_result(
             return _check(structured.invoke(prompt, config=config))
         except OutputParserException as exc:
             raise StructuredOutputParseError(
-                f"model returned invalid {tool} tool arguments"
+                f"model returned invalid {tool} tool arguments",
+                check=ResponseCheck.TOOL_ARGUMENTS_INVALID,
+                schema_errors=_schema_errors(exc, schema),
             ) from exc
 
     async def _ainvoke(prompt: Any, config: RunnableConfig) -> object:
@@ -647,7 +700,9 @@ def _validate_tool_call_result(
             return _check(await structured.ainvoke(prompt, config=config))
         except OutputParserException as exc:
             raise StructuredOutputParseError(
-                f"model returned invalid {tool} tool arguments"
+                f"model returned invalid {tool} tool arguments",
+                check=ResponseCheck.TOOL_ARGUMENTS_INVALID,
+                schema_errors=_schema_errors(exc, schema),
             ) from exc
 
     return RunnableLambda(_invoke, _ainvoke)

@@ -14,8 +14,18 @@ import pytest
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 
-from skillspector.inspection_ledger import LedgerReason
-from skillspector.llm_analyzer_base import Batch, LLMAnalysisResult, LLMAnalyzerBase
+from skillspector.inspection_ledger import (
+    LedgerOutcome,
+    LedgerReason,
+    finalize_ledger,
+    ledger_event,
+)
+from skillspector.llm_analyzer_base import (
+    Batch,
+    LLMAnalysisResult,
+    LLMAnalyzerBase,
+    ledger_events_for_batches,
+)
 from skillspector.llm_utils import bind_structured_output, register_chat_model_provider
 from skillspector.nodes.analyzers.mcp_tool_poisoning import _TP4AnalysisResult, _TP4Analyzer
 from skillspector.nodes.analyzers.semantic_security_discovery import node as security_discovery
@@ -24,10 +34,12 @@ from skillspector.providers import reset_provider, use_provider
 from skillspector.providers.openai import OpenAIProvider
 from skillspector.structured_response import (
     MAX_RESPONSE_DEPTH,
+    ResponseCheck,
     ResponseIssue,
     StructuredOutputParseError,
     formatting_tokens,
     validate_message,
+    validate_payload,
     validate_response_text,
 )
 
@@ -752,3 +764,131 @@ def test_responses_api_keeps_original_tool_arguments_for_validation(monkeypatch,
             assert error.value.issue == ResponseIssue.INVALID_SCHEMA
         else:
             assert runnable.invoke("Assess").findings == []
+
+
+# Diagnostics name the failed check, never the model's text. A response carries
+# this canary so each test can prove it never reaches a diagnostic or log line.
+_CANARY = "canary-7f3a9c"
+
+
+@pytest.mark.parametrize(
+    "text, check, shape",
+    [
+        ('Here is the result:\n```json\n{"findings": []}\n```', "not_json_object", "prefix+fence"),
+        ('{"findings": []}\nNo issues found.', "not_json_object", "suffix"),
+        ('{"findings": []} {"findings": []}', "trailing_content", "object"),
+        ("No issues found.", "not_json_object", "no_object"),
+        ('{"findings": [}]}', "unbalanced_containers", None),
+        ('{"findings": ["\\$"]}', "invalid_string", None),
+        ('{"findings": [],}', "malformed_json", None),
+        ("", "empty_response", None),
+    ],
+)
+def test_text_failures_name_the_rejecting_check(text, check, shape):
+    message = AIMessage(content=text, response_metadata={"finish_reason": "stop"})
+    with pytest.raises(StructuredOutputParseError) as error:
+        validate_message(message, LLMAnalysisResult, tool="LLMAnalysisResult")
+    assert error.value.check == check
+    assert error.value.shape == shape
+    assert error.value.channel == ("text" if text else "empty")
+    assert error.value.finish == "stop"
+
+
+def test_schema_errors_report_declared_paths_without_values_or_invented_keys():
+    finding = {
+        "rule_id": "SDI-1",
+        "message": _CANARY,
+        "severity": _CANARY,
+        "start_line": 3,
+        _CANARY: "x",
+    }
+    with pytest.raises(StructuredOutputParseError) as error:
+        validate_payload({"findings": [finding]}, LLMAnalysisResult)
+    assert error.value.check == ResponseCheck.INVALID_FIELD
+    assert error.value.schema_errors == (
+        "findings.0.severity:literal_error",
+        "findings.0.*:extra_forbidden",
+    )
+
+
+def test_unrecognized_completion_labels_are_not_echoed():
+    message = AIMessage(content="prose", response_metadata={"finish_reason": _CANARY})
+    with pytest.raises(StructuredOutputParseError) as error:
+        validate_message(message, LLMAnalysisResult, tool="LLMAnalysisResult")
+    assert error.value.finish == "other"
+
+
+@pytest.mark.parametrize("method", ["json_schema", "function_calling"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_exhausted_retries_keep_each_attempts_check_in_the_ledger(
+    http_model, caplog, method, asynchronous
+):
+    answer = f'Assessment of {_CANARY}:\n```json\n{{"findings": []}}\n```'
+    requests = http_model([(answer, "stop")], method=method)
+    analyzer = make_analyzer("semantic_developer_intent")
+    batches = [Batch(file_path="a.py", content="x")]
+    outcome = (
+        asyncio.run(analyzer.arun_batches_detailed(batches))
+        if asynchronous
+        else analyzer.run_batches_detailed(batches)
+    )
+
+    channel = "text" if method == "json_schema" else "tool_call"
+    finish = "stop" if method == "json_schema" else "tool_calls"
+    expected = (
+        f"check=not_json_object; channel={channel}; finish={finish}; shape=prefix+fence; "
+        "attempts=4; checks=not_json_object,not_json_object,not_json_object,not_json_object"
+    )
+    assert len(requests) == 4
+    assert not outcome.successful
+    failure = outcome.failures[0]
+    assert failure.reason == LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+    assert failure.error_class == "ValidationError"
+    assert failure.diagnostic == expected
+    events, status = ledger_events_for_batches("semantic_developer_intent", outcome)
+    assert events[0]["diagnostic"] == expected
+    completeness, _ = finalize_ledger(
+        {
+            "components": ["a.py"],
+            "findings": [],
+            "inspection_ledger": events,
+            "analyzer_status_events": [status],
+        }
+    )
+    assert [row.get("diagnostic") for row in completeness["ledger_exceptions"]] == [expected]
+    assert _CANARY not in caplog.text
+    assert expected in caplog.text
+
+
+def test_format_recovery_failure_keeps_the_original_attempt_checks(http_model):
+    source = '{"findings":[{"rule_id":"SDI-1","message":"m","severity":"HIGH","start_line":1}],}'
+    http_model([(source, "stop"), ('{"findings": []}', "stop")])
+    outcome = make_analyzer("discovery").run_batches_detailed(
+        [Batch(file_path="a.py", content="x")]
+    )
+    assert outcome.failures[0].reason == LedgerReason.LLM_FORMAT_CHANGED
+    assert outcome.failures[0].diagnostic == (
+        "check=format_changed; channel=text; finish=stop; "
+        "attempts=2; checks=malformed_json,format_changed"
+    )
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        f"check=not_json_object; note={_CANARY} text",
+        'check=invalid_field; schema=findings.0."severity":literal_error',
+        "Check=not_json_object",
+        "check=" + "a" * 600,
+    ],
+)
+def test_ledger_drops_diagnostics_outside_the_fixed_code_format(diagnostic):
+    event = ledger_event(
+        outcome=LedgerOutcome.SKIPPED,
+        phase="semantic",
+        path="a.py",
+        analyzer_id="semantic_developer_intent",
+        reason=LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+        diagnostic=diagnostic,
+    )
+    assert "diagnostic" not in event

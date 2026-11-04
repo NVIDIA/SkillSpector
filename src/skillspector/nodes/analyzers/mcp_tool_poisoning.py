@@ -1581,6 +1581,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     end_line=failure.batch.end_line,
                     reason=failure.reason,
                     error_class=failure.error_class,
+                    diagnostic=failure.diagnostic,
                     observed_seconds=(
                         0.0 if failure.reason is LedgerReason.RUNTIME_LIMIT else None
                     ),
