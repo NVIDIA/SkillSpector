@@ -1561,7 +1561,7 @@ class TestDynamicTimeout:
             return chat_model
 
         calls = 200
-        countdown = iter(float(seconds) for seconds in range(calls + 1, 0, -1))
+        countdown = iter(float(seconds) for seconds in range(calls + 2, 0, -1))
         with patch(MOCK_PATCH_TARGET, side_effect=_factory):
             analyzer = LLMAnalyzerBase(
                 base_prompt="test",
@@ -1591,7 +1591,7 @@ class TestDynamicTimeout:
     def test_run_batches_resolves_timeout_per_batch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Dynamic timeout providers are called again before every LLM call."""
         captured_timeouts: list[float | None] = []
-        timeout_values = iter([30.0, 20.0, 10.0])
+        timeout_values = iter([30.0, 30.0, 20.0, 10.0])
 
         class _Structured:
             def invoke(self, prompt: str) -> LLMAnalysisResult:
@@ -1668,7 +1668,7 @@ class TestDynamicTimeout:
     def test_provider_timeout_at_shared_deadline_preserves_primary_cause(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        timeout_values = iter([5.0, 0.1, 0.0])
+        timeout_values = iter([5.0, 5.0, 0.1, 0.0])
 
         class _LLM:
             def with_structured_output(self, schema: type) -> _LLM:

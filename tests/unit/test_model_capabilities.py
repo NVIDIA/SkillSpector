@@ -22,7 +22,6 @@ from unittest.mock import patch
 
 import pytest
 from langchain_anthropic import ChatAnthropic
-from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_openai import ChatOpenAI
@@ -56,6 +55,7 @@ from skillspector.providers.structured_output import (
     rejects_forced_tool_call,
     rejects_sampling_controls,
 )
+from skillspector.structured_response import ResponseIssue
 
 
 class Verdict(BaseModel):
@@ -237,9 +237,11 @@ class TestAnthropicClaude55:
 
         chain = bind_structured_output(llm, Verdict, "claude-opus-5-5", provider)
 
-        # A ValueError after a response fails the analyzer instead of reading as clean.
-        with pytest.raises(OutputParserException):
+        # Refusals remain terminal and never supply text to formatting recovery.
+        with pytest.raises(StructuredOutputParseError) as caught:
             chain.invoke("analyse this")
+        assert caught.value.issue is ResponseIssue.REFUSED
+        assert caught.value.recovery_text is None
 
     @pytest.mark.parametrize(
         ("provider_cls", "temperature"),
@@ -315,7 +317,14 @@ class TestOpenAIStructuredOutput:
 
         assert chain.invoke("analyse this") == Verdict(ok=True)
         request = requests[0]
-        assert request["response_format"] is Verdict
+        response_format = request["response_format"]
+        assert response_format["type"] == "json_schema"
+        definition = response_format["json_schema"]
+        assert definition["name"] == "Verdict" and definition["strict"] is True
+        schema = definition["schema"]
+        assert schema["required"] == ["ok"]
+        assert schema["properties"]["ok"]["type"] == "boolean"
+        assert schema["additionalProperties"] is False
         assert "tools" not in request and "tool_choice" not in request
         assert request["max_completion_tokens"] == 128_000
         assert "temperature" not in request and "reasoning_effort" not in request

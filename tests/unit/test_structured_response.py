@@ -1087,7 +1087,7 @@ def test_formatting_retry_after_cannot_exceed_shared_deadline(
         ('{"findings": [], "extra": true}', "stop", LedgerReason.LLM_FORMAT_CHANGED),
     ],
 )
-def test_returned_formatting_failure_is_never_retried(
+def test_returned_formatting_failure_recovers_only_original_complete_answer(
     http_model, asynchronous, answer, stop, reason
 ):
     requests = http_model([('{"findings": [],}', "stop"), (answer, stop)])
@@ -1098,8 +1098,13 @@ def test_returned_formatting_failure_is_never_retried(
         if asynchronous
         else analyzer.run_batches_detailed(batches)
     )
-    assert not outcome.successful
-    assert outcome.failures[0].reason == reason
+    if stop == "stop":
+        assert outcome.successful == [(batches[0], [])]
+        assert not outcome.failures
+        assert not outcome.warnings
+    else:
+        assert not outcome.successful
+        assert outcome.failures[0].reason == reason
     assert len(requests) == 2
 
 
