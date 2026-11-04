@@ -1636,6 +1636,13 @@ class LLMAnalyzerBase:
                 items.extend(original.findings if is_list else [original])
                 return self._recovered_result(batch, items, True)
             raw_items = payload.get("findings") if is_list else [payload]
+            if is_list and not isinstance(raw_items, list):
+                # A malformed container cannot establish an exhaustive assessment.
+                # Retain a single object before asking for a count so a later zero
+                # cannot erase an issue already present in the original answer.
+                complete = False
+                if isinstance(raw_items, dict):
+                    raw_items = [raw_items]
             if isinstance(raw_items, list) and (item_schema is LLMFinding or not is_list):
                 for raw_item in raw_items:
                     retained: dict[str, Any] = {}

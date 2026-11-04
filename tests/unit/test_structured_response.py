@@ -773,6 +773,8 @@ def test_formatting_cannot_turn_a_finding_into_a_clean_result(http_model):
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("object_container", [False, True])
+@pytest.mark.parametrize("severity", ["LOW", "MEDIUM", "HIGH", "CRITICAL"])
 @pytest.mark.parametrize(
     "original_fields,expected_confidence",
     [
@@ -783,19 +785,18 @@ def test_formatting_cannot_turn_a_finding_into_a_clean_result(http_model):
         ({"start_line": "unknown"}, 0.5),
     ],
 )
-def test_field_recovery_cannot_erase_original_high_when_details_remain_unknown(
-    http_model, asynchronous, original_fields, expected_confidence
+def test_field_recovery_cannot_erase_original_finding_when_details_remain_unknown(
+    http_model, asynchronous, object_container, severity, original_fields, expected_confidence
 ):
-    source = json.dumps(
-        {"findings": [{"rule_id": "SSD-1", "severity": "HIGH", "start_line": 1, **original_fields}]}
-    )
+    original = {"rule_id": "SSD-1", "severity": severity, "start_line": 1, **original_fields}
+    source = json.dumps({"findings": original if object_container else [original]})
     requests = http_model([(source, "stop"), ("0", "stop"), ("UNKNOWN", "stop")])
     analyzer = make_analyzer("discovery")
     analyzer.recovery_rule_ids = ("SSD-1",)
     outcome = run_outcome(analyzer, [Batch(file_path="a.py", content="x")], asynchronous)
     assert not outcome.successful and not outcome.failures
     (finding,) = outcome.recovered[0][1]
-    assert (finding.rule_id, finding.severity) == ("SSD-1", "HIGH")
+    assert (finding.rule_id, finding.severity) == ("SSD-1", severity)
     assert finding.confidence == expected_confidence
     assert finding.start_line == 1
     assert finding.evidence["assessment_complete"] is False
@@ -805,10 +806,14 @@ def test_field_recovery_cannot_erase_original_high_when_details_remain_unknown(
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("object_container", [False, True])
 def test_known_high_switches_to_field_recovery_before_a_replacement_assessment(
-    http_model, asynchronous
+    http_model, asynchronous, object_container
 ):
-    source = '{"findings":[{"rule_id":"SSD-1","severity":"HIGH","start_line":1}]}'
+    original = {"rule_id": "SSD-1", "severity": "HIGH", "start_line": 1}
+    if object_container:
+        original["message"] = "Leaks data"
+    source = json.dumps({"findings": original if object_container else [original]})
     requests = http_model([(source, "stop"), ("0", "stop")])
     analyzer = make_analyzer("discovery")
     analyzer.recovery_rule_ids = ("SSD-1",)
@@ -893,14 +898,15 @@ def test_failed_formatting_retains_original_high_and_terminal_failure(
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("object_container", [False, True])
 @pytest.mark.parametrize("failure_stage,expected_calls", [("formatting", 2), ("initial_count", 2)])
 def test_provider_failure_preserves_original_high_before_recovery_fields_finish(
-    http_model, asynchronous, failure_stage, expected_calls
+    http_model, asynchronous, object_container, failure_stage, expected_calls
 ):
     original = {"rule_id": "SSD-1", "severity": "HIGH", "start_line": 1}
     if failure_stage == "formatting":
         original["message"] = "Leaks data"
-    source = json.dumps({"findings": [original]})
+    source = json.dumps({"findings": original if object_container else [original]})
     if failure_stage == "formatting":
         source = source[:-1] + ",}"
     requests = http_model([(source, "stop")], failures={expected_calls: 401})
@@ -1117,6 +1123,9 @@ def test_missing_or_extra_assessment_data_uses_bounded_recovery_without_formatti
         '{"findings": [], "findings": [{"severity": "HIGH"}]}',
         '{"findings": NaN}',
         '{"findings": 1e999}',
+        '{"findings": null}',
+        '{"findings": "unknown"}',
+        "{}",
         '{"findings": []} {"findings": [{"severity": "HIGH"}]}',
     ],
 )
