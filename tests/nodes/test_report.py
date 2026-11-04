@@ -41,6 +41,7 @@ from skillspector.nodes.report import (
     report,
 )
 from skillspector.sarif_models import validate_sarif_report
+from skillspector.semantic_runtime import required_semantic_analyzer_ids
 from skillspector.state import SkillspectorState, llm_call_record
 from skillspector.suppression import Baseline, SuppressionRule
 
@@ -1846,6 +1847,74 @@ def test_report_markdown_shows_degraded_warning(monkeypatch: pytest.MonkeyPatch)
     }
     body = report(state)["report_body"]
     assert "Degraded scan" in body
+
+
+@pytest.mark.parametrize("output_format", ["json", "markdown", "terminal", "sarif"])
+@pytest.mark.parametrize("transitive_truncated", [False, True])
+def test_format_policy_reports_acceptance_without_claiming_complete_inspection(
+    output_format: str,
+    transitive_truncated: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
+    events = [
+        ledger_event(
+            analyzer_id=analyzer,
+            phase="semantic",
+            path="SKILL.md",
+            outcome=(
+                LedgerOutcome.PARTIAL
+                if analyzer == "semantic_security_discovery"
+                else LedgerOutcome.COMPLETED
+            ),
+            reason=(
+                LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+                if analyzer == "semantic_security_discovery"
+                else None
+            ),
+        )
+        for analyzer in sorted(required_semantic_analyzer_ids({}))
+    ]
+    state = {
+        "use_llm": True,
+        "components": ["SKILL.md"],
+        "output_format": output_format,
+        "findings": [],
+        "filtered_findings": [],
+        "manifest": {"name": "format-recovery"},
+        "inspection_ledger": events,
+        "analyzer_status_events": [
+            analyzer_status_for_events(event["analyzer_id"], [event]) for event in events
+        ],
+        "llm_call_log": [llm_call_record(event["analyzer_id"], ok=True) for event in events],
+    }
+    state["analysis_completeness"], _ = finalize_ledger(state)
+    if transitive_truncated:
+        state["transitive_truncation_reasons"] = ["target budget reached"]
+    result = report(state)
+    completeness = result["analysis_completeness"]
+    assert completeness["policy_accepted"] is (not transitive_truncated)
+    assert all(
+        warning["accepted_by_policy"] is (not transitive_truncated)
+        for warning in completeness["warnings"]
+    )
+    assert state["analysis_completeness"]["warnings"][0]["accepted_by_policy"] is True
+    assert completeness["is_complete"] is False
+    assert completeness["status"] == "partial"
+    assert result["risk_recommendation"] == "CAUTION"
+    if output_format == "json":
+        payload = json.loads(result["report_body"])
+        assert payload["metadata"]["llm_assessment_complete"] is False
+        assert payload["metadata"]["llm_recovery_policy_accepted"] is (not transitive_truncated)
+    elif output_format == "sarif":
+        invocation = result["sarif_report"]["runs"][0]["invocations"][0]
+        projection = invocation["properties"]["analysisCompleteness"]
+        assert projection["acceptedByPolicy"] is (not transitive_truncated)
+        assert projection["assessmentComplete"] is False
+    else:
+        assert ("Accepted with warning" in result["report_body"]) is (not transitive_truncated)
+        if not transitive_truncated:
+            assert "assessment remains incomplete" in result["report_body"]
 
 
 def test_report_sarif_carries_degradation_notification() -> None:

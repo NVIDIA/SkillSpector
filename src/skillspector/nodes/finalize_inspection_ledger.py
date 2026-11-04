@@ -24,6 +24,7 @@ from skillspector.inspection_ledger import (
     LedgerRecordType,
     analyzer_status_for_events,
     finalize_ledger,
+    format_recovery_policy_accepted,
     inspection_work_id,
     ledger_event,
 )
@@ -803,9 +804,11 @@ def _reference_coverage_findings(
     fatal_paths: set[str] = set()
     exceptions_by_path: dict[str, list[Mapping[str, object]]] = {}
     canonicalization_succeeded = False
+    format_recovery_accepted = False
     if ledger_shape_complete and inventory_shape_complete and status_shape_complete:
         try:
             preexisting_completeness, _ = finalize_ledger(state)
+            format_recovery_accepted = format_recovery_policy_accepted(preexisting_completeness)
             for exception in preexisting_completeness["ledger_exceptions"]:
                 exceptions_by_path.setdefault(str(exception.get("path", "")), []).append(exception)
             fatal_paths = {
@@ -928,6 +931,22 @@ def _reference_coverage_findings(
             else ""
         )
         if final_disposition not in {"partial", "failed", "out_of_scope"}:
+            continue
+        # Accepted AI formatting uncertainty remains a visible coverage warning.
+        # It does not turn already-read text into a HIGH artifact-evasion finding.
+        # The global proof rejects any independent analyzer/accounting gap.
+        if (
+            ledger_evidence_complete
+            and format_recovery_accepted
+            and target_path not in invalid_status_paths
+            and target_path not in duplicate_inventory_paths
+            and inventory_item is not None
+            and disposition == reference_disposition == ArtifactDisposition.ANALYZED
+            and inventory_item.get("content_kind") == ContentKind.TEXT
+            and inventory_item.get("reason") is None
+            and inventory_item.get("inherited_exclusion_reason") is None
+            and inventory_item.get("misleading_extension") is not True
+        ):
             continue
         if (
             provider_evidence_complete
@@ -1094,6 +1113,65 @@ def _analyzer_load_error_events() -> list[InspectionLedgerEvent]:
         )
         for module_name in sorted(ANALYZER_LOAD_ERRORS)
     ]
+
+
+def _reconcile_inspected_containers(state: SkillspectorState) -> dict[str, object]:
+    """Roll descendant gaps into successfully traversed containers in linear time."""
+    raw_inventory = state.get("artifact_inventory") or []
+    if not isinstance(raw_inventory, list) or not all(
+        isinstance(item, dict) and isinstance(item.get("path"), str) for item in raw_inventory
+    ):
+        return {}
+    rows = [dict(item) for item in raw_inventory]
+    inventory = {item["path"]: item for item in rows}
+    containers = {
+        path: item["inspected_members"]
+        for path, item in inventory.items()
+        if "inspected_members" in item
+    }
+    if not containers:
+        return {}
+    completeness, _ = finalize_ledger(state)
+    if format_recovery_policy_accepted(completeness):
+        # Traversal succeeded; the member's AI warning remains in the ledger.
+        # Do not turn accepted formatting uncertainty into an archive-access gap.
+        return {}
+    incomplete = {
+        str(row["path"])
+        for row in completeness["ledger_exceptions"]
+        if row.get("reason_code") not in _REFERENCE_CAVEAT_REASONS
+    } | {
+        path
+        for path, item in inventory.items()
+        if item["disposition"] in {"partial", "failed"}
+        or (item["disposition"] == "out_of_scope" and item.get("referenced"))
+    }
+    parents: dict[str, set[str]] = {}
+    for path, members in containers.items():
+        for member in members:
+            parents.setdefault(member, set()).add(path)
+            if member not in inventory:
+                incomplete.add(path)
+    pending = list(incomplete)
+    while pending:
+        for parent in parents.get(pending.pop(), ()):
+            if parent not in incomplete:
+                incomplete.add(parent)
+                pending.append(parent)
+    incomplete_containers = containers.keys() & incomplete
+    for item in rows:
+        if item["path"] in incomplete_containers and item["disposition"] == "analyzed":
+            item["disposition"] = ArtifactDisposition.PARTIAL
+            item["reason"] = LedgerReason.ARCHIVE_MEMBER_INCOMPLETE.value
+    return {
+        "artifact_inventory": rows,
+        "artifact_references": [
+            {**reference, "disposition": inventory[reference["target_path"]]["disposition"]}
+            if reference.get("target_path") in containers
+            else reference
+            for reference in state.get("artifact_references") or []
+        ],
+    }
 
 
 def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:

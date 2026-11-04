@@ -29,6 +29,9 @@ RESOURCE_MEASUREMENT_UNITS: Final = (
     "records",
     "seconds",
 )
+FORMAT_RECOVERY_SEMANTIC_ANALYZERS: Final = frozenset(
+    {"semantic_security_discovery", "semantic_developer_intent", "semantic_quality_policy"}
+)
 
 
 class LedgerOutcome(StrEnum):
@@ -85,6 +88,7 @@ class LedgerReason(StrEnum):
     LLM_RESPONSE_EMPTY = "llm_response_empty"
     LLM_RESPONSE_LIMIT = "llm_response_limit"
     LLM_FORMAT_CHANGED = "llm_format_changed"
+    LLM_FORMAT_RECOVERY_EXHAUSTED = "llm_format_recovery_exhausted"
     LLM_CONNECTION_RETRIES_EXHAUSTED = "llm_connection_retries_exhausted"
     ANALYZER_RUNTIME_ERROR = "analyzer_runtime_error"
     ANALYZER_LOAD_ERROR = "analyzer_load_error"
@@ -150,6 +154,229 @@ def only_missing_reference_exceptions(exceptions: object) -> bool:
     )
 
 
+def format_recovery_policy_accepted(completeness: Mapping[str, object]) -> bool:
+    """Validate the derived format-only acceptance without claiming complete inspection.
+
+    The producer also proves runtime accounting before setting ``policy_accepted``.
+    Consumers must retain that projection intact: a flag alone, extra limitations,
+    or a warning for a different file cannot waive a remaining inspection gap.
+    """
+    if (
+        completeness.get("policy_accepted") is not True
+        or completeness.get("execution_successful") is not True
+        or completeness.get("status") != "partial"
+        or completeness.get("is_complete") is not False
+        or completeness.get("entirely_uninspected_files") != 0
+        or any(completeness.get(name) for name in ("exceptions", "errors", "failures"))
+    ):
+        return False
+    scope_rows = completeness.get("scope_exclusions")
+    if not isinstance(scope_rows, list) or any(
+        not isinstance(row, Mapping)
+        or row.get("outcome") != LedgerOutcome.OUT_OF_SCOPE
+        or row.get("fatal") is not False
+        or row.get("reason_code")
+        not in (LedgerReason.BASELINE_FILE, LedgerReason.OMS_SIGNATURE, LedgerReason.VCS_METADATA)
+        for row in scope_rows
+    ):
+        return False
+    counts = [
+        completeness.get(name)
+        for name in (
+            "total_components",
+            "scanned_components",
+            "fully_inspected_files",
+            "partially_inspected_files",
+            "entirely_uninspected_files",
+        )
+    ]
+    if not all(type(value) is int and value >= 0 for value in counts):
+        return False
+    total, scanned, fully, partially, entirely = (cast(int, value) for value in counts)
+    if total != fully + partially + entirely or scanned != fully:
+        return False
+    rows = completeness.get("ledger_exceptions")
+    warnings = completeness.get("warnings")
+    statuses = completeness.get("analyzer_statuses")
+    limitations = completeness.get("limitations")
+    if not all(isinstance(value, list) for value in (rows, warnings, statuses, limitations)):
+        return False
+    assert isinstance(rows, list) and isinstance(warnings, list)
+    assert isinstance(statuses, list) and isinstance(limitations, list)
+    if not all(isinstance(value, str) for value in limitations):
+        return False
+    if not rows or not warnings or len(warnings) > MAX_INSPECTION_LEDGER_EVENTS:
+        return False
+    format_rows: list[dict[str, object]] = []
+    warning_counts: dict[tuple[str, str], int] = {}
+    partial_paths: set[tuple[str, str]] = set()
+    identities: set[tuple[object, ...]] = set()
+    runtime_rows: list[Mapping[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("fatal") is not False:
+            return False
+        if row.get("outcome") != LedgerOutcome.PARTIAL:
+            return False
+        reason = row.get("reason_code")
+        if reason == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED:
+            analyzers = row.get("analyzers")
+            phase = row.get("phase")
+            path = row.get("path")
+            start_line, end_line = row.get("start_line"), row.get("end_line")
+            if (
+                phase not in ("semantic", "meta")
+                or not isinstance(path, str)
+                or not path
+                or not isinstance(analyzers, list)
+                or not analyzers
+                or not all(isinstance(value, str) and value for value in analyzers)
+                or any(
+                    value is not None and type(value) is not int for value in (start_line, end_line)
+                )
+            ):
+                return False
+            if len(set(analyzers)) != len(analyzers):
+                return False
+            allowed_analyzers = (
+                {"meta_analyzer"}
+                if phase == "meta"
+                else FORMAT_RECOVERY_SEMANTIC_ANALYZERS | {"mcp_tool_poisoning"}
+            )
+            if not set(analyzers) <= allowed_analyzers:
+                return False
+            try:
+                if _normalize_relative_path(path) != path:
+                    return False
+                _validate_range(cast(int | None, start_line), cast(int | None, end_line))
+            except ValueError:
+                return False
+            source = row.get("source_identity", "")
+            if not isinstance(source, str):
+                return False
+            if source and not str(row["path"]).startswith(source + "/"):
+                return False
+            identity = (
+                source,
+                row["path"],
+                row.get("start_line"),
+                row.get("end_line"),
+                row["phase"],
+                tuple(analyzers),
+            )
+            if identity in identities:
+                return False
+            identities.add(identity)
+            for analyzer in analyzers:
+                key = (source, analyzer)
+                warning_counts[key] = warning_counts.get(key, 0) + 1
+            if row["phase"] == "semantic":
+                partial_paths.add((source, str(row["path"])))
+            format_rows.append(row)
+        elif reason == LedgerReason.REFERENCE_MISSING:
+            # These existing caveats describe absent references, not uninspected bytes.
+            path, source = row.get("path"), row.get("source_identity", "")
+            if (
+                row.get("phase") != "reference_resolution"
+                or row.get("analyzers")
+                or row.get("error_class")
+                or not isinstance(path, str)
+                or not path
+                or not isinstance(source, str)
+                or (source and not path.startswith(source + "/"))
+                or any(
+                    value is not None and type(value) is not int
+                    for value in (row.get("start_line"), row.get("end_line"))
+                )
+            ):
+                return False
+            try:
+                if _normalize_relative_path(path) != path:
+                    return False
+                _validate_range(
+                    cast(int | None, row.get("start_line")),
+                    cast(int | None, row.get("end_line")),
+                )
+            except ValueError:
+                return False
+        elif not (
+            reason == LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE
+            and row.get("phase") == "semantic_runtime"
+            and row.get("start_line") is None
+            and row.get("end_line") is None
+            and not row.get("analyzers")
+            and not row.get("error_class")
+        ):
+            return False
+        else:
+            runtime_rows.append(row)
+    expected_warnings = [
+        {**row, "assessment_complete": False, "accepted_by_policy": True} for row in format_rows
+    ]
+    if not format_rows or warnings != expected_warnings:
+        return False
+    if completeness.get("partially_inspected_files") != len(partial_paths):
+        return False
+    runtime_scopes: set[str] = set()
+    for row in runtime_rows:
+        source = row.get("source_identity", "")
+        if (
+            not isinstance(source, str)
+            or source in runtime_scopes
+            or row.get("path") != (source + "/SKILL.md" if source else "SKILL.md")
+            or (source and not any(scope == source for scope, _ in warning_counts))
+        ):
+            return False
+        runtime_scopes.add(source)
+    expected_limitations: list[str] = []
+    seen_statuses: set[tuple[str, str]] = set()
+    semantic_scopes = {scope for scope, _analyzer in warning_counts}
+    for status in statuses:
+        if not isinstance(status, Mapping):
+            return False
+        source, analyzer = status.get("source_identity", ""), status.get("analyzer_id")
+        if not isinstance(source, str) or not isinstance(analyzer, str) or not analyzer:
+            return False
+        key = (source, analyzer)
+        if key in seen_statuses:
+            return False
+        seen_statuses.add(key)
+        if analyzer in FORMAT_RECOVERY_SEMANTIC_ANALYZERS:
+            semantic_scopes.add(source)
+        counts = [status.get(name) for name in ("planned_work", "completed", "partial")]
+        if not all(type(value) is int and value >= 0 for value in counts):
+            return False
+        planned, completed, partial = (cast(int, value) for value in counts)
+        if (
+            planned != completed + partial
+            or partial != warning_counts.get(key, 0)
+            or any(
+                type(status.get(name)) is not int or status.get(name) != 0
+                for name in ("failed", "skipped", "unaccounted")
+            )
+        ):
+            return False
+        if status.get("status") == "not_applicable" and planned != 0:
+            return False
+        if status.get("status") in ("completed", "not_applicable") and partial == 0:
+            continue
+        if status.get("status") != "degraded" or key not in warning_counts:
+            return False
+        if status.get("reason_code") not in (None, LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED):
+            return False
+        expected_limitations.append(
+            str(status.get("message") or f"Analyzer {status['analyzer_id']} status: degraded.")
+        )
+    return (
+        warning_counts.keys() <= seen_statuses
+        and sorted(limitations) == sorted(expected_limitations)
+        and all(
+            (source, analyzer) in seen_statuses
+            for source in semantic_scopes
+            for analyzer in FORMAT_RECOVERY_SEMANTIC_ANALYZERS
+        )
+    )
+
+
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.EXCLUDED_DIRECTORY: ("Directory tree is excluded from the configured scan scope."),
     LedgerReason.HIDDEN_FILE: "Hidden file is excluded from the configured scan scope.",
@@ -183,6 +410,10 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.LLM_RESPONSE_EMPTY: "The model returned no assessment.",
     LedgerReason.LLM_RESPONSE_LIMIT: "The model's response exceeded processing or formatting limits.",
     LedgerReason.LLM_FORMAT_CHANGED: "Formatting could not preserve the complete original assessment.",
+    LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED: (
+        "The AI answered, but its full assessment could not be verified after bounded recovery. "
+        "The formatting-recovery policy permits continuing with this warning; known findings remain."
+    ),
     LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: (
         "Transient LLM provider failure persisted after bounded retries."
     ),
@@ -545,6 +776,7 @@ class InspectionLedgerException(ResourceMeasurements):
     fatal: NotRequired[bool]
     scope: NotRequired[str]
     parser_diagnostic: NotRequired[ParserDiagnostic]
+    source_identity: NotRequired[str]
 
 
 class AnalysisCompleteness(TypedDict):
@@ -566,6 +798,9 @@ class AnalysisCompleteness(TypedDict):
     limitations: NotRequired[list[str]]
     findings_before_filtering: NotRequired[int]
     findings_after_filtering: NotRequired[int]
+    dependency_inspection: NotRequired[dict[str, object]]
+    policy_accepted: NotRequired[bool]
+    warnings: NotRequired[list[dict[str, object]]]
 
 
 def _normalize_relative_path(path: str, *, scope_boundary: bool = False) -> str:
@@ -897,6 +1132,9 @@ def _exception_from_event(
     parser_diagnostic = sanitize_parser_diagnostic(event.get("parser_diagnostic"))
     if parser_diagnostic is not None:
         exception["parser_diagnostic"] = parser_diagnostic
+    source_identity = event.get("source_identity")
+    if isinstance(source_identity, str) and source_identity:
+        exception["source_identity"] = source_identity
     return exception
 
 
@@ -919,6 +1157,7 @@ def _merge_exception_projection(
             # A rule-set row and a real file's row can share a path label;
             # they must never merge into one public row.
             exception.get("scope"),
+            exception.get("source_identity"),
             tuple(resource_measurements(exception).items()),
             tuple(parser_diagnostic.items()) if parser_diagnostic else (),
         )
@@ -1155,6 +1394,8 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
             summary["reason_code"] = str(status["reason_code"])
         if status.get("message") is not None:
             summary["message"] = str(status["message"])
+        if isinstance(status.get("source_identity"), str) and status["source_identity"]:
+            summary["source_identity"] = status["source_identity"]
         status_summaries.append(summary)
 
     scope_rows = [
@@ -1364,6 +1605,32 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_before_filtering": len(findings_by_id),
         "findings_after_filtering": len(validated_effective),
     }
+    patterns = state.get("exclude_patterns", [])
+    dependency_inspection = state.get("dependency_inspection")
+    if isinstance(dependency_inspection, dict):
+        completeness["dependency_inspection"] = dict(dependency_inspection)
+    if patterns:
+        completeness["exclude_patterns"] = list(patterns)
+        completeness["excluded_file_count"] = sum(
+            item.get("reason") == LedgerReason.USER_EXCLUSION for item in inventory
+        )
+    format_warnings = [
+        {**row, "assessment_complete": False, "accepted_by_policy": True}
+        for row in ledger_exceptions
+        if row["reason_code"] == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+    ]
+    if format_warnings:
+        # Imports stay lazy: ordinary static-only ledger projection does not
+        # need to load analyzer discovery or semantic-runtime accounting.
+        from skillspector.nodes.analyzers import ANALYZER_MODULES
+        from skillspector.semantic_runtime import format_recovery_runtime_accepted
+
+        completeness["warnings"] = format_warnings
+        completeness["policy_accepted"] = format_recovery_runtime_accepted(state, ANALYZER_MODULES)
+        completeness["policy_accepted"] = format_recovery_policy_accepted(completeness)
+        if not completeness["policy_accepted"]:
+            for warning in format_warnings:
+                warning["accepted_by_policy"] = False
     return completeness, validated_effective
 
 

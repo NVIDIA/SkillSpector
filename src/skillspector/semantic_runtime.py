@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 
 from skillspector.inspection_ledger import (
+    FORMAT_RECOVERY_SEMANTIC_ANALYZERS,
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
@@ -15,13 +16,7 @@ from skillspector.inspection_ledger import (
     ledger_event,
 )
 
-CANONICAL_SEMANTIC_ANALYZER_IDS = frozenset(
-    {
-        "semantic_developer_intent",
-        "semantic_quality_policy",
-        "semantic_security_discovery",
-    }
-)
+CANONICAL_SEMANTIC_ANALYZER_IDS = FORMAT_RECOVERY_SEMANTIC_ANALYZERS
 
 SEMANTIC_PREFLIGHT_UNAVAILABLE_MESSAGE = (
     "Requested semantic analysis was unavailable before execution."
@@ -207,6 +202,140 @@ def semantic_runtime_accounting(
         return used, False
 
     return used, True
+
+
+def is_format_recovery_event(event: Mapping[str, object]) -> bool:
+    """Identify a completed recovery procedure whose assessment remains unknown."""
+    analyzer = event.get("analyzer_id")
+    return (
+        event.get("record_type") == LedgerRecordType.WORK_ITEM
+        and event.get("outcome") == LedgerOutcome.PARTIAL
+        and event.get("reason_code") == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+        and isinstance(analyzer, str)
+        and bool(analyzer)
+        and event.get("phase") == ("meta" if analyzer == "meta_analyzer" else "semantic")
+    )
+
+
+def format_recovery_runtime_accepted(
+    result: Mapping[str, object],
+    discovered_modules: Mapping[str, object],
+) -> bool:
+    """Prove format-only policy acceptance separately from semantic completeness.
+
+    Every warning must bind to one submitted work item and successful recovery
+    telemetry in the same source. Projecting those statuses here never changes
+    the original ledger, call log, or reported inspection completeness.
+    """
+    requested, enabled = semantic_runtime_intent(result)
+    events = result.get("inspection_ledger")
+    statuses = result.get("analyzer_status_events")
+    calls = result.get("llm_call_log")
+    if (
+        not requested
+        or not enabled
+        or not all(isinstance(value, list) for value in (events, statuses, calls))
+    ):
+        return False
+    assert isinstance(events, list) and isinstance(statuses, list) and isinstance(calls, list)
+    allowed_analyzers = required_semantic_analyzer_ids(discovered_modules) | {
+        "meta_analyzer",
+        "mcp_tool_poisoning",
+    }
+    by_work: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+    warning_work: set[tuple[str, str]] = set()
+    warning_scopes: set[tuple[str, str]] = set()
+    for event in events:
+        if not isinstance(event, Mapping):
+            return False
+        scope, work_id = _source_scope(event), event.get("work_id")
+        if scope is None or not isinstance(work_id, str) or not work_id:
+            return False
+        key = (scope, work_id)
+        by_work.setdefault(key, []).append(event)
+        if event.get("reason_code") == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED:
+            analyzer = event.get("analyzer_id")
+            if not is_format_recovery_event(event) or analyzer not in allowed_analyzers:
+                return False
+            assert isinstance(analyzer, str)
+            warning_work.add(key)
+            warning_scopes.add((scope, analyzer))
+    if not warning_work:
+        return False
+    projected_statuses: list[Mapping[str, object]] = []
+    accounted_work: set[tuple[str, str]] = set()
+    accounted_scopes: set[tuple[str, str]] = set()
+    for status in statuses:
+        if not isinstance(status, Mapping):
+            return False
+        scope, analyzer = _source_scope(status), status.get("analyzer_id")
+        if scope is None or not isinstance(analyzer, str):
+            return False
+        key = (scope, analyzer)
+        if key not in warning_scopes:
+            projected_statuses.append(status)
+            continue
+        targets = status.get("planned_work")
+        if (
+            key in accounted_scopes
+            or status.get("status") != "degraded"
+            or not isinstance(targets, list)
+            or not targets
+        ):
+            return False
+        for target in targets:
+            if not isinstance(target, Mapping) or not isinstance(target.get("work_id"), str):
+                return False
+            work_key = (scope, str(target["work_id"]))
+            matches = by_work.get(work_key, [])
+            if len(matches) != 1:
+                return False
+            event = matches[0]
+            # TP4 shares its status with the same node's completed static phase.
+            own_static_work = (
+                analyzer == "mcp_tool_poisoning"
+                and event.get("analyzer_id") == "mcp_tool_poisoning_static"
+                and event.get("record_type") == LedgerRecordType.WORK_ITEM
+                and event.get("phase") == "static"
+                and event.get("path")
+                == ("SKILL.md" if scope == _ROOT_SOURCE_SCOPE else scope + "/SKILL.md")
+            )
+            if (event.get("analyzer_id") != analyzer and not own_static_work) or any(
+                event.get(field) != target.get(field)
+                for field in ("path", "start_line", "end_line")
+            ):
+                return False
+            if is_format_recovery_event(event):
+                if work_key in accounted_work:
+                    return False
+                accounted_work.add(work_key)
+            elif (
+                event.get("outcome") != LedgerOutcome.COMPLETED
+                or event.get("reason_code") is not None
+            ):
+                return False
+        if (
+            sum(
+                1
+                for call in calls
+                if isinstance(call, Mapping)
+                and _source_scope(call) == scope
+                and call.get("node") == analyzer
+                and successful_llm_record(call)
+            )
+            != 1
+        ):
+            return False
+        accounted_scopes.add(key)
+        projected_statuses.append({**status, "status": "completed"})
+    if accounted_work != warning_work or accounted_scopes != warning_scopes:
+        return False
+    _used, complete = semantic_runtime_accounting(
+        enabled=True,
+        result={**result, "analyzer_status_events": projected_statuses},
+        discovered_modules=discovered_modules,
+    )
+    return complete
 
 
 def semantic_runtime_limitation(

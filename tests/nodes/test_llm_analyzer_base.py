@@ -3768,3 +3768,246 @@ class TestConcurrencyIsGlobalAcrossLoops:
         assert asyncio.run(_exercise()) == 0, (
             "the limiter stranded a permit handed to a cancelled waiter"
         )
+
+
+# Recovery uses completed plain responses and the same bounded batch scheduler.
+def _plain_recovery_analyzer(monkeypatch, answer, *, model="custom/vendor-model-v99"):
+    from skillspector.structured_response import ResponseIssue
+
+    with patch(MOCK_PATCH_TARGET, _mock_get_chat_model):
+        analyzer = LLMAnalyzerBase(
+            base_prompt="Check TEST-1 and TEST-2.",
+            model=model,
+            recovery_rule_ids=("TEST-1", "TEST-2"),
+            node="semantic_security_discovery",
+        )
+    requests = []
+
+    def respond(_runnable, prompt):
+        field = prompt.rsplit("Requested field: ", 1)[1].split(".", 1)[0]
+        identity = json.loads(
+            prompt.rsplit("Item and already established fields: ", 1)[1].splitlines()[0]
+        )
+        requests.append((field, identity))
+        value = answer(field, identity)
+        if isinstance(value, BaseException):
+            raise value
+        return (
+            AIMessage(content=value, response_metadata={"finish_reason": "stop"})
+            if isinstance(value, str)
+            else value
+        )
+
+    async def arespond(runnable, prompt):
+        return respond(runnable, prompt)
+
+    def malformed(_batch, _prompt):
+        cause = StructuredOutputParseError(
+            "Completed prose",
+            issue=ResponseIssue.INVALID_JSON,
+            recovery_text="The assessment is written in prose, including all severities.",
+        )
+        raise _StructuredResponseValidationError(cause.issue) from cause
+
+    async def amalformed(batch, prompt):
+        return malformed(batch, prompt)
+
+    async def asleep(_delay):
+        pass
+
+    monkeypatch.setattr(analyzer, "_model_for_call", lambda: (object(), None))
+    monkeypatch.setattr(analyzer, "_invoke_with_failure_diagnostic", respond)
+    monkeypatch.setattr(analyzer, "_ainvoke_with_failure_diagnostic", arespond)
+    monkeypatch.setattr(analyzer, "_invoke_batch", malformed)
+    monkeypatch.setattr(analyzer, "_ainvoke_batch", amalformed)
+    monkeypatch.setattr(analyzer, "_sleep_before_retry", lambda _delay: None)
+    monkeypatch.setattr(analyzer, "_asleep_before_retry", asleep)
+    return analyzer, requests
+
+
+def _recovery_answers(field, identity):
+    return {
+        "finding_count": "1",
+        "rule_id": "TEST-1",
+        "severity": "HIGH",
+        "message": "Credentials sent without authorization.",
+        "start_line": "2",
+        "explanation": "UNKNOWN",
+        "remediation": "UNKNOWN",
+    }[field]
+
+
+def _run_plain_recovery(analyzer, asynchronous=False):
+    batches = [Batch(file_path="SKILL.md", content="First line\nSecond line\n")]
+    if asynchronous:
+        return run_async(analyzer.arun_batches_detailed(batches))
+    return analyzer.run_batches_detailed(batches)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("severity", ["LOW", "MEDIUM", "HIGH", "CRITICAL"])
+@pytest.mark.parametrize("model", ["custom/vendor-model-v99", "another-provider/unknown-model"])
+def test_plain_recovery_keeps_every_severity_without_model_matching(
+    monkeypatch, asynchronous, severity, model
+):
+    analyzer, requests = _plain_recovery_analyzer(
+        monkeypatch,
+        lambda field, identity: (
+            severity if field == "severity" else _recovery_answers(field, identity)
+        ),
+        model=model,
+    )
+    outcome = _run_plain_recovery(analyzer, asynchronous)
+    assert not outcome.failures and not outcome.warnings
+    finding = outcome.successful[0][1][0]
+    assert finding.rule_id == "TEST-1" and finding.severity == severity
+    assert finding.explanation == finding.remediation == ""
+    assert len(requests) == 7
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("reply", ["UNKNOWN", "Severity cannot be established", "", "LOW or HIGH"])
+def test_plain_recovery_unknown_severity_warns_without_inventing_a_finding(
+    monkeypatch, asynchronous, reply
+):
+    analyzer, _ = _plain_recovery_analyzer(
+        monkeypatch,
+        lambda field, identity: (
+            reply if field == "severity" else _recovery_answers(field, identity)
+        ),
+    )
+    outcome = _run_plain_recovery(analyzer, asynchronous)
+    assert not outcome.successful and not outcome.failures
+    assert outcome.recovered[0][1] == []
+    assert outcome.warnings[0].reason == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+    events, _ = ledger_events_for_batches("semantic_security_discovery", outcome)
+    assert events[0]["outcome"] == LedgerOutcome.PARTIAL
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("missing", ["message", "start_line"])
+def test_plain_recovery_keeps_minimal_high_when_details_are_unavailable(
+    monkeypatch, asynchronous, missing
+):
+    analyzer, _ = _plain_recovery_analyzer(
+        monkeypatch,
+        lambda field, identity: (
+            "UNKNOWN" if field == missing else _recovery_answers(field, identity)
+        ),
+    )
+    outcome = _run_plain_recovery(analyzer, asynchronous)
+    finding = outcome.recovered[0][1][0]
+    assert finding.rule_id == "TEST-1" and finding.severity == "HIGH"
+    assert finding.evidence["assessment_complete"] is False
+    assert outcome.warnings and not outcome.failures
+    if missing == "start_line":
+        assert "Exact line unknown" in finding.message
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_plain_recovery_provider_failure_keeps_known_high_and_execution_failure(
+    monkeypatch, asynchronous
+):
+    analyzer, _ = _plain_recovery_analyzer(
+        monkeypatch,
+        lambda field, identity: (
+            RuntimeError("provider unavailable")
+            if field == "explanation"
+            else _recovery_answers(field, identity)
+        ),
+    )
+    outcome = _run_plain_recovery(analyzer, asynchronous)
+    finding = outcome.recovered[0][1][0]
+    assert finding.severity == "HIGH" and outcome.failures and not outcome.warnings
+    events, status = ledger_events_for_batches("semantic_security_discovery", outcome)
+    completeness, effective = finalize_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [finding],
+            "inspection_ledger": events,
+            "analyzer_status_events": [status],
+        }
+    )
+    assert effective == [finding.finding_id]
+    assert completeness["execution_successful"] is False
+    assert not any(
+        row["reason_code"] in {LedgerReason.UNACCOUNTED_WORK, LedgerReason.FINDING_ACCOUNTING_ERROR}
+        for row in completeness["ledger_exceptions"]
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_plain_recovery_does_not_waive_input_budget(monkeypatch, asynchronous):
+    analyzer, requests = _plain_recovery_analyzer(monkeypatch, _recovery_answers)
+    analyzer._input_budget = 1
+    outcome = _run_plain_recovery(analyzer, asynchronous)
+    assert not requests and not outcome.warnings
+    assert outcome.failures[0].reason == LedgerReason.LLM_RESPONSE_LIMIT
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_plain_recovery_prioritizes_all_severities_before_optional_prose(monkeypatch, asynchronous):
+    def answer(field, identity):
+        if field == "finding_count":
+            return "16"
+        if field == "severity":
+            return "HIGH" if identity["finding_number"] == 16 else "LOW"
+        return _recovery_answers(field, identity)
+
+    analyzer, requests = _plain_recovery_analyzer(monkeypatch, answer)
+    outcome = _run_plain_recovery(analyzer, asynchronous)
+    assert len(requests) == 48
+    assert len(outcome.recovered[0][1]) == 16
+    assert any(f.severity == "HIGH" for f in outcome.recovered[0][1])
+    assert not any(field in {"explanation", "remediation"} for field, _ in requests)
+    assert outcome.warnings and not outcome.failures
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_plain_recovery_cli_process_completion_remains_explicitly_unverified(
+    monkeypatch, asynchronous
+):
+    from skillspector.llm_utils import _AgentCLIMessage
+
+    analyzer, _ = _plain_recovery_analyzer(
+        monkeypatch,
+        lambda field, identity: _AgentCLIMessage(_recovery_answers(field, identity)),
+    )
+    outcome = _run_plain_recovery(analyzer, asynchronous)
+    assert not outcome.successful and not outcome.failures
+    assert outcome.recovered[0][1][0].severity == "HIGH"
+    assert outcome.warnings[0].reason == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+
+
+@pytest.mark.parametrize("stop", ["length", "content_filter", "pause_turn"])
+def test_plain_recovery_refusal_truncation_incomplete_are_not_accepted(monkeypatch, stop):
+    analyzer, _ = _plain_recovery_analyzer(
+        monkeypatch,
+        lambda _field, _identity: AIMessage(content="0", response_metadata={"finish_reason": stop}),
+    )
+    outcome = _run_plain_recovery(analyzer)
+    assert outcome.failures and not outcome.warnings
+
+
+def test_plain_recovery_changed_repair_uses_only_original_assessment(monkeypatch):
+    from skillspector.structured_response import ResponseIssue
+
+    analyzer, _ = _plain_recovery_analyzer(monkeypatch, _recovery_answers)
+    original = '{"findings": [{"rule_id": "TEST-1" "severity": "HIGH"}]}'
+
+    def initial(_batch, _prompt):
+        cause = StructuredOutputParseError(
+            "punctuation", repair_text=original, recovery_text=original
+        )
+        raise _StructuredResponseValidationError(cause.issue) from cause
+
+    def changed(_batch, _source):
+        cause = StructuredOutputParseError("changed values", issue=ResponseIssue.FORMAT_CHANGED)
+        raise _StructuredResponseValidationError(cause.issue) from cause
+
+    monkeypatch.setattr(analyzer, "_invoke_batch", initial)
+    monkeypatch.setattr(analyzer, "_format_batch", changed)
+    recovery = MagicMock(return_value=(Batch("SKILL.md", ""), []))
+    monkeypatch.setattr(analyzer, "_recover_batch", recovery)
+    _run_plain_recovery(analyzer)
+    assert recovery.call_args.args[2] == original

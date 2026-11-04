@@ -34,6 +34,7 @@ from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
+    LedgerRecordType,
     analyzer_status_event,
     analyzer_status_for_events,
     ledger_event,
@@ -925,6 +926,7 @@ class _TP4Analyzer(LLMAnalyzerBase):
     """Run TP4 through the shared structured-output analyzer lifecycle."""
 
     response_schema = _TP4AnalysisResult
+    recovery_required_fields = ("confidence",)
 
     def __init__(
         self,
@@ -1507,11 +1509,17 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
         batch_outcome = run_async(analyzer.arun_batches_detailed(batches))
         result.inference_usage = cast(list[InferenceUsageRecord], analyzer.inference_usage)
         seen_finding_ids: set[str] = set()
+        recovered_batches = {id(batch) for batch, _ in batch_outcome.recovered}
+        emitted_by_batch: dict[int, list[str]] = {}
+        capped_batches: set[int] = set()
         unexpected_response = False
-        for batch, assessments in batch_outcome.successful:
+        for batch, assessments in [*batch_outcome.successful, *batch_outcome.recovered]:
             batch_findings: list[Finding] = []
+            recovered = id(batch) in recovered_batches
             assessment = assessments[0] if assessments else None
             if not isinstance(assessment, _TP4AnalysisResult):
+                if recovered:
+                    continue
                 unexpected_response = True
                 result.ledger.append(
                     ledger_event(
@@ -1544,6 +1552,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                         limit_findings=TP4_MAX_FINDINGS,
                     )
                 )
+                capped_batches.add(id(batch))
                 continue
             finding = _tp4_finding(assessment, batch, description)
             if (
@@ -1551,9 +1560,15 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                 and finding.finding_id not in seen_finding_ids
                 and len(result.findings) < TP4_MAX_FINDINGS
             ):
+                if recovered:
+                    finding.tags.append("llm-format-recovery")
+                    finding.evidence["assessment_complete"] = False
                 result.findings.append(finding)
                 batch_findings.append(finding)
                 seen_finding_ids.add(finding.finding_id)
+            emitted_by_batch[id(batch)] = [item.finding_id for item in batch_findings]
+            if recovered:
+                continue
             result.ledger.append(
                 ledger_event(
                     analyzer_id=ANALYZER_ID,
@@ -1562,25 +1577,47 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     path=batch.file_path,
                     start_line=batch.start_line,
                     end_line=batch.end_line,
-                    emitted_finding_ids=[item.finding_id for item in batch_findings],
+                    emitted_finding_ids=emitted_by_batch[id(batch)],
                 )
             )
 
-        for failure in batch_outcome.failures:
+        for failure in [*batch_outcome.warnings, *batch_outcome.failures]:
+            batch_id = id(failure.batch)
+            retained_ids = emitted_by_batch.get(batch_id, [])
+            is_warning = failure.reason is LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+            terminal_outcome = (
+                LedgerOutcome.PARTIAL
+                if failure.reason is LedgerReason.RUNTIME_LIMIT or is_warning
+                else outcome_for_llm_batch_failure(failure.reason)
+            )
+            if (batch_id in capped_batches and not is_warning) or (
+                retained_ids and terminal_outcome is LedgerOutcome.FAILED
+            ):
+                result.ledger.append(
+                    ledger_event(
+                        record_type=LedgerRecordType.SYSTEM,
+                        outcome=terminal_outcome,
+                        phase=f"{ANALYZER_ID}:recovery",
+                        path=failure.batch.file_path,
+                        start_line=failure.batch.start_line,
+                        end_line=failure.batch.end_line,
+                        reason=failure.reason,
+                        error_class=failure.error_class,
+                    )
+                )
+            if batch_id in capped_batches:
+                continue
             result.ledger.append(
                 ledger_event(
                     analyzer_id=ANALYZER_ID,
-                    outcome=(
-                        LedgerOutcome.PARTIAL
-                        if failure.reason is LedgerReason.RUNTIME_LIMIT
-                        else outcome_for_llm_batch_failure(failure.reason)
-                    ),
+                    outcome=(LedgerOutcome.PARTIAL if retained_ids else terminal_outcome),
                     phase="semantic",
                     path=failure.batch.file_path,
                     start_line=failure.batch.start_line,
                     end_line=failure.batch.end_line,
                     reason=failure.reason,
                     error_class=failure.error_class,
+                    emitted_finding_ids=retained_ids,
                     observed_seconds=(
                         0.0 if failure.reason is LedgerReason.RUNTIME_LIMIT else None
                     ),

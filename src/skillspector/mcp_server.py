@@ -38,11 +38,19 @@ from skillspector.cleanup import cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.inspection_ledger import LedgerReason
-from skillspector.inspection_ledger import only_missing_reference_exceptions
+from skillspector.inspection_ledger import (
+    format_recovery_policy_accepted,
+    only_missing_reference_exceptions,
+)
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.nodes.analyzers import ANALYZER_MODULES
-from skillspector.semantic_runtime import llm_runtime_available, semantic_runtime_accounting
+from skillspector.nodes.report import redact_llm_error
+from skillspector.semantic_runtime import (
+    format_recovery_runtime_accepted,
+    llm_runtime_available,
+    semantic_runtime_accounting,
+)
 from skillspector.suppression import effective_findings
 
 if TYPE_CHECKING:
@@ -195,13 +203,22 @@ async def run_scan(
         reference_caveat_only = only_missing_reference_exceptions(
             ledger_exceptions
         ) and not analysis_completeness.get("limitations")
-        analysis_requirement_met = not use_llm or llm_runtime_complete
+        accepted_by_policy = (
+            llm_enabled
+            and format_recovery_policy_accepted(analysis_completeness)
+            and format_recovery_runtime_accepted(result, ANALYZER_MODULES)
+        )
+        analysis_requirement_met = not use_llm or llm_runtime_complete or accepted_by_policy
         safe_to_install = (
             risk_score <= RISK_THRESHOLD
             and execution_successful
             and entirely_uninspected == 0
-            and partially_inspected == 0
-            and (bool(analysis_completeness.get("is_complete", True)) or reference_caveat_only)
+            and (partially_inspected == 0 or accepted_by_policy)
+            and (
+                bool(analysis_completeness.get("is_complete", True))
+                or reference_caveat_only
+                or accepted_by_policy
+            )
             and analysis_requirement_met
         )
         recommendation = result.get("risk_recommendation")
@@ -215,6 +232,7 @@ async def run_scan(
             "safe_to_install": safe_to_install,
             "execution_successful": execution_successful,
             "analysis_completeness": analysis_completeness,
+            "accepted_by_policy": accepted_by_policy,
             "findings": [f.to_dict() for f in findings],
             "report": result.get("report_body") or "",
             # Honest LLM accounting — never silently imply a full semantic scan.
