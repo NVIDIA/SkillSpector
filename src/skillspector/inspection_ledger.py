@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable, Iterable, Mapping
 from enum import StrEnum
 from hashlib import sha256
@@ -18,6 +19,15 @@ logger = logging.getLogger(__name__)
 MAX_INSPECTION_LEDGER_EVENTS: Final = 10_000
 MAX_FINDING_OUTPUT_RECORDS: Final = 10_000
 MAX_EFFECTIVE_FINDINGS: Final = MAX_FINDING_OUTPUT_RECORDS
+RESOURCE_MEASUREMENT_UNITS: Final = (
+    "characters",
+    "bytes",
+    "findings",
+    "artifacts",
+    "depth",
+    "records",
+    "seconds",
+)
 
 
 class LedgerOutcome(StrEnum):
@@ -66,6 +76,15 @@ class LedgerReason(StrEnum):
     SYNTAX_ERROR = "syntax_error"
     LLM_BATCH_FAILED = "llm_batch_failed"
     LLM_STRUCTURED_RESPONSE_INVALID = "llm_structured_response_invalid"
+    LLM_RESPONSE_REFUSED = "llm_response_refused"
+    LLM_RESPONSE_TRUNCATED = "llm_response_truncated"
+    LLM_RESPONSE_INCOMPLETE = "llm_response_incomplete"
+    LLM_RESPONSE_MISSING_FIELDS = "llm_response_missing_fields"
+    LLM_RESPONSE_INVALID_TOOL = "llm_response_invalid_tool"
+    LLM_RESPONSE_INVALID_SCHEMA = "llm_response_invalid_schema"
+    LLM_RESPONSE_EMPTY = "llm_response_empty"
+    LLM_RESPONSE_LIMIT = "llm_response_limit"
+    LLM_FORMAT_CHANGED = "llm_format_changed"
     LLM_CONNECTION_RETRIES_EXHAUSTED = "llm_connection_retries_exhausted"
     ANALYZER_RUNTIME_ERROR = "analyzer_runtime_error"
     ANALYZER_LOAD_ERROR = "analyzer_load_error"
@@ -83,7 +102,9 @@ class LedgerReason(StrEnum):
     ARCHIVE_MALFORMED = "archive_malformed"
     ARCHIVE_ENCRYPTED = "archive_encrypted"
     ARCHIVE_UNSUPPORTED_COMPRESSION = "archive_unsupported_compression"
+    ARCHIVE_UNSUPPORTED_MEMBER = "archive_unsupported_member"
     ARCHIVE_TRUNCATED = "archive_truncated"
+    ARCHIVE_MEMBER_INCOMPLETE = "archive_member_incomplete"
     ARCHIVE_UNSAFE_MEMBER_PATH = "archive_unsafe_member_path"
     ARCHIVE_AMBIGUOUS_MEMBER_PATH = "archive_ambiguous_member_path"
     ARTIFACT_PATH_COLLISION = "artifact_path_collision"
@@ -101,7 +122,19 @@ class LedgerReason(StrEnum):
     REFERENCE_EXTRACTION_LIMIT = "reference_extraction_limit"
     REFERENCE_MISSING = "reference_missing"
     REFERENCE_UNRESOLVED = "reference_unresolved"
+    DEPENDENCY_PARSE_ERROR = "dependency_parse_error"
     MANIFEST_PARSE_ERROR = "manifest_parse_error"
+    DEPENDENCY_LOCKFILE_MISSING = "dependency_lockfile_missing"
+    DEPENDENCY_UNSUPPORTED_LOCKFILE = "dependency_unsupported_lockfile"
+    DEPENDENCY_LOCKFILE_MISMATCH = "dependency_lockfile_mismatch"
+    DEPENDENCY_UNSUPPORTED_SOURCE = "dependency_unsupported_source"
+    DEPENDENCY_UNSUPPORTED_CONTENT = "dependency_unsupported_content"
+    DEPENDENCY_INTEGRITY_MISSING = "dependency_integrity_missing"
+    DEPENDENCY_INTEGRITY_MISMATCH = "dependency_integrity_mismatch"
+    DEPENDENCY_IDENTITY_MISMATCH = "dependency_identity_mismatch"
+    DEPENDENCY_DOWNLOAD_FAILED = "dependency_download_failed"
+    DEPENDENCY_WORKER_FAILED = "dependency_worker_failed"
+    DEPENDENCY_SANDBOX_UNAVAILABLE = "dependency_sandbox_unavailable"
     MANIFEST_PARSE_LIMIT = "manifest_parse_limit"
     ARTIFACT_COUNT_LIMIT = "artifact_count_limit"
     TRAVERSAL_DEPTH_LIMIT = "traversal_depth_limit"
@@ -117,7 +150,31 @@ class LedgerReason(StrEnum):
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
 
 
+def only_missing_reference_exceptions(exceptions: object) -> bool:
+    """Return whether non-empty ledger exceptions are only missing references."""
+    return (
+        isinstance(exceptions, list)
+        and bool(exceptions)
+        and all(
+            isinstance(exception, Mapping)
+            and exception.get("reason_code") == LedgerReason.REFERENCE_MISSING
+            for exception in exceptions
+        )
+    )
+
+
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
+    LedgerReason.DEPENDENCY_LOCKFILE_MISSING: "Requested npm content inspection has no supported project lockfile.",
+    LedgerReason.DEPENDENCY_UNSUPPORTED_LOCKFILE: "Dependency content inspection requires npm lockfile version 2 or 3.",
+    LedgerReason.DEPENDENCY_LOCKFILE_MISMATCH: "Package manifest dependency declarations differ from the lockfile root.",
+    LedgerReason.DEPENDENCY_UNSUPPORTED_SOURCE: "Dependency source is outside supported public npm registry tarballs.",
+    LedgerReason.DEPENDENCY_UNSUPPORTED_CONTENT: "Dependency artifact contains a file outside supported static text analysis.",
+    LedgerReason.DEPENDENCY_INTEGRITY_MISSING: "Dependency has no supported, valid SHA-512 integrity hash.",
+    LedgerReason.DEPENDENCY_INTEGRITY_MISMATCH: "Downloaded dependency bytes do not match the lockfile integrity hash.",
+    LedgerReason.DEPENDENCY_IDENTITY_MISMATCH: "Package identity in the artifact differs from the locked name or version.",
+    LedgerReason.DEPENDENCY_DOWNLOAD_FAILED: "Locked dependency artifact could not be acquired under the network policy.",
+    LedgerReason.DEPENDENCY_WORKER_FAILED: "Dependency inspection worker failed or returned an invalid result.",
+    LedgerReason.DEPENDENCY_SANDBOX_UNAVAILABLE: "Required operating-system isolation for dependency inspection is unavailable.",
     LedgerReason.USER_EXCLUSION: "File was not inspected because of an explicit caller exclusion.",
     LedgerReason.EXCLUDED_DIRECTORY: ("Directory tree is excluded from the configured scan scope."),
     LedgerReason.HIDDEN_FILE: "Hidden file is excluded from the configured scan scope.",
@@ -140,8 +197,17 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.SYNTAX_ERROR: "Python source could not be parsed.",
     LedgerReason.LLM_BATCH_FAILED: "LLM analysis failed for this file range.",
     LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
-        "LLM returned a malformed structured response after bounded retries."
+        "LLM response could not be validated after bounded recovery."
     ),
+    LedgerReason.LLM_RESPONSE_REFUSED: "The model declined to complete this assessment.",
+    LedgerReason.LLM_RESPONSE_TRUNCATED: "The model's answer was cut short by its output limit.",
+    LedgerReason.LLM_RESPONSE_INCOMPLETE: "The model did not finish this assessment.",
+    LedgerReason.LLM_RESPONSE_MISSING_FIELDS: "The model's assessment omitted required information.",
+    LedgerReason.LLM_RESPONSE_INVALID_TOOL: "The model returned missing, unexpected, or ambiguous tool calls.",
+    LedgerReason.LLM_RESPONSE_INVALID_SCHEMA: "The model's assessment contained invalid field values.",
+    LedgerReason.LLM_RESPONSE_EMPTY: "The model returned no assessment.",
+    LedgerReason.LLM_RESPONSE_LIMIT: "The model's response exceeded processing or formatting limits.",
+    LedgerReason.LLM_FORMAT_CHANGED: "Formatting could not preserve the complete original assessment.",
     LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: (
         "Transient LLM provider failure persisted after bounded retries."
     ),
@@ -172,12 +238,16 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.ARCHIVE_FORMAT_MISMATCH: (
         "Artifact bytes do not match the container format implied by its filename."
     ),
-    LedgerReason.ARCHIVE_MALFORMED: "ZIP-compatible content is malformed.",
+    LedgerReason.ARCHIVE_MALFORMED: "Archive or compressed content is malformed.",
     LedgerReason.ARCHIVE_ENCRYPTED: "Archive member is encrypted and could not be inspected.",
     LedgerReason.ARCHIVE_UNSUPPORTED_COMPRESSION: (
         "Archive member uses an unsupported compression method."
     ),
+    LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER: (
+        "Archive member uses a type or feature that is not supported for inspection."
+    ),
     LedgerReason.ARCHIVE_TRUNCATED: "Archive member is truncated or unreadable.",
+    LedgerReason.ARCHIVE_MEMBER_INCOMPLETE: "Nested artifact inspection is incomplete.",
     LedgerReason.ARCHIVE_UNSAFE_MEMBER_PATH: (
         "Archive member uses an absolute, traversal, or otherwise unsafe path."
     ),
@@ -203,7 +273,8 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.OPAQUE_CONTENT: "Artifact contents could not be fully interpreted.",
     LedgerReason.UNSUPPORTED_PRIMARY_CONTENT: (
         "The requested file or primary instructions could not be interpreted. "
-        "Provide UTF-8 text, a supported ZIP, or an extracted directory instead."
+        "Provide UTF-8 text, a supported ZIP, TAR, or GZIP container, "
+        "or an extracted directory instead."
     ),
     LedgerReason.REFERENCED_UNINSPECTED: ("A referenced artifact was not completely inspected."),
     LedgerReason.REFERENCE_EXTRACTION_LIMIT: (
@@ -217,8 +288,14 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "A local path-like reference matched more than one bundled artifact"
         " and could not be resolved to a single target."
     ),
+    LedgerReason.DEPENDENCY_PARSE_ERROR: (
+        "Dependency metadata could not be parsed into supported registry coordinates."
+    ),
     LedgerReason.MANIFEST_PARSE_ERROR: (
         "Manifest frontmatter is malformed or uses an unsupported value shape."
+    ),
+    LedgerReason.DEPENDENCY_PARSE_ERROR: (
+        "Dependency metadata could not be parsed into supported registry coordinates."
     ),
     LedgerReason.MANIFEST_PARSE_LIMIT: (
         "Manifest frontmatter could not be completely examined within its resource limits."
@@ -238,7 +315,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "A transitive child scan failed before complete inspection."
     ),
     LedgerReason.STATIC_PARSE_LIMIT: (
-        "A security-relevant expression exceeded a bounded static parser's span limit."
+        "A security-relevant expression could not be fully resolved by the bounded static parser."
     ),
     LedgerReason.PYTHON_SOURCE_AMBIGUOUS: (
         "Python execution intent depends on runtime or platform-specific shebang semantics."
@@ -256,7 +333,19 @@ def outcome_for_llm_batch_failure(reason: LedgerReason) -> LedgerOutcome:
     """Return the terminal ledger outcome for an exhausted LLM batch."""
     return (
         LedgerOutcome.SKIPPED
-        if reason is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        if reason
+        in {
+            LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+            LedgerReason.LLM_RESPONSE_REFUSED,
+            LedgerReason.LLM_RESPONSE_TRUNCATED,
+            LedgerReason.LLM_RESPONSE_INCOMPLETE,
+            LedgerReason.LLM_RESPONSE_MISSING_FIELDS,
+            LedgerReason.LLM_RESPONSE_INVALID_TOOL,
+            LedgerReason.LLM_RESPONSE_INVALID_SCHEMA,
+            LedgerReason.LLM_RESPONSE_EMPTY,
+            LedgerReason.LLM_RESPONSE_LIMIT,
+            LedgerReason.LLM_FORMAT_CHANGED,
+        }
         else LedgerOutcome.FAILED
     )
 
@@ -270,7 +359,42 @@ class PlannedWorkTarget(TypedDict):
     end_line: int | None
 
 
-class InspectionLedgerEvent(TypedDict):
+class ResourceMeasurements(TypedDict, total=False):
+    """Optional measured resource values with units encoded in their field names."""
+
+    observed_characters: int
+    limit_characters: int
+    observed_bytes: int
+    limit_bytes: int
+    observed_findings: int
+    limit_findings: int
+    observed_artifacts: int
+    limit_artifacts: int
+    observed_depth: int
+    limit_depth: int
+    observed_records: int
+    limit_records: int
+    observed_seconds: float
+    limit_seconds: float
+
+
+def resource_measurements(event: Mapping[str, object]) -> ResourceMeasurements:
+    """Allow only bounded numeric diagnostics, never arbitrary graph payloads."""
+    measurements: dict[str, int | float] = {}
+    for unit in RESOURCE_MEASUREMENT_UNITS:
+        for prefix in ("observed_", "limit_"):
+            key = prefix + unit
+            value = event.get(key)
+            # Machine resource counters fit in 63 bits; larger graph values
+            # must not amplify report output through unbounded decimal text.
+            if type(value) is int and 0 <= value <= (1 << 63) - 1:
+                measurements[key] = value
+            elif unit == "seconds" and type(value) is float and math.isfinite(value) and value >= 0:
+                measurements[key] = value
+    return cast(ResourceMeasurements, measurements)
+
+
+class InspectionLedgerEvent(ResourceMeasurements):
     """Internal terminal evidence for one work item or scope boundary."""
 
     work_id: str
@@ -287,20 +411,6 @@ class InspectionLedgerEvent(TypedDict):
     message: NotRequired[str]
     error_class: NotRequired[str]
     stage: NotRequired[str]
-    observed_characters: NotRequired[int]
-    limit_characters: NotRequired[int]
-    observed_bytes: NotRequired[int]
-    limit_bytes: NotRequired[int]
-    observed_findings: NotRequired[int]
-    limit_findings: NotRequired[int]
-    observed_artifacts: NotRequired[int]
-    limit_artifacts: NotRequired[int]
-    observed_depth: NotRequired[int]
-    limit_depth: NotRequired[int]
-    observed_records: NotRequired[int]
-    limit_records: NotRequired[int]
-    observed_seconds: NotRequired[float]
-    limit_seconds: NotRequired[float]
 
 
 class AnalyzerStatusEvent(TypedDict):
@@ -316,7 +426,7 @@ class AnalyzerStatusEvent(TypedDict):
     source_digest: NotRequired[str]
 
 
-class InspectionLedgerException(TypedDict):
+class InspectionLedgerException(ResourceMeasurements):
     """Public exceptional projection derived from an internal ledger event."""
 
     outcome: LedgerOutcome
@@ -353,6 +463,7 @@ class AnalysisCompleteness(TypedDict):
     limitations: NotRequired[list[str]]
     findings_before_filtering: NotRequired[int]
     findings_after_filtering: NotRequired[int]
+    dependency_inspection: NotRequired[dict[str, object]]
 
 
 def _normalize_relative_path(path: str, *, scope_boundary: bool = False) -> str:
@@ -664,7 +775,7 @@ def _exception_from_event(
         if outcome == LedgerOutcome.FAILED
         else LedgerReason.NO_APPLICABLE_FILES
     )
-    return _exception(
+    exception = _exception(
         outcome=outcome,
         phase=str(event["phase"]),
         reason=_reason(event.get("reason_code"), fallback),
@@ -676,6 +787,8 @@ def _exception_from_event(
         fatal=fatal,
         scope=RULE_SET_SCOPE if _is_rule_set_record(event) else None,
     )
+    exception.update(resource_measurements(event))
+    return exception
 
 
 def _merge_exception_projection(
@@ -696,6 +809,7 @@ def _merge_exception_projection(
             # A rule-set row and a real file's row can share a path label;
             # they must never merge into one public row.
             exception.get("scope"),
+            tuple(resource_measurements(exception).items()),
         )
         existing = grouped.get(key)
         if existing is None:
@@ -1097,14 +1211,22 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
                 else f"Analyzer {status_summary['analyzer_id']} status: {status_name}."
             )
     execution_successful = not any(exception.get("fatal") for exception in ledger_exceptions)
+    reference_caveat_only = (
+        only_missing_reference_exceptions(ledger_exceptions)
+        and not limitations
+        and partially_inspected == 0
+        and entirely_uninspected == 0
+    )
     completeness_status = (
         "failed"
         if not execution_successful
+        else "complete_with_caveats"
+        if reference_caveat_only
         else "partial"
         if ledger_exceptions or limitations or partially_inspected or entirely_uninspected
         else "complete"
     )
-    is_complete = completeness_status == "complete"
+    is_complete = completeness_status in {"complete", "complete_with_caveats"}
 
     raw_references = state.get("artifact_references", [])
     public_references = (
@@ -1132,6 +1254,9 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_after_filtering": len(validated_effective),
     }
     patterns = state.get("exclude_patterns", [])
+    dependency_inspection = state.get("dependency_inspection")
+    if isinstance(dependency_inspection, dict):
+        completeness["dependency_inspection"] = dict(dependency_inspection)
     if patterns:
         completeness["exclude_patterns"] = list(patterns)
         completeness["excluded_file_count"] = sum(

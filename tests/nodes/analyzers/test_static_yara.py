@@ -613,6 +613,53 @@ def _single_line_perl_socket_shell() -> str:
     ).decode()
 
 
+# Browser cookie-store paths an information stealer reads (base64 so the test
+# source itself carries no stealer indicator).
+_STEALER_COOKIE_PATHS = {
+    "chrome_windows": "b3MucGF0aC5qb2luKG9zLmVudmlyb25bJ0xPQ0FMQVBQREFUQSddLCAnR29vZ2xlJywgJ0Nocm9tZScsICdVc2VyIERhdGEnLCAnRGVmYXVsdCcsICdOZXR3b3JrJywgJ0Nvb2tpZXMnKQ==",
+    "edge_windows": "Y29weSAlTE9DQUxBUFBEQVRBJVxNaWNyb3NvZnRcRWRnZVxVc2VyIERhdGFcRGVmYXVsdFxOZXR3b3JrXENvb2tpZXMgb3V0LmRi",
+    "brave_linux": "fi8uY29uZmlnL0JyYXZlU29mdHdhcmUvQnJhdmUtQnJvd3Nlci9Vc2VyIERhdGEvRGVmYXVsdC9Db29raWVz",
+    "chrome_macos": "cGF0aCA9IGhvbWUgKyAiL0xpYnJhcnkvQXBwbGljYXRpb24gU3VwcG9ydC9Hb29nbGUvQ2hyb21lL0RlZmF1bHQvQ29va2llcyI=",
+    "opera_windows": "JHAgPSAiJGVudjpBUFBEQVRBXE9wZXJhIFNvZnR3YXJlXE9wZXJhIFN0YWJsZVxOZXR3b3JrXENvb2tpZXMi",
+    "firefox_profile": "c3JjID0gcHJvZmlsZV9kaXIgLyAnY29va2llcy5zcWxpdGUn",
+    "chrome_pathlib_spaced": "UGF0aC5ob21lKCkgLyAiQXBwRGF0YSIgLyAiTG9jYWwiIC8gIkdvb2dsZSIgLyAiQ2hyb21lIiAvICJVc2VyIERhdGEiIC8gIkRlZmF1bHQiIC8gIk5ldHdvcmsiIC8gIkNvb2tpZXMi",
+}
+
+
+def _stealer_cookie_path(name: str) -> str:
+    return base64.b64decode(_STEALER_COOKIE_PATHS[name]).decode()
+
+
+# Code that names the store before the browser, as the previous pattern did.
+_STEALER_COOKIE_CODE = {
+    "sqlite_connect": "Y29va2llc19kYiA9IHNxbGl0ZTMuY29ubmVjdChjaHJvbWVfcHJvZmlsZSArICIvQ29va2llcyIp",
+    "copy_to_output": "c2h1dGlsLmNvcHkocHJvZmlsZSAvICJDb29raWVzIiwgY2hyb21lX291dCk=",
+    "browser_constant": "ZGIgPSBvcy5wYXRoLmpvaW4oQ0hST01FX0RJUiwgIkRlZmF1bHQiLCAiQ29va2llcyIp",
+    "browser_argument": "c3RlYWwoIkNvb2tpZXMiLCAiZmlyZWZveCIp",
+    "keyword_argument": "Z3JhYl9jb29raWVzKGJyb3dzZXI9ImVkZ2UiKQ==",
+    "attribute_access": "Y29va2llcyA9IHJlYWQob3BlcmEucHJvZmlsZSk=",
+    "find_glob": "ZmluZCB+IC1uYW1lIENvb2tpZXMgLXBhdGggJypjaHJvbWUqJw==",
+    "quoted_path_segment": "c2h1dGlsLmNvcHkoaG9tZSArICIvQ29va2llcyIsICIvdG1wLyIgKyAiY2hyb21pdW0vIiArIG5hbWUp",
+    "dashed_path_segment": "c3JjID0gIkNvb2tpZXMiOyBkc3QgPSBwcm9maWxlX3Jvb3QgKyAiLy5jb25maWcvZ29vZ2xlLWNocm9tZS9vdXQi",
+}
+
+
+# Documentation that names the browser store and, later on the same line, a
+# browser or product name (issue #751: a Supabase skill description).
+_COOKIE_PROSE = [
+    "description: Auth issues (login, logout, sessions, JWT, cookies, getSession, getUser, "
+    "getClaims, RLS); Supabase CLI or MCP server; debugging timeouts, Edge Function crashes\n",
+    "Set cookies for Edge Functions with the SSR helper.\n",
+    "Cookies set by the Edge middleware are httpOnly.\n",
+    "Forward cookies to Chrome headless through the Playwright context.\n",
+    "Clear cookies in Chrome.\n",
+    "Cookies are shared with Edge, Chrome and Firefox.\n",
+    "Third-party cookies are blocked by Chrome's tracking protection.\n",
+    "Session cookies are dropped by Firefox's Enhanced Tracking Protection.\n",
+    "Cookies: Chrome/Edge supported, Safari planned.\n",
+]
+
+
 def _has_rule(findings: list, rule_name: str) -> bool:
     """Return True when a finding message references a specific YARA rule.
 
@@ -1926,6 +1973,143 @@ with open("README_RESTORE_FILES.txt", "w") as note:
 
         assert _has_rule(findings, "ransomware_behavior")
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param(
+                """\
+import os
+from cryptography.fernet import Fernet
+
+fernet = Fernet(Fernet.generate_key())
+for root, _dirs, files in os.walk(os.path.expanduser("~")):
+    for name in files:
+        path = os.path.join(root, name)
+        with open(path, "rb") as source:
+            data = source.read()
+        with open(path, "wb") as destination:
+            destination.write(fernet.encrypt(data))
+""",
+                id="overwrite-in-walk-loop",
+            ),
+            pytest.param(
+                """\
+import os
+from cryptography.fernet import Fernet
+
+fernet = Fernet(Fernet.generate_key())
+
+
+def lock(path):
+    with open(path, "rb") as source:
+        data = source.read()
+    with open(path, "wb") as destination:
+        destination.write(fernet.encrypt(data))
+
+
+for root, _dirs, files in os.walk(os.path.expanduser("~/Documents")):
+    for name in files:
+        lock(os.path.join(root, name))
+""",
+                id="helper-defined-before-walk",
+            ),
+            pytest.param(
+                """\
+import os
+from Crypto.Cipher import AES
+
+cipher = AES.new(key, AES.MODE_CTR)
+for root, _dirs, files in os.walk("/home"):
+    for name in files:
+        with open(os.path.join(root, name), "r+b") as handle:
+            data = handle.read()
+            handle.seek(0)
+            handle.write(cipher.encrypt(data))
+""",
+                id="read-write-in-place",
+            ),
+        ],
+    )
+    def test_multiline_walk_encrypt_overwrite_without_note_is_detected(self, content):
+        # Without a ransom note, ``ransomware_behavior`` only fires when
+        # ``os.walk`` shares a line with the encrypt/open call.
+        findings = _run_builtin(content, "organize.py")
+
+        heuristic = _findings_from_rule(findings, "ransomware_behavior_multiline")
+        assert len(heuristic) == 1
+        assert heuristic[0].rule_id == "YR1"
+        assert heuristic[0].severity == "HIGH"
+        assert heuristic[0].confidence == 0.6
+        assert not _findings_from_rule(findings, "ransomware_behavior")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param(
+                """\
+import os
+import requests
+
+for root, _dirs, files in os.walk("assets"):
+    print(root, len(files))
+response = requests.get("https://example.com/model.bin")
+with open("model.bin", "wb") as handle:
+    handle.write(response.content)
+""",
+                id="walk-and-download-without-encryption",
+            ),
+            pytest.param(
+                """\
+import hashlib
+import os
+
+for root, _dirs, files in os.walk("."):
+    for name in files:
+        with open(os.path.join(root, name), "rb") as handle:
+            print(hashlib.sha256(handle.read()).hexdigest(), name)
+""",
+                id="walk-and-hash-read-only",
+            ),
+            pytest.param(
+                """\
+import sys
+from cryptography.fernet import Fernet
+
+fernet = Fernet(open("key", "rb").read())
+with open(sys.argv[1], "rb") as source:
+    data = source.read()
+with open(sys.argv[1] + ".enc", "wb") as destination:
+    destination.write(fernet.encrypt(data))
+""",
+                id="single-file-encryption-without-walk",
+            ),
+            pytest.param(
+                "import os\nfor root, _dirs, files in os.walk('.'):\n    print(root)\n"
+                + "# unrelated\n" * 100
+                + "with open('out.bin', 'wb') as handle:\n"
+                + "    handle.write(cipher.encrypt(b'data'))\n",
+                id="walk-far-from-encrypt-and-write",
+            ),
+        ],
+    )
+    def test_multiline_walk_without_nearby_encrypt_and_write_is_not_ransomware(self, content):
+        findings = _run_builtin(content, "tool.py")
+
+        assert not _has_rule(findings, "ransomware_behavior")
+
+    def test_single_line_walk_encrypt_reports_only_the_certain_rule(self):
+        content = (
+            "for root, _, files in os.walk(home): "
+            "[open(os.path.join(root, n), 'wb').write(f.encrypt(b'')) for n in files]\n"
+        )
+
+        findings = _run_builtin(content, "organize.py")
+
+        certain = _findings_from_rule(findings, "ransomware_behavior")
+        assert len(certain) == 1
+        assert certain[0].severity == "CRITICAL"
+        assert not _findings_from_rule(findings, "ransomware_behavior_multiline")
+
     def test_wallet_text_still_reaches_custom_rules(self, tmp_path):
         _write_rule(
             tmp_path,
@@ -2233,6 +2417,41 @@ rule agent_skill_destructive_autonomous_actions {
     def test_known_webshell_rule_matches_family_markers(self, fixture, filename):
         findings = _run_builtin(_webshell_fixture(fixture), filename)
         assert _has_rule(findings, "php_webshell_known")
+
+    @pytest.mark.parametrize(
+        "content",
+        _COOKIE_PROSE,
+        ids=[
+            "supabase_description",
+            "edge_functions",
+            "edge_middleware",
+            "chrome_headless",
+            "clear_in_chrome",
+            "shared_with_browsers",
+            "chrome_possessive",
+            "firefox_possessive",
+            "browser_list_with_slash",
+        ],
+    )
+    def test_info_stealer_ignores_cookie_prose(self, content):
+        findings = _run_builtin(content, "SKILL.md")
+        assert not _has_rule(findings, "info_stealer")
+
+    @pytest.mark.parametrize("name", sorted(_STEALER_COOKIE_PATHS))
+    def test_info_stealer_matches_browser_cookie_store_paths(self, name):
+        findings = _run_builtin(_stealer_cookie_path(name) + "\n", "collect.py")
+        assert _has_rule(findings, "info_stealer")
+
+    @pytest.mark.parametrize("name", sorted(_STEALER_COOKIE_CODE))
+    def test_info_stealer_matches_code_naming_the_store_first(self, name):
+        code = base64.b64decode(_STEALER_COOKIE_CODE[name]).decode()
+        findings = _run_builtin(code + "\n", "collect.py")
+        assert _has_rule(findings, "info_stealer")
+
+    def test_info_stealer_matches_cookie_store_path_next_to_prose(self):
+        content = _COOKIE_PROSE[1] + _stealer_cookie_path("chrome_windows") + "\n"
+        findings = _run_builtin(content, "collect.py")
+        assert _has_rule(findings, "info_stealer")
 
 
 # ── Rule caching ──────────────────────────────────────────────────────
@@ -2572,6 +2791,32 @@ class TestContentHashInvalidation:
 
 
 class TestInspectionLedgerResponse:
+    @pytest.mark.parametrize("path_kind", ["missing", "file", "symlink"])
+    def test_invalid_custom_rule_directory_is_incomplete_after_cache_hit(
+        self, tmp_path, path_kind
+    ) -> None:
+        state = {"components": ["skill.txt"], "file_cache": {"skill.txt": "ordinary text"}}
+        assert static_yara.node(state)["analyzer_status_events"][0]["status"] == "completed"
+        invalid = tmp_path / "custom-rules"
+        if path_kind == "file":
+            invalid.write_text("not a directory")
+        elif path_kind == "symlink":
+            try:
+                invalid.symlink_to(tmp_path, target_is_directory=True)
+            except OSError:
+                pytest.skip("Creating symlinks is unavailable on this platform")
+
+        result = static_yara.node({**state, "yara_rules_dir": str(invalid)})
+
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+        assert result["analyzer_status_events"][0]["reason_code"] == "read_error"
+        assert result["inspection_ledger"][0]["outcome"] == "partial"
+        assert result["inspection_ledger"][0]["reason_code"] == "read_error"
+        assert str(invalid) not in json.dumps(result)
+        assert static_yara.node(state)["analyzer_status_events"][0]["status"] == "completed"
+        empty = static_yara.node({**state, "yara_rules_dir": str(tmp_path)})
+        assert empty["analyzer_status_events"][0]["status"] == "completed"
+
     def test_rule_discovery_limit_marks_every_component_partial(
         self, monkeypatch, tmp_path
     ) -> None:

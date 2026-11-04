@@ -4,6 +4,7 @@
 """Unsupported requested content must never become a passive-asset exclusion."""
 
 import bz2
+import gzip
 import io
 import json
 import tarfile
@@ -20,13 +21,15 @@ _SKILL = b"---\nname: primary-input-check\ndescription: Summarize supplied text.
 _PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(32))
 
 
-def _archive_bytes(*, compressed: bool = False) -> bytes:
+def _archive_bytes(members: dict[str, bytes], *, compressed: bool = False) -> bytes:
     stream = io.BytesIO()
-    with tarfile.open(fileobj=stream, mode="w:gz" if compressed else "w") as archive:
-        member = tarfile.TarInfo("SKILL.md")
-        member.size = len(_SKILL)
-        archive.addfile(member, io.BytesIO(_SKILL))
-    return stream.getvalue()
+    with tarfile.open(fileobj=stream, mode="w") as archive:
+        for path, content in members.items():
+            member = tarfile.TarInfo(path)
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+    data = stream.getvalue() if members else bytes(2 * tarfile.BLOCKSIZE)
+    return gzip.compress(data) if compressed else data
 
 
 @pytest.mark.parametrize(
@@ -36,10 +39,6 @@ def _archive_bytes(*, compressed: bool = False) -> bytes:
         ("SKILL.md", _SKILL.decode().encode("utf-16"), False),
         ("SKILL.md", _SKILL.decode().encode("utf-16"), True),
         ("skill.md", _SKILL.decode().encode("utf-16-be"), True),
-        ("bundle.tar", _archive_bytes(), False),
-        ("bundle.tar.gz", _archive_bytes(compressed=True), False),
-        ("notes.md", _archive_bytes(), False),
-        ("notes.md", _archive_bytes(compressed=True), False),
         ("notes.md", bz2.compress(_SKILL), False),
         ("SKILL.md", _SKILL + b"Legacy caf\xe9 text.\n", True),
         ("notes.md", _SKILL + b"\xff", False),
@@ -49,10 +48,6 @@ def _archive_bytes(*, compressed: bool = False) -> bytes:
         "utf16-file",
         "utf16-primary",
         "utf16-no-bom",
-        "tar",
-        "targz",
-        "renamed-tar",
-        "renamed-gzip",
         "renamed-bzip2",
         "lossy-primary",
         "lossy-explicit",
@@ -73,9 +68,15 @@ async def test_unsupported_primary_is_incomplete_and_not_install_safe(
     assert completeness["coverage_percent"] < 100.0
     assert result["recommendation"] != "SAFE"
     exceptions = completeness["ledger_exceptions"]
-    assert any(
-        item["path"] == name and item["reason_code"] == "unsupported_primary_content"
+    primary = next(
+        item
         for item in exceptions
+        if item["path"] == name and item["reason_code"] == "unsupported_primary_content"
+    )
+    assert primary["message"] == (
+        "The requested file or primary instructions could not be interpreted. "
+        "Provide UTF-8 text, a supported ZIP, TAR, or GZIP container, "
+        "or an extracted directory instead."
     )
     assert not any(item["path"] == name for item in completeness["scope_exclusions"])
 
@@ -100,6 +101,13 @@ async def test_passive_asset_keeps_existing_reference_policy(
         assert any(
             item["path"] == "image.png" and item["reason_code"] == "binary_content"
             for item in result["analysis_completeness"]["scope_exclusions"]
+        )
+    else:
+        assert any(
+            item["path"] == "image.png"
+            and item["reason_code"] == "opaque_content"
+            and item["message"] == "Artifact contents could not be fully interpreted."
+            for item in result["analysis_completeness"]["ledger_exceptions"]
         )
 
 
@@ -136,17 +144,56 @@ async def test_primary_failure_preserves_excluded_executable_evidence(
 
 
 @pytest.mark.parametrize("layout", ["flat", "nested", "empty", "renamed"])
-async def test_supported_zip_remains_complete(tmp_path: Path, layout: str) -> None:
-    target = tmp_path / ("bundle.dat" if layout == "renamed" else "bundle.zip")
-    with zipfile.ZipFile(target, "w") as archive:
-        if layout != "empty":
-            archive.writestr("skill/SKILL.md" if layout == "nested" else "SKILL.md", _SKILL)
-            archive.writestr("skill/image.png" if layout == "nested" else "image.png", _PNG)
+@pytest.mark.parametrize("archive_kind", ["zip", "tar", "gzip"])
+async def test_supported_archives_remain_complete(
+    tmp_path: Path, layout: str, archive_kind: str
+) -> None:
+    prefix = "skill/" if layout == "nested" else ""
+    members = {} if layout == "empty" else {prefix + "SKILL.md": _SKILL, prefix + "image.png": _PNG}
+    suffix = {"zip": ".zip", "tar": ".tar", "gzip": ".tar.gz"}[archive_kind]
+    name = "bundle" + suffix
+    if layout == "renamed":
+        name = "bundle.dat" if archive_kind == "zip" else "notes.md"
+    target = tmp_path / name
+    if archive_kind == "zip":
+        with zipfile.ZipFile(target, "w") as archive:
+            for path, content in members.items():
+                archive.writestr(path, content)
+    else:
+        target.write_bytes(_archive_bytes(members, compressed=archive_kind == "gzip"))
 
     result = await run_scan(str(target), use_llm=False)
 
     assert result["analysis_completeness"]["is_complete"] is True
     assert result["safe_to_install"] is True
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+@pytest.mark.parametrize("member_type", [tarfile.FIFOTYPE, tarfile.GNUTYPE_SPARSE])
+async def test_unsupported_tar_members_keep_incomplete_reference_evidence(
+    tmp_path: Path, compressed: bool, member_type: bytes
+) -> None:
+    name = "bundle.tar.gz" if compressed else "bundle.tar"
+    info = tarfile.TarInfo("unsupported")
+    info.type = member_type
+    data = info.tobuf(format=tarfile.GNU_FORMAT) + bytes(1024)
+    (tmp_path / name).write_bytes(gzip.compress(data) if compressed else data)
+    (tmp_path / "SKILL.md").write_bytes(_SKILL + f"\nRead [archive]({name}).\n".encode())
+
+    result = await run_scan(str(tmp_path), use_llm=False)
+
+    assert result["safe_to_install"] is False
+    assert result["analysis_completeness"]["is_complete"] is False
+    assert result["recommendation"] != "SAFE"
+    assert any(
+        item["path"].startswith(name)
+        and item["reason_code"] == "archive_unsupported_member"
+        and item["message"]
+        == "Archive member uses a type or feature that is not supported for inspection."
+        and item["outcome"] == "skipped"
+        for item in result["analysis_completeness"]["ledger_exceptions"]
+    )
+    assert any(issue["id"] == "AE1" and issue["severity"] == "HIGH" for issue in result["findings"])
 
 
 @pytest.mark.parametrize("extension", ["zip", "dat"])

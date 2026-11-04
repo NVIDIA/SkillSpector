@@ -67,6 +67,7 @@ from skillspector.python_ast import (
     may_be_python_source,
     resolve_python_source_classification,
 )
+from skillspector.python_import_bounds import PythonImportBounds
 from skillspector.python_tokens import PythonStringClosers
 from skillspector.security_reconstruction import (
     MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
@@ -74,6 +75,7 @@ from skillspector.security_reconstruction import (
     build_declared_marker_views,
 )
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
+from skillspector.surface import COMMENTS, infer_surface
 
 from .common import (
     LINE_BREAK_CHARS,
@@ -103,12 +105,16 @@ FILE_TYPES: dict[str, str] = {
     ".bash": "shell",
     ".zsh": "shell",
     ".ps1": "powershell",
+    ".psm1": "powershell",
+    ".psd1": "powershell",
     ".json": "json",
     ".yaml": "yaml",
     ".yml": "yaml",
     ".toml": "toml",
     ".txt": "text",
     ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
     ".ts": "typescript",
     ".rb": "ruby",
     ".pl": "perl",
@@ -491,6 +497,13 @@ def _markdown_context_prefix(
     return ""
 
 
+# Separators that ``str.splitlines()`` honours but CPython's own line numbering
+# does not: vertical tab, form feed, file/group/record separators, NEL, and the
+# Unicode line/paragraph separators. They make the two coordinate systems used
+# below disagree -- see :func:`_refined_surface_line`.
+_EXOTIC_LINE_BREAKS = tuple(ch for ch in LINE_BREAK_CHARS if ch not in "\r\n")
+
+
 def _normalize_license_line(line: str) -> str:
     return " ".join(line.casefold().split())
 
@@ -674,8 +687,15 @@ def _is_env_file_reference_in_docs(
 def analyzer_finding_to_finding(
     af: AnalyzerFinding,
     get_remediation_fn: Callable[[str], str] | None = None,
+    *,
+    line_text: str | None = None,
 ) -> Finding:
-    """Convert an AnalyzerFinding (from any analyzer) to graph-state Finding."""
+    """Convert an AnalyzerFinding (from any analyzer) to graph-state Finding.
+
+    ``line_text`` is the matched source line when the caller has it. It only
+    refines a ``code``/``config`` path into the ``comments`` surface, so callers
+    that cannot supply content still receive a path-derived classification.
+    """
     rem_fn = get_remediation_fn or get_remediation
     remediation = af.remediation or rem_fn(af.rule_id)
     category = (af.tags[0] if af.tags else None) or get_category(af.rule_id)
@@ -703,6 +723,7 @@ def analyzer_finding_to_finding(
         intent=None,
         evidence=dict(af.evidence),
         match_fingerprint=af.match_fingerprint,
+        surface=infer_surface(af.location.file, line_text),
     )
 
 
@@ -957,7 +978,37 @@ def _convert_analyzer_finding(
         for triage_tag in ("contextual-triage", "likely-benign-context"):
             if triage_tag not in af.tags:
                 af.tags.append(triage_tag)
-    return analyzer_finding_to_finding(af)
+    return analyzer_finding_to_finding(
+        af, line_text=_refined_surface_line(af, path, content, content_lines)
+    )
+
+
+def _refined_surface_line(
+    af: AnalyzerFinding,
+    path: str,
+    content: str,
+    content_lines: list[str],
+) -> str | None:
+    """The matched source line, or ``None`` when line numbering is ambiguous.
+
+    Findings from the pattern modules number lines with
+    :func:`logical_line_starts`, which breaks on ``_EXOTIC_LINE_BREAKS`` as well
+    as CR/LF; Python AST findings use CPython's physical ``\n`` count instead.
+    The two agree only when the source contains none of those extra separators,
+    so for such files the refinement is skipped rather than indexing
+    ``content_lines`` with a line number from the other system -- which would
+    otherwise report a neighbouring line's surface.
+    """
+    if any(ch in content for ch in _EXOTIC_LINE_BREAKS):
+        return None
+    start_line = af.location.start_line
+    end_line = af.location.end_line or start_line
+    start_index = max(0, start_line - 1)
+    end_index = min(len(content_lines), end_line)
+    covered_lines = content_lines[start_index:end_index]
+    if covered_lines and all(infer_surface(path, text) == COMMENTS for text in covered_lines):
+        return covered_lines[0]
+    return None
 
 
 def _scan_path(
@@ -2058,6 +2109,44 @@ def _window_string_closer(
     return closes_string
 
 
+def _python_import_bounds(
+    state: Mapping[str, object], components: list[str], file_cache: Mapping[str, str]
+) -> PythonImportBounds:
+    # Known omitted files still affect import identity. Their absence from the
+    # analyzer work list cannot establish that an import is external.
+    paths = list(components)
+    inventory = state.get("artifact_inventory")
+    if isinstance(inventory, list):
+        paths.extend(
+            path
+            for artifact in inventory
+            if isinstance(artifact, dict) and isinstance(path := artifact.get("path"), str) and path
+        )
+    return PythonImportBounds(paths, file_cache)
+
+
+def _bounded_parse_exhaustion(
+    module: object,
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    path: str,
+    file_type: str,
+    complete_context: bool,
+    python_import_bounds: PythonImportBounds | None,
+) -> bool:
+    hook = getattr(module, "has_bounded_parse_exhaustion", None)
+    if not callable(hook):
+        return False
+    kwargs = {"file_type": file_type, "complete_context": complete_context}
+    if vars(module).get("USES_PYTHON_IMPORT_BOUNDS") is True and python_import_bounds is not None:
+        kwargs["python_import_check"] = lambda check: python_import_bounds.allows(
+            path, content, check
+        )
+        kwargs["python_stdlib_check"] = python_import_bounds.allows_stdlib
+    return bool(hook(content, check_runtime, **kwargs))
+
+
 def _scan_declared_marker_views(
     path: str,
     content: str,
@@ -2071,6 +2160,7 @@ def _scan_declared_marker_views(
     defer_projected_output_limit: bool,
     complete_context: bool,
     prepared_analyses: Mapping[int, object] | None = None,
+    python_import_bounds: PythonImportBounds | None = None,
 ) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
@@ -2279,11 +2369,14 @@ def _scan_declared_marker_views(
                     if callable(exhaustion_hook):
                         check_runtime()
                         bounded_parse_limited = bounded_parse_limited or bool(
-                            exhaustion_hook(
+                            _bounded_parse_exhaustion(
+                                module,
                                 marker_view.text,
                                 check_runtime,
                                 file_type=_infer_file_type(path),
                                 complete_context=complete_context,
+                                path=path,
+                                python_import_bounds=python_import_bounds,
                             )
                         )
 
@@ -2314,6 +2407,7 @@ def _scan_all_views_detailed(
     python_source: bool | None = None,
     readable_binary: bool = False,
     _oms_projected: bool = False,
+    python_import_bounds: PythonImportBounds | None = None,
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Scan bounded raw windows and return any limit with observed/limit metrics."""
     started_at = time.monotonic() if started_at is None else started_at
@@ -2340,6 +2434,7 @@ def _scan_all_views_detailed(
             timeout_seconds=timeout_seconds,
             started_at=started_at,
             python_source=False,
+            python_import_bounds=python_import_bounds,
         )
         findings = [
             finding
@@ -2390,6 +2485,7 @@ def _scan_all_views_detailed(
             # This view is derived JSON metadata, not a Python execution surface.
             python_source=False,
             _oms_projected=True,
+            python_import_bounds=python_import_bounds,
         )
         for finding in findings:
             finding.start_line = finding.end_line = 1
@@ -2578,6 +2674,7 @@ def _scan_all_views_detailed(
                 defer_projected_output_limit=coalesce is not None,
                 complete_context=whole_artifact_window,
                 prepared_analyses=prepared_analyses,
+                python_import_bounds=python_import_bounds,
             )
             bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
@@ -2614,11 +2711,14 @@ def _scan_all_views_detailed(
                 if callable(exhaustion_hook):
                     finding_budget.check_runtime()
                     bounded_parse_limited = bounded_parse_limited or bool(
-                        exhaustion_hook(
+                        _bounded_parse_exhaustion(
+                            module,
                             content,
                             finding_budget.check_runtime,
                             file_type=_infer_file_type(path),
                             complete_context=True,
+                            path=path,
+                            python_import_bounds=python_import_bounds,
                         )
                     )
         except _StaticResourceLimitError as exc:
@@ -2742,13 +2842,16 @@ def _scan_all_views_detailed(
                                 python_source=python_source,
                             )
                             bounded_parse_limited = bounded_parse_limited or bool(
-                                exhaustion_hook(
+                                _bounded_parse_exhaustion(
+                                    module,
                                     full_view.text,
                                     finding_budget.check_runtime,
                                     file_type=module_file_type,
                                     # A fragment cannot prove surrounding HTML,
                                     # container, or inline delimiter ownership.
                                     complete_context=whole_artifact_window,
+                                    path=path,
+                                    python_import_bounds=python_import_bounds,
                                 )
                             )
                 except _StaticResourceLimitError as exc:
@@ -3076,6 +3179,7 @@ def _scan_all_views(
     started_at: float | None = None,
     python_ast: ParsedPythonFile | None = None,
     python_source: bool | None = None,
+    python_import_bounds: PythonImportBounds | None = None,
 ) -> list[Finding]:
     findings, _, _ = _scan_all_views_detailed(
         path,
@@ -3087,6 +3191,7 @@ def _scan_all_views(
         started_at=started_at,
         python_ast=python_ast,
         python_source=python_source,
+        python_import_bounds=python_import_bounds,
     )
     return findings
 
@@ -3168,6 +3273,7 @@ def run_static_patterns(
     file_cache = cast(
         dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
     )
+    python_import_bounds = _python_import_bounds(state, components, file_cache)
     raw_file_cache = cast(Mapping[str, bytes] | None, state.get("raw_file_cache"))
     source_classifications = cast(
         Mapping[str, PythonSourceClassification | str] | None,
@@ -3183,7 +3289,7 @@ def run_static_patterns(
     container_paths = {
         str(metadata.get("path", ""))
         for metadata in cast(list[dict[str, object]], state.get("component_metadata") or [])
-        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx"}
+        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx", "tar", "gzip"}
         and "!/" not in str(metadata.get("path", ""))
     }
     raw_inventory = state.get("artifact_inventory", [])
@@ -3262,6 +3368,7 @@ def run_static_patterns(
             python_ast=python_ast,
             python_source=python_source,
             readable_binary=path in readable_binary_paths,
+            python_import_bounds=python_import_bounds,
         )
         runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
         if shared_remaining is not None:
@@ -3301,6 +3408,7 @@ def run_static_patterns_with_ledger(
     file_cache = cast(
         dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
     )
+    python_import_bounds = _python_import_bounds(state, components, file_cache)
     raw_file_cache = cast(Mapping[str, bytes] | None, state.get("raw_file_cache"))
     source_classifications = cast(
         Mapping[str, PythonSourceClassification | str] | None,
@@ -3319,7 +3427,7 @@ def run_static_patterns_with_ledger(
     container_paths = {
         str(metadata.get("path", ""))
         for metadata in cast(list[dict[str, object]], state.get("component_metadata") or [])
-        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx"}
+        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx", "tar", "gzip"}
         and "!/" not in str(metadata.get("path", ""))
     }
     findings: list[Finding] = []
@@ -3329,6 +3437,9 @@ def run_static_patterns_with_ledger(
         {str(item.get("path", "")): item for item in raw_inventory if isinstance(item, dict)}
         if isinstance(raw_inventory, list)
         else {}
+    )
+    container_paths.update(
+        path for path, artifact in inventory.items() if "inspected_members" in artifact
     )
 
     for path in components:
@@ -3467,6 +3578,7 @@ def run_static_patterns_with_ledger(
                             python_ast=python_ast,
                             python_source=python_source,
                             readable_binary=bool(artifact.get("readable_binary")),
+                            python_import_bounds=python_import_bounds,
                         )
                         fully_scanned_aggregate_overflow = bool(
                             resource_limit is LedgerReason.OUTPUT_LIMIT

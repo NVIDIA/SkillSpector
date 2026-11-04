@@ -12,6 +12,7 @@ that was inspected.
 from __future__ import annotations
 
 import re
+import tarfile
 import unicodedata
 from array import array
 from collections.abc import Callable, Iterator
@@ -47,6 +48,7 @@ class ReferenceKind(StrEnum):
     """Syntactic use that produced one intra-bundle reference."""
 
     MARKDOWN_IMAGE = "markdown_image"
+    DOCUMENTATION_IMAGE = "documentation_image"
     MARKDOWN_LINK = "markdown_link"
     INLINE_COMMAND = "inline_command"
     QUOTED_OR_CODE = "quoted_or_code"
@@ -67,6 +69,7 @@ class ArtifactRecord(TypedDict):
     readable_binary: NotRequired[bool]
     reason: NotRequired[str]
     inherited_exclusion_reason: NotRequired[str]
+    inspected_members: NotRequired[list[str]]
 
 
 class BundleReference(TypedDict):
@@ -80,6 +83,7 @@ class BundleReference(TypedDict):
     status: str
     disposition: ArtifactDisposition
     reference_kind: ReferenceKind
+    source_sha256: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -195,6 +199,7 @@ _BINARY_MAGIC = (
     b"GIF87a",
     b"GIF89a",
     b"PK\x03\x04",
+    b"\x1f\x8b",
     b"\x7fELF",
     b"MZ",
     b"\x00asm",
@@ -211,6 +216,8 @@ _BINARY_EXTENSIONS = frozenset(
         ".pdf",
         ".zip",
         ".gz",
+        ".tar",
+        ".tgz",
         ".exe",
         ".dll",
         ".dex",
@@ -357,10 +364,25 @@ def has_dex_magic(data: bytes) -> bool:
     return len(data) >= 8 and data.startswith(b"dex\n") and data[4:7].isdigit() and data[7] == 0
 
 
+def has_tar_header(data: bytes) -> bool:
+    """Validate a fixed TAR header without reading members or expanding metadata."""
+    if len(data) < tarfile.BLOCKSIZE:
+        return False
+    try:
+        tarfile.TarInfo.frombuf(data[: tarfile.BLOCKSIZE], "utf-8", "surrogateescape")
+    except tarfile.HeaderError:
+        return len(data) >= 1024 and data[:1024] == bytes(1024)
+    return True
+
+
 def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> ArtifactRecord:
     """Classify from bytes and decodability; an extension is never authoritative."""
     contains_nul = b"\x00" in data
-    has_binary_magic = has_dex_magic(data) or any(data.startswith(magic) for magic in _BINARY_MAGIC)
+    has_binary_magic = (
+        has_dex_magic(data)
+        or any(data.startswith(magic) for magic in _BINARY_MAGIC)
+        or has_tar_header(data)
+    )
     try:
         decoded = data.decode("utf-8")
         decodable = True
@@ -691,6 +713,9 @@ def _concealed_instruction_run_spans(
 
 def _security_skeleton_piece(character: str) -> str:
     """Return the case-folded NFKC/confusable skeleton for one source character."""
+    # NFKC and the pinned confusable map leave ASCII unchanged.
+    if character.isascii():
+        return character.lower()
     folded = (
         unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON).casefold()
     )
@@ -702,6 +727,8 @@ def _security_skeleton_piece(character: str) -> str:
 
 def _fold_security_character(character: str) -> str:
     """Return a one-letter ASCII security skeleton, or an empty sentinel."""
+    if character.isascii():
+        return character.lower() if len(character) == 1 and character.isalpha() else ""
     folded = _security_skeleton_piece(character)
     return folded if len(folded) == 1 and folded.isascii() and folded.isalpha() else ""
 
