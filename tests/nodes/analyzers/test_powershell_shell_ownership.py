@@ -58,9 +58,8 @@ def test_powershell_comments_and_messages_have_complete_analysis(
     content: str, newline: str
 ) -> None:
     content = content.replace("\n", newline)
-    # Each case exercises a host-syntax false positive present before #711.
-    assert tm.has_bounded_parse_exhaustion(content, lambda: None, file_type="shell") is True
-
+    # These are PowerShell regressions. Shell quote ownership can independently
+    # accept some of their strings, so shell-mode failure is not a precondition.
     result = _scan(content)
 
     assert _limited(content) is False
