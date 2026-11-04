@@ -13,6 +13,7 @@ from skillspector.inspection_ledger import (
     inspection_work_id,
     ledger_event,
     outcome_for_llm_batch_failure,
+    resource_measurements,
 )
 
 
@@ -182,3 +183,40 @@ def test_failed_event_includes_sanitized_failure_metadata_only_when_provided() -
 
     assert event["error_class"] == "PermissionError"
     assert event["stage"] == "read"
+
+
+@pytest.mark.parametrize(
+    "unit", ["characters", "bytes", "findings", "artifacts", "depth", "records"]
+)
+@pytest.mark.parametrize("value", [0, (1 << 53) + 1, (1 << 63) - 1])
+def test_resource_counters_preserve_zero_and_exact_integers(unit: str, value: int) -> None:
+    measurements = {f"observed_{unit}": value, f"limit_{unit}": value}
+    assert resource_measurements(measurements) == measurements
+
+
+@pytest.mark.parametrize(
+    "unit", ["characters", "bytes", "findings", "artifacts", "depth", "records"]
+)
+@pytest.mark.parametrize(
+    "value", [True, False, -1, 1.5, "12", float("nan"), float("inf"), 1 << 4096]
+)
+def test_resource_counters_reject_unsafe_or_inexact_values(unit: str, value: object) -> None:
+    assert resource_measurements({f"observed_{unit}": value, f"limit_{unit}": value}) == {}
+
+
+@pytest.mark.parametrize("value", [0, 0.0, 0.25, 1e308])
+def test_resource_seconds_preserve_finite_values_and_missing_side(value: int | float) -> None:
+    assert resource_measurements({"observed_seconds": value}) == {"observed_seconds": value}
+
+
+@pytest.mark.parametrize(
+    "value", [True, False, -0.1, "0.1", float("nan"), float("inf"), float("-inf")]
+)
+def test_resource_seconds_reject_invalid_values(value: object) -> None:
+    assert resource_measurements({"observed_seconds": value, "limit_seconds": value}) == {}
+
+
+def test_resource_measurements_never_copy_stage_or_arbitrary_payloads() -> None:
+    assert resource_measurements(
+        {"observed_bytes": 0, "limit_bytes": 4, "stage": "private-stage", "payload": "secret"}
+    ) == {"observed_bytes": 0, "limit_bytes": 4}
