@@ -324,6 +324,51 @@ def test_finalization_discards_unsafe_measurements_without_hiding_incompleteness
     json.dumps(completeness, allow_nan=False)
 
 
+def test_parser_diagnostics_survive_projection_and_distinguish_exception_identity() -> None:
+    diagnostic = {
+        "cause": "resource_limit",
+        "check": "command_word_unquoted_characters",
+        "source_start_offset": 3,
+        "source_end_offset": 4100,
+        "start_line": 2,
+        "end_line": 2,
+        "unchecked_scope": "command_word",
+        "location_precision": "source_span",
+        "full_input_checked": False,
+        "observed_is_lower_bound": True,
+        "observed_characters": 4097,
+        "limit_characters": 4096,
+    }
+    events = []
+    statuses = []
+    for analyzer, observed in [("a", 4097), ("b", 4097), ("c", 4100)]:
+        event = ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            analyzer_id=analyzer,
+            path="script.sh",
+            reason=LedgerReason.STATIC_PARSE_LIMIT,
+            parser_diagnostic={**diagnostic, "observed_characters": observed},
+        )
+        events.append(event)
+        statuses.append(analyzer_status_for_events(analyzer, [event]))
+    completeness, _ = finalize_ledger(
+        {
+            "components": ["script.sh"],
+            "findings": [],
+            "inspection_ledger": events,
+            "analyzer_status_events": statuses,
+        }
+    )
+    exceptions = completeness["ledger_exceptions"]
+    assert len(exceptions) == 2
+    assert {
+        row["parser_diagnostic"]["observed_characters"]: row["analyzers"] for row in exceptions
+    } == {4097: ["a", "b"], 4100: ["c"]}
+    assert completeness["is_complete"] is False
+    assert completeness["execution_successful"] is True
+
+
 def test_out_of_scope_boundaries_do_not_count_as_analyzer_failures() -> None:
     """Non-fatal scope boundaries are not planned work for an analyzer."""
     analyzer_id = "static_patterns_prompt_injection"
