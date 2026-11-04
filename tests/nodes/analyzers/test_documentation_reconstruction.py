@@ -379,6 +379,34 @@ def test_nested_list_fence_uses_container_relative_indentation() -> None:
     assert "rm -rf /" in projected
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    "opening,indent",
+    [("- ~~~sh", "  "), ("- Modes:\n  - Commands:\n    ~~~sh", "    "), ("-\t~~~sh", "\t")],
+)
+@pytest.mark.parametrize("threat_location", [None, "inside", "after"])
+def test_list_fence_dedent_preserves_prose_and_commands(
+    newline: str, opening: str, indent: str, threat_location: str | None
+) -> None:
+    content = opening + "\n" + indent + "printf ok\n"
+    if threat_location == "inside":
+        content += indent + "rm -rf /\n"
+    content += "\nThe interface doesn't match the spec.\n"
+    if threat_location == "after":
+        content += "```sh\nrm -rf /\n```\n"
+    content += "Ordinary documentation.\n" * 500
+    content = content.replace("\n", newline)
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm_module]
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert any(finding.rule_id == "TM1" for finding in result["findings"]) is (
+        threat_location is not None
+    )
+
+
 @pytest.mark.parametrize("language", ["tcl", "verilog"])
 def test_nested_list_fence_keeps_typed_fence_quote_ownership(language: str) -> None:
     # A nested list fence takes the same typed-fence path as a top-level fence:
@@ -415,7 +443,11 @@ def test_list_fence_container_relative_indentation_boundary(
 
 @pytest.mark.parametrize("opening,indent", [("   ```sh", "      "), ("- - ```sh", "        ")])
 def test_deeply_indented_marker_does_not_close_fence(opening: str, indent: str) -> None:
-    content = opening + "\n" + indent + "```\n" + _LITERAL_BACKTICK_COMMAND + "\n```\n"
+    # Keep the command inside the list; dedenting would itself end its fence.
+    command_indent = "    " if opening.startswith("-") else ""
+    content = (
+        opening + "\n" + indent + "```\n" + command_indent + _LITERAL_BACKTICK_COMMAND + "\n```\n"
+    )
     projected = tm_module._markdown_shell_text(content, lambda: None)
     assert _LITERAL_BACKTICK_COMMAND in projected
 
