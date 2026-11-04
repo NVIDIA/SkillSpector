@@ -103,6 +103,7 @@ class LedgerReason(StrEnum):
     ARCHIVE_MALFORMED = "archive_malformed"
     ARCHIVE_ENCRYPTED = "archive_encrypted"
     ARCHIVE_UNSUPPORTED_COMPRESSION = "archive_unsupported_compression"
+    ARCHIVE_UNSUPPORTED_MEMBER = "archive_unsupported_member"
     ARCHIVE_TRUNCATED = "archive_truncated"
     ARCHIVE_MEMBER_INCOMPLETE = "archive_member_incomplete"
     ARCHIVE_UNSAFE_MEMBER_PATH = "archive_unsafe_member_path"
@@ -238,10 +239,13 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.ARCHIVE_FORMAT_MISMATCH: (
         "Artifact bytes do not match the container format implied by its filename."
     ),
-    LedgerReason.ARCHIVE_MALFORMED: "ZIP-compatible content is malformed.",
+    LedgerReason.ARCHIVE_MALFORMED: "Archive or compressed content is malformed.",
     LedgerReason.ARCHIVE_ENCRYPTED: "Archive member is encrypted and could not be inspected.",
     LedgerReason.ARCHIVE_UNSUPPORTED_COMPRESSION: (
         "Archive member uses an unsupported compression method."
+    ),
+    LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER: (
+        "Archive member uses a type or feature that is not supported for inspection."
     ),
     LedgerReason.ARCHIVE_TRUNCATED: "Archive member is truncated or unreadable.",
     LedgerReason.ARCHIVE_MEMBER_INCOMPLETE: "Nested artifact inspection is incomplete.",
@@ -270,7 +274,8 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.OPAQUE_CONTENT: "Artifact contents could not be fully interpreted.",
     LedgerReason.UNSUPPORTED_PRIMARY_CONTENT: (
         "The requested file or primary instructions could not be interpreted. "
-        "Provide UTF-8 text, a supported ZIP, or an extracted directory instead."
+        "Provide UTF-8 text, a supported ZIP, TAR, or GZIP container, "
+        "or an extracted directory instead."
     ),
     LedgerReason.REFERENCED_UNINSPECTED: ("A referenced artifact was not completely inspected."),
     LedgerReason.REFERENCE_EXTRACTION_LIMIT: (
