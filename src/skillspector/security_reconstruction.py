@@ -730,6 +730,61 @@ def validated_json_string_closers(text: str, check_runtime: Callable[[], None] |
     return {end - 1 for _, end in validated_json_string_spans(text, check_runtime)}
 
 
+def _is_quoted_mapping_key(text: str, start: int) -> bool:
+    """Return whether the exact quoted removal verb is followed by a key colon."""
+    if start == 0 or text[start - 1] not in _ALL_QUOTE_CHARACTERS:
+        return False
+    closing_quote = _QUOTE_OPEN_TO_CLOSE[text[start - 1]]
+    closing = text.find(closing_quote, start)
+    if (
+        closing < 0
+        or re.fullmatch(_FALLBACK_REMOVAL_VERBS, text[start:closing], re.IGNORECASE) is None
+    ):
+        return False
+    cursor = closing + len(closing_quote)
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    return cursor < len(text) and text[cursor] == ":"
+
+
+def _verb_is_in_cli_flag_token(text: str, start: int) -> bool:
+    """Return whether a fallback verb is part of a hyphen-prefixed token."""
+    token_start = start
+    while token_start > 0 and (text[token_start - 1].isalnum() or text[token_start - 1] in "_-"):
+        token_start -= 1
+    return token_start < start and text[token_start] == "-"
+
+
+def _quoted_verb_in_string_sequence(text: str, match: re.Match[str]) -> bool:
+    """Return whether the fallback header's quote ends a verb in a string sequence.
+
+    The loose fallback header reads ``verb <filler> '`` as a marker opener.
+    When the removal verb is itself a quoted string literal (``'delete'``),
+    the matched quote is that literal's closing delimiter, and the literal is
+    followed by a separator and another quoted literal, the text is a sequence
+    of quoted strings (a list, tuple, or mapping), not a prose instruction:
+    reading the closing quote as a marker opener misreads ordinary code such
+    as ``['delete', 'run', 'list']`` as an obfuscated directive and fails the
+    deterministic layer closed. Matches with any filler between the verb and
+    the quote (``delete 'x'``), and quoted verbs not followed by another quoted
+    literal (``mode="omit", flag=...``), are unaffected.
+    """
+    quote_index = match.start("quote")
+    verb = re.match(_FALLBACK_REMOVAL_VERBS, text[match.start() :], re.IGNORECASE)
+    if verb is None or match.start() + verb.end() != quote_index:
+        return False
+    opener_index = match.start() - 1
+    if opener_index < 0:
+        return False
+    opener = text[opener_index]
+    if opener not in _QUOTE_OPEN_TO_CLOSE or _QUOTE_OPEN_TO_CLOSE[opener] != text[quote_index]:
+        return False
+    cursor = quote_index + 1
+    while cursor < len(text) and text[cursor] in " \t\r\n,":
+        cursor += 1
+    return cursor < len(text) and text[cursor] in _ALL_QUOTE_CHARACTERS
+
+
 def _view_string_closer(
     view: SecurityTextView, validated_string_closer: Callable[[int], bool]
 ) -> Callable[[int], bool]:
@@ -766,6 +821,12 @@ def _quoted_directives(
     for match in pattern.finditer(text):
         if check_runtime is not None:
             check_runtime()
+        if unsupported_header and _verb_is_in_cli_flag_token(text, match.start()):
+            continue
+        if unsupported_header and _is_quoted_mapping_key(text, match.start()):
+            continue
+        if unsupported_header and _quoted_verb_in_string_sequence(text, match):
+            continue
         if match.end() - 1 in json_value_closers:
             continue
         if (
@@ -969,6 +1030,8 @@ def _tag_directives(
     for match in pattern.finditer(text):
         if check_runtime is not None:
             check_runtime()
+        if unsupported_header and _verb_is_in_cli_flag_token(text, match.start()):
+            continue
         marker_start = match.start("open")
         if unsupported_header:
             # The header's filler may be at most _MAX_FALLBACK_PREFIX_CHARS
@@ -1010,6 +1073,8 @@ def _encoded_directives(
     for match in pattern.finditer(text):
         if check_runtime is not None:
             check_runtime()
+        if unsupported_header and _verb_is_in_cli_flag_token(text, match.start()):
+            continue
         quote = match.group("quote")
         closing_pattern = (
             _ENCODED_SINGLE_QUOTE_RE
@@ -1060,6 +1125,8 @@ def _encoded_tag_directives(
     for match in pattern.finditer(text):
         if check_runtime is not None:
             check_runtime()
+        if unsupported_header and _verb_is_in_cli_flag_token(text, match.start()):
+            continue
         marker_start = match.start("open")
         marker_end_limit = min(len(text), marker_start + MAX_MARKER_LOOKAHEAD_CHARS)
         marker_end = _ENCODED_TAG_END_RE.search(text, match.end(), marker_end_limit)
@@ -1180,12 +1247,16 @@ def _bounded_sentence_end(
     maximum_end: int,
     *,
     end_is_truncated: bool,
+    closes_owned_string: Callable[[int], bool] | None = None,
     context_start: int | None = None,
 ) -> tuple[int, bool]:
     # A directive can be inside a quoted string; retain that quote's state.
     scan_start = start if context_start is None else context_start
     for boundary_start, _ in _sentence_boundaries(
-        text, scan_start, min(len(text), maximum_end + 1)
+        text,
+        scan_start,
+        min(len(text), maximum_end + 1),
+        closes_owned_string=closes_owned_string,
     ):
         if start <= boundary_start <= maximum_end:
             return boundary_start, False
@@ -1233,6 +1304,7 @@ def _sentence_boundaries(
     start: int,
     end: int,
     *,
+    closes_owned_string: Callable[[int], bool] | None = None,
     quote_spans: tuple[list[int], list[int]] | None = None,
     check_runtime: Callable[[], None] | None = None,
 ) -> Iterator[tuple[int, int]]:
@@ -1271,8 +1343,13 @@ def _sentence_boundaries(
             and text[cursor - 1].isalnum()
             and text[cursor + 1].isalnum()
         ):
-            quote_start = cursor
-            quote_close = _QUOTE_OPEN_TO_CLOSE[character]
+            # A scan can begin inside an embedded program/string. Its host's
+            # proven closing delimiter does not open a new prose quotation
+            # that swallows subsequent line boundaries. Existing open quotes
+            # still close normally above, and literal contents remain scanned.
+            if closes_owned_string is None or not closes_owned_string(cursor):
+                quote_start = cursor
+                quote_close = _QUOTE_OPEN_TO_CLOSE[character]
         elif character == "\n":
             yield cursor, cursor + 1
         elif character in ".!?" and (cursor + 1 == len(text) or text[cursor + 1].isspace()):
@@ -1790,14 +1867,19 @@ def _classify_directive(
     directive: _Directive,
     *,
     end_is_truncated: bool,
+    closes_owned_string: Callable[[int], bool] | None = None,
     context_start: int | None = None,
 ) -> _DirectiveClassification:
     if directive.exhausted:
         return _DirectiveClassification(None, False, True)
 
     baseline = None
-    if context_start is not None:
-        baseline = _classify_directive(view, directive, end_is_truncated=end_is_truncated)
+    if context_start is not None or closes_owned_string is not None:
+        baseline = _classify_directive(
+            view,
+            directive,
+            end_is_truncated=end_is_truncated,
+        )
         if baseline.active or not baseline.limited:
             return baseline
 
@@ -1812,6 +1894,7 @@ def _classify_directive(
         directive.end,
         scope_cap,
         end_is_truncated=end_is_truncated,
+        closes_owned_string=closes_owned_string,
         context_start=context_start,
     )
     lookahead_cap = min(len(view.text), directive.end + MAX_MARKER_LOOKAHEAD_CHARS)
@@ -1820,6 +1903,7 @@ def _classify_directive(
         directive.end,
         lookahead_cap,
         end_is_truncated=end_is_truncated,
+        closes_owned_string=closes_owned_string,
         context_start=context_start,
     )
     first_sentence_end = lookahead_end
@@ -1838,23 +1922,27 @@ def _classify_directive(
             first_sentence_end + 1,
             lookahead_cap,
             end_is_truncated=end_is_truncated,
+            closes_owned_string=closes_owned_string,
         )
         lookahead_exhausted = lookahead_exhausted or continuation_exhausted
-    if (
-        baseline is not None
-        and context_start is not None
-        and any(
-            pattern.search(view.text, min(clause_start, context_start), lookahead_end) is not None
-            for pattern in (
-                _UNAMBIGUOUS_ACTION_RE,
-                _CONTEXTUAL_ACTION_RE,
-                _PASTE_ACTION_RE,
-            )
+    if baseline is not None and any(
+        pattern.search(
+            view.text,
+            min(clause_start, context_start) if context_start is not None else clause_start,
+            lookahead_end,
+        )
+        is not None
+        for pattern in (
+            _UNAMBIGUOUS_ACTION_RE,
+            _CONTEXTUAL_ACTION_RE,
+            _PASTE_ACTION_RE,
         )
     ):
         # Even an unbound action can acquire its payload through adjacent
         # literals. Wrapper proof may repair an inert method-like header, but
         # it cannot clear a prior limit for a potentially active instruction.
+        # Proven host closers have the same restriction: adjacent literals can
+        # supply the payload after a closer shortens the lexical sentence.
         # Ambiguous or negated action cues also retain that conservative result.
         return baseline
     payloads = _quoted_payloads(view.text, directive, scope_end)
@@ -2024,6 +2112,7 @@ def build_declared_marker_views(
                     0,
                     len(view.text),
                     quote_spans=quote_spans,
+                    closes_owned_string=closes_owned_string,
                     check_runtime=check_runtime,
                 ):
                     pass
@@ -2042,6 +2131,7 @@ def build_declared_marker_views(
             view,
             directive,
             end_is_truncated=source_end_is_truncated,
+            closes_owned_string=closes_owned_string,
             context_start=context_start,
         )
         limited = limited or classification.limited

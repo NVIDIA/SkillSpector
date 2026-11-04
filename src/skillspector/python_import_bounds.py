@@ -70,6 +70,19 @@ class PythonImportBounds:
         characters = 0
         nodes_seen = 0
 
+        def unreadable(stems: tuple[str, ...]) -> bool:
+            for candidate in self._components:
+                check_runtime()
+                normalized = ("/" + candidate.replace("\\", "/")).casefold()
+                if not normalized.endswith((".pyc", ".pyo", ".so", ".pyd", ".dll")):
+                    continue
+                normalized = normalized.replace("/__pycache__/", "/")
+                for stem in stems:
+                    _, separator, extension = normalized.rpartition("/" + stem.casefold() + ".")
+                    if separator and "/" not in extension:
+                        return True
+            return False
+
         def resolve(module: str, caller: str, level: int) -> list[str] | None:
             check_runtime()
             suffix = module.replace(".", "/")
@@ -78,6 +91,15 @@ class PythonImportBounds:
                 for _ in range(level - 1):
                     parent = parent.parent
                 suffix = str(parent / suffix)
+            # Native and bytecode members can supply or replace this module;
+            # a readable sibling cannot establish which body is imported.
+            requested = PurePosixPath(suffix)
+            while True:
+                if unreadable((str(requested), str(requested / "__init__"))):
+                    return None
+                if requested.parent == requested:
+                    break
+                requested = requested.parent
             matches = []
             for candidate in self._paths:
                 check_runtime()
@@ -92,7 +114,8 @@ class PythonImportBounds:
             # An absent relative module or a visible package with no resolvable
             # entry is missing bundled evidence, rather than an external import.
             if level or any(
-                ("/" + suffix + "/") in ("/" + p.replace("\\", "/")) for p in self._paths
+                ("/" + suffix.casefold() + "/") in ("/" + p.replace("\\", "/").casefold())
+                for p in self._components
             ):
                 return None
             return []
@@ -128,6 +151,8 @@ class PythonImportBounds:
             # package. A namespace package with no initializer adds no code.
             for parent in PurePosixPath(module_path.replace("\\", "/")).parents:
                 check_runtime()
+                if unreadable((str(parent), str(parent / "__init__"))):
+                    return False
                 initializer = str(parent / "__init__.py")
                 matches = [p for p in self._paths if p.replace("\\", "/") == initializer]
                 if len(matches) > 1:

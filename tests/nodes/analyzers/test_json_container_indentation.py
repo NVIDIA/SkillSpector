@@ -137,7 +137,7 @@ def test_json_quote_caller_requires_complete_markdown_context(
     exhausted = tm_module.has_bounded_parse_exhaustion(
         source, lambda: None, file_type="markdown", complete_context=complete_context
     )
-    assert calls == ([source] if complete_context else [])
+    assert calls == ([source, source] if complete_context else [])
     assert exhausted is not complete_context
 
 

@@ -32,8 +32,13 @@ import pytest
 import yaml
 from pydantic import BaseModel
 
-from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
-from skillspector.llm_analyzer_base import LLMAnalyzerBase
+from skillspector.inspection_ledger import (
+    LedgerOutcome,
+    LedgerReason,
+    LedgerRecordType,
+    finalize_ledger,
+)
+from skillspector.llm_analyzer_base import BatchExecutionResult, BatchFailure, LLMAnalyzerBase
 from skillspector.llm_utils import AgentCLIChatModel
 from skillspector.nodes.analyzers import mcp_tool_poisoning
 from skillspector.nodes.deduplicate import deduplicate
@@ -1978,6 +1983,193 @@ class TestTP4Telemetry:
         state = _make_state("mcp_mismatched_skill", use_llm=False)
         result = node(state)
         assert "llm_call_log" not in result
+
+
+class TestTP4PlaintextRecovery:
+    @pytest.mark.parametrize("confidence", [None, 0.6, 0.9])
+    @pytest.mark.parametrize(
+        "reason,expected_outcome,call_ok",
+        [
+            (LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED, LedgerOutcome.PARTIAL, True),
+            (LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED, LedgerOutcome.FAILED, False),
+            (LedgerReason.RUNTIME_LIMIT, LedgerOutcome.PARTIAL, False),
+        ],
+    )
+    def test_partial_findings_and_unknowns_keep_terminal_evidence(
+        self, monkeypatch, confidence, reason, expected_outcome, call_ok
+    ):
+        assert mcp_tool_poisoning._TP4Analyzer.recovery_required_fields == ("confidence",)
+
+        class RecoveryAnalyzer:
+            inference_usage = []
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def arun_batches_detailed(self, batches):
+                assert len(batches) == 1
+                batch = batches[0]
+                assessments = (
+                    []
+                    if confidence is None
+                    else [
+                        mcp_tool_poisoning._TP4AnalysisResult(
+                            is_mismatch=True,
+                            confidence=confidence,
+                            mismatched_capabilities=["network access"],
+                        )
+                    ]
+                )
+                terminal = BatchFailure(batch, "RecoveryStopped", reason)
+                return BatchExecutionResult(
+                    recovered=[(batch, assessments)],
+                    warnings=[terminal] if call_ok else [],
+                    failures=[] if call_ok else [terminal],
+                )
+
+        monkeypatch.setattr(mcp_tool_poisoning, "_TP4Analyzer", RecoveryAnalyzer)
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Read local files."},
+                "file_cache": {"tool.py": "print('local')\n"},
+                "component_metadata": [{"path": "tool.py", "type": "python"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert len(result.findings) == (0 if confidence is None else 1)
+        if confidence is not None:
+            finding = result.findings[0]
+            assert finding.rule_id == "TP4"
+            assert finding.severity == ("HIGH" if confidence >= 0.7 else "MEDIUM")
+            assert finding.evidence["assessment_complete"] is False
+            assert "llm-format-recovery" in finding.tags
+        producers = [
+            event for event in result.ledger if event["record_type"] is LedgerRecordType.WORK_ITEM
+        ]
+        (event,) = producers
+        assert event["outcome"] is (
+            LedgerOutcome.PARTIAL if confidence is not None else expected_outcome
+        )
+        assert event["reason_code"] is reason
+        assert event["emitted_finding_ids"] == [finding.finding_id for finding in result.findings]
+        assert event["error_class"] != "UnexpectedStructuredResponse"
+        assert result.record["ok"] is call_ok
+        completeness, _ = finalize_ledger(
+            {
+                "components": ["tool.py"],
+                "findings": result.findings,
+                "inspection_ledger": result.ledger,
+                "analyzer_status_events": [
+                    mcp_tool_poisoning.analyzer_status_for_events(
+                        "mcp_tool_poisoning", result.ledger
+                    )
+                ],
+            }
+        )
+        assert completeness["execution_successful"] is (
+            expected_outcome is not LedgerOutcome.FAILED
+        )
+        assert not any(
+            row["reason_code"]
+            in {LedgerReason.UNACCOUNTED_WORK, LedgerReason.FINDING_ACCOUNTING_ERROR}
+            for row in completeness["ledger_exceptions"]
+        )
+
+    @pytest.mark.parametrize(
+        "failure_reason",
+        [None, LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED, LedgerReason.RUNTIME_LIMIT],
+    )
+    def test_formatting_warning_does_not_mask_a_finding_cap(self, monkeypatch, failure_reason):
+        class RecoveryAnalyzer:
+            inference_usage = []
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def arun_batches_detailed(self, batches):
+                return BatchExecutionResult(
+                    recovered=[
+                        (
+                            batch,
+                            [
+                                mcp_tool_poisoning._TP4AnalysisResult(
+                                    is_mismatch=True,
+                                    confidence=0.9,
+                                    mismatched_capabilities=[batch.file_path],
+                                )
+                            ],
+                        )
+                        for batch in batches
+                    ],
+                    warnings=[
+                        BatchFailure(
+                            batch,
+                            "UnverifiedAssessment",
+                            LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED,
+                        )
+                        for batch in (batches if failure_reason is None else batches[:1])
+                    ],
+                    failures=[]
+                    if failure_reason is None
+                    else [BatchFailure(batches[1], "RecoveryStopped", failure_reason)],
+                )
+
+        monkeypatch.setattr(mcp_tool_poisoning, "_TP4Analyzer", RecoveryAnalyzer)
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_FINDINGS", 1)
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Read local files."},
+                "file_cache": {"first.py": "print('first')\n", "second.py": "print('second')\n"},
+                "component_metadata": [
+                    {"path": "first.py", "type": "python"},
+                    {"path": "second.py", "type": "python"},
+                ],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert len(result.findings) == 1
+        assert any(event["reason_code"] is LedgerReason.OUTPUT_LIMIT for event in result.ledger)
+        warnings = [
+            event
+            for event in result.ledger
+            if event["reason_code"] is LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+        ]
+        assert len(warnings) == 1
+        assert warnings[0]["emitted_finding_ids"] == [result.findings[0].finding_id]
+        assert all(
+            event["outcome"] is LedgerOutcome.PARTIAL
+            for event in result.ledger
+            if event["record_type"] is LedgerRecordType.WORK_ITEM
+        )
+        assert len({event["work_id"] for event in result.ledger}) == len(result.ledger)
+        if failure_reason is not None:
+            (system,) = [
+                event for event in result.ledger if event["record_type"] is LedgerRecordType.SYSTEM
+            ]
+            assert system["reason_code"] is failure_reason
+            assert result.record["ok"] is False
+        completeness, _ = finalize_ledger(
+            {
+                "components": ["first.py", "second.py"],
+                "findings": result.findings,
+                "inspection_ledger": result.ledger,
+                "analyzer_status_events": [
+                    mcp_tool_poisoning.analyzer_status_for_events(
+                        "mcp_tool_poisoning", result.ledger
+                    )
+                ],
+            }
+        )
+        assert completeness["execution_successful"] is (
+            failure_reason is not LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+        )
+        assert not any(
+            row["reason_code"]
+            in {LedgerReason.UNACCOUNTED_WORK, LedgerReason.FINDING_ACCOUNTING_ERROR}
+            for row in completeness["ledger_exceptions"]
+        )
 
 
 class TestInspectionLedgerStatus:

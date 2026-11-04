@@ -33,7 +33,6 @@ import os
 from pathlib import Path
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_openai import AzureChatOpenAI
 from pydantic import SecretStr
 
 from skillspector.inference_usage import (
@@ -41,7 +40,7 @@ from skillspector.inference_usage import (
     retained_chat_model_controls,
 )
 from skillspector.providers import registry
-from skillspector.providers.chat_models import resolve_sampling_parameters
+from skillspector.providers.chat_models import AzureChatOpenAI, resolve_sampling_parameters
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -84,7 +83,7 @@ class AzureOpenAIProvider:
             "max_tokens": max_tokens,
             "timeout": timeout,
         }
-        sampling_parameters = resolve_sampling_parameters(include_seed=True)
+        sampling_parameters = resolve_sampling_parameters(model, include_seed=True)
         kwargs.update(sampling_parameters)
         chat_model = AzureChatOpenAI(**kwargs)
         register_chat_model_controls(

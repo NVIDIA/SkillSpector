@@ -28,12 +28,20 @@ import pytest
 
 from skillspector import mcp_server
 from skillspector.graph import graph as workflow_graph
+from skillspector.inspection_ledger import (
+    LedgerOutcome,
+    LedgerReason,
+    analyzer_status_for_events,
+    finalize_ledger,
+    ledger_event,
+)
 from skillspector.mcp_server import _llm_runtime_accounting, run_scan
 from skillspector.models import Finding
 from skillspector.nodes.build_context import build_context
 from skillspector.nodes.report import report
 from skillspector.providers import reset_provider, use_provider
 from skillspector.providers.openai import OpenAIProvider
+from skillspector.semantic_runtime import required_semantic_analyzer_ids
 from skillspector.suppression import SuppressedFinding
 
 
@@ -286,9 +294,9 @@ def test_static_only_graph_keeps_semantic_nodes_without_constructing_a_model(
     finally:
         reset_provider(token)
 
-    assert capability_probes > 0
+    assert capability_probes == 0
     semantic_model_factory.assert_not_called()
-    assert json.loads(result["report_body"])["metadata"]["llm_available"] is True
+    assert json.loads(result["report_body"])["metadata"]["llm_available"] is False
     semantic_statuses = {
         status["analyzer_id"]: status["status"]
         for status in result["analyzer_status_events"]
@@ -726,16 +734,16 @@ async def test_explicit_static_only_keeps_embedded_json_report_unchanged(
     assert payload["metadata"]["meta_analysis_applied"] is False
 
 
-async def test_run_scan_reports_llm_available_with_credentials(
+async def test_run_scan_static_mode_skips_availability_with_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Credentials present but use_llm=False: available, but honestly not used."""
+    """Static scans do not advertise availability without probing credentials."""
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
 
-    assert result["llm_available"] is True
+    assert result["llm_available"] is False
     assert result["llm_requested"] is False
     assert result["llm_used"] is False
     assert result["scan_mode"] == "static-only"
@@ -948,6 +956,101 @@ async def test_mcp_blocks_install_when_analysis_is_incomplete(
     assert verdict["safe_to_install"] is False
     assert verdict["execution_successful"] is True
     assert verdict["analysis_completeness"]["status"] == "partial"
+
+
+def _format_recovery_graph_result() -> dict:
+    """Derive the public warning from the same runtime evidence MCP validates."""
+    events = [
+        ledger_event(
+            analyzer_id=analyzer,
+            phase="semantic",
+            path="SKILL.md",
+            outcome=(
+                LedgerOutcome.PARTIAL
+                if analyzer == "semantic_security_discovery"
+                else LedgerOutcome.COMPLETED
+            ),
+            reason=(
+                LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+                if analyzer == "semantic_security_discovery"
+                else None
+            ),
+        )
+        for analyzer in sorted(required_semantic_analyzer_ids({}))
+    ]
+    result = {
+        "use_llm": True,
+        "components": ["SKILL.md"],
+        "inspection_ledger": events,
+        "analyzer_status_events": [
+            analyzer_status_for_events(event["analyzer_id"], [event]) for event in events
+        ],
+        "llm_call_log": [
+            {"node": event["analyzer_id"], "ok": True, "error": None} for event in events
+        ],
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "risk_recommendation": "CAUTION",
+        "filtered_findings": [],
+        "report_body": "{}",
+    }
+    result["analysis_completeness"], _ = finalize_ledger(result)
+    result["execution_successful"] = result["analysis_completeness"]["execution_successful"]
+    return result
+
+
+@pytest.mark.parametrize("risk_score, safe_to_install", [(0, True), (51, False)])
+async def test_mcp_format_policy_preserves_incompleteness_and_risk_gate(
+    risk_score: int,
+    safe_to_install: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _format_recovery_graph_result()
+    result["risk_score"] = risk_score
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", AsyncMock(return_value=result))
+
+    verdict = await run_scan("fixture", use_llm=True)
+
+    assert verdict["safe_to_install"] is safe_to_install
+    assert verdict["accepted_by_policy"] is True
+    assert verdict["recommendation"] == "CAUTION"
+    assert verdict["analysis_completeness"]["is_complete"] is False
+    assert verdict["analysis_completeness"]["warnings"][0]["assessment_complete"] is False
+
+
+@pytest.mark.parametrize(
+    "gap",
+    ["preflight", "missing_call", "failed_call", "wrong_source", "missing_status"],
+)
+async def test_mcp_rechecks_runtime_before_accepting_public_format_policy(
+    gap: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _format_recovery_graph_result()
+    assert result["analysis_completeness"]["policy_accepted"] is True
+    call = next(
+        call for call in result["llm_call_log"] if call["node"] == "semantic_security_discovery"
+    )
+    if gap == "missing_call":
+        result["llm_call_log"].remove(call)
+    elif gap == "failed_call":
+        call.update(ok=False, error="provider unavailable")
+    elif gap == "wrong_source":
+        call["source_identity"] = "external/unrelated"
+    elif gap == "missing_status":
+        result["analyzer_status_events"].pop()
+    monkeypatch.setattr(
+        mcp_server,
+        "is_llm_available",
+        lambda: (False, "provider unavailable") if gap == "preflight" else (True, None),
+    )
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", AsyncMock(return_value=result))
+
+    verdict = await run_scan("fixture", use_llm=True)
+
+    assert verdict["safe_to_install"] is False
+    assert verdict["accepted_by_policy"] is False
 
 
 async def test_run_scan_rejects_local_target_when_disallowed(

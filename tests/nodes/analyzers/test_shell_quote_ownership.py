@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 
 from skillspector.cli import app
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+from skillspector.nodes.analyzers import static_runner
 
 
 @pytest.mark.parametrize("padding", [0, 5000, 9000])
@@ -151,6 +152,30 @@ def test_heredoc_delimiter_can_end_at_eof(body: str) -> None:
     assert tm._skip_static_heredoc_bodies(
         body, 0, len(body), (("END", True, False),), lambda: None
     ) == len(body)
+
+
+@pytest.mark.parametrize(
+    "newline, closing, complete",
+    [
+        ("\n", "EOF\n", True),
+        ("\n", "EOF\r\n", False),
+        ("\r\n", "EOF\r\n", True),
+        ("\r\n", "EOF\n", False),
+        ("\n", "EOF", True),
+        ("\n", "EOF\r", False),
+        ("\r\n", "EOF", True),
+        ("\r\n", "EOF\r", False),
+    ],
+)
+def test_heredoc_delimiter_preserves_body_newline_style(
+    newline: str, closing: str, complete: bool
+) -> None:
+    content = "literal body" + newline + closing
+    end = tm._skip_static_heredoc_bodies(
+        content, 0, len(content), (("EOF", False, True),), lambda: None
+    )
+
+    assert (end == len(content)) is complete
 
 
 def test_large_continued_heredoc_checks_runtime_and_keeps_raw_commands() -> None:
@@ -478,10 +503,14 @@ def test_runtime_and_unresolved_controls_remain_partial(source: str, padding: in
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
-@pytest.mark.parametrize("file_type", ["markdown", "python", "powershell"])
-def test_ownership_does_not_apply_to_other_languages(file_type: str) -> None:
+@pytest.mark.parametrize(
+    "file_type, partial", [("markdown", True), ("python", True), ("powershell", False)]
+)
+def test_quote_ownership_respects_host_language(file_type: str, partial: bool) -> None:
     source = 'echo "hello $(printf x) ${DELAY}s"\n' + "#" * 6000
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type)
+    # Complete PowerShell has its own projection; other host languages cannot
+    # borrow shell ownership for this source.
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type) is partial
 
 
 def test_fragment_cannot_prove_initial_quote_state() -> None:
@@ -503,12 +532,111 @@ def test_unsupported_or_unresolved_source_discards_all_ownership(source: str) ->
     assert tm._shell_quoted_candidate_limits(source, lambda: None) == {}
 
 
+@pytest.mark.parametrize("body", ['"unowned\n', '"$($CMD -rf /)"\n'])
+def test_complete_heredoc_preserves_outer_quotes_and_executable_substitutions(
+    body: str,
+) -> None:
+    source = 'echo "prefix $(date) suffix"\ncat <<E\n' + body + "E\n"
+    limits = tm._shell_quoted_candidate_limits(source, lambda: None)
+    assert limits[source.index("$(")] == source.index('"\n')
+    assert all(end < source.index("cat <<E") for end in limits.values())
+    # Outer quote ownership does not bound the raw scanner's unmatched quote
+    # inside heredoc data. That case remains conservatively partial; the
+    # balanced-quote executable substitution must retain its runtime limit too.
+    assert tm.has_bounded_parse_exhaustion(
+        source + "# " + "." * 6000 + "\n", lambda: None, file_type="shell"
+    )
+
+
 def test_ownership_walk_obeys_runtime_budget() -> None:
     def cancel() -> None:
         raise TimeoutError("fixture budget")
 
     with pytest.raises(TimeoutError, match="fixture budget"):
         tm._shell_quoted_candidate_limits('echo "$(date)"\n', cancel)
+
+
+@pytest.mark.parametrize("padding", [0, 6000])
+def test_literal_trap_command_is_bounded_before_its_host_quote(padding: int) -> None:
+    source = """cat <<'DATA'
+"quoted data"
+DATA
+trap 'saved=$?; trap - EXIT; finish "$saved"; result=$?; exit "$result"' EXIT
+"""
+    source += "#" * padding + "\n"
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "$CMD -rf /",
+        'finish "$saved"; $CMD -rf /',
+        "echo \"$(bash -c '$CMD -rf /')\"",
+    ],
+)
+def test_literal_quote_bound_does_not_hide_runtime_destructive_commands(body: str) -> None:
+    # The third form is deliberately malformed shell quoting; it must also
+    # retain the conservative result rather than borrow an outer delimiter.
+    source = "cat <<'DATA'\nquoted data\nDATA\ntrap '" + body + "' EXIT\n" + "#" * 6000
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("file_type", ["shell", "markdown"])
+def test_quoted_assignment_value_owns_its_closing_quote(file_type: str) -> None:
+    command = 'tool --field "Description=ordinary value with <placeholders>" --show\n'
+    source = command if file_type == "shell" else "```bash\n" + command + "```\n"
+    source += "\nOrdinary trailing explanation.\n" * 300
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'bash -c "NAME=value; $CMD -rf /"',
+        "bash -c 'NAME=value; rm -rf /'",
+        "tool \"NAME=$(bash -c '$CMD -rf /')\"",
+        'tool "NAME=ordinary value"; $CMD -rf /',
+    ],
+)
+def test_quoted_assignment_delimiters_do_not_hide_executable_payloads(source: str) -> None:
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("depth", [1, 8, 32])
+def test_nested_command_substitutions_keep_shell_consumers_visible(depth: int) -> None:
+    command = "bash -c '$CMD -rf /'"
+    for _ in range(depth):
+        command = f'printf "%s" "$({command})"'
+    assert tm.has_bounded_parse_exhaustion(command, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "printf '%s' '$(bash -c \"$CMD -rf /\")'",
+        'printf "%s" "\\$(ordinary data)"',
+        'tool "NAME=$(printf %s safe)"',
+        "printf '%s' $'literal \\' $(bash -c \"$CMD -rf /\")'",
+    ],
+)
+def test_literal_and_benign_substitution_text_is_not_an_executable_shell_string(
+    source: str,
+) -> None:
+    assert list(tm._shell_command_strings(source, lambda: None)) == []
+
+
+@pytest.mark.parametrize(
+    "file_type,source",
+    [
+        ("javascript", "const message = \"$(bash -c '$CMD -rf /')\";"),
+        ("python", "message = \"$(bash -c '$CMD -rf /')\""),
+    ],
+)
+def test_host_strings_do_not_acquire_shell_substitution_semantics(
+    file_type: str, source: str
+) -> None:
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type)
 
 
 def test_quoted_helper_is_completely_inspected(tmp_path: Path) -> None:
@@ -568,6 +696,28 @@ def test_compound_adversarial_inputs_retain_security_signal(
             ), source
 
 
+def test_mixed_newline_heredoc_does_not_prove_a_false_closer() -> None:
+    source = "cat <<'EOF'\nbody\nEOF\r\necho \"quoted\"\n"
+    assert tm._shell_quoted_candidate_limits(source, lambda: None) == {}
+
+
+@pytest.mark.parametrize("statement", ["trap - EXIT", "trap '' EXIT", "trap -p", "trap -l"])
+def test_trap_reset_ignore_and_query_forms_have_no_executable_body(statement: str) -> None:
+    assert list(tm._shell_command_strings(statement + "\n", lambda: None)) == []
+
+
+def test_runtime_trap_body_remains_incomplete() -> None:
+    assert tm.has_bounded_parse_exhaustion(
+        'trap "$HANDLER" EXIT\n', lambda: None, file_type="shell"
+    )
+
+
+def test_unmatched_heredoc_data_quote_keeps_conservative_large_source_result() -> None:
+    # This separate limitation concerns data ownership, not trap-body parsing.
+    source = "cat <<'DATA'\n\"unmatched data quote\nDATA\n" + "#" * 6000
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
 def test_empty_shell_clauses_do_not_repeat_command_string_parsing() -> None:
     source = " \t\n" * 10000 + "bash -c 'echo ready'\n"
     checks = 0
@@ -614,6 +764,41 @@ def test_quoted_printf_preserves_multiline_literal_value(newline: str) -> None:
     assert not tm.has_bounded_parse_exhaustion(
         f'test "$observed" = "{substitution}"\n', lambda: None, file_type="shell"
     )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    "prefix, argument, suffix, complete_context",
+    [
+        ("", '"$VALUE"', "", True),
+        ("", '"$($CMD -rf /)"', "", True),
+        ('printf() { "$CMD" "$@"; }\n', '"known value"', "", True),
+        ("", '"known value"', "$CMD -rf /\n", True),
+        ("", '"known value"', 'echo "\n' + "#" * 6000, True),
+        ("", '"known value"', "", False),
+    ],
+)
+def test_multiline_printf_quote_proof_keeps_unresolved_commands_partial(
+    prefix: str, argument: str, suffix: str, complete_context: bool, newline: str
+) -> None:
+    source = prefix + 'test x = "$(printf "%s\\n" "first value" \\\n  ' + argument + ')"\n' + suffix
+
+    assert tm.has_bounded_parse_exhaustion(
+        source.replace("\n", newline),
+        lambda: None,
+        file_type="shell",
+        complete_context=complete_context,
+    )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_multiline_printf_quote_proof_preserves_destructive_execution(newline: str) -> None:
+    source = '"$(printf "%s%s" r \\\n  m)" -rf /\n'.replace("\n", newline)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["run.sh"], "file_cache": {"run.sh": source}}, [tm]
+    )
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
 
 
 @pytest.mark.parametrize(

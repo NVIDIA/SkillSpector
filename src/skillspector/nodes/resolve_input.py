@@ -66,6 +66,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             update: dict[str, object] = {
                 "skill_path": str(resolved),
                 "primary_file_path": handler.primary_file_path,
+                "primary_file_parent_path": handler.primary_file_parent_path,
                 "selected_source_identity": selected_source_identity_for_input(
                     input_path.strip(),
                     source_type=source_type,

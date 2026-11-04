@@ -9,6 +9,7 @@ import hashlib
 import heapq
 import posixpath
 import re
+import stat
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -60,7 +61,7 @@ _QUOTED_OR_CODE_PATH = re.compile(
 # grammar intentionally smaller than Markdown's general inline-code grammar.
 _DOCUMENTATION_IMAGE_DECLARATION = re.compile(
     r"(?:Asset|Image|Illustration|Diagram|Figure|Screenshot|Photo|Picture)"
-    r":[ \t]+`((?:\./)?(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:png|jpg|jpeg))`"
+    r":[ \t]+`((?:\./)?(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:png|jpg|jpeg|bmp))`"
     r"\.?[ \t]*",
     re.IGNORECASE,
 )
@@ -612,7 +613,7 @@ def _normalize_candidate(raw: str, source_path: str) -> str | None:
     # Split URI syntax before decoding so %23/%3F remain filename characters.
     # Decode exactly once, then apply containment checks to the decoded path.
     path_part = unquote(split.path).replace("\\", "/")
-    if not path_part or path_part.startswith("/"):
+    if not path_part or "\x00" in path_part or path_part.startswith("/"):
         return None
     if len(path_part) >= 2 and path_part[1] == ":":
         return None
@@ -670,12 +671,30 @@ def documentation_image_provenance(
     )
 
 
+def _target_exists_without_following_symlinks(skill_dir: Path, target: str) -> bool:
+    """Check path metadata only, treating symlinks and stat errors as present."""
+    current = skill_dir
+    for part in PurePosixPath(target).parts:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError:
+            # We cannot prove the target is absent, so it must not be a caveat.
+            return True
+        if stat.S_ISLNK(metadata.st_mode):
+            return True
+    return True
+
+
 def resolve_bundle_references_with_metadata(
     skill_dir: Path,
     *,
     source_path: str,
     source_text: str,
     known_paths: list[str],
+    metadata_root: Path | None = None,
     clock: Callable[[], float] = time.monotonic,
     deadline: float | None = None,
 ) -> ReferenceResolutionResult:
@@ -749,10 +768,20 @@ def resolve_bundle_references_with_metadata(
                     status = "ambiguous"
                     disposition = ArtifactDisposition.PARTIAL
                 else:
-                    status = "missing"
+                    if _target_exists_without_following_symlinks(
+                        metadata_root or skill_dir, target
+                    ):
+                        resolved_target = target
+                        status = "uninspected"
+                    else:
+                        status = "missing"
                     disposition = ArtifactDisposition.PARTIAL
             else:
-                status = "missing"
+                if _target_exists_without_following_symlinks(metadata_root or skill_dir, target):
+                    resolved_target = target
+                    status = "uninspected"
+                else:
+                    status = "missing"
                 disposition = ArtifactDisposition.PARTIAL
         # Real inventory matches (including ambiguity) always take precedence
         # over prose. An independent file use of the same token stays a record.
@@ -783,7 +812,7 @@ def resolve_bundle_references_with_metadata(
         needs_provenance = reference_kind is ReferenceKind.DOCUMENTATION_IMAGE or (
             reference_kind is ReferenceKind.MARKDOWN_IMAGE
             and resolved_target is not None
-            and PurePosixPath(resolved_target).suffix.lower() in {".jpg", ".jpeg"}
+            and PurePosixPath(resolved_target).suffix.lower() in {".jpg", ".jpeg", ".bmp"}
         )
         if needs_provenance and not input_limited:
             if source_sha256 is None:

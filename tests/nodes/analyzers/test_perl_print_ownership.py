@@ -102,7 +102,9 @@ def test_crlf_inside_print_literal_does_not_acquire_ownership() -> None:
 
     assert tm._perl_literal_print_shell_text(content, lambda: None) == content
     assert tm.has_bounded_parse_exhaustion(content, lambda: None, file_type="perl") == (
-        tm.has_bounded_parse_exhaustion(content, lambda: None, file_type="shell")
+        tm.has_bounded_parse_exhaustion(
+            content, lambda: None, file_type="perl", complete_context=False
+        )
     )
 
 
@@ -135,7 +137,9 @@ def test_unsupported_or_ambiguous_source_keeps_conservative_parse_status(content
 def test_unproven_literal_delimiters_do_not_acquire_ownership(content: str) -> None:
     assert tm._perl_literal_print_shell_text(content, lambda: None) == content
     assert tm.has_bounded_parse_exhaustion(content, lambda: None, file_type="perl") == (
-        tm.has_bounded_parse_exhaustion(content, lambda: None, file_type="shell")
+        tm.has_bounded_parse_exhaustion(
+            content, lambda: None, file_type="perl", complete_context=False
+        )
     )
 
 
@@ -171,7 +175,6 @@ def test_ambiguous_perl_quote_tokens_cannot_hide_executable_shell(
     content = f'{prefix}\nqx{{\n# {comment_quote}\nprint "Use rm to remove a project\\n";\n}};\n'
 
     assert tm._perl_literal_print_shell_text(content, lambda: None) == content
-    assert tm.has_bounded_parse_exhaustion(content, lambda: None, file_type="shell") is True
     result = _scan(content)
     assert any(
         row["outcome"] is LedgerOutcome.PARTIAL
@@ -201,7 +204,6 @@ def test_quote_like_perl_variables_cannot_hide_executable_shell(
     )
 
     assert tm._perl_literal_print_shell_text(content, lambda: None) == content
-    assert tm.has_bounded_parse_exhaustion(content, lambda: None, file_type="shell") is True
     result = _scan(content)
     assert any(
         row["outcome"] is LedgerOutcome.PARTIAL
@@ -308,14 +310,15 @@ def test_print_literal_does_not_bypass_shell_parser_bounds(newline: str) -> None
 
 @pytest.mark.parametrize("file_type,complete_context", [("shell", True), ("perl", False)])
 def test_only_complete_perl_source_can_grant_host_quote_ownership(
-    file_type: str, complete_context: bool
+    file_type: str, complete_context: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    assert (
-        tm.has_bounded_parse_exhaustion(
-            'print "Use rm to remove a project\\n";',
-            lambda: None,
-            file_type=file_type,
-            complete_context=complete_context,
-        )
-        is True
-    )
+    def reject_projection(*_args):
+        raise AssertionError("Perl ownership requires complete Perl source")
+
+    monkeypatch.setattr(tm, "_perl_literal_print_shell_text", reject_projection)
+    assert tm.has_bounded_parse_exhaustion(
+        'print "Use rm to remove a project\\n";',
+        lambda: None,
+        file_type=file_type,
+        complete_context=complete_context,
+    ) is (file_type == "perl")

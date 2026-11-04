@@ -5493,7 +5493,9 @@ def test_scan_transitive_intrinsic_child_partial_is_not_traversal_truncation(
         }
         assert reason_codes == {"static_parse_limit"}
     else:
-        assert "bounded static parser's span limit" in report_body
+        assert "could not be fully resolved by the bounded static parser" in " ".join(
+            report_body.split()
+        )
 
 
 def test_scan_transitive_child_failure_stays_visible_and_fail_closed(monkeypatch) -> None:

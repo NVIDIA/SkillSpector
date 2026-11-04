@@ -24,6 +24,7 @@ from skillspector.inspection_ledger import (
     analyzer_status_event,
     analyzer_status_for_events,
     finalize_ledger,
+    format_recovery_policy_accepted,
     guard_analyzer_node,
     inspection_work_id,
     ledger_event,
@@ -31,6 +32,7 @@ from skillspector.inspection_ledger import (
 from skillspector.models import Finding
 from skillspector.nodes.finalize_inspection_ledger import finalize_inspection_ledger
 from skillspector.nodes.report import report
+from skillspector.passive_bmp import is_structurally_valid_passive_bmp
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 
@@ -53,6 +55,103 @@ _VALID_PASSIVE_PNG = (
     + _png_chunk(b"IDAT", zlib.compress(b"\x00\x40\x80\xc0\xff"))
     + _png_chunk(b"IEND", b"")
 )
+
+_VALID_PASSIVE_BMP = (
+    b"BM"
+    + struct.pack("<III", 58, 0, 54)
+    + struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 0, 3780, 3780, 0, 0)
+    + b"\xc0\x80\xff\x00"
+)
+
+
+@pytest.mark.parametrize("height,image_size", [(1, 0), (-1, 0), (1, 4), (-1, 4)])
+def test_passive_bmp_supports_both_orientations_and_uncompressed_size_conventions(
+    height: int, image_size: int
+) -> None:
+    data = bytearray(_VALID_PASSIVE_BMP)
+    struct.pack_into("<i", data, 22, height)
+    struct.pack_into("<I", data, 34, image_size)
+    assert is_structurally_valid_passive_bmp(bytes(data))
+
+
+@pytest.mark.parametrize(
+    "offset,format_string,value",
+    [
+        (2, "I", 59),
+        (6, "I", 1),
+        (10, "I", 55),
+        (14, "I", 124),
+        (18, "i", 0),
+        (18, "i", 100_000),
+        (22, "i", 0),
+        (26, "H", 2),
+        (28, "H", 12),
+        (30, "I", 1),
+        (34, "I", 3),
+        (46, "I", 1),
+        (57, "B", 1),
+    ],
+)
+def test_passive_bmp_rejects_invalid_headers_pixels_and_unused_storage(
+    offset: int, format_string: str, value: int
+) -> None:
+    data = bytearray(_VALID_PASSIVE_BMP)
+    struct.pack_into("<" + format_string, data, offset, value)
+    assert not is_structurally_valid_passive_bmp(bytes(data))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _VALID_PASSIVE_BMP[:-1],
+        _VALID_PASSIVE_BMP + b"exec(payload)",
+        b"BM\nexec(payload)",
+        b"#!/bin/sh\nrm -rf /",
+        b"BM",
+    ],
+)
+def test_passive_bmp_rejects_truncated_and_mixed_content(payload: bytes) -> None:
+    assert not is_structurally_valid_passive_bmp(payload)
+
+
+@pytest.mark.parametrize("bits", [1, 4, 8, 16, 24, 32])
+def test_passive_bmp_validates_supported_pixel_and_palette_storage(bits: int) -> None:
+    colors = 1 << bits if bits <= 8 else 0
+    offset = 54 + 4 * colors
+    data = (
+        b"BM"
+        + struct.pack("<III", offset + 4, 0, offset)
+        + struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, bits, 0, 4, 0, 0, colors, 0)
+        + bytes(4 * colors + 4)
+    )
+    assert is_structurally_valid_passive_bmp(data)
+
+
+def test_passive_bmp_corroboration_requires_complete_canonical_bytes() -> None:
+    path = "assets/chart.bmp"
+    inventory = {"size_bytes": len(_VALID_PASSIVE_BMP)}
+    assert finalizer_module._has_verified_passive_raster(
+        path, inventory, {path: _VALID_PASSIVE_BMP}
+    )
+    inventory["size_bytes"] += 1
+    assert not finalizer_module._has_verified_passive_raster(
+        path, inventory, {path: _VALID_PASSIVE_BMP}
+    )
+
+
+def test_passive_bmp_core_header_and_palette_index_validation() -> None:
+    core = (
+        b"BM" + struct.pack("<III", 30, 0, 26) + struct.pack("<IHHHH", 12, 1, 1, 1, 24) + bytes(4)
+    )
+    assert is_structurally_valid_passive_bmp(core)
+    indexed = (
+        b"BM"
+        + struct.pack("<III", 62, 0, 58)
+        + struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 8, 0, 4, 0, 0, 1, 0)
+        + bytes(8)
+    )
+    assert is_structurally_valid_passive_bmp(indexed)
+    assert not is_structurally_valid_passive_bmp(indexed[:-4] + b"\x01\x00\x00\x00")
 
 
 @pytest.mark.parametrize(
@@ -124,6 +223,151 @@ def test_completed_work_is_covered_and_resolves_emitted_finding_ids() -> None:
     assert completeness["coverage_percent"] == 100.0
     assert completeness["ledger_exceptions"] == []
     assert effective_ids == [finding.finding_id]
+
+
+@pytest.mark.parametrize(
+    "unit", ["characters", "bytes", "findings", "artifacts", "depth", "records", "seconds"]
+)
+def test_resource_measurements_survive_finalization_with_findings(unit: str) -> None:
+    finding = Finding(rule_id="P1", message="retained evidence", file="SKILL.md")
+    measurements = {f"observed_{unit}": 10, f"limit_{unit}": 8}
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        analyzer_id="static_test",
+        path="SKILL.md",
+        reason=LedgerReason.RUNTIME_LIMIT,
+        emitted_finding_ids=[finding.finding_id],
+        **measurements,
+    )
+    completeness, effective_ids = finalize_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [finding],
+            "effective_finding_ids": [finding.finding_id],
+            "inspection_ledger": [event],
+            "analyzer_status_events": [analyzer_status_for_events("static_test", [event])],
+        }
+    )
+
+    exception = completeness["ledger_exceptions"][0]
+    assert {key: exception[key] for key in measurements} == measurements
+    assert exception["analyzers"] == ["static_test"]
+    assert exception["reason_code"] is LedgerReason.RUNTIME_LIMIT
+    assert completeness["status"] == "partial"
+    assert completeness["is_complete"] is False
+    assert completeness["execution_successful"] is True
+    assert effective_ids == [finding.finding_id]
+
+
+def test_exception_grouping_retains_distinct_and_unknown_resource_measurements() -> None:
+    events = []
+    statuses = []
+    for analyzer, observed in [("a", 10), ("b", 10), ("c", 11), ("d", None), ("e", 0)]:
+        event = ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            analyzer_id=analyzer,
+            path="SKILL.md",
+            reason=LedgerReason.OUTPUT_LIMIT,
+            observed_findings=observed,
+            limit_findings=8,
+        )
+        events.append(event)
+        statuses.append(analyzer_status_for_events(analyzer, [event]))
+
+    completeness, _ = finalize_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [],
+            "inspection_ledger": events,
+            "analyzer_status_events": statuses,
+        }
+    )
+
+    exceptions = completeness["ledger_exceptions"]
+    assert len(exceptions) == 4
+    assert {row.get("observed_findings"): row["analyzers"] for row in exceptions} == {
+        10: ["a", "b"],
+        11: ["c"],
+        None: ["d"],
+        0: ["e"],
+    }
+    assert all(row["limit_findings"] == 8 for row in exceptions)
+
+
+def test_finalization_discards_unsafe_measurements_without_hiding_incompleteness() -> None:
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        analyzer_id="static_test",
+        path="SKILL.md",
+        reason=LedgerReason.RUNTIME_LIMIT,
+        limit_seconds=1.0,
+        stage="private-stage",
+    )
+    event.update({"observed_seconds": float("nan"), "observed_bytes": True})
+    completeness, _ = finalize_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [],
+            "inspection_ledger": [event],
+            "analyzer_status_events": [analyzer_status_for_events("static_test", [event])],
+        }
+    )
+
+    exception = completeness["ledger_exceptions"][0]
+    assert exception["limit_seconds"] == 1.0
+    assert "observed_seconds" not in exception
+    assert "observed_bytes" not in exception
+    assert "stage" not in exception
+    assert completeness["is_complete"] is False
+    json.dumps(completeness, allow_nan=False)
+
+
+def test_parser_diagnostics_survive_projection_and_distinguish_exception_identity() -> None:
+    diagnostic = {
+        "cause": "resource_limit",
+        "check": "command_word_unquoted_characters",
+        "source_start_offset": 3,
+        "source_end_offset": 4100,
+        "start_line": 2,
+        "end_line": 2,
+        "unchecked_scope": "command_word",
+        "location_precision": "source_span",
+        "full_input_checked": False,
+        "observed_is_lower_bound": True,
+        "observed_characters": 4097,
+        "limit_characters": 4096,
+    }
+    events = []
+    statuses = []
+    for analyzer, observed in [("a", 4097), ("b", 4097), ("c", 4100)]:
+        event = ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            analyzer_id=analyzer,
+            path="script.sh",
+            reason=LedgerReason.STATIC_PARSE_LIMIT,
+            parser_diagnostic={**diagnostic, "observed_characters": observed},
+        )
+        events.append(event)
+        statuses.append(analyzer_status_for_events(analyzer, [event]))
+    completeness, _ = finalize_ledger(
+        {
+            "components": ["script.sh"],
+            "findings": [],
+            "inspection_ledger": events,
+            "analyzer_status_events": statuses,
+        }
+    )
+    exceptions = completeness["ledger_exceptions"]
+    assert len(exceptions) == 2
+    assert {
+        row["parser_diagnostic"]["observed_characters"]: row["analyzers"] for row in exceptions
+    } == {4097: ["a", "b"], 4100: ["c"]}
+    assert completeness["is_complete"] is False
+    assert completeness["execution_successful"] is True
 
 
 def test_out_of_scope_boundaries_do_not_count_as_analyzer_failures() -> None:
@@ -786,6 +1030,37 @@ def test_finalization_coverage_finding_does_not_require_meta_review(
     assert not any(
         event.get("phase") == "semantic_runtime" for event in result["inspection_ledger"]
     )
+
+
+def test_coverage_finding_downgrades_complete_with_caveats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coverage = Finding(
+        rule_id="AE1",
+        message="coverage",
+        finding_id="coverage-caveat",
+        severity="HIGH",
+        file="SKILL.md",
+        start_line=1,
+        tags=["coverage"],
+    )
+    monkeypatch.setattr(finalizer_module, "_reference_coverage_findings", lambda _state: [coverage])
+    monkeypatch.setattr(finalizer_module, "_size_coverage_findings", lambda *_args, **_kwargs: [])
+    result = finalize_inspection_ledger(
+        {
+            "components": ["SKILL.md"],
+            "artifact_inventory": [{"path": "SKILL.md", "disposition": "analyzed"}],
+            "artifact_references": [],
+            "findings": [],
+            "effective_finding_ids": [],
+            "meta_review_required": False,
+            "use_llm": False,
+            "inspection_ledger": [_reference_caveat(LedgerReason.REFERENCE_MISSING)],
+            "analyzer_status_events": [],
+        }
+    )
+    assert result["analysis_completeness"]["status"] == "partial"
+    assert result["analysis_completeness"]["is_complete"] is False
 
 
 def test_ae1_reports_target_specific_parser_diagnostics_for_each_reference() -> None:
@@ -2141,6 +2416,190 @@ def _self_reference_state(
         ],
         "inspection_ledger": list(events),
     }
+
+
+def _format_recovery_reference_state(path: str = "SKILL.md") -> SkillspectorState:
+    from skillspector.semantic_runtime import required_semantic_analyzer_ids
+
+    finding = Finding(rule_id="TM1", message="Known unsafe command", severity="HIGH", file=path)
+    events = [
+        ledger_event(
+            analyzer_id=analyzer,
+            outcome=(
+                LedgerOutcome.PARTIAL
+                if analyzer == "semantic_security_discovery"
+                else LedgerOutcome.COMPLETED
+            ),
+            phase="semantic",
+            path=path,
+            reason=(
+                LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+                if analyzer == "semantic_security_discovery"
+                else None
+            ),
+        )
+        for analyzer in sorted(required_semantic_analyzer_ids({}))
+    ]
+    calls = [{"node": event["analyzer_id"], "ok": True, "error": None} for event in events]
+    calls.append({"node": "meta_analyzer", "ok": True, "error": None})
+    events.append(
+        ledger_event(
+            analyzer_id="static_patterns_tool_misuse",
+            outcome=LedgerOutcome.COMPLETED,
+            phase="static",
+            path=path,
+            emitted_finding_ids=[finding.finding_id],
+        )
+    )
+    return {
+        "use_llm": True,
+        "components": [path],
+        "findings": [finding],
+        "effective_finding_ids": [finding.finding_id],
+        "artifact_inventory": [
+            {
+                "path": path,
+                "disposition": "analyzed",
+                "content_kind": "text",
+            }
+        ],
+        "artifact_references": [
+            {
+                "source_path": path,
+                "line": 5,
+                "target_path": path,
+                "status": "resolved",
+                "disposition": "analyzed",
+            }
+        ],
+        "inspection_ledger": events,
+        "analyzer_status_events": [
+            analyzer_status_for_events(event["analyzer_id"], [event]) for event in events
+        ],
+        "llm_call_log": calls,
+    }
+
+
+def test_format_recovery_warning_does_not_invent_ae1_or_drop_known_high_finding() -> None:
+    state = _format_recovery_reference_state()
+    assert finalizer_module._reference_coverage_findings(state) == []
+    result = finalize_inspection_ledger(state)
+    assert result["findings"] == []
+    assert result["effective_finding_ids"] == state["effective_finding_ids"]
+    assert state["findings"][0].severity == "HIGH"
+    assert format_recovery_policy_accepted(result["analysis_completeness"])
+    assert result["analysis_completeness"]["is_complete"] is False
+
+
+def test_format_recovery_preserves_existing_missing_reference_caveat() -> None:
+    state = _format_recovery_reference_state()
+    state["artifact_references"].append(
+        {"source_path": "SKILL.md", "line": 3, "target_path": None, "status": "missing"}
+    )
+    state["inspection_ledger"].append(
+        ledger_event(
+            record_type=LedgerRecordType.SYSTEM,
+            outcome=LedgerOutcome.PARTIAL,
+            phase="reference_resolution",
+            path="SKILL.md",
+            start_line=3,
+            end_line=3,
+            reason=LedgerReason.REFERENCE_MISSING,
+        )
+    )
+    result = finalize_inspection_ledger(state)
+    completeness = result["analysis_completeness"]
+    assert format_recovery_policy_accepted(completeness)
+    assert completeness["is_complete"] is False
+    assert completeness["partially_inspected_files"] == 1
+    assert any(
+        row["reason_code"] == "reference_missing" for row in completeness["ledger_exceptions"]
+    )
+    assert result["effective_finding_ids"] == state["effective_finding_ids"]
+    assert result["findings"] == []
+
+
+@pytest.mark.parametrize("static_gap", [False, True])
+def test_format_recovery_does_not_create_archive_gap_but_preserves_static_gaps(
+    static_gap: bool,
+) -> None:
+    member = "bundle.zip!/SKILL.md"
+    state = _format_recovery_reference_state(member)
+    state["components"].append("bundle.zip")
+    state["artifact_inventory"].append(
+        {
+            "path": "bundle.zip",
+            "disposition": "analyzed",
+            "content_kind": "binary",
+            "inspected_members": [member],
+        }
+    )
+    events = [
+        ledger_event(
+            analyzer_id="archive_inspection",
+            phase="static",
+            path="bundle.zip",
+            outcome=LedgerOutcome.COMPLETED,
+        )
+    ]
+    if static_gap:
+        events.append(
+            ledger_event(
+                analyzer_id="static_extra",
+                phase="static",
+                path=member,
+                outcome=LedgerOutcome.PARTIAL,
+                reason=LedgerReason.STATIC_PARSE_LIMIT,
+            )
+        )
+    state["inspection_ledger"].extend(events)
+    state["analyzer_status_events"].extend(
+        analyzer_status_for_events(event["analyzer_id"], [event]) for event in events
+    )
+
+    result = finalize_inspection_ledger(state)
+    inventory = result.get("artifact_inventory", state["artifact_inventory"])
+    container = next(row for row in inventory if row["path"] == "bundle.zip")
+    if static_gap:
+        assert container["reason"] == LedgerReason.ARCHIVE_MEMBER_INCOMPLETE
+        assert not format_recovery_policy_accepted(result["analysis_completeness"])
+    else:
+        assert container["disposition"] == "analyzed"
+        assert format_recovery_policy_accepted(result["analysis_completeness"])
+        assert result["analysis_completeness"]["partially_inspected_files"] == 1
+        assert result["findings"] == []
+        assert result["effective_finding_ids"] == state["effective_finding_ids"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["static_gap", "missing_status", "reference_partial", "binary", "misleading", "inventory_gap"],
+)
+def test_format_recovery_cannot_hide_independent_reference_gaps(mutation: str) -> None:
+    state = _format_recovery_reference_state()
+    if mutation == "static_gap":
+        event = ledger_event(
+            analyzer_id="static_extra",
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            path="SKILL.md",
+            reason=LedgerReason.STATIC_PARSE_LIMIT,
+        )
+        state["inspection_ledger"].append(event)
+        state["analyzer_status_events"].append(analyzer_status_for_events("static_extra", [event]))
+    elif mutation == "missing_status":
+        state["analyzer_status_events"].pop(0)
+    elif mutation == "reference_partial":
+        state["artifact_references"][0]["disposition"] = "partial"
+    elif mutation == "binary":
+        state["artifact_inventory"][0]["content_kind"] = "binary"
+    elif mutation == "misleading":
+        state["artifact_inventory"][0]["misleading_extension"] = True
+    else:
+        state["artifact_inventory"][0]["disposition"] = "partial"
+    assert [
+        finding.rule_id for finding in finalizer_module._reference_coverage_findings(state)
+    ] == ["AE1"]
 
 
 _REFERENCE_CAVEAT_CASES = [

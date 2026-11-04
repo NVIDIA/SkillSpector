@@ -29,6 +29,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 
 from skillspector.providers import registry
 from skillspector.providers.chat_models import create_openai_compatible_chat_model
+from skillspector.providers.structured_output import forced_tool_choice_supported
 
 # Documented for completeness — ChatOpenAI defaults here when base_url=None.
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -46,7 +47,7 @@ def _resolve_openai_project_headers() -> dict[str, str] | None:
 class OpenAIProvider:
     """Stock OpenAI credentials + bundled-YAML metadata provider."""
 
-    DEFAULT_MODEL = "gpt-5.4"
+    DEFAULT_MODEL = "gpt-6.1-sol"
     SLOT_DEFAULTS: dict[str, str] = {}
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
@@ -71,6 +72,7 @@ class OpenAIProvider:
             max_tokens=max_tokens,
             timeout=timeout,
             default_headers=_resolve_openai_project_headers(),
+            forced_tool_choice=self.forced_tool_choice_supported(model),
         )
 
     def get_context_length(self, model: str) -> int | None:
@@ -83,3 +85,11 @@ class OpenAIProvider:
         """Resolve model: ``SKILLSPECTOR_MODEL`` env > slot default > ``DEFAULT_MODEL``."""
         user_input = os.environ.get("SKILLSPECTOR_MODEL", "").strip()
         return user_input or self.SLOT_DEFAULTS.get(slot, "") or self.DEFAULT_MODEL
+
+    def forced_tool_choice_supported(self, model: str) -> bool:
+        """``False`` when a registry ``tool_choice: auto`` entry or the Claude model name says so."""
+        return forced_tool_choice_supported(model, REGISTRY_PATH)
+
+    def structured_output_method(self, model: str) -> str | None:
+        """``with_structured_output`` method: tool calling when ``tool_choice`` must stay ``auto``."""
+        return None if self.forced_tool_choice_supported(model) else "function_calling"

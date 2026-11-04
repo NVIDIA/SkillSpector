@@ -12,6 +12,7 @@ that was inspected.
 from __future__ import annotations
 
 import re
+import tarfile
 import unicodedata
 from array import array
 from collections.abc import Callable, Iterator
@@ -197,6 +198,7 @@ _BINARY_MAGIC = (
     b"GIF87a",
     b"GIF89a",
     b"PK\x03\x04",
+    b"\x1f\x8b",
     b"\x7fELF",
     b"MZ",
     b"\x00asm",
@@ -213,6 +215,8 @@ _BINARY_EXTENSIONS = frozenset(
         ".pdf",
         ".zip",
         ".gz",
+        ".tar",
+        ".tgz",
         ".exe",
         ".dll",
         ".dex",
@@ -360,10 +364,25 @@ def has_dex_magic(data: bytes) -> bool:
     return len(data) >= 8 and data.startswith(b"dex\n") and data[4:7].isdigit() and data[7] == 0
 
 
+def has_tar_header(data: bytes) -> bool:
+    """Validate a fixed TAR header without reading members or expanding metadata."""
+    if len(data) < tarfile.BLOCKSIZE:
+        return False
+    try:
+        tarfile.TarInfo.frombuf(data[: tarfile.BLOCKSIZE], "utf-8", "surrogateescape")
+    except tarfile.HeaderError:
+        return len(data) >= 1024 and data[:1024] == bytes(1024)
+    return True
+
+
 def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> ArtifactRecord:
     """Classify from bytes and decodability; an extension is never authoritative."""
     contains_nul = b"\x00" in data
-    has_binary_magic = has_dex_magic(data) or any(data.startswith(magic) for magic in _BINARY_MAGIC)
+    has_binary_magic = (
+        has_dex_magic(data)
+        or any(data.startswith(magic) for magic in _BINARY_MAGIC)
+        or has_tar_header(data)
+    )
     try:
         decoded = data.decode("utf-8")
         decodable = True

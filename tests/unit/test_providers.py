@@ -364,9 +364,12 @@ class TestOpenAIProvider:
         assert llm.default_headers == {"OpenAI-Project": "proj_123"}
 
     def test_default_model(self) -> None:
-        assert OpenAIProvider().resolve_model() == "gpt-5.4"
-        # All slots inherit DEFAULT_MODEL — gpt-5.4 everywhere.
-        assert OpenAIProvider().resolve_model("meta_analyzer") == "gpt-5.4"
+        provider = OpenAIProvider()
+        assert provider.resolve_model() == "gpt-6.1-sol"
+        # All slots inherit DEFAULT_MODEL — gpt-6.1-sol everywhere.
+        assert provider.resolve_model("meta_analyzer") == "gpt-6.1-sol"
+        assert provider.get_context_length(provider.DEFAULT_MODEL) == 1_050_000
+        assert provider.get_max_output_tokens(provider.DEFAULT_MODEL) == 128_000
 
     def test_metadata_known_model(self) -> None:
         provider = OpenAIProvider()
@@ -405,6 +408,47 @@ class TestOpenAIProvider:
 
 class TestAnthropicProvider:
     """Anthropic provider — Claude credentials + bundled YAML metadata."""
+
+    @pytest.mark.parametrize(
+        "model", ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-mythos-5-1"]
+    )
+    def test_structured_output_method_is_json_schema_for_registry_models(self, model: str) -> None:
+        assert AnthropicProvider().structured_output_method(model) == "json_schema"
+
+    @pytest.mark.parametrize("model", ["claude-fable-5-1-20260901", "claude-mythos-5-1-preview"])
+    def test_structured_output_method_accepts_a_version_suffix(self, model: str) -> None:
+        assert AnthropicProvider().structured_output_method(model) == "json_schema"
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-opus-5",
+            "claude-fable-5",
+            "claude-fable-6",
+            "claude-mythos-5",
+            "gpt-5.4",
+        ],
+    )
+    def test_structured_output_method_is_default_elsewhere(self, model: str) -> None:
+        assert AnthropicProvider().structured_output_method(model) is None
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5-1",
+            "claude-opus-4-8",
+        ],
+    )
+    def test_current_generation_models_carry_token_limits(self, model: str) -> None:
+        provider = AnthropicProvider()
+        assert provider.get_context_length(model) == 1_000_000
+        assert provider.get_max_output_tokens(model) == 128_000
 
     def test_returns_none_without_env_var(self) -> None:
         assert AnthropicProvider().resolve_credentials() is None
@@ -503,8 +547,8 @@ class TestAnthropicProvider:
         assert AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123) is None
 
     def test_default_model_and_meta_downgrade(self) -> None:
-        assert AnthropicProvider().resolve_model() == "claude-opus-4-6"
-        assert AnthropicProvider().resolve_model("meta_analyzer") == "claude-sonnet-4-6"
+        assert AnthropicProvider().resolve_model() == "claude-opus-5-5"
+        assert AnthropicProvider().resolve_model("meta_analyzer") == "claude-sonnet-5-5"
 
     def test_metadata_known_models(self) -> None:
         provider = AnthropicProvider()
