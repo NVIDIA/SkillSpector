@@ -36,11 +36,23 @@ Do not rely on the numeric score alone. A low score can miss semantic risk, and 
 
 2. Run the static scan.
 
+   On POSIX systems:
+
    ```bash
    skillspector scan "$TARGET" --no-llm --format json --output /tmp/skill-inspector-report.json
    ```
 
-   If the command exits non-zero, inspect any partial report and continue manually. Record that the static line was incomplete.
+   On Windows, safe file output is unsupported, so `--output` always fails
+   (exit code 2) and no report is written. Omit `--output` and redirect
+   stdout to a file outside the scan target instead. Use
+   `Set-Content -Encoding utf8`, not `>`, so PowerShell writes UTF-8 JSON
+   rather than UTF-16:
+
+   ```powershell
+   skillspector scan "$TARGET" --no-llm --format json | Set-Content -Encoding utf8 "$env:TEMP\skill-inspector-report.json"
+   ```
+
+   If the command exits non-zero, inspect any partial report and continue manually. Record that the static line was incomplete. On Windows, a non-zero exit from a command using `--output` is a platform refusal, not a scan failure: no partial report exists, so do not look for one or retry the same command.
 
 3. Read the SkillSpector report.
 
