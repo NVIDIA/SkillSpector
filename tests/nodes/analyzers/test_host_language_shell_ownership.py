@@ -583,6 +583,236 @@ def test_constant_field_shrinkage_within_operand_window_stays_complete(layout: s
     assert _python(source) is False
 
 
+@pytest.mark.parametrize(
+    "shadow,body,partial",
+    [
+        pytest.param("urllibish.py", "VALUE = 1\n", False, id="unrelated-module"),
+        pytest.param("urllib.py", "VALUE = 1\n", True, id="module"),
+        pytest.param("urllib/__init__.py", "", True, id="package"),
+        pytest.param(
+            "vendor/urllib/parse.py",
+            "def urlparse(value):\n    return replacement\n",
+            True,
+            id="package-member",
+        ),
+        pytest.param("urllib.cpython-313.so", None, True, id="opaque-extension"),
+        pytest.param("vendor/URLLIB/parse.so", None, True, id="opaque-package-member"),
+    ],
+)
+def test_constant_checkout_full_bundle_requires_native_urllib(
+    shadow: str, body: str | None, partial: bool
+) -> None:
+    source = _OPTION_TEXT + _CONSTANT_CHECKOUT_SOURCE + _TAIL
+    files = {"caller.py": source}
+    if body is not None:
+        files[shadow] = body
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["caller.py", shadow], "file_cache": files}, [tm]
+    )
+    event = next(event for event in result["inspection_ledger"] if event["path"] == "caller.py")
+
+    assert event["outcome"] is (LedgerOutcome.PARTIAL if partial else LedgerOutcome.COMPLETED)
+    if partial:
+        assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "module,opaque,readable,partial",
+    [
+        pytest.param("helpers", "helpers.pyc", False, True, id="bytecode"),
+        pytest.param("helpers", "helpers.pyo", False, True, id="legacy-bytecode"),
+        pytest.param("helpers", "helpers.cpython-313.so", False, True, id="native-abi"),
+        pytest.param("helpers", "helpers.abi3.pyd", False, True, id="native-pyd"),
+        pytest.param("helpers", "helpers.dll", False, True, id="native-dll"),
+        pytest.param("helpers", "helpers/__init__.pyc", False, True, id="bytecode-package"),
+        pytest.param("helpers", "helpers/__init__.abi3.so", False, True, id="native-package"),
+        pytest.param(
+            "helpers", "__pycache__/helpers.cpython-313.pyc", False, True, id="cached-bytecode"
+        ),
+        pytest.param("pkg.helpers", "pkg/helpers.pyc", False, True, id="nested-module"),
+        pytest.param("helpers", "helpers.pyc", True, True, id="readable-bytecode-sibling"),
+        pytest.param("helpers", "helpers.abi3.so", True, True, id="readable-native-sibling"),
+        pytest.param(
+            "pkg.helpers", "pkg/__init__.abi3.so", True, True, id="opaque-ancestor-initializer"
+        ),
+        pytest.param(
+            "pkg.helpers",
+            "pkg/__pycache__/__init__.cpython-313.pyc",
+            True,
+            True,
+            id="cached-ancestor-initializer",
+        ),
+        pytest.param("pkg.helpers", "pkg.pyd", True, True, id="opaque-ancestor-module"),
+        pytest.param(
+            "pkg.helpers", "pkg/__init__.pyc", False, True, id="missing-child-opaque-parent"
+        ),
+        pytest.param("pkg.helpers", "pkg.abi3.so", False, True, id="missing-child-native-parent"),
+        pytest.param("helpers", "helpers_extra.so", False, False, id="unrelated-prefix"),
+        pytest.param("helpers", "vendor/not_helpers.pyc", True, False, id="unrelated-basename"),
+        pytest.param("helpers", "helpers.txt", False, False, id="non-import-artifact"),
+        pytest.param("helpers", None, False, False, id="existing-external-import-limit"),
+    ],
+)
+def test_constant_checkout_full_bundle_refuses_unreadable_import_evidence(
+    module: str, opaque: str | None, readable: bool, partial: bool
+) -> None:
+    source = (
+        _OPTION_TEXT
+        + f"from {module} import output\n"
+        + _CONSTANT_CHECKOUT_SOURCE
+        + "output(message())\n"
+        + _TAIL
+    )
+    files = {"caller.py": source}
+    if readable:
+        files[module.replace(".", "/") + ".py"] = "def output(value):\n    print(value)\n"
+    components = list(files) + ([opaque] if opaque is not None else [])
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": components, "file_cache": files}, [tm]
+    )
+    event = next(event for event in result["inspection_ledger"] if event["path"] == "caller.py")
+
+    # Account for the caller separately from the unreadable artifact's own gap.
+    assert event["outcome"] is (LedgerOutcome.PARTIAL if partial else LedgerOutcome.COMPLETED)
+    if partial:
+        assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "omitted,partial",
+    [
+        ("helpers.pyc", True),
+        ("helpers.py", True),
+        ("urllib/parse.pyc", True),
+        ("helpers_extra.pyc", False),
+    ],
+)
+def test_constant_checkout_uses_known_omitted_import_inventory(omitted: str, partial: bool) -> None:
+    source = (
+        _OPTION_TEXT
+        + "from helpers import output\n"
+        + _CONSTANT_CHECKOUT_SOURCE
+        + "output(message())\n"
+        + _TAIL
+    )
+    result = static_runner.run_static_patterns_with_ledger(
+        {
+            "components": ["caller.py"],
+            "file_cache": {"caller.py": source},
+            "artifact_inventory": [{"path": omitted, "disposition": "partial"}],
+        },
+        [tm],
+    )
+    assert len(result["inspection_ledger"]) == 1
+    event = result["inspection_ledger"][0]
+    assert event["path"] == "caller.py"
+    assert event["outcome"] is (LedgerOutcome.PARTIAL if partial else LedgerOutcome.COMPLETED)
+    if partial:
+        assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize("executor", [False, True], ids=["safe-helper", "shell-initializer"])
+@pytest.mark.parametrize(
+    "initialization",
+    ["install()\n", "def unused(value=install()):\n    pass\n"],
+    ids=["direct-call", "default-call"],
+)
+def test_constant_checkout_full_bundle_checks_imported_initialization(
+    executor: bool, initialization: str
+) -> None:
+    source = (
+        _OPTION_TEXT
+        + "from helpers import output\n"
+        + _CONSTANT_CHECKOUT_SOURCE
+        + "output(message())\n"
+        + _TAIL
+    )
+    files = {
+        "caller.py": source,
+        "helpers.py": "from engine import install\n"
+        + initialization
+        + "def output(value):\n    print(value)\n",
+        "engine.py": (
+            "import subprocess\n"
+            "def install():\n"
+            '    subprocess.run(["bash", "-c", "printf initializing"])\n'
+            if executor
+            else 'def install():\n    print("initializing")\n'
+        ),
+    }
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": list(files), "file_cache": files}, [tm]
+    )
+    event = next(event for event in result["inspection_ledger"] if event["path"] == "caller.py")
+
+    assert event["outcome"] is (LedgerOutcome.PARTIAL if executor else LedgerOutcome.COMPLETED)
+    if executor:
+        assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize("guard", ["flow", "import", "stdlib"])
+def test_refused_constant_proof_preserves_existing_literal_value_bounds(
+    guard: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if guard == "flow":
+        monkeypatch.setattr(tm, "python_string_value_bounds_allowed", lambda content, check: False)
+
+    def import_check(check_runtime: Callable[[], None]) -> bool:
+        check_runtime()
+        return guard != "import"
+
+    def stdlib_check(module: str, check_runtime: Callable[[], None]) -> bool:
+        check_runtime()
+        return guard != "stdlib"
+
+    source = _OPTION_TEXT + _CONSTANT_CHECKOUT_SOURCE + _TAIL
+    start = source.index("$TOOL_ROOT")
+    ownership = tm._PythonSourceOwnership(source, lambda: None, import_check, stdlib_check)
+    value = ownership.string_value(start, start + len("$TOOL_ROOT"))
+
+    assert value is not None
+    assert " -rf {" in value[0]
+    assert tm.has_bounded_parse_exhaustion(
+        source,
+        lambda: None,
+        file_type="python",
+        python_import_check=import_check,
+        python_stdlib_check=stdlib_check,
+    )
+    # Refusing the added proof cannot revoke an existing non-root literal bound.
+    benign = _OPTION_TEXT + 'MESSAGE = "$TOOL -rf build"\n' + _TAIL
+    assert not tm.has_bounded_parse_exhaustion(
+        benign,
+        lambda: None,
+        file_type="python",
+        python_import_check=import_check,
+        python_stdlib_check=stdlib_check,
+    )
+
+
+def test_interrupted_constant_import_proof_does_not_cache_success() -> None:
+    source = _OPTION_TEXT + _CONSTANT_CHECKOUT_SOURCE + _TAIL
+    calls = 0
+
+    def import_check(check_runtime: Callable[[], None]) -> bool:
+        nonlocal calls
+        check_runtime()
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("constant import deadline")
+        return False
+
+    start = source.index("$TOOL_ROOT")
+    ownership = tm._PythonSourceOwnership(source, lambda: None, import_check)
+    with pytest.raises(TimeoutError, match="constant import deadline"):
+        ownership.string_value(start, start + len("$TOOL_ROOT"))
+
+    value = ownership.string_value(start, start + len("$TOOL_ROOT"))
+    assert calls == 2
+    assert value is not None
+    assert " -rf {" in value[0]
+
+
 @pytest.mark.parametrize("target,partial", [("/", True), ("build", False)])
 @pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
 @pytest.mark.parametrize("leading", ["", "\n"], ids=["body-start", "next-line"])
@@ -1234,11 +1464,8 @@ def test_node_assert_message_fix_keeps_unresolved_shell_commands_partial(stateme
 @pytest.mark.parametrize(
     "statement",
     [
-        "run(`${cmd}`);",
         "sh`${obj.cmd}`;",
         "sh`${obj.cmd} -rf /`;",
-        "execSync(String.raw`${obj.cmd}`);",
-        'execSync(`${cmd}` + " -rf /");',
     ],
 )
 def test_unrecognized_template_consumers_keep_existing_behavior(statement: str) -> None:
@@ -1248,6 +1475,26 @@ def test_unrecognized_template_consumers_keep_existing_behavior(statement: str) 
 
     assert assertion_template_shell_text(source, lambda: None) == source
     assert _javascript(source) is _shell(source)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "run(`${cmd}`);",
+        "execSync(String.raw`${obj.cmd}`);",
+        'execSync(`${cmd}` + " -rf /");',
+    ],
+)
+@pytest.mark.parametrize("suffix", ["", _TAIL], ids=["short", "padded"])
+def test_known_template_execution_keeps_unresolved_operands_partial(
+    statement: str, suffix: str
+) -> None:
+    source = _JS_ASSERT_IMPORT + statement + "\n" + suffix
+
+    assert _javascript(source) is True
+    result = _ledger("scripts/check.mjs", source)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
 @pytest.mark.parametrize(

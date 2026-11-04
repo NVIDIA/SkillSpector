@@ -30,8 +30,8 @@ import re
 import sys
 import time
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, field
 from hashlib import sha256
 
 from skillspector.artifacts import (
@@ -44,6 +44,7 @@ from skillspector.artifacts import (
 from skillspector.javascript_tokens import assertion_template_shell_text
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
+from skillspector.powershell_tokens import PowerShellSource, PowerShellString, powershell_source
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_string_constants import python_constant_string_fields
 from skillspector.python_tokens import (
@@ -72,6 +73,7 @@ logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_tool_misuse"
 USES_RUNTIME_CHECK = True
+USES_PYTHON_IMPORT_BOUNDS = True
 ANALYZE_USES_POSTPROCESS = True
 POSTPROCESS_USES_PYTHON_AST = True
 POSTPROCESS_USES_RUNTIME_BUDGET = True
@@ -658,6 +660,7 @@ def _skip_static_heredoc_bodies(
     joins unquoted continuations while retaining at most one delimiter's width.
     """
     cursor = start
+    expected_crlf = content[start - 2 : start] == "\r\n" if start > 0 else None
     for delimiter, strip_tabs, quoted in pending:
         logical_prefix = ""
         while cursor < limit:
@@ -665,7 +668,16 @@ def _skip_static_heredoc_bodies(
                 check_runtime()
             newline = content.find("\n", cursor, limit)
             line_end = limit if newline < 0 else newline
-            if line_end > cursor and content[line_end - 1] == "\r":
+            crlf = newline >= 0 and line_end > cursor and content[line_end - 1] == "\r"
+            if newline >= 0:
+                if expected_crlf is None:
+                    expected_crlf = crlf
+                elif crlf != expected_crlf:
+                    # Mixed physical endings cannot manufacture a delimiter.
+                    # Body-only callers establish the style on their first
+                    # complete line; uniformly CRLF bodies remain supported.
+                    return None
+            if crlf:
                 line_end -= 1
             line = content[cursor:line_end]
             continued = (
@@ -2246,12 +2258,12 @@ def _shell_quoted_candidate_limits(
     *,
     quote_closers: set[int] | None = None,
 ) -> dict[int, int]:
-    """Prove single-line double-quote bounds by walking shell source in order.
+    """Prove literal quote bounds by walking shell source in order.
 
     This is only an ownership refinement, never an execution or finding parser.
     Comments and single quotes cannot open double-quoted spans. Substitution
-    bodies have independent lexical state. Literal heredoc bodies cannot own
-    quotes in the surrounding command. Unsupported delimiters/backticks or
+    bodies have independent lexical state. Heredoc bodies cannot own surrounding
+    quotes. Unsupported delimiters/backticks or
     unresolved syntax discard ALL ownership, retaining the conservative scan.
     """
     limits: dict[int, int] = {}
@@ -2323,7 +2335,7 @@ def _shell_quoted_candidate_limits(
                 continue
             if quote is None and content.startswith("<<", cursor):
                 header = _static_heredoc_header(content, cursor, end)
-                if header is None or len(pending_heredocs) == _SHELL_COMMAND_STRING_ARGUMENTS:
+                if header is None or len(pending_heredocs) >= _SHELL_COMMAND_STRING_ARGUMENTS:
                     return False
                 spec, cursor = header
                 pending_heredocs += (spec,)
@@ -2602,6 +2614,8 @@ def _has_shell_command_word_exhaustion(
     structural_quote_closers: set[int] | None = None,
     structural_quote_openers: set[int] | None = None,
     python_source: _PythonSourceOwnership | None = None,
+    javascript_source: _JavaScriptTemplateOwnership | None = None,
+    powershell: PowerShellSource | None = None,
     perl_eval_blocks: bool = False,
     quote_limits: dict[int, int] | None = None,
     file_type: str = "shell",
@@ -2626,7 +2640,19 @@ def _has_shell_command_word_exhaustion(
     parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
     substitution_end_cache: dict[int, int | None] = {}
     backtick_end_cache: dict[int, int | None] = {}
-    may_have_destructive_outer_operands = _may_have_destructive_outer_operands(content)
+    powershell_strings = _powershell_string_operands(powershell)
+    powershell_here_closers = (
+        {
+            string.end - 2
+            for string in powershell.strings
+            if string.invoked and content[string.start : string.start + 2] in {"@'", '@"'}
+        }
+        if powershell is not None
+        else set()
+    )
+    may_have_destructive_outer_operands = _may_have_destructive_outer_operands(content) or any(
+        string.decoded for string in powershell_strings.values()
+    )
     json_openers = sorted(structural_quote_openers or ())
     complete_comments: set[tuple[int, int]] = set()
     # Short text without shell-expansion openers cannot trigger these shell-word
@@ -2645,6 +2671,28 @@ def _has_shell_command_word_exhaustion(
             continue
         if start in owned_word_positions:
             continue
+        if javascript_source is not None and javascript_source.owns(start):
+            continue
+        if powershell is not None and powershell.owns(start):
+            continue
+        if start in powershell_here_closers:
+            # This quote closes a proven host literal. Its body remains visible,
+            # and native invocation checks retain the decoded value and operands.
+            continue
+        if powershell is not None and file_type == "powershell" and content[start] == "$":
+            line_start = content.rfind("\n", max(0, start - 512), start) + 1
+            if (
+                (line_start > 0 or start <= 512)
+                and not content[line_start:start].strip(" \t")
+                and re.match(
+                    r"\$(?:[A-Za-z_][A-Za-z0-9_]*:)?[A-Za-z_][A-Za-z0-9_]*[ \t]*=(?!=)",
+                    content[start : start + 512],
+                )
+            ):
+                # A native assignment's left side is not a runtime command.
+                # Skip only that candidate; executable subexpressions in its
+                # value remain independently visited through lexical holes.
+                continue
         if structural_quote_closers is not None and start in structural_quote_closers:
             continue
         json_string_start = structural_quote_openers is not None and (
@@ -2664,6 +2712,7 @@ def _has_shell_command_word_exhaustion(
             # A quoted NAME=value argument cannot be the command word. Claim
             # only a complete static word; dynamic substitutions must remain
             # visible as independent executable candidates.
+            assignment_positions: set[int] = set()
             parsed = _parse_shell_command_word(
                 content,
                 start,
@@ -2671,8 +2720,21 @@ def _has_shell_command_word_exhaustion(
                 substitution_end_cache,
                 backtick_end_cache,
                 check_runtime=check_runtime,
+                owned_word_positions=assignment_positions,
             )
-            if parsed is not None and _plain_quoted_assignment_word(parsed):
+            if (
+                parsed is not None
+                and not parsed.dynamic
+                and not parsed.limited
+                and not shadowed
+                and "\n" not in content[start : parsed.end]
+                and "\r" not in content[start : parsed.end]
+            ):
+                # Spaces or punctuation inside a quoted value do not turn
+                # its closing quote into a new opener. Own only delimiters:
+                # embedded command text remains independently inspected.
+                owned_word_positions.update(assignment_positions)
+            if parsed is not None and _plain_quoted_assignment_word(parsed) and not shadowed:
                 parsed_through = max(parsed_through, parsed.end)
             continue
         candidate_word_positions: set[int] = set()
@@ -2722,6 +2784,8 @@ def _has_shell_command_word_exhaustion(
             unresolved_end = (
                 json_openers[next_json] if next_json < len(json_openers) else len(content)
             )
+            if powershell is not None:
+                unresolved_end = min(unresolved_end, powershell.next_boundary(start, len(content)))
             if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS and python_source is not None:
                 # Likewise, a host string or comment token owns its bytes: a
                 # shell quote it opens cannot continue into later host code.
@@ -2735,11 +2799,13 @@ def _has_shell_command_word_exhaustion(
         # A mis-paired quote can produce a completed word that crosses several
         # Python tokens. It cannot own quotes or skip candidates beyond its
         # proven host region, even when that lexical parse itself succeeded.
-        owned_end = (
-            min(parsed.end, python_word_source.word_end(start))
-            if python_word_source is not None
-            else parsed.end
+        ownership_boundary = min(
+            python_word_source.word_end(start) if python_word_source is not None else len(content),
+            powershell.next_boundary(start, len(content))
+            if powershell is not None
+            else len(content),
         )
+        owned_end = min(parsed.end, ownership_boundary)
         # Comments end at a newline, and a quote after ``=`` in prose or host
         # source may be mis-paired. Such a word cannot own a later line.
         confined_word = "\n" in content[start : parsed.end] and (
@@ -2750,10 +2816,12 @@ def _has_shell_command_word_exhaustion(
         if not confined_word:
             # A quote that opens a runtime-selected word stays an independent
             # candidate, so a mis-paired claim cannot hide its operands.
+            # An enclosing backtick may be owned at parsed.end itself.
             owned_word_positions.update(
                 position
                 for position in candidate_word_positions
-                if (python_word_source is None or position < owned_end)
+                if position <= parsed.end
+                and position < ownership_boundary
                 and content[position + 1 : position + 2] not in ("$", "`")
             )
         # Only executable nested substitutions retain independent command
@@ -2800,6 +2868,7 @@ def _has_shell_command_word_exhaustion(
                 start,
                 parsed.end,
                 check_runtime,
+                powershell_strings=powershell_strings,
                 quoted_printf_allowed=quoted_printf_allowed,
             )
         ):
@@ -2842,6 +2911,8 @@ def _has_shell_command_word_exhaustion(
         check_runtime,
         perl_eval_blocks=perl_eval_blocks,
         python_source=python_source,
+        powershell=powershell,
+        shell_substitutions=file_type == "shell",
         startup_exposure=_startup_exposure,
     ):
         if command_string is None or _command_string_depth >= 8:
@@ -2865,12 +2936,33 @@ def _has_shell_command_word_exhaustion(
     return False
 
 
+def _powershell_string_operands(
+    source: PowerShellSource | None,
+) -> dict[int, PowerShellString]:
+    """Native string arguments retain their boundaries and known literal text.
+
+    Embedded executable subexpressions split ownership and are excluded here.
+    Ordinary variable interpolation stays opaque, just as in shell arguments;
+    it never makes PowerShell backticks into Bash command substitution.
+    """
+    if source is None:
+        return {}
+    return {
+        string.start: string
+        for string in source.strings
+        if not string.invoked
+        and source.owns(string.start)
+        and source.next_boundary(string.start, string.end) == string.end
+    }
+
+
 def _has_runtime_command_operand_exhaustion(
     content: str,
     start: int,
     word_end: int,
     check_runtime: Callable[[], None],
     *,
+    powershell_strings: Mapping[int, PowerShellString] | None = None,
     quoted_printf_allowed: bool = True,
 ) -> bool:
     """Return whether a runtime-selected command's operands are undecidable."""
@@ -2879,6 +2971,7 @@ def _has_runtime_command_operand_exhaustion(
         start,
         word_end,
         check_runtime=check_runtime,
+        powershell_strings=powershell_strings,
         quoted_printf_allowed=quoted_printf_allowed,
     )
     if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
@@ -2904,26 +2997,72 @@ def _shell_command_strings(
     *,
     perl_eval_blocks: bool = False,
     python_source: _PythonSourceOwnership | None = None,
+    powershell: PowerShellSource | None = None,
+    shell_substitutions: bool = True,
     startup_exposure: list[bool] | None = None,
 ) -> Iterator[tuple[str | None, list[bool]]]:
     """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
     nested_substitutions = startup_exposure is not None and ("$(" in content or "`" in content)
     if startup_exposure is None:
         startup_exposure = [False]
+    substitution_scopes: list[int] = []
+    backtick_starts: set[int] = set()
+    scoped_startup: list[tuple[int, list[bool], int, str]] = []
     startup_work = [4 * len(content) + _ROOT_GLOB_COMMAND_CHARS]
-    for clause_start in _nonempty_shell_clause_starts(content, check_runtime):
+    clause_starts = (
+        powershell.clause_starts
+        if powershell is not None
+        else _nonempty_shell_clause_starts(
+            content,
+            check_runtime,
+            shell_substitutions=shell_substitutions,
+            substitution_scopes=substitution_scopes,
+            backtick_starts=backtick_starts,
+        )
+    )
+    for clause_start in clause_starts:
         check_runtime()
-        if not startup_exposure[0]:
-            startup_exposure[0] = _shell_clause_sets_startup(
-                content, clause_start, check_runtime, startup_work
+        # Substitutions inherit settings but cannot alter their parent shell.
+        # Keep each live lexical scope's mutable context so eval still updates
+        # subsequent commands in that same scope.
+        while scoped_startup and (
+            len(scoped_startup) > len(substitution_scopes)
+            or scoped_startup[-1][0] != substitution_scopes[len(scoped_startup) - 1]
+        ):
+            scoped_startup.pop()
+        for scope in substitution_scopes[len(scoped_startup) :]:
+            inherited = scoped_startup[-1][1] if scoped_startup else startup_exposure
+            # Legacy closers are not shell word delimiters. Cache this body's
+            # bounded source once, so readers cannot consume its closing tick.
+            body_start = clause_start if content[scope - 1] == "`" else 0
+            body = content[body_start : scope - 1] if body_start else content
+            scoped_startup.append((scope, [inherited[0]], body_start, body))
+        startup_context = scoped_startup[-1][1] if scoped_startup else startup_exposure
+        if clause_start in backtick_starts:
+            # A legacy substitution may launch a child with startup code.
+            # Only its opener enters this lexical marker set.
+            if startup_context[0]:
+                yield None, startup_context
+                return
+            continue
+        body_start, body = scoped_startup[-1][2:] if scoped_startup else (0, content)
+        if not startup_context[0]:
+            startup_context[0] = _shell_clause_sets_startup(
+                body, clause_start - body_start, check_runtime, startup_work
             )
+        if body_start and startup_context[0] and "`" in body:
+            # Escaped nested legacy substitutions need another decoding pass;
+            # this scope walk cannot prove their child startup dependencies.
+            yield None, startup_context
+            return
         starts_shell = [False]
         recognized, command_string = _command_string_from_clause(
-            content,
-            clause_start,
+            body,
+            clause_start - body_start,
             check_runtime,
             perl_eval_blocks=perl_eval_blocks,
-            startup_exposure=startup_exposure,
+            shell_traps=shell_substitutions,
+            startup_exposure=startup_context,
             starts_shell=starts_shell,
         )
         if nested_substitutions and startup_exposure[0]:
@@ -2943,7 +3082,7 @@ def _shell_command_strings(
                 continue
         # eval shares this shell's settings; a child shell has its own scope.
         # Keep exposure monotonic across eval, including settings in its body.
-        yield command_string, [False] if starts_shell[0] else startup_exposure
+        yield command_string, [False] if starts_shell[0] else startup_context
 
 
 def _shell_clause_sets_startup(
@@ -3200,9 +3339,22 @@ def _shell_redefines_printf(content: str, check_runtime: Callable[[], None]) -> 
     return False
 
 
-def _nonempty_shell_clause_starts(content: str, check_runtime: Callable[[], None]) -> Iterator[int]:
+def _nonempty_shell_clause_starts(
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    shell_substitutions: bool = False,
+    substitution_scopes: list[int] | None = None,
+    backtick_starts: set[int] | None = None,
+) -> Iterator[int]:
     """Avoid reparsing the same trailing command across empty physical lines."""
-    for start in _shell_clause_starts(content, check_runtime):
+    for start in _shell_clause_starts(
+        content,
+        check_runtime,
+        shell_substitutions=shell_substitutions,
+        substitution_scopes=substitution_scopes,
+        backtick_starts=backtick_starts,
+    ):
         while start < len(content) and content[start] in " \t":
             if start % 4096 == 0:
                 check_runtime()
@@ -3214,33 +3366,100 @@ def _nonempty_shell_clause_starts(content: str, check_runtime: Callable[[], None
 def _shell_clause_starts(
     content: str,
     check_runtime: Callable[[], None],
+    *,
+    shell_substitutions: bool = False,
+    substitution_scopes: list[int] | None = None,
+    backtick_starts: set[int] | None = None,
 ) -> Iterator[int]:
     """Yield command-clause starts outside quotes and comments in one pass."""
     yield 0
     quote: str | None = None
+    ansi_c_quote = False
     word_started = False
     cursor = 0
-    while cursor < len(content):
+    limit = len(content)
+    frames: list[tuple[int, int, str | None, bool, bool]] = []
+    substitution_ends: dict[int, int | None] = {}
+    backtick_ends: dict[int, int | None] = {}
+    while cursor < limit or frames:
+        if cursor >= limit:
+            cursor, limit, quote, ansi_c_quote, word_started = frames.pop()
+            if substitution_scopes is not None:
+                substitution_scopes.pop()
+            continue
         if cursor % 4096 == 0:
             check_runtime()
         character = content[cursor]
+        if shell_substitutions and quote != "'" and content.startswith("$(", cursor):
+            end = _skip_command_substitution(
+                content, cursor, limit, check_runtime, end_cache=substitution_ends
+            )
+            if end is not None:
+                # A command substitution executes even inside double quotes.
+                # Give its body an independent quote state and then resume
+                # the parent word; cached endpoints keep nested walks linear.
+                frames.append((end, limit, quote, ansi_c_quote, True))
+                if substitution_scopes is not None:
+                    substitution_scopes.append(end)
+                cursor += 2
+                limit = end - 1
+                quote = None
+                ansi_c_quote = False
+                word_started = False
+                yield cursor
+                continue
+        if (
+            shell_substitutions
+            and backtick_starts is not None
+            and quote != "'"
+            and character == "`"
+        ):
+            end = _skip_backtick_substitution(
+                content, cursor, limit, check_runtime, end_cache=backtick_ends
+            )
+            if end is not None:
+                backtick_starts.add(cursor)
+                yield cursor
+                frames.append((end, limit, quote, ansi_c_quote, True))
+                if substitution_scopes is not None:
+                    substitution_scopes.append(end)
+                cursor += 1
+                limit = end - 1
+                quote = None
+                ansi_c_quote = False
+                word_started = False
+                if cursor < limit:
+                    yield cursor
+                continue
         if quote is not None:
             if character == quote:
                 quote = None
-            elif quote == '"' and character == "\\" and cursor + 1 < len(content):
+                ansi_c_quote = False
+            elif (quote == '"' or ansi_c_quote) and character == "\\" and cursor + 1 < limit:
                 cursor += 2
                 continue
+        elif (
+            shell_substitutions
+            and character == "$"
+            and content[cursor + 1 : cursor + 2] in {"'", '"'}
+        ):
+            quote = content[cursor + 1]
+            ansi_c_quote = quote == "'"
+            word_started = True
+            cursor += 2
+            continue
         elif character in "'\"":
             quote = character
             word_started = True
-        elif character == "\\" and cursor + 1 < len(content):
+        elif character == "\\" and cursor + 1 < limit:
             cursor += 2
             word_started = True
             continue
         elif character == "#" and not word_started:
-            newline = content.find("\n", cursor + 1)
+            newline = content.find("\n", cursor + 1, limit)
             if newline < 0:
-                return
+                cursor = limit
+                continue
             cursor = newline + 1
             word_started = False
             yield cursor
@@ -3316,6 +3535,7 @@ def _command_string_from_clause(
     check_runtime: Callable[[], None],
     *,
     perl_eval_blocks: bool = False,
+    shell_traps: bool = False,
     literal_command_spans: list[tuple[int, int]] | None = None,
     startup_exposure: list[bool] | None = None,
     starts_shell: list[bool] | None = None,
@@ -3394,6 +3614,20 @@ def _command_string_from_clause(
         command = word.casefold().rsplit("/", 1)[-1]
         if command in _SHELL_CLAUSE_PREFIX_WORDS:
             continue
+        if shell_traps and command == "trap":
+            body, limited = next_word()
+            if body == "--" and not limited:
+                body, limited = next_word()
+            if limited:
+                return True, None
+            # Reset/ignore/query forms install no executable command string.
+            if body is None or body in {"", "-", "-p", "-l"}:
+                return False, None
+            while cursor < len(content) and content[cursor] in " \t":
+                cursor += 1
+            if cursor == len(content) or content[cursor] in "\r\n;|&()#":
+                return False, None
+            return True, resolved_command_string(body, False)
         if command == "eval":
             if (
                 perl_eval_blocks
@@ -3699,6 +3933,429 @@ def _perl_literal_print_shell_text(
     return "".join(output)
 
 
+class _PowerShellOwnershipUnprovenError(Exception):
+    """PowerShell source left the bounded token subset this projection proves."""
+
+
+@dataclass(eq=False)
+class _PowerShellSegment:
+    """One pipeline element: a command name and the strings it receives."""
+
+    frame: str
+    command: str | None = None
+    started: bool = False
+    captured: bool = False
+    first_start: int = -1
+    strings: list[tuple[int, int, list[tuple[int, int]]]] = field(default_factory=list)
+
+    def owns_messages(self) -> bool:
+        if self.captured or self.command is None:
+            return False
+        if self.command in _POWERSHELL_STREAM_ONLY_COMMANDS:
+            return self.frame != "hash"
+        return self.command in _POWERSHELL_OUTPUT_COMMANDS and self.frame == "top"
+
+
+class _PowerShellProjection:
+    """Lex the PowerShell token subset that proves comment and message ownership.
+
+    The lexer tracks comments, quoted strings, here-strings, subexpressions,
+    script blocks and pipeline boundaries. Any construct whose tokenization
+    depends on parser mode (a ``#`` or ``<#`` inside a word, a word glued to
+    a closing quote, stop-parsing ``--%``) or that does not close raises
+    ``_PowerShellOwnershipUnprovenError``, so the caller keeps the raw source.
+    """
+
+    def __init__(self, content: str, check_runtime: Callable[[], None]) -> None:
+        self.content = content
+        self.check_runtime = check_runtime
+        self.next_runtime_check = 0
+        self.comments: list[tuple[int, int]] = []
+        self.continuations: list[int] = []
+        self.segments: list[_PowerShellSegment] = []
+
+    def tick(self, position: int) -> None:
+        if position >= self.next_runtime_check:
+            self.check_runtime()
+            self.next_runtime_check = position + 4096
+
+    def code(self, position: int, closer: str | None, frame: str, depth: int) -> int:
+        """Lex code until ``closer`` (or the end of input) and return its end."""
+        if depth > _POWERSHELL_MAX_NESTING:
+            raise _PowerShellOwnershipUnprovenError
+        content = self.content
+        length = len(content)
+        segment = self.segment(frame)
+        last_segment: _PowerShellSegment | None = None
+        token_start = True
+        # The last code character and token of this frame decide whether a
+        # newline ends the statement or the statement continues past it.
+        last_code_end = 0
+        comma_end = -1
+        last_token_start = -1
+        while position < length:
+            self.tick(position)
+            character = content[position]
+            following = content[position + 1 : position + 2]
+            if character in "\r\n" and last_code_end:
+                last_code = content[last_code_end - 1]
+                if last_code_end == comma_end or (
+                    segment.command is None
+                    and segment.started
+                    and (
+                        last_code in "=+-*/%!<>.:"
+                        or (last_token_start >= 0 and content[last_token_start] == "-")
+                    )
+                ):
+                    # A trailing comma continues a command's arguments. An
+                    # expression also continues after an operator; such an
+                    # element names no command and never owns a message.
+                    position += 1
+                    token_start = True
+                    continue
+            if character in " \t\f\v,":
+                if character == ",":
+                    last_code_end = comma_end = position + 1
+                position += 1
+                token_start = True
+                continue
+            if character == "#" or (character == "<" and following == "#"):
+                if not token_start:
+                    raise _PowerShellOwnershipUnprovenError
+                if character == "#":
+                    end = position
+                    while end < length and content[end] not in "\r\n":
+                        end += 1
+                else:
+                    end = content.find("#>", position + 2)
+                    if end < 0:
+                        raise _PowerShellOwnershipUnprovenError
+                    end += 2
+                self.comments.append((position, end))
+                position = end
+                continue
+            if (
+                token_start
+                and character not in "\r\n;|&)}"
+                and not (character == "`" and following in "\r\n")
+            ):
+                last_token_start = position
+            if character in "\r\n;" or (
+                character == "&"
+                and following != "&"
+                and segment.started
+                and _POWERSHELL_STATEMENT_END_RE.match(content, position + 1) is not None
+            ):
+                # A newline, semicolon or trailing background operator ends
+                # the pipeline element without passing its output onward.
+                if segment.started:
+                    last_segment = segment
+                    segment = self.segment(frame)
+                position += 1
+                token_start = True
+            elif closer is not None and character == closer:
+                return position + 1
+            elif character in ")}":
+                raise _PowerShellOwnershipUnprovenError
+            elif character == "|" or character == "&":
+                if following == character:
+                    # ``&&`` and ``||`` chain statements by status. The chain
+                    # shares one assignment or redirection target.
+                    position += 2
+                    if segment.started:
+                        last_segment = segment
+                        segment = self.segment(frame)
+                        segment.captured = last_segment.captured
+                elif character == "|":
+                    # The previous element's output flows into the next one.
+                    # PowerShell 7 also accepts a pipe that starts a new line.
+                    upstream = segment if segment.started else last_segment
+                    segment = self.segment(frame)
+                    if upstream is not None:
+                        # The last element's output goes wherever the
+                        # pipeline's does, such as an assignment upstream.
+                        segment.captured = upstream.captured
+                        upstream.captured = True
+                    position += 1
+                else:
+                    # A call operator runs a computed command.
+                    segment.started = segment.captured = True
+                    position += 1
+                token_start = True
+            elif character == "`":
+                if position + 1 >= length:
+                    raise _PowerShellOwnershipUnprovenError
+                if following in " \t\f\v" or content.startswith("--%", position + 1):
+                    # An escaped blank splits or joins words by parser mode,
+                    # and an escaped stop-parsing token still stops parsing.
+                    raise _PowerShellOwnershipUnprovenError
+                if following in "\r\n":
+                    if not token_start:
+                        # Glued to a word, the escaped newline either ends a
+                        # parameter or joins the word, depending on mode.
+                        raise _PowerShellOwnershipUnprovenError
+                    # A line continuation is whitespace within one statement.
+                    self.continuations.append(position)
+                    position += 3 if content.startswith("\r\n", position + 1) else 2
+                    token_start = True
+                    continue
+                self.word(segment, position, token_start)
+                position += 2
+                token_start = False
+            elif character in _POWERSHELL_QUOTES:
+                standalone = token_start
+                if not standalone:
+                    if last_token_start == segment.first_start:
+                        # A quote inside the command-name word builds the
+                        # name itself; its parts are not message arguments.
+                        raise _PowerShellOwnershipUnprovenError
+                    if content[position - 1] in ".:[":
+                        # A member name, parameter value or index is not a
+                        # message argument.
+                        segment.captured = True
+                self.word(segment, position, token_start)
+                position = self.string(segment, position, depth)
+                if standalone:
+                    token_start = self.string_suffix(segment, position)
+                else:
+                    token_start = False
+                    if content[position : position + 1] in (".", "["):
+                        segment.captured = True
+            elif character == "@" and following in _POWERSHELL_QUOTES:
+                if not token_start:
+                    raise _PowerShellOwnershipUnprovenError
+                self.word(segment, position, token_start)
+                position = self.here_string(segment, position, depth)
+                token_start = self.string_suffix(segment, position)
+            elif character in "$@" and following == "(":
+                self.word(segment, position, token_start)
+                position = self.code(position + 2, ")", "paren", depth + 1)
+                token_start = False
+            elif character == "@" and following == "{":
+                self.word(segment, position, token_start)
+                position = self.code(position + 2, "}", "hash", depth + 1)
+                token_start = False
+            elif character == "(":
+                self.word(segment, position, token_start)
+                position = self.code(position + 1, ")", "paren", depth + 1)
+                token_start = True
+            elif character == "{":
+                self.word(segment, position, token_start)
+                position = self.code(position + 1, "}", "block", depth + 1)
+                token_start = True
+            elif character == "$" and following == "{":
+                self.word(segment, position, token_start)
+                position = self.braced_variable(position)
+                token_start = False
+            else:
+                if content.startswith("--%", position):
+                    # Stop-parsing passes the rest of the line verbatim.
+                    raise _PowerShellOwnershipUnprovenError
+                if character in "=>":
+                    # Assignment and redirection can retain a message as data.
+                    segment.captured = True
+                elif token_start and character == "@" and following.isalnum():
+                    # Splatting can supply a capture parameter.
+                    segment.captured = True
+                elif token_start and character == "-" and segment.command is not None:
+                    match = _POWERSHELL_PARAMETER_RE.match(content, position)
+                    if match is not None:
+                        name = match.group(1).lower()
+                        if name in _POWERSHELL_CAPTURE_PARAMETER_ALIASES or any(
+                            parameter.startswith(name)
+                            for parameter in _POWERSHELL_CAPTURE_PARAMETERS
+                        ):
+                            segment.captured = True
+                self.word(segment, position, token_start)
+                position += 1
+                token_start = False
+            last_code_end = position
+        if closer is not None:
+            raise _PowerShellOwnershipUnprovenError
+        return position
+
+    def string_suffix(self, segment: _PowerShellSegment, position: int) -> bool:
+        """Classify what follows a standalone string; return whether a token starts."""
+        content = self.content
+        if (
+            position >= len(content)
+            or content[position] in _POWERSHELL_TOKEN_BREAKS
+            or content[position] in _POWERSHELL_QUOTES
+            or content[position] == "#"
+            or content.startswith("<#", position)
+        ):
+            return True
+        if content[position] not in ".[":
+            # Whether a glued suffix continues this string's word depends on
+            # parser mode; do not guess.
+            raise _PowerShellOwnershipUnprovenError
+        # Member access or indexing passes the string to an expression, which
+        # can hand it to a script block. A later ``#`` is inside that word.
+        segment.captured = True
+        return False
+
+    def segment(self, frame: str) -> _PowerShellSegment:
+        segment = _PowerShellSegment(frame)
+        self.segments.append(segment)
+        return segment
+
+    def word(self, segment: _PowerShellSegment, position: int, token_start: bool) -> None:
+        """Record the first token of a pipeline element as its command name."""
+        if not token_start or segment.started:
+            return
+        segment.started = True
+        segment.first_start = position
+        match = _POWERSHELL_COMMAND_NAME_RE.match(self.content, position)
+        if match is None:
+            return
+        end = match.end()
+        if end < len(self.content) and self.content[end] not in _POWERSHELL_TOKEN_BREAKS:
+            return
+        segment.command = match.group().lower()
+
+    def braced_variable(self, position: int) -> int:
+        content = self.content
+        cursor = position + 2
+        while cursor < len(content):
+            self.tick(cursor)
+            if content[cursor] == "`":
+                cursor += 2
+            elif content[cursor] == "}":
+                return cursor + 1
+            else:
+                cursor += 1
+        raise _PowerShellOwnershipUnprovenError
+
+    def string(self, segment: _PowerShellSegment, position: int, depth: int) -> int:
+        content = self.content
+        expandable = content[position] in _POWERSHELL_DOUBLE_QUOTES
+        quotes = _POWERSHELL_DOUBLE_QUOTES if expandable else _POWERSHELL_SINGLE_QUOTES
+        holes: list[tuple[int, int]] = []
+        cursor = position + 1
+        while cursor < len(content):
+            self.tick(cursor)
+            character = content[cursor]
+            if character in quotes:
+                if content[cursor + 1 : cursor + 2] and content[cursor + 1] in quotes:
+                    cursor += 2
+                    continue
+                segment.strings.append((position, cursor + 1, holes))
+                return cursor + 1
+            if expandable:
+                cursor = self.expansion(cursor, holes, depth)
+            else:
+                cursor += 1
+        raise _PowerShellOwnershipUnprovenError
+
+    def expansion(self, cursor: int, holes: list[tuple[int, int]], depth: int) -> int:
+        """Advance over one expandable-string character, lexing subexpressions."""
+        content = self.content
+        character = content[cursor]
+        following = content[cursor + 1 : cursor + 2]
+        if character == "`":
+            return cursor + 2
+        if character == "$" and following == "(":
+            # Subexpressions are code: their commands run even when the
+            # surrounding string is only a message.
+            end = self.code(cursor + 2, ")", "paren", depth + 1)
+            holes.append((cursor, end))
+            return end
+        if character == "$" and following == "{":
+            return self.braced_variable(cursor)
+        return cursor + 1
+
+    def here_string(self, segment: _PowerShellSegment, position: int, depth: int) -> int:
+        content = self.content
+        quote = content[position + 1]
+        if quote not in "'\"":
+            raise _PowerShellOwnershipUnprovenError
+        cursor = position + 2
+        while cursor < len(content) and content[cursor] in " \t":
+            cursor += 1
+        if content.startswith("\r\n", cursor):
+            cursor += 2
+        elif content.startswith("\n", cursor):
+            cursor += 1
+        else:
+            raise _PowerShellOwnershipUnprovenError
+        holes: list[tuple[int, int]] = []
+        line_start = True
+        while cursor < len(content):
+            self.tick(cursor)
+            if line_start and content.startswith(quote + "@", cursor):
+                segment.strings.append((position, cursor + 2, holes))
+                return cursor + 2
+            character = content[cursor]
+            if quote == '"' and character != "\n":
+                next_cursor = self.expansion(cursor, holes, depth)
+            else:
+                next_cursor = cursor + 1
+            line_start = content[next_cursor - 1] == "\n"
+            cursor = next_cursor
+        raise _PowerShellOwnershipUnprovenError
+
+
+def _powershell_shell_text(
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    continuations: list[int] | None = None,
+    allow_messages: bool = True,
+) -> str:
+    """Mask PowerShell comments and display-only messages, preserving offsets.
+
+    PowerShell is not a POSIX shell: ``#`` comments, ``<# #>`` blocks,
+    doubled-quote escapes, backtick escapes and here-strings otherwise look
+    like unclosed shell quotes and substitutions. Comments never execute. A
+    string is a message only when it is a direct argument of a host-display
+    command (or a top-level ``Write-Output``) whose output is not piped,
+    redirected, assigned or captured, and only when the file cannot rebind
+    that command or run runtime-built code. Subexpressions inside a message
+    remain code. All other strings, including payloads for ``bash -c``,
+    ``Invoke-Expression``, script-block creation and call operators, keep their
+    bytes for the bounded shell checks. Source this lexer cannot fully prove
+    is returned unchanged, so every existing bound and partial status applies.
+    """
+    projection = _PowerShellProjection(content, check_runtime)
+    try:
+        projection.code(0, None, "top", 0)
+    except _PowerShellOwnershipUnprovenError:
+        return content
+    masked: list[tuple[int, int]] = list(projection.comments)
+    output = list(content)
+    for position in projection.continuations:
+        # A code-level backtick before a newline continues the statement, as
+        # a backslash does in POSIX shell. Every other escape keeps its bytes,
+        # so a string payload's escaped expansion still reaches the checks.
+        output[position] = "\\"
+        if continuations is not None:
+            continuations.append(position)
+    if allow_messages and _POWERSHELL_COMMAND_REBINDING_RE.search(content) is None:
+        for segment in projection.segments:
+            check_runtime()
+            if not segment.owns_messages():
+                continue
+            for start, end, holes in segment.strings:
+                if not holes:
+                    masked.append((start, end))
+                    continue
+                # Keep each subexpression, including its ``$(`` and ``)``, and
+                # the string's own delimiters, so the subexpression keeps the
+                # quoted context its existing proofs (such as -replace) need.
+                delimiter = 2 if content[start] == "@" else 1
+                cursor = start + delimiter
+                for hole_start, hole_end in holes:
+                    masked.append((cursor, hole_start))
+                    cursor = hole_end
+                masked.append((cursor, end - delimiter))
+    for start, end in masked:
+        check_runtime()
+        for index in range(start, end):
+            if output[index] not in "\r\n":
+                output[index] = " "
+    return "".join(output)
+
+
 def _python_literal_operands(
     content: str,
     token: tuple[int, int],
@@ -3761,6 +4418,7 @@ class _PythonSourceOwnership:
     ) -> None:
         self._python_import_check = python_import_check
         self._python_stdlib_check = python_stdlib_check
+        self._constant_fields: tuple[tuple[int, int, str], ...] | None = None
         self._content = content
         self._check_runtime = check_runtime
         self._spans: PythonLiteralSpans | None = None
@@ -3943,6 +4601,61 @@ class _PythonSourceOwnership:
         return result
 
 
+class _JavaScriptTemplateOwnership:
+    """Lazily proven ownership of template literal bytes in complete JavaScript."""
+
+    def __init__(self, content: str, check_runtime: Callable[[], None]) -> None:
+        self._content = content
+        self._check_runtime = check_runtime
+        self._spans: JavaScriptTemplateSpans | None = None
+        self._spans_computed = False
+        self._unresolved_executables: list[int] = []
+
+    def _owned_spans(self) -> JavaScriptTemplateSpans | None:
+        if not self._spans_computed:
+            self._spans = _javascript_template_spans(
+                self._content,
+                self._check_runtime,
+                unresolved_executables=self._unresolved_executables,
+            )
+            self._spans_computed = True
+        return self._spans
+
+    def has_unresolved_execution(self) -> bool:
+        """Keep dynamic execution incomplete even when raw shell text is short."""
+        self._owned_spans()
+        return bool(self._unresolved_executables)
+
+    def owns(self, position: int) -> bool:
+        spans = self._owned_spans()
+        if spans is None:
+            return False
+        starts, ends = spans
+        index = bisect_right(starts, position) - 1
+        return index >= 0 and position < ends[index]
+
+    def word_end(self, start: int) -> int:
+        """Return the end of a shell word while skipping proven template bytes."""
+        spans = self._owned_spans()
+        content = self._content
+        if spans is None:
+            return len(content)
+        starts, ends = spans
+        cursor = start
+        while True:
+            self._check_runtime()
+            index = bisect_right(starts, cursor) - 1
+            if index >= 0 and cursor < ends[index]:
+                cursor = ends[index]
+            segment_end = starts[index + 1] if index + 1 < len(starts) else len(content)
+            match = _PYTHON_SHELL_WORD_BREAK_RE.search(content, cursor, segment_end)
+            if match is not None:
+                return match.start()
+            if segment_end == len(content):
+                return segment_end
+            cursor = segment_end
+
+
 def _skip_command_substitution(
     content: str,
     start: int,
@@ -3982,6 +4695,7 @@ def _bounded_shell_tokens(
     body_start: int,
     *,
     check_runtime: Callable[[], None] | None = None,
+    powershell_strings: Mapping[int, PowerShellString] | None = None,
     quoted_printf_allowed: bool = True,
 ) -> tuple[tuple[_ShellToken, ...], int, bool]:
     """Return argument words from one security-view-bounded shell command."""
@@ -4093,6 +4807,21 @@ def _bounded_shell_tokens(
         if (cursor - body_start) % 256 == 0:
             runtime_check()
         character = content[cursor]
+        native_string = powershell_strings.get(cursor) if powershell_strings is not None else None
+        if quote is None and native_string is not None:
+            if native_string.end > limit:
+                return tuple(tokens), limit, True
+            # PowerShell's backtick escapes belong to one native argument.
+            # They cannot open Bash command substitution or consume later
+            # lines. Decoded flags remain visible to the operand checks.
+            mark_quoted_word()
+            append_piece(
+                native_string.value,
+                quoted=True,
+                dynamic_can_be_empty="$" in native_string.value,
+            )
+            cursor = native_string.end
+            continue
         if quote is not None:
             if character == quote:
                 quote = None
@@ -5989,7 +6718,8 @@ def _markdown_table_delimiter_columns(
             check_runtime()
         column += 4 - column % 4 if line[prefix] == "\t" else 1
         prefix += 1
-    if column < minimum_indent or column >= 4 or prefix == len(line):
+    # Indentation belongs to the proven container, not the absolute column.
+    if column < minimum_indent or column - minimum_indent >= 4 or prefix == len(line):
         return None
     if line[prefix] not in "|:-":
         return None
@@ -6071,6 +6801,7 @@ def _markdown_shell_text(
     word_apostrophes: bool = False,
     shell_fence_ranges: list[tuple[int, int]] | None = None,
     hardware_apostrophe_ambiguity: list[bool] | None = None,
+    powershell_blocks: list[tuple[int, int]] | None = None,
 ) -> str:
     """Mask Markdown delimiters while retaining code and exact source offsets.
 
@@ -6174,6 +6905,8 @@ def _markdown_shell_text(
     # Container/HTML bodies with uncertain inline ownership remain literal.
     fence: tuple[str, int, int, str] | None = None
     shell_fence_start: int | None = None
+
+    fence_body_start = 0
     fence_literal_apostrophes: list[int] = []
     fence_literal_ownership = True
     fence_has_literal_apostrophe = False
@@ -6304,6 +7037,12 @@ def _markdown_shell_text(
                 begin, end = closing_fence.span(1)
                 body_start = offset + len(stripped) - len(fence_body)
                 output[body_start + begin : body_start + end] = " " * (end - begin)
+                if (
+                    powershell_blocks is not None
+                    and complete_context
+                    and fence[3] in {"powershell", "pwsh", "ps1"}
+                ):
+                    powershell_blocks.append((fence_body_start, offset))
                 if shell_fence_start is not None and shell_fence_ranges is not None:
                     shell_fence_ranges.append((shell_fence_start, offset))
                 shell_fence_start = None
@@ -6391,12 +7130,38 @@ def _markdown_shell_text(
                 paragraph_list_indent,
                 info.split(maxsplit=1)[0].casefold() if info else "",
             )
+            fence_body_start = offset + len(line)
             fence_literal_apostrophes.clear()
             fence_literal_ownership = True
             fence_has_literal_apostrophe = False
             fence_has_nonliteral_apostrophe = False
             output[offset + prefix + begin : offset + prefix + end] = " " * (end - begin)
-        elif not leading or indented_code or list_indented:
+        elif (
+            not leading
+            or list_indented
+            or indentation >= 4
+            and not (
+                paragraph_in_list
+                and 0 <= indentation - paragraph_list_indent <= 3
+                # A continuation uses the proven content margin. A nested
+                # marker or a new block needs its own container proof.
+                and list_marker.match(leading) is None
+                and not leading.startswith((">", "|"))
+                and re.match(r"#{1,6}(?:[ \t]|$)", leading) is None
+                and not _markdown_block_separator(leading, check_runtime)
+                and table_columns is None
+                and not (
+                    line_index + 1 < len(lines)
+                    and (
+                        columns := _markdown_table_delimiter_columns(
+                            lines[line_index + 1], paragraph_list_indent, check_runtime
+                        )
+                    )
+                    is not None
+                    and len(_markdown_table_cells(stripped, prefix, check_runtime)) == columns
+                )
+            )
+        ):
             mask_inline_delimiters()
         else:
             # Inline code may continue within a paragraph/list item, but cannot
@@ -6416,6 +7181,7 @@ def _markdown_shell_text(
                     column if has_list_marker else 0,
                     language,
                 )
+                fence_body_start = offset + len(line)
                 fence_literal_apostrophes.clear()
                 fence_literal_ownership = True
                 fence_has_literal_apostrophe = False
@@ -6592,6 +7358,75 @@ def _markdown_shell_text(
 
 USES_PYTHON_IMPORT_BOUNDS = True
 
+def _fenced_powershell_source(
+    content: str,
+    blocks: list[tuple[int, int]],
+    check_runtime: Callable[[], None],
+    unresolved_executables: list[int],
+) -> PowerShellSource | None:
+    """Keep complete PowerShell fence ownership in document coordinates."""
+    starts: list[int] = []
+    ends: list[int] = []
+    strings: list[PowerShellString] = []
+    clause_starts: set[int] = set()
+    continuations: list[tuple[int, int]] = []
+    invocations: list[tuple[int, int]] = []
+    for start, end in blocks:
+        check_runtime()
+        unresolved: list[int] = []
+        source = powershell_source(
+            content[start:end], check_runtime, unresolved_executables=unresolved
+        )
+        unresolved_executables.extend(start + position for position in unresolved)
+        if source is None:
+            continue
+        starts.extend(start + position for position in source.starts)
+        ends.extend(start + position for position in source.ends)
+        strings.extend(
+            PowerShellString(
+                start + string.start,
+                start + string.end,
+                string.value,
+                string.decoded,
+                string.invoked,
+                start + string.operand_start if string.operand_start is not None else None,
+            )
+            for string in source.strings
+        )
+        clause_starts.update(start + position for position in source.clause_starts)
+        continuations.extend((start + begin, start + end) for begin, end in source.continuations)
+        invocations.extend((start + begin, start + end) for begin, end in source.invocations)
+    if not starts and not strings and not continuations and not invocations:
+        return None
+    source = PowerShellSource(tuple(starts), tuple(ends), tuple(strings), ())
+    # Preserve the ordinary shell traversal outside the proven host spans.
+    # Add code inside PowerShell $() that POSIX string rules would miss.
+    # Host quotes cannot swallow a following Bash fence. This projection is
+    # only for locating clauses; command strings still use the original bytes.
+    projected = list(content)
+    for start, end in zip(source.starts, source.ends, strict=True):
+        check_runtime()
+        projected[start:end] = [
+            character if character in "\r\n" else " " for character in content[start:end]
+        ]
+    for start in _shell_clause_starts("".join(projected), check_runtime):
+        check_runtime()
+        position = start
+        while position < len(content) and content[position] in " \t":
+            if (position - start) % 1024 == 0:
+                check_runtime()
+            position += 1
+        if not source.owns(position):
+            clause_starts.add(start)
+    return PowerShellSource(
+        source.starts,
+        source.ends,
+        source.strings,
+        tuple(sorted(clause_starts)),
+        tuple(continuations),
+        tuple(invocations),
+    )
+
 
 def has_bounded_parse_exhaustion(
     content: str,
@@ -6629,18 +7464,36 @@ def _has_bounded_parse_exhaustion(
     *,
     file_type: str,
     complete_context: bool = True,
+    word_apostrophes: bool = False,
     python_import_check: Callable[[Callable[[], None]], bool] | None = None,
     python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
-    word_apostrophes: bool = False,
 ) -> bool:
     # PowerShell source can invoke another shell with an executable command
     # string. Apply the same bounded checks to those strings; benign PowerShell
     # -replace values have their own narrowly proven expression context.
     structural_quote_closers = None
+    projected_continuations: list[int] = []
+    if file_type == "powershell" and complete_context:
+        # Only a complete script proves token ownership. A fragment may begin
+        # inside a string or comment and would invert code and literal bytes.
+        content = _powershell_shell_text(
+            content, check_runtime, continuations=projected_continuations
+        )
+        if projected_continuations and _has_destructive_command_string(content):
+            # Projection can expose operands absent from the raw finding view.
+            # Retain the native continuation contract before ownership is rebuilt.
+            return True
     structural_quote_openers = None
     shell_fence_ranges: list[tuple[int, int]] = []
     json_strings: list[tuple[int, int]] = []
     python_source = None
+    javascript_source = None
+    unresolved_executables: list[int] = []
+    powershell = (
+        powershell_source(content, check_runtime, unresolved_executables=unresolved_executables)
+        if file_type == "powershell" and complete_context
+        else None
+    )
     if file_type == "perl" and complete_context:
         content = _perl_literal_print_shell_text(content, check_runtime)
     if file_type == "python" and complete_context:
@@ -6649,12 +7502,30 @@ def _has_bounded_parse_exhaustion(
         python_source = _PythonSourceOwnership(
             content, check_runtime, python_import_check, python_stdlib_check
         )
+    if file_type == "javascript" and complete_context:
+        # A complete parse proves which backticks own host template bytes.
+        # Interpolated templates in files with shell calls retain conservative
+        # bounds because this analyzer does not prove their data flow.
+        javascript_source = _JavaScriptTemplateOwnership(content, check_runtime)
+        if javascript_source.has_unresolved_execution():
+            return True
+    if file_type in {"json", "markdown"} and complete_context:
+        json_strings = validated_json_string_spans(content, check_runtime)
+        structural_quote_closers = {end - 1 for _, end in json_strings}
+        structural_quote_openers = {start for start, _ in json_strings}
+        # Raw substitution delimiters must survive Markdown's inline projection.
+        json_operand_spans = [
+            (start, end)
+            for start, end in json_strings
+            if "$(" not in content[start:end] and "`" not in content[start:end]
+        ]
     if file_type == "markdown":
         if complete_context:
             json_strings = validated_json_string_spans(content, check_runtime)
             structural_quote_closers = {end - 1 for _, end in json_strings}
             structural_quote_openers = {start for start, _ in json_strings}
         hardware_apostrophe_ambiguity = [False]
+        powershell_blocks: list[tuple[int, int]] = []
         content = _markdown_shell_text(
             content,
             check_runtime,
@@ -6662,8 +7533,42 @@ def _has_bounded_parse_exhaustion(
             word_apostrophes=word_apostrophes,
             shell_fence_ranges=shell_fence_ranges,
             hardware_apostrophe_ambiguity=hardware_apostrophe_ambiguity,
+            powershell_blocks=powershell_blocks,
         )
         if hardware_apostrophe_ambiguity[0]:
+            return True
+        if powershell_blocks:
+            projected = list(content)
+            # Separate code fences do not establish separate runtime scopes.
+            allow_messages = _POWERSHELL_COMMAND_REBINDING_RE.search(content) is None
+            for start, end in powershell_blocks:
+                check_runtime()
+                block_continuations: list[int] = []
+                block = _powershell_shell_text(
+                    content[start:end],
+                    check_runtime,
+                    continuations=block_continuations,
+                    allow_messages=allow_messages,
+                )
+                if block_continuations and _has_destructive_command_string(block):
+                    return True
+                projected[start:end] = block
+            content = "".join(projected)
+            powershell = _fenced_powershell_source(
+                content, powershell_blocks, check_runtime, unresolved_executables
+            )
+    if unresolved_executables:
+        return True
+    if powershell is not None and powershell.continuations:
+        projected = list(content)
+        for start, end in powershell.continuations:
+            check_runtime()
+            projected[start:end] = " " * (end - start)
+        content = "".join(projected)
+        # The continuation may have hidden destructive operands from the raw
+        # finding parser. Keep coverage partial when the logical command now
+        # exposes them; never claim those operands were fully inspected.
+        if _has_destructive_command_string(content):
             return True
     # Diagnostic template delimiters belong to JavaScript only when the whole
     # source proves their assertion-message owner. Destructive checks stay raw.
@@ -6705,15 +7610,23 @@ def _has_bounded_parse_exhaustion(
         structural_quote_closers=structural_quote_closers,
         structural_quote_openers=structural_quote_openers,
         python_source=python_source,
+        javascript_source=javascript_source,
+        powershell=powershell,
         perl_eval_blocks=file_type == "perl",
         quote_limits=quote_limits,
         file_type=file_type,
     ):
         return True
     covered_until = 0
+    powershell_strings = _powershell_string_operands(powershell)
+    decoded_starts = sorted(
+        string.start for string in powershell_strings.values() if string.decoded
+    )
     for command_start, body_start in _destructive_command_words(content):
         check_runtime()
         if command_start < covered_until:
+            continue
+        if powershell is not None and powershell.owns(command_start):
             continue
         # A recognized prose description cannot contribute parse exhaustion:
         # the same predicate below would discard it after parsing.  Short-circuit
@@ -6725,10 +7638,93 @@ def _has_bounded_parse_exhaustion(
             command_start,
             body_start,
             check_runtime=check_runtime,
+            powershell_strings=powershell_strings,
         )
         covered_until = max(covered_until, command_end)
         if exhausted or _has_unsupported_brace_expansion(tokens):
             return True
+        decoded_index = bisect_left(decoded_starts, body_start)
+        if (
+            decoded_index < len(decoded_starts)
+            and decoded_starts[decoded_index] < command_end
+            and (_has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens))
+        ):
+            # Native escapes can assemble destructive flags the raw finding
+            # parser did not see. Keep this reconstruction explicitly partial.
+            return True
+    if powershell is not None:
+        for start, end in powershell.invocations:
+            check_runtime()
+            if _has_runtime_command_operand_exhaustion(
+                content, start, end, check_runtime, powershell_strings=powershell_strings
+            ):
+                return True
+            tokens, _, _ = _bounded_shell_tokens(
+                content,
+                start,
+                end,
+                check_runtime=check_runtime,
+                powershell_strings=powershell_strings,
+            )
+            skip_option_value = False
+            for token in tokens:
+                if skip_option_value:
+                    skip_option_value = False
+                    continue
+                option = token.text.casefold()
+                if not option.startswith("-") or option == "--":
+                    break
+                if (
+                    option in {"-ec", "--command"}
+                    or any(name.startswith(option[1:]) for name in ("command", "encodedcommand"))
+                    or re.fullmatch(
+                        r"-[abefhkmnoptuvxBCEHPTilrsO]*c[abefhkmnoptuvxBCEHPTilrsO]*", token.text
+                    )
+                ):
+                    # Inspect actual code-selector options, not arbitrary
+                    # native options containing 'c' such as -NonInteractive.
+                    # Options after a script/subcommand operand are its data.
+                    return True
+                skip_option_value = token.text in {"-o", "-O"} or option in {
+                    "-executionpolicy",
+                    "-ep",
+                    "-inputformat",
+                    "-if",
+                    "-outputformat",
+                    "-of",
+                    "-windowstyle",
+                    "-w",
+                    "-workingdirectory",
+                    "-wd",
+                }
+        for string in powershell.strings:
+            check_runtime()
+            if not string.invoked and _has_bounded_parse_exhaustion(
+                string.value, check_runtime, file_type="powershell", complete_context=False
+            ):
+                # The projection already removed proven display-only messages.
+                # Remaining values can be captured or reach rebound commands;
+                # native delimiter ownership must not hide their shell limits.
+                return True
+            # A PowerShell escape can assemble shell syntax absent from the
+            # original bytes. Never turn such a command into a clean result
+            # merely because the host string's boundaries are now understood.
+            if string.decoded and _has_destructive_command_string(string.value):
+                return True
+            if string.invoked:
+                # A quoted command after & or dot-sourcing retains its actual
+                # operands. Ordinary host strings are not shell programs.
+                if string.operand_start is None:
+                    return True
+                end = min(len(content), string.operand_start + _ROOT_GLOB_COMMAND_CHARS)
+                newline = content.find("\n", string.operand_start, end)
+                if newline >= 0:
+                    end = newline
+                command = string.value + content[string.operand_start : end]
+                if _has_destructive_command_string(command) or _has_bounded_parse_exhaustion(
+                    command, check_runtime, file_type="shell", complete_context=False
+                ):
+                    return True
     # A literal candidate outside a JSON string can consume it before the
     # whole-content parser reaches its structural opener. Recover each proven
     # string independently, without bypassing that parser's forward watermark
