@@ -24,6 +24,7 @@ from skillspector.inspection_ledger import (
     LedgerRecordType,
     analyzer_status_for_events,
     finalize_ledger,
+    format_recovery_policy_accepted,
     inspection_work_id,
     ledger_event,
 )
@@ -803,9 +804,11 @@ def _reference_coverage_findings(
     fatal_paths: set[str] = set()
     exceptions_by_path: dict[str, list[Mapping[str, object]]] = {}
     canonicalization_succeeded = False
+    format_recovery_accepted = False
     if ledger_shape_complete and inventory_shape_complete and status_shape_complete:
         try:
             preexisting_completeness, _ = finalize_ledger(state)
+            format_recovery_accepted = format_recovery_policy_accepted(preexisting_completeness)
             for exception in preexisting_completeness["ledger_exceptions"]:
                 exceptions_by_path.setdefault(str(exception.get("path", "")), []).append(exception)
             fatal_paths = {
@@ -928,6 +931,22 @@ def _reference_coverage_findings(
             else ""
         )
         if final_disposition not in {"partial", "failed", "out_of_scope"}:
+            continue
+        # Accepted AI formatting uncertainty remains a visible coverage warning.
+        # It does not turn already-read text into a HIGH artifact-evasion finding.
+        # The global proof rejects any independent analyzer/accounting gap.
+        if (
+            ledger_evidence_complete
+            and format_recovery_accepted
+            and target_path not in invalid_status_paths
+            and target_path not in duplicate_inventory_paths
+            and inventory_item is not None
+            and disposition == reference_disposition == ArtifactDisposition.ANALYZED
+            and inventory_item.get("content_kind") == ContentKind.TEXT
+            and inventory_item.get("reason") is None
+            and inventory_item.get("inherited_exclusion_reason") is None
+            and inventory_item.get("misleading_extension") is not True
+        ):
             continue
         if (
             provider_evidence_complete
@@ -1113,6 +1132,10 @@ def _reconcile_inspected_containers(state: SkillspectorState) -> dict[str, objec
     if not containers:
         return {}
     completeness, _ = finalize_ledger(state)
+    if format_recovery_policy_accepted(completeness):
+        # Traversal succeeded; the member's AI warning remains in the ledger.
+        # Do not turn accepted formatting uncertainty into an archive-access gap.
+        return {}
     incomplete = {
         str(row["path"])
         for row in completeness["ledger_exceptions"]
