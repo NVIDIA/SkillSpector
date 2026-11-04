@@ -21,7 +21,7 @@ import pytest
 
 from skillspector import python_string_constants, python_tokens
 from skillspector.graph import graph
-from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, ParserCause
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.nodes.analyzers import static_runner
 
@@ -811,6 +811,23 @@ def test_interrupted_constant_import_proof_does_not_cache_success() -> None:
     assert calls == 2
     assert value is not None
     assert " -rf {" in value[0]
+
+
+def test_refused_constant_proof_keeps_typed_diagnostic_source_range() -> None:
+    source = _OPTION_TEXT + _CONSTANT_CHECKOUT_SOURCE + _TAIL
+    diagnostic = tm.bounded_parse_diagnostic(
+        source,
+        lambda: None,
+        file_type="python",
+        python_import_check=lambda check: False,
+    )
+    final_literal = 'f"checked out to {active_branch}"'
+
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.UNSUPPORTED_SYNTAX
+    assert diagnostic.start == source.index('f"$TOOL_ROOT')
+    assert diagnostic.end == source.index(final_literal) + len(final_literal)
+    assert diagnostic.location_precision == "enclosing_expression"
 
 
 @pytest.mark.parametrize("target,partial", [("/", True), ("build", False)])
