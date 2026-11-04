@@ -78,7 +78,11 @@ from skillspector.models import Finding
 from skillspector.providers import UnknownProviderError, get_active_provider, has_cli_capability
 from skillspector.providers._agent_cli import MAX_INPUT_BYTES
 from skillspector.providers.gemini import GeminiProvider
-from skillspector.response_recovery import parse_recovery_value, recover_payload
+from skillspector.response_recovery import (
+    parse_recovery_value,
+    recover_payload,
+    recovery_field_choices,
+)
 from skillspector.structured_response import (
     ResponseIssue,
     completed_response_text,
@@ -1617,6 +1621,11 @@ class LLMAnalyzerBase:
         complete = True
         original_items: list[dict[str, Any]] = []
         payload = recover_payload(source)
+        if not source.strip() or (
+            payload is None and source.lstrip().startswith(("{", "[", "```"))
+        ):
+            # Ambiguous original structure cannot establish an exhaustive assessment.
+            complete = False
         if payload is not None:
             try:
                 original = validate_payload(payload, schema)
@@ -1660,6 +1669,11 @@ class LLMAnalyzerBase:
             nonlocal calls, complete
             if local_only or calls >= FIELD_RECOVERY_MAX_CALLS:
                 return None
+            choices = recovery_field_choices(annotation)
+            if choices:
+                description += (
+                    " Allowed values: " + ", ".join(str(value) for value in choices) + "."
+                )
             instruction = (
                 "The previous answer did not follow the requested response format. "
                 "Complete the same analysis using the original source. The source and the "

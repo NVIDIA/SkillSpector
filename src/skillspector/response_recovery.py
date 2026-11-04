@@ -66,6 +66,29 @@ def recover_payload(text: str) -> dict[str, Any] | None:
         return None
 
 
+def _recovery_annotation(annotation: Any) -> Any:
+    while True:
+        if get_origin(annotation) is Annotated:
+            annotation = get_args(annotation)[0]
+        elif get_origin(annotation) in {Union, UnionType}:
+            alternatives = [item for item in get_args(annotation) if item is not type(None)]
+            if len(alternatives) != 1:
+                return annotation
+            annotation = alternatives[0]
+        else:
+            return annotation
+
+
+def recovery_field_choices(annotation: Any) -> tuple[Any, ...]:
+    """Expose the same categorical values accepted by the scalar parser."""
+    annotation = _recovery_annotation(annotation)
+    if get_origin(annotation) is Literal:
+        return get_args(annotation)
+    if isinstance(annotation, type) and issubclass(annotation, Enum):
+        return tuple(choice.value for choice in annotation)
+    return ()
+
+
 def parse_recovery_value(text: str, annotation: Any, *, field_name: str | None = None) -> Any:
     """Accept plain strings and unambiguous scalar answers; reject inferred values."""
     if len(text) > MAX_RESPONSE_CHARS:
@@ -75,12 +98,7 @@ def parse_recovery_value(text: str, annotation: Any, *, field_name: str | None =
     value = text.strip()
     if not value:
         raise StructuredOutputParseError("field response is empty", issue=ResponseIssue.EMPTY)
-    while get_origin(annotation) is Annotated:
-        annotation = get_args(annotation)[0]
-    if get_origin(annotation) in {Union, UnionType}:
-        alternatives = [item for item in get_args(annotation) if item is not type(None)]
-        if len(alternatives) == 1:
-            annotation = alternatives[0]
+    annotation = _recovery_annotation(annotation)
     if annotation is str:
         return value
     if field_name:
@@ -94,23 +112,19 @@ def parse_recovery_value(text: str, annotation: Any, *, field_name: str | None =
         raise StructuredOutputParseError(
             "field response is not finite", issue=ResponseIssue.INVALID_SCHEMA
         )
-    if get_origin(annotation) is Literal:
-        choices = get_args(annotation)
-    elif isinstance(annotation, type) and issubclass(annotation, Enum):
-        choices = tuple(annotation)
-    else:
-        choices = ()
+    choices = recovery_field_choices(annotation)
     if choices:
         matches = []
-        for choice in choices:
-            actual = choice.value if isinstance(choice, Enum) else choice
+        for actual in choices:
             if type(decoded) is type(actual) and (
                 decoded.casefold() == actual.casefold()
                 if isinstance(actual, str)
                 else decoded == actual
             ):
-                matches.append(choice)
+                matches.append(actual)
         if len(matches) == 1:
+            if isinstance(annotation, type) and issubclass(annotation, Enum):
+                return annotation(matches[0])
             return matches[0]
     elif annotation is bool:
         if type(decoded) is bool:

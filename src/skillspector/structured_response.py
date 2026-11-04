@@ -140,6 +140,30 @@ def _unique_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _check_recovery_nesting(text: str) -> None:
+    """Apply the nesting bound even when malformed outer syntax stops tokenization."""
+    depth = 0
+    quoted = escaped = False
+    for char in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "{[":
+            depth += 1
+            if depth > MAX_RESPONSE_DEPTH:
+                raise StructuredOutputParseError(
+                    "response exceeds nesting limit", issue=ResponseIssue.LIMIT
+                )
+        elif char in "}]":
+            depth = max(0, depth - 1)
+
+
 def validate_payload(payload: dict, schema: type[BaseModel]) -> object:
     """Require an explicit findings list even when the internal model has a default."""
     fields = getattr(schema, "model_fields", {})
@@ -182,22 +206,24 @@ def validate_response_text(
     body = _json_body(text)
     if not body:
         raise StructuredOutputParseError(
-            "model returned an empty response", issue=ResponseIssue.EMPTY
+            "model returned an empty response",
+            issue=ResponseIssue.EMPTY,
+            recovery_text=body if completed and preserve_text is None else None,
         )
     # Bound nesting before invoking the recursive JSON decoder.
     try:
         tokens = formatting_tokens(body)
     except StructuredOutputParseError as exc:
-        if (
-            completed
-            and preserve_text is None
-            and exc.issue == ResponseIssue.INVALID_JSON
-            and not body.startswith(("{", "[", "```"))
-        ):
+        if completed and preserve_text is None and exc.issue == ResponseIssue.INVALID_JSON:
+            _check_recovery_nesting(body)
             exc.recovery_text = body
         raise
     try:
         payload = json.loads(body, object_pairs_hook=_unique_fields)
+    except StructuredOutputParseError as exc:
+        if completed and preserve_text is None:
+            exc.recovery_text = body
+        raise
     except json.JSONDecodeError as exc:
         raise StructuredOutputParseError(
             "model returned malformed JSON",
@@ -364,11 +390,16 @@ def validate_message(
                 try:
                     validate_response_text(candidate, schema, completed=True)
                 except StructuredOutputParseError as parse_error:
+                    if parse_error.issue == ResponseIssue.LIMIT:
+                        raise
                     exc.recovery_text = parse_error.recovery_text
                 else:
                     exc.recovery_text = candidate
-            except StructuredOutputParseError:
-                pass
+            except StructuredOutputParseError as candidate_error:
+                if candidate_error.issue == ResponseIssue.EMPTY:
+                    exc.recovery_text = ""
+                elif candidate_error.issue == ResponseIssue.LIMIT:
+                    raise candidate_error from exc
         raise
     return validate_response_text(
         text,

@@ -61,6 +61,8 @@ from skillspector.providers import (
 from skillspector.providers.nv_build import NvBuildProvider
 from skillspector.structured_response import (
     MAX_RESPONSE_CHARS,
+    MAX_RESPONSE_DEPTH,
+    ResponseIssue,
     completed_response_text,
 )
 
@@ -573,7 +575,19 @@ class TestGetChatModelCLIAdapter:
                 )
 
     @pytest.mark.parametrize("method", [None, "json_schema", "function_calling"])
-    @pytest.mark.parametrize("raw", ["No security issues found.", '{"score": 1}', '{"verdict": 1}'])
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "No security issues found.",
+            '{"score": 1}',
+            '{"verdict": 1}',
+            "",
+            '{"verdict": ',
+            '{"verdict": "safe", "verdict": "unsafe"}',
+            '{"verdict": "safe"} {"verdict": "unsafe"}',
+            '{"verdict": NaN}',
+        ],
+    )
     async def test_cli_plaintext_recovery_is_shared_by_sync_async_and_output_methods(
         self, method, raw
     ):
@@ -597,14 +611,11 @@ class TestGetChatModelCLIAdapter:
     @pytest.mark.parametrize(
         "raw",
         [
-            "",
-            '{"verdict": ',
-            '{"verdict": "safe", "verdict": "unsafe"}',
-            '{"verdict": "safe"} {"verdict": "unsafe"}',
             "x" * (MAX_RESPONSE_CHARS + 1),
+            '{"verdict": ' + "[" * MAX_RESPONSE_DEPTH,
         ],
     )
-    def test_cli_recovery_keeps_invalid_or_ambiguous_answers_ineligible(self, raw):
+    def test_cli_recovery_keeps_resource_limits_ineligible(self, raw):
         class _Schema(BaseModel):
             verdict: str
 
@@ -616,6 +627,7 @@ class TestGetChatModelCLIAdapter:
             runnable.invoke("assessment")
 
         assert error.value.recovery_text is None
+        assert error.value.issue == ResponseIssue.LIMIT
 
     @pytest.mark.parametrize("method", [None, "json_schema", "function_calling"])
     def test_set_timeout_reaches_structured_wrapper(self, method: str | None) -> None:

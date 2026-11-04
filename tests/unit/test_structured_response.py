@@ -24,12 +24,17 @@ from skillspector.llm_analyzer_base import (
     LLMAnalyzerBase,
 )
 from skillspector.llm_utils import bind_structured_output, register_chat_model_provider
+from skillspector.models import Finding
 from skillspector.nodes.analyzers.mcp_tool_poisoning import _TP4AnalysisResult, _TP4Analyzer
 from skillspector.nodes.analyzers.semantic_security_discovery import node as security_discovery
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, MetaAnalyzerResult
 from skillspector.providers import reset_provider, use_provider
 from skillspector.providers.openai import OpenAIProvider
-from skillspector.response_recovery import parse_recovery_value, recover_payload
+from skillspector.response_recovery import (
+    parse_recovery_value,
+    recover_payload,
+    recovery_field_choices,
+)
 from skillspector.structured_response import (
     MAX_RESPONSE_CHARS,
     MAX_RESPONSE_DEPTH,
@@ -61,6 +66,7 @@ def test_duplicate_fields_are_never_silently_discarded(text):
     with pytest.raises(StructuredOutputParseError) as error:
         validate_response_text(text, LLMAnalysisResult, completed=True)
     assert error.value.repair_text is None
+    assert error.value.recovery_text == text
 
 
 @pytest.mark.parametrize(
@@ -155,18 +161,55 @@ def test_completed_prose_and_missing_schema_fields_are_separate_from_lossless_re
         '{"findings": []} {"findings": []}',
         '{"findings": NaN}',
         '{"findings": 1e999}',
-        "x" * (MAX_RESPONSE_CHARS + 1),
-        '{"findings": ' + "[" * MAX_RESPONSE_DEPTH + "]" * MAX_RESPONSE_DEPTH + "}",
+        '```json\n{"findings": []',
+        '[{"severity": "HIGH"}]',
     ],
 )
 @pytest.mark.parametrize("require_tool", [False, True])
-def test_unusable_json_cannot_enter_plaintext_recovery(text, require_tool):
+@pytest.mark.parametrize("completed", [False, True])
+def test_completed_malformed_text_is_available_only_for_uncertain_recovery(
+    text, require_tool, completed
+):
+    message = AIMessage(
+        content=text, response_metadata={"finish_reason": "stop"} if completed else {}
+    )
+    with pytest.raises(StructuredOutputParseError) as error:
+        validate_message(
+            message, LLMAnalysisResult, tool="LLMAnalysisResult", require_tool=require_tool
+        )
+    assert error.value.repair_text is None
+    assert error.value.recovery_text == (text if completed else None)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("x" * (MAX_RESPONSE_CHARS + 1), id="size"),
+        pytest.param('{"findings": ' + "[" * MAX_RESPONSE_DEPTH, id="unbalanced-depth"),
+        pytest.param("[" * (MAX_RESPONSE_DEPTH + 1), id="array-depth"),
+        pytest.param(
+            '{"findings": ' + "[" * MAX_RESPONSE_DEPTH + "]" * MAX_RESPONSE_DEPTH + "}",
+            id="balanced-depth",
+        ),
+    ],
+)
+@pytest.mark.parametrize("require_tool", [False, True])
+def test_recovery_does_not_waive_size_or_nesting_limits(text, require_tool):
     message = AIMessage(content=text, response_metadata={"finish_reason": "stop"})
     with pytest.raises(StructuredOutputParseError) as error:
         validate_message(
             message, LLMAnalysisResult, tool="LLMAnalysisResult", require_tool=require_tool
         )
+    assert error.value.issue == ResponseIssue.LIMIT
     assert error.value.recovery_text is None
+
+
+def test_malformed_text_nesting_guard_ignores_containers_inside_quoted_strings():
+    text = '{"message": ' + json.dumps("[" * (MAX_RESPONSE_DEPTH + 1))
+    with pytest.raises(StructuredOutputParseError) as error:
+        validate_response_text(text, LLMAnalysisResult, completed=True)
+    assert error.value.issue == ResponseIssue.INVALID_JSON
+    assert error.value.recovery_text == text
 
 
 def test_missing_tool_call_keeps_completed_prose_for_recovery():
@@ -309,6 +352,23 @@ def test_recovery_field_parser_accepts_only_unambiguous_values(
     text, annotation, field_name, expected
 ):
     assert parse_recovery_value(text, annotation, field_name=field_name) == expected
+
+
+@pytest.mark.parametrize(
+    "annotation,expected",
+    [
+        (Literal["low", "high"], ("low", "high")),
+        (Annotated[Literal["low", "high"] | None, "impact"], ("low", "high")),
+        (Annotated[_RecoverySeverity, "severity"] | None, ("HIGH", "LOW")),
+        (str, ()),
+        (int | str, ()),
+    ],
+)
+def test_recovery_prompt_choices_match_scalar_validation(annotation, expected):
+    assert recovery_field_choices(annotation) == expected
+    for choice in expected:
+        value = parse_recovery_value(json.dumps(choice), annotation)
+        assert (value.value if isinstance(value, Enum) else value) == choice
 
 
 @pytest.mark.parametrize(
@@ -503,6 +563,19 @@ def make_analyzer(name, *, timeout=None, model="test-model"):
     if name == "review":
         return LLMMetaAnalyzer(model=model, timeout=timeout)
     return LLMAnalyzerBase(base_prompt="Assess the code", node=name, model=model, timeout=timeout)
+
+
+def test_meta_recovery_prompt_names_the_allowed_categorical_values(http_model):
+    http_model([])
+    analyzer = make_analyzer("review")
+    batch = Batch(file_path="a.py", content="x")
+    batch.findings = [
+        Finding(rule_id="E2", message="Untrusted input", severity="HIGH", file="a.py")
+    ]
+    plan = analyzer._field_recovery_plan(batch, "Assess", "Completed prose assessment", [])
+    prompts = {question.name: question.prompt for question in plan}
+    assert "Allowed values: malicious, negligent, benign." in prompts["intent"]
+    assert "Allowed values: critical, high, medium, low." in prompts["impact"]
 
 
 @pytest.mark.parametrize(
@@ -911,6 +984,37 @@ def test_missing_or_extra_assessment_data_uses_bounded_recovery_without_formatti
     assert outcome.warnings[0].reason == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
     assert 4 <= len(requests) <= 4 + FIELD_RECOVERY_MAX_CALLS
     assert all("Requested field:" in r["messages"][0]["content"] for r in requests[4:])
+    assert all("Repair JSON punctuation" not in r["messages"][0]["content"] for r in requests)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "",
+        '{"findings": [',
+        '{"findings": [], "findings": [{"severity": "HIGH"}]}',
+        '{"findings": NaN}',
+        '{"findings": 1e999}',
+        '{"findings": []} {"findings": [{"severity": "HIGH"}]}',
+    ],
+)
+@pytest.mark.parametrize("method", ["json_schema", "function_calling"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_completed_ambiguous_response_remains_partial_even_when_recovery_says_zero(
+    http_model, source, method, asynchronous
+):
+    requests = http_model([(source, "stop")] * 4 + [("0", "stop")], method=method)
+    analyzer = make_analyzer("discovery")
+    batches = [Batch(file_path="a.py", content="x")]
+    outcome = (
+        asyncio.run(analyzer.arun_batches_detailed(batches))
+        if asynchronous
+        else analyzer.run_batches_detailed(batches)
+    )
+    assert not outcome.successful and not outcome.failures
+    assert outcome.warnings[0].reason == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+    assert 4 < len(requests) <= 4 + FIELD_RECOVERY_MAX_CALLS
+    assert "Requested field: finding_count" in requests[-1]["messages"][0]["content"]
     assert all("Repair JSON punctuation" not in r["messages"][0]["content"] for r in requests)
 
 

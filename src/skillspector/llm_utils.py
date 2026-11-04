@@ -360,10 +360,16 @@ class _StructuredAgentCLIModel:
         try:
             payload = _extract_json_object(raw)
         except StructuredOutputParseError as exc:
-            if exc.issue == ResponseIssue.INVALID_JSON:
+            if exc.issue in {
+                ResponseIssue.INVALID_JSON,
+                ResponseIssue.INVALID_SCHEMA,
+                ResponseIssue.EMPTY,
+            }:
                 try:
                     validate_response_text(raw, self._schema, completed=True)
                 except StructuredOutputParseError as parse_error:
+                    if parse_error.issue == ResponseIssue.LIMIT:
+                        raise
                     exc.recovery_text = parse_error.recovery_text
             raise
         try:
