@@ -2260,6 +2260,7 @@ def _scan_declared_marker_views(
     prepared_analyses: Mapping[int, object] | None = None,
     parser_diagnostics: list[StaticParserDiagnostic] | None = None,
     python_import_bounds: PythonImportBounds | None = None,
+    parser_file_type: str | None = None,
 ) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
@@ -2481,7 +2482,7 @@ def _scan_declared_marker_views(
                                 module,
                                 marker_view,
                                 check_runtime,
-                                file_type=_infer_file_type(path),
+                                file_type=parser_file_type or _infer_file_type(path),
                                 complete_context=complete_context,
                                 source_start=raw_start,
                                 diagnostics=parser_diagnostics,
@@ -2652,9 +2653,7 @@ def _scan_all_views_with_parser_diagnostics(
     projection = None if _oms_projected else project_oms_content(content)
     if projection is not None and projection.view.name != "raw":
         findings, reason, metrics = _scan_all_views_detailed(
-            # The decoded representation is JSON regardless of the carrier's
-            # extension. Keep its string boundaries when inspecting metadata.
-            path + ".json",
+            path,
             projection.view.text,
             pattern_modules,
             None,
@@ -2668,7 +2667,6 @@ def _scan_all_views_with_parser_diagnostics(
             python_import_bounds=python_import_bounds,
         )
         for finding in findings:
-            finding.file = path
             finding.start_line = finding.end_line = 1
             finding.start_column = finding.end_column = None
             finding.evidence["oms_projection"] = (
@@ -2680,6 +2678,9 @@ def _scan_all_views_with_parser_diagnostics(
         if isinstance(diagnostic, StaticParserDiagnostic):
             parser_diagnostics.append(diagnostic.enclosed(0, len(content)))
         return findings, reason, metrics
+    # Only the parser uses decoded JSON boundaries. Finding rules keep the
+    # carrier's type so unknown encoded fields retain their original checks.
+    parser_file_type = "json" if _oms_projected else _infer_file_type(path)
     ast_modules = [module for module in pattern_modules if _uses_python_ast(module)]
     lexical_modules = [module for module in pattern_modules if not _uses_python_ast(module)]
     if python_source is None:
@@ -2863,6 +2864,7 @@ def _scan_all_views_with_parser_diagnostics(
                 python_import_bounds=python_import_bounds,
                 prepared_analyses=prepared_analyses,
                 parser_diagnostics=parser_diagnostics,
+                parser_file_type=parser_file_type,
             )
             bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
@@ -2982,7 +2984,7 @@ def _scan_all_views_with_parser_diagnostics(
                             module,
                             SecurityTextView("raw", content),
                             finding_budget.check_runtime,
-                            file_type=_infer_file_type(path),
+                            file_type=parser_file_type,
                             complete_context=True,
                             diagnostics=parser_diagnostics,
                             path=path,
@@ -3104,10 +3106,14 @@ def _scan_all_views_with_parser_diagnostics(
                         )
                         if callable(exhaustion_hook) and full_view.name != "raw":
                             finding_budget.check_runtime()
-                            module_file_type = _effective_module_file_type(
-                                path,
-                                module,
-                                python_source=python_source,
+                            module_file_type = (
+                                "json"
+                                if _oms_projected
+                                else _effective_module_file_type(
+                                    path,
+                                    module,
+                                    python_source=python_source,
+                                )
                             )
                             bounded_parse_limited = bounded_parse_limited or bool(
                                 _bounded_parser_incomplete(
