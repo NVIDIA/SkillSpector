@@ -29,6 +29,8 @@ from skillspector.python_ast import MAX_PYTHON_AST_SOURCE_CHARS, parse_python_so
 # The tokenizer and the compiler disagree about a carriage return that does
 # not start CRLF, so such source never acquires token ownership.
 _LONE_CARRIAGE_RETURN_RE = re.compile(r"\r(?!\n)")
+# ``str.splitlines`` also ends lines at these characters; Python does not.
+_NON_NEWLINE_LINE_BREAK_RE = re.compile("[\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029](?<!\r(?=\n))")
 # A shebang that names another interpreter (for example a shell polyglot)
 # makes the Python host ambiguous. Without a shebang, ``.py`` source is Python.
 _PYTHON_SHEBANG_RE = re.compile(
@@ -897,6 +899,80 @@ def python_string_body(content: str, start: int, end: int) -> tuple[int, int]:
     return opener + width, end - width
 
 
+def python_discarded_string_spans(
+    content: str, check_runtime: Callable[[], None]
+) -> tuple[tuple[int, int], ...]:
+    """Return the source spans of string statements whose value Python discards.
+
+    A docstring, or any other statement that is only a string literal, is
+    evaluated and dropped: no later concatenation, call or shell receives it.
+    Introspection can read a docstring back. The bare name ``__doc__`` reads
+    only the module docstring, which then proves nothing; an ``.__doc__``
+    attribute, a ``"__doc__"`` string or a ``getdoc`` helper can reach any
+    docstring, so such a module, or one that does not parse, proves no span.
+    """
+    # Line offsets below follow ``str.splitlines``; Python ends lines only at
+    # newlines, so other separators would shift every later span.
+    if len(content) > MAX_PYTHON_AST_SOURCE_CHARS or _NON_NEWLINE_LINE_BREAK_RE.search(content):
+        return ()
+    check_runtime()
+    with _PYTHON_OWNERSHIP_PARSE_LOCK, warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        parsed = parse_python_source(content, "<discarded strings>")
+    tree = parsed.tree
+    if tree is None:
+        return ()
+    check_runtime()
+
+    def offset(line: int, byte_column: int) -> int | None:
+        column = parsed.character_column(line, byte_column)
+        return None if column is None else parsed.line_character_starts[line - 1] + column
+
+    module_docstring = (
+        tree.body[0]
+        if tree.body
+        and isinstance(tree.body[0], ast.Expr)
+        and isinstance(tree.body[0].value, ast.Constant)
+        and isinstance(tree.body[0].value.value, str)
+        else None
+    )
+    module_docstring_read = False
+    statements: list[ast.Expr] = []
+    for node in ast.walk(tree):
+        check_runtime()
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr in {"__doc__", "getdoc"}
+            or isinstance(node, ast.Name)
+            and node.id == "getdoc"
+            or isinstance(node, ast.Constant)
+            and node.value == "__doc__"
+        ):
+            return ()
+        if isinstance(node, ast.Name) and node.id == "__doc__":
+            module_docstring_read = True
+        elif (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            statements.append(node)
+    spans: list[tuple[int, int]] = []
+    for node in statements:
+        if (
+            module_docstring_read
+            and node is module_docstring
+            or node.end_lineno is None
+            or node.end_col_offset is None
+        ):
+            continue
+        start = offset(node.lineno, node.col_offset)
+        end = offset(node.end_lineno, node.end_col_offset)
+        if start is not None and end is not None:
+            spans.append((start, end))
+    return tuple(sorted(spans))
+
+
 def python_string_value_bounds_allowed(
     content: str,
     check_runtime: Callable[[], None],
@@ -1003,7 +1079,37 @@ def python_string_value_bounds_allowed(
         "R_OK",
         "W_OK",
         "X_OK",
+        # File, directory and signal operations run no program and take no command text.
+        "chdir",
+        "chmod",
+        "get_terminal_size",
+        "getegid",
+        "geteuid",
+        "getgid",
+        "getlogin",
+        "getpid",
+        "getppid",
+        "getuid",
+        "isatty",
+        "kill",
+        "link",
+        "makedirs",
+        "mkdir",
+        "readlink",
+        "remove",
+        "removedirs",
+        "rename",
+        "renames",
+        "replace",
+        "rmdir",
+        "symlink",
+        "umask",
+        "unlink",
+        "urandom",
+        "utime",
     }
+    # Name and path strings cannot reach another object or module.
+    name_dunders = {"__name__", "__qualname__", "__module__", "__file__"}
     shells = {
         "sh",
         "bash",
@@ -1167,7 +1273,11 @@ def python_string_value_bounds_allowed(
             # A safe first attribute does not own the rest of a chain, e.g.
             # os.path.os.system or an event loop's subprocess_shell method.
             if (
-                (node.attr.startswith("__") and node.attr.endswith("__"))
+                (
+                    node.attr.startswith("__")
+                    and node.attr.endswith("__")
+                    and node.attr not in name_dunders
+                )
                 or node.attr in reflection
                 or node.attr
                 in {

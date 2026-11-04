@@ -49,6 +49,7 @@ from skillspector.python_string_constants import python_constant_string_fields
 from skillspector.python_tokens import (
     PythonLiteralSpans,
     python_browser_template_shell_text,
+    python_discarded_string_spans,
     python_string_value_bounds_allowed,
 )
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
@@ -3572,6 +3573,7 @@ class _PythonSourceOwnership:
         self._spans: PythonLiteralSpans | None = None
         self._spans_computed = False
         self._string_value_bounds_allowed: bool | None = None
+        self._discarded_strings: tuple[tuple[int, int], ...] | None = None
         self._constant_fields: tuple[tuple[int, int, str], ...] | None = None
         self._cached_word_start = -1
         self._cached_word_end = -1
@@ -3620,6 +3622,20 @@ class _PythonSourceOwnership:
         start, end = _python_string_body(self._content, *owner)
         return not start <= position < end
 
+    def _discarded(self, owner: tuple[int, int]) -> bool:
+        """Return whether the string token *owner* is part of a discarded statement.
+
+        Python evaluates and drops a docstring or other bare string statement,
+        so no later concatenation or shell call can extend its value, whatever
+        execution paths the rest of the module has.
+        """
+        if self._discarded_strings is None:
+            self._discarded_strings = python_discarded_string_spans(
+                self._content, self._check_runtime
+            )
+        index = bisect_right(self._discarded_strings, (owner[0], len(self._content))) - 1
+        return index >= 0 and owner[1] <= self._discarded_strings[index][1]
+
     def string_value(self, start: int, end: int) -> tuple[str, int, int] | None:
         """Return the proven string value that holds a shell word, and its span.
 
@@ -3645,7 +3661,7 @@ class _PythonSourceOwnership:
             ) and (
                 self._python_import_check is None or self._python_import_check(self._check_runtime)
             )
-        if not self._string_value_bounds_allowed:
+        if not self._string_value_bounds_allowed and not self._discarded(owner):
             return None
         if self._constant_fields is None:
             self._constant_fields = python_constant_string_fields(
