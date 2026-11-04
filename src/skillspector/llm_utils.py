@@ -554,6 +554,13 @@ def bind_structured_output(
                 )
                 | checked
             )
+        if _gateway_claude_json_schema(llm, model, kwargs.get("method")):
+            return (
+                RunnableLambda(
+                    lambda prompt: f"{prompt}\n\n{_JSON_OBJECT_INSTRUCTION.format(tool=tool)}"
+                )
+                | checked
+            )
         return checked
     if unforced:
         return _require_tool_call(structured, schema, include_raw=include_raw)
@@ -585,6 +592,22 @@ def _binds_unforced_tool_call(llm: object, method: str | None) -> bool:
 _TOOL_CALL_INSTRUCTION = (
     "Report your result by calling the {tool} tool exactly once. Do not answer in prose."
 )
+
+# OpenAI-compatible gateways can serve Claude's ``json_schema`` answer through a tool the
+# model is not forced to call, so a prose answer leaves no JSON object to validate.
+_JSON_OBJECT_INSTRUCTION = (
+    "Return your result as exactly one JSON object that matches the required {tool} "
+    "schema. Do not add prose or Markdown code fences before or after it."
+)
+
+
+def _gateway_claude_json_schema(llm: object, model: str, method: str | None) -> bool:
+    """``True`` when an OpenAI-protocol client asks a Claude *model* for ``json_schema``."""
+    return (
+        isinstance(llm, BaseChatOpenAI)
+        and method in (None, "json_schema")
+        and "claude-" in model.rpartition("/")[2].lower()
+    )
 
 
 def _require_tool_call(

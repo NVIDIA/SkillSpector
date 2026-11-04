@@ -1,6 +1,7 @@
 ### Unreleased maintenance fixes
 ### Fixes
 * Backport scoped `allowed-tools` grant handling from #768: recognize declarations such as `Bash(git:*)`, preserve spaces and commas inside scopes, and keep malformed grants or embedded tool names from declaring shell capability. Command restrictions remain intact in the manifest.
+* Ask Claude models reached through OpenAI-compatible gateways for exactly one JSON object when the schema is bound as `json_schema`. Gateways can serve that format through a tool Claude may skip, and a prose answer is rejected as `llm_structured_response_invalid`. Validation is unchanged.
 * Report which check rejected a model answer. Ledger rows and logs for rejected structured responses carry a `diagnostic` built only from fixed codes (check, channel, completion label, JSON shape, schema paths and per-attempt checks), never model output.
 * Retain up to 64 OSV advisories per locked package (was 16), so a dependency such as `filelock` with 17 advisories no longer leaves `poetry.lock` partial with `output_limit`. Per-scan detail and result budgets are unchanged.
 ---
