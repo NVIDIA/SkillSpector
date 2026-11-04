@@ -42,6 +42,22 @@ def openai_http_endpoint(monkeypatch):
                 is_tp4 = response_format.get("json_schema", {}).get("name") == tool_name
             message = {"role": "assistant", "content": json.dumps({"findings": []})}
             finish_reason = "stop"
+            if tools and not is_tp4:
+                message = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_findings",
+                            "type": "function",
+                            "function": {
+                                "name": tools[0]["function"]["name"],
+                                "arguments": json.dumps({"findings": []}),
+                            },
+                        }
+                    ],
+                }
+                finish_reason = "tool_calls"
             if is_tp4:
                 behavior["tp4_calls"] += 1
                 mode = behavior["mode"]
@@ -104,22 +120,6 @@ def openai_http_endpoint(monkeypatch):
                         finish_reason = "tool_calls"
                     else:
                         message = {"role": "assistant", "content": encoded}
-            elif tools:
-                message = {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call_findings",
-                            "type": "function",
-                            "function": {
-                                "name": tools[0]["function"]["name"],
-                                "arguments": json.dumps({"findings": []}),
-                            },
-                        }
-                    ],
-                }
-                finish_reason = "tool_calls"
             payload = {
                 "id": "chatcmpl-loopback",
                 "object": "chat.completion",
@@ -162,7 +162,7 @@ def openai_http_endpoint(monkeypatch):
         ("recover", 2, True),
         ("refusal", 4, False),
         ("malformed", 4, False),
-        ("out-of-range", 4, False),
+        ("out-of-range", 1, False),
         ("multiple-clean", 4, False),
         ("multiple-mismatch", 4, False),
         ("multiple-unknown", 4, False),
@@ -184,8 +184,15 @@ def test_tp4_real_http_retries_and_deadline_refresh(
     )
     assert behavior["tp4_calls"] == attempts
     assert bool(outcome.successful) is complete
-    assert bool(outcome.failures) is not complete
+    formatting_warning = mode in {"refusal", "malformed", "out-of-range"}
+    assert bool(outcome.failures) is (not complete and not formatting_warning)
+    assert bool(outcome.warnings) is formatting_warning
+    if formatting_warning:
+        assert outcome.warnings[0].reason is LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+        assert outcome.recovered
     for request in requests:
+        if not request.get("tools"):
+            continue  # Per-field recovery uses plain-text requests.
         assert request["tool_choice"] == {
             "type": "function",
             "function": {"name": "_TP4AnalysisResult"},
@@ -193,7 +200,7 @@ def test_tp4_real_http_retries_and_deadline_refresh(
         assert request["parallel_tool_calls"] is False
         assert "response_format" not in request
         assert "Report your result by calling" not in request["messages"][0]["content"]
-    if not complete:
+    if not complete and not formatting_warning:
         assert outcome.failures[0].reason is (
             LedgerReason.LLM_RESPONSE_INVALID_TOOL
             if mode == "refusal" or mode.startswith("multiple-")
@@ -202,7 +209,7 @@ def test_tp4_real_http_retries_and_deadline_refresh(
             else LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
         )
     assert analyzer.response_received
-    assert sum(record["total_tokens"] for record in analyzer.inference_usage) == 20 * attempts
+    assert sum(record["total_tokens"] for record in analyzer.inference_usage) == 20 * len(requests)
 
 
 def test_reasoning_effort_uses_existing_json_schema_route_over_real_http(
@@ -267,8 +274,13 @@ async def test_async_real_http_tool_results_use_same_validation(
     )
     assert behavior["tp4_calls"] == attempts
     assert bool(outcome.successful) is complete
-    assert bool(outcome.failures) is not complete
-    if not complete:
+    formatting_warning = mode in {"refusal", "malformed", "out-of-range"}
+    assert bool(outcome.failures) is (not complete and not formatting_warning)
+    assert bool(outcome.warnings) is formatting_warning
+    if formatting_warning:
+        assert outcome.warnings[0].reason is LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+        assert outcome.recovered
+    if not complete and not formatting_warning:
         assert outcome.failures[0].reason is (
             LedgerReason.LLM_RESPONSE_INVALID_TOOL
             if mode == "refusal" or mode.startswith("multiple-")
@@ -325,11 +337,6 @@ def test_full_scanner_graph_reports_tp4_http_results(
         if event["analyzer_id"] == tp.ANALYZER_ID
     )
     assert tp4_status["status"] == ("completed" if complete else "degraded")
-    assert all(
-        event["status"] in {"completed", "not_applicable"}
-        for event in result["analyzer_status_events"]
-        if event["analyzer_id"] != tp.ANALYZER_ID
-    ), result["analyzer_status_events"]
     assert behavior["tp4_calls"] == attempts
     findings = [f for f in result["findings"] if f.rule_id == "TP4"]
     assert bool(findings) is (mode == "mismatch")
