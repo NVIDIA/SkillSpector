@@ -74,8 +74,8 @@ from skillspector.nested_artifacts import (
     expected_container_type,
     has_binary_executable_magic,
     inspect_nested_artifacts,
+    is_archive_content,
     is_executable_content,
-    is_zip_content,
 )
 from skillspector.oms import project_oms_content
 from skillspector.python_ast import (
@@ -126,7 +126,7 @@ MAX_MANIFEST_YAML_DEPTH = 64
 MAX_MANIFEST_PARSE_SECONDS = 1.0
 MAX_MANIFEST_OUTPUT_RECORDS = 1_024
 MAX_MANIFEST_OUTPUT_CHARACTERS = 256 * 1024
-_EXECUTABLE_PROBE_BYTES = 8
+_EXECUTABLE_PROBE_BYTES = 1024
 
 
 def _is_allowed_inactive_git_hook_template(path: str, probe: bytes) -> bool:
@@ -1275,7 +1275,7 @@ def _inspect_excluded_artifacts(
     """Inventory excluded files and fail closed on statically executable content.
 
     Ordinary excluded files require only the longest executable/archive magic prefix.
-    ZIP-family outers are read once into a private bounded cache for local nested
+    Supported archives are read once into a private bounded cache for local nested
     inspection. Excluded bytes are never added to provider-visible caches, and every
     byte is charged to both the bundle-local and graph-wide input budgets.
     """
@@ -1517,7 +1517,7 @@ def _inspect_excluded_artifacts(
                         file_stat.st_mode,
                         complete_content=len(probe) == size_bytes,
                     )
-                archive_candidate = is_zip_content(probe)
+                archive_candidate = is_archive_content(probe)
                 expected_archive = expected_container_type(path) is not None
                 if expected_archive and not archive_candidate:
                     record_partial(
@@ -2698,7 +2698,7 @@ def _unsupported_primary_bytes(
 ) -> bool:
     """Recognize opaque primary content without opening or expanding containers.
 
-    ZIPs are handled separately by bounded nested inspection. Other archive
+    Supported archives are handled separately by bounded nested inspection. Other archive
     headers and UTF-16/32 instructions must not count as decoded source text,
     even when their bytes happen to be valid UTF-8 (for example an ASCII TAR).
     Python source is decoded by its PEP 263 declaration rather than as UTF-8,
@@ -3453,7 +3453,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             "SKILL.md",
             "skill.md",
         }
-        if not required or path in nested.recognized_zip_paths:
+        if not required or path in nested.recognized_container_paths:
             continue
         data = raw_file_cache.get(path)
         if data is None or not _unsupported_primary_bytes(
