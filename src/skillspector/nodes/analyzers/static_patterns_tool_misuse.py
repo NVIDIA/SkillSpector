@@ -9504,9 +9504,8 @@ def _has_bounded_parse_exhaustion(
             content, check_runtime, python_import_check, python_stdlib_check
         )
     if file_type == "javascript" and complete_context:
-        # A complete parse proves which backticks own host template bytes.
-        # Interpolated templates in files with shell calls retain conservative
-        # bounds because this analyzer does not prove their data flow.
+        # Modern host syntax owns literal delimiters only after a bounded,
+        # complete parse. Unresolved executable interpolations keep their bounds.
         javascript_source = _JavaScriptTemplateOwnership(content, check_runtime)
         diagnostic = javascript_source.unresolved_execution_diagnostic()
         if diagnostic is not None:

@@ -53,7 +53,7 @@ _QUOTED_OR_CODE_PATH = re.compile(
 # grammar intentionally smaller than Markdown's general inline-code grammar.
 _DOCUMENTATION_IMAGE_DECLARATION = re.compile(
     r"(?:Asset|Image|Illustration|Diagram|Figure|Screenshot|Photo|Picture)"
-    r":[ \t]+`((?:\./)?(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:png|jpg|jpeg))`"
+    r":[ \t]+`((?:\./)?(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:png|jpg|jpeg|bmp))`"
     r"\.?[ \t]*",
     re.IGNORECASE,
 )
@@ -679,7 +679,7 @@ def resolve_bundle_references_with_metadata(
         needs_provenance = reference_kind is ReferenceKind.DOCUMENTATION_IMAGE or (
             reference_kind is ReferenceKind.MARKDOWN_IMAGE
             and resolved_target is not None
-            and PurePosixPath(resolved_target).suffix.lower() in {".jpg", ".jpeg"}
+            and PurePosixPath(resolved_target).suffix.lower() in {".jpg", ".jpeg", ".bmp"}
         )
         if needs_provenance and not input_limited:
             if source_sha256 is None:
