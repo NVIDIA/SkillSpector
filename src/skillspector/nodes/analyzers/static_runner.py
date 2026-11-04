@@ -67,6 +67,7 @@ from skillspector.python_ast import (
     may_be_python_source,
     resolve_python_source_classification,
 )
+from skillspector.python_import_bounds import PythonImportBounds
 from skillspector.python_tokens import PythonStringClosers
 from skillspector.security_reconstruction import (
     MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
@@ -104,6 +105,8 @@ FILE_TYPES: dict[str, str] = {
     ".bash": "shell",
     ".zsh": "shell",
     ".ps1": "powershell",
+    ".psm1": "powershell",
+    ".psd1": "powershell",
     ".json": "json",
     ".yaml": "yaml",
     ".yml": "yaml",
@@ -2106,6 +2109,44 @@ def _window_string_closer(
     return closes_string
 
 
+def _python_import_bounds(
+    state: Mapping[str, object], components: list[str], file_cache: Mapping[str, str]
+) -> PythonImportBounds:
+    # Known omitted files still affect import identity. Their absence from the
+    # analyzer work list cannot establish that an import is external.
+    paths = list(components)
+    inventory = state.get("artifact_inventory")
+    if isinstance(inventory, list):
+        paths.extend(
+            path
+            for artifact in inventory
+            if isinstance(artifact, dict) and isinstance(path := artifact.get("path"), str) and path
+        )
+    return PythonImportBounds(paths, file_cache)
+
+
+def _bounded_parse_exhaustion(
+    module: object,
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    path: str,
+    file_type: str,
+    complete_context: bool,
+    python_import_bounds: PythonImportBounds | None,
+) -> bool:
+    hook = getattr(module, "has_bounded_parse_exhaustion", None)
+    if not callable(hook):
+        return False
+    kwargs = {"file_type": file_type, "complete_context": complete_context}
+    if vars(module).get("USES_PYTHON_IMPORT_BOUNDS") is True and python_import_bounds is not None:
+        kwargs["python_import_check"] = lambda check: python_import_bounds.allows(
+            path, content, check
+        )
+        kwargs["python_stdlib_check"] = python_import_bounds.allows_stdlib
+    return bool(hook(content, check_runtime, **kwargs))
+
+
 def _scan_declared_marker_views(
     path: str,
     content: str,
@@ -2119,6 +2160,7 @@ def _scan_declared_marker_views(
     defer_projected_output_limit: bool,
     complete_context: bool,
     prepared_analyses: Mapping[int, object] | None = None,
+    python_import_bounds: PythonImportBounds | None = None,
 ) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
@@ -2327,11 +2369,14 @@ def _scan_declared_marker_views(
                     if callable(exhaustion_hook):
                         check_runtime()
                         bounded_parse_limited = bounded_parse_limited or bool(
-                            exhaustion_hook(
+                            _bounded_parse_exhaustion(
+                                module,
                                 marker_view.text,
                                 check_runtime,
                                 file_type=_infer_file_type(path),
                                 complete_context=complete_context,
+                                path=path,
+                                python_import_bounds=python_import_bounds,
                             )
                         )
 
@@ -2362,6 +2407,7 @@ def _scan_all_views_detailed(
     python_source: bool | None = None,
     readable_binary: bool = False,
     _oms_projected: bool = False,
+    python_import_bounds: PythonImportBounds | None = None,
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Scan bounded raw windows and return any limit with observed/limit metrics."""
     started_at = time.monotonic() if started_at is None else started_at
@@ -2388,6 +2434,7 @@ def _scan_all_views_detailed(
             timeout_seconds=timeout_seconds,
             started_at=started_at,
             python_source=False,
+            python_import_bounds=python_import_bounds,
         )
         findings = [
             finding
@@ -2438,6 +2485,7 @@ def _scan_all_views_detailed(
             # This view is derived JSON metadata, not a Python execution surface.
             python_source=False,
             _oms_projected=True,
+            python_import_bounds=python_import_bounds,
         )
         for finding in findings:
             finding.start_line = finding.end_line = 1
@@ -2626,6 +2674,7 @@ def _scan_all_views_detailed(
                 defer_projected_output_limit=coalesce is not None,
                 complete_context=whole_artifact_window,
                 prepared_analyses=prepared_analyses,
+                python_import_bounds=python_import_bounds,
             )
             bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
@@ -2662,11 +2711,14 @@ def _scan_all_views_detailed(
                 if callable(exhaustion_hook):
                     finding_budget.check_runtime()
                     bounded_parse_limited = bounded_parse_limited or bool(
-                        exhaustion_hook(
+                        _bounded_parse_exhaustion(
+                            module,
                             content,
                             finding_budget.check_runtime,
                             file_type=_infer_file_type(path),
                             complete_context=True,
+                            path=path,
+                            python_import_bounds=python_import_bounds,
                         )
                     )
         except _StaticResourceLimitError as exc:
@@ -2790,13 +2842,16 @@ def _scan_all_views_detailed(
                                 python_source=python_source,
                             )
                             bounded_parse_limited = bounded_parse_limited or bool(
-                                exhaustion_hook(
+                                _bounded_parse_exhaustion(
+                                    module,
                                     full_view.text,
                                     finding_budget.check_runtime,
                                     file_type=module_file_type,
                                     # A fragment cannot prove surrounding HTML,
                                     # container, or inline delimiter ownership.
                                     complete_context=whole_artifact_window,
+                                    path=path,
+                                    python_import_bounds=python_import_bounds,
                                 )
                             )
                 except _StaticResourceLimitError as exc:
@@ -3124,6 +3179,7 @@ def _scan_all_views(
     started_at: float | None = None,
     python_ast: ParsedPythonFile | None = None,
     python_source: bool | None = None,
+    python_import_bounds: PythonImportBounds | None = None,
 ) -> list[Finding]:
     findings, _, _ = _scan_all_views_detailed(
         path,
@@ -3135,6 +3191,7 @@ def _scan_all_views(
         started_at=started_at,
         python_ast=python_ast,
         python_source=python_source,
+        python_import_bounds=python_import_bounds,
     )
     return findings
 
@@ -3216,6 +3273,7 @@ def run_static_patterns(
     file_cache = cast(
         dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
     )
+    python_import_bounds = _python_import_bounds(state, components, file_cache)
     raw_file_cache = cast(Mapping[str, bytes] | None, state.get("raw_file_cache"))
     source_classifications = cast(
         Mapping[str, PythonSourceClassification | str] | None,
@@ -3310,6 +3368,7 @@ def run_static_patterns(
             python_ast=python_ast,
             python_source=python_source,
             readable_binary=path in readable_binary_paths,
+            python_import_bounds=python_import_bounds,
         )
         runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
         if shared_remaining is not None:
@@ -3349,6 +3408,7 @@ def run_static_patterns_with_ledger(
     file_cache = cast(
         dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
     )
+    python_import_bounds = _python_import_bounds(state, components, file_cache)
     raw_file_cache = cast(Mapping[str, bytes] | None, state.get("raw_file_cache"))
     source_classifications = cast(
         Mapping[str, PythonSourceClassification | str] | None,
@@ -3518,6 +3578,7 @@ def run_static_patterns_with_ledger(
                             python_ast=python_ast,
                             python_source=python_source,
                             readable_binary=bool(artifact.get("readable_binary")),
+                            python_import_bounds=python_import_bounds,
                         )
                         fully_scanned_aggregate_overflow = bool(
                             resource_limit is LedgerReason.OUTPUT_LIMIT
