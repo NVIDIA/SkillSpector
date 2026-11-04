@@ -1,18 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded lexical ownership for Node assertion template-message delimiters.
+"""Bounded JavaScript ownership for shell-completeness checks.
 
-This is not a JavaScript parser or a shell-sink/dataflow model. Only a direct
-diagnostic argument of one unaliased built-in assertion import may borrow
-ownership. Unsupported source keeps its original conservative shell reading.
+Assertion messages require a proved receiver. General template ownership also
+requires a complete syntax tree and retains conservative shell-execution checks.
+Original source bytes remain the input to security matching.
 """
 
 from __future__ import annotations
 
 import re
 from bisect import bisect_left
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from html.parser import HTMLParser
 
@@ -1655,17 +1655,24 @@ def _has_shell_execution_call(
                 pending.extend(imported.named_children)
         if target is not None and target.type == "identifier" and value is not None:
             name = program.text(target)
-            for source in _selected_identifiers(program, value, check_runtime):
-                aliases.setdefault(source, set()).add(name)
+            if node.type == "augmented_assignment_expression":
+                uncertain_bindings.add(name)
             if value.type == "template_string":
                 template_values.add(name)
-        if node.type == "variable_declarator":
-            if (
-                target is not None
-                and target.type == "identifier"
-                and value is not None
-                and value.type
-                in {
+            for origin in _callable_values(program, value, check_runtime):
+                if origin.type in {"identifier", "shorthand_property_identifier"}:
+                    aliases.setdefault(program.text(origin), set()).add(name)
+                elif origin.type in {"member_expression", "subscript_expression"}:
+                    # Extracting call/apply/bind retains the receiver's
+                    # provenance. Other member values remain unknown callables.
+                    member = _callable_member(program, origin)
+                    owner = origin.child_by_field_name("object")
+                    if member not in {"call", "apply", "bind"} or (
+                        member == "apply" and owner is not None and program.text(owner) == "Reflect"
+                    ):
+                        uncertain_bindings.add(name)
+                elif origin.type not in {
+                    "identifier",
                     "arrow_function",
                     "function_expression",
                     "generator_function",
@@ -1677,9 +1684,9 @@ def _has_shell_execution_call(
                     "true",
                     "false",
                     "null",
-                }
-            ):
-                continue
+                }:
+                    uncertain_bindings.add(name)
+            continue
         if target is not None:
             # Unknown callable origins include computed global members,
             # injected parameters, aliases and reassigned local bindings.
@@ -1690,7 +1697,12 @@ def _has_shell_execution_call(
                 if binding.type in {"identifier", "shorthand_property_identifier_pattern"}:
                     uncertain_bindings.add(program.text(binding))
                 pending.extend(binding.named_children)
-    for names in (global_objects, imported_callables, template_values):
+    for names in (
+        global_objects,
+        imported_callables,
+        template_values,
+        uncertain_bindings,
+    ):
         pending_names = list(names)
         while pending_names:
             check_runtime()
@@ -1713,7 +1725,12 @@ def _has_shell_execution_call(
                 return True
         if node.type == "subscript_expression":
             owner = node.child_by_field_name("object")
-            if owner is not None and program.text(owner) in global_objects:
+            while owner is not None and owner.type in {"member_expression", "subscript_expression"}:
+                check_runtime()
+                owner = owner.child_by_field_name("object")
+            if _callable_member(program, node) in {"eval", "Function"} or (
+                owner is not None and program.text(owner) in global_objects
+            ):
                 # A computed global can supply eval/Function through an alias,
                 # including an object or array later destructured elsewhere.
                 return True
@@ -1727,22 +1744,40 @@ def _has_shell_execution_call(
         arguments = node.child_by_field_name("arguments")
         if callee is None or arguments is None or arguments.type == "template_string":
             return True
-        if callee.type in {"call_expression", "parenthesized_expression", "subscript_expression"}:
-            if callee.type != "subscript_expression":
-                return True
-            index = callee.child_by_field_name("index")
-            if index is None or index.type not in {"number", "null", "true", "false"}:
-                return True
-        name = program.text(callee)
-        if callee.type == "identifier" and name in uncertain_bindings:
-            return True
-        imported_receiver = callee
-        while imported_receiver.type == "member_expression":
-            owner = imported_receiver.child_by_field_name("object")
-            if owner is None:
-                break
-            imported_receiver = owner
-        if program.text(imported_receiver) in imported_callables:
+        selected_names: set[str] = set()
+        callable_ids = {origin.id for origin in _callable_values(program, callee, check_runtime)}
+        for origin in _callable_values(program, callee, check_runtime, all_receivers=True):
+            if origin.type == "identifier":
+                name = program.text(origin)
+                selected_names.add(name)
+                if origin.id in callable_ids and name in uncertain_bindings:
+                    return True
+            elif origin.type in {"call_expression", "new_expression"}:
+                # Unknown call results, including bound functions, cannot
+                # borrow the ordinary direct-call ownership heuristic.
+                if origin.id in callable_ids:
+                    return True
+            elif origin.type in {"member_expression", "subscript_expression"}:
+                member = _callable_member(program, origin)
+                if member is not None and member.casefold() in _SHELL_EXECUTION_CALLS:
+                    return True
+                owner = origin.child_by_field_name("object")
+                if (
+                    member == "construct"
+                    or member == "apply"
+                    and owner is not None
+                    and program.text(owner) == "Reflect"
+                ):
+                    return True
+                if origin.type == "subscript_expression" and member not in {
+                    "call",
+                    "apply",
+                    "bind",
+                }:
+                    index = origin.child_by_field_name("index")
+                    if index is None or index.type not in {"number", "null", "true", "false"}:
+                        return True
+        if selected_names & imported_callables:
             # An unresolved imported function may execute its argument. Keep
             # direct template arguments and simple local aliases unowned;
             # this does not claim interprocedural argument-flow analysis.
@@ -1755,7 +1790,7 @@ def _has_shell_execution_call(
                 ):
                     return True
                 pending.extend(argument.named_children)
-        if name in {"require", "import"}:
+        if selected_names & {"require", "import"} or callee.type == "import":
             args = arguments.named_children
             if (
                 len(args) != 1
@@ -1763,32 +1798,42 @@ def _has_shell_execution_call(
                 or _is_shell_execution_module(program.text(args[0]))
             ):
                 return True
-        if callee.type == "member_expression":
-            member = callee.child_by_field_name("property")
-            if member is None or program.text(member) in {"call", "apply", "bind", "construct"}:
-                return True
     return False
 
 
-def _selected_identifiers(
-    program: JavaScriptProgram, value: Node, check_runtime: Callable[[], None]
-) -> set[str]:
-    """Overapproximate direct and conditional aliases without evaluating code."""
-    names: set[str] = set()
+def _callable_member(program: JavaScriptProgram, node: Node) -> str | None:
+    member = node.child_by_field_name("property") or node.child_by_field_name("index")
+    if member is None or member.type not in {"property_identifier", "string"}:
+        return None
+    return program.text(member).strip("\"'")
+
+
+def _callable_values(
+    program: JavaScriptProgram,
+    value: Node,
+    check_runtime: Callable[[], None],
+    *,
+    all_receivers: bool = False,
+) -> Iterator[Node]:
+    """Walk selected values and function-helper receivers without executing code."""
     pending = [value]
     while pending:
         check_runtime()
         node = pending.pop()
-        if node.type == "identifier":
-            names.add(program.text(node))
-        elif node.type in {"parenthesized_expression", "binary_expression"}:
+        if node.type in {"parenthesized_expression", "await_expression"}:
+            pending.extend(node.named_children)
+        elif (
+            node.type == "binary_expression"
+            and (operator := node.child_by_field_name("operator")) is not None
+            and program.text(operator) in {"&&", "||", "??"}
+        ):
             pending.extend(node.named_children)
         elif node.type == "ternary_expression":
             for field in ("consequence", "alternative"):
                 child = node.child_by_field_name(field)
                 if child is not None:
                     pending.append(child)
-        elif node.type == "assignment_expression":
+        elif node.type in {"assignment_expression", "assignment_pattern"}:
             child = node.child_by_field_name("right")
             if child is not None:
                 pending.append(child)
@@ -1796,7 +1841,14 @@ def _selected_identifiers(
             children = [child for child in node.named_children if child.type != "comment"]
             if children:
                 pending.append(children[-1])
-    return names
+        elif node.type != "comment":
+            yield node
+            if node.type in {"member_expression", "subscript_expression"} and (
+                all_receivers or _callable_member(program, node) in {"call", "apply", "bind"}
+            ):
+                owner = node.child_by_field_name("object")
+                if owner is not None:
+                    pending.append(owner)
 
 
 def _has_unproven_assertion_template_call(

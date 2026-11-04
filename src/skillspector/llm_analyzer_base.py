@@ -1526,14 +1526,20 @@ class LLMAnalyzerBase:
         retry_outcome = retry_outcome or _ProviderRetryOutcome()
         structured_retries = 0
         connection_retries = 0
+        formatting_source: str | None = None
         for attempt in range(1, LLM_BATCH_MAX_ATTEMPTS + 1):
             try:
+                if formatting_source is not None:
+                    return self._format_batch(batch, formatting_source)
                 return self._invoke_batch(batch, prompt)
             except _StructuredResponseValidationError as exc:
+                if formatting_source is not None:
+                    raise
                 cause = exc.__cause__
                 if isinstance(cause, StructuredOutputParseError):
                     if cause.repair_text is not None and attempt < LLM_BATCH_MAX_ATTEMPTS:
-                        return self._format_batch(batch, cause.repair_text)
+                        formatting_source = cause.repair_text
+                        continue
                     if not cause.retryable:
                         raise
                 if (
@@ -1622,14 +1628,20 @@ class LLMAnalyzerBase:
         retry_outcome = retry_outcome or _ProviderRetryOutcome()
         structured_retries = 0
         connection_retries = 0
+        formatting_source: str | None = None
         for attempt in range(1, LLM_BATCH_MAX_ATTEMPTS + 1):
             try:
+                if formatting_source is not None:
+                    return await self._aformat_batch(batch, formatting_source)
                 return await self._ainvoke_batch(batch, prompt)
             except _StructuredResponseValidationError as exc:
+                if formatting_source is not None:
+                    raise
                 cause = exc.__cause__
                 if isinstance(cause, StructuredOutputParseError):
                     if cause.repair_text is not None and attempt < LLM_BATCH_MAX_ATTEMPTS:
-                        return await self._aformat_batch(batch, cause.repair_text)
+                        formatting_source = cause.repair_text
+                        continue
                     if not cause.retryable:
                         raise
                 if (

@@ -2159,6 +2159,144 @@ def test_report_sarif_projects_incomplete_analysis_without_internal_payloads() -
     validate_sarif_report(result["sarif_report"])
 
 
+@pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
+def test_report_preserves_resource_measurements_with_units(output_format: str) -> None:
+    measurements = {
+        "observed_characters": 0,
+        "limit_characters": 0,
+        "observed_bytes": (1 << 53) + 1,
+        "limit_bytes": (1 << 53),
+        "observed_findings": 12,
+        "limit_findings": 10,
+        "observed_artifacts": 5,
+        "limit_artifacts": 4,
+        "observed_depth": 3,
+        "limit_depth": 2,
+        "observed_records": 9,
+        "limit_records": 8,
+        "observed_seconds": 0.25,
+        "limit_seconds": 0.125,
+    }
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": output_format,
+        "use_llm": False,
+        "llm_requested": False,
+        "analysis_completeness": {  # type: ignore[typeddict-item]
+            "total_components": 1,
+            "coverage_percent": 0.0,
+            "is_complete": False,
+            "status": "partial",
+            "fully_inspected_files": 0,
+            "partially_inspected_files": 1,
+            "entirely_uninspected_files": 0,
+            "ledger_exceptions": [
+                {
+                    "outcome": "partial",
+                    "phase": "static",
+                    "reason_code": "output_limit",
+                    "message": "Inspection reached its configured output limit.",
+                    "path": "SKILL.md",
+                    "start_line": 2,
+                    "end_line": 3,
+                    "analyzers": ["static_test"],
+                    "fatal": False,
+                    **measurements,
+                }
+            ],
+            "scope_exclusions": [],
+            "limitations": [],
+        },
+    }
+
+    result = report(state)
+
+    if output_format == "json":
+        exception = json.loads(result["report_body"])["analysis_completeness"]["ledger_exceptions"][
+            0
+        ]
+        assert {key: exception[key] for key in measurements} == measurements
+    elif output_format == "sarif":
+        notification = result["sarif_report"]["runs"][0]["invocations"][0][
+            "toolExecutionNotifications"
+        ][0]
+        for key, value in measurements.items():
+            prefix, _, unit = key.partition("_")
+            assert notification["properties"][prefix + unit.capitalize()] == value
+        assert "seconds: observed 0.25, limit 0.125" in notification["message"]["text"]
+        assert notification["locations"][0]["physicalLocation"]["region"]["startLine"] == 2
+        validate_sarif_report(result["sarif_report"])
+    else:
+        rendered = " ".join(result["report_body"].split())
+        if output_format == "markdown":
+            rendered = rendered.replace(r"\.", ".")
+        for unit in ["characters", "bytes", "findings", "artifacts", "depth", "records", "seconds"]:
+            expected = f"{unit}: observed {measurements['observed_' + unit]}, limit {measurements['limit_' + unit]}"
+            assert expected in rendered
+    assert result["analysis_completeness"]["is_complete"] is False
+
+
+@pytest.mark.parametrize("output_format", ["terminal", "markdown", "sarif"])
+@pytest.mark.parametrize(
+    ("measurements", "expected"),
+    [
+        ({"observed_seconds": 0.0}, "seconds: observed 0.0, limit not recorded"),
+        ({"limit_seconds": 1.0}, "seconds: observed not recorded, limit 1.0"),
+        ({}, "Resource measurements not recorded."),
+        (
+            {"observed_seconds": True, "limit_seconds": float("nan")},
+            "Resource measurements not recorded.",
+        ),
+    ],
+)
+def test_report_distinguishes_unrecorded_and_zero_resource_measurements(
+    output_format: str, measurements: dict[str, object], expected: str
+) -> None:
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": output_format,
+        "use_llm": False,
+        "llm_requested": False,
+        "analysis_completeness": {  # type: ignore[typeddict-item]
+            "total_components": 1,
+            "coverage_percent": 0.0,
+            "is_complete": False,
+            "status": "partial",
+            "fully_inspected_files": 0,
+            "partially_inspected_files": 1,
+            "entirely_uninspected_files": 0,
+            "ledger_exceptions": [
+                {
+                    "path": "SKILL.md",
+                    "reason_code": "runtime_limit",
+                    "message": "Incomplete.",
+                    **measurements,
+                }
+            ],
+            "scope_exclusions": [],
+            "limitations": [],
+        },
+    }
+    result = report(state)
+    rendered = " ".join(result["report_body"].split())
+    if output_format == "markdown":
+        rendered = rendered.replace(r"\.", ".")
+    assert expected in rendered
+    if output_format == "sarif":
+        notification = result["sarif_report"]["runs"][0]["invocations"][0][
+            "toolExecutionNotifications"
+        ][0]
+        if type(measurements.get("observed_seconds")) is bool:
+            assert "observedSeconds" not in notification["properties"]
+            assert "limitSeconds" not in notification["properties"]
+
+
 def test_report_sarif_bounds_completeness_notifications(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
