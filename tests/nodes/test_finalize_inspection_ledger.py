@@ -126,6 +126,106 @@ def test_completed_work_is_covered_and_resolves_emitted_finding_ids() -> None:
     assert effective_ids == [finding.finding_id]
 
 
+@pytest.mark.parametrize(
+    "unit", ["characters", "bytes", "findings", "artifacts", "depth", "records", "seconds"]
+)
+def test_resource_measurements_survive_finalization_with_findings(unit: str) -> None:
+    finding = Finding(rule_id="P1", message="retained evidence", file="SKILL.md")
+    measurements = {f"observed_{unit}": 10, f"limit_{unit}": 8}
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        analyzer_id="static_test",
+        path="SKILL.md",
+        reason=LedgerReason.RUNTIME_LIMIT,
+        emitted_finding_ids=[finding.finding_id],
+        **measurements,
+    )
+    completeness, effective_ids = finalize_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [finding],
+            "effective_finding_ids": [finding.finding_id],
+            "inspection_ledger": [event],
+            "analyzer_status_events": [analyzer_status_for_events("static_test", [event])],
+        }
+    )
+
+    exception = completeness["ledger_exceptions"][0]
+    assert {key: exception[key] for key in measurements} == measurements
+    assert exception["analyzers"] == ["static_test"]
+    assert exception["reason_code"] is LedgerReason.RUNTIME_LIMIT
+    assert completeness["status"] == "partial"
+    assert completeness["is_complete"] is False
+    assert completeness["execution_successful"] is True
+    assert effective_ids == [finding.finding_id]
+
+
+def test_exception_grouping_retains_distinct_and_unknown_resource_measurements() -> None:
+    events = []
+    statuses = []
+    for analyzer, observed in [("a", 10), ("b", 10), ("c", 11), ("d", None), ("e", 0)]:
+        event = ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            analyzer_id=analyzer,
+            path="SKILL.md",
+            reason=LedgerReason.OUTPUT_LIMIT,
+            observed_findings=observed,
+            limit_findings=8,
+        )
+        events.append(event)
+        statuses.append(analyzer_status_for_events(analyzer, [event]))
+
+    completeness, _ = finalize_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [],
+            "inspection_ledger": events,
+            "analyzer_status_events": statuses,
+        }
+    )
+
+    exceptions = completeness["ledger_exceptions"]
+    assert len(exceptions) == 4
+    assert {row.get("observed_findings"): row["analyzers"] for row in exceptions} == {
+        10: ["a", "b"],
+        11: ["c"],
+        None: ["d"],
+        0: ["e"],
+    }
+    assert all(row["limit_findings"] == 8 for row in exceptions)
+
+
+def test_finalization_discards_unsafe_measurements_without_hiding_incompleteness() -> None:
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        analyzer_id="static_test",
+        path="SKILL.md",
+        reason=LedgerReason.RUNTIME_LIMIT,
+        limit_seconds=1.0,
+        stage="private-stage",
+    )
+    event.update({"observed_seconds": float("nan"), "observed_bytes": True})
+    completeness, _ = finalize_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [],
+            "inspection_ledger": [event],
+            "analyzer_status_events": [analyzer_status_for_events("static_test", [event])],
+        }
+    )
+
+    exception = completeness["ledger_exceptions"][0]
+    assert exception["limit_seconds"] == 1.0
+    assert "observed_seconds" not in exception
+    assert "observed_bytes" not in exception
+    assert "stage" not in exception
+    assert completeness["is_complete"] is False
+    json.dumps(completeness, allow_nan=False)
+
+
 def test_out_of_scope_boundaries_do_not_count_as_analyzer_failures() -> None:
     """Non-fatal scope boundaries are not planned work for an analyzer."""
     analyzer_id = "static_patterns_prompt_injection"

@@ -732,8 +732,6 @@ def _runtime_limited_events(findings: list[Finding]) -> list[InspectionLedgerEve
                 reason=LedgerReason.RUNTIME_LIMIT,
                 input_finding_ids=finding_ids,
                 emitted_finding_ids=finding_ids,
-                observed_seconds=0.0,
-                limit_seconds=0.0,
             )
         )
     return events
