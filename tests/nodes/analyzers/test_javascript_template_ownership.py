@@ -342,6 +342,11 @@ def test_native_timeout_does_not_depend_on_python_clock_checks(
         r"\u0065xec(`${command}`);",
         "runner['exec'](`${command}`);",
         "Reflect.apply(runner, null, [`${command}`]);",
+        "const reflect = Reflect; const invoke = reflect.apply; "
+        "invoke(callback, null, [`${command}`]);",
+        "const box = {reflection: Reflect}; "
+        "box.reflection.apply(source[key], null, [`${command}`]);",
+        "globalThis.Reflect.apply(callback, null, [`${command}`]);",
         "const runner = execute.bind(null); runner(`${command}`);",
         "getRunner()(`${command}`);",
         "const invoke = globalThis[key]; invoke?.(`${command}`);",

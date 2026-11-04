@@ -1665,11 +1665,7 @@ def _has_shell_execution_call(
                 elif origin.type in {"member_expression", "subscript_expression"}:
                     # Extracting call/apply/bind retains the receiver's
                     # provenance. Other member values remain unknown callables.
-                    member = _callable_member(program, origin)
-                    owner = origin.child_by_field_name("object")
-                    if member not in {"call", "apply", "bind"} or (
-                        member == "apply" and owner is not None and program.text(owner) == "Reflect"
-                    ):
+                    if _callable_member(program, origin) not in {"call", "apply", "bind"}:
                         uncertain_bindings.add(name)
                 elif origin.type not in {
                     "identifier",
@@ -1719,8 +1715,13 @@ def _has_shell_execution_call(
         ):
             spelling = program.text(node)
             # Escaped names and extracted callable aliases are not resolved here.
-            if "\\" in spelling or (
-                spelling.casefold() in _SHELL_EXECUTION_CALLS and node.id not in scalar_identifiers
+            if (
+                "\\" in spelling
+                or spelling == "Reflect"
+                or (
+                    spelling.casefold() in _SHELL_EXECUTION_CALLS
+                    and node.id not in scalar_identifiers
+                )
             ):
                 return True
         if node.type == "subscript_expression":
@@ -1728,7 +1729,7 @@ def _has_shell_execution_call(
             while owner is not None and owner.type in {"member_expression", "subscript_expression"}:
                 check_runtime()
                 owner = owner.child_by_field_name("object")
-            if _callable_member(program, node) in {"eval", "Function"} or (
+            if _callable_member(program, node) in {"eval", "Function", "Reflect"} or (
                 owner is not None and program.text(owner) in global_objects
             ):
                 # A computed global can supply eval/Function through an alias,
@@ -1761,13 +1762,7 @@ def _has_shell_execution_call(
                 member = _callable_member(program, origin)
                 if member is not None and member.casefold() in _SHELL_EXECUTION_CALLS:
                     return True
-                owner = origin.child_by_field_name("object")
-                if (
-                    member == "construct"
-                    or member == "apply"
-                    and owner is not None
-                    and program.text(owner) == "Reflect"
-                ):
+                if member == "construct":
                     return True
                 if origin.type == "subscript_expression" and member not in {
                     "call",
