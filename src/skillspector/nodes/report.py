@@ -46,6 +46,7 @@ from skillspector.inspection_ledger import (
     RULE_SET_SCOPE,
     AnalysisCompleteness,
     finalize_ledger,
+    format_recovery_policy_accepted,
     only_missing_reference_exceptions,
     resource_measurements,
 )
@@ -917,6 +918,9 @@ def _build_sarif(
         "notificationRecordLimit": MAX_FINDING_OUTPUT_RECORDS,
         "notificationsTruncated": False,
     }
+    if completeness.get("warnings"):
+        completeness_projection["acceptedByPolicy"] = format_recovery_policy_accepted(completeness)
+        completeness_projection["assessmentComplete"] = False
 
     if completeness.get("exclude_patterns"):
         completeness_projection["excludePatterns"] = completeness["exclude_patterns"]
@@ -1097,6 +1101,10 @@ def _render_terminal_completeness(
     table.add_column("Value")
     table.add_row("Execution", "successful" if execution_successful else "failed")
     table.add_row("Status", _terminal_text(completeness.get("status", "complete")))
+    if format_recovery_policy_accepted(completeness):
+        table.add_row(
+            "Formatting policy", "Accepted with warning; AI assessment remains incomplete"
+        )
     dependency_inspection = completeness.get("dependency_inspection")
     if isinstance(dependency_inspection, dict):
         table.add_row("Dependency contents", _terminal_text(dependency_inspection.get("status")))
@@ -1141,6 +1149,7 @@ def _render_terminal_completeness(
 
     render_rows("Scope exclusions", completeness.get("scope_exclusions"))
     render_rows("Ledger exceptions", completeness.get("ledger_exceptions"))
+    render_rows("Formatting recovery warnings", completeness.get("warnings"))
     render_rows("Analyzer statuses", completeness.get("analyzer_statuses"))
     limitations = completeness.get("limitations")
     if isinstance(limitations, list) and limitations:
@@ -1614,6 +1623,17 @@ def _format_json(
         "execution_successful": execution_successful,
     }
     data["analysis_completeness"] = dict(analysis_completeness or {})
+    completeness = analysis_completeness or {}
+    recovery_warnings = completeness.get("warnings")
+    if isinstance(recovery_warnings, list) and recovery_warnings:
+        metadata = cast(dict[str, object], data["metadata"])
+        metadata["llm_assessment_complete"] = False
+        metadata["llm_recovery_policy_accepted"] = format_recovery_policy_accepted(completeness)
+        if any(
+            isinstance(warning, Mapping) and warning.get("phase") == "meta"
+            for warning in recovery_warnings
+        ):
+            metadata["meta_analysis_applied"] = False
     return json.dumps(data, indent=2)
 
 
@@ -1650,6 +1670,10 @@ def _render_markdown_completeness(
     lines.append("|--------|-------|")
     lines.append(f"| Execution | {'successful' if execution_successful else 'failed'} |")
     lines.append(f"| Status | {_markdown_cell(completeness.get('status', 'complete'))} |")
+    if format_recovery_policy_accepted(completeness):
+        lines.append(
+            "| Formatting policy | Accepted with warning; AI assessment remains incomplete |"
+        )
     dependency_inspection = completeness.get("dependency_inspection")
     if isinstance(dependency_inspection, dict):
         lines.append(
@@ -1703,6 +1727,7 @@ def _render_markdown_completeness(
 
     render_rows("Scope Exclusions", completeness.get("scope_exclusions"))
     render_rows("Ledger Exceptions", completeness.get("ledger_exceptions"))
+    render_rows("Formatting Recovery Warnings", completeness.get("warnings"))
     render_rows("Analyzer Statuses", completeness.get("analyzer_statuses"))
     limitations = completeness.get("limitations")
     if isinstance(limitations, list) and limitations:
@@ -1945,6 +1970,8 @@ def report(state: SkillspectorState) -> dict[str, object]:
         if transitive_limitation not in limitations:
             limitations.append(transitive_limitation)
         analysis_completeness["limitations"] = limitations
+        if analysis_completeness.get("policy_accepted") is True:
+            analysis_completeness["policy_accepted"] = False
         analysis_completeness["is_complete"] = False
         if analysis_completeness.get("status", "complete") in {
             "complete",
@@ -2001,6 +2028,11 @@ def report(state: SkillspectorState) -> dict[str, object]:
         degraded_notice = (
             "LLM analysis was requested but semantic runtime telemetry was incomplete; "
             "results may reflect static analysis only."
+        )
+    if format_recovery_policy_accepted(analysis_completeness):
+        degraded_notice = (
+            "The full AI assessment could not be verified after formatting recovery. "
+            "The scan is accepted with a warning by policy; known findings remain."
         )
     if unavailable_before_execution:
         logger.warning(

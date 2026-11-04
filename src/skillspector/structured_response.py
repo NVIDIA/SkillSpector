@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Validate model answers and admit only lossless formatting recovery."""
+"""Validate model answers and retain bounded evidence for response recovery."""
 
 from __future__ import annotations
 
@@ -40,10 +40,12 @@ class StructuredOutputParseError(ValueError):
         *,
         issue: ResponseIssue = ResponseIssue.INVALID_JSON,
         repair_text: str | None = None,
+        recovery_text: str | None = None,
     ) -> None:
         super().__init__(message)
         self.issue = issue
         self.repair_text = repair_text
+        self.recovery_text = recovery_text
 
     @property
     def retryable(self) -> bool:
@@ -183,13 +185,24 @@ def validate_response_text(
             "model returned an empty response", issue=ResponseIssue.EMPTY
         )
     # Bound nesting before invoking the recursive JSON decoder.
-    tokens = formatting_tokens(body)
+    try:
+        tokens = formatting_tokens(body)
+    except StructuredOutputParseError as exc:
+        if (
+            completed
+            and preserve_text is None
+            and exc.issue == ResponseIssue.INVALID_JSON
+            and not body.startswith(("{", "[", "```"))
+        ):
+            exc.recovery_text = body
+        raise
     try:
         payload = json.loads(body, object_pairs_hook=_unique_fields)
     except json.JSONDecodeError as exc:
         raise StructuredOutputParseError(
             "model returned malformed JSON",
             repair_text=body if completed and preserve_text is None else None,
+            recovery_text=body if completed and preserve_text is None else None,
         ) from exc
     if preserve_text is not None and tokens != formatting_tokens(preserve_text):
         raise StructuredOutputParseError(
@@ -201,19 +214,15 @@ def validate_response_text(
         key = next(iter(payload))
         if key in {"json", "input", "parameters"} and isinstance(payload[key], dict):
             payload = payload[key]
-    return validate_payload(payload, schema)
+    try:
+        return validate_payload(payload, schema)
+    except StructuredOutputParseError as exc:
+        if completed and preserve_text is None:
+            exc.recovery_text = body
+        raise
 
 
-def validate_message(
-    message: object,
-    schema: type[BaseModel],
-    *,
-    tool: str,
-    require_tool: bool = False,
-    allow_json_wrapper: bool = False,
-    preserve_text: str | None = None,
-) -> object:
-    """Read stop/refusal evidence before parsing either text or tool arguments."""
+def _message_completed(message: object) -> bool:
     metadata = getattr(message, "response_metadata", {}) or {}
     additional = getattr(message, "additional_kwargs", {}) or {}
     content = getattr(message, "content", "")
@@ -245,16 +254,20 @@ def validate_message(
         raise StructuredOutputParseError(
             "model did not finish the assessment", issue=ResponseIssue.INCOMPLETE
         )
-    completed = stop in {"stop", "end_turn", "tool_use", "tool_calls"} or status == "completed"
-    if preserve_text is not None and not completed:
-        raise StructuredOutputParseError(
-            "formatting response has no completion evidence", issue=ResponseIssue.FORMAT_CHANGED
-        )
+    return (
+        stop in {"stop", "end_turn", "stop_sequence", "tool_use", "tool_calls"}
+        or status == "completed"
+    )
+
+
+def _message_text(message: object, *, tool: str | None, require_tool: bool = False) -> str:
+    additional = getattr(message, "additional_kwargs", {}) or {}
+    content = getattr(message, "content", "")
     calls = list(getattr(message, "tool_calls", []) or []) + list(
         getattr(message, "invalid_tool_calls", []) or []
     )
     if require_tool or calls:
-        if len(calls) != 1 or calls[0].get("name") != tool:
+        if tool is None or len(calls) != 1 or calls[0].get("name") != tool:
             raise StructuredOutputParseError(
                 f"model must return exactly one {tool} tool call", issue=ResponseIssue.INVALID_TOOL
             )
@@ -294,6 +307,69 @@ def validate_message(
         raise StructuredOutputParseError(
             "model returned no usable answer", issue=ResponseIssue.EMPTY
         )
+    return text
+
+
+def completed_response_text(message: object, *, tool: str | None = None) -> str:
+    """Read a bounded plain answer only when its provider confirms completion."""
+    if not _message_completed(message):
+        raise StructuredOutputParseError(
+            "response has no completion evidence", issue=ResponseIssue.INCOMPLETE
+        )
+    additional = getattr(message, "additional_kwargs", {}) or {}
+    content = getattr(message, "content", "")
+    if tool is None and (
+        additional.get("tool_calls")
+        or isinstance(content, list)
+        and any(
+            isinstance(block, dict) and block.get("type") in {"function_call", "tool_use"}
+            for block in content
+        )
+    ):
+        raise StructuredOutputParseError(
+            "model returned an unexpected tool", issue=ResponseIssue.INVALID_TOOL
+        )
+    text = _message_text(message, tool=tool)
+    if len(text) > MAX_RESPONSE_CHARS:
+        raise StructuredOutputParseError("response exceeds size limit", issue=ResponseIssue.LIMIT)
+    if not text.strip():
+        raise StructuredOutputParseError(
+            "model returned an empty response", issue=ResponseIssue.EMPTY
+        )
+    return text.strip()
+
+
+def validate_message(
+    message: object,
+    schema: type[BaseModel],
+    *,
+    tool: str,
+    require_tool: bool = False,
+    allow_json_wrapper: bool = False,
+    preserve_text: str | None = None,
+) -> object:
+    """Read stop/refusal evidence before parsing either text or tool arguments."""
+    completed = _message_completed(message)
+    if preserve_text is not None and not completed:
+        raise StructuredOutputParseError(
+            "formatting response has no completion evidence", issue=ResponseIssue.FORMAT_CHANGED
+        )
+    try:
+        text = _message_text(message, tool=tool, require_tool=require_tool)
+    except StructuredOutputParseError as exc:
+        if completed and preserve_text is None and exc.issue == ResponseIssue.INVALID_TOOL:
+            try:
+                # A missing tool call can still contain a complete prose assessment.
+                candidate = completed_response_text(message)
+                try:
+                    validate_response_text(candidate, schema, completed=True)
+                except StructuredOutputParseError as parse_error:
+                    exc.recovery_text = parse_error.recovery_text
+                else:
+                    exc.recovery_text = candidate
+            except StructuredOutputParseError:
+                pass
+        raise
     return validate_response_text(
         text,
         schema,

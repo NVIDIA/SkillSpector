@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from enum import Enum
+from typing import Annotated, Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -22,10 +24,13 @@ from skillspector.nodes.analyzers.semantic_security_discovery import node as sec
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, MetaAnalyzerResult
 from skillspector.providers import reset_provider, use_provider
 from skillspector.providers.openai import OpenAIProvider
+from skillspector.response_recovery import parse_recovery_value
 from skillspector.structured_response import (
+    MAX_RESPONSE_CHARS,
     MAX_RESPONSE_DEPTH,
     ResponseIssue,
     StructuredOutputParseError,
+    completed_response_text,
     formatting_tokens,
     validate_message,
     validate_response_text,
@@ -123,6 +128,207 @@ def test_stop_evidence_overrides_an_apparently_valid_clean_answer(stop, extra, i
         validate_message(message, LLMAnalysisResult, tool="LLMAnalysisResult")
     assert error.value.issue == issue
     assert not error.value.retryable
+
+
+@pytest.mark.parametrize("text", ["No security issues found.", '{"message": "No issues."}'])
+@pytest.mark.parametrize("completed", [False, True])
+def test_completed_prose_and_missing_schema_fields_are_separate_from_lossless_repair(
+    text, completed
+):
+    with pytest.raises(StructuredOutputParseError) as error:
+        validate_response_text(text, LLMAnalysisResult, completed=completed)
+    assert error.value.repair_text is None
+    assert error.value.recovery_text == (text if completed else None)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        '{"findings": [',
+        '{"findings": [], "findings": []}',
+        '{"findings": []} {"findings": []}',
+        '{"findings": NaN}',
+        '{"findings": 1e999}',
+        "x" * (MAX_RESPONSE_CHARS + 1),
+        '{"findings": ' + "[" * MAX_RESPONSE_DEPTH + "]" * MAX_RESPONSE_DEPTH + "}",
+    ],
+)
+@pytest.mark.parametrize("require_tool", [False, True])
+def test_unusable_json_cannot_enter_plaintext_recovery(text, require_tool):
+    message = AIMessage(content=text, response_metadata={"finish_reason": "stop"})
+    with pytest.raises(StructuredOutputParseError) as error:
+        validate_message(
+            message, LLMAnalysisResult, tool="LLMAnalysisResult", require_tool=require_tool
+        )
+    assert error.value.recovery_text is None
+
+
+def test_missing_tool_call_keeps_completed_prose_for_recovery():
+    message = AIMessage(content="No issues found.", response_metadata={"finish_reason": "stop"})
+    with pytest.raises(StructuredOutputParseError) as error:
+        validate_message(message, LLMAnalysisResult, tool="LLMAnalysisResult", require_tool=True)
+    assert error.value.issue == ResponseIssue.INVALID_TOOL
+    assert error.value.recovery_text == message.content
+
+
+def test_missing_tool_call_keeps_complete_json_for_recovery():
+    message = AIMessage(content='{"findings": []}', response_metadata={"finish_reason": "stop"})
+    with pytest.raises(StructuredOutputParseError) as error:
+        validate_message(message, LLMAnalysisResult, tool="LLMAnalysisResult", require_tool=True)
+    assert error.value.issue == ResponseIssue.INVALID_TOOL
+    assert error.value.recovery_text == message.content
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"finish_reason": "stop"},
+        {"finish_reason": "STOP"},
+        {"stop_reason": "end_turn"},
+        {"stop_reason": "stop_sequence"},
+        {"stopReason": "end_turn"},
+        {"stopReason": "stop_sequence"},
+        {"status": "completed"},
+    ],
+)
+def test_completed_plain_fields_are_provider_independent(metadata):
+    assert (
+        completed_response_text(AIMessage(content="  Severity: HIGH  ", response_metadata=metadata))
+        == "Severity: HIGH"
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata,additional,issue",
+    [
+        ({}, {}, ResponseIssue.INCOMPLETE),
+        ({"finish_reason": "length"}, {}, ResponseIssue.TRUNCATED),
+        ({"stop_reason": "max_tokens"}, {}, ResponseIssue.TRUNCATED),
+        ({"status": "incomplete"}, {}, ResponseIssue.INCOMPLETE),
+        ({"stop_reason": "pause_turn"}, {}, ResponseIssue.INCOMPLETE),
+        ({"finish_reason": "content_filter"}, {}, ResponseIssue.REFUSED),
+        ({"finish_reason": "stop"}, {"refusal": "Refused"}, ResponseIssue.REFUSED),
+    ],
+)
+def test_plain_fields_require_the_same_completion_and_refusal_guards(metadata, additional, issue):
+    message = AIMessage(content="HIGH", response_metadata=metadata, additional_kwargs=additional)
+    with pytest.raises(StructuredOutputParseError) as error:
+        completed_response_text(message)
+    assert error.value.issue == issue
+
+
+def test_plain_string_without_completion_metadata_is_not_a_completed_answer():
+    with pytest.raises(StructuredOutputParseError) as error:
+        completed_response_text("HIGH")
+    assert error.value.issue == ResponseIssue.INCOMPLETE
+
+
+def test_plain_field_refusal_blocks_are_rejected_even_with_completion():
+    message = AIMessage(
+        content=[{"type": "refusal", "refusal": "Refused"}, {"type": "text", "text": "LOW"}],
+        response_metadata={"finish_reason": "stop"},
+    )
+    with pytest.raises(StructuredOutputParseError) as error:
+        completed_response_text(message)
+    assert error.value.issue == ResponseIssue.REFUSED
+
+
+def test_plain_fields_reject_unparsed_tool_blocks():
+    message = AIMessage(
+        content=[
+            {"type": "function_call", "name": "unexpected", "arguments": "{}"},
+            {"type": "text", "text": "LOW"},
+        ],
+        response_metadata={"status": "completed"},
+    )
+    with pytest.raises(StructuredOutputParseError) as error:
+        completed_response_text(message)
+    assert error.value.issue == ResponseIssue.INVALID_TOOL
+
+
+@pytest.mark.parametrize("names", [["other"], ["LLMAnalysisResult", "LLMAnalysisResult"]])
+def test_wrong_or_multiple_tools_never_become_plain_recovery(names):
+    message = AIMessage(
+        content="No issues found.",
+        response_metadata={"finish_reason": "tool_calls"},
+        tool_calls=[{"name": name, "args": {}, "id": str(i)} for i, name in enumerate(names)],
+    )
+    with pytest.raises(StructuredOutputParseError) as error:
+        validate_message(message, LLMAnalysisResult, tool="LLMAnalysisResult")
+    assert error.value.issue == ResponseIssue.INVALID_TOOL
+    assert error.value.recovery_text is None
+    with pytest.raises(StructuredOutputParseError):
+        completed_response_text(message)
+
+
+@pytest.mark.parametrize(
+    "text,issue",
+    [(" ", ResponseIssue.EMPTY), ("x" * (MAX_RESPONSE_CHARS + 1), ResponseIssue.LIMIT)],
+)
+def test_plain_fields_remain_nonempty_and_bounded(text, issue):
+    with pytest.raises(StructuredOutputParseError) as error:
+        completed_response_text(
+            AIMessage(content=text, response_metadata={"finish_reason": "stop"})
+        )
+    assert error.value.issue == issue
+
+
+class _RecoverySeverity(Enum):
+    HIGH = "HIGH"
+    LOW = "LOW"
+
+
+@pytest.mark.parametrize(
+    "text,annotation,field_name,expected",
+    [
+        ("Severity: high", Literal["LOW", "HIGH", "CRITICAL"], "severity", "HIGH"),
+        ('"HIGH"', _RecoverySeverity, "severity", _RecoverySeverity.HIGH),
+        ("Rule ID: TM-1", Literal["TM-1", "TM-2"], "rule_id", "TM-1"),
+        ("Findings count: 2", int, "findings_count", 2),
+        ("Start_line: 1", int | None, "start_line", 1),
+        ("Confidence: 0.75", float, "confidence", 0.75),
+        ("1", float, None, 1.0),
+        ("YES", bool, None, True),
+        ("false", bool, None, False),
+        ("No", Annotated[bool, "a field"], None, False),
+        (
+            "  Keep the quoted 'false' value.\nSecond line.  ",
+            str,
+            "message",
+            "Keep the quoted 'false' value.\nSecond line.",
+        ),
+    ],
+)
+def test_recovery_field_parser_accepts_only_unambiguous_values(
+    text, annotation, field_name, expected
+):
+    assert parse_recovery_value(text, annotation, field_name=field_name) == expected
+
+
+@pytest.mark.parametrize(
+    "text,annotation,field_name",
+    [
+        ("not high, maybe critical", Literal["LOW", "HIGH", "CRITICAL"], "severity"),
+        ("Severity: HIGH or LOW", _RecoverySeverity, "severity"),
+        ("Message: HIGH", _RecoverySeverity, "severity"),
+        ("No, but yes", bool, None),
+        ("1", bool, None),
+        ("true", int, None),
+        ("1.0", int, None),
+        ("1e999", float, None),
+        ("NaN", float, None),
+        ("Infinity", float, None),
+        ("2 findings", int, None),
+        ("[2]", int, None),
+        ("null", int | None, None),
+        ("", str, None),
+        ("x" * (MAX_RESPONSE_CHARS + 1), str, None),
+    ],
+)
+def test_recovery_field_parser_does_not_guess(text, annotation, field_name):
+    with pytest.raises(StructuredOutputParseError):
+        parse_recovery_value(text, annotation, field_name=field_name)
 
 
 @pytest.fixture

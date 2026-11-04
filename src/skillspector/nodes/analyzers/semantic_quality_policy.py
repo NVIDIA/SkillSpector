@@ -239,11 +239,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             model=model,
             node=ANALYZER_ID,
             timeout=timeout,
+            recovery_rule_ids=("SQP-1", "SQP-2", "SQP-3"),
         )
         batches = analyzer.get_batches(files, file_cache)
         results = run_async(analyzer.arun_batches(batches))
         outcome = getattr(analyzer, "_last_batch_outcome", BatchExecutionResult(successful=results))
-        findings = analyzer.collect_findings(outcome.successful)
+        findings = analyzer.collect_findings([*outcome.successful, *outcome.recovered])
         events, status = ledger_events_for_batches(ANALYZER_ID, outcome)
         logger.info("%s: %d findings", ANALYZER_ID, len(findings))
         return {
@@ -251,10 +252,8 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             "inspection_ledger": events,
             "analyzer_status_events": [status],
             "llm_call_log": [
-                # A record is ok only when every submitted batch succeeded. A
-                # partial batch failure (e.g. one file's batch 429'd while
-                # another's succeeded) is still lost coverage, so it must not
-                # read as ok=True just because some batches came back.
+                # Formatting warnings describe an unknown assessment; provider
+                # failures still make execution unsuccessful. Coverage is in the ledger.
                 llm_call_record(ANALYZER_ID, ok=not outcome.failures)
             ],
             "inference_usage": analyzer.inference_usage,

@@ -414,6 +414,17 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
             return 0
         return estimate_tokens(_format_findings_for_prompt(findings))
 
+    def _recovery_known_items(self, batch: Batch) -> list[dict[str, Any]]:
+        return [
+            {
+                "finding_id": finding.finding_id,
+                "pattern_id": finding.rule_id,
+                "start_line": finding.start_line,
+                "end_line": finding.end_line,
+            }
+            for finding in batch.findings
+        ]
+
     def build_prompt(self, batch: Batch, **kwargs: object) -> str:
         metadata_text = redact_text(str(kwargs.get("metadata_text", "No metadata available")))
         findings_text = _format_findings_for_prompt(batch.findings)
@@ -643,7 +654,7 @@ def _meta_ledger_response(
                 ],
             )
         )
-    for failure in outcome.failures:
+    for failure in [*outcome.warnings, *outcome.failures]:
         batch = failure.batch
         input_ids = [
             finding.finding_id
@@ -657,7 +668,11 @@ def _meta_ledger_response(
                 analyzer_id="meta_analyzer",
                 outcome=(
                     LedgerOutcome.PARTIAL
-                    if failure.reason is LedgerReason.RUNTIME_LIMIT
+                    if failure.reason
+                    in {
+                        LedgerReason.RUNTIME_LIMIT,
+                        LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED,
+                    }
                     else outcome_for_llm_batch_failure(failure.reason)
                 ),
                 phase="meta",
@@ -876,6 +891,9 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         )
 
         returned_results = run_async(analyzer.arun_batches(batches, metadata_text=metadata_text))
+        detailed = getattr(analyzer, "_last_batch_outcome", None)
+        if isinstance(detailed, BatchExecutionResult):
+            returned_results = [*returned_results, *detailed.recovered]
         submitted_batches = {_meta_batch_work_id(batch): batch for batch in batches}
         returned_by_work_id: dict[str, tuple[Batch, list]] = {}
         for returned_batch, response_findings in returned_results:
@@ -890,7 +908,6 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             for batch in batches
             if (work_id := _meta_batch_work_id(batch)) in returned_by_work_id
         ]
-        detailed = getattr(analyzer, "_last_batch_outcome", None)
         if not isinstance(detailed, BatchExecutionResult):
             successful_work_ids = set(returned_by_work_id)
             detailed = BatchExecutionResult(
@@ -947,10 +964,8 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             "inspection_ledger": ledger_events,
             "analyzer_status_events": [status],
             "llm_call_log": [
-                # A record is ok only when every submitted batch succeeded. A
-                # partial batch failure (e.g. one file's batch 429'd while
-                # another's succeeded) is still lost coverage, so it must not
-                # read as ok=True just because some batches came back.
+                # Formatting warnings retain partial coverage in the ledger;
+                # genuine provider/runtime failures still mark the call failed.
                 llm_call_record("meta_analyzer", ok=not detailed.failures)
             ],
             "inference_usage": analyzer.inference_usage,
