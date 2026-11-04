@@ -2348,6 +2348,32 @@ def test_format_recovery_warning_does_not_invent_ae1_or_drop_known_high_finding(
     assert result["analysis_completeness"]["is_complete"] is False
 
 
+def test_format_recovery_preserves_existing_missing_reference_caveat() -> None:
+    state = _format_recovery_reference_state()
+    state["artifact_references"].append(
+        {"source_path": "SKILL.md", "line": 3, "target_path": None, "status": "missing"}
+    )
+    state["inspection_ledger"].append(
+        ledger_event(
+            record_type=LedgerRecordType.SYSTEM,
+            outcome=LedgerOutcome.PARTIAL,
+            phase="reference_resolution",
+            path="SKILL.md",
+            start_line=3,
+            end_line=3,
+            reason=LedgerReason.REFERENCE_MISSING,
+        )
+    )
+    result = finalize_inspection_ledger(state)
+    completeness = result["analysis_completeness"]
+    assert format_recovery_policy_accepted(completeness)
+    assert completeness["is_complete"] is False
+    assert completeness["partially_inspected_files"] == 1
+    assert any(row["reason_code"] == "reference_missing" for row in completeness["ledger_exceptions"])
+    assert result["effective_finding_ids"] == state["effective_finding_ids"]
+    assert result["findings"] == []
+
+
 @pytest.mark.parametrize("static_gap", [False, True])
 def test_format_recovery_does_not_create_archive_gap_but_preserves_static_gaps(
     static_gap: bool,

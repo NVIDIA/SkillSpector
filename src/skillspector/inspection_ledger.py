@@ -285,6 +285,32 @@ def format_recovery_policy_accepted(completeness: Mapping[str, object]) -> bool:
             if row["phase"] == "semantic":
                 partial_paths.add((source, str(row["path"])))
             format_rows.append(row)
+        elif reason == LedgerReason.REFERENCE_MISSING:
+            # These existing caveats describe absent references, not uninspected bytes.
+            path, source = row.get("path"), row.get("source_identity", "")
+            if (
+                row.get("phase") != "reference_resolution"
+                or row.get("analyzers")
+                or row.get("error_class")
+                or not isinstance(path, str)
+                or not path
+                or not isinstance(source, str)
+                or (source and not path.startswith(source + "/"))
+                or any(
+                    value is not None and type(value) is not int
+                    for value in (row.get("start_line"), row.get("end_line"))
+                )
+            ):
+                return False
+            try:
+                if _normalize_relative_path(path) != path:
+                    return False
+                _validate_range(
+                    cast(int | None, row.get("start_line")),
+                    cast(int | None, row.get("end_line")),
+                )
+            except ValueError:
+                return False
         elif not (
             reason == LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE
             and row.get("phase") == "semantic_runtime"

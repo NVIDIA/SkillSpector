@@ -72,6 +72,39 @@ def test_format_policy_retains_unknown_assessment_and_accurate_coverage() -> Non
 
 @pytest.mark.parametrize(
     "mutation",
+    [None, "fatal", "phase", "analyzers", "error_class", "path", "line", "source", "reason"],
+)
+def test_format_policy_preserves_only_valid_missing_reference_caveats(mutation: str | None) -> None:
+    result = _format_policy_completeness()
+    row = {
+        "outcome": "partial",
+        "phase": "reference_resolution",
+        "fatal": False,
+        "reason_code": "reference_missing",
+        "path": "SKILL.md",
+        "start_line": 3,
+        "end_line": 3,
+    }
+    changes = {
+        "fatal": ("fatal", True),
+        "phase": ("phase", "static"),
+        "analyzers": ("analyzers", ["static_patterns_tool_misuse"]),
+        "error_class": ("error_class", "RuntimeError"),
+        "path": ("path", "../outside.py"),
+        "line": ("start_line", True),
+        "source": ("source_identity", "external/other"),
+        "reason": ("reason_code", "reference_unscanned"),
+    }
+    if mutation is not None:
+        key, value = changes[mutation]
+        row[key] = value
+    result["ledger_exceptions"].append(row)
+    assert format_recovery_policy_accepted(result) is (mutation is None)
+    assert result["is_complete"] is False
+
+
+@pytest.mark.parametrize(
+    "mutation",
     [
         "extra_gap",
         "warning_path",
