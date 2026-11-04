@@ -42,10 +42,12 @@ from skillspector.dependency_sources import redact_text
 from skillspector.inference_usage import looks_like_credential, sanitize_inference_usage
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
+    RESOURCE_MEASUREMENT_UNITS,
     RULE_SET_SCOPE,
     AnalysisCompleteness,
     finalize_ledger,
     only_missing_reference_exceptions,
+    resource_measurements,
 )
 from skillspector.llm_provenance import sanitize_llm_provenance
 from skillspector.llm_utils import is_llm_available
@@ -132,6 +134,23 @@ _SANITIZED_FIELDS = (
 )
 
 _REPORT_SAFE_SOURCE_ID_RE = re.compile(r"external/[0-9a-f]{64}\Z")
+
+
+def _inspection_exception_message(row: Mapping[str, object]) -> str:
+    """Describe recorded resource values without inventing missing measurements."""
+    message = str(row.get("message", ""))
+    measurements = resource_measurements(row)
+    details: list[str] = []
+    for unit in RESOURCE_MEASUREMENT_UNITS:
+        if f"observed_{unit}" in measurements or f"limit_{unit}" in measurements:
+            observed = measurements.get(f"observed_{unit}", "not recorded")
+            limit = measurements.get(f"limit_{unit}", "not recorded")
+            details.append(f"{unit}: observed {observed}, limit {limit}")
+    if details:
+        return f"{message} Measurements: {'; '.join(details)}."
+    if str(row.get("reason_code", "")).endswith("_limit"):
+        return f"{message} Resource measurements not recorded."
+    return message
 
 
 def _clean_text(value: str | None) -> str | None:
@@ -963,8 +982,11 @@ def _build_sarif(
         analyzers = exception.get("analyzers")
         if isinstance(analyzers, list):
             properties["analyzers"] = list(analyzers)
+        for key, value in resource_measurements(exception).items():
+            prefix, _, unit = key.partition("_")
+            properties[prefix + unit.capitalize()] = value
         return SarifNotification(
-            message=SarifMessage(text=str(exception.get("message", "Inspection exception."))),
+            message=SarifMessage(text=_inspection_exception_message(exception)),
             level=level,
             locations=locations,
             properties=properties,
@@ -1114,7 +1136,7 @@ def _render_terminal_completeness(
                 # The path of a rule-set row is a label, not an artifact.
                 location = f"rule set {location}"
             reason = str(row.get("reason_code", row.get("status", "status")))
-            message = str(row.get("message", ""))
+            message = _inspection_exception_message(row)
             console.print(_terminal_text(f"  - {reason} {location}: {message}"))
 
     render_rows("Scope exclusions", completeness.get("scope_exclusions"))
@@ -1675,7 +1697,7 @@ def _render_markdown_completeness(
                 location_cell = f"rule set {location_cell}"
             lines.append(
                 f"| {_markdown_cell(reason)} | {location_cell} | "
-                f"{_markdown_cell(row.get('message', ''))} |"
+                f"{_markdown_cell(_inspection_exception_message(row))} |"
             )
         lines.append("")
 
