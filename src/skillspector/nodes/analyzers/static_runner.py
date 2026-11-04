@@ -3231,7 +3231,7 @@ def run_static_patterns(
     container_paths = {
         str(metadata.get("path", ""))
         for metadata in cast(list[dict[str, object]], state.get("component_metadata") or [])
-        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx"}
+        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx", "tar", "gzip"}
         and "!/" not in str(metadata.get("path", ""))
     }
     raw_inventory = state.get("artifact_inventory", [])
@@ -3367,7 +3367,7 @@ def run_static_patterns_with_ledger(
     container_paths = {
         str(metadata.get("path", ""))
         for metadata in cast(list[dict[str, object]], state.get("component_metadata") or [])
-        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx"}
+        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx", "tar", "gzip"}
         and "!/" not in str(metadata.get("path", ""))
     }
     findings: list[Finding] = []
