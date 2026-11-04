@@ -61,7 +61,10 @@ MAX_OSV_QUERIES_PER_BATCH = 64
 MAX_OSV_DETAIL_REQUESTS = 64
 MAX_OSV_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_OSV_RESULTS = 256
-MAX_OSV_VULNS_PER_PACKAGE = 16
+# Per-package advisories retained for one locked version. Widely used packages can
+# carry more than a dozen advisories for one release, and truncating them makes
+# the manifest partial; the aggregate detail and result budgets above still apply.
+MAX_OSV_VULNS_PER_PACKAGE = 64
 MAX_OSV_LIMITATIONS = 16
 MAX_OSV_CACHE_ENTRIES = 4_096
 MAX_OSV_PACKAGE_NAME_CHARS = 256

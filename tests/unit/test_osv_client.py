@@ -482,6 +482,26 @@ class TestQueryResourceBounds:
         assert [item.vuln_id for item in results[0]] == ["OSV-1"]
         assert any(item.reason is LedgerReason.OUTPUT_LIMIT for item in results.limitations)
 
+    def test_package_with_more_than_sixteen_advisories_keeps_complete_coverage(self) -> None:
+        """A locked package with 17 advisories (seen in a real poetry.lock) is not truncated."""
+        vulns = [{"id": f"OSV-{index}"} for index in range(17)]
+        client = self._client_for_batches([{"results": [{"vulns": vulns}]}])
+
+        def detail(url: str, **_kwargs: object) -> MagicMock:
+            response = MagicMock()
+            response.raise_for_status = MagicMock()
+            response.json.return_value = {"id": url.rsplit("/", 1)[-1], "summary": "advisory"}
+            return response
+
+        client.get.side_effect = detail
+
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=client):
+            results = query_batch([("demo", "1.0.0")], ECOSYSTEM_PYPI)
+
+        assert [item.vuln_id for item in results[0]] == [f"OSV-{index}" for index in range(17)]
+        assert client.get.call_count == 17
+        assert not results.limitations
+
     def test_truncated_provider_result_is_not_cached(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import skillspector.nodes.analyzers.osv_client as osv
 
