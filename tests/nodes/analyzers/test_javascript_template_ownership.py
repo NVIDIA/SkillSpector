@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
+from skillspector import javascript_ast as js
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.javascript_tokens import javascript_template_spans
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
@@ -149,6 +152,287 @@ def test_non_string_computed_member_with_template_does_not_crash(member: str) ->
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript") is False
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "const config = {...defaults, limit: 10_000}; const label = `item ${config?.name ?? 'none'}`;",
+        "import {fileURLToPath} from 'node:url'; const label = `${fileURLToPath(import.meta.url)}`;",
+        "class View { #name = 'chart'; label() { return `chart ${this.#name}`; } }",
+        "const label = `outer ${items.map(item => `inner ${item?.name ?? ''}`).join(',')}`;",
+        "#!/usr/bin/env node\nconst result = await Promise.resolve('done'); const label = `result ${result}`;",
+    ],
+)
+def test_modern_javascript_preserves_template_host_ownership(source: str) -> None:
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is False
+    )
+
+
+def test_shared_parser_retains_exact_unicode_and_comment_offsets() -> None:
+    source = "// café 😀\nconst label = `日本語 ${value?.name ?? 'none'}`;"
+    program = js.parse_javascript_source(source, lambda: None)
+    assert program is not None
+    comment = next(node for node in program.nodes if node.type == "comment")
+    template = next(node for node in program.nodes if node.type == "template_string")
+    assert program.text(comment) == "// café 😀"
+    assert program.span(template) == (source.index("`"), len(source) - 1)
+    assert program.text(template) == "`日本語 ${value?.name ?? 'none'}`"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "const label = `unterminated ${value};",
+        "const = `invalid ${value}`;",
+        "const typed: string = `unsupported ${value}`;",
+        "const value = '\x00';",
+        "const value = '\ud800';",
+        "entry?.label = `value ${input}`;",
+        "entry?.count++; const value = `${input}`;",
+        "(entry?.label) = `value ${input}`;",
+        "new Constructor?.(`${input}`);",
+        "entry?.tag`value ${input}`;",
+        "#!/bin/sh\nconst value = `${input}`;",
+        "const value = `${input}`;\n#!/usr/bin/env node",
+    ],
+)
+def test_shared_parser_returns_no_ownership_for_unusable_source(source: str) -> None:
+    assert js.parse_javascript_source(source, lambda: None) is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "target[entry?.key] = 1;",
+        "target[entry?.key]++;",
+        "(entry?.target).value = 1;",
+        "new (entry?.Constructor)();",
+        "new Constructor(entry?.value);",
+        "(entry?.tag)`value`;",
+    ],
+)
+def test_independent_optional_expressions_keep_valid_syntax(source: str) -> None:
+    assert js.parse_javascript_source(source, lambda: None) is not None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'const metadata = {eval: false, Function: "render", label: "plot"}; console.log(`${metadata?.label}`);',
+        "const label = source[key]; console.log(`Value: ${label}`);",
+    ],
+)
+def test_data_properties_do_not_acquire_execution_semantics(source: str) -> None:
+    assert javascript_template_spans(source, lambda: None) is not None
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is False
+    )
+
+
+@pytest.mark.parametrize("name", ["run", "exec", "spawn"])
+@pytest.mark.parametrize("value", ["1", "'frame'", "true", "false", "null"])
+def test_const_scalar_execution_names_retain_template_ownership(name: str, value: str) -> None:
+    source = f"const {name} = {value}; const label = `frame ${{{name}}}.png`;"
+    unresolved: list[int] = []
+    assert (
+        javascript_template_spans(source, lambda: None, unresolved_executables=unresolved)
+        is not None
+    )
+    assert not unresolved
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "let run = 1; const label = `${run}`;",
+        "function label() { const run = 1; return `${run}`; }",
+        "export const run = 1; const label = `${run}`;",
+        "const run = 1; { const run = command; const label = `${run}`; }",
+        "const run = 1; function label(run) { return `${run}`; }",
+        "const run = 1; function label({run}) { return `${run}`; }",
+        "const run = 1; run = command; const label = `${run}`;",
+        "const run = 1; run++; const label = `${run}`;",
+        "const run = 1; const alias = run; const label = `${run}`;",
+        "const run = 1; run(); const label = `${run}`;",
+        "const run = 1; run.member; const label = `${run}`;",
+        "const run = 1; accept(run); const label = `${run}`;",
+        "const run = 1; const receiver = {run}; const label = `${run}`;",
+        "const run = 1; receiver.run(); const label = `${run}`;",
+        "const run = 1; with (receiver) { const label = `${run}`; }",
+        "const label = `${run}`; const run = 1;",
+        "const eval = 1; const label = `${eval}`;",
+        "const Function = 1; const label = `${Function}`;",
+    ],
+)
+def test_unproven_scalar_execution_names_remain_partial(source: str) -> None:
+    unresolved: list[int] = []
+    assert (
+        javascript_template_spans(source, lambda: None, unresolved_executables=unresolved) is None
+    )
+    assert unresolved
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript") is True
+
+
+def test_proven_assertion_message_retains_host_ownership() -> None:
+    source = (
+        "import assert from 'node:assert/strict'; assert.equal(actual, expected, `value ${label}`);"
+    )
+    unresolved: list[int] = []
+    assert (
+        javascript_template_spans(source, lambda: None, unresolved_executables=unresolved)
+        is not None
+    )
+    assert not unresolved
+
+
+@pytest.mark.parametrize(
+    ("limit", "value", "source"),
+    [
+        ("MAX_JAVASCRIPT_SOURCE_CHARS", 10, "const label = `long`;"),
+        ("_MAX_NODES", 20, "const values = [" + ",".join(str(i) for i in range(30)) + "];"),
+        ("_MAX_DEPTH", 8, "const value = " + "(" * 20 + "1" + ")" * 20 + ";"),
+    ],
+)
+def test_shared_parser_preserves_resource_bounds(
+    monkeypatch: pytest.MonkeyPatch, limit: str, value: int, source: str
+) -> None:
+    monkeypatch.setattr(js, limit, value)
+    assert js.parse_javascript_source(source, lambda: None) is None
+
+
+@pytest.mark.parametrize("expire_at", [1, 2, 3], ids=["entry", "before-native", "after-native"])
+def test_parser_preserves_caller_runtime_signal(expire_at: int) -> None:
+    checks = 0
+
+    def check_runtime() -> None:
+        nonlocal checks
+        checks += 1
+        if checks >= expire_at:
+            raise TimeoutError("test runtime exhausted")
+
+    with pytest.raises(TimeoutError, match="test runtime exhausted"):
+        js.parse_javascript_source("const label = `value ${item}`;", check_runtime)
+
+
+def test_native_timeout_does_not_depend_on_python_clock_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Freeze only the helper's clock: the native parser must enforce its own
+    # finite budget rather than relying on a check after unlimited native work.
+    monkeypatch.setattr(js, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    source = "const values = [" + "'value'," * 5_000 + "];"
+    assert js.parse_javascript_source(source, lambda: None) is not None
+    monkeypatch.setattr(js, "_MAX_SECONDS", 0.000001)
+    assert js.parse_javascript_source(source, lambda: None) is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import { exec as launch } from 'node:child_process'; launch(`${command}`);",
+        "import {exec} from 'node:child_process'; const marker = 'node:assert'; exec(`${command}`);",
+        "const cp = require('node:child_process'); const launch = cp.exec; launch(`${command}`);",
+        "const launch = require(moduleName); launch(`${command}`);",
+        r"\u0065xec(`${command}`);",
+        "runner['exec'](`${command}`);",
+        "Reflect.apply(runner, null, [`${command}`]);",
+        "const reflect = Reflect; const invoke = reflect.apply; "
+        "invoke(callback, null, [`${command}`]);",
+        "const box = {reflection: Reflect}; "
+        "box.reflection.apply(source[key], null, [`${command}`]);",
+        "globalThis.Reflect.apply(callback, null, [`${command}`]);",
+        "const runner = execute.bind(null); runner(`${command}`);",
+        "getRunner()(`${command}`);",
+        "const invoke = globalThis[key]; invoke?.(`${command}`);",
+        "const 調用 = globalThis[key]; 調用?.(`${command}`);",
+        "const [invoke] = [globalThis[key]]; invoke?.(`${command}`);",
+        "const {invoke} = {invoke: source[key]}; invoke?.(`${command}`);",
+        "const receiver = {invoke: globalThis[key]}; receiver.invoke(`${command}`);",
+        "const receiver = {invoke: globalThis.eval}; receiver.invoke(`${command}`);",
+        "const receiver = {invoke: tool.exec}; receiver.invoke(`${command}`);",
+        "const handlers = [tool.exec]; handlers[0](`${command}`);",
+        "const handlers = {nested: {invoke: tool.exec}}; handlers.nested.invoke(`${command}`);",
+        "const source = {invoke: tool.exec}; const alias = source.invoke; "
+        "const handlers = {invoke: alias}; handlers.invoke(`${command}`);",
+        "const source = {invoke: tool.exec}; const handlers = {}; "
+        "Object.assign(handlers, {invoke: source.invoke}); handlers.invoke(`${command}`);",
+        "const {invoke} = {invoke: tool.exec}; const handlers = {invoke}; "
+        "handlers.invoke(`${command}`);",
+        "const [invoke] = [tool.exec]; const handlers = {invoke}; handlers.invoke(`${command}`);",
+        "const invoke = await tool.exec; const handlers = {invoke}; handlers.invoke(`${command}`);",
+        "function* pick() { yield tool.exec; } pick().next().value(`${command}`);",
+        "class Handlers { static invoke = tool.exec; } Handlers.invoke(`${command}`);",
+        "class Handler extends tool.exec {} new Handler(`${command}`);",
+        "for (const invoke of [tool.exec]) { const handlers = {invoke}; "
+        "handlers.invoke(`${command}`); }",
+        "const handlers = {}; handlers.invoke = tool.exec; handlers.invoke(`${command}`);",
+        "const handlers = []; handlers[0] = tool.exec; handlers[0](`${command}`);",
+        "const handlers = {nested: {}}; handlers.nested.invoke = tool.exec; "
+        "handlers.nested.invoke(`${command}`);",
+        "const execute = tool.exec; const handlers = {}; handlers.invoke = execute; "
+        "handlers.invoke(`${command}`);",
+        "const handlers = {}; Object.assign(handlers, {invoke: tool.exec}); "
+        "handlers.invoke(`${command}`);",
+        "const handlers = {}; Object.defineProperty(handlers, 'invoke', {value: tool.exec}); "
+        "handlers.invoke(`${command}`);",
+        "function pick() { return {invoke: tool.exec}; } pick().invoke(`${command}`);",
+        "const execute = tool.exec; const pick = () => ({invoke: execute}); "
+        "pick().invoke(`${command}`);",
+        "const root = globalThis; const receiver = {invoke: root[key]}; receiver.invoke?.(`${command}`);",
+        "const root = flag ? globalThis : window; const receiver = {invoke: root[key]}; receiver.invoke(`${command}`);",
+        "import {launch} from 'unknown'; launch?.(`${command}`);",
+        "import {launch} from 'unknown'; const text = `${command}`; const alias = text; launch?.(alias);",
+        "import * as tools from 'unknown'; tools.launch?.(`${command}`);",
+        "let invoke; invoke = globalThis[key]; invoke(`${command}`);",
+        "function main(invoke) { return invoke(`${command}`); }",
+        "format?.bind(null, `hello ${name}`)();",
+        "const {render: go = format} = source; go(`hello ${name}`);",
+        "function invoke(go = format) { go(`hello ${name}`); }",
+        "unknown`rm -rf /`;",
+    ],
+)
+def test_indirect_or_unknown_execution_retains_conservative_templates(source: str) -> None:
+    unresolved: list[int] = []
+    assert (
+        javascript_template_spans(source, lambda: None, unresolved_executables=unresolved) is None
+    )
+    assert unresolved
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript") is True
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is True
+    )
+
+
+def test_literal_shell_template_keeps_raw_inspection_and_findings() -> None:
+    source = "import { execSync } from 'node:child_process'; execSync(`rm -rf /`);"
+    unresolved: list[int] = []
+    assert (
+        javascript_template_spans(source, lambda: None, unresolved_executables=unresolved) is None
+    )
+    assert not unresolved
+    assert any(
+        finding.rule_id == "TM1" for finding in tm.analyze(source, "install.mjs", "javascript")
+    )
+
+
+@pytest.mark.parametrize("source", ["exec(`${command}`);", "exec(`$COMMAND`);", "const = `bad`;"])
+def test_short_unknown_templates_produce_partial_ledger_evidence(source: str) -> None:
+    path = "scripts/run.mjs"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: source}}, [tm]
+    )
+    row = result["inspection_ledger"][0]
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
 @pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
 @pytest.mark.parametrize("interpreter", ["#!/usr/bin/env node", "#!/usr/bin/node --no-warnings"])
 def test_node_hashbang_preserves_nested_template_ownership(interpreter: str, newline: str) -> None:
@@ -206,14 +490,16 @@ def test_optional_chain_projection_preserves_literal_and_unicode_offsets() -> No
         " const value = `${input}`;\n#!/usr/bin/env node",
     ],
 )
-def test_invalid_or_unproven_host_syntax_keeps_conservative_fallback(source: str) -> None:
+def test_invalid_or_unproven_host_syntax_keeps_inspection_partial(source: str) -> None:
     source += _PADDING
-    assert javascript_template_spans(source, lambda: None) is None
-    # This hook reports bounded shell inspection, not JavaScript validity.
-    # Refusing ownership must leave the ordinary conservative scan unchanged.
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript") == (
-        tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="text")
+    unresolved: list[int] = []
+    assert (
+        javascript_template_spans(source, lambda: None, unresolved_executables=unresolved) is None
     )
+    # A failed complete host parse cannot prove executable template ownership,
+    # even when the ordinary shell fallback would fit within its span limit.
+    assert unresolved
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
 
 
 @pytest.mark.parametrize(
@@ -249,8 +535,14 @@ def test_supported_host_syntax_cannot_hide_code_execution(source: str, suffix: s
 )
 def test_independent_optional_expressions_do_not_invalidate_templates(statement: str) -> None:
     source = statement + "console.log(`Value: ${entry?.value}`);" + _PADDING
-    assert javascript_template_spans(source, lambda: None) is not None
-    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+    assert js.parse_javascript_source(source, lambda: None) is not None
+    if statement == "(entry?.tag)`value`;":
+        # Valid syntax does not establish the behavior of an unknown tag.
+        assert javascript_template_spans(source, lambda: None) is None
+        assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+    else:
+        assert javascript_template_spans(source, lambda: None) is not None
+        assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
 
 
 @pytest.mark.parametrize(
@@ -317,6 +609,8 @@ def test_computed_evaluator_aliases_cannot_own_executable_templates(member: str)
         "const evaluate = source[key]; const run = evaluate; run(`${command} -rf /`);",
         "let run; run = source[key]; run.call(null, `${command} -rf /`);",
         "source[key](`${command} -rf /`);",
+        "source[key].call(null, `${command} -rf /`);",
+        "const invoke = source[key].apply; invoke(null, [`${command} -rf /`]);",
         "source[key].bind(null)(`${command} -rf /`);",
         "const {eval: run} = globalThis; run(`${command} -rf /`);",
         "const {'Function': run} = globalThis; new run(`${command} -rf /`);",
@@ -325,8 +619,9 @@ def test_computed_evaluator_aliases_cannot_own_executable_templates(member: str)
         "source[key].call`${command} -rf /`;",
     ],
 )
-def test_unresolved_computed_evaluators_cannot_own_templates(statement: str) -> None:
-    source = statement + _PADDING
+@pytest.mark.parametrize("suffix", ["", _PADDING], ids=["short", "padded"])
+def test_unresolved_computed_evaluators_cannot_own_templates(statement: str, suffix: str) -> None:
+    source = statement + suffix
     assert javascript_template_spans(source, lambda: None) is None
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
 
@@ -406,22 +701,19 @@ def test_execution_helpers_and_aliases_keep_dynamic_templates_unverified(
     [
         "format?.call(null, `hello ${name}`);",
         "format?.apply(null, [`hello ${name}`]);",
-        "format?.bind(null, `hello ${name}`)();",
         "format['call']?.(null, `hello ${name}`);",
-        "const config = {exec: 'label'}; console.log(config?.exec, `hello ${name}`);",
-        "const label = source.exec; console.log(`Value: ${label}`);",
         "const {exec: label} = source; console.log(`Value: ${label}`);",
-        "const label = flag ? source.exec : 'label'; console.log(`Value: ${label}`);",
         "const format = flag ? first : second; format?.call(null, `hello ${name}`);",
         "(observe(), format)?.call(null, `hello ${name}`);",
         "const first = format; const invoke = first.call; "
         "invoke.call(first, null, `hello ${name}`);",
         "const first = format; const invoke = first['apply']; "
         "invoke.call(first, null, [`hello ${name}`]);",
-        "const {render: go = format} = source; go(`hello ${name}`);",
-        "function invoke(go = format) { go(`hello ${name}`); }",
-        "const {render: label = tool.exec} = source; console.log(`Value: ${label}`);",
-        "const first = tool.exec; const label = first.call; console.log(`Value: ${label}`);",
+        "function pick() { return {label: source[key]}; } console.log(`Value: ${pick().label}`);",
+        "function label(values, key) { return values[key].replace(/ +/g, ' '); } "
+        "console.log(`Value: ${label(items, key)}`);",
+        "function label(values, key) { return values[key].split(':')[0].split(',')[0]; } "
+        "console.log(`Value: ${label(items, key)}`);",
     ],
 )
 @pytest.mark.parametrize("suffix", ["", _PADDING], ids=["short", "padded"])
@@ -445,3 +737,26 @@ def test_benign_function_helper_chain_has_bounded_traversal(extracted: bool) -> 
         assert checks <= 1000
 
     assert javascript_template_spans(source, check_runtime) is not None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "const config = {exec: 'label'}; console.log(config?.exec, `hello ${name}`);",
+        "const label = source.exec; console.log(`Value: ${label}`);",
+        "const label = flag ? source.exec : 'label'; console.log(`Value: ${label}`);",
+        "const {render: label = tool.exec} = source; console.log(`Value: ${label}`);",
+        "const first = tool.exec; const label = first.call; console.log(`Value: ${label}`);",
+        "const handlers = {invoke: tool.exec}; console.log(`Value: ${name}`);",
+        "const handlers = [tool.exec]; console.log(`Value: ${name}`);",
+    ],
+)
+def test_executor_member_reads_keep_existing_conservative_coverage(source: str) -> None:
+    # The syntax tree does not prove that an executor-named member is data-only.
+    # Keep the existing file-local refusal rather than infer arbitrary value flow.
+    unresolved: list[int] = []
+    assert (
+        javascript_template_spans(source, lambda: None, unresolved_executables=unresolved) is None
+    )
+    assert unresolved
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
