@@ -4540,10 +4540,15 @@ class _JavaScriptTemplateOwnership:
         self._check_runtime = check_runtime
         self._spans: JavaScriptTemplateSpans | None = None
         self._spans_computed = False
+        self._unresolved_executables: list[int] = []
 
     def _owned_spans(self) -> JavaScriptTemplateSpans | None:
         if not self._spans_computed:
-            self._spans = _javascript_template_spans(self._content, self._check_runtime)
+            self._spans = _javascript_template_spans(
+                self._content,
+                self._check_runtime,
+                unresolved_executables=self._unresolved_executables,
+            )
             self._spans_computed = True
         return self._spans
 
@@ -4554,6 +4559,10 @@ class _JavaScriptTemplateOwnership:
         starts, ends = spans
         index = bisect_right(starts, position) - 1
         return index >= 0 and position < ends[index]
+
+    def has_unresolved_execution(self) -> bool:
+        self._owned_spans()
+        return bool(self._unresolved_executables)
 
     def word_end(self, start: int) -> int:
         """Return the end of a shell word while skipping proven template bytes."""
@@ -7261,10 +7270,11 @@ def _has_bounded_parse_exhaustion(
         # may begin inside a string and would invert code and literal bytes.
         python_source = _PythonSourceOwnership(content, check_runtime)
     if file_type == "javascript" and complete_context:
-        # A complete parse proves which backticks own host template bytes.
-        # Interpolated templates in files with shell calls retain conservative
-        # bounds because this analyzer does not prove their data flow.
+        # Modern host syntax owns literal delimiters only after a bounded,
+        # complete parse. Unresolved executable interpolations keep their bounds.
         javascript_source = _JavaScriptTemplateOwnership(content, check_runtime)
+        if javascript_source.has_unresolved_execution():
+            return True
     if file_type in {"json", "markdown"} and complete_context:
         json_strings = validated_json_string_spans(content, check_runtime)
         structural_quote_closers = {end - 1 for _, end in json_strings}

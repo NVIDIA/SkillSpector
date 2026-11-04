@@ -29,6 +29,7 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.models import Finding
 from skillspector.nodes.analyzers import ANALYZER_LOAD_ERRORS, ANALYZER_MODULES
+from skillspector.passive_bmp import is_structurally_valid_passive_bmp
 from skillspector.passive_jpeg import is_structurally_valid_passive_jpeg
 from skillspector.references import (
     MAX_REFERENCE_RUNTIME_SECONDS,
@@ -313,7 +314,8 @@ def _has_verified_passive_raster(
 ) -> bool:
     if PurePosixPath(target_path).suffix.lower() == ".png":
         return _has_verified_passive_png(target_path, inventory_item, raw_file_cache)
-    if PurePosixPath(target_path).suffix.lower() not in {".jpg", ".jpeg"} or not inventory_item:
+    suffix = PurePosixPath(target_path).suffix.lower()
+    if suffix not in {".jpg", ".jpeg", ".bmp"} or not inventory_item:
         return False
     raw = raw_file_cache.get(target_path)
     size_bytes = inventory_item.get("size_bytes")
@@ -321,7 +323,11 @@ def _has_verified_passive_raster(
         isinstance(raw, bytes)
         and type(size_bytes) is int
         and size_bytes == len(raw)
-        and is_structurally_valid_passive_jpeg(raw)
+        and (
+            is_structurally_valid_passive_bmp(raw)
+            if suffix == ".bmp"
+            else is_structurally_valid_passive_jpeg(raw)
+        )
     )
 
 
@@ -379,7 +385,7 @@ def _verified_documentation_image_references(
     inventory: Mapping[str, Mapping[str, object]],
     raw_file_cache: Mapping[str, object],
 ) -> set[tuple[str, int, int, str, str, str]]:
-    """Corroborate declarations and newly supported rendered JPEG references.
+    """Corroborate declarations and rendered JPEG/BMP references.
 
     The provenance label is not authority: bind it to canonical source bytes,
     exact syntax/position and target. All sources share one byte/time allowance;
@@ -403,7 +409,7 @@ def _verified_documentation_image_references(
         if kind != ReferenceKind.DOCUMENTATION_IMAGE and not (
             kind == ReferenceKind.MARKDOWN_IMAGE
             and isinstance(reference.get("target_path"), str)
-            and PurePosixPath(reference["target_path"]).suffix.lower() in {".jpg", ".jpeg"}
+            and PurePosixPath(reference["target_path"]).suffix.lower() in {".jpg", ".jpeg", ".bmp"}
         ):
             continue
         source_path = reference.get("source_path")
