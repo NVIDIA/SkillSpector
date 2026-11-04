@@ -42,10 +42,12 @@ from skillspector.dependency_sources import redact_text
 from skillspector.inference_usage import looks_like_credential, sanitize_inference_usage
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
+    RESOURCE_MEASUREMENT_UNITS,
     RULE_SET_SCOPE,
     AnalysisCompleteness,
     finalize_ledger,
     only_missing_reference_exceptions,
+    resource_measurements,
 )
 from skillspector.llm_provenance import sanitize_llm_provenance
 from skillspector.llm_utils import is_llm_available
@@ -132,6 +134,23 @@ _SANITIZED_FIELDS = (
 )
 
 _REPORT_SAFE_SOURCE_ID_RE = re.compile(r"external/[0-9a-f]{64}\Z")
+
+
+def _inspection_exception_message(row: Mapping[str, object]) -> str:
+    """Describe recorded resource values without inventing missing measurements."""
+    message = str(row.get("message", ""))
+    measurements = resource_measurements(row)
+    details: list[str] = []
+    for unit in RESOURCE_MEASUREMENT_UNITS:
+        if f"observed_{unit}" in measurements or f"limit_{unit}" in measurements:
+            observed = measurements.get(f"observed_{unit}", "not recorded")
+            limit = measurements.get(f"limit_{unit}", "not recorded")
+            details.append(f"{unit}: observed {observed}, limit {limit}")
+    if details:
+        return f"{message} Measurements: {'; '.join(details)}."
+    if str(row.get("reason_code", "")).endswith("_limit"):
+        return f"{message} Resource measurements not recorded."
+    return message
 
 
 def _clean_text(value: str | None) -> str | None:
@@ -318,10 +337,17 @@ def _expand_occurrences(findings: list[Finding]) -> list[Finding]:
             start_column, end_column = _occurrence_columns(finding, occurrence)
             provenance = _occurrence_provenance(finding, occurrence)
             depth_value = provenance.get("transitive_depth")
+            occurrence_file = str(occurrence.get("file", finding.file))
+            recorded_surface = occurrence.get("surface")
+            occurrence_surface = (
+                str(recorded_surface)
+                if isinstance(recorded_surface, str) and recorded_surface
+                else (finding.surface if occurrence_file == finding.file else None)
+            )
             expanded.append(
                 replace(
                     occurrence_finding,
-                    file=str(occurrence.get("file", finding.file)),
+                    file=occurrence_file,
                     start_line=start_line,
                     end_line=end_line,
                     start_column=start_column,
@@ -339,6 +365,10 @@ def _expand_occurrences(findings: list[Finding]) -> list[Finding]:
                     ),
                     transitive_depth=depth_value if isinstance(depth_value, int) else 0,
                     occurrences=[],
+                    # Prefer the occurrence's own recorded label. An occurrence
+                    # aggregated from another file keeps the surface that file's
+                    # finding carried; ``None`` falls back to a path-only label.
+                    surface=occurrence_surface,
                 )
             )
     return expanded
@@ -409,6 +439,12 @@ def _build_sarif_properties(
     """Project selected finding metadata into a SARIF properties dictionary."""
     occurrence_finding = _finding_for_occurrence(finding, occurrence or {})
     finding_dict = occurrence_finding.to_dict()
+    recorded_surface = (occurrence or {}).get("surface")
+    surface = (
+        str(recorded_surface)
+        if isinstance(recorded_surface, str) and recorded_surface
+        else finding_dict["surface"]
+    )
     metadata: dict[str, object] = {
         "findingId": occurrence_finding.finding_id,
         "severity": finding_dict["severity"],
@@ -425,6 +461,7 @@ def _build_sarif_properties(
         "intent": finding_dict["intent"],
         "tags": finding_dict["tags"],
         "evidence": finding_dict["evidence"],
+        "surface": surface,
     }
     provenance = _occurrence_provenance(finding, occurrence)
     for key, sarif_key in (
@@ -945,8 +982,11 @@ def _build_sarif(
         analyzers = exception.get("analyzers")
         if isinstance(analyzers, list):
             properties["analyzers"] = list(analyzers)
+        for key, value in resource_measurements(exception).items():
+            prefix, _, unit = key.partition("_")
+            properties[prefix + unit.capitalize()] = value
         return SarifNotification(
-            message=SarifMessage(text=str(exception.get("message", "Inspection exception."))),
+            message=SarifMessage(text=_inspection_exception_message(exception)),
             level=level,
             locations=locations,
             properties=properties,
@@ -1096,7 +1136,7 @@ def _render_terminal_completeness(
                 # The path of a rule-set row is a label, not an artifact.
                 location = f"rule set {location}"
             reason = str(row.get("reason_code", row.get("status", "status")))
-            message = str(row.get("message", ""))
+            message = _inspection_exception_message(row)
             console.print(_terminal_text(f"  - {reason} {location}: {message}"))
 
     render_rows("Scope exclusions", completeness.get("scope_exclusions"))
@@ -1657,7 +1697,7 @@ def _render_markdown_completeness(
                 location_cell = f"rule set {location_cell}"
             lines.append(
                 f"| {_markdown_cell(reason)} | {location_cell} | "
-                f"{_markdown_cell(row.get('message', ''))} |"
+                f"{_markdown_cell(_inspection_exception_message(row))} |"
             )
         lines.append("")
 
