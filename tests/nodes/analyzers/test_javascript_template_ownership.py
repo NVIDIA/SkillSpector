@@ -231,6 +231,54 @@ def test_data_properties_do_not_acquire_execution_semantics(source: str) -> None
     )
 
 
+@pytest.mark.parametrize("name", ["run", "exec", "spawn"])
+@pytest.mark.parametrize("value", ["1", "'frame'", "true", "false", "null"])
+def test_const_scalar_execution_names_retain_template_ownership(name: str, value: str) -> None:
+    source = f"const {name} = {value}; const label = `frame ${{{name}}}.png`;"
+    unresolved: list[int] = []
+    assert (
+        javascript_template_spans(source, lambda: None, unresolved_executables=unresolved)
+        is not None
+    )
+    assert not unresolved
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "let run = 1; const label = `${run}`;",
+        "function label() { const run = 1; return `${run}`; }",
+        "export const run = 1; const label = `${run}`;",
+        "const run = 1; { const run = command; const label = `${run}`; }",
+        "const run = 1; function label(run) { return `${run}`; }",
+        "const run = 1; function label({run}) { return `${run}`; }",
+        "const run = 1; run = command; const label = `${run}`;",
+        "const run = 1; run++; const label = `${run}`;",
+        "const run = 1; const alias = run; const label = `${run}`;",
+        "const run = 1; run(); const label = `${run}`;",
+        "const run = 1; run.member; const label = `${run}`;",
+        "const run = 1; accept(run); const label = `${run}`;",
+        "const run = 1; const receiver = {run}; const label = `${run}`;",
+        "const run = 1; receiver.run(); const label = `${run}`;",
+        "const run = 1; with (receiver) { const label = `${run}`; }",
+        "const label = `${run}`; const run = 1;",
+        "const eval = 1; const label = `${eval}`;",
+        "const Function = 1; const label = `${Function}`;",
+    ],
+)
+def test_unproven_scalar_execution_names_remain_partial(source: str) -> None:
+    unresolved: list[int] = []
+    assert (
+        javascript_template_spans(source, lambda: None, unresolved_executables=unresolved) is None
+    )
+    assert unresolved
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript") is True
+
+
 def test_proven_assertion_message_retains_host_ownership() -> None:
     source = (
         "import assert from 'node:assert/strict'; assert.equal(actual, expected, `value ${label}`);"

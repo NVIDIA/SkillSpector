@@ -1561,9 +1561,66 @@ def javascript_template_spans(
     return tuple(starts), tuple(ends)
 
 
+def _scalar_template_identifiers(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> set[int]:
+    """Own exact references to unique immutable scalars used only in templates."""
+    candidates: dict[str, tuple[Node, int]] = {}
+    references: dict[str, list[Node]] = {}
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return set()
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            name = program.text(node)
+            if name.casefold() in _SHELL_EXECUTION_CALLS:
+                references.setdefault(name, []).append(node)
+        if node.type != "variable_declarator":
+            continue
+        declaration = node.parent
+        binding = node.child_by_field_name("name")
+        value = node.child_by_field_name("value")
+        if (
+            declaration is not None
+            and declaration.type == "lexical_declaration"
+            and declaration.children[0].type == "const"
+            and declaration.parent == program.root_node
+            and binding is not None
+            and binding.type == "identifier"
+            and value is not None
+            and value.type in {"number", "string", "true", "false", "null"}
+        ):
+            name = program.text(binding)
+            # CST parsing does not establish strict-mode intrinsic binding rules.
+            if name.casefold() in _SHELL_EXECUTION_CALLS - {"eval", "function"}:
+                candidates[name] = (binding, node.end_byte)
+    owned: set[int] = set()
+    for name, (binding, declaration_end) in candidates.items():
+        identifiers: set[int] = set()
+        for node in references[name]:
+            check_runtime()
+            if node.id != binding.id and not (
+                node.type == "identifier"
+                and node.start_byte > declaration_end
+                and node.parent is not None
+                and node.parent.type == "template_substitution"
+                and node.parent.named_children == [node]
+            ):
+                break
+            identifiers.add(node.id)
+        else:
+            owned.update(identifiers)
+    return owned
+
+
 def _has_shell_execution_call(
     program: JavaScriptProgram, check_runtime: Callable[[], None]
 ) -> bool:
+    scalar_identifiers = _scalar_template_identifiers(program, check_runtime)
     uncertain_bindings: set[str] = set()
     global_objects = {"globalThis", "global", "window", "self"}
     imported_callables: set[str] = set()
@@ -1650,7 +1707,9 @@ def _has_shell_execution_call(
         ):
             spelling = program.text(node)
             # Escaped names and extracted callable aliases are not resolved here.
-            if "\\" in spelling or spelling.casefold() in _SHELL_EXECUTION_CALLS:
+            if "\\" in spelling or (
+                spelling.casefold() in _SHELL_EXECUTION_CALLS and node.id not in scalar_identifiers
+            ):
                 return True
         if node.type == "subscript_expression":
             owner = node.child_by_field_name("object")

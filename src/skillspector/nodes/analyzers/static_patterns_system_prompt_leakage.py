@@ -755,7 +755,14 @@ class _PreparedAnalysis:
     def is_javascript_non_extraction(
         self, match: re.Match[str], view: SecurityTextView, file_path: str
     ) -> bool:
-        if not self.javascript_file or view.name not in {"raw", "normalized"}:
+        if not self.javascript_file or view.name not in {
+            "raw",
+            "normalized",
+            "whitespace-continuity-raw",
+            "whitespace-continuity-normalized",
+            "continuity-raw",
+            "continuity-normalized",
+        }:
             return False
         if (
             _P6_LOCAL_RETURN.fullmatch(match.group(0)) is None
@@ -1041,9 +1048,9 @@ def _javascript_non_extraction_spans(
 ) -> frozenset[tuple[int, int]]:
     """Own parsed descriptions and boolean array predicates, never arbitrary returns.
 
-    Array methods use their ordinary built-in behavior. Explicit method/prototype
-    mutation, dynamic evaluation, ambiguous bindings and escaped receivers revoke
-    that proof; returning a local value alone does not establish benign intent.
+    Refuse visible method/prototype mutation and opaque local callable aliases.
+    This is a bounded file-local check, not proof about external module effects;
+    returning a local value alone does not establish benign intent.
     """
     program = parse_javascript_source(content, check_runtime)
     if program is None:
@@ -1051,9 +1058,105 @@ def _javascript_non_extraction_spans(
     spans: set[tuple[int, int]] = set()
     identifiers: dict[str, list[Any]] = {}
     functions: dict[str, list[Any]] = {}
+    aliases: dict[str, set[str]] = {}
+    opaque_callables: set[str] = set()
+    computed_values: set[str] = set()
+    local_factories: set[str] = set()
+    member_call_origins: set[str] = set()
     predicate_proof = True
+
+    def unparenthesized(node: Any) -> Any | None:
+        for _ in range(16):
+            check_runtime()
+            if node is None or node.type != "parenthesized_expression":
+                return node
+            children = [child for child in node.named_children if child.type != "comment"]
+            node = children[0] if len(children) == 1 else None
+        return None
+
+    def computed_binding(node: Any) -> str | None:
+        """Follow a local value into a binding; refuse callable/receiver escapes."""
+        nonlocal predicate_proof
+        child, owner = node, node.parent
+        metadata = False
+        for _ in range(64):
+            check_runtime()
+            if owner is None:
+                return None
+            if owner.type in _JAVASCRIPT_FUNCTIONS:
+                if owner.child_by_field_name("body") == child and not metadata:
+                    predicate_proof = False
+                return None
+            if owner.type in {"variable_declarator", "assignment_expression"}:
+                name = owner.child_by_field_name("name") or owner.child_by_field_name("left")
+                if child == name:
+                    if owner.type == "assignment_expression":
+                        predicate_proof = False
+                    return None
+                if name is not None and name.type == "identifier":
+                    return program.text(name)
+                predicate_proof = False
+                return None
+            operator = owner.child_by_field_name("operator")
+            if (
+                owner.type == "binary_expression"
+                and operator is not None
+                and program.text(operator) in {"===", "!=="}
+                or owner.type == "template_substitution"
+            ):
+                return None
+            metadata = metadata or owner.type == "object"
+            if owner.type == "return_statement" and metadata:
+                return None
+            if (
+                owner.type
+                in {
+                    "arguments",
+                    "return_statement",
+                    "augmented_assignment_expression",
+                    "update_expression",
+                }
+                or (
+                    owner.type in {"member_expression", "subscript_expression"}
+                    and owner.child_by_field_name("object") == child
+                )
+                or (
+                    owner.type in {"call_expression", "new_expression"}
+                    and (
+                        owner.child_by_field_name("function")
+                        or owner.child_by_field_name("constructor")
+                    )
+                    == child
+                )
+            ):
+                predicate_proof = False
+                return None
+            child, owner = owner, owner.parent
+        predicate_proof = False
+        return None
+
     for node in program.nodes:
         check_runtime()
+        if node.type in _JAVASCRIPT_FUNCTIONS:
+            owner = node.parent
+            while owner is not None and owner.type == "parenthesized_expression":
+                check_runtime()
+                owner = owner.parent
+            if owner is not None and owner.type in {"pair", "array", "object"}:
+                predicate_proof = False
+        if node.type in {"variable_declarator", "assignment_expression"}:
+            name = node.child_by_field_name("name") or node.child_by_field_name("left")
+            value = unparenthesized(
+                node.child_by_field_name("value") or node.child_by_field_name("right")
+            )
+            if name is not None and name.type == "identifier":
+                binding_name = program.text(name)
+                if value is not None and value.type == "identifier":
+                    aliases.setdefault(program.text(value), set()).add(binding_name)
+                elif value is not None and value.type in _JAVASCRIPT_FUNCTIONS:
+                    local_factories.add(binding_name)
+                else:
+                    opaque_callables.add(binding_name)
         if node.type in {
             "identifier",
             "shorthand_property_identifier",
@@ -1061,7 +1164,18 @@ def _javascript_non_extraction_spans(
         }:
             name = program.text(node)
             identifiers.setdefault(name, []).append(node)
-            if name in _PROTOTYPE_ACCESS | {"globalThis", "window", "self"} or "\\" in name:
+            if node.parent is not None and node.parent.type in {
+                "array_pattern",
+                "object_pattern",
+                "pair_pattern",
+                "assignment_pattern",
+                "rest_pattern",
+            }:
+                opaque_callables.add(name)
+            if (
+                name in _PROTOTYPE_ACCESS | {"globalThis", "global", "window", "self"}
+                or "\\" in name
+            ):
                 predicate_proof = False
             if name in _READ_ONLY_INTRINSICS:
                 owner = node.parent
@@ -1083,10 +1197,21 @@ def _javascript_non_extraction_spans(
             key = node.child_by_field_name("key")
             if key is None or key.type != "property_identifier":
                 predicate_proof = False
+        if node.type == "subscript_expression":
+            index = unparenthesized(node.child_by_field_name("index"))
+            if index is not None and index.type in {"string", "template_string"}:
+                key = program.text(index)
+                if "\\" in key or key[1:-1] in _PROTOTYPE_ACCESS | _READ_ONLY_INTRINSICS.keys():
+                    predicate_proof = False
+            if index is None or index.type != "number":
+                binding = computed_binding(node)
+                if binding is not None:
+                    computed_values.add(binding)
         if node.type == "function_declaration":
             name = node.child_by_field_name("name")
             if name is not None:
                 functions.setdefault(program.text(name), []).append(node)
+                local_factories.add(program.text(name))
         if node.type == "comment":
             start, end = program.span(node)
             comment = content[start:end]
@@ -1106,9 +1231,23 @@ def _javascript_non_extraction_spans(
         if node.type == "with_statement":
             predicate_proof = False
         if node.type == "call_expression":
-            callee = node.child_by_field_name("function")
-            if callee is not None and callee.type == "subscript_expression":
+            callee = unparenthesized(node.child_by_field_name("function"))
+            if callee is None or callee.type in {"subscript_expression", "call_expression"}:
                 predicate_proof = False
+            origin = callee
+            for _ in range(16):
+                check_runtime()
+                if origin is None or origin.type != "member_expression":
+                    break
+                origin = unparenthesized(origin.child_by_field_name("object"))
+            else:
+                predicate_proof = False
+            if origin is not None and origin.type == "call_expression":
+                factory = unparenthesized(origin.child_by_field_name("function"))
+                if factory is not None and factory.type == "identifier":
+                    member_call_origins.add(program.text(factory))
+                elif factory is None or factory.type in _JAVASCRIPT_FUNCTIONS:
+                    predicate_proof = False
         if node.type in {
             "assignment_expression",
             "augmented_assignment_expression",
@@ -1117,6 +1256,61 @@ def _javascript_non_extraction_spans(
             left = node.child_by_field_name("left") or node.child_by_field_name("argument")
             if left is not None and left.type in {"member_expression", "subscript_expression"}:
                 predicate_proof = False
+
+    for names in (opaque_callables, local_factories):
+        pending = list(names)
+        while pending:
+            check_runtime()
+            for alias in aliases.get(pending.pop(), ()):
+                if alias not in names:
+                    names.add(alias)
+                    pending.append(alias)
+    # A local factory's returned metadata cannot become an opaque member call.
+    if local_factories & member_call_origins:
+        predicate_proof = False
+    for name in opaque_callables | local_factories:
+        for reference in identifiers.get(name, ()):
+            check_runtime()
+            owner = reference.parent
+            while owner is not None and owner.type == "parenthesized_expression":
+                check_runtime()
+                reference, owner = owner, owner.parent
+            if owner is None:
+                continue
+            called = (
+                owner.type in {"call_expression", "new_expression"}
+                and (
+                    owner.child_by_field_name("function")
+                    or owner.child_by_field_name("constructor")
+                )
+                == reference
+            )
+            if name in opaque_callables and called:
+                predicate_proof = False
+            if name in local_factories and not (
+                called
+                or owner.type == "function_declaration"
+                and owner.child_by_field_name("name") == reference
+                or owner.type == "variable_declarator"
+                and owner.child_by_field_name("name") == reference
+                or owner.type in {"variable_declarator", "assignment_expression"}
+                and (owner.child_by_field_name("value") or owner.child_by_field_name("right"))
+                == reference
+                and (
+                    target := owner.child_by_field_name("name") or owner.child_by_field_name("left")
+                )
+                is not None
+                and target.type == "identifier"
+            ):
+                predicate_proof = False
+    pending = list(computed_values)
+    while pending:
+        check_runtime()
+        for reference in identifiers.get(pending.pop(), ()):
+            binding = computed_binding(reference)
+            if binding is not None and binding not in computed_values:
+                computed_values.add(binding)
+                pending.append(binding)
     if not predicate_proof:
         return frozenset(spans)
 
