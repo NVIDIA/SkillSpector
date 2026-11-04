@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from skillspector import javascript_ast as js
@@ -256,17 +258,30 @@ def test_shared_parser_preserves_resource_bounds(
     assert js.parse_javascript_source(source, lambda: None) is None
 
 
-def test_native_parse_cancellation_preserves_caller_runtime_signal() -> None:
+@pytest.mark.parametrize("expire_at", [1, 2, 3], ids=["entry", "before-native", "after-native"])
+def test_parser_preserves_caller_runtime_signal(expire_at: int) -> None:
     checks = 0
 
     def check_runtime() -> None:
         nonlocal checks
         checks += 1
-        if checks >= 4:
+        if checks >= expire_at:
             raise TimeoutError("test runtime exhausted")
 
     with pytest.raises(TimeoutError, match="test runtime exhausted"):
-        js.parse_javascript_source("const values = [" + "'value'," * 20_000 + "];", check_runtime)
+        js.parse_javascript_source("const label = `value ${item}`;", check_runtime)
+
+
+def test_native_timeout_does_not_depend_on_python_clock_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Freeze only the helper's clock: the native parser must enforce its own
+    # finite budget rather than relying on a check after unlimited native work.
+    monkeypatch.setattr(js, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    source = "const values = [" + "'value'," * 5_000 + "];"
+    assert js.parse_javascript_source(source, lambda: None) is not None
+    monkeypatch.setattr(js, "_MAX_SECONDS", 0.000001)
+    assert js.parse_javascript_source(source, lambda: None) is None
 
 
 @pytest.mark.parametrize(

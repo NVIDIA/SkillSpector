@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import tree_sitter_javascript
-from tree_sitter import Language, Node, Parser, Point, Tree
+from tree_sitter import Language, Node, Parser, Tree
 
 MAX_JAVASCRIPT_SOURCE_CHARS = 1_000_000
 _MAX_NODES = 100_000
@@ -54,9 +54,9 @@ def parse_javascript_source(
 ) -> JavaScriptProgram | None:
     """Return complete syntax, or no ownership on malformed/over-budget input.
 
-    A reader callback is necessary: tree-sitter ignores its cancellation
-    callback for a bytestring input. Callback exceptions are re-raised only
-    after the native parser returns, preserving the caller's runtime signal.
+    The pinned native timeout bounds parsing without Python callbacks: the
+    upstream progress callback crashes on Python 3.12/3.13. Caller expiry is
+    checked immediately before and after that bounded native operation.
     """
     check_runtime()
     if len(content) > MAX_JAVASCRIPT_SOURCE_CHARS or "\x00" in content:
@@ -66,33 +66,20 @@ def parse_javascript_source(
         source = content.encode("utf-8")
     except UnicodeEncodeError:
         return None
-    failure: BaseException | None = None
-    expired = False
-
-    def cancelled(_offset: int = 0, _has_error: bool = False) -> bool:
-        nonlocal failure, expired
-        if failure is not None or expired:
-            return True
-        try:
-            check_runtime()
-        except BaseException as error:
-            failure = error
-            return True
-        expired = time.monotonic() >= deadline
-        return expired
-
-    def read(offset: int, _point: Point) -> bytes:
-        return b"" if cancelled() else source[offset : offset + 4096]
-
+    check_runtime()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
     tree: Tree | None
     try:
-        tree = Parser(_LANGUAGE).parse(read, progress_callback=cancelled)
+        # Zero disables the native timeout, so round a positive budget up to
+        # at least one microsecond. A fresh parser cannot resume timed-out work.
+        parser = Parser(_LANGUAGE, timeout_micros=max(1, int(remaining * 1_000_000)))
+        tree = parser.parse(source)
     except (ValueError, TypeError, OverflowError):
         tree = None
-    if failure is not None:
-        raise failure
     check_runtime()
-    if tree is None or expired or time.monotonic() >= deadline:
+    if tree is None or time.monotonic() >= deadline:
         return None
     root = tree.root_node
     if root.type != "program" or root.has_error or root.end_byte != len(source):
