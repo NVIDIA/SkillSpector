@@ -110,7 +110,6 @@ def test_exact_owned_inline_body_refines_the_false_backtick_runtime_reading(mess
         'Run sh -c "echo `library`\'s"; An example `$(...)`.',
         'Run sh -c "echo\n`library`\'s\n"; An example `$(...)`.',
         'Run `sh` -c "echo `$(cat command.txt)`\'s".',
-        'Run `bash -c` "$PAYLOAD".',
         'The `library`\'s example `$(...)` then run sh -c "$PAYLOAD".',
         'The `library`\'s example `$(...)`; source helper.sh; echo sh -c "$PAYLOAD".',
     ],
@@ -212,6 +211,7 @@ def test_cancellation_after_markdown_owner_collection_propagates(monkeypatch) ->
         "Run sh -c 'echo `$(...)`'.",
         'Run `sh` -c "echo `$PAYLOAD`\'s".',
         "Run sh -c 'echo `$(cat command.txt)`'s.",
+        'Run `bash -c` "$PAYLOAD".',
     ],
 )
 def test_existing_generated_or_split_runtime_consumer_gap(message: str) -> None:
