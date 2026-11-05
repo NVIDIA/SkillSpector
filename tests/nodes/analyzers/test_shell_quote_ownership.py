@@ -1636,3 +1636,48 @@ def test_literal_trap_cannot_hide_aliased_wrapper_binding_effects(wrapper):
     )
     assert tm._xargs_has_source_override(source, lambda: None)
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        "-a /dev/null",
+        "--arg-file /dev/null",
+        "--arg-file=/dev/null",
+        "-a/dev/null",
+        "-o",
+        "--open-tty",
+    ],
+)
+@pytest.mark.parametrize("utility", ["bash", "sh -s", "env bash", "command bash"])
+@pytest.mark.parametrize("placement", ["before", "after"])
+def test_xargs_child_input_cannot_hide_runtime_shell_code(options, utility, placement):
+    source = (
+        f'xargs {options} <<< "$CODE" {utility}'
+        if placement == "before"
+        else f'xargs {options} {utility} <<< "$CODE"'
+    )
+    diagnostics = []
+    recognized, body = tm._command_string_from_clause(
+        source, 0, lambda: None, diagnostics=diagnostics
+    )
+    assert recognized
+    assert body is None
+    assert diagnostics
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "options", ["-a /dev/null", "--arg-file /dev/null", "--arg-file=/dev/null"]
+)
+def test_xargs_arg_file_keeps_dynamic_c_body_unresolved(options):
+    source = f'xargs {options} <<< "$VALUE" env sh -c "$CODE"'
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "options", ["-a /dev/null", "--arg-file /dev/null", "--arg-file=/dev/null"]
+)
+def test_xargs_arg_file_still_inspects_literal_c_body(options):
+    source = f"xargs {options} <<< \"$VALUE\" env sh -c 'printf done'"
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, "printf done")

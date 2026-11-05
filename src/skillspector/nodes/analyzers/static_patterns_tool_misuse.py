@@ -4727,6 +4727,7 @@ def _command_string_from_clause(
     last_word_start = start
     word_start = [start]
     xargs_replacements: set[str] = set()
+    xargs_child_stdin = False
     if xargs_override_cache is None:
         xargs_override_cache = [None]
 
@@ -4911,6 +4912,9 @@ def _command_string_from_clause(
                 ):
                     return failed(ParserCause.RUNTIME_DEPENDENT)
                 if option is None:
+                    # Arg-file/TTY mode leaves input available to the child.
+                    if xargs_child_stdin:
+                        return failed(ParserCause.RUNTIME_DEPENDENT)
                     # Without -c there is no command string to reconstruct.
                     # This also keeps Markdown fence labels such as sh inert.
                     return False, None
@@ -4941,6 +4945,8 @@ def _command_string_from_clause(
                     continue
                 if option.startswith("+") or option.startswith("--"):
                     continue
+                if xargs_child_stdin:
+                    return failed(ParserCause.RUNTIME_DEPENDENT)
                 return False, None
             return failed(
                 ParserCause.RESOURCE_LIMIT,
@@ -5118,6 +5124,12 @@ def _command_string_from_clause(
                         return failed(ParserCause.RUNTIME_DEPENDENT)
                     xargs_replacements.add(marker)
                     continue
+                if command == "xargs" and (
+                    option in {"-a", "--arg-file", "--open-tty"}
+                    or option.startswith(("-a", "--arg-file="))
+                    or re.fullmatch(r"-[0rtpox]*o[0rtpox]*", option)
+                ):
+                    xargs_child_stdin = True
                 if command == "xargs" and option in {
                     "-a",
                     "--arg-file",
