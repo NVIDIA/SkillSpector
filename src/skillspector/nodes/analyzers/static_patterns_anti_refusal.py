@@ -320,6 +320,33 @@ _AR2_REPORT_PREFIX_CHARS = 160
 # A comment block reaching this many lines on either side of the match keeps it.
 _AR2_COMMENT_BLOCK_MAX_LINES = 64
 
+_AR2_JUDGE_ONLY_PATTERN = re.compile(r"(?:do\s+not|don'?t|never)\s+judge", re.IGNORECASE)
+_AR2_TASK_JUDGMENT_OBJECT_PATTERN = re.compile(
+    r"\s+(?:(?:the|this|that|its|their)\s+)?"
+    r"(?:(?:change|code|implementation|requirement|test|output|result|proposal|design|document)"
+    r"['’]s\s+)?"
+    r"(?:correctness|accuracy|quality|testability|readiness|performance)\b",
+    re.IGNORECASE,
+)
+_AR2_OBSERVATION_SUBJECT_PATTERN = re.compile(
+    r"\b(?:observations|measurements|metrics|logs|results|data)\s+"
+    r"(?:(?:describe|report|record)\s*;\s*(?:they|these)\s+)?\Z",
+    re.IGNORECASE,
+)
+
+
+def _is_task_judgment(match_line: str, matched_text: str, start: int, end: int) -> bool:
+    """Separate technical assessment scope from moral or safety judgment suppression."""
+    if not _AR2_JUDGE_ONLY_PATTERN.fullmatch(matched_text):
+        return False
+    suffix = match_line[end:]
+    if _AR2_TASK_JUDGMENT_OBJECT_PATTERN.match(suffix):
+        return True
+    return bool(
+        not suffix.strip(" \t.;!?")
+        and _AR2_OBSERVATION_SUBJECT_PATTERN.search(match_line, max(0, start - 96), start)
+    )
+
 
 def _is_directly_instructive(context: str, matched_text: str) -> bool:
     """Return True when the match still looks like an active adversarial instruction."""
@@ -597,6 +624,10 @@ def analyze(
                 line_start = content.rfind("\n", 0, match.start()) + 1
                 line_match_start = match.start() - line_start
                 line_match_end = line_match_start + len(match.group(0))
+                if rule_id == "AR2" and _is_task_judgment(
+                    match_line, match.group(0), line_match_start, line_match_end
+                ):
+                    continue
                 match_clause, _, _ = _match_clause(match_line, line_match_start, line_match_end)
                 is_directive = _is_directly_instructive(match_clause.lower(), match.group(0))
                 example_context = is_code_example(context) and _is_explicit_example_context(context)
