@@ -1401,6 +1401,15 @@ def test_startup_names_in_non_setter_operands_do_not_taint_child(prefix: str) ->
         "alias xargs='delegate'",
         "alias -- xargs='delegate'",
         'alias "xargs=delegate"',
+        "builtin alias xargs='delegate'",
+        "builtin -- alias xargs='delegate'",
+        "command alias xargs='delegate'",
+        "command -p -- alias xargs='delegate'",
+        "command builtin alias xargs='delegate'",
+        "NAME=value builtin alias xargs='delegate'",
+        "builtin eval 'alias xargs=delegate'",
+        "builtin source setup.sh",
+        "enable -f extension.so xargs",
     ],
 )
 @pytest.mark.parametrize("ending", ["", "\necho finished\n"])
@@ -1497,4 +1506,9 @@ def test_repeated_redirected_xargs_proves_each_source_scope_once(monkeypatch):
     ],
 )
 def test_xargs_binding_proof_includes_executable_substitutions(source):
+    assert tm._xargs_has_source_override(source, lambda: None)
+
+
+def test_xargs_binding_proof_stays_conservative_at_its_wrapper_bound():
+    source = ("builtin " * 9) + "alias xargs=delegate\n"
     assert tm._xargs_has_source_override(source, lambda: None)

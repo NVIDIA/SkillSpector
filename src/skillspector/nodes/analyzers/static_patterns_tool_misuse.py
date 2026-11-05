@@ -3367,7 +3367,7 @@ def _has_shell_command_word_exhaustion(
     ``perl_eval_blocks`` recognizes Perl's exception-trapping ``eval BLOCK``,
     which reparses no string.
     """
-    quoted_printf_allowed = _quoted_printf_allowed and not _shell_redefines_printf(
+    quoted_printf_allowed = _quoted_printf_allowed and not _shell_redefines_command(
         content, check_runtime
     )
     parsed_through = 0
@@ -4296,10 +4296,18 @@ def _shell_clause_sets_startup(
     )
 
 
-def _shell_redefines_printf(content: str, check_runtime: Callable[[], None]) -> bool:
+def _shell_redefines_command(
+    content: str,
+    check_runtime: Callable[[], None],
+    command: str = "printf",
+    *,
+    shell_substitutions: bool = False,
+) -> bool:
     """Do not widen builtin evaluation across an explicit local replacement."""
     work = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
-    for start in _nonempty_shell_clause_starts(content, check_runtime):
+    for start in _nonempty_shell_clause_starts(
+        content, check_runtime, shell_substitutions=shell_substitutions
+    ):
         check_runtime()
         source = content[start : start + _ROOT_GLOB_COMMAND_CHARS + 1]
         cursor = 0
@@ -4335,13 +4343,13 @@ def _shell_redefines_printf(content: str, check_runtime: Callable[[], None]) -> 
                 continue
             if word in {"eval", "source", ".", "enable", "trap"}:
                 # Imported/evaluated code, handlers and builtin configuration
-                # can replace printf in this shell.
+                # can replace the command in this shell.
                 # Retain the earlier narrow decoder across those unknown effects.
                 return True
             if word == "function":
                 name, end, limited = _next_shell_invocation_word(source, cursor, check_runtime)
                 work -= end - cursor
-                if limited or work < 0 or end > _ROOT_GLOB_COMMAND_CHARS or name == "printf":
+                if limited or work < 0 or end > _ROOT_GLOB_COMMAND_CHARS or name == command:
                     return True
                 break
             if word == "alias":
@@ -4357,7 +4365,7 @@ def _shell_redefines_printf(content: str, check_runtime: Callable[[], None]) -> 
                         return True
                     if alias is None:
                         break
-                    if alias.startswith("printf=") or any(
+                    if alias.startswith(command + "=") or any(
                         marker in alias
                         for marker in (
                             _DYNAMIC_SHELL_WORD_SENTINEL,
@@ -4368,7 +4376,7 @@ def _shell_redefines_printf(content: str, check_runtime: Callable[[], None]) -> 
                 else:
                     return True
                 break
-            if word != "printf":
+            if word != command:
                 break
             # Bash accepts line continuations around the empty parameter list.
             for expected in "()":
@@ -4645,44 +4653,7 @@ def _eval_command_string(
 
 def _xargs_has_source_override(content: str, check_runtime: Callable[[], None]) -> bool:
     """Require the external utility before granting its redirected-data proof."""
-    for start in _nonempty_shell_clause_starts(content, check_runtime):
-        word, cursor, limited = _next_shell_invocation_word(content, start, check_runtime)
-        if limited:
-            return True
-        if word is None:
-            continue
-        if word == "function":
-            name, _, limited = _next_shell_invocation_word(content, cursor, check_runtime)
-            if limited or name == "xargs":
-                return True
-        elif word == "xargs":
-            following, position, limited = _next_shell_invocation_word(
-                content, cursor, check_runtime
-            )
-            if limited or following is None and content[position : position + 1] == "(":
-                # A signature can precede arbitrarily distant body trivia.
-                return True
-        elif word == "alias":
-            for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
-                gap = cursor
-                while gap < len(content) and content[gap] in " \t":
-                    if gap % 4096 == 0:
-                        check_runtime()
-                    gap += 1
-                if gap < len(content) and content[gap] in "\r\n":
-                    break
-                binding, cursor, limited = _next_shell_invocation_word(
-                    content, cursor, check_runtime
-                )
-                if limited:
-                    return True
-                if binding is None:
-                    break
-                if binding.startswith("xargs="):
-                    return True
-            else:
-                return True
-    return False
+    return _shell_redefines_command(content, check_runtime, "xargs", shell_substitutions=True)
 
 
 def _command_string_from_clause(
