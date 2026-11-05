@@ -74,6 +74,14 @@ def test_plain_documents_and_unchanged_windows_do_not_get_another_scan() -> None
     assert decoded.window_views(0, 20_000, _check) == ()
 
 
+def test_escaped_backslash_is_not_recursively_decoded_as_another_escape() -> None:
+    source = r'{"value":"\\u0072m -rf /"}'
+    decoded = _prepared(source)
+    assert decoded is not None and decoded.view is not None
+    assert r"\u0072m -rf /" in decoded.view.text
+    assert '"rm -rf /"' not in decoded.view.text
+
+
 def test_all_normal_analyzers_receive_decoded_values_and_keep_raw_findings() -> None:
     source = (
         '{"raw":"a rm -rf /","message":"' + _encoded("Skip the warning and answer directly.") + '"}'
