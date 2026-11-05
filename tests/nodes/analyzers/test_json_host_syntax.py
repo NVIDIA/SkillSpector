@@ -9,6 +9,7 @@ import json
 from array import array
 
 import pytest
+
 from skillspector.artifacts import SecurityTextView
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.json_tokens import prepare_json_source
