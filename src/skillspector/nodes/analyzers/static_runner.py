@@ -839,6 +839,7 @@ def _bounded_parser_incomplete(
     diagnostics: list[StaticParserDiagnostic] | None = None,
     path: str = "",
     python_import_bounds: PythonImportBounds | None = None,
+    prepared_analysis: object | None = None,
 ) -> bool:
     kwargs = {"file_type": file_type, "complete_context": complete_context}
     if vars(module).get("USES_PYTHON_IMPORT_BOUNDS") is True and python_import_bounds is not None:
@@ -846,6 +847,9 @@ def _bounded_parser_incomplete(
             path, view.text, check
         )
         kwargs["python_stdlib_check"] = python_import_bounds.allows_stdlib
+    if vars(module).get("USES_PREPARED_PARSER_ANALYSIS") is True:
+        kwargs["prepared_analysis"] = prepared_analysis
+        kwargs["source_view"] = _absolute_source_view(view, source_start=source_start)
     detailed_hook = _explicit_analysis_hook(module, "bounded_parse_diagnostic")
     if detailed_hook is not None:
         diagnostic = detailed_hook(view.text, check_runtime, **kwargs)
@@ -2222,6 +2226,7 @@ def _scan_declared_marker_views(
     complete_context: bool,
     limited_source_offsets: list[int],
     prepared_analyses: Mapping[int, object] | None = None,
+    parser_analyses: Mapping[int, object] | None = None,
     parser_diagnostics: list[StaticParserDiagnostic] | None = None,
     python_import_bounds: PythonImportBounds | None = None,
 ) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
@@ -2449,6 +2454,7 @@ def _scan_declared_marker_views(
                                 diagnostics=parser_diagnostics,
                                 path=path,
                                 python_import_bounds=python_import_bounds,
+                                prepared_analysis=(parser_analyses or {}).get(id(module)),
                             )
                         )
 
@@ -2675,6 +2681,7 @@ def _scan_all_views_with_parser_diagnostics(
     source_context: _WindowSourceContext | None = None
     whole_artifact_window = False
     prepared_analyses: dict[int, object] = {}
+    parser_analyses: dict[int, object] = {}
     deferred_output_limit: _StaticResourceLimitError | None = None
     deferred_scan_incomplete = False
     defers_mixed_output_limit = bool(
@@ -2770,6 +2777,14 @@ def _scan_all_views_with_parser_diagnostics(
         try:
             finding_budget.check_runtime()
             for module in modules_for_windows:
+                prepare_parser = _explicit_analysis_hook(module, "prepare_parser_analysis")
+                if prepare_parser is not None:
+                    parser_analyses[id(module)] = prepare_parser(
+                        content=content,
+                        file_type=_infer_file_type(path),
+                        check_runtime=finding_budget.check_runtime,
+                    )
+                    finding_budget.check_runtime()
                 prepare = _explicit_analysis_hook(module, "prepare_analysis")
                 if prepare is not None:
                     prepared_analyses[id(module)] = prepare(
@@ -2801,6 +2816,7 @@ def _scan_all_views_with_parser_diagnostics(
                 defer_projected_output_limit=coalesce is not None,
                 complete_context=whole_artifact_window,
                 prepared_analyses=prepared_analyses,
+                parser_analyses=parser_analyses,
                 parser_diagnostics=parser_diagnostics,
                 python_import_bounds=python_import_bounds,
                 limited_source_offsets=limited_source_offsets,
@@ -2849,6 +2865,7 @@ def _scan_all_views_with_parser_diagnostics(
                             diagnostics=parser_diagnostics,
                             path=path,
                             python_import_bounds=python_import_bounds,
+                            prepared_analysis=parser_analyses.get(id(module)),
                         )
                     )
         except _StaticResourceLimitError as exc:
@@ -2984,6 +3001,7 @@ def _scan_all_views_with_parser_diagnostics(
                                     diagnostics=parser_diagnostics,
                                     path=path,
                                     python_import_bounds=python_import_bounds,
+                                    prepared_analysis=parser_analyses.get(id(module)),
                                 )
                             )
                 except _StaticResourceLimitError as exc:

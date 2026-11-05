@@ -81,6 +81,14 @@ empty, marks the primary artifact `partial`, and records an allowlisted parse er
 
 ## JSON quote ownership
 
+Standalone `.json` artifacts also have a separate, **2,097,152-character** host-syntax
+prepass for command-parser completeness. It reuses the iterative grammar to prove the
+entire original document, then treats only JSON punctuation outside strings as word
+boundaries. The proof carries through bounded windows only with ordered source mappings
+and intact original quote delimiters. String contents and all finding views stay visible;
+individual command-word, reconstruction, archive, output, and runtime limits still apply.
+This allowance does not expand the Markdown/frontmatter quote-ownership limits below.
+
 The deterministic instruction parser can distinguish structural JSON quotes from instruction
 delimiters only after validating a complete JSON value within **131,072 source characters**.
 This is a structural capacity limit, independent of file-size and scan-time allowances.

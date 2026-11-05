@@ -457,6 +457,7 @@ _MAX_JSON_QUOTE_CONTAINER_CHARS: Final = 131_072
 # A tab in a Markdown container can expand to at most four validation columns.
 # This bounds the validation copy separately from the raw source-size ceiling.
 _MAX_JSON_QUOTE_VALIDATION_CHARS: Final = 4 * _MAX_JSON_QUOTE_CONTAINER_CHARS
+MAX_STANDALONE_JSON_SOURCE_CHARS: Final = 2 * 1024 * 1024
 _JSON_FENCE_OPEN_RE: Final = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})([^\r\n]*)$")
 _JSON_FENCE_CLOSE_RE: Final = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*$")
 _JSON_LIST_MARKER_RE: Final = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])")
@@ -592,7 +593,12 @@ def _json_body_after_frontmatter(text: str, check_runtime: Callable[[], None] | 
     return None
 
 
-def _validate_json_without_decoding(body: str, check_runtime: Callable[[], None] | None) -> bool:
+def _validate_json_without_decoding(
+    body: str,
+    check_runtime: Callable[[], None] | None,
+    *,
+    max_characters: int = _MAX_JSON_QUOTE_VALIDATION_CHARS,
+) -> bool:
     """Validate one bounded JSON value without recursion or decoded allocations.
 
     Every grammar transition consumes source; only a byte per open container
@@ -600,7 +606,7 @@ def _validate_json_without_decoding(body: str, check_runtime: Callable[[], None]
     tokens and later quote spans. No ownership escapes a partially read value.
     """
     length = len(body)
-    if length > _MAX_JSON_QUOTE_VALIDATION_CHARS:
+    if length > max_characters or max_characters > MAX_STANDALONE_JSON_SOURCE_CHARS:
         return False
     next_check = 0
 

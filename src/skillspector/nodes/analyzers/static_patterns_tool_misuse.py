@@ -50,6 +50,7 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.javascript_tokens import JavaScriptTemplateSpans, assertion_template_shell_text
 from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
+from skillspector.json_tokens import JSONSourceOwnership, prepare_json_source
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.powershell_tokens import PowerShellSource, PowerShellString, powershell_source
@@ -83,6 +84,7 @@ logger = get_logger(__name__)
 ANALYZER_ID = "static_patterns_tool_misuse"
 USES_RUNTIME_CHECK = True
 USES_PYTHON_IMPORT_BOUNDS = True
+USES_PREPARED_PARSER_ANALYSIS = True
 ANALYZE_USES_POSTPROCESS = True
 POSTPROCESS_USES_PYTHON_AST = True
 POSTPROCESS_USES_RUNTIME_BUDGET = True
@@ -8727,12 +8729,21 @@ def _fenced_powershell_source(
     )
 
 
+def prepare_parser_analysis(
+    *, content: str, file_type: str, check_runtime: Callable[[], None]
+) -> JSONSourceOwnership | None:
+    """Prove original JSON syntax once before bounded finding windows run."""
+    return prepare_json_source(content, check_runtime) if file_type == "json" else None
+
+
 def has_bounded_parse_exhaustion(
     content: str,
     check_runtime: Callable[[], None],
     *,
     file_type: str = "shell",
     complete_context: bool = True,
+    prepared_analysis: object | None = None,
+    source_view: SecurityTextView | None = None,
     python_import_check: Callable[[Callable[[], None]], bool] | None = None,
     python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
 ) -> bool:
@@ -8743,6 +8754,8 @@ def has_bounded_parse_exhaustion(
             check_runtime,
             file_type=file_type,
             complete_context=complete_context,
+            prepared_analysis=prepared_analysis,
+            source_view=source_view,
             python_import_check=python_import_check,
             python_stdlib_check=python_stdlib_check,
         )
@@ -8756,6 +8769,8 @@ def bounded_parse_diagnostic(
     *,
     file_type: str = "shell",
     complete_context: bool = True,
+    prepared_analysis: object | None = None,
+    source_view: SecurityTextView | None = None,
     python_import_check: Callable[[Callable[[], None]], bool] | None = None,
     python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
 ) -> StaticParserDiagnostic | None:
@@ -8765,6 +8780,8 @@ def bounded_parse_diagnostic(
         check_runtime,
         file_type=file_type,
         complete_context=complete_context,
+        prepared_analysis=prepared_analysis,
+        source_view=source_view,
         python_import_check=python_import_check,
         python_stdlib_check=python_stdlib_check,
     )
@@ -8789,6 +8806,8 @@ def _has_bounded_parse_exhaustion(
     file_type: str,
     complete_context: bool = True,
     word_apostrophes: bool = False,
+    prepared_analysis: object | None = None,
+    source_view: SecurityTextView | None = None,
     python_import_check: Callable[[Callable[[], None]], bool] | None = None,
     python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
 ) -> StaticParserDiagnostic | None:
@@ -8837,10 +8856,23 @@ def _has_bounded_parse_exhaustion(
         diagnostic = javascript_source.unresolved_execution_diagnostic()
         if diagnostic is not None:
             return diagnostic
-    if file_type in {"json", "markdown"} and complete_context:
+    json_projection = None
+    if file_type == "json":
+        if prepared_analysis is None and complete_context:
+            prepared_analysis = prepare_json_source(content, check_runtime)
+        if isinstance(prepared_analysis, JSONSourceOwnership):
+            view = source_view or SecurityTextView("raw", content)
+            if view.text == content:
+                json_projection = prepared_analysis.project(view, check_runtime)
+    if json_projection is not None:
+        json_strings = list(json_projection.strings)
+        structural_quote_closers = json_projection.closers
+        structural_quote_openers = json_projection.openers
+    elif file_type in {"json", "markdown"} and complete_context:
         json_strings = validated_json_string_spans(content, check_runtime)
         structural_quote_closers = {end - 1 for _, end in json_strings}
         structural_quote_openers = {start for start, _ in json_strings}
+    if json_strings:
         # Raw substitution delimiters must survive Markdown's inline projection.
         json_operand_spans = [
             (start, end)
@@ -8923,6 +8955,10 @@ def _has_bounded_parse_exhaustion(
     )
     if file_type == "python" and complete_context:
         shell_word_content = python_browser_template_shell_text(content, check_runtime)
+    if json_projection is not None:
+        # Only validated host punctuation terminates command words. Every byte
+        # inside strings stays in the parser and original finding views remain raw.
+        shell_word_content = json_projection.text
     quote_limits = None
     if file_type == "shell" and complete_context:
         # A closing delimiter in proven shell source cannot open a new
