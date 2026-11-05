@@ -888,10 +888,18 @@ class StructuredStringClosers:
     and explicit marker declarations continue through ordinary security matching.
     """
 
-    def __init__(self, content: str, file_type: str, check_runtime: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        content: str,
+        file_type: str,
+        check_runtime: Callable[[], None],
+        *,
+        shell_quote_closers: Callable[[], set[int]] | None = None,
+    ) -> None:
         self._content = content
         self._file_type = file_type
         self._check_runtime = check_runtime
+        self._shell_quote_closers = shell_quote_closers
         self._closers: set[int] | None = None
 
     def closes_string(self, offset: int) -> bool:
@@ -904,6 +912,8 @@ class StructuredStringClosers:
         content = self._content
         if len(content) > MAX_JAVASCRIPT_SOURCE_CHARS:
             return set()
+        if self._file_type == "shell" and self._shell_quote_closers is not None:
+            return self._shell_quote_closers()
         if self._file_type == "javascript":
             program = parse_javascript_source(content, self._check_runtime)
             if program is None:
