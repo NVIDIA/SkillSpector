@@ -70,7 +70,7 @@ _CASES = [
     [
         "Read `guide.md` for the interface.\nThe runner's manifest identifies the source.\n",
         "- Read `guide.md` for the interface.\n  The runner's manifest identifies the source.\n",
-        "Read ``one ` character`` for the interface.\nThe runner's manifest identifies the source.\n",
+        'Read the reader\'s "documented behavior" for the interface.\nThe runner\'s manifest identifies the source.\n',
         "Read \\` literally and `guide.md` for the interface.\nThe runner's manifest identifies the source.\n",
         "| Topic | Description |\n| --- | --- |\n| Memory | The engine's limit applies. |\n",
         "| Topic | Description |\n| --- | --- |\n| Memory | The engine's limit and runner's settings don't conflict. |\n",
@@ -94,6 +94,7 @@ def test_completed_inline_lines_and_table_prose_own_apostrophes(
     [
         "Read `an unfinished span.\nThe runner's manifest identifies the source.\n",
         "Read `an unfinished span with ``paired`` ticks.\nThe runner's manifest identifies it.\n",
+        "Read ``one ` character`` for the interface.\nThe runner's manifest identifies the source.\n",
         "| Command | Description |\n| --- | --- |\n| `$CMD -rf /` | The engine's limit applies. |\n",
     ],
 )

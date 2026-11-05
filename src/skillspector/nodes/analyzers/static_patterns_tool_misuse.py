@@ -247,6 +247,9 @@ _MARKDOWN_WORD_APOSTROPHE_RE = re.compile(
 )
 # Shell syntax that opens a quote, an expansion, or a line continuation.
 _MARKDOWN_PROSE_SHELL_SYNTAX_RE = re.compile(r"[$`\\\"]")
+# Candidate punctuation may surround quoted prose; the final shell walk below
+# still refuses apostrophes owned by an earlier quote or unresolved word.
+_MARKDOWN_PROSE_EXPANSION_RE = re.compile(r"[$`\\]")
 _ROOT_GLOB_DOCUMENTATION_LINE_RE = re.compile(
     r"[ \t]*(?:(?:[-*+]|#{1,6})[ \t]+)?"
     r"(?:(?:(?:documentation|note|example)[ \t]*:[ \t]*)"
@@ -8560,7 +8563,7 @@ def _markdown_shell_text(
                             word_apostrophes
                             and complete_context
                             and "'" in stripped
-                            and _MARKDOWN_PROSE_SHELL_SYNTAX_RE.search(stripped) is None
+                            and _MARKDOWN_PROSE_EXPANSION_RE.search(stripped) is None
                         ):
                             apostrophes = [
                                 offset + word.start("apostrophe")
@@ -8609,7 +8612,7 @@ def _markdown_shell_text(
                         # Inline-code delimiters are Markdown, not shell
                         # syntax: judge the line with its line-local pairs
                         # blanked, exactly as the masking pass will.
-                        and _MARKDOWN_PROSE_SHELL_SYNTAX_RE.search(
+                        and _MARKDOWN_PROSE_EXPANSION_RE.search(
                             _blank_line_local_paired_backticks(prose_leading)
                         )
                         is None
