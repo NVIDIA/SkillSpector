@@ -141,6 +141,13 @@ def test_quoted_list_source_bound_retains_conservative_fallback():
     assert quoted_list_spans(content, lambda: None) is None
 
 
+def test_quoted_list_nesting_bound_retains_conservative_fallback():
+    from skillspector.markdown_tokens import quoted_list_spans
+
+    content = "> " * 40 + "- Read `guide.md` from the reader's guide.\n"
+    assert quoted_list_spans(content, lambda: None) is None
+
+
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 @pytest.mark.parametrize(
     "paragraph",

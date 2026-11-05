@@ -51,6 +51,8 @@ def _quoted_list_spans(content: str) -> QuotedListSpans | None:
     for block in blocks:
         if block.nesting == 1:
             ancestors.append(block.type)
+            if len(ancestors) >= 32:
+                return None
         elif block.nesting == -1:
             ancestors.pop()
         elif (
