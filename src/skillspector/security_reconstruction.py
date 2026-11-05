@@ -18,6 +18,7 @@ from typing import Final
 
 from skillspector.artifacts import SecurityTextView
 from skillspector.javascript_ast import MAX_JAVASCRIPT_SOURCE_CHARS, parse_javascript_source
+from skillspector.yaml_tokens import yaml_source_spans
 
 MAX_MARKER_LENGTH: Final = 16
 MAX_MARKER_SCOPE_CHARS: Final = 768
@@ -886,7 +887,15 @@ class StructuredStringClosers:
             self._check_runtime()
             return {end - 1 for _, end in _json_string_spans(content, self._check_runtime)}
         if self._file_type == "markdown":
-            return _markdown_inline_closers(content, self._check_runtime)
+            closers = _markdown_inline_closers(content, self._check_runtime)
+            header_end = _json_body_after_frontmatter(content, self._check_runtime)
+            if header_end is not None:
+                header = yaml_source_spans(content[:header_end], self._check_runtime)
+                if header is not None:
+                    closers.update(
+                        scalar.end - 1 for scalar in header.scalars if scalar.style in {"'", '"'}
+                    )
+            return closers
         if self._file_type == "html":
             return _html_attribute_closers(content, self._check_runtime)
         return set()
@@ -915,6 +924,22 @@ def _verb_is_in_cli_flag_token(text: str, start: int) -> bool:
     while token_start > 0 and (text[token_start - 1].isalnum() or text[token_start - 1] in "_-"):
         token_start -= 1
     return token_start < start and text[token_start] == "-"
+
+
+def _verb_is_make_strip_function(text: str, match: re.Match[str]) -> bool:
+    """Recognize the bounded Make built-in around one simple variable reference.
+
+    This is native function syntax, not a prose marker-removal header. Nested
+    functions, dynamic names and incomplete calls retain the lexical fallback.
+    """
+    start, quote = match.start(), match.start("quote")
+    return (
+        text[max(0, start - 2) : start] == "$("
+        and re.fullmatch(
+            r"strip[ \t]+\$\([A-Za-z_][A-Za-z0-9_]*\)\)[ \t]*", text[start:quote]
+        )
+        is not None
+    )
 
 
 def _quoted_verb_in_string_sequence(text: str, match: re.Match[str]) -> bool:
@@ -984,6 +1009,8 @@ def _quoted_directives(
         if check_runtime is not None:
             check_runtime()
         if unsupported_header and _verb_is_in_cli_flag_token(text, match.start()):
+            continue
+        if unsupported_header and _verb_is_make_strip_function(text, match):
             continue
         if unsupported_header and _is_quoted_mapping_key(text, match.start()):
             continue
