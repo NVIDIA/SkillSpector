@@ -9047,7 +9047,7 @@ def bounded_parse_diagnostic(
                     diagnostic = bounded_parse_diagnostic(
                         scalar.value, check_runtime, file_type="markdown", complete_context=True
                     )
-                elif role == "message":
+                if role == "message":
                     diagnostic = _message_inline_runtime_diagnostic(
                         scalar.value, check_runtime, diagnostic
                     )
