@@ -388,6 +388,7 @@ def _refused_runtime_is_accounted(
     projected_statuses: list[Mapping[str, object]] = []
     accounted_work: set[tuple[str, str]] = set()
     accounted_refusals: set[tuple[str, str]] = set()
+    accounted_statuses: set[tuple[str, str]] = set()
     for status in statuses:
         if not isinstance(status, Mapping):
             return False
@@ -397,6 +398,8 @@ def _refused_runtime_is_accounted(
         if (scope, analyzer) not in refused_nodes:
             projected_statuses.append(status)
             continue
+        if (scope, analyzer) in accounted_statuses:
+            return False
         targets = status.get("planned_work")
         if status.get("status") != "degraded" or not isinstance(targets, list) or not targets:
             return False
@@ -449,9 +452,10 @@ def _refused_runtime_is_accounted(
                 node_refusals.add(key)
         if not node_refusals:
             return False
+        accounted_statuses.add((scope, analyzer))
         accounted_refusals.update(node_refusals)
         projected_statuses.append({**status, "status": "completed"})
-    if accounted_refusals != refusals:
+    if accounted_refusals != refusals or accounted_statuses != refused_nodes:
         return False
 
     projected_calls: list[object] = []

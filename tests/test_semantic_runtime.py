@@ -564,6 +564,31 @@ def test_tp4_and_meta_refusal_proof_rejects_incomplete_or_contradictory_work(mut
     assert state == before
 
 
+@pytest.mark.parametrize("analyzer", ["mcp_tool_poisoning", "meta_analyzer"])
+def test_refusal_status_cannot_split_disjoint_work_across_duplicate_nodes(analyzer: str) -> None:
+    state = _refused_tp4_meta_state()
+    extra = ledger_event(
+        analyzer_id=analyzer,
+        outcome=LedgerOutcome.SKIPPED,
+        phase="meta" if analyzer == "meta_analyzer" else "semantic",
+        path="second-refusal.yaml",
+        reason=LedgerReason.LLM_RESPONSE_REFUSED,
+    )
+    extra_status = analyzer_status_for_events(analyzer, [extra])
+    original = next(s for s in state["analyzer_status_events"] if s["analyzer_id"] == analyzer)
+    state["inspection_ledger"].append(extra)
+    original["planned_work"].extend(extra_status["planned_work"])
+    assert _runtime_event(state) is None
+    original["planned_work"].pop()
+    state["analyzer_status_events"].append(extra_status)
+    assert not {t["work_id"] for t in original["planned_work"]} & {
+        t["work_id"] for t in extra_status["planned_work"]
+    }
+    before = deepcopy(state)
+    assert _runtime_event(state) is not None
+    assert state == before
+
+
 def _format_recovery_state() -> dict:
     analyzer = "semantic_security_discovery"
     event = ledger_event(
