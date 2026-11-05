@@ -2797,7 +2797,7 @@ def _scan_all_views_with_parser_diagnostics(
                 prepared_analyses=prepared_analyses,
                 parser_diagnostics=parser_diagnostics,
                 python_import_bounds=python_import_bounds,
-                parser_file_type=parser_file_type,
+                parser_file_type="json" if _oms_projected else None,
             )
             bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
