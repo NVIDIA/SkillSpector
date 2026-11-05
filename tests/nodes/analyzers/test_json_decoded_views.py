@@ -119,6 +119,39 @@ def test_arbitrary_marker_view_cannot_claim_decoded_raw_provenance() -> None:
     assert not decoded.owns(SecurityTextView("json-decoded-raw", decoded.view.text), _check)
 
 
+def test_unproven_decoded_source_mapping_is_explicitly_incomplete() -> None:
+    source = '{"value":"\\u0061"}'
+    ownership = prepare_json_source(source, _check)
+    assert ownership is not None
+    decoded = prepare_decoded_json_source(ownership, _check)
+    assert decoded is not None and decoded.view is not None
+    forged = SecurityTextView("json-decoded-raw", decoded.view.text)
+    diagnostic = tm.bounded_parse_diagnostic(
+        forged.text,
+        _check,
+        file_type="json",
+        prepared_analysis=replace(ownership, decoded=decoded),
+        source_view=forged,
+    )
+    assert diagnostic is not None and diagnostic.check.value == "json_string_decoding"
+
+
+def test_proven_normalization_expansion_retains_string_ownership() -> None:
+    source = '{"value":"\\u0061 ﬃ"}'
+    ownership = prepare_json_source(source, _check)
+    assert ownership is not None
+    decoded = prepare_decoded_json_source(ownership, _check)
+    assert decoded is not None
+    normalized = next(
+        view
+        for view in decoded.window_views(0, len(source), _check)
+        if view.name == "json-decoded-normalized"
+    )
+    assert "a ffi" in normalized.text
+    assert decoded.owns(normalized, _check)
+    assert replace(ownership, decoded=decoded).project(normalized, _check) is not None
+
+
 @pytest.mark.parametrize("literal", [r"\ud800", r"\udfff", r"\ud800x", r"\ud800\u0061"])
 def test_lone_surrogates_stay_raw_and_are_explicitly_incomplete(literal: str) -> None:
     source = '{"value":"' + literal + '"}'

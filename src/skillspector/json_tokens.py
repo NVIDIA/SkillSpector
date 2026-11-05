@@ -210,12 +210,23 @@ class JSONSourceOwnership:
         strings: list[tuple[int, int]] = []
         string_start: int | None = None
         previous = -1
+        repeated_source_owned: bool | None = None
         for index, character in enumerate(text):
             if index % 1024 == 0:
                 check_runtime()
             offset = view.source_offset(index)
-            if not previous < offset < len(self.source):
+            if not previous <= offset < len(self.source):
                 return None
+            role = self.roles[offset]
+            if offset == previous:
+                if role != _STRING:
+                    return None
+                if repeated_source_owned is None:
+                    repeated_source_owned = self.decoded is not None and self.decoded.owns(
+                        view, check_runtime
+                    )
+                if not repeated_source_owned:
+                    return None
             if (
                 previous >= 0
                 and offset > previous + 1
@@ -225,7 +236,6 @@ class JSONSourceOwnership:
                 )
             ):
                 return None
-            role = self.roles[offset]
             if role != _STRING and character != self.source[offset]:
                 return None
             if role == _PUNCTUATION:
