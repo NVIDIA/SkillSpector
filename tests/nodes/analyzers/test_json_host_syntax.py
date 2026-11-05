@@ -181,3 +181,21 @@ def test_cancellation_propagates_before_any_ownership_escapes() -> None:
 
     with pytest.raises(CancelledError):
         prepare_json_source(_dense(), check)
+
+
+@pytest.mark.parametrize("source", ["r " * 10_000, "'" + "r" * 20_000 + "'"])
+def test_literal_effects_walk_checks_cancellation_without_yielding_a_command(source: str) -> None:
+    class CancelledError(Exception):
+        pass
+
+    calls = 0
+
+    def check() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise CancelledError
+
+    with pytest.raises(CancelledError):
+        tm._has_destructive_command_string(source, check_runtime=check)
+    assert calls == 3

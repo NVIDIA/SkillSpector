@@ -2829,12 +2829,18 @@ def _plain_quoted_assignment_word(parsed: _ShellCommandWord) -> bool:
     )
 
 
-def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
+def _destructive_command_words(
+    content: str, *, check_runtime: Callable[[], None] | None = None
+) -> Iterator[tuple[int, int]]:
+    if check_runtime is not None:
+        check_runtime()
     parsed_through = 0
     parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
     substitution_end_cache: dict[int, int | None] = {}
     backtick_end_cache: dict[int, int | None] = {}
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
+        if check_runtime is not None:
+            check_runtime()
         start = candidate.start()
         if start < parsed_through:
             continue
@@ -2851,6 +2857,7 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
                 parameter_end_cache,
                 substitution_end_cache,
                 backtick_end_cache,
+                check_runtime=check_runtime,
             )
             if parsed is not None and _plain_quoted_assignment_word(parsed):
                 parsed_through = max(parsed_through, parsed.end)
@@ -2877,6 +2884,7 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
             parameter_end_cache,
             substitution_end_cache,
             backtick_end_cache,
+            check_runtime=check_runtime,
         )
         if parsed is None:
             continue
@@ -2958,10 +2966,12 @@ def _has_destructive_command_string(
     check_runtime: Callable[[], None] | None = None,
 ) -> bool:
     """Return whether an executable string contains a proven destructive command."""
-    for command_start, body_start in _destructive_command_words(content):
+    for command_start, body_start in _destructive_command_words(content, check_runtime=check_runtime):
         if check_runtime is not None:
             check_runtime()
-        tokens, _, _ = _bounded_shell_tokens(content, command_start, body_start)
+        tokens, _, _ = _bounded_shell_tokens(
+            content, command_start, body_start, check_runtime=check_runtime
+        )
         if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
             _note_parser_diagnostic(
                 diagnostics,
