@@ -2834,6 +2834,7 @@ def _destructive_command_words(
 ) -> Iterator[tuple[int, int]]:
     if check_runtime is not None:
         check_runtime()
+    runtime_kwargs = {"check_runtime": check_runtime} if check_runtime is not None else {}
     parsed_through = 0
     parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
     substitution_end_cache: dict[int, int | None] = {}
@@ -2857,7 +2858,7 @@ def _destructive_command_words(
                 parameter_end_cache,
                 substitution_end_cache,
                 backtick_end_cache,
-                check_runtime=check_runtime,
+                **runtime_kwargs,
             )
             if parsed is not None and _plain_quoted_assignment_word(parsed):
                 parsed_through = max(parsed_through, parsed.end)
@@ -2884,7 +2885,7 @@ def _destructive_command_words(
             parameter_end_cache,
             substitution_end_cache,
             backtick_end_cache,
-            check_runtime=check_runtime,
+            **runtime_kwargs,
         )
         if parsed is None:
             continue
