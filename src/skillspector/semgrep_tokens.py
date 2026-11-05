@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import ast
+import keyword
+import re
 from collections.abc import Callable
 
 import yaml
@@ -27,6 +30,7 @@ _LANGUAGES = {
     "js",
     "typescript",
     "ts",
+    "yaml",
 }
 _LEAVES = {
     "pattern",
@@ -39,6 +43,8 @@ _LEAVES = {
 _GROUPS = {"patterns", "pattern-either"}
 _SELECTORS = {"pattern", "patterns", "pattern-either", "pattern-regex"}
 _OPTIONAL = {"metadata", "options", "paths", "min-version", "max-version", "fix"}
+_METAVARIABLE = re.compile(r"\$(?:\.\.\.)?[A-Z_][A-Z_0-9]*\Z")
+_BOOL = "tag:yaml.org,2002:bool"
 
 
 def _mapping(node: Node | None) -> dict[str, Node] | None:
@@ -54,6 +60,37 @@ def _mapping(node: Node | None) -> dict[str, Node] | None:
 
 def _text(node: Node | None) -> bool:
     return isinstance(node, ScalarNode) and node.tag == _STRING and bool(node.value)
+
+
+def _metavariable(node: Node | None) -> bool:
+    return _text(node) and _METAVARIABLE.fullmatch(node.value) is not None
+
+
+def _requires(node: Node, check_runtime: Callable[[], None]) -> bool:
+    if not _text(node) or len(node.value) > 4096:
+        return False
+    check_runtime()
+    try:
+        tree = ast.parse(node.value, mode="eval")
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    check_runtime()
+    # This recognizes label expressions; it never evaluates them.
+    allowed = (
+        ast.Expression,
+        ast.BoolOp,
+        ast.And,
+        ast.Or,
+        ast.UnaryOp,
+        ast.Not,
+        ast.Name,
+        ast.Load,
+    )
+    for count, part in enumerate(ast.walk(tree)):
+        check_runtime()
+        if count >= 128 or not isinstance(part, allowed):
+            return False
+    return True
 
 
 def semgrep_rule_scalar_roles(content: str, check_runtime: Callable[[], None]) -> dict[int, str]:
@@ -80,21 +117,88 @@ def semgrep_rule_scalar_roles(content: str, check_runtime: Callable[[], None]) -
     roles: dict[int, str] = {}
     rule_ids: set[str] = set()
 
-    def operator(name: str, value: Node) -> bool:
+    def operator(name: str, value: Node, *, constraints: bool = True) -> bool:
         check_runtime()
         if name in _LEAVES and _text(value):
             roles[value.start_mark.index] = "pattern"
             return True
+        if constraints and name == "focus-metavariable":
+            values = value.value if isinstance(value, SequenceNode) else [value]
+            return bool(values) and all(_metavariable(item) for item in values)
+        if constraints and name in {"metavariable-regex", "metavariable-pattern"}:
+            fields = _mapping(value)
+            if fields is None or not _metavariable(fields.get("metavariable")):
+                return False
+            if name == "metavariable-regex":
+                if not {"metavariable", "regex"} <= fields.keys() or not fields.keys() <= {
+                    "metavariable",
+                    "regex",
+                    "constant-propagation",
+                }:
+                    return False
+                if not _text(fields["regex"]):
+                    return False
+                if "constant-propagation" in fields and fields["constant-propagation"].tag != _BOOL:
+                    return False
+                roles[fields["regex"].start_mark.index] = "pattern"
+                return True
+            if not fields.keys() <= {"metavariable", "language"} | _SELECTORS:
+                return False
+            if "language" in fields and (
+                not _text(fields["language"]) or fields["language"].value not in _LANGUAGES
+            ):
+                return False
+            selectors = fields.keys() & _SELECTORS
+            return len(selectors) == 1 and operator(
+                next(iter(selectors)), fields[next(iter(selectors))]
+            )
         return (
             name in _GROUPS
             and isinstance(value, SequenceNode)
             and bool(value.value)
-            and all(formula(child) for child in value.value)
+            and all(formula(child, constraints=name == "patterns") for child in value.value)
         )
 
-    def formula(node: Node) -> bool:
+    def formula(node: Node, *, constraints: bool = True) -> bool:
         fields = _mapping(node)
-        return fields is not None and len(fields) == 1 and operator(*next(iter(fields.items())))
+        return (
+            fields is not None
+            and len(fields) == 1
+            and operator(*next(iter(fields.items())), constraints=constraints)
+        )
+
+    def taint_formula(node: Node, kind: str) -> bool:
+        fields = _mapping(node)
+        if fields is None:
+            return False
+        options = {
+            "pattern-sources": {"label", "requires", "by-side-effect", "exact", "control"},
+            "pattern-sinks": {"requires", "exact", "at-exit"},
+            "pattern-sanitizers": {"by-side-effect", "exact"},
+        }[kind]
+        if not fields.keys() <= _SELECTORS | options:
+            return False
+        for key in fields.keys() & options:
+            value = fields[key]
+            if key == "label":
+                if (
+                    not _text(value)
+                    or not value.value.isidentifier()
+                    or keyword.iskeyword(value.value)
+                ):
+                    return False
+            elif key == "requires":
+                if not _requires(value, check_runtime):
+                    return False
+            elif value.tag != _BOOL and not (
+                key == "by-side-effect" and _text(value) and value.value == "only"
+            ):
+                return False
+        selectors = fields.keys() & _SELECTORS
+        if len(selectors) != 1:
+            return False
+        key = next(iter(selectors))
+        return operator(key, fields[key])
 
     for node in rules.value:
         check_runtime()
@@ -131,7 +235,7 @@ def semgrep_rule_scalar_roles(content: str, check_runtime: Callable[[], None]) -
                 if (
                     not isinstance(values, SequenceNode)
                     or not values.value
-                    or not all(formula(value) for value in values.value)
+                    or not all(taint_formula(value, name) for value in values.value)
                 ):
                     return {}
         else:
