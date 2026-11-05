@@ -69,7 +69,7 @@ smaller remaining artifact or byte allowance, and its deadline always takes prec
 | Members | 4,096 (configurable) | All outer and recursively nested containers combined |
 | Expanded member bytes | 25 MiB | All outer and recursively nested containers combined |
 | Central directory | 4 MiB | Each container, checked before creating ZIP metadata objects |
-| Materialized member | 1,000,000 bytes | Each member |
+| Materialized member | 1,000,000 bytes (configurable) | Each member |
 | Compression ratio | 100:1 | Each member |
 | Inspection wall time | 5 seconds | All outer and recursively nested containers combined |
 

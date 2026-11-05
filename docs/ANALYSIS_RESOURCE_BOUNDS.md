@@ -34,6 +34,7 @@ Retained inspection-work capacities can be adjusted before starting the scanner:
 |---|---:|---:|---|
 | `SKILLSPECTOR_MAX_INSPECTION_LEDGER_EVENTS` | 100,000 | 1,000,000 | Work-accounting records |
 | `SKILLSPECTOR_ARCHIVE_MAX_MEMBERS` | 4,096 | 10,000 | Members across all archives |
+| `SKILLSPECTOR_ARCHIVE_MAX_MEMBER_BYTES` | 1,000,000 | 16 MiB | Bytes in one expanded archive member |
 | `SKILLSPECTOR_MAX_PYTHON_AST_SOURCE_CHARS` | 1,000,000 | 8,000,000 | Characters in one Python source |
 | `SKILLSPECTOR_TP4_MAX_FILES` | 128 | 10,000 | Files admitted to TP4 |
 | `SKILLSPECTOR_TP4_MAX_FILE_CODE_BYTES` | 1 MiB | 16 MiB | UTF-8 bytes in one TP4 source |
@@ -74,7 +75,7 @@ Its additional ceilings are:
 | Members | 4,096 | All outer and nested containers combined |
 | Expanded bytes | 25 MiB | All outer and nested containers combined |
 | Central-directory bytes | 4 MiB | One container, before ZIP metadata allocation |
-| Materialized member | 1,000,000 bytes | One member |
+| Materialized member | 1,000,000 bytes (configurable) | One member |
 | Compression ratio | 100:1 | One member |
 | Archive-inspection time | 5 seconds | All outer and nested containers combined |
 

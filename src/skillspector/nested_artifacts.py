@@ -31,7 +31,7 @@ from skillspector.artifacts import (
     has_dex_magic,
     has_tar_header,
 )
-from skillspector.constants import MAX_FILE_BYTES
+from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES, MAX_FILE_BYTES
 from skillspector.input_handler import (
     _FileOpenError,
     _open_regular_file_no_follow,
@@ -50,6 +50,9 @@ from skillspector.resource_limits import bounded_capacity
 
 ARCHIVE_MAX_DEPTH = 3
 ARCHIVE_MAX_MEMBERS = bounded_capacity("SKILLSPECTOR_ARCHIVE_MAX_MEMBERS", 4_096, 10_000)
+ARCHIVE_MAX_MEMBER_BYTES = bounded_capacity(
+    "SKILLSPECTOR_ARCHIVE_MAX_MEMBER_BYTES", MAX_FILE_BYTES, MAX_ANALYZABLE_FILE_BYTES
+)
 ARCHIVE_MAX_UNCOMPRESSED_BYTES = 25 * 1024 * 1024
 ARCHIVE_MAX_CENTRAL_DIRECTORY_BYTES = 4 * 1024 * 1024
 ARCHIVE_MAX_COMPRESSION_RATIO = 100
@@ -1926,7 +1929,7 @@ def inspect_nested_artifacts(
         max_members=member_limit,
         max_uncompressed_bytes=byte_limit,
         max_central_directory_bytes=ARCHIVE_MAX_CENTRAL_DIRECTORY_BYTES,
-        max_member_bytes=MAX_FILE_BYTES,
+        max_member_bytes=ARCHIVE_MAX_MEMBER_BYTES,
         max_depth=ARCHIVE_MAX_DEPTH,
         max_compression_ratio=ARCHIVE_MAX_COMPRESSION_RATIO,
         deadline=deadline,

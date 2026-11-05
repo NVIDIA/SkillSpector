@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import gzip
 import io
 import json
 import os
 import subprocess
 import sys
+import tarfile
 import zipfile
 from pathlib import Path
 
@@ -64,18 +66,19 @@ def test_bounded_capacity_parsing_does_not_log_values(
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     [
-        ({}, [100_000, 10_000, 4096, 1_000_000, 128, 1048576, 4194304, 4194304]),
+        ({}, [100_000, 10_000, 4096, 1_000_000, 1_000_000, 128, 1048576, 4194304, 4194304]),
         (
             {
                 "SKILLSPECTOR_MAX_INSPECTION_LEDGER_EVENTS": "250000",
                 "SKILLSPECTOR_ARCHIVE_MAX_MEMBERS": "8192",
+                "SKILLSPECTOR_ARCHIVE_MAX_MEMBER_BYTES": "2097152",
                 "SKILLSPECTOR_MAX_PYTHON_AST_SOURCE_CHARS": "2000000",
                 "SKILLSPECTOR_TP4_MAX_FILES": "1024",
                 "SKILLSPECTOR_TP4_MAX_FILE_CODE_BYTES": "2097152",
                 "SKILLSPECTOR_TP4_MAX_TOTAL_CODE_BYTES": "16777216",
                 "SKILLSPECTOR_TP4_MAX_TOTAL_INPUT_BYTES": "33554432",
             },
-            [250000, 10_000, 8192, 2_000_000, 1024, 2097152, 16777216, 33554432],
+            [250000, 10_000, 8192, 2097152, 2_000_000, 1024, 2097152, 16777216, 33554432],
         ),
     ],
 )
@@ -91,7 +94,7 @@ def test_capacity_settings_are_bound_on_import(
         "nested_artifacts as n, python_ast as p; "
         "from skillspector.nodes.analyzers import mcp_tool_poisoning as t; "
         "print(json.dumps([l.MAX_INSPECTION_LEDGER_EVENTS, l.MAX_FINDING_OUTPUT_RECORDS, "
-        "n.ARCHIVE_MAX_MEMBERS, p.MAX_PYTHON_AST_SOURCE_CHARS, t.TP4_MAX_FILES, "
+        "n.ARCHIVE_MAX_MEMBERS, n.ARCHIVE_MAX_MEMBER_BYTES, p.MAX_PYTHON_AST_SOURCE_CHARS, t.TP4_MAX_FILES, "
         "t.TP4_MAX_FILE_CODE_BYTES, t.TP4_MAX_TOTAL_CODE_BYTES, t.TP4_MAX_TOTAL_INPUT_BYTES]))"
     )
     result = subprocess.run(
@@ -179,3 +182,54 @@ def test_archive_shared_remaining_budget_stays_stricter(tmp_path: Path, constrai
             disposition[1] == LedgerReason.ARCHIVE_SIZE_LIMIT
             for disposition in result.inventory_overrides.values()
         )
+
+
+@pytest.mark.parametrize("size", [15, 16, 17])
+@pytest.mark.parametrize("archive_kind", ["zip", "tar", "gzip"])
+def test_configured_archive_member_byte_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, size: int, archive_kind: str
+) -> None:
+    monkeypatch.setattr(nested_artifacts, "ARCHIVE_MAX_MEMBER_BYTES", 16)
+    buffer = io.BytesIO()
+    path = f"bundle.{archive_kind}"
+    member = "source.txt"
+    if archive_kind == "zip":
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr(member, b"x" * size)
+    elif archive_kind == "tar":
+        with tarfile.open(fileobj=buffer, mode="w") as archive:
+            info = tarfile.TarInfo(member)
+            info.size = size
+            archive.addfile(info, io.BytesIO(b"x" * size))
+    else:
+        path, member = "source.txt.gz", "source.txt"
+        buffer.write(gzip.compress(b"x" * size))
+    result = nested_artifacts.inspect_nested_artifacts(
+        tmp_path, [path], raw_file_cache={path: buffer.getvalue()}
+    )
+    if size <= 16:
+        assert result.raw_file_cache[f"{path}!/{member}"] == b"x" * size
+        assert not result.ledger_events
+    else:
+        assert path not in result.inspected_containers
+        assert any(
+            event.get("reason_code") == LedgerReason.ARCHIVE_MEMBER_SIZE_LIMIT
+            for event in result.ledger_events
+        )
+
+
+def test_larger_member_setting_preserves_compression_ratio_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(nested_artifacts, "ARCHIVE_MAX_MEMBER_BYTES", 16 * 1024 * 1024)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("source.txt", b"x" * 100_000)
+    result = nested_artifacts.inspect_nested_artifacts(
+        tmp_path, ["bundle.zip"], raw_file_cache={"bundle.zip": buffer.getvalue()}
+    )
+    assert "bundle.zip" not in result.inspected_containers
+    assert any(
+        event.get("reason_code") == LedgerReason.ARCHIVE_COMPRESSION_RATIO
+        for event in result.ledger_events
+    )
