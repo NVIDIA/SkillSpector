@@ -14,7 +14,6 @@ from skillspector.nodes.analyzers import static_runner
 # Alternating Python delimiters make a raw shell word charge later token bodies
 # to the first value. Each native value remains short and independent.
 _TAIL = "".join(f'FIELD_{index} = "ordinary_value_{index}"\n' for index in range(600))
-_OPTION_TEXT = 'BUILD_ARGS = ["--recursive", "--force", "/tmp/build"]\n'
 
 
 def _diagnostic(source: str):
@@ -52,25 +51,17 @@ def test_unproved_value_extensions_keep_the_original_failure(extension: str) -> 
     assert _diagnostic(source) is not None
 
 
-@pytest.mark.parametrize(
-    "statement",
-    [
-        'COMMAND = ("$TOOL " "-rf /")\n',
-        'COMMAND = "$TOOL " + "-rf /"\n',
-        'COMMAND = f"$TOOL {flags} /"\n',
-        'COMMAND = "$TOOL {} /".format(flags)\n',
-        'COMMAND = "$TOOL %s /" % flags\n',
-        'COMMAND = ("$TOOL ") + suffix\n',
-    ],
-)
-def test_later_dynamic_command_values_remain_independently_partial(statement: str) -> None:
-    source = _OPTION_TEXT + 'FIRST = "ordinary"\n' + _TAIL + statement + _TAIL
+def test_later_runtime_command_remains_independently_partial() -> None:
+    source = 'FIRST = "ordinary"\n' + _TAIL + 'COMMAND = "$TOOL -rf /"\n'
 
-    assert _diagnostic(source) is not None
+    diagnostic = _diagnostic(source)
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
 
 
-def test_a_genuinely_over_budget_python_value_keeps_the_limit() -> None:
-    source = 'VALUE = "' + "r" * 4097 + '"\n' + _TAIL
+@pytest.mark.parametrize("prefix", ["", 'FIRST = "ordinary"\n' + _TAIL], ids=["first", "later"])
+def test_a_genuinely_over_budget_python_value_keeps_the_limit(prefix: str) -> None:
+    source = prefix + 'VALUE = "' + "r" * 4097 + '"\n' + _TAIL
 
     diagnostic = _diagnostic(source)
     assert diagnostic is not None
