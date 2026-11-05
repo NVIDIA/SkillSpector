@@ -104,6 +104,7 @@ _ANALYZER_SEVERITY_ORDER = {
 # Extension -> file type (match v1 InventoryBuilder.FILE_TYPES)
 FILE_TYPES: dict[str, str] = {
     ".md": "markdown",
+    ".mdc": "markdown",
     ".markdown": "markdown",
     ".py": "python",
     ".pyw": "python",
