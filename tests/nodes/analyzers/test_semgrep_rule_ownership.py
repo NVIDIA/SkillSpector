@@ -16,7 +16,7 @@ from skillspector.semgrep_tokens import semgrep_rule_scalar_roles
 
 def _rule(selector: str, *, message: str = "A matching token was found.") -> str:
     return (
-        "rules:\n- id: token-check\n  languages: [regex]\n  severity: ERROR\n"
+        "rules:\n- id: token-check\n  languages: [generic]\n  severity: ERROR\n"
         f"  message: {json.dumps(message)}\n" + selector
     )
 
@@ -29,14 +29,17 @@ def _result(content: str) -> dict:
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 @pytest.mark.parametrize("style", ["plain", "quoted", "block"])
-def test_complete_rule_regex_quotes_are_pattern_data(style: str, newline: str) -> None:
+@pytest.mark.parametrize("language", ["generic", "regex"])
+def test_complete_rule_regex_quotes_are_pattern_data(style: str, newline: str, language: str) -> None:
     pattern = r"(?i)token.{0,12}[\"|'|`]?[a-z0-9]{24}[\"|'|`]?"
     value = {
         "plain": pattern,
         "quoted": json.dumps(pattern),
         "block": "|-\n    " + pattern,
     }[style]
-    source = ("# café\n" + _rule("  pattern-regex: " + value + "\n")).replace("\n", newline)
+    source = ("# café\n" + _rule("  pattern-regex: " + value + "\n")).replace(
+        "languages: [generic]", "languages: [" + language + "]"
+    ).replace("\n", newline)
     roles = semgrep_rule_scalar_roles(source, lambda: None)
     assert "pattern" in roles.values() and "message" in roles.values()
     assert _result(source)["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
@@ -117,7 +120,7 @@ def test_unmapped_transformed_query_keeps_finding_provenance_incomplete() -> Non
         lambda value: value.replace("rules:", "configuration:"),
         lambda value: value.replace("  severity: ERROR\n", ""),
         lambda value: value.replace("severity: ERROR", "severity: UNKNOWN"),
-        lambda value: value.replace("languages: [regex]", "languages: [unknown]"),
+        lambda value: value.replace("languages: [generic]", "languages: [unknown]"),
         lambda value: value.replace("  message:", "  id: duplicate\n  message:"),
         lambda value: value + "  execute: ordinary\n",
         lambda value: value + "---\nother: document\n",
