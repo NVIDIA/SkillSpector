@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import time
 from array import array
 
 import pytest
@@ -226,12 +225,27 @@ def test_reported_command_cannot_hide_a_later_unreported_string_command(source: 
     assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
-def test_raw_provenance_does_not_search_unrelated_large_regex_suffixes() -> None:
+def test_raw_provenance_does_not_search_unrelated_large_regex_suffixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source = json.dumps({"command": "a rm -rf /", "data": "git push " * 75_000})
-    deadline = time.monotonic() + 10
+    command_start = source.index("rm -rf /")
+    command_end = source.index('"', command_start)
+    matches: list[tuple[int, int]] = []
+    original_match = tm._has_tm1_code_pattern_at
 
-    def check_runtime() -> None:
-        if time.monotonic() > deadline:
-            raise TimeoutError("JSON provenance deadline")
+    def bounded_match(content, start, end, check_runtime):
+        assert content is source
+        assert (start, end) == (command_start, command_end)
+        matches.append((start, end))
+        return original_match(content, start, end, check_runtime)
 
-    assert tm.bounded_parse_diagnostic(source, check_runtime, file_type="json") is None
+    def unrelated_candidates(*args, **kwargs):
+        yield from ()
+        pytest.fail("Exact raw evidence must not prime unrelated global candidate scans")
+
+    monkeypatch.setattr(tm, "_has_tm1_code_pattern_at", bounded_match)
+    monkeypatch.setattr(tm, "_destructive_command_candidates", unrelated_candidates)
+
+    assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is None
+    assert matches == [(command_start, command_end)]

@@ -8951,14 +8951,16 @@ def _has_bounded_parse_exhaustion(
                 content[start + 1 : end - 1], check_runtime
             ):
                 absolute_start = start + 1 + command_start
-                while reported_start is not None and reported_start < absolute_start:
-                    reported_start = next(reported_starts, None)
-                if reported_start == absolute_start or _has_tm1_code_pattern_at(
+                if _has_tm1_code_pattern_at(
                     content,
                     absolute_start,
                     min(end - 1, start + 1 + body_start + _ROOT_GLOB_COMMAND_CHARS),
                     check_runtime,
                 ):
+                    continue
+                while reported_start is not None and reported_start < absolute_start:
+                    reported_start = next(reported_starts, None)
+                if reported_start == absolute_start:
                     continue
                 # Structural ownership alone cannot establish provenance for
                 # an embedded command the raw analyzer cannot report. Derived
