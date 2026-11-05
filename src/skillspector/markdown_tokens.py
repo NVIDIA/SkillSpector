@@ -14,7 +14,9 @@ from functools import lru_cache
 _MAX_SOURCE_CHARS = 131_072
 _MAX_TOKENS = 16_384
 _LITERAL_CODE = re.compile(r"[A-Za-z0-9_./:<>=@%+,?*~ \t-]+\Z")
-_CONTAINER_MARKER = re.compile(r"(?m)^ {0,3}(?:>|[-+*][ \t]|[0-9]{1,9}[.)][ \t])")
+_CONTAINER_MARKER = re.compile(
+    r"(?m)(?:^|(?<=\r)) {0,3}(?:>|(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t\r\n]|$))"
+)
 
 
 @dataclass(frozen=True, slots=True)

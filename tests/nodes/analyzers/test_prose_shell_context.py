@@ -113,13 +113,15 @@ def test_quoted_list_literal_ownership_preserves_security_findings():
     assert any(finding.rule_id == "TM1" for finding in tm.analyze(content, "guide.md", "markdown"))
 
 
-@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
 @pytest.mark.parametrize(
     "paragraph",
     [
         "> Read `~/guide.md` for the reader's interface.\n",
         "> Read ``guide.md`` for the reader's interface.\n",
         "1. Read `guide.md` for the reader's interface.\n",
+        "-\n  Read `guide.md` for the reader's interface.\n",
+        "1.\n   Read `guide.md` for the reader's interface.\n",
         "3. Read `guide.md` for the interface.\n   The reader's copy identifies the source.\n",
         "> The reader's guide is described below.\n>\n> Read `guide.md` for the interface.\n",
     ],
@@ -168,7 +170,9 @@ def test_existing_quoted_list_heading_keeps_its_native_inline_ownership():
 
 @pytest.mark.parametrize("quote", ["'", '"'])
 @pytest.mark.parametrize("container", ["> ", "1. "])
-def test_native_container_cannot_steal_an_enclosing_shell_quote(quote, container):
+def test_native_container_preserves_existing_enclosing_shell_quote_reading(
+    monkeypatch, quote, container
+):
     content = (
         f"bash -c {quote}\n"
         + container
@@ -176,18 +180,38 @@ def test_native_container_cannot_steal_an_enclosing_shell_quote(quote, container
         + quote
         + "\n"
     )
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm, "quoted_list_spans", lambda *args: None)
+        before = tm._markdown_shell_text(content, lambda: None, word_apostrophes=True)
+        before_diagnostic = tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
     projected = tm._markdown_shell_text(content, lambda: None, word_apostrophes=True)
-    assert "`guide.md`" in projected
+    assert projected == before
     assert "reader's" in projected
+    assert (
+        tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
+        == before_diagnostic
+    )
 
 
 @pytest.mark.parametrize("container", ["> ", "1. "])
 @pytest.mark.parametrize("body", ["$CMD -rf /", 'sh -c "$PAYLOAD"', "$(cat command.txt)"])
-def test_container_runtime_inline_code_keeps_its_existing_fallback(container, body):
+def test_container_runtime_inline_code_keeps_its_existing_fallback(monkeypatch, container, body):
+    from skillspector.markdown_tokens import quoted_list_spans
+
     content = container + "Run `" + body + "` using the reader's command.\n\n" + _OBSERVATIONS
+    spans = quoted_list_spans(content, lambda: None)
+    assert spans is not None
+    assert spans.code == ()
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm, "quoted_list_spans", lambda *args: None)
+        before = tm._markdown_shell_text(content, lambda: None, word_apostrophes=True)
+        before_diagnostic = tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
     projected = tm._markdown_shell_text(content, lambda: None, word_apostrophes=True)
-    assert "`" in projected
-    assert tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown") is not None
+    assert projected == before
+    assert (
+        tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
+        == before_diagnostic
+    )
 
 
 @pytest.mark.parametrize("container", ["> ", "1. "])
