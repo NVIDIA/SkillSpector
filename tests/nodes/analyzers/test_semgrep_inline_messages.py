@@ -58,12 +58,18 @@ def test_exact_owned_inline_body_refines_the_false_backtick_runtime_reading(mess
         'An example `$(...)`; later execute "$COMMAND" -rf /.',
         'An example `$(...)`; env BASH_ENV="$STARTUP" sh -c "echo safe".',
         'Run `sh -c "echo safe"` and later eval "$PAYLOAD".',
+        'An example `$(...)` then run env BASH_ENV="$STARTUP" bash -c "echo safe".',
+        'An example `$(...)` then run env BASH_ENV="$STARTUP" sh -c "echo safe".',
+        'An example `$(...)`; later sh -c `printf %s "$PAYLOAD"`.',
+        "Run sh -c 'echo `$(...)`'.",
+        'Run sh -c "echo `$(...)`".',
+        'Run sh -c "echo\n`$(...)`\n".',
     ],
 )
 def test_inline_body_trailing_and_later_runtime_consumers_remain_partial(message: str) -> None:
     result = _scan(message)
     assert any(
-        event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+        event.get("reason_code") is LedgerReason.STATIC_PARSE_LIMIT
         for event in result["inspection_ledger"]
     )
 

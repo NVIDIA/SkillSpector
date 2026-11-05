@@ -8902,10 +8902,10 @@ def has_bounded_parse_exhaustion(
 def _message_inline_runtime_diagnostic(
     content: str,
     check_runtime: Callable[[], None],
-    raw_diagnostic: StaticParserDiagnostic,
+    raw_diagnostic: StaticParserDiagnostic | None,
 ) -> StaticParserDiagnostic | None:
-    """Refine one legacy-backtick reading using proved Markdown ownership."""
-    if (
+    """Check displayed commands before refining one legacy-backtick reading."""
+    if raw_diagnostic is not None and (
         raw_diagnostic.cause is not ParserCause.RUNTIME_DEPENDENT
         or raw_diagnostic.check is not ParserCheck.PRINTF_INVOCATION
         or raw_diagnostic.location_precision != "source_span"
@@ -8913,49 +8913,74 @@ def _message_inline_runtime_diagnostic(
         return raw_diagnostic
     ranges: list[tuple[int, int]] = []
     projected = _markdown_shell_text(content, check_runtime, inline_code_ranges=ranges)
-    if (raw_diagnostic.start, raw_diagnostic.end) not in ranges or "`" in projected:
+    if (
+        not ranges
+        or (raw_diagnostic is not None and (raw_diagnostic.start, raw_diagnostic.end) not in ranges)
+        or "`" in projected
+    ):
         return raw_diagnostic
+    work_limit = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
+    remaining_work = work_limit
+
+    def limited() -> StaticParserDiagnostic:
+        return raw_diagnostic or StaticParserDiagnostic(
+            ParserCause.RESOURCE_LIMIT,
+            ParserCheck.MARKDOWN_LITERAL_OWNERSHIP,
+            0,
+            len(content),
+            ParserUncheckedScope.REMAINING_INPUT,
+            measurements={
+                "observed_characters": work_limit - remaining_work,
+                "limit_characters": work_limit,
+            },
+            observed_is_lower_bound=True,
+        )
+
+    # Prose may place execution consumers outside an inline span. Inspect the
+    # original commands first: masking backticks inside a quoted shell -c
+    # argument must not replace executable substitution with display text.
+    for source in (content, projected):
+        for match in re.finditer(r"\S+", source):
+            check_runtime()
+            start = match.start()
+            source_span = [start, start]
+            diagnostics: list[StaticParserDiagnostic] = []
+            found, command = _command_string_from_clause(
+                source,
+                start,
+                check_runtime,
+                startup_exposure=[False],
+                diagnostics=diagnostics,
+                source_span=source_span,
+            )
+            remaining_work -= max(1, source_span[1] - start)
+            if remaining_work < 0:
+                return limited()
+            if not found:
+                continue
+            if command is None:
+                return diagnostics[0] if diagnostics else limited()
+            remaining_work -= len(command)
+            if remaining_work < 0:
+                return limited()
+            diagnostic = bounded_parse_diagnostic(command, check_runtime, file_type="shell")
+            if diagnostic is not None:
+                return diagnostic.enclosed(start, max(start + 1, source_span[1]))
     diagnostic = bounded_parse_diagnostic(content, check_runtime, file_type="markdown")
     if diagnostic is not None:
         return diagnostic
-    # Inspect each literal body together with its following operands. A label
-    # before `sh -c "$PAYLOAD"` cannot hide the executable start, nor can a
-    # later span borrow an earlier inert example's completed assessment.
-    remaining_work = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
+    # Each literal body retains its following operands, so a split shell name
+    # and -c argument cannot borrow an earlier inert example's assessment.
     for start, _end in ranges:
         check_runtime()
         remaining_work -= len(projected) - start
         if remaining_work < 0:
-            return raw_diagnostic
+            return limited()
         diagnostic = bounded_parse_diagnostic(
             projected[start:], check_runtime, file_type="markdown"
         )
         if diagnostic is not None:
             return diagnostic.shifted(start)
-    # Prose may place a literal execution consumer outside its inline span.
-    # Reuse the bounded consumer parser at word boundaries instead of deciding
-    # whether a sentence sounds harmless. Non-consumers return immediately.
-    for match in re.finditer(r"\S+", projected):
-        check_runtime()
-        start = match.start()
-        source_span = [start, start]
-        diagnostics: list[StaticParserDiagnostic] = []
-        found, command = _command_string_from_clause(
-            projected, start, check_runtime, diagnostics=diagnostics, source_span=source_span
-        )
-        remaining_work -= max(1, source_span[1] - start)
-        if remaining_work < 0:
-            return raw_diagnostic
-        if not found:
-            continue
-        if command is None:
-            return diagnostics[0] if diagnostics else raw_diagnostic
-        remaining_work -= len(command)
-        if remaining_work < 0:
-            return raw_diagnostic
-        diagnostic = bounded_parse_diagnostic(command, check_runtime, file_type="shell")
-        if diagnostic is not None:
-            return diagnostic.enclosed(start, max(start + 1, source_span[1]))
     return None
 
 
@@ -9011,7 +9036,7 @@ def bounded_parse_diagnostic(
                     diagnostic = bounded_parse_diagnostic(
                         scalar.value, check_runtime, file_type="markdown", complete_context=True
                     )
-                elif role == "message" and diagnostic is not None:
+                elif role == "message":
                     diagnostic = _message_inline_runtime_diagnostic(
                         scalar.value, check_runtime, diagnostic
                     )
