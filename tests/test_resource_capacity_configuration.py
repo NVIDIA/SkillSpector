@@ -83,9 +83,7 @@ def test_capacity_settings_are_bound_on_import(
     tmp_path: Path, overrides: dict[str, str], expected: list[int]
 ) -> None:
     environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("SKILLSPECTOR_")
+        key: value for key, value in os.environ.items() if not key.startswith("SKILLSPECTOR_")
     }
     environment.update(overrides)
     script = (
@@ -154,9 +152,7 @@ def test_archive_default_admits_more_than_one_thousand_small_members(tmp_path: P
 
 
 @pytest.mark.parametrize("constraint", ["members", "bytes"])
-def test_archive_shared_remaining_budget_stays_stricter(
-    tmp_path: Path, constraint: str
-) -> None:
+def test_archive_shared_remaining_budget_stays_stricter(tmp_path: Path, constraint: str) -> None:
     data = _archive(3)
     settings = {"max_members": 2} if constraint == "members" else {"max_uncompressed_bytes": 15}
     result = nested_artifacts.inspect_nested_artifacts(
@@ -169,4 +165,11 @@ def test_archive_shared_remaining_budget_stays_stricter(
     )
     assert any(event.get("reason_code") == reason for event in result.ledger_events)
     assert "bundle.zip" not in result.inspected_containers
-    assert len(result.file_cache) < 3
+    if constraint == "members":
+        assert len(result.file_cache) < 3
+    else:
+        assert result.uncompressed_bytes <= 15
+        assert any(
+            disposition[1] == LedgerReason.ARCHIVE_SIZE_LIMIT
+            for disposition in result.inventory_overrides.values()
+        )

@@ -15,11 +15,7 @@ def bounded_capacity(name: str, default: int, maximum: int) -> int:
     if not value:
         return default
     digits = value.lstrip("0")
-    if (
-        0 < len(digits) <= len(str(maximum))
-        and digits.isascii()
-        and digits.isdecimal()
-    ):
+    if 0 < len(digits) <= len(str(maximum)) and digits.isascii() and digits.isdecimal():
         capacity = int(digits)
         if capacity <= maximum:
             return capacity
