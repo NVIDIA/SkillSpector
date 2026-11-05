@@ -104,8 +104,6 @@ def test_invalid_fingerprint_only_document_keeps_real_fallback_failure(change) -
         lambda s: s.replace("- id: TM2", "- id: TM2\n  rule_id: TM2"),
         lambda s: s.replace('  path: "*SKILL.md"', '  path: "*SKILL.md"\n  file: other'),
         lambda s: s.replace('  reason: "Reviewed matching data."\n', ""),
-        lambda s: s.replace("- id: TM2", "- id: !!str TM2"),
-        lambda s: s.replace("- id: TM2", "- id: &name TM2"),
         lambda s: s + "execute: ordinary\n",
         lambda s: s + "---\nother: document\n",
     ],
@@ -118,6 +116,23 @@ def test_unsupported_or_ambiguous_schema_never_grants_matcher_ownership(change) 
     result = _result(source)
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
     assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize("declaration", ["!!str TM2", "&name TM2"])
+def test_tags_and_anchors_preserve_existing_unproved_yaml_fallback(
+    declaration, monkeypatch
+) -> None:
+    original = _baseline('sh -c "$PAYLOAD"')
+    source = original.replace("- id: TM2", "- id: " + declaration)
+    assert source != original
+    assert baseline_rule_scalar_roles(source, lambda: None) == {}
+    result = _result(source)
+    monkeypatch.setattr(tm, "baseline_rule_scalar_roles", lambda *args: {})
+    fallback = _result(source)
+    # The existing raw-YAML fallback does not claim these quoted values execute.
+    # Unsupported schema must neither grant roles nor change that fallback.
+    assert result["inspection_ledger"] == fallback["inspection_ledger"]
+    assert result["findings"] == fallback["findings"]
 
 
 @pytest.mark.parametrize(
