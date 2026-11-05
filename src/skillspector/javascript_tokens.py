@@ -1678,7 +1678,7 @@ def _ordinary_native_calls(
             spelling = program.text(node).strip("\"'")
             if spelling in override_names:
                 intrinsic_override = True
-            if spelling == "syncBuiltinESMExports":
+            if spelling in {"syncBuiltinESMExports", "require", "getBuiltinModule"}:
                 path_unproven = True
             if spelling == "prototype":
                 # A direct hasOwnProperty.call read does not expose a prototype
@@ -1753,7 +1753,10 @@ def _ordinary_native_calls(
         if node.type != "import_statement":
             continue
         source = node.child_by_field_name("source")
-        if source is None or program.text(source).strip("\"'") not in {"node:path", "path"}:
+        module = "" if source is None else program.text(source).strip("\"'")
+        if module.removeprefix("node:").startswith("path/"):
+            path_unproven = True
+        if module not in {"node:path", "path"}:
             continue
         path_imports += 1
         for clause in node.named_children:
