@@ -8959,7 +8959,18 @@ def _message_inline_runtime_diagnostic(
             if not found:
                 continue
             if command is None:
-                return diagnostics[0] if diagnostics else limited()
+                return (
+                    diagnostics[0]
+                    if diagnostics
+                    else raw_diagnostic
+                    or StaticParserDiagnostic(
+                        ParserCause.BOUNDARY_UNRESOLVED,
+                        ParserCheck.COMMAND_STRING_RUNTIME,
+                        start,
+                        max(start + 1, source_span[1]),
+                        ParserUncheckedScope.COMMAND_STRING,
+                    )
+                )
             remaining_work -= len(command)
             if remaining_work < 0:
                 return limited()
