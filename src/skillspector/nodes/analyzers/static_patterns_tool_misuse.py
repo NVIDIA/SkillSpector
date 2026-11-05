@@ -8802,6 +8802,15 @@ def bounded_parse_diagnostic(
                     scalar.end,
                     ParserUncheckedScope.EXPRESSION,
                 )
+        for start, end in yaml_spans.comments:
+            check_runtime()
+            # Comments can instruct an agent too. Prose punctuation has its
+            # own reading, while runtime-dependent commands remain incomplete.
+            diagnostic = bounded_parse_diagnostic(
+                content[start + 1 : end], check_runtime, file_type="markdown"
+            )
+            if diagnostic is not None:
+                return diagnostic.shifted(start + 1)
         return None
     if not exhausted or file_type != "markdown" or not complete_context:
         return exhausted

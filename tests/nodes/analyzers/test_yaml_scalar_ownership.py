@@ -61,6 +61,23 @@ def test_yaml_scalar_ownership_preserves_dangerous_literal_finding() -> None:
     assert any(f.rule_id == "TM1" for f in result["findings"])
 
 
+@pytest.mark.parametrize("command", ["$CMD -rf /", 'sh -c "$CMD -rf /"', 'eval "$CMD"'])
+@pytest.mark.parametrize("prefix", ["# Run ", "field: ordinary value # Run "])
+def test_yaml_comment_instructions_keep_runtime_inspection_incomplete(
+    command: str, prefix: str
+) -> None:
+    result = _result(prefix + command + "\n" + _TAIL)
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+def test_yaml_comment_ownership_preserves_dangerous_literal_finding() -> None:
+    result = _result("# Run rm -rf /\n" + _TAIL)
+
+    assert any(f.rule_id == "TM1" for f in result["findings"])
+
+
 @pytest.mark.parametrize(
     "source",
     [
