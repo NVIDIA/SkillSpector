@@ -4691,6 +4691,20 @@ def _command_string_from_clause(
             source_span[1] = cursor
         return word, limited
 
+    def horizontal_gap() -> None:
+        nonlocal cursor
+        while cursor < len(content):
+            if cursor % 4096 == 0:
+                check_runtime()
+            if content[cursor] in " \t":
+                cursor += 1
+            elif content.startswith("\\\r\n", cursor):
+                cursor += 3
+            elif content.startswith("\\\n", cursor):
+                cursor += 2
+            else:
+                break
+
     def resolved_command_string(word: str | None, limited: bool) -> str | None:
         if (
             limited
@@ -4749,6 +4763,14 @@ def _command_string_from_clause(
             observe_assignment(word)
             continue
         command = word.casefold().rsplit("/", 1)[-1]
+        if (
+            not wrapper_seen
+            and content[last_word_start:cursor] == word
+            and re.match(r"[ \t]*\([ \t]*\)[ \t]*(?:\r?\n[ \t]*)?\{", content[cursor : cursor + 256])
+        ):
+            # A function declaration names no invocation; its body is scanned
+            # independently when clause traversal reaches the opening brace.
+            return False, None
         if command in _SHELL_CLAUSE_PREFIX_WORDS:
             continue
         if shell_traps and command == "trap":
@@ -4907,17 +4929,11 @@ def _command_string_from_clause(
             xargs_redirected = False
             for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
                 if command == "xargs":
-                    while cursor < len(content) and content[cursor] in " \t":
-                        if cursor % 4096 == 0:
-                            check_runtime()
-                        cursor += 1
+                    horizontal_gap()
                     here_string = re.match(r"(?:[0-9]+)?<<<", content[cursor : cursor + 32])
                     if here_string is not None:
                         cursor += here_string.end()
-                        while cursor < len(content) and content[cursor] in " \t":
-                            if cursor % 4096 == 0:
-                                check_runtime()
-                            cursor += 1
+                        horizontal_gap()
                         if cursor < len(content) and content[cursor] in "\r\n":
                             return failed(
                                 ParserCause.BOUNDARY_UNRESOLVED, ParserCheck.COMMAND_WORD_BOUNDARY

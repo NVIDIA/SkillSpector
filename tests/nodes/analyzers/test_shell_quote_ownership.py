@@ -230,6 +230,21 @@ def test_xargs_here_string_pipeline_does_not_hide_runtime_loaded_code(consumer: 
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
+@pytest.mark.parametrize("name", ["command", "builtin", "xargs", "sudo", "timeout", "eval"])
+def test_wrapper_named_function_declaration_is_not_an_invocation(name: str) -> None:
+    source = f'{name}() {{ printf "%s\\n" "$VALUE"; }}\n'
+
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+    assert tm.has_bounded_parse_exhaustion(
+        source + 'sh -c "$CMD -rf /"\n', lambda: None, file_type="shell"
+    )
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": f"{name}() {{ rm -rf /; }}\n"}},
+        [tm],
+    )
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
 @pytest.mark.parametrize(
     "command",
     [
