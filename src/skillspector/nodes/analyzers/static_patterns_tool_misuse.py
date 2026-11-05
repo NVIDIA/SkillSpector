@@ -4903,7 +4903,36 @@ def _command_string_from_clause(
             continue
         if command in {"sudo", "nice", "xargs"}:
             wrapper_seen = True
-            while True:
+            xargs_options = True
+            xargs_redirected = False
+            for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
+                if command == "xargs":
+                    while cursor < len(content) and content[cursor] in " \t":
+                        if cursor % 4096 == 0:
+                            check_runtime()
+                        cursor += 1
+                    here_string = re.match(r"(?:[0-9]+)?<<<", content[cursor : cursor + 32])
+                    if here_string is not None:
+                        cursor += here_string.end()
+                        while cursor < len(content) and content[cursor] in " \t":
+                            if cursor % 4096 == 0:
+                                check_runtime()
+                            cursor += 1
+                        if cursor < len(content) and content[cursor] in "\r\n":
+                            return failed(
+                                ParserCause.BOUNDARY_UNRESOLVED, ParserCheck.COMMAND_WORD_BOUNDARY
+                            )
+                        operand, limited = next_word()
+                        if limited or operand is None:
+                            return failed(
+                                ParserCause.BOUNDARY_UNRESOLVED, ParserCheck.COMMAND_WORD_BOUNDARY
+                            )
+                        xargs_redirected = True
+                        continue
+                    if xargs_redirected and cursor < len(content) and content[cursor] in "\r\n":
+                        # Without an explicit utility xargs prints its input.
+                        # A following physical command is a separate clause.
+                        return False, None
                 option, limited = next_word()
                 if limited:
                     return failed()
@@ -4916,13 +4945,38 @@ def _command_string_from_clause(
                         )
                     )
                 if option == "--":
+                    if command == "xargs" and xargs_options:
+                        xargs_options = False
+                        continue
                     pending, limited = next_word()
                     if limited:
                         return failed()
                     break
-                if not option.startswith("-"):
+                if command == "xargs" and any(
+                    marker in option
+                    for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+                ):
+                    return failed(ParserCause.RUNTIME_DEPENDENT)
+                if not option.startswith("-") or command == "xargs" and not xargs_options:
                     pending = option
                     break
+                if command == "xargs" and option in {
+                    "-a",
+                    "--arg-file",
+                    "-d",
+                    "--delimiter",
+                    "-E",
+                    "-J",
+                    "--max-args",
+                    "--max-procs",
+                    "--max-chars",
+                }:
+                    operand, limited = next_word()
+                    if limited or operand is None:
+                        return failed(
+                            ParserCause.BOUNDARY_UNRESOLVED, ParserCheck.COMMAND_WORD_BOUNDARY
+                        )
+                    continue
                 # Unlike nice/xargs, sudo's -n is a flag, not an operand option.
                 if command == "sudo" and option == "-n":
                     continue
@@ -4944,6 +4998,16 @@ def _command_string_from_clause(
                     _, limited = next_word()
                     if limited:
                         return failed()
+            else:
+                return failed(
+                    ParserCause.RESOURCE_LIMIT,
+                    ParserCheck.WRAPPER_ARGUMENTS,
+                    {
+                        "observed_records": _SHELL_COMMAND_STRING_ARGUMENTS,
+                        "limit_records": _SHELL_COMMAND_STRING_ARGUMENTS,
+                    },
+                    lower_bound=True,
+                )
             continue
         if command == "timeout":
             wrapper_seen = True

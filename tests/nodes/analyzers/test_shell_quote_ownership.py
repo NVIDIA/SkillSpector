@@ -158,6 +158,68 @@ def test_here_string_keeps_following_quote_bounds(operator: str) -> None:
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
+@pytest.mark.parametrize("prefix", ["xargs", "xargs -0", "xargs -I '{}'", "xargs --"])
+@pytest.mark.parametrize("operator", ["<<<", "0<<<", "<<< "])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_commandless_xargs_here_string_keeps_default_printing_semantics(
+    prefix: str, operator: str, newline: str
+) -> None:
+    source = f'echo "devices ($( {prefix} {operator}\"$USERS\"))."\n'
+    source += "# " + "." * 6000 + "\n"
+
+    assert not tm.has_bounded_parse_exhaustion(
+        source.replace("\n", newline), lambda: None, file_type="shell"
+    )
+
+
+@pytest.mark.parametrize("prefix", ["xargs", "xargs -0", "xargs -a input", "xargs --arg-file input"])
+@pytest.mark.parametrize("placement", ["before", "after"])
+def test_xargs_here_string_preserves_an_explicit_shell_utility(prefix: str, placement: str) -> None:
+    source = (
+        f'{prefix} <<< "$VALUES" sh -c \'$CMD -rf /\''
+        if placement == "before"
+        else f'{prefix} sh -c \'$CMD -rf /\' <<< "$VALUES"'
+    )
+
+    assert tm.has_bounded_parse_exhaustion(source + "\n", lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'xargs <<< "$VALUES" sh -c \'printf done\')',
+        'xargs -- <<< "$VALUES" sh -c \'printf done\')',
+        'xargs -a input <<< "$VALUES" sh -c \'printf done\')',
+    ],
+)
+def test_xargs_redirection_does_not_replace_the_explicit_command_string(source: str) -> None:
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, "printf done")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "xargs <<<)",
+        'xargs <<< "$VALUES"',
+        'xargs <<< "$VALUES" "$TOOL")',
+        'xargs <<< "unterminated)',
+        'xargs << "END")',
+        "xargs " + '<<< "input" ' * 33 + ")",
+    ],
+)
+def test_unproven_xargs_redirection_or_runtime_utility_stays_partial(source: str) -> None:
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, None)
+
+
+def test_xargs_here_string_keeps_destructive_substitutions_visible() -> None:
+    source = 'echo "devices ($(xargs <<< "$(rm -rf /)"))."\n'
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
 @pytest.mark.parametrize(
     "command",
     [
