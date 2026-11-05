@@ -1019,7 +1019,7 @@ _JS_REGEX_BOUNDARY_SOURCE = (
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
-def test_native_regex_origin_does_not_borrow_a_later_string_boundary(newline, monkeypatch):
+def test_native_regex_ranges_preserve_existing_small_file_completion(newline, monkeypatch):
     source = _JS_REGEX_BOUNDARY_SOURCE.replace("\n", newline)
     with monkeypatch.context() as baseline:
         baseline.setattr(
@@ -1027,8 +1027,13 @@ def test_native_regex_origin_does_not_borrow_a_later_string_boundary(newline, mo
         )
         baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
         before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
-    assert before is not None
+    assert before is None
     assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is None
+    owner = tm._JavaScriptTemplateOwnership(source, lambda: None)
+    start = source.index("/read")
+    end = source.index("/);", start) + 1
+    assert owner.regex_literal_end(source.index("`", start)) == end
+    assert owner.regex_literal_end(end) is None
 
 
 @pytest.mark.parametrize(
@@ -1041,11 +1046,15 @@ def test_native_regex_origin_does_not_borrow_a_later_string_boundary(newline, mo
         "const rule = /read `([^`]+policy\\.md)` before review/; eval(rule['source']);",
     ],
 )
-def test_regex_runtime_consumers_do_not_receive_native_pattern_boundaries(source):
+def test_regex_unproved_consumers_do_not_receive_native_pattern_boundaries(source, monkeypatch):
     regexes = []
     javascript_template_spans(source, lambda: None, regex_literals=regexes)
     assert regexes == []
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    after = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert after == before
 
 
 def test_regex_origin_keeps_later_executable_limits_and_raw_findings():
