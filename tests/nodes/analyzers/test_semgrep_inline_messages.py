@@ -111,10 +111,11 @@ def test_exact_owned_inline_body_refines_the_false_backtick_runtime_reading(mess
         'Run `eval` "$SETUP"; An example `$(...)`; echo sh -c "$PAYLOAD".',
         "Run `enable` -n printf; An example `$(...)`; printf '%s' sh -c \"$PAYLOAD\".",
         'Run `trap` "$SETUP" DEBUG; An example `$(...)`; echo sh -c "$PAYLOAD".',
-        "Run sh -c 'echo `library`'s; An example `$(...)`.",
         'Run sh -c "echo `library`\'s"; An example `$(...)`.',
         'Run sh -c "echo\n`library`\'s\n"; An example `$(...)`.',
-        'Run `sh` -c "echo `library`\'s"; An example `$(...)`.',
+        'Run `sh` -c "echo `$PAYLOAD`\'s".',
+        "Run sh -c 'echo `$(cat command.txt)`'s.",
+        'Run `sh` -c "echo `$(cat command.txt)`\'s".',
         'The `library`\'s example `$(...)` then run sh -c "$PAYLOAD".',
         'The `library`\'s example `$(...)`; source helper.sh; echo sh -c "$PAYLOAD".',
     ],
@@ -142,6 +143,19 @@ def test_unproven_block_or_inline_ownership_keeps_the_original_runtime_limit(mes
 
 def test_message_without_an_exact_inline_diagnostic_owner_keeps_runtime_limit() -> None:
     assert _scan('sh -c "$PAYLOAD"')["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["Run sh -c 'echo `library`'s.", 'Run `sh` -c "echo `library`\'s".'],
+)
+def test_literal_child_quote_ownership_keeps_outer_apostrophes(command: str) -> None:
+    message = command + " An example `$(...)`."
+    apostrophes: set[int] = set()
+    tm._markdown_shell_text(message, lambda: None, inline_possessive_apostrophes=apostrophes)
+    assert not apostrophes
+    assert _scan(command)["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert _scan(message)["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
 def test_many_inline_suffixes_do_not_create_unbounded_reparsing() -> None:
