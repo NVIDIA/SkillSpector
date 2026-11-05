@@ -75,6 +75,7 @@ from skillspector.python_tokens import PythonStringClosers
 from skillspector.security_reconstruction import (
     MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
     MAX_MARKER_LOOKAHEAD_CHARS,
+    StructuredStringClosers,
     build_declared_marker_views,
 )
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
@@ -2179,12 +2180,12 @@ def _restore_source_lines(
 
 
 def _window_string_closer(
-    python_strings: PythonStringClosers, window_start: int
+    source_closer: Callable[[int], bool], window_start: int
 ) -> Callable[[int], bool]:
     """Answer string-closer queries in one window's source coordinates."""
 
     def closes_string(offset: int) -> bool:
-        return python_strings.closes_string(window_start + offset)
+        return source_closer(window_start + offset)
 
     return closes_string
 
@@ -2269,11 +2270,15 @@ def _scan_declared_marker_views(
             )
         return True
 
-    # A complete Python module proves which quotes close its string literals.
-    # The proof covers the whole artifact, so it holds in every window. It is
-    # computed only when a loose quoted directive header reaches a quote.
-    python_strings = (
-        PythonStringClosers(content, check_runtime) if _infer_file_type(path) == "python" else None
+    # Structural delimiter proof covers the complete artifact, so windows do
+    # not mistake a literal closer for a new marker opener. Compute it lazily.
+    file_type = _infer_file_type(path)
+    if path.lower().endswith((".html", ".htm")):
+        file_type = "html"
+    source_strings = (
+        PythonStringClosers(content, check_runtime)
+        if file_type == "python"
+        else StructuredStringClosers(content, file_type, check_runtime)
     )
 
     for owned_start, raw_start in zip(owned_starts, raw_starts, strict=True):
@@ -2305,8 +2310,8 @@ def _scan_declared_marker_views(
         # never occurs for Python, but it would not map onto module offsets.
         string_closer = (
             None
-            if python_strings is None or context_prefix
-            else _window_string_closer(python_strings, raw_start)
+            if context_prefix
+            else _window_string_closer(source_strings.closes_string, raw_start)
         )
         for full_view in full_views:
             full_view_limited = False

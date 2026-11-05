@@ -13,9 +13,11 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from io import StringIO
+from html.parser import HTMLParser
 from typing import Final
 
 from skillspector.artifacts import SecurityTextView
+from skillspector.javascript_ast import MAX_JAVASCRIPT_SOURCE_CHARS, parse_javascript_source
 
 MAX_MARKER_LENGTH: Final = 16
 MAX_MARKER_SCOPE_CHARS: Final = 768
@@ -730,6 +732,130 @@ def validated_json_string_closers(text: str, check_runtime: Callable[[], None] |
     return {end - 1 for _, end in validated_json_string_spans(text, check_runtime)}
 
 
+_HTML_ATTRIBUTE_RE = re.compile(
+    r"[^\s/=>\"'`<]+(?:\s*=\s*(?P<value>\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+))?"
+)
+_HTML_START_TAG_RE = re.compile(
+    rf"<([A-Za-z][A-Za-z0-9:-]*)(?:\s+{_HTML_ATTRIBUTE_RE.pattern})*\s*/?>\Z"
+)
+_BACKTICK_RUN_RE = re.compile(r"`+")
+
+
+def _html_attribute_closers(content: str, check_runtime: Callable[[], None]) -> set[int]:
+    """Own only quoted attribute delimiters inside individually valid start tags."""
+    line_starts = [0, *(match.end() for match in re.finditer("\n", content))]
+    closers: set[int] = set()
+
+    class Tags(HTMLParser):
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            check_runtime()
+            raw = self.get_starttag_text()
+            parsed = _HTML_START_TAG_RE.fullmatch(raw)
+            if parsed is None:
+                return
+            row, column = self.getpos()
+            start = line_starts[row - 1] + column
+            for attribute in _HTML_ATTRIBUTE_RE.finditer(raw, parsed.end(1)):
+                value = attribute.group("value")
+                if value and value[0] in "\"'":
+                    closers.add(start + attribute.end("value") - 1)
+
+        handle_startendtag = handle_starttag
+
+    parser = Tags(convert_charrefs=False)
+    parser.feed(content)
+    parser.close()
+    check_runtime()
+    return closers
+
+
+def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) -> set[int]:
+    """Own same-line CommonMark code delimiters outside recognized fenced blocks."""
+    closers: set[int] = set()
+    fence: tuple[str, int, tuple[tuple[str, int], ...], int] | None = None
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        check_runtime()
+        body, context = _json_fence_prefix(line.rstrip("\r\n"), check_runtime)
+        if fence is not None:
+            fenced_body = _json_fence_body(line, fence[2], check_runtime, last_quote_index=fence[3])
+            if fenced_body is not None:
+                closing = _JSON_FENCE_CLOSE_RE.fullmatch(fenced_body.rstrip("\r\n"))
+                if closing and closing[1][0] == fence[0] and len(closing[1]) >= fence[1]:
+                    fence = None
+                offset += len(line)
+                continue
+            fence = None
+        opening = _JSON_FENCE_OPEN_RE.fullmatch(body)
+        if opening and not (opening[1][0] == "`" and "`" in opening[2]):
+            last_quote = max((i for i, entry in enumerate(context) if entry[0] == "quote"), default=-1)
+            fence = opening[1][0], len(opening[1]), context, last_quote
+        else:
+            opener: re.Match[str] | None = None
+            for run in _BACKTICK_RUN_RE.finditer(line):
+                if opener is None:
+                    cursor = run.start() - 1
+                    while cursor >= 0 and line[cursor] == "\\":
+                        cursor -= 1
+                    if (run.start() - 1 - cursor) % 2:
+                        continue
+                    opener = run
+                elif len(run[0]) == len(opener[0]):
+                    closers.update(range(offset + run.start(), offset + run.end()))
+                    opener = None
+        offset += len(line)
+    return closers
+
+
+class StructuredStringClosers:
+    """Lazily prove structural closing delimiters against a complete bounded artifact.
+
+    Only the loose declared-marker fallback consumes this proof. Literal contents
+    and explicit marker declarations continue through ordinary security matching.
+    """
+
+    def __init__(self, content: str, file_type: str, check_runtime: Callable[[], None]) -> None:
+        self._content = content
+        self._file_type = file_type
+        self._check_runtime = check_runtime
+        self._closers: set[int] | None = None
+
+    def closes_string(self, offset: int) -> bool:
+        self._check_runtime()
+        if self._closers is None:
+            self._closers = self._compute()
+        return offset in self._closers
+
+    def _compute(self) -> set[int]:
+        content = self._content
+        if len(content) > MAX_JAVASCRIPT_SOURCE_CHARS:
+            return set()
+        if self._file_type == "javascript":
+            program = parse_javascript_source(content, self._check_runtime)
+            if program is None:
+                return set()
+            return {
+                program.span(node)[1] - 1
+                for node in program.nodes
+                if node.type in {"string", "template_string"}
+            }
+        if self._file_type == "json":
+            def reject_constant(value: str) -> None:
+                raise ValueError(value)
+
+            try:
+                json.loads(content, parse_constant=reject_constant)
+            except (ValueError, RecursionError):
+                return set()
+            self._check_runtime()
+            return {end - 1 for _, end in _json_string_spans(content, self._check_runtime)}
+        if self._file_type == "markdown":
+            return _markdown_inline_closers(content, self._check_runtime)
+        if self._file_type == "html":
+            return _html_attribute_closers(content, self._check_runtime)
+        return set()
+
+
 def _is_quoted_mapping_key(text: str, start: int) -> bool:
     """Return whether the exact quoted removal verb is followed by a key colon."""
     if start == 0 or text[start - 1] not in _ALL_QUOTE_CHARACTERS:
@@ -795,7 +921,7 @@ def _view_string_closer(
     """
 
     def closes_owned_string(index: int) -> bool:
-        return view.text[index] in "'\"" and validated_string_closer(view.source_offset(index))
+        return view.text[index] in "'\"`" and validated_string_closer(view.source_offset(index))
 
     return closes_owned_string
 
