@@ -1013,13 +1013,17 @@ def test_plain_quoted_files_keep_no_backtick_fast_path(monkeypatch) -> None:
 
 
 _JS_REGEX_BOUNDARY_SOURCE = (
+    "const text = 'safe';\n"
     "const captured = text.match(/read `([^`]+policy\\.md)` before review/);\n"
-    "for (const row of [['label', '`render_proof` passed']]) { inspect(row); }\n"
+    + "// "
+    + "padding " * 1024
+    + "\n"
+    + "for (const row of [['label', '`render_proof` passed']]) { inspect(row); }\n"
 )
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
-def test_native_regex_ranges_preserve_existing_small_file_completion(newline, monkeypatch):
+def test_native_regex_origin_does_not_borrow_a_distant_string_boundary(newline, monkeypatch):
     source = _JS_REGEX_BOUNDARY_SOURCE.replace("\n", newline)
     with monkeypatch.context() as baseline:
         baseline.setattr(
@@ -1027,7 +1031,8 @@ def test_native_regex_ranges_preserve_existing_small_file_completion(newline, mo
         )
         baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
         before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
-    assert before is None
+    assert before is not None
+    assert before.cause is tm.ParserCause.BOUNDARY_UNRESOLVED
     assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is None
     owner = tm._JavaScriptTemplateOwnership(source, lambda: None)
     start = source.index("/read")
@@ -1100,3 +1105,30 @@ def test_regex_execution_and_override_barriers_keep_existing_incompleteness(sour
         before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
     after = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
     assert after == before
+
+
+@pytest.mark.parametrize(
+    "prefix,receiver",
+    [
+        ("import value from './runtime.mjs';", "value"),
+        ("const value = getValue();", "value"),
+        ("let value = 'safe'; value = getValue();", "value"),
+        ("const value = 'safe'; function shadow(value) {}", "value"),
+        ("function check(value) {", "value"),
+    ],
+)
+def test_unknown_or_shadowed_string_receivers_keep_the_regex_fallback(prefix, receiver):
+    source = prefix + receiver + ".match(/`$TOOL -rf \\//);"
+    if prefix.startswith("function"):
+        source += "}"
+    regexes = []
+    javascript_template_spans(source, lambda: None, regex_literals=regexes)
+    assert regexes == []
+
+
+def test_direct_primitive_string_can_prove_its_matching_regex_boundaries():
+    source = "'safe'.match(/`label/);"
+    regexes = []
+    javascript_template_spans(source, lambda: None, regex_literals=regexes)
+    start = source.index("/`label")
+    assert regexes == [(start, start + len("/`label/"))]

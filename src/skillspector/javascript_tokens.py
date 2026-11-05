@@ -1627,10 +1627,12 @@ def _plain_regex_value_spans(
 ) -> list[tuple[int, int]]:
     """Bound lexical regex candidates after the execution barrier.
 
-    Matching names are candidate syntax, not a receiver type proof. Explicit
-    matching overrides or reflection keep the conservative shell fallback.
+    Only direct String values and immutable top-level String bindings supply
+    native matching receivers. Explicit overrides retain the shell fallback.
     """
-    matching = {"match", "matchAll", "search", "split", "replace", "replaceAll", "test", "exec"}
+    matching = {"match", "matchAll", "search", "split", "replace", "replaceAll"}
+    references: dict[str, list[Node]] = {}
+    candidates: dict[str, tuple[Node, Node]] = {}
     overrides = {
         "String",
         "RegExp",
@@ -1647,6 +1649,27 @@ def _plain_regex_value_spans(
     }
     for node in program.nodes:
         check_runtime()
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            references.setdefault(program.text(node), []).append(node)
+        if node.type == "variable_declarator":
+            binding = node.child_by_field_name("name")
+            value = node.child_by_field_name("value")
+            declaration = node.parent
+            if (
+                binding is not None
+                and binding.type == "identifier"
+                and value is not None
+                and value.type == "string"
+                and declaration is not None
+                and declaration.type == "lexical_declaration"
+                and declaration.children[0].type == "const"
+                and declaration.parent == program.root_node
+            ):
+                candidates[program.text(binding)] = (binding, node)
         if node.type in {"identifier", "property_identifier", "string"} and (
             program.text(node).strip("\"'") in overrides
         ):
@@ -1678,13 +1701,34 @@ def _plain_regex_value_spans(
             # Source extraction needs a separate use proof before a pattern
             # can stop lending boundaries to executable text.
             return []
-    boundaries = {
-        "program",
-        "expression_statement",
-        "return_statement",
-        "variable_declarator",
-        "for_in_statement",
-    }
+    string_references: set[int] = set()
+    budget = _MAX_TOKENS * 4
+    for name, (binding, declaration) in candidates.items():
+        owned = {binding.id}
+        for reference in references[name]:
+            budget -= 1
+            if budget < 0:
+                return []
+            check_runtime()
+            if reference == binding:
+                continue
+            member = reference.parent
+            call = None if member is None else member.parent
+            if not (
+                reference.type == "identifier"
+                and reference.start_byte >= declaration.end_byte
+                and member is not None
+                and member.type == "member_expression"
+                and member.child_by_field_name("object") == reference
+                and _callable_member(program, member) in matching
+                and call is not None
+                and call.type == "call_expression"
+                and call.child_by_field_name("function") == member
+            ):
+                break
+            owned.add(reference.id)
+        else:
+            string_references.update(owned)
     spans: list[tuple[int, int]] = []
     for node in program.nodes:
         check_runtime()
@@ -1707,32 +1751,23 @@ def _plain_regex_value_spans(
             or program.content[pattern_end : pattern_end + 1] != "/"
         ):
             continue
-        parent = node.parent
-        while parent is not None and parent.type not in boundaries:
-            check_runtime()
-            if parent.type in {
-                "binary_expression",
-                "augmented_assignment_expression",
-                "new_expression",
-                "template_substitution",
-                "export_statement",
-            }:
-                break
-            if (
-                parent.type in {"member_expression", "subscript_expression"}
-                and _callable_member(program, parent) not in matching
-            ):
-                break
-            if parent.type == "call_expression":
-                callee = parent.child_by_field_name("function")
-                if (
-                    callee is None
-                    or callee.type != "member_expression"
-                    or _callable_member(program, callee) not in matching
-                ):
-                    break
-            parent = parent.parent
-        else:
+        arguments = node.parent
+        call = None if arguments is None else arguments.parent
+        member = None if call is None else call.child_by_field_name("function")
+        receiver = None if member is None else member.child_by_field_name("object")
+        if (
+            arguments is not None
+            and arguments.type == "arguments"
+            and arguments.named_children
+            and arguments.named_children[0] == node
+            and call is not None
+            and call.type == "call_expression"
+            and member is not None
+            and member.type == "member_expression"
+            and _callable_member(program, member) in matching
+            and receiver is not None
+            and (receiver.type == "string" or receiver.id in string_references)
+        ):
             spans.append((start, end))
     return spans
 
