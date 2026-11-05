@@ -7870,6 +7870,17 @@ def _destructive_command_candidates(
             yield command_start, command_end, command, 0.9, False, None, None, None
 
 
+def _has_tm1_code_pattern_at(
+    content: str, start: int, end: int, check_runtime: Callable[[], None]
+) -> bool:
+    """Check existing raw patterns at one bounded, proven command position."""
+    for pattern, _ in TM1_CODE_PATTERNS:
+        check_runtime()
+        if re.compile(pattern, re.IGNORECASE | re.MULTILINE).match(content, start, end):
+            return True
+    return False
+
+
 def _tm1_candidates(
     content: str,
     *,
@@ -8930,18 +8941,24 @@ def _has_bounded_parse_exhaustion(
         # Both iterators are ordered; retain only one candidate, not a per-file
         # set or repeated scans of every suffix. Finding construction stays raw.
         reported_starts = (
-            candidate[0] for candidate in _tm1_candidates(content, check_runtime=check_runtime)
+            candidate[0]
+            for candidate in _destructive_command_candidates(content, check_runtime=check_runtime)
         )
         reported_start: int | None = -1
         for start, end in json_strings:
             check_runtime()
-            for command_start, _ in _destructive_command_effects(
+            for command_start, body_start in _destructive_command_effects(
                 content[start + 1 : end - 1], check_runtime
             ):
                 absolute_start = start + 1 + command_start
                 while reported_start is not None and reported_start < absolute_start:
                     reported_start = next(reported_starts, None)
-                if reported_start == absolute_start:
+                if reported_start == absolute_start or _has_tm1_code_pattern_at(
+                    content,
+                    absolute_start,
+                    min(end - 1, start + 1 + body_start + _ROOT_GLOB_COMMAND_CHARS),
+                    check_runtime,
+                ):
                     continue
                 # Structural ownership alone cannot establish provenance for
                 # an embedded command the raw analyzer cannot report. Derived

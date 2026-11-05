@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import time
 from array import array
 
 import pytest
@@ -223,3 +224,14 @@ def test_reported_command_cannot_hide_a_later_unreported_string_command(source: 
     assert any(finding.rule_id == "TM1" for finding in result["findings"])
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
     assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+def test_raw_provenance_does_not_search_unrelated_large_regex_suffixes() -> None:
+    source = json.dumps({"command": "a rm -rf /", "data": "git push " * 75_000})
+    deadline = time.monotonic() + 10
+
+    def check_runtime() -> None:
+        if time.monotonic() > deadline:
+            raise TimeoutError("JSON provenance deadline")
+
+    assert tm.bounded_parse_diagnostic(source, check_runtime, file_type="json") is None
