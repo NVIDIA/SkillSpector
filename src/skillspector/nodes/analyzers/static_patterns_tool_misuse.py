@@ -673,7 +673,7 @@ class _ShellCommandString:
     end: int
     exact_source: bool
     diagnostic: StaticParserDiagnostic | None
-    xargs_override: bool = False
+    xargs_contexts: tuple[tuple[str, list[bool | None]], ...] = ()
 
 
 def _note_parser_diagnostic(
@@ -3359,7 +3359,7 @@ def _has_shell_command_word_exhaustion(
     _quoted_printf_allowed: bool = True,
     _startup_exposure: list[bool] | None = None,
     _startup_diagnostics: list[StaticParserDiagnostic] | None = None,
-    _xargs_override: bool = False,
+    _xargs_contexts: tuple[tuple[str, list[bool | None]], ...] = (),
     complete_context: bool = True,
 ) -> StaticParserDiagnostic | None:
     """Find candidate command words whose deterministic parse hit a safety bound.
@@ -3759,7 +3759,7 @@ def _has_shell_command_word_exhaustion(
         shell_substitutions=file_type == "shell",
         startup_exposure=_startup_exposure,
         startup_diagnostics=_startup_diagnostics,
-        xargs_override=_xargs_override,
+        xargs_contexts=_xargs_contexts,
     ):
         command_string = command.content
         if command_string is None:
@@ -3802,7 +3802,7 @@ def _has_shell_command_word_exhaustion(
             _quoted_printf_allowed=quoted_printf_allowed,
             _startup_exposure=command.startup_context,
             _startup_diagnostics=nested_startup_diagnostics,
-            _xargs_override=command.xargs_override,
+            _xargs_contexts=command.xargs_contexts,
         )
         if nested_startup_diagnostics and not command.startup_diagnostics:
             # eval shares the exposure flag with its parent; retain its cause
@@ -3900,7 +3900,7 @@ def _shell_command_strings(
     shell_substitutions: bool = True,
     startup_exposure: list[bool] | None = None,
     startup_diagnostics: list[StaticParserDiagnostic] | None = None,
-    xargs_override: bool = False,
+    xargs_contexts: tuple[tuple[str, list[bool | None]], ...] = (),
 ) -> Iterator[_ShellCommandString]:
     """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
     nested_substitutions = startup_exposure is not None and ("$(" in content or "`" in content)
@@ -3915,7 +3915,7 @@ def _shell_command_strings(
     ] = []
     startup_work_limit = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
     startup_work = [startup_work_limit]
-    xargs_override_cache: list[bool | None] = [True if xargs_override else None]
+    xargs_override_cache: list[bool | None] = [None]
     clause_starts = (
         powershell.clause_starts
         if powershell is not None
@@ -4024,6 +4024,7 @@ def _shell_command_strings(
             literal_command_spans=literal_spans,
             xargs_override_cache=xargs_override_cache,
             xargs_source=content,
+            xargs_parent_contexts=xargs_contexts,
         )
         if nested_substitutions and startup_exposure[0]:
             # Quoted substitutions can launch shells outside this clause walk.
@@ -4062,9 +4063,6 @@ def _shell_command_strings(
         diagnostic = diagnostics[0] if diagnostics else None
         if diagnostic is not None and not any(diagnostic is item for item in context_diagnostics):
             diagnostic = diagnostic.shifted(body_start)
-        # Substitutions and reparsed literal bodies retain enclosing bindings.
-        if xargs_override_cache[0] is None:
-            xargs_override_cache[0] = _xargs_has_source_override(content, check_runtime)
         yield _ShellCommandString(
             command_string,
             [False] if starts_shell[0] else startup_context,
@@ -4073,7 +4071,7 @@ def _shell_command_strings(
             max(start + 1, end) + body_start,
             bool(literal_spans),
             diagnostic,
-            xargs_override_cache[0],
+            xargs_contexts + ((content, xargs_override_cache),),
         )
 
 
@@ -4324,10 +4322,12 @@ def _shell_redefines_command(
     """Do not widen builtin evaluation across an explicit local replacement."""
     work = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
     setting_work = [work]
+    scope_ends: list[int] = []
     for start in _nonempty_shell_clause_starts(
         content,
         check_runtime,
         shell_substitutions=shell_substitutions,
+        substitution_scopes=scope_ends,
         backtick_starts=set() if shell_substitutions else None,
     ):
         check_runtime()
@@ -4340,7 +4340,10 @@ def _shell_redefines_command(
             allow_empty=False,
         ):
             return True
-        source = content[start : start + _ROOT_GLOB_COMMAND_CHARS + 1]
+        scope_end = scope_ends[-1] - 1 if scope_ends else len(content)
+        if start >= scope_end:
+            continue
+        source = content[start : min(scope_end, start + _ROOT_GLOB_COMMAND_CHARS + 1)]
         cursor = 0
         wrapper: str | None = None
         for _ in range(8):
@@ -4749,6 +4752,7 @@ def _command_string_from_clause(
     source_span: list[int] | None = None,
     xargs_override_cache: list[bool | None] | None = None,
     xargs_source: str | None = None,
+    xargs_parent_contexts: tuple[tuple[str, list[bool | None]], ...] = (),
 ) -> tuple[bool, str | None]:
     """Resolve a bounded wrapper chain to an ``eval`` or shell command string."""
     cursor = start
@@ -4763,6 +4767,12 @@ def _command_string_from_clause(
     def external_xargs_proved() -> bool:
         if startup_exposure is not None and startup_exposure[0]:
             return False
+        # Defer ancestor checks until xargs needs the printing exemption.
+        for source, cached in xargs_parent_contexts:
+            if cached[0] is None:
+                cached[0] = _xargs_has_source_override(source, check_runtime)
+            if cached[0]:
+                return False
         if xargs_override_cache[0] is None:
             xargs_override_cache[0] = _xargs_has_source_override(
                 content if xargs_source is None else xargs_source, check_runtime
