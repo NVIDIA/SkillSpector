@@ -218,6 +218,37 @@ def test_xargs_replacement_keeps_runtime_utility_unresolved() -> None:
     ) == (True, "printf done")
 
 
+@pytest.mark.parametrize("wrapper", ["env", "sudo", "command", "builtin"])
+@pytest.mark.parametrize("separator", ["", "-- "])
+def test_xargs_replacement_cannot_escape_through_a_wrapper_separator(
+    wrapper: str, separator: str
+) -> None:
+    source = f'xargs -I {{}} <<< "$CMD" -- {wrapper} {separator}{{}} -rf /)'
+
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, None)
+
+
+def test_xargs_second_separator_is_a_literal_utility_name() -> None:
+    source = 'xargs -- -- sh -c "printf done")'
+
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (False, None)
+
+
+@pytest.mark.parametrize("continuation", ["\\\n", "\\\r\n"])
+def test_xargs_continued_gap_checks_the_runtime_deadline(continuation: str) -> None:
+    source = "xargs  " + continuation * 12000 + '<<< "$VALUES")'
+    checks = 0
+
+    def cancelled() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 4:
+            raise TimeoutError("continued gap deadline")
+
+    with pytest.raises(TimeoutError, match="continued gap deadline"):
+        tm._command_string_from_clause(source, 0, cancelled)
+
+
 @pytest.mark.parametrize(
     "source",
     [

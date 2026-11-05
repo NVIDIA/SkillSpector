@@ -4696,9 +4696,11 @@ def _command_string_from_clause(
 
     def horizontal_gap() -> None:
         nonlocal cursor
+        next_runtime_check = cursor
         while cursor < len(content):
-            if cursor % 4096 == 0:
+            if cursor >= next_runtime_check:
                 check_runtime()
+                next_runtime_check = cursor + 4096
             if content[cursor] in " \t":
                 cursor += 1
             elif content.startswith("\\\r\n", cursor):
@@ -4765,6 +4767,8 @@ def _command_string_from_clause(
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word, re.DOTALL) is not None:
             observe_assignment(word)
             continue
+        if xargs_replacements and _DYNAMIC_SHELL_WORD_SENTINEL in word:
+            return failed(ParserCause.RUNTIME_DEPENDENT)
         command = word.casefold().rsplit("/", 1)[-1]
         if (
             not wrapper_seen
@@ -4969,7 +4973,7 @@ def _command_string_from_clause(
                             ParserCause.BOUNDARY_UNRESOLVED, ParserCheck.COMMAND_WORD_BOUNDARY
                         )
                     )
-                if option == "--":
+                if option == "--" and (command != "xargs" or xargs_options):
                     if command == "xargs" and xargs_options:
                         xargs_options = False
                         continue
