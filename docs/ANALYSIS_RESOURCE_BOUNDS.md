@@ -324,8 +324,8 @@ removes the rejected partial checkout.
 | Dependency analysis time | 30 seconds | One analyzer execution, within the workflow deadline |
 | OSV packages / query batches / detail requests | 256 / 4 / 64 | One dependency analysis budget |
 | OSV response bytes / retained results | 4 MiB / 256 | One dependency analysis budget |
-| TP4 source files / batches / findings | 128 / 256 / 64 | One analyzer execution |
-| TP4 source and prompt input | 4 MiB each | One analyzer execution |
+| TP4 source files / batches / findings | 128 / 256 / 64 | One analyzer execution; file and batch capacities are configurable |
+| TP4 source and prompt input | 4 MiB each (configurable) | One analyzer execution |
 | TP4 model input | 32,000 tokens | One batch |
 | Public finding and occurrence records | 10,000 | One report |
 
