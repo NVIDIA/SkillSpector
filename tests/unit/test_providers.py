@@ -167,7 +167,11 @@ def test_prepare_transport_imports_skips_unconfigured_bound_provider(
     imports: list[str] = []
     monkeypatch.setattr(chat_models, "import_module", imports.append)
 
-    providers_module.prepare_chat_model_imports()
+    token = use_provider(get_active_provider())
+    try:
+        providers_module.prepare_chat_model_imports()
+    finally:
+        reset_provider(token)
 
     assert imports == []
 
@@ -192,12 +196,15 @@ def test_prepare_transport_imports_uses_actual_unbound_openai_fallback(
 def test_prepare_transport_imports_does_not_fall_back_for_explicit_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "nv_build")
     monkeypatch.setenv("OPENAI_API_KEY", "test-fallback")
     imports: list[str] = []
     monkeypatch.setattr(chat_models, "import_module", imports.append)
 
-    providers_module.prepare_chat_model_imports()
+    token = use_provider(NvBuildProvider())
+    try:
+        providers_module.prepare_chat_model_imports()
+    finally:
+        reset_provider(token)
 
     assert imports == []
 
