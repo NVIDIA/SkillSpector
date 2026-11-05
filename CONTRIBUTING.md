@@ -11,9 +11,31 @@ by the [Developer Certificate of Origin](#developer-certificate-of-origin).
 4. **Sign off** every commit (see below).
 5. **Open a pull request** referencing the issue.
 
+## Development Setup
+
+Follow the [README development setup](README.md#setup) for supported Python
+versions, cloning, virtual environment activation, and dependency installation.
+The [Development guide](docs/DEVELOPMENT.md) covers architecture and extending
+the analyzers.
+
+Initial local checks:
+
+```bash
+make test-unit
+make lint
+make format-check
+```
+
+These initial checks do not replace the `make test` requirement above.
+`make test` also runs integration tests, which may call a configured LLM provider
+and send test content to it. Review the provider prerequisites in the setup guide
+before running the full target. The unit-test marker selection does not cover
+every CI job or guarantee network isolation.
+
 ## Coding Standards
 
-- Run `make lint` and `make format` before submitting.
+- Use `make format` to apply lint fixes and formatting in place before committing.
+  Verify with `make lint` and `make format-check` before submitting.
 - All new source files must include the SPDX license header (see any existing
   `.py` file for the template).
 - New analyzers should include corresponding unit tests and, where applicable,

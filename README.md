@@ -65,10 +65,10 @@ uv venv .venv && source .venv/bin/activate
 
 # Install for production use
 make install
-
-# Or install with development dependencies
-make install-dev
 ```
+
+To contribute, follow the [Development setup](#setup) for a supported Python
+interpreter and development dependencies.
 
 ### Docker (no Python required)
 
@@ -944,28 +944,62 @@ SkillSpector computes the score band and recommendation; how strict the gate is 
 
 ### Setup
 
-All `make` targets assume a virtual environment is already created and activated. The Makefile uses **uv** if available, else **pip**.
+This is the canonical setup recipe for contributing from this checkout. Use
+**Python 3.12-3.15** (`>=3.12,<3.16`, as defined in [pyproject.toml](pyproject.toml)),
+Git, and `make`. A release tag can have a different Python range; check that
+tag's metadata. The commands below use Bash or Zsh.
+
+With **uv** installed:
 
 ```bash
-# Clone, create venv, activate, install dev dependencies
 git clone https://github.com/NVIDIA/skillspector.git
 cd skillspector
-uv venv .venv && source .venv/bin/activate
-# or: python3 -m venv .venv && source .venv/bin/activate
+uv venv --python 3.12 .venv
+source .venv/bin/activate
 make install-dev
-
-# Run tests
-make test
-
-# Run tests with coverage
-make test-cov
-
-# Run linting
-make lint
-
-# Format code
-make format
 ```
+
+If uv is not installed, clone the repository and enter it as above, then use
+an installed supported Python interpreter with `venv` and pip:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+make install-dev
+```
+
+Create and activate the virtual environment before running any `make` target.
+`make install-dev` uses `uv sync --all-extras` when uv is available, otherwise
+`pip install -e ".[dev]"`.
+
+Start with these local checks:
+
+```bash
+make test-unit
+make lint
+make format-check
+```
+
+`make test-unit` excludes tests marked `integration` or `provider`. This selection
+does not cover every CI job or guarantee network isolation.
+
+Before submitting a PR, [CONTRIBUTING.md](CONTRIBUTING.md#how-to-contribute)
+requires `make test`. It runs both `test-unit` and `test-integration`; integration
+tests invoke the full graph and may send test content to a configured LLM provider.
+Review the [provider configuration](docs/DEVELOPMENT.md#10-environment-and-configuration)
+and credentials or local-service prerequisites before running it:
+
+```bash
+make test
+```
+
+`make test-provider` makes live provider requests and requires the corresponding
+provider configuration; see [Live provider tests](docs/DEVELOPMENT.md#live-provider-tests).
+`make test-cov` runs the same marker-filtered selection as `test-unit`, with coverage.
+
+`make format` applies lint fixes and formats files **in place**. Run it before
+committing when changes are needed, review the diff, then recheck with `make lint`
+and `make format-check`.
 
 ## How It Works
 
