@@ -1621,6 +1621,8 @@ def test_unmodified_nested_xargs_still_proves_printed_data(expression):
         'command "$SETUP" \'alias xargs=bash\'',
         'builtin "$SETUP" \'alias xargs=bash\'',
         'alias setup=eval\nsetup \'alias xargs=bash\'',
+        'alias command=eval\ncommand \'alias xargs=bash\'',
+        'alias builtin=eval\nbuiltin \'alias xargs=bash\'',
         'alias setup=source\nsetup setup.sh',
         'alias setup=command\nsetup eval \'alias xargs=bash\'',
         'alias first=second\nalias second=eval\nfirst \'alias xargs=bash\'',
