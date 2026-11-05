@@ -767,6 +767,7 @@ def test_executor_member_reads_keep_existing_conservative_coverage(source: str) 
     [
         "const match = /^(\\d+)(?:\\.(\\d+))?$/.exec(text);",
         "const match = /exec/.exec(text); const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);",
+        "const NUMBER = /^[0-9]+$/; const valid = value => NUMBER.test(value); const match = /[0-9]+/.exec(text);",
         "import {posix} from 'node:path'; const path = posix.join(posix.dirname(source), `${name}.json`);",
         "import {win32 as p} from 'node:path'; const path = p.join(`${name}`, 'file');",
         "import {join as makePath} from 'path'; const path = makePath(`${name}`, 'file');",
@@ -789,6 +790,15 @@ def test_proven_native_and_local_numeric_calls_retain_templates(
     "statement",
     [
         "RegExp.prototype.exec = executor; /x/.exec(text);",
+        "function mutate(x, f) { x['__pro' + 'to__']['e' + 'xec'] = f; } mutate(/x/, handler); /x/.exec(`${command}`);",
+        "mutate(/x/, handler); /x/.exec(`${command}`);",
+        "const NUMBER = /x/; mutate(NUMBER, handler); /x/.exec(`${command}`);",
+        "const NUMBER = /x/; const alias = NUMBER; /x/.exec(`${command}`);",
+        "const NUMBER = /x/; function use(NUMBER) { return NUMBER.test(value); } /x/.exec(`${command}`);",
+        "const NUMBER = /x/; NUMBER.test = handler; /x/.exec(`${command}`);",
+        "const NUMBER = /x/; const method = NUMBER.test; method(value); /x/.exec(`${command}`);",
+        "export const NUMBER = /x/; /x/.exec(`${command}`);",
+
         "import {join as eval} from 'node:path'; eval(`${command}`);",
         "import {join as Function} from 'node:path'; Function(`${command}`);",
         "const prototype = RegExp.prototype; prototype[key] = executor; /x/.exec(text);",

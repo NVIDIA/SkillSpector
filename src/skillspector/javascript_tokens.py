@@ -1646,6 +1646,7 @@ def _ordinary_native_calls(
     references: dict[str, list[Node]] = {}
     path_bindings: dict[str, tuple[Node, bool]] = {}
     regex_calls: list[Node] = []
+    regex_bindings: dict[str, Node] = {}
     intrinsic_override = False
     path_unproven = False
     path_imports = 0
@@ -1710,14 +1711,33 @@ def _ordinary_native_calls(
                 member is not None
                 and member.type == "member_expression"
                 and member.child_by_field_name("object") == node
-                and _callable_member(program, member) == "exec"
+                and _callable_member(program, member) in {"exec", "test"}
                 and call is not None
                 and call.type == "call_expression"
                 and call.child_by_field_name("function") == member
+                and call.child_by_field_name("arguments") is not None
+                and call.child_by_field_name("arguments").type != "template_string"
             ):
-                regex_calls.append(member)
-            elif member is None or member.type not in {"arguments", "member_expression"}:
-                # A stored/returned literal could expose its prototype indirectly.
+                if _callable_member(program, member) == "exec":
+                    regex_calls.append(member)
+            elif member is not None and member.type == "variable_declarator":
+                binding = member.child_by_field_name("name")
+                declaration = member.parent
+                if (
+                    binding is not None
+                    and binding.type == "identifier"
+                    and member.child_by_field_name("value") == node
+                    and declaration is not None
+                    and declaration.type == "lexical_declaration"
+                    and declaration.children[0].type == "const"
+                    and declaration.parent is not None
+                    and declaration.parent.type in {"program", "statement_block"}
+                ):
+                    regex_bindings[program.text(binding)] = binding
+                else:
+                    intrinsic_override = True
+            else:
+                # Even an argument can expose the shared RegExp prototype.
                 intrinsic_override = True
         if node.type == "call_expression":
             callee = node.child_by_field_name("function")
@@ -1758,6 +1778,26 @@ def _ordinary_native_calls(
                     else:
                         path_unproven = True
             pending.extend(specifier.named_children)
+    for name, binding in regex_bindings.items():
+        for reference in references[name]:
+            check_runtime()
+            if reference == binding:
+                continue
+            member = reference.parent
+            call = None if member is None else member.parent
+            if not (
+                member is not None
+                and member.type == "member_expression"
+                and member.child_by_field_name("object") == reference
+                and _callable_member(program, member) == "test"
+                and call is not None
+                and call.type == "call_expression"
+                and call.child_by_field_name("function") == member
+                and call.child_by_field_name("arguments") is not None
+                and call.child_by_field_name("arguments").type != "template_string"
+            ):
+                intrinsic_override = True
+                break
     for reference in references.get("Object", ()):
         parent = reference.parent
         if (
