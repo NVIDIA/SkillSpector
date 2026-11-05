@@ -1580,3 +1580,34 @@ def test_literal_trap_proof_has_a_command_and_recursion_bound():
     assert tm._shell_redefines_command(
         "trap 'echo done' EXIT", lambda: None, "xargs", _handler_depth=8
     )
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        '`xargs <<< "$CODE"\n`',
+        '$(xargs <<< "$CODE"\n)',
+        '$(printf "%s" "`xargs <<< \"$CODE\"\n`")',
+        'eval \'xargs <<< "$CODE"\n\'',
+        'bash -c \'xargs <<< "$CODE"\n\'',
+    ],
+)
+@pytest.mark.parametrize(
+    "binding",
+    [
+        'xargs() { bash; }',
+        'alias xargs=bash',
+        'PATH=/tmp/controlled',
+        'hash -p /bin/bash xargs',
+        'eval "$SETUP"',
+        'source setup.sh',
+    ],
+)
+def test_nested_xargs_keeps_enclosing_binding_uncertainty(expression, binding):
+    source = binding + "\n" + expression + "\n"
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("expression", ['`xargs <<< "$VALUE"\n`', '$(xargs <<< "$VALUE"\n)'])
+def test_unmodified_nested_xargs_still_proves_printed_data(expression):
+    assert not tm.has_bounded_parse_exhaustion(expression, lambda: None, file_type="shell")
