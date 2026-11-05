@@ -3910,9 +3910,7 @@ def _shell_command_strings(
         startup_diagnostics = []
     substitution_scopes: list[int] = []
     backtick_starts: set[int] = set()
-    scoped_startup: list[
-        tuple[int, list[bool], list[StaticParserDiagnostic], int, str]
-    ] = []
+    scoped_startup: list[tuple[int, list[bool], list[StaticParserDiagnostic], int, str]] = []
     startup_work_limit = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
     startup_work = [startup_work_limit]
     xargs_override_cache: list[bool | None] = [None]

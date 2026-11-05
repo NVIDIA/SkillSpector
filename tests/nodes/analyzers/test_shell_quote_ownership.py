@@ -1587,20 +1587,20 @@ def test_literal_trap_proof_has_a_command_and_recursion_bound():
     [
         '`xargs <<< "$CODE"\n`',
         '$(xargs <<< "$CODE"\n)',
-        '$(printf "%s" "`xargs <<< \"$CODE\"\n`")',
-        'eval \'xargs <<< "$CODE"\n\'',
-        'bash -c \'xargs <<< "$CODE"\n\'',
+        '$(printf "%s" "`xargs <<< "$CODE"\n`")',
+        "eval 'xargs <<< \"$CODE\"\n'",
+        "bash -c 'xargs <<< \"$CODE\"\n'",
     ],
 )
 @pytest.mark.parametrize(
     "binding",
     [
-        'xargs() { bash; }',
-        'alias xargs=bash',
-        'PATH=/tmp/controlled',
-        'hash -p /bin/bash xargs',
+        "xargs() { bash; }",
+        "alias xargs=bash",
+        "PATH=/tmp/controlled",
+        "hash -p /bin/bash xargs",
         'eval "$SETUP"',
-        'source setup.sh',
+        "source setup.sh",
     ],
 )
 def test_nested_xargs_keeps_enclosing_binding_uncertainty(expression, binding):
