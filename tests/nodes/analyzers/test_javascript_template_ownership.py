@@ -884,7 +884,6 @@ def test_quoted_backtick_values_cannot_consume_later_host_code(newline: str) -> 
         "exec(`${tool} -rf /`);",
         "new Function(`${code}`);",
         "import {exec} from 'node:child_process'; exec(`${command}`);",
-        "const other = ['`$TOOL -rf /`'];",
     ],
 )
 def test_completed_quoted_value_never_clears_later_runtime_uncertainty(suffix: str) -> None:
@@ -985,12 +984,17 @@ def test_quoted_refinement_preserves_established_indirect_runtime_diagnostics(
     assert after == before
 
 
-def test_quoted_refinement_continues_to_later_overbudget_ordinary_string() -> None:
-    prefix = "const values = ['`name` before', '`name` after'];\n"
-    source = prefix + "const other = '$(" + ("a" * 5000) + "';\n"
-    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
-    assert diagnostic is not None
-    assert diagnostic.start >= len(prefix)
+@pytest.mark.parametrize("value", ["`$TOOL -rf /`", "$(" + "a" * 5000])
+def test_ordinary_quoted_data_keeps_its_existing_complete_result(value, monkeypatch) -> None:
+    source = "const values = ['`name` before', '`name` after'];\nconst other = '" + value + "';"
+    with monkeypatch.context() as baseline:
+        baseline.setattr(
+            tm._JavaScriptTemplateOwnership, "quoted_string_is_complete", lambda *args: False
+        )
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    after = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is None
+    assert after is None
 
 
 def test_plain_quoted_files_keep_no_backtick_fast_path(monkeypatch) -> None:
@@ -1006,3 +1010,53 @@ def test_plain_quoted_files_keep_no_backtick_fast_path(monkeypatch) -> None:
         is None
     )
     assert quoted == []
+
+
+_JS_REGEX_BOUNDARY_SOURCE = (
+    "const captured = text.match(/read `([^`]+policy\\.md)` before review/);\n"
+    "for (const row of [['label', '`render_proof` passed']]) { inspect(row); }\n"
+)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_native_regex_origin_does_not_borrow_a_later_string_boundary(newline, monkeypatch):
+    source = _JS_REGEX_BOUNDARY_SOURCE.replace("\n", newline)
+    with monkeypatch.context() as baseline:
+        baseline.setattr(
+            tm._JavaScriptTemplateOwnership, "quoted_string_is_complete", lambda *args: False
+        )
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is not None
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "eval(/read `([^`]+policy\\.md)` before review/);",
+        "new Function(/read `([^`]+policy\\.md)` before review/);",
+        "launch(/read `([^`]+policy\\.md)` before review/);",
+        "const rule = /read `([^`]+policy\\.md)` before review/; eval(rule.source);",
+        "const rule = /read `([^`]+policy\\.md)` before review/; eval(rule['source']);",
+    ],
+)
+def test_regex_runtime_consumers_do_not_receive_native_pattern_boundaries(source):
+    regexes = []
+    javascript_template_spans(source, lambda: None, regex_literals=regexes)
+    assert regexes == []
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+def test_regex_origin_keeps_later_executable_limits_and_raw_findings():
+    runtime = _JS_REGEX_BOUNDARY_SOURCE + "exec(`${tool} -rf /`);"
+    assert tm.has_bounded_parse_exhaustion(runtime, lambda: None, file_type="javascript")
+    high = _JS_REGEX_BOUNDARY_SOURCE + "exec('rm -rf /');"
+    assert any(f.rule_id == "TM1" for f in tm.analyze(high, "example.mjs", "javascript"))
+
+
+def test_regex_origin_keeps_later_overbudget_executable_word():
+    source = _JS_REGEX_BOUNDARY_SOURCE + "exec(`" + "a" * 5000 + "`);"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert diagnostic is not None
+    assert diagnostic.start >= len(_JS_REGEX_BOUNDARY_SOURCE)

@@ -3528,6 +3528,13 @@ def _has_shell_command_word_exhaustion(
             quoted_printf_allowed=quoted_printf_allowed,
             diagnostics=word_diagnostics,
         )
+        regex_end = (
+            javascript_source.regex_literal_end(start) if javascript_source is not None else None
+        )
+        if regex_end is not None and (parsed is None or parsed.limited or parsed.end > regex_end):
+            # RegExp backticks belong to matching syntax; a failed shell read
+            # cannot acquire ownership of later JavaScript through them.
+            continue
         if parsed is None:
             substitution_start = (
                 start + 1
@@ -5813,6 +5820,8 @@ class _JavaScriptTemplateOwnership:
         self._quoted_strings: list[tuple[int, int]] = []
         self._quoted_starts: list[int] = []
         self._quoted_complete: dict[int, bool] = {}
+        self._regex_literals: list[tuple[int, int]] = []
+        self._regex_starts: list[int] = []
 
     def _owned_spans(self) -> JavaScriptTemplateSpans | None:
         if not self._spans_computed:
@@ -5821,7 +5830,9 @@ class _JavaScriptTemplateOwnership:
                 self._check_runtime,
                 unresolved_executables=self._unresolved_executables,
                 quoted_strings=self._quoted_strings,
+                regex_literals=self._regex_literals,
             )
+            self._regex_starts = [start for start, _ in self._regex_literals]
             self._quoted_starts = [start for start, _ in self._quoted_strings]
             self._spans_computed = True
         return self._spans
@@ -5838,6 +5849,16 @@ class _JavaScriptTemplateOwnership:
             len(self._content),
             ParserUncheckedScope.REMAINING_INPUT,
         )
+
+    def regex_literal_end(self, position: int) -> int | None:
+        """Bound a matching-language candidate by its complete native literal."""
+        self._owned_spans()
+        index = bisect_right(self._regex_starts, position) - 1
+        if index >= 0:
+            start, end = self._regex_literals[index]
+            if start <= position < end:
+                return end
+        return None
 
     def quoted_string_is_complete(self, position: int, check_value: Callable[[str], bool]) -> bool:
         """Refine one failed candidate only after checking its whole value."""

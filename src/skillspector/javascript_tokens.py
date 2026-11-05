@@ -1500,6 +1500,7 @@ def javascript_template_spans(
     *,
     unresolved_executables: list[int] | None = None,
     quoted_strings: list[tuple[int, int]] | None = None,
+    regex_literals: list[tuple[int, int]] | None = None,
 ) -> JavaScriptTemplateSpans | None:
     """Prove host delimiters while retaining unresolved executable templates.
 
@@ -1517,6 +1518,8 @@ def javascript_template_spans(
         return None
     if quoted_strings is not None:
         quoted_strings.extend(_plain_quoted_value_spans(program, check_runtime))
+    if regex_literals is not None:
+        regex_literals.extend(_plain_regex_value_spans(program, check_runtime))
     templates = [node for node in program.nodes if node.type == "template_string"]
     if not templates:
         return None
@@ -1607,6 +1610,81 @@ def _plain_quoted_value_spans(
             check_runtime()
             if parent.type in extensions:
                 break
+            parent = parent.parent
+        else:
+            spans.append((start, end))
+    return spans
+
+
+def _plain_regex_value_spans(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> list[tuple[int, int]]:
+    """Keep native matching syntax separate from executable string consumers."""
+    for node in program.nodes:
+        check_runtime()
+        property_node = node.child_by_field_name("property") or node.child_by_field_name("index")
+        if node.type in {"member_expression", "subscript_expression"} and (
+            _callable_member(program, node) == "source"
+            or property_node is not None
+            and "\\" in program.text(property_node)
+        ):
+            # Source extraction needs a separate use proof before a pattern
+            # can stop lending boundaries to executable text.
+            return []
+    matching = {"match", "matchAll", "search", "split", "replace", "replaceAll", "test", "exec"}
+    boundaries = {
+        "program",
+        "expression_statement",
+        "return_statement",
+        "variable_declarator",
+        "for_in_statement",
+    }
+    spans: list[tuple[int, int]] = []
+    for node in program.nodes:
+        check_runtime()
+        if node.type != "regex":
+            continue
+        pattern = node.child_by_field_name("pattern")
+        flags = node.child_by_field_name("flags")
+        flag_text = program.text(flags) if flags is not None else ""
+        if (
+            pattern is None
+            or len(set(flag_text)) != len(flag_text)
+            or set(flag_text) - set("dgimsuvy")
+            or {"u", "v"} <= set(flag_text)
+        ):
+            continue
+        start, end = program.span(node)
+        pattern_end = program.span(pattern)[1]
+        if (
+            program.content[start : start + 1] != "/"
+            or program.content[pattern_end : pattern_end + 1] != "/"
+        ):
+            continue
+        parent = node.parent
+        while parent is not None and parent.type not in boundaries:
+            check_runtime()
+            if parent.type in {
+                "binary_expression",
+                "augmented_assignment_expression",
+                "new_expression",
+                "template_substitution",
+                "export_statement",
+            }:
+                break
+            if (
+                parent.type in {"member_expression", "subscript_expression"}
+                and _callable_member(program, parent) not in matching
+            ):
+                break
+            if parent.type == "call_expression":
+                callee = parent.child_by_field_name("function")
+                if (
+                    callee is None
+                    or callee.type != "member_expression"
+                    or _callable_member(program, callee) not in matching
+                ):
+                    break
             parent = parent.parent
         else:
             spans.append((start, end))
