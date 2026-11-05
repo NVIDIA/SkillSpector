@@ -66,6 +66,7 @@ def semgrep_rule_scalar_roles(
     if not isinstance(rules, SequenceNode) or not rules.value:
         return {}
     roles: dict[int, str] = {}
+    rule_ids: set[str] = set()
 
     def operator(name: str, value: Node) -> bool:
         check_runtime()
@@ -90,6 +91,9 @@ def semgrep_rule_scalar_roles(
             return {}
         if not all(_text(rule[key]) for key in ("id", "message", "severity")):
             return {}
+        if rule["id"].value in rule_ids:
+            return {}
+        rule_ids.add(rule["id"].value)
         if rule["severity"].value not in _SEVERITIES:
             return {}
         languages = rule["languages"]

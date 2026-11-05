@@ -141,6 +141,12 @@ def test_unknown_nested_formula_does_not_own_pattern_named_metadata() -> None:
     assert _result(source)["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
 
 
+def test_duplicate_rule_ids_do_not_grant_document_ownership() -> None:
+    source = _rule("  pattern: ordinary\n")
+    source += _rule("  pattern: ordinary\n").removeprefix("rules:\n")
+    assert semgrep_rule_scalar_roles(source, lambda: None) == {}
+
+
 def test_recognized_nested_queries_are_owned_without_executing_them() -> None:
     source = _rule("""  patterns:
   - pattern-regex: '[\"`]?token'
