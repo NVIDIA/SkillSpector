@@ -61,8 +61,17 @@ def test_yaml_scalar_ownership_preserves_dangerous_literal_finding() -> None:
     assert any(f.rule_id == "TM1" for f in result["findings"])
 
 
-@pytest.mark.parametrize("command", ["$CMD -rf /", 'sh -c "$CMD -rf /"', 'eval "$CMD"'])
-@pytest.mark.parametrize("prefix", ["# Run ", "field: ordinary value # Run "])
+@pytest.mark.parametrize(
+    "command, prefix",
+    [
+        ("$CMD -rf /", "# Run "),
+        ("$CMD -rf /", "field: ordinary value # Run "),
+        ('sh -c "$CMD -rf /"', "# "),
+        ('sh -c "$CMD -rf /"', "field: ordinary value # "),
+        ('eval "$CMD"', "# "),
+        ('eval "$CMD"', "field: ordinary value # "),
+    ],
+)
 def test_yaml_comment_instructions_keep_runtime_inspection_incomplete(
     command: str, prefix: str
 ) -> None:
