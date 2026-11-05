@@ -777,7 +777,9 @@ def test_executor_member_reads_keep_existing_conservative_coverage(source: str) 
     ],
 )
 @pytest.mark.parametrize("suffix", ["", _PADDING], ids=["short", "padded"])
-def test_proven_native_and_local_numeric_calls_retain_templates(statement: str, suffix: str) -> None:
+def test_proven_native_and_local_numeric_calls_retain_templates(
+    statement: str, suffix: str
+) -> None:
     source = statement + " console.log(`Value: ${name}`);" + suffix
     assert javascript_template_spans(source, lambda: None) is not None
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
@@ -787,6 +789,8 @@ def test_proven_native_and_local_numeric_calls_retain_templates(statement: str, 
     "statement",
     [
         "RegExp.prototype.exec = executor; /x/.exec(text);",
+        "import {join as eval} from 'node:path'; eval(`${command}`);",
+        "import {join as Function} from 'node:path'; Function(`${command}`);",
         "const prototype = RegExp.prototype; prototype[key] = executor; /x/.exec(text);",
         "Object.getPrototypeOf(/x/)[key] = executor; /x/.exec(text);",
         "Object.defineProperty(Object.getPrototypeOf(/x/), key, {value: executor}); /x/.exec(text);",
@@ -822,7 +826,6 @@ def test_proven_native_and_local_numeric_calls_retain_templates(statement: str, 
         "import {posix as p} from 'node:path'; const other = await import('node:path'); other.posix.join = executor; p.join(`${command}`);",
         "import {join} from 'node:path'; const other = require('node:path'); other.join = executor; syncBuiltinESMExports(); join(`${command}`);",
         "import {posix} from 'node:path'; with (tools) { posix.join(`${command}`); }",
-
     ],
 )
 def test_unproved_native_or_local_callable_overrides_stay_partial(statement: str) -> None:
@@ -832,6 +835,10 @@ def test_unproved_native_or_local_callable_overrides_stay_partial(statement: str
 
 
 def test_known_native_callee_cannot_hide_security_findings() -> None:
-    source = "const match = /value/.exec(text); console.log(`Value: ${name}`); tool.exec(\"rm -rf /\");"
+    source = (
+        'const match = /value/.exec(text); console.log(`Value: ${name}`); tool.exec("rm -rf /");'
+    )
     assert javascript_template_spans(source, lambda: None) is None
-    assert any(finding.rule_id == "TM1" for finding in tm.analyze(source, "display.js", "javascript"))
+    assert any(
+        finding.rule_id == "TM1" for finding in tm.analyze(source, "display.js", "javascript")
+    )

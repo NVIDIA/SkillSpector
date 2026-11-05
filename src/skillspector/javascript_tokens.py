@@ -1617,10 +1617,20 @@ def _scalar_template_identifiers(
     return owned
 
 
-
 _PATH_FUNCTIONS = frozenset(
-    {"basename", "dirname", "extname", "format", "isAbsolute", "join", "normalize", "parse",
-     "relative", "resolve", "toNamespacedPath"}
+    {
+        "basename",
+        "dirname",
+        "extname",
+        "format",
+        "isAbsolute",
+        "join",
+        "normalize",
+        "parse",
+        "relative",
+        "resolve",
+        "toNamespacedPath",
+    }
 )
 
 
@@ -1640,14 +1650,28 @@ def _ordinary_native_calls(
     path_unproven = False
     path_imports = 0
     override_names = {
-        "RegExp", "Reflect", "constructor", "__proto__", "defineProperty", "defineProperties",
-        "getPrototypeOf", "setPrototypeOf", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors",
+        "RegExp",
+        "Reflect",
+        "constructor",
+        "__proto__",
+        "defineProperty",
+        "defineProperties",
+        "getPrototypeOf",
+        "setPrototypeOf",
+        "getOwnPropertyDescriptor",
+        "getOwnPropertyDescriptors",
+        "__defineGetter__",
+        "__defineSetter__",
     }
     for node in program.nodes:
         check_runtime()
         if node.type == "with_statement":
             return set(), set()
-        if node.type in {"identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern"}:
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
             references.setdefault(program.text(node), []).append(node)
         if node.type in {"identifier", "property_identifier", "string"}:
             spelling = program.text(node).strip("\"'")
@@ -1663,13 +1687,17 @@ def _ordinary_native_calls(
                 helper = None if method is None else method.parent
                 call = None if helper is None else helper.parent
                 if not (
-                    owner is not None and owner.type == "member_expression"
+                    owner is not None
+                    and owner.type == "member_expression"
                     and program.text(owner.child_by_field_name("object")) == "Object"
-                    and method is not None and method.type == "member_expression"
+                    and method is not None
+                    and method.type == "member_expression"
                     and _callable_member(program, method) == "hasOwnProperty"
-                    and helper is not None and helper.type == "member_expression"
+                    and helper is not None
+                    and helper.type == "member_expression"
                     and _callable_member(program, helper) == "call"
-                    and call is not None and call.type == "call_expression"
+                    and call is not None
+                    and call.type == "call_expression"
                     and call.child_by_field_name("function") == helper
                 ):
                     intrinsic_override = True
@@ -1679,10 +1707,12 @@ def _ordinary_native_calls(
             member = node.parent
             call = None if member is None else member.parent
             if (
-                member is not None and member.type == "member_expression"
+                member is not None
+                and member.type == "member_expression"
                 and member.child_by_field_name("object") == node
                 and _callable_member(program, member) == "exec"
-                and call is not None and call.type == "call_expression"
+                and call is not None
+                and call.type == "call_expression"
                 and call.child_by_field_name("function") == member
             ):
                 regex_calls.append(member)
@@ -1694,7 +1724,11 @@ def _ordinary_native_calls(
             arguments = node.child_by_field_name("arguments")
             if callee is not None and program.text(callee) in {"require", "import"}:
                 args = [] if arguments is None else arguments.named_children
-                if len(args) != 1 or args[0].type != "string" or program.text(args[0]).strip("\"'") in {"node:path", "path"}:
+                if (
+                    len(args) != 1
+                    or args[0].type != "string"
+                    or program.text(args[0]).strip("\"'") in {"node:path", "path"}
+                ):
                     path_unproven = True
         if node.type != "import_statement":
             continue
@@ -1703,7 +1737,9 @@ def _ordinary_native_calls(
             continue
         path_imports += 1
         for clause in node.named_children:
-            if clause.type == "import_clause" and any(child.type != "named_imports" for child in clause.named_children):
+            if clause.type == "import_clause" and any(
+                child.type != "named_imports" for child in clause.named_children
+            ):
                 path_unproven = True
         pending = list(node.named_children)
         while pending:
@@ -1714,6 +1750,9 @@ def _ordinary_native_calls(
                 binding = specifier.child_by_field_name("alias") or original
                 if original is not None and binding is not None:
                     name = program.text(original)
+                    if program.text(binding).casefold() in {"eval", "function"}:
+                        path_unproven = True
+                        continue
                     if name in _PATH_FUNCTIONS or name in {"posix", "win32"}:
                         path_bindings[program.text(binding)] = (binding, name in {"posix", "win32"})
                     else:
@@ -1721,7 +1760,11 @@ def _ordinary_native_calls(
             pending.extend(specifier.named_children)
     for reference in references.get("Object", ()):
         parent = reference.parent
-        if parent is None or parent.type != "member_expression" or parent.child_by_field_name("object") != reference:
+        if (
+            parent is None
+            or parent.type != "member_expression"
+            or parent.child_by_field_name("object") != reference
+        ):
             intrinsic_override = True
     owned: set[int] = set()
     native_calls: set[int] = set()
@@ -1741,18 +1784,18 @@ def _ordinary_native_calls(
             if reference == binding:
                 continue
             callee = reference.parent if namespace else reference
-            if (
-                namespace and (
-                    callee is None or callee.type != "member_expression"
-                    or callee.child_by_field_name("object") != reference
-                    or _callable_member(program, callee) not in _PATH_FUNCTIONS
-                )
+            if namespace and (
+                callee is None
+                or callee.type != "member_expression"
+                or callee.child_by_field_name("object") != reference
+                or _callable_member(program, callee) not in _PATH_FUNCTIONS
             ):
                 path_unproven = True
                 break
             call = None if callee is None else callee.parent
             if (
-                call is None or call.type != "call_expression"
+                call is None
+                or call.type != "call_expression"
                 or call.child_by_field_name("function") != callee
                 or call.child_by_field_name("arguments") is None
                 or call.child_by_field_name("arguments").type == "template_string"
@@ -1785,7 +1828,11 @@ def _numeric_local_identifiers(
         check_runtime()
         if node.type == "with_statement":
             return set()
-        if node.type in {"identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern"}:
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
             references.setdefault(program.text(node), []).append(node)
         if node.type != "variable_declarator":
             continue
@@ -1793,12 +1840,16 @@ def _numeric_local_identifiers(
         binding = node.child_by_field_name("name")
         function = node.child_by_field_name("value")
         if (
-            declaration is None or declaration.type != "lexical_declaration"
+            declaration is None
+            or declaration.type != "lexical_declaration"
             or declaration.children[0].type != "const"
-            or declaration.parent is None or declaration.parent.type not in {"program", "statement_block"}
-            or binding is None or binding.type != "identifier"
+            or declaration.parent is None
+            or declaration.parent.type not in {"program", "statement_block"}
+            or binding is None
+            or binding.type != "identifier"
             or program.text(binding).casefold() in {"eval", "function"}
-            or function is None or function.type != "arrow_function"
+            or function is None
+            or function.type != "arrow_function"
         ):
             continue
         parameters = function.child_by_field_name("parameters")
@@ -1823,7 +1874,21 @@ def _numeric_local_identifiers(
                     break
             elif expression.type in {"unary_expression", "binary_expression"}:
                 operator = expression.child_by_field_name("operator")
-                if operator is None or program.text(operator) not in {"+", "-", "*", "/", "%", "**", "~", "&", "|", "^", "<<", ">>", ">>>"}:
+                if operator is None or program.text(operator) not in {
+                    "+",
+                    "-",
+                    "*",
+                    "/",
+                    "%",
+                    "**",
+                    "~",
+                    "&",
+                    "|",
+                    "^",
+                    "<<",
+                    ">>",
+                    ">>>",
+                }:
                     break
             elif expression.type not in {"number", "parenthesized_expression"}:
                 break
@@ -1839,12 +1904,15 @@ def _numeric_local_identifiers(
             if budget < 0:
                 return set()
             check_runtime()
-            if reference == binding or not (scope.start_byte <= reference.start_byte < scope.end_byte):
+            if reference == binding or not (
+                scope.start_byte <= reference.start_byte < scope.end_byte
+            ):
                 continue
             call = reference.parent
             if (
                 reference.start_byte < declaration.end_byte
-                or call is None or call.type != "call_expression"
+                or call is None
+                or call.type != "call_expression"
                 or call.child_by_field_name("function") != reference
                 or call.child_by_field_name("arguments") is None
                 or call.child_by_field_name("arguments").type == "template_string"
@@ -1994,7 +2062,8 @@ def _has_shell_execution_call(
                 name = program.text(origin)
                 selected_names.add(name)
                 if (
-                    origin.id in callable_ids and name in uncertain_bindings
+                    origin.id in callable_ids
+                    and name in uncertain_bindings
                     and origin.id not in ordinary_identifiers
                 ):
                     return True
@@ -2006,7 +2075,8 @@ def _has_shell_execution_call(
             elif origin.type in {"member_expression", "subscript_expression"}:
                 member = _callable_member(program, origin)
                 if (
-                    member is not None and member.casefold() in _SHELL_EXECUTION_CALLS
+                    member is not None
+                    and member.casefold() in _SHELL_EXECUTION_CALLS
                     and origin.id not in native_members
                 ):
                     return True
