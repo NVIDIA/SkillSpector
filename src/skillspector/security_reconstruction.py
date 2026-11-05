@@ -850,6 +850,11 @@ def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) ->
                 elif len(run[0]) == len(opener[0]):
                     closers.update(range(offset + run.start(), offset + run.end()))
                     opener = None
+            if opener is not None:
+                # A code span can continue on another line. This helper proves
+                # same-line pairs only, so an unmatched run makes later quote
+                # state ambiguous and cannot grant more delimiter ownership.
+                return closers
         offset += len(line)
     return closers
 
