@@ -123,13 +123,17 @@ def test_explicit_marker_instructions_inside_literals_and_comments_remain_checke
     text: str,
 ) -> None:
     result = _scan(text, threats=True)
-    assert any(finding.rule_id == "TM1" and finding.severity == "HIGH" for finding in result["findings"])
+    assert any(
+        finding.rule_id == "TM1" and finding.severity == "HIGH" for finding in result["findings"]
+    )
 
 
 def test_raw_security_findings_survive_closing_delimiter_refinement() -> None:
     text = 'echo "cleanup: remove --temporary"\nrm -rf *\n' + _TAIL
     result = _scan(text, threats=True)
-    assert any(finding.rule_id == "TM1" and finding.severity == "HIGH" for finding in result["findings"])
+    assert any(
+        finding.rule_id == "TM1" and finding.severity == "HIGH" for finding in result["findings"]
+    )
 
 
 def test_shell_marker_refinement_does_not_complete_dynamic_execution() -> None:
