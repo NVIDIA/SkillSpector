@@ -352,6 +352,7 @@ def _refused_runtime_is_accounted(
     by_work: dict[tuple[str, str], list[Mapping[str, object]]] = {}
     refusals: set[tuple[str, str]] = set()
     refused_nodes: set[tuple[str, str]] = set()
+    required_analyzers = required_semantic_analyzer_ids(discovered_modules)
     for event in events:
         if not isinstance(event, Mapping):
             return False
@@ -374,7 +375,7 @@ def _refused_runtime_is_accounted(
             ):
                 return False
             analyzer = event.get("analyzer_id")
-            if not isinstance(analyzer, str) or not analyzer:
+            if not isinstance(analyzer, str) or analyzer not in required_analyzers:
                 return False
             refusals.add(key)
             refused_nodes.add((scope, analyzer))

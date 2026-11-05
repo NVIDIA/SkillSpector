@@ -315,6 +315,22 @@ def test_refusal_accounting_includes_new_required_analyzers() -> None:
     assert _runtime_event(state, discovered) is not None
 
 
+@pytest.mark.parametrize("analyzer", ["semantic_unregistered", "static_patterns_tool_misuse"])
+def test_refusal_cannot_promote_an_unrecognized_analyzer(analyzer: str) -> None:
+    state = _refused_semantic_state()
+    event = ledger_event(
+        analyzer_id=analyzer,
+        outcome=LedgerOutcome.SKIPPED,
+        phase="semantic",
+        path="rules.yaml",
+        reason=LedgerReason.LLM_RESPONSE_REFUSED,
+    )
+    state["inspection_ledger"].append(event)
+    state["analyzer_status_events"].append(analyzer_status_for_events(analyzer, [event]))
+    state["llm_call_log"].append({"node": analyzer, "ok": False, "error": None})
+    assert _runtime_event(state) is not None
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
