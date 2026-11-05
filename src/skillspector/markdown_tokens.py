@@ -83,17 +83,17 @@ def _quoted_list_spans(content: str) -> QuotedListSpans | None:
             else:
                 captured: list[tuple[int, int, int]] = []
 
-                def record_backtick(state, silent):
+                def record_backtick(state, silent, source=block.content, spans=captured):
                     begin = state.pos
                     previous = len(state.tokens)
                     result = backtick(state, silent)
                     if (
                         not silent
-                        and state.src == block.content
+                        and state.src == source
                         and len(state.tokens) > previous
                         and state.tokens[-1].type == "code_inline"
                     ):
-                        captured.append((begin, state.pos, len(state.tokens[-1].markup)))
+                        spans.append((begin, state.pos, len(state.tokens[-1].markup)))
                     return result
 
                 # Observe the native rule; no rendering or external plugins run.
