@@ -5028,6 +5028,12 @@ def _command_string_from_clause(
                     "--max-args",
                     "--max-procs",
                     "--max-chars",
+                    "-n",
+                    "-L",
+                    "-P",
+                    "-s",
+                    "-R",
+                    "-S",
                 }:
                     operand, limited = next_word()
                     if limited or operand is None:
@@ -5035,6 +5041,28 @@ def _command_string_from_clause(
                             ParserCause.BOUNDARY_UNRESOLVED, ParserCheck.COMMAND_WORD_BOUNDARY
                         )
                     continue
+                if command == "xargs":
+                    if (
+                        option in {
+                            "--null",
+                            "--no-run-if-empty",
+                            "--verbose",
+                            "--interactive",
+                            "--exit",
+                            "--open-tty",
+                            "--max-lines",
+                            "--eof",
+                        }
+                        or re.fullmatch(r"-(?:[0rtpox]+|[nLPRsS][0-9]+|[adE].+)", option)
+                        or re.fullmatch(
+                            r"--(?:arg-file|delimiter|max-args|max-procs|max-chars|max-lines|eof)=.+",
+                            option,
+                        )
+                    ):
+                        continue
+                    # In particular, combined argument-taking flags can hide
+                    # a replacement option. Unknown forms grant no proof.
+                    return failed()
                 # Unlike nice/xargs, sudo's -n is a flag, not an operand option.
                 if command == "sudo" and option == "-n":
                     continue

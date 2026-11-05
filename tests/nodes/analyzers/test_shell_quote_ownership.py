@@ -235,6 +235,20 @@ def test_xargs_second_separator_is_a_literal_utility_name() -> None:
     assert tm._command_string_from_clause(source, 0, lambda: None) == (False, None)
 
 
+@pytest.mark.parametrize("options", ["-0I{}", "-tI{}", "-0i{}", "-0J{}", "-0n1", "--future-option"])
+def test_unproved_combined_xargs_options_cannot_hide_runtime_replacement(options: str) -> None:
+    source = f'xargs {options} <<< "$CMD" sh -c "{{}}")'
+
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, None)
+
+
+@pytest.mark.parametrize("options", ["-0rt", "--null", "--no-run-if-empty", "-n2", "--max-args=2"])
+def test_proven_xargs_options_keep_the_explicit_command_visible(options: str) -> None:
+    source = f'xargs {options} <<< "$VALUES" sh -c "printf done")'
+
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, "printf done")
+
+
 @pytest.mark.parametrize("continuation", ["\\\n", "\\\r\n"])
 def test_xargs_continued_gap_checks_the_runtime_deadline(continuation: str) -> None:
     source = "xargs  " + continuation * 12000 + '<<< "$VALUES")'
