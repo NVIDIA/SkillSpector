@@ -3690,6 +3690,23 @@ def _has_shell_command_word_exhaustion(
                 # spans and runtime-selected operands keep their existing
                 # conservative treatment.
                 continue
+            if python_word_source is not None and ownership_boundary < parsed.end:
+                # A raw shell word may pair Python delimiters across unrelated
+                # tokens. Recheck only the complete value the native owner proves.
+                value_source_range: list[int] = []
+                value = python_word_source.string_value(
+                    start, parsed.end, source_range=value_source_range
+                )
+                if value is not None:
+                    value_diagnostic = _has_shell_command_word_exhaustion(
+                        value[0],
+                        check_runtime,
+                        _command_string_depth=_command_string_depth,
+                        _quoted_printf_allowed=quoted_printf_allowed,
+                    )
+                    if value_diagnostic is not None:
+                        return value_diagnostic.enclosed(*value_source_range)
+                    continue
             if not _quoted_candidate_is_complete(
                 content, start, quote_limits, check_runtime, quoted_printf_allowed
             ):
