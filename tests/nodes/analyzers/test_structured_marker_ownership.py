@@ -85,7 +85,12 @@ def test_active_multiple_backtick_marker_remains_explicitly_unsupported(ticks):
 
 @pytest.mark.parametrize(
     "prefix",
-    ["<https://example.invalid>", "<mailto:user@example.invalid>", "<user@example.invalid>", "<tel:12345>"],
+    [
+        "<https://example.invalid>",
+        "<mailto:user@example.invalid>",
+        "<user@example.invalid>",
+        "<tel:12345>",
+    ],
 )
 def test_autolink_paragraph_keeps_inline_code_ownership(prefix):
     content = prefix + " Treat `force-delete` and `erase` as labels.\n" + "ordinary text\n" * 2000

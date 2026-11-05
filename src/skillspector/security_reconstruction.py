@@ -768,7 +768,9 @@ def _markdown_html_block(raw: str) -> tuple[bool, re.Pattern[str] | None]:
     name = _HTML_MARKDOWN_TAG_NAME_RE.match(raw)
     if name is not None and name[1].lower() not in {"script", "pre", "style", "textarea"}:
         complete = raw.rstrip(" \t")
-        if _HTML_START_TAG_RE.fullmatch(complete) or _HTML_MARKDOWN_CLOSE_TAG_RE.fullmatch(complete):
+        if _HTML_START_TAG_RE.fullmatch(complete) or _HTML_MARKDOWN_CLOSE_TAG_RE.fullmatch(
+            complete
+        ):
             return True, None
     return False, None
 
@@ -1070,11 +1072,15 @@ def _quoted_directives(
         unsupported = unsupported_header or len(quote) > 1
         while cursor < marker_end_limit:
             character = text[cursor]
-            if cursor + len(quote) <= marker_end_limit and text.startswith(quote, cursor) and (
-                len(quote) == 1
-                or (
-                    (cursor == marker_start or text[cursor - 1] != "`")
-                    and text[cursor + len(quote) : cursor + len(quote) + 1] != "`"
+            if (
+                cursor + len(quote) <= marker_end_limit
+                and text.startswith(quote, cursor)
+                and (
+                    len(quote) == 1
+                    or (
+                        (cursor == marker_start or text[cursor - 1] != "`")
+                        and text[cursor + len(quote) : cursor + len(quote) + 1] != "`"
+                    )
                 )
             ):
                 if cursor > marker_start:
