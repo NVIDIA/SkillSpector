@@ -1508,13 +1508,11 @@ def javascript_template_spans(
     command templates retain the ordinary bounded shell inspection instead of
     gaining a delimiter exemption. Raw finding checks always keep the source.
     """
-    if "`" not in content and (
-        quoted_strings is None or not any(quote in content for quote in "\"'")
-    ):
+    if "`" not in content:
         return None
     program = parse_javascript_source(content, check_runtime)
     if program is None:
-        if unresolved_executables is not None and "`" in content:
+        if unresolved_executables is not None:
             unresolved_executables.append(content.index("`"))
         return None
     if quoted_strings is not None:

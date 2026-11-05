@@ -959,3 +959,50 @@ def test_interrupted_quoted_body_check_is_not_cached() -> None:
     with pytest.raises(TimeoutError, match="cancelled"):
         owner.quoted_string_is_complete(position, cancelled)
     assert owner.quoted_string_is_complete(position, lambda value: True)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "const value = '`name`'; eval(`${value}${payload}`);",
+        "let value = '`name`'; value += `${payload}`; Function(value)();",
+        "const values = ['`name`']; eval(`${values[0]}${payload}`);",
+        "import {exec as launch} from 'node:child_process'; "
+        "const value = '`name`'; launch(`${value}${payload}`);",
+    ],
+)
+def test_quoted_refinement_preserves_established_indirect_runtime_diagnostics(
+    source: str, monkeypatch
+) -> None:
+    with monkeypatch.context() as baseline:
+        baseline.setattr(
+            tm._JavaScriptTemplateOwnership, "quoted_string_is_complete", lambda *args: False
+        )
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    after = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is not None
+    assert before.cause is tm.ParserCause.RUNTIME_DEPENDENT
+    assert after == before
+
+
+def test_quoted_refinement_continues_to_later_overbudget_ordinary_string() -> None:
+    prefix = "const values = ['`name` before', '`name` after'];\n"
+    source = prefix + "const other = '$(" + ("a" * 5000) + "';\n"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert diagnostic is not None
+    assert diagnostic.start >= len(prefix)
+
+
+def test_plain_quoted_files_keep_no_backtick_fast_path(monkeypatch) -> None:
+    from skillspector import javascript_tokens
+
+    def must_not_parse(*args):
+        raise AssertionError("no-backtick source should not require a native parse")
+
+    monkeypatch.setattr(javascript_tokens, "parse_javascript_source", must_not_parse)
+    quoted: list[tuple[int, int]] = []
+    assert (
+        javascript_template_spans("const label = 'ordinary';", lambda: None, quoted_strings=quoted)
+        is None
+    )
+    assert quoted == []
