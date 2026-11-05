@@ -775,18 +775,25 @@ def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) ->
     closers: set[int] = set()
     fence: tuple[str, int, tuple[tuple[str, int], ...], int] | None = None
     html_end: re.Pattern[str] | None = None
+    html_context: tuple[tuple[str, int], ...] = ()
+    html_last_quote = -1
     in_html = False
     offset = 0
     for line in content.splitlines(keepends=True):
         check_runtime()
         body, context = _json_fence_prefix(line.rstrip("\r\n"), check_runtime)
         if in_html:
-            if (html_end is None and not body.strip()) or (
-                html_end is not None and html_end.search(body) is not None
-            ):
-                in_html = False
-            offset += len(line)
-            continue
+            html_body = _json_fence_body(
+                line, html_context, check_runtime, last_quote_index=html_last_quote
+            )
+            if html_body is not None:
+                if (html_end is None and not html_body.strip()) or (
+                    html_end is not None and html_end.search(html_body) is not None
+                ):
+                    in_html = False
+                offset += len(line)
+                continue
+            in_html = False
         if fence is not None:
             fenced_body = _json_fence_body(line, fence[2], check_runtime, last_quote_index=fence[3])
             if fenced_body is not None:
@@ -813,6 +820,10 @@ def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) ->
                 html_end = re.compile(">")
             else:
                 html_end = None
+            html_context = context
+            html_last_quote = max(
+                (i for i, entry in enumerate(context) if entry[0] == "quote"), default=-1
+            )
             in_html = html_end is None or html_end.search(raw) is None
             offset += len(line)
             continue
