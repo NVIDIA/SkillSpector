@@ -51,6 +51,7 @@ from skillspector.inspection_ledger import (
 from skillspector.javascript_tokens import JavaScriptTemplateSpans, assertion_template_shell_text
 from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
 from skillspector.logging_config import get_logger
+from skillspector.markdown_tokens import quoted_list_spans
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.powershell_tokens import PowerShellSource, PowerShellString, powershell_source
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
@@ -8658,21 +8659,53 @@ def _markdown_shell_text(
         offset += len(line)
     mask_inline_delimiters()
     projected = "".join(output)
-    if prose_apostrophes:
+    quoted_code: dict[int, tuple[int, int, int]] = {}
+    if complete_context and (quoted := quoted_list_spans(content, check_runtime)) is not None:
+        quoted_code = {start: (body, close, end) for start, body, close, end in quoted.code}
+        if word_apostrophes:
+            code_starts = sorted(quoted_code)
+            for start, end in quoted.lines:
+                check_runtime()
+                line_start = content.rfind("\n", 0, start) + 1
+                if line_start and content[max(0, line_start - 3) : line_start].rstrip(
+                    "\r\n"
+                ).endswith("\\"):
+                    continue
+                line = list(projected[start:end])
+                for index in range(bisect_left(code_starts, start), bisect_left(code_starts, end)):
+                    opening = code_starts[index]
+                    body, close, finish = quoted_code[opening]
+                    line[opening - start : body - start] = " " * (body - opening)
+                    line[close - start : finish - start] = " " * (finish - close)
+                prose = "".join(line)
+                if "'" in prose and _MARKDOWN_PROSE_EXPANSION_RE.search(prose) is None:
+                    apostrophes = [
+                        start + word.start("apostrophe")
+                        for word in _MARKDOWN_WORD_APOSTROPHE_RE.finditer(prose)
+                    ]
+                    if len(apostrophes) == prose.count("'"):
+                        prose_apostrophes.update(apostrophes)
+    if prose_apostrophes or quoted_code:
         # A prose-looking line can still be inside an earlier shell word, such
         # as a multiline bash -c string. Reuse the shell parser to preserve that
         # ownership before masking any apostrophe. Unresolved words retain all
         # remaining bytes; this pass never grants ownership past a parse limit.
         cursor = 0
         next_runtime_check = 0
-        last_apostrophe = max(prose_apostrophes)
+        last_candidate = max(prose_apostrophes | quoted_code.keys())
         parameter_ends: dict[int, _ParameterExpansionEnd] = {}
         substitution_ends: dict[int, int | None] = {}
         backtick_ends: dict[int, int | None] = {}
-        while cursor <= last_apostrophe:
+        while cursor <= last_candidate:
             if cursor >= next_runtime_check:
                 check_runtime()
                 next_runtime_check = cursor + 4096
+            if cursor in quoted_code:
+                body, close, end = quoted_code[cursor]
+                output[cursor:body] = " " * (body - cursor)
+                output[close:end] = " " * (end - close)
+                cursor = end
+                continue
             if cursor in prose_apostrophes:
                 output[cursor] = " "
             elif projected[cursor] in "'\"`$\\":
