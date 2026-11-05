@@ -12,8 +12,8 @@ from bisect import bisect_right
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from io import StringIO
 from html.parser import HTMLParser
+from io import StringIO
 from typing import Final
 
 from skillspector.artifacts import SecurityTextView
