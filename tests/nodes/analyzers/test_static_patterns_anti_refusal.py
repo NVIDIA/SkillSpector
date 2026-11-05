@@ -199,6 +199,7 @@ class TestTaskJudgment:
             "Never judge accuracy from an empty sample.",
             "Don't judge this performance without a reference measurement.",
             "Measurements do not judge.",
+            "Measurements do not judge. Report any safety-relevant caveats.",
             "Results describe; they do not judge.",
             "- Logs record; these do not judge.",
         ],

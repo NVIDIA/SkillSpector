@@ -345,10 +345,10 @@ def _is_task_judgment(match_line: str, matched_text: str, start: int, end: int) 
     """Separate technical assessment scope from moral or safety judgment suppression."""
     if not _AR2_JUDGE_ONLY_PATTERN.fullmatch(matched_text):
         return False
-    match_clause, _, _ = _match_clause(match_line, start, end)
+    match_clause, _, clause_match_end = _match_clause(match_line, start, end)
     if _AR2_SAFETY_JUDGMENT_PATTERN.search(match_clause):
         return False
-    suffix = match_line[end:]
+    suffix = match_clause[clause_match_end:]
     if _AR2_TASK_JUDGMENT_OBJECT_PATTERN.match(suffix):
         return True
     return bool(
