@@ -41,6 +41,18 @@ def test_ordinary_markdown_code_pattern_policy_is_unchanged():
     )
 
 
+@pytest.mark.parametrize("path", ["rules/local.mdc", "rules/local.MDC", "bundle.zip!/rule.mdc"])
+def test_markdown_mdc_runner_preserves_encoded_execution(path):
+    content = "# Local rule\n\n```javascript\neval(atob('aGVsbG8='));\n```\n"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: content}}, [sc]
+    )
+    assert any(
+        finding.rule_id == "SC3" and finding.location.file == path
+        for finding in result["findings"]
+    )
+
+
 @pytest.mark.parametrize("path", ["rules/local.mdc", "rules/local.MDC"])
 def test_mdc_python_source_precedence_keeps_encoded_execution_finding(path):
     content = "#!/usr/bin/env python3\nimport base64\nexec(base64.b64decode('aGVsbG8='))\n"
