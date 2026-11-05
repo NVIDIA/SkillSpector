@@ -9,7 +9,7 @@ they are not a separate scanner or a provider-free execution path.
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 import click
 import typer
@@ -38,6 +38,12 @@ class _LazyCommandGroup(TyperGroup):
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
         self._load_commands()
         return super().get_command(ctx, cmd_name)
+
+    def main(self, *args: Any, **kwargs: Any) -> Any:
+        # On Windows, Click expands globs, ~ and environment variables in sys.argv by
+        # default, turning a quoted --exclude 'tests/*' into the matching file names.
+        kwargs.setdefault("windows_expand_args", False)
+        return super().main(*args, **kwargs)
 
 
 def version_callback(value: bool) -> None:
