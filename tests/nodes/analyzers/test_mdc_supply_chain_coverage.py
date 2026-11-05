@@ -11,7 +11,9 @@ from skillspector.nodes.analyzers import static_patterns_supply_chain as sc
 from skillspector.nodes.analyzers import static_runner
 
 
-@pytest.mark.parametrize("path", ["rules/local.mdc", "rules/local.MDC", "bundle.zip!/rules/local.mdc"])
+@pytest.mark.parametrize(
+    "path", ["rules/local.mdc", "rules/local.MDC", "bundle.zip!/rules/local.mdc"]
+)
 @pytest.mark.parametrize("fenced", [False, True])
 @pytest.mark.parametrize(
     "payload",
@@ -33,7 +35,9 @@ def test_mdc_encoded_execution_keeps_existing_sc3(path, fenced, payload):
 def test_ordinary_markdown_code_pattern_policy_is_unchanged():
     assert not any(
         finding.rule_id == "SC3"
-        for finding in sc.analyze("```javascript\neval(atob('aGVsbG8='));\n```\n", "guide.md", "markdown")
+        for finding in sc.analyze(
+            "```javascript\neval(atob('aGVsbG8='));\n```\n", "guide.md", "markdown"
+        )
     )
 
 
@@ -56,4 +60,6 @@ def test_benign_mdc_remains_without_encoded_execution_warning(fenced):
     content = "print('local example')\n"
     if fenced:
         content = "```python\n" + content + "```\n"
-    assert not any(finding.rule_id == "SC3" for finding in sc.analyze(content, "rule.mdc", "markdown"))
+    assert not any(
+        finding.rule_id == "SC3" for finding in sc.analyze(content, "rule.mdc", "markdown")
+    )
