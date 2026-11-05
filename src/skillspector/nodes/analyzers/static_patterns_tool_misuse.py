@@ -4076,6 +4076,8 @@ def _shell_clause_sets_startup(
     diagnostics: list[StaticParserDiagnostic] | None = None,
     *,
     work_limit: int | None = None,
+    variable_names: tuple[str, ...] = ("BASH_ENV", "ENV"),
+    allow_empty: bool = True,
 ) -> bool:
     """Find explicit startup settings in bounded command-prefix syntax."""
     source = content[start : start + _ROOT_GLOB_COMMAND_CHARS + 1]
@@ -4088,6 +4090,11 @@ def _shell_clause_sets_startup(
     printf_options = True
     setting_namerefs = False
     word_diagnostics: list[StaticParserDiagnostic] = []
+    variable_pattern = (
+        "BASH_ENV|ENV"
+        if variable_names == ("BASH_ENV", "ENV")
+        else "|".join(re.escape(name) for name in variable_names)
+    )
 
     def uncertain(
         cause: ParserCause = ParserCause.RUNTIME_DEPENDENT,
@@ -4111,7 +4118,7 @@ def _shell_clause_sets_startup(
     def startup_target(word: str) -> bool:
         # A setter can modify an already exported variable even without a
         # preceding export in this source. Dynamic destinations remain unknown.
-        return bool(re.fullmatch(r"(?:BASH_ENV|ENV)(?:\[.*\])?", word, re.DOTALL)) or any(
+        return bool(re.fullmatch(rf"(?:{variable_pattern})(?:\[.*\])?", word, re.DOTALL)) or any(
             marker in word
             for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
         )
@@ -4234,11 +4241,11 @@ def _shell_clause_sets_startup(
             if not read_array and startup_target(word):
                 return uncertain()
             continue
-        assignment = re.fullmatch(r"(BASH_ENV|ENV)(\+?=)(.*)", word, re.DOTALL)
+        assignment = re.fullmatch(rf"({variable_pattern})(\+?=)(.*)", word, re.DOTALL)
         if assignment is not None and (
             mode in {"env", "setting"} or _SHELL_ASSIGNMENT_PREFIX_RE.match(source, word_start)
         ):
-            if assignment[2] == "+=" or assignment[3]:
+            if assignment[2] == "+=" or assignment[3] or not allow_empty:
                 return uncertain()
             continue
         if mode == "setting":
@@ -4302,9 +4309,12 @@ def _shell_redefines_command(
     command: str = "printf",
     *,
     shell_substitutions: bool = False,
+    _handler_commands: set[str] | None = None,
+    _handler_depth: int = 0,
 ) -> bool:
     """Do not widen builtin evaluation across an explicit local replacement."""
     work = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
+    setting_work = [work]
     for start in _nonempty_shell_clause_starts(
         content,
         check_runtime,
@@ -4312,6 +4322,15 @@ def _shell_redefines_command(
         backtick_starts=set() if shell_substitutions else None,
     ):
         check_runtime()
+        if command == "xargs" and _shell_clause_sets_startup(
+            content,
+            start,
+            check_runtime,
+            setting_work,
+            variable_names=("PATH",),
+            allow_empty=False,
+        ):
+            return True
         source = content[start : start + _ROOT_GLOB_COMMAND_CHARS + 1]
         cursor = 0
         wrapper: str | None = None
@@ -4331,6 +4350,8 @@ def _shell_redefines_command(
             cursor = end
             if work < 0 or limited or cursor > _ROOT_GLOB_COMMAND_CHARS:
                 return True
+            if command == "xargs" and re.fullmatch(r"PATH(?:\+)?=.*", word or "", re.DOTALL):
+                return True
             if _SHELL_ASSIGNMENT_PREFIX_RE.match(source, word_start):
                 continue
             if wrapper is not None:
@@ -4344,11 +4365,56 @@ def _shell_redefines_command(
                 continue
             if word in _SHELL_CLAUSE_PREFIX_WORDS or word in {"if", "while", "until"}:
                 continue
+            if command == "xargs" and word == "hash":
+                return True
+            if command == "xargs" and word == "trap":
+                if _handler_depth >= 8:
+                    return True
+                span = [0, 0]
+                recognized, handler = _command_string_from_clause(
+                    source, 0, check_runtime, shell_traps=True, source_span=span
+                )
+                commands: set[str] = set()
+                if recognized:
+                    if handler is None:
+                        return True
+                    if _shell_redefines_command(
+                        handler,
+                        check_runtime,
+                        command,
+                        shell_substitutions=True,
+                        _handler_commands=commands,
+                        _handler_depth=_handler_depth + 1,
+                    ):
+                        return True
+                # Registration itself changes no utility binding. Check
+                # the handler's callees against the enclosing source too.
+                masked = content[:start] + (" " * span[1]) + content[start + span[1] :]
+                if any(
+                    _shell_redefines_command(masked, check_runtime, name)
+                    for name in commands | {"trap"}
+                ):
+                    return True
+                if _handler_commands is not None:
+                    _handler_commands.update(commands | {"trap"})
+                    if len(_handler_commands) > 8:
+                        return True
+                break
             if word in {"eval", "source", ".", "enable", "trap"}:
                 # Imported/evaluated code, handlers and builtin configuration
                 # can replace the command in this shell.
                 # Retain the earlier narrow decoder across those unknown effects.
                 return True
+            if _handler_commands is not None:
+                if word in {"alias", "function"} or any(
+                    marker in (word or "")
+                    for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+                ):
+                    return True
+                if word is not None:
+                    _handler_commands.add(word)
+                    if len(_handler_commands) > 8:
+                        return True
             if word == "function":
                 name, end, limited = _next_shell_invocation_word(source, cursor, check_runtime)
                 work -= end - cursor

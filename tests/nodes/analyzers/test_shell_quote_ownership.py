@@ -1512,3 +1512,71 @@ def test_xargs_binding_proof_includes_executable_substitutions(source):
 def test_xargs_binding_proof_stays_conservative_at_its_wrapper_bound():
     source = ("builtin " * 9) + "alias xargs=delegate\n"
     assert tm._xargs_has_source_override(source, lambda: None)
+
+
+@pytest.mark.parametrize(
+    "registration",
+    [
+        "trap 'rm -rf \"$WORK\"' EXIT",
+        "trap 'printf \"%s\" done' EXIT",
+        "trap 'echo ready; printf \"%s\" done' INT",
+        "trap - EXIT",
+        "builtin trap 'rm -rf \"$WORK\"' EXIT",
+    ],
+)
+def test_literal_binding_free_traps_preserve_redirected_xargs_data(registration):
+    source = registration + '\nxargs <<< "$VALUE"\n'
+    assert not tm._xargs_has_source_override(source, lambda: None)
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "registration",
+    [
+        'trap "$HANDLER" EXIT',
+        "trap 'eval \"$CODE\"' EXIT",
+        "trap 'alias xargs=bash' EXIT",
+        "trap '\"$COMMAND\"' EXIT",
+        "alias rm=eval\ntrap 'rm \"alias xargs=bash\"' EXIT",
+        "rm() { delegate; }\ntrap 'rm \"$WORK\"' EXIT",
+        "alias trap=eval\ntrap - EXIT",
+        "trap 'PATH=/tmp/controlled' EXIT",
+    ],
+)
+def test_unproven_handler_effects_and_callee_bindings_stay_incomplete(registration):
+    source = registration + '\nxargs <<< "$VALUE"\n'
+    assert tm._xargs_has_source_override(source, lambda: None)
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "PATH=/tmp/controlled",
+        "PATH=",
+        "export PATH=/tmp/controlled",
+        "export PATH=",
+        "declare -x PATH=/tmp/controlled",
+        "printf -v PATH '%s' /tmp/controlled",
+        "read -r PATH",
+        "declare -n pathref=PATH",
+        "hash -p /bin/bash xargs",
+        'hash -p "$TARGET" xargs',
+    ],
+)
+def test_external_lookup_changes_cannot_borrow_xargs_semantics(prefix):
+    source = prefix + '\nxargs <<< "$VALUE"\n'
+    assert tm._xargs_has_source_override(source, lambda: None)
+
+
+def test_literal_trap_ownership_preserves_raw_dangerous_findings():
+    source = "trap 'rm -rf /' EXIT\nxargs <<< \"$VALUE\"\n"
+    assert any(f.rule_id == "TM1" for f in tm.analyze(source, "control.sh", "shell"))
+
+
+def test_literal_trap_proof_has_a_command_and_recursion_bound():
+    body = "true; false; pwd; date; uname; ls; wc; id; whoami"
+    assert tm._xargs_has_source_override("trap '" + body + "' EXIT", lambda: None)
+    assert tm._shell_redefines_command(
+        "trap 'echo done' EXIT", lambda: None, "xargs", _handler_depth=8
+    )
