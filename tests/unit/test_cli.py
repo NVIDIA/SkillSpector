@@ -2424,12 +2424,14 @@ def test_scan_multi_skill_markdown_output_to_file(
 
     result1 = {
         "report_body": "# Report ALPHA for skill1",
+        "manifest": {"name": "ALPHA"},
         "risk_score": 10,
         "risk_severity": "LOW",
         "findings": [],
     }
     result2 = {
         "report_body": "# Report BETA for skill2",
+        "manifest": {"name": "BETA"},
         "risk_score": 10,
         "risk_severity": "LOW",
         "findings": [],
@@ -2985,11 +2987,11 @@ def test_recursive_oversized_failed_child_preserves_fatal_aggregate(
     assert "x" * 1_001 not in output.read_text(encoding="utf-8")
 
 
-def test_recursive_postscan_failure_counts_child_once_and_cleans_result(
+def test_recursive_collection_ignores_unused_legacy_render_fields_and_cleans_result(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A failure after scanning replaces, rather than duplicates, child accounting."""
+    """Unusable legacy render fields cannot turn completed analysis into failure."""
     skill = SkillDirectory(tmp_path / "one", "one", "one")
     output = tmp_path / "combined.json"
     child = _bounded_recursive_result("one", finding_count=0)
@@ -2999,22 +3001,20 @@ def test_recursive_postscan_failure_counts_child_once_and_cleans_result(
     monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: child)
     monkeypatch.setattr(cli, "cleanup_result", lambda result: cleaned.append(result))
 
-    with pytest.raises(typer.Exit) as exit_info:
-        cli._scan_multi_skill(
-            MultiSkillDetectionResult(is_multi_skill=True, skills=[skill]),
-            FormatChoice.json,
-            output,
-            no_llm=True,
-        )
+    cli._scan_multi_skill(
+        MultiSkillDetectionResult(is_multi_skill=True, skills=[skill]),
+        FormatChoice.json,
+        output,
+        no_llm=True,
+    )
 
-    assert exit_info.value.exit_code == 2
     payload = json.loads(output.read_text(encoding="utf-8"))
     completeness = payload["analysis_completeness"]
     assert payload["skill_count"] == 1
     assert payload["skills_scanned"] == 1
     assert payload["skills_output_omitted"] == 0
-    assert completeness["fully_inspected_files"] == 0
-    assert completeness["entirely_uninspected_files"] == 1
+    assert completeness["fully_inspected_files"] == 1
+    assert completeness["entirely_uninspected_files"] == 0
     assert completeness["total_files"] == 1
     assert sum(result is child for result in cleaned) == 1
 
@@ -3046,7 +3046,8 @@ def test_recursive_over_record_budget_child_preserves_risk_and_exit(
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["max_risk_score"] == 100
     assert payload["risk_recommendation"] == "DO_NOT_INSTALL"
-    assert payload["analysis_completeness"]["is_complete"] is False
+    assert payload["analysis_completeness"]["is_complete"] is True
+    assert payload["report_completeness"]["is_complete"] is False
     assert payload["skills_scanned"] == 1
     assert payload["skills_omitted"] == 0
     assert payload["skills_output_omitted"] == 1
@@ -3138,14 +3139,14 @@ def test_recursive_non_json_caps_preserve_aggregate_risk(
 
 @pytest.mark.parametrize(
     "limit_kind",
-    ["public_records", "child_report_characters"],
+    ["public_records", "prepared_payload"],
 )
 def test_recursive_sarif_retention_caps_keep_exact_reason_without_output_limit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     limit_kind: str,
 ) -> None:
-    """Pre-serialization retention caps are not mislabeled as output limits."""
+    """Retention omissions affect reports, never a fully inspected child's analysis."""
     skill = SkillDirectory(tmp_path / "one", "one", "one")
     output = tmp_path / "combined.sarif"
     child = _bounded_recursive_result(
@@ -3154,11 +3155,10 @@ def test_recursive_sarif_retention_caps_keep_exact_reason_without_output_limit(
     )
     if limit_kind == "public_records":
         monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_PUBLIC_RECORDS", 1)
-        expected = "recursive public finding record budget 1 reached"
+        expected = "recursive_finding_record_limit"
     else:
-        monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_REPORT_CHARACTERS", 2_000)
-        child["report_body"] = "x" * 2_001
-        expected = "recursive report character budget 2000 reached"
+        monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_PREPARED_BYTES", 1)
+        expected = "prepared_payload_limit"
     monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: child)
 
     cli._scan_multi_skill(
@@ -3172,7 +3172,8 @@ def test_recursive_sarif_retention_caps_keep_exact_reason_without_output_limit(
     validate_sarif_report(payload)
     notifications = payload["runs"][-1]["invocations"][0]["toolExecutionNotifications"]
     exact = next(item for item in notifications if item["message"]["text"] == expected)
-    assert exact["properties"] == {"kind": "inspection_limitation"}
+    assert exact["properties"] == {"kind": "report_omission"}
+    assert payload["runs"][-1]["invocations"][0]["properties"]["analysisCompleteness"]["is_complete"]
     assert not any(
         item.get("properties", {}).get("reasonCode") == "output_limit" for item in notifications
     )
@@ -3181,7 +3182,7 @@ def test_recursive_sarif_retention_caps_keep_exact_reason_without_output_limit(
 def test_recursive_markdown_report_character_limit_is_explicit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Combined text output stops before retaining an oversized child body."""
+    """An oversized text projection applies a report-local bounded fallback."""
     skills = [SkillDirectory(tmp_path / "one", "one", "one")]
     detection = MultiSkillDetectionResult(is_multi_skill=True, skills=skills)
     output = tmp_path / "combined.md"
@@ -3191,7 +3192,7 @@ def test_recursive_markdown_report_character_limit_is_explicit(
         "invoke",
         lambda *_args, **_kwargs: {
             **_bounded_recursive_result("one", finding_count=0),
-            "report_body": "x" * 1_025,
+            "manifest": {"name": "x" * 1_025},
         },
     )
 
@@ -3200,7 +3201,7 @@ def test_recursive_markdown_report_character_limit_is_explicit(
     body = output.read_text(encoding="utf-8")
     assert "x" * 1_025 not in body
     assert "Recursive Inspection Completeness" in body
-    assert "recursive report character budget 1024 reached" in body
+    assert "serialized_output_limit" in body
     assert len(body) <= 1_024
 
 
@@ -3350,8 +3351,9 @@ def test_recursive_json_bounds_the_final_serialized_document(
     body = output.read_text(encoding="utf-8")
     payload = json.loads(body)
     assert len(body) <= 900
-    assert payload["analysis_completeness"]["is_complete"] is False
-    assert payload["risk_recommendation"] == "CAUTION"
+    assert payload["analysis_completeness"]["is_complete"] is True
+    assert payload["risk_recommendation"] == "SAFE"
+    assert payload["report_completeness"]["is_complete"] is False
     assert payload["skills_output_omitted"] == 1
     assert payload["skills"] == [
         {"omitted": True, "omitted_count": 1, "reason": "aggregate_output_limit"}
@@ -3379,7 +3381,7 @@ def test_recursive_markdown_bounds_wrapper_overhead(
     body = output.read_text(encoding="utf-8")
     assert len(body) <= 1_000
     assert "x" * 700 not in body
-    assert "recursive serialized report character budget 1000 reached" in body
+    assert "serialized_output_limit" in body
 
 
 def test_recursive_sarif_is_valid_and_carries_aggregate_completeness(
@@ -3695,7 +3697,10 @@ def test_recursive_no_output_emits_selected_format_with_intrinsic_partial_reason
     else:
         assert "Recursive Inspection Completeness" in captured.out
         assert "Status: partial" in captured.out
-        assert "A security expression exceeded its bounded parser span" in captured.out
+        # The real terminal renderer wraps ledger details at its fixed width.
+        assert "A security expression exceeded its bounded parser span" in " ".join(
+            captured.out.split()
+        )
     if output_format is not FormatChoice.terminal:
         assert "Multi-skill directory detected" not in captured.out
         assert "Multi-skill directory detected" in captured.err
@@ -3849,6 +3854,7 @@ def test_recursive_sarif_bounds_the_final_serialized_document(
     output = tmp_path / "combined.sarif"
     monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_REPORT_CHARACTERS", 1_800)
     child = _bounded_recursive_result("one", finding_count=0)
+    child["findings"] = [_finding("P5", "x" * 2_000)]
     sarif = cast(dict[str, object], child["sarif_report"])
     runs = cast(list[dict[str, object]], sarif["runs"])
     runs[0]["properties"] = {"padding": "x" * 2_000}
@@ -3867,189 +3873,65 @@ def test_recursive_sarif_bounds_the_final_serialized_document(
     assert len(body) <= 1_800
     assert len(payload["runs"]) == 1
     completeness = payload["runs"][0]["invocations"][0]["properties"]["analysisCompleteness"]
-    assert completeness["is_complete"] is False
+    assert completeness["is_complete"] is True
+    assert not payload["runs"][0]["invocations"][0]["properties"]["reportCompleteness"]["is_complete"]
 
 
 def test_cli_scan_recursive_json_includes_full_skill_payload(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Recursive JSON output keeps summary keys and full per-skill payload fields."""
+    """Recursive JSON keeps summary keys and canonical per-skill report fields."""
+    from skillspector.nodes.report import prepare_report, serialize_report
 
     skills_root = tmp_path / "multi"
-
-    def fake_detect_skills(_: Path) -> MultiSkillDetectionResult:
-        return MultiSkillDetectionResult(
-            is_multi_skill=True,
-            has_root_skill=False,
-            skills=[
-                SkillDirectory(
-                    path=(skills_root / "alpha"),
-                    name="alpha",
-                    relative_path="alpha",
-                ),
-                SkillDirectory(
-                    path=(skills_root / "beta"),
-                    name="beta",
-                    relative_path="beta",
-                ),
-                SkillDirectory(
-                    path=(skills_root / "gamma"),
-                    name="gamma",
-                    relative_path="gamma",
-                ),
-                SkillDirectory(
-                    path=(skills_root / "delta"),
-                    name="delta",
-                    relative_path="delta",
-                ),
-                SkillDirectory(
-                    path=(skills_root / "broken"),
-                    name="broken",
-                    relative_path="broken",
-                ),
+    skills = [SkillDirectory(skills_root / name, name, name) for name in ("alpha", "beta")]
+    for skill in skills:
+        skill.path.mkdir(parents=True)
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=skills)
+    prepared = prepare_report(
+        {
+            "manifest": {"name": "alpha"},
+            "skill_path": str(skills_root / "alpha"),
+            "use_llm": False,
+            "findings": [
+                Finding(rule_id="I-1", severity="LOW", message="A finding", file="agent.py", start_line=1)
             ],
-        )
-
-    for skill in ("alpha", "beta", "gamma", "delta", "broken"):
-        (skills_root / skill).mkdir(parents=True)
+            "component_metadata": [
+                {"path": "agent.py", "type": "python", "lines": 10, "executable": True, "size_bytes": 100}
+            ],
+            "analysis_completeness": {"is_complete": True, "coverage_percent": 100},
+        }
+    )
+    expected = json.loads(serialize_report(prepared, "json")["report_body"])
 
     def fake_invoke(state: dict[str, Any], config: Any = None) -> dict[str, Any]:
-        skill_name = Path(state["input_path"]).name
-        if skill_name == "alpha":
-            return {
-                "risk_score": 45,
-                "risk_severity": "MEDIUM",
-                "filtered_findings": [1, 2],
-                "report_body": json.dumps(
-                    {
-                        "skill": {
-                            "name": "alpha",
-                            "source": str(skills_root / "alpha"),
-                            "scanned_at": "2026-06-29T12:00:00+00:00",
-                        },
-                        "risk_assessment": {
-                            "score": 45,
-                            "severity": "MEDIUM",
-                            "recommendation": "CAUTION",
-                        },
-                        "components": [
-                            {
-                                "path": "agent.py",
-                                "type": "python",
-                                "lines": 10,
-                                "executable": True,
-                                "size_bytes": 100,
-                            }
-                        ],
-                        "issues": [
-                            {
-                                "id": "I-1",
-                                "severity": "medium",
-                                "location": {"file": "agent.py"},
-                            }
-                        ],
-                        "suppressed_count": 0,
-                        "suppressed": [],
-                        "metadata": {
-                            "scan_scope": {"components_scanned": 2},
-                            "scan_environment": {"provider": "test"},
-                        },
-                        "analysis_completeness": {
-                            "total_components": 2,
-                            "scanned_components": 2,
-                            "coverage_percent": 100,
-                        },
-                    }
-                ),
-            }
-        if skill_name == "beta":
-            return {
-                "risk_score": 15,
-                "risk_severity": "LOW",
-                "filtered_findings": [],
-                "report_body": "not-json",
-            }
-        if skill_name == "gamma":
-            return {
-                "risk_score": 10,
-                "risk_severity": "LOW",
-                "filtered_findings": [],
-            }
-        if skill_name == "delta":
-            return {
-                "risk_score": 5,
-                "risk_severity": "LOW",
-                "filtered_findings": [],
-                "report_body": "[]",
-            }
-        return {"error": "scan failed"}
+        if Path(state["input_path"]).name == "alpha":
+            return {**prepared.public_fields, "prepared_report": prepared}
+        empty = prepare_report({"manifest": {"name": "beta"}, "use_llm": False, "findings": []})
+        return {**empty.public_fields, "prepared_report": empty}
 
-    monkeypatch.setattr("skillspector.cli.detect_skills", fake_detect_skills)
-    monkeypatch.setattr("skillspector.cli.graph", SimpleNamespace(invoke=fake_invoke))
-
-    out_file = tmp_path / "recursive.json"
+    monkeypatch.setattr(cli, "detect_skills", lambda _: detection)
+    monkeypatch.setattr(cli, "graph", SimpleNamespace(invoke=fake_invoke))
+    output = tmp_path / "recursive.json"
     result = runner.invoke(
         app,
-        [
-            "scan",
-            str(skills_root),
-            "--recursive",
-            "--format",
-            "json",
-            "--no-llm",
-            "--output",
-            str(out_file),
-        ],
+        ["scan", str(skills_root), "--recursive", "--format", "json", "--no-llm", "--output", str(output)],
     )
-    assert result.exit_code == 0
-    assert out_file.exists()
-    payload = json.loads(out_file.read_text(encoding="utf-8"))
+    assert result.exit_code == 0, result.output
+    payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["multi_skill"] is True
-    assert payload["skill_count"] == 5
-    assert payload["max_risk_score"] == 45
-    by_name = {skill["name"]: skill for skill in payload["skills"]}
-
-    alpha = by_name["alpha"]
-    assert alpha["path"] == "alpha"
-    assert alpha["risk_score"] == 45
-    assert alpha["risk_severity"] == "MEDIUM"
-    assert alpha["finding_count"] == 2
+    assert payload["skill_count"] == 2
+    assert payload["max_risk_score"] == prepared.risk_score
+    alpha, beta = payload["skills"]
+    assert alpha["name"] == alpha["path"] == "alpha"
+    assert alpha["risk_score"] == prepared.risk_score
+    assert alpha["finding_count"] == 1
+    for key in ("components", "issues", "suppressed", "suppressed_count", "metadata", "analysis_completeness", "report_completeness"):
+        assert alpha[key] == expected[key]
     assert alpha["skill"]["source"] == str(skills_root / "alpha")
-    assert alpha["skill"]["scanned_at"] == "2026-06-29T12:00:00+00:00"
-    assert alpha["risk_assessment"]["score"] == 45
-    assert alpha["risk_assessment"]["recommendation"] == "CAUTION"
-    assert alpha["components"][0]["path"] == "agent.py"
-    assert alpha["issues"] == [
-        {"id": "I-1", "severity": "medium", "location": {"file": "agent.py"}}
-    ]
-    assert alpha["suppressed_count"] == 0
-    assert alpha["suppressed"] == []
-    assert alpha["metadata"]["scan_scope"] == {"components_scanned": 2}
-    assert alpha["analysis_completeness"]["coverage_percent"] == 100
-
-    beta = by_name["beta"]
-    assert beta["path"] == "beta"
-    assert beta["risk_score"] == 15
-    assert beta["risk_severity"] == "LOW"
+    assert beta["name"] == beta["path"] == "beta"
     assert beta["finding_count"] == 0
-    assert "issues" not in beta
-    assert "components" not in beta
-    assert "analysis_completeness" not in beta
-
-    gamma = by_name["gamma"]
-    assert gamma["path"] == "gamma"
-    assert gamma["risk_score"] == 10
-    assert gamma["finding_count"] == 0
-    assert "risk_assessment" not in gamma
-
-    delta = by_name["delta"]
-    assert delta["path"] == "delta"
-    assert delta["risk_score"] == 5
-    assert delta["finding_count"] == 0
-    assert "risk_assessment" not in delta
-
-    broken = by_name["broken"]
-    assert broken == {"name": "broken", "error": "scan failed"}
+    assert beta["issues"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -4305,6 +4187,7 @@ def test_cli_scan_recursive_terminal_preserves_literal_report_text(
             "risk_score": 0,
             "risk_severity": "LOW",
             "report_body": f"{name}: {text}",
+            "manifest": {"name": f"{name}: {text}"},
         }
 
     monkeypatch.setattr("skillspector.cli.detect_skills", lambda _: detection)
@@ -4354,7 +4237,11 @@ def test_cli_scan_recursive_terminal_output_to_file(
     def fake_invoke(state: dict[str, Any], config: Any = None) -> dict[str, Any]:
         skill_name = Path(state["input_path"]).name
         if skill_name == "alpha":
-            return {"risk_score": 1, "risk_severity": "LOW", "report_body": "ALPHA_REPORT"}
+            return {
+                "risk_score": 1,
+                "risk_severity": "LOW",
+                "manifest": {"name": "ALPHA_REPORT"},
+            }
         if skill_name == "beta":
             return {"error": "scan failed"}
         raise AssertionError(f"Unexpected skill input path: {state['input_path']}")
@@ -4382,7 +4269,7 @@ def test_cli_scan_recursive_terminal_output_to_file(
     assert out_file.exists()
     combined = out_file.read_text(encoding="utf-8")
     assert "--- alpha ---" in combined
-    assert "ALPHA_REPORT" in combined
+    assert "ALPHA_REPORT" in MarkdownIt().render(combined)
     assert '"multi_skill": true' not in result.output
 
 

@@ -346,6 +346,10 @@ class SkillspectorState(TypedDict, total=False):
     # Output: report node writes formatted string here
     output_format: str
     report_body: str
+    # Internal CLI-only snapshot channel; never enabled by default graph/API calls.
+    defer_report_rendering: bool
+    prepared_report: object
+    report_completeness: dict[str, object]
 
     # LLM: when False, LLM-based nodes (meta_analyzer, mcp_tool_poisoning's TP4,
     # and the semantic_* analyzers) return immediately without calling the LLM.

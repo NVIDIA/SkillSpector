@@ -167,7 +167,123 @@ skillspector scan ./my-skill/ --format markdown --output report.md
 
 # SARIF output - for CI/CD integration and IDE tooling
 skillspector scan ./my-skill/ --format sarif --output report.sarif
+
+# Additional file reports; the default terminal report remains on stdout
+skillspector scan ./my-skill/ --report json=report.json --report sarif=report.sarif
+
+# Repeat a format at distinct destinations; mixed case and '=' in paths are accepted
+skillspector scan ./my-skill/ --format json --output primary.json \
+  --report JsOn=result=v1.json --report json=second.json
 ```
+
+`--report FORMAT=PATH` is repeatable and file-only. Supported formats are
+`terminal`, `json`, `markdown`, and `sarif`, case-insensitively; declarations
+split at the first `=`. A missing/unknown format, missing separator, empty path,
+or exact `PATH=-` is a usage error (exit 2) before analysis. Existing `--format`
+and `--output` select the primary report unchanged. Repeated formats require
+distinct, non-aliased destinations, including the primary file. Existing mode
+restrictions still apply: registry scans require explicit `--format json` and
+allow only JSON additional reports.
+
+With at least one `--report`, every file destination (including `--output`)
+undergoes non-destructive secure-output validation **before analysis**.
+Destination aliases and collisions with known local sources—including bundled
+scripts, discovered recursive sources beyond collection limits, and registry
+comparison inputs—are rejected with exit 2 without writing reports. Output
+parent directories must already exist; incomplete bounded source discovery
+fails closed.
+
+Sources first discovered during analysis or transitive traversal are checked
+against the **whole output plan before any report is emitted**, including
+primary stdout. A late source collision exits 2 without emitting reports or
+changing existing destinations. Preflight is not a filesystem reservation:
+secure no-follow checks still run at write time.
+
+Without `--report`, destination-validation timing and source-protection scope
+remain unchanged: existing input/manifest aliases and directory destinations
+are checked before analysis, while remaining secure-output path checks occur
+at write time (secure-platform support is still checked before analysis).
+The stronger bundled-source inventory and whole-plan late-source barrier are
+not enabled for these legacy invocations.
+
+#### Report emission and exit policy
+
+After whole-plan validation succeeds, multi-report scans attempt the primary
+stdout or file report first, then additional reports in `--report` argument
+order, all from the same analysis. Additional-report success and failure
+diagnostics identify the format and destination on stderr, keeping JSON/SARIF
+primary stdout clean and preserving legacy primary-output messages.
+
+If one report fails to render or write, later reports are still attempted.
+Successfully written files remain available: writes are atomic per
+file, not a transaction across reports. A failed render leaves its destination
+untouched. Source-validation failures instead abort the whole output plan
+before any report is emitted.
+
+Analysis completeness describes inspected scope; report completeness describes
+content omitted by retention or serialization limits. JSON exposes
+`analysis_completeness` and `report_completeness`; SARIF exposes
+`analysisCompleteness` and `reportCompleteness` in invocation properties.
+Terminal/Markdown include a labeled report-completeness notice. A format-local
+fallback does not change shared analysis completeness, risk, or other reports.
+
+```bash
+skillspector scan ./my-skill/ --no-llm --format json \
+  --report sarif=report.sarif --report markdown=report.md --fail-on-incomplete
+```
+
+This example emits primary JSON on stdout, then attempts `report.sarif` and
+`report.md`. If analysis and JSON are complete but SARIF omits content, the
+Markdown report is still attempted before the strict gate exits 1.
+
+Final exit precedence is:
+
+- **2:** source-validation, rendering/write, or analysis execution failure.
+  After validation passes and a completed result is available, rendering/write
+  or recorded execution failures still allow all remaining report attempts.
+- **1:** otherwise, a risk/other policy gate fails, or enabled
+  `--fail-on-incomplete` detects incomplete analysis or omissions in **any**
+  requested report, including the primary, after all eligible attempts.
+- **0:** otherwise. `--fail-on-incomplete` is default-off; a valid bounded
+  fallback alone does not cause exit 1 or 2 without that gate.
+
+#### Transitive multi-report scans
+
+```bash
+# Primary JSON on stdout, then additional files from the merged root/child result
+skillspector scan ./my-skill/ --no-llm --transitive --inspect-dependencies \
+  --format json --report sarif=report.sarif --report markdown=report.md \
+  --report json=second.json
+```
+
+Transitive root and child analysis share one bounded traversal and target cache.
+Additional formats, including repeated formats, do not rerun analyzers,
+dependency inspection, or target traversal, or reset target, byte, artifact,
+time, or retained-record allowances. All reports use the final merged prepared
+result; each format retains its applicable output bounds. Serialization does
+not consume the traversal deadline or expand analysis scope. If a traversal
+limit leaves targets uninspected, reports describe the same incomplete analysis;
+`--fail-on-incomplete` exits 1 only after all eligible reports are attempted.
+
+With `--report`, known local source collisions are rejected before analysis.
+**Post-analysis, pre-emission rejection is permitted only for sources not known
+at preflight**, such as files first discovered during transitive child analysis.
+Their paths and file identities remain protected independently of retained
+report content, including when component/record caps omit that content.
+
+```bash
+# Rejected if child analysis first discovers ./unretained-source.py as a source
+skillspector scan ./my-skill/ --no-llm --transitive --inspect-dependencies \
+  --format json --output ./unretained-source.py \
+  --report json=safe.json --report sarif=not-created.sarif
+```
+
+If that newly discovered source aliases the primary destination (as above) or
+an additional destination, including through a hard link, the whole plan exits
+2 before any emission. No primary stdout report is emitted, no report file is
+created or replaced, and the source and existing destinations remain unchanged.
+Root/child cleanup still runs. This late-source barrier requires `--report`;
+the no-`--report` validation boundary described above remains unchanged.
 
 ### Recursive Collection Scanning
 
@@ -175,16 +291,77 @@ skillspector scan ./my-skill/ --format sarif --output report.sarif
 skills, with a default aggregate limit of **32 skills**. To raise or lower it:
 
 ```bash
+# Single report: JSON on stdout
 skillspector scan ./my-skills/ --recursive --max-skills 100 --no-llm --format json
+
+# Same bounded collection, with additional file reports (parents must exist)
+skillspector scan ./my-skills/ --recursive --max-skills 100 --no-llm --format json \
+  --report sarif=recursive.sarif --report markdown=recursive.md
 ```
 
 `--max-skills` requires a local recursive collection and a positive integer; `0`
-does not mean unlimited. Discovery, byte, finding-record, time and report-size
-budgets still apply, so increasing the count does not guarantee complete coverage.
+does not mean unlimited. Discovery, shared source-byte/time analysis budgets,
+and canonical retention bounds still apply, so increasing the count does not
+guarantee complete coverage.
 When the count limit is reached, the CLI names the limit and suggests adjusting it
-or scanning sub-skills separately. Omitted skills remain visible in the aggregate
-report and coverage stays incomplete. Use `--fail-on-incomplete` in CI to fail on
-incomplete coverage; the default exit policy is unchanged.
+or scanning sub-skills separately. Uninspected skills remain accounted for in the
+aggregate report and analysis coverage stays incomplete.
+
+#### Format-independent scope and bounds
+
+**Every recursive invocation, with or without `--report`, uses the same
+format-independent collection.** With identical inputs and analysis budgets,
+terminal, JSON, Markdown, and SARIF select the same analyzed and retained child
+identities. Adding, removing, reordering, or repeating report formats does not
+rerun children or increase discovery, traversal, analysis, or retention budgets.
+Collection finishes before any child report is rendered; report size or a
+renderer failure cannot stop inspection or consume its analysis deadline.
+
+Canonical prepared child snapshots are retained under three aggregate bounds:
+
+- **10,000 public occurrence records**, including active and suppressed findings;
+  a finding without explicit occurrences counts as one record.
+- A dedicated prepared-payload byte cap, initially equal to `MAX_WORKFLOW_BYTES`.
+  Fixed, format-neutral accounting measures canonical strings as **UTF-8 bytes**
+  and includes container/field overhead, without invoking an output serializer.
+- A separate **10,000 metadata collection-record cap**, using the existing record
+  limit to bound prepared metadata.
+
+These retention bounds are separate from source-byte analysis budgets and from
+the **4,194,304-character ceiling per combined report**. That serialization
+ceiling counts characters, not UTF-8 bytes, and includes report wrapper overhead.
+Each primary/additional format applies its own bounded fallback independently;
+one format's overflow does not change retained children or other reports.
+
+#### Omission categories and legacy compatibility
+
+- **Analysis omissions:** children or sources left uninspected by discovery,
+  skill, source-byte, time, or collection limits make `analysis_completeness`
+  incomplete.
+- **Shared retention omissions:** already-analyzed child content excluded by
+  canonical bounds makes affected reports' `report_completeness` incomplete,
+  with reasons such as `recursive_finding_record_limit`, `prepared_payload_limit`,
+  or `metadata_record_limit`. Analyzed-child risk/policy summaries and tracked
+  source-protection identities survive content omission. If a retention stop also
+  leaves later children uninspected, both omission categories are recorded.
+- **Format-local omissions:** serialization fallback records
+  `serialized_output_limit` in that report's completeness without changing shared
+  analysis completeness, risk, or another report's completeness. Normal format
+  layout differences are not omissions; renderer errors are output failures,
+  not failed child inspection.
+
+**Intentional legacy change:** even without `--report`, scans near the old
+primary-format serialized limits may now analyze or retain different children
+than older versions. Serialized length no longer controls recursive scope, and
+output truncation no longer falsely marks completed analysis as incomplete.
+Primary syntax/defaults and the no-`--report` destination-validation and
+source-protection boundary described above remain unchanged.
+
+Use the default-off `--fail-on-incomplete` to exit 1 for incomplete analysis or
+content omissions in any requested report, including a sole report. With
+`--report`, every eligible output is attempted before this decision; output or
+analysis execution failures take precedence with exit 2. A bounded fallback
+alone does not fail the default policy; existing risk/other policy gates apply.
 
 ### Batch Scanning
 
@@ -863,6 +1040,7 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
 {
   "skill": { "name": "...", "source": "...", "scanned_at": "<ISO 8601>" },
   "risk_assessment": { "score": 0, "severity": "LOW", "recommendation": "SAFE" },
+  "report_completeness": { "is_complete": true, "omission_reasons": [], "omitted_records": 0, "omitted_skills": 0 },
   "components": [ { "path": "...", "type": "...", "lines": 0, "executable": false, "size_bytes": 0 } ],
   "issues": [ { "id": "...", "category": "...", "severity": "...", "confidence": 0.0, "location": { "file": "...", "start_line": 0 }, "surface": "code" } ],
   "metadata": {
@@ -891,6 +1069,22 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
 
 - `risk_assessment.severity` ∈ `LOW | MEDIUM | HIGH | CRITICAL`.
 - `risk_assessment.recommendation` ∈ `SAFE | CAUTION | DO_NOT_INSTALL`, mapped from severity: `LOW → SAFE`, `MEDIUM → CAUTION`, `HIGH`/`CRITICAL → DO_NOT_INSTALL`.
+- `analysis_completeness` describes inspected scope; the separate, additive
+  `report_completeness` describes retained/emitted report content. Complete analysis
+  can produce an incomplete report, and a complete report can describe incomplete
+  analysis. Report omissions never change the shared analysis completeness, risk
+  score, severity, or recommendation.
+- `report_completeness` contains `is_complete`, bounded `omission_reasons` machine
+  codes, and `omitted_records`/`omitted_skills` counts where known. Reasons include
+  `finding_record_limit`, `suppression_record_limit`, and format-local
+  `notification_record_limit`. Zero counts do not imply completeness when a reason
+  or an explicit incomplete status is present. Reason lists retain at most 256
+  short identifiers; counts saturate at 9,223,372,036,854,775,807.
+- Canonical retention omissions affect every report that uses that retained
+  content. Serialization omissions affect only the corresponding format.
+  Normal layout differences (for example, summaries as SARIF notifications or
+  hidden suppressed rows in text output) are not omissions. Terminal and Markdown
+  always include a labeled **Report completeness** notice, even for complete reports.
 - `issues[].surface` and `suppressed[].surface` are advisory, heuristic labels for where a finding landed:
   `code | instructions | docs | tests | comments | config`. JSON expands compacted groups into one `issues[]` entry
   per occurrence, each with its own `surface`; SARIF emits `properties.surface` on each result. The label is
@@ -927,6 +1121,15 @@ read only rule-level severity cannot distinguish their result severities.
 Recursive scans chain each percent-encoded skill-directory URI through an
 absolute scan-root file URI. External dependency locations retain their source
 provenance instead of being rebased into the local skill directory.
+Each invocation exposes report-content completeness separately at
+`properties.reportCompleteness`, using the same `is_complete`,
+`omission_reasons`, `omitted_records`, and `omitted_skills` fields as JSON.
+`properties.analysisCompleteness` continues to describe inspection, and
+`executionSuccessful` continues to describe execution. When bounded SARIF
+notifications replace detail with an output-limit sentinel, report completeness
+records `notification_record_limit` and counts the replaced detail as omitted.
+That SARIF-local omission does not make JSON, terminal, or Markdown incomplete
+and does not alter the shared analysis verdict.
 
 ### Recommended gate mapping
 

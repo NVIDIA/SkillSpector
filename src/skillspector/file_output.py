@@ -76,6 +76,66 @@ def open_output_parent(path: str | Path) -> Iterator[tuple[Path, int]]:
             os.close(directory_fd)
 
 
+def preflight_output(path: str | Path) -> tuple[Path, os.stat_result | None]:
+    """Validate a destination without creating, truncating, or replacing files.
+
+    Return the normalized path and the existing regular file's stat, if any,
+    for destination/source alias checking. Parent write/search access is checked
+    relative to the no-follow descriptor with effective process credentials.
+    Existing files are opened for writing without truncation, as in the writer.
+
+    This is a point-in-time check, not a reservation: callers must still use
+    ``write_text_no_follow`` for emission. Legacy writers do not call preflight.
+    """
+    try:
+        with open_output_parent(path) as (absolute, directory_fd):
+            if not os.access(
+                ".", os.W_OK | os.X_OK, dir_fd=directory_fd, effective_ids=True
+            ):
+                raise ValueError(
+                    f"Could not preflight output {str(path)!r}: "
+                    "the output directory is not writable or searchable."
+                )
+            try:
+                existing = os.stat(
+                    absolute.name or ".", dir_fd=directory_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                return absolute, None
+            if not S_ISREG(existing.st_mode):
+                raise ValueError(
+                    f"Refusing to overwrite non-regular output {str(path)!r} "
+                    f"(type {filemode(existing.st_mode)[0]!r})."
+                )
+            descriptor = os.open(
+                absolute.name,
+                os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if not S_ISREG(opened.st_mode):
+                    raise ValueError(
+                        f"Refusing to overwrite non-regular output {str(path)!r}."
+                    )
+                if (opened.st_dev, opened.st_ino) != (existing.st_dev, existing.st_ino):
+                    raise ValueError(
+                        f"Could not preflight output {str(path)!r}: "
+                        "the output changed during validation."
+                    )
+                return absolute, opened
+            finally:
+                os.close(descriptor)
+    except NotImplementedError as exc:
+        raise ValueError(
+            "Safe output preflight is unsupported on this platform: "
+            "descriptor-relative effective-credential permission checks are required."
+        ) from exc
+    except OSError as exc:
+        detail = exc.strerror or str(exc)
+        raise ValueError(f"Could not preflight output {str(path)!r}: {detail}.") from exc
+
+
 def write_text_no_follow(path: str | Path, text: str) -> None:
     """Atomically replace a regular output through an anchored parent descriptor.
 

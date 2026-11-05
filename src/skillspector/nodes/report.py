@@ -24,7 +24,9 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from html import escape as escape_html
@@ -64,6 +66,12 @@ from skillspector.models import (
 from skillspector.nodes.analyzers import ANALYZER_MODULES
 from skillspector.nodes.deduplicate import deduplicate
 from skillspector.python_ast import clear_python_ast_cache
+from skillspector.report_completeness import (
+    ReportCompleteness,
+    build_report_completeness,
+    merge_report_completeness,
+    report_completeness_notice,
+)
 from skillspector.sarif_models import (
     SARIF_SCHEMA_URI,
     SarifArtifactLocation,
@@ -95,6 +103,24 @@ from skillspector.suppression import Baseline, SuppressedFinding, partition_find
 from skillspector.terminal_text import visible_terminal_text
 
 logger = get_logger(__name__)
+
+_DEFER_REPORT_RENDERING: ContextVar[bool] = ContextVar("defer_report_rendering", default=False)
+
+
+@contextmanager
+def report_rendering_deferred():
+    """Defer CLI serialization across root and child graph calls, safely scoped."""
+    token = _DEFER_REPORT_RENDERING.set(True)
+    try:
+        yield
+    finally:
+        _DEFER_REPORT_RENDERING.reset(token)
+
+
+def report_rendering_is_deferred() -> bool:
+    """Return the internal CLI rendering mode; ordinary graph/API calls default off."""
+    return _DEFER_REPORT_RENDERING.get()
+
 
 # Risk bands (v1 alignment)
 _RISK_SEVERITY_BANDS = [(81, "CRITICAL"), (51, "HIGH"), (21, "MEDIUM"), (0, "LOW")]
@@ -1931,11 +1957,50 @@ def _format_markdown(
     return "\n".join(lines)
 
 
-def report(state: SkillspectorState) -> dict[str, object]:
-    """Render canonical findings and the exceptional ledger projection.
+@dataclass(frozen=True)
+class PreparedReport:
+    """Canonical, reusable rendering inputs; contains no baseline or source cache.
+
+    Preparation captures provider availability and suppression exactly once.
+    Serializers must treat these inputs as read-only and build private projections.
+    """
+
+    public_fields: dict[str, object]
+    reported_findings: list[Finding]
+    suppressed: list[SuppressedFinding]
+    display_findings: list[Finding]
+    component_metadata: list[dict[str, object]]
+    manifest: dict[str, object]
+    skill_path: str | None
+    risk_score: int
+    risk_severity: str
+    risk_recommendation: str
+    has_executable_scripts: bool
+    llm_requested: bool
+    use_llm: bool
+    llm_call_log: list[Mapping[str, object]]
+    inference_usage: Sequence[Mapping[str, object]]
+    llm_provenance: object
+    analysis_completeness: Mapping[str, object]
+    report_completeness: ReportCompleteness
+    execution_successful: bool
+    transitive_targets_scanned: int | None
+    transitive_bytes_scanned: int | None
+    transitive_truncation_reasons: list[str]
+    structured_summaries: list[dict[str, object]]
+    show_suppressed: bool
+    semantic_runtime_incomplete: bool
+    runtime_available: bool
+    provider_available: bool
+    provider_error: str | None
+    degraded_notice: str | None
+
+
+def prepare_report(state: SkillspectorState) -> PreparedReport:
+    """Prepare canonical findings and the exceptional ledger projection.
 
     Finalization owns completeness derivation. The report node only selects the
-    validated finding IDs, applies baseline suppression, and renders all surfaces.
+    validated finding IDs and applies baseline suppression. No format is rendered.
     """
     clear_python_ast_cache(state.get("python_ast_cache_key"))
     raw_findings = state.get("findings")
@@ -1983,7 +2048,6 @@ def report(state: SkillspectorState) -> dict[str, object]:
     has_executable_scripts = state.get("has_executable_scripts", False)
     manifest = state.get("manifest") or {}
     skill_path = state.get("skill_path")
-    output_format = state.get("output_format") or "sarif"
     llm_requested, use_llm = semantic_runtime_intent(state)
     raw_llm_call_log = state.get("llm_call_log")
     llm_call_log: list[Mapping[str, object]] = (
@@ -2130,7 +2194,12 @@ def report(state: SkillspectorState) -> dict[str, object]:
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
         active_findings, has_executable_scripts, component_metadata
     )
-    reported_findings = _bounded_report_findings(deduplicate(active_findings))
+    compact_findings = deduplicate(active_findings)
+    reported_findings = _bounded_report_findings(compact_findings)
+    omitted_findings = _finding_output_record_count(compact_findings) - (
+        _finding_output_record_count(reported_findings)
+    )
+    suppressed_record_count = _finding_output_record_count([item.finding for item in suppressed])
     remaining_output_records = max(
         0,
         MAX_FINDING_OUTPUT_RECORDS - _finding_output_record_count(reported_findings),
@@ -2138,6 +2207,20 @@ def report(state: SkillspectorState) -> dict[str, object]:
     suppressed = _bounded_suppressed_findings(
         suppressed,
         limit=remaining_output_records,
+    )
+    omitted_suppressed = suppressed_record_count - _finding_output_record_count(
+        [item.finding for item in suppressed]
+    )
+    report_completeness = build_report_completeness(
+        omission_reasons=[
+            reason
+            for reason, count in (
+                ("finding_record_limit", omitted_findings),
+                ("suppression_record_limit", omitted_suppressed),
+            )
+            if count > 0
+        ],
+        omitted_records=omitted_findings + omitted_suppressed,
     )
     display_findings = _expand_occurrences(reported_findings)
     exceptions = analysis_completeness.get("ledger_exceptions", [])
@@ -2179,106 +2262,203 @@ def report(state: SkillspectorState) -> dict[str, object]:
             ],
         }
 
-    sarif_report = _build_sarif(
-        reported_findings,
-        suppressed,
-        degraded_notice=degraded_notice,
-        analysis_completeness=analysis_completeness,
-        execution_successful=execution_successful,
-        structured_summaries=structured_summaries,
-    )
-    if output_format == "terminal":
-        report_body = _format_terminal(
-            display_findings,
-            component_metadata,
-            manifest,
-            skill_path,
-            risk_score,
-            risk_severity,
-            risk_recommendation,
-            has_executable_scripts,
-            use_llm=llm_requested,
-            llm_call_log=llm_call_log,
-            degraded_notice=degraded_notice,
-            suppressed=suppressed,
-            structured_summaries=structured_summaries,
-            show_suppressed=show_suppressed,
-            analysis_completeness=analysis_completeness,
-            execution_successful=execution_successful,
-        )
-    elif output_format == "json":
-        report_body = _format_json(
-            display_findings,
-            component_metadata,
-            manifest,
-            skill_path,
-            risk_score,
-            risk_severity,
-            risk_recommendation,
-            has_executable_scripts,
-            use_llm=llm_requested,
-            llm_call_log=llm_call_log,
-            inference_usage=inference_usage,
-            llm_provenance=llm_provenance,
-            analysis_completeness=analysis_completeness,
-            suppressed=suppressed,
-            execution_successful=execution_successful,
-            transitive_targets_scanned=(
-                int(transitive_targets_scanned)
-                if isinstance(transitive_targets_scanned, int)
-                else None
-            ),
-            transitive_bytes_scanned=(
-                int(transitive_bytes_scanned) if isinstance(transitive_bytes_scanned, int) else None
-            ),
-            transitive_truncation_reasons=transitive_truncation_reasons,
-            structured_summaries=structured_summaries,
-            llm_execution_enabled=use_llm,
-            semantic_runtime_incomplete=semantic_runtime_incomplete,
-            runtime_available=runtime_available,
-            provider_availability=(provider_available, provider_error),
-        )
-    elif output_format == "markdown":
-        report_body = _format_markdown(
-            display_findings,
-            component_metadata,
-            manifest,
-            skill_path,
-            risk_score,
-            risk_severity,
-            risk_recommendation,
-            has_executable_scripts,
-            use_llm=llm_requested,
-            llm_call_log=llm_call_log,
-            degraded_notice=degraded_notice,
-            suppressed=suppressed,
-            structured_summaries=structured_summaries,
-            show_suppressed=show_suppressed,
-            analysis_completeness=analysis_completeness,
-            execution_successful=execution_successful,
-        )
-    else:
-        report_body = json.dumps(sarif_report, indent=2)
-
-    logger.debug(
-        "Report generated: format=%s, findings_count=%d, suppressed_count=%d",
-        output_format,
-        len(active_findings),
-        len(suppressed),
-    )
-    return {
-        "sarif_report": sarif_report,
+    public_fields = {
         "risk_score": risk_score,
         "risk_severity": risk_severity,
         "risk_recommendation": risk_recommendation,
-        "report_body": report_body,
         "filtered_findings": reported_findings,
         "suppressed_findings": suppressed,
         "active_findings": active_findings,
         "execution_successful": execution_successful,
         "analysis_completeness": dict(analysis_completeness),
+        "report_completeness": merge_report_completeness(report_completeness),
         "transitive_targets_scanned": transitive_targets_scanned,
         "transitive_bytes_scanned": transitive_bytes_scanned,
         "transitive_truncated": bool(transitive_truncation_reasons),
         "transitive_truncation_reasons": transitive_truncation_reasons,
     }
+    return PreparedReport(
+        public_fields=public_fields,
+        reported_findings=reported_findings,
+        suppressed=suppressed,
+        display_findings=display_findings,
+        component_metadata=component_metadata,
+        manifest=manifest,
+        skill_path=skill_path,
+        risk_score=risk_score,
+        risk_severity=risk_severity,
+        risk_recommendation=risk_recommendation,
+        has_executable_scripts=has_executable_scripts,
+        llm_requested=llm_requested,
+        use_llm=use_llm,
+        llm_call_log=llm_call_log,
+        inference_usage=inference_usage,
+        llm_provenance=llm_provenance,
+        analysis_completeness=analysis_completeness,
+        report_completeness=report_completeness,
+        execution_successful=execution_successful,
+        transitive_targets_scanned=transitive_targets_scanned,
+        transitive_bytes_scanned=transitive_bytes_scanned,
+        transitive_truncation_reasons=transitive_truncation_reasons,
+        structured_summaries=structured_summaries,
+        show_suppressed=show_suppressed,
+        semantic_runtime_incomplete=semantic_runtime_incomplete,
+        runtime_available=runtime_available,
+        provider_available=provider_available,
+        provider_error=provider_error,
+        degraded_notice=degraded_notice,
+    )
+
+
+def _serialize_sarif(prepared: PreparedReport) -> dict[str, object]:
+    sarif = _build_sarif(
+        prepared.reported_findings,
+        prepared.suppressed,
+        degraded_notice=prepared.degraded_notice,
+        analysis_completeness=prepared.analysis_completeness,
+        execution_successful=prepared.execution_successful,
+        structured_summaries=prepared.structured_summaries,
+    )
+    invocation = sarif["runs"][0]["invocations"][0]
+    projection = merge_report_completeness(prepared.report_completeness)
+    if invocation["properties"]["analysisCompleteness"]["notificationsTruncated"]:
+        notifications = invocation.get("toolExecutionNotifications", [])
+        # The existing bounded renderer replaces one detailed notification with
+        # a truncation sentinel. Count that replaced record as omitted, too.
+        observed = len(prepared.structured_summaries) + bool(prepared.degraded_notice)
+        for key in ("ledger_exceptions", "scope_exclusions"):
+            rows = prepared.analysis_completeness.get(key, [])
+            if isinstance(rows, list):
+                observed += sum(isinstance(row, Mapping) for row in rows)
+        limitations = prepared.analysis_completeness.get("limitations", [])
+        if isinstance(limitations, list):
+            observed += len(limitations)
+        retained_details = sum(
+            row.get("properties", {}).get("kind") != "inspection_notification_limit"
+            for row in notifications
+        )
+        projection = merge_report_completeness(
+            projection,
+            omission_reasons=["notification_record_limit"],
+            omitted_records=max(0, observed - retained_details),
+        )
+    invocation["properties"]["reportCompleteness"] = projection
+    return sarif
+
+
+def serialize_report(prepared: PreparedReport, output_format: str) -> dict[str, object]:
+    """Render one format without resolving providers or repeating preparation."""
+    projection = merge_report_completeness(prepared.report_completeness)
+    if output_format == "terminal":
+        report_body = _format_terminal(
+            prepared.display_findings,
+            prepared.component_metadata,
+            prepared.manifest,
+            prepared.skill_path,
+            prepared.risk_score,
+            prepared.risk_severity,
+            prepared.risk_recommendation,
+            prepared.has_executable_scripts,
+            use_llm=prepared.llm_requested,
+            llm_call_log=prepared.llm_call_log,
+            degraded_notice=prepared.degraded_notice,
+            suppressed=prepared.suppressed,
+            structured_summaries=prepared.structured_summaries,
+            show_suppressed=prepared.show_suppressed,
+            analysis_completeness=prepared.analysis_completeness,
+            execution_successful=prepared.execution_successful,
+        )
+    elif output_format == "json":
+        report_body = _format_json(
+            prepared.display_findings,
+            prepared.component_metadata,
+            prepared.manifest,
+            prepared.skill_path,
+            prepared.risk_score,
+            prepared.risk_severity,
+            prepared.risk_recommendation,
+            prepared.has_executable_scripts,
+            use_llm=prepared.llm_requested,
+            llm_call_log=prepared.llm_call_log,
+            inference_usage=prepared.inference_usage,
+            llm_provenance=prepared.llm_provenance,
+            analysis_completeness=prepared.analysis_completeness,
+            suppressed=prepared.suppressed,
+            execution_successful=prepared.execution_successful,
+            transitive_targets_scanned=(
+                int(prepared.transitive_targets_scanned)
+                if isinstance(prepared.transitive_targets_scanned, int)
+                else None
+            ),
+            transitive_bytes_scanned=(
+                int(prepared.transitive_bytes_scanned)
+                if isinstance(prepared.transitive_bytes_scanned, int)
+                else None
+            ),
+            transitive_truncation_reasons=prepared.transitive_truncation_reasons,
+            structured_summaries=prepared.structured_summaries,
+            llm_execution_enabled=prepared.use_llm,
+            semantic_runtime_incomplete=prepared.semantic_runtime_incomplete,
+            runtime_available=prepared.runtime_available,
+            provider_availability=(prepared.provider_available, prepared.provider_error),
+        )
+    elif output_format == "markdown":
+        report_body = _format_markdown(
+            prepared.display_findings,
+            prepared.component_metadata,
+            prepared.manifest,
+            prepared.skill_path,
+            prepared.risk_score,
+            prepared.risk_severity,
+            prepared.risk_recommendation,
+            prepared.has_executable_scripts,
+            use_llm=prepared.llm_requested,
+            llm_call_log=prepared.llm_call_log,
+            degraded_notice=prepared.degraded_notice,
+            suppressed=prepared.suppressed,
+            structured_summaries=prepared.structured_summaries,
+            show_suppressed=prepared.show_suppressed,
+            analysis_completeness=prepared.analysis_completeness,
+            execution_successful=prepared.execution_successful,
+        )
+    elif output_format == "sarif":
+        sarif_report = _serialize_sarif(prepared)
+        projection = merge_report_completeness(
+            sarif_report["runs"][0]["invocations"][0]["properties"]["reportCompleteness"]
+        )
+        report_body = json.dumps(sarif_report, indent=2)
+    else:
+        raise ValueError(f"Unsupported report format: {output_format!r}")
+
+    if output_format == "json":
+        payload = json.loads(report_body)
+        payload["report_completeness"] = merge_report_completeness(projection)
+        report_body = json.dumps(payload, indent=2)
+    elif output_format in {"terminal", "markdown"}:
+        notice = report_completeness_notice(projection)
+        report_body += (
+            "\n\n" + (_markdown_cell(notice) if output_format == "markdown" else notice) + "\n"
+        )
+    result = {
+        **prepared.public_fields,
+        "report_body": report_body,
+        "report_completeness": projection,
+    }
+    if output_format == "sarif":
+        result["sarif_report"] = sarif_report
+    return result
+
+
+def report(state: SkillspectorState) -> dict[str, object]:
+    """Compatibility wrapper retaining the graph/API body and SARIF contract."""
+    prepared = prepare_report(state)
+    if state.get("defer_report_rendering") or report_rendering_is_deferred():
+        return {**prepared.public_fields, "prepared_report": prepared}
+    output_format = state.get("output_format") or "sarif"
+    # Historically unknown output formats use SARIF for direct node callers.
+    if output_format not in {"terminal", "json", "markdown", "sarif"}:
+        output_format = "sarif"
+    result = serialize_report(prepared, output_format)
+    if output_format != "sarif":
+        result["sarif_report"] = _serialize_sarif(prepared)
+    return result
