@@ -48,7 +48,7 @@ _HTML_CONTEXT_START = re.compile(
 # Only a complete, strict JSON VERSION field is proven metadata. Never
 # suppress numeric paths or other quoted references by value alone.
 _JSON_VERSION_FIELD = re.compile(
-    r'^[ \t]*"VERSION"[ \t]*:[ \t]*"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)"[ \t]*,?[ \t]*$'
+    r'^[ \t]*"VERSION"[ \t]*:[ \t]*"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)"[ \t]*(?:,[ \t]*)?$'
 )
 _QUOTED_OR_CODE_PATH = re.compile(
     r"(?:`|'|\")((?:\./)?(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?:`|'|\")"

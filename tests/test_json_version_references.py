@@ -4,6 +4,8 @@
 """JSON version literals are metadata, not references to local artifacts."""
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -56,7 +58,7 @@ def test_json_version_exemption_preserves_other_missing_references(
     )
     assert result.complete
     assert any(
-        r["status"] == "missing" and expected_missing in (r["evidence"] or "")
+        r["status"] == "missing" and r["column"] == body.index(expected_missing) + 1
         for r in result.records
     )
 
@@ -107,3 +109,18 @@ def test_json_version_does_not_hide_real_missing_cli_reference(tmp_path: Path) -
     references = report["analysis_completeness"]["references"]
     assert not any("1.0.0" in r["evidence"] for r in references)
     assert any(r["status"] == "missing" and "scripts/emit.py" in r["evidence"] for r in references)
+
+
+def test_json_version_matcher_rejects_long_malformed_suffix_promptly() -> None:
+    # Isolate the matcher so a backtracking regression cannot hang the suite.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from skillspector.references import _JSON_VERSION_FIELD\n"
+            'line = \'"VERSION": "1.0.0"\' + " " * 250_000 + "x"\n'
+            "assert _JSON_VERSION_FIELD.fullmatch(line) is None",
+        ],
+        check=True,
+        timeout=5,
+    )
