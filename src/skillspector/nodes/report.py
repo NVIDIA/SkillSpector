@@ -2107,7 +2107,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
         logger.warning(
             "LLM stage unavailable during preflight; report reflects static analysis only"
         )
-    elif semantic_runtime_incomplete:
+    elif runtime_event is not None:
         logger.warning(
             "LLM stage degraded: semantic runtime telemetry was incomplete; "
             "report may reflect static analysis only"

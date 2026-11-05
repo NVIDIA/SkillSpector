@@ -338,6 +338,140 @@ def format_recovery_runtime_accepted(
     return complete
 
 
+def _refused_runtime_is_accounted(
+    result: Mapping[str, object],
+    discovered_modules: Mapping[str, object],
+) -> bool:
+    """Distinguish reported refusals from missing execution evidence."""
+    events = result.get("inspection_ledger")
+    statuses = result.get("analyzer_status_events")
+    calls = result.get("llm_call_log")
+    if not all(isinstance(value, list) for value in (events, statuses, calls)):
+        return False
+    assert isinstance(events, list) and isinstance(statuses, list) and isinstance(calls, list)
+    by_work: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+    refusals: set[tuple[str, str]] = set()
+    refused_nodes: set[tuple[str, str]] = set()
+    for event in events:
+        if not isinstance(event, Mapping):
+            return False
+        scope, work_id = _source_scope(event), event.get("work_id")
+        if scope is None or not isinstance(work_id, str) or not work_id:
+            return False
+        key = (scope, work_id)
+        by_work.setdefault(key, []).append(event)
+        if not isinstance(event.get("phase"), str):
+            return False
+        if (
+            event.get("phase") in {"semantic", "meta"}
+            and event.get("outcome") != LedgerOutcome.COMPLETED
+        ):
+            if (
+                event.get("record_type") != LedgerRecordType.WORK_ITEM
+                or event.get("phase") != "semantic"
+                or event.get("outcome") != LedgerOutcome.SKIPPED
+                or event.get("reason_code") != LedgerReason.LLM_RESPONSE_REFUSED
+            ):
+                return False
+            analyzer = event.get("analyzer_id")
+            if not isinstance(analyzer, str) or not analyzer:
+                return False
+            refusals.add(key)
+            refused_nodes.add((scope, analyzer))
+    if not refusals:
+        return False
+
+    projected_statuses: list[Mapping[str, object]] = []
+    accounted_work: set[tuple[str, str]] = set()
+    accounted_refusals: set[tuple[str, str]] = set()
+    for status in statuses:
+        if not isinstance(status, Mapping):
+            return False
+        scope, analyzer = _source_scope(status), status.get("analyzer_id")
+        if scope is None or not isinstance(analyzer, str) or not analyzer:
+            return False
+        if (scope, analyzer) not in refused_nodes:
+            projected_statuses.append(status)
+            continue
+        targets = status.get("planned_work")
+        if status.get("status") != "degraded" or not isinstance(targets, list) or not targets:
+            return False
+        node_refusals: set[tuple[str, str]] = set()
+        for target in targets:
+            if not isinstance(target, Mapping):
+                return False
+            work_id, path = target.get("work_id"), target.get("path")
+            if not isinstance(work_id, str) or not work_id or not isinstance(path, str) or not path:
+                return False
+            start, end = target.get("start_line"), target.get("end_line")
+            if (start is not None and (type(start) is not int or start < 1)) or (
+                end is not None and (type(end) is not int or start is None or end < start)
+            ):
+                return False
+            key = (scope, work_id)
+            matches = by_work.get(key, [])
+            if key in accounted_work or len(matches) != 1:
+                return False
+            event = matches[0]
+            if (
+                event.get("record_type") != LedgerRecordType.WORK_ITEM
+                or event.get("analyzer_id") != analyzer
+                or event.get("phase") != "semantic"
+                or any(
+                    event.get(field) != target.get(field)
+                    for field in ("path", "start_line", "end_line")
+                )
+                or not (
+                    key in refusals
+                    or (
+                        event.get("outcome") == LedgerOutcome.COMPLETED
+                        and event.get("reason_code") is None
+                    )
+                )
+            ):
+                return False
+            accounted_work.add(key)
+            if key in refusals:
+                node_refusals.add(key)
+        if not node_refusals:
+            return False
+        accounted_refusals.update(node_refusals)
+        projected_statuses.append({**status, "status": "completed"})
+    if accounted_refusals != refusals:
+        return False
+
+    projected_calls: list[object] = []
+    accounted_nodes: set[tuple[str, str]] = set()
+    for call in calls:
+        if not isinstance(call, Mapping):
+            return False
+        scope, node = _source_scope(call), call.get("node")
+        if scope is None or not isinstance(node, str) or not node:
+            return False
+        key = (scope, node)
+        if call.get("ok") is False and key in refused_nodes:
+            # Refusal batch outcomes have no transport error. Other failures
+            # must retain their missing-runtime warning.
+            if "error" not in call or call["error"] is not None:
+                return False
+            accounted_nodes.add(key)
+            projected_calls.append({**call, "ok": True})
+        else:
+            projected_calls.append(call)
+    if accounted_nodes != refused_nodes:
+        return False
+    _used, complete = semantic_runtime_accounting(
+        enabled=True,
+        result={
+            **result,
+            "analyzer_status_events": projected_statuses,
+            "llm_call_log": projected_calls,
+        },
+        discovered_modules=discovered_modules,
+    )
+    return complete
+
+
 def semantic_runtime_limitation(
     *,
     requested: bool,
@@ -378,6 +512,8 @@ def semantic_runtime_ledger_event(
         discovered_modules=discovered_modules,
     )
     if limitation is None:
+        return None
+    if enabled and _refused_runtime_is_accounted(result, discovered_modules):
         return None
     event = ledger_event(
         outcome=LedgerOutcome.PARTIAL,
