@@ -160,14 +160,18 @@ _SC3_SUBSTITUTION_EXECUTOR = (
 # fetch-and-run as a pipe to sh, with no pipe for the patterns above. The fetch
 # must be a command: it starts the substitution, possibly on a later line, or
 # follows a command separator, and quoted words are skipped whole, so
-# `printf 'curl ...'` is not a fetch. The match ends with the fetch command, so
-# a URL in a later command cannot mark the download as trusted.
+# `printf 'curl ...'` is not a fetch. A path such as /usr/bin/curl still counts.
+# `sc2_fetch` holds only the fetch command, so the trust check cannot see a URL
+# from another command in the same substitution.
 _SC2_SUBSTITUTION_FETCH = (
     rf"{_SC3_SUBSTITUTION_EXECUTOR}"
-    r"(?:(?:[^()`'\"]|'[^'()`]*'|\"[^\"()`]*\"){0,256}?[;&|\r\n\v\f\x1c-\x1e\x85  ])?"
-    r"[\s\\]{0,64}(?:sudo\s+)?(?:curl|wget)\s+"
-    r"[^)`;&|\r\n\v\f\x1c-\x1e\x85  ]{0,256}"
+    r"(?:(?:[^()`'\"]|'[^'()`]*'|\"[^\"()`]*\"){0,256}?[;&|\r\n\v\f\x1c-\x1e\x85\u2028\u2029])?"
+    r"[\s\\]{0,64}(?P<sc2_fetch>(?:sudo\s+)?(?:[\w.~+-]*/){0,16}(?:curl|wget)\s+"
+    r"(?:[^)`;&|\r\n\v\f\x1c-\x1e\x85\u2028\u2029]|&>){0,256})"
 )
+# A fetch whose stdout is redirected (`>file`, `1>`, `&>`, `>&2`) leaves nothing
+# for the substitution to run; `2>` only moves errors.
+_SC2_FETCH_STDOUT_REDIRECT = re.compile(r"(?<![0-9])>|(?<=[\s&]1)>")
 SC2_CODE_PATTERNS = [
     (r"curl\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh", 0.9),
     (r"wget\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh", 0.9),
@@ -2489,6 +2493,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in matches:
             line_num = line_number(match.start())
             mt = match.group(0)
+            fetch = match.groupdict().get("sc2_fetch")
+            if fetch is not None and _SC2_FETCH_STDOUT_REDIRECT.search(fetch):
+                continue
             warned_internal_installer = _is_warned_internal_installer(
                 content,
                 match,
@@ -2500,7 +2507,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 match.start(),
                 line_starts,
             )
-            if _is_safe_supply_chain_pattern(mt) or data_consumer:
+            if _is_safe_supply_chain_pattern(fetch or mt) or data_consumer:
                 adj = min(confidence, 0.15)
                 sev = Severity.LOW
             else:

