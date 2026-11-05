@@ -1770,7 +1770,9 @@ def test_special_xargs_input_mode_keeps_raw_destructive_findings():
     assert any(finding.rule_id == "TM1" for finding in result["findings"])
 
 
-@pytest.mark.parametrize("redirection", ["&> output", "2>&1", "< <(printf '')", "<(printf '')"])
+@pytest.mark.parametrize(
+    "redirection", ["&> output", "2>&1", "< <(printf '')", "<(printf '')", "> >(cat)", ">(cat)"]
+)
 def test_arg_file_later_here_string_cannot_hide_after_other_redirections(redirection):
     source = f'xargs -a input sh -c "printf done" {redirection} <<< "$CODE"'
     diagnostics = []
@@ -1781,7 +1783,21 @@ def test_arg_file_later_here_string_cannot_hide_after_other_redirections(redirec
     assert diagnostics[0].cause.value == "unsupported_syntax"
 
 
-@pytest.mark.parametrize("redirection", ["&> output", "2>&1", "< <(printf '')", "<(printf '')"])
+@pytest.mark.parametrize(
+    "redirection", ["&> output", "2>&1", "< <(printf '')", "<(printf '')", "> >(cat)", ">(cat)"]
+)
 def test_arg_file_other_redirections_without_here_string_preserve_literal_c_body(redirection):
     source = f'xargs -a input sh -c "printf done" {redirection}'
     assert tm._command_string_from_clause(source, 0, lambda: None) == (True, "printf done")
+
+
+@pytest.mark.parametrize("suffix", ["<(printf", ">(cat", "<(" + "a" * 9000 + ")"])
+def test_arg_file_lookahead_cannot_assume_a_truncated_process_substitution_is_closed(suffix):
+    diagnostics = []
+    assert tm._command_string_from_clause(
+        'xargs -a input sh -c "printf done" ' + suffix,
+        0,
+        lambda: None,
+        diagnostics=diagnostics,
+    ) == (True, None)
+    assert diagnostics

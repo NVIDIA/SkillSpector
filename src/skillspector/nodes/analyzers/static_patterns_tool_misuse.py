@@ -4820,8 +4820,14 @@ def _command_string_from_clause(
                 return False
             if re.match(r"(?:[0-9]+)?<<<", tail[position : position + 32]):
                 return True
+            if tail.startswith(("<(", ">("), position):
+                end = _skip_command_substitution(tail, position, len(tail), check_runtime)
+                if end is None or end <= position or end > _ROOT_GLOB_COMMAND_CHARS:
+                    return None
+                position = end
+                continue
             redirection = _SHELL_REDIRECTION_PREFIX_RE.match(tail, position)
-            if redirection is not None and not tail.startswith(("<(", ">("), position):
+            if redirection is not None:
                 position = redirection.end()
                 continue
             if tail[position] in "\r\n;|&()#":
