@@ -4304,6 +4304,7 @@ def _shell_redefines_primitives(
     names: frozenset[str],
     *,
     candidate_starts: Iterator[int] | None = None,
+    candidate_ends: Mapping[int, int] | None = None,
     remaining_work: list[int] | None = None,
 ) -> bool:
     """Retain the same bounded binding proof for selected builtin names."""
@@ -4319,7 +4320,10 @@ def _shell_redefines_primitives(
     )
     for start in starts:
         check_runtime()
-        source = content[start : start + _ROOT_GLOB_COMMAND_CHARS + 1]
+        end = min(start + _ROOT_GLOB_COMMAND_CHARS + 1, len(content))
+        if candidate_ends is not None:
+            end = min(end, candidate_ends.get(start, end))
+        source = content[start:end]
         cursor = 0
         wrapper: str | None = None
         for _ in range(8):
@@ -4352,6 +4356,15 @@ def _shell_redefines_primitives(
             if word in _SHELL_CLAUSE_PREFIX_WORDS or word in {"if", "while", "until"}:
                 continue
             if word in {"eval", "source", ".", "enable", "trap"}:
+                if candidate_ends is not None and start in candidate_ends:
+                    operand, end, limited = _next_shell_invocation_word(
+                        source, cursor, check_runtime
+                    )
+                    work[0] -= end - cursor
+                    if limited or work[0] < 0:
+                        return True
+                    if operand is None:
+                        break
                 # Imported/evaluated code, handlers and builtin configuration
                 # can replace printf in this shell.
                 # Retain the earlier narrow decoder across those unknown effects.
@@ -4676,6 +4689,7 @@ def _command_string_from_clause(
     source_span: list[int] | None = None,
     data_argument_spans: list[tuple[int, int]] | None = None,
     output_binding_proven: bool = False,
+    output_argument_end: int | None = None,
 ) -> tuple[bool, str | None]:
     """Resolve a bounded wrapper chain to an ``eval`` or shell command string."""
     cursor = start
@@ -4780,13 +4794,17 @@ def _command_string_from_clause(
         command = word.casefold().rsplit("/", 1)[-1]
         if command in _SHELL_CLAUSE_PREFIX_WORDS:
             continue
-        if data_argument_spans is not None and word in {"echo", "printf"}:
+        if (
+            data_argument_spans is not None
+            and output_argument_end is not None
+            and word in {"echo", "printf"}
+        ):
             if not output_binding_proven or (startup_exposure and startup_exposure[0]):
                 return failed(ParserCause.RUNTIME_DEPENDENT)
             spans: list[tuple[int, int]] = []
             format_pending = word == "printf"
             for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
-                while cursor < len(content):
+                while cursor < output_argument_end:
                     if content.startswith("\\\r\n", cursor):
                         cursor += 3
                     elif content.startswith("\\\n", cursor):
@@ -4795,16 +4813,16 @@ def _command_string_from_clause(
                         cursor += 1
                     else:
                         break
-                if cursor < len(content) and content[cursor] in "|&":
+                if cursor < output_argument_end and content[cursor] in "|&":
                     # Output may become another command's executable input.
                     return failed(ParserCause.RUNTIME_DEPENDENT)
-                if cursor >= len(content) or content[cursor] in "\r\n;()#":
+                if cursor >= output_argument_end or content[cursor] in "\r\n;()#":
                     if format_pending:
                         return failed(ParserCause.BOUNDARY_UNRESOLVED)
                     data_argument_spans.extend(spans)
                     return False, None
                 argument, limited = next_word()
-                if limited or argument is None:
+                if limited or argument is None or cursor > output_argument_end:
                     return failed(ParserCause.BOUNDARY_UNRESOLVED)
                 if _DYNAMIC_SHELL_WORD_SENTINEL in argument:
                     return failed(ParserCause.RUNTIME_DEPENDENT)
@@ -8977,7 +8995,7 @@ def _message_shell_words(
     check_runtime: Callable[[], None],
     remaining_work: list[int],
     diagnostics: list[StaticParserDiagnostic],
-) -> Iterator[tuple[int, int]]:
+) -> Iterator[tuple[int, int, str]]:
     """Enumerate full words with the existing quote/substitution reader."""
     cursor = 0
     while cursor < len(content):
@@ -9008,7 +9026,7 @@ def _message_shell_words(
                 cursor = max(cursor + 1, end + 1)
             continue
         cursor = end
-        yield start, end
+        yield start, end, word
 
 
 def _message_inline_runtime_diagnostic(
@@ -9048,21 +9066,66 @@ def _message_inline_runtime_diagnostic(
             observed_is_lower_bound=True,
         )
 
+    range_starts = [start for start, _end in ranges]
+
+    def inline_end(start: int) -> int | None:
+        index = bisect_right(range_starts, start) - 1
+        return ranges[index][1] if index >= 0 and start < ranges[index][1] else None
+
+    def output_end(start: int, native_starts: set[int]) -> int | None:
+        return inline_end(start) or (len(content) if start in native_starts else None)
+
+    def binding_starts(
+        source: str,
+        native_starts: set[int],
+        candidate_ends: dict[int, int],
+        lexical_diagnostics: list[StaticParserDiagnostic],
+    ) -> Iterator[int]:
+        skip_until = 0
+        for start, _end, word in _message_shell_words(
+            source, check_runtime, remaining_work, lexical_diagnostics
+        ):
+            if start < skip_until:
+                continue
+            owner_end = inline_end(start)
+            if owner_end is not None:
+                candidate_ends[start] = owner_end
+            if word in {"echo", "printf"}:
+                spans: list[tuple[int, int]] = []
+                source_span = [start, start]
+                # These are structural argument roles, not builtin trust.
+                _command_string_from_clause(
+                    source,
+                    start,
+                    check_runtime,
+                    source_span=source_span,
+                    data_argument_spans=spans,
+                    output_binding_proven=True,
+                    output_argument_end=output_end(start, native_starts),
+                )
+                remaining_work[0] -= max(1, source_span[1] - start)
+                if remaining_work[0] < 0:
+                    return
+                if spans:
+                    skip_until = spans[-1][1]
+            yield start
+
     # Prose may place execution consumers outside an inline span. Inspect the
     # original commands first: masking backticks inside a quoted shell -c
     # argument must not replace executable substitution with display text.
     for source in (content, projected):
         lexical_diagnostics: list[StaticParserDiagnostic] = []
+        native_starts = set(_nonempty_shell_clause_starts(source, check_runtime))
+        remaining_work[0] -= len(source)
+        candidate_ends: dict[int, int] = {}
         output_binding_proven = not _shell_redefines_primitives(
             source,
             check_runtime,
             frozenset({"echo", "printf"}),
-            candidate_starts=(
-                start
-                for start, _end in _message_shell_words(
-                    source, check_runtime, remaining_work, lexical_diagnostics
-                )
+            candidate_starts=binding_starts(
+                source, native_starts, candidate_ends, lexical_diagnostics
             ),
+            candidate_ends=candidate_ends,
             remaining_work=remaining_work,
         )
         if lexical_diagnostics:
@@ -9072,7 +9135,7 @@ def _message_inline_runtime_diagnostic(
         skip_until = 0
         startup_exposure = [False]
         startup_diagnostics: list[StaticParserDiagnostic] = []
-        for start, _word_end in _message_shell_words(
+        for start, _word_end, _word in _message_shell_words(
             source, check_runtime, remaining_work, lexical_diagnostics
         ):
             if start < skip_until:
@@ -9101,6 +9164,7 @@ def _message_inline_runtime_diagnostic(
                 source_span=source_span,
                 data_argument_spans=argument_spans,
                 output_binding_proven=output_binding_proven,
+                output_argument_end=output_end(start, native_starts),
             )
             remaining_work[0] -= max(1, source_span[1] - start)
             if remaining_work[0] < 0:

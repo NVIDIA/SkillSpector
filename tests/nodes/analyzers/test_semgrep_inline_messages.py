@@ -47,6 +47,15 @@ def _scan(message: str, *, encoded: bool = False) -> dict:
         "An example `$(...)`; printf -- '%s' 'sh -c value'.",
         'An example `$(...)`; echo "sh -c value".',
         'An example `$(...)` then display "BASH_ENV=literal" as data; bash -c "printf done".',
+        "An example `$(...)`; echo 'source'.",
+        "An example `$(...)`; echo 'eval'.",
+        "An example `$(...)`; echo 'alias printf=eval'.",
+        "An example `$(...)`; printf '%s' 'source'.",
+        "An example `$(...)`; printf '%s' 'eval'.",
+        "An example `$(...)`; printf '%s' 'alias printf=eval'.",
+        "An example `$(...)`. Use `source` as a reference; echo 'status'.",
+        "An example `$(...)`. Use `printf` as a reference; echo 'status'.",
+        "An example `$(...)`. Use `echo` as a reference; echo 'status'.",
     ],
 )
 def test_exact_owned_inline_body_refines_the_false_backtick_runtime_reading(message: str) -> None:
@@ -93,6 +102,10 @@ def test_exact_owned_inline_body_refines_the_false_backtick_runtime_reading(mess
         "An example `$(...)`; echo \"$(sh -c '$PAYLOAD')\".",
         "An example `$(...)`; printf '%s' \"$PAYLOAD\" | sh",
         "An example `$(...)`; printf '%s' value > >(sh -c \"$PAYLOAD\")",
+        'An example `$(...)`. Use `echo` to show status, then run sh -c "$PAYLOAD".',
+        'An example `$(...)`. Use `printf` to show status, then run sh -c "$PAYLOAD".',
+        'An example `$(...)`. Use `echo` to show status, then run `sh` -c "$PAYLOAD".',
+        'An example `$(...)`. Use `printf` to show status, then run `sh` -c "$PAYLOAD".',
     ],
 )
 def test_inline_body_trailing_and_later_runtime_consumers_remain_partial(message: str) -> None:
