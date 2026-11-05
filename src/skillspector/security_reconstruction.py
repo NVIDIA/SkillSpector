@@ -1040,17 +1040,28 @@ def _quoted_directives(
             continue
         quote = _QUOTE_OPEN_TO_CLOSE[match.group("quote")]
         marker_start = match.end()
+        if quote == "`":
+            opener = _BACKTICK_RUN_RE.match(text, match.start("quote"))
+            assert opener is not None
+            quote = opener[0]
+            marker_start = opener.end()
         marker_end_limit = min(len(text), marker_start + MAX_MARKER_LOOKAHEAD_CHARS)
         cursor = marker_start
-        unsupported = unsupported_header
+        unsupported = unsupported_header or len(quote) > 1
         while cursor < marker_end_limit:
             character = text[cursor]
-            if character == quote:
+            if text.startswith(quote, cursor) and (
+                len(quote) == 1
+                or (
+                    (cursor == marker_start or text[cursor - 1] != "`")
+                    and text[cursor + len(quote) : cursor + len(quote) + 1] != "`"
+                )
+            ):
                 if cursor > marker_start:
                     yield _Directive(
                         text[marker_start:cursor],
                         match.start(),
-                        cursor + 1,
+                        cursor + len(quote),
                         unsupported=unsupported,
                     )
                 break
