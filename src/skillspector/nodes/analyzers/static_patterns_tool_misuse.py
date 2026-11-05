@@ -4326,14 +4326,18 @@ def _shell_redefines_command(
     scope_ends: list[int] = []
     aliases: set[str] = set()
     invoked: set[str] = set()
+    backtick_starts: set[int] = set()
     for start in _nonempty_shell_clause_starts(
         content,
         check_runtime,
         shell_substitutions=shell_substitutions,
         substitution_scopes=scope_ends,
-        backtick_starts=set() if shell_substitutions else None,
+        backtick_starts=backtick_starts if shell_substitutions else None,
     ):
         check_runtime()
+        if start in backtick_starts:
+            # The opener is a traversal marker; its body is visited separately.
+            continue
         scope_end = scope_ends[-1] - 1 if scope_ends else len(content)
         if start >= scope_end:
             continue

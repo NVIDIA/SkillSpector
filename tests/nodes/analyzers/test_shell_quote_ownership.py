@@ -1600,8 +1600,17 @@ def test_nested_xargs_keeps_enclosing_binding_uncertainty(expression, binding):
 
 
 @pytest.mark.parametrize("expression", ['`xargs <<< "$VALUE"\n`', '$(xargs <<< "$VALUE"\n)'])
-def test_unmodified_nested_xargs_still_proves_printed_data(expression):
-    assert not tm.has_bounded_parse_exhaustion(expression, lambda: None, file_type="shell")
+def test_naked_xargs_substitution_keeps_runtime_selected_outer_command_partial(expression):
+    diagnostic = tm.bounded_parse_diagnostic(expression, lambda: None, file_type="shell")
+    assert diagnostic is not None
+    assert diagnostic.cause is tm.ParserCause.RUNTIME_DEPENDENT
+
+
+@pytest.mark.parametrize("expression", ['`xargs <<< "$VALUE"\n`', '$(xargs <<< "$VALUE"\n)'])
+@pytest.mark.parametrize("context", ['echo "values ({})"\n', "result={}\n"])
+def test_unmodified_nested_xargs_still_proves_printed_or_assigned_data(expression, context):
+    source = context.format(expression)
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
 @pytest.mark.parametrize(
@@ -1830,3 +1839,14 @@ def test_process_word_lookahead_opt_in_preserves_default_redirection_boundary():
     assert not limited
     assert word is not None and word.endswith("#suffix")
     assert source[end:].startswith(" <<<")
+
+
+@pytest.mark.parametrize("binding", ["xargs() { bash; }", "alias xargs=bash", 'eval "$SETUP"'])
+def test_printed_legacy_substitution_does_not_skip_enclosing_binding_effects(binding):
+    source = binding + '\necho "values (`xargs <<< "$VALUE"\n`)"\n'
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+def test_printed_legacy_substitution_keeps_raw_destructive_commands():
+    source = 'echo "values (`xargs <<< "$(rm -rf /)"`)"\n'
+    assert any(finding.rule_id == "TM1" for finding in tm.analyze(source, "example.sh", "shell"))
