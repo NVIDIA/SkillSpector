@@ -1660,6 +1660,7 @@ def _next_shell_invocation_word(
     *,
     diagnostics: list[StaticParserDiagnostic] | None = None,
     source_start: list[int] | None = None,
+    leading_process_substitution: bool = False,
 ) -> tuple[str | None, int, bool]:
     """Read one direct shell word without traversing nested substitutions."""
     cursor = start
@@ -1697,7 +1698,11 @@ def _next_shell_invocation_word(
         else:
             source_start.append(cursor)
     start = cursor
-    if cursor >= limit or content[cursor] in ");|&()<>":
+    if cursor >= limit:
+        return None, cursor, False
+    if content[cursor] in ");|&()<>" and not (
+        leading_process_substitution and content.startswith(("<(", ">("), cursor)
+    ):
         return None, cursor, False
 
     output: list[str] = []
@@ -4820,19 +4825,15 @@ def _command_string_from_clause(
                 return False
             if re.match(r"(?:[0-9]+)?<<<", tail[position : position + 32]):
                 return True
-            if tail.startswith(("<(", ">("), position):
-                end = _skip_command_substitution(tail, position, len(tail), check_runtime)
-                if end is None or end <= position or end > _ROOT_GLOB_COMMAND_CHARS:
-                    return None
-                position = end
-                continue
             redirection = _SHELL_REDIRECTION_PREFIX_RE.match(tail, position)
-            if redirection is not None:
+            if redirection is not None and not tail.startswith(("<(", ">("), position):
                 position = redirection.end()
                 continue
             if tail[position] in "\r\n;|&()#":
                 return False
-            word, end, limited = _next_shell_invocation_word(tail, position, check_runtime)
+            word, end, limited = _next_shell_invocation_word(
+                tail, position, check_runtime, leading_process_substitution=True
+            )
             if limited or word is None or end <= position or end > _ROOT_GLOB_COMMAND_CHARS:
                 return None
             position = end

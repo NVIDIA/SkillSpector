@@ -1801,3 +1801,32 @@ def test_arg_file_lookahead_cannot_assume_a_truncated_process_substitution_is_cl
         diagnostics=diagnostics,
     ) == (True, None)
     assert diagnostics
+
+
+@pytest.mark.parametrize("suffix", ["#suffix", "'suffix'", '"#suffix"', "<(printf x)#tail"])
+@pytest.mark.parametrize("opener", ["<(printf '')", ">(cat)"])
+def test_arg_file_process_word_keeps_adjacent_suffixes_before_later_here_string(opener, suffix):
+    source = f'xargs -a input sh -c bash {opener}{suffix} <<< "$CODE"'
+    diagnostics = []
+    assert tm._command_string_from_clause(source, 0, lambda: None, diagnostics=diagnostics) == (
+        True,
+        None,
+    )
+    assert diagnostics[0].cause.value == "unsupported_syntax"
+
+
+@pytest.mark.parametrize("suffix", ["#suffix", "'suffix'", '"#suffix"', "<(printf x)#tail"])
+def test_arg_file_adjacent_process_suffix_without_here_string_preserves_literal_c_body(suffix):
+    source = f'xargs -a input sh -c "printf done" <(printf x){suffix}'
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, "printf done")
+
+
+def test_process_word_lookahead_opt_in_preserves_default_redirection_boundary():
+    source = "<(printf '')#suffix <<< '$CODE'"
+    assert tm._next_shell_invocation_word(source, 0, lambda: None) == (None, 0, False)
+    word, end, limited = tm._next_shell_invocation_word(
+        source, 0, lambda: None, leading_process_substitution=True
+    )
+    assert not limited
+    assert word is not None and word.endswith("#suffix")
+    assert source[end:].startswith(" <<<")
