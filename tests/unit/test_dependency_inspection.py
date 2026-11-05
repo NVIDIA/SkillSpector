@@ -250,6 +250,66 @@ def test_stale_lockfile_is_not_used(monkeypatch):
     assert "dependency_lockfile_mismatch" in reasons(inspect_dependencies(state))
 
 
+@pytest.mark.parametrize("lock_version", [2, 3])
+@pytest.mark.parametrize("shadowed_version", ["1.0.0", "^2.0.0"])
+def test_optional_declarations_override_ordinary_dependencies(lock_version, shadowed_version):
+    state = scan_state(
+        {"node_modules/fixture-package": entry(package_blob())}, lock_version=lock_version
+    )
+    manifest = {
+        "dependencies": {"fixture-package": shadowed_version, "other": "1.0.0"},
+        "optionalDependencies": {"fixture-package": "1.0.0"},
+        "devDependencies": {"dev-only": "2.0.0"},
+        "peerDependencies": {"peer-only": "3.0.0"},
+    }
+    lock = json.loads(state["raw_file_cache"]["package-lock.json"])
+    lock["packages"][""] = {**manifest, "dependencies": {"other": "1.0.0"}}
+    state["raw_file_cache"].update(
+        {
+            "package.json": json.dumps(manifest).encode(),
+            "package-lock.json": json.dumps(lock).encode(),
+        }
+    )
+    artifacts, events, count = _collect_artifacts(state, DependencyInspectionLimits())
+    assert not events and count == 1
+    assert [(artifact.name, artifact.version) for artifact in artifacts] == [
+        ("fixture-package", "1.0.0")
+    ]
+
+
+@pytest.mark.parametrize(
+    "key", ["dependencies", "optionalDependencies", "devDependencies", "peerDependencies"]
+)
+def test_optional_override_preserves_other_declaration_mismatches(key):
+    manifest = {
+        "dependencies": {"fixture-package": "^2.0.0", "other": "1.0.0"},
+        "optionalDependencies": {"fixture-package": "1.0.0"},
+        "devDependencies": {"other": "1.0.0"},
+        "peerDependencies": {"other": "1.0.0"},
+    }
+    locked = {**manifest, "dependencies": {"other": "1.0.0"}}
+    name = "fixture-package" if key == "optionalDependencies" else "other"
+    locked[key] = {**locked[key], name: "9.0.0"}
+    state = scan_state({"": locked, "node_modules/fixture-package": entry(package_blob())})
+    state["raw_file_cache"]["package.json"] = json.dumps(manifest).encode()
+    artifacts, events, count = _collect_artifacts(state, DependencyInspectionLimits())
+    assert not artifacts and count == 0
+    assert [event["reason_code"] for event in events] == ["dependency_lockfile_mismatch"]
+
+
+@pytest.mark.parametrize(
+    "key", ["dependencies", "optionalDependencies", "devDependencies", "peerDependencies"]
+)
+@pytest.mark.parametrize("invalid", [None, [], "fixture-package"])
+def test_invalid_declaration_maps_remain_incomplete(key, invalid):
+    manifest = {key: invalid}
+    state = scan_state({"": manifest, "node_modules/fixture-package": entry(package_blob())})
+    state["raw_file_cache"]["package.json"] = json.dumps(manifest).encode()
+    artifacts, events, count = _collect_artifacts(state, DependencyInspectionLimits())
+    assert not artifacts and count == 0
+    assert [event["reason_code"] for event in events] == ["dependency_parse_error"]
+
+
 def test_integrity_mismatch_never_reaches_worker(monkeypatch):
     state = scan_state({"node_modules/fixture-package": entry(package_blob())})
     download_fixture(monkeypatch, b"tampered")
