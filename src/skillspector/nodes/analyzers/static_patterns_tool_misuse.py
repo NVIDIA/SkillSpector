@@ -9130,10 +9130,10 @@ def _message_inline_runtime_diagnostic(
         check_runtime()
         raw_consumer_chars[apostrophe] = " "
     raw_consumer = "".join(raw_consumer_chars)
+    native_starts = set(_nonempty_shell_clause_starts(raw_consumer, check_runtime))
+    remaining_work[0] -= len(raw_consumer)
     for source_index, source in enumerate((raw_consumer, projected)):
         lexical_diagnostics: list[StaticParserDiagnostic] = []
-        native_starts = set(_nonempty_shell_clause_starts(source, check_runtime))
-        remaining_work[0] -= len(source)
         output_binding_proven = not _shell_redefines_primitives(
             source,
             check_runtime,
