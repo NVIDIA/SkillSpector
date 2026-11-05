@@ -798,12 +798,10 @@ def test_proven_native_and_local_numeric_calls_retain_templates(
         "const NUMBER = /x/; NUMBER.test = handler; /x/.exec(`${command}`);",
         "const NUMBER = /x/; const method = NUMBER.test; method(value); /x/.exec(`${command}`);",
         "export const NUMBER = /x/; /x/.exec(`${command}`);",
-
         "import {join as eval} from 'node:path'; eval(`${command}`);",
         "import {posix as p} from 'node:path'; const load = require; const other = load('node:path'); other.posix.join = handler; p.join(`${command}`);",
         "import {posix as p} from 'node:path'; const other = process.getBuiltinModule('node:path'); other.posix.join = handler; p.join(`${command}`);",
         "import {posix as p} from 'node:path'; import other from 'node:path/posix'; other.join = handler; p.join(`${command}`);",
-
         "import {join as Function} from 'node:path'; Function(`${command}`);",
         "const prototype = RegExp.prototype; prototype[key] = executor; /x/.exec(text);",
         "Object.getPrototypeOf(/x/)[key] = executor; /x/.exec(text);",
