@@ -8190,6 +8190,7 @@ def _markdown_shell_text(
     hardware_apostrophe_locations: list[tuple[int, int]] | None = None,
     powershell_blocks: list[tuple[int, int]] | None = None,
     inline_code_ranges: list[tuple[int, int]] | None = None,
+    inline_possessive_apostrophes: set[int] | None = None,
 ) -> str:
     """Mask Markdown delimiters while retaining code and exact source offsets.
 
@@ -8203,6 +8204,7 @@ def _markdown_shell_text(
     """
     output = list(content)
     prose_apostrophes: set[int] = set()
+    inline_possessives: set[int] = set()
     runs: list[tuple[int, int]] = []
     list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
     backtick_runs = re.compile(r"`+")
@@ -8247,6 +8249,16 @@ def _markdown_shell_text(
             output[close_start:close_end] = " " * (close_end - close_start)
             if inline_code_ranges is not None:
                 inline_code_ranges.append((end, close_start))
+            if (
+                inline_possessive_apostrophes is not None
+                and content[close_end : close_end + 2].casefold() == "'s"
+                and (
+                    close_end + 2 == len(content)
+                    or re.match(r"[\w'/]", content[close_end + 2]) is None
+                )
+            ):
+                prose_apostrophes.add(close_end)
+                inline_possessives.add(close_end)
         runs.clear()
 
     def prose_without_complete_inline_code(
@@ -8723,6 +8735,8 @@ def _markdown_shell_text(
                 next_runtime_check = cursor + 4096
             if cursor in prose_apostrophes:
                 output[cursor] = " "
+                if inline_possessive_apostrophes is not None and cursor in inline_possessives:
+                    inline_possessive_apostrophes.add(cursor)
             elif projected[cursor] in "'\"`$\\":
                 parsed = _parse_shell_command_word(
                     projected,
@@ -9029,7 +9043,13 @@ def _message_inline_runtime_diagnostic(
     ):
         return raw_diagnostic
     ranges: list[tuple[int, int]] = []
-    projected = _markdown_shell_text(content, check_runtime, inline_code_ranges=ranges)
+    possessives: set[int] = set()
+    projected = _markdown_shell_text(
+        content,
+        check_runtime,
+        inline_code_ranges=ranges,
+        inline_possessive_apostrophes=possessives,
+    )
     if (
         not ranges
         or (raw_diagnostic is not None and (raw_diagnostic.start, raw_diagnostic.end) not in ranges)
@@ -9038,6 +9058,7 @@ def _message_inline_runtime_diagnostic(
         return raw_diagnostic
     work_limit = 8 * len(content) + _ROOT_GLOB_COMMAND_CHARS
     remaining_work = [work_limit]
+    raw_words: set[int] = set()
 
     def limited() -> StaticParserDiagnostic:
         return raw_diagnostic or StaticParserDiagnostic(
@@ -9066,12 +9087,20 @@ def _message_inline_runtime_diagnostic(
         source: str,
         native_starts: set[int],
         lexical_diagnostics: list[StaticParserDiagnostic],
+        projected_source: bool,
     ) -> Iterator[int]:
         skip_until = 0
         for start, _end, word in _message_shell_words(
             source, check_runtime, remaining_work, lexical_diagnostics
         ):
             if start < skip_until:
+                continue
+            if (
+                projected_source
+                and start not in raw_words
+                and start not in native_starts
+                and inline_end(start) is None
+            ):
                 continue
             if word in {"echo", "printf"}:
                 spans: list[tuple[int, int]] = []
@@ -9096,7 +9125,12 @@ def _message_inline_runtime_diagnostic(
     # Prose may place execution consumers outside an inline span. Inspect the
     # original commands first: masking backticks inside a quoted shell -c
     # argument must not replace executable substitution with display text.
-    for source in (content, projected):
+    raw_consumer_chars = list(content)
+    for apostrophe in possessives:
+        check_runtime()
+        raw_consumer_chars[apostrophe] = " "
+    raw_consumer = "".join(raw_consumer_chars)
+    for source_index, source in enumerate((raw_consumer, projected)):
         lexical_diagnostics: list[StaticParserDiagnostic] = []
         native_starts = set(_nonempty_shell_clause_starts(source, check_runtime))
         remaining_work[0] -= len(source)
@@ -9104,7 +9138,9 @@ def _message_inline_runtime_diagnostic(
             source,
             check_runtime,
             frozenset({"echo", "printf"}),
-            candidate_starts=binding_starts(source, native_starts, lexical_diagnostics),
+            candidate_starts=binding_starts(
+                source, native_starts, lexical_diagnostics, source_index == 1
+            ),
             remaining_work=remaining_work,
         )
         if lexical_diagnostics:
@@ -9117,6 +9153,8 @@ def _message_inline_runtime_diagnostic(
         for start, _word_end, _word in _message_shell_words(
             source, check_runtime, remaining_work, lexical_diagnostics
         ):
+            if source_index == 0:
+                raw_words.add(start)
             if start < skip_until:
                 continue
             if not startup_exposure[0]:
