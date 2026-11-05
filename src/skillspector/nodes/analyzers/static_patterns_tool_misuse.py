@@ -4773,7 +4773,9 @@ def _command_string_from_clause(
         if (
             not wrapper_seen
             and content[last_word_start:cursor] == word
-            and re.match(r"[ \t]*\([ \t]*\)[ \t]*(?:\r?\n[ \t]*)?\{", content[cursor : cursor + 256])
+            and re.match(
+                r"[ \t]*\([ \t]*\)[ \t]*(?:\r?\n[ \t]*)?\{", content[cursor : cursor + 256]
+            )
         ):
             # A function declaration names no invocation; its body is scanned
             # independently when clause traversal reaches the opening brace.
@@ -5002,11 +5004,15 @@ def _command_string_from_clause(
                             option.partition("=")[2] if option.startswith("--") else option[2:],
                             False,
                         )
-                    if not marker or limited or any(
-                        sentinel in marker
-                        for sentinel in (
-                            _DYNAMIC_SHELL_WORD_SENTINEL,
-                            _RUNTIME_SHELL_PARAMETER_SENTINEL,
+                    if (
+                        not marker
+                        or limited
+                        or any(
+                            sentinel in marker
+                            for sentinel in (
+                                _DYNAMIC_SHELL_WORD_SENTINEL,
+                                _RUNTIME_SHELL_PARAMETER_SENTINEL,
+                            )
                         )
                     ):
                         return failed(ParserCause.RUNTIME_DEPENDENT)
