@@ -2041,7 +2041,7 @@ def test_tar_member_size_limit_records_exact_measurements(
 ) -> None:
     import skillspector.nested_artifacts as nested
 
-    monkeypatch.setattr(nested, "MAX_FILE_BYTES", 4)
+    monkeypatch.setattr(nested, "ARCHIVE_MAX_MEMBER_BYTES", 4)
     data = _tar_bytes([("file.txt", b"X" * size)])
     result = inspect_nested_artifacts(tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": data})
     events = [
