@@ -64,6 +64,7 @@ from skillspector.python_tokens import python_literal_spans as _python_literal_s
 from skillspector.python_tokens import python_string_body as _python_string_body
 from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+from skillspector.yaml_tokens import yaml_source_spans
 
 from . import static_runner
 from .common import (
@@ -8770,6 +8771,38 @@ def bounded_parse_diagnostic(
     )
     if exhausted is not None and not complete_context:
         exhausted = replace(exhausted, full_input_checked=False)
+    if file_type == "yaml" and complete_context:
+        # A complete YAML grammar bounds scalars independently. Inspect decoded
+        # text even when raw quoting concealed a runtime command or finding.
+        yaml_spans = yaml_source_spans(content, check_runtime)
+        if yaml_spans is None:
+            return exhausted
+        for scalar in yaml_spans.scalars:
+            check_runtime()
+            diagnostic = _has_bounded_parse_exhaustion(
+                scalar.value, check_runtime, file_type="shell", complete_context=True
+            )
+            exact_source = content[scalar.body_start : scalar.body_end] == scalar.value
+            if diagnostic is not None:
+                return (
+                    diagnostic.shifted(scalar.body_start)
+                    if exact_source
+                    else diagnostic.enclosed(scalar.start, scalar.end)
+                )
+            # Folding and escapes may introduce a finding without raw source
+            # provenance. Keep that transformed form partial until a derived
+            # finding view can carry it through the normal reporting path.
+            if not exact_source and analyze(
+                scalar.value, "<yaml-scalar>", "shell", check_runtime=check_runtime
+            ):
+                return StaticParserDiagnostic(
+                    ParserCause.UNSUPPORTED_SYNTAX,
+                    ParserCheck.COMMAND_STRING_EFFECTS,
+                    scalar.start,
+                    scalar.end,
+                    ParserUncheckedScope.EXPRESSION,
+                )
+        return None
     if not exhausted or file_type != "markdown" or not complete_context:
         return exhausted
     # A possessive such as "reference's" in prose is punctuation, yet the
