@@ -71,6 +71,8 @@ def test_valid_html_attribute_closers_do_not_consume_later_text(tag):
         ("json", '{"value": NaN, "label": "delete"}'),
         ("html", '<button title="delete-selection"'),
         ("markdown", '```text\n`delete`\n'),
+        ("markdown", '    `delete`\n'),
+        ("markdown", '<pre>\n`delete`\n</pre>'),
         ("markdown", r"escaped \`delete\`"),
     ],
 )

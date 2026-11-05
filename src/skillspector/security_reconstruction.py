@@ -786,6 +786,12 @@ def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) ->
                 offset += len(line)
                 continue
             fence = None
+        # HTML block context and indented code do not establish inline-code ownership.
+        if body.lstrip().startswith("<"):
+            return closers
+        if body.startswith("    "):
+            offset += len(line)
+            continue
         opening = _JSON_FENCE_OPEN_RE.fullmatch(body)
         if opening and not (opening[1][0] == "`" and "`" in opening[2]):
             last_quote = max((i for i, entry in enumerate(context) if entry[0] == "quote"), default=-1)
