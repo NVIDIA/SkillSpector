@@ -8111,6 +8111,7 @@ def _markdown_shell_text(
     hardware_apostrophe_ambiguity: list[bool] | None = None,
     hardware_apostrophe_locations: list[tuple[int, int]] | None = None,
     powershell_blocks: list[tuple[int, int]] | None = None,
+    inline_code_ranges: list[tuple[int, int]] | None = None,
 ) -> str:
     """Mask Markdown delimiters while retaining code and exact source offsets.
 
@@ -8166,6 +8167,8 @@ def _markdown_shell_text(
         for (start, end), (close_start, close_end) in complete_inline_code_pairs(content, runs):
             output[start:end] = " " * (end - start)
             output[close_start:close_end] = " " * (close_end - close_start)
+            if inline_code_ranges is not None:
+                inline_code_ranges.append((end, close_start))
         runs.clear()
 
     def prose_without_complete_inline_code(
@@ -8896,6 +8899,66 @@ def has_bounded_parse_exhaustion(
     )
 
 
+def _message_inline_runtime_diagnostic(
+    content: str,
+    check_runtime: Callable[[], None],
+    raw_diagnostic: StaticParserDiagnostic,
+) -> StaticParserDiagnostic | None:
+    """Refine one legacy-backtick reading using proved Markdown ownership."""
+    if (
+        raw_diagnostic.cause is not ParserCause.RUNTIME_DEPENDENT
+        or raw_diagnostic.check is not ParserCheck.PRINTF_INVOCATION
+        or raw_diagnostic.location_precision != "source_span"
+    ):
+        return raw_diagnostic
+    ranges: list[tuple[int, int]] = []
+    projected = _markdown_shell_text(content, check_runtime, inline_code_ranges=ranges)
+    if (raw_diagnostic.start, raw_diagnostic.end) not in ranges or "`" in projected:
+        return raw_diagnostic
+    diagnostic = bounded_parse_diagnostic(content, check_runtime, file_type="markdown")
+    if diagnostic is not None:
+        return diagnostic
+    # Inspect each literal body together with its following operands. A label
+    # before `sh -c "$PAYLOAD"` cannot hide the executable start, nor can a
+    # later span borrow an earlier inert example's completed assessment.
+    remaining_work = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
+    for start, _end in ranges:
+        check_runtime()
+        remaining_work -= len(projected) - start
+        if remaining_work < 0:
+            return raw_diagnostic
+        diagnostic = bounded_parse_diagnostic(
+            projected[start:], check_runtime, file_type="markdown"
+        )
+        if diagnostic is not None:
+            return diagnostic.shifted(start)
+    # Prose may place a literal execution consumer outside its inline span.
+    # Reuse the bounded consumer parser at word boundaries instead of deciding
+    # whether a sentence sounds harmless. Non-consumers return immediately.
+    for match in re.finditer(r"\S+", projected):
+        check_runtime()
+        start = match.start()
+        source_span = [start, start]
+        diagnostics: list[StaticParserDiagnostic] = []
+        found, command = _command_string_from_clause(
+            projected, start, check_runtime, diagnostics=diagnostics, source_span=source_span
+        )
+        remaining_work -= max(1, source_span[1] - start)
+        if remaining_work < 0:
+            return raw_diagnostic
+        if not found:
+            continue
+        if command is None:
+            return diagnostics[0] if diagnostics else raw_diagnostic
+        remaining_work -= len(command)
+        if remaining_work < 0:
+            return raw_diagnostic
+        diagnostic = bounded_parse_diagnostic(command, check_runtime, file_type="shell")
+        if diagnostic is not None:
+            return diagnostic.enclosed(start, max(start + 1, source_span[1]))
+    return None
+
+
 def bounded_parse_diagnostic(
     content: str,
     check_runtime: Callable[[], None],
@@ -8947,6 +9010,10 @@ def bounded_parse_diagnostic(
                     # independent runtime or resource failure in inline code.
                     diagnostic = bounded_parse_diagnostic(
                         scalar.value, check_runtime, file_type="markdown", complete_context=True
+                    )
+                elif role == "message" and diagnostic is not None:
+                    diagnostic = _message_inline_runtime_diagnostic(
+                        scalar.value, check_runtime, diagnostic
                     )
             exact_source = content[scalar.body_start : scalar.body_end] == scalar.value
             if diagnostic is not None:
