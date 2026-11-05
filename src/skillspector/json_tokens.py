@@ -215,7 +215,7 @@ class JSONSourceOwnership:
             if index % 1024 == 0:
                 check_runtime()
             offset = view.source_offset(index)
-            if not previous <= offset < len(self.source):
+            if not 0 <= offset < len(self.source) or offset < previous:
                 return None
             role = self.roles[offset]
             if offset == previous:
