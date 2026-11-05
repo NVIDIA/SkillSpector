@@ -51,7 +51,7 @@ from skillspector.inspection_ledger import (
 from skillspector.javascript_tokens import JavaScriptTemplateSpans, assertion_template_shell_text
 from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
 from skillspector.logging_config import get_logger
-from skillspector.models import AnalyzerFinding, Finding, Location, Severity
+from skillspector.models import AnalyzerFinding, Finding, Location, Severity, map_analyzer_findings
 from skillspector.powershell_tokens import PowerShellSource, PowerShellString, powershell_source
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_string_constants import python_constant_string_fields
@@ -64,7 +64,7 @@ from skillspector.python_tokens import python_literal_spans as _python_literal_s
 from skillspector.python_tokens import python_string_body as _python_string_body
 from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
-from skillspector.yaml_tokens import yaml_source_spans
+from skillspector.yaml_tokens import YamlScalar, YamlSourceSpans, yaml_source_spans
 
 from . import static_runner
 from .common import (
@@ -84,6 +84,7 @@ logger = get_logger(__name__)
 ANALYZER_ID = "static_patterns_tool_misuse"
 USES_RUNTIME_CHECK = True
 USES_PYTHON_IMPORT_BOUNDS = True
+USES_PREPARED_PARSER_ANALYSIS = True
 ANALYZE_USES_POSTPROCESS = True
 POSTPROCESS_USES_PYTHON_AST = True
 POSTPROCESS_USES_RUNTIME_BUDGET = True
@@ -8728,6 +8729,116 @@ def _fenced_powershell_source(
     )
 
 
+@dataclass(frozen=True)
+class _YamlParserAnalysis:
+    content: str
+    spans: YamlSourceSpans
+
+    def can_emit(self, scalar: YamlScalar) -> bool:
+        # A scalar no wider than the overlap fits the raw window owning its
+        # opener. Larger scalars need the complete small-artifact window.
+        return (
+            len(self.content) <= static_runner.SECURITY_VIEW_WINDOW_CHARS
+            or scalar.end - scalar.start <= static_runner._WINDOW_OVERLAP_CHARS
+        )
+
+    def owns(self, content: str, source_view: SecurityTextView | None) -> bool:
+        return (
+            source_view is not None
+            and source_view.name == "raw"
+            and content == self.content
+            and source_view.text == content
+            and bool(content)
+            and source_view.source_offset(0) == 0
+            and source_view.source_offset(len(content) - 1) == len(content) - 1
+        )
+
+
+def prepare_parser_analysis(
+    content: str, file_type: str, check_runtime: Callable[[], None]
+) -> _YamlParserAnalysis | None:
+    if file_type != "yaml":
+        return None
+    spans = yaml_source_spans(content, check_runtime)
+    return _YamlParserAnalysis(content, spans) if spans is not None else None
+
+
+@dataclass(frozen=True)
+class _PreparedYamlAnalysis:
+    parser: _YamlParserAnalysis
+    check_runtime: Callable[[], None]
+
+    def analyze(
+        self, content: str, file_path: str, file_type: str, source_view: SecurityTextView
+    ) -> list[AnalyzerFinding]:
+        findings = analyze(
+            content,
+            file_path,
+            file_type,
+            check_runtime=self.check_runtime,
+            defer_variable_reconciliation=True,
+        )
+        if file_type != "yaml" or not content or source_view.name != "raw":
+            return findings
+        source_start = source_view.source_offset(0)
+        source_end = source_view.source_offset(len(content) - 1) + 1
+        if content != self.parser.content[source_start:source_end]:
+            return findings
+        locations = SourceLocationIndex(content, file_path)
+        for scalar in self.parser.spans.scalars:
+            self.check_runtime()
+            if not self.parser.can_emit(scalar):
+                continue
+            start, end = scalar.start - source_start, scalar.end - source_start
+            if not 0 <= start < end <= len(content):
+                continue
+            if self.parser.content[scalar.body_start : scalar.body_end] == scalar.value:
+                continue
+            begin_line, begin_column = locations.line_and_column(start)
+            end_line, end_column = locations.line_and_column(end)
+            raw_context = get_context(content, start)
+            occurrence = 0
+
+            def enclose(finding: AnalyzerFinding) -> None:
+                nonlocal occurrence
+                occurrence += 1
+                # Decoded coordinates must never escape through an interrupted
+                # finding-budget prefix or Python-specific reconciliation.
+                finding.location = Location(
+                    file_path, begin_line, end_line, begin_column, end_column
+                )
+                decoded_line = finding.location.start_line
+                finding.context = raw_context
+                finding.evidence = {
+                    key: value for key, value in finding.evidence.items() if not key.startswith("_")
+                }
+                finding.evidence.update(
+                    {
+                        static_runner._VIEW_START_EVIDENCE: start,
+                        "yaml_scalar": {
+                            "location_precision": "enclosing_expression",
+                            "source_start_offset": scalar.start,
+                            "source_end_offset": scalar.end,
+                            "decoded_start_line": decoded_line,
+                            "decoded_occurrence": occurrence,
+                        },
+                    }
+                )
+
+            with map_analyzer_findings(enclose):
+                findings.extend(
+                    analyze(scalar.value, file_path, "shell", check_runtime=self.check_runtime)
+                )
+        return findings
+
+
+def prepare_analysis(
+    content: str, file_type: str, check_runtime: Callable[[], None]
+) -> _PreparedYamlAnalysis | None:
+    parser = prepare_parser_analysis(content, file_type, check_runtime)
+    return _PreparedYamlAnalysis(parser, check_runtime) if parser is not None else None
+
+
 def has_bounded_parse_exhaustion(
     content: str,
     check_runtime: Callable[[], None],
@@ -8736,6 +8847,8 @@ def has_bounded_parse_exhaustion(
     complete_context: bool = True,
     python_import_check: Callable[[Callable[[], None]], bool] | None = None,
     python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
+    prepared_analysis: object | None = None,
+    source_view: SecurityTextView | None = None,
 ) -> bool:
     """Return whether the bounded static parser leaves an expression unresolved."""
     return (
@@ -8746,6 +8859,8 @@ def has_bounded_parse_exhaustion(
             complete_context=complete_context,
             python_import_check=python_import_check,
             python_stdlib_check=python_stdlib_check,
+            prepared_analysis=prepared_analysis,
+            source_view=source_view,
         )
         is not None
     )
@@ -8759,6 +8874,8 @@ def bounded_parse_diagnostic(
     complete_context: bool = True,
     python_import_check: Callable[[Callable[[], None]], bool] | None = None,
     python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
+    prepared_analysis: object | None = None,
+    source_view: SecurityTextView | None = None,
 ) -> StaticParserDiagnostic | None:
     """Explain the existing first incomplete parser scope without reparsing it."""
     exhausted = _has_bounded_parse_exhaustion(
@@ -8792,7 +8909,12 @@ def bounded_parse_diagnostic(
             # Folding and escapes may introduce a finding without raw source
             # provenance. Keep that transformed form partial until a derived
             # finding view can carry it through the normal reporting path.
-            if not exact_source and analyze(
+            mapped_scalar = (
+                isinstance(prepared_analysis, _YamlParserAnalysis)
+                and prepared_analysis.owns(content, source_view)
+                and prepared_analysis.can_emit(scalar)
+            )
+            if not exact_source and not mapped_scalar and analyze(
                 scalar.value, "<yaml-scalar>", "shell", check_runtime=check_runtime
             ):
                 return StaticParserDiagnostic(
