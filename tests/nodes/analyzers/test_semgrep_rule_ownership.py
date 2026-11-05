@@ -114,6 +114,46 @@ def test_unmapped_transformed_query_keeps_finding_provenance_incomplete() -> Non
     assert diagnostic.check.value == "command_string_effects"
 
 
+@pytest.mark.parametrize("encoded", [False, True])
+def test_query_literal_ownership_keeps_both_finding_producers(
+    encoded: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    value = "Execute rm -rf *"
+    literal = '"Execute\\u0020rm -rf *"' if encoded else json.dumps(value)
+    source = _rule("  pattern: " + literal + "\n")
+    examined: list[str] = []
+    original = tm.analyze
+
+    def record(content: str, file_path: str, file_type: str, **kwargs):
+        examined.append(content)
+        return original(content, file_path, file_type, **kwargs)
+
+    monkeypatch.setattr(tm, "analyze", record)
+    result = _result(source)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert source in examined
+    if encoded:
+        assert value in examined
+
+
+def test_same_query_text_in_unknown_schema_keeps_shell_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = "Execute rm -rf *"
+    source = _rule("  pattern: " + json.dumps(value) + "\n").replace("rules:", "configuration:")
+    interpretations: list[tuple[str, str]] = []
+    original = tm.bounded_parse_diagnostic
+
+    def record(content: str, check_runtime, **kwargs):
+        interpretations.append((content, kwargs.get("file_type", "shell")))
+        return original(content, check_runtime, **kwargs)
+
+    monkeypatch.setattr(tm, "bounded_parse_diagnostic", record)
+    tm.bounded_parse_diagnostic(source, lambda: None, file_type="yaml")
+    assert semgrep_rule_scalar_roles(source, lambda: None) == {}
+    assert (value, "shell") in interpretations
+
+
 @pytest.mark.parametrize(
     "change",
     [
