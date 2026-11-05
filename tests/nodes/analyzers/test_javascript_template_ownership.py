@@ -1055,8 +1055,39 @@ def test_regex_origin_keeps_later_executable_limits_and_raw_findings():
     assert any(f.rule_id == "TM1" for f in tm.analyze(high, "example.mjs", "javascript"))
 
 
-def test_regex_origin_keeps_later_overbudget_executable_word():
+def test_regex_origin_keeps_later_overbudget_executable_word(monkeypatch):
     source = _JS_REGEX_BOUNDARY_SOURCE + "exec(`" + "a" * 5000 + "`);"
-    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
-    assert diagnostic is not None
-    assert diagnostic.start >= len(_JS_REGEX_BOUNDARY_SOURCE)
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    after = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is not None
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import {exec} from 'node:child_process'; "
+        "const receiver={match(pattern){exec(String(pattern).slice(2,-1));}}; "
+        "receiver.match(/`$TOOL -rf \\//);",
+        "import cp from 'node:child_process'; cp.exec(/`$TOOL -rf \\//);",
+        "import {exec as launch} from 'node:child_process'; "
+        "const runner={exec:launch}; runner.exec(/`$TOOL -rf \\//);",
+        "const receiver={match(pattern){consume(pattern);}}; receiver.match(/`name/);",
+        "text.match = custom; text.match(/`name/);",
+        "text['match'] = custom; text.match(/`name/);",
+        "String.prototype.match = custom; text.match(/`name/);",
+        "RegExp.prototype.exec = custom; text.match(/`name/);",
+        "const rule = /`name/; use(rule['so'+'urce']);",
+    ],
+)
+def test_regex_execution_and_override_barriers_keep_existing_incompleteness(source, monkeypatch):
+    regexes = []
+    javascript_template_spans(source, lambda: None, regex_literals=regexes)
+    assert regexes == []
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    after = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert after == before

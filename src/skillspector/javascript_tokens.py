@@ -1518,13 +1518,19 @@ def javascript_template_spans(
         return None
     if quoted_strings is not None:
         quoted_strings.extend(_plain_quoted_value_spans(program, check_runtime))
+    executable = None
     if regex_literals is not None:
-        regex_literals.extend(_plain_regex_value_spans(program, check_runtime))
+        # A lexical boundary cannot replace unresolved behavior. Apply the
+        # existing execution barrier even when the source has no templates.
+        executable = _has_shell_execution_call(program, check_runtime)
+        if not executable:
+            regex_literals.extend(_plain_regex_value_spans(program, check_runtime))
     templates = [node for node in program.nodes if node.type == "template_string"]
     if not templates:
         return None
     projected = assertion_template_shell_text(content, check_runtime)
-    executable = _has_shell_execution_call(program, check_runtime)
+    if executable is None:
+        executable = _has_shell_execution_call(program, check_runtime)
     if executable:
         for node in templates:
             check_runtime()
@@ -1619,7 +1625,46 @@ def _plain_quoted_value_spans(
 def _plain_regex_value_spans(
     program: JavaScriptProgram, check_runtime: Callable[[], None]
 ) -> list[tuple[int, int]]:
-    """Keep native matching syntax separate from executable string consumers."""
+    """Bound lexical regex candidates after the execution barrier.
+
+    Matching names are candidate syntax, not a receiver type proof. Explicit
+    matching overrides or reflection keep the conservative shell fallback.
+    """
+    matching = {"match", "matchAll", "search", "split", "replace", "replaceAll", "test", "exec"}
+    overrides = {
+        "String",
+        "RegExp",
+        "Reflect",
+        "prototype",
+        "constructor",
+        "__proto__",
+        "defineProperty",
+        "defineProperties",
+        "getPrototypeOf",
+        "setPrototypeOf",
+        "__defineGetter__",
+        "__defineSetter__",
+    }
+    for node in program.nodes:
+        check_runtime()
+        if node.type in {"identifier", "property_identifier", "string"} and (
+            program.text(node).strip("\"'") in overrides
+        ):
+            return []
+        if node.type in {"method_definition", "pair"}:
+            name = node.child_by_field_name("name") or node.child_by_field_name("key")
+            if name is not None and (
+                name.type == "computed_property_name" or program.text(name).strip("\"'") in matching
+            ):
+                return []
+        if node.type in {"assignment_expression", "augmented_assignment_expression"}:
+            target = node.child_by_field_name("left")
+            if target is not None and (
+                target.type == "subscript_expression"
+                or target.type == "member_expression"
+                and _callable_member(program, target) in matching
+            ):
+                return []
     for node in program.nodes:
         check_runtime()
         property_node = node.child_by_field_name("property") or node.child_by_field_name("index")
@@ -1627,11 +1672,12 @@ def _plain_regex_value_spans(
             _callable_member(program, node) == "source"
             or property_node is not None
             and "\\" in program.text(property_node)
+            or node.type == "subscript_expression"
+            and (property_node is None or property_node.type not in {"string", "number"})
         ):
             # Source extraction needs a separate use proof before a pattern
             # can stop lending boundaries to executable text.
             return []
-    matching = {"match", "matchAll", "search", "split", "replace", "replaceAll", "test", "exec"}
     boundaries = {
         "program",
         "expression_statement",
