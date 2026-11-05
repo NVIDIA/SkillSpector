@@ -4321,6 +4321,8 @@ def _shell_redefines_command(
     work = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
     setting_work = [work]
     scope_ends: list[int] = []
+    aliases: set[str] = set()
+    invoked: set[str] = set()
     for start in _nonempty_shell_clause_starts(
         content,
         check_runtime,
@@ -4375,8 +4377,16 @@ def _shell_redefines_command(
                 continue
             if word in _SHELL_CLAUSE_PREFIX_WORDS or word in {"if", "while", "until"}:
                 continue
-            if command == "xargs" and word == "hash":
-                return True
+            if command == "xargs":
+                if any(
+                    marker in (word or "")
+                    for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+                ):
+                    return True
+                if word is not None:
+                    invoked.add(word)
+                if word == "hash":
+                    return True
             if command == "xargs" and word == "trap":
                 if _handler_depth >= 8:
                     return True
@@ -4444,6 +4454,8 @@ def _shell_redefines_command(
                         return True
                     if alias is None:
                         break
+                    if command == "xargs" and "=" in alias:
+                        aliases.add(alias.partition("=")[0])
                     if alias.startswith(command + "=") or any(
                         marker in alias
                         for marker in (
@@ -4478,7 +4490,8 @@ def _shell_redefines_command(
             break
         else:
             return True
-    return False
+    # A used alias can turn an ordinary name into eval/source or another alias.
+    return bool(aliases & invoked)
 
 
 def _nonempty_shell_clause_starts(

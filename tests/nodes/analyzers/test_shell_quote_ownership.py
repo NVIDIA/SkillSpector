@@ -1611,3 +1611,22 @@ def test_nested_xargs_keeps_enclosing_binding_uncertainty(expression, binding):
 @pytest.mark.parametrize("expression", ['`xargs <<< "$VALUE"\n`', '$(xargs <<< "$VALUE"\n)'])
 def test_unmodified_nested_xargs_still_proves_printed_data(expression):
     assert not tm.has_bounded_parse_exhaustion(expression, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        '$SETUP \'alias xargs=bash\'',
+        '"$SETUP" \'alias xargs=bash\'',
+        'command "$SETUP" \'alias xargs=bash\'',
+        'builtin "$SETUP" \'alias xargs=bash\'',
+        'alias setup=eval\nsetup \'alias xargs=bash\'',
+        'alias setup=source\nsetup setup.sh',
+        'alias setup=command\nsetup eval \'alias xargs=bash\'',
+        'alias first=second\nalias second=eval\nfirst \'alias xargs=bash\'',
+    ],
+)
+def test_indirect_binding_effects_cannot_borrow_external_xargs_semantics(setup):
+    source = setup + '\nxargs <<< "$CODE"\n'
+    assert tm._xargs_has_source_override(source, lambda: None)
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
