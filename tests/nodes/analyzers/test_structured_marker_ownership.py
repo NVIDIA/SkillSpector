@@ -33,13 +33,21 @@ def _marker_limited(result) -> bool:
 @pytest.mark.parametrize("extension", ["js", "mjs", "cjs"])
 @pytest.mark.parametrize("prefix", ["", "// Unicode offset: 🧪\n"])
 def test_complete_javascript_closers_survive_window_boundaries(extension, prefix):
-    content = prefix + 'const label = "Delete blocked";\nconst padding = "' + "a" * 18000 + '";\n'
+    content = (
+        prefix
+        + 'const earlier = "'
+        + "a" * 270000
+        + '";\nconst label = "Delete blocked";\nconst padding = "'
+        + "a" * 18000
+        + '";\n'
+    )
     assert not _marker_limited(_scan("script." + extension, content))
 
 
 def test_complete_json_larger_than_a_window_retains_ownership():
     content = json.dumps(
-        {"padding": "a" * 72000, "label": "drop is only a recorded status", "tail": "a" * 18000}
+        {"padding": "🧪" + "a" * 270000, "label": "drop is only a recorded status", "tail": "a" * 18000},
+        ensure_ascii=False,
     )
     assert not _marker_limited(_scan("records.json", content))
 
@@ -48,6 +56,28 @@ def test_complete_json_larger_than_a_window_retains_ownership():
 def test_inline_code_closer_is_not_a_marker_opener(ticks):
     content = f"Treat {ticks}force-delete{ticks} and {ticks}erase{ticks} as labels.\n" + "a" * 18000
     assert not _marker_limited(_scan("notes.md", content))
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        "<p>HTML paragraph</p>\n\n",
+        "<pre>\n`example`\n\n`label`\n</pre>\n",
+        "<script>\n\nconst label = `example`;\n</script>\n",
+        "<!--\n\n`example`\n-->\n",
+        "<?process\n\n`example`\n?>\n",
+        "<![CDATA[\n\n`example`\n]]>\n",
+        "<!DECLARATION\n\n`example`\n>\n",
+    ],
+)
+def test_inline_code_ownership_resumes_after_terminated_html(block):
+    suffix = "Treat `force-delete` and `erase` as labels.\n" + "a" * 18000
+    proof = StructuredStringClosers(block + suffix, "markdown", lambda: None)
+    for run in ("`example`", "`label`"):
+        if run in block:
+            assert not proof.closes_string(block.index(run) + len(run) - 1)
+    assert proof.closes_string(len(block) + suffix.index("`force-delete`") + 13)
+    assert not _marker_limited(_scan("notes.md", block + suffix))
 
 
 @pytest.mark.parametrize(

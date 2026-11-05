@@ -773,10 +773,19 @@ def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) ->
     """Own same-line CommonMark code delimiters outside recognized fenced blocks."""
     closers: set[int] = set()
     fence: tuple[str, int, tuple[tuple[str, int], ...], int] | None = None
+    html_end: re.Pattern[str] | None = None
+    in_html = False
     offset = 0
     for line in content.splitlines(keepends=True):
         check_runtime()
         body, context = _json_fence_prefix(line.rstrip("\r\n"), check_runtime)
+        if in_html:
+            if (html_end is None and not body.strip()) or (
+                html_end is not None and html_end.search(body) is not None
+            ):
+                in_html = False
+            offset += len(line)
+            continue
         if fence is not None:
             fenced_body = _json_fence_body(line, fence[2], check_runtime, last_quote_index=fence[3])
             if fenced_body is not None:
@@ -786,9 +795,27 @@ def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) ->
                 offset += len(line)
                 continue
             fence = None
-        # HTML block context and indented code do not establish inline-code ownership.
+        # Raw HTML blocks end at their explicit terminator. Other possible HTML
+        # blocks are conservatively skipped through their terminating blank line.
         if body.lstrip().startswith("<"):
-            return closers
+            raw = body.lstrip()
+            tag = re.match(r"<(script|pre|style|textarea)(?:[\s>]|$)", raw, re.IGNORECASE)
+            if tag is not None:
+                html_end = re.compile(r"</" + tag[1] + r"\s*>", re.IGNORECASE)
+            elif raw.startswith("<!--"):
+                html_end = re.compile("-->")
+            elif raw.startswith("<?"):
+                html_end = re.compile(r"\?>")
+            elif raw.startswith("<![CDATA["):
+                html_end = re.compile(r"\]\]>")
+            elif re.match(r"<![A-Z]", raw):
+                html_end = re.compile(">")
+            else:
+                html_end = None
+            in_html = html_end is None or html_end.search(raw) is None
+            offset += len(line)
+            continue
+        # Indented code does not establish inline-code ownership.
         if body.startswith("    "):
             offset += len(line)
             continue
