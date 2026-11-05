@@ -7836,14 +7836,15 @@ def _lexical_shell_has_counterevidence(
 
 
 def _destructive_command_candidates(
-    candidate_content: str, *, check_runtime: Callable[[], None]
+    candidate_content: str, *, check_runtime: Callable[[], None] | None
 ) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
     seen_commands: set[tuple[int, int]] = set()
     covered_until = 0
     for command_start, body_start in _destructive_command_words(
         candidate_content, check_runtime=check_runtime
     ):
-        check_runtime()
+        if check_runtime is not None:
+            check_runtime()
         if command_start < covered_until:
             continue
         command_key = (command_start, body_start)
@@ -7874,7 +7875,7 @@ def _tm1_candidates(
     *,
     direct_shell_only: bool = False,
     shell_content: str | None = None,
-    check_runtime: Callable[[], None],
+    check_runtime: Callable[[], None] | None,
 ) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
     def direct_matches(
         pattern_index: int,
@@ -8929,8 +8930,7 @@ def _has_bounded_parse_exhaustion(
         # Both iterators are ordered; retain only one candidate, not a per-file
         # set or repeated scans of every suffix. Finding construction stays raw.
         reported_starts = (
-            candidate[0]
-            for candidate in _destructive_command_candidates(content, check_runtime=check_runtime)
+            candidate[0] for candidate in _tm1_candidates(content, check_runtime=check_runtime)
         )
         reported_start: int | None = -1
         for start, end in json_strings:
@@ -9436,7 +9436,7 @@ def analyze(
         content,
         direct_shell_only=_direct_shell_only,
         shell_content=shell_content,
-        check_runtime=runtime_check,
+        check_runtime=check_runtime,
     ):
         runtime_check()
         variable_match = variable_matches.get((match_start, match_end))
