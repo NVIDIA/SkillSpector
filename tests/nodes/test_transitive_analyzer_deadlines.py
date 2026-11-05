@@ -321,6 +321,8 @@ def test_meta_deadline_preserves_deterministic_finding_and_source_provenance() -
     assert event["outcome"] is LedgerOutcome.PARTIAL
     assert event["reason_code"] is LedgerReason.RUNTIME_LIMIT
     assert event["emitted_finding_ids"] == [original.finding_id]
+    assert "observed_seconds" not in event
+    assert "limit_seconds" not in event
 
 
 def test_disabled_meta_deadline_returns_canonical_finding_without_clone() -> None:

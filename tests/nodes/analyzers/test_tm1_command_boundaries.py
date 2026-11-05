@@ -279,3 +279,102 @@ def test_escaped_arguments_do_not_skip_runtime_checks():
 
     with pytest.raises(TimeoutError, match="deadline expired"):
         tm._option_command_end(source, 5, len(source), cancel)
+
+
+@pytest.mark.parametrize(
+    "command,option",
+    [
+        ("curl https://example.com", "--insecure"),
+        ("curl https://example.com", "-k"),
+        ("git push origin topic", "--force"),
+        ("wget https://example.com", "--no-check-certificate"),
+        ("chmod", "a+rwx"),
+        ("chown", "a+rwx"),
+    ],
+)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("split_after_command", [False, True])
+@pytest.mark.parametrize("fence", [None, "yaml", "yml", "", "unknown-host"])
+def test_folded_yaml_keeps_unsafe_options(command, option, newline, split_after_command, fence):
+    first, _, rest = command.partition(" ") if split_after_command else (command, "", "")
+    source = newline.join(
+        ["steps:", "  - run: >", "      " + first, "      " + (rest + " " + option).lstrip(), ""]
+    )
+    if command in {"chmod", "chown"}:
+        source = source.rstrip() + " file" + newline
+    if fence is not None:
+        source = "```" + fence + newline + source + "```" + newline
+    findings = [
+        f
+        for f in tm.analyze(
+            source,
+            "workflow.yaml" if fence is None else "guide.md",
+            "yaml" if fence is None else "markdown",
+        )
+        if f.rule_id == "TM1" and f.matched_text.startswith(command.split()[0])
+    ]
+    assert len(findings) == 1
+    assert findings[0].location.start_line == (3 if fence is None else 4)
+    assert option in findings[0].matched_text
+
+
+@pytest.mark.parametrize("file_type", ["python", "javascript", "json", "", "text"])
+def test_unproven_host_values_keep_conservative_option_matching(file_type):
+    findings = tm.analyze("curl\nhttps://example.com\n--insecure", "commands", file_type)
+    assert any(f.rule_id == "TM1" and "--insecure" in f.matched_text for f in findings)
+
+
+@pytest.mark.parametrize("file_type", ["shell", "powershell"])
+@pytest.mark.parametrize("safe,unsafe", COMMANDS)
+def test_shell_commands_keep_their_own_options(file_type, safe, unsafe):
+    findings = [
+        f
+        for f in tm.analyze(safe + "\n" + unsafe, "commands", file_type)
+        if f.rule_id == "TM1" and f.matched_text.startswith(unsafe.split()[0])
+    ]
+    assert len(findings) == 1
+    assert findings[0].location.start_line == 2
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_dedenting_out_of_a_list_fence_ends_the_command(newline):
+    source = newline.join(
+        ["- example:", "", "  ```sh", '  curl --data "first', "", "Explain --insecure here.", ""]
+    )
+    assert not tm1(source)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("command", ["curl https://example.com", "curl"])
+def test_multiline_inline_code_keeps_folded_options(newline, command):
+    assert tm1(f"Run `{command}{newline}--insecure https://example.com`.")
+
+
+def test_python_fence_keeps_multiline_host_string_options():
+    assert tm1('```python\ncommand = """curl https://example.com\n--insecure"""\n```\n')
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("continuation", ["\\", "`"])
+def test_inline_metadata_preserves_shell_prefix_continuations(newline, continuation):
+    source = newline.join(
+        [
+            "Read `flags`.",
+            "",
+            "```sh",
+            "git" + continuation,
+            " push --force origin topic",
+            "```",
+            "",
+        ]
+    )
+    assert any(f.location.start_line == 4 for f in tm1(source))
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("language", ["cmd", "bat", "batch", "dos"])
+def test_unparsed_batch_fences_keep_caret_continuations(language, newline):
+    source = newline.join(
+        ["```" + language, "curl https://example.com ^", "  --insecure", "```", ""]
+    )
+    assert any(f.location.start_line == 2 for f in tm1(source))

@@ -3114,6 +3114,7 @@ def test_nested_env_parameter_assignments_are_scanned_linearly(
         backtick_end_cache: dict[int, int | None] | None = None,
         inherited_double_quote: bool = False,
         inherited_quote_closed: list[bool] | None = None,
+        **kwargs: object,
     ) -> int | None:
         nonlocal calls
         calls += 1
@@ -3127,6 +3128,7 @@ def test_nested_env_parameter_assignments_are_scanned_linearly(
             backtick_end_cache,
             inherited_double_quote,
             inherited_quote_closed,
+            **kwargs,
         )
 
     monkeypatch.setattr(tm_module, "_skip_parameter_expansion", counted)
