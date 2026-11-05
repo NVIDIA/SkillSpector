@@ -47,10 +47,7 @@ def test_markdown_mdc_runner_preserves_encoded_execution(path):
     result = static_runner.run_static_patterns_with_ledger(
         {"components": [path], "file_cache": {path: content}}, [sc]
     )
-    assert any(
-        finding.rule_id == "SC3" and finding.file == path
-        for finding in result["findings"]
-    )
+    assert any(finding.rule_id == "SC3" and finding.file == path for finding in result["findings"])
 
 
 @pytest.mark.parametrize("path", ["rules/local.mdc", "rules/local.MDC"])
