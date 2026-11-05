@@ -913,6 +913,7 @@ def test_quoted_value_refinement_preserves_raw_high_commands() -> None:
         "new Function('`name`');",
         "unknown('`name`');",
         "const value = ['`name`];",
+        "const value = ['unterminated];",
     ],
 )
 def test_unproved_quoted_values_do_not_receive_boundary_refinement(source: str) -> None:

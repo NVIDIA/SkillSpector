@@ -1514,7 +1514,7 @@ def javascript_template_spans(
         return None
     program = parse_javascript_source(content, check_runtime)
     if program is None:
-        if unresolved_executables is not None:
+        if unresolved_executables is not None and "`" in content:
             unresolved_executables.append(content.index("`"))
         return None
     if quoted_strings is not None:
