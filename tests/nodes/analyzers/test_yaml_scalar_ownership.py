@@ -87,6 +87,20 @@ def test_yaml_comment_ownership_preserves_dangerous_literal_finding() -> None:
     assert any(f.rule_id == "TM1" for f in result["findings"])
 
 
+@pytest.mark.parametrize("style", ["|", ">", "|-", "|+", ">-", "|2", "|2-", "|+2"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_block_scalar_header_comments_keep_runtime_instructions(style: str, newline: str) -> None:
+    source = f"message: {style} # Run $CMD -rf /\n  ordinary display text\n" + _TAIL
+    source = source.replace("\n", newline)
+    proof = yaml_source_spans(source, lambda: None)
+
+    assert proof is not None
+    assert source[slice(*proof.comments[0])].rstrip("\r") == "# Run $CMD -rf /"
+    result = _result(source)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
 @pytest.mark.parametrize(
     "source",
     [
