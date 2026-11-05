@@ -123,6 +123,10 @@ def _parse(content: str, check_runtime: Callable[[], None]) -> YamlSourceSpans |
             elif token.style in {"|", ">"}:
                 newline = content.find("\n", start, end)
                 body_start = end if newline < 0 else newline + 1
+                header_end = end if newline < 0 else newline
+                comment_start = content.find("#", start, header_end)
+                if comment_start >= 0:
+                    comments.append((comment_start, header_end))
             scalars.append(YamlScalar(start, end, body_start, body_end, token.style, token.value))
     except (yaml.YAMLError, ValueError, RecursionError):
         return None
