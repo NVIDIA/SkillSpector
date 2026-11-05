@@ -5043,7 +5043,8 @@ def _command_string_from_clause(
                     continue
                 if command == "xargs":
                     if (
-                        option in {
+                        option
+                        in {
                             "--null",
                             "--no-run-if-empty",
                             "--verbose",
