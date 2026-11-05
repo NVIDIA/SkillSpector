@@ -8780,6 +8780,38 @@ def prepare_parser_analysis(
     return _YamlParserAnalysis(content, spans) if spans is not None else None
 
 
+def _yaml_scalar_mapper(
+    location: Location, context: str, start: int, scalar: YamlScalar
+) -> Callable[[AnalyzerFinding], None]:
+    occurrence = 0
+
+    def enclose(finding: AnalyzerFinding) -> None:
+        nonlocal occurrence
+        occurrence += 1
+        decoded_line = finding.location.start_line
+        # Decoded coordinates must never escape through an interrupted
+        # finding-budget prefix or Python-specific reconciliation.
+        finding.location = replace(location)
+        finding.context = context
+        finding.evidence = {
+            key: value for key, value in finding.evidence.items() if not key.startswith("_")
+        }
+        finding.evidence.update(
+            {
+                static_runner._VIEW_START_EVIDENCE: start,
+                "yaml_scalar": {
+                    "location_precision": "enclosing_expression",
+                    "source_start_offset": scalar.start,
+                    "source_end_offset": scalar.end,
+                    "decoded_start_line": decoded_line,
+                    "decoded_occurrence": occurrence,
+                },
+            }
+        )
+
+    return enclose
+
+
 @dataclass(frozen=True)
 class _PreparedYamlAnalysis:
     parser: _YamlParserAnalysis
@@ -8812,37 +8844,9 @@ class _PreparedYamlAnalysis:
                 continue
             if self.parser.content[scalar.body_start : scalar.body_end] == scalar.value:
                 continue
-            begin_line, begin_column = locations.line_and_column(start)
-            end_line, end_column = locations.line_and_column(end)
-            raw_context = get_context(content, start)
-            occurrence = 0
-
-            def enclose(finding: AnalyzerFinding) -> None:
-                nonlocal occurrence
-                occurrence += 1
-                decoded_line = finding.location.start_line
-                # Decoded coordinates must never escape through an interrupted
-                # finding-budget prefix or Python-specific reconciliation.
-                finding.location = Location(
-                    file_path, begin_line, end_line, begin_column, end_column
-                )
-                finding.context = raw_context
-                finding.evidence = {
-                    key: value for key, value in finding.evidence.items() if not key.startswith("_")
-                }
-                finding.evidence.update(
-                    {
-                        static_runner._VIEW_START_EVIDENCE: start,
-                        "yaml_scalar": {
-                            "location_precision": "enclosing_expression",
-                            "source_start_offset": scalar.start,
-                            "source_end_offset": scalar.end,
-                            "decoded_start_line": decoded_line,
-                            "decoded_occurrence": occurrence,
-                        },
-                    }
-                )
-
+            enclose = _yaml_scalar_mapper(
+                locations.location(start, end), get_context(content, start), start, scalar
+            )
             with map_analyzer_findings(enclose):
                 findings.extend(
                     analyze(scalar.value, file_path, "shell", check_runtime=self.check_runtime)
