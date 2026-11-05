@@ -209,3 +209,17 @@ def test_literal_effects_walk_checks_cancellation_without_yielding_a_command(sou
     with pytest.raises(CancelledError):
         tm._has_destructive_command_string(source, check_runtime=check)
     assert calls == 3
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '{"first":"a rm -rf /","second":"Execute rm -rf *"}',
+        '{"steps":"a rm -rf /; Execute rm -rf *"}',
+    ],
+)
+def test_reported_command_cannot_hide_a_later_unreported_string_command(source: str) -> None:
+    result = _scan(source)
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT

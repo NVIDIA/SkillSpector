@@ -2959,13 +2959,10 @@ def _literal_shell_command_spans(
     return {begin + start: begin + stop for start, stop in spans}
 
 
-def _has_destructive_command_string(
-    content: str,
-    *,
-    diagnostics: list[StaticParserDiagnostic] | None = None,
-    check_runtime: Callable[[], None] | None = None,
-) -> bool:
-    """Return whether an executable string contains a proven destructive command."""
+def _destructive_command_effects(
+    content: str, check_runtime: Callable[[], None] | None = None
+) -> Iterator[tuple[int, int]]:
+    """Yield commands whose existing operand parser proves destructive effects."""
     for command_start, body_start in _destructive_command_words(
         content, check_runtime=check_runtime
     ):
@@ -2975,15 +2972,26 @@ def _has_destructive_command_string(
             content, command_start, body_start, check_runtime=check_runtime
         )
         if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
-            _note_parser_diagnostic(
-                diagnostics,
-                ParserCause.UNSUPPORTED_SYNTAX,
-                ParserCheck.COMMAND_STRING_EFFECTS,
-                command_start,
-                len(content),
-                ParserUncheckedScope.COMMAND_STRING,
-            )
-            return True
+            yield command_start, body_start
+
+
+def _has_destructive_command_string(
+    content: str,
+    *,
+    diagnostics: list[StaticParserDiagnostic] | None = None,
+    check_runtime: Callable[[], None] | None = None,
+) -> bool:
+    """Return whether an executable string contains a proven destructive command."""
+    for command_start, _ in _destructive_command_effects(content, check_runtime):
+        _note_parser_diagnostic(
+            diagnostics,
+            ParserCause.UNSUPPORTED_SYNTAX,
+            ParserCheck.COMMAND_STRING_EFFECTS,
+            command_start,
+            len(content),
+            ParserUncheckedScope.COMMAND_STRING,
+        )
+        return True
     return False
 
 
@@ -7826,6 +7834,40 @@ def _lexical_shell_has_counterevidence(
     return False
 
 
+def _destructive_command_candidates(
+    candidate_content: str, *, check_runtime: Callable[[], None]
+) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
+    seen_commands: set[tuple[int, int]] = set()
+    covered_until = 0
+    for command_start, body_start in _destructive_command_words(
+        candidate_content, check_runtime=check_runtime
+    ):
+        check_runtime()
+        if command_start < covered_until:
+            continue
+        command_key = (command_start, body_start)
+        if command_key in seen_commands:
+            continue
+        seen_commands.add(command_key)
+        # Documentation is excluded regardless of the shell parse result. Apply
+        # that existing semantic gate first so large manuals do not pay for a
+        # character-by-character shell parse for every explanatory ``rm`` noun.
+        if _is_root_glob_documentation(candidate_content, command_start, body_start):
+            continue
+        tokens, command_end, exhausted = _bounded_shell_tokens(
+            candidate_content,
+            command_start,
+            body_start,
+            check_runtime=check_runtime,
+        )
+        # An unresolved quote cannot own and hide later executable candidates.
+        if not exhausted:
+            covered_until = max(covered_until, command_end)
+        command = candidate_content[command_start:command_end]
+        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
+            yield command_start, command_end, command, 0.9, False, None, None, None
+
+
 def _tm1_candidates(
     content: str,
     *,
@@ -7933,40 +7975,12 @@ def _tm1_candidates(
                 None,
             )
 
-    def destructive_candidates(
-        candidate_content: str,
-    ) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
-        seen_commands: set[tuple[int, int]] = set()
-        covered_until = 0
-        for command_start, body_start in _destructive_command_words(candidate_content):
-            check_runtime()
-            if command_start < covered_until:
-                continue
-            command_key = (command_start, body_start)
-            if command_key in seen_commands:
-                continue
-            seen_commands.add(command_key)
-            # Documentation is excluded regardless of the shell parse result. Apply
-            # that existing semantic gate first so large manuals do not pay for a
-            # character-by-character shell parse for every explanatory ``rm`` noun.
-            if _is_root_glob_documentation(candidate_content, command_start, body_start):
-                continue
-            tokens, command_end, exhausted = _bounded_shell_tokens(
-                candidate_content,
-                command_start,
-                body_start,
-                check_runtime=check_runtime,
-            )
-            # An unresolved quote cannot own and hide later executable candidates.
-            if not exhausted:
-                covered_until = max(covered_until, command_end)
-            command = candidate_content[command_start:command_end]
-            if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
-                yield command_start, command_end, command, 0.9, False, None, None, None
 
-    destructive_iterators = [destructive_candidates(content)]
+    destructive_iterators = [_destructive_command_candidates(content, check_runtime=check_runtime)]
     if shell_content is not None and shell_content != content:
-        destructive_iterators.append(destructive_candidates(shell_content))
+        destructive_iterators.append(
+            _destructive_command_candidates(shell_content, check_runtime=check_runtime)
+        )
     yield from heapq.merge(
         direct_candidates(),
         ordinary_candidates(),
@@ -8890,18 +8904,35 @@ def _has_bounded_parse_exhaustion(
         structural_quote_closers = {end - 1 for _, end in json_strings}
         structural_quote_openers = {start for start, _ in json_strings}
     if json_strings and (source_view is None or source_view.name == "raw"):
+        # The original finding producer is the authority for source provenance.
+        # Both iterators are ordered; retain only one candidate, not a per-file
+        # set or repeated scans of every suffix. Finding construction stays raw.
+        reported_starts = (
+            candidate[0]
+            for candidate in _destructive_command_candidates(content, check_runtime=check_runtime)
+        )
+        reported_start: int | None = -1
         for start, end in json_strings:
             check_runtime()
-            effects: list[StaticParserDiagnostic] = []
-            if _has_destructive_command_string(
-                content[start + 1 : end - 1], diagnostics=effects, check_runtime=check_runtime
+            for command_start, _ in _destructive_command_effects(
+                content[start + 1 : end - 1], check_runtime
             ):
-                # Structural ownership does not establish finding provenance
-                # for commands embedded in an original JSON string. Keep that
-                # interpretation incomplete; ordinary findings still run raw.
-                # Marker-derived views already carry their reconstructed
-                # findings and must not borrow this original-string caveat.
-                return effects[0].enclosed(start, end)
+                absolute_start = start + 1 + command_start
+                while reported_start is not None and reported_start < absolute_start:
+                    reported_start = next(reported_starts, None)
+                if reported_start == absolute_start:
+                    continue
+                # Structural ownership alone cannot establish provenance for
+                # an embedded command the raw analyzer cannot report. Derived
+                # marker views already carry their reconstructed findings.
+                return StaticParserDiagnostic(
+                    ParserCause.UNSUPPORTED_SYNTAX,
+                    ParserCheck.COMMAND_STRING_EFFECTS,
+                    start,
+                    end,
+                    ParserUncheckedScope.COMMAND_STRING,
+                    location_precision="enclosing_expression",
+                )
     if json_strings:
         # Raw substitution delimiters must survive Markdown's inline projection.
         json_operand_spans = [
