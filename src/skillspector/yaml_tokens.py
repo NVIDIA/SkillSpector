@@ -114,7 +114,10 @@ def _parse(content: str, check_runtime: Callable[[], None]) -> YamlSourceSpans |
                 continue
             body_start, body_end = start, end
             if token.style in {"'", '"'}:
-                if content[start : start + 1] != token.style or content[end - 1 : end] != token.style:
+                if (
+                    content[start : start + 1] != token.style
+                    or content[end - 1 : end] != token.style
+                ):
                     return None
                 body_start, body_end = start + 1, end - 1
             elif token.style in {"|", ">"}:
