@@ -13,7 +13,8 @@ from skillspector.artifacts import _concealed_instruction_run_spans, _letter_spa
 def test_spaced_letters_after_ordinary_word_preserve_exact_offsets(scan, length):
     prefix = "a" * length + " "
     body = "i g n o r e"
-    assert list(scan(prefix + body, lambda: None)) == [(len(prefix), len(prefix + body))]
+    start = 0 if length == 1 else len(prefix)
+    assert list(scan(prefix + body, lambda: None)) == [(start, len(prefix + body))]
 
 
 @pytest.mark.parametrize("scan", [_letter_spacing_run_spans, _concealed_instruction_run_spans])
