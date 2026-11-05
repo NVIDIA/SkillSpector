@@ -84,6 +84,23 @@ def test_active_multiple_backtick_marker_remains_explicitly_unsupported(ticks):
 
 
 @pytest.mark.parametrize(
+    "prefix",
+    ["<https://example.invalid>", "<mailto:user@example.invalid>", "<user@example.invalid>", "<tel:12345>"],
+)
+def test_autolink_paragraph_keeps_inline_code_ownership(prefix):
+    content = prefix + " Treat `force-delete` and `erase` as labels.\n" + "ordinary text\n" * 2000
+    assert not _marker_limited(_scan("notes.md", content))
+
+
+@pytest.mark.parametrize("opening", ["<widget data-label='example'>", "<div"])
+def test_real_html_block_does_not_grant_inline_ownership_before_blank(opening):
+    content = opening + "\n`delete`\n\nTreat `erase` as a label.\n"
+    proof = StructuredStringClosers(content, "markdown", lambda: None)
+    assert not proof.closes_string(content.index("`delete`") + 7)
+    assert proof.closes_string(content.index("`erase`") + 6)
+
+
+@pytest.mark.parametrize(
     "block",
     [
         "<p>HTML paragraph</p>\n\n",

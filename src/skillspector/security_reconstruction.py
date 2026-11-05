@@ -740,6 +740,37 @@ _HTML_START_TAG_RE = re.compile(
     rf"<([A-Za-z][A-Za-z0-9:-]*)(?:\s+{_HTML_ATTRIBUTE_RE.pattern})*\s*/?>\Z"
 )
 _BACKTICK_RUN_RE = re.compile(r"`+")
+_HTML_BLOCK_TAG_RE = re.compile(
+    r"</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|"
+    r"dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|"
+    r"h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|"
+    r"optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|"
+    r"track|ul)(?=[ \t>]|/?>|$)",
+    re.IGNORECASE,
+)
+_HTML_MARKDOWN_TAG_NAME_RE = re.compile(r"</?([A-Za-z][A-Za-z0-9-]*)(?=[ \t/>]|$)")
+_HTML_MARKDOWN_CLOSE_TAG_RE = re.compile(r"</[A-Za-z][A-Za-z0-9-]*[ \t]*>")
+
+
+def _markdown_html_block(raw: str) -> tuple[bool, re.Pattern[str] | None]:
+    """Recognize HTML block starts without treating angle-bracket autolinks as tags."""
+    if not raw.startswith("<"):
+        return False, None
+    if re.match(r"<(script|pre|style|textarea)(?=[ \t>]|$)", raw, re.IGNORECASE):
+        return True, re.compile(r"</(?:script|pre|style|textarea)>", re.IGNORECASE)
+    for opening, closing in (("<!--", "-->"), ("<?", "?>"), ("<![CDATA[", "]]>")):
+        if raw.startswith(opening):
+            return True, re.compile(re.escape(closing))
+    if re.match(r"<![A-Za-z]", raw):
+        return True, re.compile(">")
+    if _HTML_BLOCK_TAG_RE.match(raw):
+        return True, None
+    name = _HTML_MARKDOWN_TAG_NAME_RE.match(raw)
+    if name is not None and name[1].lower() not in {"script", "pre", "style", "textarea"}:
+        complete = raw.rstrip(" \t")
+        if _HTML_START_TAG_RE.fullmatch(complete) or _HTML_MARKDOWN_CLOSE_TAG_RE.fullmatch(complete):
+            return True, None
+    return False, None
 
 
 def _html_attribute_closers(content: str, check_runtime: Callable[[], None]) -> set[int]:
@@ -803,32 +834,21 @@ def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) ->
                 offset += len(line)
                 continue
             fence = None
-        # Raw HTML blocks end at their explicit terminator. Other possible HTML
-        # blocks are conservatively skipped through their terminating blank line.
-        if body.lstrip().startswith("<"):
-            raw = body.lstrip()
-            tag = re.match(r"<(script|pre|style|textarea)(?:[\s>]|$)", raw, re.IGNORECASE)
-            if tag is not None:
-                html_end = re.compile(r"</" + tag[1] + r"\s*>", re.IGNORECASE)
-            elif raw.startswith("<!--"):
-                html_end = re.compile("-->")
-            elif raw.startswith("<?"):
-                html_end = re.compile(r"\?>")
-            elif raw.startswith("<![CDATA["):
-                html_end = re.compile(r"\]\]>")
-            elif re.match(r"<![A-Z]", raw):
-                html_end = re.compile(">")
-            else:
-                html_end = None
+        # Indented code does not establish inline-code ownership.
+        if body.startswith("    "):
+            offset += len(line)
+            continue
+        # Type-7 HTML starts are treated conservatively even when their
+        # ability to interrupt an existing paragraph has not been proved.
+        raw = body.lstrip()
+        html_start, html_terminator = _markdown_html_block(raw)
+        if html_start:
+            html_end = html_terminator
             html_context = context
             html_last_quote = max(
                 (i for i, entry in enumerate(context) if entry[0] == "quote"), default=-1
             )
             in_html = html_end is None or html_end.search(raw) is None
-            offset += len(line)
-            continue
-        # Indented code does not establish inline-code ownership.
-        if body.startswith("    "):
             offset += len(line)
             continue
         opening = _JSON_FENCE_OPEN_RE.fullmatch(body)
