@@ -1637,18 +1637,24 @@ def _ordinary_native_calls(
     path_bindings: dict[str, tuple[Node, bool]] = {}
     regex_calls: list[Node] = []
     intrinsic_override = False
+    path_unproven = False
+    path_imports = 0
     override_names = {
         "RegExp", "Reflect", "constructor", "__proto__", "defineProperty", "defineProperties",
         "getPrototypeOf", "setPrototypeOf", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors",
     }
     for node in program.nodes:
         check_runtime()
+        if node.type == "with_statement":
+            return set(), set()
         if node.type in {"identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern"}:
             references.setdefault(program.text(node), []).append(node)
         if node.type in {"identifier", "property_identifier", "string"}:
             spelling = program.text(node).strip("\"'")
             if spelling in override_names:
                 intrinsic_override = True
+            if spelling == "syncBuiltinESMExports":
+                path_unproven = True
             if spelling == "prototype":
                 # A direct hasOwnProperty.call read does not expose a prototype
                 # to an uploaded mutator. Other prototype uses remain unproved.
@@ -1683,11 +1689,22 @@ def _ordinary_native_calls(
             elif member is None or member.type not in {"arguments", "member_expression"}:
                 # A stored/returned literal could expose its prototype indirectly.
                 intrinsic_override = True
+        if node.type == "call_expression":
+            callee = node.child_by_field_name("function")
+            arguments = node.child_by_field_name("arguments")
+            if callee is not None and program.text(callee) in {"require", "import"}:
+                args = [] if arguments is None else arguments.named_children
+                if len(args) != 1 or args[0].type != "string" or program.text(args[0]).strip("\"'") in {"node:path", "path"}:
+                    path_unproven = True
         if node.type != "import_statement":
             continue
         source = node.child_by_field_name("source")
         if source is None or program.text(source).strip("\"'") not in {"node:path", "path"}:
             continue
+        path_imports += 1
+        for clause in node.named_children:
+            if clause.type == "import_clause" and any(child.type != "named_imports" for child in clause.named_children):
+                path_unproven = True
         pending = list(node.named_children)
         while pending:
             check_runtime()
@@ -1699,6 +1716,8 @@ def _ordinary_native_calls(
                     name = program.text(original)
                     if name in _PATH_FUNCTIONS or name in {"posix", "win32"}:
                         path_bindings[program.text(binding)] = (binding, name in {"posix", "win32"})
+                    else:
+                        path_unproven = True
             pending.extend(specifier.named_children)
     for reference in references.get("Object", ()):
         parent = reference.parent
@@ -1712,6 +1731,8 @@ def _ordinary_native_calls(
             property_node = member.child_by_field_name("property")
             if property_node is not None:
                 owned.add(property_node.id)
+    path_calls: set[int] = set()
+    path_identifiers: set[int] = set()
     for name, (binding, namespace) in path_bindings.items():
         calls: set[int] = set()
         identifiers = {binding.id}
@@ -1727,6 +1748,7 @@ def _ordinary_native_calls(
                     or _callable_member(program, callee) not in _PATH_FUNCTIONS
                 )
             ):
+                path_unproven = True
                 break
             call = None if callee is None else callee.parent
             if (
@@ -1739,8 +1761,13 @@ def _ordinary_native_calls(
             calls.add(call.id)
             identifiers.add(reference.id)
         else:
-            native_calls.update(calls)
-            owned.update(identifiers)
+            path_calls.update(calls)
+            path_identifiers.update(identifiers)
+            continue
+        path_unproven = True
+    if not path_unproven and path_imports == 1:
+        native_calls.update(path_calls)
+        owned.update(path_identifiers)
     return owned, native_calls
 
 
@@ -1804,9 +1831,13 @@ def _numeric_local_identifiers(
         else:
             candidates.append((binding, node, declaration.parent))
     owned: set[int] = set()
+    budget = _MAX_TOKENS * 4
     for binding, declaration, scope in candidates:
         identifiers = {binding.id}
         for reference in references[program.text(binding)]:
+            budget -= 1
+            if budget < 0:
+                return set()
             check_runtime()
             if reference == binding or not (scope.start_byte <= reference.start_byte < scope.end_byte):
                 continue
@@ -1831,6 +1862,7 @@ def _has_shell_execution_call(
     scalar_identifiers = _scalar_template_identifiers(program, check_runtime)
     ordinary_identifiers = _numeric_local_identifiers(program, check_runtime)
     native_members, native_calls = _ordinary_native_calls(program, check_runtime)
+    owned_identifiers = scalar_identifiers | ordinary_identifiers | native_members
     uncertain_bindings: set[str] = set()
     global_objects = {"globalThis", "global", "window", "self"}
     imported_callables: set[str] = set()
@@ -1930,7 +1962,7 @@ def _has_shell_execution_call(
                 or spelling == "Reflect"
                 or (
                     spelling.casefold() in _SHELL_EXECUTION_CALLS
-                    and node.id not in scalar_identifiers | ordinary_identifiers | native_members
+                    and node.id not in owned_identifiers
                 )
             ):
                 return True

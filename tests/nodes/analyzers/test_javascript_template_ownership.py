@@ -815,6 +815,14 @@ def test_proven_native_and_local_numeric_calls_retain_templates(statement: str, 
         "const eval = x => x + 1; eval(`${command}`);",
         "const r = x => x + 1; with (tools) { r(`${command}`); }",
         "import {join as run} from 'node:path'; const alias = run; alias(`${command}`);",
+        "import {posix as p, posix as q} from 'node:path'; q.join = executor; p.join(`${command}`);",
+        "import {posix as p} from 'node:path'; import {posix as q} from 'node:path'; q.join = executor; p.join(`${command}`);",
+        "import path, {posix as p} from 'node:path'; path.posix.join = executor; p.join(`${command}`);",
+        "import {posix as p} from 'node:path'; const other = require('node:path'); other.posix.join = executor; p.join(`${command}`);",
+        "import {posix as p} from 'node:path'; const other = await import('node:path'); other.posix.join = executor; p.join(`${command}`);",
+        "import {join} from 'node:path'; const other = require('node:path'); other.join = executor; syncBuiltinESMExports(); join(`${command}`);",
+        "import {posix} from 'node:path'; with (tools) { posix.join(`${command}`); }",
+
     ],
 )
 def test_unproved_native_or_local_callable_overrides_stay_partial(statement: str) -> None:
