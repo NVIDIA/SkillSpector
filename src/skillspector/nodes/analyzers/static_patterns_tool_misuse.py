@@ -8156,11 +8156,27 @@ def _markdown_shell_text(
             index = close_index + 1
         return pairs
 
-    def mask_inline_delimiters() -> None:
+    def mask_inline_delimiters(*, only_complete: bool = False) -> None:
         if not complete_context:
             runs.clear()
             return
-        for (start, end), (close_start, close_end) in complete_inline_code_pairs(content, runs):
+        pairs = complete_inline_code_pairs(content, runs)
+        if only_complete:
+            pair_index = 0
+            for start, end in runs:
+                check_runtime()
+                while pair_index < len(pairs) and pairs[pair_index][1][1] <= start:
+                    pair_index += 1
+                if pair_index < len(pairs) and (
+                    pairs[pair_index][0][0] <= start < end <= pairs[pair_index][1][1]
+                ):
+                    continue
+                escape_start = start
+                while escape_start > 0 and content[escape_start - 1] == "\\":
+                    escape_start -= 1
+                if (start - escape_start) % 2 == 0:
+                    return
+        for (start, end), (close_start, close_end) in pairs:
             output[start:end] = " " * (end - start)
             output[close_start:close_end] = " " * (close_end - close_start)
         runs.clear()
@@ -8540,6 +8556,18 @@ def _markdown_shell_text(
                             mask_inline_delimiters()
                         if not cells:
                             table_columns = None
+                        elif (
+                            word_apostrophes
+                            and complete_context
+                            and "'" in stripped
+                            and _MARKDOWN_PROSE_SHELL_SYNTAX_RE.search(stripped) is None
+                        ):
+                            apostrophes = [
+                                offset + word.start("apostrophe")
+                                for word in _MARKDOWN_WORD_APOSTROPHE_RE.finditer(stripped)
+                            ]
+                            if len(apostrophes) == stripped.count("'"):
+                                prose_apostrophes.update(apostrophes)
                 elif not separator and not empty_list_item:
                     prose_leading = leading
                     inline_runtime_guard = False
@@ -8605,12 +8633,17 @@ def _markdown_shell_text(
                             apostrophes.append(offset + prefix + word.start("apostrophe"))
                         if len(apostrophes) == prose_leading.count("'"):
                             prose_apostrophes.update(apostrophes)
+                    pending_inline = bool(runs)
                     for match in backtick_runs.finditer(line):
                         check_runtime()
                         runs.append((offset + match.start(), offset + match.end()))
                     if heading:
                         mask_inline_delimiters()
                     else:
+                        if not pending_inline:
+                            # A complete line cannot lend an opener to later prose.
+                            # Unmatched runs retain the existing multiline proof.
+                            mask_inline_delimiters(only_complete=True)
                         continuing_paragraph = True
                         paragraph_in_list = has_list_marker or paragraph_in_list
                         if has_list_marker:

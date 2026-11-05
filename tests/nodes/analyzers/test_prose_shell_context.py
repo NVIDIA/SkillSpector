@@ -64,6 +64,64 @@ _CASES = [
 ]
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    "paragraph",
+    [
+        "Read `guide.md` for the interface.\nThe runner's manifest identifies the source.\n",
+        "- Read `guide.md` for the interface.\n  The runner's manifest identifies the source.\n",
+        "Read ``one ` character`` for the interface.\nThe runner's manifest identifies the source.\n",
+        "Read \\` literally and `guide.md` for the interface.\nThe runner's manifest identifies the source.\n",
+        "| Topic | Description |\n| --- | --- |\n| Memory | The engine's limit applies. |\n",
+        "| Topic | Description |\n| --- | --- |\n| Memory | The engine's limit and runner's settings don't conflict. |\n",
+    ],
+)
+def test_completed_inline_lines_and_table_prose_own_apostrophes(
+    paragraph: str, newline: str
+) -> None:
+    content = (paragraph + "\n" + _OBSERVATIONS).replace("\n", newline)
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+
+    assert result["findings"] == []
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Read `an unfinished span.\nThe runner's manifest identifies the source.\n",
+        "Read `an unfinished span with ``paired`` ticks.\nThe runner's manifest identifies it.\n",
+        "| Command | Description |\n| --- | --- |\n| `$CMD -rf /` | The engine's limit applies. |\n",
+    ],
+)
+def test_prose_ownership_keeps_unmatched_inline_and_runtime_commands_partial(content: str) -> None:
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content + "\n" + _OBSERVATIONS}},
+        [tm],
+    )
+
+    assert any(
+        event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+        for event in result["inspection_ledger"]
+    )
+
+
+def test_inline_line_ownership_preserves_later_destructive_command() -> None:
+    content = (
+        "Read `guide.md` for the interface.\nThe runner's manifest identifies the source.\n\n"
+        "```bash\nrm -rf /\n```\n" + _OBSERVATIONS
+    )
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
 _NESTED_SHELL_QUOTES = 'echo "entry: $item => $(readlink -f "$item")"\n'
 
 
