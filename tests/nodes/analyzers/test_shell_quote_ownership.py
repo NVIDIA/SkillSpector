@@ -1432,3 +1432,40 @@ def test_redirected_xargs_binding_scan_respects_cancellation():
 
     with pytest.raises(TimeoutError, match="cancelled"):
         tm._xargs_has_source_override('xargs <<< "$VALUE"', cancelled)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'xargs -I c <<< "c" sh -c "$CODE"',
+        'xargs -I c <<< "c" bash -c "$CODE"',
+        'xargs -I c <<< "c" sh -ec "$CODE"',
+        'xargs -I OPT <<< "-c" sh OPT "$CODE"',
+        'xargs -I o <<< "c" sh +o "$CODE"',
+        'xargs -I c <<< "c" env sh -c "$CODE"',
+    ],
+)
+def test_xargs_replacement_dependent_shell_options_stay_incomplete(command):
+    diagnostics = []
+    recognized, body = tm._command_string_from_clause(
+        command, 0, lambda: None, diagnostics=diagnostics
+    )
+    assert recognized
+    assert body is None
+    assert diagnostics
+    assert tm.has_bounded_parse_exhaustion(command, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("ending", ["", "\necho finished\n"])
+def test_redirected_xargs_keeps_unknown_startup_bindings_incomplete(ending):
+    diagnostics = []
+    recognized, body = tm._command_string_from_clause(
+        'xargs <<< "$VALUE"' + ending,
+        0,
+        lambda: None,
+        startup_exposure=[True],
+        diagnostics=diagnostics,
+    )
+    assert recognized
+    assert body is None
+    assert diagnostics

@@ -4850,6 +4850,18 @@ def _command_string_from_clause(
                 option, limited = next_word()
                 if limited:
                     return failed()
+                if (
+                    xargs_replacements
+                    and option is not None
+                    and any(
+                        marker in option
+                        for marker in (
+                            _DYNAMIC_SHELL_WORD_SENTINEL,
+                            _RUNTIME_SHELL_PARAMETER_SENTINEL,
+                        )
+                    )
+                ):
+                    return failed(ParserCause.RUNTIME_DEPENDENT)
                 if option is None:
                     # Without -c there is no command string to reconstruct.
                     # This also keeps Markdown fence labels such as sh inert.
@@ -4991,7 +5003,11 @@ def _command_string_from_clause(
                         xargs_redirected = True
                         continue
                     if xargs_redirected and cursor < len(content) and content[cursor] in "\r\n":
-                        if _xargs_has_source_override(content, check_runtime):
+                        if (
+                            startup_exposure is not None
+                            and startup_exposure[0]
+                            or _xargs_has_source_override(content, check_runtime)
+                        ):
                             return failed(ParserCause.RUNTIME_DEPENDENT)
                         # Without an explicit utility xargs prints its input.
                         # A following physical command is a separate clause.
@@ -5006,7 +5022,11 @@ def _command_string_from_clause(
                         if xargs_redirected and content[cursor : cursor + 1] == "|":
                             # A pipeline may load the printed input as code.
                             return failed(ParserCause.RUNTIME_DEPENDENT)
-                        if xargs_redirected and _xargs_has_source_override(content, check_runtime):
+                        if xargs_redirected and (
+                            startup_exposure is not None
+                            and startup_exposure[0]
+                            or _xargs_has_source_override(content, check_runtime)
+                        ):
                             return failed(ParserCause.RUNTIME_DEPENDENT)
                     return (
                         (False, None)
