@@ -4304,7 +4304,6 @@ def _shell_redefines_primitives(
     names: frozenset[str],
     *,
     candidate_starts: Iterator[int] | None = None,
-    candidate_ends: Mapping[int, int] | None = None,
     remaining_work: list[int] | None = None,
 ) -> bool:
     """Retain the same bounded binding proof for selected builtin names."""
@@ -4320,10 +4319,7 @@ def _shell_redefines_primitives(
     )
     for start in starts:
         check_runtime()
-        end = min(start + _ROOT_GLOB_COMMAND_CHARS + 1, len(content))
-        if candidate_ends is not None:
-            end = min(end, candidate_ends.get(start, end))
-        source = content[start:end]
+        source = content[start : start + _ROOT_GLOB_COMMAND_CHARS + 1]
         cursor = 0
         wrapper: str | None = None
         for _ in range(8):
@@ -4356,15 +4352,6 @@ def _shell_redefines_primitives(
             if word in _SHELL_CLAUSE_PREFIX_WORDS or word in {"if", "while", "until"}:
                 continue
             if word in {"eval", "source", ".", "enable", "trap"}:
-                if candidate_ends is not None and start in candidate_ends:
-                    operand, end, limited = _next_shell_invocation_word(
-                        source, cursor, check_runtime
-                    )
-                    work[0] -= end - cursor
-                    if limited or work[0] < 0:
-                        return True
-                    if operand is None:
-                        break
                 # Imported/evaluated code, handlers and builtin configuration
                 # can replace printf in this shell.
                 # Retain the earlier narrow decoder across those unknown effects.
@@ -4817,7 +4804,7 @@ def _command_string_from_clause(
                     # Output may become another command's executable input.
                     return failed(ParserCause.RUNTIME_DEPENDENT)
                 if cursor >= output_argument_end or content[cursor] in "\r\n;()#":
-                    if format_pending:
+                    if format_pending and spans:
                         return failed(ParserCause.BOUNDARY_UNRESOLVED)
                     data_argument_spans.extend(spans)
                     return False, None
@@ -9078,7 +9065,6 @@ def _message_inline_runtime_diagnostic(
     def binding_starts(
         source: str,
         native_starts: set[int],
-        candidate_ends: dict[int, int],
         lexical_diagnostics: list[StaticParserDiagnostic],
     ) -> Iterator[int]:
         skip_until = 0
@@ -9087,9 +9073,6 @@ def _message_inline_runtime_diagnostic(
         ):
             if start < skip_until:
                 continue
-            owner_end = inline_end(start)
-            if owner_end is not None:
-                candidate_ends[start] = owner_end
             if word in {"echo", "printf"}:
                 spans: list[tuple[int, int]] = []
                 source_span = [start, start]
@@ -9117,15 +9100,11 @@ def _message_inline_runtime_diagnostic(
         lexical_diagnostics: list[StaticParserDiagnostic] = []
         native_starts = set(_nonempty_shell_clause_starts(source, check_runtime))
         remaining_work[0] -= len(source)
-        candidate_ends: dict[int, int] = {}
         output_binding_proven = not _shell_redefines_primitives(
             source,
             check_runtime,
             frozenset({"echo", "printf"}),
-            candidate_starts=binding_starts(
-                source, native_starts, candidate_ends, lexical_diagnostics
-            ),
-            candidate_ends=candidate_ends,
+            candidate_starts=binding_starts(source, native_starts, lexical_diagnostics),
             remaining_work=remaining_work,
         )
         if lexical_diagnostics:
