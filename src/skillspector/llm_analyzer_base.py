@@ -2266,9 +2266,9 @@ class LLMAnalyzerBase:
     ) -> list[tuple[Batch, list]]:
         """Execute LLM calls for all *batches* concurrently.
 
-        Uses ``asyncio.gather`` with a semaphore to run up to
-        *max_concurrency* LLM requests in parallel.  Both cross-file and
-        cross-chunk batches are parallelized in a single gather call.
+        A bounded worker window submits up to *max_concurrency* batches to
+        the shared request limiter. Cross-file and cross-chunk batches can
+        run together without queuing every batch ahead of later analyzers.
 
         When *max_concurrency* is ``None`` (the default) it is resolved from
         ``SKILLSPECTOR_MAX_LLM_CONCURRENCY`` via :func:`resolve_max_concurrency`,
@@ -2321,10 +2321,13 @@ class LLMAnalyzerBase:
         # An explicit argument keeps its documented meaning and stays local to this call: a caller
         # that passes a number is asking for a fan-out width, not for a share of the budget.
         sem: _GlobalLLMLimiter | asyncio.Semaphore
+        concurrency = resolve_max_concurrency() if max_concurrency is None else max_concurrency
+        if not isinstance(concurrency, int) or concurrency < 1:
+            raise ValueError("max_concurrency must be a positive integer")
         if max_concurrency is None:
-            sem = _shared_limiter(resolve_max_concurrency())
+            sem = _shared_limiter(concurrency)
         else:
-            sem = asyncio.Semaphore(max_concurrency)
+            sem = asyncio.Semaphore(concurrency)
 
         async def _process(
             batch: Batch, retry_outcome: _ProviderRetryOutcome
@@ -2336,10 +2339,18 @@ class LLMAnalyzerBase:
                 )
 
         retry_outcomes = [_ProviderRetryOutcome() for _ in batches]
-        results = await asyncio.gather(
-            *[_process(b, retry) for b, retry in zip(batches, retry_outcomes, strict=True)],
-            return_exceptions=True,
-        )
+        results: list[Any] = [None] * len(batches)
+        pending = iter(range(len(batches)))
+
+        async def _worker() -> None:
+            for index in pending:
+                # Preserve per-batch exceptions while external worker cancellation
+                # still cancels the in-flight request and releases its permit.
+                (results[index],) = await asyncio.gather(
+                    _process(batches[index], retry_outcomes[index]), return_exceptions=True
+                )
+
+        await asyncio.gather(*(_worker() for _ in range(min(concurrency, len(batches)))))
         outcome = BatchExecutionResult()
         for batch, result, retry_outcome in zip(batches, results, retry_outcomes, strict=True):
             if isinstance(result, _RecoveredBatch):
