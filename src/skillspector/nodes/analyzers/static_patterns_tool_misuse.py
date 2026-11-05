@@ -4816,14 +4816,16 @@ def _command_string_from_clause(
                     break
             if position > _ROOT_GLOB_COMMAND_CHARS:
                 return None
-            if position == len(tail) or tail[position] in "\r\n;|&()#":
+            if position == len(tail):
                 return False
             if re.match(r"(?:[0-9]+)?<<<", tail[position : position + 32]):
                 return True
             redirection = _SHELL_REDIRECTION_PREFIX_RE.match(tail, position)
-            if redirection is not None:
+            if redirection is not None and not tail.startswith(("<(", ">("), position):
                 position = redirection.end()
                 continue
+            if tail[position] in "\r\n;|&()#":
+                return False
             word, end, limited = _next_shell_invocation_word(tail, position, check_runtime)
             if limited or word is None or end <= position or end > _ROOT_GLOB_COMMAND_CHARS:
                 return None
