@@ -1383,3 +1383,52 @@ def test_startup_names_in_non_setter_operands_do_not_taint_child(prefix: str) ->
     source = prefix + "; bash -c 'printf %s ready'\n"
 
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        'xargs() { delegate "$@"; }',
+        'xargs ()\n{ delegate "$@"; }',
+        'function xargs { delegate "$@"; }',
+        'function xargs() { delegate "$@"; }',
+        "'xargs'() { delegate; }",
+        "x\\args() { delegate; }",
+        "alias xargs='delegate'",
+        "alias -- xargs='delegate'",
+        'alias "xargs=delegate"',
+    ],
+)
+@pytest.mark.parametrize("ending", ["", "\necho finished\n"])
+def test_redirected_xargs_cannot_assume_external_utility_after_source_override(binding, ending):
+    source = binding + '\nxargs <<< "$VALUE"' + ending
+    diagnostics = []
+    recognized, command = tm._command_string_from_clause(
+        source, source.rfind("\nxargs") + 1, lambda: None, diagnostics=diagnostics
+    )
+
+    assert recognized
+    assert command is None
+    assert diagnostics
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "helper() { echo ready; }",
+        "printf '%s' 'xargs() { delegate; }'",
+        "# xargs() { delegate; }",
+        "alias other='delegate'",
+    ],
+)
+def test_redirected_xargs_ignores_inert_or_other_bindings(prefix):
+    source = prefix + '\nxargs <<< "$VALUE"\necho finished\n'
+    assert not tm._xargs_has_source_override(source, lambda: None)
+
+
+def test_redirected_xargs_binding_scan_respects_cancellation():
+    def cancelled():
+        raise TimeoutError("cancelled")
+
+    with pytest.raises(TimeoutError, match="cancelled"):
+        tm._xargs_has_source_override('xargs <<< "$VALUE"', cancelled)

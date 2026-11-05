@@ -96,6 +96,7 @@ LEXICAL_BOUND_CLASSIFICATION_EVIDENCE = "_tm1_lexical_bound_classification"
 LEXICAL_REACH_TERMINATED_EVIDENCE = "_tm1_lexical_reach_terminated"
 LEXICAL_BOUND_REACHABLE_EVIDENCE = "_tm1_lexical_bound_reachable"
 _MAX_DIRECT_SHELL_CONTEXT_CHARS = 1024
+_SHELL_FUNCTION_BODY_RE = re.compile(r"[ \t]*\([ \t]*\)[ \t]*(?:\r?\n[ \t]*)?\{")
 
 _SHELL_COMMAND_WORD_START_RE = re.compile(r"[rRdDeE$'\"`\\]")
 _SHELL_COMMAND_WORD_CHARS = 4096
@@ -4637,6 +4638,43 @@ def _eval_command_string(
     return None
 
 
+def _xargs_has_source_override(content: str, check_runtime: Callable[[], None]) -> bool:
+    """Require the external utility before granting its redirected-data proof."""
+    for start in _nonempty_shell_clause_starts(content, check_runtime, shell_substitutions=False):
+        word, cursor, limited = _next_shell_invocation_word(content, start, check_runtime)
+        if limited:
+            return True
+        if word is None:
+            continue
+        if word == "function":
+            name, _, limited = _next_shell_invocation_word(content, cursor, check_runtime)
+            if limited or name == "xargs":
+                return True
+        elif word == "xargs" and _SHELL_FUNCTION_BODY_RE.match(content[cursor : cursor + 256]):
+            return True
+        elif word == "alias":
+            for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
+                gap = cursor
+                while gap < len(content) and content[gap] in " \t":
+                    if gap % 4096 == 0:
+                        check_runtime()
+                    gap += 1
+                if gap < len(content) and content[gap] in "\r\n":
+                    break
+                binding, cursor, limited = _next_shell_invocation_word(
+                    content, cursor, check_runtime
+                )
+                if limited:
+                    return True
+                if binding is None:
+                    break
+                if binding.startswith("xargs="):
+                    return True
+            else:
+                return True
+    return False
+
+
 def _command_string_from_clause(
     content: str,
     start: int,
@@ -4773,9 +4811,7 @@ def _command_string_from_clause(
         if (
             not wrapper_seen
             and content[last_word_start:cursor] == word
-            and re.match(
-                r"[ \t]*\([ \t]*\)[ \t]*(?:\r?\n[ \t]*)?\{", content[cursor : cursor + 256]
-            )
+            and _SHELL_FUNCTION_BODY_RE.match(content[cursor : cursor + 256])
         ):
             # A function declaration names no invocation; its body is scanned
             # independently when clause traversal reaches the opening brace.
@@ -4955,6 +4991,8 @@ def _command_string_from_clause(
                         xargs_redirected = True
                         continue
                     if xargs_redirected and cursor < len(content) and content[cursor] in "\r\n":
+                        if _xargs_has_source_override(content, check_runtime):
+                            return failed(ParserCause.RUNTIME_DEPENDENT)
                         # Without an explicit utility xargs prints its input.
                         # A following physical command is a separate clause.
                         return False, None
@@ -4967,6 +5005,8 @@ def _command_string_from_clause(
                             continue
                         if xargs_redirected and content[cursor : cursor + 1] == "|":
                             # A pipeline may load the printed input as code.
+                            return failed(ParserCause.RUNTIME_DEPENDENT)
+                        if xargs_redirected and _xargs_has_source_override(content, check_runtime):
                             return failed(ParserCause.RUNTIME_DEPENDENT)
                     return (
                         (False, None)
