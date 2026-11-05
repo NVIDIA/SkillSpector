@@ -10,8 +10,8 @@ from dataclasses import dataclass
 
 from skillspector.artifacts import SecurityTextView
 from skillspector.security_reconstruction import (
-    MAX_STANDALONE_JSON_SOURCE_CHARS,
     _MAX_JSON_QUOTE_CONTAINER_CHARS,
+    MAX_STANDALONE_JSON_SOURCE_CHARS,
     _json_string_spans,
     _validate_json_without_decoding,
     _validated_json_ranges,
@@ -64,9 +64,13 @@ class JSONSourceOwnership:
             offset = view.source_offset(index)
             if not previous < offset < len(self.source):
                 return None
-            if previous >= 0 and offset > previous + 1 and (
-                self.roles.find(bytes([_OPEN]), previous + 1, offset) >= 0
-                or self.roles.find(bytes([_CLOSE]), previous + 1, offset) >= 0
+            if (
+                previous >= 0
+                and offset > previous + 1
+                and (
+                    self.roles.find(bytes([_OPEN]), previous + 1, offset) >= 0
+                    or self.roles.find(bytes([_CLOSE]), previous + 1, offset) >= 0
+                )
             ):
                 return None
             role = self.roles[offset]

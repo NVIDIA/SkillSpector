@@ -2966,7 +2966,9 @@ def _has_destructive_command_string(
     check_runtime: Callable[[], None] | None = None,
 ) -> bool:
     """Return whether an executable string contains a proven destructive command."""
-    for command_start, body_start in _destructive_command_words(content, check_runtime=check_runtime):
+    for command_start, body_start in _destructive_command_words(
+        content, check_runtime=check_runtime
+    ):
         if check_runtime is not None:
             check_runtime()
         tokens, _, _ = _bounded_shell_tokens(

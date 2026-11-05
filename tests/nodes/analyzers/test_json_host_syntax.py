@@ -9,7 +9,6 @@ import json
 from array import array
 
 import pytest
-
 from skillspector.artifacts import SecurityTextView
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.json_tokens import prepare_json_source
@@ -100,7 +99,9 @@ def test_security_text_inside_json_strings_is_never_masked(instruction: str) -> 
     if instruction.startswith("remove"):
         assert any(finding.rule_id == "TM1" for finding in result["findings"])
     else:
-        assert result["findings"] or result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+        assert (
+            result["findings"] or result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+        )
 
 
 def test_known_literal_command_without_a_finding_remains_incomplete() -> None:
@@ -118,14 +119,17 @@ def test_ordered_window_coordinates_inherit_only_original_delimiters() -> None:
     view = SecurityTextView("window", source[begin:end], array("I", range(begin, end)))
     projection = proof.project(view, _check)
     assert projection is not None
-    assert tm.bounded_parse_diagnostic(
-        view.text,
-        _check,
-        file_type="json",
-        complete_context=False,
-        prepared_analysis=proof,
-        source_view=view,
-    ) is None
+    assert (
+        tm.bounded_parse_diagnostic(
+            view.text,
+            _check,
+            file_type="json",
+            complete_context=False,
+            prepared_analysis=proof,
+            source_view=view,
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("change", ["remove-quote", "replace-punctuation", "reorder", "duplicate"])
@@ -144,7 +148,10 @@ def test_unproven_source_mappings_cannot_borrow_json_ownership(change: str) -> N
         offsets[2], offsets[3] = offsets[3], offsets[2]
     else:
         offsets[2] = offsets[1]
-    assert proof.project(SecurityTextView("derived", "".join(text), array("I", offsets)), _check) is None
+    assert (
+        proof.project(SecurityTextView("derived", "".join(text), array("I", offsets)), _check)
+        is None
+    )
 
 
 def test_changed_string_contents_remain_visible_to_the_parser() -> None:
@@ -159,7 +166,9 @@ def test_changed_string_contents_remain_visible_to_the_parser() -> None:
     assert projection.text.count("$(rm -rf /)") == 1
 
 
-def test_large_validation_does_not_allocate_decoded_objects(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_large_validation_does_not_allocate_decoded_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     def reject_decode(*args, **kwargs):
         raise AssertionError("Large JSON must use the existing iterative grammar")
 
