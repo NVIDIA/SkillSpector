@@ -12,6 +12,7 @@ from skillspector.nodes.analyzers import static_patterns_anti_refusal as anti_re
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.nodes.analyzers import static_runner
 from skillspector.semgrep_tokens import semgrep_rule_scalar_roles
+from skillspector.yaml_tokens import yaml_source_spans
 
 
 def _rule(selector: str, *, message: str = "A matching token was found.") -> str:
@@ -91,7 +92,7 @@ def test_owned_fields_keep_raw_and_decoded_destructive_findings(field: str, enco
         "  metadata:\n    command: 'sh -c \"$PAYLOAD\"'\n",
         "  options:\n    command: 'sh -c \"$PAYLOAD\"'\n",
         "  fix: 'sh -c \"$PAYLOAD\"'\n",
-        '# Run sh -c "$PAYLOAD"\n',
+        '# sh -c "$PAYLOAD"\n',
     ],
 )
 def test_other_fields_and_comments_keep_runtime_limits(extra: str) -> None:
@@ -100,8 +101,9 @@ def test_other_fields_and_comments_keep_runtime_limits(extra: str) -> None:
     assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
-def test_message_instructions_do_not_become_inert_prose() -> None:
-    source = _rule("  pattern: ordinary\n", message='Run `sh -c "$PAYLOAD"` now.')
+@pytest.mark.parametrize("shell", ["sh", "bash"])
+def test_message_instructions_do_not_become_inert_prose(shell: str) -> None:
+    source = _rule("  pattern: ordinary\n", message=f'Run `{shell} -c "$PAYLOAD"` now.')
     assert _result(source)["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
 
 
@@ -170,15 +172,25 @@ def test_same_query_text_in_unknown_schema_keeps_shell_fallback(
         lambda value: value.replace("  message:", "  id: duplicate\n  message:"),
         lambda value: value + "  execute: ordinary\n",
         lambda value: value + "---\nother: document\n",
-        lambda value: value.replace("pattern-regex:", "metadata:\n    pattern-regex:"),
-        lambda value: value.replace("  id: token-check", "  id: !!str token-check"),
-        lambda value: value.replace("  id: token-check", "  id: &name token-check"),
+        lambda value: value.replace("  pattern:", "  metadata:\n    pattern:"),
     ],
 )
 def test_unknown_or_malformed_schema_grants_no_ownership(change) -> None:
-    source = change(_rule("  pattern-regex: |\n    [\"|'|`]?token\n"))
+    original = _rule("  pattern: 'sh -c \"$PAYLOAD\"'\n")
+    source = change(original)
+    assert source != original
     assert semgrep_rule_scalar_roles(source, lambda: None) == {}
     assert _result(source)["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+
+
+@pytest.mark.parametrize("marker", ["!!str", "&name"])
+def test_explicit_tags_and_anchors_grant_no_ownership_and_keep_raw_findings(marker: str) -> None:
+    original = _rule("  pattern: 'rm -rf /'\n")
+    source = original.replace("- id: token-check", f"- id: {marker} token-check")
+    assert source != original
+    assert yaml_source_spans(source, lambda: None) is None
+    assert semgrep_rule_scalar_roles(source, lambda: None) == {}
+    assert any(f.rule_id == "TM1" and f.severity == "HIGH" for f in _result(source)["findings"])
 
 
 def test_unknown_nested_formula_does_not_own_pattern_named_metadata() -> None:

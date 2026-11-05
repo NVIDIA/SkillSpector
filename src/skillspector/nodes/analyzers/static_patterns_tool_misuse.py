@@ -8933,16 +8933,21 @@ def bounded_parse_diagnostic(
             role = scalar_roles.get(scalar.start)
             # Proven rule queries are matching-language data, not shell
             # programs. Finding production still checks their raw/decoded text.
-            diagnostic = (
-                None
-                if role == "pattern"
-                else bounded_parse_diagnostic(
-                    scalar.value,
-                    check_runtime,
-                    file_type="markdown" if role == "message" else "shell",
-                    complete_context=True,
+            diagnostic = None
+            if role != "pattern":
+                diagnostic = bounded_parse_diagnostic(
+                    scalar.value, check_runtime, file_type="shell", complete_context=True
                 )
-            )
+                if role == "message" and (
+                    diagnostic is None
+                    or diagnostic.cause
+                    not in {ParserCause.RUNTIME_DEPENDENT, ParserCause.RESOURCE_LIMIT}
+                ):
+                    # Markdown may refine punctuation, but cannot erase an
+                    # independent runtime or resource failure in inline code.
+                    diagnostic = bounded_parse_diagnostic(
+                        scalar.value, check_runtime, file_type="markdown", complete_context=True
+                    )
             exact_source = content[scalar.body_start : scalar.body_end] == scalar.value
             if diagnostic is not None:
                 return (
