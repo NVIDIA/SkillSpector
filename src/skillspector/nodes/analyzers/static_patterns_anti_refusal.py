@@ -328,6 +328,12 @@ _AR2_TASK_JUDGMENT_OBJECT_PATTERN = re.compile(
     r"(?:correctness|accuracy|quality|testability|readiness|performance)\b",
     re.IGNORECASE,
 )
+_AR2_SAFETY_JUDGMENT_PATTERN = re.compile(
+    r"\b(?:safe(?:ty)?|unsafe|secur(?:e|ity)|ethic(?:s|al)?|moral(?:ity|s)?|legal(?:ity)?|"
+    r"illegal|risks?|danger(?:ous)?|harm(?:ful|less)?|refus(?:e|al)|warnings?|disclaimers?|"
+    r"caveats?|polic(?:y|ies)|restrictions?)\b",
+    re.IGNORECASE,
+)
 _AR2_OBSERVATION_SUBJECT_PATTERN = re.compile(
     r"\b(?:observations|measurements|metrics|logs|results|data)\s+"
     r"(?:(?:describe|report|record)\s*;\s*(?:they|these)\s+)?\Z",
@@ -338,6 +344,9 @@ _AR2_OBSERVATION_SUBJECT_PATTERN = re.compile(
 def _is_task_judgment(match_line: str, matched_text: str, start: int, end: int) -> bool:
     """Separate technical assessment scope from moral or safety judgment suppression."""
     if not _AR2_JUDGE_ONLY_PATTERN.fullmatch(matched_text):
+        return False
+    match_clause, _, _ = _match_clause(match_line, start, end)
+    if _AR2_SAFETY_JUDGMENT_PATTERN.search(match_clause):
         return False
     suffix = match_line[end:]
     if _AR2_TASK_JUDGMENT_OBJECT_PATTERN.match(suffix):
