@@ -71,9 +71,12 @@ _SURROGATE_START = 0xD800
 _SURROGATE_END = 0xDFFF
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _MODULE_KEYWORDS = frozenset({"from", "import", "require"})
-# The shared list also carries the ``function`` keyword for JavaScript call
-# shapes. In TypeScript it is a declaration keyword, so it names no call site.
-_SHELL_EXECUTION_CALLS = _JAVASCRIPT_EXECUTION_CALLS - {"function"}
+_FORM_KEYWORDS = frozenset({"import", "from", "as"})
+_SHELL_EXECUTION_CALLS = _JAVASCRIPT_EXECUTION_CALLS
+# Lowercase ``function`` is the declaration keyword; ``Function``, which the
+# casefolded comparison would otherwise fold together with it, is the
+# constructor an executable template can reach.
+_DECLARATION_KEYWORD = "function"
 
 
 def _decode_string_source(source: str, check_runtime: Callable[[], None]) -> str | None:
@@ -171,14 +174,36 @@ def typescript_template_spans(
     last_closed_control = False
     paren_stack: list[bool] = []
     square_stack: list[int] = []
+    delimiters: list[str] = []
     spans: list[tuple[int, int]] = []
     values: dict[int, str | None] = {}
+    callee: str | None = None
 
     def check(position: int) -> None:
         nonlocal next_check
         if position >= next_check:
             check_runtime()
             next_check = position + 4096
+
+    def execution_name(word: str) -> bool:
+        """Whether *word*, as written, names a shell execution call.
+
+        The list is lowercase, so the comparison folds case; only the exact
+        lowercase ``function`` keyword is read as a declaration instead.
+        """
+        return word.casefold() in _SHELL_EXECUTION_CALLS and word != _DECLARATION_KEYWORD
+
+    def brace_member() -> bool | None:
+        """Whether a template right after ``{`` sits where a command runs.
+
+        Returns None when the brace is not proven to belong to an execution
+        call, which keeps the template unproven rather than owned.
+        """
+        if last_kind == "identifier":
+            return execution_name(last_value) or None
+        if last_kind == "punct" and last_value == ".":
+            return True
+        return None
 
     def regex_allowed() -> bool:
         if last_kind is None:
@@ -212,7 +237,7 @@ def typescript_template_spans(
         if last_kind == "punct" and last_value == ".":
             return content[span[0] : span[1]].casefold() in _SHELL_EXECUTION_CALLS
         value = string_value(span)
-        return value is None or value.casefold() in _SHELL_EXECUTION_CALLS
+        return value is None or execution_name(value)
 
     def template_member_value(span: tuple[int, int]) -> str | None:
         start, end = span
@@ -227,7 +252,9 @@ def typescript_template_spans(
         return _is_shell_execution_module(value)
 
     def tagged_template() -> bool:
-        if last_kind == "identifier":
+        # ``import ... from`` is a module clause, not a tag; ``import()`` and a
+        # bare ``import`` tag are not.
+        if last_kind == "identifier" and last_value not in _FORM_KEYWORDS:
             return last_value.casefold() not in _EXPRESSION_PREFIX_WORDS
         if last_kind in {"number", "string", "template", "regex", "postfix"}:
             return True
@@ -283,6 +310,7 @@ def typescript_template_spans(
         return None
 
     def skip_template(cursor: int, depth: int) -> int | None:
+        nonlocal callee
         if depth >= _MAX_NESTING or len(templates) >= _MAX_TEMPLATES:
             return None
         start = cursor
@@ -298,21 +326,31 @@ def typescript_template_spans(
                 templates.append((start, end))
                 return end
             if content.startswith("${", cursor):
+                # The substitution brace is recorded on the shared delimiter
+                # stack so a later top-level ``}`` cannot close it.
+                delimiters.append("{")
                 next_cursor = scan_code(cursor + 2, depth + 1, interpolation=True)
                 if next_cursor is None:
                     return None
                 cursor = next_cursor
+                callee = None
                 continue
             cursor += 1
         return None
 
     def scan_code(cursor: int, depth: int, *, interpolation: bool = False) -> int | None:
-        nonlocal last_kind, last_value, last_closed_control
+        nonlocal last_kind, last_value, last_closed_control, callee
         if depth >= _MAX_NESTING:
             return None
+        outer_callee = callee
+        callee = None
         braces = 0
-        paren_floor = len(paren_stack) if interpolation else 0
-        square_floor = len(square_stack) if interpolation else 0
+        paren_boundary = 0
+        paren_floor = 0
+        square_floor = 0
+        if interpolation:
+            paren_boundary = paren_floor = len(paren_stack)
+            square_floor = len(square_stack)
         while cursor < len(content):
             check(cursor)
             character = content[cursor]
@@ -347,6 +385,14 @@ def typescript_template_spans(
                     and module_string(span)
                 ):
                     return None
+                elif (
+                    last_kind == "punct"
+                    and last_value == "("
+                    and callee is not None
+                    and callee.casefold() in _MODULE_KEYWORDS
+                    and module_string(span)
+                ):
+                    return None
                 cursor = end
                 last_kind, last_value, last_closed_control = "string", "", False
                 continue
@@ -358,7 +404,22 @@ def typescript_template_spans(
                     return None
                 if last_kind == "punct" and last_value == "[":
                     member = template_member_value((cursor, end))
-                    if member is None or member.casefold() in _SHELL_EXECUTION_CALLS:
+                    if member is None or execution_name(member):
+                        return None
+                elif (
+                    last_kind == "punct"
+                    and last_value == "("
+                    and callee is not None
+                    and callee.casefold() in _MODULE_KEYWORDS
+                ):
+                    module = template_member_value((cursor, end))
+                    if module is None or _is_shell_execution_module(module):
+                        return None
+                elif last_kind == "punct" and last_value == "{":
+                    # A brace body such as ``cp.exec({ command: `...` })`` is a
+                    # call argument; one we cannot place stays unproven.
+                    member = brace_member()
+                    if not member:
                         return None
                 cursor = end
                 last_kind, last_value, last_closed_control = "template", "", False
@@ -380,40 +441,77 @@ def typescript_template_spans(
                 paren_stack.append(
                     last_kind == "identifier" and last_value.casefold() in _CONTROL_WORDS
                 )
+                callee = last_value if last_kind == "identifier" else None
+                delimiters.append(character)
                 cursor += 1
                 last_kind, last_value, last_closed_control = "punct", "(", False
                 continue
             if character == ")":
-                if len(paren_stack) <= paren_floor:
+                if (
+                    len(paren_stack) <= paren_floor
+                    or not delimiters
+                    or delimiters[-1] != "("
+                    or delimiters.count("[") > delimiters.count("]")
+                ):
                     return None
+                delimiters.pop()
                 last_closed_control = paren_stack.pop()
+                callee = None
                 cursor += 1
                 last_kind, last_value = "punct", ")"
                 continue
             if character == "{":
                 braces += 1
+                delimiters.append("{")
+                paren_stack.append(paren_boundary)
+                callee = None
                 cursor += 1
                 last_kind, last_value, last_closed_control = "punct", "{", False
                 continue
             if character == "}":
+                if not delimiters or delimiters[-1] != "{":
+                    return None
                 if interpolation and braces == 0:
-                    if len(paren_stack) != paren_floor or len(square_stack) != square_floor:
+                    if len(paren_stack) != paren_boundary or len(square_stack) != square_floor:
                         return None
+                    delimiters.pop()
+                    callee = outer_callee
                     return cursor + 1
+                delimiters.pop()
                 if interpolation:
+                    # A block cannot open inside ``[ ... ]``; that bracket
+                    # would otherwise stay pending while the block closes.
+                    if delimiters.count("[") > delimiters.count("]"):
+                        return None
                     braces -= 1
+                else:
+                    if len(square_stack) != square_floor:
+                        return None
+                    if paren_stack.pop() != paren_boundary:
+                        return None
+                    braces = 0
+                callee = None
                 cursor += 1
                 last_kind, last_value, last_closed_control = "punct", "}", False
                 continue
             if character == "[":
                 square_stack.append(cursor)
+                delimiters.append("[")
+                callee = None
                 cursor += 1
                 last_kind, last_value, last_closed_control = "punct", "[", False
                 continue
             if character == "]":
-                if len(square_stack) <= square_floor:
+                if (
+                    len(square_stack) <= square_floor
+                    or not delimiters
+                    or delimiters[-1] != "["
+                    or delimiters.count("(") > delimiters.count(")")
+                ):
                     return None
+                delimiters.pop()
                 square_stack.pop()
+                callee = None
                 cursor += 1
                 last_kind, last_value, last_closed_control = "punct", "]", False
                 continue
@@ -440,6 +538,18 @@ def typescript_template_spans(
                     ("postfix", "!", False) if postfix else ("punct", "!", False)
                 )
                 continue
+            if character in "+-" and cursor + 1 < len(content) and content[cursor + 1] == character:
+                postfix = last_kind in {"identifier", "number", "string", "template", "regex"} or (
+                    last_kind == "punct" and last_value in {")", "]"}
+                )
+                cursor += 2
+                callee = None
+                last_kind, last_value, last_closed_control = (
+                    ("postfix", character * 2, False)
+                    if postfix
+                    else ("punct", character * 2, False)
+                )
+                continue
             if character == "=" and cursor + 1 < len(content) and content[cursor + 1] == ">":
                 cursor += 2
                 last_kind, last_value, last_closed_control = "punct", "=>", False
@@ -461,8 +571,13 @@ def typescript_template_spans(
             identifier = _IDENTIFIER.match(content, cursor)
             if identifier is not None:
                 word = identifier.group(0)
-                if word.casefold() in _SHELL_EXECUTION_CALLS:
+                # ``if (...)`` reaches a statement head, so only a control
+                # keyword followed by an argument list is a call here.
+                if execution_name(word) and not (
+                    word.casefold() in _CONTROL_WORDS and content.startswith("(", identifier.end())
+                ):
                     return None
+                callee = None
                 cursor = identifier.end()
                 last_kind, last_value, last_closed_control = "identifier", word, False
                 continue
@@ -477,7 +592,7 @@ def typescript_template_spans(
                 continue
             cursor += 1
             last_kind, last_value, last_closed_control = "punct", character, False
-        if interpolation:
+        if interpolation or braces or delimiters:
             return None
         return cursor
 

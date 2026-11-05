@@ -311,3 +311,103 @@ def test_declaration_keywords_do_not_read_as_execution_calls() -> None:
         tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="typescript")
         is False
     )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("const code = new Function(`rm -rf / ${payload}`)();", id="new-operator"),
+        pytest.param("const code = Function(`return ${payload}`)();", id="bare-call"),
+    ],
+)
+def test_the_function_constructor_stays_a_shell_execution_surface(source: str) -> None:
+    # The shared call list is compared casefolded, so ``function`` is excluded
+    # by exact spelling; ``Function``, which builds code the template supplies,
+    # must still be rejected.
+    assert typescript_template_spans(source, lambda: None) is None
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="typescript")
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "const cp = await import('node:child_process');\nconst label = `${command}`;",
+            id="static-import",
+        ),
+        pytest.param(
+            "const cp = await import(`node:child_process`);\nconst label = `${command}`;",
+            id="template-import",
+        ),
+    ],
+)
+def test_module_loaders_checked_through_the_call_parens_keep_ownership(
+    source: str,
+) -> None:
+    # ``require(...)`` and ``import(...)`` are calls, so the module string sits
+    # after ``(``; the callee name must survive that token for the check.
+    assert typescript_template_spans(source, lambda: None) is None
+
+
+def test_a_loaded_execution_module_keeps_its_samples_unowned() -> None:
+    source = "const launch = require('execa');\nlaunch(`${command.name}`);"
+
+    assert typescript_template_spans(source, lambda: None) is None
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="typescript")
+        is True
+    )
+
+
+def test_shell_execution_module_loaded_without_reaching_a_sink_is_not_claimed() -> None:
+    # The module string alone is not destructive; a member call is. Loading
+    # ``fs`` is plain code, so the template stays owned.
+    source = "const fs = require('node:fs');\nconst label = `${file}`;"
+
+    assert typescript_template_spans(source, lambda: None) is not None
+
+
+def test_postfix_increment_before_a_slash_does_not_open_a_regex() -> None:
+    # A collided ``+`` used to leave ``+`` as the last token, so
+    # ``/ eval(payload) /`` read as a regex and hid the ``eval`` guard.
+    source = "const n = counter++ / eval(payload) / 2;\nconst label = `${item.name}`;"
+
+    assert typescript_template_spans(source, lambda: None) is None
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="typescript")
+        is True
+    )
+
+
+def test_an_incomplete_block_does_not_claim_ownership() -> None:
+    # The host block is never closed, so the source is incomplete and the
+    # conservative shell reading must survive.
+    source = "if (ok) { const label = `${item.name}`;"
+
+    assert typescript_template_spans(source, lambda: None) is None
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="typescript")
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("const label = `${x}`};\n", id="extra-close-brace"),
+        pytest.param("const label = `${fn([)]}`;", id="crossed-square-parens"),
+    ],
+)
+def test_delimiters_must_nest_in_the_matching_order(source: str) -> None:
+    assert typescript_template_spans(source, lambda: None) is None
+
+
+def test_closing_blocks_keep_later_templates_owned() -> None:
+    # Balance tracking must survive ordinary closed blocks, not only reject
+    # incomplete ones.
+    source = "if (ok) { render(); }\nfor (const x of xs) { use(x); }\nconst label = `${item.name}`;"
+
+    assert typescript_template_spans(source, lambda: None) is not None
