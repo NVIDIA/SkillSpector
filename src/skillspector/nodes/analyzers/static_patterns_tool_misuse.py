@@ -8735,7 +8735,12 @@ def _yaml_source_start(
     canonical: str,
     check_runtime: Callable[[], None],
 ) -> int | None:
-    if source_view is None or source_view.name != "raw" or source_view.text != content or not content:
+    if (
+        source_view is None
+        or source_view.name != "raw"
+        or source_view.text != content
+        or not content
+    ):
         return None
     start = source_view.source_offset(0)
     end = start + len(content)
@@ -8857,6 +8862,8 @@ class _PreparedYamlAnalysis:
 def prepare_analysis(
     content: str, file_type: str, check_runtime: Callable[[], None]
 ) -> _PreparedYamlAnalysis | None:
+    if file_type != "yaml":
+        return None
     parser = prepare_parser_analysis(content, file_type, check_runtime)
     return _PreparedYamlAnalysis(parser, check_runtime) if parser is not None else None
 
@@ -8916,9 +8923,9 @@ def bounded_parse_diagnostic(
         yaml_spans = yaml_source_spans(content, check_runtime)
         if yaml_spans is None:
             return exhausted
-        mapped_source = isinstance(prepared_analysis, _YamlParserAnalysis) and prepared_analysis.owns(
-            content, source_view, check_runtime
-        )
+        mapped_source = isinstance(
+            prepared_analysis, _YamlParserAnalysis
+        ) and prepared_analysis.owns(content, source_view, check_runtime)
         for scalar in yaml_spans.scalars:
             check_runtime()
             diagnostic = _has_bounded_parse_exhaustion(
@@ -8939,8 +8946,10 @@ def bounded_parse_diagnostic(
                 and mapped_source
                 and prepared_analysis.can_emit(scalar)
             )
-            if not exact_source and not mapped_scalar and analyze(
-                scalar.value, "<yaml-scalar>", "shell", check_runtime=check_runtime
+            if (
+                not exact_source
+                and not mapped_scalar
+                and analyze(scalar.value, "<yaml-scalar>", "shell", check_runtime=check_runtime)
             ):
                 return StaticParserDiagnostic(
                     ParserCause.UNSUPPORTED_SYNTAX,
