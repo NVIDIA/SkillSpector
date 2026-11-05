@@ -4937,6 +4937,12 @@ def _command_string_from_clause(
                 if limited:
                     return failed()
                 if option is None:
+                    if command == "xargs":
+                        if re.match(r"(?:[0-9]+)?<<<", content[cursor : cursor + 32]):
+                            continue
+                        if xargs_redirected and content[cursor : cursor + 1] == "|":
+                            # A pipeline may load the printed input as code.
+                            return failed(ParserCause.RUNTIME_DEPENDENT)
                     return (
                         (False, None)
                         if _ends_wrapped_clause(content, cursor)

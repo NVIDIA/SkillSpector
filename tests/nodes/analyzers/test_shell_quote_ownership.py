@@ -158,7 +158,9 @@ def test_here_string_keeps_following_quote_bounds(operator: str) -> None:
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
-@pytest.mark.parametrize("prefix", ["xargs", "xargs -0", "xargs -I '{}'", "xargs --"])
+@pytest.mark.parametrize(
+    "prefix", ["xargs", "xargs -0", "xargs -I '{}'", "xargs --", "xargs \\\n"]
+)
 @pytest.mark.parametrize("operator", ["<<<", "0<<<", "<<< "])
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 def test_commandless_xargs_here_string_keeps_default_printing_semantics(
@@ -188,6 +190,7 @@ def test_xargs_here_string_preserves_an_explicit_shell_utility(prefix: str, plac
     "source",
     [
         'xargs <<< "$VALUES" sh -c \'printf done\')',
+        'xargs \\\n <<< "$VALUES" sh -c \'printf done\')',
         'xargs -- <<< "$VALUES" sh -c \'printf done\')',
         'xargs -a input <<< "$VALUES" sh -c \'printf done\')',
     ],
@@ -218,6 +221,13 @@ def test_xargs_here_string_keeps_destructive_substitutions_visible() -> None:
     )
 
     assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+@pytest.mark.parametrize("consumer", ["sh", "bash", "grep . | sh"])
+def test_xargs_here_string_pipeline_does_not_hide_runtime_loaded_code(consumer: str) -> None:
+    source = f'xargs <<< "$CMD" | {consumer}\n'
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
 @pytest.mark.parametrize(
