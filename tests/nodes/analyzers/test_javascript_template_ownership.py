@@ -854,3 +854,107 @@ def test_known_native_callee_cannot_hide_security_findings() -> None:
     assert any(
         finding.rule_id == "TM1" for finding in tm.analyze(source, "display.js", "javascript")
     )
+
+
+def test_plain_quoted_values_expose_native_boundaries_without_becoming_templates() -> None:
+    source = "const values = ['`first` before', \"`second` after\"];\n"
+    quoted: list[tuple[int, int]] = []
+    assert javascript_template_spans(source, lambda: None, quoted_strings=quoted) is None
+    assert [source[start:end] for start, end in quoted] == [
+        "'`first` before'",
+        '"`second` after"',
+    ]
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_quoted_backtick_values_cannot_consume_later_host_code(newline: str) -> None:
+    source = newline.join(
+        [
+            "const values = [['`first` before', '`first` after']];",
+            "// " + ("padding " * 1000),
+            "const other = ['`second` before', '`second` after'];",
+        ]
+    )
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "exec(`${tool} -rf /`);",
+        "new Function(`${code}`);",
+        "import {exec} from 'node:child_process'; exec(`${command}`);",
+        "const other = ['`$TOOL -rf /`'];",
+    ],
+)
+def test_completed_quoted_value_never_clears_later_runtime_uncertainty(suffix: str) -> None:
+    source = "const values = ['`name` before', '`name` after'];\n" + suffix
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+def test_quoted_value_refinement_preserves_raw_high_commands() -> None:
+    source = (
+        "const values = ['`name` before', '`name` after'];\n"
+        "import {execSync} from 'node:child_process'; execSync('rm -rf /');\n"
+    )
+    assert any(
+        finding.rule_id == "TM1" for finding in tm.analyze(source, "control.mjs", "javascript")
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        r"const value = ['`name`\n'];",
+        "const value = ['`$TOOL -rf /`'];",
+        "const value = ['`name`' + extra];",
+        "const value = ['`name`'.concat(extra)];",
+        "eval('`name`');",
+        "new Function('`name`');",
+        "unknown('`name`');",
+        "const value = ['`name`];",
+    ],
+)
+def test_unproved_quoted_values_do_not_receive_boundary_refinement(source: str) -> None:
+    quoted: list[tuple[int, int]] = []
+    javascript_template_spans(source, lambda: None, quoted_strings=quoted)
+    assert quoted == []
+
+
+def test_quoted_value_boundaries_keep_unicode_character_offsets() -> None:
+    source = "const label = '日本語'; const values = ['`café` before'];"
+    quoted: list[tuple[int, int]] = []
+    javascript_template_spans(source, lambda: None, quoted_strings=quoted)
+    assert [source[start:end] for start, end in quoted] == ["'日本語'", "'`café` before'"]
+
+
+def test_quoted_body_is_checked_once_and_does_not_own_its_delimiters() -> None:
+    source = "const values = ['`name` before'];"
+    owner = tm._JavaScriptTemplateOwnership(source, lambda: None)
+    seen: list[str] = []
+
+    def checked(value: str) -> bool:
+        seen.append(value)
+        return True
+
+    start = source.index("'")
+    end = source.rindex("'")
+    assert not owner.quoted_string_is_complete(start, checked)
+    assert owner.quoted_string_is_complete(start + 1, checked)
+    assert owner.quoted_string_is_complete(start + 3, checked)
+    assert not owner.quoted_string_is_complete(end, checked)
+    assert not owner.quoted_string_is_complete(len(source) - 1, checked)
+    assert seen == ["`name` before"]
+
+
+def test_interrupted_quoted_body_check_is_not_cached() -> None:
+    source = "const values = ['`name` before'];"
+    owner = tm._JavaScriptTemplateOwnership(source, lambda: None)
+    position = source.index("`")
+
+    def cancelled(value: str) -> bool:
+        raise TimeoutError("cancelled")
+
+    with pytest.raises(TimeoutError, match="cancelled"):
+        owner.quoted_string_is_complete(position, cancelled)
+    assert owner.quoted_string_is_complete(position, lambda value: True)
