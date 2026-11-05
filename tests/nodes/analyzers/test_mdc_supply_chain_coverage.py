@@ -48,7 +48,7 @@ def test_markdown_mdc_runner_preserves_encoded_execution(path):
         {"components": [path], "file_cache": {path: content}}, [sc]
     )
     assert any(
-        finding.rule_id == "SC3" and finding.location.file == path
+        finding.rule_id == "SC3" and finding.file == path
         for finding in result["findings"]
     )
 
