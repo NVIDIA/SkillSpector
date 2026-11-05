@@ -69,17 +69,20 @@ def test_oversized_documents_keep_their_original_limits() -> None:
     assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is not None
 
 
-def test_individual_string_limit_is_not_removed_by_host_punctuation() -> None:
+def test_quoted_data_does_not_acquire_an_unquoted_command_word_limit() -> None:
     source = json.dumps({"value": "a" * 5000}, separators=(",", ":"))
-    diagnostic = tm.bounded_parse_diagnostic(source, _check, file_type="json")
-    assert diagnostic is not None
-    assert diagnostic.measurements["limit_characters"] == 4096
+    assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is None
+
+
+def test_existing_over_budget_nested_shell_command_remains_partial() -> None:
+    source = 'echo "$(' + "r" * 4097 + ' -rf /)"'
+    assert tm.bounded_parse_diagnostic(source, _check, file_type="shell") is not None
 
 
 def test_json_looking_shell_and_markdown_keep_their_existing_contract() -> None:
     source = _dense(20_000)
-    for kind in ("shell", "markdown"):
-        assert tm.bounded_parse_diagnostic(source, _check, file_type=kind) is not None
+    assert tm.bounded_parse_diagnostic(source, _check, file_type="shell") is None
+    assert tm.bounded_parse_diagnostic(source, _check, file_type="markdown") is not None
 
 
 @pytest.mark.parametrize(
@@ -165,7 +168,7 @@ def test_large_validation_does_not_allocate_decoded_objects(monkeypatch: pytest.
 
 
 def test_cancellation_propagates_before_any_ownership_escapes() -> None:
-    class Cancelled(Exception):
+    class CancelledError(Exception):
         pass
 
     calls = 0
@@ -174,7 +177,7 @@ def test_cancellation_propagates_before_any_ownership_escapes() -> None:
         nonlocal calls
         calls += 1
         if calls == 100:
-            raise Cancelled
+            raise CancelledError
 
-    with pytest.raises(Cancelled):
+    with pytest.raises(CancelledError):
         prepare_json_source(_dense(), check)

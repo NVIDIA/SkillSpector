@@ -2952,10 +2952,15 @@ def _literal_shell_command_spans(
 
 
 def _has_destructive_command_string(
-    content: str, *, diagnostics: list[StaticParserDiagnostic] | None = None
+    content: str,
+    *,
+    diagnostics: list[StaticParserDiagnostic] | None = None,
+    check_runtime: Callable[[], None] | None = None,
 ) -> bool:
     """Return whether an executable string contains a proven destructive command."""
     for command_start, body_start in _destructive_command_words(content):
+        if check_runtime is not None:
+            check_runtime()
         tokens, _, _ = _bounded_shell_tokens(content, command_start, body_start)
         if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
             _note_parser_diagnostic(
@@ -8872,6 +8877,19 @@ def _has_bounded_parse_exhaustion(
         json_strings = validated_json_string_spans(content, check_runtime)
         structural_quote_closers = {end - 1 for _, end in json_strings}
         structural_quote_openers = {start for start, _ in json_strings}
+    if json_strings and (source_view is None or source_view.name == "raw"):
+        for start, end in json_strings:
+            check_runtime()
+            effects: list[StaticParserDiagnostic] = []
+            if _has_destructive_command_string(
+                content[start + 1 : end - 1], diagnostics=effects, check_runtime=check_runtime
+            ):
+                # Structural ownership does not establish finding provenance
+                # for commands embedded in an original JSON string. Keep that
+                # interpretation incomplete; ordinary findings still run raw.
+                # Marker-derived views already carry their reconstructed
+                # findings and must not borrow this original-string caveat.
+                return effects[0].enclosed(start, end)
     if json_strings:
         # Raw substitution delimiters must survive Markdown's inline projection.
         json_operand_spans = [

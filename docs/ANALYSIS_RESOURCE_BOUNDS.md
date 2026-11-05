@@ -88,6 +88,9 @@ boundaries. The proof carries through bounded windows only with ordered source m
 and intact original quote delimiters. String contents and all finding views stay visible;
 individual command-word, reconstruction, archive, output, and runtime limits still apply.
 This allowance does not expand the Markdown/frontmatter quote-ownership limits below.
+Concrete destructive commands inside original JSON strings retain an explicit incomplete
+interpretation until their finding provenance is supported. Existing raw and reconstructed
+findings remain visible; structural syntax ownership cannot turn that gap into a clean scan.
 
 The deterministic instruction parser can distinguish structural JSON quotes from instruction
 delimiters only after validating a complete JSON value within **131,072 source characters**.
