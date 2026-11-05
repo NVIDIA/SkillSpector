@@ -1524,10 +1524,10 @@ def test_xargs_binding_proof_stays_conservative_at_its_wrapper_bound():
         "builtin trap 'rm -rf \"$WORK\"' EXIT",
     ],
 )
-def test_literal_binding_free_traps_preserve_redirected_xargs_data(registration):
+def test_literal_traps_retain_unproven_binding_effects(registration):
     source = registration + '\nxargs <<< "$VALUE"\n'
-    assert not tm._xargs_has_source_override(source, lambda: None)
-    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+    assert tm._xargs_has_source_override(source, lambda: None)
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
 @pytest.mark.parametrize(
@@ -1572,14 +1572,6 @@ def test_external_lookup_changes_cannot_borrow_xargs_semantics(prefix):
 def test_literal_trap_ownership_preserves_raw_dangerous_findings():
     source = "trap 'rm -rf /' EXIT\nxargs <<< \"$VALUE\"\n"
     assert any(f.rule_id == "TM1" for f in tm.analyze(source, "control.sh", "shell"))
-
-
-def test_literal_trap_proof_has_a_command_and_recursion_bound():
-    body = "true; false; pwd; date; uname; ls; wc; id; whoami"
-    assert tm._xargs_has_source_override("trap '" + body + "' EXIT", lambda: None)
-    assert tm._shell_redefines_command(
-        "trap 'echo done' EXIT", lambda: None, "xargs", _handler_depth=8
-    )
 
 
 @pytest.mark.parametrize(

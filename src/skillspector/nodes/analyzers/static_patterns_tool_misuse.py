@@ -4314,8 +4314,6 @@ def _shell_redefines_command(
     command: str = "printf",
     *,
     shell_substitutions: bool = False,
-    _handler_commands: set[str] | None = None,
-    _handler_depth: int = 0,
 ) -> bool:
     """Do not widen builtin evaluation across an explicit local replacement."""
     work = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
@@ -4375,10 +4373,6 @@ def _shell_redefines_command(
                     break
                 wrapper = None
             if word in {"command", "builtin"}:
-                if _handler_commands is not None:
-                    _handler_commands.add(word)
-                    if len(_handler_commands) > 8:
-                        return True
                 wrapper = word
                 continue
             if word in _SHELL_CLAUSE_PREFIX_WORDS or word in {"if", "while", "until"}:
@@ -4391,54 +4385,11 @@ def _shell_redefines_command(
                     return True
                 if word == "hash":
                     return True
-            if command == "xargs" and word == "trap":
-                if _handler_depth >= 8:
-                    return True
-                span = [0, 0]
-                recognized, handler = _command_string_from_clause(
-                    source, 0, check_runtime, shell_traps=True, source_span=span
-                )
-                commands: set[str] = set()
-                if recognized:
-                    if handler is None:
-                        return True
-                    if _shell_redefines_command(
-                        handler,
-                        check_runtime,
-                        command,
-                        shell_substitutions=True,
-                        _handler_commands=commands,
-                        _handler_depth=_handler_depth + 1,
-                    ):
-                        return True
-                # Registration itself changes no utility binding. Check
-                # the handler's callees against the enclosing source too.
-                masked = content[:start] + (" " * span[1]) + content[start + span[1] :]
-                if any(
-                    _shell_redefines_command(masked, check_runtime, name)
-                    for name in commands | {"trap"}
-                ):
-                    return True
-                if _handler_commands is not None:
-                    _handler_commands.update(commands | {"trap"})
-                    if len(_handler_commands) > 8:
-                        return True
-                break
             if word in {"eval", "source", ".", "enable", "trap"}:
                 # Imported/evaluated code, handlers and builtin configuration
                 # can replace the command in this shell.
                 # Retain the earlier narrow decoder across those unknown effects.
                 return True
-            if _handler_commands is not None:
-                if word in {"alias", "function"} or any(
-                    marker in (word or "")
-                    for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
-                ):
-                    return True
-                if word is not None:
-                    _handler_commands.add(word)
-                    if len(_handler_commands) > 8:
-                        return True
             if word == "function":
                 name, end, limited = _next_shell_invocation_word(source, cursor, check_runtime)
                 work -= end - cursor
