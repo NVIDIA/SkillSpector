@@ -14,6 +14,7 @@ from skillspector.nodes.analyzers import static_runner
 # Alternating Python delimiters make a raw shell word charge later token bodies
 # to the first value. Each native value remains short and independent.
 _TAIL = "".join(f'FIELD_{index} = "ordinary_value_{index}"\n' for index in range(600))
+_OPTION_TEXT = 'BUILD_ARGS = ["--recursive", "--force", "/tmp/build"]\n'
 
 
 def _diagnostic(source: str):
@@ -43,7 +44,10 @@ def test_short_python_values_do_not_consume_later_token_bodies(
     "extension", [" + unknown", " % unknown", ".format(unknown)", " * count", "[part:]"]
 )
 def test_unproved_value_extensions_keep_the_original_failure(extension: str) -> None:
-    source = 'VALUE = "ordinary"' + extension + "\n" + _TAIL
+    source = 'def read(access: str = "read"' + extension + "):\n    return access\n" + _TAIL
+    owner = tm._PythonSourceOwnership(source, lambda: None)
+    start = source.index('read"')
+    assert owner.string_value(start, start + len("read")) is None
 
     assert _diagnostic(source) is not None
 
@@ -60,7 +64,7 @@ def test_unproved_value_extensions_keep_the_original_failure(extension: str) -> 
     ],
 )
 def test_later_dynamic_command_values_remain_independently_partial(statement: str) -> None:
-    source = 'FIRST = "ordinary"\n' + _TAIL + statement
+    source = _OPTION_TEXT + 'FIRST = "ordinary"\n' + _TAIL + statement + _TAIL
 
     assert _diagnostic(source) is not None
 
@@ -76,7 +80,8 @@ def test_a_genuinely_over_budget_python_value_keeps_the_limit() -> None:
 
 
 def test_native_ownership_requires_complete_valid_python() -> None:
-    source = 'VALUE = "ordinary"\n' + _TAIL + "def broken(:\n"
+    source = 'FENCE = "\\n```\\n"\n' + _TAIL + "def broken(:\n"
+    assert tm._python_literal_spans(source, lambda: None) is None
 
     assert _diagnostic(source) is not None
     assert (
