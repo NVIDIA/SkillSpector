@@ -63,6 +63,7 @@ from skillspector.python_tokens import (
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
 from skillspector.python_tokens import python_string_body as _python_string_body
 from skillspector.security_reconstruction import validated_json_string_spans
+from skillspector.semgrep_tokens import semgrep_rule_scalar_roles
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 from skillspector.yaml_tokens import YamlScalar, YamlSourceSpans, yaml_source_spans
 
@@ -8926,10 +8927,17 @@ def bounded_parse_diagnostic(
         mapped_source = isinstance(
             prepared_analysis, _YamlParserAnalysis
         ) and prepared_analysis.owns(content, source_view, check_runtime)
+        scalar_roles = semgrep_rule_scalar_roles(content, check_runtime)
         for scalar in yaml_spans.scalars:
             check_runtime()
-            diagnostic = _has_bounded_parse_exhaustion(
-                scalar.value, check_runtime, file_type="shell", complete_context=True
+            role = scalar_roles.get(scalar.start)
+            # Proven rule queries are matching-language data, not shell
+            # programs. Finding production still checks their raw/decoded text.
+            diagnostic = None if role == "pattern" else bounded_parse_diagnostic(
+                scalar.value,
+                check_runtime,
+                file_type="markdown" if role == "message" else "shell",
+                complete_context=True,
             )
             exact_source = content[scalar.body_start : scalar.body_end] == scalar.value
             if diagnostic is not None:
