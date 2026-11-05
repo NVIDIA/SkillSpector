@@ -199,6 +199,25 @@ def test_xargs_redirection_does_not_replace_the_explicit_command_string(source: 
     assert tm._command_string_from_clause(source, 0, lambda: None) == (True, "printf done")
 
 
+@pytest.mark.parametrize("options", ["-I '{}'", "-I{}", "--replace", "--replace={}", "-i", "-i{}"])
+@pytest.mark.parametrize("template", ["{}", "printf '%s' '{}'", "echo safe; {}"])
+def test_xargs_replacement_keeps_runtime_command_templates_unresolved(
+    options: str, template: str
+) -> None:
+    source = f'xargs {options} <<< "$CMD" sh -c "{template}")'
+
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, None)
+
+
+def test_xargs_replacement_keeps_runtime_utility_unresolved() -> None:
+    assert tm._command_string_from_clause(
+        'xargs -I {} <<< "$CMD" {} -rf /)', 0, lambda: None
+    ) == (True, None)
+    assert tm._command_string_from_clause(
+        'xargs -I {} <<< "$VALUE" sh -c "printf done")', 0, lambda: None
+    ) == (True, "printf done")
+
+
 @pytest.mark.parametrize(
     "source",
     [

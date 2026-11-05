@@ -4657,6 +4657,7 @@ def _command_string_from_clause(
     wrapper_seen = False
     last_word_start = start
     word_start = [start]
+    xargs_replacements: set[str] = set()
 
     def failed(
         cause: ParserCause = ParserCause.UNSUPPORTED_SYNTAX,
@@ -4686,6 +4687,8 @@ def _command_string_from_clause(
         word, cursor, limited = _next_shell_invocation_word(
             content, cursor, check_runtime, diagnostics=diagnostics, source_start=word_start
         )
+        if word is not None and any(marker in word for marker in xargs_replacements):
+            word = _DYNAMIC_SHELL_WORD_SENTINEL
         last_word_start = word_start[0]
         if source_span is not None:
             source_span[1] = cursor
@@ -4982,6 +4985,29 @@ def _command_string_from_clause(
                 if not option.startswith("-") or command == "xargs" and not xargs_options:
                     pending = option
                     break
+                if command == "xargs" and (
+                    option in {"-I", "-J", "-i", "--replace"}
+                    or option.startswith(("-I", "-J", "--replace=", "-i"))
+                ):
+                    if option in {"-I", "-J"}:
+                        marker, limited = next_word()
+                    elif option in {"-i", "--replace"}:
+                        marker, limited = "{}", False
+                    else:
+                        marker, limited = (
+                            option.partition("=")[2] if option.startswith("--") else option[2:],
+                            False,
+                        )
+                    if not marker or limited or any(
+                        sentinel in marker
+                        for sentinel in (
+                            _DYNAMIC_SHELL_WORD_SENTINEL,
+                            _RUNTIME_SHELL_PARAMETER_SENTINEL,
+                        )
+                    ):
+                        return failed(ParserCause.RUNTIME_DEPENDENT)
+                    xargs_replacements.add(marker)
+                    continue
                 if command == "xargs" and option in {
                     "-a",
                     "--arg-file",
