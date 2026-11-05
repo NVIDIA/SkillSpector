@@ -2237,7 +2237,7 @@ def _scan_declared_marker_views(
             ) from exc
 
     check_runtime()
-    parser_file_type = parser_file_type or _infer_file_type(path)
+    bounded_file_type = parser_file_type or _infer_file_type(path)
     projection_limited = False
     bounded_parse_limited = False
     seen_views: set[tuple[str, int, int]] = set()
@@ -2276,7 +2276,7 @@ def _scan_declared_marker_views(
     # The proof covers the whole artifact, so it holds in every window. It is
     # computed only when a loose quoted directive header reaches a quote.
     python_strings = (
-        PythonStringClosers(content, check_runtime) if parser_file_type == "python" else None
+        PythonStringClosers(content, check_runtime) if bounded_file_type == "python" else None
     )
 
     for owned_start, raw_start in zip(owned_starts, raw_starts, strict=True):
@@ -2435,7 +2435,7 @@ def _scan_declared_marker_views(
                                 module,
                                 marker_view,
                                 check_runtime,
-                                file_type=parser_file_type,
+                                file_type=bounded_file_type,
                                 complete_context=complete_context,
                                 source_start=raw_start,
                                 diagnostics=parser_diagnostics,
