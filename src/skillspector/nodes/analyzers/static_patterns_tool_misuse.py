@@ -7976,7 +7976,6 @@ def _tm1_candidates(
                 None,
             )
 
-
     destructive_iterators = [_destructive_command_candidates(content, check_runtime=check_runtime)]
     if shell_content is not None and shell_content != content:
         destructive_iterators.append(
