@@ -1636,10 +1636,14 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                 if batch_outcome.failures
                 else "UnexpectedStructuredResponse"
             )
+            refusal_only = not unexpected_response and all(
+                failure.reason is LedgerReason.LLM_RESPONSE_REFUSED
+                for failure in batch_outcome.failures
+            )
             result.record = llm_call_record(
                 ANALYZER_ID,
                 ok=False,
-                error=f"TP4 LLM batch failed: {error_class}",
+                error=None if refusal_only else f"TP4 LLM batch failed: {error_class}",
             )
         else:
             result.record = llm_call_record(ANALYZER_ID, ok=True)

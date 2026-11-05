@@ -352,7 +352,10 @@ def _refused_runtime_is_accounted(
     by_work: dict[tuple[str, str], list[Mapping[str, object]]] = {}
     refusals: set[tuple[str, str]] = set()
     refused_nodes: set[tuple[str, str]] = set()
-    required_analyzers = required_semantic_analyzer_ids(discovered_modules)
+    required_analyzers = required_semantic_analyzer_ids(discovered_modules) | {
+        "mcp_tool_poisoning",
+        "meta_analyzer",
+    }
     for event in events:
         if not isinstance(event, Mapping):
             return False
@@ -367,15 +370,15 @@ def _refused_runtime_is_accounted(
             event.get("phase") in {"semantic", "meta"}
             and event.get("outcome") != LedgerOutcome.COMPLETED
         ):
+            analyzer = event.get("analyzer_id")
             if (
                 event.get("record_type") != LedgerRecordType.WORK_ITEM
-                or event.get("phase") != "semantic"
+                or not isinstance(analyzer, str)
+                or analyzer not in required_analyzers
+                or event.get("phase") != ("meta" if analyzer == "meta_analyzer" else "semantic")
                 or event.get("outcome") != LedgerOutcome.SKIPPED
                 or event.get("reason_code") != LedgerReason.LLM_RESPONSE_REFUSED
             ):
-                return False
-            analyzer = event.get("analyzer_id")
-            if not isinstance(analyzer, str) or analyzer not in required_analyzers:
                 return False
             refusals.add(key)
             refused_nodes.add((scope, analyzer))
@@ -414,10 +417,20 @@ def _refused_runtime_is_accounted(
             if key in accounted_work or len(matches) != 1:
                 return False
             event = matches[0]
+            own_static_work = (
+                analyzer == "mcp_tool_poisoning"
+                and event.get("analyzer_id") == "mcp_tool_poisoning_static"
+                and event.get("phase") == "static"
+                and event.get("path")
+                == ("SKILL.md" if scope == _ROOT_SOURCE_SCOPE else scope + "/SKILL.md")
+            )
             if (
                 event.get("record_type") != LedgerRecordType.WORK_ITEM
-                or event.get("analyzer_id") != analyzer
-                or event.get("phase") != "semantic"
+                or (event.get("analyzer_id") != analyzer and not own_static_work)
+                or (
+                    event.get("phase") != ("meta" if analyzer == "meta_analyzer" else "semantic")
+                    and not own_static_work
+                )
                 or any(
                     event.get(field) != target.get(field)
                     for field in ("path", "start_line", "end_line")
@@ -450,10 +463,15 @@ def _refused_runtime_is_accounted(
         if scope is None or not isinstance(node, str) or not node:
             return False
         key = (scope, node)
-        if call.get("ok") is False and key in refused_nodes:
+        if key in refused_nodes:
             # Refusal batch outcomes have no transport error. Other failures
             # must retain their missing-runtime warning.
-            if "error" not in call or call["error"] is not None:
+            if (
+                key in accounted_nodes
+                or call.get("ok") is not False
+                or "error" not in call
+                or call["error"] is not None
+            ):
                 return False
             accounted_nodes.add(key)
             projected_calls.append({**call, "ok": True})

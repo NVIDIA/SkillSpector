@@ -1446,7 +1446,7 @@ def _llm_degradation_notice(
     failed = attempted - succeeded
     return (
         f"LLM analysis was requested but {failed} of {attempted} LLM call(s) failed - "
-        "results reflect STATIC analysis only for the affected batch(es)."
+        "affected AI assessments are incomplete; completed results are retained."
     )
 
 
@@ -1563,11 +1563,7 @@ def _build_metadata(
             }
         )
         detail = f" Reasons: {'; '.join(reasons)}" if reasons else ""
-        failed = attempted - succeeded
-        meta["llm_error"] = (
-            f"LLM analysis was requested but {failed} of {attempted} LLM call(s) failed; "
-            f"results reflect static analysis only for the affected batch(es).{detail}"
-        )
+        meta["llm_error"] = f"{_llm_degradation_notice(use_llm, llm_call_log)}{detail}"
     elif semantic_runtime_incomplete:
         meta["llm_degraded"] = True
         meta["llm_error"] = (

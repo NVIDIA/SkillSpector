@@ -427,6 +427,143 @@ def test_accounted_refusal_cannot_hide_unproven_execution(mutation: str) -> None
     assert _runtime_event(state) is not None
 
 
+def _refused_tp4_meta_state() -> dict:
+    state = _refused_semantic_state()
+    for analyzer in ("mcp_tool_poisoning", "meta_analyzer"):
+        phase = "meta" if analyzer == "meta_analyzer" else "semantic"
+        own_events = [
+            ledger_event(
+                analyzer_id=analyzer,
+                outcome=LedgerOutcome.COMPLETED,
+                phase=phase,
+                path="complete.py",
+            ),
+            ledger_event(
+                analyzer_id=analyzer,
+                outcome=LedgerOutcome.SKIPPED,
+                phase=phase,
+                path="rules.yaml",
+                reason=LedgerReason.LLM_RESPONSE_REFUSED,
+            ),
+        ]
+        if analyzer == "mcp_tool_poisoning":
+            own_events.insert(
+                0,
+                ledger_event(
+                    analyzer_id="mcp_tool_poisoning_static",
+                    outcome=LedgerOutcome.COMPLETED,
+                    phase="static",
+                    path="SKILL.md",
+                ),
+            )
+        state["inspection_ledger"].extend(own_events)
+        state["analyzer_status_events"].append(analyzer_status_for_events(analyzer, own_events))
+        state["llm_call_log"].append({"node": analyzer, "ok": False, "error": None})
+    state["findings"] = [{"id": "TM1", "severity": "HIGH", "tags": []}]
+    state["meta_review_required"] = True
+    return state
+
+
+def test_bound_tp4_and_meta_refusals_retain_original_failure_and_findings() -> None:
+    state = _refused_tp4_meta_state()
+    before = deepcopy(state)
+    assert _runtime_event(state) is None
+    assert state == before
+    assert semantic_runtime_accounting(enabled=True, result=state, discovered_modules={}) == (
+        False,
+        False,
+    )
+    assert state["findings"][0]["severity"] == "HIGH"
+    assert all(call["ok"] is False for call in state["llm_call_log"])
+    assert all(status["status"] == "degraded" for status in state["analyzer_status_events"])
+
+
+def test_bound_tp4_and_meta_refusals_require_matching_child_scope() -> None:
+    state = _refused_tp4_meta_state()
+    scope = "external/child-digest"
+    for event in state["inspection_ledger"]:
+        event["source_identity"] = scope
+        event["path"] = scope + "/" + event["path"]
+    for status in state["analyzer_status_events"]:
+        status["source_identity"] = scope
+        for target in status["planned_work"]:
+            target["path"] = scope + "/" + target["path"]
+    for call in state["llm_call_log"]:
+        call["source_identity"] = scope
+    assert _runtime_event(state) is None
+    state["llm_call_log"][-1].pop("source_identity")
+    assert _runtime_event(state) is not None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_meta_call",
+        "duplicate_meta_call",
+        "contradictory_meta_call",
+        "missing_meta_event",
+        "duplicate_meta_event",
+        "missing_meta_status",
+        "duplicate_meta_status",
+        "duplicate_tp4_target",
+        "tp4_static_path",
+        "tp4_static_failure",
+        "meta_phase",
+        "tp4_phase",
+        "provider_failure",
+        "missing_error",
+        "mixed_provider_error",
+        "unknown_analyzer",
+    ],
+)
+def test_tp4_and_meta_refusal_proof_rejects_incomplete_or_contradictory_work(mutation: str) -> None:
+    state = _refused_tp4_meta_state()
+    events, statuses, calls = (
+        state["inspection_ledger"],
+        state["analyzer_status_events"],
+        state["llm_call_log"],
+    )
+    if mutation == "missing_meta_call":
+        calls.pop()
+    elif mutation == "duplicate_meta_call":
+        calls.append(dict(calls[-1]))
+    elif mutation == "contradictory_meta_call":
+        calls.append({"node": "meta_analyzer", "ok": True, "error": None})
+    elif mutation == "missing_meta_event":
+        events.pop()
+    elif mutation == "duplicate_meta_event":
+        events.append(dict(events[-1]))
+    elif mutation == "missing_meta_status":
+        statuses.pop()
+    elif mutation == "duplicate_meta_status":
+        statuses.append(deepcopy(statuses[-1]))
+    elif mutation == "duplicate_tp4_target":
+        statuses[-2]["planned_work"].append(dict(statuses[-2]["planned_work"][0]))
+    elif mutation == "tp4_static_path":
+        static = next(event for event in events if event["phase"] == "static")
+        static["path"] = statuses[-2]["planned_work"][0]["path"] = "wrong.md"
+    elif mutation == "tp4_static_failure":
+        static = next(event for event in events if event["phase"] == "static")
+        static["outcome"] = LedgerOutcome.PARTIAL
+        static["reason_code"] = LedgerReason.RUNTIME_LIMIT
+    elif mutation == "meta_phase":
+        events[-1]["phase"] = "semantic"
+    elif mutation == "tp4_phase":
+        events[-3]["phase"] = "meta"
+    elif mutation == "provider_failure":
+        events[-1]["outcome"] = LedgerOutcome.FAILED
+        events[-1]["reason_code"] = LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+    elif mutation == "missing_error":
+        calls[-1].pop("error")
+    elif mutation == "mixed_provider_error":
+        calls[-2]["error"] = "connection failed"
+    elif mutation == "unknown_analyzer":
+        events[-1]["analyzer_id"] = "static_patterns_tool_misuse"
+    before = deepcopy(state)
+    assert _runtime_event(state) is not None
+    assert state == before
+
+
 def _format_recovery_state() -> dict:
     analyzer = "semantic_security_discovery"
     event = ledger_event(
