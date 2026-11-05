@@ -1632,3 +1632,15 @@ def test_indirect_binding_effects_cannot_borrow_external_xargs_semantics(setup):
     source = setup + '\nxargs <<< "$CODE"\n'
     assert tm._xargs_has_source_override(source, lambda: None)
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("wrapper", ["command", "builtin"])
+def test_literal_trap_cannot_hide_aliased_wrapper_binding_effects(wrapper):
+    source = (
+        "shopt -s expand_aliases\n"
+        f"alias {wrapper}=eval\n"
+        f"trap '{wrapper} \"xargs() {{ bash; }}\"' DEBUG\n"
+        'xargs <<< "$CODE"\n'
+    )
+    assert tm._xargs_has_source_override(source, lambda: None)
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")

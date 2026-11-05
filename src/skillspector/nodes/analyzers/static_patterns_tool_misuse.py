@@ -4375,6 +4375,10 @@ def _shell_redefines_command(
                     break
                 wrapper = None
             if word in {"command", "builtin"}:
+                if _handler_commands is not None:
+                    _handler_commands.add(word)
+                    if len(_handler_commands) > 8:
+                        return True
                 wrapper = word
                 continue
             if word in _SHELL_CLAUSE_PREFIX_WORDS or word in {"if", "while", "until"}:
