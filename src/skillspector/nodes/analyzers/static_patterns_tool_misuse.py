@@ -4331,19 +4331,19 @@ def _shell_redefines_command(
         backtick_starts=set() if shell_substitutions else None,
     ):
         check_runtime()
+        scope_end = scope_ends[-1] - 1 if scope_ends else len(content)
+        if start >= scope_end:
+            continue
+        source = content[start : min(scope_end, start + _ROOT_GLOB_COMMAND_CHARS + 1)]
         if command == "xargs" and _shell_clause_sets_startup(
-            content,
-            start,
+            source,
+            0,
             check_runtime,
             setting_work,
             variable_names=("PATH",),
             allow_empty=False,
         ):
             return True
-        scope_end = scope_ends[-1] - 1 if scope_ends else len(content)
-        if start >= scope_end:
-            continue
-        source = content[start : min(scope_end, start + _ROOT_GLOB_COMMAND_CHARS + 1)]
         cursor = 0
         wrapper: str | None = None
         for _ in range(8):
