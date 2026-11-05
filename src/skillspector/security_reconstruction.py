@@ -935,9 +935,7 @@ def _verb_is_make_strip_function(text: str, match: re.Match[str]) -> bool:
     start, quote = match.start(), match.start("quote")
     return (
         text[max(0, start - 2) : start] == "$("
-        and re.fullmatch(
-            r"strip[ \t]+\$\([A-Za-z_][A-Za-z0-9_]*\)\)[ \t]*", text[start:quote]
-        )
+        and re.fullmatch(r"strip[ \t]+\$\([A-Za-z_][A-Za-z0-9_]*\)\)[ \t]*", text[start:quote])
         is not None
     )
 
