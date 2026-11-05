@@ -145,8 +145,15 @@ def test_message_without_an_exact_inline_diagnostic_owner_keeps_runtime_limit() 
 
 
 def test_many_inline_suffixes_do_not_create_unbounded_reparsing() -> None:
-    result = _scan("Example `$(...)`. " + "Reference `label`. " * 1000)
-    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    source = _source("Example `$(...)`. " + "Reference `label`. " * 1000)
+    calls = 0
+
+    def check() -> None:
+        nonlocal calls
+        calls += 1
+        assert calls <= 32 * len(source) + 8192
+
+    assert tm.bounded_parse_diagnostic(source, check, file_type="yaml") is None
 
 
 @pytest.mark.parametrize("encoded", [False, True])

@@ -9216,15 +9216,15 @@ def _message_inline_runtime_diagnostic(
     diagnostic = bounded_parse_diagnostic(content, check_runtime, file_type="markdown")
     if diagnostic is not None:
         return diagnostic
-    # Each literal body retains its following operands, so a split shell name
-    # and -c argument cannot borrow an earlier inert example's assessment.
-    for start, _end in ranges:
+    # Execution consumers above own their operands. A displayed body cannot
+    # borrow the surrounding prose as another shell command string.
+    for start, end in ranges:
         check_runtime()
-        remaining_work[0] -= len(projected) - start
+        remaining_work[0] -= end - start
         if remaining_work[0] < 0:
             return limited()
         diagnostic = bounded_parse_diagnostic(
-            projected[start:], check_runtime, file_type="markdown"
+            projected[start:end], check_runtime, file_type="markdown"
         )
         if diagnostic is not None:
             return diagnostic.shifted(start)
