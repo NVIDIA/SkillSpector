@@ -159,11 +159,11 @@ def test_recognized_nested_queries_are_owned_without_executing_them() -> None:
 
 
 def test_cancelled_rule_proof_does_not_return_partial_ownership() -> None:
-    class Cancelled(Exception):
+    class CancelledError(Exception):
         pass
 
     def cancelled() -> None:
-        raise Cancelled
+        raise CancelledError
 
-    with pytest.raises(Cancelled):
+    with pytest.raises(CancelledError):
         semgrep_rule_scalar_roles(_rule("  pattern: ordinary\n"), cancelled)
