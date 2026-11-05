@@ -9216,18 +9216,6 @@ def _message_inline_runtime_diagnostic(
     diagnostic = bounded_parse_diagnostic(content, check_runtime, file_type="markdown")
     if diagnostic is not None:
         return diagnostic
-    # Execution consumers above own their operands. A displayed body cannot
-    # borrow the surrounding prose as another shell command string.
-    for start, end in ranges:
-        check_runtime()
-        remaining_work[0] -= end - start
-        if remaining_work[0] < 0:
-            return limited()
-        diagnostic = bounded_parse_diagnostic(
-            projected[start:end], check_runtime, file_type="markdown"
-        )
-        if diagnostic is not None:
-            return diagnostic.shifted(start)
     return None
 
 

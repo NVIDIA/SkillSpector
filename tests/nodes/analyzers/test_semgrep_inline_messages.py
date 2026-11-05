@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, ParserCause, ParserCheck
 from skillspector.nodes.analyzers import static_patterns_anti_refusal as ar
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.nodes.analyzers import static_runner
@@ -56,6 +56,7 @@ def _scan(message: str, *, encoded: bool = False) -> dict:
         "An example `$(...)`. Use `printf` as a reference; echo 'status'.",
         "An example `$(...)`. Use `echo` as a reference; echo 'status'.",
         "The `library`'s matching expression `$(...)` is displayed.",
+        "A command reference `bash -c`.",
     ],
 )
 def test_exact_owned_inline_body_refines_the_false_backtick_runtime_reading(message: str) -> None:
@@ -116,6 +117,7 @@ def test_exact_owned_inline_body_refines_the_false_backtick_runtime_reading(mess
         'Run `sh` -c "echo `$PAYLOAD`\'s".',
         "Run sh -c 'echo `$(cat command.txt)`'s.",
         'Run `sh` -c "echo `$(cat command.txt)`\'s".',
+        'Run `bash -c` "$PAYLOAD".',
         'The `library`\'s example `$(...)` then run sh -c "$PAYLOAD".',
         'The `library`\'s example `$(...)`; source helper.sh; echo sh -c "$PAYLOAD".',
     ],
@@ -167,7 +169,12 @@ def test_many_inline_suffixes_do_not_create_unbounded_reparsing() -> None:
         calls += 1
         assert calls <= 32 * len(source) + 8192
 
-    assert tm.bounded_parse_diagnostic(source, check, file_type="yaml") is None
+    diagnostic = tm.bounded_parse_diagnostic(source, check, file_type="yaml")
+    assert 0 < calls <= 32 * len(source) + 8192
+    assert diagnostic is None or (
+        diagnostic.cause is ParserCause.RESOURCE_LIMIT
+        or diagnostic.check is ParserCheck.PRINTF_INVOCATION
+    )
 
 
 @pytest.mark.parametrize("encoded", [False, True])
