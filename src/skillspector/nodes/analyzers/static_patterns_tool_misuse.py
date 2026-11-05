@@ -4727,7 +4727,6 @@ def _command_string_from_clause(
     last_word_start = start
     word_start = [start]
     xargs_replacements: set[str] = set()
-    xargs_child_stdin = False
     if xargs_override_cache is None:
         xargs_override_cache = [None]
 
@@ -4796,6 +4795,40 @@ def _command_string_from_clause(
                 cursor += 2
             else:
                 break
+
+    def later_here_string() -> bool | None:
+        # Input modes need their own child-input analysis; do not extend the
+        # redirected-data exemption to a redirection after the utility either.
+        tail = content[cursor : cursor + _ROOT_GLOB_COMMAND_CHARS + 1]
+        position = 0
+        for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
+            check_runtime()
+            while position < len(tail):
+                if position % 4096 == 0:
+                    check_runtime()
+                if tail[position] in " \t":
+                    position += 1
+                elif tail.startswith("\\\r\n", position):
+                    position += 3
+                elif tail.startswith("\\\n", position):
+                    position += 2
+                else:
+                    break
+            if position > _ROOT_GLOB_COMMAND_CHARS:
+                return None
+            if position == len(tail) or tail[position] in "\r\n;|&()#":
+                return False
+            if re.match(r"(?:[0-9]+)?<<<", tail[position : position + 32]):
+                return True
+            redirection = _SHELL_REDIRECTION_PREFIX_RE.match(tail, position)
+            if redirection is not None:
+                position = redirection.end()
+                continue
+            word, end, limited = _next_shell_invocation_word(tail, position, check_runtime)
+            if limited or word is None or end <= position or end > _ROOT_GLOB_COMMAND_CHARS:
+                return None
+            position = end
+        return None
 
     def resolved_command_string(word: str | None, limited: bool) -> str | None:
         if (
@@ -4912,9 +4945,6 @@ def _command_string_from_clause(
                 ):
                     return failed(ParserCause.RUNTIME_DEPENDENT)
                 if option is None:
-                    # Arg-file/TTY mode leaves input available to the child.
-                    if xargs_child_stdin:
-                        return failed(ParserCause.RUNTIME_DEPENDENT)
                     # Without -c there is no command string to reconstruct.
                     # This also keeps Markdown fence labels such as sh inert.
                     return False, None
@@ -4945,8 +4975,6 @@ def _command_string_from_clause(
                     continue
                 if option.startswith("+") or option.startswith("--"):
                     continue
-                if xargs_child_stdin:
-                    return failed(ParserCause.RUNTIME_DEPENDENT)
                 return False, None
             return failed(
                 ParserCause.RESOURCE_LIMIT,
@@ -5038,6 +5066,7 @@ def _command_string_from_clause(
             wrapper_seen = True
             xargs_options = True
             xargs_redirected = False
+            xargs_input_mode = False
             for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
                 if command == "xargs":
                     horizontal_gap()
@@ -5056,6 +5085,8 @@ def _command_string_from_clause(
                             )
                         if not external_xargs_proved():
                             return failed(ParserCause.RUNTIME_DEPENDENT)
+                        if xargs_input_mode:
+                            return failed()
                         xargs_redirected = True
                         continue
                     if xargs_redirected and cursor < len(content) and content[cursor] in "\r\n":
@@ -5131,7 +5162,10 @@ def _command_string_from_clause(
                     or option.startswith(("-a", "--arg-file="))
                     or re.fullmatch(r"-[0rtpox]*o[0rtpox]*", option)
                 ):
-                    xargs_child_stdin = True
+                    if not xargs_input_mode:
+                        xargs_input_mode = True
+                        if xargs_redirected or later_here_string() is not False:
+                            return failed()
                 if command == "xargs" and option in {
                     "-a",
                     "--arg-file",

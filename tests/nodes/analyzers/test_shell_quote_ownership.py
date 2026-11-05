@@ -192,7 +192,6 @@ def test_xargs_here_string_preserves_an_explicit_shell_utility(prefix: str, plac
         "xargs <<< \"$VALUES\" sh -c 'printf done')",
         "xargs \\\n <<< \"$VALUES\" sh -c 'printf done')",
         "xargs -- <<< \"$VALUES\" sh -c 'printf done')",
-        "xargs -a input <<< \"$VALUES\" sh -c 'printf done')",
     ],
 )
 def test_xargs_redirection_does_not_replace_the_explicit_command_string(source: str) -> None:
@@ -1649,11 +1648,16 @@ def test_literal_trap_cannot_hide_aliased_wrapper_binding_effects(wrapper):
         "--open-tty",
     ],
 )
-@pytest.mark.parametrize("utility", ["bash", "sh -s", "env bash", "command bash"])
-@pytest.mark.parametrize("placement", ["before", "after"])
+@pytest.mark.parametrize(
+    "utility",
+    ["bash", "sh -s", "python3", "node", "env bash", "command bash", "sh -c bash"],
+)
+@pytest.mark.parametrize("placement", ["before", "after", "before-options"])
 def test_xargs_child_input_cannot_hide_runtime_shell_code(options, utility, placement):
     source = (
-        f'xargs {options} <<< "$CODE" {utility}'
+        f'xargs <<< "$CODE" {options} {utility}'
+        if placement == "before-options"
+        else f'xargs {options} <<< "$CODE" {utility}'
         if placement == "before"
         else f'xargs {options} {utility} <<< "$CODE"'
     )
@@ -1679,14 +1683,14 @@ def test_xargs_arg_file_keeps_dynamic_c_body_unresolved(options):
     "options", ["-a /dev/null", "--arg-file /dev/null", "--arg-file=/dev/null"]
 )
 def test_xargs_arg_file_still_inspects_literal_c_body(options):
-    source = f"xargs {options} <<< \"$VALUE\" env sh -c 'printf done'"
+    source = f"xargs {options} env sh -c 'printf done'"
     assert tm._command_string_from_clause(source, 0, lambda: None) == (True, "printf done")
 
 
 @pytest.mark.parametrize(
     "binding",
     [
-        'xargs() { bash; }',
+        "xargs() { bash; }",
         "alias xargs=bash",
         "builtin alias xargs=bash",
         "source setup.sh",
@@ -1716,5 +1720,51 @@ def test_explicit_xargs_utility_cannot_skip_startup_binding_context(expression):
     assert body is None
     assert diagnostics
     assert tm.has_bounded_parse_exhaustion(
-        'BASH_ENV=setup.sh\n' + source, lambda: None, file_type="shell"
+        "BASH_ENV=setup.sh\n" + source, lambda: None, file_type="shell"
     )
+
+
+@pytest.mark.parametrize("options", ["-a input", "--arg-file=input", "-o", "--open-tty"])
+@pytest.mark.parametrize("utility", ["sh -c 'printf done'", "sh -c bash", "python3", "node"])
+def test_xargs_special_input_modes_do_not_gain_here_string_support(options, utility):
+    source = f'xargs {options} {utility} 0<<< "$CODE"'
+    diagnostics = []
+    assert tm._command_string_from_clause(source, 0, lambda: None, diagnostics=diagnostics) == (
+        True,
+        None,
+    )
+    assert diagnostics[0].cause.value == "unsupported_syntax"
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "'<<<' )",
+        "'$(printf x) <<<' )",
+        "'printf done' > output)",
+        "'printf done'; cat <<< '$CODE'",
+        "'printf done'\ncat <<< '$CODE'",
+    ],
+)
+def test_arg_file_lookahead_respects_literal_words_redirections_and_clause_ends(suffix):
+    source = f"xargs -a input sh -c {suffix}"
+    assert tm._command_string_from_clause(source, 0, lambda: None)[1] is not None
+
+
+@pytest.mark.parametrize("tail", ["a " * 40, "x" * 9000, "\\\n" * 5000])
+def test_arg_file_lookahead_does_not_claim_unbounded_clause_support(tail):
+    source = "xargs -a input " + tail
+    diagnostics = []
+    assert tm._command_string_from_clause(source, 0, lambda: None, diagnostics=diagnostics) == (
+        True,
+        None,
+    )
+    assert diagnostics
+
+
+def test_special_xargs_input_mode_keeps_raw_destructive_findings():
+    source = 'xargs -a input sh -c "rm -rf /" <<< "$CODE"\n'
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
