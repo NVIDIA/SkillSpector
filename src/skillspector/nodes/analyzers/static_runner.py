@@ -2222,6 +2222,7 @@ def _scan_declared_marker_views(
     prepared_analyses: Mapping[int, object] | None = None,
     parser_diagnostics: list[StaticParserDiagnostic] | None = None,
     python_import_bounds: PythonImportBounds | None = None,
+    parser_file_type: str | None = None,
 ) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
@@ -2273,8 +2274,8 @@ def _scan_declared_marker_views(
 
     # Structural delimiter proof covers the complete artifact, so windows do
     # not mistake a literal closer for a new marker opener. Compute it lazily.
-    file_type = _infer_file_type(path)
-    if path.lower().endswith((".html", ".htm")):
+    file_type = parser_file_type or _infer_file_type(path)
+    if parser_file_type is None and path.lower().endswith((".html", ".htm")):
         file_type = "html"
     source_strings = (
         PythonStringClosers(content, check_runtime)
