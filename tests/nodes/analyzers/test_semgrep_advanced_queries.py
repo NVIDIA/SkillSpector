@@ -10,6 +10,7 @@ import copy
 import pytest
 import yaml
 
+from skillspector import semgrep_tokens
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_anti_refusal as ar
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
@@ -189,3 +190,54 @@ def test_cancelled_advanced_role_proof_does_not_return_partial_roles() -> None:
 
     with pytest.raises(TimeoutError, match="query deadline"):
         semgrep_rule_scalar_roles(_source(_query()), expired)
+
+
+def test_cancellation_after_a_query_role_was_collected_propagates(monkeypatch) -> None:
+    reached_constraint = False
+    original = semgrep_tokens._metavariable
+
+    def record(node):
+        nonlocal reached_constraint
+        reached_constraint = True
+        return original(node)
+
+    def expired() -> None:
+        if reached_constraint:
+            raise TimeoutError("constraint deadline")
+
+    monkeypatch.setattr(semgrep_tokens, "_metavariable", record)
+    # The first pattern precedes focus and the following metavariable filter.
+    with pytest.raises(TimeoutError, match="constraint deadline"):
+        semgrep_rule_scalar_roles(_source(_query()), expired)
+    assert reached_constraint
+
+
+def test_cancellation_during_requires_expression_walk_propagates(monkeypatch) -> None:
+    walking = False
+    original = semgrep_tokens.ast.walk
+
+    def walk(tree):
+        nonlocal walking
+        for index, node in enumerate(original(tree)):
+            if index > 1:
+                walking = True
+            yield node
+
+    def expired() -> None:
+        if walking:
+            raise TimeoutError("label expression deadline")
+
+    text = _source(
+        _rule(
+            mode="taint",
+            **{
+                "pattern-sources": [{"pattern": "source($X)", "label": "INPUT"}],
+                "pattern-sinks": [{"pattern": "sink($X)", "requires": "INPUT and not CLEAN"}],
+            },
+        )
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(semgrep_tokens.ast, "walk", walk)
+        with pytest.raises(TimeoutError, match="label expression deadline"):
+            semgrep_rule_scalar_roles(text, expired)
+    assert walking
