@@ -128,7 +128,9 @@ class SecurityTextView:
         for item in self.reconstructions:
             overlap_start = max(derived_start, item.derived_start)
             overlap_end = min(derived_end, item.derived_end)
-            for offset in range(max(overlap_start + 1, item.derived_start + 1), overlap_end):
+            for offset in range(
+                max(overlap_start + 1, item.derived_start + 1), overlap_end
+            ):
                 previous_source = self.source_offsets[offset - 1]
                 source = self.source_offsets[offset]
                 if source > previous_source + 1:
@@ -296,12 +298,16 @@ _DEFAULT_IGNORABLE_RANGES = (
     (0xE0000, 0xE0FFF),
 )
 _DEFAULT_IGNORABLE_CODEPOINTS = frozenset(
-    codepoint for start, end in _DEFAULT_IGNORABLE_RANGES for codepoint in range(start, end + 1)
+    codepoint
+    for start, end in _DEFAULT_IGNORABLE_RANGES
+    for codepoint in range(start, end + 1)
 )
 _DEFAULT_IGNORABLE_PATTERN = re.compile(
     "["
     + "".join(
-        re.escape(chr(start)) if start == end else f"{re.escape(chr(start))}-{re.escape(chr(end))}"
+        re.escape(chr(start))
+        if start == end
+        else f"{re.escape(chr(start))}-{re.escape(chr(end))}"
         for start, end in _DEFAULT_IGNORABLE_RANGES
     )
     + "]"
@@ -309,7 +315,9 @@ _DEFAULT_IGNORABLE_PATTERN = re.compile(
 _DEFAULT_IGNORABLE_RUN_PATTERN = re.compile(_DEFAULT_IGNORABLE_PATTERN.pattern + "+")
 _REPEATED_CHARACTER_RUN_PATTERN = re.compile(r"(.)\1+")
 _ASCII_CONFUSABLE_PATTERN = re.compile(
-    "[" + "".join(re.escape(chr(codepoint)) for codepoint in ASCII_CONFUSABLE_SKELETON) + "]"
+    "["
+    + "".join(re.escape(chr(codepoint)) for codepoint in ASCII_CONFUSABLE_SKELETON)
+    + "]"
 )
 _OBFUSCATED_INSTRUCTION_ACTIONS = (
     "ignore",
@@ -318,7 +326,9 @@ _OBFUSCATED_INSTRUCTION_ACTIONS = (
     "disregard",
     "forget",
 )
-_OBFUSCATED_ACTION_INITIALS = frozenset(action[0] for action in _OBFUSCATED_INSTRUCTION_ACTIONS)
+_OBFUSCATED_ACTION_INITIALS = frozenset(
+    action[0] for action in _OBFUSCATED_INSTRUCTION_ACTIONS
+)
 _ASCII_OBFUSCATED_ACTION_START_PATTERN = re.compile(
     "[" + re.escape("".join(sorted(_OBFUSCATED_ACTION_INITIALS))) + "]",
     re.ASCII | re.IGNORECASE,
@@ -351,7 +361,9 @@ _MULTILINE_PROMPT_SPACING_PAIR = re.compile(
     r"|[^\S\r\n\v\f\x1c-\x1e\x85\u2028\u2029])"
     r"[^\W\d_](?!\w)"
 )
-_REMOVE_ALLOWED_FORMAT_CHARACTERS = str.maketrans("", "", "".join(_ALLOWED_FORMAT_CHARS))
+_REMOVE_ALLOWED_FORMAT_CHARACTERS = str.maketrans(
+    "", "", "".join(_ALLOWED_FORMAT_CHARS)
+)
 
 
 def _suffix(path: str) -> str:
@@ -362,7 +374,12 @@ def _suffix(path: str) -> str:
 
 def has_dex_magic(data: bytes) -> bool:
     """Return whether bytes start with the versioned eight-byte DEX signature."""
-    return len(data) >= 8 and data.startswith(b"dex\n") and data[4:7].isdigit() and data[7] == 0
+    return (
+        len(data) >= 8
+        and data.startswith(b"dex\n")
+        and data[4:7].isdigit()
+        and data[7] == 0
+    )
 
 
 def has_tar_header(data: bytes) -> bool:
@@ -376,7 +393,9 @@ def has_tar_header(data: bytes) -> bool:
     return True
 
 
-def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> ArtifactRecord:
+def classify_artifact(
+    path: str, data: bytes, *, referenced: bool = False
+) -> ArtifactRecord:
     """Classify from bytes and decodability; an extension is never authoritative."""
     contains_nul = b"\x00" in data
     has_binary_magic = (
@@ -405,7 +424,9 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
     elif not data:
         kind = ContentKind.TEXT
     else:
-        printable = sum(ch.isprintable() or ch in _ALLOWED_FORMAT_CHARS for ch in decoded)
+        printable = sum(
+            ch.isprintable() or ch in _ALLOWED_FORMAT_CHARS for ch in decoded
+        )
         replacement_ratio = decoded.count("\ufffd") / max(1, len(decoded))
         if printable / max(1, len(decoded)) >= 0.85 and replacement_ratio <= 0.10:
             kind = ContentKind.TEXT
@@ -453,7 +474,11 @@ def binary_instruction_view(content: str) -> tuple[SecurityTextView, bool]:
             next_start = content.find(header, start + len(header))
             packet_end = next_start if next_start >= 0 else len(content)
             metadata = content.find("<x:xmpmeta", start + len(header), packet_end)
-            close = content.find("</x:xmpmeta>", metadata, packet_end) if metadata >= 0 else -1
+            close = (
+                content.find("</x:xmpmeta>", metadata, packet_end)
+                if metadata >= 0
+                else -1
+            )
             if close < 0:
                 start = next_start
                 continue
@@ -461,7 +486,9 @@ def binary_instruction_view(content: str) -> tuple[SecurityTextView, bool]:
             padding_end = padding_start
             while padding_end < packet_end and content[padding_end] in " \t\r\n":
                 padding_end += 1
-            if content.startswith(('<?xpacket end="w"?>', '<?xpacket end="r"?>'), padding_end):
+            if content.startswith(
+                ('<?xpacket end="w"?>', '<?xpacket end="r"?>'), padding_end
+            ):
                 bom = start + header.index("\ufeff")
                 excluded.extend([(bom, bom + 1), (padding_start, padding_end)])
             start = next_start
@@ -625,12 +652,20 @@ def _letter_spacing_run_spans(
         # A letter touching another letter cannot start a single-letter run.
         # Seek across ordinary ASCII words, stopping at the next cancellation
         # checkpoint; non-ASCII letters retain the exact Unicode path below.
-        if text[offset].isascii() and text[offset].isalpha() and (
-            offset > 0 and text[offset - 1].isalpha()
-            or offset + 1 < len(text) and text[offset + 1].isalpha()
+        if (
+            text[offset].isascii()
+            and text[offset].isalpha()
+            and (
+                offset > 0
+                and text[offset - 1].isalpha()
+                or offset + 1 < len(text)
+                and text[offset + 1].isalpha()
+            )
         ):
             word = _ASCII_ALPHABETIC_RUN.match(
-                text, offset, next_runtime_check if check_runtime is not None else len(text)
+                text,
+                offset,
+                next_runtime_check if check_runtime is not None else len(text),
             )
             if word is not None:
                 offset = word.end()
@@ -696,12 +731,20 @@ def _concealed_instruction_run_spans(
     offset = 0
     while offset < len(text):
         check_progress(offset)
-        if text[offset].isascii() and text[offset].isalpha() and (
-            offset > 0 and text[offset - 1].isalpha()
-            or offset + 1 < len(text) and text[offset + 1].isalpha()
+        if (
+            text[offset].isascii()
+            and text[offset].isalpha()
+            and (
+                offset > 0
+                and text[offset - 1].isalpha()
+                or offset + 1 < len(text)
+                and text[offset + 1].isalpha()
+            )
         ):
             word = _ASCII_ALPHABETIC_RUN.match(
-                text, offset, next_runtime_check if check_runtime is not None else len(text)
+                text,
+                offset,
+                next_runtime_check if check_runtime is not None else len(text),
             )
             if word is not None:
                 offset = word.end()
@@ -741,7 +784,9 @@ def _security_skeleton_piece(character: str) -> str:
     if character.isascii():
         return character.lower()
     folded = (
-        unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON).casefold()
+        unicodedata.normalize("NFKC", character)
+        .translate(ASCII_CONFUSABLE_SKELETON)
+        .casefold()
     )
     # Python's Unicode IGNORECASE treats LATIN CAPITAL I WITH DOT ABOVE as
     # equivalent to ``i``. Mirror that finite equivalence without stripping
@@ -758,7 +803,9 @@ def _fold_security_character(character: str) -> str:
 
 
 def _is_normalization_ignored_offset(text: str, offset: int) -> bool:
-    return _is_unconditionally_ignored(text[offset]) or _is_contextual_default_ignorable_offset(
+    return _is_unconditionally_ignored(
+        text[offset]
+    ) or _is_contextual_default_ignorable_offset(
         text,
         offset,
     )
@@ -928,7 +975,9 @@ def _obfuscated_instruction_right_context(
         gaps += match.gaps
         requires_targeted = requires_targeted or match.requires_targeted_reconstruction
 
-    def match_one(start: int, expected_words: tuple[str, ...]) -> _ObfuscatedWordMatch | None:
+    def match_one(
+        start: int, expected_words: tuple[str, ...]
+    ) -> _ObfuscatedWordMatch | None:
         for expected in expected_words:
             match = _match_obfuscated_security_word(
                 text,
@@ -1028,7 +1077,14 @@ def _obfuscated_instruction_right_context(
     expected_contexts = (
         ("safety", "security", "system")
         if action == "override"
-        else ("safety", "security", "restriction", "restrictions", "constraint", "constraints")
+        else (
+            "safety",
+            "security",
+            "restriction",
+            "restrictions",
+            "constraint",
+            "constraints",
+        )
     )
     context_match = match_one(cursor, expected_contexts)
     if context_match is None:
@@ -1043,7 +1099,9 @@ def _obfuscated_instruction_left_context(
     check_runtime: Callable[[], None] | None = None,
 ) -> _ObfuscatedBackwardWordMatch | None:
     """Match the existing ``you must [always]`` P1 form before an action."""
-    cursor = _skip_required_security_whitespace_backward(text, action_start, check_runtime)
+    cursor = _skip_required_security_whitespace_backward(
+        text, action_start, check_runtime
+    )
     if cursor is None:
         return None
     gaps: tuple[tuple[int, int], ...] = ()
@@ -1171,7 +1229,9 @@ def _match_obfuscated_security_word(
             return None
         return _ObfuscatedWordMatch(cursor + 1)
 
-    states: dict[int, tuple[_ObfuscatedIgnoreState, ...]] = {first_offset: (first_state,)}
+    states: dict[int, tuple[_ObfuscatedIgnoreState, ...]] = {
+        first_offset: (first_state,)
+    }
     cursor += 1
 
     def keep_best(
@@ -1215,7 +1275,9 @@ def _match_obfuscated_security_word(
                 ):
                     has_gap = cursor > state.last_letter_end
                     next_gaps = (
-                        state.gaps + ((state.last_letter_end, cursor),) if has_gap else state.gaps
+                        state.gaps + ((state.last_letter_end, cursor),)
+                        if has_gap
+                        else state.gaps
                     )
                     requires_targeted = state.requires_targeted_reconstruction or (
                         has_gap and state.gap_has_targeted_character
@@ -1241,8 +1303,12 @@ def _match_obfuscated_security_word(
                             ),
                         )
 
-                if not character.isalpha() or _is_existing_projection_gap_character(character):
-                    existing_projection = _is_existing_projection_gap_character(character)
+                if not character.isalpha() or _is_existing_projection_gap_character(
+                    character
+                ):
+                    existing_projection = _is_existing_projection_gap_character(
+                        character
+                    )
                     has_existing_projection = (
                         state.gap_has_existing_projection or existing_projection
                     )
@@ -1250,7 +1316,9 @@ def _match_obfuscated_security_word(
                         character.isascii() and character.isspace()
                     )
                     crosses_line = character in _LOGICAL_LINE_BREAK_CHARACTERS
-                    if not crosses_line and not (has_existing_projection and has_ascii_whitespace):
+                    if not crosses_line and not (
+                        has_existing_projection and has_ascii_whitespace
+                    ):
                         keep_best(
                             next_states,
                             expected_offset,
@@ -1264,13 +1332,16 @@ def _match_obfuscated_security_word(
                                 gap_has_existing_projection=has_existing_projection,
                                 gap_has_ascii_whitespace=has_ascii_whitespace,
                                 gap_has_targeted_character=(
-                                    state.gap_has_targeted_character or not existing_projection
+                                    state.gap_has_targeted_character
+                                    or not existing_projection
                                 ),
                             ),
                         )
 
         for completion in completions:
-            if not _has_security_word_character_after(text, completion.end, check_runtime):
+            if not _has_security_word_character_after(
+                text, completion.end, check_runtime
+            ):
                 return completion
         states = next_states
         cursor += 1
@@ -1315,7 +1386,9 @@ def _match_obfuscated_security_word_backward(
             return None
         return _ObfuscatedBackwardWordMatch(cursor)
 
-    states: dict[int, tuple[_ObfuscatedBackwardState, ...]] = {expected_end: (first_state,)}
+    states: dict[int, tuple[_ObfuscatedBackwardState, ...]] = {
+        expected_end: (first_state,)
+    }
     cursor -= 1
 
     def keep_best(
@@ -1384,8 +1457,12 @@ def _match_obfuscated_security_word_backward(
                             ),
                         )
 
-                if not character.isalpha() or _is_existing_projection_gap_character(character):
-                    existing_projection = _is_existing_projection_gap_character(character)
+                if not character.isalpha() or _is_existing_projection_gap_character(
+                    character
+                ):
+                    existing_projection = _is_existing_projection_gap_character(
+                        character
+                    )
                     has_existing_projection = (
                         state.gap_has_existing_projection or existing_projection
                     )
@@ -1393,7 +1470,9 @@ def _match_obfuscated_security_word_backward(
                         character.isascii() and character.isspace()
                     )
                     crosses_line = character in _LOGICAL_LINE_BREAK_CHARACTERS
-                    if not crosses_line and not (has_existing_projection and has_ascii_whitespace):
+                    if not crosses_line and not (
+                        has_existing_projection and has_ascii_whitespace
+                    ):
                         keep_best(
                             next_states,
                             target_end,
@@ -1406,13 +1485,16 @@ def _match_obfuscated_security_word_backward(
                                 gap_has_existing_projection=has_existing_projection,
                                 gap_has_ascii_whitespace=has_ascii_whitespace,
                                 gap_has_targeted_character=(
-                                    state.gap_has_targeted_character or not existing_projection
+                                    state.gap_has_targeted_character
+                                    or not existing_projection
                                 ),
                             ),
                         )
 
         for completion in completions:
-            if not _has_security_word_character_before(text, completion.start, check_runtime):
+            if not _has_security_word_character_before(
+                text, completion.start, check_runtime
+            ):
                 return completion
         states = next_states
         cursor -= 1
@@ -1496,7 +1578,9 @@ def _obfuscated_action_completions(
                 else:
                     has_gap = cursor > state.last_letter_end
                     next_gaps = (
-                        state.gaps + ((state.last_letter_end, cursor),) if has_gap else state.gaps
+                        state.gaps + ((state.last_letter_end, cursor),)
+                        if has_gap
+                        else state.gaps
                     )
                     requires_targeted = state.requires_targeted_reconstruction or (
                         has_gap and state.gap_has_targeted_character
@@ -1524,8 +1608,12 @@ def _obfuscated_action_completions(
                             ),
                         )
 
-                if not character.isalpha() or _is_existing_projection_gap_character(character):
-                    existing_projection = _is_existing_projection_gap_character(character)
+                if not character.isalpha() or _is_existing_projection_gap_character(
+                    character
+                ):
+                    existing_projection = _is_existing_projection_gap_character(
+                        character
+                    )
                     has_existing_projection = (
                         state.gap_has_existing_projection or existing_projection
                     )
@@ -1533,7 +1621,9 @@ def _obfuscated_action_completions(
                         character.isascii() and character.isspace()
                     )
                     crosses_line = character in _LOGICAL_LINE_BREAK_CHARACTERS
-                    if not crosses_line and not (has_existing_projection and has_ascii_whitespace):
+                    if not crosses_line and not (
+                        has_existing_projection and has_ascii_whitespace
+                    ):
                         keep_extremes(
                             next_states,
                             (expected, expected_offset),
@@ -1547,15 +1637,19 @@ def _obfuscated_action_completions(
                                 gap_has_existing_projection=has_existing_projection,
                                 gap_has_ascii_whitespace=has_ascii_whitespace,
                                 gap_has_targeted_character=(
-                                    state.gap_has_targeted_character or not existing_projection
+                                    state.gap_has_targeted_character
+                                    or not existing_projection
                                 ),
                             ),
                         )
 
-        if skeleton in _OBFUSCATED_ACTION_INITIALS and not _has_security_word_character_before(
-            text,
-            cursor,
-            check_runtime,
+        if (
+            skeleton in _OBFUSCATED_ACTION_INITIALS
+            and not _has_security_word_character_before(
+                text,
+                cursor,
+                check_runtime,
+            )
         ):
             for expected in _OBFUSCATED_INSTRUCTION_ACTIONS:
                 if skeleton == expected[0]:
@@ -1617,13 +1711,17 @@ def _obfuscated_instruction_matches(
             if left_context_match is None:
                 continue
             if not (
-                action_requires_targeted or left_context_match.requires_targeted_reconstruction
+                action_requires_targeted
+                or left_context_match.requires_targeted_reconstruction
             ):
                 continue
             match_end = action_end
             gaps = tuple(sorted(left_context_match.gaps + action_gaps))
         else:
-            if not (action_requires_targeted or context_match.requires_targeted_reconstruction):
+            if not (
+                action_requires_targeted
+                or context_match.requires_targeted_reconstruction
+            ):
                 continue
             match_end = context_match.end
             gaps = action_gaps + context_match.gaps
@@ -1704,7 +1802,9 @@ _ASCII_TOKEN_GAP_CHARS = frozenset(
 # pure overhead.
 _TOKEN_GAP_CANDIDATE = re.compile(
     "[^"
-    + "".join(re.escape(ch) for ch in map(chr, range(128)) if ch not in _ASCII_TOKEN_GAP_CHARS)
+    + "".join(
+        re.escape(ch) for ch in map(chr, range(128)) if ch not in _ASCII_TOKEN_GAP_CHARS
+    )
     + "]"
 )
 
@@ -1789,10 +1889,14 @@ def _contextual_default_ignorable_spans(
                 if _is_unconditionally_ignored(character):
                     continue
                 contextual_start = (
-                    start if _is_contextual_default_ignorable_offset(text, start) else start + 1
+                    start
+                    if _is_contextual_default_ignorable_offset(text, start)
+                    else start + 1
                 )
                 contextual_end = (
-                    end if _is_contextual_default_ignorable_offset(text, end - 1) else end - 1
+                    end
+                    if _is_contextual_default_ignorable_offset(text, end - 1)
+                    else end - 1
                 )
                 if contextual_start < contextual_end:
                     yield contextual_start, contextual_end
@@ -1910,8 +2014,8 @@ def _compact_gap_offsets(
         for offset in range(start, end):
             if check_runtime is not None and offset % 4096 == 0:
                 check_runtime()
-            has_non_ascii_separator = has_non_ascii_separator or _is_non_ascii_separator(
-                text[offset]
+            has_non_ascii_separator = (
+                has_non_ascii_separator or _is_non_ascii_separator(text[offset])
             )
         if has_non_ascii_separator:
             for offset in range(start, end):
@@ -1947,7 +2051,9 @@ def normalized_security_view(
         if _is_unconditionally_ignored(ch):
             source_offset += 1
             continue
-        normalized = unicodedata.normalize("NFKC", ch).translate(ASCII_CONFUSABLE_SKELETON)
+        normalized = unicodedata.normalize("NFKC", ch).translate(
+            ASCII_CONFUSABLE_SKELETON
+        )
         for normalized_char in normalized:
             output.write(normalized_char)
             offsets.append(source_offset)
@@ -1965,7 +2071,9 @@ def normalized_security_prefix(text: str, max_chars: int) -> str:
 
     def append(character: str) -> bool:
         nonlocal output_chars
-        normalized = unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON)
+        normalized = unicodedata.normalize("NFKC", character).translate(
+            ASCII_CONFUSABLE_SKELETON
+        )
         remaining = max_chars - output_chars
         output.write(normalized[:remaining])
         output_chars += min(len(normalized), remaining)
@@ -1980,7 +2088,9 @@ def normalized_security_prefix(text: str, max_chars: int) -> str:
             continue
 
         gap_start = source_offset
-        while source_offset < len(text) and _is_token_gap_character(text[source_offset]):
+        while source_offset < len(text) and _is_token_gap_character(
+            text[source_offset]
+        ):
             source_offset += 1
         gap_end = source_offset
         before_is_word = gap_start > 0 and _is_word_character(text[gap_start - 1])
@@ -1997,7 +2107,9 @@ def normalized_security_prefix(text: str, max_chars: int) -> str:
                 gap_offset = next_ignored[1]
                 next_ignored = next(ignored_spans, None)
                 continue
-            if not _is_unconditionally_ignored(text[gap_offset]) and append(text[gap_offset]):
+            if not _is_unconditionally_ignored(text[gap_offset]) and append(
+                text[gap_offset]
+            ):
                 break
             gap_offset += 1
 
@@ -2013,7 +2125,9 @@ def obfuscated_instruction_view(
     offsets = array("I")
     if check_runtime is not None:
         check_runtime()
-    contextual_offsets = iter(_contextual_default_ignorable_offsets(text, check_runtime))
+    contextual_offsets = iter(
+        _contextual_default_ignorable_offsets(text, check_runtime)
+    )
     instruction_offsets = iter(_obfuscated_instruction_gap_offsets(text, check_runtime))
     next_contextual = _next_offset(contextual_offsets)
     next_instruction = _next_offset(instruction_offsets)
@@ -2033,7 +2147,9 @@ def obfuscated_instruction_view(
             or is_instruction
         ):
             continue
-        normalized = unicodedata.normalize("NFKC", ch).translate(ASCII_CONFUSABLE_SKELETON)
+        normalized = unicodedata.normalize("NFKC", ch).translate(
+            ASCII_CONFUSABLE_SKELETON
+        )
         for normalized_char in normalized:
             output.write(normalized_char)
             offsets.append(source_offset)
@@ -2049,10 +2165,14 @@ def compact_letter_view(
     offsets = array("I")
     if check_runtime is not None:
         check_runtime()
-    contextual_offsets = iter(_contextual_default_ignorable_offsets(text, check_runtime))
+    contextual_offsets = iter(
+        _contextual_default_ignorable_offsets(text, check_runtime)
+    )
     compact_offsets = iter(_compact_gap_offsets(text, check_runtime))
     letter_spacing_offsets = iter(_letter_spacing_gap_offsets(text, check_runtime))
-    obfuscated_instruction_offsets = iter(_obfuscated_instruction_gap_offsets(text, check_runtime))
+    obfuscated_instruction_offsets = iter(
+        _obfuscated_instruction_gap_offsets(text, check_runtime)
+    )
     next_contextual = _next_offset(contextual_offsets)
     next_compact = _next_offset(compact_offsets)
     next_letter_spacing = _next_offset(letter_spacing_offsets)
@@ -2081,7 +2201,9 @@ def compact_letter_view(
             or is_obfuscated_instruction
         ):
             continue
-        normalized = unicodedata.normalize("NFKC", ch).translate(ASCII_CONFUSABLE_SKELETON)
+        normalized = unicodedata.normalize("NFKC", ch).translate(
+            ASCII_CONFUSABLE_SKELETON
+        )
         for normalized_char in normalized:
             output.write(normalized_char)
             offsets.append(source_offset)
@@ -2136,7 +2258,9 @@ def prompt_injection_letter_spacing_view(
         record_work()
         # A line break is never a token: starting a run on it would treat the
         # previous line's last character as the identifier-boundary neighbor.
-        if text[index] in _LOGICAL_LINE_BREAK_CHARACTERS or _is_letter_spacing_separator(
+        if text[
+            index
+        ] in _LOGICAL_LINE_BREAK_CHARACTERS or _is_letter_spacing_separator(
             text[index]
         ):
             index += 1
@@ -2150,7 +2274,10 @@ def prompt_injection_letter_spacing_view(
         run_end = run_start + 1
         while run_end < len(text):
             gap_start = run_end
-            if text[gap_start].isspace() and text[gap_start] not in _LOGICAL_LINE_BREAK_CHARACTERS:
+            if (
+                text[gap_start].isspace()
+                and text[gap_start] not in _LOGICAL_LINE_BREAK_CHARACTERS
+            ):
                 while (
                     run_end < len(text)
                     and text[run_end].isspace()
@@ -2205,7 +2332,11 @@ def prompt_injection_letter_spacing_view(
             # A separator before a multi-letter word is an observed token
             # boundary, not another inter-character gap. In particular, this
             # keeps the first character of "conversation" out of "s e n d".
-            if text[run_end].isalpha() and run_end + 1 < len(text) and text[run_end + 1].isalpha():
+            if (
+                text[run_end].isalpha()
+                and run_end + 1 < len(text)
+                and text[run_end + 1].isalpha()
+            ):
                 run_end = gap_start
                 break
 
@@ -2371,7 +2502,8 @@ def _has_derived_security_view(text: str) -> bool:
             or next(_obfuscated_instruction_matches(text), None) is not None
         )
     if any(
-        unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON) != character
+        unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON)
+        != character
         for character in text
     ):
         return True
@@ -2405,7 +2537,9 @@ def security_text_views(
     else:
         # Deadline-aware scans must keep checking during predicate evaluation.
         # Do not put callbacks in cache keys or let a hit bypass those checks.
-        has_letter_spacing = next(_letter_spacing_run_spans(text, check_runtime), None) is not None
+        has_letter_spacing = (
+            next(_letter_spacing_run_spans(text, check_runtime), None) is not None
+        )
         has_obfuscated_instruction = (
             next(_obfuscated_instruction_matches(text, check_runtime), None) is not None
         )
