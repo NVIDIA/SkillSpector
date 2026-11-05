@@ -3210,8 +3210,12 @@ def _scan_all_views_with_parser_diagnostics(
                                         module,
                                         full_view,
                                         finding_budget.check_runtime,
-                                        file_type=_effective_module_file_type(
-                                            path, module, python_source=python_source
+                                        file_type=(
+                                            "json"
+                                            if _oms_projected
+                                            else _effective_module_file_type(
+                                                path, module, python_source=python_source
+                                            )
                                         ),
                                         complete_context=whole_artifact_window,
                                         source_start=raw_start,

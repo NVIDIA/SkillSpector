@@ -279,3 +279,35 @@ def test_cancellation_during_mapping_publishes_no_partial_projection() -> None:
 
     with pytest.raises(CancelledError):
         prepare_decoded_json_source(ownership, check)
+
+
+def test_projected_oms_decoded_parser_uses_json_while_findings_keep_carrier_type() -> None:
+    parser_kinds: list[tuple[str, str]] = []
+    finding_kinds: list[str] = []
+
+    def prepare(content, file_type, check_runtime):
+        assert file_type == "json"
+        return prepare_json_source(content, check_runtime)
+
+    def diagnose(content, check_runtime, *, file_type, source_view, **kwargs):
+        parser_kinds.append((source_view.name, file_type))
+        return None
+
+    def findings(content, file_path, file_type):
+        finding_kinds.append(file_type)
+        return []
+
+    module = SimpleNamespace(
+        USES_PREPARED_PARSER_ANALYSIS=True,
+        prepare_parser_analysis=prepare,
+        has_bounded_parse_exhaustion=lambda *args, **kwargs: False,
+        bounded_parse_diagnostic=diagnose,
+        analyze=findings,
+    )
+    path = "bundle.oms.sig"
+    static_runner._scan_all_views_detailed(
+        path, '{"value":"\\u0061"}', [module], None, _oms_projected=True
+    )
+    decoded = [kind for name, kind in parser_kinds if name.startswith("json-decoded-")]
+    assert decoded and set(decoded) == {"json"}
+    assert finding_kinds and set(finding_kinds) == {static_runner._infer_file_type(path)}
