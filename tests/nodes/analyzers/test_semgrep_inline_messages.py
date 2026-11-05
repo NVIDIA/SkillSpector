@@ -39,6 +39,9 @@ def _scan(message: str, *, encoded: bool = False) -> dict:
         "User data in `$(...)` is a matching expression.",
         'Using `${{...}}` with `github` data in a `run:` example. Use `env:` to store "$ENVVAR".',
         "Unicode offset: 🧪. An example `$(...)` can be displayed with another `label`.",
+        "A matching value `\"literal sh -c '$PAYLOAD -rf /' tail\"` is displayed.",
+        "An example `$(...)` then display \"literal sh -c '$PAYLOAD -rf /' tail\".",
+        "A matching value `'literal sh -c \"$PAYLOAD\" tail'` is displayed.",
     ],
 )
 def test_exact_owned_inline_body_refines_the_false_backtick_runtime_reading(message: str) -> None:
@@ -60,6 +63,8 @@ def test_exact_owned_inline_body_refines_the_false_backtick_runtime_reading(mess
         'Run `sh -c "echo safe"` and later eval "$PAYLOAD".',
         'An example `$(...)` then run env BASH_ENV="$STARTUP" bash -c "echo safe".',
         'An example `$(...)` then run env BASH_ENV="$STARTUP" sh -c "echo safe".',
+        'An example `$(...)` then export BASH_ENV="$STARTUP"; bash -c "echo safe".',
+        'An example `$(...)` then BASH_ENV="$STARTUP"; bash -c "echo safe".',
         'An example `$(...)`; later sh -c `printf %s "$PAYLOAD"`.',
         "Run sh -c 'echo `$(...)`'.",
         'Run sh -c "echo `$(...)`".',

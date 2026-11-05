@@ -8940,16 +8940,35 @@ def _message_inline_runtime_diagnostic(
     # original commands first: masking backticks inside a quoted shell -c
     # argument must not replace executable substitution with display text.
     for source in (content, projected):
-        for match in re.finditer(r"\S+", source):
+        cursor = 0
+        startup_exposure = [False]
+        while cursor < len(source):
             check_runtime()
-            start = match.start()
-            source_span = [start, start]
+            word_start = [cursor]
             diagnostics: list[StaticParserDiagnostic] = []
+            word, end, word_limited = _next_shell_invocation_word(
+                source, cursor, check_runtime, diagnostics=diagnostics, source_start=word_start
+            )
+            remaining_work -= max(1, end - cursor)
+            if remaining_work < 0:
+                return limited()
+            if word_limited:
+                return diagnostics[0] if diagnostics else limited()
+            start = word_start[0]
+            if word is None:
+                if source[start : start + 1] == "#":
+                    line_end = LOGICAL_LINE_BREAK.search(source, start)
+                    cursor = line_end.end() if line_end else len(source)
+                else:
+                    cursor = max(cursor + 1, end + 1)
+                continue
+            cursor = end
+            source_span = [start, start]
             found, command = _command_string_from_clause(
                 source,
                 start,
                 check_runtime,
-                startup_exposure=[False],
+                startup_exposure=startup_exposure,
                 diagnostics=diagnostics,
                 source_span=source_span,
             )
