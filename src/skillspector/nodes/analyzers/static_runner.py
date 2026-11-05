@@ -753,13 +753,11 @@ def _uses_python_source_type(module: object) -> bool:
     )
 
 
-def _effective_module_file_type(
-    path: str, module: object, *, python_source: bool, file_type: str | None = None
-) -> str:
+def _effective_module_file_type(path: str, module: object, *, python_source: bool) -> str:
     """Resolve the file type consistently for every hook owned by one module."""
     if python_source and _uses_python_source_type(module):
         return "python"
-    return file_type or _infer_file_type(path)
+    return _infer_file_type(path)
 
 
 def _requires_python_ast(pattern_modules: list) -> bool:
@@ -1106,11 +1104,10 @@ def _scan_path(
     prepared_analyses: Mapping[int, object] | None = None,
     source_view: SecurityTextView | None = None,
     analysis_method: str = "analyze",
-    file_type: str | None = None,
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Run pattern modules with construction, emission, and runtime guards."""
     findings: list[Finding] = []
-    file_type = file_type or _infer_file_type(path)
+    file_type = _infer_file_type(path)
     if python_source is None:
         python_source = may_be_python_source(path, content)
     content_lines = content.splitlines()
@@ -1130,7 +1127,6 @@ def _scan_path(
             path,
             module,
             python_source=python_source,
-            file_type=file_type,
         )
         module_finding_start = len(findings)
         occurrence_columns = _OccurrenceColumnResolver(content, line_starts)
@@ -1343,7 +1339,6 @@ def _scan_view_windows(
     source_view: SecurityTextView | None = None,
     evidence_source_view: SecurityTextView | None = None,
     analysis_method: str = "analyze",
-    file_type: str | None = None,
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Scan one already-bounded view."""
     view_token = _ACTIVE_SECURITY_VIEW.set((view, source_text))
@@ -1358,7 +1353,6 @@ def _scan_view_windows(
             prepared_analyses=prepared_analyses,
             source_view=source_view,
             analysis_method=analysis_method,
-            file_type=file_type,
         )
     finally:
         _ACTIVE_SECURITY_VIEW.reset(view_token)
@@ -2227,7 +2221,7 @@ def _scan_declared_marker_views(
     prepared_analyses: Mapping[int, object] | None = None,
     parser_diagnostics: list[StaticParserDiagnostic] | None = None,
     python_import_bounds: PythonImportBounds | None = None,
-    file_type: str | None = None,
+    parser_file_type: str | None = None,
 ) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
@@ -2243,7 +2237,7 @@ def _scan_declared_marker_views(
             ) from exc
 
     check_runtime()
-    file_type = file_type or _infer_file_type(path)
+    parser_file_type = parser_file_type or _infer_file_type(path)
     projection_limited = False
     bounded_parse_limited = False
     seen_views: set[tuple[str, int, int]] = set()
@@ -2282,7 +2276,7 @@ def _scan_declared_marker_views(
     # The proof covers the whole artifact, so it holds in every window. It is
     # computed only when a loose quoted directive header reaches a quote.
     python_strings = (
-        PythonStringClosers(content, check_runtime) if file_type == "python" else None
+        PythonStringClosers(content, check_runtime) if parser_file_type == "python" else None
     )
 
     for owned_start, raw_start in zip(owned_starts, raw_starts, strict=True):
@@ -2362,7 +2356,6 @@ def _scan_declared_marker_views(
                         view_budget,
                         None,
                         python_source=python_source,
-                        file_type=file_type,
                         source_text=raw_window,
                         prepared_analyses=prepared_analyses,
                         source_view=(
@@ -2442,7 +2435,7 @@ def _scan_declared_marker_views(
                                 module,
                                 marker_view,
                                 check_runtime,
-                                file_type=file_type,
+                                file_type=parser_file_type,
                                 complete_context=complete_context,
                                 source_start=raw_start,
                                 diagnostics=parser_diagnostics,
@@ -2621,8 +2614,9 @@ def _scan_all_views_with_parser_diagnostics(
         if isinstance(diagnostic, StaticParserDiagnostic):
             parser_diagnostics.append(diagnostic.enclosed(0, len(content)))
         return findings, reason, metrics
-    # A DSSE projection is JSON even when its carrier is named skill.oms.sig.
-    file_type = "json" if _oms_projected else _infer_file_type(path)
+    # Decode ownership uses JSON grammar; rule applicability retains the carrier
+    # type so opaque and unknown bundle fields keep their original security checks.
+    parser_file_type = "json" if _oms_projected else _infer_file_type(path)
     ast_modules = [module for module in pattern_modules if _uses_python_ast(module)]
     lexical_modules = [module for module in pattern_modules if not _uses_python_ast(module)]
     if python_source is None:
@@ -2774,7 +2768,7 @@ def _scan_all_views_with_parser_diagnostics(
                 if prepare is not None:
                     prepared_analyses[id(module)] = prepare(
                         content=content,
-                        file_type=file_type,
+                        file_type=_infer_file_type(path),
                         check_runtime=finding_budget.check_runtime,
                     )
                     finding_budget.check_runtime()
@@ -2803,7 +2797,7 @@ def _scan_all_views_with_parser_diagnostics(
                 prepared_analyses=prepared_analyses,
                 parser_diagnostics=parser_diagnostics,
                 python_import_bounds=python_import_bounds,
-                file_type=file_type,
+                parser_file_type=parser_file_type,
             )
             bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
@@ -2844,7 +2838,7 @@ def _scan_all_views_with_parser_diagnostics(
                             module,
                             SecurityTextView("raw", content),
                             finding_budget.check_runtime,
-                            file_type=file_type,
+                            file_type=parser_file_type,
                             complete_context=True,
                             diagnostics=parser_diagnostics,
                             path=path,
@@ -2868,7 +2862,6 @@ def _scan_all_views_with_parser_diagnostics(
                 python_ast_cache_key,
                 python_ast,
                 python_source=python_source,
-                file_type=file_type,
             )
         except _StaticResourceLimitError as exc:
             return reconciled_prefix(), exc.reason, exc.metrics
@@ -2967,11 +2960,12 @@ def _scan_all_views_with_parser_diagnostics(
                         )
                         if callable(exhaustion_hook) and full_view.name != "raw":
                             finding_budget.check_runtime()
-                            module_file_type = _effective_module_file_type(
-                                path,
-                                module,
-                                python_source=python_source,
-                                file_type=file_type,
+                            module_file_type = (
+                                parser_file_type
+                                if _oms_projected
+                                else _effective_module_file_type(
+                                    path, module, python_source=python_source
+                                )
                             )
                             bounded_parse_limited = bounded_parse_limited or bool(
                                 _bounded_parser_incomplete(
@@ -3010,7 +3004,6 @@ def _scan_all_views_with_parser_diagnostics(
                             view_budget,
                             None,
                             python_source=python_source,
-                            file_type=file_type,
                             source_text=raw_window,
                             prepared_analyses=prepared_analyses,
                             source_view=(
@@ -3147,7 +3140,6 @@ def _scan_all_views_with_parser_diagnostics(
                                 view_budget,
                                 None,
                                 python_source=python_source,
-                                file_type=file_type,
                                 source_text=projection.text,
                                 prepared_analyses=prepared_analyses,
                                 source_view=source_view,
@@ -3214,7 +3206,6 @@ def _scan_all_views_with_parser_diagnostics(
                             view_budget,
                             None,
                             python_source=python_source,
-                            file_type=file_type,
                             source_text=continuity.view.text,
                             prepared_analyses=prepared_analyses,
                             source_view=(
