@@ -4208,6 +4208,7 @@ class TestBoundedBatchAdmission:
             )
 
         analyzer._structured_llm.ainvoke = AsyncMock(side_effect=first_response)
+        monkeypatch.setattr(MOCK_PATCH_TARGET, lambda **_kwargs: analyzer._llm)
         batches = [Batch(file_path=f"{index}.py", content="print(1)") for index in range(20)]
         result = await analyzer.arun_batches_detailed(batches)
         assert len(result.successful) == 1
