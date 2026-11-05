@@ -15,12 +15,26 @@ from skillspector.yaml_tokens import yaml_source_spans
 _STRING = "tag:yaml.org,2002:str"
 _SEVERITIES = {"LOW", "MEDIUM", "HIGH", "CRITICAL", "ERROR", "WARNING", "INFO"}
 _LANGUAGES = {
-    "regex", "generic", "bash", "sh", "python", "python2", "python3", "py",
-    "javascript", "js", "typescript", "ts",
+    "regex",
+    "generic",
+    "bash",
+    "sh",
+    "python",
+    "python2",
+    "python3",
+    "py",
+    "javascript",
+    "js",
+    "typescript",
+    "ts",
 }
 _LEAVES = {
-    "pattern", "pattern-not", "pattern-inside", "pattern-not-inside",
-    "pattern-regex", "pattern-not-regex",
+    "pattern",
+    "pattern-not",
+    "pattern-inside",
+    "pattern-not-inside",
+    "pattern-regex",
+    "pattern-not-regex",
 }
 _GROUPS = {"patterns", "pattern-either"}
 _SELECTORS = {"pattern", "patterns", "pattern-either", "pattern-regex"}
@@ -42,9 +56,7 @@ def _text(node: Node | None) -> bool:
     return isinstance(node, ScalarNode) and node.tag == _STRING and bool(node.value)
 
 
-def semgrep_rule_scalar_roles(
-    content: str, check_runtime: Callable[[], None]
-) -> dict[int, str]:
+def semgrep_rule_scalar_roles(content: str, check_runtime: Callable[[], None]) -> dict[int, str]:
     """Prove selected query/text roles, never security finding exemptions.
 
     The full YAML grammar bounds source size, nesting and token count before
@@ -97,8 +109,12 @@ def semgrep_rule_scalar_roles(
         if rule["severity"].value not in _SEVERITIES:
             return {}
         languages = rule["languages"]
-        if not isinstance(languages, SequenceNode) or not languages.value or not all(
-            _text(language) and language.value in _LANGUAGES for language in languages.value
+        if (
+            not isinstance(languages, SequenceNode)
+            or not languages.value
+            or not all(
+                _text(language) and language.value in _LANGUAGES for language in languages.value
+            )
         ):
             return {}
         allowed = {"id", "message", "severity", "languages"} | _OPTIONAL | _SELECTORS
@@ -112,8 +128,10 @@ def semgrep_rule_scalar_roles(
                 if name not in rule:
                     continue
                 values = rule[name]
-                if not isinstance(values, SequenceNode) or not values.value or not all(
-                    formula(value) for value in values.value
+                if (
+                    not isinstance(values, SequenceNode)
+                    or not values.value
+                    or not all(formula(value) for value in values.value)
                 ):
                     return {}
         else:

@@ -30,16 +30,20 @@ def _result(content: str) -> dict:
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 @pytest.mark.parametrize("style", ["plain", "quoted", "block"])
 @pytest.mark.parametrize("language", ["generic", "regex"])
-def test_complete_rule_regex_quotes_are_pattern_data(style: str, newline: str, language: str) -> None:
+def test_complete_rule_regex_quotes_are_pattern_data(
+    style: str, newline: str, language: str
+) -> None:
     pattern = r"(?i)token.{0,12}[\"|'|`]?[a-z0-9]{24}[\"|'|`]?"
     value = {
         "plain": pattern,
         "quoted": json.dumps(pattern),
         "block": "|-\n    " + pattern,
     }[style]
-    source = ("# café\n" + _rule("  pattern-regex: " + value + "\n")).replace(
-        "languages: [generic]", "languages: [" + language + "]"
-    ).replace("\n", newline)
+    source = (
+        ("# café\n" + _rule("  pattern-regex: " + value + "\n"))
+        .replace("languages: [generic]", "languages: [" + language + "]")
+        .replace("\n", newline)
+    )
     roles = semgrep_rule_scalar_roles(source, lambda: None)
     assert "pattern" in roles.values() and "message" in roles.values()
     assert _result(source)["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
@@ -70,8 +74,10 @@ def test_taint_queries_and_explanatory_markdown_have_distinct_owners() -> None:
 def test_owned_fields_keep_raw_and_decoded_destructive_findings(field: str, encoded: bool) -> None:
     value = '"rm\\u0020-rf\\u0020/"' if encoded else '"rm -rf /"'
     source = _rule("  pattern: ordinary\n")
-    source = source.replace("  pattern: ordinary", "  pattern: " + value) if field == "pattern" else source.replace(
-        '"A matching token was found."', value
+    source = (
+        source.replace("  pattern: ordinary", "  pattern: " + value)
+        if field == "pattern"
+        else source.replace('"A matching token was found."', value)
     )
     result = _result(source)
     assert any(f.rule_id == "TM1" and f.severity == "HIGH" for f in result["findings"])
@@ -85,7 +91,7 @@ def test_owned_fields_keep_raw_and_decoded_destructive_findings(field: str, enco
         "  metadata:\n    command: 'sh -c \"$PAYLOAD\"'\n",
         "  options:\n    command: 'sh -c \"$PAYLOAD\"'\n",
         "  fix: 'sh -c \"$PAYLOAD\"'\n",
-        "# Run sh -c \"$PAYLOAD\"\n",
+        '# Run sh -c "$PAYLOAD"\n',
     ],
 )
 def test_other_fields_and_comments_keep_runtime_limits(extra: str) -> None:
