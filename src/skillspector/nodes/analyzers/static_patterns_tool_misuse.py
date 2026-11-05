@@ -9347,8 +9347,8 @@ def _message_inline_runtime_diagnostic(
     check_runtime: Callable[[], None],
     raw_diagnostic: StaticParserDiagnostic | None,
 ) -> StaticParserDiagnostic | None:
-    """Check displayed commands before refining one legacy-backtick reading."""
-    if raw_diagnostic is not None and (
+    """Refine an existing, source-owned legacy-backtick limitation only."""
+    if raw_diagnostic is None or (
         raw_diagnostic.cause is not ParserCause.RUNTIME_DEPENDENT
         or raw_diagnostic.check is not ParserCheck.PRINTF_INVOCATION
         or raw_diagnostic.location_precision != "source_span"
