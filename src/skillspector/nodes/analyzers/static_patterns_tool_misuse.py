@@ -41,6 +41,7 @@ from skillspector.artifacts import (
     normalized_security_view,
     security_text_views,
 )
+from skillspector.baseline_tokens import baseline_rule_scalar_roles
 from skillspector.inspection_ledger import (
     ParserCause,
     ParserCheck,
@@ -8927,7 +8928,9 @@ def bounded_parse_diagnostic(
         mapped_source = isinstance(
             prepared_analysis, _YamlParserAnalysis
         ) and prepared_analysis.owns(content, source_view, check_runtime)
-        scalar_roles = semgrep_rule_scalar_roles(content, check_runtime)
+        scalar_roles = semgrep_rule_scalar_roles(
+            content, check_runtime
+        ) or baseline_rule_scalar_roles(content, check_runtime)
         for scalar in yaml_spans.scalars:
             check_runtime()
             role = scalar_roles.get(scalar.start)
