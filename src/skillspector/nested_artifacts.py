@@ -46,9 +46,10 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.passive_svg import is_structurally_valid_passive_svg
 from skillspector.python_ast import PythonSourceClassification, classify_python_source
+from skillspector.resource_limits import bounded_capacity
 
 ARCHIVE_MAX_DEPTH = 3
-ARCHIVE_MAX_MEMBERS = 1_000
+ARCHIVE_MAX_MEMBERS = bounded_capacity("SKILLSPECTOR_ARCHIVE_MAX_MEMBERS", 4_096, 10_000)
 ARCHIVE_MAX_UNCOMPRESSED_BYTES = 25 * 1024 * 1024
 ARCHIVE_MAX_CENTRAL_DIRECTORY_BYTES = 4 * 1024 * 1024
 ARCHIVE_MAX_COMPRESSION_RATIO = 100

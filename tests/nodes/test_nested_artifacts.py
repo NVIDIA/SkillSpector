@@ -2225,7 +2225,9 @@ def test_pax_field_count_is_bounded_before_global_dictionary_expansion(
     data = stream.getvalue()
     if leading_control:
         data = _tar_metadata_bytes(tarfile.XHDTYPE) + data
-    result = inspect_nested_artifacts(tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": data})
+    result = inspect_nested_artifacts(
+        tmp_path, ["bundle.tar"], raw_file_cache={"bundle.tar": data}, max_members=1000
+    )
     event = next(
         event
         for event in result.ledger_events

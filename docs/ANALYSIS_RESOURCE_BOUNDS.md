@@ -28,6 +28,28 @@ Failures and unsupported content remain in the completeness ledger. See
 | End-to-end workflow time | 1080 seconds | One graph execution |
 | Cache and context-processing time | 60 seconds | One skill bundle, within the workflow deadline |
 
+Retained inspection-work capacities can be adjusted before starting the scanner:
+
+| Environment variable | Default | Maximum | Unit |
+|---|---:|---:|---|
+| `SKILLSPECTOR_MAX_INSPECTION_LEDGER_EVENTS` | 100,000 | 1,000,000 | Work-accounting records |
+| `SKILLSPECTOR_ARCHIVE_MAX_MEMBERS` | 4,096 | 10,000 | Members across all archives |
+| `SKILLSPECTOR_MAX_PYTHON_AST_SOURCE_CHARS` | 1,000,000 | 8,000,000 | Characters in one Python source |
+| `SKILLSPECTOR_TP4_MAX_FILES` | 128 | 10,000 | Files admitted to TP4 |
+| `SKILLSPECTOR_TP4_MAX_FILE_CODE_BYTES` | 1 MiB | 16 MiB | UTF-8 bytes in one TP4 source |
+| `SKILLSPECTOR_TP4_MAX_TOTAL_CODE_BYTES` | 4 MiB | 64 MiB | UTF-8 source bytes admitted to TP4 |
+| `SKILLSPECTOR_TP4_MAX_TOTAL_INPUT_BYTES` | 4 MiB | 64 MiB | All serialized TP4 prompt bytes |
+
+Values must be positive decimal integers; byte settings use bytes rather than MiB suffixes.
+Unset or blank values retain the default. Invalid or out-of-range values warn without logging
+the supplied value and retain the default. Settings are read on import and require a process
+restart. A larger ledger retains independent analyzer results for each artifact; the public
+finding-output limit remains 10,000. All other limits still apply, including the shared workflow
+deadline, remaining artifact/byte allowance, Python AST cache budget, per-request token budget,
+TP4 batch limit, archive expansion ratio, depth and inspection time. Raising a capacity does not
+guarantee completion; omitted work remains explicitly incomplete. Larger Python AST settings can
+increase peak memory even though cached source characters remain bounded.
+
 The 64 MiB ceiling accounts for the canonical raw bytes retained for analysis. Local decoded text
 and LLM-safe text are derived only from those bounded bytes; they do not authorize another source
 read allowance. Exact raw bytes from readable nested members consume the remaining portion of the
@@ -48,7 +70,7 @@ Its additional ceilings are:
 | Resource | Ceiling | Scope |
 |---|---:|---|
 | Recursion depth | 3 | One outer-to-inner provenance chain |
-| Members | 1,000 | All outer and nested containers combined |
+| Members | 4,096 | All outer and nested containers combined |
 | Expanded bytes | 25 MiB | All outer and nested containers combined |
 | Central-directory bytes | 4 MiB | One container, before ZIP metadata allocation |
 | Materialized member | 1,000,000 bytes | One member |
