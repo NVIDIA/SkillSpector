@@ -1050,7 +1050,7 @@ def _quoted_directives(
         unsupported = unsupported_header or len(quote) > 1
         while cursor < marker_end_limit:
             character = text[cursor]
-            if text.startswith(quote, cursor) and (
+            if cursor + len(quote) <= marker_end_limit and text.startswith(quote, cursor) and (
                 len(quote) == 1
                 or (
                     (cursor == marker_start or text[cursor - 1] != "`")
