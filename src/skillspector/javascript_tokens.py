@@ -1617,10 +1617,220 @@ def _scalar_template_identifiers(
     return owned
 
 
+
+_PATH_FUNCTIONS = frozenset(
+    {"basename", "dirname", "extname", "format", "isAbsolute", "join", "normalize", "parse",
+     "relative", "resolve", "toNamespacedPath"}
+)
+
+
+def _ordinary_native_calls(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> tuple[set[int], set[int]]:
+    """Prove direct native calls without granting ownership to escaped methods.
+
+    As with the existing browser/assertion proofs, ordinary built-ins are
+    assumed. Explicit overrides, reflection, shadowing and escaping references
+    cannot borrow that assumption. Raw finding inspection remains unchanged.
+    """
+    references: dict[str, list[Node]] = {}
+    path_bindings: dict[str, tuple[Node, bool]] = {}
+    regex_calls: list[Node] = []
+    intrinsic_override = False
+    override_names = {
+        "RegExp", "Reflect", "constructor", "__proto__", "defineProperty", "defineProperties",
+        "getPrototypeOf", "setPrototypeOf", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors",
+    }
+    for node in program.nodes:
+        check_runtime()
+        if node.type in {"identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern"}:
+            references.setdefault(program.text(node), []).append(node)
+        if node.type in {"identifier", "property_identifier", "string"}:
+            spelling = program.text(node).strip("\"'")
+            if spelling in override_names:
+                intrinsic_override = True
+            if spelling == "prototype":
+                # A direct hasOwnProperty.call read does not expose a prototype
+                # to an uploaded mutator. Other prototype uses remain unproved.
+                owner = node.parent
+                method = None if owner is None else owner.parent
+                helper = None if method is None else method.parent
+                call = None if helper is None else helper.parent
+                if not (
+                    owner is not None and owner.type == "member_expression"
+                    and program.text(owner.child_by_field_name("object")) == "Object"
+                    and method is not None and method.type == "member_expression"
+                    and _callable_member(program, method) == "hasOwnProperty"
+                    and helper is not None and helper.type == "member_expression"
+                    and _callable_member(program, helper) == "call"
+                    and call is not None and call.type == "call_expression"
+                    and call.child_by_field_name("function") == helper
+                ):
+                    intrinsic_override = True
+        if node.type == "this":
+            intrinsic_override = True
+        if node.type == "regex":
+            member = node.parent
+            call = None if member is None else member.parent
+            if (
+                member is not None and member.type == "member_expression"
+                and member.child_by_field_name("object") == node
+                and _callable_member(program, member) == "exec"
+                and call is not None and call.type == "call_expression"
+                and call.child_by_field_name("function") == member
+            ):
+                regex_calls.append(member)
+            elif member is None or member.type not in {"arguments", "member_expression"}:
+                # A stored/returned literal could expose its prototype indirectly.
+                intrinsic_override = True
+        if node.type != "import_statement":
+            continue
+        source = node.child_by_field_name("source")
+        if source is None or program.text(source).strip("\"'") not in {"node:path", "path"}:
+            continue
+        pending = list(node.named_children)
+        while pending:
+            check_runtime()
+            specifier = pending.pop()
+            if specifier.type == "import_specifier":
+                original = specifier.child_by_field_name("name")
+                binding = specifier.child_by_field_name("alias") or original
+                if original is not None and binding is not None:
+                    name = program.text(original)
+                    if name in _PATH_FUNCTIONS or name in {"posix", "win32"}:
+                        path_bindings[program.text(binding)] = (binding, name in {"posix", "win32"})
+            pending.extend(specifier.named_children)
+    for reference in references.get("Object", ()):
+        parent = reference.parent
+        if parent is None or parent.type != "member_expression" or parent.child_by_field_name("object") != reference:
+            intrinsic_override = True
+    owned: set[int] = set()
+    native_calls: set[int] = set()
+    if not intrinsic_override:
+        for member in regex_calls:
+            owned.add(member.id)
+            property_node = member.child_by_field_name("property")
+            if property_node is not None:
+                owned.add(property_node.id)
+    for name, (binding, namespace) in path_bindings.items():
+        calls: set[int] = set()
+        identifiers = {binding.id}
+        for reference in references[name]:
+            check_runtime()
+            if reference == binding:
+                continue
+            callee = reference.parent if namespace else reference
+            if (
+                namespace and (
+                    callee is None or callee.type != "member_expression"
+                    or callee.child_by_field_name("object") != reference
+                    or _callable_member(program, callee) not in _PATH_FUNCTIONS
+                )
+            ):
+                break
+            call = None if callee is None else callee.parent
+            if (
+                call is None or call.type != "call_expression"
+                or call.child_by_field_name("function") != callee
+                or call.child_by_field_name("arguments") is None
+                or call.child_by_field_name("arguments").type == "template_string"
+            ):
+                break
+            calls.add(call.id)
+            identifiers.add(reference.id)
+        else:
+            native_calls.update(calls)
+            owned.update(identifiers)
+    return owned, native_calls
+
+
+def _numeric_local_identifiers(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> set[int]:
+    """Resolve exact references to immutable local arithmetic helpers.
+
+    Other scopes can reuse the name. Shadowing, reassignment, escaping helpers
+    and bodies with calls/member reads cannot establish this narrower proof.
+    """
+    references: dict[str, list[Node]] = {}
+    candidates: list[tuple[Node, Node, Node]] = []
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return set()
+        if node.type in {"identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern"}:
+            references.setdefault(program.text(node), []).append(node)
+        if node.type != "variable_declarator":
+            continue
+        declaration = node.parent
+        binding = node.child_by_field_name("name")
+        function = node.child_by_field_name("value")
+        if (
+            declaration is None or declaration.type != "lexical_declaration"
+            or declaration.children[0].type != "const"
+            or declaration.parent is None or declaration.parent.type not in {"program", "statement_block"}
+            or binding is None or binding.type != "identifier"
+            or program.text(binding).casefold() in {"eval", "function"}
+            or function is None or function.type != "arrow_function"
+        ):
+            continue
+        parameters = function.child_by_field_name("parameters")
+        single = function.child_by_field_name("parameter")
+        params = [] if parameters is None else parameters.named_children
+        if single is not None:
+            params = [single]
+        if any(parameter.type != "identifier" for parameter in params):
+            continue
+        names = {program.text(parameter) for parameter in params}
+        if len(names) != len(params):
+            continue
+        body = function.child_by_field_name("body")
+        if body is None:
+            continue
+        pending = [body]
+        while pending:
+            check_runtime()
+            expression = pending.pop()
+            if expression.type == "identifier":
+                if program.text(expression) not in names:
+                    break
+            elif expression.type in {"unary_expression", "binary_expression"}:
+                operator = expression.child_by_field_name("operator")
+                if operator is None or program.text(operator) not in {"+", "-", "*", "/", "%", "**", "~", "&", "|", "^", "<<", ">>", ">>>"}:
+                    break
+            elif expression.type not in {"number", "parenthesized_expression"}:
+                break
+            pending.extend(expression.named_children)
+        else:
+            candidates.append((binding, node, declaration.parent))
+    owned: set[int] = set()
+    for binding, declaration, scope in candidates:
+        identifiers = {binding.id}
+        for reference in references[program.text(binding)]:
+            check_runtime()
+            if reference == binding or not (scope.start_byte <= reference.start_byte < scope.end_byte):
+                continue
+            call = reference.parent
+            if (
+                reference.start_byte < declaration.end_byte
+                or call is None or call.type != "call_expression"
+                or call.child_by_field_name("function") != reference
+                or call.child_by_field_name("arguments") is None
+                or call.child_by_field_name("arguments").type == "template_string"
+            ):
+                break
+            identifiers.add(reference.id)
+        else:
+            owned.update(identifiers)
+    return owned
+
+
 def _has_shell_execution_call(
     program: JavaScriptProgram, check_runtime: Callable[[], None]
 ) -> bool:
     scalar_identifiers = _scalar_template_identifiers(program, check_runtime)
+    ordinary_identifiers = _numeric_local_identifiers(program, check_runtime)
+    native_members, native_calls = _ordinary_native_calls(program, check_runtime)
     uncertain_bindings: set[str] = set()
     global_objects = {"globalThis", "global", "window", "self"}
     imported_callables: set[str] = set()
@@ -1720,7 +1930,7 @@ def _has_shell_execution_call(
                 or spelling == "Reflect"
                 or (
                     spelling.casefold() in _SHELL_EXECUTION_CALLS
-                    and node.id not in scalar_identifiers
+                    and node.id not in scalar_identifiers | ordinary_identifiers | native_members
                 )
             ):
                 return True
@@ -1751,7 +1961,10 @@ def _has_shell_execution_call(
             if origin.type == "identifier":
                 name = program.text(origin)
                 selected_names.add(name)
-                if origin.id in callable_ids and name in uncertain_bindings:
+                if (
+                    origin.id in callable_ids and name in uncertain_bindings
+                    and origin.id not in ordinary_identifiers
+                ):
                     return True
             elif origin.type in {"call_expression", "new_expression"}:
                 # Unknown call results, including bound functions, cannot
@@ -1760,7 +1973,10 @@ def _has_shell_execution_call(
                     return True
             elif origin.type in {"member_expression", "subscript_expression"}:
                 member = _callable_member(program, origin)
-                if member is not None and member.casefold() in _SHELL_EXECUTION_CALLS:
+                if (
+                    member is not None and member.casefold() in _SHELL_EXECUTION_CALLS
+                    and origin.id not in native_members
+                ):
                     return True
                 if member == "construct":
                     return True
@@ -1772,7 +1988,7 @@ def _has_shell_execution_call(
                     index = origin.child_by_field_name("index")
                     if index is None or index.type not in {"number", "null", "true", "false"}:
                         return True
-        if selected_names & imported_callables:
+        if selected_names & imported_callables and node.id not in native_calls:
             # An unresolved imported function may execute its argument. Keep
             # direct template arguments and simple local aliases unowned;
             # this does not claim interprocedural argument-flow analysis.

@@ -760,3 +760,70 @@ def test_executor_member_reads_keep_existing_conservative_coverage(source: str) 
     )
     assert unresolved
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "const match = /^(\\d+)(?:\\.(\\d+))?$/.exec(text);",
+        "const match = /exec/.exec(text); const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);",
+        "import {posix} from 'node:path'; const path = posix.join(posix.dirname(source), `${name}.json`);",
+        "import {win32 as p} from 'node:path'; const path = p.join(`${name}`, 'file');",
+        "import {join as makePath} from 'path'; const path = makePath(`${name}`, 'file');",
+        "import {join as run} from 'node:path'; const path = run(`${name}`, 'file');",
+        "function hash(values) { const r = (x, n) => (x >>> n) | (x << (32 - n)); return r(values[0], 7); } function other(r) { return r; }",
+        "function hash(values) { const run = x => x * 2; return run(values[0]); } function other(run) { return run; }",
+        "function first(values) { const r = x => x + 1; return r(values[0]); } function second(r) { return r; }",
+    ],
+)
+@pytest.mark.parametrize("suffix", ["", _PADDING], ids=["short", "padded"])
+def test_proven_native_and_local_numeric_calls_retain_templates(statement: str, suffix: str) -> None:
+    source = statement + " console.log(`Value: ${name}`);" + suffix
+    assert javascript_template_spans(source, lambda: None) is not None
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "RegExp.prototype.exec = executor; /x/.exec(text);",
+        "const prototype = RegExp.prototype; prototype[key] = executor; /x/.exec(text);",
+        "Object.getPrototypeOf(/x/)[key] = executor; /x/.exec(text);",
+        "Object.defineProperty(Object.getPrototypeOf(/x/), key, {value: executor}); /x/.exec(text);",
+        "const expression = /x/; expression[key] = executor; /x/.exec(text);",
+        "(/x/)[key][other] = executor; /x/.exec(text);",
+        "(/x/).constructor.prototype[key] = executor; /x/.exec(text);",
+        "this['Reg' + 'Exp'].prototype[key] = executor; /x/.exec(text);",
+        "const Object = tools; Object.prototype.hasOwnProperty.call(value, key); /x/.exec(text);",
+        "const method = /x/.exec; method(`${command}`);",
+        "tool.exec(`${command}`); /x/.exec(text);",
+        "import {posix} from 'node:path'; posix.join = executor; posix.join(`${command}`);",
+        "import {posix} from 'node:path'; const alias = posix; alias.join = executor; posix.join(`${command}`);",
+        "import {posix} from 'node:path'; mutate(posix); posix.join(`${command}`);",
+        "import {posix} from 'node:path'; function use(posix) { return posix.join(`${command}`); }",
+        "import {posix} from 'node:path'; const method = posix.join; method(`${command}`);",
+        "import {join} from 'node:path'; function use(join) { return join(`${command}`); }",
+        "import {join} from 'unknown'; join(`${command}`);",
+        "function hash(r) { return r(`${command}`); }",
+        "function hash() { let r = x => x + 1; r = executor; return r(`${command}`); }",
+        "function hash() { const r = x => x + 1; function use(r) { return r(`${command}`); } return r(1); }",
+        "function hash() { const r = x => x + 1; const alias = r; return alias(`${command}`); } function other(r) { return r; }",
+        "const r = x => x + 1; r = executor; r(`${command}`);",
+        "const r = x => executor(x); r(`${command}`);",
+        "const r = x => object[key]; r(`${command}`);",
+        "const run = x => x + 1; run.call(executor, `${command}`);",
+        "const eval = x => x + 1; eval(`${command}`);",
+        "const r = x => x + 1; with (tools) { r(`${command}`); }",
+        "import {join as run} from 'node:path'; const alias = run; alias(`${command}`);",
+    ],
+)
+def test_unproved_native_or_local_callable_overrides_stay_partial(statement: str) -> None:
+    source = statement + " console.log(`Value: ${name}`);"
+    assert javascript_template_spans(source, lambda: None) is None
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+def test_known_native_callee_cannot_hide_security_findings() -> None:
+    source = "const match = /value/.exec(text); console.log(`Value: ${name}`); tool.exec(\"rm -rf /\");"
+    assert javascript_template_spans(source, lambda: None) is None
+    assert any(finding.rule_id == "TM1" for finding in tm.analyze(source, "display.js", "javascript"))
