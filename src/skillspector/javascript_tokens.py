@@ -1499,7 +1499,6 @@ def javascript_template_spans(
     check_runtime: Callable[[], None],
     *,
     unresolved_executables: list[int] | None = None,
-    quoted_strings: list[tuple[int, int]] | None = None,
     regex_literals: list[tuple[int, int]] | None = None,
 ) -> JavaScriptTemplateSpans | None:
     """Prove host delimiters while retaining unresolved executable templates.
@@ -1516,8 +1515,6 @@ def javascript_template_spans(
         if unresolved_executables is not None:
             unresolved_executables.append(content.index("`"))
         return None
-    if quoted_strings is not None:
-        quoted_strings.extend(_plain_quoted_value_spans(program, check_runtime))
     executable = None
     if regex_literals is not None:
         # A lexical boundary cannot replace unresolved behavior. Apply the
@@ -1571,55 +1568,6 @@ def javascript_template_spans(
         starts.append(start)
         ends.append(end)
     return tuple(starts), tuple(ends)
-
-
-def _plain_quoted_value_spans(
-    program: JavaScriptProgram, check_runtime: Callable[[], None]
-) -> list[tuple[int, int]]:
-    """Bound plain literal values; do not infer escaped or extended code."""
-    spans: list[tuple[int, int]] = []
-    extensions = {
-        "binary_expression",
-        "augmented_assignment_expression",
-        "member_expression",
-        "subscript_expression",
-        "call_expression",
-        "new_expression",
-        "template_substitution",
-        "import_statement",
-        "export_statement",
-    }
-    boundaries = {
-        "program",
-        "expression_statement",
-        "return_statement",
-        "lexical_declaration",
-        "variable_declarator",
-        "for_in_statement",
-    }
-    for node in program.nodes:
-        check_runtime()
-        if node.type != "string":
-            continue
-        start, end = program.span(node)
-        value = program.content[start + 1 : end - 1]
-        if (
-            end - start < 2
-            or program.content[start] not in "\"'"
-            or program.content[end - 1] != program.content[start]
-            or "\\" in value
-            or "$" in value
-        ):
-            continue
-        parent = node.parent
-        while parent is not None and parent.type not in boundaries:
-            check_runtime()
-            if parent.type in extensions:
-                break
-            parent = parent.parent
-        else:
-            spans.append((start, end))
-    return spans
 
 
 def _plain_regex_value_spans(

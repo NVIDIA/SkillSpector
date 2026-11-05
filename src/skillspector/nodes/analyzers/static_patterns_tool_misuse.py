@@ -3370,27 +3370,6 @@ def _has_shell_command_word_exhaustion(
         content, check_runtime
     )
 
-    def candidate_is_complete(start: int) -> bool:
-        if _quoted_candidate_is_complete(
-            content, start, quote_limits, check_runtime, quoted_printf_allowed
-        ):
-            return True
-        if javascript_source is None or _command_string_depth >= 8:
-            return False
-        return javascript_source.quoted_string_is_complete(
-            start,
-            lambda value: (
-                _has_shell_command_word_exhaustion(
-                    value,
-                    check_runtime,
-                    _command_string_depth=_command_string_depth + 1,
-                    _quoted_printf_allowed=quoted_printf_allowed,
-                    complete_context=False,
-                )
-                is None
-            ),
-        )
-
     parsed_through = 0
     # A word that spans lines may pair a heredoc, comment or prose quote with
     # a later command line. Main skips the candidates inside such a word, so
@@ -3557,7 +3536,9 @@ def _has_shell_command_word_exhaustion(
                     substitution_end,
                     check_runtime=check_runtime,
                 ):
-                    if not candidate_is_complete(start):
+                    if not _quoted_candidate_is_complete(
+                        content, start, quote_limits, check_runtime, quoted_printf_allowed
+                    ):
                         return (
                             word_diagnostics[0]
                             if word_diagnostics
@@ -3629,7 +3610,9 @@ def _has_shell_command_word_exhaustion(
                 # expressions cannot continue a shell word into later code.
                 unresolved_end = min(unresolved_end, javascript_source.word_end(start))
             if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS:
-                if not candidate_is_complete(start):
+                if not _quoted_candidate_is_complete(
+                    content, start, quote_limits, check_runtime, quoted_printf_allowed
+                ):
                     return (
                         word_diagnostics[0]
                         if word_diagnostics
@@ -3715,7 +3698,9 @@ def _has_shell_command_word_exhaustion(
                 # spans and runtime-selected operands keep their existing
                 # conservative treatment.
                 continue
-            if not candidate_is_complete(start):
+            if not _quoted_candidate_is_complete(
+                content, start, quote_limits, check_runtime, quoted_printf_allowed
+            ):
                 assert parsed.diagnostic is not None
                 return parsed.diagnostic
         operand_diagnostic = (
@@ -3733,7 +3718,9 @@ def _has_shell_command_word_exhaustion(
         if operand_diagnostic is not None:
             comment = python_source.comment(start) if python_source is not None else None
             if comment is None:
-                if candidate_is_complete(start):
+                if _quoted_candidate_is_complete(
+                    content, start, quote_limits, check_runtime, quoted_printf_allowed
+                ):
                     continue
                 # Host code after a Python string's closing quote is not shell
                 # text, so a command in the string takes operands only from
@@ -5817,9 +5804,6 @@ class _JavaScriptTemplateOwnership:
         self._spans: JavaScriptTemplateSpans | None = None
         self._spans_computed = False
         self._unresolved_executables: list[int] = []
-        self._quoted_strings: list[tuple[int, int]] = []
-        self._quoted_starts: list[int] = []
-        self._quoted_complete: dict[int, bool] = {}
         self._regex_literals: list[tuple[int, int]] = []
         self._regex_starts: list[int] = []
 
@@ -5829,11 +5813,9 @@ class _JavaScriptTemplateOwnership:
                 self._content,
                 self._check_runtime,
                 unresolved_executables=self._unresolved_executables,
-                quoted_strings=self._quoted_strings,
                 regex_literals=self._regex_literals,
             )
             self._regex_starts = [start for start, _ in self._regex_literals]
-            self._quoted_starts = [start for start, _ in self._quoted_strings]
             self._spans_computed = True
         return self._spans
 
@@ -5859,19 +5841,6 @@ class _JavaScriptTemplateOwnership:
             if start <= position < end:
                 return end
         return None
-
-    def quoted_string_is_complete(self, position: int, check_value: Callable[[str], bool]) -> bool:
-        """Refine one failed candidate only after checking its whole value."""
-        self._owned_spans()
-        index = bisect_right(self._quoted_starts, position) - 1
-        if index < 0:
-            return False
-        start, end = self._quoted_strings[index]
-        if not start < position < end - 1:
-            return False
-        if start not in self._quoted_complete:
-            self._quoted_complete[start] = check_value(self._content[start + 1 : end - 1])
-        return self._quoted_complete[start]
 
     def owns(self, position: int) -> bool:
         spans = self._owned_spans()

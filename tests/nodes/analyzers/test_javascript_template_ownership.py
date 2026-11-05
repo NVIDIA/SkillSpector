@@ -856,16 +856,6 @@ def test_known_native_callee_cannot_hide_security_findings() -> None:
     )
 
 
-def test_plain_quoted_values_expose_native_boundaries_without_becoming_templates() -> None:
-    source = "const values = ['`first` before', \"`second` after\"];\n"
-    quoted: list[tuple[int, int]] = []
-    assert javascript_template_spans(source, lambda: None, quoted_strings=quoted) is None
-    assert [source[start:end] for start, end in quoted] == [
-        "'`first` before'",
-        '"`second` after"',
-    ]
-
-
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 def test_quoted_backtick_values_cannot_consume_later_host_code(newline: str) -> None:
     source = newline.join(
@@ -891,7 +881,7 @@ def test_completed_quoted_value_never_clears_later_runtime_uncertainty(suffix: s
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
 
 
-def test_quoted_value_refinement_preserves_raw_high_commands() -> None:
+def test_regex_refinement_preserves_neighbor_raw_high_commands() -> None:
     source = (
         "const values = ['`name` before', '`name` after'];\n"
         "import {execSync} from 'node:child_process'; execSync('rm -rf /');\n"
@@ -904,65 +894,6 @@ def test_quoted_value_refinement_preserves_raw_high_commands() -> None:
 @pytest.mark.parametrize(
     "source",
     [
-        r"const value = ['`name`\n'];",
-        "const value = ['`$TOOL -rf /`'];",
-        "const value = ['`name`' + extra];",
-        "const value = ['`name`'.concat(extra)];",
-        "eval('`name`');",
-        "new Function('`name`');",
-        "unknown('`name`');",
-        "const value = ['`name`];",
-        "const value = ['unterminated];",
-    ],
-)
-def test_unproved_quoted_values_do_not_receive_boundary_refinement(source: str) -> None:
-    quoted: list[tuple[int, int]] = []
-    javascript_template_spans(source, lambda: None, quoted_strings=quoted)
-    assert quoted == []
-
-
-def test_quoted_value_boundaries_keep_unicode_character_offsets() -> None:
-    source = "const label = '日本語'; const values = ['`café` before'];"
-    quoted: list[tuple[int, int]] = []
-    javascript_template_spans(source, lambda: None, quoted_strings=quoted)
-    assert [source[start:end] for start, end in quoted] == ["'日本語'", "'`café` before'"]
-
-
-def test_quoted_body_is_checked_once_and_does_not_own_its_delimiters() -> None:
-    source = "const values = ['`name` before'];"
-    owner = tm._JavaScriptTemplateOwnership(source, lambda: None)
-    seen: list[str] = []
-
-    def checked(value: str) -> bool:
-        seen.append(value)
-        return True
-
-    start = source.index("'")
-    end = source.rindex("'")
-    assert not owner.quoted_string_is_complete(start, checked)
-    assert owner.quoted_string_is_complete(start + 1, checked)
-    assert owner.quoted_string_is_complete(start + 3, checked)
-    assert not owner.quoted_string_is_complete(end, checked)
-    assert not owner.quoted_string_is_complete(len(source) - 1, checked)
-    assert seen == ["`name` before"]
-
-
-def test_interrupted_quoted_body_check_is_not_cached() -> None:
-    source = "const values = ['`name` before'];"
-    owner = tm._JavaScriptTemplateOwnership(source, lambda: None)
-    position = source.index("`")
-
-    def cancelled(value: str) -> bool:
-        raise TimeoutError("cancelled")
-
-    with pytest.raises(TimeoutError, match="cancelled"):
-        owner.quoted_string_is_complete(position, cancelled)
-    assert owner.quoted_string_is_complete(position, lambda value: True)
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
         "const value = '`name`'; eval(`${value}${payload}`);",
         "let value = '`name`'; value += `${payload}`; Function(value)();",
         "const values = ['`name`']; eval(`${values[0]}${payload}`);",
@@ -970,13 +901,11 @@ def test_interrupted_quoted_body_check_is_not_cached() -> None:
         "const value = '`name`'; launch(`${value}${payload}`);",
     ],
 )
-def test_quoted_refinement_preserves_established_indirect_runtime_diagnostics(
+def test_regex_refinement_preserves_established_indirect_runtime_diagnostics(
     source: str, monkeypatch
 ) -> None:
     with monkeypatch.context() as baseline:
-        baseline.setattr(
-            tm._JavaScriptTemplateOwnership, "quoted_string_is_complete", lambda *args: False
-        )
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
         before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
     after = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
     assert before is not None
@@ -988,9 +917,7 @@ def test_quoted_refinement_preserves_established_indirect_runtime_diagnostics(
 def test_ordinary_quoted_data_keeps_its_existing_complete_result(value, monkeypatch) -> None:
     source = "const values = ['`name` before', '`name` after'];\nconst other = '" + value + "';"
     with monkeypatch.context() as baseline:
-        baseline.setattr(
-            tm._JavaScriptTemplateOwnership, "quoted_string_is_complete", lambda *args: False
-        )
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
         before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
     after = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
     assert before is None
@@ -1004,12 +931,12 @@ def test_plain_quoted_files_keep_no_backtick_fast_path(monkeypatch) -> None:
         raise AssertionError("no-backtick source should not require a native parse")
 
     monkeypatch.setattr(javascript_tokens, "parse_javascript_source", must_not_parse)
-    quoted: list[tuple[int, int]] = []
+    regexes: list[tuple[int, int]] = []
     assert (
-        javascript_template_spans("const label = 'ordinary';", lambda: None, quoted_strings=quoted)
+        javascript_template_spans("const label = 'ordinary';", lambda: None, regex_literals=regexes)
         is None
     )
-    assert quoted == []
+    assert regexes == []
 
 
 _JS_REGEX_BOUNDARY_SOURCE = (
@@ -1026,9 +953,6 @@ _JS_REGEX_BOUNDARY_SOURCE = (
 def test_native_regex_origin_does_not_borrow_a_distant_string_boundary(newline, monkeypatch):
     source = _JS_REGEX_BOUNDARY_SOURCE.replace("\n", newline)
     with monkeypatch.context() as baseline:
-        baseline.setattr(
-            tm._JavaScriptTemplateOwnership, "quoted_string_is_complete", lambda *args: False
-        )
         baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
         before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
     assert before is not None
