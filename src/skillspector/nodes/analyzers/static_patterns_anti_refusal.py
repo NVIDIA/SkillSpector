@@ -326,7 +326,7 @@ _AR2_TASK_JUDGMENT_OBJECT_PATTERN = re.compile(
     r"\s+(?:(?:the|this|that|its|their)\s+)?"
     r"(?:(?:change|code|implementation|requirement|test|output|result|proposal|design|document)"
     r"['’]s\s+)?"
-    rf"{_AR2_TECHNICAL_CRITERION}"
+    rf"(?:technical\s+)?{_AR2_TECHNICAL_CRITERION}"
     rf"(?:\s+(?:beyond|outside)\s+(?:(?:its|their|the)\s+)?{_AR2_TECHNICAL_CRITERION})?\s*\Z",
     re.IGNORECASE,
 )
