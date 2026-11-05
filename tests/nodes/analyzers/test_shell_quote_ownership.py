@@ -1681,3 +1681,40 @@ def test_xargs_arg_file_keeps_dynamic_c_body_unresolved(options):
 def test_xargs_arg_file_still_inspects_literal_c_body(options):
     source = f"xargs {options} <<< \"$VALUE\" env sh -c 'printf done'"
     assert tm._command_string_from_clause(source, 0, lambda: None) == (True, "printf done")
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        'xargs() { bash; }',
+        "alias xargs=bash",
+        "builtin alias xargs=bash",
+        "source setup.sh",
+    ],
+)
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "xargs <<< \"$CODE\" sh -c 'printf done'",
+        "$(xargs <<< \"$CODE\" sh -c 'printf done')",
+        "`xargs <<< \"$CODE\" sh -c 'printf done'`",
+    ],
+)
+def test_explicit_xargs_utility_cannot_skip_enclosing_source_binding(binding, expression):
+    source = binding + "\n" + expression + "\n"
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("expression", ["sh -c 'printf done'", "env sh -c 'printf done'"])
+def test_explicit_xargs_utility_cannot_skip_startup_binding_context(expression):
+    source = 'xargs <<< "$CODE" ' + expression
+    diagnostics = []
+    recognized, body = tm._command_string_from_clause(
+        source, 0, lambda: None, startup_exposure=[True], diagnostics=diagnostics
+    )
+    assert recognized
+    assert body is None
+    assert diagnostics
+    assert tm.has_bounded_parse_exhaustion(
+        'BASH_ENV=setup.sh\n' + source, lambda: None, file_type="shell"
+    )

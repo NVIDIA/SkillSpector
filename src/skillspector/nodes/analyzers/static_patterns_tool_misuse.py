@@ -5054,6 +5054,8 @@ def _command_string_from_clause(
                             return failed(
                                 ParserCause.BOUNDARY_UNRESOLVED, ParserCheck.COMMAND_WORD_BOUNDARY
                             )
+                        if not external_xargs_proved():
+                            return failed(ParserCause.RUNTIME_DEPENDENT)
                         xargs_redirected = True
                         continue
                     if xargs_redirected and cursor < len(content) and content[cursor] in "\r\n":
