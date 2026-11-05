@@ -390,6 +390,7 @@ def _decode_ascii_letter_entities_view(view: SecurityTextView) -> SecurityTextVi
 
     output = StringIO()
     offsets = array("I")
+    ends = array("I") if view.source_end_offsets is not None else None
     cursor = 0
     for match, character in replacements:
         output.write(view.text[cursor : match.start()])
@@ -397,15 +398,23 @@ def _decode_ascii_letter_entities_view(view: SecurityTextView) -> SecurityTextVi
             offsets.extend(range(cursor, match.start()))
         else:
             offsets.extend(view.source_offsets[cursor : match.start()])
+        if ends is not None:
+            ends.extend(view.source_end_offsets[cursor : match.start()])
         output.write(character)
         offsets.append(view.source_offset(match.start()))
+        if ends is not None:
+            ends.append(view.source_end_offset(match.end() - 1))
         cursor = match.end()
     output.write(view.text[cursor:])
     if view.source_offsets is None:
         offsets.extend(range(cursor, len(view.text)))
     else:
         offsets.extend(view.source_offsets[cursor:])
-    return SecurityTextView(f"entity-{view.name}", output.getvalue(), offsets)
+    if ends is not None:
+        ends.extend(view.source_end_offsets[cursor:])
+    return SecurityTextView(
+        f"entity-{view.name}", output.getvalue(), offsets, source_end_offsets=ends
+    )
 
 
 def _compact_spaced_security_word_view(view: SecurityTextView) -> SecurityTextView:
@@ -426,6 +435,7 @@ def _compact_spaced_security_word_view(view: SecurityTextView) -> SecurityTextVi
 
     output = StringIO()
     offsets = array("I")
+    ends = array("I") if view.source_end_offsets is not None else None
     cursor = 0
     for match in matches:
         output.write(view.text[cursor : match.start()])
@@ -433,19 +443,27 @@ def _compact_spaced_security_word_view(view: SecurityTextView) -> SecurityTextVi
             offsets.extend(range(cursor, match.start()))
         else:
             offsets.extend(view.source_offsets[cursor : match.start()])
+        if ends is not None:
+            ends.extend(view.source_end_offsets[cursor : match.start()])
         for source_offset in range(match.start(), match.end()):
             character = view.text[source_offset]
             if not character.isalpha():
                 continue
             output.write(character)
             offsets.append(view.source_offset(source_offset))
+            if ends is not None:
+                ends.append(view.source_end_offset(source_offset))
         cursor = match.end()
     output.write(view.text[cursor:])
     if view.source_offsets is None:
         offsets.extend(range(cursor, len(view.text)))
     else:
         offsets.extend(view.source_offsets[cursor:])
-    return SecurityTextView(f"marker-{view.name}", output.getvalue(), offsets)
+    if ends is not None:
+        ends.extend(view.source_end_offsets[cursor:])
+    return SecurityTextView(
+        f"marker-{view.name}", output.getvalue(), offsets, source_end_offsets=ends
+    )
 
 
 # Only bounded, complete JSON values establish quote ownership. Arbitrary
@@ -2048,6 +2066,7 @@ def _retained_ranges(
 def _project_payload(view: SecurityTextView, candidate: _ProjectionCandidate) -> SecurityTextView:
     output = StringIO()
     offsets = array("I")
+    ends = array("I") if view.source_end_offsets is not None else None
     for start, end in _retained_ranges(
         candidate.payload.start,
         candidate.payload.end,
@@ -2059,10 +2078,13 @@ def _project_payload(view: SecurityTextView, candidate: _ProjectionCandidate) ->
             offsets.extend(range(start, end))
         else:
             offsets.extend(view.source_offsets[start:end])
+        if ends is not None:
+            ends.extend(view.source_end_offsets[start:end])
     return SecurityTextView(
         name=f"declared-marker-{view.name}",
         text=output.getvalue(),
         source_offsets=offsets,
+        source_end_offsets=ends,
     )
 
 

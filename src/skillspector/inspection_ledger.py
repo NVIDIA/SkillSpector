@@ -643,6 +643,7 @@ class ParserCheck(StrEnum):
     COMMAND_STRING_DEPTH = "command_string_depth"
     COMMAND_STRING_RUNTIME = "command_string_runtime"
     COMMAND_STRING_EFFECTS = "command_string_effects"
+    JSON_STRING_DECODING = "json_string_decoding"
     STARTUP_PROOF_CHARACTERS = "startup_proof_characters"
     BRACE_CHARACTERS = "brace_characters"
     BRACE_ALTERNATIVES = "brace_alternatives"

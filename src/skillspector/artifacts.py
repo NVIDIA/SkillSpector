@@ -106,6 +106,7 @@ class SecurityTextView:
     reconstructions: tuple[SecurityTextReconstruction, ...] = ()
     right_boundary_is_fixed: bool = False
     right_boundary_recovery_start: int | None = None
+    source_end_offsets: array[int] | None = None
 
     def source_offset(self, derived_offset: int) -> int:
         """Map a derived character offset to the corresponding source offset."""
@@ -115,6 +116,17 @@ class SecurityTextView:
             return 0
         index = min(max(derived_offset, 0), len(self.source_offsets) - 1)
         return self.source_offsets[index]
+
+    def source_end_offset(self, derived_offset: int) -> int:
+        """Return the exclusive original end of one projected character."""
+        if not self.text:
+            return 0
+        if self.source_end_offsets is None:
+            return self.source_offset(derived_offset) + 1
+        if not self.source_end_offsets:
+            return 0
+        index = min(max(derived_offset, 0), len(self.source_end_offsets) - 1)
+        return self.source_end_offsets[index]
 
     def reconstructed_source_spans(
         self,
