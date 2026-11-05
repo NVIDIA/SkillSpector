@@ -2831,6 +2831,60 @@ def test_preflight_unavailable_log_does_not_claim_runtime_calls_failed(
     }
 
 
+def test_accounted_refusal_log_retains_completed_ai_results(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
+    events = []
+    statuses = []
+    calls = []
+    refused = "semantic_security_discovery"
+    for analyzer in sorted(required_semantic_analyzer_ids({})):
+        own_events = [
+            ledger_event(
+                analyzer_id=analyzer,
+                outcome=LedgerOutcome.COMPLETED,
+                phase="semantic",
+                path="SKILL.md",
+            ),
+            ledger_event(
+                analyzer_id=analyzer,
+                outcome=LedgerOutcome.SKIPPED if analyzer == refused else LedgerOutcome.COMPLETED,
+                phase="semantic",
+                path="rules.yaml",
+                reason=LedgerReason.LLM_RESPONSE_REFUSED if analyzer == refused else None,
+            ),
+        ]
+        events.extend(own_events)
+        statuses.append(analyzer_status_for_events(analyzer, own_events))
+        calls.append(llm_call_record(analyzer, ok=analyzer != refused))
+    calls.append(llm_call_record("meta_analyzer", ok=True))
+    finding = _finding("TM1", "HIGH")
+    state: SkillspectorState = {
+        "filtered_findings": [finding],
+        "findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_requested": True,
+        "meta_review_required": True,
+        "inspection_ledger": events,
+        "analyzer_status_events": statuses,
+        "llm_call_log": calls,
+    }
+    with caplog.at_level(logging.WARNING, logger="skillspector.nodes.report"):
+        result = report(state)
+    assert "affected AI assessments are incomplete" in caplog.text
+    assert "runtime telemetry was incomplete" not in caplog.text
+    assert "report reflects static analysis only" not in caplog.text
+    payload = json.loads(result["report_body"])
+    assert payload["metadata"]["llm_degraded"] is True
+    assert any(issue["id"] == "TM1" and issue["severity"] == "HIGH" for issue in payload["issues"])
+    assert events[-1]["reason_code"] == LedgerReason.LLM_RESPONSE_REFUSED
+
+
 def test_non_degraded_clean_scan_stays_safe() -> None:
     """Without degradation, a clean scan still reports SAFE (no over-flooring)."""
     state: SkillspectorState = {

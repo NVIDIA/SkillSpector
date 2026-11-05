@@ -2114,7 +2114,8 @@ def report(state: SkillspectorState) -> dict[str, object]:
         )
     elif degraded:
         logger.warning(
-            "LLM stage degraded: %d/%d LLM call(s) failed; report reflects static analysis only",
+            "LLM stage degraded: %d/%d LLM call(s) failed; "
+            "affected AI assessments are incomplete; completed results are retained",
             _attempted - _succeeded,
             _attempted,
         )
