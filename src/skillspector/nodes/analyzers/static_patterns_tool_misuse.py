@@ -8729,6 +8729,26 @@ def _fenced_powershell_source(
     )
 
 
+def _yaml_source_start(
+    content: str,
+    source_view: SecurityTextView | None,
+    canonical: str,
+    check_runtime: Callable[[], None],
+) -> int | None:
+    if source_view is None or source_view.name != "raw" or source_view.text != content or not content:
+        return None
+    start = source_view.source_offset(0)
+    end = start + len(content)
+    if not 0 <= start < end <= len(canonical) or canonical[start:end] != content:
+        return None
+    for offset in range(len(content)):
+        if offset % 4096 == 0:
+            check_runtime()
+        if source_view.source_offset(offset) != start + offset:
+            return None
+    return start
+
+
 @dataclass(frozen=True)
 class _YamlParserAnalysis:
     content: str
@@ -8742,15 +8762,12 @@ class _YamlParserAnalysis:
             or scalar.end - scalar.start <= static_runner._WINDOW_OVERLAP_CHARS
         )
 
-    def owns(self, content: str, source_view: SecurityTextView | None) -> bool:
+    def owns(
+        self, content: str, source_view: SecurityTextView | None, check_runtime: Callable[[], None]
+    ) -> bool:
         return (
-            source_view is not None
-            and source_view.name == "raw"
-            and content == self.content
-            and source_view.text == content
-            and bool(content)
-            and source_view.source_offset(0) == 0
-            and source_view.source_offset(len(content) - 1) == len(content) - 1
+            len(content) == len(self.content)
+            and _yaml_source_start(content, source_view, self.content, check_runtime) == 0
         )
 
 
@@ -8778,11 +8795,12 @@ class _PreparedYamlAnalysis:
             check_runtime=self.check_runtime,
             defer_variable_reconciliation=True,
         )
-        if file_type != "yaml" or not content or source_view.name != "raw":
+        if file_type != "yaml":
             return findings
-        source_start = source_view.source_offset(0)
-        source_end = source_view.source_offset(len(content) - 1) + 1
-        if content != self.parser.content[source_start:source_end]:
+        source_start = _yaml_source_start(
+            content, source_view, self.parser.content, self.check_runtime
+        )
+        if source_start is None:
             return findings
         locations = SourceLocationIndex(content, file_path)
         for scalar in self.parser.spans.scalars:
@@ -8802,12 +8820,12 @@ class _PreparedYamlAnalysis:
             def enclose(finding: AnalyzerFinding) -> None:
                 nonlocal occurrence
                 occurrence += 1
+                decoded_line = finding.location.start_line
                 # Decoded coordinates must never escape through an interrupted
                 # finding-budget prefix or Python-specific reconciliation.
                 finding.location = Location(
                     file_path, begin_line, end_line, begin_column, end_column
                 )
-                decoded_line = finding.location.start_line
                 finding.context = raw_context
                 finding.evidence = {
                     key: value for key, value in finding.evidence.items() if not key.startswith("_")
@@ -8894,6 +8912,9 @@ def bounded_parse_diagnostic(
         yaml_spans = yaml_source_spans(content, check_runtime)
         if yaml_spans is None:
             return exhausted
+        mapped_source = isinstance(prepared_analysis, _YamlParserAnalysis) and prepared_analysis.owns(
+            content, source_view, check_runtime
+        )
         for scalar in yaml_spans.scalars:
             check_runtime()
             diagnostic = _has_bounded_parse_exhaustion(
@@ -8911,7 +8932,7 @@ def bounded_parse_diagnostic(
             # finding view can carry it through the normal reporting path.
             mapped_scalar = (
                 isinstance(prepared_analysis, _YamlParserAnalysis)
-                and prepared_analysis.owns(content, source_view)
+                and mapped_source
                 and prepared_analysis.can_emit(scalar)
             )
             if not exact_source and not mapped_scalar and analyze(

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from array import array
 
 import pytest
 
@@ -161,6 +162,38 @@ def test_unbound_or_derived_parser_context_keeps_attribution_incomplete() -> Non
             prepared_analysis=prepared,
             source_view=view,
         ) is not None
+
+
+def test_nonidentity_interior_mapping_cannot_borrow_raw_scalar_provenance() -> None:
+    source = 'name: example\nrun: "rm\\u0020-rf\\u0020/"\n'
+    offsets = array("I", range(len(source)))
+    offsets[2], offsets[3] = offsets[3], offsets[2]
+    view = SecurityTextView("raw", source, offsets)
+    parser = tm.prepare_parser_analysis(source, "yaml", lambda: None)
+    prepared = tm.prepare_analysis(source, "yaml", lambda: None)
+    assert parser is not None and prepared is not None
+    assert tm.bounded_parse_diagnostic(
+        source,
+        lambda: None,
+        file_type="yaml",
+        prepared_analysis=parser,
+        source_view=view,
+    ) is not None
+    assert not any(
+        "yaml_scalar" in f.evidence
+        for f in prepared.analyze(source, "rules.yaml", "yaml", view)
+    )
+
+
+def test_decoded_line_metadata_is_distinct_from_enclosing_raw_line() -> None:
+    source = "a: one\nb: two\nc: three\nrun: |\n  ordinary text\n  rm -rf /\n"
+    decoded = [f for f in _result(source)["findings"] if "yaml_scalar" in f.evidence]
+    assert any(
+        f.rule_id == "TM1"
+        and f.start_line == 4
+        and f.evidence["yaml_scalar"]["decoded_start_line"] == 2
+        for f in decoded
+    )
 
 
 def test_distinct_decoded_findings_are_not_collapsed_by_rule() -> None:
