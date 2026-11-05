@@ -1161,6 +1161,7 @@ def _tag_directives(
     end_is_truncated: bool,
     pattern: re.Pattern[str] = _TAG_DIRECTIVE_START_RE,
     unsupported_header: bool = False,
+    closes_owned_string: Callable[[int], bool] | None = None,
 ) -> Iterator[_Directive]:
     for match in pattern.finditer(text):
         if check_runtime is not None:
@@ -1178,6 +1179,11 @@ def _tag_directives(
                 check_runtime,
             )
             if opener is None:
+                continue
+            if closes_owned_string is not None and any(
+                text[index] in "\"'`" and closes_owned_string(index)
+                for index in range(match.start(), opener)
+            ):
                 continue
             marker_start = opener
         marker_end_limit = min(len(text), marker_start + MAX_MARKER_LOOKAHEAD_CHARS)
@@ -1340,6 +1346,7 @@ def _directives(
             end_is_truncated=end_is_truncated,
             pattern=_UNSUPPORTED_TAG_DIRECTIVE_START_RE,
             unsupported_header=True,
+            closes_owned_string=closes_owned_string,
         ),
         *_encoded_directives(text, check_runtime, end_is_truncated=end_is_truncated),
         *_encoded_directives(
