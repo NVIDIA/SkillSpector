@@ -2781,7 +2781,7 @@ def _scan_all_views_with_parser_diagnostics(
                 if prepare_parser is not None:
                     parser_analyses[id(module)] = prepare_parser(
                         content=content,
-                        file_type=_infer_file_type(path),
+                        file_type="json" if _oms_projected else _infer_file_type(path),
                         check_runtime=finding_budget.check_runtime,
                     )
                     finding_budget.check_runtime()
