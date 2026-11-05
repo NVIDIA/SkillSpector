@@ -246,6 +246,30 @@ def test_heredoc_delimiter_can_end_at_eof(body: str) -> None:
     ) == len(body)
 
 
+@pytest.mark.parametrize(
+    "newline, closing, complete",
+    [
+        ("\n", "EOF\n", True),
+        ("\n", "EOF\r\n", False),
+        ("\r\n", "EOF\r\n", True),
+        ("\r\n", "EOF\n", False),
+        ("\n", "EOF", True),
+        ("\n", "EOF\r", False),
+        ("\r\n", "EOF", True),
+        ("\r\n", "EOF\r", False),
+    ],
+)
+def test_heredoc_delimiter_preserves_body_newline_style(
+    newline: str, closing: str, complete: bool
+) -> None:
+    content = "literal body" + newline + closing
+    end = tm._skip_static_heredoc_bodies(
+        content, 0, len(content), (("EOF", False, True),), lambda: None
+    )
+
+    assert (end == len(content)) is complete
+
+
 def test_large_continued_heredoc_checks_runtime_and_keeps_raw_commands() -> None:
     body = ("x" * 5000 + "\\\n") * 40 + "END\n$CMD -rf /\nEND\n"
     checks = 0
@@ -608,6 +632,89 @@ def test_ownership_walk_obeys_runtime_budget() -> None:
         tm._shell_quoted_candidate_limits('echo "$(date)"\n', cancel)
 
 
+@pytest.mark.parametrize("padding", [0, 6000])
+def test_literal_trap_command_is_bounded_before_its_host_quote(padding: int) -> None:
+    source = """cat <<'DATA'
+"quoted data"
+DATA
+trap 'saved=$?; trap - EXIT; finish "$saved"; result=$?; exit "$result"' EXIT
+"""
+    source += "#" * padding + "\n"
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "$CMD -rf /",
+        'finish "$saved"; $CMD -rf /',
+        "echo \"$(bash -c '$CMD -rf /')\"",
+    ],
+)
+def test_literal_quote_bound_does_not_hide_runtime_destructive_commands(body: str) -> None:
+    # The third form is deliberately malformed shell quoting; it must also
+    # retain the conservative result rather than borrow an outer delimiter.
+    source = "cat <<'DATA'\nquoted data\nDATA\ntrap '" + body + "' EXIT\n" + "#" * 6000
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("file_type", ["shell", "markdown"])
+def test_quoted_assignment_value_owns_its_closing_quote(file_type: str) -> None:
+    command = 'tool --field "Description=ordinary value with <placeholders>" --show\n'
+    source = command if file_type == "shell" else "```bash\n" + command + "```\n"
+    source += "\nOrdinary trailing explanation.\n" * 300
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'bash -c "NAME=value; $CMD -rf /"',
+        "bash -c 'NAME=value; rm -rf /'",
+        "tool \"NAME=$(bash -c '$CMD -rf /')\"",
+        'tool "NAME=ordinary value"; $CMD -rf /',
+    ],
+)
+def test_quoted_assignment_delimiters_do_not_hide_executable_payloads(source: str) -> None:
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("depth", [1, 8, 32])
+def test_nested_command_substitutions_keep_shell_consumers_visible(depth: int) -> None:
+    command = "bash -c '$CMD -rf /'"
+    for _ in range(depth):
+        command = f'printf "%s" "$({command})"'
+    assert tm.has_bounded_parse_exhaustion(command, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "printf '%s' '$(bash -c \"$CMD -rf /\")'",
+        'printf "%s" "\\$(ordinary data)"',
+        'tool "NAME=$(printf %s safe)"',
+        "printf '%s' $'literal \\' $(bash -c \"$CMD -rf /\")'",
+    ],
+)
+def test_literal_and_benign_substitution_text_is_not_an_executable_shell_string(
+    source: str,
+) -> None:
+    assert list(tm._shell_command_strings(source, lambda: None)) == []
+
+
+@pytest.mark.parametrize(
+    "file_type,source",
+    [
+        ("javascript", "const message = \"$(bash -c '$CMD -rf /')\";"),
+        ("python", "message = \"$(bash -c '$CMD -rf /')\""),
+    ],
+)
+def test_host_strings_do_not_acquire_shell_substitution_semantics(
+    file_type: str, source: str
+) -> None:
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type)
+
+
 def test_quoted_helper_is_completely_inspected(tmp_path: Path) -> None:
     (tmp_path / "SKILL.md").write_text(
         "---\nname: repro\ndescription: Minimal shell fixture.\n---\nRun `scripts/run.sh`.\n"
@@ -663,6 +770,28 @@ def test_compound_adversarial_inputs_retain_security_signal(
                 finding.rule_id == "TM1" and finding.severity.value == "HIGH"
                 for finding in tm.analyze(source, "run.sh", "shell")
             ), source
+
+
+def test_mixed_newline_heredoc_does_not_prove_a_false_closer() -> None:
+    source = "cat <<'EOF'\nbody\nEOF\r\necho \"quoted\"\n"
+    assert tm._shell_quoted_candidate_limits(source, lambda: None) == {}
+
+
+@pytest.mark.parametrize("statement", ["trap - EXIT", "trap '' EXIT", "trap -p", "trap -l"])
+def test_trap_reset_ignore_and_query_forms_have_no_executable_body(statement: str) -> None:
+    assert list(tm._shell_command_strings(statement + "\n", lambda: None)) == []
+
+
+def test_runtime_trap_body_remains_incomplete() -> None:
+    assert tm.has_bounded_parse_exhaustion(
+        'trap "$HANDLER" EXIT\n', lambda: None, file_type="shell"
+    )
+
+
+def test_unmatched_heredoc_data_quote_keeps_conservative_large_source_result() -> None:
+    # This separate limitation concerns data ownership, not trap-body parsing.
+    source = "cat <<'DATA'\n\"unmatched data quote\nDATA\n" + "#" * 6000
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
 def test_empty_shell_clauses_do_not_repeat_command_string_parsing() -> None:

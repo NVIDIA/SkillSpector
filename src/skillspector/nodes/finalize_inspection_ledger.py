@@ -24,11 +24,13 @@ from skillspector.inspection_ledger import (
     LedgerRecordType,
     analyzer_status_for_events,
     finalize_ledger,
+    format_recovery_policy_accepted,
     inspection_work_id,
     ledger_event,
 )
 from skillspector.models import Finding
 from skillspector.nodes.analyzers import ANALYZER_LOAD_ERRORS, ANALYZER_MODULES
+from skillspector.passive_bmp import is_structurally_valid_passive_bmp
 from skillspector.passive_jpeg import is_structurally_valid_passive_jpeg
 from skillspector.references import (
     MAX_REFERENCE_RUNTIME_SECONDS,
@@ -313,7 +315,8 @@ def _has_verified_passive_raster(
 ) -> bool:
     if PurePosixPath(target_path).suffix.lower() == ".png":
         return _has_verified_passive_png(target_path, inventory_item, raw_file_cache)
-    if PurePosixPath(target_path).suffix.lower() not in {".jpg", ".jpeg"} or not inventory_item:
+    suffix = PurePosixPath(target_path).suffix.lower()
+    if suffix not in {".jpg", ".jpeg", ".bmp"} or not inventory_item:
         return False
     raw = raw_file_cache.get(target_path)
     size_bytes = inventory_item.get("size_bytes")
@@ -321,7 +324,11 @@ def _has_verified_passive_raster(
         isinstance(raw, bytes)
         and type(size_bytes) is int
         and size_bytes == len(raw)
-        and is_structurally_valid_passive_jpeg(raw)
+        and (
+            is_structurally_valid_passive_bmp(raw)
+            if suffix == ".bmp"
+            else is_structurally_valid_passive_jpeg(raw)
+        )
     )
 
 
@@ -379,7 +386,7 @@ def _verified_documentation_image_references(
     inventory: Mapping[str, Mapping[str, object]],
     raw_file_cache: Mapping[str, object],
 ) -> set[tuple[str, int, int, str, str, str]]:
-    """Corroborate declarations and newly supported rendered JPEG references.
+    """Corroborate declarations and rendered JPEG/BMP references.
 
     The provenance label is not authority: bind it to canonical source bytes,
     exact syntax/position and target. All sources share one byte/time allowance;
@@ -403,7 +410,7 @@ def _verified_documentation_image_references(
         if kind != ReferenceKind.DOCUMENTATION_IMAGE and not (
             kind == ReferenceKind.MARKDOWN_IMAGE
             and isinstance(reference.get("target_path"), str)
-            and PurePosixPath(reference["target_path"]).suffix.lower() in {".jpg", ".jpeg"}
+            and PurePosixPath(reference["target_path"]).suffix.lower() in {".jpg", ".jpeg", ".bmp"}
         ):
             continue
         source_path = reference.get("source_path")
@@ -797,9 +804,11 @@ def _reference_coverage_findings(
     fatal_paths: set[str] = set()
     exceptions_by_path: dict[str, list[Mapping[str, object]]] = {}
     canonicalization_succeeded = False
+    format_recovery_accepted = False
     if ledger_shape_complete and inventory_shape_complete and status_shape_complete:
         try:
             preexisting_completeness, _ = finalize_ledger(state)
+            format_recovery_accepted = format_recovery_policy_accepted(preexisting_completeness)
             for exception in preexisting_completeness["ledger_exceptions"]:
                 exceptions_by_path.setdefault(str(exception.get("path", "")), []).append(exception)
             fatal_paths = {
@@ -922,6 +931,22 @@ def _reference_coverage_findings(
             else ""
         )
         if final_disposition not in {"partial", "failed", "out_of_scope"}:
+            continue
+        # Accepted AI formatting uncertainty remains a visible coverage warning.
+        # It does not turn already-read text into a HIGH artifact-evasion finding.
+        # The global proof rejects any independent analyzer/accounting gap.
+        if (
+            ledger_evidence_complete
+            and format_recovery_accepted
+            and target_path not in invalid_status_paths
+            and target_path not in duplicate_inventory_paths
+            and inventory_item is not None
+            and disposition == reference_disposition == ArtifactDisposition.ANALYZED
+            and inventory_item.get("content_kind") == ContentKind.TEXT
+            and inventory_item.get("reason") is None
+            and inventory_item.get("inherited_exclusion_reason") is None
+            and inventory_item.get("misleading_extension") is not True
+        ):
             continue
         if (
             provider_evidence_complete
@@ -1107,6 +1132,10 @@ def _reconcile_inspected_containers(state: SkillspectorState) -> dict[str, objec
     if not containers:
         return {}
     completeness, _ = finalize_ledger(state)
+    if format_recovery_policy_accepted(completeness):
+        # Traversal succeeded; the member's AI warning remains in the ledger.
+        # Do not turn accepted formatting uncertainty into an archive-access gap.
+        return {}
     incomplete = {
         str(row["path"])
         for row in completeness["ledger_exceptions"]

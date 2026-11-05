@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from hashlib import sha256
 from typing import Final, NotRequired, cast
@@ -27,6 +28,9 @@ RESOURCE_MEASUREMENT_UNITS: Final = (
     "depth",
     "records",
     "seconds",
+)
+FORMAT_RECOVERY_SEMANTIC_ANALYZERS: Final = frozenset(
+    {"semantic_security_discovery", "semantic_developer_intent", "semantic_quality_policy"}
 )
 
 
@@ -85,6 +89,7 @@ class LedgerReason(StrEnum):
     LLM_RESPONSE_EMPTY = "llm_response_empty"
     LLM_RESPONSE_LIMIT = "llm_response_limit"
     LLM_FORMAT_CHANGED = "llm_format_changed"
+    LLM_FORMAT_RECOVERY_EXHAUSTED = "llm_format_recovery_exhausted"
     LLM_CONNECTION_RETRIES_EXHAUSTED = "llm_connection_retries_exhausted"
     ANALYZER_RUNTIME_ERROR = "analyzer_runtime_error"
     ANALYZER_LOAD_ERROR = "analyzer_load_error"
@@ -163,6 +168,229 @@ def only_missing_reference_exceptions(exceptions: object) -> bool:
     )
 
 
+def format_recovery_policy_accepted(completeness: Mapping[str, object]) -> bool:
+    """Validate the derived format-only acceptance without claiming complete inspection.
+
+    The producer also proves runtime accounting before setting ``policy_accepted``.
+    Consumers must retain that projection intact: a flag alone, extra limitations,
+    or a warning for a different file cannot waive a remaining inspection gap.
+    """
+    if (
+        completeness.get("policy_accepted") is not True
+        or completeness.get("execution_successful") is not True
+        or completeness.get("status") != "partial"
+        or completeness.get("is_complete") is not False
+        or completeness.get("entirely_uninspected_files") != 0
+        or any(completeness.get(name) for name in ("exceptions", "errors", "failures"))
+    ):
+        return False
+    scope_rows = completeness.get("scope_exclusions")
+    if not isinstance(scope_rows, list) or any(
+        not isinstance(row, Mapping)
+        or row.get("outcome") != LedgerOutcome.OUT_OF_SCOPE
+        or row.get("fatal") is not False
+        or row.get("reason_code")
+        not in (LedgerReason.BASELINE_FILE, LedgerReason.OMS_SIGNATURE, LedgerReason.VCS_METADATA)
+        for row in scope_rows
+    ):
+        return False
+    counts = [
+        completeness.get(name)
+        for name in (
+            "total_components",
+            "scanned_components",
+            "fully_inspected_files",
+            "partially_inspected_files",
+            "entirely_uninspected_files",
+        )
+    ]
+    if not all(type(value) is int and value >= 0 for value in counts):
+        return False
+    total, scanned, fully, partially, entirely = (cast(int, value) for value in counts)
+    if total != fully + partially + entirely or scanned != fully:
+        return False
+    rows = completeness.get("ledger_exceptions")
+    warnings = completeness.get("warnings")
+    statuses = completeness.get("analyzer_statuses")
+    limitations = completeness.get("limitations")
+    if not all(isinstance(value, list) for value in (rows, warnings, statuses, limitations)):
+        return False
+    assert isinstance(rows, list) and isinstance(warnings, list)
+    assert isinstance(statuses, list) and isinstance(limitations, list)
+    if not all(isinstance(value, str) for value in limitations):
+        return False
+    if not rows or not warnings or len(warnings) > MAX_INSPECTION_LEDGER_EVENTS:
+        return False
+    format_rows: list[dict[str, object]] = []
+    warning_counts: dict[tuple[str, str], int] = {}
+    partial_paths: set[tuple[str, str]] = set()
+    identities: set[tuple[object, ...]] = set()
+    runtime_rows: list[Mapping[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("fatal") is not False:
+            return False
+        if row.get("outcome") != LedgerOutcome.PARTIAL:
+            return False
+        reason = row.get("reason_code")
+        if reason == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED:
+            analyzers = row.get("analyzers")
+            phase = row.get("phase")
+            path = row.get("path")
+            start_line, end_line = row.get("start_line"), row.get("end_line")
+            if (
+                phase not in ("semantic", "meta")
+                or not isinstance(path, str)
+                or not path
+                or not isinstance(analyzers, list)
+                or not analyzers
+                or not all(isinstance(value, str) and value for value in analyzers)
+                or any(
+                    value is not None and type(value) is not int for value in (start_line, end_line)
+                )
+            ):
+                return False
+            if len(set(analyzers)) != len(analyzers):
+                return False
+            allowed_analyzers = (
+                {"meta_analyzer"}
+                if phase == "meta"
+                else FORMAT_RECOVERY_SEMANTIC_ANALYZERS | {"mcp_tool_poisoning"}
+            )
+            if not set(analyzers) <= allowed_analyzers:
+                return False
+            try:
+                if _normalize_relative_path(path) != path:
+                    return False
+                _validate_range(cast(int | None, start_line), cast(int | None, end_line))
+            except ValueError:
+                return False
+            source = row.get("source_identity", "")
+            if not isinstance(source, str):
+                return False
+            if source and not str(row["path"]).startswith(source + "/"):
+                return False
+            identity = (
+                source,
+                row["path"],
+                row.get("start_line"),
+                row.get("end_line"),
+                row["phase"],
+                tuple(analyzers),
+            )
+            if identity in identities:
+                return False
+            identities.add(identity)
+            for analyzer in analyzers:
+                key = (source, analyzer)
+                warning_counts[key] = warning_counts.get(key, 0) + 1
+            if row["phase"] == "semantic":
+                partial_paths.add((source, str(row["path"])))
+            format_rows.append(row)
+        elif reason == LedgerReason.REFERENCE_MISSING:
+            # These existing caveats describe absent references, not uninspected bytes.
+            path, source = row.get("path"), row.get("source_identity", "")
+            if (
+                row.get("phase") != "reference_resolution"
+                or row.get("analyzers")
+                or row.get("error_class")
+                or not isinstance(path, str)
+                or not path
+                or not isinstance(source, str)
+                or (source and not path.startswith(source + "/"))
+                or any(
+                    value is not None and type(value) is not int
+                    for value in (row.get("start_line"), row.get("end_line"))
+                )
+            ):
+                return False
+            try:
+                if _normalize_relative_path(path) != path:
+                    return False
+                _validate_range(
+                    cast(int | None, row.get("start_line")),
+                    cast(int | None, row.get("end_line")),
+                )
+            except ValueError:
+                return False
+        elif not (
+            reason == LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE
+            and row.get("phase") == "semantic_runtime"
+            and row.get("start_line") is None
+            and row.get("end_line") is None
+            and not row.get("analyzers")
+            and not row.get("error_class")
+        ):
+            return False
+        else:
+            runtime_rows.append(row)
+    expected_warnings = [
+        {**row, "assessment_complete": False, "accepted_by_policy": True} for row in format_rows
+    ]
+    if not format_rows or warnings != expected_warnings:
+        return False
+    if completeness.get("partially_inspected_files") != len(partial_paths):
+        return False
+    runtime_scopes: set[str] = set()
+    for row in runtime_rows:
+        source = row.get("source_identity", "")
+        if (
+            not isinstance(source, str)
+            or source in runtime_scopes
+            or row.get("path") != (source + "/SKILL.md" if source else "SKILL.md")
+            or (source and not any(scope == source for scope, _ in warning_counts))
+        ):
+            return False
+        runtime_scopes.add(source)
+    expected_limitations: list[str] = []
+    seen_statuses: set[tuple[str, str]] = set()
+    semantic_scopes = {scope for scope, _analyzer in warning_counts}
+    for status in statuses:
+        if not isinstance(status, Mapping):
+            return False
+        source, analyzer = status.get("source_identity", ""), status.get("analyzer_id")
+        if not isinstance(source, str) or not isinstance(analyzer, str) or not analyzer:
+            return False
+        key = (source, analyzer)
+        if key in seen_statuses:
+            return False
+        seen_statuses.add(key)
+        if analyzer in FORMAT_RECOVERY_SEMANTIC_ANALYZERS:
+            semantic_scopes.add(source)
+        counts = [status.get(name) for name in ("planned_work", "completed", "partial")]
+        if not all(type(value) is int and value >= 0 for value in counts):
+            return False
+        planned, completed, partial = (cast(int, value) for value in counts)
+        if (
+            planned != completed + partial
+            or partial != warning_counts.get(key, 0)
+            or any(
+                type(status.get(name)) is not int or status.get(name) != 0
+                for name in ("failed", "skipped", "unaccounted")
+            )
+        ):
+            return False
+        if status.get("status") == "not_applicable" and planned != 0:
+            return False
+        if status.get("status") in ("completed", "not_applicable") and partial == 0:
+            continue
+        if status.get("status") != "degraded" or key not in warning_counts:
+            return False
+        if status.get("reason_code") not in (None, LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED):
+            return False
+        expected_limitations.append(
+            str(status.get("message") or f"Analyzer {status['analyzer_id']} status: degraded.")
+        )
+    return (
+        warning_counts.keys() <= seen_statuses
+        and sorted(limitations) == sorted(expected_limitations)
+        and all(
+            (source, analyzer) in seen_statuses
+            for source in semantic_scopes
+            for analyzer in FORMAT_RECOVERY_SEMANTIC_ANALYZERS
+        )
+    )
+
+
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.DEPENDENCY_LOCKFILE_MISSING: "Requested npm content inspection has no supported project lockfile.",
     LedgerReason.DEPENDENCY_UNSUPPORTED_LOCKFILE: "Dependency content inspection requires npm lockfile version 2 or 3.",
@@ -208,6 +436,10 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.LLM_RESPONSE_EMPTY: "The model returned no assessment.",
     LedgerReason.LLM_RESPONSE_LIMIT: "The model's response exceeded processing or formatting limits.",
     LedgerReason.LLM_FORMAT_CHANGED: "Formatting could not preserve the complete original assessment.",
+    LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED: (
+        "The AI answered, but its full assessment could not be verified after bounded recovery. "
+        "The formatting-recovery policy permits continuing with this warning; known findings remain."
+    ),
     LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: (
         "Transient LLM provider failure persisted after bounded retries."
     ),
@@ -378,6 +610,141 @@ class ResourceMeasurements(TypedDict, total=False):
     limit_seconds: float
 
 
+class ParserCause(StrEnum):
+    RESOURCE_LIMIT = "resource_limit"
+    BOUNDARY_UNRESOLVED = "boundary_unresolved"
+    MALFORMED_INPUT = "malformed_input"
+    UNSUPPORTED_SYNTAX = "unsupported_syntax"
+    RUNTIME_DEPENDENT = "runtime_dependent"
+
+
+class ParserCheck(StrEnum):
+    COMMAND_WORD_CHARACTERS = "command_word_unquoted_characters"
+    COMMAND_ARGUMENT_CHARACTERS = "command_argument_characters"
+    COMMAND_WORD_BOUNDARY = "command_word_boundary"
+    COMMAND_ARGUMENT_BOUNDARY = "command_argument_boundary"
+    COMMAND_IDENTITY = "runtime_command_identity"
+    PRINTF_INPUT_CHARACTERS = "printf_input_characters"
+    PRINTF_ARGUMENT_COUNT = "printf_argument_count"
+    PRINTF_ARGUMENT_CHARACTERS = "printf_argument_characters"
+    PRINTF_OUTPUT_CHARACTERS = "printf_output_characters"
+    PRINTF_FORMAT = "printf_format"
+    PRINTF_INVOCATION = "printf_invocation"
+    WRAPPER_DEPTH = "wrapper_depth"
+    WRAPPER_ARGUMENTS = "wrapper_arguments"
+    WRAPPER_CLAUSE_STEPS = "wrapper_clause_steps"
+    COMMAND_STRING_DEPTH = "command_string_depth"
+    COMMAND_STRING_RUNTIME = "command_string_runtime"
+    COMMAND_STRING_EFFECTS = "command_string_effects"
+    STARTUP_PROOF_CHARACTERS = "startup_proof_characters"
+    BRACE_CHARACTERS = "brace_characters"
+    BRACE_ALTERNATIVES = "brace_alternatives"
+    BRACE_PRODUCTS = "brace_products"
+    BRACE_ROUNDS = "brace_rounds"
+    BRACE_SYNTAX = "brace_syntax"
+    MARKDOWN_LITERAL_OWNERSHIP = "markdown_literal_ownership"
+    HEREDOC_HEADER = "heredoc_header"
+    HEREDOC_COUNT = "heredoc_count"
+    HEREDOC_BODY = "heredoc_body"
+    HEREDOC_GRAMMAR = "heredoc_grammar"
+    EXPANSION_BOUNDARY = "expansion_boundary"
+
+
+class ParserUncheckedScope(StrEnum):
+    COMMAND_WORD = "command_word"
+    COMMAND_ARGUMENTS = "command_arguments"
+    COMMAND_STRING = "command_string"
+    EXPRESSION = "expression"
+    REMAINING_INPUT = "remaining_input"
+
+
+@dataclass(frozen=True)
+class StaticParserDiagnostic:
+    """Internal parser evidence in the current view's character coordinates."""
+
+    cause: ParserCause
+    check: ParserCheck
+    start: int
+    end: int
+    unchecked_scope: ParserUncheckedScope
+    measurements: ResourceMeasurements = field(default_factory=ResourceMeasurements)
+    observed_is_lower_bound: bool = False
+    full_input_checked: bool = False
+    location_precision: str = "source_span"
+
+    def shifted(self, offset: int) -> StaticParserDiagnostic:
+        return replace(self, start=self.start + offset, end=self.end + offset)
+
+    def enclosed(self, start: int, end: int) -> StaticParserDiagnostic:
+        """Attribute decoded text to its carrier without inventing inner columns."""
+        return replace(self, start=start, end=end, location_precision="enclosing_expression")
+
+
+class ParserDiagnostic(ResourceMeasurements):
+    """Payload-free public explanation of a parser's first unresolved scope."""
+
+    cause: ParserCause
+    check: ParserCheck
+    source_start_offset: int
+    source_end_offset: int
+    start_line: int
+    end_line: int
+    unchecked_scope: ParserUncheckedScope
+    observed_is_lower_bound: bool
+    full_input_checked: bool
+    location_precision: str
+
+
+def sanitize_parser_diagnostic(value: object) -> ParserDiagnostic | None:
+    """Accept only known parser identifiers, source coordinates and measurements."""
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        if not all(
+            isinstance(value.get(key), str) for key in ("cause", "check", "unchecked_scope")
+        ):
+            return None
+        cause = ParserCause(value.get("cause"))
+        check = ParserCheck(value.get("check"))
+        scope = ParserUncheckedScope(value.get("unchecked_scope"))
+    except (TypeError, ValueError):
+        return None
+    offsets = [value.get("source_start_offset"), value.get("source_end_offset")]
+    lines = [value.get("start_line"), value.get("end_line")]
+    if not all(type(number) is int and 0 <= number <= (1 << 63) - 1 for number in offsets + lines):
+        return None
+    start, end = cast(list[int], offsets)
+    start_line, end_line = cast(list[int], lines)
+    if start >= end or start_line < 1 or end_line < start_line:
+        return None
+    precision = value.get("location_precision")
+    lower_bound = value.get("observed_is_lower_bound")
+    checked = value.get("full_input_checked")
+    if (
+        type(precision) is not str
+        or precision not in {"source_span", "enclosing_expression"}
+        or type(lower_bound) is not bool
+        or type(checked) is not bool
+    ):
+        return None
+    if cause is ParserCause.MALFORMED_INPUT and (not checked or precision != "source_span"):
+        cause = ParserCause.BOUNDARY_UNRESOLVED
+    result: ParserDiagnostic = {
+        "cause": cause,
+        "check": check,
+        "source_start_offset": start,
+        "source_end_offset": end,
+        "start_line": start_line,
+        "end_line": end_line,
+        "unchecked_scope": scope,
+        "observed_is_lower_bound": lower_bound,
+        "full_input_checked": checked,
+        "location_precision": precision,
+    }
+    result.update(resource_measurements(value))
+    return result
+
+
 def resource_measurements(event: Mapping[str, object]) -> ResourceMeasurements:
     """Allow only bounded numeric diagnostics, never arbitrary graph payloads."""
     measurements: dict[str, int | float] = {}
@@ -411,6 +778,7 @@ class InspectionLedgerEvent(ResourceMeasurements):
     message: NotRequired[str]
     error_class: NotRequired[str]
     stage: NotRequired[str]
+    parser_diagnostic: NotRequired[ParserDiagnostic]
 
 
 class AnalyzerStatusEvent(TypedDict):
@@ -440,6 +808,8 @@ class InspectionLedgerException(ResourceMeasurements):
     analyzers: NotRequired[list[str]]
     fatal: NotRequired[bool]
     scope: NotRequired[str]
+    source_identity: NotRequired[str]
+    parser_diagnostic: NotRequired[ParserDiagnostic]
 
 
 class AnalysisCompleteness(TypedDict):
@@ -464,6 +834,8 @@ class AnalysisCompleteness(TypedDict):
     findings_before_filtering: NotRequired[int]
     findings_after_filtering: NotRequired[int]
     dependency_inspection: NotRequired[dict[str, object]]
+    policy_accepted: NotRequired[bool]
+    warnings: NotRequired[list[dict[str, object]]]
 
 
 def _normalize_relative_path(path: str, *, scope_boundary: bool = False) -> str:
@@ -551,6 +923,7 @@ def ledger_event(
     limit_records: int | None = None,
     observed_seconds: float | None = None,
     limit_seconds: float | None = None,
+    parser_diagnostic: ParserDiagnostic | None = None,
 ) -> InspectionLedgerEvent:
     """Create one validated terminal ledger record without sensitive payloads."""
     _validate_range(start_line, end_line)
@@ -633,6 +1006,9 @@ def ledger_event(
         event["observed_seconds"] = observed_seconds
     if limit_seconds is not None:
         event["limit_seconds"] = limit_seconds
+    safe_parser_diagnostic = sanitize_parser_diagnostic(parser_diagnostic)
+    if safe_parser_diagnostic is not None:
+        event["parser_diagnostic"] = safe_parser_diagnostic
     return event
 
 
@@ -788,6 +1164,12 @@ def _exception_from_event(
         scope=RULE_SET_SCOPE if _is_rule_set_record(event) else None,
     )
     exception.update(resource_measurements(event))
+    source_identity = event.get("source_identity")
+    if isinstance(source_identity, str) and source_identity:
+        exception["source_identity"] = source_identity
+    parser_diagnostic = sanitize_parser_diagnostic(event.get("parser_diagnostic"))
+    if parser_diagnostic is not None:
+        exception["parser_diagnostic"] = parser_diagnostic
     return exception
 
 
@@ -797,6 +1179,7 @@ def _merge_exception_projection(
     """Group duplicate public rows while retaining all contributing analyzers."""
     grouped: dict[tuple[object, ...], InspectionLedgerException] = {}
     for exception in exceptions:
+        parser_diagnostic = sanitize_parser_diagnostic(exception.get("parser_diagnostic"))
         key = (
             exception["outcome"],
             exception["phase"],
@@ -809,7 +1192,9 @@ def _merge_exception_projection(
             # A rule-set row and a real file's row can share a path label;
             # they must never merge into one public row.
             exception.get("scope"),
+            exception.get("source_identity"),
             tuple(resource_measurements(exception).items()),
+            tuple(parser_diagnostic.items()) if parser_diagnostic else (),
         )
         existing = grouped.get(key)
         if existing is None:
@@ -1044,6 +1429,8 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
             summary["reason_code"] = str(status["reason_code"])
         if status.get("message") is not None:
             summary["message"] = str(status["message"])
+        if isinstance(status.get("source_identity"), str) and status["source_identity"]:
+            summary["source_identity"] = status["source_identity"]
         status_summaries.append(summary)
 
     scope_rows = [
@@ -1262,6 +1649,23 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         completeness["excluded_file_count"] = sum(
             item.get("reason") == LedgerReason.USER_EXCLUSION for item in inventory
         )
+    format_warnings = [
+        {**row, "assessment_complete": False, "accepted_by_policy": True}
+        for row in ledger_exceptions
+        if row["reason_code"] == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+    ]
+    if format_warnings:
+        # Imports stay lazy: ordinary static-only ledger projection does not
+        # need to load analyzer discovery or semantic-runtime accounting.
+        from skillspector.nodes.analyzers import ANALYZER_MODULES
+        from skillspector.semantic_runtime import format_recovery_runtime_accepted
+
+        completeness["warnings"] = format_warnings
+        completeness["policy_accepted"] = format_recovery_runtime_accepted(state, ANALYZER_MODULES)
+        completeness["policy_accepted"] = format_recovery_policy_accepted(completeness)
+        if not completeness["policy_accepted"]:
+            for warning in format_warnings:
+                warning["accepted_by_policy"] = False
     return completeness, validated_effective
 
 

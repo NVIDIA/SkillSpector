@@ -1160,3 +1160,102 @@ def test_optional_prose_assessment_keeps_finding_verdict(assessment):
     assert result.findings[0].pattern_id == "P1"
     assert result.findings[0].is_vulnerability is True
     assert result.overall_assessment is None
+
+
+def test_meta_recovery_copies_exact_finding_identities():
+    original = _finding("E2", 12, 14)
+    batch = Batch(file_path=original.file, content="source", findings=[original])
+
+    identities = _analyzer()._recovery_known_items(batch)
+
+    assert identities == [
+        {
+            "finding_id": original.finding_id,
+            "pattern_id": "E2",
+            "start_line": 12,
+            "end_line": 14,
+        }
+    ]
+    identities[0]["pattern_id"] = "different"
+    assert original.rule_id == "E2"
+    assert _analyzer()._recovery_known_items(batch)[0]["pattern_id"] == "E2"
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+@pytest.mark.parametrize("assessment", ["missing", "valid", "unknown_id", "wrong_rule"])
+@pytest.mark.parametrize(
+    "reason,expected_outcome,call_ok",
+    [
+        (LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED, LedgerOutcome.PARTIAL, True),
+        (LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED, LedgerOutcome.FAILED, False),
+        (LedgerReason.RUNTIME_LIMIT, LedgerOutcome.PARTIAL, False),
+    ],
+)
+def test_meta_partial_recovery_preserves_originals_and_terminal_cause(
+    assessment, reason, expected_outcome, call_ok
+):
+    first = Finding(
+        rule_id="E2", message="original high", severity="HIGH", file="a.py", start_line=1
+    )
+    second = Finding(
+        rule_id="P1", message="original low", severity="LOW", file="a.py", start_line=2
+    )
+    batch = Batch(file_path="a.py", content="first\nsecond", findings=[first, second])
+    state = {
+        "findings": [first, second],
+        "use_llm": True,
+        "file_cache": {"a.py": batch.content},
+        "manifest": {},
+        "model_config": {},
+    }
+
+    async def recover(self, batches, **_kwargs):
+        returned_batch = Batch(file_path="a.py", content=batch.content, findings=[first, second])
+        response = MetaAnalyzerResult.model_validate(
+            {
+                "findings": [
+                    {
+                        "finding_id": "unknown" if assessment == "unknown_id" else first.finding_id,
+                        "pattern_id": "different" if assessment == "wrong_rule" else first.rule_id,
+                        "start_line": first.start_line,
+                        "end_line": first.end_line,
+                        "is_vulnerability": True,
+                        "confidence": 0.95,
+                        "intent": "malicious",
+                        "impact": "high",
+                        "explanation": "Recovered confirmed issue",
+                    }
+                ]
+                if assessment != "missing"
+                else [],
+            }
+        )
+        terminal = BatchFailure(batch, "RecoveryStopped", reason)
+        self._last_batch_outcome = BatchExecutionResult(
+            recovered=[(returned_batch, self.parse_response(response, returned_batch))],
+            warnings=[terminal] if call_ok else [],
+            failures=[] if call_ok else [terminal],
+        )
+        return []
+
+    with (
+        patch.object(LLMMetaAnalyzer, "get_batches", return_value=[batch]),
+        patch.object(LLMMetaAnalyzer, "arun_batches", recover),
+    ):
+        result = meta_analyzer(state)
+
+    assert [item.finding_id for item in result["findings"]] == [first.finding_id, second.finding_id]
+    assert [item.severity for item in result["findings"]] == ["HIGH", "LOW"]
+    if assessment == "valid":
+        assert result["findings"][0].explanation == "Recovered confirmed issue"
+        assert result["findings"][0].evidence["llm_review_outcome"] == "confirmed"
+    else:
+        assert result["findings"][0].evidence["llm_review_outcome"] == "failed"
+    assert result["findings"][1].evidence["llm_review_outcome"] == "failed"
+    assert all("llm-unconfirmed" not in item.tags for item in result["findings"])
+    (event,) = result["inspection_ledger"]
+    assert event["outcome"] is expected_outcome
+    assert event["reason_code"] is reason
+    assert event["input_finding_ids"] == [first.finding_id, second.finding_id]
+    assert event["emitted_finding_ids"] == [first.finding_id, second.finding_id]
+    assert result["llm_call_log"][0]["ok"] is call_ok

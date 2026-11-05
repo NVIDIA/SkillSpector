@@ -45,9 +45,12 @@ from skillspector.inspection_ledger import (
     RESOURCE_MEASUREMENT_UNITS,
     RULE_SET_SCOPE,
     AnalysisCompleteness,
+    ParserCause,
     finalize_ledger,
+    format_recovery_policy_accepted,
     only_missing_reference_exceptions,
     resource_measurements,
+    sanitize_parser_diagnostic,
 )
 from skillspector.llm_provenance import sanitize_llm_provenance
 from skillspector.llm_utils import is_llm_available
@@ -135,22 +138,81 @@ _SANITIZED_FIELDS = (
 
 _REPORT_SAFE_SOURCE_ID_RE = re.compile(r"external/[0-9a-f]{64}\Z")
 
+_PARSER_CAUSE_DESCRIPTIONS = {
+    ParserCause.RESOURCE_LIMIT: "SkillSpector reached a configured inspection limit.",
+    ParserCause.BOUNDARY_UNRESOLVED: (
+        "SkillSpector could not determine this command or code fragment's boundaries."
+    ),
+    ParserCause.MALFORMED_INPUT: (
+        "This code fragment has invalid syntax (its structure is not valid for this language)."
+    ),
+    ParserCause.UNSUPPORTED_SYNTAX: "SkillSpector cannot fully inspect this code pattern yet.",
+    ParserCause.RUNTIME_DEPENDENT: (
+        "Full inspection depends on information available only when this code runs."
+    ),
+}
 
-def _inspection_exception_message(row: Mapping[str, object]) -> str:
-    """Describe recorded resource values without inventing missing measurements."""
-    message = str(row.get("message", ""))
+
+def _resource_measurement_description(
+    row: Mapping[str, object], *, lower_bound: bool = False
+) -> str:
     measurements = resource_measurements(row)
     details: list[str] = []
     for unit in RESOURCE_MEASUREMENT_UNITS:
         if f"observed_{unit}" in measurements or f"limit_{unit}" in measurements:
             observed = measurements.get(f"observed_{unit}", "not recorded")
             limit = measurements.get(f"limit_{unit}", "not recorded")
+            if lower_bound and f"observed_{unit}" in measurements:
+                observed = f"at least {observed}"
             details.append(f"{unit}: observed {observed}, limit {limit}")
+    return "; ".join(details)
+
+
+def _inspection_exception_message(row: Mapping[str, object]) -> str:
+    """Describe only vetted parser causes and actual resource measurements."""
+    original_message = str(row.get("message", ""))
+    message = ""
+    diagnostic = sanitize_parser_diagnostic(row.get("parser_diagnostic"))
+    details = _resource_measurement_description(row)
     if details:
-        return f"{message} Measurements: {'; '.join(details)}."
-    if str(row.get("reason_code", "")).endswith("_limit"):
-        return f"{message} Resource measurements not recorded."
-    return message
+        message += f" Measurements: {details}."
+    elif str(row.get("reason_code", "")).endswith("_limit") and (
+        diagnostic is None
+        or (
+            diagnostic["cause"] is ParserCause.RESOURCE_LIMIT
+            and not resource_measurements(diagnostic)
+        )
+    ):
+        message += " Resource measurements not recorded."
+    if diagnostic is not None:
+        message += f" {_PARSER_CAUSE_DESCRIPTIONS[diagnostic['cause']]}"
+        check = diagnostic["check"].replace("_", " ")
+        scope = diagnostic["unchecked_scope"].replace("_", " ")
+        location = (
+            "reported source range"
+            if diagnostic["location_precision"] == "source_span"
+            else "enclosing expression (exact inner location unavailable)"
+        )
+        message += f" Check: {check}; location: {location}; unchecked scope: {scope}."
+        message += (
+            " Relevant parser input fully checked."
+            if diagnostic["full_input_checked"]
+            else " Relevant parser input not fully checked."
+        )
+        measurements = _resource_measurement_description(
+            diagnostic, lower_bound=diagnostic["observed_is_lower_bound"]
+        )
+        if measurements:
+            message += f" Parser measurements: {measurements}."
+    return original_message if original_message.endswith(message) else original_message + message
+
+
+def _inspection_exception_lines(row: Mapping[str, object]) -> tuple[int | None, int | None]:
+    start, end = row.get("start_line"), row.get("end_line")
+    if type(start) is int and start > 0:
+        return start, end if type(end) is int and end >= start else None
+    diagnostic = sanitize_parser_diagnostic(row.get("parser_diagnostic"))
+    return (diagnostic["start_line"], diagnostic["end_line"]) if diagnostic else (None, None)
 
 
 def _clean_text(value: str | None) -> str | None:
@@ -917,6 +979,9 @@ def _build_sarif(
         "notificationRecordLimit": MAX_FINDING_OUTPUT_RECORDS,
         "notificationsTruncated": False,
     }
+    if completeness.get("warnings"):
+        completeness_projection["acceptedByPolicy"] = format_recovery_policy_accepted(completeness)
+        completeness_projection["assessmentComplete"] = False
 
     if completeness.get("exclude_patterns"):
         completeness_projection["excludePatterns"] = completeness["exclude_patterns"]
@@ -947,8 +1012,7 @@ def _build_sarif(
         exception: Mapping[str, object], level: Literal["error", "warning", "note"]
     ) -> SarifNotification:
         path = str(exception.get("path", ""))
-        start_line = exception.get("start_line")
-        end_line = exception.get("end_line")
+        start_line, end_line = _inspection_exception_lines(exception)
         scope = exception.get("scope")
         locations = None
         # A rule-set row's path is a label, not an artifact; giving it a
@@ -985,6 +1049,9 @@ def _build_sarif(
         for key, value in resource_measurements(exception).items():
             prefix, _, unit = key.partition("_")
             properties[prefix + unit.capitalize()] = value
+        diagnostic = sanitize_parser_diagnostic(exception.get("parser_diagnostic"))
+        if diagnostic is not None:
+            properties["parserDiagnostic"] = dict(diagnostic)
         return SarifNotification(
             message=SarifMessage(text=_inspection_exception_message(exception)),
             level=level,
@@ -1097,6 +1164,10 @@ def _render_terminal_completeness(
     table.add_column("Value")
     table.add_row("Execution", "successful" if execution_successful else "failed")
     table.add_row("Status", _terminal_text(completeness.get("status", "complete")))
+    if format_recovery_policy_accepted(completeness):
+        table.add_row(
+            "Formatting policy", "Accepted with warning; AI assessment remains incomplete"
+        )
     dependency_inspection = completeness.get("dependency_inspection")
     if isinstance(dependency_inspection, dict):
         table.add_row("Dependency contents", _terminal_text(dependency_inspection.get("status")))
@@ -1128,8 +1199,7 @@ def _render_terminal_completeness(
                 continue
             # Analyzer status rows name an analyzer rather than a file.
             location = str(row.get("path") or row.get("analyzer_id") or "")
-            start_line = row.get("start_line")
-            end_line = row.get("end_line")
+            start_line, end_line = _inspection_exception_lines(row)
             if isinstance(start_line, int):
                 location += f":{start_line}" + (f"-{end_line}" if end_line else "")
             if row.get("scope") == RULE_SET_SCOPE:
@@ -1141,6 +1211,7 @@ def _render_terminal_completeness(
 
     render_rows("Scope exclusions", completeness.get("scope_exclusions"))
     render_rows("Ledger exceptions", completeness.get("ledger_exceptions"))
+    render_rows("Formatting recovery warnings", completeness.get("warnings"))
     render_rows("Analyzer statuses", completeness.get("analyzer_statuses"))
     limitations = completeness.get("limitations")
     if isinstance(limitations, list) and limitations:
@@ -1614,6 +1685,17 @@ def _format_json(
         "execution_successful": execution_successful,
     }
     data["analysis_completeness"] = dict(analysis_completeness or {})
+    completeness = analysis_completeness or {}
+    recovery_warnings = completeness.get("warnings")
+    if isinstance(recovery_warnings, list) and recovery_warnings:
+        metadata = cast(dict[str, object], data["metadata"])
+        metadata["llm_assessment_complete"] = False
+        metadata["llm_recovery_policy_accepted"] = format_recovery_policy_accepted(completeness)
+        if any(
+            isinstance(warning, Mapping) and warning.get("phase") == "meta"
+            for warning in recovery_warnings
+        ):
+            metadata["meta_analysis_applied"] = False
     return json.dumps(data, indent=2)
 
 
@@ -1650,6 +1732,10 @@ def _render_markdown_completeness(
     lines.append("|--------|-------|")
     lines.append(f"| Execution | {'successful' if execution_successful else 'failed'} |")
     lines.append(f"| Status | {_markdown_cell(completeness.get('status', 'complete'))} |")
+    if format_recovery_policy_accepted(completeness):
+        lines.append(
+            "| Formatting policy | Accepted with warning; AI assessment remains incomplete |"
+        )
     dependency_inspection = completeness.get("dependency_inspection")
     if isinstance(dependency_inspection, dict):
         lines.append(
@@ -1686,8 +1772,7 @@ def _render_markdown_completeness(
                 continue
             # Analyzer status rows name an analyzer rather than a file.
             location = str(row.get("path") or row.get("analyzer_id") or "")
-            start_line = row.get("start_line")
-            end_line = row.get("end_line")
+            start_line, end_line = _inspection_exception_lines(row)
             if isinstance(start_line, int):
                 location += f":{start_line}" + (f"-{end_line}" if end_line else "")
             reason = row.get("reason_code", row.get("status", "status"))
@@ -1703,6 +1788,7 @@ def _render_markdown_completeness(
 
     render_rows("Scope Exclusions", completeness.get("scope_exclusions"))
     render_rows("Ledger Exceptions", completeness.get("ledger_exceptions"))
+    render_rows("Formatting Recovery Warnings", completeness.get("warnings"))
     render_rows("Analyzer Statuses", completeness.get("analyzer_statuses"))
     limitations = completeness.get("limitations")
     if isinstance(limitations, list) and limitations:
@@ -1945,6 +2031,16 @@ def report(state: SkillspectorState) -> dict[str, object]:
         if transitive_limitation not in limitations:
             limitations.append(transitive_limitation)
         analysis_completeness["limitations"] = limitations
+        if analysis_completeness.get("policy_accepted") is True:
+            analysis_completeness["policy_accepted"] = False
+            raw_warnings = analysis_completeness.get("warnings")
+            if isinstance(raw_warnings, list):
+                analysis_completeness["warnings"] = [
+                    {**warning, "accepted_by_policy": False}
+                    if isinstance(warning, Mapping)
+                    else warning
+                    for warning in raw_warnings
+                ]
         analysis_completeness["is_complete"] = False
         if analysis_completeness.get("status", "complete") in {
             "complete",
@@ -2001,6 +2097,11 @@ def report(state: SkillspectorState) -> dict[str, object]:
         degraded_notice = (
             "LLM analysis was requested but semantic runtime telemetry was incomplete; "
             "results may reflect static analysis only."
+        )
+    if format_recovery_policy_accepted(analysis_completeness):
+        degraded_notice = (
+            "The full AI assessment could not be verified after formatting recovery. "
+            "The scan is accepted with a warning by policy; known findings remain."
         )
     if unavailable_before_execution:
         logger.warning(
@@ -2064,6 +2165,19 @@ def report(state: SkillspectorState) -> dict[str, object]:
         or transitive_truncation_reasons
     ) and risk_recommendation == "SAFE":
         risk_recommendation = "CAUTION"
+
+    raw_exceptions = analysis_completeness.get("ledger_exceptions")
+    if isinstance(raw_exceptions, list):
+        analysis_completeness = {
+            **analysis_completeness,
+            "ledger_exceptions": [
+                {**row, "message": _inspection_exception_message(row)}
+                if isinstance(row, Mapping)
+                and sanitize_parser_diagnostic(row.get("parser_diagnostic")) is not None
+                else row
+                for row in raw_exceptions
+            ],
+        }
 
     sarif_report = _build_sarif(
         reported_findings,
