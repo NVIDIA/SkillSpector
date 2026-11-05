@@ -4366,6 +4366,8 @@ def _shell_redefines_command(
                 return True
             if _SHELL_ASSIGNMENT_PREFIX_RE.match(source, word_start):
                 continue
+            if command == "xargs" and word is not None:
+                invoked.add(word)
             if wrapper is not None:
                 if word == "--" or (wrapper == "command" and word == "-p"):
                     continue
@@ -4373,8 +4375,6 @@ def _shell_redefines_command(
                     break
                 wrapper = None
             if word in {"command", "builtin"}:
-                if command == "xargs":
-                    invoked.add(word)
                 wrapper = word
                 continue
             if word in _SHELL_CLAUSE_PREFIX_WORDS or word in {"if", "while", "until"}:
@@ -4385,8 +4385,6 @@ def _shell_redefines_command(
                     for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
                 ):
                     return True
-                if word is not None:
-                    invoked.add(word)
                 if word == "hash":
                     return True
             if command == "xargs" and word == "trap":
