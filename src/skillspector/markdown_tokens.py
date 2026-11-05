@@ -58,8 +58,12 @@ def _quoted_list_spans(content: str) -> QuotedListSpans | None:
             ancestors.pop()
         elif (
             block.type == "inline"
-            and "paragraph_open" in ancestors
-            and ("blockquote_open" in ancestors or "list_item_open" in ancestors)
+            and (
+                "blockquote_open" in ancestors
+                and "list_item_open" in ancestors
+                or "paragraph_open" in ancestors
+                and ("blockquote_open" in ancestors or "list_item_open" in ancestors)
+            )
             and block.map is not None
         ):
             start, end = block.map

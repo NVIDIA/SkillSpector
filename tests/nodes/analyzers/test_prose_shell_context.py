@@ -155,6 +155,17 @@ def test_native_quote_paragraph_recovers_an_established_prose_boundary(monkeypat
     assert tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown") is None
 
 
+def test_existing_quoted_list_heading_keeps_its_native_inline_ownership():
+    from skillspector.markdown_tokens import quoted_list_spans
+
+    content = "> - ### Read `guide.md` from the reader's guide.\n\n" + _OBSERVATIONS
+    spans = quoted_list_spans(content, lambda: None)
+    assert spans is not None
+    start = content.index("`guide.md`")
+    assert (start, start + 1, start + 9, start + 10) in spans.code
+    assert tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown") is None
+
+
 @pytest.mark.parametrize("quote", ["'", '"'])
 @pytest.mark.parametrize("container", ["> ", "1. "])
 def test_native_container_cannot_steal_an_enclosing_shell_quote(quote, container):
