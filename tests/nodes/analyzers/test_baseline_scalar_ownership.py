@@ -62,6 +62,38 @@ def test_valid_fingerprints_reuse_canonical_schema_constraints() -> None:
     assert baseline_rule_scalar_roles(source.replace("a" * 64, "invalid"), lambda: None) == {}
 
 
+def _fingerprint_only() -> str:
+    return (
+        'version: 2\nscanner_version: "1.2.3"\nfingerprints:\n- hash: "sha256:'
+        + "a" * 64
+        + '"\n  rule_id: TM1\n  file: "; sudo"\n  reason: "Reviewed evidence."\n'
+    )
+
+
+def test_fingerprint_only_document_owns_matching_metadata() -> None:
+    source = _fingerprint_only()
+    assert len(baseline_rule_scalar_roles(source, lambda: None)) == 3
+    assert _result(source)["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda s: s.replace('scanner_version: "1.2.3"\n', ""),
+        lambda s: s.replace("a" * 64, "invalid"),
+        lambda s: s.replace('- hash: "sha256:' + "a" * 64 + '"\n', "- other: value\n"),
+        lambda s: s.replace('  reason: "Reviewed evidence."\n', ""),
+        lambda s: s.replace("version: 2", "version: 1"),
+    ],
+)
+def test_invalid_fingerprint_only_document_keeps_real_fallback_failure(change) -> None:
+    original = _fingerprint_only()
+    source = change(original)
+    assert source != original
+    assert baseline_rule_scalar_roles(source, lambda: None) == {}
+    assert _result(source)["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+
+
 @pytest.mark.parametrize(
     "change",
     [

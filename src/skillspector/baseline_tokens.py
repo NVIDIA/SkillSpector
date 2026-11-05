@@ -48,7 +48,11 @@ def baseline_rule_scalar_roles(content: str, check_runtime: Callable[[], None]) 
     try:
         node = loader.get_single_node()
         fields = _mapping(node)
-        if fields is None or not {"version", "rules"} <= fields.keys():
+        if (
+            fields is None
+            or "version" not in fields
+            or not {"rules", "fingerprints"} & fields.keys()
+        ):
             return {}
         if not fields.keys() <= {"version", "rules", "fingerprints", "scanner_version"}:
             return {}
