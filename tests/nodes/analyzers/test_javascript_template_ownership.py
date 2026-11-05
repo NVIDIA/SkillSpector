@@ -1132,3 +1132,15 @@ def test_direct_primitive_string_can_prove_its_matching_regex_boundaries():
     javascript_template_spans(source, lambda: None, regex_literals=regexes)
     start = source.index("/`label")
     assert regexes == [(start, start + len("/`label/"))]
+
+
+def test_with_scope_cannot_borrow_a_top_level_primitive_string_binding(monkeypatch):
+    source = "const text='safe'; with (runtimeScope) { text.match(/`$TOOL -rf \\//); }"
+    regexes = []
+    javascript_template_spans(source, lambda: None, regex_literals=regexes)
+    assert regexes == []
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is not None
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") == before

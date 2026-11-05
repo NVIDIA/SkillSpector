@@ -1649,6 +1649,8 @@ def _plain_regex_value_spans(
     }
     for node in program.nodes:
         check_runtime()
+        if node.type == "with_statement":
+            return []
         if node.type in {
             "identifier",
             "shorthand_property_identifier",
