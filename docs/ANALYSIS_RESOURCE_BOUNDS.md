@@ -59,8 +59,9 @@ overhead or decoded Unicode storage occupies exactly the same amount of memory.
 Files larger than 16 MiB receive a bounded local projection and a `partial` inventory disposition.
 They are not sent to an external model. Lexical static analysis uses 256,000-character windows with
 an 8,192-character overlap. Unicode-derived security views are re-sliced to the same ceiling before
-pattern modules receive them. Whole-file Python AST analysis is limited to 1,000,000 characters, and
-the shared parsed-AST cache retains at most 8,000,000 source characters per scan.
+pattern modules receive them. Whole-file Python AST analysis defaults to 1,000,000 characters;
+`SKILLSPECTOR_MAX_PYTHON_AST_SOURCE_CHARS` sets its bounded per-file ceiling. The shared parsed-AST
+cache retains at most 8,000,000 source characters per scan.
 
 ## Nested containers
 
@@ -301,7 +302,7 @@ removes the rejected partial checkout.
 
 | Resource | Ceiling | Scope |
 |---|---:|---|
-| Inspection-ledger events | 10,000 | One graph execution |
+| Inspection-ledger events | 100,000 (configurable) | One graph execution |
 | Build-context ledger events | 10,000 | One bundle context |
 | Static findings | 10,000 | One artifact |
 | Static findings | 10,000 | One analyzer |

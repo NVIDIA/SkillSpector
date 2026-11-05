@@ -106,7 +106,10 @@ def test_capacity_settings_are_bound_on_import(
     assert json.loads(result.stdout) == expected
 
 
-def test_ordinary_multi_analyzer_work_keeps_more_than_ten_thousand_rows() -> None:
+def test_ordinary_multi_analyzer_work_keeps_more_than_ten_thousand_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(state, "MAX_INSPECTION_LEDGER_EVENTS", 100_000)
     rows = [
         ledger_event(outcome=LedgerOutcome.COMPLETED, phase="static", path=f"file-{i}.txt")
         for i in range(10_001)
@@ -138,7 +141,10 @@ def _archive(members: int) -> bytes:
     return buffer.getvalue()
 
 
-def test_archive_default_admits_more_than_one_thousand_small_members(tmp_path: Path) -> None:
+def test_archive_default_admits_more_than_one_thousand_small_members(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(nested_artifacts, "ARCHIVE_MAX_MEMBERS", 4096)
     data = _archive(1025)
     result = nested_artifacts.inspect_nested_artifacts(
         tmp_path,

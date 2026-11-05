@@ -66,14 +66,14 @@ smaller remaining artifact or byte allowance, and its deadline always takes prec
 | Bound | Limit | Scope |
 |---|---:|---|
 | Container depth | 3 | One outer-to-inner provenance chain |
-| Members | 1,000 | All outer and recursively nested containers combined |
+| Members | 4,096 (configurable) | All outer and recursively nested containers combined |
 | Expanded member bytes | 25 MiB | All outer and recursively nested containers combined |
 | Central directory | 4 MiB | Each container, checked before creating ZIP metadata objects |
 | Materialized member | 1,000,000 bytes | Each member |
 | Compression ratio | 100:1 | Each member |
 | Inspection wall time | 5 seconds | All outer and recursively nested containers combined |
 
-The 1,000-member and 25 MiB ceilings are also reduced to the bundle scanner's remaining
+The configured member ceiling and 25 MiB ceiling are also reduced to the bundle scanner's remaining
 10,000-artifact and 64 MiB canonical-byte budgets. Nested members therefore cannot obtain a fresh
 allowance after ordinary files have consumed part of the bundle budget.
 
