@@ -3414,7 +3414,11 @@ def _has_shell_command_word_exhaustion(
             continue
         if start in owned_word_positions:
             continue
-        if javascript_source is not None and javascript_source.owns(start):
+        if javascript_source is not None and (
+            javascript_source.owns(start) or javascript_source.regex_literal_end(start) is not None
+        ):
+            # Proven native matching patterns have no shell-word semantics.
+            # This candidate owns no later host code or raw finding input.
             continue
         if powershell is not None and powershell.owns(start):
             continue
@@ -3507,13 +3511,6 @@ def _has_shell_command_word_exhaustion(
             quoted_printf_allowed=quoted_printf_allowed,
             diagnostics=word_diagnostics,
         )
-        regex_end = (
-            javascript_source.regex_literal_end(start) if javascript_source is not None else None
-        )
-        if regex_end is not None and (parsed is None or parsed.limited or parsed.end > regex_end):
-            # RegExp backticks belong to matching syntax; a failed shell read
-            # cannot acquire ownership of later JavaScript through them.
-            continue
         if parsed is None:
             substitution_start = (
                 start + 1

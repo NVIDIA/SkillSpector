@@ -1705,11 +1705,14 @@ def _plain_regex_value_spans(
         call = None if arguments is None else arguments.parent
         member = None if call is None else call.child_by_field_name("function")
         receiver = None if member is None else member.child_by_field_name("object")
+        previous = node.prev_named_sibling
+        while previous is not None and previous.type == "comment":
+            check_runtime()
+            previous = previous.prev_named_sibling
         if (
             arguments is not None
             and arguments.type == "arguments"
-            and arguments.named_children
-            and arguments.named_children[0] == node
+            and previous is None
             and call is not None
             and call.type == "call_expression"
             and member is not None

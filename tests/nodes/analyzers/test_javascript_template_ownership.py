@@ -993,14 +993,16 @@ def test_regex_origin_keeps_later_executable_limits_and_raw_findings():
     assert any(f.rule_id == "TM1" for f in tm.analyze(high, "example.mjs", "javascript"))
 
 
-def test_regex_origin_keeps_later_overbudget_executable_word(monkeypatch):
-    source = _JS_REGEX_BOUNDARY_SOURCE + "exec(`" + "a" * 5000 + "`);"
+def test_regex_origin_keeps_later_overbudget_host_word(monkeypatch):
+    source = _JS_REGEX_BOUNDARY_SOURCE + "r" * (tm._SHELL_COMMAND_WORD_CHARS + 1) + ";\n"
     with monkeypatch.context() as baseline:
         baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
         before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
     after = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
     assert before is not None
-    assert after == before
+    assert after is not None
+    assert after.cause is tm.ParserCause.RESOURCE_LIMIT
+    assert after.start >= len(_JS_REGEX_BOUNDARY_SOURCE)
 
 
 @pytest.mark.parametrize(
@@ -1083,3 +1085,45 @@ def test_quoted_backtick_data_keeps_the_no_regex_execution_fast_path(monkeypatch
         is None
     )
     assert regexes == []
+
+
+def test_native_matching_pattern_dollars_are_data_not_runtime_commands(monkeypatch):
+    source = "'safe'.match(/`$TOOL -rf \\//);"
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is not None
+    assert before.cause is tm.ParserCause.RUNTIME_DEPENDENT
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is None
+
+
+@pytest.mark.parametrize("comment", ["/* pattern */ ", "// pattern\n", "/* first */ /* second */ "])
+def test_first_regex_argument_can_follow_native_comments(comment, monkeypatch):
+    source = _JS_REGEX_BOUNDARY_SOURCE.replace("text.match(", "text.match(" + comment)
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is not None
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is None
+
+
+def test_comments_do_not_make_a_second_argument_a_matching_pattern(monkeypatch):
+    source = _JS_REGEX_BOUNDARY_SOURCE.replace(
+        "text.match(", "text.match(unresolved, /* pattern */ "
+    )
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is not None
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") == before
+
+
+def test_native_pattern_boundaries_cannot_hide_a_later_dynamic_consumer():
+    source = "'safe'.match(/`$TOOL -rf \\//);\nexec(`${tool} -rf /`);"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert diagnostic is not None
+    assert diagnostic.cause is tm.ParserCause.RUNTIME_DEPENDENT
+    assert any(
+        f.rule_id == "TM1"
+        for f in tm.analyze(source + "exec('rm -rf /');", "control.mjs", "javascript")
+    )
