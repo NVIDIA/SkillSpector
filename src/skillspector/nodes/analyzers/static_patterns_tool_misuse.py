@@ -4306,7 +4306,10 @@ def _shell_redefines_command(
     """Do not widen builtin evaluation across an explicit local replacement."""
     work = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
     for start in _nonempty_shell_clause_starts(
-        content, check_runtime, shell_substitutions=shell_substitutions
+        content,
+        check_runtime,
+        shell_substitutions=shell_substitutions,
+        backtick_starts=set() if shell_substitutions else None,
     ):
         check_runtime()
         source = content[start : start + _ROOT_GLOB_COMMAND_CHARS + 1]
