@@ -70,7 +70,7 @@ _CASES = [
     [
         "Read `guide.md` for the interface.\nThe runner's manifest identifies the source.\n",
         "- Read `guide.md` for the interface.\n  The runner's manifest identifies the source.\n",
-        'Read the reader\'s "documented behavior" for the interface.\nThe runner\'s manifest identifies the source.\n',
+        "Read the reader's \"documented behavior\" for the interface.\nThe runner's manifest identifies the source.\n",
         "Read \\` literally and `guide.md` for the interface.\nThe runner's manifest identifies the source.\n",
         "| Topic | Description |\n| --- | --- |\n| Memory | The engine's limit applies. |\n",
         "| Topic | Description |\n| --- | --- |\n| Memory | The engine's limit and runner's settings don't conflict. |\n",
