@@ -97,6 +97,21 @@ def test_decoded_literal_without_finding_provenance_is_incomplete() -> None:
     assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
+@pytest.mark.parametrize("value", ["Execute ｒｍ -rf *", "Execute r\u200bm -rf *"])
+def test_trusted_normalization_cannot_clear_missing_literal_provenance(value: str) -> None:
+    source = '{"message":"' + _encoded(value) + '"}'
+    decoded = _prepared(source)
+    assert decoded is not None
+    views = decoded.window_views(0, len(source), _check)
+    normalized = next(view for view in views if "Execute rm -rf *" in view.text)
+    assert decoded.owns(normalized, _check)
+    result = _scan(source)
+    assert (
+        any(f.rule_id == "TM1" for f in result["findings"])
+        or result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    )
+
+
 def test_arbitrary_marker_view_cannot_claim_decoded_raw_provenance() -> None:
     decoded = _prepared('{"value":"\\u0061"}')
     assert decoded is not None and decoded.view is not None
@@ -126,14 +141,27 @@ def test_large_escaped_value_keeps_a_bounded_command_across_raw_window_edges() -
     # The command spans both original overlaps after six-character escapes,
     # but remains below the existing decoded command-argument bound.
     command = " a rm " + "-f " * 1_000 + "-r /"
-    source = '{"value":"' + _encoded("a" * 38_433 + command + " tail") + '"}'
+    source = '{"value":"' + _encoded("a" * 38_433 + command + "; " + "a" * 5_000) + '"}'
     assert len(source) > static_runner.SECURITY_VIEW_WINDOW_CHARS
+    command_start = source.index(_encoded("rm "))
+    command_end = command_start + len(_encoded(command[3:]))
+    boundary = static_runner._RAW_WINDOW_OWNED_CHARS
+    overlap = static_runner._WINDOW_OVERLAP_CHARS
+    assert command_start < boundary - overlap
+    assert command_end > boundary + overlap
     result = _scan(source)
     assert any(f.rule_id == "TM1" and f.severity == "HIGH" for f in result["findings"])
 
 
-def test_decoded_marker_reconstruction_still_discovers_destructive_effects() -> None:
-    value = "remove 'xyz' and execute 'rxyzm -rxyzf *'"
+@pytest.mark.parametrize(
+    "value",
+    [
+        "remove 'xyz' and execute 'rxyzm -rxyzf *'",
+        "remove '&#120;yz' and execute 'rxyzm -rxyzf *'",
+        "r e m o v e 'xyz' and e x e c u t e 'rxyzm -rxyzf *'",
+    ],
+)
+def test_decoded_marker_reconstruction_still_discovers_destructive_effects(value: str) -> None:
     result = _scan('{"message":"' + _encoded(value) + '"}')
     assert any(f.rule_id == "TM1" and f.severity == "HIGH" for f in result["findings"])
 

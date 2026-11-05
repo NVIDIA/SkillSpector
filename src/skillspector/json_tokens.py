@@ -38,22 +38,32 @@ class JSONDecodedSource:
     def owns(self, view: SecurityTextView, check_runtime: Callable[[], None]) -> bool:
         """Require exact decoded-source provenance, not a caller-supplied name."""
         canonical = self.view
-        if canonical is None or view.name != "json-decoded-raw" or not view.text:
+        if canonical is None or not view.name.startswith("json-decoded-") or not view.text:
             return False
-        offsets = canonical.source_offsets
-        assert offsets is not None
+        offsets, ends = canonical.source_offsets, canonical.source_end_offsets
+        assert offsets is not None and ends is not None
         begin = bisect_left(offsets, view.source_offset(0))
-        end = begin + len(view.text)
-        if canonical.text[begin:end] != view.text:
+        end = bisect_right(ends, view.source_end_offset(len(view.text) - 1))
+        if begin >= end:
             return False
-        for index in range(len(view.text)):
-            if index % 1024 == 0:
-                check_runtime()
-            if view.source_offset(index) != canonical.source_offset(
-                begin + index
-            ) or view.source_end_offset(index) != canonical.source_end_offset(begin + index):
-                return False
-        return True
+        # Prove the exact trusted transformation over this canonical interval.
+        # Marker removal and renamed views cannot borrow ownership, while
+        # normalized/compact commands retain their finding-provenance check.
+        for expected in security_text_views(canonical.text[begin:end], check_runtime):
+            if view.name != "json-decoded-" + expected.name or view.text != expected.text:
+                continue
+            for index in range(len(view.text)):
+                if index % 1024 == 0:
+                    check_runtime()
+                left = begin + expected.source_offset(index)
+                right = begin + expected.source_end_offset(index) - 1
+                if view.source_offset(index) != canonical.source_offset(
+                    left
+                ) or view.source_end_offset(index) != canonical.source_end_offset(right):
+                    break
+            else:
+                return True
+        return False
 
     def window_views(
         self,
