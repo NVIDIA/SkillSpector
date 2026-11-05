@@ -156,6 +156,18 @@ _SC3_SUBSTITUTION_EXECUTOR = (
     r"(?:[ \t]{1,16}-{1,2}[A-Za-z]{0,16}){0,2}(?:[ \t]{1,16}/dev/stdin)?"
     r"[ \t]{1,16}(?:<<<[ \t]{0,16}\\?[\"']?(?:\$\(|`)|<(?:[ \t]{0,16}<)?\())"
 )
+# bash -c "$(curl ...)", bash <(curl ...), eval "$(wget ...)": the same
+# fetch-and-run as a pipe to sh, with no pipe for the patterns above. The fetch
+# must be a command: it starts the substitution, possibly on a later line, or
+# follows a command separator, and quoted words are skipped whole, so
+# `printf 'curl ...'` is not a fetch. The match ends with the fetch command, so
+# a URL in a later command cannot mark the download as trusted.
+_SC2_SUBSTITUTION_FETCH = (
+    rf"{_SC3_SUBSTITUTION_EXECUTOR}"
+    r"(?:(?:[^()`'\"]|'[^'()`]*'|\"[^\"()`]*\"){0,256}?[;&|\r\n\v\f\x1c-\x1e\x85  ])?"
+    r"[\s\\]{0,64}(?:sudo\s+)?(?:curl|wget)\s+"
+    r"[^)`;&|\r\n\v\f\x1c-\x1e\x85  ]{0,256}"
+)
 SC2_CODE_PATTERNS = [
     (r"curl\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh", 0.9),
     (r"wget\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh", 0.9),
@@ -168,9 +180,7 @@ SC2_CODE_PATTERNS = [
     (r"eval\s*\(\s*(?:await\s+)?fetch\s*\(", 0.9),
     (r"new\s+Function\s*\([^)]*fetch\s*\(", 0.9),
     (r"subprocess\.[^(]+\([^)]*(?:curl|wget)\s+https?://", 0.8),
-    # bash -c "$(curl ...)", bash <(curl ...), eval "$(wget ...)": the same
-    # fetch-and-run as a pipe to sh, with no pipe for the patterns above
-    (rf"{_SC3_SUBSTITUTION_EXECUTOR}[^()`\n]{{0,256}}?\b(?:curl|wget)\s+[^)`\n]{{0,256}}", 0.9),
+    (_SC2_SUBSTITUTION_FETCH, 0.9),
 ]
 SC2_PROSE_PATTERNS = [
     (r"download\s+and\s+(?:run|execute)\s+(?:the\s+)?script", 0.7),
