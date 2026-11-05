@@ -132,6 +132,14 @@ def test_make_function_does_not_hide_a_separate_marker_instruction():
     )
 
 
+def test_shell_substitution_keeps_its_unresolved_execution_coverage():
+    result = _scan("command.sh", '#!/bin/sh\nvalue="$(strip $(PROFILE))"\n', threats=True)
+    assert any(
+        row.get("reason_code") is LedgerReason.STATIC_PARSE_LIMIT
+        for row in result["inspection_ledger"]
+    )
+
+
 @pytest.mark.parametrize(
     "tag",
     [
