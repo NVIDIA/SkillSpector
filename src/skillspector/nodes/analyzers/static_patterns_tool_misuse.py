@@ -4748,7 +4748,10 @@ def _command_string_from_clause(
             return failed() if wrapper_seen else (False, None)
         if word is None:
             return False, None
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word, re.DOTALL) is not None:
+        if (
+            _SHELL_ASSIGNMENT_PREFIX_RE.match(content, last_word_start) is not None
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word, re.DOTALL) is not None
+        ):
             observe_assignment(word)
             continue
         command = word.casefold().rsplit("/", 1)[-1]

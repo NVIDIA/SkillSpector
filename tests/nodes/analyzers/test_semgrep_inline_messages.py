@@ -42,6 +42,8 @@ def _scan(message: str, *, encoded: bool = False) -> dict:
         "A matching value `\"literal sh -c '$PAYLOAD -rf /' tail\"` is displayed.",
         "An example `$(...)` then display \"literal sh -c '$PAYLOAD -rf /' tail\".",
         "A matching value `'literal sh -c \"$PAYLOAD\" tail'` is displayed.",
+        "An example `$(...)`; printf '%s' 'BASH_ENV=x'; bash -c 'echo safe'.",
+        'An example `$(...)` then display "BASH_ENV=literal" as data; bash -c "printf done".',
     ],
 )
 def test_exact_owned_inline_body_refines_the_false_backtick_runtime_reading(message: str) -> None:
@@ -65,6 +67,7 @@ def test_exact_owned_inline_body_refines_the_false_backtick_runtime_reading(mess
         'An example `$(...)` then run env BASH_ENV="$STARTUP" sh -c "echo safe".',
         'An example `$(...)` then export BASH_ENV="$STARTUP"; bash -c "echo safe".',
         'An example `$(...)` then BASH_ENV="$STARTUP"; bash -c "echo safe".',
+        "An example `$(...)` then env 'BASH_ENV=$STARTUP' bash -c 'echo safe'.",
         'An example `$(...)`; later sh -c `printf %s "$PAYLOAD"`.',
         "Run sh -c 'echo `$(...)`'.",
         'Run sh -c "echo `$(...)`".',
