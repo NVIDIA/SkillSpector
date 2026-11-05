@@ -623,6 +623,7 @@ def _virtual_type(
     suffix = Path(path).suffix.lower()
     return {
         ".md": "markdown",
+        ".mdc": "markdown",
         ".markdown": "markdown",
         ".py": "python",
         ".pyw": "python",
