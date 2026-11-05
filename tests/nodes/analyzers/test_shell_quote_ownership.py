@@ -1390,6 +1390,10 @@ def test_startup_names_in_non_setter_operands_do_not_taint_child(prefix: str) ->
     [
         'xargs() { delegate "$@"; }',
         'xargs ()\n{ delegate "$@"; }',
+        'xargs()\n\n{ delegate "$@"; }',
+        'xargs() # documented helper\n{ delegate "$@"; }',
+        "xargs()" + (" " * 300) + '{ delegate "$@"; }',
+        "xargs" + (" " * 300) + '() { delegate "$@"; }',
         'function xargs { delegate "$@"; }',
         'function xargs() { delegate "$@"; }',
         "'xargs'() { delegate; }",
@@ -1469,3 +1473,28 @@ def test_redirected_xargs_keeps_unknown_startup_bindings_incomplete(ending):
     assert recognized
     assert body is None
     assert diagnostics
+
+
+def test_repeated_redirected_xargs_proves_each_source_scope_once(monkeypatch):
+    original = tm._xargs_has_source_override
+    seen = []
+
+    def counted(content, check_runtime):
+        seen.append(content)
+        return original(content, check_runtime)
+
+    monkeypatch.setattr(tm, "_xargs_has_source_override", counted)
+    source = 'xargs <<< "$VALUE"\n' * 30
+    list(tm._shell_command_strings(source, lambda: None))
+    assert seen == [source]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'printf "%s" "$(xargs() { delegate; }; xargs <<< \'value\')"',
+        'printf "%s" "`xargs() { delegate; }; xargs <<< \'value\'`"',
+    ],
+)
+def test_xargs_binding_proof_includes_executable_substitutions(source):
+    assert tm._xargs_has_source_override(source, lambda: None)

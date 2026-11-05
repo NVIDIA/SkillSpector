@@ -3905,9 +3905,12 @@ def _shell_command_strings(
         startup_diagnostics = []
     substitution_scopes: list[int] = []
     backtick_starts: set[int] = set()
-    scoped_startup: list[tuple[int, list[bool], list[StaticParserDiagnostic], int, str]] = []
+    scoped_startup: list[
+        tuple[int, list[bool], list[StaticParserDiagnostic], int, str, list[bool | None]]
+    ] = []
     startup_work_limit = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
     startup_work = [startup_work_limit]
+    xargs_override_cache: list[bool | None] = [None]
     clause_starts = (
         powershell.clause_starts
         if powershell is not None
@@ -3937,7 +3940,7 @@ def _shell_command_strings(
             body_start = clause_start if content[scope - 1] == "`" else 0
             body = content[body_start : scope - 1] if body_start else content
             scoped_startup.append(
-                (scope, [inherited[0]], list(inherited_diagnostics), body_start, body)
+                (scope, [inherited[0]], list(inherited_diagnostics), body_start, body, [None])
             )
         startup_context = scoped_startup[-1][1] if scoped_startup else startup_exposure
         context_diagnostics = scoped_startup[-1][2] if scoped_startup else startup_diagnostics
@@ -3964,7 +3967,8 @@ def _shell_command_strings(
                 )
                 return
             continue
-        body_start, body = scoped_startup[-1][3:] if scoped_startup else (0, content)
+        body_start, body = scoped_startup[-1][3:5] if scoped_startup else (0, content)
+        xargs_bindings = scoped_startup[-1][5] if scoped_startup else xargs_override_cache
         if not startup_context[0]:
             local_diagnostics: list[StaticParserDiagnostic] = []
             startup_context[0] = _shell_clause_sets_startup(
@@ -4014,6 +4018,7 @@ def _shell_command_strings(
             diagnostics=diagnostics,
             source_span=source_span,
             literal_command_spans=literal_spans,
+            xargs_override_cache=xargs_bindings,
         )
         if nested_substitutions and startup_exposure[0]:
             # Quoted substitutions can launch shells outside this clause walk.
@@ -4640,7 +4645,7 @@ def _eval_command_string(
 
 def _xargs_has_source_override(content: str, check_runtime: Callable[[], None]) -> bool:
     """Require the external utility before granting its redirected-data proof."""
-    for start in _nonempty_shell_clause_starts(content, check_runtime, shell_substitutions=False):
+    for start in _nonempty_shell_clause_starts(content, check_runtime):
         word, cursor, limited = _next_shell_invocation_word(content, start, check_runtime)
         if limited:
             return True
@@ -4650,8 +4655,13 @@ def _xargs_has_source_override(content: str, check_runtime: Callable[[], None]) 
             name, _, limited = _next_shell_invocation_word(content, cursor, check_runtime)
             if limited or name == "xargs":
                 return True
-        elif word == "xargs" and _SHELL_FUNCTION_BODY_RE.match(content[cursor : cursor + 256]):
-            return True
+        elif word == "xargs":
+            following, position, limited = _next_shell_invocation_word(
+                content, cursor, check_runtime
+            )
+            if limited or following is None and content[position : position + 1] == "(":
+                # A signature can precede arbitrarily distant body trivia.
+                return True
         elif word == "alias":
             for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
                 gap = cursor
@@ -4688,6 +4698,7 @@ def _command_string_from_clause(
     starts_shell: list[bool] | None = None,
     diagnostics: list[StaticParserDiagnostic] | None = None,
     source_span: list[int] | None = None,
+    xargs_override_cache: list[bool | None] | None = None,
 ) -> tuple[bool, str | None]:
     """Resolve a bounded wrapper chain to an ``eval`` or shell command string."""
     cursor = start
@@ -4696,6 +4707,15 @@ def _command_string_from_clause(
     last_word_start = start
     word_start = [start]
     xargs_replacements: set[str] = set()
+    if xargs_override_cache is None:
+        xargs_override_cache = [None]
+
+    def external_xargs_proved() -> bool:
+        if startup_exposure is not None and startup_exposure[0]:
+            return False
+        if xargs_override_cache[0] is None:
+            xargs_override_cache[0] = _xargs_has_source_override(content, check_runtime)
+        return not xargs_override_cache[0]
 
     def failed(
         cause: ParserCause = ParserCause.UNSUPPORTED_SYNTAX,
@@ -5003,11 +5023,7 @@ def _command_string_from_clause(
                         xargs_redirected = True
                         continue
                     if xargs_redirected and cursor < len(content) and content[cursor] in "\r\n":
-                        if (
-                            startup_exposure is not None
-                            and startup_exposure[0]
-                            or _xargs_has_source_override(content, check_runtime)
-                        ):
+                        if not external_xargs_proved():
                             return failed(ParserCause.RUNTIME_DEPENDENT)
                         # Without an explicit utility xargs prints its input.
                         # A following physical command is a separate clause.
@@ -5022,11 +5038,7 @@ def _command_string_from_clause(
                         if xargs_redirected and content[cursor : cursor + 1] == "|":
                             # A pipeline may load the printed input as code.
                             return failed(ParserCause.RUNTIME_DEPENDENT)
-                        if xargs_redirected and (
-                            startup_exposure is not None
-                            and startup_exposure[0]
-                            or _xargs_has_source_override(content, check_runtime)
-                        ):
+                        if xargs_redirected and not external_xargs_proved():
                             return failed(ParserCause.RUNTIME_DEPENDENT)
                     return (
                         (False, None)
