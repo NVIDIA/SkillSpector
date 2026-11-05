@@ -1068,3 +1068,18 @@ def test_with_scope_cannot_borrow_a_top_level_primitive_string_binding(monkeypat
         before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
     assert before is not None
     assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") == before
+
+
+def test_quoted_backtick_data_keeps_the_no_regex_execution_fast_path(monkeypatch):
+    from skillspector import javascript_tokens
+
+    def must_not_analyze_execution(*args):
+        raise AssertionError("ordinary quoted data needs no regex execution proof")
+
+    monkeypatch.setattr(javascript_tokens, "_has_shell_execution_call", must_not_analyze_execution)
+    regexes = []
+    assert (
+        javascript_template_spans("const label='`name`';", lambda: None, regex_literals=regexes)
+        is None
+    )
+    assert regexes == []

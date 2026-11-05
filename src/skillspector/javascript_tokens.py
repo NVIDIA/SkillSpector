@@ -1516,7 +1516,7 @@ def javascript_template_spans(
             unresolved_executables.append(content.index("`"))
         return None
     executable = None
-    if regex_literals is not None:
+    if regex_literals is not None and any(node.type == "regex" for node in program.nodes):
         # A lexical boundary cannot replace unresolved behavior. Apply the
         # existing execution barrier even when the source has no templates.
         executable = _has_shell_execution_call(program, check_runtime)
