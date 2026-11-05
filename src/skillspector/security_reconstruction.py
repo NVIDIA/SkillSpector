@@ -794,7 +794,9 @@ def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) ->
             continue
         opening = _JSON_FENCE_OPEN_RE.fullmatch(body)
         if opening and not (opening[1][0] == "`" and "`" in opening[2]):
-            last_quote = max((i for i, entry in enumerate(context) if entry[0] == "quote"), default=-1)
+            last_quote = max(
+                (i for i, entry in enumerate(context) if entry[0] == "quote"), default=-1
+            )
             fence = opening[1][0], len(opening[1]), context, last_quote
         else:
             opener: re.Match[str] | None = None
@@ -846,6 +848,7 @@ class StructuredStringClosers:
                 if node.type in {"string", "template_string"}
             }
         if self._file_type == "json":
+
             def reject_constant(value: str) -> None:
                 raise ValueError(value)
 
