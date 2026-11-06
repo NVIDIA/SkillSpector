@@ -44,7 +44,13 @@ from skillspector.state import (
     transitive_remaining_seconds,
 )
 
+from .canonical_sink import (
+    canonical_sibling_method,
+    canonical_sibling_sink,
+    resolve_to_canonical_sink,
+)
 from .common import (
+    build_type_map,
     get_complete_source_segment,
     get_context_from_lines,
     resolve_call_name,
@@ -419,6 +425,41 @@ def _reflective_module_dict_base(node: ast.Subscript, aliases: dict[str, str]) -
     return _reflective_module_dict_container(node.value, aliases)
 
 
+def _covered_by_ast9(node: ast.Call, aliases: dict[str, str]) -> bool:
+    """True when the callee of *node* is a reflective read that AST9 already reports.
+
+    AST9 fires on the reflective *read* of an allowlisted name
+    (:data:`_DANGEROUS_GETATTR_NAMES`) in three spellings: ``getattr(obj, "<name>")``
+    (including constant-joined names), ``<module>.__dict__["<name>"]`` /
+    ``vars(<module>)["<name>"]``, and the ``.get`` / ``.setdefault`` / ``.pop`` reads of
+    the same namespaces. When *node* invokes one of those reads, the canonical-sink
+    fallback must stay silent so one expression yields one sink finding; it then owns
+    only the spellings AST9 does not report (``__builtins__["exec"]``, an un-imported
+    ``vars(builtins)``, and getattr targets outside the allowlist such as
+    ``getattr(subprocess, "Popen")``).
+    """
+    callee = node.func
+    if isinstance(callee, ast.Subscript):
+        if _reflective_module_dict_base(callee, aliases) is None:
+            return False
+        key = callee.slice
+        return isinstance(key, ast.Constant) and key.value in _DANGEROUS_GETATTR_NAMES
+    if not (isinstance(callee, ast.Call) and len(callee.args) >= 1):
+        return False
+    if isinstance(callee.func, ast.Name) and callee.func.id == "getattr":
+        return len(callee.args) >= 2 and (
+            _constant_string(callee.args[1]) in _DANGEROUS_GETATTR_NAMES
+        )
+    if (
+        isinstance(callee.func, ast.Attribute)
+        and callee.func.attr in _REFLECTIVE_DICT_READ_METHODS
+        and _reflective_module_dict_container(callee.func.value, aliases) is not None
+    ):
+        key = callee.args[0]
+        return isinstance(key, ast.Constant) and key.value in _DANGEROUS_GETATTR_NAMES
+    return False
+
+
 def _analyze_python(
     python_ast: ParsedPythonFile,
     file_path: str,
@@ -429,6 +470,7 @@ def _analyze_python(
         return []
 
     aliases = python_ast.import_aliases
+    type_map = build_type_map(tree, aliases)
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
     contexts: dict[tuple[int, int], str] = {}
@@ -544,10 +586,32 @@ def _analyze_python(
                 continue
 
         call_name = resolve_call_name(ast_node, aliases)
+        if call_name is not None:
+            # Dynamic-import / code-exec sibling machinery (importlib.__import__,
+            # importlib.util.find_spec, runpy.run_module, code.interact, and the
+            # instance-method tails spec.loader.exec_module / runsource) resolves by name
+            # but matches no ladder; remap it to the primitive it equals so it re-enters
+            # the __import__/exec arms below.
+            call_name = (
+                canonical_sibling_sink(call_name)
+                or canonical_sibling_method(ast_node, type_map, aliases)
+                or call_name
+            )
         if call_name is None:
             # Dynamic-import chain: importlib.import_module('os').system(...) →
             # 'os.system', so it re-enters the os./subprocess. sink ladders below.
             call_name = resolve_dynamic_import_call(ast_node, aliases)
+        reflective = False
+        if call_name is None and not _covered_by_ast9(ast_node, aliases):
+            # Reflective invocation whose callee does not resolve by name:
+            # getattr(subprocess, "Popen")(cmd) (outside AST9's allowlist),
+            # __builtins__["exec"](src), vars(builtins)["exec"](src). Canonicalize to
+            # the bare/dotted sink id so it re-enters the ladders below with the correct
+            # rule + severity. A reflective read AST9 already reports (allowlisted getattr
+            # or module-namespace read) is left to AST9 (see _covered_by_ast9) so the
+            # two rules stay complementary, not duplicate.
+            call_name = resolve_to_canonical_sink(ast_node, aliases)
+            reflective = call_name is not None
         if call_name is None:
             continue
 
@@ -586,7 +650,11 @@ def _analyze_python(
         elif call_name.startswith("subprocess."):
             attr = call_name.split(".", 1)[1]
             if attr in _SUBPROCESS_CALLS:
-                _emit(node_index, "AST4", ast_node)
+                # A *reflective* subprocess invocation (getattr/subscript) signals the
+                # same evasion intent as reflective os.system, so it grades AST9-HIGH to
+                # stay consistent with that case; a direct subprocess.* call keeps its
+                # baseline AST4-MEDIUM.
+                _emit(node_index, "AST9" if reflective else "AST4", ast_node)
 
         elif call_name.startswith("os."):
             attr = call_name.split(".", 1)[1]
