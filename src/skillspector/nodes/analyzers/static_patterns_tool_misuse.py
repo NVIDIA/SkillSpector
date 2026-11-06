@@ -9321,9 +9321,9 @@ def _unsupported_outer_shell_notation_spans(
         remaining_work -= len(literal)
         if remaining_work < 0:
             return
-        parsed = _parse_shell_command_word(literal, 0, check_runtime=check_runtime)
+        parsed, parsed_end, limited = _next_shell_invocation_word(literal, 0, check_runtime)
         check_runtime()
-        if parsed is None or parsed.limited or parsed.end != len(literal):
+        if parsed is None or limited or parsed_end != len(literal):
             continue
         denied = False
         quoted_through = begin
@@ -9335,14 +9335,14 @@ def _unsupported_outer_shell_notation_spans(
             remaining_work -= len(word)
             if remaining_work < 0:
                 return
-            owned = _parse_shell_command_word(word, 0, check_runtime=check_runtime)
+            owned, owned_end, limited = _next_shell_invocation_word(word, 0, check_runtime)
             check_runtime()
-            if owned is None or owned.limited or candidate.end() <= earlier.start() + owned.end:
+            if owned is None or limited or candidate.end() <= earlier.start() + owned_end:
                 # Optional metadata never borrows an unproved quoted prefix.
                 # This denial affects no parser result or finding producer.
                 denied = True
                 break
-            quoted_through = earlier.start() + owned.end
+            quoted_through = earlier.start() + owned_end
         if not denied:
             yield start, close + 1
 

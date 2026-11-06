@@ -294,7 +294,7 @@ def test_optional_outer_notice_does_not_parse_a_line_past_existing_allowance(mon
     def no_parse(*_args, **_kwargs):
         raise AssertionError("Oversized optional notation must not invoke a word reader")
 
-    monkeypatch.setattr(tm, "_parse_shell_command_word", no_parse)
+    monkeypatch.setattr(tm, "_next_shell_invocation_word", no_parse)
     assert not list(
         tm._unsupported_outer_shell_notation_spans(
             message, [(begin, message.index("`", begin))], lambda: None
@@ -307,7 +307,7 @@ def test_outer_shell_notice_does_not_nominate_execution_or_swallow_deadline(monk
     begin = message.index("$(")
     ranges = [(begin, message.index("`", begin))]
     entered = False
-    original = tm._parse_shell_command_word
+    original = tm._next_shell_invocation_word
 
     def parse(*args, **kwargs):
         nonlocal entered
@@ -323,7 +323,7 @@ def test_outer_shell_notice_does_not_nominate_execution_or_swallow_deadline(monk
 
     monkeypatch.setattr(tm, "_command_string_from_clause", no_consumer)
     assert list(tm._unsupported_outer_shell_notation_spans(message, ranges, lambda: None))
-    monkeypatch.setattr(tm, "_parse_shell_command_word", parse)
+    monkeypatch.setattr(tm, "_next_shell_invocation_word", parse)
     with pytest.raises(TimeoutError, match="annotation deadline"):
         list(tm._unsupported_outer_shell_notation_spans(message, ranges, expired))
 
