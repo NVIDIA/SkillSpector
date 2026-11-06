@@ -84,6 +84,44 @@ def test_adjacent_native_assignments_keep_the_child_startup_context(prefix: str,
 
 @pytest.mark.parametrize("kind", ["markdown", "yaml"])
 @pytest.mark.parametrize(
+    "prefix", ["A+=done", "A+=", 'BASH_ENV+="$STARTUP"', "BASH_ENV+=", 'ENV+="$STARTUP"', "ENV+="]
+)
+def test_append_prefixes_keep_an_explicit_unsupported_boundary(prefix: str, kind: str) -> None:
+    message = "Run `" + prefix + '` `bash -c` "printf done".'
+    diagnostic = tm._markdown_split_command_diagnostic(message, lambda: None)
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.UNSUPPORTED_SYNTAX
+    assert diagnostic.check is ParserCheck.COMMAND_STRING_RUNTIME
+    assert message[diagnostic.start : diagnostic.end] == prefix
+    assert tm.bounded_parse_diagnostic(_source(message, kind), lambda: None, file_type=kind)
+
+
+@pytest.mark.parametrize("assignment", ["BASH_ENV+=literal", "BASH_ENV+=", "ENV+=literal", "ENV+="])
+@pytest.mark.parametrize("identity_required", [False, True])
+def test_bridge_does_not_reinterpret_env_variable_names_as_shell_append(
+    assignment: str, identity_required: bool
+) -> None:
+    # env's NAME=value operands have their own grammar. Preserve the shared
+    # reader's existing unsupported-name result rather than treating NAME+
+    # as an append to NAME or manufacturing a startup-setting effect.
+    source = "env " + assignment + " bash -c 'printf done'"
+    startup = [False]
+    diagnostics = []
+    result = tm._command_string_from_clause(
+        source,
+        0,
+        lambda: None,
+        startup_exposure=startup,
+        diagnostics=diagnostics,
+        require_command_identity=identity_required,
+    )
+    assert result == (False, None)
+    assert startup == [False]
+    assert diagnostics == []
+
+
+@pytest.mark.parametrize("kind", ["markdown", "yaml"])
+@pytest.mark.parametrize(
     "message",
     [
         'Run `BASH_ENV="$STARTUP"` then `bash -c` "printf done".',

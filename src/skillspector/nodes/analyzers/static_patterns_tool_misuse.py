@@ -9888,7 +9888,8 @@ def _markdown_split_command_diagnostic(
                 return observed, None
             if index == _SHELL_COMMAND_STRING_ARGUMENTS:
                 return False, limit(start, end)
-            if _SHELL_ASSIGNMENT_PREFIX_RE.match(source, cursor) is None:
+            prefix = _SHELL_ASSIGNMENT_PREFIX_RE.match(source, cursor)
+            if prefix is None:
                 return False, None
             diagnostics: list[StaticParserDiagnostic] = []
             word = _parse_shell_command_word(
@@ -9904,6 +9905,17 @@ def _markdown_split_command_diagnostic(
             remaining_work[0] -= max(1, word.end - cursor)
             if remaining_work[0] < 0:
                 return False, limit(start, end)
+            if source[prefix.end() - 2 : prefix.end()] == "+=":
+                # The shared consumer does not model shell append assignment.
+                # A bounded native prefix must retain that uncertainty rather
+                # than lend a startup context the consumer cannot reconstruct.
+                return False, StaticParserDiagnostic(
+                    ParserCause.UNSUPPORTED_SYNTAX,
+                    ParserCheck.COMMAND_STRING_RUNTIME,
+                    start + cursor,
+                    start + word.end,
+                    ParserUncheckedScope.COMMAND_STRING,
+                )
             observed = True
             cursor = word.end
         return False, limit(start, end)
