@@ -140,16 +140,25 @@ def test_message_without_an_exact_inline_diagnostic_owner_keeps_runtime_limit() 
 
 
 @pytest.mark.parametrize(
-    "command",
-    ["Run sh -c 'echo `library`'s.", 'Run `sh` -c "echo `library`\'s".'],
+    "command, expected",
+    [
+        ("Run sh -c 'echo `library`'s.", LedgerOutcome.COMPLETED),
+        ('Run `sh` -c "echo `library`\'s".', LedgerOutcome.PARTIAL),
+        ("Run `sh` -c 'echo `library`s'.", LedgerOutcome.COMPLETED),
+    ],
 )
-def test_literal_child_quote_ownership_keeps_outer_apostrophes(command: str) -> None:
+def test_literal_child_quote_ownership_keeps_outer_apostrophes(
+    command: str, expected: LedgerOutcome
+) -> None:
     message = command + " An example `$(...)`."
     apostrophes: set[int] = set()
     tm._markdown_shell_text(message, lambda: None, inline_possessive_apostrophes=apostrophes)
     assert not apostrophes
-    assert _scan(command)["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
-    assert _scan(message)["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    # A double-quoted external body expands the parent substitution before
+    # child parsing; its unknown output can supply child source. A literal
+    # single-quoted body instead retains the substitution as echo data.
+    assert _scan(command)["inspection_ledger"][0]["outcome"] is expected
+    assert _scan(message)["inspection_ledger"][0]["outcome"] is expected
 
 
 def test_many_inline_suffixes_do_not_create_unbounded_reparsing() -> None:
@@ -204,14 +213,9 @@ def test_cancellation_after_markdown_owner_collection_propagates(monkeypatch) ->
 @pytest.mark.parametrize(
     "message",
     [
-        'Run `sh` -c "$PAYLOAD" now.',
-        'Run `env` sh -c "$PAYLOAD" now.',
-        'Run `xargs -a input` sh -c "$PAYLOAD".',
         'Run `sh -c "echo safe"` and later eval "$PAYLOAD".',
         "Run sh -c 'echo `$(...)`'.",
-        'Run `sh` -c "echo `$PAYLOAD`\'s".',
         "Run sh -c 'echo `$(cat command.txt)`'s.",
-        'Run `bash -c` "$PAYLOAD".',
     ],
 )
 def test_existing_generated_or_split_runtime_consumer_gap(message: str) -> None:
