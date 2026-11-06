@@ -2581,6 +2581,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     sc3_patterns = (
         SC3_PATTERNS
         if file_type in ("python", "javascript", "shell", "perl", "powershell", "other")
+        or file_path.lower().endswith(".mdc")
         else []
     )
     if has_shell_decoder:
