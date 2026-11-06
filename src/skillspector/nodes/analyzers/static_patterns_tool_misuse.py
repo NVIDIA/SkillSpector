@@ -9736,7 +9736,7 @@ def _owned_inline_command_diagnostic(
         remaining_work[0] -= max(1, parsed.end - start)
         if remaining_work[0] < 0:
             return limit(start)
-        if parsed.dynamic and (executing or scope_ends or "$()" in parsed.text):
+        if parsed.dynamic and (executing or scope_ends or parsed.text == "$()"):
             return parsed.diagnostic or StaticParserDiagnostic(
                 ParserCause.RUNTIME_DEPENDENT,
                 ParserCheck.COMMAND_IDENTITY,

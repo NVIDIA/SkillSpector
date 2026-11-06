@@ -56,6 +56,26 @@ def test_literal_references_data_and_proved_printf_values_stay_complete(source: 
     assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
 
 
+@pytest.mark.parametrize("word", ["$(hostname).example", "$(resolve_tool).example/service"])
+def test_display_word_fragment_does_not_independently_establish_execution(word: str) -> None:
+    source = "A data reference ``" + word + "``."
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+
+
+@pytest.mark.parametrize("word", ["$(hostname).example", "$(resolve_tool).example/service"])
+@pytest.mark.parametrize("template", ["sh -c '{}'", "eval '{}'", "echo $({})"])
+def test_executed_and_nested_dynamic_word_fragments_remain_uncertain(
+    word: str, template: str
+) -> None:
+    body = template.format(word + " -rf /")
+    source = "Run ``" + body + "``."
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+    assert diagnostic.check is ParserCheck.COMMAND_IDENTITY
+    assert source.index(body) <= diagnostic.start < diagnostic.end <= source.index(body) + len(body)
+
+
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 def test_later_inline_consumer_is_not_hidden_by_an_earlier_reference(newline: str) -> None:
     source = 'Use `label` first.\nThen run `sh -c "$PAYLOAD"`.\n'.replace("\n", newline)
