@@ -344,6 +344,7 @@ def test_many_literal_bodies_share_a_finite_work_allowance() -> None:
         "$(strip $(EXTRA_FLAGS))",
         "$(if $(DEBUG),-g,-O2)",
         "$(foreach target,$(TARGETS),$(target))",
+        " \t$(CC) \t",
     ],
 )
 def test_whole_native_display_values_do_not_independently_prove_execution(value: str) -> None:
@@ -421,12 +422,21 @@ def test_display_value_cannot_bypass_work_depth_or_deadline(monkeypatch) -> None
         tm._owned_inline_command_diagnostic(value, expired, [8 * len(value)])
 
 
-@pytest.mark.parametrize("command", ["Test-Path", "Compare-Item"])
+@pytest.mark.parametrize(
+    "command",
+    ["Test-Path", "Join-Path", "Split-Path", "Resolve-Path", "Convert-Path", "Write-Host"],
+)
 @pytest.mark.parametrize("member", ["$_.FullName", "$item.Parent.Name"])
 def test_native_quoted_property_arguments_keep_value_ownership(command: str, member: str) -> None:
     body = command + ' "$(' + member + ')/item"'
-    spans = tm._powershell_property_argument_spans(body, lambda: None, [8 * len(body)])
-    assert spans == [(body.index('"'), len(body))]
+    end = len(body)
+    if command == "Join-Path":
+        body += ' "leaf"'
+    assert tm._powershell_property_argument_spans(body, lambda: None, [8 * len(body)]) == []
+    spans = tm._powershell_property_argument_spans(
+        body, lambda: None, [8 * len(body)], bindings_proven=True
+    )
+    assert spans == [(body.index('"'), end)]
     assert (
         tm.bounded_parse_diagnostic(
             "Reference ``" + body + "``.", lambda: None, file_type="markdown"
@@ -452,8 +462,13 @@ def test_native_quoted_property_arguments_keep_value_ownership(command: str, mem
     ],
 )
 def test_property_value_owner_excludes_calls_operators_and_statements(expression: str) -> None:
-    body = 'Compare-Item "$(' + expression + ')"'
-    assert tm._powershell_property_argument_spans(body, lambda: None, [8 * len(body)]) == []
+    body = 'Test-Path "$(' + expression + ')"'
+    assert (
+        tm._powershell_property_argument_spans(
+            body, lambda: None, [8 * len(body)], bindings_proven=True
+        )
+        == []
+    )
     assert (
         tm.bounded_parse_diagnostic(
             "Reference ``" + body + "``.", lambda: None, file_type="markdown"
@@ -463,7 +478,7 @@ def test_property_value_owner_excludes_calls_operators_and_statements(expression
 
 
 def test_property_value_does_not_own_following_execution_or_raw_findings() -> None:
-    body = 'Compare-Item "$($item.Name)"; sh -c "$PAYLOAD"'
+    body = 'Test-Path "$($item.Name)"; sh -c "$PAYLOAD"'
     diagnostic = tm.bounded_parse_diagnostic(
         "Reference ``" + body + "``.", lambda: None, file_type="markdown"
     )
@@ -478,3 +493,86 @@ def test_property_value_does_not_own_following_execution_or_raw_findings() -> No
         and "rm -rf /" in (f.matched_text or "")
         for f in result["findings"]
     )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cmd /c",
+        "powershell -Command",
+        "pwsh -Command",
+        "python -c",
+        "node -e",
+        "perl -e",
+        "Compare-Item",
+        "sh -c",
+        "bash -c",
+        "eval",
+    ],
+)
+def test_property_shape_does_not_prove_unknown_or_executed_argument_roles(command: str) -> None:
+    body = command + ' "$($item.Name)"'
+    assert (
+        tm._powershell_property_argument_spans(
+            body, lambda: None, [8 * len(body)], bindings_proven=True
+        )
+        == []
+    )
+    diagnostic = tm.bounded_parse_diagnostic(
+        "Reference ``" + body + "``.", lambda: None, file_type="markdown"
+    )
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '"$($item.Name)"',
+        '$result = Test-Path "$($item.Name)"',
+        'Test-Path "$($item.Name)" | Invoke-Expression',
+    ],
+)
+def test_property_arguments_cannot_own_dynamic_heads_or_captured_values(body: str) -> None:
+    assert (
+        tm._powershell_property_argument_spans(
+            body, lambda: None, [8 * len(body)], bindings_proven=True
+        )
+        == []
+    )
+    assert (
+        tm.bounded_parse_diagnostic(
+            "Reference ``" + body + "``.", lambda: None, file_type="markdown"
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "Set-Alias Test-Path unknown",
+        "function Test-Path {}",
+        "filter Test-Path {}",
+        "workflow Test-Path {}",
+        "Import-Module unknown",
+        ". helper.ps1",
+        "Im`port-`Module unknown",
+    ],
+)
+def test_property_bindings_must_hold_across_the_whole_original_markdown(
+    monkeypatch, binding: str
+) -> None:
+    body = 'Test-Path "$($item.Name)"'
+    observed = []
+    original = tm._powershell_property_argument_spans
+
+    def spans(content, *args, **kwargs):
+        if content == body:
+            observed.append(kwargs.get("bindings_proven", False))
+        return original(content, *args, **kwargs)
+
+    monkeypatch.setattr(tm, "_powershell_property_argument_spans", spans)
+    source = "Earlier ``" + binding + "``.\n\nReference ``" + body + "``."
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is not None
+    assert observed == [False]

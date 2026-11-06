@@ -176,6 +176,10 @@ _POWERSHELL_STREAM_ONLY_COMMANDS = frozenset(
 # Output-stream commands emit their arguments as values. Only a top-level
 # statement's value leaves the script uncaptured by an expression in it.
 _POWERSHELL_OUTPUT_COMMANDS = frozenset({"write-output", "echo", "write"})
+# These native cmdlets consume path strings, never executable command text.
+_POWERSHELL_PATH_VALUE_COMMANDS = frozenset(
+    {"test-path", "join-path", "split-path", "resolve-path", "convert-path"}
+)
 # Common parameters that capture a stream into a variable. PowerShell accepts
 # any unambiguous prefix, so every prefix of these names counts.
 _POWERSHELL_CAPTURE_PARAMETERS = (
@@ -9635,10 +9639,20 @@ def _is_inline_make_display_value(
     content: str, check_runtime: Callable[[], None], remaining_work: list[int]
 ) -> bool:
     """Retain the whole-expression display reading, without evaluating Make values."""
-    if not content.startswith(("$(", "${")):
+    if not content.startswith(("$(", "${", " ", "\t")):
         return False
     remaining_work[0] -= len(content)
     if remaining_work[0] < 0:
+        return False
+    check_runtime()
+    # Only horizontal padding belongs to this whole native display value.
+    padded = content.strip(" \t")
+    if padded != content:
+        remaining_work[0] -= len(content)
+        if remaining_work[0] < 0:
+            return False
+        content = padded
+    if not content.startswith(("$(", "${")):
         return False
     # Reuse the bounded expansion reader; the narrower grammar below also
     # rejects shell quoting and unproved Make functions or indirect names.
@@ -9705,10 +9719,14 @@ def _is_inline_make_display_value(
 
 
 def _powershell_property_argument_spans(
-    content: str, check_runtime: Callable[[], None], remaining_work: list[int]
+    content: str,
+    check_runtime: Callable[[], None],
+    remaining_work: list[int],
+    *,
+    bindings_proven: bool = False,
 ) -> list[tuple[int, int]]:
     """Own only native quoted arguments whose subexpressions read member values."""
-    if '"$(' not in content:
+    if not bindings_proven or '"$(' not in content:
         return []
     remaining_work[0] -= 2 * len(content)
     if remaining_work[0] < 0:
@@ -9726,6 +9744,8 @@ def _powershell_property_argument_spans(
     for segment in projection.segments:
         check_runtime()
         if segment.frame != "top" or segment.command is None or segment.captured:
+            continue
+        if segment.command not in _POWERSHELL_PATH_VALUE_COMMANDS and not segment.owns_messages():
             continue
         for start, end, holes in segment.strings:
             check_runtime()
@@ -9750,6 +9770,7 @@ def _owned_inline_command_diagnostic(
     *,
     executing: bool = False,
     depth: int = 0,
+    powershell_value_bindings_proven: bool = False,
 ) -> StaticParserDiagnostic | None:
     """Inspect only native-owned code bodies and their explicit executable operands."""
     remaining_work[0] -= len(content)
@@ -9780,7 +9801,12 @@ def _owned_inline_command_diagnostic(
     value_spans = (
         []
         if executing
-        else _powershell_property_argument_spans(content, check_runtime, remaining_work)
+        else _powershell_property_argument_spans(
+            content,
+            check_runtime,
+            remaining_work,
+            bindings_proven=powershell_value_bindings_proven,
+        )
     )
     if remaining_work[0] < 0:
         return limit()
@@ -10226,10 +10252,30 @@ def _markdown_owned_commands_diagnostic(
     ranges: list[tuple[int, int]] = []
     projected = _markdown_shell_text(content, check_runtime, inline_code_ranges=ranges)
     remaining_work = [8 * len(content) + _ROOT_GLOB_COMMAND_CHARS]
+    property_bindings_proven = False
+    if '"$(' in content:
+        # Binding can change in another native span or fence. Check the whole
+        # original source once; retained backticks can escape a binding token.
+        remaining_work[0] -= len(content)
+        check_runtime()
+        property_bindings_proven = (
+            "`" not in projected
+            and re.search(
+                r"\b(?:function|filter|workflow)\b|(?:^|[\s;|&({`])\.[ \t]+\S",
+                content,
+                re.IGNORECASE | re.MULTILINE,
+            )
+            is None
+            and _POWERSHELL_COMMAND_REBINDING_RE.search(content) is None
+        )
+        check_runtime()
     for start, end in ranges:
         check_runtime()
         diagnostic = _owned_inline_command_diagnostic(
-            content[start:end], check_runtime, remaining_work
+            content[start:end],
+            check_runtime,
+            remaining_work,
+            powershell_value_bindings_proven=property_bindings_proven,
         )
         if diagnostic is not None:
             return diagnostic.shifted(start)
