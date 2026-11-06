@@ -1852,7 +1852,8 @@ def _is_requirements_file(file_path: str) -> bool:
     path_parts = normalized_path.split("/")
     filename = path_parts[-1]
     if filename in {"requirements", "requirements.txt", "requirements.in"} or re.fullmatch(
-        r"requirements[-_][a-z0-9_-]+\.(?:txt|in)", filename
+        r"(?:requirements[-_][a-z0-9_-]+|[a-z0-9][a-z0-9_-]*[-_]requirements)\.(?:txt|in)",
+        filename,
     ):
         return True
     return "requirements" in path_parts[:-1] and bool(
@@ -2580,6 +2581,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     sc3_patterns = (
         SC3_PATTERNS
         if file_type in ("python", "javascript", "shell", "perl", "powershell", "other")
+        or file_path.lower().endswith(".mdc")
         else []
     )
     if has_shell_decoder:

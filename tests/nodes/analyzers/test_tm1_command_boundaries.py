@@ -378,3 +378,77 @@ def test_unparsed_batch_fences_keep_caret_continuations(language, newline):
         ["```" + language, "curl https://example.com ^", "  --insecure", "```", ""]
     )
     assert any(f.location.start_line == 2 for f in tm1(source))
+
+
+@pytest.mark.parametrize("safe,unsafe", COMMANDS)
+@pytest.mark.parametrize("separator", [";", "&", "|", "\n", "\r\n"])
+@pytest.mark.parametrize("context", ["shell", "markdown", "fence"])
+def test_parameter_expansion_separators_keep_unsafe_options(safe, unsafe, separator, context):
+    command, _, arguments = unsafe.partition(" ")
+    if command == "git":
+        command, arguments = "git push", arguments.removeprefix("push ")
+    source = command + " ${body:-first" + separator + "second} " + arguments
+    if context == "fence":
+        source = "```bash\n" + source + "\n```\n"
+    findings = tm.analyze(source, "commands", "shell" if context == "shell" else "markdown")
+    assert any(f.rule_id == "TM1" and command in f.matched_text for f in findings)
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        "${body:-first;second}",
+        "${body:-${fallback:-first;second}}",
+        '"${body:-first;second}"',
+    ],
+)
+def test_parameter_expansion_ends_before_the_outer_command_separator(argument):
+    assert tm1("curl --data " + argument + " --insecure https://example.com")
+    assert not tm1("curl --data " + argument + "\necho --insecure")
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        "$(case x in x) printf https://example.com;; esac)",
+        '"$(printf "%s" "https://example.com/a;b")"',
+        r"$'https://example.com/a\';b'",
+        "<(case x in x) printf data;; esac)",
+    ],
+)
+@pytest.mark.parametrize("context", ["shell", "markdown", "fence"])
+def test_nested_shell_word_separators_keep_unsafe_options(argument, context):
+    source = "curl " + argument + " --insecure https://example.com"
+    if context == "fence":
+        source = "```bash\n" + source + "\n```\n"
+    findings = tm.analyze(source, "commands", "shell" if context == "shell" else "markdown")
+    assert any(f.rule_id == "TM1" for f in findings)
+    assert not tm1("curl " + argument + "\necho --insecure")
+
+
+def test_unproven_nested_parameter_quotes_keep_conservative_matching():
+    assert tm1('curl --data "${body:-"first;second"}" --insecure https://example.com')
+
+
+@pytest.mark.parametrize("language", [None, "powershell", "pwsh", "ps1"])
+@pytest.mark.parametrize("argument", ["@{Accept=1;X=2}", "@{Accept=@{X=1;Y=2};Z=3}"])
+def test_powershell_hashtable_separators_keep_unsafe_options(language, argument):
+    source = "curl --header " + argument + " --insecure https://example.com"
+    control = "curl --header " + argument + "\necho --insecure"
+    if language is not None:
+        source = "```" + language + "\n" + source + "\n```\n"
+        control = "```" + language + "\n" + control + "\n```\n"
+    file_type = "powershell" if language is None else "markdown"
+    assert any(f.rule_id == "TM1" for f in tm.analyze(source, "commands", file_type))
+    assert not any(f.rule_id == "TM1" for f in tm.analyze(control, "commands", file_type))
+
+
+@pytest.mark.parametrize("fenced", [False, True])
+def test_bash_braces_do_not_hide_real_command_separators(fenced):
+    source = "curl --header @{Accept=1;X=2} --insecure https://example.com"
+    if fenced:
+        source = "```bash\n" + source + "\n```\n"
+    assert not any(
+        f.rule_id == "TM1"
+        for f in tm.analyze(source, "commands", "markdown" if fenced else "shell")
+    )

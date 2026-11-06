@@ -43,7 +43,10 @@ from pathlib import Path
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from skillspector.providers import registry
-from skillspector.providers.chat_models import create_openai_compatible_chat_model
+from skillspector.providers.chat_models import (
+    create_openai_compatible_chat_model,
+    prepare_openai_chat_model_imports,
+)
 from skillspector.providers.structured_output import forced_tool_choice_supported
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
@@ -73,6 +76,10 @@ class OpenAICompatibleProvider:
 
     DEFAULT_MODEL = "llama-3.1-70b-versatile"
     SLOT_DEFAULTS: dict[str, str] = {}
+
+    def prepare_chat_model_imports(self) -> None:
+        """Prepare the OpenAI transport without resolving or creating a client."""
+        prepare_openai_chat_model_imports()
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
         """Return ``(api_key, base_url)`` from ``SKILLSPECTOR_COMPAT_*`` env vars."""
