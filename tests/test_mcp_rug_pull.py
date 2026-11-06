@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 
 import pytest
 import yaml
@@ -118,6 +119,31 @@ def test_rp1_yaml_mcp_config_pinned_no_finding():
         result = node(_state(file_cache={"mcp.yaml": config}))
 
         assert not [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+
+@pytest.mark.parametrize("args_first", [False, True])
+@pytest.mark.parametrize("output_format", ["json", "markdown", "sarif"])
+def test_rp1_yaml_evidence_excludes_unrelated_credentials(args_first, output_format):
+    secret = "rp1-test-credential-canary"
+    command = "    command: npx # runner comment\n"
+    args = '    args: ["-y", "@scope/server"] # argument comment\n'
+    env = f"    env:\n      API_TOKEN: {secret}\n"
+    pair = args + env + command if args_first else command + env + args
+    content = "mcpServers:\n  fs:\n" + pair
+    result = node(_state(file_cache={"mcp.yaml": content}))
+    rp1 = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+    assert len(rp1) == 1
+    finding = rp1[0]
+    assert finding.file == "mcp.yaml"
+    assert finding.start_line == (6 if args_first else 3)
+    assert "@scope/server" in finding.matched_text
+    body = report({"filtered_findings": rp1, "output_format": output_format})["report_body"]
+    for evidence in (json.dumps(asdict(finding)), body):
+        assert secret not in evidence
+        assert "API_TOKEN" not in evidence
+        assert "runner comment" not in evidence
+        assert "argument comment" not in evidence
 
 
 @pytest.mark.parametrize("style", ["flow", "block"])

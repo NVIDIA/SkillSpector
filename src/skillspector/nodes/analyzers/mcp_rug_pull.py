@@ -279,7 +279,6 @@ def _iter_config_npx_commands(
 
         args_indent = len(args_match.group("indent")) + len(args_match.group("item") or "")
         args_lines = [_strip_yaml_comment(args_match.group("value"))]
-        args_end_index = args_index
         for index in range(
             args_index + 1, min(len(lines), args_index + _RP1_CONFIG_MAX_ARG_LINES + 1)
         ):
@@ -299,7 +298,6 @@ def _iter_config_npx_commands(
             if indentless_item and _RP1_CONFIG_KEY.match(candidate_line):
                 break
             args_lines.append(_strip_yaml_comment(candidate_line.lstrip(" \t")))
-            args_end_index = index
 
         args_text = " ".join(args_lines)
         for token_match in _RP1_CONFIG_ARG_TOKEN.finditer(args_text):
@@ -312,9 +310,9 @@ def _iter_config_npx_commands(
                 # Do not shift a later argument into its position or invent RP1.
                 break
             start = offsets[command_index]
-            full_match = "".join(
-                lines[min(command_index, args_index) : max(command_index, args_end_index) + 1]
-            ).strip()
+            # Only the runner and package justify this finding. A contiguous
+            # source slice could expose credentials in unrelated sibling keys.
+            full_match = f"{command.group('runner')} {token}"
             matches.append((start, full_match, token))
             break
 
