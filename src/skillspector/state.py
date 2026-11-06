@@ -36,6 +36,7 @@ from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
+    bounded_inspection_notices,
     ledger_event,
 )
 from skillspector.logging_config import get_logger
@@ -230,6 +231,12 @@ def merge_inspection_ledger(
     ]
 
 
+def merge_inspection_notices(
+    existing: list[dict[str, object]], updates: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    return bounded_inspection_notices([*existing, *updates])
+
+
 class SkillspectorState(TypedDict, total=False):
     """Graph state shared by all nodes."""
 
@@ -285,6 +292,7 @@ class SkillspectorState(TypedDict, total=False):
     # Accumulated canonical findings. Same-ID meta updates replace in place.
     findings: Annotated[list[Finding], merge_findings_by_id]
     inspection_ledger: Annotated[list[InspectionLedgerEvent], merge_inspection_ledger]
+    inspection_notices: Annotated[list[dict[str, object]], merge_inspection_notices]
     analyzer_status_events: Annotated[list[AnalyzerStatusEvent], operator.add]
     effective_finding_ids: list[str]
     # Whether meta-analysis had provider-eligible findings when it ran.  This
@@ -475,6 +483,7 @@ class AnalyzerNodeResponse(TypedDict):
 
     findings: list[Finding]
     inspection_ledger: NotRequired[list[InspectionLedgerEvent]]
+    inspection_notices: NotRequired[list[dict[str, object]]]
     analyzer_status_events: NotRequired[list[AnalyzerStatusEvent]]
     structured_summaries: NotRequired[list[dict[str, object]]]
     # LLM-backed analyzers also report one telemetry record; static analyzers

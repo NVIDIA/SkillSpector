@@ -42,6 +42,7 @@ from skillspector.artifacts import (
     security_text_views,
 )
 from skillspector.inspection_ledger import (
+    MAX_FINDING_OUTPUT_RECORDS,
     ParserCause,
     ParserCheck,
     ParserUncheckedScope,
@@ -77,6 +78,7 @@ from .common import (
     get_context,
     get_context_from_lines,
     is_reference_material,
+    logical_line_starts,
 )
 from .pattern_defaults import PatternCategory
 
@@ -9289,6 +9291,45 @@ def _yaml_scalar_mapper(
 class _PreparedYamlAnalysis:
     parser: _YamlParserAnalysis
     check_runtime: Callable[[], None]
+
+    def inspection_notices(self) -> list[tuple[int, int]]:
+        """Notice unsupported prose after an inline example, without executing it."""
+        content = self.parser.content
+        if "eval" not in content:
+            return []
+        roles = semgrep_rule_scalar_roles(content, self.check_runtime)
+        notices: dict[tuple[int, int], None] = {}
+        for scalar in self.parser.spans.scalars:
+            self.check_runtime()
+            if not roles or roles.get(scalar.start) != "message" or "eval" not in scalar.value:
+                continue
+            ranges: list[tuple[int, int]] = []
+            _markdown_shell_text(scalar.value, self.check_runtime, inline_code_ranges=ranges)
+            if not ranges:
+                continue
+            ranges.sort()
+            starts = [start for start, _end in ranges]
+            lines = logical_line_starts(scalar.value)
+            exact_source = content[scalar.body_start : scalar.body_end] == scalar.value
+            for candidate in re.finditer(r"(?<![\w$])eval[ \t]+['\"]", scalar.value):
+                self.check_runtime()
+                index = bisect_right(starts, candidate.start()) - 1
+                line = lines[bisect_right(lines, candidate.start()) - 1]
+                # Only same-line prose following a native inline example is
+                # nominated. Native bodies and code blocks supply no notice.
+                if index < 0 or not line <= ranges[index][1] <= candidate.start():
+                    continue
+                span = (
+                    (scalar.body_start + candidate.start(), scalar.body_start + candidate.end())
+                    if exact_source
+                    else (scalar.start, scalar.end)
+                )
+                notices[span] = None
+                if len(notices) >= MAX_FINDING_OUTPUT_RECORDS:
+                    return list(notices)
+                if not exact_source:
+                    break
+        return list(notices)
 
     def analyze(
         self, content: str, file_path: str, file_type: str, source_view: SecurityTextView

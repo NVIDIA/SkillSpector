@@ -213,13 +213,89 @@ def test_cancellation_after_markdown_owner_collection_propagates(monkeypatch) ->
 @pytest.mark.parametrize(
     "message",
     [
-        'Run `sh -c "echo safe"` and later eval "$PAYLOAD".',
         "Run sh -c 'echo `$(...)`'.",
         "Run sh -c 'echo `$(cat command.txt)`'s.",
     ],
 )
 def test_existing_generated_or_split_runtime_consumer_gap(message: str) -> None:
     assert _scan(message)["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+
+
+def test_unowned_prose_command_remains_documentation_with_a_notice() -> None:
+    result = _scan('Run `sh -c "echo safe"` and later eval "$PAYLOAD".')
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert not result["findings"]
+    assert len(result["inspection_notices"]) == 1
+    notice = result["inspection_notices"][0]
+    assert notice["message"] == (
+        "This command pattern is not allowed for inspection; put the command in a code block."
+    )
+    assert notice["path"] == "rules.yaml"
+    source = _source('Run `sh -c "echo safe"` and later eval "$PAYLOAD".')
+    assert source[notice["source_start_offset"] : notice["source_end_offset"]].startswith('"Run ')
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        'Run `eval "$PAYLOAD"`.',
+        'Run `sh -c "$PAYLOAD"`.',
+        'Run `sh -c "echo safe" and later eval "$PAYLOAD"`.',
+        'An eval "$PAYLOAD" mention without an inline example.',
+        'A `value` reference.\n```sh\neval "$PAYLOAD"\n```',
+        "An `eval` reference has no quoted operand.",
+    ],
+)
+def test_native_or_unmatched_forms_do_not_gain_a_prose_notice(message: str) -> None:
+    assert not _scan(message)["inspection_notices"]
+
+
+def test_notice_does_not_clear_owned_runtime_or_high_findings() -> None:
+    result = _scan('Run `sh -c "$PAYLOAD"` and later eval "$OTHER"; rm -rf /.')
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert len(result["inspection_notices"]) == 1
+    assert any(f.rule_id == "TM1" and str(f.severity) == "HIGH" for f in result["findings"])
+
+
+def test_notice_requires_an_actual_semgrep_message_role() -> None:
+    source = _source('Run `sh -c "echo safe"` and later eval "$PAYLOAD".')
+    for content in [source.replace("message:", "pattern:"), source.replace("rules:", "unknown:")]:
+        result = static_runner.run_static_patterns_with_ledger(
+            {"components": ["rules.yaml"], "file_cache": {"rules.yaml": content}}, [tm, ar]
+        )
+        assert not result["inspection_notices"]
+
+
+def test_notice_prepass_keeps_deadline_cancellation() -> None:
+    source = _source('Run `sh -c "echo safe"` and later eval "$PAYLOAD".')
+    prepared = tm.prepare_analysis(source, "yaml", lambda: None)
+    assert prepared is not None
+
+    def expired() -> None:
+        raise TimeoutError("notice deadline")
+
+    with pytest.raises(TimeoutError, match="notice deadline"):
+        tm._PreparedYamlAnalysis(prepared.parser, expired).inspection_notices()
+
+
+def test_plain_scalar_notice_retains_exact_original_offsets() -> None:
+    message = 'Run `sh -c "echo safe"` and later eval "$PAYLOAD".'
+    source = _source(message).replace(json.dumps(message), message)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["rules.yaml"], "file_cache": {"rules.yaml": source}}, [tm, ar]
+    )
+    assert len(result["inspection_notices"]) == 1
+    notice = result["inspection_notices"][0]
+    assert source[notice["source_start_offset"] : notice["source_end_offset"]] == 'eval "'
+    assert notice["start_line"] == notice["end_line"] == 5
+
+
+def test_derived_oms_views_cannot_emit_original_source_notices() -> None:
+    source = _source('Run `sh -c "echo safe"` and later eval "$PAYLOAD".')
+    _findings, _reason, metrics = static_runner._scan_all_views_detailed(
+        "rules.yaml", source, [tm], None, _oms_projected=True
+    )
+    assert not getattr(metrics, "inspection_notices", ())
 
 
 @pytest.mark.parametrize(
