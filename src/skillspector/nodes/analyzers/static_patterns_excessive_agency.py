@@ -44,9 +44,28 @@ logger = get_logger(__name__)
 ANALYZER_ID = "static_patterns_excessive_agency"
 
 # EA1: Unrestricted Tool Access
-# Configuration syntax can span blank lines; prose instructions cannot.
 EA1_CODE_PATTERNS = [
-    (r"(?:tools?|permissions?)\s*:[ \t]*\[?[ \t]*['\"]?\*(?!\*|\w)['\"]?[ \t]*\]?", 0.85),
+    # Consume complete scalar elements so quoted tool arguments cannot look
+    # like wildcard grants. Possessive token bodies avoid repartitioning long
+    # near-misses; unquoted nested arrays/objects remain outside this grammar.
+    (
+        r"['\"]?(?:tools?|permissions?)['\"]?[ \t]*:[ \t]*"
+        r"(?:\[(?:[ \t]*+(?:\"(?:[^\"\\\r\n]++|\\[^\r\n])*+\""
+        r"|'(?:[^'\r\n]++|'')*+'|[^\][{},'\"\r\n]++)[ \t]*+,)*"
+        r"[ \t]*(?:\"\*\"|'\*')(?=[ \t]*[,\]])"
+        r"|(?:\"\*\"|'\*')(?=[ \t]*(?:[,}#]|\r?$))"
+        r"|\[?[ \t]*\*(?![\*\w])[ \t]*\]?[ \t]*(?:#[^\r\n]*)?\r?$)",
+        0.85,
+    ),
+    # YAML block list whose first item is the wildcard (#445). Bounded to a
+    # single newline — a blank line still breaks the match — and the item's
+    # '*' must be standalone, so markdown lists ("- **Read**", "- *note*")
+    # do not collide. Later items are out of scope until seen in practice.
+    (
+        r"['\"]?(?:tools?|permissions?)['\"]?[ \t]*:[ \t]*(?:#[^\r\n]*)?\r?\n"
+        r"[ \t]*-[ \t]+['\"]?\*(?![\*\w])['\"]?[ \t]*(?:#[^\r\n]*)?\r?$",
+        0.85,
+    ),
     (r"tools?\s*:\s*\[\s*['\"]shell['\"].*?['\"](?:file_write|network|http)['\"]", 0.7),
 ]
 EA1_PROSE_PATTERNS = [
