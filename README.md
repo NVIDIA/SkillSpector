@@ -476,6 +476,25 @@ skillspector scan ./my-skill/
 skillspector scan ./my-skill/ --no-llm
 ```
 
+#### Per-request size limits
+
+Deployments whose endpoint or gateway rejects large requests can lower the
+per-request input size without changing model context metadata or output-token
+settings:
+
+| Variable | Unit | When unset |
+|---|---|---|
+| `SKILLSPECTOR_MAX_BATCH_INPUT_TOKENS` | estimated input tokens per LLM request (about 4 characters per token) | the model's input budget |
+| `SKILLSPECTOR_MAX_PROMPT_BYTES` | UTF-8 bytes of the prompt text | the provider's limit (CLI providers only) |
+| `SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS` | estimated input tokens per TP4 request | 32,000 |
+
+Each setting only lowers a limit; the smallest of it, the model's input budget
+and the provider's byte limit applies (`SKILLSPECTOR_MAX_BATCH_INPUT_TOKENS` also
+bounds TP4). Files are split into line-aligned chunks; a line or fixed prompt that
+cannot fit is reported as a size-limit failure, never truncated. The byte limit
+measures prompt text, not the serialized HTTP request. Blank values keep the
+defaults; other values that are not positive integers are ignored with a warning.
+
 ### MCP Server
 
 Run SkillSpector as a [Model Context Protocol](https://modelcontextprotocol.io)

@@ -41,11 +41,15 @@ from skillspector.inspection_ledger import (
     outcome_for_llm_batch_failure,
 )
 from skillspector.llm_analyzer_base import (
+    PROMPT_BYTE_SAFETY_MARGIN,
     Batch,
     LLMAnalyzerBase,
     LLMRuntimeLimitError,
     append_output_language_instruction,
+    cap_input_tokens,
     estimate_tokens,
+    max_prompt_bytes,
+    optional_positive_int_env,
 )
 from skillspector.llm_utils import run_async
 from skillspector.model_info import get_max_input_tokens
@@ -91,6 +95,18 @@ TP4_MAX_BATCH_INPUT_TOKENS = 32_000
 TP4_MIN_CODE_TOKENS = 64
 TP4_MAX_DECLARATION_CHARS = 16_384
 TP4_MAX_FINDINGS = 64
+
+
+def _tp4_batch_token_ceiling() -> int:
+    """Return TP4's per-request token ceiling before the model budget is applied.
+
+    ``SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS`` overrides the
+    :data:`TP4_MAX_BATCH_INPUT_TOKENS` default.
+    """
+    return (
+        optional_positive_int_env("SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS")
+        or TP4_MAX_BATCH_INPUT_TOKENS
+    )
 
 
 def _tp4_max_batches_from_environment(value: str | None) -> int:
@@ -1080,31 +1096,44 @@ def _bounded_utf8_prefix(text: str, max_bytes: int) -> tuple[str, int, bool]:
     return candidate, len(encoded), len(candidate) < len(text)
 
 
-def _tp4_line_chunks(content: str, max_tokens: int) -> Iterator[_TP4CodeChunk]:
-    """Yield bounded line-aligned chunks; oversized single lines fail closed."""
+def _tp4_line_chunks(
+    content: str, max_tokens: int, max_bytes: int | None = None
+) -> Iterator[_TP4CodeChunk]:
+    """Yield bounded line-aligned chunks; oversized single lines fail closed.
+
+    When *max_bytes* is set each chunk also stays within that many UTF-8 bytes.
+    """
     lines = content.splitlines(keepends=True)
     current: list[str] = []
     current_tokens = 0
+    current_bytes = 0
     start_line = 1
     for line_number, line in enumerate(lines, start=1):
         line_tokens = max(1, (len(line) + 3) // 4)
-        if line_tokens > max_tokens:
+        line_bytes = len(line.encode("utf-8"))
+        if line_tokens > max_tokens or (max_bytes is not None and line_bytes > max_bytes):
             if current:
                 yield _TP4CodeChunk("".join(current), start_line, line_number - 1)
                 current = []
                 current_tokens = 0
+                current_bytes = 0
             yield _TP4CodeChunk(None, line_number, line_number, len(line))
             start_line = line_number + 1
             continue
-        if current and current_tokens + line_tokens > max_tokens:
+        if current and (
+            current_tokens + line_tokens > max_tokens
+            or (max_bytes is not None and current_bytes + line_bytes > max_bytes)
+        ):
             yield _TP4CodeChunk("".join(current), start_line, line_number - 1)
             current = []
             current_tokens = 0
+            current_bytes = 0
             start_line = line_number
         if not current:
             start_line = line_number
         current.append(line)
         current_tokens += line_tokens
+        current_bytes += line_bytes
     if current:
         yield _TP4CodeChunk("".join(current), start_line, len(lines))
 
@@ -1224,7 +1253,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
         model_config: dict = state.get("model_config") or {}
         model = model_config.get(ANALYZER_ID) or model_config.get("default")
         model = model or get_active_provider().resolve_model()
-        model_input_tokens = get_max_input_tokens(model)
+        model_input_tokens = cap_input_tokens(get_max_input_tokens(model))
 
         description = description_value[:TP4_MAX_DECLARATION_CHARS]
         triggers_text = str(manifest.get("triggers") or [])[:TP4_MAX_DECLARATION_CHARS]
@@ -1242,7 +1271,8 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
             permissions=permissions_text,
         )
         overhead_tokens = estimate_tokens(prefix + _TP4_PROMPT_SUFFIX) + 16
-        batch_input_tokens = min(TP4_MAX_BATCH_INPUT_TOKENS, model_input_tokens)
+        batch_input_tokens = min(_tp4_batch_token_ceiling(), model_input_tokens)
+        prompt_byte_cap = max_prompt_bytes()
         code_token_budget = batch_input_tokens - overhead_tokens
 
         llm_cache = state.get("llm_file_cache")
@@ -1309,7 +1339,18 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     )
                 )
                 return
-            for chunk in _tp4_line_chunks(candidate.content, code_token_budget):
+            header = f"### {candidate.path} ({candidate.language})\n"
+            code_byte_budget: int | None = None
+            if prompt_byte_cap is not None:
+                fixed_bytes = len(
+                    append_output_language_instruction(prefix + header + _TP4_PROMPT_SUFFIX).encode(
+                        "utf-8"
+                    )
+                )
+                code_byte_budget = max(0, prompt_byte_cap - fixed_bytes - PROMPT_BYTE_SAFETY_MARGIN)
+            for chunk in _tp4_line_chunks(
+                candidate.content, code_token_budget, max_bytes=code_byte_budget
+            ):
                 chunk_start_line = candidate.start_line + chunk.start_line - 1
                 chunk_end_line = min(candidate.end_line, candidate.start_line + chunk.end_line - 1)
                 dynamic_remaining = transitive_remaining_seconds(state)
@@ -1355,11 +1396,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                         )
                     )
                     break
-                prompt = (
-                    prefix
-                    + f"### {candidate.path} ({candidate.language})\n{chunk.content}"
-                    + _TP4_PROMPT_SUFFIX
-                )
+                prompt = prefix + header + chunk.content + _TP4_PROMPT_SUFFIX
                 if estimate_tokens(prompt) > batch_input_tokens:
                     add_partial_once(
                         _tp4_partial_event(
@@ -1373,6 +1410,19 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     )
                     continue
                 prompt_bytes = len(prompt.encode("utf-8"))
+                sent_bytes = len(append_output_language_instruction(prompt).encode("utf-8"))
+                if prompt_byte_cap is not None and sent_bytes > prompt_byte_cap:
+                    add_partial_once(
+                        _tp4_partial_event(
+                            path,
+                            LedgerReason.SIZE_LIMIT,
+                            start_line=chunk_start_line,
+                            end_line=chunk_end_line,
+                            observed_bytes=sent_bytes,
+                            limit_bytes=prompt_byte_cap,
+                        )
+                    )
+                    continue
                 if total_prompt_bytes + prompt_bytes > TP4_MAX_TOTAL_INPUT_BYTES:
                     stop_planning(
                         LedgerReason.TOTAL_BYTES_LIMIT,
