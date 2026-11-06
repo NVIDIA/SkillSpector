@@ -148,7 +148,11 @@ _ADOPTION_PARAGRAPH_BOUNDARY = re.compile(
 MP3_PATTERNS = [
     (_MP3_STATE_ADOPTION_PATTERN, 0.85),
     (
-        r"(?:clear|reset|wipe|erase|delete|purge)\s+(?:your\s+)?(?:memory|context|state|history|conversation)",
+        # The noun must end its word, so "Clear statement" is not a reset. The
+        # lookahead also allows a plural "s", or "conversational"/"contextual"
+        # before another whole memory noun; the matched text still ends at the noun.
+        r"(?:clear|reset|wipe|erase|delete|purge)\s+(?:your\s+)?(?:memory|context|state|history|conversation)"
+        r"(?=s?(?![a-z])|u?al\s+(?:memor(?:y|ies)|contexts?|states?|histor(?:y|ies))(?![a-z]))",
         0.8,
     ),
     (
