@@ -509,6 +509,11 @@ The server exposes a single tool:
   so a low score from a static-only scan is never mistaken for a clean full
   scan.
 
+For a repeatable CLI and real stdio MCP check, see the
+[agent scan workflow observation](docs/validation/AGENT_SCAN_WORKFLOW.md).
+It records the installed artifact, controlled inputs, protocol exchange, and
+interpretation of findings, incomplete analysis, and unavailable LLM analysis.
+
 Register it with Claude Code via:
 
 ```bash
