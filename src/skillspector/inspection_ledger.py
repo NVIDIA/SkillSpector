@@ -157,6 +157,7 @@ class LedgerReason(StrEnum):
     STATIC_PARSE_LIMIT = "static_parse_limit"
     PYTHON_SOURCE_AMBIGUOUS = "python_source_ambiguous"
     PYTHON_SOURCE_DECODE_ERROR = "python_source_decode_error"
+    JSON_QUOTE_OWNERSHIP_LIMIT = "json_quote_ownership_limit"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
 
 
@@ -560,6 +561,12 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.PYTHON_SOURCE_DECODE_ERROR: (
         "Python source bytes could not be decoded under their declared encoding."
     ),
+    LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT: (
+        "JSON quote ownership was not validated because a candidate source span exceeds "
+        "the character limit. JSON validity remains unverified; other instruction uncertainty "
+        "may remain. Split the document into smaller complete JSON values without dropping "
+        "required content, then rescan. Increasing the scan timeout does not raise this limit."
+    ),
     LedgerReason.OBFUSCATED_INSTRUCTION_TEXT: (
         "Obfuscated instruction text could not be fully evaluated by the deterministic layer."
     ),
@@ -641,6 +648,7 @@ class ParserCheck(StrEnum):
     COMMAND_STRING_DEPTH = "command_string_depth"
     COMMAND_STRING_RUNTIME = "command_string_runtime"
     COMMAND_STRING_EFFECTS = "command_string_effects"
+    JSON_STRING_DECODING = "json_string_decoding"
     STARTUP_PROOF_CHARACTERS = "startup_proof_characters"
     BRACE_CHARACTERS = "brace_characters"
     BRACE_ALTERNATIVES = "brace_alternatives"
@@ -784,6 +792,8 @@ class InspectionLedgerEvent(ResourceMeasurements):
     error_class: NotRequired[str]
     stage: NotRequired[str]
     parser_diagnostic: NotRequired[ParserDiagnostic]
+    source_start_offset: NotRequired[int]
+    source_end_offset: NotRequired[int]
 
 
 class AnalyzerStatusEvent(TypedDict):
@@ -815,6 +825,8 @@ class InspectionLedgerException(ResourceMeasurements):
     scope: NotRequired[str]
     source_identity: NotRequired[str]
     parser_diagnostic: NotRequired[ParserDiagnostic]
+    source_start_offset: NotRequired[int]
+    source_end_offset: NotRequired[int]
 
 
 class AnalysisCompleteness(TypedDict):
@@ -1175,6 +1187,31 @@ def _exception_from_event(
     parser_diagnostic = sanitize_parser_diagnostic(event.get("parser_diagnostic"))
     if parser_diagnostic is not None:
         exception["parser_diagnostic"] = parser_diagnostic
+    if exception["reason_code"] is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT:
+        # Copy only consistent numeric evidence, never an arbitrary message or
+        # source payload from graph state. Keep distinct spans distinct when
+        # the public projection groups contributing analyzers below.
+        start = event.get("source_start_offset")
+        end = event.get("source_end_offset")
+        observed = event.get("observed_characters")
+        limit = event.get("limit_characters")
+        if (
+            type(start) is int
+            and type(end) is int
+            and type(observed) is int
+            and type(limit) is int
+            and 0 <= start < end
+            and observed == end - start
+            and observed > limit > 0
+        ):
+            exception["source_start_offset"] = start
+            exception["source_end_offset"] = end
+            exception["observed_characters"] = observed
+            exception["limit_characters"] = limit
+            exception["message"] += (
+                f" Observed source character span [{start}, {end}) "
+                f"({observed} characters; limit {limit})."
+            )
     return exception
 
 
