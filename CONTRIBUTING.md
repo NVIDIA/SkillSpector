@@ -3,9 +3,13 @@
 We welcome contributions to SkillSpector! By contributing, you agree to abide
 by the [Developer Certificate of Origin](#developer-certificate-of-origin).
 
+> **Security vulnerabilities:** Report suspected vulnerabilities, including in
+> SkillSpector itself, privately to NVIDIA PSIRT by following [SECURITY.md](SECURITY.md).
+> Do not report them through GitHub issues, pull requests, or Discussions.
+
 ## How to Contribute
 
-1. **Open an issue** describing the bug or feature you'd like to work on.
+1. **Open an issue** describing the non-security bug, false positive, or feature you'd like to work on.
 2. **Fork** the repository and create a branch for your change.
 3. **Make your changes**, ensuring all tests pass (`make test`).
 4. **Sign off** every commit (see below).
