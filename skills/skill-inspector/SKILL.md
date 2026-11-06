@@ -49,7 +49,7 @@ Do not rely on the numeric score alone. A low score can miss semantic risk, and 
    rather than UTF-16:
 
    ```powershell
-   skillspector scan "$TARGET" --no-llm --format json | Set-Content -Encoding utf8 "$env:TEMP\skill-inspector-report.json"
+   skillspector scan "$TARGET" --no-llm --format json | Set-Content -Encoding utf8 -LiteralPath "$env:TEMP\skill-inspector-report.json"
    ```
 
    If the command exits non-zero, inspect any partial report and continue manually. Record that the static line was incomplete. On Windows, a non-zero exit from a command using `--output` is a platform refusal, not a scan failure: no partial report exists, so do not look for one or retry the same command.
