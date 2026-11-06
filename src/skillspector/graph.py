@@ -23,8 +23,14 @@ from __future__ import annotations
 
 from typing import Any
 
+# Configure serializer warnings before LangGraph imports its serializer.
+from skillspector import _workflow_warnings as _workflow_warnings
+
+# isort: split
+
 from langgraph.graph import END, START, StateGraph
 
+from skillspector.dependency_inspection import inspect_dependencies
 from skillspector.inspection_ledger import guard_analyzer_node
 from skillspector.llm_utils import is_llm_available as is_llm_available
 from skillspector.logging_config import get_logger
@@ -49,6 +55,9 @@ def create_graph():
 
     workflow.add_node("resolve_input", resolve_input)
     workflow.add_node("build_context", build_context)
+    workflow.add_node(
+        "inspect_dependencies", guard_analyzer_node("dependency_contents", inspect_dependencies)
+    )
     workflow.add_node("meta_analyzer", meta_analyzer)
     workflow.add_node("finalize_inspection_ledger", finalize_inspection_ledger)
     workflow.add_node("report", report)
@@ -76,9 +85,10 @@ def create_graph():
 
     workflow.add_edge(START, "resolve_input")
     workflow.add_edge("resolve_input", "build_context")
+    workflow.add_edge("build_context", "inspect_dependencies")
 
     for analyzer_id in wired_analyzers:
-        workflow.add_edge("build_context", analyzer_id)
+        workflow.add_edge("inspect_dependencies", analyzer_id)
         workflow.add_edge(analyzer_id, "meta_analyzer")
 
     workflow.add_edge("meta_analyzer", "finalize_inspection_ledger")

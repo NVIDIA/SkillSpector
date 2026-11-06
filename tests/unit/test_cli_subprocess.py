@@ -54,7 +54,7 @@ def _run_python(
 
 
 def _run_cli(*args: str, provider: str = "nv_build") -> subprocess.CompletedProcess[str]:
-    return _run_python("from skillspector.cli import app; app()", *args, provider=provider)
+    return _run_python("from skillspector.cli_entry import app; app()", *args, provider=provider)
 
 
 def _write_skill(path: Path, body: str = "# Helper\n\nFormat a table.\n") -> Path:

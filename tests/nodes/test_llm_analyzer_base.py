@@ -22,6 +22,7 @@ import concurrent.futures
 import contextlib
 import json
 import threading
+from contextvars import ContextVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -88,10 +89,16 @@ from skillspector.llm_analyzer_base import (
     findings_in_range,
     ledger_events_for_batches,
     number_lines,
+    numbered_line_overhead_bytes,
     resolve_max_concurrency,
     resolve_output_language,
 )
-from skillspector.llm_utils import AgentCLIChatModel, StructuredOutputParseError, run_async
+from skillspector.llm_utils import (
+    AgentCLIChatModel,
+    StructuredOutputParseError,
+    _StructuredAgentCLIModel,
+    run_async,
+)
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
@@ -99,6 +106,7 @@ from skillspector.nodes.meta_analyzer import (
     MetaAnalyzerResult,
     _format_findings_for_prompt,
 )
+from skillspector.providers._agent_cli import MAX_INPUT_BYTES
 
 # ---------------------------------------------------------------------------
 # estimate_tokens
@@ -255,6 +263,60 @@ class TestChunkFileByLines:
         chunks = chunk_file_by_lines(content, max_tokens=100)
         assert len(chunks) == 1
         assert chunks[0][1] == 1
+
+    def test_max_bytes_none_is_unchanged(self) -> None:
+        content = "".join(f"x = {i}\n" for i in range(5000))
+        assert chunk_file_by_lines(content, 500) == chunk_file_by_lines(
+            content, 500, max_bytes=None
+        )
+
+    def test_chunks_respect_byte_budget_including_line_prefix(self) -> None:
+        # The token budget alone would fit every line; only the byte budget splits.
+        content = "".join("a" * 40 + "\n" for _ in range(20_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=100_000)
+        assert len(chunks) > 1
+        for text, start, _end in chunks:
+            assert len(number_lines(text, start).encode("utf-8")) <= 100_000
+
+    def test_byte_budget_covers_every_line(self) -> None:
+        content = "".join(f"line {i}\n" for i in range(20_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=50_000)
+        covered: set[int] = set()
+        for _text, start, end in chunks:
+            covered.update(range(start, end + 1))
+        assert covered == set(range(1, 20_001))
+
+    def test_multibyte_lines_counted_in_bytes(self) -> None:
+        # 300 UTF-8 bytes but only 25 estimated tokens per line.
+        content = "".join("漢" * 100 + "\n" for _ in range(5_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=200_000)
+        assert len(chunks) > 1
+        for text, start, _end in chunks:
+            assert len(number_lines(text, start).encode("utf-8")) <= 200_000
+
+    def test_single_oversized_line_is_kept_whole(self) -> None:
+        long_line = "y" * 300_000
+        content = "short\n" + long_line + "\nshort\n"
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=100_000)
+        assert any(long_line in text for text, _start, _end in chunks)
+        covered: set[int] = set()
+        for _text, start, end in chunks:
+            covered.update(range(start, end + 1))
+        assert covered == {1, 2, 3}
+
+    def test_compact_prompts_and_crlf_stay_under_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_COMPACT_PROMPTS", "1")
+        content = "".join("b" * 30 + "\r\n" for _ in range(20_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=60_000)
+        assert len(chunks) > 1
+        for text, start, _end in chunks:
+            assert len(number_lines(text, start).encode("utf-8")) <= 60_000
+
+    def test_numbered_line_overhead_bytes_matches_widest_prefix(self) -> None:
+        assert numbered_line_overhead_bytes(9) == len("L9: ")
+        assert numbered_line_overhead_bytes(19_239) == len("L19239: ")
 
 
 # ---------------------------------------------------------------------------
@@ -1018,6 +1080,113 @@ class TestMetaAnalyzerResultFindingsValidator:
 
 
 # ---------------------------------------------------------------------------
+# LLMAnalyzerBase.get_batches — CLI provider input byte cap
+# ---------------------------------------------------------------------------
+
+
+class TestCliPromptByteBudget:
+    """CLI providers reject prompts over ``MAX_INPUT_BYTES`` before the CLI starts.
+
+    The token budget alone does not keep a numbered prompt under that cap: with a
+    272k-token context window (input budget 204k tokens), short lines carry a
+    line-number prefix the token estimate ignores, and multi-byte text is larger in
+    bytes than in estimated tokens.
+    """
+
+    MODEL = "nvidia/openai/gpt-oss-120b"
+    LARGE_CONTEXT_INPUT_BUDGET = int(272_000 * 0.75)
+
+    @pytest.fixture
+    def cli_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+
+    @pytest.fixture
+    def http_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+
+    def _analyzer(self) -> LLMAnalyzerBase:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._input_budget = self.LARGE_CONTEXT_INPUT_BUDGET
+        return analyzer
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_provider_batches_fit_max_input_bytes(self, cli_provider: None) -> None:
+        analyzer = self._analyzer()
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        batches = analyzer.get_batches(["big.js"], {"big.js": content})
+        assert len(batches) > 1
+        for batch in batches:
+            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_provider_batches_cover_every_line(self, cli_provider: None) -> None:
+        analyzer = self._analyzer()
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        covered: set[int] = set()
+        for batch in analyzer.get_batches(["big.js"], {"big.js": content}):
+            assert batch.end_line is not None
+            covered.update(range(batch.start_line, batch.end_line + 1))
+        assert covered == set(range(1, 150_001))
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_provider_splits_multibyte_file_under_token_budget(
+        self, cli_provider: None
+    ) -> None:
+        analyzer = self._analyzer()
+        # ~1.2 MB of UTF-8 but only ~100k estimated tokens: fits the token budget whole.
+        content = "".join("漢" * 200 + "\n" for _ in range(2_000))
+        assert estimate_tokens(content) <= self.LARGE_CONTEXT_INPUT_BUDGET
+        batches = analyzer.get_batches(["cjk.md"], {"cjk.md": content})
+        assert len(batches) > 1
+        for batch in batches:
+            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_http_provider_batching_unchanged(self, http_provider: None) -> None:
+        analyzer = self._analyzer()
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        budget = max(analyzer._input_budget - estimate_tokens("test"), 1024)
+        expected = [(s, e) for _t, s, e in chunk_file_by_lines(content, budget)]
+        batches = analyzer.get_batches(["big.js"], {"big.js": content})
+        assert [(b.start_line, b.end_line) for b in batches] == expected
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_payload_with_schema_instructions_fits_without_margin(
+        self, cli_provider: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The CLI transport appends the JSON schema after build_prompt; the budget must
+        # measure it rather than rely on the safety margin to absorb it.
+        monkeypatch.setattr("skillspector.llm_analyzer_base.PROMPT_BYTE_SAFETY_MARGIN", 0)
+        analyzer = self._analyzer()
+        structured = _StructuredAgentCLIModel(MagicMock(), LLMAnalysisResult)
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        for batch in analyzer.get_batches(["big.js"], {"big.js": content}):
+            payload = structured._augment(analyzer.build_prompt(batch))
+            assert len(payload.encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_path_with_unencodable_characters_does_not_raise(self, cli_provider: None) -> None:
+        # A non-UTF-8 file name decoded with surrogateescape; the provider encodes
+        # with errors="replace", so batching must not be stricter than the transport.
+        analyzer = self._analyzer()
+        path = "skill/\udcff.md"
+        batches = analyzer.get_batches([path], {path: "line \udcfe\n"})
+        assert [b.file_path for b in batches] == [path]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_oversized_single_line_warns_and_is_not_truncated(
+        self, cli_provider: None, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        analyzer = self._analyzer()
+        # Fewer estimated tokens than the budget, more bytes than the cap.
+        line = "漢" * (MAX_INPUT_BYTES // 3 + 10)
+        with caplog.at_level("WARNING"):
+            batches = analyzer.get_batches(["min.js"], {"min.js": line + "\n"})
+        assert any(line in batch.content for batch in batches)
+        assert "exceeds the provider input limit" in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # LLMAnalyzerBase.collect_findings
 # ---------------------------------------------------------------------------
 
@@ -1288,6 +1457,50 @@ class TestRunBatches:
         assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
             ("malformed.py", "ValidationError")
         ]
+        assert analyzer._structured_llm.invoke.call_count == 5
+        assert sleep.call_args_list == [
+            ((0.5,), {}),
+            ((1.0,), {}),
+            ((2.0,), {}),
+        ]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_missing_structured_response_recovers_on_retry(self, sleep: MagicMock) -> None:
+        """A tool-call parser returns None when the reply has no tool call."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[None, LLMAnalysisResult(findings=[])]
+        )
+
+        outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert analyzer._structured_llm.invoke.call_count == 2
+        sleep.assert_called_once_with(0.5)
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_missing_structured_response_isolated_after_three_retries(
+        self, sleep: MagicMock
+    ) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[None, None, None, None, LLMAnalysisResult(findings=[])]
+        )
+        batches = [
+            Batch(file_path="missing.py", content="no tool call"),
+            Batch(file_path="clean.py", content="clean response"),
+        ]
+
+        outcome = analyzer.run_batches_detailed(batches)
+
+        assert [item[0].file_path for item in outcome.successful] == ["clean.py"]
+        assert [
+            (failure.batch.file_path, failure.error_class, failure.reason)
+            for failure in outcome.failures
+        ] == [("missing.py", "ValidationError", LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID)]
         assert analyzer._structured_llm.invoke.call_count == 5
         assert sleep.call_args_list == [
             ((0.5,), {}),
@@ -2004,6 +2217,50 @@ class TestARunBatches:
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_missing_structured_response_recovers_on_retry(self, sleep: AsyncMock) -> None:
+        """A tool-call parser returns None when the reply has no tool call."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
+            side_effect=[None, LLMAnalysisResult(findings=[])]
+        )
+
+        outcome = await analyzer.arun_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert analyzer._structured_llm.ainvoke.call_count == 2
+        sleep.assert_awaited_once_with(0.5)
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_missing_structured_response_isolated_after_three_retries(
+        self, sleep: AsyncMock
+    ) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
+            side_effect=[None, None, None, None, LLMAnalysisResult(findings=[])]
+        )
+        batches = [
+            Batch(file_path="missing.py", content="no tool call"),
+            Batch(file_path="clean.py", content="clean response"),
+        ]
+
+        outcome = await analyzer.arun_batches_detailed(batches, max_concurrency=1)
+
+        assert [item[0].file_path for item in outcome.successful] == ["clean.py"]
+        assert [
+            (failure.batch.file_path, failure.error_class, failure.reason)
+            for failure in outcome.failures
+        ] == [("missing.py", "ValidationError", LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID)]
+        assert analyzer._structured_llm.ainvoke.call_count == 5
+        assert sleep.await_args_list == [
+            ((0.5,), {}),
+            ((1.0,), {}),
+            ((2.0,), {}),
+        ]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
     async def test_api_connection_error_recovers_with_bounded_backoff(
         self, sleep: AsyncMock
     ) -> None:
@@ -2449,10 +2706,7 @@ class TestLedgerEventsForBatches:
         assert events[0]["outcome"] is LedgerOutcome.SKIPPED
         assert status["status"] == "degraded"
         assert events[0]["reason_code"] == LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
-        assert (
-            events[0]["message"]
-            == "LLM returned a malformed structured response after bounded retries."
-        )
+        assert events[0]["message"] == "LLM response could not be validated after bounded recovery."
 
         completeness, _ = finalize_ledger(
             {
@@ -2467,7 +2721,7 @@ class TestLedgerEventsForBatches:
             LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
         )
         assert completeness["ledger_exceptions"][0]["message"] == (
-            "LLM returned a malformed structured response after bounded retries."
+            "LLM response could not be validated after bounded recovery."
         )
         assert completeness["ledger_exceptions"][0]["fatal"] is False
         assert completeness["execution_successful"] is True
@@ -2944,6 +3198,73 @@ class TestLLMMetaAnalyzerGetBatches:
         batches = analyzer.get_batches(["a.py"], file_cache, [])
         assert len(batches) == 1
         assert batches[0].findings == []
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_batches_fit_with_large_metadata_and_findings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        analyzer._input_budget = int(272_000 * 0.75)
+        content = "".join("m" * 40 + "\n" for _ in range(30_000))
+        findings = [self._make_finding("big.js", line=i) for i in range(1, 30_000, 100)]
+        metadata = "d" * 400_000
+        batches = analyzer.get_batches(
+            ["big.js"], {"big.js": content}, findings, metadata_text=metadata
+        )
+        for batch in batches:
+            prompt = analyzer.build_prompt(batch, metadata_text=metadata)
+            assert len(prompt.encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_sc10_redaction_cannot_push_prompt_over_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        analyzer._input_budget = int(272_000 * 0.75)
+        # Each short credential URL grows when redact_text rewrites it.
+        content = "".join("x=http://u:p@h\n" for _ in range(70_000))
+        findings = [self._make_finding("creds.py", line=1, rule_id="SC10")]
+        batches = analyzer.get_batches(["creds.py"], {"creds.py": content}, findings)
+        assert all("u:p@" not in batch.content for batch in batches)
+        for batch in batches:
+            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_sc10_redaction_keeps_lines_and_finding_aligned(self) -> None:
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        lines = [f"line {i}\n" for i in range(1, 11)]
+        lines[4] = "x=http://u:p@h?token=s3cret more\n"
+        content = "".join(lines)
+        cache = {"creds.py": content, "plain.py": "y=http://u:p@h\n"}
+        finding = self._make_finding("creds.py", line=5, rule_id="SC10")
+        batches = analyzer.get_batches(["creds.py", "plain.py"], cache, [finding])
+        creds = next(b for b in batches if b.file_path == "creds.py")
+        redacted = creds.content.splitlines()
+        assert len(redacted) == 10
+        assert redacted[3] == "line 4" and redacted[5] == "line 6"
+        assert "u:p@" not in redacted[4] and "s3cret" not in redacted[4]
+        assert creds.findings == [finding]
+        assert cache["creds.py"] == content  # the caller's cache is not mutated
+        plain = next(b for b in batches if b.file_path == "plain.py")
+        assert plain.content == "y=http://u:p@h\n"  # files without SC10 stay as they are
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_fixed_prompt_over_cap_warns_and_keeps_content(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        content = "".join(f"line {i}\n" for i in range(1, 101))
+        findings = [self._make_finding("a.py", line=1)]
+        metadata = "d" * (MAX_INPUT_BYTES + 10)
+        with caplog.at_level("WARNING"):
+            batches = analyzer.get_batches(
+                ["a.py"], {"a.py": content}, findings, metadata_text=metadata
+            )
+        assert "".join(b.content for b in batches) == content
+        assert "exceeds the provider input limit" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -3761,6 +4082,171 @@ class TestConcurrencyIsGlobal:
         assert peak[0] == 2
 
 
+class TestBoundedBatchAdmission:
+    MODEL = "gpt-4o-mini"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_late_analyzer_progresses_before_an_early_queue_drains(self, monkeypatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "1")
+        limiter = _GlobalLLMLimiter(1)
+        monkeypatch.setattr("skillspector.llm_analyzer_base._shared_limiter", lambda _: limiter)
+        owner = ContextVar("batch_owner", default="")
+        first_started, late_waiting, release = (threading.Event() for _ in range(3))
+        order: list[str] = []
+        lock = threading.Lock()
+        acquire = limiter.acquire
+
+        async def observed_acquire():
+            if owner.get() == "late":
+                late_waiting.set()
+            await acquire()
+
+        monkeypatch.setattr(limiter, "acquire", observed_acquire)
+
+        async def invoke(*_args, **_kwargs):
+            label = owner.get()
+            with lock:
+                order.append(label)
+                first = len(order) == 1
+            if first:
+                first_started.set()
+                assert await asyncio.to_thread(release.wait, 5)
+            await asyncio.sleep(0)
+            return LLMAnalysisResult(findings=[])
+
+        first = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        late = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        first._structured_llm.ainvoke = AsyncMock(side_effect=invoke)
+        late._structured_llm.ainvoke = AsyncMock(side_effect=invoke)
+        batches = [Batch(file_path=f"early-{index}.py", content="print(1)") for index in range(64)]
+
+        def run(label, analyzer, own_batches):
+            token = owner.set(label)
+            try:
+                return run_async(analyzer.arun_batches_detailed(own_batches))
+            finally:
+                owner.reset(token)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            early_future = pool.submit(run, "early", first, batches)
+            try:
+                assert first_started.wait(5)
+                late_future = pool.submit(
+                    run, "late", late, [Batch(file_path="late.py", content="print(2)")]
+                )
+                assert late_waiting.wait(5)
+            finally:
+                release.set()
+            early_result = early_future.result(timeout=10)
+            late_result = late_future.result(timeout=10)
+        assert order.index("late") <= 2
+        assert [batch.file_path for batch, _ in early_result.successful] == [
+            batch.file_path for batch in batches
+        ]
+        assert len(late_result.successful) == 1
+        assert not early_result.failures and not late_result.failures
+
+    @pytest.mark.parametrize("width", [1, 3])
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_cancelled_worker_windows_release_the_global_permits(
+        self, width, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", str(width))
+        limiter = _GlobalLLMLimiter(width)
+        monkeypatch.setattr("skillspector.llm_analyzer_base._shared_limiter", lambda _: limiter)
+        entered, release = asyncio.Event(), asyncio.Event()
+        started = 0
+
+        async def blocked(*_args, **_kwargs):
+            nonlocal started
+            started += 1
+            if started == width:
+                entered.set()
+            await release.wait()
+            return LLMAnalysisResult(findings=[])
+
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(side_effect=blocked)
+        task = asyncio.create_task(
+            analyzer.arun_batches_detailed(
+                [Batch(file_path=f"{index}.py", content="print(1)") for index in range(20)]
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        probe = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        probe._structured_llm.ainvoke = AsyncMock(return_value=LLMAnalysisResult(findings=[]))
+        result = await asyncio.wait_for(
+            probe.arun_batches_detailed([Batch(file_path="probe.py", content="print(2)")]), 5
+        )
+        assert len(result.successful) == 1
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_unstarted_batches_keep_terminal_runtime_outcomes_and_findings(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "1")
+        remaining = [60.0]
+        analyzer = LLMAnalyzerBase(
+            base_prompt="test", model=self.MODEL, timeout=lambda: remaining[0]
+        )
+
+        async def first_response(*_args, **_kwargs):
+            remaining[0] = 0.0
+            return LLMAnalysisResult(
+                findings=[
+                    LLMFinding(
+                        rule_id="SEC-001",
+                        message="Bad",
+                        severity="HIGH",
+                        start_line=1,
+                        confidence=0.9,
+                    )
+                ]
+            )
+
+        analyzer._structured_llm.ainvoke = AsyncMock(side_effect=first_response)
+        monkeypatch.setattr(MOCK_PATCH_TARGET, lambda **_kwargs: analyzer._llm)
+        batches = [Batch(file_path=f"{index}.py", content="print(1)") for index in range(20)]
+        result = await analyzer.arun_batches_detailed(batches)
+        assert len(result.successful) == 1
+        assert result.successful[0][0] is batches[0]
+        assert result.successful[0][1][0].severity == "HIGH"
+        assert [failure.batch for failure in result.failures] == batches[1:]
+        assert all(failure.reason == LedgerReason.RUNTIME_LIMIT for failure in result.failures)
+        analyzer._structured_llm.ainvoke.assert_awaited_once()
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_one_cancelled_batch_does_not_cancel_sibling_results(self, monkeypatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "2")
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        batches = [Batch(file_path=f"{index}.py", content="print(1)") for index in range(4)]
+
+        async def invoke(batch, _prompt, **_kwargs):
+            if batch is batches[1]:
+                raise asyncio.CancelledError
+            await asyncio.sleep(0)
+            return batch, []
+
+        monkeypatch.setattr(analyzer, "_ainvoke_batch_with_retries", invoke)
+        result = await analyzer.arun_batches_detailed(batches)
+        assert [batch for batch, _ in result.successful] == [batches[0], batches[2], batches[3]]
+        assert len(result.failures) == 1
+        assert result.failures[0].batch is batches[1]
+        assert result.failures[0].error_class == "CancelledError"
+
+    @pytest.mark.parametrize("width", [0, -1, 1.5])
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_invalid_worker_width_is_rejected(self, width) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        with pytest.raises(ValueError, match="positive integer"):
+            await analyzer.arun_batches_detailed(
+                [Batch(file_path="a.py", content="print(1)")], max_concurrency=width
+            )
+
+
 class TestConcurrencyIsGlobalAcrossLoops:
     """The same bound, exercised the way the graph actually runs.
 
@@ -3911,3 +4397,246 @@ class TestConcurrencyIsGlobalAcrossLoops:
         assert asyncio.run(_exercise()) == 0, (
             "the limiter stranded a permit handed to a cancelled waiter"
         )
+
+
+# Recovery uses completed plain responses and the same bounded batch scheduler.
+def _plain_recovery_analyzer(monkeypatch, answer, *, model="custom/vendor-model-v99"):
+    from skillspector.structured_response import ResponseIssue
+
+    with patch(MOCK_PATCH_TARGET, _mock_get_chat_model):
+        analyzer = LLMAnalyzerBase(
+            base_prompt="Check TEST-1 and TEST-2.",
+            model=model,
+            recovery_rule_ids=("TEST-1", "TEST-2"),
+            node="semantic_security_discovery",
+        )
+    requests = []
+
+    def respond(_runnable, prompt):
+        field = prompt.rsplit("Requested field: ", 1)[1].split(".", 1)[0]
+        identity = json.loads(
+            prompt.rsplit("Item and already established fields: ", 1)[1].splitlines()[0]
+        )
+        requests.append((field, identity))
+        value = answer(field, identity)
+        if isinstance(value, BaseException):
+            raise value
+        return (
+            AIMessage(content=value, response_metadata={"finish_reason": "stop"})
+            if isinstance(value, str)
+            else value
+        )
+
+    async def arespond(runnable, prompt):
+        return respond(runnable, prompt)
+
+    def malformed(_batch, _prompt):
+        cause = StructuredOutputParseError(
+            "Completed prose",
+            issue=ResponseIssue.INVALID_JSON,
+            recovery_text="The assessment is written in prose, including all severities.",
+        )
+        raise _StructuredResponseValidationError(cause.issue) from cause
+
+    async def amalformed(batch, prompt):
+        return malformed(batch, prompt)
+
+    async def asleep(_delay):
+        pass
+
+    monkeypatch.setattr(analyzer, "_model_for_call", lambda: (object(), None))
+    monkeypatch.setattr(analyzer, "_invoke_with_failure_diagnostic", respond)
+    monkeypatch.setattr(analyzer, "_ainvoke_with_failure_diagnostic", arespond)
+    monkeypatch.setattr(analyzer, "_invoke_batch", malformed)
+    monkeypatch.setattr(analyzer, "_ainvoke_batch", amalformed)
+    monkeypatch.setattr(analyzer, "_sleep_before_retry", lambda _delay: None)
+    monkeypatch.setattr(analyzer, "_asleep_before_retry", asleep)
+    return analyzer, requests
+
+
+def _recovery_answers(field, identity):
+    return {
+        "finding_count": "1",
+        "rule_id": "TEST-1",
+        "severity": "HIGH",
+        "message": "Credentials sent without authorization.",
+        "start_line": "2",
+        "explanation": "UNKNOWN",
+        "remediation": "UNKNOWN",
+    }[field]
+
+
+def _run_plain_recovery(analyzer, asynchronous=False):
+    batches = [Batch(file_path="SKILL.md", content="First line\nSecond line\n")]
+    if asynchronous:
+        return run_async(analyzer.arun_batches_detailed(batches))
+    return analyzer.run_batches_detailed(batches)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("severity", ["LOW", "MEDIUM", "HIGH", "CRITICAL"])
+@pytest.mark.parametrize("model", ["custom/vendor-model-v99", "another-provider/unknown-model"])
+def test_plain_recovery_keeps_every_severity_without_model_matching(
+    monkeypatch, asynchronous, severity, model
+):
+    analyzer, requests = _plain_recovery_analyzer(
+        monkeypatch,
+        lambda field, identity: (
+            severity if field == "severity" else _recovery_answers(field, identity)
+        ),
+        model=model,
+    )
+    outcome = _run_plain_recovery(analyzer, asynchronous)
+    assert not outcome.failures and not outcome.warnings
+    finding = outcome.successful[0][1][0]
+    assert finding.rule_id == "TEST-1" and finding.severity == severity
+    assert finding.explanation == finding.remediation == ""
+    assert len(requests) == 7
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("reply", ["UNKNOWN", "Severity cannot be established", "", "LOW or HIGH"])
+def test_plain_recovery_unknown_severity_warns_without_inventing_a_finding(
+    monkeypatch, asynchronous, reply
+):
+    analyzer, _ = _plain_recovery_analyzer(
+        monkeypatch,
+        lambda field, identity: (
+            reply if field == "severity" else _recovery_answers(field, identity)
+        ),
+    )
+    outcome = _run_plain_recovery(analyzer, asynchronous)
+    assert not outcome.successful and not outcome.failures
+    assert outcome.recovered[0][1] == []
+    assert outcome.warnings[0].reason == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+    events, _ = ledger_events_for_batches("semantic_security_discovery", outcome)
+    assert events[0]["outcome"] == LedgerOutcome.PARTIAL
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("missing", ["message", "start_line"])
+def test_plain_recovery_keeps_minimal_high_when_details_are_unavailable(
+    monkeypatch, asynchronous, missing
+):
+    analyzer, _ = _plain_recovery_analyzer(
+        monkeypatch,
+        lambda field, identity: (
+            "UNKNOWN" if field == missing else _recovery_answers(field, identity)
+        ),
+    )
+    outcome = _run_plain_recovery(analyzer, asynchronous)
+    finding = outcome.recovered[0][1][0]
+    assert finding.rule_id == "TEST-1" and finding.severity == "HIGH"
+    assert finding.evidence["assessment_complete"] is False
+    assert outcome.warnings and not outcome.failures
+    if missing == "start_line":
+        assert "Exact line unknown" in finding.message
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_plain_recovery_provider_failure_keeps_known_high_and_execution_failure(
+    monkeypatch, asynchronous
+):
+    analyzer, _ = _plain_recovery_analyzer(
+        monkeypatch,
+        lambda field, identity: (
+            RuntimeError("provider unavailable")
+            if field == "explanation"
+            else _recovery_answers(field, identity)
+        ),
+    )
+    outcome = _run_plain_recovery(analyzer, asynchronous)
+    finding = outcome.recovered[0][1][0]
+    assert finding.severity == "HIGH" and outcome.failures and not outcome.warnings
+    events, status = ledger_events_for_batches("semantic_security_discovery", outcome)
+    completeness, effective = finalize_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [finding],
+            "inspection_ledger": events,
+            "analyzer_status_events": [status],
+        }
+    )
+    assert effective == [finding.finding_id]
+    assert completeness["execution_successful"] is False
+    assert not any(
+        row["reason_code"] in {LedgerReason.UNACCOUNTED_WORK, LedgerReason.FINDING_ACCOUNTING_ERROR}
+        for row in completeness["ledger_exceptions"]
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_plain_recovery_does_not_waive_input_budget(monkeypatch, asynchronous):
+    analyzer, requests = _plain_recovery_analyzer(monkeypatch, _recovery_answers)
+    analyzer._input_budget = 1
+    outcome = _run_plain_recovery(analyzer, asynchronous)
+    assert not requests and not outcome.warnings
+    assert outcome.failures[0].reason == LedgerReason.LLM_RESPONSE_LIMIT
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_plain_recovery_prioritizes_all_severities_before_optional_prose(monkeypatch, asynchronous):
+    def answer(field, identity):
+        if field == "finding_count":
+            return "16"
+        if field == "severity":
+            return "HIGH" if identity["finding_number"] == 16 else "LOW"
+        return _recovery_answers(field, identity)
+
+    analyzer, requests = _plain_recovery_analyzer(monkeypatch, answer)
+    outcome = _run_plain_recovery(analyzer, asynchronous)
+    assert len(requests) == 48
+    assert len(outcome.recovered[0][1]) == 16
+    assert any(f.severity == "HIGH" for f in outcome.recovered[0][1])
+    assert not any(field in {"explanation", "remediation"} for field, _ in requests)
+    assert outcome.warnings and not outcome.failures
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_plain_recovery_cli_process_completion_remains_explicitly_unverified(
+    monkeypatch, asynchronous
+):
+    from skillspector.llm_utils import _AgentCLIMessage
+
+    analyzer, _ = _plain_recovery_analyzer(
+        monkeypatch,
+        lambda field, identity: _AgentCLIMessage(_recovery_answers(field, identity)),
+    )
+    outcome = _run_plain_recovery(analyzer, asynchronous)
+    assert not outcome.successful and not outcome.failures
+    assert outcome.recovered[0][1][0].severity == "HIGH"
+    assert outcome.warnings[0].reason == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+
+
+@pytest.mark.parametrize("stop", ["length", "content_filter", "pause_turn"])
+def test_plain_recovery_refusal_truncation_incomplete_are_not_accepted(monkeypatch, stop):
+    analyzer, _ = _plain_recovery_analyzer(
+        monkeypatch,
+        lambda _field, _identity: AIMessage(content="0", response_metadata={"finish_reason": stop}),
+    )
+    outcome = _run_plain_recovery(analyzer)
+    assert outcome.failures and not outcome.warnings
+
+
+def test_plain_recovery_changed_repair_uses_only_original_assessment(monkeypatch):
+    from skillspector.structured_response import ResponseIssue
+
+    analyzer, _ = _plain_recovery_analyzer(monkeypatch, _recovery_answers)
+    original = '{"findings": [{"rule_id": "TEST-1" "severity": "HIGH"}]}'
+
+    def initial(_batch, _prompt):
+        cause = StructuredOutputParseError(
+            "punctuation", repair_text=original, recovery_text=original
+        )
+        raise _StructuredResponseValidationError(cause.issue) from cause
+
+    def changed(_batch, _source):
+        cause = StructuredOutputParseError("changed values", issue=ResponseIssue.FORMAT_CHANGED)
+        raise _StructuredResponseValidationError(cause.issue) from cause
+
+    monkeypatch.setattr(analyzer, "_invoke_batch", initial)
+    monkeypatch.setattr(analyzer, "_format_batch", changed)
+    recovery = MagicMock(return_value=(Batch("SKILL.md", ""), []))
+    monkeypatch.setattr(analyzer, "_recover_batch", recovery)
+    _run_plain_recovery(analyzer)
+    assert recovery.call_args.args[2] == original

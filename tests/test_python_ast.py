@@ -504,6 +504,28 @@ def test_python_org_macos_interpreter_aliases_are_python(content: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param("#!/usr/bin/env python3\r\npass\r\n", id="env-text"),
+        pytest.param(b"#!/usr/bin/env python3\r\npass\r\n", id="env-bytes"),
+        pytest.param("#!/usr/bin/python3\r\npass\r\n", id="absolute-text"),
+        pytest.param("#!/usr/bin/env -S python3 -B\r\npass\r\n", id="env-split-string"),
+    ],
+)
+def test_crlf_shebang_is_ambiguous(content: str | bytes) -> None:
+    # Direct execution keeps the carriage return in the interpreter name and
+    # fails, but ``python3 runner`` runs the file, so it stays in Python analysis.
+    assert classify_python_source("runner", content) is PythonSourceClassification.AMBIGUOUS
+
+
+def test_crlf_after_a_non_python_shebang_stays_non_python() -> None:
+    assert (
+        classify_python_source("runner", "#!/bin/sh\r\necho hi\r\n")
+        is PythonSourceClassification.NON_PYTHON
+    )
+
+
+@pytest.mark.parametrize(
     "interpreter",
     [
         pytest.param("python3.14-config", id="config-tool"),

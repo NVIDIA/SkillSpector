@@ -90,6 +90,7 @@ def test_workflow_budget_starts_before_input_materialization(
 
     class CapturingHandler:
         primary_file_path = None
+        primary_file_parent_path = None
 
         def __init__(
             self, transitive_budget: object | None = None, *, allow_git_credentials: bool = True
@@ -104,6 +105,9 @@ def test_workflow_budget_starts_before_input_materialization(
 
         def temp_dir_for_cleanup(self) -> None:
             return None
+
+        def cleanup(self) -> None:
+            pass
 
     monkeypatch.setattr("skillspector.nodes.resolve_input.InputHandler", CapturingHandler)
 

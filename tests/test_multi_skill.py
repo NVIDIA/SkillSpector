@@ -165,6 +165,7 @@ class TestDetectSkills:
         assert len(result.skills) == 1
         assert result.skills[0].name == "workflow-bundle"
         assert result.skills[0].path == sub
+        assert result.skills[0].primary_path == sub / "workflow.aisop.json"
 
     def test_structured_bundles_under_aisop_directories_are_detected(self, tmp_path: Path) -> None:
         """The supported .aisop container is not treated as a generic hidden tree."""
@@ -179,6 +180,10 @@ class TestDetectSkills:
         assert result.complete is True
         assert result.is_multi_skill is True
         assert {skill.name for skill in result.skills} == {"workflow-a", "workflow-b"}
+        assert all(
+            skill.primary_path == skill.path / ".aisop" / "workflow.aisop.json"
+            for skill in result.skills
+        )
 
     def test_single_structured_child_not_multi(self, tmp_path: Path) -> None:
         """One structured subdirectory should not force multi-skill mode."""

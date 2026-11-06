@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import math
 import re
+import time
 import zlib
 from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 
-from skillspector.artifacts import ContentKind, ReferenceKind
+from skillspector.artifacts import ArtifactDisposition, ContentKind, ReferenceKind
 from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
@@ -23,13 +24,22 @@ from skillspector.inspection_ledger import (
     LedgerRecordType,
     analyzer_status_for_events,
     finalize_ledger,
+    format_recovery_policy_accepted,
     inspection_work_id,
     ledger_event,
 )
 from skillspector.models import Finding
 from skillspector.nodes.analyzers import ANALYZER_LOAD_ERRORS, ANALYZER_MODULES
+from skillspector.passive_bmp import is_structurally_valid_passive_bmp
+from skillspector.passive_jpeg import is_structurally_valid_passive_jpeg
+from skillspector.references import (
+    MAX_REFERENCE_RUNTIME_SECONDS,
+    MAX_REFERENCE_SOURCE_BYTES,
+    documentation_image_provenance,
+)
 from skillspector.semantic_runtime import (
     has_semantic_runtime_event,
+    semantic_runtime_accounting,
     semantic_runtime_intent,
     semantic_runtime_ledger_event,
 )
@@ -47,6 +57,10 @@ _PNG_BIT_DEPTHS = {
 }
 _MAX_PASSIVE_PNG_CHUNKS = 4_096
 _MAX_REFERENCE_REASONS = 16
+_MAX_PASSIVE_REFERENCE_SOURCES = 16
+_MAX_PASSIVE_RASTER_PROOFS = 256
+_MAX_PASSIVE_RASTER_TOTAL_BYTES = 128 * 1024 * 1024
+_MAX_PASSIVE_RASTER_SECONDS = 2.0
 _REFERENCE_CAVEAT_REASONS = (LedgerReason.REFERENCE_MISSING, LedgerReason.REFERENCE_UNRESOLVED)
 _REFERENCE_LIMIT_FIELDS = frozenset(
     f"{prefix}_{unit}"
@@ -281,7 +295,7 @@ def _has_verified_passive_png(
     inventory_item: Mapping[str, object] | None,
     raw_file_cache: Mapping[str, object],
 ) -> bool:
-    """Require complete canonical bytes for the one proven-passive image format."""
+    """Require complete canonical bytes for the existing passive PNG subset."""
     if PurePosixPath(target_path).suffix.lower() != ".png" or not inventory_item:
         return False
     raw = raw_file_cache.get(target_path)
@@ -294,14 +308,42 @@ def _has_verified_passive_png(
     )
 
 
+def _has_verified_passive_raster(
+    target_path: str,
+    inventory_item: Mapping[str, object] | None,
+    raw_file_cache: Mapping[str, object],
+) -> bool:
+    if PurePosixPath(target_path).suffix.lower() == ".png":
+        return _has_verified_passive_png(target_path, inventory_item, raw_file_cache)
+    suffix = PurePosixPath(target_path).suffix.lower()
+    if suffix not in {".jpg", ".jpeg", ".bmp"} or not inventory_item:
+        return False
+    raw = raw_file_cache.get(target_path)
+    size_bytes = inventory_item.get("size_bytes")
+    return (
+        isinstance(raw, bytes)
+        and type(size_bytes) is int
+        and size_bytes == len(raw)
+        and (
+            is_structurally_valid_passive_bmp(raw)
+            if suffix == ".bmp"
+            else is_structurally_valid_passive_jpeg(raw)
+        )
+    )
+
+
 def _has_only_format_limitations(
     target_path: str,
     inventory_item: Mapping[str, object] | None,
     events: list[Mapping[str, object]],
     raw_file_cache: Mapping[str, object],
+    *,
+    format_verified: bool | None = None,
 ) -> bool:
     """Recognize unsupported content without hiding other coverage failures."""
-    if not _has_verified_passive_png(target_path, inventory_item, raw_file_cache):
+    if format_verified is None:
+        format_verified = _has_verified_passive_raster(target_path, inventory_item, raw_file_cache)
+    if not format_verified:
         return False
     if not inventory_item or str(inventory_item.get("content_kind")) not in {
         ContentKind.BINARY,
@@ -337,6 +379,84 @@ def _has_only_format_limitations(
             for event in exceptions
         )
     )
+
+
+def _verified_documentation_image_references(
+    state: SkillspectorState,
+    inventory: Mapping[str, Mapping[str, object]],
+    raw_file_cache: Mapping[str, object],
+) -> set[tuple[str, int, int, str, str, str]]:
+    """Corroborate declarations and rendered JPEG/BMP references.
+
+    The provenance label is not authority: bind it to canonical source bytes,
+    exact syntax/position and target. All sources share one byte/time allowance;
+    failed proofs are cached too. Existing image coverage remains partial.
+    """
+    resolution = state.get("reference_resolution")
+    if (
+        not isinstance(resolution, dict)
+        or resolution.get("complete") is not True
+        or resolution.get("limitations") != []
+    ):
+        return set()
+    deadline = time.monotonic() + MAX_REFERENCE_RUNTIME_SECONDS
+    remaining_bytes = MAX_REFERENCE_SOURCE_BYTES
+    proofs: dict[str, tuple[str, frozenset[tuple[int, int, str, str]]] | None] = {}
+    verified: set[tuple[str, int, int, str, str, str]] = set()
+    for reference in state.get("artifact_references", []):
+        if not isinstance(reference, dict):
+            continue
+        kind = reference.get("reference_kind")
+        if kind != ReferenceKind.DOCUMENTATION_IMAGE and not (
+            kind == ReferenceKind.MARKDOWN_IMAGE
+            and isinstance(reference.get("target_path"), str)
+            and PurePosixPath(reference["target_path"]).suffix.lower() in {".jpg", ".jpeg", ".bmp"}
+        ):
+            continue
+        source_path = reference.get("source_path")
+        if (
+            not _path_is_canonical(source_path)
+            or PurePosixPath(source_path).suffix.lower() != ".md"
+        ):
+            continue
+        if source_path not in proofs:
+            if len(proofs) >= _MAX_PASSIVE_REFERENCE_SOURCES or time.monotonic() >= deadline:
+                continue
+            proofs[source_path] = None
+            raw = raw_file_cache.get(source_path)
+            source_item = inventory.get(source_path)
+            if (
+                not isinstance(raw, bytes)
+                or not source_item
+                or type(source_item.get("size_bytes")) is not int
+                or source_item.get("size_bytes") != len(raw)
+                or str(source_item.get("content_kind")) != ContentKind.TEXT
+                or source_item.get("misleading_extension") is True
+                or len(raw) > remaining_bytes
+            ):
+                continue
+            remaining_bytes -= len(raw)
+            proofs[source_path] = documentation_image_provenance(
+                source_path, raw, deadline=deadline
+            )
+        proof = proofs[source_path]
+        if proof is None:
+            continue
+        digest, identities = proof
+        line, column, target = (
+            reference.get("line"),
+            reference.get("column"),
+            reference.get("target_path"),
+        )
+        if (
+            type(line) is int
+            and type(column) is int
+            and isinstance(target, str)
+            and reference.get("source_sha256") == digest
+            and (line, column, target, str(kind)) in identities
+        ):
+            verified.add((source_path, line, column, target, digest, str(kind)))
+    return verified
 
 
 def _ledger_evidence_was_truncated(events: Sequence[Mapping[str, object]]) -> bool:
@@ -501,6 +621,135 @@ def _status_paths_with_incomplete_evidence(
     return True, invalid_paths
 
 
+def _is_provider_failure(event: Mapping[str, object]) -> bool:
+    """Require concrete failed semantic work, rather than an untyped provider label."""
+    source = event.get("source_identity")
+    return (
+        event.get("reason_code") == LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+        and event.get("outcome") == LedgerOutcome.FAILED
+        and event.get("record_type") == LedgerRecordType.WORK_ITEM
+        and event.get("phase") in {"semantic", "meta"}
+        and isinstance(event.get("analyzer_id"), str)
+        and bool(event.get("analyzer_id"))
+        and (source is None or (isinstance(source, str) and bool(source)))
+    )
+
+
+def _runtime_gap_is_correlated_with_provider_failures(state: SkillspectorState) -> bool:
+    """Check whether provider failures alone explain derived runtime telemetry gaps.
+
+    Use the existing per-source runtime accounting on a private projection in
+    which only corroborated provider failures are treated as successful. Missing
+    calls, unrelated failed calls and missing required analyzers still fail that
+    accounting. The actual ledger, telemetry and execution status are untouched.
+    """
+    raw_statuses = state.get("analyzer_status_events")
+    if not isinstance(raw_statuses, list):
+        return False
+    events = {event["work_id"]: event for event in state.get("inspection_ledger", [])}
+    provider_scopes: set[tuple[object, str]] = set()
+    statuses: list[dict[str, object]] = []
+    for status in raw_statuses:
+        projected = dict(status)
+        if status.get("status") in {"failed", "degraded"}:
+            matches = [events.get(target["work_id"]) for target in status["planned_work"]]
+            if (
+                matches
+                and any(event is not None and _is_provider_failure(event) for event in matches)
+                and all(
+                    event is not None
+                    and (event["outcome"] == LedgerOutcome.COMPLETED or _is_provider_failure(event))
+                    and event.get("analyzer_id") == status.get("analyzer_id")
+                    and event.get("source_identity") == status.get("source_identity")
+                    for event in matches
+                )
+            ):
+                scope = status.get("source_identity")
+                if scope is not None and (not isinstance(scope, str) or not scope):
+                    return False
+                provider_scopes.add((scope, str(status["analyzer_id"])))
+                projected["status"] = "completed"
+        statuses.append(projected)
+    calls = state.get("llm_call_log")
+    if not provider_scopes or not isinstance(calls, list):
+        return False
+    projected_calls: list[object] = []
+    accounted: set[tuple[object, str]] = set()
+    for record in calls:
+        if not isinstance(record, Mapping):
+            return False
+        if "error" not in record or (
+            record["error"] is not None and not isinstance(record["error"], str)
+        ):
+            return False
+        scope = record.get("source_identity")
+        node = record.get("node")
+        if (scope is not None and (not isinstance(scope, str) or not scope)) or not isinstance(
+            node, str
+        ):
+            return False
+        key = (scope, node)
+        if record.get("ok") is False and key in provider_scopes:
+            accounted.add(key)
+            projected_calls.append({**record, "ok": True, "error": None})
+        else:
+            projected_calls.append(record)
+    if accounted != provider_scopes:
+        return False
+    _used, complete = semantic_runtime_accounting(
+        enabled=True,
+        result={**state, "analyzer_status_events": statuses, "llm_call_log": projected_calls},
+        discovered_modules=ANALYZER_MODULES,
+    )
+    return complete
+
+
+def _has_only_provider_failures(
+    inventory_item: Mapping[str, object] | None,
+    events: Sequence[Mapping[str, object]],
+    exceptions: Sequence[Mapping[str, object]],
+    *,
+    runtime_gap_correlated: bool,
+) -> bool:
+    """Separate execution infrastructure failures from artifact inspection failures."""
+    if (
+        not inventory_item
+        or inventory_item.get("disposition") != "analyzed"
+        or inventory_item.get("content_kind") != ContentKind.TEXT
+        or inventory_item.get("reason") is not None
+        or inventory_item.get("inherited_exclusion_reason") is not None
+        or inventory_item.get("misleading_extension") is True
+    ):
+        return False
+    incomplete = [event for event in events if event.get("outcome") != LedgerOutcome.COMPLETED]
+    provider_events = [event for event in incomplete if _is_provider_failure(event)]
+    if not provider_events:
+        return False
+    provider_sources = {event.get("source_identity") for event in provider_events}
+    allowed_reasons = {LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED}
+    if runtime_gap_correlated:
+        allowed_reasons.add(LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE)
+    return all(
+        _is_provider_failure(event)
+        or (
+            runtime_gap_correlated
+            and event.get("reason_code") == LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE
+            and event.get("record_type") == LedgerRecordType.SYSTEM
+            and event.get("outcome") == LedgerOutcome.PARTIAL
+            and event.get("phase") == "semantic_runtime"
+            and event.get("stage") == "runtime_telemetry"
+            and (
+                event.get("source_identity") is None
+                or (
+                    isinstance(event.get("source_identity"), str)
+                    and event.get("source_identity") in provider_sources
+                )
+            )
+        )
+        for event in incomplete
+    ) and all(exception.get("reason_code") in allowed_reasons for exception in exceptions)
+
+
 def _reference_coverage_findings(
     state: SkillspectorState,
 ) -> list[Finding]:
@@ -553,10 +802,15 @@ def _reference_coverage_findings(
         state.get("analyzer_status_events"), ledger_events
     )
     fatal_paths: set[str] = set()
+    exceptions_by_path: dict[str, list[Mapping[str, object]]] = {}
     canonicalization_succeeded = False
+    format_recovery_accepted = False
     if ledger_shape_complete and inventory_shape_complete and status_shape_complete:
         try:
             preexisting_completeness, _ = finalize_ledger(state)
+            format_recovery_accepted = format_recovery_policy_accepted(preexisting_completeness)
+            for exception in preexisting_completeness["ledger_exceptions"]:
+                exceptions_by_path.setdefault(str(exception.get("path", "")), []).append(exception)
             fatal_paths = {
                 str(exception.get("path", ""))
                 for exception in preexisting_completeness["ledger_exceptions"]
@@ -575,6 +829,79 @@ def _reference_coverage_findings(
         and canonicalization_succeeded
         and not _ledger_evidence_was_truncated(ledger_events)
     )
+    provider_evidence_complete = (
+        ledger_evidence_complete and len(ledger_events) <= MAX_INSPECTION_LEDGER_EVENTS
+    )
+    # Reference findings are created before finalization adds runtime telemetry.
+    # Include that pending cause in this private proof so a first pass cannot
+    # bypass the all-reasons check merely because the event is not stored yet.
+    pending_runtime_event = None
+    if provider_evidence_complete:
+        requested, enabled = semantic_runtime_intent(state)
+        pending_runtime_event = semantic_runtime_ledger_event(
+            requested=requested,
+            enabled=enabled,
+            result=state,
+            discovered_modules=ANALYZER_MODULES,
+        )
+        if (
+            pending_runtime_event is not None
+            and any(
+                _is_provider_failure(event)
+                for event in events_by_path.get(pending_runtime_event["path"], [])
+            )
+            and not has_semantic_runtime_event(ledger_events, pending_runtime_event)
+        ):
+            events_by_path.setdefault(pending_runtime_event["path"], []).append(
+                pending_runtime_event
+            )
+    runtime_gap_correlated = (
+        provider_evidence_complete
+        and not invalid_status_paths
+        and (
+            (
+                pending_runtime_event is not None
+                and pending_runtime_event.get("reason_code")
+                == LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE
+            )
+            or any(
+                event.get("reason_code") == LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE
+                for event in ledger_events
+            )
+        )
+        and _runtime_gap_is_correlated_with_provider_failures(state)
+    )
+    documentation_references = (
+        _verified_documentation_image_references(state, inventory, raw_file_cache)
+        if ledger_evidence_complete and not duplicate_inventory_paths
+        else set()
+    )
+    raster_proofs: dict[str, bool] = {}
+    raster_bytes_remaining = _MAX_PASSIVE_RASTER_TOTAL_BYTES
+    raster_deadline = time.monotonic() + _MAX_PASSIVE_RASTER_SECONDS
+
+    def format_is_verified(target_path: str, inventory_item: Mapping[str, object] | None) -> bool:
+        nonlocal raster_bytes_remaining
+        if target_path in raster_proofs:
+            return raster_proofs[target_path]
+        if len(raster_proofs) >= _MAX_PASSIVE_RASTER_PROOFS:
+            return False
+        raster_proofs[target_path] = False
+        raw = raw_file_cache.get(target_path)
+        if (
+            not isinstance(raw, bytes)
+            or len(raw) > raster_bytes_remaining
+            or time.monotonic() >= raster_deadline
+        ):
+            return False
+        # Charge attempted work before decoding; malformed bytes are not free.
+        raster_bytes_remaining -= len(raw)
+        raster_proofs[target_path] = (
+            _has_verified_passive_raster(target_path, inventory_item, raw_file_cache)
+            and time.monotonic() < raster_deadline
+        )
+        return raster_proofs[target_path]
+
     findings: list[Finding] = []
     seen_locations: set[tuple[str, int, str]] = set()
     diagnostics_by_target: dict[tuple[str, str], tuple[dict[str, object], str]] = {}
@@ -605,6 +932,56 @@ def _reference_coverage_findings(
         )
         if final_disposition not in {"partial", "failed", "out_of_scope"}:
             continue
+        # Accepted AI formatting uncertainty remains a visible coverage warning.
+        # It does not turn already-read text into a HIGH artifact-evasion finding.
+        # The global proof rejects any independent analyzer/accounting gap.
+        if (
+            ledger_evidence_complete
+            and format_recovery_accepted
+            and target_path not in invalid_status_paths
+            and target_path not in duplicate_inventory_paths
+            and inventory_item is not None
+            and disposition == reference_disposition == ArtifactDisposition.ANALYZED
+            and inventory_item.get("content_kind") == ContentKind.TEXT
+            and inventory_item.get("reason") is None
+            and inventory_item.get("inherited_exclusion_reason") is None
+            and inventory_item.get("misleading_extension") is not True
+        ):
+            continue
+        if (
+            provider_evidence_complete
+            and target_path not in invalid_status_paths
+            and target_path not in duplicate_inventory_paths
+            and reference_disposition == disposition
+            and _has_only_provider_failures(
+                inventory_item,
+                target_events,
+                exceptions_by_path.get(target_path, []),
+                runtime_gap_correlated=runtime_gap_correlated,
+            )
+        ):
+            continue
+        documentation_reference_verified = (
+            str(reference.get("reference_kind"))
+            in {
+                ReferenceKind.DOCUMENTATION_IMAGE,
+                ReferenceKind.MARKDOWN_IMAGE,
+            }
+            and isinstance(reference.get("source_path"), str)
+            and type(reference.get("line")) is int
+            and type(reference.get("column")) is int
+            and isinstance(reference.get("target_path"), str)
+            and isinstance(reference.get("source_sha256"), str)
+            and (
+                reference["source_path"],
+                reference["line"],
+                reference["column"],
+                reference["target_path"],
+                reference["source_sha256"],
+                str(reference["reference_kind"]),
+            )
+            in documentation_references
+        )
         # The all-reasons check is the safety boundary: executables, concealed
         # content, read failures, and any mixed limitation must retain AE1.
         if (
@@ -613,12 +990,19 @@ def _reference_coverage_findings(
             and target_path not in invalid_status_paths
             and target_path not in duplicate_inventory_paths
             and reference_disposition == disposition
-            and str(reference.get("reference_kind", "")) == ReferenceKind.MARKDOWN_IMAGE
+            and (
+                (
+                    str(reference.get("reference_kind", "")) == ReferenceKind.MARKDOWN_IMAGE
+                    and PurePosixPath(target_path).suffix.lower() == ".png"
+                )
+                or documentation_reference_verified
+            )
             and _has_only_format_limitations(
                 target_path,
                 inventory_item,
                 target_events,
                 raw_file_cache,
+                format_verified=format_is_verified(target_path, inventory_item),
             )
         ):
             continue
@@ -731,8 +1115,69 @@ def _analyzer_load_error_events() -> list[InspectionLedgerEvent]:
     ]
 
 
+def _reconcile_inspected_containers(state: SkillspectorState) -> dict[str, object]:
+    """Roll descendant gaps into successfully traversed containers in linear time."""
+    raw_inventory = state.get("artifact_inventory") or []
+    if not isinstance(raw_inventory, list) or not all(
+        isinstance(item, dict) and isinstance(item.get("path"), str) for item in raw_inventory
+    ):
+        return {}
+    rows = [dict(item) for item in raw_inventory]
+    inventory = {item["path"]: item for item in rows}
+    containers = {
+        path: item["inspected_members"]
+        for path, item in inventory.items()
+        if "inspected_members" in item
+    }
+    if not containers:
+        return {}
+    completeness, _ = finalize_ledger(state)
+    if format_recovery_policy_accepted(completeness):
+        # Traversal succeeded; the member's AI warning remains in the ledger.
+        # Do not turn accepted formatting uncertainty into an archive-access gap.
+        return {}
+    incomplete = {
+        str(row["path"])
+        for row in completeness["ledger_exceptions"]
+        if row.get("reason_code") not in _REFERENCE_CAVEAT_REASONS
+    } | {
+        path
+        for path, item in inventory.items()
+        if item["disposition"] in {"partial", "failed"}
+        or (item["disposition"] == "out_of_scope" and item.get("referenced"))
+    }
+    parents: dict[str, set[str]] = {}
+    for path, members in containers.items():
+        for member in members:
+            parents.setdefault(member, set()).add(path)
+            if member not in inventory:
+                incomplete.add(path)
+    pending = list(incomplete)
+    while pending:
+        for parent in parents.get(pending.pop(), ()):
+            if parent not in incomplete:
+                incomplete.add(parent)
+                pending.append(parent)
+    incomplete_containers = containers.keys() & incomplete
+    for item in rows:
+        if item["path"] in incomplete_containers and item["disposition"] == "analyzed":
+            item["disposition"] = ArtifactDisposition.PARTIAL
+            item["reason"] = LedgerReason.ARCHIVE_MEMBER_INCOMPLETE.value
+    return {
+        "artifact_inventory": rows,
+        "artifact_references": [
+            {**reference, "disposition": inventory[reference["target_path"]]["disposition"]}
+            if reference.get("target_path") in containers
+            else reference
+            for reference in state.get("artifact_references") or []
+        ],
+    }
+
+
 def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
     """Validate full internal facts and derive the public completeness projection."""
+    container_updates = _reconcile_inspected_containers(state)
+    state = {**state, **container_updates}
     reference_findings = _reference_coverage_findings(state)
     size_findings = _size_coverage_findings(
         state,
@@ -822,12 +1267,13 @@ def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
         *reference_statuses,
     ]
     completeness, effective_finding_ids = finalize_ledger(merged_state)
-    if coverage_findings and completeness["status"] == "complete":
+    if coverage_findings and completeness["status"] in {"complete", "complete_with_caveats"}:
         completeness["status"] = "partial"
         completeness["is_complete"] = False
         limitations = completeness.setdefault("limitations", [])
         limitations.append("One or more artifacts were not completely inspected.")
     return {
+        **container_updates,
         "analysis_completeness": completeness,
         "execution_successful": completeness["execution_successful"],
         "findings": coverage_findings,

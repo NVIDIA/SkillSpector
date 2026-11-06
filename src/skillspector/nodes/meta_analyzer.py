@@ -414,6 +414,17 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
             return 0
         return estimate_tokens(_format_findings_for_prompt(findings))
 
+    def _recovery_known_items(self, batch: Batch) -> list[dict[str, Any]]:
+        return [
+            {
+                "finding_id": finding.finding_id,
+                "pattern_id": finding.rule_id,
+                "start_line": finding.start_line,
+                "end_line": finding.end_line,
+            }
+            for finding in batch.findings
+        ]
+
     def build_prompt(self, batch: Batch, **kwargs: object) -> str:
         metadata_text = redact_text(str(kwargs.get("metadata_text", "No metadata available")))
         findings_text = _format_findings_for_prompt(batch.findings)
@@ -431,13 +442,22 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
         file_paths: list[str],
         file_cache: dict[str, str],
         findings: list[Finding] | None = None,
+        **prompt_kwargs: object,
     ) -> list[Batch]:
-        """Redact credential-bearing SC10 source text before provider batching."""
-        batches = super().get_batches(file_paths, file_cache, findings)
-        for batch in batches:
-            if any(finding.rule_id == "SC10" for finding in batch.findings):
-                batch.content = redact_text(batch.content)
-        return batches
+        """Redact credential-bearing SC10 source text before provider batching.
+
+        Files with an SC10 finding are redacted as a whole *before* they are split:
+        redaction can lengthen text, so the batches must be sized from what is
+        actually sent.  ``redact_text`` never spans whitespace, so line numbers stay
+        aligned with the original file.
+        """
+        sc10_files = {finding.file for finding in findings or [] if finding.rule_id == "SC10"}
+        if sc10_files:
+            file_cache = {
+                path: redact_text(text) if path in sc10_files else text
+                for path, text in file_cache.items()
+            }
+        return super().get_batches(file_paths, file_cache, findings, **prompt_kwargs)
 
     def parse_response(  # type: ignore[override]  # Base class permits custom parsed values.
         self,
@@ -634,7 +654,7 @@ def _meta_ledger_response(
                 ],
             )
         )
-    for failure in outcome.failures:
+    for failure in [*outcome.warnings, *outcome.failures]:
         batch = failure.batch
         input_ids = [
             finding.finding_id
@@ -648,7 +668,11 @@ def _meta_ledger_response(
                 analyzer_id="meta_analyzer",
                 outcome=(
                     LedgerOutcome.PARTIAL
-                    if failure.reason is LedgerReason.RUNTIME_LIMIT
+                    if failure.reason
+                    in {
+                        LedgerReason.RUNTIME_LIMIT,
+                        LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED,
+                    }
                     else outcome_for_llm_batch_failure(failure.reason)
                 ),
                 phase="meta",
@@ -723,8 +747,6 @@ def _runtime_limited_events(findings: list[Finding]) -> list[InspectionLedgerEve
                 reason=LedgerReason.RUNTIME_LIMIT,
                 input_finding_ids=finding_ids,
                 emitted_finding_ids=finding_ids,
-                observed_seconds=0.0,
-                limit_seconds=0.0,
             )
         )
     return events
@@ -857,7 +879,9 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         # and recorded as a degraded LLM call (consistent with the semantic
         # analyzers) rather than crashing the whole graph.
         analyzer = LLMMetaAnalyzer(model=model, timeout=timeout)
-        batches = analyzer.get_batches(files_with_findings, file_cache, eligible_findings)
+        batches = analyzer.get_batches(
+            files_with_findings, file_cache, eligible_findings, metadata_text=metadata_text
+        )
         batches = [batch for batch in batches if batch.findings]
         logger.debug(
             "Meta-analyzer: %d files -> %d batches (model=%s)",
@@ -867,6 +891,9 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         )
 
         returned_results = run_async(analyzer.arun_batches(batches, metadata_text=metadata_text))
+        detailed = getattr(analyzer, "_last_batch_outcome", None)
+        if isinstance(detailed, BatchExecutionResult):
+            returned_results = [*returned_results, *detailed.recovered]
         submitted_batches = {_meta_batch_work_id(batch): batch for batch in batches}
         returned_by_work_id: dict[str, tuple[Batch, list]] = {}
         for returned_batch, response_findings in returned_results:
@@ -881,7 +908,6 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             for batch in batches
             if (work_id := _meta_batch_work_id(batch)) in returned_by_work_id
         ]
-        detailed = getattr(analyzer, "_last_batch_outcome", None)
         if not isinstance(detailed, BatchExecutionResult):
             successful_work_ids = set(returned_by_work_id)
             detailed = BatchExecutionResult(
@@ -893,29 +919,33 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
                 ],
             )
 
-        if len(batch_results) < len(batches):
-            # Some batches never returned. A finding the LLM never saw has no
-            # verdict — keep it via the fallback path instead of letting
-            # apply_filter treat the missing confirmation as a rejection.
-            analysed_ids = {
-                finding.finding_id for batch, _ in batch_results for finding in batch.findings
-            }
-            analysed = [
-                finding for finding in eligible_findings if finding.finding_id in analysed_ids
-            ]
-            unanalysed = [
-                finding for finding in eligible_findings if finding.finding_id not in analysed_ids
-            ]
-        else:
-            analysed, unanalysed = eligible_findings, []
+        completed_work_ids = {_meta_batch_work_id(batch) for batch, _ in detailed.successful}
+        analysed_ids: set[str] = set()
+        for batch, assessments in batch_results:
+            if _meta_batch_work_id(batch) in completed_work_ids:
+                analysed_ids.update(finding.finding_id for finding in batch.findings)
+                continue
+            # Partial recovery proves only the returned item assessments, even
+            # when all submitted batches have a partial result.
+            originals = {finding.finding_id: finding for finding in batch.findings}
+            for assessment in assessments:
+                finding_id = assessment.get("finding_id")
+                if not isinstance(finding_id, str):
+                    continue
+                original = originals.get(finding_id)
+                if original is not None and _assessment_matches_finding(
+                    assessment, original, batch.file_path
+                ):
+                    analysed_ids.add(finding_id)
+        analysed = [finding for finding in eligible_findings if finding.finding_id in analysed_ids]
+        unanalysed = [
+            finding for finding in eligible_findings if finding.finding_id not in analysed_ids
+        ]
 
         filtered = analyzer.apply_filter(analysed, batch_results)
         if unanalysed:
             logger.warning(
-                "Meta-analyzer: %d/%d batches failed; keeping %d findings in %d "
-                "files unfiltered (no LLM verdict)",
-                len(batches) - len(batch_results),
-                len(batches),
+                "Meta-analyzer: keeping %d findings in %d files without a completed LLM verdict",
                 len(unanalysed),
                 len({f.file for f in unanalysed}),
             )
@@ -938,10 +968,8 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             "inspection_ledger": ledger_events,
             "analyzer_status_events": [status],
             "llm_call_log": [
-                # A record is ok only when every submitted batch succeeded. A
-                # partial batch failure (e.g. one file's batch 429'd while
-                # another's succeeded) is still lost coverage, so it must not
-                # read as ok=True just because some batches came back.
+                # Formatting warnings retain partial coverage in the ledger;
+                # genuine provider/runtime failures still mark the call failed.
                 llm_call_record("meta_analyzer", ok=not detailed.failures)
             ],
             "inference_usage": analyzer.inference_usage,
