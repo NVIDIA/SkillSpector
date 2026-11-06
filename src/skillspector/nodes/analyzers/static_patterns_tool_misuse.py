@@ -2534,6 +2534,7 @@ def _parse_shell_command_word(
     enclosing_delimiter: str | None = None,
     quoted_printf_allowed: bool = True,
     diagnostics: list[StaticParserDiagnostic] | None = None,
+    native_argument: bool = False,
 ) -> _ShellCommandWord | None:
     runtime_check = check_runtime or (lambda: None)
     # The shell recognizes ``NAME=value`` before expansion and never runs the
@@ -2608,6 +2609,7 @@ def _parse_shell_command_word(
                             runtime_check,
                             quoted_result=quoted_printf_allowed,
                             recognize_limit=not limited and not assignment,
+                            **({"check_command_context": False} if native_argument else {}),
                         )
                     )
                     if static_value is None:
@@ -2664,6 +2666,7 @@ def _parse_shell_command_word(
                         runtime_check,
                         backtick=True,
                         recognize_limit=not limited and not assignment,
+                        **({"check_command_context": False} if native_argument else {}),
                     )
                 )
                 if static_value is None:
@@ -2720,6 +2723,7 @@ def _parse_shell_command_word(
                     substitution_end,
                     runtime_check,
                     recognize_limit=not limited and not assignment,
+                    **({"check_command_context": False} if native_argument else {}),
                 )
             )
             if static_value is None:
@@ -2780,6 +2784,7 @@ def _parse_shell_command_word(
                     runtime_check,
                     backtick=True,
                     recognize_limit=not limited and not assignment,
+                    **({"check_command_context": False} if native_argument else {}),
                 )
             )
             if static_value is None:
@@ -3391,6 +3396,8 @@ def _has_shell_command_word_exhaustion(
     _startup_diagnostics: list[StaticParserDiagnostic] | None = None,
     _xargs_contexts: tuple[tuple[str, list[bool | None]], ...] = (),
     complete_context: bool = True,
+    native_argument_spans: tuple[tuple[int, int], ...] = (),
+    native_argument_work: list[int] | None = None,
 ) -> StaticParserDiagnostic | None:
     """Find candidate command words whose deterministic parse hit a safety bound.
 
@@ -3430,6 +3437,8 @@ def _has_shell_command_word_exhaustion(
     json_openers = sorted(structural_quote_openers or ())
     complete_comments: set[tuple[int, int]] = set()
     word_diagnostics: list[StaticParserDiagnostic] = []
+    native_argument_index = 0
+    native_argument_through = 0
     # Short text without shell-expansion openers cannot trigger these shell-word
     # reconstruction or span limits. Keep its prior lazy ownership paths instead
     # of parsing an ordinary Python module for every candidate letter.
@@ -3442,6 +3451,62 @@ def _has_shell_command_word_exhaustion(
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
+        if start < native_argument_through:
+            continue
+        while (
+            native_argument_index < len(native_argument_spans)
+            and native_argument_spans[native_argument_index][1] <= start
+        ):
+            check_runtime()
+            native_argument_index += 1
+        if native_argument_index < len(native_argument_spans):
+            begin, end = native_argument_spans[native_argument_index]
+            if begin <= start < end:
+                # Only a complete native quoted argument supplies this role.
+                # Read its whole word, without borrowing later native values.
+                assert native_argument_work is not None
+                native_argument_work[0] -= 2 * (end - begin)
+                if native_argument_work[0] < 0:
+                    return StaticParserDiagnostic(
+                        ParserCause.RESOURCE_LIMIT,
+                        ParserCheck.MARKDOWN_LITERAL_OWNERSHIP,
+                        begin,
+                        end,
+                        ParserUncheckedScope.REMAINING_INPUT,
+                    )
+                argument = content[begin:end]
+                argument_diagnostics: list[StaticParserDiagnostic] = []
+                parsed_argument = _parse_shell_command_word(
+                    argument,
+                    0,
+                    check_runtime=check_runtime,
+                    diagnostics=argument_diagnostics,
+                    native_argument=True,
+                )
+                if parsed_argument is None or parsed_argument.limited or argument_diagnostics:
+                    diagnostic = parsed_argument.diagnostic if parsed_argument is not None else None
+                    if diagnostic is not None or argument_diagnostics:
+                        return (diagnostic or argument_diagnostics[0]).shifted(begin)
+                    if parsed_argument is not None and parsed_argument.limited:
+                        return StaticParserDiagnostic(
+                            ParserCause.RESOURCE_LIMIT,
+                            ParserCheck.COMMAND_WORD_CHARACTERS,
+                            begin,
+                            end,
+                            ParserUncheckedScope.COMMAND_WORD,
+                        )
+                if parsed_argument is None or parsed_argument.end != len(argument):
+                    return StaticParserDiagnostic(
+                        ParserCause.BOUNDARY_UNRESOLVED,
+                        ParserCheck.COMMAND_WORD_BOUNDARY,
+                        begin,
+                        end,
+                        ParserUncheckedScope.COMMAND_WORD,
+                    )
+                # Property-only native holes contain no executable child.
+                # The separate raw command-string walk receives no such grant.
+                native_argument_through = end
+                continue
         if python_word_source is not None and python_word_source.is_string_delimiter(start):
             continue
         if start in owned_word_positions:
@@ -9616,10 +9681,24 @@ def _markdown_structure_diagnostic(
     check_runtime: Callable[[], None],
     *,
     complete_context: bool = True,
+    native_argument_spans: tuple[tuple[int, int], ...] = (),
+    native_argument_work: list[int] | None = None,
 ) -> StaticParserDiagnostic | None:
     """Retain the Markdown punctuation proof independently of execution checks."""
+    native_options = (
+        {
+            "native_argument_spans": native_argument_spans,
+            "native_argument_work": native_argument_work,
+        }
+        if native_argument_spans
+        else {}
+    )
     exhausted = _has_bounded_parse_exhaustion(
-        content, check_runtime, file_type="markdown", complete_context=complete_context
+        content,
+        check_runtime,
+        file_type="markdown",
+        complete_context=complete_context,
+        **native_options,
     )
     if not complete_context:
         return replace(exhausted, full_input_checked=False) if exhausted is not None else None
@@ -9631,7 +9710,11 @@ def _markdown_structure_diagnostic(
     # a later closing quote into an opener, so the prose reading may only
     # resolve a limit of the lexical one, never introduce one.
     return _has_bounded_parse_exhaustion(
-        content, check_runtime, file_type="markdown", word_apostrophes=True
+        content,
+        check_runtime,
+        file_type="markdown",
+        word_apostrophes=True,
+        **native_options,
     )
 
 
@@ -9771,6 +9854,7 @@ def _owned_inline_command_diagnostic(
     executing: bool = False,
     depth: int = 0,
     powershell_value_bindings_proven: bool = False,
+    property_argument_spans: tuple[tuple[int, int], ...] | None = None,
 ) -> StaticParserDiagnostic | None:
     """Inspect only native-owned code bodies and their explicit executable operands."""
     remaining_work[0] -= len(content)
@@ -9801,6 +9885,8 @@ def _owned_inline_command_diagnostic(
     value_spans = (
         []
         if executing
+        else list(property_argument_spans)
+        if property_argument_spans is not None
         else _powershell_property_argument_spans(
             content,
             check_runtime,
@@ -10244,11 +10330,8 @@ def _markdown_owned_commands_diagnostic(
     *,
     complete_context: bool,
 ) -> StaticParserDiagnostic | None:
-    diagnostic = _markdown_structure_diagnostic(
-        content, check_runtime, complete_context=complete_context
-    )
-    if diagnostic is not None or not complete_context:
-        return diagnostic
+    if not complete_context:
+        return _markdown_structure_diagnostic(content, check_runtime, complete_context=False)
     ranges: list[tuple[int, int]] = []
     projected = _markdown_shell_text(content, check_runtime, inline_code_ranges=ranges)
     remaining_work = [8 * len(content) + _ROOT_GLOB_COMMAND_CHARS]
@@ -10270,6 +10353,49 @@ def _markdown_owned_commands_diagnostic(
             and _POWERSHELL_COMMAND_REBINDING_RE.search(content) is None
         )
         check_runtime()
+    property_arguments: dict[int, tuple[tuple[int, int], ...]] = {}
+    native_arguments: list[tuple[int, int]] = []
+    if property_bindings_proven:
+        for start, end in ranges:
+            check_runtime()
+            if content.find("$(", start, end) < 0 or content.find('"', start, end) < 0:
+                property_arguments[start] = ()
+                continue
+            remaining_work[0] -= end - start
+            if remaining_work[0] < 0:
+                break
+            spans = tuple(
+                _powershell_property_argument_spans(
+                    content[start:end], check_runtime, remaining_work, bindings_proven=True
+                )
+            )
+            property_arguments[start] = spans
+            for begin, finish in spans:
+                check_runtime()
+                native_arguments.append((start + begin, start + finish))
+    if remaining_work[0] < 0:
+        return StaticParserDiagnostic(
+            ParserCause.RESOURCE_LIMIT,
+            ParserCheck.MARKDOWN_LITERAL_OWNERSHIP,
+            0,
+            len(content),
+            ParserUncheckedScope.REMAINING_INPUT,
+        )
+    diagnostic = _markdown_structure_diagnostic(
+        content,
+        check_runtime,
+        complete_context=True,
+        **(
+            {
+                "native_argument_spans": tuple(native_arguments),
+                "native_argument_work": remaining_work,
+            }
+            if native_arguments
+            else {}
+        ),
+    )
+    if diagnostic is not None:
+        return diagnostic
     for start, end in ranges:
         check_runtime()
         diagnostic = _owned_inline_command_diagnostic(
@@ -10277,6 +10403,11 @@ def _markdown_owned_commands_diagnostic(
             check_runtime,
             remaining_work,
             powershell_value_bindings_proven=property_bindings_proven,
+            **(
+                {"property_argument_spans": property_arguments[start]}
+                if start in property_arguments
+                else {}
+            ),
         )
         if diagnostic is not None:
             return diagnostic.shifted(start)
@@ -10400,6 +10531,8 @@ def _has_bounded_parse_exhaustion(
     word_apostrophes: bool = False,
     python_import_check: Callable[[Callable[[], None]], bool] | None = None,
     python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
+    native_argument_spans: tuple[tuple[int, int], ...] = (),
+    native_argument_work: list[int] | None = None,
 ) -> StaticParserDiagnostic | None:
     # PowerShell source can invoke another shell with an executable command
     # string. Apply the same bounded checks to those strings; benign PowerShell
@@ -10568,6 +10701,14 @@ def _has_bounded_parse_exhaustion(
         quote_limits=quote_limits,
         file_type=file_type,
         complete_context=complete_context,
+        **(
+            {
+                "native_argument_spans": native_argument_spans,
+                "native_argument_work": native_argument_work,
+            }
+            if native_argument_spans
+            else {}
+        ),
     )
     if diagnostic is not None:
         return diagnostic
