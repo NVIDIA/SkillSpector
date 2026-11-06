@@ -73,9 +73,11 @@ from skillspector.python_ast import (
 from skillspector.python_import_bounds import PythonImportBounds
 from skillspector.python_tokens import PythonStringClosers
 from skillspector.security_reconstruction import (
+    _MAX_JSON_QUOTE_CONTAINER_CHARS,
     MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
     MAX_MARKER_LOOKAHEAD_CHARS,
     build_declared_marker_views,
+    json_quote_capacity_limit,
 )
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
 from skillspector.surface import COMMENTS, infer_surface
@@ -837,6 +839,7 @@ def _bounded_parser_incomplete(
     diagnostics: list[StaticParserDiagnostic] | None = None,
     path: str = "",
     python_import_bounds: PythonImportBounds | None = None,
+    prepared_analysis: object | None = None,
 ) -> bool:
     kwargs = {"file_type": file_type, "complete_context": complete_context}
     if vars(module).get("USES_PYTHON_IMPORT_BOUNDS") is True and python_import_bounds is not None:
@@ -844,6 +847,9 @@ def _bounded_parser_incomplete(
             path, view.text, check
         )
         kwargs["python_stdlib_check"] = python_import_bounds.allows_stdlib
+    if vars(module).get("USES_PREPARED_PARSER_ANALYSIS") is True:
+        kwargs["prepared_analysis"] = prepared_analysis
+        kwargs["source_view"] = _absolute_source_view(view, source_start=source_start)
     detailed_hook = _explicit_analysis_hook(module, "bounded_parse_diagnostic")
     if detailed_hook is not None:
         diagnostic = detailed_hook(view.text, check_runtime, **kwargs)
@@ -2218,7 +2224,9 @@ def _scan_declared_marker_views(
     python_source: bool,
     defer_projected_output_limit: bool,
     complete_context: bool,
+    limited_source_offsets: list[int],
     prepared_analyses: Mapping[int, object] | None = None,
+    parser_analyses: Mapping[int, object] | None = None,
     parser_diagnostics: list[StaticParserDiagnostic] | None = None,
     python_import_bounds: PythonImportBounds | None = None,
 ) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
@@ -2320,6 +2328,13 @@ def _scan_declared_marker_views(
                 validated_string_closer=string_closer,
             )
             projection_limited = projection_limited or reconstruction.limited
+            if (
+                reconstruction.first_limited_source_offset is not None
+                and not limited_source_offsets
+            ):
+                limited_source_offsets.append(
+                    raw_start + reconstruction.first_limited_source_offset
+                )
             for marker_view in reconstruction.views:
                 marker_offsets = marker_view.source_offsets
                 if not marker_offsets:
@@ -2439,6 +2454,7 @@ def _scan_declared_marker_views(
                                 diagnostics=parser_diagnostics,
                                 path=path,
                                 python_import_bounds=python_import_bounds,
+                                prepared_analysis=(parser_analyses or {}).get(id(module)),
                             )
                         )
 
@@ -2655,6 +2671,7 @@ def _scan_all_views_with_parser_diagnostics(
         if pattern_modules
         else None
     )
+    limited_source_offsets: list[int] = []
     modules_for_windows = lexical_modules or ([] if ast_modules else pattern_modules)
     bounded_parse_limited = False
     marker_owned_starts: tuple[int, ...] = ()
@@ -2664,6 +2681,7 @@ def _scan_all_views_with_parser_diagnostics(
     source_context: _WindowSourceContext | None = None
     whole_artifact_window = False
     prepared_analyses: dict[int, object] = {}
+    parser_analyses: dict[int, object] = {}
     deferred_output_limit: _StaticResourceLimitError | None = None
     deferred_scan_incomplete = False
     defers_mixed_output_limit = bool(
@@ -2759,6 +2777,14 @@ def _scan_all_views_with_parser_diagnostics(
         try:
             finding_budget.check_runtime()
             for module in modules_for_windows:
+                prepare_parser = _explicit_analysis_hook(module, "prepare_parser_analysis")
+                if prepare_parser is not None:
+                    parser_analyses[id(module)] = prepare_parser(
+                        content=content,
+                        file_type="json" if _oms_projected else _infer_file_type(path),
+                        check_runtime=finding_budget.check_runtime,
+                    )
+                    finding_budget.check_runtime()
                 prepare = _explicit_analysis_hook(module, "prepare_analysis")
                 if prepare is not None:
                     prepared_analyses[id(module)] = prepare(
@@ -2790,8 +2816,10 @@ def _scan_all_views_with_parser_diagnostics(
                 defer_projected_output_limit=coalesce is not None,
                 complete_context=whole_artifact_window,
                 prepared_analyses=prepared_analyses,
+                parser_analyses=parser_analyses,
                 parser_diagnostics=parser_diagnostics,
                 python_import_bounds=python_import_bounds,
+                limited_source_offsets=limited_source_offsets,
             )
             bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
@@ -2837,6 +2865,7 @@ def _scan_all_views_with_parser_diagnostics(
                             diagnostics=parser_diagnostics,
                             path=path,
                             python_import_bounds=python_import_bounds,
+                            prepared_analysis=parser_analyses.get(id(module)),
                         )
                     )
         except _StaticResourceLimitError as exc:
@@ -2972,6 +3001,7 @@ def _scan_all_views_with_parser_diagnostics(
                                     diagnostics=parser_diagnostics,
                                     path=path,
                                     python_import_bounds=python_import_bounds,
+                                    prepared_analysis=parser_analyses.get(id(module)),
                                 )
                             )
                 except _StaticResourceLimitError as exc:
@@ -3273,6 +3303,27 @@ def _scan_all_views_with_parser_diagnostics(
             deferred_output_limit.reason,
             metrics,
         )
+    if limited_source_offsets and not (python_syntax_error or bounded_parse_limited):
+        try:
+            capacity_span = json_quote_capacity_limit(
+                content,
+                finding_budget.check_runtime,
+                containing_offset=limited_source_offsets[0],
+            )
+        except _StaticResourceLimitError as exc:
+            return deduplicated, exc.reason, exc.metrics
+        if capacity_span is not None:
+            start, end = capacity_span
+            return (
+                deduplicated,
+                LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT,
+                {
+                    "observed_characters": end - start,
+                    "limit_characters": _MAX_JSON_QUOTE_CONTAINER_CHARS,
+                    "source_start_offset": start,
+                    "source_end_offset": end,
+                },
+            )
     return (
         deduplicated,
         (
@@ -3858,10 +3909,18 @@ def run_static_patterns_with_ledger(
                     emitted_finding_ids=[finding.finding_id for finding in path_findings],
                     parser_diagnostic=_public_parser_diagnostic(content, path_parser_diagnostic),
                     observed_characters=(
-                        len(content) if partial_reason is LedgerReason.SIZE_LIMIT else None
+                        int(resource_metrics["observed_characters"])
+                        if partial_reason is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT
+                        else len(content)
+                        if partial_reason is LedgerReason.SIZE_LIMIT
+                        else None
                     ),
                     limit_characters=(
-                        MAX_FILE_CHARS if partial_reason is LedgerReason.SIZE_LIMIT else None
+                        int(resource_metrics["limit_characters"])
+                        if partial_reason is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT
+                        else MAX_FILE_CHARS
+                        if partial_reason is LedgerReason.SIZE_LIMIT
+                        else None
                     ),
                     observed_findings=(
                         int(resource_metrics.get("observed_findings", len(path_findings)))
@@ -3888,6 +3947,12 @@ def run_static_patterns_with_ledger(
                         else None
                     ),
                 )
+                if partial_reason is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT:
+                    # Keep the file-level work identity; the diagnostic span is
+                    # not a separately planned inspection range. Finalization
+                    # projects these numeric facts into a safe public message.
+                    event["source_start_offset"] = int(resource_metrics["source_start_offset"])
+                    event["source_end_offset"] = int(resource_metrics["source_end_offset"])
         events.append(event)
 
     return {
