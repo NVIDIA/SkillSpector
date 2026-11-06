@@ -125,6 +125,46 @@ def test_one_value_cannot_borrow_another_values_backtick_closer() -> None:
     assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is not None
 
 
+@pytest.mark.parametrize("opener, closer", [("$(printf %s", ")"), ("`printf %s", "`")])
+def test_native_value_printf_recovery_keeps_its_same_eof(
+    monkeypatch: pytest.MonkeyPatch, opener: str, closer: str
+) -> None:
+    source = json.dumps({"first": "$HOME `tag` " + opener, "second": "later" + closer})
+    first_end = source.index('", "second"') + 1
+    proof = prepare_json_source(source, _check)
+    assert proof is not None
+    projection = proof.project(SecurityTextView("raw", source), _check)
+    assert projection is not None
+    original = (
+        tm._skip_backtick_substitution if opener.startswith("`") else tm._skip_command_substitution
+    )
+    target = source.index(opener)
+    observed = []
+
+    def bounded(content, start, limit, *args, **kwargs):
+        if content is projection.text and start == target:
+            observed.append(limit)
+            assert limit <= first_end
+        return original(content, start, limit, *args, **kwargs)
+
+    name = "_skip_backtick_substitution" if opener.startswith("`") else "_skip_command_substitution"
+    monkeypatch.setattr(tm, name, bounded)
+    assert (
+        tm._has_shell_command_word_exhaustion(
+            projection.text,
+            _check,
+            structural_quote_openers=projection.openers,
+            structural_quote_closers=projection.closers,
+            json_key_spans=projection.key_spans,
+            json_value_spans=tuple(
+                span for span in projection.strings if span not in projection.key_spans
+            ),
+        )
+        is not None
+    )
+    assert observed
+
+
 def test_clipped_value_cannot_claim_a_closing_backtick() -> None:
     source = json.dumps({"message": "$HOME reference `label` " + "ordinary data " * 600})
     proof = prepare_json_source(source, _check)

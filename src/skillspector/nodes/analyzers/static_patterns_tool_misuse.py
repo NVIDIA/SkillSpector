@@ -3558,6 +3558,7 @@ def _has_shell_command_word_exhaustion(
                 scoped_caches = ({}, {}, {})
                 native_caches[value_span[0]] = scoped_caches
             word_caches = scoped_caches
+        word_limit = value_span[1] if value_span is not None else len(content)
         parsed = _parse_shell_command_word(
             content,
             start,
@@ -3592,11 +3593,11 @@ def _has_shell_command_word_exhaustion(
                 substitution_end = _skip_command_substitution(
                     content,
                     substitution_start,
-                    len(content),
+                    word_limit,
                     check_runtime,
-                    end_cache=substitution_end_cache,
-                    parameter_end_cache=parameter_end_cache,
-                    backtick_end_cache=backtick_end_cache,
+                    end_cache=word_caches[1],
+                    parameter_end_cache=word_caches[0],
+                    backtick_end_cache=word_caches[2],
                 )
                 if substitution_end is not None and _is_printf_substitution(
                     content,
@@ -3622,7 +3623,7 @@ def _has_shell_command_word_exhaustion(
                     continue
             if content[start] == "`":
                 substitution_end = _skip_backtick_substitution(
-                    content, start, len(content), check_runtime, end_cache=backtick_end_cache
+                    content, start, word_limit, check_runtime, end_cache=word_caches[2]
                 )
                 if (
                     substitution_end is not None
