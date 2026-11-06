@@ -9,8 +9,9 @@ import json
 
 import pytest
 
-from skillspector.inspection_ledger import ParserCause, ParserCheck
+from skillspector.inspection_ledger import LedgerOutcome, ParserCause, ParserCheck
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+from skillspector.nodes.analyzers import static_runner
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
@@ -590,3 +591,207 @@ def test_property_bindings_must_hold_across_the_whole_original_markdown(
     source = "Earlier ``" + binding + "``.\n\nReference ``" + body + "``."
     assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is not None
     assert observed == [False]
+
+
+_PATH_VALUE_DOCUMENT = (
+    'Path values\n\nReference ``Test-Path "$($_.FullName)/item"``.\n'
+    'Reference ``Test-Path "prefix/$($item.Name)/item"``.\n'
+    'Reference ``Join-Path "$($item.Parent.Name)/item" "leaf"``.\n'
+    'Reference ``Split-Path "$($item.Name)/item"``.\n'
+    'Reference ``Resolve-Path "$($item.Name)/item"``.\n'
+    'Reference ``Convert-Path "$($item.Name)/item"``.\n'
+    'Reference ``Write-Host "$($item.Name)"``.\n'
+)
+
+
+@pytest.mark.parametrize("prefix", ["", "# 比較 🧪\n\n"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_multiple_native_property_values_keep_complete_normal_caller_coverage(
+    prefix: str, newline: str
+) -> None:
+    assert len(_PATH_VALUE_DOCUMENT) == 360
+    content = (prefix + _PATH_VALUE_DOCUMENT).replace("\n", newline)
+    path = "references/paths.md"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: content}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert result["findings"] == []
+
+
+def test_property_structural_reads_are_exact_bounded_quoted_arguments(monkeypatch) -> None:
+    observed = []
+    original = tm._parse_shell_command_word
+
+    def parse(content, start, *args, **kwargs):
+        if kwargs.get("native_argument", False):
+            observed.append((content, start))
+        return original(content, start, *args, **kwargs)
+
+    monkeypatch.setattr(tm, "_parse_shell_command_word", parse)
+    assert (
+        tm.bounded_parse_diagnostic(_PATH_VALUE_DOCUMENT, lambda: None, file_type="markdown")
+        is None
+    )
+    assert observed == [
+        ('"$($_.FullName)/item"', 0),
+        ('"prefix/$($item.Name)/item"', 0),
+        ('"$($item.Parent.Name)/item"', 0),
+        ('"$($item.Name)/item"', 0),
+        ('"$($item.Name)/item"', 0),
+        ('"$($item.Name)/item"', 0),
+        ('"$($item.Name)"', 0),
+    ]
+
+
+def test_multiple_property_arguments_in_one_native_body_keep_their_own_ends() -> None:
+    content = (
+        'Reference ``Join-Path "prefix/$($item.Parent.Name)" "$($item.Name)/child"``.\n'
+        + _PATH_VALUE_DOCUMENT
+    )
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert result["findings"] == []
+
+
+@pytest.mark.parametrize("end_delta", [-1, 1])
+def test_native_argument_word_must_match_the_entire_proven_endpoint(end_delta: int) -> None:
+    content = 'Test-Path "prefix/$($item.Name)/item" later'
+    begin = content.index('"')
+    end = content.index('"', begin + 1) + 1 + end_delta
+    diagnostic = tm._has_shell_command_word_exhaustion(
+        content,
+        lambda: None,
+        native_argument_spans=((begin, end),),
+        native_argument_work=[8 * len(content)],
+    )
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.BOUNDARY_UNRESOLVED
+    assert diagnostic.check is ParserCheck.COMMAND_WORD_BOUNDARY
+    assert begin <= diagnostic.start < diagnostic.end <= end
+
+
+def test_native_argument_word_read_cannot_exceed_shared_work() -> None:
+    content = 'Test-Path "prefix/$($item.Name)/item"'
+    begin, end = content.index('"'), len(content)
+    diagnostic = tm._has_shell_command_word_exhaustion(
+        content,
+        lambda: None,
+        native_argument_spans=((begin, end),),
+        native_argument_work=[2 * (end - begin) - 1],
+    )
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RESOURCE_LIMIT
+    assert diagnostic.check is ParserCheck.MARKDOWN_LITERAL_OWNERSHIP
+
+
+@pytest.mark.parametrize(
+    "following",
+    [
+        'Run ``sh -c "$PAYLOAD"``.',
+        'Run ``eval "$PAYLOAD"``.',
+        'Run ``sh`` -c "$PAYLOAD".',
+        'Run ``cmd /c "$($item.Name)"``.',
+        'Run ``pwsh -Command "$($item.Name)"``.',
+        'Reference ``Compare-Item "$($item.Name)"``.',
+        'Reference ``Test-Path "$($item.Method())"``.',
+        'Reference ``Test-Path "$($item.Items[0])"``.',
+        '```sh\nsh -c "$PAYLOAD"\n```',
+    ],
+)
+def test_property_argument_transport_keeps_other_executable_scopes(following: str) -> None:
+    content = _PATH_VALUE_DOCUMENT + "\n" + following
+    diagnostic = tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert len(_PATH_VALUE_DOCUMENT) <= diagnostic.start < diagnostic.end <= len(content)
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "function Test-Path {}",
+        "Set-Alias Test-Path unknown",
+        ". helper.ps1",
+        "Add-Member -InputObject $item -MemberType ScriptProperty -Name Name "
+        "-Value { $getter.Invoke() }",
+    ],
+)
+def test_cross_span_bindings_disable_structural_argument_transport(
+    monkeypatch, binding: str
+) -> None:
+    transported = []
+    original = tm._parse_shell_command_word
+
+    def parse(content, start, *args, **kwargs):
+        if kwargs.get("native_argument", False):
+            transported.append(content)
+        return original(content, start, *args, **kwargs)
+
+    monkeypatch.setattr(tm, "_parse_shell_command_word", parse)
+    content = "Earlier ``" + binding + "``.\n\n" + _PATH_VALUE_DOCUMENT
+    assert tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown") is not None
+    assert transported == []
+
+
+@pytest.mark.parametrize("wrapper", ["sh -c", "eval"])
+def test_executed_children_receive_no_native_property_argument_grant(
+    monkeypatch, wrapper: str
+) -> None:
+    child = 'Test-Path "prefix/$($item.Name)/item"'
+    observed = []
+    original = tm._has_shell_command_word_exhaustion
+
+    def exhaustion(content, *args, **kwargs):
+        if content == child:
+            observed.append(kwargs.get("native_argument_spans", ()))
+        return original(content, *args, **kwargs)
+
+    monkeypatch.setattr(tm, "_has_shell_command_word_exhaustion", exhaustion)
+    content = _PATH_VALUE_DOCUMENT + "\nRun ``" + wrapper + " '" + child + "'``."
+    assert tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown") is not None
+    assert observed and all(spans == () for spans in observed)
+
+
+@pytest.mark.parametrize("length", [4096, 4097])
+def test_native_property_transport_retains_independent_word_limits(length: int) -> None:
+    content = _PATH_VALUE_DOCUMENT + "\nReference `r" + "a" * (length - 1) + "`."
+    diagnostic = tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
+    if length == 4096:
+        assert diagnostic is None
+    else:
+        assert diagnostic is not None
+        assert diagnostic.cause is ParserCause.RESOURCE_LIMIT
+        assert diagnostic.check is ParserCheck.COMMAND_WORD_CHARACTERS
+
+
+def test_native_property_transport_preserves_raw_destructive_source() -> None:
+    path = "references/paths.md"
+    content = _PATH_VALUE_DOCUMENT + "\nRun `rm -rf /`.\n"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: content}}, [tm]
+    )
+    findings = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
+    assert findings
+    assert all(finding.severity == "HIGH" and finding.file == path for finding in findings)
+    assert all(finding.start_line == 11 and finding.start_column == 5 for finding in findings)
+    assert any(finding.matched_text == "rm -rf /" for finding in findings)
+
+
+def test_cancellation_during_native_property_argument_read_propagates(monkeypatch) -> None:
+    entered = False
+    original = tm._parse_shell_command_word
+
+    def parse(content, start, *args, **kwargs):
+        nonlocal entered
+        entered = entered or kwargs.get("native_argument", False)
+        return original(content, start, *args, **kwargs)
+
+    def expired() -> None:
+        if entered:
+            raise TimeoutError("native argument deadline")
+
+    monkeypatch.setattr(tm, "_parse_shell_command_word", parse)
+    with pytest.raises(TimeoutError, match="native argument deadline"):
+        tm.bounded_parse_diagnostic(_PATH_VALUE_DOCUMENT, expired, file_type="markdown")
