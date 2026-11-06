@@ -36,6 +36,136 @@ def _scan(source: str):
     )
 
 
+def _without_native_consumer_roles(monkeypatch: pytest.MonkeyPatch, source: str):
+    original = tm._has_shell_command_word_exhaustion
+
+    def without_roles(*args, **kwargs):
+        kwargs.pop("json_key_spans", None)
+        kwargs.pop("json_value_spans", None)
+        return original(*args, **kwargs)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(tm, "_has_shell_command_word_exhaustion", without_roles)
+        return tm.bounded_parse_diagnostic(source, _check, file_type="json")
+
+
+def test_native_colons_prove_key_roles_without_classifying_value_text() -> None:
+    source = '{"timeout" \n : 1, "message": "timeout"}'
+    proof = prepare_json_source(source, _check)
+    assert proof is not None
+    projection = proof.project(SecurityTextView("raw", source), _check)
+    assert projection is not None
+    assert [source[start:end] for start, end in projection.key_spans] == [
+        '"timeout"',
+        '"message"',
+    ]
+    assert tuple(span for span in projection.strings if span not in projection.key_spans) == (
+        (source.rindex('"timeout"'), source.rindex('"timeout"') + len('"timeout"')),
+    )
+
+
+@pytest.mark.parametrize("left", [0, 1])
+def test_clipped_key_or_missing_native_colon_grants_no_key_role(left: int) -> None:
+    source = '{"timeout": 1}'
+    proof = prepare_json_source(source, _check)
+    assert proof is not None
+    start, end = 1 + left, source.index(":")
+    view = SecurityTextView("window", source[start:end], array("I", range(start, end)))
+    projection = proof.project(view, _check)
+    assert projection is not None
+    assert projection.key_spans == ()
+
+
+@pytest.mark.parametrize("indent", [None, 2])
+def test_native_key_is_not_a_wrapper_waiting_for_executable_operands(
+    monkeypatch: pytest.MonkeyPatch, indent: int | None
+) -> None:
+    source = json.dumps({"marks": {"timeout": 1}, "value": "ordinary data"}, indent=indent)
+    assert _without_native_consumer_roles(monkeypatch, source) is not None
+    assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is None
+
+
+@pytest.mark.parametrize("ensure_ascii", [False, True])
+def test_native_value_owns_only_its_proven_backtick_closers(
+    monkeypatch: pytest.MonkeyPatch, ensure_ascii: bool
+) -> None:
+    source = json.dumps(
+        {"message": "比較 $HOME reference `label` " + "ordinary data " * 600},
+        ensure_ascii=ensure_ascii,
+    )
+    assert _without_native_consumer_roles(monkeypatch, source) is not None
+    assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is None
+
+
+def test_native_roles_keep_later_unreported_commands_partial() -> None:
+    source = json.dumps({"timeout": 1, "message": "Execute rm -rf *"})
+    result = _scan(source)
+    assert result["findings"] == []
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+def test_native_roles_preserve_raw_high_findings() -> None:
+    result = _scan(json.dumps({"timeout": 1, "message": "a rm -rf /"}))
+    assert any(
+        finding.rule_id == "TM1" and finding.severity == "HIGH" for finding in result["findings"]
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    ['eval "$PAYLOAD -rf /"', 'sh -c "$PAYLOAD -rf /"', "$HOME `$(cat command) -rf /`"],
+)
+def test_proven_keys_and_closers_cannot_hide_executable_runtime_consumers(command: str) -> None:
+    source = json.dumps({"timeout": 1, "command": command})
+    assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is not None
+
+
+def test_one_value_cannot_borrow_another_values_backtick_closer() -> None:
+    source = json.dumps({"first": "$HOME `unfinished", "second": "closing` " + "data " * 1200})
+    assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is not None
+
+
+def test_clipped_value_cannot_claim_a_closing_backtick() -> None:
+    source = json.dumps({"message": "$HOME reference `label` " + "ordinary data " * 600})
+    proof = prepare_json_source(source, _check)
+    assert proof is not None
+    start = source.index("`", source.index("`") + 1)
+    view = SecurityTextView("window", source[start:], array("I", range(start, len(source))))
+    assert (
+        tm.bounded_parse_diagnostic(
+            view.text,
+            _check,
+            file_type="json",
+            complete_context=False,
+            prepared_analysis=proof,
+            source_view=view,
+        )
+        is not None
+    )
+
+
+def test_cancellation_during_native_closer_collection_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = tm._parse_shell_command_word
+    entered = False
+
+    def collect(*args, **kwargs):
+        nonlocal entered
+        if kwargs.get("backtick_closures") is not None:
+            entered = True
+        return original(*args, **kwargs)
+
+    def cancelled() -> None:
+        if entered:
+            raise TimeoutError("native JSON deadline")
+
+    monkeypatch.setattr(tm, "_parse_shell_command_word", collect)
+    source = json.dumps({"message": "$HOME reference `label` " + "ordinary data " * 600})
+    with pytest.raises(TimeoutError, match="native JSON deadline"):
+        tm.bounded_parse_diagnostic(source, cancelled, file_type="json")
+
+
 @pytest.mark.parametrize("size", [20_000, 131_073, MAX_STANDALONE_JSON_SOURCE_CHARS])
 def test_dense_standalone_json_owns_punctuation_without_raising_shell_word_limit(size: int) -> None:
     source = _dense(size)

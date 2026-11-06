@@ -2518,6 +2518,8 @@ def _parse_shell_command_word(
     enclosing_delimiter: str | None = None,
     quoted_printf_allowed: bool = True,
     diagnostics: list[StaticParserDiagnostic] | None = None,
+    backtick_closures: set[tuple[int, int]] | None = None,
+    source_end: int | None = None,
 ) -> _ShellCommandWord | None:
     runtime_check = check_runtime or (lambda: None)
     # The shell recognizes ``NAME=value`` before expansion and never runs the
@@ -2537,7 +2539,7 @@ def _parse_shell_command_word(
     diagnostic: StaticParserDiagnostic | None = None
     unquoted_characters = 0
     cursor = start
-    limit = len(content)
+    limit = min(len(content), source_end) if source_end is not None else len(content)
     while cursor < limit:
         if cursor > start and (cursor - start) % 4096 == 0:
             runtime_check()
@@ -2634,6 +2636,8 @@ def _parse_shell_command_word(
                 )
                 if substitution_end is None:
                     return None
+                if backtick_closures is not None:
+                    backtick_closures.add((cursor, substitution_end))
                 static_value, substitution_limited, substitution_diagnostic = (
                     _printf_substitution_result(
                         content,
@@ -2742,6 +2746,8 @@ def _parse_shell_command_word(
             )
             if substitution_end is None:
                 return None
+            if backtick_closures is not None:
+                backtick_closures.add((cursor, substitution_end))
             static_value, substitution_limited, substitution_diagnostic = (
                 _printf_substitution_result(
                     content,
@@ -3375,6 +3381,8 @@ def _has_shell_command_word_exhaustion(
     *,
     structural_quote_closers: set[int] | None = None,
     structural_quote_openers: set[int] | None = None,
+    json_key_spans: tuple[tuple[int, int], ...] = (),
+    json_value_spans: tuple[tuple[int, int], ...] = (),
     python_source: _PythonSourceOwnership | None = None,
     javascript_source: _JavaScriptTemplateOwnership | None = None,
     powershell: PowerShellSource | None = None,
@@ -3423,6 +3431,19 @@ def _has_shell_command_word_exhaustion(
         string.decoded for string in powershell_strings.values()
     )
     json_openers = sorted(structural_quote_openers or ())
+    backtick_values = tuple(
+        span for span in json_value_spans if content.find("`", span[0] + 1, span[1] - 1) >= 0
+    )
+    value_starts = [start for start, _end in backtick_values]
+    backtick_closers: set[int] = set()
+    native_caches: dict[
+        int,
+        tuple[
+            dict[int, _ParameterExpansionEnd],
+            dict[int, int | None],
+            dict[int, int | None],
+        ],
+    ] = {}
     complete_comments: set[tuple[int, int]] = set()
     word_diagnostics: list[StaticParserDiagnostic] = []
     # Short text without shell-expansion openers cannot trigger these shell-word
@@ -3437,6 +3458,8 @@ def _has_shell_command_word_exhaustion(
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
+        if start in backtick_closers:
+            continue
         if python_word_source is not None and python_word_source.is_string_delimiter(start):
             continue
         if start in owned_word_positions:
@@ -3520,12 +3543,25 @@ def _has_shell_command_word_exhaustion(
             continue
         candidate_word_positions: set[int] = set()
         word_diagnostics.clear()
+        value_index = bisect_right(value_starts, start) - 1
+        value_span = (
+            backtick_values[value_index]
+            if value_index >= 0 and start < backtick_values[value_index][1]
+            else None
+        )
+        native_backticks: set[tuple[int, int]] | None = set() if value_span else None
+        word_caches = (parameter_end_cache, substitution_end_cache, backtick_end_cache)
+        if value_span is not None:
+            # Endpoints cached against a different EOF cannot prove this value.
+            scoped_caches = native_caches.get(value_span[0])
+            if scoped_caches is None:
+                scoped_caches = ({}, {}, {})
+                native_caches[value_span[0]] = scoped_caches
+            word_caches = scoped_caches
         parsed = _parse_shell_command_word(
             content,
             start,
-            parameter_end_cache,
-            substitution_end_cache,
-            backtick_end_cache,
+            *word_caches,
             check_runtime=check_runtime,
             owned_word_positions=candidate_word_positions,
             enclosing_delimiter=(
@@ -3533,7 +3569,19 @@ def _has_shell_command_word_exhaustion(
             ),
             quoted_printf_allowed=quoted_printf_allowed,
             diagnostics=word_diagnostics,
+            **(
+                {"backtick_closures": native_backticks, "source_end": value_span[1]}
+                if native_backticks is not None and value_span is not None
+                else {}
+            ),
         )
+        if value_span is not None and native_backticks:
+            for opening, end in native_backticks:
+                check_runtime()
+                if value_span[0] < opening < end - 1 < value_span[1] - 1:
+                    # Only this proven native value owns the matching closer.
+                    # Opening/inner command candidates remain independent.
+                    backtick_closers.add(end - 1)
         if parsed is None:
             substitution_start = (
                 start + 1
@@ -3784,6 +3832,11 @@ def _has_shell_command_word_exhaustion(
         shell_substitutions=file_type == "shell",
         startup_exposure=_startup_exposure,
         startup_diagnostics=_startup_diagnostics,
+        **(
+            {"json_key_starts": frozenset(start for start, _end in json_key_spans)}
+            if json_key_spans
+            else {}
+        ),
     ):
         command_string = command.content
         if command_string is None:
@@ -3923,6 +3976,7 @@ def _shell_command_strings(
     shell_substitutions: bool = True,
     startup_exposure: list[bool] | None = None,
     startup_diagnostics: list[StaticParserDiagnostic] | None = None,
+    json_key_starts: frozenset[int] = frozenset(),
 ) -> Iterator[_ShellCommandString]:
     """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
     nested_substitutions = startup_exposure is not None and ("$(" in content or "`" in content)
@@ -3948,6 +4002,10 @@ def _shell_command_strings(
     )
     for clause_start in clause_starts:
         check_runtime()
+        if clause_start in json_key_starts:
+            # A whole native object key names data, not a wrapper invocation.
+            # Its inner candidates and ordinary finding analysis stay active.
+            continue
         # Substitutions inherit settings but cannot alter their parent shell.
         # Keep each live lexical scope's mutable context so eval still updates
         # subsequent commands in that same scope.
@@ -9060,6 +9118,17 @@ def _has_bounded_parse_exhaustion(
         # Only validated host punctuation terminates command words. Every byte
         # inside strings stays in the parser and original finding views remain raw.
         shell_word_content = json_projection.text
+    json_keys = frozenset(json_projection.key_spans) if json_projection is not None else frozenset()
+    json_word_roles = (
+        {
+            "json_key_spans": json_projection.key_spans,
+            "json_value_spans": tuple(
+                span for span in json_projection.strings if span not in json_keys
+            ),
+        }
+        if json_projection is not None
+        else {}
+    )
     quote_limits = None
     if file_type == "shell" and complete_context:
         # A closing delimiter in proven shell source cannot open a new
@@ -9096,6 +9165,7 @@ def _has_bounded_parse_exhaustion(
         quote_limits=quote_limits,
         file_type=file_type,
         complete_context=complete_context,
+        **json_word_roles,
     )
     if diagnostic is not None:
         return diagnostic
@@ -9299,6 +9369,13 @@ def _has_bounded_parse_exhaustion(
             check_runtime,
             structural_quote_openers={0},
             structural_quote_closers={len(projected) - 1},
+            **(
+                {"json_key_spans": ((0, len(projected)),)}
+                if (start, end) in json_keys
+                else {"json_value_spans": ((0, len(projected)),)}
+                if json_projection is not None
+                else {}
+            ),
         )
         if diagnostic is not None:
             return diagnostic.shifted(start)
