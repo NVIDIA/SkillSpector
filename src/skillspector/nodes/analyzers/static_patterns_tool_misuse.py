@@ -9655,10 +9655,9 @@ def _owned_inline_command_diagnostic(
             continue
         # Reuse the existing finite value proof before either a whole quoted
         # word or its nested expression is interpreted as a POSIX command.
-        boundary = min(len(content), start + _PRINTF_STATIC_CHARS + 3)
-        newline = content.find("\n", start, boundary)
-        if newline >= 0:
-            boundary = newline
+        boundary = content.find("\n", start)
+        if boundary < 0:
+            boundary = len(content)
         remaining_work[0] -= boundary - start
         if remaining_work[0] < 0:
             return limit(start)

@@ -105,6 +105,19 @@ def test_existing_powershell_value_owner_is_retained(body: str, newline: str) ->
     assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("characters", [512, 4097])
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_long_native_replace_value_uses_its_physical_line_owner(
+    newline: str, characters: int, pipeline: bool
+) -> None:
+    replacement = ("data " * ((characters + 4) // 5))[:characters]
+    value = "\"$($text -replace '%s', '" + replacement + "')\""
+    body = value + " | Write-Output" if pipeline else "Write-Output (" + value + ")"
+    source = ("# 比較\n\nPowerShell example: ``" + body + "``.\n").replace("\n", newline)
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+
+
 @pytest.mark.parametrize(
     "body",
     [
