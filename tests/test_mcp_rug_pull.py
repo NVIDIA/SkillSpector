@@ -366,7 +366,7 @@ def test_rp1_yaml_runner_hash_boundaries(runner, newline, value, expected):
     content = content.replace("\n", newline)
     parsed = yaml.safe_load(content)["mcpServers"]["fs"]
     assert (parsed["command"] == runner) is expected
-    matches = _iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml")
+    matches = list(_iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml"))
     assert len(matches) == int(expected)
     rp1 = [
         f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
@@ -380,7 +380,7 @@ def test_rp1_yaml_runner_tab_comment_retains_existing_scanner_behavior(runner, n
     # PyYAML rejects raw tab separators; this is a scanner compatibility control,
     # separate from the parsed-YAML oracle above.
     content = f'command: {runner}\t# comment\nargs: ["@scope/server"]\n'.replace("\n", newline)
-    matches = _iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml")
+    matches = list(_iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml"))
     assert len(matches) == 1
     assert matches[0][2] == "@scope/server"
 
@@ -408,7 +408,7 @@ def test_rp1_yaml_quoted_args_keys(key, layout, args_first, flow, newline, pinne
     parsed = yaml.safe_load(content)
     server = parsed["mcpServers"]["fs"] if layout == "mapping" else parsed["servers"][0]
     assert server == {"command": "npx", "args": ["-y", package]}
-    matches = _iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml")
+    matches = list(_iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml"))
     assert len(matches) == 1
     assert matches[0][2] == package
     rp1 = [
@@ -434,7 +434,7 @@ def test_rp1_yaml_quoted_args_do_not_cross_server_boundaries(key, layout, args_f
         else f"servers:\n  - {first}  - {second}"
     )
     assert yaml.safe_load(content) is not None
-    assert not _iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml")
+    assert not list(_iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml"))
     assert not [
         f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
     ]
@@ -448,8 +448,8 @@ def test_rp1_yaml_physical_search_hard_limit(direction, at_limit):
     command = "    command: npx\n"
     args = '    args: ["@scope/server"]\n'
     pair = args + filler + command if direction == "before" else command + filler + args
-    matches = _iter_config_npx_commands(
-        "mcpServers:\n  fs:\n" + pair, _RugPullBudget({}), "mcp.yaml"
+    matches = list(
+        _iter_config_npx_commands("mcpServers:\n  fs:\n" + pair, _RugPullBudget({}), "mcp.yaml")
     )
     assert len(matches) == (1 if at_limit else 0)
 
@@ -460,7 +460,7 @@ def test_rp1_yaml_argument_collection_hard_limit(indent, at_limit):
     distance = _RP1_CONFIG_MAX_ARG_LINES + (0 if at_limit else 1)
     content = "mcpServers:\n  fs:\n    command: npx\n    args:\n"
     content += f"{indent}- -y\n" * (distance - 1) + f'{indent}- "@scope/server"\n'
-    matches = _iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml")
+    matches = list(_iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml"))
     assert len(matches) == (1 if at_limit else 0)
 
 
@@ -476,7 +476,7 @@ def test_rp1_yaml_long_value_traversal_checks_runtime(monkeypatch):
     monkeypatch.setattr(_RugPullBudget, "check_runtime", check_runtime)
     content = "    command: npx\n    env:\n" + "      KEY: value\n" * 100
     with pytest.raises(RuntimeError, match="test deadline"):
-        _iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml")
+        list(_iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml"))
     assert calls == 20
 
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from skillspector.inspection_ledger import (
@@ -205,7 +206,7 @@ def _strip_yaml_comment(line: str) -> str:
 
 def _iter_config_npx_commands(
     content: str, budget: _RugPullBudget, file_path: str
-) -> list[tuple[int, str, str]]:
+) -> Iterator[tuple[int, str, str]]:
     """Find bounded YAML MCP command/args pairs that run an npx-style runner."""
     lines = content.splitlines(keepends=True)
     offsets: list[int] = []
@@ -214,7 +215,6 @@ def _iter_config_npx_commands(
         offsets.append(offset)
         offset += len(line)
 
-    matches: list[tuple[int, str, str]] = []
     for command_index, command_line in enumerate(lines):
         budget.check_runtime(file_path)
         command = _RP1_CONFIG_RUNNER.fullmatch(command_line.rstrip("\r\n"))
@@ -313,10 +313,8 @@ def _iter_config_npx_commands(
             # Only the runner and package justify this finding. A contiguous
             # source slice could expose credentials in unrelated sibling keys.
             full_match = f"{command.group('runner')} {token}"
-            matches.append((start, full_match, token))
+            yield start, full_match, token
             break
-
-    return matches
 
 
 def _normalize_string_list(
