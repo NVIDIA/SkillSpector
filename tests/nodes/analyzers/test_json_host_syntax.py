@@ -98,6 +98,51 @@ def test_native_value_owns_only_its_proven_backtick_closers(
     assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is None
 
 
+def test_native_value_keeps_its_consumer_without_a_false_startup_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = json.dumps({"message": "$HOME reference `label` " + "ordinary data " * 600})
+    value = source[source.index(': "') + 2 : -1]
+    startup_calls = []
+    consumer_calls = []
+    original_startup = tm._shell_clause_sets_startup
+    original_consumer = tm._command_string_from_clause
+
+    def startup(content, start, *args, **kwargs):
+        startup_calls.append((content, start))
+        return original_startup(content, start, *args, **kwargs)
+
+    def consumer(content, start, *args, **kwargs):
+        consumer_calls.append((content, start))
+        return original_consumer(content, start, *args, **kwargs)
+
+    monkeypatch.setattr(tm, "_shell_clause_sets_startup", startup)
+    monkeypatch.setattr(tm, "_command_string_from_clause", consumer)
+    assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is None
+    assert (value, 0) in consumer_calls
+    assert (value, 0) not in startup_calls
+
+
+def test_native_value_opener_does_not_disable_later_real_startup_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = json.dumps("$HOME reference `label` " + "ordinary data " * 600)
+    content = value + '\nBASH_ENV=/tmp/startup sh -c "$PAYLOAD -rf /"'
+    start = len(value) + 1
+    calls = []
+    original = tm._shell_clause_sets_startup
+
+    def startup(source, position, *args, **kwargs):
+        calls.append(position)
+        return original(source, position, *args, **kwargs)
+
+    monkeypatch.setattr(tm, "_shell_clause_sets_startup", startup)
+    commands = list(tm._shell_command_strings(content, _check, json_value_starts=frozenset({0})))
+    assert 0 not in calls
+    assert start in calls
+    assert any(command.content is None and command.diagnostic is not None for command in commands)
+
+
 def test_native_roles_keep_later_unreported_commands_partial() -> None:
     source = json.dumps({"timeout": 1, "message": "Execute rm -rf *"})
     result = _scan(source)
@@ -118,7 +163,13 @@ def test_native_roles_preserve_raw_high_findings() -> None:
 )
 def test_proven_keys_and_closers_cannot_hide_executable_runtime_consumers(command: str) -> None:
     source = json.dumps({"timeout": 1, "command": command})
-    assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is not None
+    # Escaped JSON operands reach execution checks through the normal decoded
+    # view; the raw-only helper cannot establish their logical shell quotes.
+    result = _scan(source)
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+    assert event["parser_diagnostic"]["cause"] == "runtime_dependent"
 
 
 def test_one_value_cannot_borrow_another_values_backtick_closer() -> None:

@@ -3838,6 +3838,11 @@ def _has_shell_command_word_exhaustion(
             if json_key_spans
             else {}
         ),
+        **(
+            {"json_value_starts": frozenset(start for start, _end in backtick_values)}
+            if backtick_values
+            else {}
+        ),
     ):
         command_string = command.content
         if command_string is None:
@@ -3978,6 +3983,7 @@ def _shell_command_strings(
     startup_exposure: list[bool] | None = None,
     startup_diagnostics: list[StaticParserDiagnostic] | None = None,
     json_key_starts: frozenset[int] = frozenset(),
+    json_value_starts: frozenset[int] = frozenset(),
 ) -> Iterator[_ShellCommandString]:
     """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
     nested_substitutions = startup_exposure is not None and ("$(" in content or "`" in content)
@@ -4051,7 +4057,9 @@ def _shell_command_strings(
                 return
             continue
         body_start, body = scoped_startup[-1][3:] if scoped_startup else (0, content)
-        if not startup_context[0]:
+        if not startup_context[0] and clause_start not in json_value_starts:
+            # A native scalar's whole quoted value is not a startup-setting
+            # statement. Its ordinary consumer and inner candidates stay live.
             local_diagnostics: list[StaticParserDiagnostic] = []
             startup_context[0] = _shell_clause_sets_startup(
                 body,
