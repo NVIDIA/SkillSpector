@@ -3502,6 +3502,27 @@ def _has_shell_command_word_exhaustion(
         ):
             continue
         shadowed = start < shadow_through
+        value_index = bisect_right(value_starts, start) - 1
+        value_span = (
+            backtick_values[value_index]
+            if value_index >= 0 and start < backtick_values[value_index][1]
+            else None
+        )
+        native_backticks: set[tuple[int, int]] | None = set() if value_span else None
+        word_caches = (parameter_end_cache, substitution_end_cache, backtick_end_cache)
+        if value_span is not None:
+            # Endpoints cached against a different EOF cannot prove this value.
+            scoped_caches = native_caches.get(value_span[0])
+            if scoped_caches is None:
+                scoped_caches = ({}, {}, {})
+                native_caches[value_span[0]] = scoped_caches
+            word_caches = scoped_caches
+        word_limit = value_span[1] if value_span is not None else len(content)
+        reader_options = (
+            {"backtick_closures": native_backticks, "source_end": word_limit}
+            if native_backticks is not None
+            else {}
+        )
         if _has_quoted_assignment_prefix(content, start):
             # A quoted NAME=value argument cannot be the command word. Claim
             # only a complete static word; dynamic substitutions must remain
@@ -3510,11 +3531,10 @@ def _has_shell_command_word_exhaustion(
             parsed = _parse_shell_command_word(
                 content,
                 start,
-                parameter_end_cache,
-                substitution_end_cache,
-                backtick_end_cache,
+                *word_caches,
                 check_runtime=check_runtime,
                 owned_word_positions=assignment_positions,
+                **reader_options,
             )
             if (
                 parsed is not None
@@ -3543,22 +3563,6 @@ def _has_shell_command_word_exhaustion(
             continue
         candidate_word_positions: set[int] = set()
         word_diagnostics.clear()
-        value_index = bisect_right(value_starts, start) - 1
-        value_span = (
-            backtick_values[value_index]
-            if value_index >= 0 and start < backtick_values[value_index][1]
-            else None
-        )
-        native_backticks: set[tuple[int, int]] | None = set() if value_span else None
-        word_caches = (parameter_end_cache, substitution_end_cache, backtick_end_cache)
-        if value_span is not None:
-            # Endpoints cached against a different EOF cannot prove this value.
-            scoped_caches = native_caches.get(value_span[0])
-            if scoped_caches is None:
-                scoped_caches = ({}, {}, {})
-                native_caches[value_span[0]] = scoped_caches
-            word_caches = scoped_caches
-        word_limit = value_span[1] if value_span is not None else len(content)
         parsed = _parse_shell_command_word(
             content,
             start,
@@ -3570,11 +3574,7 @@ def _has_shell_command_word_exhaustion(
             ),
             quoted_printf_allowed=quoted_printf_allowed,
             diagnostics=word_diagnostics,
-            **(
-                {"backtick_closures": native_backticks, "source_end": value_span[1]}
-                if native_backticks is not None and value_span is not None
-                else {}
-            ),
+            **reader_options,
         )
         if value_span is not None and native_backticks:
             for opening, end in native_backticks:
