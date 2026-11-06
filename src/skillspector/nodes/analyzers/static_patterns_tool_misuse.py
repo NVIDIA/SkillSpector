@@ -9631,6 +9631,118 @@ def _markdown_structure_diagnostic(
     )
 
 
+def _is_inline_make_display_value(
+    content: str, check_runtime: Callable[[], None], remaining_work: list[int]
+) -> bool:
+    """Retain the whole-expression display reading, without evaluating Make values."""
+    if not content.startswith(("$(", "${")):
+        return False
+    remaining_work[0] -= len(content)
+    if remaining_work[0] < 0:
+        return False
+    # Reuse the bounded expansion reader; the narrower grammar below also
+    # rejects shell quoting and unproved Make functions or indirect names.
+    reader = _skip_command_substitution if content[1] == "(" else _skip_parameter_expansion
+    if reader(content, 0, len(content), check_runtime) != len(content):
+        return False
+    cursor = 0
+
+    def advance() -> None:
+        nonlocal cursor
+        if cursor % 256 == 0:
+            check_runtime()
+        remaining_work[0] -= 1
+        cursor += 1
+
+    def expression(depth: int) -> bool:
+        if depth >= 8 or remaining_work[0] < 0:
+            return False
+        closer = ")" if content[cursor : cursor + 2] == "$(" else "}"
+        advance()
+        advance()
+        name_start = cursor
+        while cursor < len(content) and content[cursor] in _SHELL_ASSIGNMENT_NAME_CHARACTERS:
+            advance()
+        name = content[name_start:cursor]
+        if not name or name[0].isdigit() or name in {"shell", "file", "eval", "call", "guile"}:
+            return False
+        if content[cursor : cursor + 1] == closer:
+            advance()
+            return True
+        arities = {"error": {1}, "strip": {1}, "if": {2, 3}, "foreach": {3}}
+        if closer != ")" or name not in arities or content[cursor : cursor + 1] not in {" ", "\t"}:
+            return False
+        argument_start = cursor
+        arguments = 1
+        while cursor < len(content) and remaining_work[0] >= 0:
+            character = content[cursor]
+            if character == closer:
+                advance()
+                return arguments in arities[name]
+            if character == ",":
+                if (
+                    name == "foreach"
+                    and arguments == 1
+                    and re.fullmatch(
+                        r"[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*", content[argument_start:cursor]
+                    )
+                    is None
+                ):
+                    return False
+                arguments += 1
+                if arguments > max(arities[name]):
+                    return False
+            elif content[cursor : cursor + 2] in {"$(", "${"}:
+                if not expression(depth + 1):
+                    return False
+                continue
+            elif character in "$(){}'\"`\\;|&<>\r\n#[]":
+                return False
+            advance()
+        return False
+
+    return expression(0) and cursor == len(content) and remaining_work[0] >= 0
+
+
+def _powershell_property_argument_spans(
+    content: str, check_runtime: Callable[[], None], remaining_work: list[int]
+) -> list[tuple[int, int]]:
+    """Own only native quoted arguments whose subexpressions read member values."""
+    if '"$(' not in content:
+        return []
+    remaining_work[0] -= 2 * len(content)
+    if remaining_work[0] < 0:
+        return []
+    source = powershell_source(content, check_runtime)
+    if source is None or source.invocations:
+        return []
+    projection = _PowerShellProjection(content, check_runtime)
+    try:
+        projection.code(0, None, "top", 0)
+    except _PowerShellOwnershipUnprovenError:
+        return []
+    native_strings = {(string.start, string.end) for string in source.strings if not string.invoked}
+    spans = []
+    for segment in projection.segments:
+        check_runtime()
+        if segment.frame != "top" or segment.command is None or segment.captured:
+            continue
+        for start, end, holes in segment.strings:
+            check_runtime()
+            if (start, end) not in native_strings or content[start] != '"' or not holes:
+                continue
+            if all(
+                re.fullmatch(
+                    r"\$[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+",
+                    content[opening + 2 : closing - 1],
+                )
+                is not None
+                for opening, closing in holes
+            ):
+                spans.append((start, end))
+    return spans
+
+
 def _owned_inline_command_diagnostic(
     content: str,
     check_runtime: Callable[[], None],
@@ -9658,7 +9770,20 @@ def _owned_inline_command_diagnostic(
             ParserUncheckedScope.REMAINING_INPUT,
         )
 
-    value_spans: list[tuple[int, int]] = []
+    # A native display value does not independently prove POSIX execution.
+    # Its raw bytes still pass the existing structure and finding producers.
+    check_runtime()
+    if remaining_work[0] < 0 or depth >= 8:
+        return limit()
+    if not executing and _is_inline_make_display_value(content, check_runtime, remaining_work):
+        return None
+    value_spans = (
+        []
+        if executing
+        else _powershell_property_argument_spans(content, check_runtime, remaining_work)
+    )
+    if remaining_work[0] < 0:
+        return limit()
     # Explicit eval/shell operands already have POSIX execution semantics.
     value_candidates = () if executing else re.finditer(r"\$\(", content)
     for candidate in value_candidates:
@@ -9686,6 +9811,7 @@ def _owned_inline_command_diagnostic(
             )
         ):
             value_spans.append((start - 1, end + 1))
+    value_spans = sorted(set(value_spans))
     value_starts = [start for start, _end in value_spans]
 
     for start in _nonempty_shell_clause_starts(

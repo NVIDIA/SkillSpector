@@ -332,3 +332,149 @@ def test_many_literal_bodies_share_a_finite_work_allowance() -> None:
 
     assert tm.bounded_parse_diagnostic(source, check, file_type="markdown") is None
     assert calls > 0
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "$(CC)",
+        "${CFLAGS}",
+        "$(error)",
+        "$(error unsupported option)",
+        "$(strip $(EXTRA_FLAGS))",
+        "$(if $(DEBUG),-g,-O2)",
+        "$(foreach target,$(TARGETS),$(target))",
+    ],
+)
+def test_whole_native_display_values_do_not_independently_prove_execution(value: str) -> None:
+    assert tm._is_inline_make_display_value(value, lambda: None, [8 * len(value)])
+    assert tm._owned_inline_command_diagnostic(value, lambda: None, [8 * len(value)]) is None
+    diagnostic = tm._owned_inline_command_diagnostic(
+        value, lambda: None, [16 * len(value)], executing=True
+    )
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "$(shell)",
+        "$(shell echo done)",
+        "$(file)",
+        "$(eval)",
+        "$(call)",
+        "$(guile)",
+        "$(unknown value)",
+        "$($(NAME))",
+        "$(if yes,done,$(shell echo done))",
+        "$(strip $(call tool))",
+        "$(strip $(guile value))",
+    ],
+)
+def test_execution_capable_unknown_or_indirect_expressions_keep_fallback(value: str) -> None:
+    assert not tm._is_inline_make_display_value(value, lambda: None, [8 * len(value)])
+    diagnostic = tm.bounded_parse_diagnostic(
+        "Reference ``" + value + "``.", lambda: None, file_type="markdown"
+    )
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "$(CC) -rf /",
+        "$(CC)suffix",
+        "$(strip $(VAR))suffix",
+        "$(strip $(VAR); sh -c $PAYLOAD)",
+        "$(foreach $(NAME),items,data)",
+        "$(if yes,done,other,extra)",
+        "$(strip $(VAR)",
+        "$(strip 'quoted value')",
+    ],
+)
+def test_display_value_ownership_requires_the_entire_supported_expression(value: str) -> None:
+    assert not tm._is_inline_make_display_value(value, lambda: None, [8 * len(value)])
+
+
+def test_display_value_cannot_bypass_work_depth_or_deadline(monkeypatch) -> None:
+    value = "$(strip $(FLAGS))"
+    for work, depth in [(len(value), 0), (8 * len(value), 8)]:
+        diagnostic = tm._owned_inline_command_diagnostic(value, lambda: None, [work], depth=depth)
+        assert diagnostic is not None
+        assert diagnostic.cause is ParserCause.RESOURCE_LIMIT
+    entered = False
+    proof = tm._is_inline_make_display_value
+
+    def display_value(*args, **kwargs):
+        nonlocal entered
+        entered = True
+        return proof(*args, **kwargs)
+
+    def expired() -> None:
+        if entered:
+            raise TimeoutError("display value deadline")
+
+    monkeypatch.setattr(tm, "_is_inline_make_display_value", display_value)
+    with pytest.raises(TimeoutError, match="display value deadline"):
+        tm._owned_inline_command_diagnostic(value, expired, [8 * len(value)])
+
+
+@pytest.mark.parametrize("command", ["Test-Path", "Compare-Item"])
+@pytest.mark.parametrize("member", ["$_.FullName", "$item.Parent.Name"])
+def test_native_quoted_property_arguments_keep_value_ownership(command: str, member: str) -> None:
+    body = command + ' "$(' + member + ')/item"'
+    spans = tm._powershell_property_argument_spans(body, lambda: None, [8 * len(body)])
+    assert spans == [(body.index('"'), len(body))]
+    assert (
+        tm.bounded_parse_diagnostic(
+            "Reference ``" + body + "``.", lambda: None, file_type="markdown"
+        )
+        is None
+    )
+    diagnostic = tm._owned_inline_command_diagnostic(
+        body, lambda: None, [16 * len(body)], executing=True
+    )
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "$item.Method()",
+        "$item.Items[0]",
+        "$item.Name + $CMD",
+        "$item.Name; $CMD",
+        "$item.Name\r$CMD",
+        "$item.Name\n$CMD",
+    ],
+)
+def test_property_value_owner_excludes_calls_operators_and_statements(expression: str) -> None:
+    body = 'Compare-Item "$(' + expression + ')"'
+    assert tm._powershell_property_argument_spans(body, lambda: None, [8 * len(body)]) == []
+    assert (
+        tm.bounded_parse_diagnostic(
+            "Reference ``" + body + "``.", lambda: None, file_type="markdown"
+        )
+        is not None
+    )
+
+
+def test_property_value_does_not_own_following_execution_or_raw_findings() -> None:
+    body = 'Compare-Item "$($item.Name)"; sh -c "$PAYLOAD"'
+    diagnostic = tm.bounded_parse_diagnostic(
+        "Reference ``" + body + "``.", lambda: None, file_type="markdown"
+    )
+    assert diagnostic is not None
+    assert diagnostic.start >= len("Reference ``") + body.index("sh -c")
+    source = "Reference `$(error rm -rf /)`."
+    result = tm.node({"components": ["guide.md"], "file_cache": {"guide.md": source}})
+    assert any(
+        f.rule_id == "TM1"
+        and f.severity == "HIGH"
+        and f.file == "guide.md"
+        and "rm -rf /" in (f.matched_text or "")
+        for f in result["findings"]
+    )
