@@ -11,7 +11,7 @@ from array import array
 import pytest
 
 from skillspector.artifacts import SecurityTextView
-from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, ParserCause, ParserCheck
 from skillspector.json_tokens import prepare_json_source
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.nodes.analyzers import static_runner
@@ -474,3 +474,126 @@ def test_raw_provenance_does_not_search_unrelated_large_regex_suffixes(
 
     assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is None
     assert matches == [(command_start, command_end)]
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"message": "Use `python3 ${ROOT:-$HOME/.config}/script.py get --id item` then `label`."},
+        {"first": "Feature `tool erase disk` is documented.", "second": "A `show` label."},
+    ],
+)
+def test_native_substitution_operands_do_not_borrow_later_closers(
+    monkeypatch: pytest.MonkeyPatch, values: dict[str, str]
+) -> None:
+    source = json.dumps(values)
+    original = tm._bounded_shell_tokens
+
+    def without_native_end(*args, **kwargs):
+        kwargs.pop("source_end", None)
+        return original(*args, **kwargs)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(tm, "_bounded_shell_tokens", without_native_end)
+        assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is not None
+    assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is None
+    assert _scan(source)["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_native_operand_scope_is_from_the_complete_parser_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = json.dumps(
+        {"message": "Reference `python3 ${ROOT:-$HOME/.config}/script.py get item`."}
+    )
+    head = source.index("${ROOT")
+    closer = source.index("`", source.index("`") + 1)
+    original = tm._bounded_shell_tokens
+    observed = []
+
+    def bounded(content, start, body_start, **kwargs):
+        if start == head and kwargs.get("source_end") is not None:
+            observed.append(kwargs["source_end"])
+            assert kwargs["source_end"] == closer
+        return original(content, start, body_start, **kwargs)
+
+    monkeypatch.setattr(tm, "_bounded_shell_tokens", bounded)
+    assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is None
+    assert observed
+
+
+def test_native_pair_does_not_bound_a_generated_outer_command() -> None:
+    bounds = tm._NativeBacktickOperandBounds.from_closures({(5, 20), (25, 40)}, _check)
+    assert bounds is not None
+    assert bounds.source_end(6, 19) == 19
+    assert bounds.source_end(5, 12) is None
+    assert bounds.source_end(6, 20) is None
+    assert bounds.source_end(21, 24) is None
+    assert tm._NativeBacktickOperandBounds.from_closures({(5, 20), (10, 30)}, _check) is None
+    result = _scan(json.dumps({"message": "`printf rm` -rf /"}))
+    assert any(f.rule_id == "TM1" and f.severity == "HIGH" for f in result["findings"])
+
+
+@pytest.mark.parametrize("operand", ['"unfinished', "disk\\", "disk >", "$(unfinished"])
+def test_proven_native_operand_eof_does_not_forgive_unfinished_syntax(operand: str) -> None:
+    content = "erase " + operand + "` later value"
+    end = content.index("`")
+    diagnostics = []
+    _tokens, command_end, exhausted = tm._bounded_shell_tokens(
+        content, 0, len("erase"), source_end=end, check_runtime=_check, diagnostics=diagnostics
+    )
+    assert exhausted
+    assert command_end <= end
+    assert diagnostics
+    assert diagnostics[0].cause is ParserCause.BOUNDARY_UNRESOLVED
+
+
+def test_native_operand_eof_keeps_argument_budget_and_cancellation() -> None:
+    content = "erase " + "x" * (tm._ROOT_GLOB_COMMAND_CHARS + 1) + "`"
+    diagnostics = []
+    _tokens, end, exhausted = tm._bounded_shell_tokens(
+        content,
+        0,
+        len("erase"),
+        source_end=len(content) - 1,
+        check_runtime=_check,
+        diagnostics=diagnostics,
+    )
+    assert exhausted and end < len(content) - 1
+    assert diagnostics[0].check is ParserCheck.COMMAND_ARGUMENT_CHARACTERS
+    assert diagnostics[0].observed_is_lower_bound
+    assert not diagnostics[0].full_input_checked
+
+    class CancelledError(Exception):
+        pass
+
+    def cancelled() -> None:
+        raise CancelledError
+
+    with pytest.raises(CancelledError):
+        tm._bounded_shell_tokens(
+            content, 0, len("erase"), source_end=len(content) - 1, check_runtime=cancelled
+        )
+    with pytest.raises(CancelledError):
+        tm._NativeBacktickOperandBounds.from_closures({(5, 20)}, cancelled)
+
+
+@pytest.mark.parametrize("command", ["`$TOOL -rf /`", "`$(cat command) -rf /`"])
+def test_native_pair_keeps_genuine_interior_runtime_uncertainty(command: str) -> None:
+    result = _scan(json.dumps({"message": command}))
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["parser_diagnostic"]["cause"] == "runtime_dependent"
+
+
+def test_native_bound_preserves_an_already_reported_reconstructed_effect() -> None:
+    result = _scan('{"note":"`$(printf rm) -rf *`"}')
+    assert any(f.rule_id == "TM1" and f.severity == "HIGH" for f in result["findings"])
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_native_bound_cannot_hide_an_unreported_reconstructed_destructive_effect() -> None:
+    result = _scan('{"note":"`echo; $(printf rm) -rf *`"}')
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["parser_diagnostic"]["check"] == "command_string_effects"

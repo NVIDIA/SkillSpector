@@ -9248,6 +9248,8 @@ def _has_bounded_parse_exhaustion(
         return diagnostic
     json_starts = [start for start, _ in json_operand_spans]
     native_backtick_starts = sorted(native_backtick_bounds)
+    native_reported_starts: Iterator[int] | None = None
+    native_reported_start: int | None = -1
     covered_until = 0
     powershell_strings = _powershell_string_operands(powershell)
     decoded_starts = sorted(
@@ -9331,15 +9333,27 @@ def _has_bounded_parse_exhaustion(
             and (_has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens))
             and not _has_tm1_code_pattern_at(content, command_start, command_end, check_runtime)
         ):
-            # A native bound can expose an operand the raw producer did not
-            # flush. Do not turn that new effect into complete unreported work.
-            return StaticParserDiagnostic(
-                ParserCause.UNSUPPORTED_SYNTAX,
-                ParserCheck.COMMAND_STRING_EFFECTS,
-                command_start,
-                command_end,
-                ParserUncheckedScope.COMMAND_ARGUMENTS,
-            )
+            # Preserve already reported reconstructed heads too. This ordered
+            # producer stays lazy: ordinary exact raw patterns never prime it.
+            if native_reported_starts is None:
+                native_reported_starts = (
+                    item[0]
+                    for item in _destructive_command_candidates(
+                        content, check_runtime=check_runtime
+                    )
+                )
+            while native_reported_start is not None and native_reported_start < command_start:
+                native_reported_start = next(native_reported_starts, None)
+            if native_reported_start != command_start:
+                # A native bound exposed an effect the raw producer did not
+                # report. Keep its provenance explicitly unresolved.
+                return StaticParserDiagnostic(
+                    ParserCause.UNSUPPORTED_SYNTAX,
+                    ParserCheck.COMMAND_STRING_EFFECTS,
+                    command_start,
+                    command_end,
+                    ParserUncheckedScope.COMMAND_ARGUMENTS,
+                )
         brace_diagnostic = _brace_expansion_diagnostic(tokens, command_start, command_end)
         if brace_diagnostic is not None:
             return brace_diagnostic
