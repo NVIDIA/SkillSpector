@@ -86,11 +86,12 @@ def test_native_key_is_not_a_wrapper_waiting_for_executable_operands(
 
 
 @pytest.mark.parametrize("ensure_ascii", [False, True])
+@pytest.mark.parametrize("prefix", ["$HOME", "A=$HOME"])
 def test_native_value_owns_only_its_proven_backtick_closers(
-    monkeypatch: pytest.MonkeyPatch, ensure_ascii: bool
+    monkeypatch: pytest.MonkeyPatch, ensure_ascii: bool, prefix: str
 ) -> None:
     source = json.dumps(
-        {"message": "比較 $HOME reference `label` " + "ordinary data " * 600},
+        {"message": prefix + " 比較 reference `label` " + "ordinary data " * 600},
         ensure_ascii=ensure_ascii,
     )
     assert _without_native_consumer_roles(monkeypatch, source) is not None
