@@ -9648,7 +9648,9 @@ def _owned_inline_command_diagnostic(
         )
 
     value_spans: list[tuple[int, int]] = []
-    for candidate in re.finditer(r"\$\(", content):
+    # Explicit eval/shell operands already have POSIX execution semantics.
+    value_candidates = () if executing else re.finditer(r"\$\(", content)
+    for candidate in value_candidates:
         check_runtime()
         start = candidate.start()
         if not start or content[start - 1] != '"':

@@ -162,6 +162,28 @@ def test_native_replace_value_cannot_own_a_following_inner_statement(separator: 
     assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
 
 
+@pytest.mark.parametrize("consumer", ["sh -c", "eval"])
+def test_explicit_shell_operand_cannot_borrow_native_value_ownership(consumer: str) -> None:
+    body = consumer + " 'Write-Output \"$($text -replace x y)\"'"
+    source = "Run ``" + body + "``."
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+    assert diagnostic.check is ParserCheck.COMMAND_IDENTITY
+    assert source.index(body) <= diagnostic.start < diagnostic.end <= source.index("``.")
+
+
+def test_execution_context_directly_controls_the_existing_native_value_owner() -> None:
+    body = 'Write-Output "$($text -replace x y)"'
+    assert tm._owned_inline_command_diagnostic(body, lambda: None, [16 * len(body)]) is None
+    diagnostic = tm._owned_inline_command_diagnostic(
+        body, lambda: None, [16 * len(body)], executing=True
+    )
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+    assert diagnostic.check is ParserCheck.COMMAND_IDENTITY
+
+
 @pytest.mark.parametrize(
     "body",
     [
