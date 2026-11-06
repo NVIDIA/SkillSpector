@@ -130,7 +130,9 @@ def test_one_value_cannot_borrow_another_values_backtick_closer() -> None:
 def test_native_value_printf_recovery_keeps_its_same_eof(
     monkeypatch: pytest.MonkeyPatch, opener: str, closer: str, prefix: str
 ) -> None:
-    source = json.dumps({"first": prefix + opener, "second": "later" + closer})
+    # Keep the unresolved body beyond the existing shell-word bound; the read
+    # spy independently checks EOF authority even before that limit is reached.
+    source = json.dumps({"first": prefix + opener + " data" * 1200, "second": "later" + closer})
     first_end = source.index('", "second"') + 1
     proof = prepare_json_source(source, _check)
     assert proof is not None
