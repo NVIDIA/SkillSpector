@@ -133,13 +133,13 @@ def test_native_value_opener_does_not_disable_later_real_startup_checks(
     original = tm._shell_clause_sets_startup
 
     def startup(source, position, *args, **kwargs):
-        calls.append(position)
+        calls.append((source, position))
         return original(source, position, *args, **kwargs)
 
     monkeypatch.setattr(tm, "_shell_clause_sets_startup", startup)
     commands = list(tm._shell_command_strings(content, _check, json_value_starts=frozenset({0})))
-    assert 0 not in calls
-    assert start in calls
+    assert (content, 0) not in calls
+    assert (content, start) in calls
     assert any(command.content is None and command.diagnostic is not None for command in commands)
 
 
