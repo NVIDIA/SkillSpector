@@ -9287,21 +9287,85 @@ def _yaml_scalar_mapper(
     return enclose
 
 
+def _unsupported_outer_shell_notation_spans(
+    content: str, ranges: list[tuple[int, int]], check_runtime: Callable[[], None]
+) -> Iterator[tuple[int, int]]:
+    """Nominate unsupported documentation notation, without proving execution."""
+    starts = [start for start, _end in ranges]
+    lines = logical_line_starts(content)
+    remaining_work = 8 * len(content) + _ROOT_GLOB_COMMAND_CHARS
+    quoted_prefixes = re.compile(r"(?<![\w$\\])['\"]")
+    for candidate in re.finditer(r"(?<![\w$./\\-])([a-z]+)[ \t]+-c[ \t]+'", content):
+        check_runtime()
+        if candidate[1] not in _SHELL_COMMAND_STRING_SHELLS:
+            continue
+        start, quote = candidate.start(), candidate.end() - 1
+        index = bisect_right(starts, start) - 1
+        if index >= 0 and start < ranges[index][1]:
+            continue
+        line_index = bisect_right(lines, start) - 1
+        begin = lines[line_index]
+        end = lines[line_index + 1] if line_index + 1 < len(lines) else len(content)
+        if end - begin > _ROOT_GLOB_COMMAND_CHARS:
+            continue
+        remaining_work -= end - begin
+        if remaining_work < 0:
+            return
+        close = content.find("'", quote + 1, end)
+        inline = bisect_right(starts, quote)
+        if close < 0 or inline >= len(ranges) or not ranges[inline][1] <= close:
+            continue
+        # The complete quoted operand is the only supported notation here.
+        # A suffix such as an apostrophe-s supplies no new command boundary.
+        literal = content[quote : close + 1]
+        remaining_work -= len(literal)
+        if remaining_work < 0:
+            return
+        parsed = _parse_shell_command_word(literal, 0, check_runtime=check_runtime)
+        check_runtime()
+        if parsed is None or parsed.limited or parsed.end != len(literal):
+            continue
+        denied = False
+        quoted_through = begin
+        for earlier in quoted_prefixes.finditer(content, begin, start):
+            check_runtime()
+            if earlier.start() < quoted_through:
+                continue
+            word = content[earlier.start() : end]
+            remaining_work -= len(word)
+            if remaining_work < 0:
+                return
+            owned = _parse_shell_command_word(word, 0, check_runtime=check_runtime)
+            check_runtime()
+            if owned is None or owned.limited or candidate.end() <= earlier.start() + owned.end:
+                # Optional metadata never borrows an unproved quoted prefix.
+                # This denial affects no parser result or finding producer.
+                denied = True
+                break
+            quoted_through = earlier.start() + owned.end
+        if not denied:
+            yield start, close + 1
+
+
 @dataclass(frozen=True)
 class _PreparedYamlAnalysis:
     parser: _YamlParserAnalysis
     check_runtime: Callable[[], None]
 
     def inspection_notices(self) -> list[tuple[int, int]]:
-        """Notice unsupported prose after an inline example, without executing it."""
+        """Notice unsupported prose command notation, without executing it."""
         content = self.parser.content
-        if "eval" not in content:
+        if "eval" not in content and "-c" not in content:
             return []
         roles = semgrep_rule_scalar_roles(content, self.check_runtime)
         notices: dict[tuple[int, int], None] = {}
         for scalar in self.parser.spans.scalars:
             self.check_runtime()
-            if not roles or roles.get(scalar.start) != "message" or "eval" not in scalar.value:
+            if (
+                not roles
+                or roles.get(scalar.start) != "message"
+                or ("eval" not in scalar.value and "-c" not in scalar.value)
+            ):
                 continue
             ranges: list[tuple[int, int]] = []
             _markdown_shell_text(scalar.value, self.check_runtime, inline_code_ranges=ranges)
@@ -9311,16 +9375,28 @@ class _PreparedYamlAnalysis:
             starts = [start for start, _end in ranges]
             lines = logical_line_starts(scalar.value)
             exact_source = content[scalar.body_start : scalar.body_end] == scalar.value
-            for candidate in re.finditer(r"(?<![\w$])eval[ \t]+['\"]", scalar.value):
-                self.check_runtime()
-                index = bisect_right(starts, candidate.start()) - 1
-                line = lines[bisect_right(lines, candidate.start()) - 1]
-                # Only same-line prose following a native inline example is
-                # nominated. Native bodies and code blocks supply no notice.
-                if index < 0 or not line <= ranges[index][1] <= candidate.start():
-                    continue
+
+            def candidates(
+                value: str,
+                inline_ranges: list[tuple[int, int]],
+                inline_starts: list[int],
+                line_starts: list[int],
+            ) -> Iterator[tuple[int, int]]:
+                for candidate in re.finditer(r"(?<![\w$])eval[ \t]+['\"]", value):
+                    self.check_runtime()
+                    index = bisect_right(inline_starts, candidate.start()) - 1
+                    line = line_starts[bisect_right(line_starts, candidate.start()) - 1]
+                    # Only same-line prose following a native inline example is
+                    # nominated. Native bodies and code blocks supply no notice.
+                    if index >= 0 and line <= inline_ranges[index][1] <= candidate.start():
+                        yield candidate.start(), candidate.end()
+                yield from _unsupported_outer_shell_notation_spans(
+                    value, inline_ranges, self.check_runtime
+                )
+
+            for start, end in candidates(scalar.value, ranges, starts, lines):
                 span = (
-                    (scalar.body_start + candidate.start(), scalar.body_start + candidate.end())
+                    (scalar.body_start + start, scalar.body_start + end)
                     if exact_source
                     else (scalar.start, scalar.end)
                 )
