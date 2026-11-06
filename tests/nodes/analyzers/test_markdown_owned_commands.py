@@ -571,6 +571,7 @@ def test_property_arguments_cannot_own_dynamic_heads_or_captured_values(body: st
         "Remove-TypeData -TypeName Example",
         "Add-Type 'class Example {}'",
         "New-Object PSCodeProperty Name $getter",
+        "Import-Clixml item.xml",
     ],
 )
 def test_property_bindings_must_hold_across_the_whole_original_markdown(
