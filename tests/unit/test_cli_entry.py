@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -109,3 +110,39 @@ def test_entry_point_preserves_cli_parsing(args: list[str], monkeypatch) -> None
     assert entry.exit_code == original.exit_code
     assert entry.stdout == original.stdout
     assert entry.stderr == original.stderr
+
+
+class _WindowsOs:
+    """Report ``os.name == "nt"`` so Typer applies its Windows argv expansion on any platform."""
+
+    name = "nt"
+
+    def __getattr__(self, attribute: str) -> object:
+        return getattr(os, attribute)
+
+
+def test_entry_point_keeps_exclude_globs_verbatim(tmp_path: Path, monkeypatch, capsys) -> None:
+    from importlib import import_module
+
+    (tmp_path / "SKILL.md").write_text("# Demo\nA harmless example skill.\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "a.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "tests" / "b.py").write_text("print(2)\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("typer.core.os", _WindowsOs())
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)  # app() replaces it
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["skillspector", "scan", ".", "--no-llm", "--format", "json", "--exclude", "tests/*"],
+    )
+    module, name = _entry_point()
+
+    with pytest.raises(SystemExit) as exited:
+        getattr(import_module(module), name)()
+
+    captured = capsys.readouterr()
+    assert exited.value.code == 0, captured.err
+    report = json.loads(captured.out)
+    assert report["analysis_completeness"]["exclude_patterns"] == ["tests/*"]
+    assert [component["path"] for component in report["components"]] == ["SKILL.md"]
