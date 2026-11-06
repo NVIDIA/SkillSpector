@@ -88,7 +88,7 @@ def test_the_same_unresolved_quote_in_an_executed_operand_stays_partial(
 
 @pytest.mark.parametrize(
     "word",
-    ['"$CMD', '"$(resolve_tool)', "$(unfinished", '"${unfinished', "${unfinished", "`unfinished"],
+    ['"$CMD', '"$(resolve_tool)', "$(unfinished", '"${unfinished', "`unfinished"],
 )
 def test_opaque_or_unclosed_expansion_heads_keep_their_boundary(word: str) -> None:
     source = "An owned fragment `` " + word + " ``."
@@ -138,6 +138,7 @@ def test_later_inline_consumer_is_not_hidden_by_an_earlier_reference(newline: st
     [
         ("a" * 4097, ParserCheck.COMMAND_WORD_CHARACTERS),
         ('"unfinished', ParserCheck.COMMAND_WORD_BOUNDARY),
+        ('"${unfinished', ParserCheck.EXPANSION_BOUNDARY),
         ("$(unfinished", ParserCheck.EXPANSION_BOUNDARY),
         ("echo $(" + "a" * 4097 + ")", ParserCheck.COMMAND_WORD_CHARACTERS),
         ("alias " + "a" * 4097, ParserCheck.COMMAND_WORD_CHARACTERS),
