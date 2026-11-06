@@ -15,9 +15,14 @@ from typing import Final, NotRequired, cast
 
 from typing_extensions import TypedDict
 
+from skillspector.resource_limits import bounded_capacity
+
 logger = logging.getLogger(__name__)
 
-MAX_INSPECTION_LEDGER_EVENTS: Final = 10_000
+# Every artifact produces separate work rows for multiple analyzers.
+MAX_INSPECTION_LEDGER_EVENTS: Final = bounded_capacity(
+    "SKILLSPECTOR_MAX_INSPECTION_LEDGER_EVENTS", 100_000, 1_000_000
+)
 MAX_FINDING_OUTPUT_RECORDS: Final = 10_000
 MAX_EFFECTIVE_FINDINGS: Final = MAX_FINDING_OUTPUT_RECORDS
 UNSUPPORTED_PROSE_COMMAND_PATTERN: Final = "unsupported_prose_command_pattern"
