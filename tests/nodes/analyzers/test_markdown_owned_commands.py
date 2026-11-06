@@ -86,7 +86,10 @@ def test_the_same_unresolved_quote_in_an_executed_operand_stays_partial(
     assert source.index(body) <= diagnostic.start < diagnostic.end <= source.index(body) + len(body)
 
 
-@pytest.mark.parametrize("word", ['"$CMD', '"$(resolve_tool)', "$(unfinished"])
+@pytest.mark.parametrize(
+    "word",
+    ['"$CMD', '"$(resolve_tool)', "$(unfinished", '"${unfinished', "${unfinished", "`unfinished"],
+)
 def test_opaque_or_unclosed_expansion_heads_keep_their_boundary(word: str) -> None:
     source = "An owned fragment ``" + word + "``."
     diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
