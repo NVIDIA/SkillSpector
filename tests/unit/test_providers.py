@@ -114,6 +114,135 @@ class FakeProvider:
         return self.chat_model
 
 
+@pytest.mark.parametrize(
+    ("name", "credentials"),
+    [
+        ("openai", {"OPENAI_API_KEY": "test"}),
+        ("nv_build", {"NVIDIA_INFERENCE_KEY": "test"}),
+        ("ollama", {}),
+        (
+            "openai_compatible",
+            {
+                "SKILLSPECTOR_COMPAT_API_KEY": "test",
+                "SKILLSPECTOR_COMPAT_BASE_URL": "https://example.invalid/v1",
+            },
+        ),
+        (
+            "azure_openai",
+            {"AZURE_OPENAI_API_KEY": "test", "AZURE_OPENAI_ENDPOINT": "https://example.invalid"},
+        ),
+    ],
+)
+def test_prepare_transport_imports_without_creating_a_client(
+    monkeypatch: pytest.MonkeyPatch, name: str, credentials: dict[str, str]
+) -> None:
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", name)
+    for key, value in credentials.items():
+        monkeypatch.setenv(key, value)
+    imports: list[str] = []
+    monkeypatch.setattr(chat_models, "import_module", imports.append)
+
+    def unexpected_client(*args, **kwargs):
+        pytest.fail("Import preparation must not construct an unused client")
+
+    monkeypatch.setattr(chat_models, "ChatOpenAI", unexpected_client)
+    monkeypatch.setattr(chat_models, "AzureChatOpenAI", unexpected_client)
+    providers_module.prepare_chat_model_imports()
+
+    assert imports == ["httpcore", "openai.resources.chat.completions.completions"]
+
+
+@pytest.mark.parametrize("name", ["openai", "nv_build", "openai_compatible", "azure_openai"])
+def test_prepare_transport_imports_skips_unconfigured_bound_provider(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", name)
+    for key in (
+        "SKILLSPECTOR_COMPAT_API_KEY",
+        "SKILLSPECTOR_COMPAT_BASE_URL",
+        "AZURE_OPENAI_API_KEY",
+        "AZURE_OPENAI_ENDPOINT",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    imports: list[str] = []
+    monkeypatch.setattr(chat_models, "import_module", imports.append)
+
+    token = use_provider(get_active_provider())
+    try:
+        providers_module.prepare_chat_model_imports()
+    finally:
+        reset_provider(token)
+
+    assert imports == []
+
+
+def test_prepare_transport_imports_uses_actual_unbound_openai_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = NvBuildProvider()
+    monkeypatch.setattr(providers_module, "_select_active_provider", lambda: provider)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-fallback")
+    imports: list[str] = []
+    monkeypatch.setattr(chat_models, "import_module", imports.append)
+    monkeypatch.setattr(
+        provider, "prepare_chat_model_imports", lambda: pytest.fail("Wrong transport")
+    )
+
+    providers_module.prepare_chat_model_imports()
+
+    assert imports == ["httpcore", "openai.resources.chat.completions.completions"]
+
+
+def test_prepare_transport_imports_does_not_fall_back_for_explicit_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-fallback")
+    imports: list[str] = []
+    monkeypatch.setattr(chat_models, "import_module", imports.append)
+
+    token = use_provider(NvBuildProvider())
+    try:
+        providers_module.prepare_chat_model_imports()
+    finally:
+        reset_provider(token)
+
+    assert imports == []
+
+
+@pytest.mark.parametrize("name", ["claude_cli", "bedrock", "gemini", "anthropic_proxy", "custom"])
+def test_prepare_transport_imports_does_not_probe_providers_without_the_hook(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", name)
+    provider = get_active_provider() if name != "custom" else FakeProvider(name)
+    token = use_provider(provider)
+    try:
+        monkeypatch.setattr(
+            provider, "resolve_credentials", lambda: pytest.fail("Unexpected credential probe")
+        )
+        if has_cli_capability(provider):
+            monkeypatch.setattr(
+                provider, "is_available", lambda: pytest.fail("Unexpected CLI probe")
+            )
+        providers_module.prepare_chat_model_imports()
+    finally:
+        reset_provider(token)
+
+
+def test_prepare_transport_import_failure_does_not_construct_a_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+
+    def failed_import(name: str):
+        raise ImportError(name)
+
+    monkeypatch.setattr(chat_models, "import_module", failed_import)
+    with pytest.raises(ImportError, match="httpcore"):
+        providers_module.prepare_chat_model_imports()
+
+
 @pytest.fixture(autouse=True)
 def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     """Isolate provider-related env vars and the YAML cache for each test."""
