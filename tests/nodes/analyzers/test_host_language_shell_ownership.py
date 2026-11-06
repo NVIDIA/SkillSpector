@@ -1410,20 +1410,27 @@ def test_prefix_negation_and_inequality_keep_assert_message_ownership(expression
 
 
 @pytest.mark.parametrize(
-    "statement",
+    "statement,expected",
     [
-        "",
-        "const n = value! / (check.equal = run) / divisor;\n",
-        "const n = factory<number> / (check.equal = run) / divisor;\n",
+        ("", False),
+        ("const n = value! / (check.equal = run) / divisor;\n", True),
+        ("const n = factory<number> / (check.equal = run) / divisor;\n", True),
     ],
 )
-def test_typescript_does_not_borrow_javascript_assert_ownership(statement: str) -> None:
+def test_typescript_owns_templates_but_keeps_postfix_and_generic_ambiguity_partial(
+    statement: str, expected: bool
+) -> None:
     source = _JS_ASSERT_IMPORT + statement + _JS_ASSERT_CALL
 
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="typescript") is True
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="typescript") is expected
     result = _ledger("scripts/check.ts", source)
-    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
-    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+    row = result["inspection_ledger"][0]
+    if expected:
+        assert row["outcome"] is LedgerOutcome.PARTIAL
+        assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+    else:
+        assert row["outcome"] is LedgerOutcome.COMPLETED
+        assert "reason_code" not in row
 
 
 @pytest.mark.parametrize(
