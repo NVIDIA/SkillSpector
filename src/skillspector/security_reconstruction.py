@@ -12,10 +12,13 @@ from bisect import bisect_right
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from io import StringIO
 from typing import Final
 
 from skillspector.artifacts import SecurityTextView
+from skillspector.javascript_ast import MAX_JAVASCRIPT_SOURCE_CHARS, parse_javascript_source
+from skillspector.yaml_tokens import yaml_source_spans
 
 MAX_MARKER_LENGTH: Final = 16
 MAX_MARKER_SCOPE_CHARS: Final = 768
@@ -730,6 +733,222 @@ def validated_json_string_closers(text: str, check_runtime: Callable[[], None] |
     return {end - 1 for _, end in validated_json_string_spans(text, check_runtime)}
 
 
+_HTML_ATTRIBUTE_RE = re.compile(
+    r"[^\s/=>\"'`<]+(?:\s*=\s*(?P<value>\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+))?"
+)
+_HTML_START_TAG_RE = re.compile(
+    rf"<([A-Za-z][A-Za-z0-9:-]*)(?:\s+{_HTML_ATTRIBUTE_RE.pattern})*\s*/?>\Z"
+)
+_BACKTICK_RUN_RE = re.compile(r"`+")
+_HTML_BLOCK_TAG_RE = re.compile(
+    r"</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|"
+    r"dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|"
+    r"h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|"
+    r"optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|"
+    r"track|ul)(?=[ \t>]|/?>|$)",
+    re.IGNORECASE,
+)
+_HTML_MARKDOWN_TAG_NAME_RE = re.compile(r"</?([A-Za-z][A-Za-z0-9-]*)(?=[ \t/>]|$)")
+_HTML_MARKDOWN_CLOSE_TAG_RE = re.compile(r"</[A-Za-z][A-Za-z0-9-]*[ \t]*>")
+
+
+def _markdown_html_block(raw: str) -> tuple[bool, re.Pattern[str] | None]:
+    """Recognize HTML block starts without treating angle-bracket autolinks as tags."""
+    if not raw.startswith("<"):
+        return False, None
+    if re.match(r"<(script|pre|style|textarea)(?=[ \t>]|$)", raw, re.IGNORECASE):
+        return True, re.compile(r"</(?:script|pre|style|textarea)>", re.IGNORECASE)
+    for opening, closing in (("<!--", "-->"), ("<?", "?>"), ("<![CDATA[", "]]>")):
+        if raw.startswith(opening):
+            return True, re.compile(re.escape(closing))
+    if re.match(r"<![A-Za-z]", raw):
+        return True, re.compile(">")
+    if _HTML_BLOCK_TAG_RE.match(raw):
+        return True, None
+    name = _HTML_MARKDOWN_TAG_NAME_RE.match(raw)
+    if name is not None and name[1].lower() not in {"script", "pre", "style", "textarea"}:
+        complete = raw.rstrip(" \t")
+        if _HTML_START_TAG_RE.fullmatch(complete) or _HTML_MARKDOWN_CLOSE_TAG_RE.fullmatch(
+            complete
+        ):
+            return True, None
+    return False, None
+
+
+def _html_attribute_closers(content: str, check_runtime: Callable[[], None]) -> set[int]:
+    """Own only quoted attribute delimiters inside individually valid start tags."""
+    line_starts = [0, *(match.end() for match in re.finditer("\n", content))]
+    closers: set[int] = set()
+
+    class Tags(HTMLParser):
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            check_runtime()
+            raw = self.get_starttag_text()
+            parsed = _HTML_START_TAG_RE.fullmatch(raw)
+            if parsed is None:
+                return
+            row, column = self.getpos()
+            start = line_starts[row - 1] + column
+            for attribute in _HTML_ATTRIBUTE_RE.finditer(raw, parsed.end(1)):
+                value = attribute.group("value")
+                if value and value[0] in "\"'":
+                    closers.add(start + attribute.end("value") - 1)
+
+        handle_startendtag = handle_starttag
+
+    parser = Tags(convert_charrefs=False)
+    parser.feed(content)
+    parser.close()
+    check_runtime()
+    return closers
+
+
+def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) -> set[int]:
+    """Own same-line CommonMark code delimiters outside recognized fenced blocks."""
+    closers: set[int] = set()
+    fence: tuple[str, int, tuple[tuple[str, int], ...], int] | None = None
+    html_end: re.Pattern[str] | None = None
+    html_context: tuple[tuple[str, int], ...] = ()
+    html_last_quote = -1
+    in_html = False
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        check_runtime()
+        body, context = _json_fence_prefix(line.rstrip("\r\n"), check_runtime)
+        if in_html:
+            html_body = _json_fence_body(
+                line, html_context, check_runtime, last_quote_index=html_last_quote
+            )
+            if html_body is not None:
+                if (html_end is None and not html_body.strip()) or (
+                    html_end is not None and html_end.search(html_body) is not None
+                ):
+                    in_html = False
+                offset += len(line)
+                continue
+            in_html = False
+        if fence is not None:
+            fenced_body = _json_fence_body(line, fence[2], check_runtime, last_quote_index=fence[3])
+            if fenced_body is not None:
+                closing = _JSON_FENCE_CLOSE_RE.fullmatch(fenced_body.rstrip("\r\n"))
+                if closing and closing[1][0] == fence[0] and len(closing[1]) >= fence[1]:
+                    fence = None
+                offset += len(line)
+                continue
+            fence = None
+        # Indented code does not establish inline-code ownership.
+        if body.startswith("    "):
+            offset += len(line)
+            continue
+        # Type-7 HTML starts are treated conservatively even when their
+        # ability to interrupt an existing paragraph has not been proved.
+        raw = body.lstrip()
+        html_start, html_terminator = _markdown_html_block(raw)
+        if html_start:
+            html_end = html_terminator
+            html_context = context
+            html_last_quote = max(
+                (i for i, entry in enumerate(context) if entry[0] == "quote"), default=-1
+            )
+            in_html = html_end is None or html_end.search(raw) is None
+            offset += len(line)
+            continue
+        opening = _JSON_FENCE_OPEN_RE.fullmatch(body)
+        if opening and not (opening[1][0] == "`" and "`" in opening[2]):
+            last_quote = max(
+                (i for i, entry in enumerate(context) if entry[0] == "quote"), default=-1
+            )
+            fence = opening[1][0], len(opening[1]), context, last_quote
+        else:
+            opener: re.Match[str] | None = None
+            for run in _BACKTICK_RUN_RE.finditer(line):
+                if opener is None:
+                    cursor = run.start() - 1
+                    while cursor >= 0 and line[cursor] == "\\":
+                        cursor -= 1
+                    if (run.start() - 1 - cursor) % 2:
+                        continue
+                    opener = run
+                elif len(run[0]) == len(opener[0]):
+                    closers.update(range(offset + run.start(), offset + run.end()))
+                    opener = None
+            if opener is not None:
+                # A code span can continue on another line. This helper proves
+                # same-line pairs only, so an unmatched run makes later quote
+                # state ambiguous and cannot grant more delimiter ownership.
+                return closers
+        offset += len(line)
+    return closers
+
+
+class StructuredStringClosers:
+    """Lazily prove structural closing delimiters against a complete bounded artifact.
+
+    Only the loose declared-marker fallback consumes this proof. Literal contents
+    and explicit marker declarations continue through ordinary security matching.
+    """
+
+    def __init__(
+        self,
+        content: str,
+        file_type: str,
+        check_runtime: Callable[[], None],
+        *,
+        shell_quote_closers: Callable[[], set[int]] | None = None,
+    ) -> None:
+        self._content = content
+        self._file_type = file_type
+        self._check_runtime = check_runtime
+        self._shell_quote_closers = shell_quote_closers
+        self._closers: set[int] | None = None
+
+    def closes_string(self, offset: int) -> bool:
+        self._check_runtime()
+        if self._closers is None:
+            self._closers = self._compute()
+        return offset in self._closers
+
+    def _compute(self) -> set[int]:
+        content = self._content
+        if len(content) > MAX_JAVASCRIPT_SOURCE_CHARS:
+            return set()
+        if self._file_type == "shell" and self._shell_quote_closers is not None:
+            return self._shell_quote_closers()
+        if self._file_type == "javascript":
+            program = parse_javascript_source(content, self._check_runtime)
+            if program is None:
+                return set()
+            return {
+                program.span(node)[1] - 1
+                for node in program.nodes
+                if node.type in {"string", "template_string"}
+            }
+        if self._file_type == "json":
+
+            def reject_constant(value: str) -> None:
+                raise ValueError(value)
+
+            try:
+                json.loads(content, parse_constant=reject_constant)
+            except (ValueError, RecursionError):
+                return set()
+            self._check_runtime()
+            return {end - 1 for _, end in _json_string_spans(content, self._check_runtime)}
+        if self._file_type == "markdown":
+            closers = _markdown_inline_closers(content, self._check_runtime)
+            header_end = _json_body_after_frontmatter(content, self._check_runtime)
+            if header_end is not None:
+                header = yaml_source_spans(content[:header_end], self._check_runtime)
+                if header is not None:
+                    closers.update(
+                        scalar.end - 1 for scalar in header.scalars if scalar.style in {"'", '"'}
+                    )
+            return closers
+        if self._file_type == "html":
+            return _html_attribute_closers(content, self._check_runtime)
+        return set()
+
+
 def _is_quoted_mapping_key(text: str, start: int) -> bool:
     """Return whether the exact quoted removal verb is followed by a key colon."""
     if start == 0 or text[start - 1] not in _ALL_QUOTE_CHARACTERS:
@@ -753,6 +972,20 @@ def _verb_is_in_cli_flag_token(text: str, start: int) -> bool:
     while token_start > 0 and (text[token_start - 1].isalnum() or text[token_start - 1] in "_-"):
         token_start -= 1
     return token_start < start and text[token_start] == "-"
+
+
+def _verb_is_make_strip_function(text: str, match: re.Match[str]) -> bool:
+    """Recognize the bounded Make built-in around one simple variable reference.
+
+    This is native function syntax, not a prose marker-removal header. Nested
+    functions, dynamic names and incomplete calls retain the lexical fallback.
+    """
+    start, quote = match.start(), match.start("quote")
+    return (
+        text[max(0, start - 2) : start] == "$("
+        and re.fullmatch(r"strip[ \t]+\$\([A-Za-z_][A-Za-z0-9_]*\)\)[ \t]*", text[start:quote])
+        is not None
+    )
 
 
 def _quoted_verb_in_string_sequence(text: str, match: re.Match[str]) -> bool:
@@ -795,7 +1028,7 @@ def _view_string_closer(
     """
 
     def closes_owned_string(index: int) -> bool:
-        return view.text[index] in "'\"" and validated_string_closer(view.source_offset(index))
+        return view.text[index] in "'\"`" and validated_string_closer(view.source_offset(index))
 
     return closes_owned_string
 
@@ -823,6 +1056,8 @@ def _quoted_directives(
             check_runtime()
         if unsupported_header and _verb_is_in_cli_flag_token(text, match.start()):
             continue
+        if unsupported_header and _verb_is_make_strip_function(text, match):
+            continue
         if unsupported_header and _is_quoted_mapping_key(text, match.start()):
             continue
         if unsupported_header and _quoted_verb_in_string_sequence(text, match):
@@ -837,17 +1072,32 @@ def _quoted_directives(
             continue
         quote = _QUOTE_OPEN_TO_CLOSE[match.group("quote")]
         marker_start = match.end()
+        if quote == "`":
+            opener = _BACKTICK_RUN_RE.match(text, match.start("quote"))
+            assert opener is not None
+            quote = opener[0]
+            marker_start = opener.end()
         marker_end_limit = min(len(text), marker_start + MAX_MARKER_LOOKAHEAD_CHARS)
         cursor = marker_start
-        unsupported = unsupported_header
+        unsupported = unsupported_header or len(quote) > 1
         while cursor < marker_end_limit:
             character = text[cursor]
-            if character == quote:
+            if (
+                cursor + len(quote) <= marker_end_limit
+                and text.startswith(quote, cursor)
+                and (
+                    len(quote) == 1
+                    or (
+                        (cursor == marker_start or text[cursor - 1] != "`")
+                        and text[cursor + len(quote) : cursor + len(quote) + 1] != "`"
+                    )
+                )
+            ):
                 if cursor > marker_start:
                     yield _Directive(
                         text[marker_start:cursor],
                         match.start(),
-                        cursor + 1,
+                        cursor + len(quote),
                         unsupported=unsupported,
                     )
                 break
@@ -1026,6 +1276,7 @@ def _tag_directives(
     end_is_truncated: bool,
     pattern: re.Pattern[str] = _TAG_DIRECTIVE_START_RE,
     unsupported_header: bool = False,
+    closes_owned_string: Callable[[int], bool] | None = None,
 ) -> Iterator[_Directive]:
     for match in pattern.finditer(text):
         if check_runtime is not None:
@@ -1043,6 +1294,11 @@ def _tag_directives(
                 check_runtime,
             )
             if opener is None:
+                continue
+            if closes_owned_string is not None and any(
+                text[index] in "\"'`" and closes_owned_string(index)
+                for index in range(match.start(), opener)
+            ):
                 continue
             marker_start = opener
         marker_end_limit = min(len(text), marker_start + MAX_MARKER_LOOKAHEAD_CHARS)
@@ -1205,6 +1461,7 @@ def _directives(
             end_is_truncated=end_is_truncated,
             pattern=_UNSUPPORTED_TAG_DIRECTIVE_START_RE,
             unsupported_header=True,
+            closes_owned_string=closes_owned_string,
         ),
         *_encoded_directives(text, check_runtime, end_is_truncated=end_is_truncated),
         *_encoded_directives(
