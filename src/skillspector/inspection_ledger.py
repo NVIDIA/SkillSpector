@@ -25,6 +25,10 @@ MAX_INSPECTION_LEDGER_EVENTS: Final = bounded_capacity(
 )
 MAX_FINDING_OUTPUT_RECORDS: Final = 10_000
 MAX_EFFECTIVE_FINDINGS: Final = MAX_FINDING_OUTPUT_RECORDS
+UNSUPPORTED_PROSE_COMMAND_PATTERN: Final = "unsupported_prose_command_pattern"
+UNSUPPORTED_PROSE_COMMAND_NOTICE: Final = (
+    "This command pattern is not allowed for inspection; put the command in a code block."
+)
 RESOURCE_MEASUREMENT_UNITS: Final = (
     "characters",
     "bytes",
@@ -841,6 +845,55 @@ class AnalysisCompleteness(TypedDict):
     dependency_inspection: NotRequired[dict[str, object]]
     policy_accepted: NotRequired[bool]
     warnings: NotRequired[list[dict[str, object]]]
+    notices: NotRequired[list[dict[str, object]]]
+
+
+def bounded_inspection_notices(rows: object) -> list[dict[str, object]]:
+    """Keep documentation notices separate from inspection gaps and findings."""
+    if not isinstance(rows, list) or MAX_FINDING_OUTPUT_RECORDS <= 0:
+        return []
+    notices: dict[tuple[str, int, int], dict[str, object]] = {}
+    for row in rows[:MAX_INSPECTION_LEDGER_EVENTS]:
+        if (
+            not isinstance(row, Mapping)
+            or row.get("reason_code") != UNSUPPORTED_PROSE_COMMAND_PATTERN
+        ):
+            continue
+        path = row.get("path")
+        if not isinstance(path, str):
+            continue
+        try:
+            path = _normalize_relative_path(path)
+        except ValueError:
+            continue
+        start, end = row.get("source_start_offset"), row.get("source_end_offset")
+        first, last = row.get("start_line"), row.get("end_line")
+        if not (
+            type(start) is int
+            and type(end) is int
+            and 0 <= start < end < (1 << 63)
+            and type(first) is int
+            and type(last) is int
+            and 1 <= first <= last < (1 << 63)
+        ):
+            continue
+        key = (path, start, end)
+        notices.setdefault(
+            key,
+            {
+                "reason_code": UNSUPPORTED_PROSE_COMMAND_PATTERN,
+                "message": UNSUPPORTED_PROSE_COMMAND_NOTICE,
+                "phase": "documentation",
+                "path": path,
+                "start_line": first,
+                "end_line": last,
+                "source_start_offset": start,
+                "source_end_offset": end,
+            },
+        )
+        if len(notices) >= MAX_FINDING_OUTPUT_RECORDS:
+            break
+    return list(notices.values())
 
 
 def _normalize_relative_path(path: str, *, scope_boundary: bool = False) -> str:
@@ -1645,6 +1698,9 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_before_filtering": len(findings_by_id),
         "findings_after_filtering": len(validated_effective),
     }
+    notices = bounded_inspection_notices(state.get("inspection_notices"))
+    if notices:
+        completeness["notices"] = notices
     patterns = state.get("exclude_patterns", [])
     dependency_inspection = state.get("dependency_inspection")
     if isinstance(dependency_inspection, dict):
