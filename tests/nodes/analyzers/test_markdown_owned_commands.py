@@ -108,10 +108,46 @@ def test_existing_powershell_value_owner_is_retained(body: str, newline: str) ->
 @pytest.mark.parametrize(
     "body",
     [
+        "Write-Host -NoNewline \"$($text -replace '%s', 'r m')\"",
+        "Write-Output (\"$($text -replace '%s', 'r m')\")",
+        "\"$($text -replace '%s', 'r m')\" | Write-Output",
+        "$result = \"$($text -replace '%s', 'r m')\"",
+    ],
+)
+def test_one_value_owner_precedes_whole_word_and_nested_command_reads(
+    monkeypatch, body: str
+) -> None:
+    original = tm._parse_shell_command_word
+    parsed_starts = []
+
+    def parse(content, start, *args, **kwargs):
+        parsed_starts.append(start)
+        return original(content, start, *args, **kwargs)
+
+    monkeypatch.setattr(tm, "_parse_shell_command_word", parse)
+    assert tm._owned_inline_command_diagnostic(body, lambda: None, [16 * len(body)]) is None
+    opening = body.index("$(")
+    assert opening - 1 not in parsed_starts
+    assert opening + 2 not in parsed_starts
+
+
+def test_native_value_proof_obeys_shared_work_allowance() -> None:
+    body = "\"$($text -replace '%s', 'r m')\" | Write-Output"
+    diagnostic = tm._owned_inline_command_diagnostic(body, lambda: None, [len(body) + 1])
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RESOURCE_LIMIT
+    assert diagnostic.check is ParserCheck.MARKDOWN_LITERAL_OWNERSHIP
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
         "echo \"$($text -replace '%s', 'r m')\"",
         "Write-Output \"$($text -replace '%s', 'r m'; $CMD)\"",
         "Write-Output \"$($text -replace '%s', $($CMD))\"",
         "Write-Output \"$($text -replace '%s', 'r m')\"; $CMD",
+        "Write-Output (\"$($text -replace '%s', 'r m')\"); eval \"$PAYLOAD\"",
+        "\"$($text -replace '%s', 'r m')\" | Write-Output; sh -c \"$PAYLOAD\"",
     ],
 )
 def test_replace_syntax_does_not_hide_executable_or_following_code(body: str) -> None:

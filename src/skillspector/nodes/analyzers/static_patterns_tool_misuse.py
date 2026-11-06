@@ -9647,6 +9647,32 @@ def _owned_inline_command_diagnostic(
             ParserUncheckedScope.REMAINING_INPUT,
         )
 
+    value_spans: list[tuple[int, int]] = []
+    for candidate in re.finditer(r"\$\(", content):
+        check_runtime()
+        start = candidate.start()
+        if not start or content[start - 1] != '"':
+            continue
+        # Reuse the existing finite value proof before either a whole quoted
+        # word or its nested expression is interpreted as a POSIX command.
+        boundary = min(len(content), start + _PRINTF_STATIC_CHARS + 3)
+        newline = content.find("\n", start, boundary)
+        if newline >= 0:
+            boundary = newline
+        remaining_work[0] -= boundary - start
+        if remaining_work[0] < 0:
+            return limit(start)
+        end = _skip_command_substitution(content, start, boundary, check_runtime)
+        if (
+            end is not None
+            and content[end : end + 1] == '"'
+            and _is_powershell_replace_value_context(
+                content, start, end, content[start + 2 : end - 1]
+            )
+        ):
+            value_spans.append((start - 1, end + 1))
+    value_starts = [start for start, _end in value_spans]
+
     for start in _nonempty_shell_clause_starts(
         content,
         check_runtime,
@@ -9662,25 +9688,11 @@ def _owned_inline_command_diagnostic(
         end = scope_ends[-1] - 1 if scope_ends else len(content)
         if start >= end:
             continue
-        if scope_ends:
-            inner_start = start
-            while inner_start > 0 and content[inner_start - 1] in " \t":
-                inner_start -= 1
-                if (start - inner_start) % 4096 == 0:
-                    check_runtime()
-            if (
-                inner_start >= 2
-                and content[inner_start - 2 : inner_start] == "$("
-                and _is_powershell_replace_value_context(
-                    content,
-                    inner_start - 2,
-                    scope_ends[-1],
-                    content[inner_start : scope_ends[-1] - 1],
-                )
-            ):
-                # This existing proof owns one complete value expression;
-                # its variable is data, not a POSIX generated command name.
-                continue
+        value_index = bisect_right(value_starts, start) - 1
+        if value_index >= 0 and start < value_spans[value_index][1]:
+            # Only this source-proven quoted value is data. Command heads and
+            # other clauses remain independently inspected by the same walk.
+            continue
         # A nested scope is copied only within the shared work allowance; all
         # quote/substitution readers see that exact native endpoint as EOF.
         if scope_ends:
