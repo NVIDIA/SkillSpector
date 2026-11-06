@@ -4783,6 +4783,7 @@ def _command_string_from_clause(
     output_argument_end: int | None = None,
     command_operand_spans: list[tuple[int, int]] | None = None,
     shell_command_only: bool = False,
+    require_command_identity: bool = False,
 ) -> tuple[bool, str | None]:
     """Resolve a bounded wrapper chain to an ``eval`` or shell command string."""
     cursor = start
@@ -4960,6 +4961,13 @@ def _command_string_from_clause(
             continue
         if xargs_replacements and _DYNAMIC_SHELL_WORD_SENTINEL in word:
             return failed(ParserCause.RUNTIME_DEPENDENT)
+        if require_command_identity and any(
+            marker in word
+            for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+        ):
+            # Wrapper options and assignment values were consumed separately;
+            # this word selects the command an owned child actually executes.
+            return failed(ParserCause.RUNTIME_DEPENDENT, ParserCheck.COMMAND_IDENTITY)
         command = word.casefold().rsplit("/", 1)[-1]
         if (
             not wrapper_seen
@@ -9797,10 +9805,15 @@ def _owned_inline_command_diagnostic(
             diagnostics=diagnostics,
             source_span=source_span,
             command_operand_spans=operands,
+            require_command_identity=executing or bool(scope_ends),
         )
         remaining_work[0] -= max(1, source_span[1] - start)
         if remaining_work[0] < 0:
             return limit(start)
+        if (executing or scope_ends) and diagnostics:
+            # An unresolved effective command needs no -c/eval operand to
+            # remain incomplete inside an already executing native scope.
+            return diagnostics[0]
         # Native code can name a command as a reference. Only an actual owned
         # operand establishes an executable string; no following prose is read.
         if not found or not operands:
@@ -9858,7 +9871,44 @@ def _markdown_split_command_diagnostic(
             ParserUncheckedScope.REMAINING_INPUT,
         )
 
-    for body_start, body_end in ranges:
+    def assignment_prefix(start: int, end: int) -> tuple[bool, StaticParserDiagnostic | None]:
+        remaining_work[0] -= end - start
+        if remaining_work[0] < 0:
+            return False, limit(start, end)
+        source = content[start:end]
+        cursor = 0
+        observed = False
+        for index in range(_SHELL_COMMAND_STRING_ARGUMENTS + 1):
+            check_runtime()
+            while cursor < len(source) and source[cursor] in " \t":
+                if cursor % 4096 == 0:
+                    check_runtime()
+                cursor += 1
+            if cursor == len(source):
+                return observed, None
+            if index == _SHELL_COMMAND_STRING_ARGUMENTS:
+                return False, limit(start, end)
+            if _SHELL_ASSIGNMENT_PREFIX_RE.match(source, cursor) is None:
+                return False, None
+            diagnostics: list[StaticParserDiagnostic] = []
+            word = _parse_shell_command_word(
+                source, cursor, check_runtime=check_runtime, diagnostics=diagnostics
+            )
+            if word is None or word.limited:
+                diagnostic = word.diagnostic if word is not None else None
+                return False, (
+                    (diagnostic or diagnostics[0]).shifted(start)
+                    if diagnostic or diagnostics
+                    else limit(start, end)
+                )
+            remaining_work[0] -= max(1, word.end - cursor)
+            if remaining_work[0] < 0:
+                return False, limit(start, end)
+            observed = True
+            cursor = word.end
+        return False, limit(start, end)
+
+    for body_index, (body_start, body_end) in enumerate(ranges):
         check_runtime()
         body = content[body_start:body_end]
         remaining_work[0] -= len(body)
@@ -9924,10 +9974,38 @@ def _markdown_split_command_diagnostic(
                 # A truncated word cannot become complete just because its
                 # shortened source extent is copied into a bounded scope.
                 return probe_diagnostics[0]
-            raw = list(content[body_start:operand_end])
+            # Only adjacent native assignment fragments can prefix this
+            # already-proven invocation. Prose and physical lines break it.
+            owned_start = body_start
+            prefix_gaps: list[tuple[int, int]] = []
+            for prefix_index in range(body_index - 1, -1, -1):
+                prefix_start, prefix_end = ranges[prefix_index]
+                check_runtime()
+                remaining_work[0] -= owned_start - prefix_end
+                if remaining_work[0] < 0:
+                    return limit(prefix_end, owned_start)
+                if projected[prefix_end:owned_start].strip(" \t") or content[
+                    prefix_end:owned_start
+                ].strip(" \t`"):
+                    break
+                prefix, diagnostic = assignment_prefix(prefix_start, prefix_end)
+                if diagnostic is not None:
+                    return diagnostic
+                if not prefix:
+                    break
+                prefix_gaps.append((prefix_end, owned_start))
+                owned_start = prefix_start
+            raw = list(content[owned_start:operand_end])
             remaining_work[0] -= len(raw)
             if remaining_work[0] < 0:
                 return limit(start, operand_end)
+            for gap_start, gap_end in prefix_gaps:
+                for offset in range(gap_start, gap_end):
+                    if (offset - gap_start) % 4096 == 0:
+                        check_runtime()
+                    if content[offset] == "`":
+                        raw[offset - owned_start] = " "
+            # Assignment values retain every original quote/substitution byte.
             for offset in range(body_start, operand_start):
                 if (offset - body_start) % 4096 == 0:
                     check_runtime()
@@ -9940,15 +10018,16 @@ def _markdown_split_command_diagnostic(
                             operand_end,
                             ParserUncheckedScope.COMMAND_STRING,
                         )
-                    raw[offset - body_start] = " "
+                    raw[offset - owned_start] = " "
             owned = "".join(raw)
             raw_operands: list[tuple[int, int]] = []
             raw_diagnostics: list[StaticParserDiagnostic] = []
-            raw_span = [clause_start, clause_start]
+            raw_start = start - owned_start
+            raw_span = [raw_start, raw_start]
             raw_shell = [False]
             _command_string_from_clause(
                 owned,
-                clause_start,
+                raw_start,
                 check_runtime,
                 starts_shell=raw_shell,
                 diagnostics=raw_diagnostics,
@@ -9957,13 +10036,13 @@ def _markdown_split_command_diagnostic(
                 shell_command_only=True,
                 xargs_override_cache=[True],
             )
-            remaining_work[0] -= max(1, raw_span[1] - clause_start)
+            remaining_work[0] -= max(1, raw_span[1] - raw_start)
             if remaining_work[0] < 0:
                 return limit(start, operand_end)
-            expected = [(operand_start - body_start, operand_end - body_start)]
+            expected = [(operand_start - owned_start, operand_end - owned_start)]
             if not raw_shell[0] or raw_operands != expected:
                 return (
-                    raw_diagnostics[0].shifted(body_start)
+                    raw_diagnostics[0].shifted(owned_start)
                     if raw_diagnostics
                     else StaticParserDiagnostic(
                         ParserCause.BOUNDARY_UNRESOLVED,
@@ -9977,10 +10056,10 @@ def _markdown_split_command_diagnostic(
                 ParserCause.RESOURCE_LIMIT,
                 ParserCause.BOUNDARY_UNRESOLVED,
             }:
-                return raw_diagnostics[0].shifted(body_start)
+                return raw_diagnostics[0].shifted(owned_start)
             diagnostic = _owned_inline_command_diagnostic(owned, check_runtime, remaining_work)
             if diagnostic is not None:
-                return diagnostic.shifted(body_start)
+                return diagnostic.shifted(owned_start)
     return None
 
 

@@ -90,6 +90,37 @@ def test_owned_command_inspection_preserves_raw_high_findings() -> None:
     assert any(event["outcome"] == "partial" for event in result["inspection_ledger"])
 
 
+@pytest.mark.parametrize("wrapper", ["env", "command", "sudo -n", "command -p env"])
+def test_executed_wrapper_retains_its_terminal_runtime_command(wrapper: str) -> None:
+    body = wrapper + ' "$CMD"'
+    source = "Run ``sh -c '" + body + "'``."
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+    assert diagnostic.check is ParserCheck.COMMAND_IDENTITY
+    assert source.index("sh -c") <= diagnostic.start < diagnostic.end <= source.index("``.")
+
+
+@pytest.mark.parametrize("body", ['env echo "$CMD"', 'command -v "$CMD"', 'sudo -n echo "$CMD"'])
+def test_executed_wrapper_keeps_output_arguments_and_queries_as_data(body: str) -> None:
+    source = "Run ``sh -c '" + body + "'``."
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+
+
+def test_effective_command_identity_is_an_optional_executed_context_contract() -> None:
+    source = 'env "$CMD"'
+    diagnostics = []
+    assert tm._command_string_from_clause(source, 0, lambda: None, diagnostics=diagnostics) == (
+        False,
+        None,
+    )
+    assert diagnostics == []
+    assert tm._command_string_from_clause(
+        source, 0, lambda: None, diagnostics=diagnostics, require_command_identity=True
+    ) == (True, None)
+    assert diagnostics[0].check is ParserCheck.COMMAND_IDENTITY
+
+
 @pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
 @pytest.mark.parametrize(
     "body",

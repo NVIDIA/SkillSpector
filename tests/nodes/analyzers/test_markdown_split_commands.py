@@ -66,6 +66,101 @@ def test_raw_child_substitutions_startup_and_binding_uncertainty_remain_partial(
 
 @pytest.mark.parametrize("kind", ["markdown", "yaml"])
 @pytest.mark.parametrize(
+    "prefix",
+    [
+        'BASH_ENV="$STARTUP"',
+        "BASH_ENV=/tmp/startup",
+        'BASH_ENV="$STARTUP" A=1',
+        'BASH_ENV="$STARTUP"` `A=1',
+    ],
+)
+def test_adjacent_native_assignments_keep_the_child_startup_context(prefix: str, kind: str) -> None:
+    source = _source("Run `" + prefix + '` `bash -c` "printf done".', kind)
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type=kind)
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+    assert 0 <= diagnostic.start < diagnostic.end <= len(source)
+
+
+@pytest.mark.parametrize("kind", ["markdown", "yaml"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        'Run `BASH_ENV="$STARTUP"` then `bash -c` "printf done".',
+        'Use `echo BASH_ENV="$STARTUP"` `bash -c` "printf done".',
+        "Use `'BASH_ENV=$STARTUP'` `bash -c` \"printf done\".",
+    ],
+)
+def test_prose_and_assignment_shaped_data_do_not_lend_startup_context(
+    message: str, kind: str
+) -> None:
+    assert tm.bounded_parse_diagnostic(_source(message, kind), lambda: None, file_type=kind) is None
+
+
+@pytest.mark.parametrize("kind", ["markdown", "yaml"])
+@pytest.mark.parametrize("separator", ["\n\n", "\r\n\r\n", "\r\r"])
+def test_native_assignment_context_stops_at_a_paragraph(separator: str, kind: str) -> None:
+    source = _source(
+        'A reference `BASH_ENV="$STARTUP"`.' + separator + 'Run `bash -c` "printf done".',
+        kind,
+    )
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type=kind) is None
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r\n", "\r", "\n\n", "\r\n\r\n", "\r\r"])
+def test_assignment_bridge_does_not_cross_physical_line_boundaries(separator: str) -> None:
+    # No prose or punctuation supplies another reason to stop the prefix.
+    source = '`BASH_ENV="$STARTUP"`' + separator + '`bash -c` "printf done".'
+    assert tm._markdown_split_command_diagnostic(source, lambda: None) is None
+
+
+@pytest.mark.parametrize("count", [31, 32, 33])
+def test_assignment_prefix_proof_retains_its_word_bound(monkeypatch, count: int) -> None:
+    prefix = " ".join(['A="$VALUE"'] + ["A=1"] * (count - 1))
+    source = "Run `" + prefix + '` `bash -c` "printf done".'
+    inspected = []
+
+    def consumer(owned, *args, **kwargs):
+        inspected.append(owned)
+        return None
+
+    # Isolate the prefix proof from the existing consumer's independent
+    # wrapper-argument bound; this asserts which complete prefix it receives.
+    monkeypatch.setattr(tm, "_owned_inline_command_diagnostic", consumer)
+    diagnostic = tm._markdown_split_command_diagnostic(source, lambda: None)
+    if count <= 32:
+        assert diagnostic is None
+        assert len(inspected) == 1
+        assert inspected[0].startswith(prefix)
+    else:
+        assert diagnostic is not None
+        assert diagnostic.cause is ParserCause.RESOURCE_LIMIT
+        assert inspected == []
+
+
+def test_deadline_during_adjacent_assignment_proof_propagates(monkeypatch) -> None:
+    original = tm._parse_shell_command_word
+    entered = False
+
+    def parse(source, *args, **kwargs):
+        nonlocal entered
+        if source == 'BASH_ENV="$STARTUP"' and "diagnostics" in kwargs:
+            entered = True
+        return original(source, *args, **kwargs)
+
+    def expired() -> None:
+        if entered:
+            raise TimeoutError("native prefix deadline")
+
+    monkeypatch.setattr(tm, "_parse_shell_command_word", parse)
+    with pytest.raises(TimeoutError, match="native prefix deadline"):
+        tm._markdown_split_command_diagnostic(
+            'Run `BASH_ENV="$STARTUP"` `bash -c` "printf done".', expired
+        )
+
+
+@pytest.mark.parametrize("kind", ["markdown", "yaml"])
+@pytest.mark.parametrize(
     "message",
     [
         "Use `eval` as a reference. " + "Ordinary reference data " * 40,
