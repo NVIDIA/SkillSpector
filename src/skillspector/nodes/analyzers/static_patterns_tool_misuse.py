@@ -2255,7 +2255,7 @@ def _is_powershell_replace_value_context(
     """Recognize a bounded PowerShell ``-replace`` value statement."""
     if (
         _POWERSHELL_REPLACE_EXPRESSION_RE.search(inner) is None
-        or any(separator in inner for separator in ";|&\n")
+        or any(separator in inner for separator in ";|&\r\n")
         or any(marker in inner for marker in ("$(", "`", "<(", ">("))
     ):
         return False
@@ -9658,6 +9658,9 @@ def _owned_inline_command_diagnostic(
         boundary = content.find("\n", start)
         if boundary < 0:
             boundary = len(content)
+        carriage_return = content.find("\r", start, boundary)
+        if carriage_return >= 0:
+            boundary = carriage_return
         remaining_work[0] -= boundary - start
         if remaining_work[0] < 0:
             return limit(start)

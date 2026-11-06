@@ -90,7 +90,7 @@ def test_owned_command_inspection_preserves_raw_high_findings() -> None:
     assert any(event["outcome"] == "partial" for event in result["inspection_ledger"])
 
 
-@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
 @pytest.mark.parametrize(
     "body",
     [
@@ -150,6 +150,16 @@ def test_native_value_proof_obeys_shared_work_allowance() -> None:
     assert diagnostic is not None
     assert diagnostic.cause is ParserCause.RESOURCE_LIMIT
     assert diagnostic.check is ParserCheck.MARKDOWN_LITERAL_OWNERSHIP
+
+
+@pytest.mark.parametrize("separator", ["\r", "\r\n"])
+def test_native_replace_value_cannot_own_a_following_inner_statement(separator: str) -> None:
+    body = "Write-Output \"$($text -replace '%s', 'r m'" + separator + ' $CMD)"'
+    start, end = body.index("$("), body.index(")") + 1
+    assert not tm._is_powershell_replace_value_context(body, start, end, body[start + 2 : end - 1])
+    diagnostic = tm._owned_inline_command_diagnostic(body, lambda: None, [16 * len(body)])
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
 
 
 @pytest.mark.parametrize(
