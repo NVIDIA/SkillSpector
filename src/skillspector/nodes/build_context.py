@@ -148,6 +148,7 @@ def _is_allowed_inactive_git_hook_template(path: str, probe: bytes) -> bool:
 # File type by extension
 _FILE_TYPES: dict[str, str] = {
     ".md": "markdown",
+    ".mdc": "markdown",
     ".markdown": "markdown",
     ".py": "python",
     ".pyw": "python",
