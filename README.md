@@ -17,6 +17,7 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 
 - **[Scan agent skills before installation](https://docs.nvidia.com/skills/scanning-agent-skills)** — Hosted guide: when to scan, how to read a report, and how to gate installs.
 - **[Development guide](docs/DEVELOPMENT.md)** — Architecture, package layout, and how to extend the analyzer pipeline.
+- **[Security policy](SECURITY.md)** — Report suspected vulnerabilities privately to NVIDIA PSIRT.
 - **[Analysis resource bounds](docs/ANALYSIS_RESOURCE_BOUNDS.md)** — Fail-closed bundle, parser, nested-artifact, ledger, and finding ceilings.
 - **[Pi extension](docs/PI_EXTENSION.md)** — Install SkillSpector as a Pi tool for scanning skills from inside agent sessions.
 - **[OpenCode extension](docs/OPENCODE_EXTENSION.md)** — Install SkillSpector as an OpenCode tool and `/skillspector` command for scanning skills from inside agent sessions.
@@ -1091,8 +1092,15 @@ Apache License 2.0 - see [LICENSE](LICENSE) for details.
 
 ## Contributing
 
+Report suspected security vulnerabilities, including vulnerabilities in SkillSpector
+itself, privately to NVIDIA PSIRT by following [SECURITY.md](SECURITY.md). Do not
+report them through GitHub issues, pull requests, or Discussions.
+
 Contributions are welcome! Please read our contributing guidelines and submit pull requests.
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/NVIDIA/skillspector/issues)
+- **Security vulnerabilities**: Follow [SECURITY.md](SECURITY.md) to report privately
+  to NVIDIA PSIRT. Do not report them through GitHub issues, pull requests, or Discussions.
+- **Issues**: [GitHub Issues](https://github.com/NVIDIA/skillspector/issues) for
+  non-security bugs, false positives, and feature requests. Use minimal, sanitized reproductions.
