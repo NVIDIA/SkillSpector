@@ -20,19 +20,12 @@ This guide helps developers understand, run, test, and extend the LangGraph-base
 
 ## 2. Prerequisites and setup
 
-**To get started:** create and activate a virtual environment, then install. All Makefile targets assume the venv is already created and activated.
+Follow the [README development setup](../README.md#setup) for the canonical
+prerequisites, clone, virtual environment, and dependency-installation recipe.
+The supported Python range is defined in [pyproject.toml](../pyproject.toml).
+All Makefile targets assume the virtual environment is already created and activated.
 
-```bash
-# Create venv (use either uv or Python)
-uv venv .venv
-# or: python3 -m venv .venv
-
-source .venv/bin/activate   # On Windows: .venv\Scripts\activate
-
-make install-dev
-```
-
-- **Python**: 3.12+ (see [pyproject.toml](../pyproject.toml)). `make install` and `make install-dev` use **uv** if available (`uv sync` / `uv sync --all-extras`), otherwise **pip** (`pip install -e .` / `pip install -e ".[dev]"`). You must create and activate the virtual environment yourself before running any make target.
+- **Installation**: `make install` and `make install-dev` use **uv** if available (`uv sync` / `uv sync --all-extras`), otherwise **pip** (`pip install -e .` / `pip install -e ".[dev]"`).
 - **Environment**: Optional `.env` in the project root. The LangGraph dev server loads it (see [langgraph.json](../langgraph.json) `"env": ".env"`). Key variables:
   - **`SKILLSPECTOR_PROVIDER`**: Selects the active LLM provider — `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `gemini_cli`, or `opencode_cli`. Defaults to `nv_build` when unset.
   - **Provider credential**: depends on the active provider. Hosted providers use the matching variables in [.env.example](../.env.example); Ollama and CLI providers do not require an API key. See [providers/](../src/skillspector/providers/).
@@ -58,10 +51,15 @@ All targets assume the virtual environment is **already created and activated**.
 | `make install` | Install the package in production mode |
 | `make install-dev` | Install the package with development dependencies |
 | `make langgraph-dev` | Run LangGraph dev server (opens Studio at `LANGGRAPH_STUDIO_URL`) |
-| `make test` | Run tests |
-| `make test-cov` | Run tests with coverage report (HTML + terminal) |
-| `make lint` | Run linters (ruff only) |
-| `make format` | Format code with ruff (check + fix, then format) |
+| `make test-unit` | Initial test selection: excludes `integration` and `provider` markers |
+| `make test-integration` | Full-graph integration tests; may call a configured LLM provider |
+| `make test` | Run `test-unit` and `test-integration`; the current contributor submission requirement |
+| `make test-provider` | Live provider requests; see [provider prerequisites](#live-provider-tests) |
+| `make test-cov` | The `test-unit` marker selection with coverage (HTML + terminal) |
+| `make test-ci` | The `test-unit` marker selection with coverage (XML + terminal) |
+| `make lint` | Check lint with Ruff |
+| `make format-check` | Check formatting without editing files |
+| `make format` | Apply Ruff lint fixes and formatting in place |
 | `make clean` | Remove build artifacts and cache files |
 | `make build` | Build the package |
 
@@ -221,7 +219,9 @@ Optional state keys: `mode`, `model_config`, `output_format`, `use_llm`. The fin
   - [tests/integration/](../tests/integration/): `test_graph.py`, `test_graph_scanner.py`, `test_meta_analyzer_use_llm.py`
   - [tests/nodes/](../tests/nodes/): `test_build_context.py`, `test_resolve_input.py`, `test_report.py`, `test_llm_analyzer_base.py`
   - [tests/nodes/analyzers/](../tests/nodes/analyzers/): analyzer tests (`test_registry.py`, `test_static_patterns.py`)
-- **Commands**: `make test`, `make test-cov`.
+- **Initial checks**: `make test-unit`, `make lint`, and `make format-check` after following the [canonical setup](../README.md#setup). The unit target excludes tests marked `integration` or `provider`; that selection is not the entire CI gate or a guarantee of network isolation.
+- **Full contributor check**: `make test` runs unit and integration tests, as required by [CONTRIBUTING.md](../CONTRIBUTING.md#how-to-contribute). `make test-integration` invokes the full graph and may send test content to a configured LLM provider; review the environment and provider prerequisites before running it. The initial unit selection does not replace this requirement.
+- **Coverage and live checks**: `make test-cov` and `make test-ci` use the same marker exclusions as `make test-unit`. `make test-provider` makes live requests and needs the corresponding [provider configuration](#live-provider-tests).
 - **Key tests**: [test_graph.py](../tests/integration/test_graph.py) invokes the graph and asserts `findings`, `sarif_report`, `risk_score`, `report_body`; [test_input_handler.py](../tests/unit/test_input_handler.py) covers directory, zip, and single-file resolution; [test_resolve_input.py](../tests/nodes/test_resolve_input.py) covers the resolve_input node; [test_build_context.py](../tests/nodes/test_build_context.py) asserts `component_metadata` and `has_executable_scripts`.
 
 ### CI coverage: public GitHub and internal GitLab
@@ -363,7 +363,8 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
 
 ## 11. Linting and formatting
 
-- **Format**: `make format` — Ruff check with auto-fix and Ruff format.
+- **Format**: `make format` — apply Ruff lint fixes and formatting in place.
+- **Check formatting**: `make format-check` — check formatting without editing files.
 - **Lint**: `make lint` — Ruff check.
 - **Config**: [pyproject.toml](../pyproject.toml) (Ruff line-length 100, target Python 3.12).
 
@@ -373,7 +374,8 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
 
 | Task | Command or action |
 |------|-------------------|
-| **Get started** | Create venv (`uv venv .venv` or `python3 -m venv .venv`), then `source .venv/bin/activate`, then `make install-dev`. Re-activate venv in each new terminal. |
+| **Get started** | Follow the [README development setup](../README.md#setup). Re-activate the virtual environment in each new terminal. |
 | **Run workflow** | `skillspector scan <path>` for CLI; `make langgraph-dev` for LangGraph Studio; or `graph.invoke({"input_path": "...", "output_format": "json"})` (or `skill_path`) programmatically |
 | **Add analyzer** | Implement node returning `{"findings": list[Finding]}`, register in `nodes/analyzers/__init__.py` |
-| **Run tests** | `make test`; key integration test: [tests/integration/test_graph.py](../tests/integration/test_graph.py) |
+| **Initial checks** | `make test-unit`, `make lint`, `make format-check`; see [Testing](#7-testing) for scope |
+| **Full contributor tests** | `make test` includes integration tests that may call a configured LLM provider; review [Testing](#7-testing) and provider prerequisites first |
