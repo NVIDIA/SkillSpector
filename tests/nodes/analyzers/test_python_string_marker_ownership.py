@@ -436,7 +436,7 @@ def test_concurrent_sources_each_get_their_own_spans() -> None:
 # --- Readings that stay fail-closed ----------------------------------------
 
 
-@pytest.mark.parametrize("path", ["notes.md", "notes.txt", "scripts/check.sh"])
+@pytest.mark.parametrize("path", ["notes.md", "notes.txt"])
 def test_other_file_types_keep_the_lexical_reading(path: str) -> None:
     _assert_partial_marker_text(_ledger(path, _ASSERT_FLAG + _LITERAL_TAIL))
 

@@ -31,9 +31,11 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from inspect import getattr_static
 from itertools import chain
+from types import MappingProxyType
 from typing import cast
 
 from skillspector.artifacts import (
+    ArtifactDisposition,
     ContentKind,
     SecurityTextView,
     _contains_default_ignorable,
@@ -77,6 +79,7 @@ from skillspector.security_reconstruction import (
     MAX_MARKER_LOOKAHEAD_CHARS,
     build_declared_marker_views,
 )
+from skillspector.shell_tokens import ShellStringClosers
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
 from skillspector.surface import COMMENTS, infer_surface
 
@@ -913,6 +916,7 @@ class _FindingBudget:
     created_findings: int = 0
     emitted_findings: int = 0
     current_created: list[AnalyzerFinding] = field(default_factory=list)
+    parent: _FindingBudget | None = None
 
     def _runtime_metrics(self, now: float) -> dict[str, int | float]:
         return {
@@ -944,6 +948,8 @@ class _FindingBudget:
                     "limit_findings": self.max_findings,
                 },
             )
+        if self.parent is not None:
+            self.parent.observe_creation(finding)
         self.current_created.append(finding)
 
     def observe_emission(self) -> None:
@@ -1012,6 +1018,76 @@ class _OccurrenceColumnResolver:
             return
         finding.location.start_column = match_start - line_start
         self.next_offsets[key] = match_start + max(1, len(finding.matched_text))
+
+
+@dataclass
+class _CompleteSourceCache:
+    """Lazily bind bundled source text to complete immutable cached bytes.
+
+    Only the original artifact scan receives this context. Validation runs under
+    its deadline and is shared across subsequent artifacts in the same node.
+    Missing inventory or lossy/provider-transformed text cannot prove a source.
+    """
+
+    text: Mapping[str, str]
+    raw: Mapping[str, bytes] | None
+    inventory: object
+    _validated: Mapping[str, str] | None = None
+
+    def validated(self, check_runtime: Callable[[], None]) -> Mapping[str, str]:
+        check_runtime()
+        if self._validated is not None:
+            return self._validated
+        sources: dict[str, str] = {}
+        if not isinstance(self.inventory, list) or self.raw is None:
+            self._validated = MappingProxyType(sources)
+            return self._validated
+        # Match the bounded discovery inventory; do not silently trust a prefix
+        # when a hand-built state exceeds its contract.
+        if len(self.inventory) > 10_000:
+            self._validated = MappingProxyType(sources)
+            return self._validated
+        # An interrupted validation must not retry the same whole bundle on
+        # every subsequent shell artifact or expose a validated prefix.
+        self._validated = MappingProxyType({})
+        seen: set[str] = set()
+        for item in self.inventory:
+            check_runtime()
+            if not isinstance(item, dict) or not isinstance(path := item.get("path"), str):
+                continue
+            if path in seen:
+                sources.pop(path, None)
+                continue
+            seen.add(path)
+            content = self.text.get(path)
+            data = self.raw.get(path)
+            if (
+                not isinstance(content, str)
+                or not isinstance(data, bytes)
+                or len(content) > MAX_FILE_CHARS
+                or len(data) > 4 * MAX_FILE_CHARS
+                or item.get("content_kind") != ContentKind.TEXT
+                or item.get("disposition") != ArtifactDisposition.ANALYZED
+                or item.get("decodable") is not True
+                or item.get("contains_nul") is not False
+                or item.get("readable_binary")
+                or "inspected_members" in item
+                or item.get("reason")
+                or type(item.get("size_bytes")) is not int
+                or item["size_bytes"] != len(data)
+                or b"\x00" in data
+            ):
+                continue
+            try:
+                matches = data.decode("utf-8") == content
+            except UnicodeDecodeError:
+                matches = False
+            check_runtime()
+            if matches:
+                sources[path] = content
+        check_runtime()
+        self._validated = MappingProxyType(sources)
+        return self._validated
 
 
 def _build_window_source_context(
@@ -1104,6 +1180,7 @@ def _scan_path(
     prepared_analyses: Mapping[int, object] | None = None,
     source_view: SecurityTextView | None = None,
     analysis_method: str = "analyze",
+    preserve_created_on_limit: bool = True,
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Run pattern modules with construction, emission, and runtime guards."""
     findings: list[Finding] = []
@@ -1140,6 +1217,11 @@ def _scan_path(
                         file_path=path,
                         file_type=module_file_type,
                         source_view=source_view or SecurityTextView("raw", content),
+                        **(
+                            {"finding_budget": finding_budget}
+                            if analysis_method == "analyze_source_commands"
+                            else {}
+                        ),
                     )
                 else:
                     analyze_kwargs: dict[str, object] = {
@@ -1169,10 +1251,26 @@ def _scan_path(
                     if converted is not None:
                         findings.append(converted)
         except _StaticResourceLimitError as exc:
+            if analysis_method == "analyze_source_commands" and prepared is not None:
+                diagnostic = getattr(prepared, "parser_diagnostic", None)
+                if (
+                    isinstance(diagnostic, StaticParserDiagnostic)
+                    and getattr(exc.metrics, "parser_diagnostic", None) is None
+                ):
+                    if not isinstance(exc.metrics, _StaticScanMetrics):
+                        exc.metrics = _StaticScanMetrics(exc.metrics)
+                    exc.metrics.parser_diagnostic = diagnostic
+                # Only already-mapped consumer evidence may survive an expired
+                # child scan or emission check; child-local coordinates cannot.
+                for finding in prepared.retained_source_findings():
+                    if finding_budget.emitted_findings >= finding_budget.max_findings:
+                        break
+                    finding_budget.emitted_findings += 1
+                    findings.append(finding)
             # A list-building module may be interrupted before it can return.
             # Preserve the bounded prefix it constructed so high-severity
             # evidence is not discarded merely because the output ceiling hit.
-            if len(findings) == module_finding_start:
+            if preserve_created_on_limit and len(findings) == module_finding_start:
                 for af in finding_budget.current_created:
                     if finding_budget.emitted_findings >= finding_budget.max_findings:
                         break
@@ -2180,12 +2278,12 @@ def _restore_source_lines(
 
 
 def _window_string_closer(
-    python_strings: PythonStringClosers, window_start: int
+    strings: PythonStringClosers | ShellStringClosers, window_start: int
 ) -> Callable[[int], bool]:
     """Answer string-closer queries in one window's source coordinates."""
 
     def closes_string(offset: int) -> bool:
-        return python_strings.closes_string(window_start + offset)
+        return strings.closes_string(window_start + offset)
 
     return closes_string
 
@@ -2270,12 +2368,22 @@ def _scan_declared_marker_views(
             )
         return True
 
-    # A complete Python module proves which quotes close its string literals.
-    # The proof covers the whole artifact, so it holds in every window. It is
-    # computed only when a loose quoted directive header reaches a quote.
-    python_strings = (
+    # Ownership covers the whole artifact, so a marker scan starting inside a
+    # literal can distinguish its closing quote from a new prose quotation.
+    # Both proofs are lazy and preserve literal contents for security checks.
+    strings: PythonStringClosers | ShellStringClosers | None = (
         PythonStringClosers(content, check_runtime) if _infer_file_type(path) == "python" else None
     )
+    if _infer_file_type(path) == "shell":
+        from . import static_patterns_tool_misuse as shell_parser
+
+        strings = ShellStringClosers(
+            content,
+            shell_parser._next_shell_invocation_word,
+            shell_parser._static_heredoc_header,
+            shell_parser._skip_static_heredoc_bodies,
+            check_runtime,
+        )
 
     for owned_start, raw_start in zip(owned_starts, raw_starts, strict=True):
         check_runtime()
@@ -2303,11 +2411,9 @@ def _scan_declared_marker_views(
         across_security_views = len(full_views) > 1
         check_runtime()
         # View offsets are window-relative. Synthetic Markdown fence context
-        # never occurs for Python, but it would not map onto module offsets.
+        # never occurs for source files, but it would not map onto source offsets.
         string_closer = (
-            None
-            if python_strings is None or context_prefix
-            else _window_string_closer(python_strings, raw_start)
+            None if strings is None or context_prefix else _window_string_closer(strings, raw_start)
         )
         for full_view in full_views:
             full_view_limited = False
@@ -2346,6 +2452,7 @@ def _scan_declared_marker_views(
                         started_at=finding_budget.started_at,
                         deadline=finding_budget.deadline,
                         clock=finding_budget.clock,
+                        parent=finding_budget.parent,
                     )
                     view_findings, resource_limit = _scan_view_windows(
                         path,
@@ -2468,7 +2575,9 @@ def _scan_all_views_detailed(
     python_ast: ParsedPythonFile | None = None,
     python_source: bool | None = None,
     readable_binary: bool = False,
+    source_cache: _CompleteSourceCache | None = None,
     _oms_projected: bool = False,
+    _parent_budget: _FindingBudget | None = None,
     python_import_bounds: PythonImportBounds | None = None,
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Retain first parser evidence alongside every existing terminal scan result."""
@@ -2496,7 +2605,9 @@ def _scan_all_views_detailed(
             python_ast=python_ast,
             python_source=python_source,
             readable_binary=readable_binary,
+            source_cache=source_cache,
             _oms_projected=_oms_projected,
+            _parent_budget=_parent_budget,
             python_import_bounds=python_import_bounds,
             parser_diagnostics=diagnostics,
         )
@@ -2518,12 +2629,23 @@ def _scan_all_views_with_parser_diagnostics(
     python_ast: ParsedPythonFile | None = None,
     python_source: bool | None = None,
     readable_binary: bool = False,
+    source_cache: _CompleteSourceCache | None = None,
     _oms_projected: bool = False,
+    _parent_budget: _FindingBudget | None = None,
     python_import_bounds: PythonImportBounds | None = None,
     parser_diagnostics: list[StaticParserDiagnostic],
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Scan bounded raw windows and return any limit with observed/limit metrics."""
-    started_at = time.monotonic() if started_at is None else started_at
+    clock = time.monotonic if _parent_budget is None else _parent_budget.clock
+    if _parent_budget is not None:
+        started_at = _parent_budget.started_at
+        timeout_seconds = _parent_budget.deadline - started_at
+        max_findings = min(
+            max_findings,
+            max(0, _parent_budget.max_findings - _parent_budget.created_findings),
+            max(0, _parent_budget.max_findings - _parent_budget.emitted_findings),
+        )
+    started_at = clock() if started_at is None else started_at
     if readable_binary:
         modules = [
             module
@@ -2547,6 +2669,7 @@ def _scan_all_views_with_parser_diagnostics(
             timeout_seconds=timeout_seconds,
             started_at=started_at,
             python_source=False,
+            _parent_budget=_parent_budget,
             python_import_bounds=python_import_bounds,
         )
         findings = [
@@ -2575,7 +2698,7 @@ def _scan_all_views_with_parser_diagnostics(
     runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
     if timeout_seconds is not None:
         runtime_limit = min(runtime_limit, max(0.0, timeout_seconds))
-    now = time.monotonic()
+    now = clock()
     if now >= started_at + runtime_limit:
         return (
             [],
@@ -2597,6 +2720,7 @@ def _scan_all_views_with_parser_diagnostics(
             started_at=started_at,
             # This view is derived JSON metadata, not a Python execution surface.
             python_source=False,
+            _parent_budget=_parent_budget,
             _oms_projected=True,
             python_import_bounds=python_import_bounds,
         )
@@ -2639,7 +2763,8 @@ def _scan_all_views_with_parser_diagnostics(
         max_findings=max(0, max_findings),
         started_at=started_at,
         deadline=deadline,
-        clock=time.monotonic,
+        clock=clock,
+        parent=_parent_budget,
     )
     marker_projection_limited = False
     coalesce_hook = (
@@ -2664,6 +2789,7 @@ def _scan_all_views_with_parser_diagnostics(
     source_context: _WindowSourceContext | None = None
     whole_artifact_window = False
     prepared_analyses: dict[int, object] = {}
+    prepared_sources: dict[int, object] = {}
     deferred_output_limit: _StaticResourceLimitError | None = None
     deferred_scan_incomplete = False
     defers_mixed_output_limit = bool(
@@ -2754,7 +2880,8 @@ def _scan_all_views_with_parser_diagnostics(
             max_findings=max(0, max_findings),
             started_at=started_at,
             deadline=deadline,
-            clock=time.monotonic,
+            clock=clock,
+            parent=_parent_budget,
         )
         try:
             finding_budget.check_runtime()
@@ -2817,6 +2944,59 @@ def _scan_all_views_with_parser_diagnostics(
             if not defer_output_limit(resource_limit, scan_incomplete=True):
                 return limited_result(resource_limit)
 
+        # Bundled command sources are available only to this complete original
+        # artifact. Scan reconstructed commands before accepting their proof;
+        # a prior partial flag must not short-circuit these additional findings.
+        try:
+            if source_cache is not None and _infer_file_type(path) == "shell":
+                for module in modules_for_windows:
+                    prepare_source = _explicit_analysis_hook(module, "prepare_source_analysis")
+                    if prepare_source is None:
+                        continue
+                    sources = source_cache.validated(finding_budget.check_runtime)
+                    if sources.get(path) != content:
+                        continue
+                    from skillspector.shell_sources import ShellSourceContext
+
+                    finding_budget.begin_module()
+                    with observe_analyzer_findings(finding_budget.observe_creation):
+                        prepared = prepare_source(
+                            content=content,
+                            file_path=path,
+                            file_type="shell",
+                            source_context=ShellSourceContext(path, sources),
+                            check_runtime=finding_budget.check_runtime,
+                        )
+                    finding_budget.check_runtime()
+                    if prepared is None:
+                        continue
+                    source_findings, resource_limit = _scan_path(
+                        path,
+                        content,
+                        [module],
+                        finding_budget,
+                        python_source=False,
+                        prepared_analyses={id(module): prepared},
+                        analysis_method="analyze_source_commands",
+                        # Child findings are not parent-addressable until the
+                        # preparation explicitly yields their mapped version.
+                        preserve_created_on_limit=False,
+                    )
+                    unique_limit = _extend_unique_findings(
+                        findings,
+                        seen_findings,
+                        source_findings,
+                        max_findings=max_findings,
+                        coalesce=coalesce,
+                    )
+                    if unique_limit is not None:
+                        return limited_result(unique_limit)
+                    if resource_limit is not None:
+                        return limited_result(resource_limit)
+                    prepared_sources[id(module)] = prepared
+        except _StaticResourceLimitError as exc:
+            return limited_result(exc)
+
         # Window overlap cannot prove completeness for one shell command that
         # spans several otherwise ordinary windows. Run each module's bounded,
         # deadline-aware completeness hook once on the full artifact; ordinary
@@ -2824,6 +3004,32 @@ def _scan_all_views_with_parser_diagnostics(
         # first so any concrete reconstructed evidence survives a deadline.
         try:
             for module in modules_for_windows:
+                prepared_source = prepared_sources.get(id(module))
+                source_diagnostic = (
+                    _explicit_analysis_hook(prepared_source, "bounded_parse_diagnostic")
+                    if prepared_source is not None
+                    else None
+                )
+                source_exhaustion = (
+                    _explicit_analysis_hook(prepared_source, "has_bounded_parse_exhaustion")
+                    if prepared_source is not None
+                    else None
+                )
+                if source_diagnostic is not None or source_exhaustion is not None:
+                    finding_budget.check_runtime()
+                    if source_diagnostic is not None:
+                        diagnostic = source_diagnostic()
+                        source_limited = diagnostic is not None
+                        if (
+                            isinstance(diagnostic, StaticParserDiagnostic)
+                            and not parser_diagnostics
+                        ):
+                            parser_diagnostics.append(diagnostic)
+                    else:
+                        source_limited = bool(source_exhaustion())
+                    finding_budget.check_runtime()
+                    bounded_parse_limited = bounded_parse_limited or source_limited
+                    continue
                 exhaustion_hook = getattr(module, "has_bounded_parse_exhaustion", None)
                 if callable(exhaustion_hook):
                     finding_budget.check_runtime()
@@ -2882,7 +3088,7 @@ def _scan_all_views_with_parser_diagnostics(
     if modules_for_windows:
         assert source_context is not None
         for owned_start, raw_start in zip(raw_owned_starts, raw_starts, strict=True):
-            now = time.monotonic()
+            now = clock()
             if now >= deadline:
                 return (
                     reconciled_prefix(),
@@ -2988,6 +3194,7 @@ def _scan_all_views_with_parser_diagnostics(
                             started_at=started_at,
                             deadline=deadline,
                             clock=finding_budget.clock,
+                            parent=_parent_budget,
                         )
                         view_findings, resource_limit = _scan_view_windows(
                             path,
@@ -3124,6 +3331,7 @@ def _scan_all_views_with_parser_diagnostics(
                                 started_at=started_at,
                                 deadline=deadline,
                                 clock=finding_budget.clock,
+                                parent=_parent_budget,
                             )
                             view_findings, resource_limit = _scan_view_windows(
                                 path,
@@ -3190,6 +3398,7 @@ def _scan_all_views_with_parser_diagnostics(
                             started_at=started_at,
                             deadline=deadline,
                             clock=finding_budget.clock,
+                            parent=_parent_budget,
                         )
                         view_findings, resource_limit = _scan_view_windows(
                             path,
@@ -3413,6 +3622,7 @@ def run_static_patterns(
         and "!/" not in str(metadata.get("path", ""))
     }
     raw_inventory = state.get("artifact_inventory", [])
+    source_cache = _CompleteSourceCache(file_cache, raw_file_cache, raw_inventory)
     binary_paths = (
         {
             str(item.get("path", ""))
@@ -3488,6 +3698,7 @@ def run_static_patterns(
             python_ast=python_ast,
             python_source=python_source,
             readable_binary=path in readable_binary_paths,
+            source_cache=source_cache,
             python_import_bounds=python_import_bounds,
         )
         runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
@@ -3553,6 +3764,7 @@ def run_static_patterns_with_ledger(
     findings: list[Finding] = []
     events: list[InspectionLedgerEvent] = []
     raw_inventory = state.get("artifact_inventory", [])
+    source_cache = _CompleteSourceCache(file_cache, raw_file_cache, raw_inventory)
     inventory: dict[str, dict[str, object]] = (
         {str(item.get("path", "")): item for item in raw_inventory if isinstance(item, dict)}
         if isinstance(raw_inventory, list)
@@ -3699,6 +3911,7 @@ def run_static_patterns_with_ledger(
                             python_ast=python_ast,
                             python_source=python_source,
                             readable_binary=bool(artifact.get("readable_binary")),
+                            source_cache=source_cache,
                             python_import_bounds=python_import_bounds,
                         )
                         path_parser_diagnostic = getattr(

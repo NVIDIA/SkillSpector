@@ -1247,12 +1247,16 @@ def _bounded_sentence_end(
     maximum_end: int,
     *,
     end_is_truncated: bool,
+    closes_owned_string: Callable[[int], bool] | None = None,
     context_start: int | None = None,
 ) -> tuple[int, bool]:
     # A directive can be inside a quoted string; retain that quote's state.
     scan_start = start if context_start is None else context_start
     for boundary_start, _ in _sentence_boundaries(
-        text, scan_start, min(len(text), maximum_end + 1)
+        text,
+        scan_start,
+        min(len(text), maximum_end + 1),
+        closes_owned_string=closes_owned_string,
     ):
         if start <= boundary_start <= maximum_end:
             return boundary_start, False
@@ -1297,6 +1301,7 @@ def _sentence_boundaries(
     start: int,
     end: int,
     *,
+    closes_owned_string: Callable[[int], bool] | None = None,
     quote_spans: tuple[list[int], list[int]] | None = None,
     check_runtime: Callable[[], None] | None = None,
 ) -> Iterator[tuple[int, int]]:
@@ -1335,8 +1340,13 @@ def _sentence_boundaries(
             and text[cursor - 1].isalnum()
             and text[cursor + 1].isalnum()
         ):
-            quote_start = cursor
-            quote_close = _QUOTE_OPEN_TO_CLOSE[character]
+            # A scan can begin inside an embedded program/string. Its host's
+            # proven closing delimiter does not open a new prose quotation
+            # that swallows subsequent line boundaries. Existing open quotes
+            # still close normally above, and literal contents remain scanned.
+            if closes_owned_string is None or not closes_owned_string(cursor):
+                quote_start = cursor
+                quote_close = _QUOTE_OPEN_TO_CLOSE[character]
         elif character == "\n":
             yield cursor, cursor + 1
         elif character in ".!?" and (cursor + 1 == len(text) or text[cursor + 1].isspace()):
@@ -1854,14 +1864,19 @@ def _classify_directive(
     directive: _Directive,
     *,
     end_is_truncated: bool,
+    closes_owned_string: Callable[[int], bool] | None = None,
     context_start: int | None = None,
 ) -> _DirectiveClassification:
     if directive.exhausted:
         return _DirectiveClassification(None, False, True)
 
     baseline = None
-    if context_start is not None:
-        baseline = _classify_directive(view, directive, end_is_truncated=end_is_truncated)
+    if context_start is not None or closes_owned_string is not None:
+        baseline = _classify_directive(
+            view,
+            directive,
+            end_is_truncated=end_is_truncated,
+        )
         if baseline.active or not baseline.limited:
             return baseline
 
@@ -1876,6 +1891,7 @@ def _classify_directive(
         directive.end,
         scope_cap,
         end_is_truncated=end_is_truncated,
+        closes_owned_string=closes_owned_string,
         context_start=context_start,
     )
     lookahead_cap = min(len(view.text), directive.end + MAX_MARKER_LOOKAHEAD_CHARS)
@@ -1884,6 +1900,7 @@ def _classify_directive(
         directive.end,
         lookahead_cap,
         end_is_truncated=end_is_truncated,
+        closes_owned_string=closes_owned_string,
         context_start=context_start,
     )
     first_sentence_end = lookahead_end
@@ -1902,23 +1919,27 @@ def _classify_directive(
             first_sentence_end + 1,
             lookahead_cap,
             end_is_truncated=end_is_truncated,
+            closes_owned_string=closes_owned_string,
         )
         lookahead_exhausted = lookahead_exhausted or continuation_exhausted
-    if (
-        baseline is not None
-        and context_start is not None
-        and any(
-            pattern.search(view.text, min(clause_start, context_start), lookahead_end) is not None
-            for pattern in (
-                _UNAMBIGUOUS_ACTION_RE,
-                _CONTEXTUAL_ACTION_RE,
-                _PASTE_ACTION_RE,
-            )
+    if baseline is not None and any(
+        pattern.search(
+            view.text,
+            min(clause_start, context_start) if context_start is not None else clause_start,
+            lookahead_end,
+        )
+        is not None
+        for pattern in (
+            _UNAMBIGUOUS_ACTION_RE,
+            _CONTEXTUAL_ACTION_RE,
+            _PASTE_ACTION_RE,
         )
     ):
         # Even an unbound action can acquire its payload through adjacent
         # literals. Wrapper proof may repair an inert method-like header, but
         # it cannot clear a prior limit for a potentially active instruction.
+        # Proven host closers have the same restriction: adjacent literals can
+        # supply the payload after a closer shortens the lexical sentence.
         # Ambiguous or negated action cues also retain that conservative result.
         return baseline
     payloads = _quoted_payloads(view.text, directive, scope_end)
@@ -2088,6 +2109,7 @@ def build_declared_marker_views(
                     0,
                     len(view.text),
                     quote_spans=quote_spans,
+                    closes_owned_string=closes_owned_string,
                     check_runtime=check_runtime,
                 ):
                     pass
@@ -2106,6 +2128,7 @@ def build_declared_marker_views(
             view,
             directive,
             end_is_truncated=source_end_is_truncated,
+            closes_owned_string=closes_owned_string,
             context_start=context_start,
         )
         limited = limited or classification.limited
