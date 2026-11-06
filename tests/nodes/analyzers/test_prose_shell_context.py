@@ -64,6 +64,149 @@ _CASES = [
 ]
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    "paragraph",
+    [
+        "> - Read `--workflow <name>` to record the reader's selected interface.\n",
+        "> 1. Read ``--workflow <name>`` to record the reader's selected interface.\n",
+        "> > - Read `--workflow <name>` to record the reader's selected interface.\n",
+        "> - Read `guide.md` for the interface.\n>   The runner's manifest identifies the source.\n",
+    ],
+)
+def test_quoted_list_literal_code_and_prose_keep_source_ownership(paragraph, newline):
+    content = (paragraph + "\n" + _OBSERVATIONS).replace("\n", newline)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+    assert result["findings"] == []
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "paragraph",
+    [
+        "> - Run `$CMD -rf /` using the reader's chosen command.\n",
+        "> - Run `$(cat command.txt)` using the reader's chosen command.\n",
+        "> - Read ``one ` character`` from the reader's guide.\n",
+        "> - Read `guide.md` for the interface.\nThe runner's manifest identifies the source.\n",
+        "> - ```sh\n>   `$CMD -rf /`\n>   ```\n",
+        "> - <pre>\n>   `guide.md` contains the reader's notes.\n>   </pre>\n",
+        ">     `guide.md` contains the reader's notes.\n",
+    ],
+)
+def test_quoted_list_unproven_inline_bodies_keep_backticks(paragraph):
+    projected = tm._markdown_shell_text(paragraph, lambda: None, word_apostrophes=True)
+    assert "`" in projected
+
+
+@pytest.mark.parametrize("quote", ["'", '"'])
+def test_quoted_list_cannot_steal_an_earlier_shell_string(quote):
+    content = f"bash -c {quote}\n> - Read `guide.md` from the reader's guide.\n{quote}\n"
+    projected = tm._markdown_shell_text(content, lambda: None, word_apostrophes=True)
+    assert "`guide.md`" in projected
+    assert "reader's" in projected
+
+
+def test_quoted_list_literal_ownership_preserves_security_findings():
+    content = "> - Run `rm -rf /` on the selected filesystem.\n"
+    assert any(finding.rule_id == "TM1" for finding in tm.analyze(content, "guide.md", "markdown"))
+
+
+def test_quoted_list_native_parser_failure_retains_original_text(monkeypatch):
+    import builtins
+
+    from skillspector import markdown_tokens
+
+    original_import = builtins.__import__
+
+    def without_parser(name, *args, **kwargs):
+        if name == "markdown_it":
+            raise ImportError("optional parser unavailable")
+        return original_import(name, *args, **kwargs)
+
+    markdown_tokens._quoted_list_spans.cache_clear()
+    monkeypatch.setattr(builtins, "__import__", without_parser)
+    content = "> - Read `guide.md` from the reader's guide.\n"
+    try:
+        assert markdown_tokens.quoted_list_spans(content, lambda: None) is None
+    finally:
+        markdown_tokens._quoted_list_spans.cache_clear()
+
+
+def test_quoted_list_source_bound_retains_conservative_fallback():
+    from skillspector.markdown_tokens import quoted_list_spans
+
+    content = "> - Read `guide.md` from the reader's guide.\n" + "a" * 131_072
+    assert quoted_list_spans(content, lambda: None) is None
+
+
+def test_quoted_list_nesting_bound_retains_conservative_fallback():
+    from skillspector.markdown_tokens import quoted_list_spans
+
+    content = "> " * 40 + "- Read `guide.md` from the reader's guide.\n"
+    assert quoted_list_spans(content, lambda: None) is None
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    "paragraph",
+    [
+        "Read `guide.md` for the interface.\nThe runner's manifest identifies the source.\n",
+        "- Read `guide.md` for the interface.\n  The runner's manifest identifies the source.\n",
+        "Read the reader's \"documented behavior\" for the interface.\nThe runner's manifest identifies the source.\n",
+        "Read \\` literally and `guide.md` for the interface.\nThe runner's manifest identifies the source.\n",
+        "| Topic | Description |\n| --- | --- |\n| Memory | The engine's limit applies. |\n",
+        "| Topic | Description |\n| --- | --- |\n| Memory | The engine's limit and runner's settings don't conflict. |\n",
+    ],
+)
+def test_completed_inline_lines_and_table_prose_own_apostrophes(
+    paragraph: str, newline: str
+) -> None:
+    content = (paragraph + "\n" + _OBSERVATIONS).replace("\n", newline)
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+
+    assert result["findings"] == []
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Read `an unfinished span.\nThe runner's manifest identifies the source.\n",
+        "Read `an unfinished span with ``paired`` ticks.\nThe runner's manifest identifies it.\n",
+        "Read ``one ` character`` for the interface.\nThe runner's manifest identifies the source.\n",
+        "| Command | Description |\n| --- | --- |\n| `$CMD -rf /` | The engine's limit applies. |\n",
+    ],
+)
+def test_prose_ownership_keeps_unmatched_inline_and_runtime_commands_partial(content: str) -> None:
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content + "\n" + _OBSERVATIONS}},
+        [tm],
+    )
+
+    assert any(
+        event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+        for event in result["inspection_ledger"]
+    )
+
+
+def test_inline_line_ownership_preserves_later_destructive_command() -> None:
+    content = (
+        "Read `guide.md` for the interface.\nThe runner's manifest identifies the source.\n\n"
+        "```bash\nrm -rf /\n```\n" + _OBSERVATIONS
+    )
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
 _NESTED_SHELL_QUOTES = 'echo "entry: $item => $(readlink -f "$item")"\n'
 
 
