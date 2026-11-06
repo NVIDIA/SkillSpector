@@ -257,8 +257,11 @@ def _iter_config_npx_commands(
                 if key_indent == command_indent:
                     if key is None:
                         # An indentless sequence belongs to a sibling value,
-                        # not a new server mapping. Other scalar lines end it.
-                        if not stripped.startswith("- ") and stripped != "-":
+                        # not a new server mapping. In backward searches, a
+                        # flow sequence's closing bracket also continues that
+                        # sibling value; mapping/list boundaries still apply.
+                        flow_end = direction == -1 and _strip_yaml_comment(stripped).strip() == "]"
+                        if not flow_end and not stripped.startswith("- ") and stripped != "-":
                             break
                     else:
                         sibling_count += 1

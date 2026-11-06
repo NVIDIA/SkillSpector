@@ -175,6 +175,53 @@ def test_rp1_yaml_empty_arguments_do_not_crash_or_shift_package(style, quote, ar
         assert "@scope/server" in rp1[0].matched_text
 
 
+@pytest.mark.parametrize("args_first", [False, True])
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("layout", ["mapping", "list"])
+@pytest.mark.parametrize("closing_comment", ["", " # end of args"])
+def test_rp1_yaml_multiline_flow_args(args_first, pinned, newline, layout, closing_comment):
+    package = "@scope/server@1.2.3" if pinned else "@scope/server"
+    command = "command: npx\n"
+    args = f'args: [\n      "-y",\n      "{package}"\n    ]{closing_comment}\n'
+    first, second = (args, command) if args_first else (command, args)
+    content = (
+        "mcpServers:\n  fs:\n    " + first + "    " + second
+        if layout == "mapping"
+        else "servers:\n  - " + first + "    " + second
+    ).replace("\n", newline)
+    parsed = yaml.safe_load(content)
+    server = parsed["mcpServers"]["fs"] if layout == "mapping" else parsed["servers"][0]
+    assert server == {"command": "npx", "args": ["-y", package]}
+
+    rp1 = [
+        finding
+        for finding in node(_state(file_cache={"mcp.yaml": content}))["findings"]
+        if finding.rule_id == "RP1"
+    ]
+    assert len(rp1) == (0 if pinned else 1)
+    if rp1:
+        assert rp1[0].start_line == next(
+            i for i, line in enumerate(content.splitlines(), 1) if "command:" in line
+        )
+        assert rp1[0].matched_text == f"npx {package}"
+
+
+@pytest.mark.parametrize("layout", ["mapping", "list"])
+@pytest.mark.parametrize("args_first", [False, True])
+def test_rp1_yaml_multiline_flow_args_do_not_cross_servers(layout, args_first):
+    command = "command: npx\n"
+    args = 'args: [\n      "@scope/server"\n    ]\n'
+    first, second = (args, command) if args_first else (command, args)
+    content = (
+        f"mcpServers:\n  first:\n    {first}  second:\n    {second}"
+        if layout == "mapping"
+        else f"servers:\n  - {first}  - {second}"
+    )
+    assert yaml.safe_load(content) is not None
+    assert not list(_iter_config_npx_commands(content, _RugPullBudget({}), "mcp.yaml"))
+
+
 def test_rp1_yaml_empty_package_does_not_abort_other_configs_or_files():
     content = (
         'mcpServers:\n  empty:\n    command: npx\n    args: ["-y", ""]\n'
