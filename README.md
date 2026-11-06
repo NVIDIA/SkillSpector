@@ -169,6 +169,23 @@ skillspector scan ./my-skill/ --format markdown --output report.md
 skillspector scan ./my-skill/ --format sarif --output report.sarif
 ```
 
+Use repeatable `--report FORMAT=PATH` options to write additional file reports
+from the same scan results. `--format` and `--output` still select the primary
+report (stdout when `--output` is omitted). Each destination must be distinct;
+additional reports do not support `PATH=-`.
+
+```bash
+skillspector scan ./my-skill/ --format json --output report.json \
+  --report markdown=report.md --report sarif=report.sarif
+skillspector scan ./my-skills/ --recursive --no-llm \
+  --report json=collection.json --report markdown=collection.md
+python -m contrib.batch_scan.batch_scan ./my-skills/ --no-llm \
+  --report json=batch.json --report markdown=batch.md
+```
+
+Batch reports support terminal, JSON, and Markdown; registry scans remain
+JSON-only. Additional outputs do not rerun analyzers or change scan limits.
+
 ### Recursive Collection Scanning
 
 `--recursive` scans immediate subdirectories containing `SKILL.md` as independent
