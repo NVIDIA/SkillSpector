@@ -2260,10 +2260,13 @@ def _is_powershell_replace_value_context(
     ):
         return False
 
-    line_start = content.rfind("\n", 0, start) + 1
+    line_start = max(content.rfind("\n", 0, start), content.rfind("\r", 0, start)) + 1
     line_end = content.find("\n", end)
     if line_end < 0:
         line_end = len(content)
+    carriage_return = content.find("\r", end, line_end)
+    if carriage_return >= 0:
+        line_end = carriage_return
     placeholder = "\ue003"
     statement = (content[line_start:start] + placeholder + content[end:line_end]).strip()
 
