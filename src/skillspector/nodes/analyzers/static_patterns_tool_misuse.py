@@ -3381,23 +3381,42 @@ class _NativeBacktickOperandBounds:
 
     starts: tuple[int, ...]
     ends: tuple[int, ...]
+    value_end: int | None = None
 
     @classmethod
     def from_closures(
-        cls, closures: set[tuple[int, int]], check_runtime: Callable[[], None]
+        cls,
+        closures: set[tuple[int, int]],
+        check_runtime: Callable[[], None],
+        *,
+        value_end: int | None = None,
     ) -> _NativeBacktickOperandBounds | None:
         ordered = sorted(closures)
         previous_end = -1
         for opening, end in ordered:
             check_runtime()
-            if opening < previous_end or opening + 1 >= end - 1:
+            if (
+                opening < previous_end
+                or opening + 1 >= end - 1
+                or (value_end is not None and end >= value_end)
+            ):
                 return None
             previous_end = end
-        return cls(tuple(start for start, _ in ordered), tuple(end for _, end in ordered))
+        return cls(
+            tuple(start for start, _ in ordered), tuple(end for _, end in ordered), value_end
+        )
 
     def source_end(self, start: int, word_end: int) -> int | None:
-        # A generated command beginning at an opener keeps its outer operands.
-        index = bisect_left(self.starts, start) - 1
+        index = bisect_left(self.starts, start)
+        if index < len(self.starts) and self.starts[index] == start:
+            # A generated outer head keeps every operand after its substitution.
+            # Only the complete containing native value terminates that scope.
+            return (
+                self.value_end - 1
+                if self.value_end is not None and start < word_end <= self.value_end - 1
+                else None
+            )
+        index -= 1
         if index >= 0 and start < word_end <= self.ends[index] - 1:
             return self.ends[index] - 1
         return None
@@ -3489,7 +3508,9 @@ def _has_shell_command_word_exhaustion(
             and parsed.end == span[1]
             and closures
         ):
-            bounds = _NativeBacktickOperandBounds.from_closures(closures, check_runtime)
+            bounds = _NativeBacktickOperandBounds.from_closures(
+                closures, check_runtime, value_end=span[1]
+            )
             if bounds is not None:
                 native_operand_bounds[span[0]] = bounds
 

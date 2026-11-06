@@ -530,6 +530,13 @@ def test_native_pair_does_not_bound_a_generated_outer_command() -> None:
     assert bounds.source_end(6, 20) is None
     assert bounds.source_end(21, 24) is None
     assert tm._NativeBacktickOperandBounds.from_closures({(5, 20), (10, 30)}, _check) is None
+    native = tm._NativeBacktickOperandBounds.from_closures({(5, 20)}, _check, value_end=50)
+    assert native is not None
+    assert native.source_end(6, 19) == 19
+    assert native.source_end(5, 20) == 49
+    assert native.source_end(5, 50) is None
+    assert native.source_end(21, 24) is None
+    assert tm._NativeBacktickOperandBounds.from_closures({(5, 20)}, _check, value_end=15) is None
     result = _scan(json.dumps({"message": "`printf rm` -rf /"}))
     assert any(f.rule_id == "TM1" and f.severity == "HIGH" for f in result["findings"])
 
@@ -578,7 +585,7 @@ def test_native_operand_eof_keeps_argument_budget_and_cancellation() -> None:
         tm._NativeBacktickOperandBounds.from_closures({(5, 20)}, cancelled)
 
 
-@pytest.mark.parametrize("command", ["`$TOOL -rf /`", "`$(cat command) -rf /`"])
+@pytest.mark.parametrize("command", ["x `$TOOL -rf /`", "`$(cat command) -rf /`"])
 def test_native_pair_keeps_genuine_interior_runtime_uncertainty(command: str) -> None:
     result = _scan(json.dumps({"message": command}))
     event = result["inspection_ledger"][0]
@@ -587,9 +594,11 @@ def test_native_pair_keeps_genuine_interior_runtime_uncertainty(command: str) ->
 
 
 def test_native_bound_preserves_an_already_reported_reconstructed_effect() -> None:
-    result = _scan('{"note":"`$(printf rm) -rf *`"}')
+    result = _scan('{"note":"x `$(printf rm) -rf *`"}')
     assert any(f.rule_id == "TM1" and f.severity == "HIGH" for f in result["findings"])
-    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["parser_diagnostic"]["check"] == "printf_invocation"
 
 
 def test_native_bound_cannot_hide_an_unreported_reconstructed_destructive_effect() -> None:
@@ -597,3 +606,40 @@ def test_native_bound_cannot_hide_an_unreported_reconstructed_destructive_effect
     event = result["inspection_ledger"][0]
     assert event["outcome"] is LedgerOutcome.PARTIAL
     assert event["parser_diagnostic"]["check"] == "command_string_effects"
+
+
+def test_generated_outer_head_uses_value_eof_after_all_outer_operands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = json.dumps(
+        {"message": "Use `python3 ${ROOT:-$HOME/.config}/script.py get item` then `label`."}
+    )
+    opener = source.index("`")
+    value_end = source.rindex('"')
+    original = tm._bounded_shell_tokens
+    observed = []
+
+    def bounded(content, start, body_start, **kwargs):
+        if start == opener and kwargs.get("source_end") is not None:
+            observed.append((body_start, kwargs["source_end"]))
+            assert body_start < kwargs["source_end"] == value_end
+        return original(content, start, body_start, **kwargs)
+
+    monkeypatch.setattr(tm, "_bounded_shell_tokens", bounded)
+    assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is None
+    assert observed
+
+
+@pytest.mark.parametrize(
+    "command", ["x `printf rm` -rf /", "x `printf rm` -rf *", "x `$(cat command)` -rf /"]
+)
+def test_generated_outer_operands_keep_their_security_effects(command: str) -> None:
+    result = _scan(json.dumps({"message": command}))
+    if not any(f.rule_id == "TM1" and f.severity == "HIGH" for f in result["findings"]):
+        event = result["inspection_ledger"][0]
+        assert event["outcome"] is LedgerOutcome.PARTIAL
+        assert event["parser_diagnostic"]["check"] in {
+            "command_string_effects",
+            "runtime_command_identity",
+            "printf_invocation",
+        }
