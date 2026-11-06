@@ -564,6 +564,13 @@ def test_property_arguments_cannot_own_dynamic_heads_or_captured_values(body: st
         "Import-Module unknown",
         ". helper.ps1",
         "Im`port-`Module unknown",
+        "Add-Member -InputObject $item -MemberType ScriptProperty -Name Name "
+        "-Value { $getter.Invoke() }",
+        "Update-TypeData -TypeName Example -MemberType ScriptProperty -MemberName Name "
+        "-Value { $getter.Invoke() }",
+        "Remove-TypeData -TypeName Example",
+        "Add-Type 'class Example {}'",
+        "New-Object PSCodeProperty Name $getter",
     ],
 )
 def test_property_bindings_must_hold_across_the_whole_original_markdown(

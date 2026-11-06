@@ -10261,7 +10261,8 @@ def _markdown_owned_commands_diagnostic(
         property_bindings_proven = (
             "`" not in projected
             and re.search(
-                r"\b(?:function|filter|workflow)\b|(?:^|[\s;|&({`])\.[ \t]+\S",
+                r"\b(?:function|filter|workflow|add-member|(?:update|remove)-typedata|add-type|"
+                r"(?:PS)?(?:Script|Code)Property)\b|(?:^|[\s;|&({`])\.[ \t]+\S",
                 content,
                 re.IGNORECASE | re.MULTILINE,
             )
