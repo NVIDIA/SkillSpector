@@ -1749,6 +1749,47 @@ def test_cli_keyring_access_can_be_suppressed_by_baseline(tmp_path: Path) -> Non
     assert any(issue["id"] == "PE3" for issue in payload["suppressed"])
 
 
+@pytest.mark.parametrize("format", ["json", "sarif"])
+@pytest.mark.parametrize("shipped", [False, True])
+@pytest.mark.parametrize("alias", ["same-path", "relative-path", "symlink", "hard-link"])
+def test_cli_scan_preserves_consumed_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, format: str, shipped: bool, alias: str
+) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: protected\n---\n# Hello\n")
+    baseline = skill / ".skillspector-baseline.yaml"
+    original = b"version: 2\nrules:\n  - id: P1\n    reason: Reviewed\n"
+    baseline.write_bytes(original)
+    output = baseline
+    monkeypatch.chdir(tmp_path)
+    if alias == "relative-path":
+        output = baseline.relative_to(tmp_path)
+    elif alias in {"symlink", "hard-link"}:
+        output = tmp_path / "report.json"
+        try:
+            if alias == "symlink":
+                output.symlink_to(baseline)
+            else:
+                os.link(baseline, output)
+        except OSError:
+            pytest.skip(f"{alias} is not supported on this filesystem")
+    scan = MagicMock(return_value={"report_body": "{}", "risk_score": 0})
+    monkeypatch.setattr(cli, "_scan_skill", scan)
+    options = ["--use-shipped-baseline"] if shipped else ["--baseline", str(baseline)]
+
+    result = runner.invoke(
+        app,
+        ["scan", str(skill), "--no-llm", "--format", format, "-o", str(output), *options],
+    )
+
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert baseline.read_bytes() == original
+    assert output.read_bytes() == original
+    scan.assert_not_called()
+
+
 def test_cli_keyring_access_is_kept_in_json_and_sarif(tmp_path: Path) -> None:
     skill = tmp_path / "skill"
     skill.mkdir()
