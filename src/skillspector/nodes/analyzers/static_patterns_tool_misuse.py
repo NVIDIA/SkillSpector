@@ -9726,7 +9726,7 @@ def _powershell_property_argument_spans(
     bindings_proven: bool = False,
 ) -> list[tuple[int, int]]:
     """Own only native quoted arguments whose subexpressions read member values."""
-    if not bindings_proven or '"$(' not in content:
+    if not bindings_proven or "$(" not in content or '"' not in content:
         return []
     remaining_work[0] -= 2 * len(content)
     if remaining_work[0] < 0:
@@ -10253,7 +10253,7 @@ def _markdown_owned_commands_diagnostic(
     projected = _markdown_shell_text(content, check_runtime, inline_code_ranges=ranges)
     remaining_work = [8 * len(content) + _ROOT_GLOB_COMMAND_CHARS]
     property_bindings_proven = False
-    if '"$(' in content:
+    if "$(" in content and '"' in content:
         # Binding can change in another native span or fence. Check the whole
         # original source once; retained backticks can escape a binding token.
         remaining_work[0] -= len(content)

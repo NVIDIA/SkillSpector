@@ -427,8 +427,11 @@ def test_display_value_cannot_bypass_work_depth_or_deadline(monkeypatch) -> None
     ["Test-Path", "Join-Path", "Split-Path", "Resolve-Path", "Convert-Path", "Write-Host"],
 )
 @pytest.mark.parametrize("member", ["$_.FullName", "$item.Parent.Name"])
-def test_native_quoted_property_arguments_keep_value_ownership(command: str, member: str) -> None:
-    body = command + ' "$(' + member + ')/item"'
+@pytest.mark.parametrize("prefix", ["", "prefix/"])
+def test_native_quoted_property_arguments_keep_value_ownership(
+    command: str, member: str, prefix: str
+) -> None:
+    body = command + ' "' + prefix + "$(" + member + ')/item"'
     end = len(body)
     if command == "Join-Path":
         body += ' "leaf"'
@@ -510,8 +513,11 @@ def test_property_value_does_not_own_following_execution_or_raw_findings() -> No
         "eval",
     ],
 )
-def test_property_shape_does_not_prove_unknown_or_executed_argument_roles(command: str) -> None:
-    body = command + ' "$($item.Name)"'
+@pytest.mark.parametrize("prefix", ["", "prefix/"])
+def test_property_shape_does_not_prove_unknown_or_executed_argument_roles(
+    command: str, prefix: str
+) -> None:
+    body = command + ' "' + prefix + '$($item.Name)/item"'
     assert (
         tm._powershell_property_argument_spans(
             body, lambda: None, [8 * len(body)], bindings_proven=True
