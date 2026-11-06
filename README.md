@@ -984,6 +984,13 @@ make format-check
 `make test-unit` excludes tests marked `integration` or `provider`. This selection
 does not cover every CI job or guarantee network isolation.
 
+Some unit tests start loopback HTTP servers and local multiprocessing sockets.
+Restricted agent sandboxes can deny these operations. Keep the failing
+command and traceback, and use an appropriately permitted environment for a
+diagnostic rerun. Report that result separately; a passing subset does not make
+the original full target pass. See the
+[contributor onboarding check](docs/validation/CONTRIBUTOR_ONBOARDING.md).
+
 Before submitting a PR, [CONTRIBUTING.md](CONTRIBUTING.md#how-to-contribute)
 requires `make test`. It runs both `test-unit` and `test-integration`; integration
 tests invoke the full graph and may send test content to a configured LLM provider.
