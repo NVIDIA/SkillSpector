@@ -274,6 +274,8 @@ _PROMPT_SPACING_CANDIDATE = re.compile(
     re.UNICODE,
 )
 _MIN_LETTER_SPACING_RUN_LETTERS = 6
+_ASCII_ALPHABETIC_RUN = re.compile(r"[A-Za-z]+")
+_ASCII_LETTER_SPACING_START = re.compile(r"(?<![A-Za-z])[A-Za-z](?=[^A-Za-z0-9\r\n])")
 # Unicode 15.1.0 DerivedCoreProperties.txt: Default_Ignorable_Code_Point.
 _DEFAULT_IGNORABLE_RANGES = (
     (0x00AD, 0x00AD),
@@ -610,6 +612,7 @@ def _letter_spacing_run_spans(
     # character-by-character pass when no six-letter run can exist.
     if check_runtime is None and _LETTER_SPACING_CANDIDATE.search(text) is None:
         return
+    ascii_source = check_runtime is not None and text.isascii()
     next_runtime_check = 4096
 
     def check_progress(position: int) -> None:
@@ -621,6 +624,37 @@ def _letter_spacing_run_spans(
     offset = 0
     while offset < len(text):
         check_progress(offset)
+        if ascii_source:
+            seek_end = min(len(text), offset + 4096, next_runtime_check)
+            candidate = _ASCII_LETTER_SPACING_START.search(
+                text, offset, min(len(text), seek_end + 1)
+            )
+            if candidate is None:
+                offset = seek_end
+                # The exact scanner can rewind before a previously checked gap.
+                if check_runtime is not None and offset < len(text) and offset < next_runtime_check:
+                    check_runtime()
+                continue
+            offset = candidate.start()
+        # A letter touching another letter cannot start a single-letter run.
+        # Seek across ordinary ASCII words, stopping at the next cancellation
+        # checkpoint; non-ASCII letters retain the exact Unicode path below.
+        if (
+            text[offset].isascii()
+            and text[offset].isalpha()
+            and (
+                offset > 0
+                and text[offset - 1].isalpha()
+                or offset + 1 < len(text)
+                and text[offset + 1].isalpha()
+            )
+        ):
+            word = _ASCII_ALPHABETIC_RUN.match(
+                text, offset, next_runtime_check if check_runtime is not None else len(text)
+            )
+            if word is not None:
+                offset = word.end()
+                continue
         if not text[offset].isalpha() or (offset > 0 and text[offset - 1].isalpha()):
             offset += 1
             continue
@@ -682,6 +716,22 @@ def _concealed_instruction_run_spans(
     offset = 0
     while offset < len(text):
         check_progress(offset)
+        if (
+            text[offset].isascii()
+            and text[offset].isalpha()
+            and (
+                offset > 0
+                and text[offset - 1].isalpha()
+                or offset + 1 < len(text)
+                and text[offset + 1].isalpha()
+            )
+        ):
+            word = _ASCII_ALPHABETIC_RUN.match(
+                text, offset, next_runtime_check if check_runtime is not None else len(text)
+            )
+            if word is not None:
+                offset = word.end()
+                continue
         if not text[offset].isalpha() or (offset > 0 and text[offset - 1].isalpha()):
             offset += 1
             continue
