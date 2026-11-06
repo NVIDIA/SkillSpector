@@ -3413,7 +3413,7 @@ class _NativeBacktickOperandBounds:
             # Only the complete containing native value terminates that scope.
             return (
                 self.value_end - 1
-                if self.value_end is not None and start < word_end <= self.value_end - 1
+                if self.value_end is not None and self.ends[index] <= word_end <= self.value_end - 1
                 else None
             )
         index -= 1

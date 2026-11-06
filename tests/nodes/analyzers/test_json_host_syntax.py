@@ -533,6 +533,7 @@ def test_native_pair_does_not_bound_a_generated_outer_command() -> None:
     native = tm._NativeBacktickOperandBounds.from_closures({(5, 20)}, _check, value_end=50)
     assert native is not None
     assert native.source_end(6, 19) == 19
+    assert native.source_end(5, 12) is None
     assert native.source_end(5, 20) == 49
     assert native.source_end(5, 50) is None
     assert native.source_end(21, 24) is None
