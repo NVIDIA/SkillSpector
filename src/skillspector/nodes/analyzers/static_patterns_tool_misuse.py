@@ -9718,6 +9718,7 @@ def _owned_inline_command_diagnostic(
         else:
             owned = content
         word_diagnostics: list[StaticParserDiagnostic] = []
+        word_expansions: set[int] = set()
         parsed = _parse_shell_command_word(
             owned,
             start,
@@ -9725,9 +9726,19 @@ def _owned_inline_command_diagnostic(
             enclosing_delimiter=content[end] if scope_ends else None,
             quoted_printf_allowed=printf_allowed,
             diagnostics=word_diagnostics,
+            expansion_positions=word_expansions,
         )
         if parsed is None:
-            if word_diagnostics:
+            # A display label's unproved quote supplies no executable head.
+            # Executed, nested or expanded words retain their own boundaries;
+            # the independent Markdown structural pass still precedes this.
+            if word_diagnostics and (
+                executing
+                or scope_ends
+                or word_expansions
+                or word_diagnostics[0].cause is not ParserCause.BOUNDARY_UNRESOLVED
+                or word_diagnostics[0].check is not ParserCheck.COMMAND_WORD_BOUNDARY
+            ):
                 return word_diagnostics[0]
             continue
         assert parsed.end <= end

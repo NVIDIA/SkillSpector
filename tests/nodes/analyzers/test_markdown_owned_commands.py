@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from skillspector.inspection_ledger import ParserCause, ParserCheck
@@ -54,6 +56,42 @@ def test_owned_executable_operands_and_generated_command_heads_are_partial(
 )
 def test_literal_references_data_and_proved_printf_values_stay_complete(source: str) -> None:
     assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "can't find the entry",
+        "reader's reference label",
+        "'unclosed display label",
+        '"unclosed display label',
+    ],
+)
+def test_display_quote_alone_does_not_establish_an_executable_head(label: str) -> None:
+    source = "Diagnostic text ``" + label + "``."
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+
+
+@pytest.mark.parametrize("label", ["can't find the entry", "'unclosed display label"])
+@pytest.mark.parametrize("utility", ["sh -c", "eval"])
+def test_the_same_unresolved_quote_in_an_executed_operand_stays_partial(
+    label: str, utility: str
+) -> None:
+    body = utility + " " + json.dumps(label)
+    source = "Run ``" + body + "``."
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.BOUNDARY_UNRESOLVED
+    assert diagnostic.check is ParserCheck.COMMAND_WORD_BOUNDARY
+    assert source.index(body) <= diagnostic.start < diagnostic.end <= source.index(body) + len(body)
+
+
+@pytest.mark.parametrize("word", ['"$CMD', '"$(resolve_tool)', "$(unfinished"])
+def test_opaque_or_unclosed_expansion_heads_keep_their_boundary(word: str) -> None:
+    source = "An owned fragment ``" + word + "``."
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.BOUNDARY_UNRESOLVED
 
 
 @pytest.mark.parametrize("word", ["$(hostname).example", "$(resolve_tool).example/service"])
