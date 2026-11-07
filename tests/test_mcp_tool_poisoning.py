@@ -1139,7 +1139,7 @@ class TestTP4DescriptionBehaviorMismatch:
         result = node(state)
         tp4 = [f for f in result["findings"] if f.rule_id == "TP4"]
         assert len(tp4) >= 1
-        assert tp4[0].severity in {"HIGH", "MEDIUM"}
+        assert tp4[0].severity == "MEDIUM"
         assert tp4[0].pattern == "Description-Behavior Mismatch"
         assert tp4[0].finding == tp4[0].message
 
@@ -1179,6 +1179,138 @@ class TestTP4Finding:
         assert finding.evidence["code_path"] == "scripts/tool.py"
         assert finding.evidence["code_start_line"] == 12
         assert finding.evidence["code_end_line"] == 12
+
+
+class TestTP4FindingIssue1066:
+    """TP4 anchors, severity, and absence-only guard (issue #1066)."""
+
+    def _result(self, confidence: float, mismatched: list[str]):
+        return mcp_tool_poisoning._TP4AnalysisResult(
+            is_mismatch=True,
+            confidence=confidence,
+            declared_purpose_summary="Video intelligence briefing skill",
+            actual_behavior_summary="Renders briefing documents",
+            mismatched_capabilities=mismatched,
+            explanation="The chunk does not show the declared video work.",
+        )
+
+    def test_finding_anchors_to_real_file_and_lines(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="references/briefing-authoring.md",
+            content="unzip -q -o out.epub -d _chk",
+            start_line=27,
+            end_line=28,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(0.99, ["EPUB archive processing"]),
+            batch,
+            "Video intelligence briefing skill",
+        )
+
+        assert finding is not None
+        assert finding.file == "references/briefing-authoring.md"
+        assert finding.start_line == 27
+        assert finding.end_line == 28
+        assert finding.evidence["code_path"] == "references/briefing-authoring.md"
+        assert finding.evidence["code_start_line"] == 27
+        assert finding.evidence["code_end_line"] == 28
+
+    def test_finding_severity_is_medium_at_high_confidence(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="SKILL.md",
+            content="python scripts/markdown_pdf.py",
+            start_line=697,
+            end_line=697,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(0.99, ["Markdown-to-PDF export of briefing files"]),
+            batch,
+            "Video intelligence briefing skill",
+        )
+
+        assert finding is not None
+        assert finding.severity == "MEDIUM"
+
+    def test_absence_only_mismatched_capabilities_suppressed(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="SKILL.md",
+            content="pytest tests/evals/test_search_quality.py -v -s",
+            start_line=314,
+            end_line=314,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(
+                0.99,
+                [
+                    "No evidence of querying videos, transcripts, concepts, "
+                    "quotes, corpus status, or profile data",
+                    "No implementation of the described nugget synthesis/save behavior",
+                ],
+            ),
+            batch,
+            "Video corpus search skill",
+        )
+
+        assert finding is None
+
+    def test_mixed_mismatched_capabilities_still_emitted(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="SKILL.md",
+            content="pytest tests/evals/test_search_quality.py -v -s",
+            start_line=314,
+            end_line=314,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(
+                0.99,
+                [
+                    "Runs automated tests/evaluations instead of providing "
+                    "corpus search functionality",
+                    "No evidence of querying videos",
+                ],
+            ),
+            batch,
+            "Video corpus search skill",
+        )
+
+        assert finding is not None
+        assert finding.severity == "MEDIUM"
+
+    def test_affirmative_mismatched_capability_emitted(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(0.9, ["Sends source data to a remote endpoint"]),
+            batch,
+            "A local text utility",
+        )
+
+        assert finding is not None
+
+    @pytest.mark.parametrize(
+        "item, expected",
+        [
+            ("No evidence of querying videos", True),
+            ("No implementation of the described behavior", True),
+            ("The code does not implement search", True),
+            ("Lacks any corpus query", True),
+            ("Missing authentication", True),
+            ("Runs automated tests instead of searching", False),
+            ("Sends source data to a remote endpoint", False),
+            ("Markdown-to-PDF export of briefing files", False),
+        ],
+    )
+    def test_absence_phrasing_detection(self, item: str, expected: bool):
+        assert mcp_tool_poisoning._tp4_mismatched_item_is_absence(item) is expected
 
 
 class TestTP4MarkdownFences:
@@ -2195,7 +2327,9 @@ class TestTP4PlaintextRecovery:
         if confidence is not None:
             finding = result.findings[0]
             assert finding.rule_id == "TP4"
-            assert finding.severity == ("HIGH" if confidence >= 0.7 else "MEDIUM")
+            # TP4 severity is MEDIUM at any confidence (README pattern table,
+            # issue #1066); the old confidence-based escalation is removed.
+            assert finding.severity == "MEDIUM"
             assert finding.evidence["assessment_complete"] is False
             assert "llm-format-recovery" in finding.tags
         producers = [

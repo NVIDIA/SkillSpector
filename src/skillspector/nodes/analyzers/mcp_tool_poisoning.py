@@ -1063,7 +1063,9 @@ _TP4_PROMPT_SUFFIX = """
 Flag a mismatch when code performs an undeclared capability, has a materially
 different primary purpose, accesses inconsistent resources, or has unrelated
 triggers. Do not flag supporting implementation details or over-declared
-permissions. Return the assessment using the structured output schema.
+permissions. A chunk may implement only one declared workflow step; do not
+flag omitted capabilities. Each entry must name what the code DOES. Return
+the assessment using the structured output schema.
 """
 
 
@@ -1147,6 +1149,47 @@ def _tp4_partial_event(
     )
 
 
+# Phrasings that describe an absence of functionality rather than a
+# capability the code performs. A TP4 assessment whose every
+# mismatched_capabilities entry matches one of these carries no affirmative
+# evidence of a mismatch (issue #1066): a partial snippet cannot be faulted
+# for omitting the rest of the declared workflow.
+_TP4_ABSENCE_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"^no\b",
+        r"^not\b",
+        r"^cannot\b",
+        r"^can'?t\b",
+        r"\bdoes not\b",
+        r"\bdoesn'?t\b",
+        r"\bdo not\b",
+        r"\bdid not\b",
+        r"\bno evidence\b",
+        r"\bno implementation\b",
+        r"\bno support\b",
+        r"\bnot implement",
+        r"\blacks?\b",
+        r"\bmissing\b",
+        r"\bwithout\b",
+        r"\bfails? to\b",
+        r"\babsence of\b",
+        r"\bomits?\b",
+    )
+)
+
+
+def _tp4_mismatched_item_is_absence(item: str) -> bool:
+    """Return whether one mismatched capability is phrased as an absence."""
+    normalized = " ".join(item.strip().casefold().split())
+    return any(pattern.search(normalized) for pattern in _TP4_ABSENCE_PATTERNS)
+
+
+def _tp4_all_mismatched_are_absences(items: list[str]) -> bool:
+    """Return whether every listed capability is an absence, not a behavior."""
+    return bool(items) and all(_tp4_mismatched_item_is_absence(item) for item in items)
+
+
 def _tp4_finding(
     result: _TP4AnalysisResult,
     batch: Batch,
@@ -1154,6 +1197,13 @@ def _tp4_finding(
 ) -> Finding | None:
     """Convert one bounded batch assessment without dropping source evidence."""
     if not result.is_mismatch or result.confidence < 0.5:
+        return None
+    if _tp4_all_mismatched_are_absences(result.mismatched_capabilities):
+        logger.debug(
+            "%s: TP4 assessment suppressed: every mismatched capability is "
+            "phrased as an absence, so there is no affirmative mismatch evidence",
+            ANALYZER_ID,
+        )
         return None
     declared = (result.declared_purpose_summary or description[:512])[:512]
     actual = result.actual_behavior_summary[:1024]
@@ -1168,9 +1218,13 @@ def _tp4_finding(
     return Finding(
         rule_id="TP4",
         message=message,
-        severity="HIGH" if result.confidence >= 0.7 else "MEDIUM",
+        # TP4 is documented as MEDIUM in the README pattern table; the
+        # confidence-based escalation to HIGH was never documented (issue #1066).
+        severity="MEDIUM",
         confidence=result.confidence,
-        file="SKILL.md",
+        file=batch.file_path,
+        start_line=batch.start_line,
+        end_line=batch.end_line,
         category=_CATEGORY,
         pattern=get_pattern_name("TP4"),
         finding=message,
