@@ -276,7 +276,7 @@ class TestNvBuildProvider:
     @pytest.mark.parametrize(
         ("model", "context_length"),
         [
-            ("z-ai/glm-5.3", 128_000),
+            ("z-ai/glm-5.3-flash", 128_000),
             ("z-ai/glm-5.2", 202_749),
             ("moonshotai/kimi-k2.6", 256_000),
         ],
@@ -298,20 +298,20 @@ class TestNvBuildProvider:
 
     def test_default_model_keeps_conservative_token_budgets(self) -> None:
         provider = NvBuildProvider()
-        assert provider.DEFAULT_MODEL == "z-ai/glm-5.3"
+        assert provider.DEFAULT_MODEL == "z-ai/glm-5.3-flash"
         assert provider.get_context_length(provider.DEFAULT_MODEL) == 128_000
         assert provider.get_max_output_tokens(provider.DEFAULT_MODEL) == 32_000
 
     @pytest.mark.parametrize(
         ("model", "configured_effort", "expected_effort"),
         [
-            ("z-ai/glm-5.3", None, "high"),
-            ("z-ai/glm-5.3", "   ", "high"),
-            ("z-ai/glm-5.3", " low ", "low"),
-            ("z-ai/glm-5.3", "high", "high"),
-            ("z-ai/glm-5.3", "max", "max"),
+            ("z-ai/glm-5.3-flash", None, "high"),
+            ("z-ai/glm-5.3-flash", "   ", "high"),
+            ("z-ai/glm-5.3-flash", " low ", "low"),
+            ("z-ai/glm-5.3-flash", "high", "high"),
+            ("z-ai/glm-5.3-flash", "max", "max"),
             ("z-ai/glm-5.2", None, None),
-            ("z-ai/glm-5.3-flash", None, None),
+            ("z-ai/glm-5.3", None, None),
             ("another/model", None, None),
         ],
     )
@@ -337,7 +337,7 @@ class TestNvBuildProvider:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-        llm = OpenAIProvider().create_chat_model("z-ai/glm-5.3", max_tokens=123)
+        llm = OpenAIProvider().create_chat_model("z-ai/glm-5.3-flash", max_tokens=123)
         assert isinstance(llm, ChatOpenAI)
         assert "reasoning_effort" not in llm._get_request_payload("hello")
 
