@@ -395,6 +395,14 @@ class TestExcessiveAgency:
             pytest.param("$ aider \\\n  --yes \\\n  -m gpt-4o", 3, id="later_continuation"),
             pytest.param("claude \\\n  -p 'Fix the tests'", 2, id="claude_print"),
             pytest.param("codex \\\n  exec 'Fix the tests'", 2, id="codex_exec"),
+            pytest.param(
+                'aider --message "first`nsecond" `\n  --yes-always --model gpt-4o',
+                2,
+                id="powershell_quoted_escape_backtick",
+            ),
+            pytest.param(
+                "cd repo && aider \\\n  --model gpt-4o", 2, id="executable_after_operator"
+            ),
         ],
     )
     def test_ea5_continued_line_is_read_after_its_executable(self, content: str, line: int) -> None:
@@ -416,6 +424,44 @@ class TestExcessiveAgency:
         content = "python evaluate.py \\\n  -v --model claude-3-7-sonnet"
         findings = ea_mod.analyze(content, "SKILL.md", "markdown")
         assert not any(finding.rule_id == "EA5" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "first_line",
+        [
+            pytest.param("python setup.py \\\\", id="escaped_backslash"),
+            pytest.param("python setup.py  # build \\", id="comment_backslash"),
+            pytest.param("python evaluate.py && \\", id="and_operator"),
+            pytest.param("python evaluate.py || \\", id="or_operator"),
+            pytest.param("python evaluate.py ; \\", id="semicolon"),
+            pytest.param("python evaluate.py | \\", id="pipe"),
+        ],
+    )
+    def test_ea5_line_after_a_finished_command_names_its_own_executable(
+        self, first_line: str
+    ) -> None:
+        content = f"{first_line}\naider --model gpt-4o"
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        ea5 = [finding for finding in findings if finding.rule_id == "EA5"]
+        assert len(ea5) == 1
+        assert ea5[0].severity == Severity.HIGH
+        assert ea5[0].location.start_line == 2
+
+    def test_ea5_continued_lines_do_not_reparse_a_long_first_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        parsed: list[int] = []
+        original = ea_mod._is_model_switch_command
+
+        def counting(command: str) -> bool:
+            parsed.append(len(command))
+            return original(command)
+
+        monkeypatch.setattr(ea_mod, "_is_model_switch_command", counting)
+        content = "x" * 100_000 + " \\\n" + "  -v \\\n" * 200 + "  -v\n"
+        ea_mod.analyze(content, "SKILL.md", "markdown")
+        # Each continued line is parsed with a bounded executable name, not the
+        # whole first token, so total parsing work stays linear in the input.
+        assert sum(parsed) < 2 * len(content)
 
     def test_ea5_shell_fence_is_actionable(self) -> None:
         content = "```shell\ncodex exec 'Fix the tests'\n```"
