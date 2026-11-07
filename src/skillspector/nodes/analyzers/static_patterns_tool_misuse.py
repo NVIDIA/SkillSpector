@@ -317,12 +317,20 @@ _SHELL_NAME_ARGUMENT_RE = re.compile(r"\bshell\s*=\s*\w+", re.IGNORECASE)
 # a terminated triple-quoted one) and a ``#`` comment are each consumed as one
 # token, so a parenthesis inside them (``"echo :("``, ``# (``) is not counted.
 # A backslash escape, including a line continuation (LF or CRLF), stays inside its string.
-# An unterminated single-line quote runs to the end of the line, so no
-# character is scanned twice.
+# The escape is atomic so backslash+CRLF has one parse; otherwise an
+# unterminated triple-quoted string backtracks exponentially.  A single-line
+# f-string consumes a replacement field (``f"{"("}"``) as part of the string.
+# A comment ends at CR or LF.  An unterminated single-line quote runs to the
+# end of the line, so no character is scanned twice.
+_CALL_ARGUMENT_ESCAPE = r"\\(?>\r\n|[\s\S])"
+_CALL_ARGUMENT_FSTRING_FIELD = r"""\{(?:'[^'\n]*'|"[^"\n]*"|\{[^{}\n]*\}|[^{}'"\n])*\}"""
 _CALL_ARGUMENT_TOKEN = (
-    r"(?>'''(?:[^'\\]|\\(?:\r\n|[\s\S])|'(?!''))*'''"
-    r'|"""(?:[^"\\]|\\(?:\r\n|[\s\S])|"(?!""))*"""'
-    r"""|'(?:[^'\\\n]|\\(?:\r\n|[\s\S]))*'?|"(?:[^"\\\n]|\\(?:\r\n|[\s\S]))*"?|#[^\n]*|[^()])"""
+    rf"(?>'''(?:[^'\\]|{_CALL_ARGUMENT_ESCAPE}|'(?!''))*'''"
+    rf'|"""(?:[^"\\]|{_CALL_ARGUMENT_ESCAPE}|"(?!""))*"""'
+    rf"|[fF][rR]?'(?!'')(?:[^'\\\n{{]|{_CALL_ARGUMENT_ESCAPE}|{_CALL_ARGUMENT_FSTRING_FIELD}|\{{)*'?"
+    rf'|[fF][rR]?"(?!"")(?:[^"\\\n{{]|{_CALL_ARGUMENT_ESCAPE}|{_CALL_ARGUMENT_FSTRING_FIELD}|\{{)*"?'
+    rf"""|'(?:[^'\\\n]|{_CALL_ARGUMENT_ESCAPE})*'?|"(?:[^"\\\n]|{_CALL_ARGUMENT_ESCAPE})*"?"""
+    r"|#[^\r\n]*|[^()])"
 )
 _CALL_ARGUMENTS_PREFIX = (
     rf"(?:{_CALL_ARGUMENT_TOKEN}|\((?:{_CALL_ARGUMENT_TOKEN}|\({_CALL_ARGUMENT_TOKEN}*\))*\))*"
