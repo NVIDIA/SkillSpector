@@ -80,6 +80,7 @@ from uuid import uuid4
 
 from skillspector.file_output import require_secure_file_output, write_text_no_follow
 from skillspector.logging_config import set_level
+from skillspector.report_outputs import parse_reports
 
 from .api_pool import create_api_key_pool_from_env
 from .discovery import discover_skills
@@ -316,6 +317,12 @@ def _main_impl() -> None:
         help="Write report to FILE (default: stdout).",
     )
     parser.add_argument(
+        "--report",
+        action="append",
+        metavar="FORMAT=PATH",
+        help="Additional file report (repeatable): terminal, json, markdown.",
+    )
+    parser.add_argument(
         "--no-llm",
         action="store_true",
         default=False,
@@ -357,6 +364,10 @@ def _main_impl() -> None:
         help="Allow non-English scans without LLM (results will be incomplete).",
     )
     args = parser.parse_args()
+    try:
+        reports = parse_reports(args.report, ("terminal", "json", "markdown"), args.output)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Structured reports must not share stdout with progress or diagnostics.
     progress_file = sys.stdout if args.format == "terminal" else sys.stderr
@@ -375,7 +386,7 @@ def _main_impl() -> None:
         else:
             print(" ".join(str(a) for a in args), file=file)  # type: ignore[arg-type]
 
-    if args.output:
+    if args.output or reports:
         try:
             require_secure_file_output()
         except ValueError as exc:
@@ -390,6 +401,11 @@ def _main_impl() -> None:
     if not root.is_dir():
         _print(f"[red]Error:[/red] {display(root)} is not a directory", file=sys.stderr)
         sys.exit(2)
+
+    for _, destination in reports:
+        if destination.exists() and destination.resolve().is_relative_to(root):
+            _print("Error: --report must not overwrite a batch input.", file=sys.stderr)
+            sys.exit(2)
 
     skill_dirs = discover_skills(root)
     if not skill_dirs:
@@ -546,6 +562,20 @@ def _main_impl() -> None:
             _print(report_body, markup=False, highlight=False)
         else:
             sys.stdout.write(report_body + "\n")
+
+    formatters = {
+        "terminal": format_terminal,
+        "json": format_json,
+        "markdown": format_markdown,
+    }
+    for report_format, destination in reports:
+        try:
+            body = report_body if report_format == fmt else formatters[report_format](results)
+            write_text_no_follow(destination, body)
+        except (OSError, ValueError) as exc:
+            _print(f"Error: {exc}", markup=False, file=sys.stderr)
+            sys.exit(2)
+        _print(f"Batch report saved to: {display(destination)}", file=sys.stderr)
 
     # -- Exit codes ----------------------------------------------------------
     if errors:
