@@ -357,7 +357,7 @@ class TestImageTextAdversarial:
         # Cut inside the tEXt payload: the declared length overruns the
         # available bytes, so nothing parses (and nothing raises).
         png = _png_with_text("Comment", INJECTION)[:56]
-        assert extract_image_text_detailed(png) == ("", False)
+        assert extract_image_text_detailed(png) == ("", True)
 
     def test_gif_comment_cut_mid_block_is_truncated(self) -> None:
         gif = b"GIF89a" + struct.pack("<HHBBB", 1, 1, 0, 0, 0) + b"\x21\xfe\x05AB\x3b"

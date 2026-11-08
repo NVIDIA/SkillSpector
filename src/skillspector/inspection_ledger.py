@@ -102,6 +102,7 @@ class LedgerReason(StrEnum):
     REFERENCE_EXTRACTION_LIMIT = "reference_extraction_limit"
     REFERENCE_MISSING = "reference_missing"
     REFERENCE_UNRESOLVED = "reference_unresolved"
+    INLINE_DATA_IMAGE = "inline_data_image"
     MANIFEST_PARSE_ERROR = "manifest_parse_error"
     DEPENDENCY_PARSE_ERROR = "dependency_parse_error"
     DEPENDENCY_LOCKFILE_MISSING = "dependency_lockfile_missing"

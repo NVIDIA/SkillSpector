@@ -152,6 +152,7 @@ def _png_text(data: bytes) -> tuple[str, bool]:
             # Declared length overruns the file: corrupt container, not a
             # parsed-then-truncated text layer (a zero-chunk file stays
             # textless-complete; JPEG overruns are flagged in _jpeg_text).
+            truncated = True
             break
         payload = data[offset + 8 : offset + 8 + length]
         if chunk_type in (b"tEXt", b"zTXt", b"iTXt"):

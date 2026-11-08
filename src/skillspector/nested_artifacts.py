@@ -108,6 +108,19 @@ _EXPECTED_SUFFIXES: dict[str, frozenset[str]] = {
     "zip": frozenset({".zip"}),
 }
 
+_DATA_IMAGE_URI_RE = re.compile(r"data:image/[^;\s\"'<>]+;base64,[A-Za-z0-9+/=_-]*")
+
+
+def _extract_data_image_uris(text: str) -> list[str]:
+    """Extract data:image/ URIs from arbitrary text content.
+
+    Returns a list of matching URIs (may contain duplicates if the same URI
+    appears multiple times). The regex is intentionally permissive on the
+    MIME subtype and base64 payload; downstream size/quantity bounds apply
+    when adding to the inventory.
+    """
+    return _DATA_IMAGE_URI_RE.findall(text)
+
 
 @dataclass
 class NestedInspectionResult:
@@ -135,6 +148,8 @@ class NestedInspectionResult:
     disk_container_events: list[InspectionLedgerEvent] = field(default_factory=list)
     _active_disk_path: str | None = None
     uncompressed_bytes: int = 0
+    # Inline data:image/ URIs found in nested text files.
+    inline_data_images: list[str] = field(default_factory=list)
     # Exceptions can target a top-level container before a virtual artifact row
     # exists. Preserve their canonical disposition so build_context can apply
     # the same accounting to the outer bundle inventory.
@@ -1134,6 +1149,10 @@ def _inspect_zip_bytes(
             result.components.append(virtual_path)
             result.file_cache[virtual_path] = member_data.decode("utf-8", errors="replace")
             result.raw_file_cache[virtual_path] = member_data
+            # Extract inline data:image/ URIs from text files.
+            text_content = result.file_cache[virtual_path]
+            for uri in _extract_data_image_uris(text_content):
+                result.inline_data_images.append(uri)
             result.python_source_classifications[virtual_path] = source_classification
             artifact = classify_artifact(virtual_path, member_data)
             member_paths.append(virtual_path)
@@ -1353,5 +1372,16 @@ def inspect_nested_artifacts(
     result._active_disk_path = None
     result.components = list(dict.fromkeys(result.components))
     result.uncompressed_bytes = budget.uncompressed_bytes
+    # Emit ledger events for inline data:image/ URIs found in nested text files.
+    for uri in result.inline_data_images:
+        result.ledger_events.append(
+            ledger_event(
+                outcome=LedgerOutcome.COMPLETED,
+                record_type=LedgerRecordType.SYSTEM,
+                phase="nested_artifact_inspection",
+                path=uri,
+                reason=LedgerReason.INLINE_DATA_IMAGE,
+            )
+        )
     _apply_inventory_overrides(result)
     return result
