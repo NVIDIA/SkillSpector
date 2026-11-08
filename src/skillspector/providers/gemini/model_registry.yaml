@@ -1,0 +1,46 @@
+# Token-budget metadata for the GeminiProvider on Google Cloud.
+# Bundled with the package; consulted whenever the active provider is GeminiProvider.
+#
+# Format:
+#   models:
+#     "<model-label>":
+#       context_length: <int>          # total context window in tokens (required)
+#       max_output_tokens: <int>       # model's max output cap (optional)
+#
+
+models:
+  "gemini-3.8-flash":
+    context_length: 1000000
+    max_output_tokens: 64000
+
+  "gemini-3.7-flash":
+    context_length: 1000000
+    max_output_tokens: 64000
+
+  "gemini-3.6-flash":
+    context_length: 1000000
+    max_output_tokens: 64000
+
+  "gemini-3.5-flash-lite":
+    context_length: 1000000
+    max_output_tokens: 64000
+
+  "gemini-3.5-flash":
+    context_length: 1000000
+    max_output_tokens: 64000
+
+  "gemini-3.1-pro-preview":
+    context_length: 1000000
+    max_output_tokens: 64000
+
+  "gemini-3.1-flash-lite":
+    context_length: 1000000
+    max_output_tokens: 64000
+
+  "gemini-2.5-pro":
+    context_length: 1000000
+    max_output_tokens: 64000
+
+  "gemini-2.5-flash":
+    context_length: 1000000
+    max_output_tokens: 64000

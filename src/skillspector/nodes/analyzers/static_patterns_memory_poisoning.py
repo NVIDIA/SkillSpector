@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Iterator
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
@@ -34,6 +35,7 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 from . import static_runner
 from .common import LOGICAL_LINE_BREAK, get_context, get_line_number
 from .pattern_defaults import PatternCategory
+from .prohibition_context import is_directly_prohibited
 
 logger = get_logger(__name__)
 
@@ -80,8 +82,10 @@ MP1_PATTERNS = [
 ]
 
 # MP2: Context Window Stuffing — filling context to displace content
-MP2_PATTERNS = [
+MP2_CONTENT_PATTERNS = [
     (r"(.{2,20}?)\1{20,}", 0.8),
+]
+MP2_PROSE_PATTERNS = [
     (
         r"(?:repeat|duplicate|echo)\s+(?:this|the\s+following)\s+(?:\d{3,}|many|hundreds?|thousands?)\s+times?",
         0.85,
@@ -107,9 +111,42 @@ MP2_PATTERNS = [
         0.8,
     ),
 ]
+MP2_PATTERNS = MP2_CONTENT_PATTERNS + MP2_PROSE_PATTERNS
+
+# Report explicit state adoption at the instruction, even when its source
+# is a separate linked document with an otherwise benign hardware state.
+# The bounded gap accepts a wrapped reference and dots inside link paths,
+# but cannot borrow the target from a later sentence or paragraph. Bounded
+# inline decorators keep the original source span and cannot hide an action.
+_ADOPTION_MARKUP = r"[*_`]{0,3}"
+_ADOPTION_DIALOGUE = (
+    rf"(?:conversation|chat|dialogue){_ADOPTION_MARKUP}"
+    rf"(?:\s+{_ADOPTION_MARKUP}(?:state|history|context|transcript))?"
+)
+_ADOPTION_ACTION_SOURCE = (
+    rf"(?<!\w){_ADOPTION_MARKUP}(?:treat|consider|regard|use|adopt){_ADOPTION_MARKUP}\s+"
+    rf"(?:(?:the|this|that){_ADOPTION_MARKUP}\s+)?"
+    rf"(?:\[\s*)?{_ADOPTION_MARKUP}(?:reset\s+)?state{_ADOPTION_MARKUP}(?!\w)"
+)
+_MP3_STATE_ADOPTION_PATTERN = (
+    _ADOPTION_ACTION_SOURCE
+    # A later adoption action owns its own target and prohibition context.
+    + rf"(?:(?!{_ADOPTION_ACTION_SOURCE})(?:[^.!?]|\.(?=\S))){{0,512}}?\bas\s+"
+    rf"{_ADOPTION_MARKUP}(?:your{_ADOPTION_MARKUP}\s+{_ADOPTION_MARKUP}"
+    rf"(?:{_ADOPTION_DIALOGUE}|memory)"
+    rf"|(?:the{_ADOPTION_MARKUP}\s+)?{_ADOPTION_MARKUP}"
+    rf"(?:agent|assistant|llm|(?:ai|language)\s+model)(?:'s|’s){_ADOPTION_MARKUP}\s+"
+    rf"{_ADOPTION_MARKUP}(?:{_ADOPTION_DIALOGUE}|memory|context|state|history|transcript))"
+    rf"{_ADOPTION_MARKUP}(?!\w)(?:[.!?][*_`]{{1,3}})?"
+)
+_ADOPTION_PARAGRAPH_BOUNDARY = re.compile(
+    rf"(?>{LOGICAL_LINE_BREAK.pattern})[ \t]*(?:>[ \t]*)*"
+    rf"(?>{LOGICAL_LINE_BREAK.pattern})"
+)
 
 # MP3: Memory Manipulation — direct modification of agent memory/state
 MP3_PATTERNS = [
+    (_MP3_STATE_ADOPTION_PATTERN, 0.85),
     (
         r"(?:clear|reset|wipe|erase|delete|purge)\s+(?:your\s+)?(?:memory|context|state|history|conversation)",
         0.8,
@@ -152,7 +189,8 @@ MP3_PATTERNS = [
     ),
 ]
 
-_LOGICAL_BREAK = rf"(?:{LOGICAL_LINE_BREAK.pattern})"
+# CRLF is one break; backtracking must not turn it into a blank paragraph.
+_LOGICAL_BREAK = rf"(?>{LOGICAL_LINE_BREAK.pattern})"
 _BENIGN_RESET_STATE_COVERAGE = re.compile(
     rf"(?:\A|{_LOGICAL_BREAK})"
     r"[ \t]*(?:-[ \t]+\*\*Incomplete[ \t]+state[ \t]+coverage\*\*[ \t]+"
@@ -191,12 +229,114 @@ _NEXT_LINE_REFERENCE = re.compile(
     re.IGNORECASE,
 )
 
+_TIMESTAMP_CONTEXT_DESCRIPTION = re.compile(
+    rf"(?:\A|{_LOGICAL_BREAK})"
+    r"[ \t]*//[ \t]*(?:✅[ \t]*)?(?:GOOD:[ \t]*)?"
+    r"(?P<target>clear[ \t]+context)[ \t]+(?:with|using)[ \t]+"
+    r"(?P<format>%[0-9]{0,3}t)[ \t]*\.?[ \t]*"
+    rf"(?=\Z|{_LOGICAL_BREAK})",
+    re.IGNORECASE,
+)
+_TIMESTAMP_DISPLAY = re.compile(
+    r'[ \t]*\$display[ \t]*\([ \t]*"'
+    r'(?P<format_string>(?:[^"\\\r\n\v\f\x85\u2028\u2029]|\\[^\r\n\v\f\x85\u2028\u2029])*)'
+    r'"[ \t]*,[ \t]*\$(?:realtime|time)[ \t]*\)[ \t]*;[ \t]*'
+    r"(?://[^\r\n\v\f\x85\u2028\u2029]*)?"
+)
+_TIMESTAMP_OWNERSHIP_PATTERN = (
+    r"\b(?:instructions?|directives?|requirements?|orders?)\b"
+    r"|\b(?:the|this|that|these|those|next|following|above|below|displayed|shown|"
+    r"described|listed|same|attached)[ \t]+"
+    r"(?:comments?|examples?|operations?|actions?|steps?|instructions?|directives?|lines?|snippets?|samples?)\b"
+    r"|\b(?:comments?|examples?|operations?|actions?|steps?|instructions?|directives?|lines?|snippets?|samples?)"
+    r"[ \t]+(?:above|below|earlier|prior|previous|preceding|following|next)\b"
+    r"|\b(?:following|next|above|below|this|that)\b[^\r\n]{0,80}"
+    r"\b(?:order|directive|instruction|command)\b"
+)
+_TIMESTAMP_OWNERSHIP_REFERENCE = re.compile(_TIMESTAMP_OWNERSHIP_PATTERN, re.IGNORECASE)
+_TIMESTAMP_AUTHORITY_HEADING = re.compile(
+    r"(?:[A-Za-z]+[ \t]+)*"
+    r"(?:commands?|instructions?|directions?|directives?|orders?|actions?|operations?|steps?|tasks?)"
+    r"(?=[ \t:]|$)[^:\r\n]{0,80}:[ \t]*",
+    re.IGNORECASE,
+)
+_TIMESTAMP_DESCRIPTION_DIRECTIVE = re.compile(
+    r"\b(?:you|agents?|assistants?|models?|llms?|bots?|must|shall|should|"
+    r"required|mandatory)\b"
+    r"|\byour[ \t]+(?:memory|context|state|history|conversation|task|objective|"
+    r"mission|instructions?)\b"
+    # Nearby memory targets can redefine what the comment's "context" means.
+    r"|\b(?:conversation|memory|history|chat|transcript|dialogue)\b"
+    r"|\b(?:follow|obey|apply|execute|perform|do|carry[ \t]+out|act[ \t]+(?:on|upon))[ \t]+"
+    r"(?:(?:the[ \t]+)?(?:following|next|above|below)[ \t]+)?"
+    r"(?:this|that|it|these|those|comments?|instructions?)\b"
+    r"|\b(?:follow|obey|apply|execute|perform|do|carry[ \t]+out|act[ \t]+(?:on|upon))\b"
+    r"[^\r\n\v\f\x85\u2028\u2029]{0,160}"
+    r"\b(?:described|displayed|documented|shown|listed|comments?|examples?|"
+    r"operations?|actions?|steps?|instructions?|directives?|lines?|snippets?|samples?)\b"
+    r"|\b(?:task|instructions?|directives?)[ \t]*:"
+    r"|\bbefore[ \t]+(?:replying|responding|answering)\b" + "|" + _TIMESTAMP_OWNERSHIP_PATTERN,
+    re.IGNORECASE,
+)
+_TIMESTAMP_BACK_REFERENCE = re.compile(
+    r"\b(?:described|displayed|documented|shown|listed|above|earlier|prior|"
+    r"previous|preceding|foregoing|same)[ \t]+"
+    r"(?:comments?|examples?|operations?|actions?|steps?|instructions?)\b"
+    r"|\b(?:comments?|examples?|operations?|actions?|steps?|instructions?)"
+    r"[ \t]+(?:above|earlier|prior|previous|preceding|foregoing)\b"
+    r"|\b(?:follow|obey|apply|execute|perform|do|carry[ \t]+out|act[ \t]+(?:on|upon)|use|run|invoke)\b"
+    r"[^\r\n\v\f\x85\u2028\u2029]{0,160}"
+    r"\b(?:this|that|it|these|those|above|earlier|prior|previous|preceding|"
+    r"foregoing|same)\b"
+    r"|\bcontext\b[^\r\n\v\f\x85\u2028\u2029]{0,160}"
+    r"\b(?:conversation|memory|history|chat|transcript|dialogue)\b"
+    r"|\b(?:conversation|memory|history|chat|transcript|dialogue)\b"
+    r"[^\r\n\v\f\x85\u2028\u2029]{0,160}\bcontext\b",
+    re.IGNORECASE,
+)
+_TIMESTAMP_REFERENCE_CUE = re.compile(
+    r"\b(?:follow|obey|apply|execute|perform|do|carry|act|use|run|invoke|context|"
+    r"described|displayed|documented|shown|listed|above|earlier|prior|previous|"
+    r"preceding|foregoing|same|commands?|instructions?|directives?|requirements?|orders?)\b",
+    re.IGNORECASE,
+)
+_CODE_FENCE_LINE = re.compile(r"[ \t]*(?:`{3,}|~{3,})[ \t]*")
+_CODE_FENCE_OPENER = re.compile(
+    r"[ \t]*(?:`{3,}|~{3,})[ \t]*(?:systemverilog|verilog)?[ \t]*", re.IGNORECASE
+)
+_CODE_FENCE_MARKER = re.compile(r"[ \t]*(?:`{3,}|~{3,})")
+
+# Require a nominal state owned by a hardware subject, not just a nearby FSM label.
+_HARDWARE_RESET_STATE = re.compile(
+    r"\b(?:(?:finite[ \t-]+)?state[ \t-]+machines?|fsms?)[ \t]+"
+    r"(?:takes?|reach(?:es)?|enters?|returns?[ \t]+to)[ \t]+(?:its|their)[ \t]+"
+    r"(?P<target>reset[ \t]+state)\b",
+    re.IGNORECASE,
+)
+_HARDWARE_CLOCK = re.compile(r"\bclocks?\b", re.IGNORECASE)
+_HARDWARE_AGENT_REFERENCE = re.compile(
+    r"\b(?:you|your|agents?|assistants?|models?|llms?|bots?|conversation|memory|"
+    r"context|history|chat|transcript|dialogue|prompt|instructions?|directives?)\b"
+    r"|\bbefore[ \t]+(?:replying|responding|answering)\b",
+    re.IGNORECASE,
+)
+
 _LAYOUT_CHAR_RANGES = (
     (0x2500, 0x257F),
     (0x2580, 0x259F),
 )
 _LAYOUT_ASCII_CHARS = frozenset("|-_=+")
 _MAX_LAYOUT_ONLY_SPAN = 256
+
+
+def _iter_state_adoption_matches(content: str) -> Iterator[re.Match[str]]:
+    """Keep adoption and its target in one paragraph, including blockquote blanks."""
+    pattern = re.compile(_MP3_STATE_ADOPTION_PATTERN, re.IGNORECASE | re.MULTILINE)
+    start = 0
+    for boundary in _ADOPTION_PARAGRAPH_BOUNDARY.finditer(content):
+        yield from pattern.finditer(content, start, boundary.start())
+        start = boundary.end()
+    yield from pattern.finditer(content, start)
 
 
 def _is_layout_only_span(span: str, max_cosmetic_span: int = _MAX_LAYOUT_ONLY_SPAN) -> bool:
@@ -217,6 +357,134 @@ def _is_layout_only_span(span: str, max_cosmetic_span: int = _MAX_LAYOUT_ONLY_SP
         if not any(start <= codepoint <= end for start, end in _LAYOUT_CHAR_RANGES):
             return False
     return True
+
+
+_TABLE_DELIMITER_CELL = re.compile(r"^\s*:?-+:?\s*$")
+
+
+def _split_unescaped_pipes(text: str) -> list[str]:
+    """Split on pipes that are Markdown cell boundaries.
+
+    A pipe preceded by a backslash (``\\|``) is literal cell text, not a
+    boundary, so splitting on raw ``|`` would invent cells out of escaped
+    content. A backslash escapes the next character, so ``\\\\|`` (an
+    escaped backslash followed by a pipe) still counts as a boundary.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            current.append(text[index : index + 2])
+            index += 2
+            continue
+        if char == "|":
+            segments.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    segments.append("".join(current))
+    return segments
+
+
+def _markdown_table_cells(line: str) -> list[str] | None:
+    """Return cells for an outer-pipe Markdown row, or ``None`` otherwise."""
+    stripped = line.strip()
+    if not (stripped.startswith("|") and stripped.endswith("|")):
+        return None
+    return _split_unescaped_pipes(stripped[1:-1])
+
+
+def _markdown_table_line_spans(content: str) -> list[tuple[int, int]]:
+    """Return (start, end) offsets of lines belonging to a proven Markdown table.
+
+    A table is proven by a header row immediately followed by a delimiter row
+    with the same number of cells; following rows belong to the table while
+    they keep that cell count. This mirrors the proven-table rule already used
+    for the P9 / whitespace-padding analyzers: aligned table rows repeat cell
+    text and padding by construction, so the MP2 repetition pattern must not
+    treat that layout repetition as context-window stuffing.
+    """
+    lines: list[tuple[int, int, str]] = []
+    pos = 0
+    for line_break in LOGICAL_LINE_BREAK.finditer(content):
+        lines.append((pos, line_break.start(), content[pos : line_break.start()]))
+        pos = line_break.end()
+    lines.append((pos, len(content), content[pos:]))
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index + 1 < len(lines):
+        header = _markdown_table_cells(lines[index][2])
+        delimiter = _markdown_table_cells(lines[index + 1][2])
+        if (
+            header
+            and delimiter
+            and len(header) == len(delimiter)
+            and all(_TABLE_DELIMITER_CELL.fullmatch(cell) for cell in delimiter)
+        ):
+            spans.append((lines[index][0], lines[index][1]))
+            spans.append((lines[index + 1][0], lines[index + 1][1]))
+            row_index = index + 2
+            while row_index < len(lines):
+                row = _markdown_table_cells(lines[row_index][2])
+                if row is None or len(row) != len(header):
+                    break
+                spans.append((lines[row_index][0], lines[row_index][1]))
+                row_index += 1
+            index = row_index
+            continue
+        index += 1
+    return spans
+
+
+def _is_markdown_table_span(spans: list[tuple[int, int]], offset: int) -> bool:
+    return any(start <= offset < end for start, end in spans)
+
+
+_TABLE_SEPARATOR_CHARS = frozenset("-:=| \t")
+
+
+def _is_table_structure_unit(unit: str) -> bool:
+    """Return True when a repeated MP2 unit is table structure, not content.
+
+    A unit containing an unescaped pipe repeats cell structure by
+    construction (the repetition spans cell boundaries, as in
+    prettier-aligned rows and delimiter rows), and a unit made only of
+    separator/padding characters repeats delimiters or alignment padding.
+    Any other unit repeats substantive cell content, so it must not be
+    exempted: a single cell stuffed with ``abcdef `` repeated 1000 times
+    has a content-only unit and stays a finding even though it sits
+    inside a proven table. An escaped pipe (``\\|``) is literal cell
+    text, not structure, so a unit whose pipes are all escaped is
+    content, not structure.
+    """
+    if not unit:
+        return False
+    if len(_split_unescaped_pipes(unit)) > 1:
+        return True
+    return all(ch in _TABLE_SEPARATOR_CHARS for ch in unit)
+
+
+def _match_contains_stuffed_cell(span: str) -> bool:
+    """Return True when one cell segment of the span repeats content itself.
+
+    Splits the span on unescaped cell boundaries and re-applies the MP2
+    content pattern inside each segment: a segment whose own repetition
+    unit carries alphanumeric content is stuffing inside that cell, even
+    when the outer match spans the whole row. Pure separator/padding
+    segments (dashes, spaces) do not count. Splitting on raw pipes
+    would shred escaped-pipe content into short nonrepeated pieces and
+    hide the stuffing.
+    """
+    content_pattern = MP2_CONTENT_PATTERNS[0][0]
+    for segment in _split_unescaped_pipes(span):
+        for inner in re.finditer(content_pattern, segment):
+            unit = inner.group(1) or ""
+            if any(ch.isalnum() for ch in unit):
+                return True
+    return False
 
 
 def _bounded_previous_nonblank_line(content: str, offset: int) -> tuple[str, bool]:
@@ -279,6 +547,284 @@ def _is_benign_reset_state_coverage(content: str, match: re.Match[str]) -> bool:
     return False
 
 
+def _is_benign_hardware_reset_state(content: str, match: re.Match[str]) -> bool:
+    """Own only a clocked hardware subject's nominal reset state on a complete line."""
+    if re.fullmatch(r"reset[ \t]+state", match.group(), re.IGNORECASE) is None:
+        return False
+
+    window_start = max(0, match.start() - 512)
+    window_end = min(len(content), match.end() + 512)
+    preceding_breaks = list(LOGICAL_LINE_BREAK.finditer(content, window_start, match.start()))
+    line_start = preceding_breaks[-1].end() if preceding_breaks else window_start
+    following_break = LOGICAL_LINE_BREAK.search(content, match.end(), window_end)
+    line_end = following_break.start() if following_break else window_end
+    if (not preceding_breaks and window_start != 0) or (
+        following_break is None and window_end != len(content)
+    ):
+        return False
+
+    if _HARDWARE_CLOCK.search(content, line_start, line_end) is None:
+        return False
+    if not any(
+        candidate.span("target") == match.span()
+        for candidate in _HARDWARE_RESET_STATE.finditer(content, line_start, line_end)
+    ):
+        return False
+
+    _, previous_complete = _bounded_previous_nonblank_line(content, line_start)
+    _, next_complete = _bounded_next_nonblank_line(content, line_end)
+    if not previous_complete or not next_complete:
+        return False
+
+    surrounding = _normalize_timestamp_guard(
+        content[max(0, line_start - 512) : min(len(content), line_end + 512)]
+    )
+    # Preserve agent-state aliases and explicit instructions that reuse a description.
+    return (
+        _HARDWARE_AGENT_REFERENCE.search(surrounding) is None
+        and _TIMESTAMP_BACK_REFERENCE.search(surrounding) is None
+    )
+
+
+def _bounded_timestamp_following_context(content: str, offset: int) -> str | None:
+    """Inspect through a nearby fence and following paragraph, without truncation."""
+    window_end = min(len(content), offset + 512)
+    window = content[offset:window_end]
+    cursor = 0
+    closed_fence = False
+    following_paragraph = False
+    for line_break in LOGICAL_LINE_BREAK.finditer(window):
+        line = window[cursor : line_break.start()]
+        cursor = line_break.end()
+        if closed_fence:
+            # A separate code block owns its contents, not this description.
+            # Keep its opening line visible in case that line is an instruction.
+            if _CODE_FENCE_MARKER.match(line):
+                return window[:cursor]
+            if line.strip():
+                following_paragraph = True
+            elif following_paragraph and window_end != len(content):
+                return window[:cursor]
+        if _CODE_FENCE_LINE.fullmatch(line):
+            closed_fence = True
+    return window if window_end == len(content) else None
+
+
+def _normalize_timestamp_guard(content: str) -> str:
+    """Join wrapped directives for boolean guards without changing source evidence."""
+    normalized = " ".join(
+        re.sub(
+            r"^[ \t]*(?:(?:>|//)[ \t]*)*"
+            r"(?:(?:[-+*]|[0-9]{1,9}[.)])[ \t]+)?(?:#{1,6}[ \t]+)?",
+            "",
+            line,
+        )
+        for line in LOGICAL_LINE_BREAK.split(content)
+    )
+    return re.sub(r"[`*_\[\]]", "", normalized)
+
+
+def _has_timestamp_back_reference(content: str, offset: int) -> bool:
+    """Keep explicit reuse visible across paragraph and independent-block boundaries."""
+    window_end = min(len(content), offset + 512)
+    window = content[offset:window_end]
+    normalized = _normalize_timestamp_guard(window)
+    if (
+        _TIMESTAMP_BACK_REFERENCE.search(normalized)
+        or _TIMESTAMP_OWNERSHIP_REFERENCE.search(normalized)
+        or _has_timestamp_authority_heading(window)
+    ):
+        return True
+    if window_end != len(content) and LOGICAL_LINE_BREAK.match(content, window_end) is None:
+        # An unfinished reference cannot establish that the description is benign.
+        last_paragraph = re.split(rf"{_LOGICAL_BREAK}[ \t]*{_LOGICAL_BREAK}", window)[-1]
+        return (
+            _TIMESTAMP_REFERENCE_CUE.search(_normalize_timestamp_guard(last_paragraph)) is not None
+        )
+    return False
+
+
+def _has_timestamp_authority_heading(content: str) -> bool:
+    """Require a complete heading; URL or metadata colons cannot confer authority."""
+    regions = (
+        *LOGICAL_LINE_BREAK.split(content),
+        *re.split(rf"{_LOGICAL_BREAK}[ \t]*{_LOGICAL_BREAK}", content),
+    )
+    return any(
+        _TIMESTAMP_AUTHORITY_HEADING.fullmatch(_normalize_timestamp_guard(paragraph).strip())
+        for paragraph in regions
+    )
+
+
+def _is_benign_timestamp_context_description(content: str, match: re.Match[str]) -> bool:
+    """Own a descriptive comment only when its example actually prints a timestamp."""
+    window_start = max(0, match.start() - 256)
+    window_end = min(len(content), match.end() + 256)
+    for candidate in _TIMESTAMP_CONTEXT_DESCRIPTION.finditer(content, window_start, window_end):
+        if candidate.span("target") != match.span():
+            continue
+        if (
+            candidate.end() != len(content)
+            and LOGICAL_LINE_BREAK.match(content, candidate.end()) is None
+        ):
+            continue
+
+        previous_line, previous_complete = _bounded_previous_nonblank_line(
+            content, candidate.start()
+        )
+        if not previous_complete:
+            continue
+        # A fence opener cannot hide the instruction introducing its comments.
+        if _CODE_FENCE_OPENER.fullmatch(previous_line):
+            opener_start = content.rfind(
+                previous_line, max(0, candidate.start() - 512), candidate.start()
+            )
+            previous_line, previous_complete = _bounded_previous_nonblank_line(
+                content, opener_start
+            )
+            if not previous_complete:
+                continue
+        # Direct reuse of the immediately preceding text cannot grant ownership
+        # to a descriptive example, regardless of the directive's action verb.
+        if _PRECEDING_DIRECTIVE.search(_normalize_timestamp_guard(previous_line)):
+            continue
+        preceding = content[max(0, candidate.start() - 512) : candidate.start()]
+        nearest_paragraph = re.split(rf"{_LOGICAL_BREAK}[ \t]*{_LOGICAL_BREAK}", preceding)[-1]
+        if any(
+            reference.group(0).strip() != ":"
+            for reference in _PRECEDING_DIRECTIVE.finditer(
+                _normalize_timestamp_guard(nearest_paragraph)
+            )
+        ):
+            continue
+        if _TIMESTAMP_DESCRIPTION_DIRECTIVE.search(
+            _normalize_timestamp_guard(preceding)
+        ) or _has_timestamp_authority_heading(preceding):
+            continue
+
+        next_line, next_complete = _bounded_next_nonblank_line(content, candidate.end())
+        display = _TIMESTAMP_DISPLAY.fullmatch(next_line) if next_complete else None
+        if display is None:
+            continue
+        # %% is a literal percent, not timestamp formatting evidence.
+        if (
+            re.search(
+                r"(?<!%)" + re.escape(candidate.group("format")), display.group("format_string")
+            )
+            is None
+        ):
+            continue
+        if _TIMESTAMP_DESCRIPTION_DIRECTIVE.search(next_line) or _NEXT_LINE_REFERENCE.search(
+            next_line
+        ):
+            continue
+        display_start = content.find(
+            next_line, candidate.end(), min(len(content), candidate.end() + 512)
+        )
+        display_end = display_start + len(next_line)
+        if _has_timestamp_back_reference(content, display_end):
+            continue
+        following = _bounded_timestamp_following_context(content, display_end)
+        if (
+            following is None
+            or _NEXT_LINE_REFERENCE.search(_normalize_timestamp_guard(following))
+            or _TIMESTAMP_DESCRIPTION_DIRECTIVE.search(_normalize_timestamp_guard(following))
+            or _has_timestamp_authority_heading(following)
+        ):
+            continue
+        return True
+    return False
+
+
+# MP3 (write variant): a write operation whose destination resolves to a known
+# agent-memory file or directory. MP1/MP3 prose patterns score the injection
+# *text*; they cannot see a write *operation*, so a test hook that appends to
+# MEMORY.md scores 0/100 SAFE (issue #879). This scores the write itself: the
+# persistence mechanism is the finding, whatever the payload bytes are.
+#
+# Calibration: the signal is the *destination* being memory the agent loads as
+# its own context, not file I/O as such; and the carrier is scoped to files
+# the developer toolchain runs without being asked (test files, conftest.py),
+# so an explicitly invoked helper that writes a report stays quiet.
+_AGENT_MEMORY_FILENAMES = frozenset({"memory.md", "claude.md", "agents.md", "soul.md"})
+_AGENT_MEMORY_DIR_SEGMENTS = frozenset({".claude", ".cursor", ".agents"})
+
+# Basename shapes the developer toolchain auto-runs: pytest/unittest discovery
+# (test_*.py, *_test.py, conftest.py) and JS/TS runners (*.test.*, *.spec.*).
+_AUTO_RUN_CARRIER_RE = re.compile(
+    r"conftest\.py|test_.*\.pyw?|.*_test\.pyw?|.*\.(?:test|spec)\.[a-z0-9]+",
+    re.IGNORECASE,
+)
+
+_PY_STRING_LITERAL = r"(?P<prefix>[A-Za-z]*)(?P<q>[\"'])(?P<dest>(?:\\.|(?!(?P=q)).)*)(?P=q)"
+_TS_STRING_LITERAL = r"(?P<q>[\"'`])(?P<dest>(?:\\.|(?!(?P=q)).)*)(?P=q)"
+
+# Write sinks that take a literal destination. open() requires an explicit
+# write mode so reads stay quiet; shutil.copy* resolve the destination, which
+# is the second positional argument.
+_PY_WRITE_SINKS = [
+    re.compile(
+        r"(?:\bio\s*\.\s*)?\bopen\s*\(\s*"
+        + _PY_STRING_LITERAL
+        + r"\s*,\s*(?:mode\s*=\s*)?(?P<mq>[\"'])(?P<mode>[^\"']*)(?P=mq)"
+    ),
+    re.compile(r"\bPath\s*\(\s*" + _PY_STRING_LITERAL + r"\s*\)\s*\.\s*write_(?:text|bytes)\s*\("),
+    re.compile(
+        r"\bshutil\s*\.\s*copy(?:2|file)?\s*\(\s*[^()]*(?:\([^()]*\)[^()]*)*,\s*"
+        + _PY_STRING_LITERAL
+    ),
+]
+_TS_WRITE_SINKS = [
+    re.compile(
+        r"(?:\bfs\s*\.\s*(?:promises\s*\.\s*)?)?"
+        r"\b(?:writeFileSync|appendFileSync|writeFile|appendFile)\s*\(\s*" + _TS_STRING_LITERAL
+    ),
+    re.compile(r"\bfs\s*\.\s*createWriteStream\s*\(\s*" + _TS_STRING_LITERAL),
+]
+
+
+def _is_agent_memory_destination(raw_destination: str, prefix: str = "") -> bool:
+    """Return True when a write destination is an agent-memory file or directory."""
+    # Literal path only: interpolation in directory segments does not change
+    # which well-known file is targeted, so f"{base}/MEMORY.md" still counts.
+    # A raw prefix (r, rf) keeps backslashes literal: decoding escapes there
+    # would eat the separators, so r"C:\Users\alice\MEMORY.md" would collapse
+    # to "C:UsersaliceMEMORY.md" and lose every path segment. Only non-raw
+    # literals get escape decoding; both forms then normalize separators.
+    if "r" in prefix.lower():
+        unescaped = raw_destination
+    else:
+        unescaped = re.sub(r"\\(.)", r"\1", raw_destination, flags=re.DOTALL)
+    normalized = unescaped.replace("\\", "/").strip()
+    segments = [s for s in normalized.split("/") if s not in ("", ".", "..")]
+    if not segments:
+        return False
+    lowered = [segment.lower() for segment in segments]
+    if lowered[-1] in _AGENT_MEMORY_FILENAMES:
+        return True
+    return any(segment in _AGENT_MEMORY_DIR_SEGMENTS for segment in lowered)
+
+
+def _iter_memory_file_writes(content: str, file_type: str) -> Iterator[tuple[re.Match[str], str]]:
+    """Yield (match, destination) for writes to agent-memory destinations."""
+    if file_type == "python":
+        sinks = _PY_WRITE_SINKS
+    elif file_type in ("typescript", "javascript"):
+        sinks = _TS_WRITE_SINKS
+    else:
+        return
+    for sink in sinks:
+        for match in sink.finditer(content):
+            destination = match.group("dest")
+            prefix = match.groupdict().get("prefix") or ""
+            if not _is_agent_memory_destination(destination, prefix):
+                continue
+            mode = match.groupdict().get("mode")
+            if mode is not None and not any(char in "wxa+" for char in mode):
+                continue
+            yield match, destination
+
+
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for memory poisoning patterns (MP1–MP3)."""
     findings: list[AnalyzerFinding] = []
@@ -292,7 +838,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.MEMORY_POISONING.value]
 
     for pattern, confidence in MP1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -304,12 +852,27 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
+    table_spans = _markdown_table_line_spans(content) if file_type == "markdown" else []
     for pattern, confidence in MP2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in MP2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             span = match.group(0)
             if _is_layout_only_span(span):
+                continue
+            if (
+                (pattern, confidence) not in MP2_PROSE_PATTERNS
+                and table_spans
+                and _is_markdown_table_span(table_spans, match.start())
+                and _is_table_structure_unit(match.group(1))
+                and not _match_contains_stuffed_cell(span)
+            ):
                 continue
             non_ws_chars = set(span) - {" ", "\t", "\n", "\r"}
             if len(non_ws_chars) <= 1 and not any(c in span for c in (" ", "\t")):
@@ -325,11 +888,27 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in MP3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            if _is_benign_reset_state_coverage(content, match):
+        mp3_matches = (
+            _iter_state_adoption_matches(content)
+            if pattern == _MP3_STATE_ADOPTION_PATTERN
+            else static_runner.iter_paragraph_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            )
+        )
+        for match in mp3_matches:
+            if pattern == _MP3_STATE_ADOPTION_PATTERN and is_directly_prohibited(
+                content, match.start(), match.end(), allow_clause_prefix=True
+            ):
+                continue
+            if (
+                _is_benign_reset_state_coverage(content, match)
+                or _is_benign_hardware_reset_state(content, match)
+                or _is_benign_timestamp_context_description(content, match)
+            ):
                 continue
             line_num = get_line_number(content, match.start())
             context_text = ctx(match.start())
@@ -343,6 +922,40 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=context_text,
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
+                )
+            )
+    # MP3 write variant: score the write to agent memory, not the written text.
+    basename = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    if (
+        file_type in ("python", "typescript", "javascript")
+        and _AUTO_RUN_CARRIER_RE.fullmatch(basename) is not None
+    ):
+        for write_match, destination in _iter_memory_file_writes(content, file_type):
+            line_num = get_line_number(content, write_match.start())
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="MP3",
+                    message="Memory Manipulation",
+                    severity=Severity.HIGH,
+                    location=loc(line_num),
+                    confidence=0.85,
+                    tags=tag,
+                    context=ctx(write_match.start()),
+                    matched_text=write_match.group(0)[:200],
+                    complete_match=write_match.group(0),
+                    remediation=(
+                        "An auto-run file writes to an agent memory file "
+                        f"({destination}). Such writes persist across agent "
+                        "interactions without model involvement. Confirm the "
+                        "destination is intentional and the written content is "
+                        "trusted before installing this skill."
+                    ),
+                    evidence={
+                        "destination": destination,
+                        "carrier_basename": basename,
+                        "carrier_kind": "auto_run",
+                    },
                 )
             )
     return findings

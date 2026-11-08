@@ -20,24 +20,54 @@ as an explicit endpoint override (e.g. a local proxy); when unset, requests
 go to api.anthropic.com. Constructs ``langchain_anthropic.ChatAnthropic``
 directly. It defaults to Opus 4.6 for analyzers and Sonnet 4.6 for
 ``meta_analyzer`` (cheaper for the high-volume filter pass).
+
+Set ``ANTHROPIC_AUTH_SCHEME=bearer`` when the endpoint expects
+``Authorization: Bearer`` (common on corporate LLM gateways) instead of
+Anthropic's default ``x-api-key`` header. The token is read from
+``ANTHROPIC_API_KEY``; request bodies and URLs stay on the standard Messages
+API (unlike ``anthropic_proxy``, which targets Vertex raw-predict).
 """
 
 from __future__ import annotations
 
 import os
+from functools import cached_property
 from pathlib import Path
+from typing import Any
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import SecretStr
 
+from skillspector.inference_usage import (
+    register_chat_model_controls,
+    retained_chat_model_controls,
+)
 from skillspector.providers import registry
-from skillspector.providers.chat_models import resolve_reasoning_effort, resolve_sampling_parameters
+from skillspector.providers.chat_models import (
+    resolve_reasoning_effort,
+    resolve_sampling_parameters,
+)
+from skillspector.providers.structured_output import rejects_forced_tool_call
 
 # Default endpoint; overridden by ``ANTHROPIC_BASE_URL`` when set.
 ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
+
+
+def _use_bearer_auth() -> bool:
+    return os.environ.get("ANTHROPIC_AUTH_SCHEME", "").strip().lower() == "bearer"
+
+
+class _ChatAnthropicBearer(ChatAnthropic):
+    """Sends the credential as ``Authorization: Bearer`` instead of ``x-api-key``."""
+
+    @cached_property
+    def _client_params(self) -> dict[str, Any]:
+        params = super()._client_params
+        params["auth_token"] = params.pop("api_key")
+        return params
 
 
 class AnthropicProvider:
@@ -69,10 +99,11 @@ class AnthropicProvider:
             return None
 
         api_key, base_url = creds
+        endpoint = base_url or ANTHROPIC_BASE_URL
         kwargs = {
             "model_name": model,
             "api_key": SecretStr(api_key),
-            "base_url": base_url or ANTHROPIC_BASE_URL,
+            "base_url": endpoint,
             "max_tokens_to_sample": max_tokens,
             "timeout": timeout,
             "stop": None,
@@ -80,8 +111,26 @@ class AnthropicProvider:
         effort = resolve_reasoning_effort()
         if effort is not None:
             kwargs["effort"] = effort
-        kwargs.update(resolve_sampling_parameters())
-        return ChatAnthropic(**kwargs)
+        # The native Messages API accepts 1.0 for backwards compatibility;
+        # endpoint overrides may have different sampling rules.
+        sampling_parameters = resolve_sampling_parameters(
+            model, native_anthropic=endpoint.rstrip("/") == ANTHROPIC_BASE_URL
+        )
+        kwargs.update(sampling_parameters)
+        chat_model_cls = _ChatAnthropicBearer if _use_bearer_auth() else ChatAnthropic
+        chat_model = chat_model_cls(**kwargs)
+        register_chat_model_controls(
+            chat_model,
+            retained_chat_model_controls(
+                chat_model,
+                ("temperature", "reasoning_effort"),
+            ),
+            requested_controls={
+                "temperature": sampling_parameters.get("temperature"),
+                "reasoning_effort": effort,
+            },
+        )
+        return chat_model
 
     def get_context_length(self, model: str) -> int | None:
         return registry.lookup_context_length(REGISTRY_PATH, model)
@@ -93,3 +142,10 @@ class AnthropicProvider:
         """Resolve model: ``SKILLSPECTOR_MODEL`` env > slot default > ``DEFAULT_MODEL``."""
         user_input = os.environ.get("SKILLSPECTOR_MODEL", "").strip()
         return user_input or self.SLOT_DEFAULTS.get(slot, "") or self.DEFAULT_MODEL
+
+    def structured_output_method(self, model: str) -> str | None:
+        """``with_structured_output`` method for *model*: registry entry, then Claude name, else ``None``."""
+        declared = registry.lookup_structured_output_method(REGISTRY_PATH, model)
+        if declared:
+            return declared
+        return "json_schema" if rejects_forced_tool_call(model) else None

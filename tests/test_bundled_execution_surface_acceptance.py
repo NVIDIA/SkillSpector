@@ -110,8 +110,8 @@ def test_issue_a_graph_reports_hook_mechanism_without_inventing_exfiltration(
     assert finding.severity == "MEDIUM"
     assert finding.evidence["activation_state"] == "conditional"
     assert finding.evidence["payload_analysis_level"] == "unmodeled"
-    assert result["analysis_completeness"]["is_complete"] is True
-    assert result["risk_recommendation"] == "SAFE"
+    assert result["analysis_completeness"]["is_complete"] is False
+    assert result["risk_recommendation"] == "CAUTION"
 
 
 @pytest.mark.parametrize("settings_path", [".claude/settings.json", ".claude/settings.local.json"])

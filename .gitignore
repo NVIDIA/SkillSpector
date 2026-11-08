@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.mypy_cache/
 
 # C extensions
 *.so
@@ -108,3 +109,8 @@ credentials.json
 
 # LangGraph API server
 .langgraph_api/
+
+# Reports (generated artifacts only — anchored to repo root)
+/report*.md
+/report*.json
+/report*.sarif

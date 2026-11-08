@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import Batch, BatchExecutionResult, BatchFailure
 from skillspector.models import Finding
@@ -31,6 +33,7 @@ from skillspector.nodes.analyzers import static_patterns_anti_refusal
 from skillspector.nodes.analyzers.static_runner import analyzer_finding_to_finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
+    MetaAnalyzerResult,
     _meta_ledger_response,
     meta_analyzer,
 )
@@ -201,6 +204,9 @@ def test_finding_clones_preserve_security_metadata_and_confidence() -> None:
         confidence=0.9,
         file="requirements.txt",
         start_line=4,
+        end_line=4,
+        start_column=7,
+        end_column=19,
         intent="malicious",
         evidence={"source": "static", "nested": {"kind": "deterministic"}},
         match_fingerprint="sha256:deterministic",
@@ -216,9 +222,11 @@ def test_finding_clones_preserve_security_metadata_and_confidence() -> None:
         [returned] = _analyzer().apply_filter([original], [(batch, items)])
         assert returned.confidence == original.confidence
         assert returned.intent == original.intent
-        assert returned.evidence == original.evidence
+        assert returned.evidence.items() >= original.evidence.items()
+        assert returned.evidence["llm_review_outcome"] in {"confirmed", "disagreed"}
         assert returned.match_fingerprint == original.match_fingerprint
         assert returned.occurrences == original.occurrences
+        assert (returned.start_column, returned.end_column) == (7, 19)
 
 
 def test_exact_end_line_match_still_works() -> None:
@@ -232,6 +240,150 @@ def test_exact_end_line_match_still_works() -> None:
 
     assert len(kept) == 1
     assert kept[0].rule_id == "AST1"
+
+
+def test_same_rule_and_line_bind_assessments_by_finding_id() -> None:
+    """A response is bound to the exact finding it names, not a shared location."""
+    first = Finding(
+        rule_id="SC4", message="first", finding_id="first", file="requirements.txt", start_line=4
+    )
+    second = Finding(
+        rule_id="SC4", message="second", finding_id="second", file="requirements.txt", start_line=4
+    )
+    batch = Batch(file_path="requirements.txt", content="", findings=[first, second])
+    items = [
+        _llm_item("SC4", 4, finding_id="first", explanation="first assessment"),
+        _llm_item("SC4", 4, finding_id="second", explanation="second assessment"),
+    ]
+
+    returned = _analyzer().apply_filter([first, second], [(batch, items)])
+    by_id = {finding.finding_id: finding for finding in returned}
+
+    assert by_id["first"].message == "first assessment"
+    assert by_id["second"].message == "second assessment"
+
+
+def test_swapped_ids_fall_back_to_location_matching() -> None:
+    """A mismatched id must not move one rule's assessment onto another rule."""
+    sc4 = Finding(
+        rule_id="SC4", message="sc4 static", finding_id="sc4", file="requirements.txt", start_line=4
+    )
+    ast1 = Finding(
+        rule_id="AST1",
+        message="ast1 static",
+        finding_id="ast1",
+        file="requirements.txt",
+        start_line=9,
+    )
+    batch = Batch(file_path="requirements.txt", content="", findings=[sc4, ast1])
+    items = [
+        _llm_item("AST1", 9, finding_id="sc4", explanation="ast1 assessment"),
+        _llm_item("SC4", 4, finding_id="ast1", explanation="sc4 assessment"),
+    ]
+
+    returned = _analyzer().apply_filter([sc4, ast1], [(batch, items)])
+    by_id = {finding.finding_id: finding for finding in returned}
+
+    assert by_id["sc4"].message == "sc4 assessment"
+    assert by_id["ast1"].message == "ast1 assessment"
+
+
+def test_unknown_id_with_correct_location_still_binds() -> None:
+    """A mistyped id should not turn a matching assessment into missing."""
+    finding = _finding("SC4", 4)
+    batch = Batch(file_path="requirements.txt", content="", findings=[finding])
+    items = [
+        _llm_item(
+            "SC4",
+            4,
+            finding_id="one-hex-digit-wrong",
+            explanation="location-bound assessment",
+        )
+    ]
+
+    returned = _analyzer().apply_filter([finding], [(batch, items)])
+
+    assert returned[0].message == "location-bound assessment"
+    assert returned[0].evidence["llm_review_outcome"] == "confirmed"
+
+
+def test_id_from_another_batch_is_rejected_and_location_is_used() -> None:
+    """An id outside the submitted batch cannot select a finding."""
+    finding = Finding(
+        rule_id="SC4", message="static", finding_id="current", file="requirements.txt", start_line=4
+    )
+    other = Finding(
+        rule_id="SC4", message="other", finding_id="other", file="requirements.txt", start_line=9
+    )
+    batch = Batch(file_path="requirements.txt", content="", findings=[finding])
+    other_batch = Batch(file_path="requirements.txt", content="", findings=[other])
+    items = [
+        _llm_item(
+            "SC4",
+            4,
+            finding_id=other.finding_id,
+            explanation="location-bound assessment",
+        )
+    ]
+
+    returned = _analyzer().apply_filter([finding], [(batch, items)])
+
+    assert returned[0].message == "location-bound assessment"
+    assert returned[0].evidence["llm_review_outcome"] == "confirmed"
+    assert other_batch.findings[0].finding_id == "other"
+
+
+def test_overlapping_chunk_assessments_prefer_confirmed() -> None:
+    """A later, less favorable chunk must not erase an earlier confirmation."""
+    finding = Finding(
+        rule_id="R1", message="static", finding_id="finding", file="a.py", start_line=10
+    )
+    first_batch = Batch(file_path="a.py", content="first", findings=[finding])
+    later_batch = Batch(file_path="a.py", content="later", findings=[finding])
+    confirmed = _llm_item(
+        "R1",
+        10,
+        is_vulnerability=True,
+        confidence=0.9,
+        explanation="confirmed assessment",
+        _file="a.py",
+    )
+    disagreed = _llm_item(
+        "R1",
+        10,
+        is_vulnerability=False,
+        confidence=0.1,
+        explanation="disagreed assessment",
+        _file="a.py",
+    )
+
+    returned = _analyzer().apply_filter(
+        [finding],
+        [(first_batch, [confirmed]), (later_batch, [disagreed])],
+    )
+
+    assert returned[0].message == "confirmed assessment"
+    assert returned[0].evidence["llm_review_outcome"] == "confirmed"
+
+
+def test_review_evidence_does_not_copy_model_reasoning() -> None:
+    """Model explanation and remediation must not be rendered as finding evidence."""
+    finding = _finding("SC4", 4)
+    batch = Batch(file_path="requirements.txt", content="", findings=[finding])
+    item = _llm_item(
+        "SC4",
+        4,
+        confidence=0.7,
+        explanation="model reasoning",
+        remediation="model remediation",
+    )
+
+    returned = _analyzer().apply_filter([finding], [(batch, [item])])
+
+    assert returned[0].evidence["llm_review_outcome"] == "confirmed"
+    assert returned[0].evidence["llm_review_confidence"] == 0.7
+    assert "llm_review_explanation" not in returned[0].evidence
+    assert "llm_review_remediation" not in returned[0].evidence
 
 
 def _confirm(pattern_id: str, file: str, start_line: int) -> dict[str, object]:
@@ -328,7 +480,10 @@ class TestMetaLedgerResponse:
 
         assert events[0]["outcome"] is LedgerOutcome.FAILED
         assert events[0]["reason_code"] == LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-        assert events[0]["message"] == "LLM connection failed after bounded retries."
+        assert (
+            events[0]["message"]
+            == "Transient LLM provider failure persisted after bounded retries."
+        )
         assert status["status"] == "failed"
 
         completeness, _ = finalize_ledger(
@@ -514,6 +669,42 @@ class TestMetaAnalyzerPartialBatchFailure:
         confirmed = next(f for f in filtered if f.file == "a.py")
         assert confirmed.explanation == "confirmed by llm"
 
+    def test_review_outcomes_distinguish_disagreement_missing_and_failed(self) -> None:
+        disagreed = _lineage_finding("disagreed", "a.py", 1)
+        omitted = _lineage_finding("omitted", "a.py", 5)
+        failed = _lineage_finding("failed", "b.py", 3)
+        batch_a = Batch(file_path="a.py", content="code a", findings=[disagreed, omitted])
+        batch_b = Batch(file_path="b.py", content="code b", findings=[failed])
+        response = [
+            {
+                "finding_id": "disagreed",
+                "pattern_id": "DISAGREED",
+                "start_line": 1,
+                "is_vulnerability": False,
+                "_file": "a.py",
+            }
+        ]
+
+        with (
+            patch.object(LLMMetaAnalyzer, "get_batches", return_value=[batch_a, batch_b]),
+            patch.object(
+                LLMMetaAnalyzer,
+                "arun_batches",
+                new_callable=AsyncMock,
+                return_value=[(batch_a, response)],
+            ),
+        ):
+            result = meta_analyzer(self._state([disagreed, omitted, failed]))
+
+        by_id = {finding.finding_id: finding for finding in result["findings"]}
+        assert by_id["disagreed"].evidence["llm_review_outcome"] == "disagreed"
+        assert by_id["omitted"].evidence["llm_review_outcome"] == "missing"
+        assert by_id["failed"].evidence["llm_review_outcome"] == "failed"
+        assert "llm-unconfirmed" in by_id["disagreed"].tags
+        assert "llm-unconfirmed" in by_id["omitted"].tags
+        assert "llm-unconfirmed" not in by_id["failed"].tags
+        assert result["meta_review_required"] is True
+
     def test_selection_does_not_persist_filtered_findings(self) -> None:
         finding = _lineage_finding("retained", "a.py", 1)
         state = self._state([finding])
@@ -631,6 +822,28 @@ class TestMetaAnalyzerPartialBatchFailure:
 
         assert arun_batches.await_args.args[0] == [finding_batch]
         assert result["effective_finding_ids"] == [finding.finding_id]
+
+    def test_node_sizes_batches_with_the_metadata_it_sends(self) -> None:
+        """get_batches must see the same metadata_text the prompts are built with."""
+        finding = Finding(rule_id="R1", message="m", file="a.py", start_line=1)
+        batch = Batch(file_path="a.py", content="code a", findings=[finding])
+        state = self._state([finding])
+        state["manifest"] = {"name": "demo", "description": "d" * 500}
+
+        with (
+            patch.object(LLMMetaAnalyzer, "get_batches", return_value=[batch]) as get_batches,
+            patch.object(
+                LLMMetaAnalyzer,
+                "arun_batches",
+                new_callable=AsyncMock,
+                return_value=[(batch, [_confirm("R1", "a.py", 1)])],
+            ) as arun_batches,
+        ):
+            meta_analyzer(state)
+
+        sized_with = get_batches.call_args.kwargs["metadata_text"]
+        assert sized_with
+        assert sized_with == arun_batches.await_args.kwargs["metadata_text"]
 
     def test_no_failures_still_preserve_deterministic_findings(self) -> None:
         """Even complete LLM coverage cannot suppress deterministic findings."""
@@ -904,7 +1117,145 @@ def test_use_llm_false_records_nothing() -> None:
     assert "filtered_findings" not in result
 
 
+@pytest.mark.parametrize("value", ["invalid JSON", "", "{not json", "null", "42", '"wrong type"'])
+def test_invalid_stringified_meta_findings_fail_validation(value) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        MetaAnalyzerResult.model_validate({"findings": value})
+
+
+def test_valid_stringified_meta_fields_are_supported() -> None:
+    result = MetaAnalyzerResult.model_validate(
+        {
+            "findings": "[]",
+            "overall_assessment": '{"risk_level": "LOW", "summary": "No issues found"}',
+        }
+    )
+    assert result.findings == []
+    assert result.overall_assessment.summary == "No issues found"
+
+
 def test_no_findings_records_nothing() -> None:
     result = meta_analyzer(_degr_state(findings=[]))
     assert "llm_call_log" not in result
     assert "filtered_findings" not in result
+
+
+@pytest.mark.parametrize("assessment", ["HIGH risk: exfiltrates credentials", "LOW", ""])
+def test_optional_prose_assessment_keeps_finding_verdict(assessment):
+    verdict = {
+        "pattern_id": "P1",
+        "is_vulnerability": True,
+        "confidence": 0.9,
+        "intent": "malicious",
+        "impact": "high",
+        "explanation": "Unsafe instruction",
+        "remediation": "Remove instruction",
+    }
+    result = MetaAnalyzerResult.model_validate(
+        {"findings": [verdict], "overall_assessment": assessment}
+    )
+    assert len(result.findings) == 1
+    assert result.findings[0].pattern_id == "P1"
+    assert result.findings[0].is_vulnerability is True
+    assert result.overall_assessment is None
+
+
+def test_meta_recovery_copies_exact_finding_identities():
+    original = _finding("E2", 12, 14)
+    batch = Batch(file_path=original.file, content="source", findings=[original])
+
+    identities = _analyzer()._recovery_known_items(batch)
+
+    assert identities == [
+        {
+            "finding_id": original.finding_id,
+            "pattern_id": "E2",
+            "start_line": 12,
+            "end_line": 14,
+        }
+    ]
+    identities[0]["pattern_id"] = "different"
+    assert original.rule_id == "E2"
+    assert _analyzer()._recovery_known_items(batch)[0]["pattern_id"] == "E2"
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+@pytest.mark.parametrize("assessment", ["missing", "valid", "unknown_id", "wrong_rule"])
+@pytest.mark.parametrize(
+    "reason,expected_outcome,call_ok",
+    [
+        (LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED, LedgerOutcome.PARTIAL, True),
+        (LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED, LedgerOutcome.FAILED, False),
+        (LedgerReason.RUNTIME_LIMIT, LedgerOutcome.PARTIAL, False),
+    ],
+)
+def test_meta_partial_recovery_preserves_originals_and_terminal_cause(
+    assessment, reason, expected_outcome, call_ok
+):
+    first = Finding(
+        rule_id="E2", message="original high", severity="HIGH", file="a.py", start_line=1
+    )
+    second = Finding(
+        rule_id="P1", message="original low", severity="LOW", file="a.py", start_line=2
+    )
+    batch = Batch(file_path="a.py", content="first\nsecond", findings=[first, second])
+    state = {
+        "findings": [first, second],
+        "use_llm": True,
+        "file_cache": {"a.py": batch.content},
+        "manifest": {},
+        "model_config": {},
+    }
+
+    async def recover(self, batches, **_kwargs):
+        returned_batch = Batch(file_path="a.py", content=batch.content, findings=[first, second])
+        response = MetaAnalyzerResult.model_validate(
+            {
+                "findings": [
+                    {
+                        "finding_id": "unknown" if assessment == "unknown_id" else first.finding_id,
+                        "pattern_id": "different" if assessment == "wrong_rule" else first.rule_id,
+                        "start_line": first.start_line,
+                        "end_line": first.end_line,
+                        "is_vulnerability": True,
+                        "confidence": 0.95,
+                        "intent": "malicious",
+                        "impact": "high",
+                        "explanation": "Recovered confirmed issue",
+                    }
+                ]
+                if assessment != "missing"
+                else [],
+            }
+        )
+        terminal = BatchFailure(batch, "RecoveryStopped", reason)
+        self._last_batch_outcome = BatchExecutionResult(
+            recovered=[(returned_batch, self.parse_response(response, returned_batch))],
+            warnings=[terminal] if call_ok else [],
+            failures=[] if call_ok else [terminal],
+        )
+        return []
+
+    with (
+        patch.object(LLMMetaAnalyzer, "get_batches", return_value=[batch]),
+        patch.object(LLMMetaAnalyzer, "arun_batches", recover),
+    ):
+        result = meta_analyzer(state)
+
+    assert [item.finding_id for item in result["findings"]] == [first.finding_id, second.finding_id]
+    assert [item.severity for item in result["findings"]] == ["HIGH", "LOW"]
+    if assessment == "valid":
+        assert result["findings"][0].explanation == "Recovered confirmed issue"
+        assert result["findings"][0].evidence["llm_review_outcome"] == "confirmed"
+    else:
+        assert result["findings"][0].evidence["llm_review_outcome"] == "failed"
+    assert result["findings"][1].evidence["llm_review_outcome"] == "failed"
+    assert all("llm-unconfirmed" not in item.tags for item in result["findings"])
+    (event,) = result["inspection_ledger"]
+    assert event["outcome"] is expected_outcome
+    assert event["reason_code"] is reason
+    assert event["input_finding_ids"] == [first.finding_id, second.finding_id]
+    assert event["emitted_finding_ids"] == [first.finding_id, second.finding_id]
+    assert result["llm_call_log"][0]["ok"] is call_ok

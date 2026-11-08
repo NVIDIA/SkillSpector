@@ -192,7 +192,9 @@ def test_arbitrary_llm_outcomes_cannot_weaken_deterministic_findings(
         assert returned.rule_id == original.rule_id
         assert returned.severity == original.severity
         assert returned.confidence >= original.confidence
-        assert returned.evidence == original.evidence
+        # The meta-analyzer may annotate evidence (e.g. llm_review_outcome), but it must
+        # never drop or rewrite the deterministic evidence it was given.
+        assert original.evidence.items() <= returned.evidence.items()
 
 
 def test_reference_model_detects_the_historical_equal_severity_order_bug() -> None:

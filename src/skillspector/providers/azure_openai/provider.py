@@ -33,11 +33,18 @@ import os
 from pathlib import Path
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_openai import AzureChatOpenAI
 from pydantic import SecretStr
 
+from skillspector.inference_usage import (
+    register_chat_model_controls,
+    retained_chat_model_controls,
+)
 from skillspector.providers import registry
-from skillspector.providers.chat_models import resolve_sampling_parameters
+from skillspector.providers.chat_models import (
+    AzureChatOpenAI,
+    prepare_openai_chat_model_imports,
+    resolve_sampling_parameters,
+)
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -47,6 +54,10 @@ class AzureOpenAIProvider:
 
     DEFAULT_MODEL = "gpt-4o"
     SLOT_DEFAULTS: dict[str, str] = {}
+
+    def prepare_chat_model_imports(self) -> None:
+        """Prepare the OpenAI transport without resolving or creating a client."""
+        prepare_openai_chat_model_imports()
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
         """Return ``(api_key, endpoint)`` from Azure OpenAI env vars."""
@@ -80,8 +91,18 @@ class AzureOpenAIProvider:
             "max_tokens": max_tokens,
             "timeout": timeout,
         }
-        kwargs.update(resolve_sampling_parameters(include_seed=True))
-        return AzureChatOpenAI(**kwargs)
+        sampling_parameters = resolve_sampling_parameters(model, include_seed=True)
+        kwargs.update(sampling_parameters)
+        chat_model = AzureChatOpenAI(**kwargs)
+        register_chat_model_controls(
+            chat_model,
+            retained_chat_model_controls(chat_model, ("temperature", "seed")),
+            requested_controls={
+                "temperature": sampling_parameters.get("temperature"),
+                "seed": sampling_parameters.get("seed"),
+            },
+        )
+        return chat_model
 
     def get_context_length(self, model: str) -> int | None:
         return registry.lookup_context_length(REGISTRY_PATH, model)

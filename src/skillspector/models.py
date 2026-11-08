@@ -21,11 +21,13 @@ import json
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from enum import StrEnum
 from hashlib import sha256
 from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
+
+from skillspector.surface import infer_surface
 
 if TYPE_CHECKING:
     from skillspector.state import SkillspectorState
@@ -40,6 +42,12 @@ class Severity(StrEnum):
     CRITICAL = "CRITICAL"
 
 
+def compute_match_fingerprint(rule_id: str, matched_text: str) -> str:
+    """Return the canonical SHA-256 identity for one rule-bound match."""
+    normalized = " ".join(matched_text.strip().split())
+    return sha256(f"{rule_id}\x1f{normalized}".encode()).hexdigest()
+
+
 @dataclass
 class Location:
     """Location of a finding within a file (used by all analyzers)."""
@@ -47,6 +55,10 @@ class Location:
     file: str
     start_line: int
     end_line: int | None = None
+    # Columns are zero-based; end_column is exclusive. They remain optional so
+    # producers that only know line-level locations keep their existing shape.
+    start_column: int | None = None
+    end_column: int | None = None
 
 
 _analyzer_finding_observer: ContextVar[Callable[[AnalyzerFinding], None] | None] = ContextVar(
@@ -72,8 +84,12 @@ class AnalyzerFinding:
     context: str | None = None
     matched_text: str | None = None
     evidence: dict[str, object] = field(default_factory=dict)
+    # Canonical rule+match digest; source binding is derived by ``Finding.fingerprint``.
+    match_fingerprint: str | None = None
+    complete_match: InitVar[str | None] = None
+    explanation: str | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, complete_match: str | None) -> None:
         """Notify an optional runner-owned resource guard after construction.
 
         Static analyzers are trusted code, but the number of findings they
@@ -82,6 +98,8 @@ class AnalyzerFinding:
         private result list instead of waiting for that list to become large.
         Other analyzer families pay no cost beyond this single context lookup.
         """
+        if complete_match is not None:
+            self.match_fingerprint = compute_match_fingerprint(self.rule_id, complete_match)
         observer = _analyzer_finding_observer.get()
         if observer is not None:
             observer(self)
@@ -99,9 +117,49 @@ def observe_analyzer_findings(
         _analyzer_finding_observer.reset(token)
 
 
+@contextmanager
+def map_analyzer_findings(mapper: Callable[[AnalyzerFinding], None]) -> Iterator[None]:
+    """Map derived findings before an enclosing resource guard observes them."""
+    parent = _analyzer_finding_observer.get()
+
+    def observe(finding: AnalyzerFinding) -> None:
+        mapper(finding)
+        if parent is not None:
+            parent(finding)
+
+    with observe_analyzer_findings(observe):
+        yield
+
+
+_finding_id_factory: ContextVar[Callable[[], str] | None] = ContextVar(
+    "skillspector_finding_id_factory", default=None
+)
+
+
+@contextmanager
+def use_finding_id_factory(factory: Callable[[], str]) -> Iterator[None]:
+    """Select a task-local identity source without changing ordinary scans."""
+    token = _finding_id_factory.set(factory)
+    try:
+        yield
+    finally:
+        _finding_id_factory.reset(token)
+
+
 def _new_finding_id() -> str:
     """Return an opaque, run-unique identity for one logical finding."""
+    factory = _finding_id_factory.get()
+    if factory is not None:
+        return factory()
     return f"finding-{uuid4().hex}"
+
+
+OCCURRENCE_FINDING_ID_KEY = "_skillspector_report_finding_id"
+OCCURRENCE_CODE_SNIPPET_KEY = "_skillspector_report_code_snippet"
+OCCURRENCE_FINDING_TEXT_KEY = "_skillspector_report_finding_text"
+_PRIVATE_OCCURRENCE_KEYS = frozenset(
+    {OCCURRENCE_FINDING_ID_KEY, OCCURRENCE_CODE_SNIPPET_KEY, OCCURRENCE_FINDING_TEXT_KEY}
+)
 
 
 @dataclass
@@ -116,6 +174,8 @@ class Finding:
     file: str = "SKILL.md"
     start_line: int = 1
     end_line: int | None = None
+    start_column: int | None = None
+    end_column: int | None = None
     category: str | None = None
     pattern: str | None = None
     finding: str | None = None  # short matched snippet
@@ -135,8 +195,14 @@ class Finding:
     source_identity: str | None = None
     source_digest: str | None = None
     evidence: dict[str, object] = field(default_factory=dict)
+    # Canonical unbound rule+match digest. Never replace it with a source-bound digest.
     match_fingerprint: str | None = None
     occurrences: list[dict[str, object]] = field(default_factory=list)
+    # Reporting-only label for the file surface this finding landed on (see
+    # ``skillspector.surface``). It is advisory metadata: it never changes
+    # severity, confidence, scoring, or the finding count. ``None`` means
+    # "derive from ``file`` at serialization time".
+    surface: str | None = None
 
     def fingerprint(self) -> str | None:
         """Return a full-match fingerprint without exposing the matched payload."""
@@ -173,7 +239,11 @@ class Finding:
             else " ".join((self.matched_text or "").strip().split())
         )
         if not has_source_provenance:
-            return sha256(f"{self.rule_id}\x1f{normalized}".encode()).hexdigest()
+            return (
+                self.match_fingerprint
+                if self.match_fingerprint
+                else compute_match_fingerprint(self.rule_id, normalized)
+            )
         payload = {
             "rule_id": self.rule_id,
             "match": normalized,
@@ -189,11 +259,15 @@ class Finding:
                 "file": self.file,
                 "start_line": self.start_line,
                 "end_line": self.end_line,
+                **({"start_column": self.start_column} if self.start_column is not None else {}),
+                **({"end_column": self.end_column} if self.end_column is not None else {}),
             }
         ]
         serialized: list[dict[str, object]] = []
         for raw in occurrences:
-            occurrence = dict(raw)
+            occurrence = {
+                key: value for key, value in raw.items() if key not in _PRIVATE_OCCURRENCE_KEYS
+            }
             if self.source_identity:
                 occurrence.setdefault("source_identity", self.source_identity)
             if self.source_digest:
@@ -218,6 +292,8 @@ class Finding:
                 "file": self.file,
                 "start_line": self.start_line,
                 "end_line": self.end_line,
+                **({"start_column": self.start_column} if self.start_column is not None else {}),
+                **({"end_column": self.end_column} if self.end_column is not None else {}),
             },
             "finding": self.finding,
             "explanation": self.explanation or self.message,
@@ -230,6 +306,9 @@ class Finding:
             "evidence": dict(self.evidence),
             "match_fingerprint": self.fingerprint(),
             "occurrences": self._serialized_occurrences(),
+            # Exposed, never filtered on: consumers decide what a surface is
+            # worth, so the scanner does not hide a finding on their behalf.
+            "surface": self.surface or infer_surface(self.file),
         }
         if self.transitive_depth:
             data["transitive_depth"] = self.transitive_depth

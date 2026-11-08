@@ -32,6 +32,7 @@ from skillspector.nodes.analyzers.osv_client import (
     _estimate_cvss_severity,
     _severity_from_vuln,
     clear_cache,
+    is_available,
     query_batch,
     was_osv_reachable,
 )
@@ -120,6 +121,20 @@ class TestSeverityFromVuln:
     def test_no_severity_defaults_high(self) -> None:
         assert _severity_from_vuln({}) == "HIGH"
 
+    def test_ghsa_moderate_normalizes_to_medium(self) -> None:
+        # GHSA's own four levels are LOW/MODERATE/HIGH/CRITICAL, not
+        # LOW/MEDIUM/HIGH/CRITICAL — confirmed live against api.osv.dev
+        # (e.g. GHSA-29mw-wpgm-hmr9, a real lodash prototype-pollution
+        # advisory, reports `"database_specific": {"severity": "MODERATE"}`).
+        # Every downstream table keys on the app's own vocabulary, so this
+        # must normalize here rather than leak the external spelling.
+        vuln = {"database_specific": {"severity": "MODERATE"}}
+        assert _severity_from_vuln(vuln) == "MEDIUM"
+
+    def test_ecosystem_specific_moderate_normalizes_to_medium(self) -> None:
+        vuln = {"affected": [{"ecosystem_specific": {"severity": "moderate"}}]}
+        assert _severity_from_vuln(vuln) == "MEDIUM"
+
 
 class TestQueryBatch:
     def test_empty_packages_returns_empty(self) -> None:
@@ -170,6 +185,43 @@ class TestQueryBatch:
         assert "CVE-2024-22195" in results[0][0].aliases
         assert len(results[1]) == 0
 
+    def test_batch_query_ghsa_moderate_normalizes_to_medium(self) -> None:
+        # Real OSV.dev record for lodash 4.17.15 (GHSA-29mw-wpgm-hmr9, a
+        # prototype-pollution advisory): `database_specific.severity` is the
+        # literal string "MODERATE", GHSA's own term, not "MEDIUM".
+        mock_batch_response = {
+            "results": [{"vulns": [{"id": "GHSA-29mw", "modified": "2024-01-01T00:00:00Z"}]}]
+        }
+        mock_detail_response = {
+            "id": "GHSA-29mw",
+            "summary": "Prototype pollution in lodash",
+            "database_specific": {"severity": "MODERATE"},
+            "aliases": ["CVE-2020-8203"],
+        }
+
+        mock_client = MagicMock()
+        mock_post_resp = MagicMock()
+        mock_post_resp.json.return_value = mock_batch_response
+        mock_post_resp.raise_for_status = MagicMock()
+
+        mock_get_resp = MagicMock()
+        mock_get_resp.json.return_value = mock_detail_response
+        mock_get_resp.raise_for_status = MagicMock()
+
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = mock_post_resp
+        mock_client.get.return_value = mock_get_resp
+
+        with patch(
+            "skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=mock_client
+        ):
+            results = query_batch([("lodash", "4.17.15")], ECOSYSTEM_NPM)
+
+        assert len(results) == 1
+        assert len(results[0]) == 1
+        assert results[0][0].severity == "MEDIUM"
+
     def test_network_failure_returns_empty(self) -> None:
         mock_client = MagicMock()
         mock_client.__enter__ = MagicMock(return_value=mock_client)
@@ -185,6 +237,46 @@ class TestQueryBatch:
         assert any(
             item.reason is LedgerReason.ANALYZER_RUNTIME_ERROR for item in results.limitations
         )
+
+    def test_bracketed_no_proxy_client_failure_returns_empty(self) -> None:
+        # httpx.InvalidURL is a bare Exception subclass, not an HTTPError or
+        # ValueError, so a bracketed IPv6 entry in no_proxy (e.g. "[::1]")
+        # used to escape query_batch() and fail the whole analyzer instead
+        # of falling back to static data (NVIDIA/SkillSpector#966).
+        with patch(
+            "skillspector.nodes.analyzers.osv_client.httpx.Client",
+            side_effect=httpx.InvalidURL("Invalid port: ':1]'"),
+        ):
+            results = query_batch([("requests", "2.31.0")], ECOSYSTEM_PYPI)
+
+        assert results == [[]]
+        assert any(
+            item.reason is LedgerReason.ANALYZER_RUNTIME_ERROR and item.error_class == "InvalidURL"
+            for item in results.limitations
+        )
+        assert was_osv_reachable() is False
+
+    def test_bracketed_no_proxy_env_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Same failure through real httpx environment parsing, no mocks.
+        monkeypatch.setenv("no_proxy", "[::1]")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("http_proxy", raising=False)
+        monkeypatch.delenv("https_proxy", raising=False)
+        monkeypatch.delenv("HTTP_PROXY", raising=False)
+        monkeypatch.delenv("HTTPS_PROXY", raising=False)
+
+        results = query_batch([("requests", "2.31.0")], ECOSYSTEM_PYPI)
+
+        assert results == [[]]
+        assert was_osv_reachable() is False
+
+    def test_bracketed_no_proxy_env_is_available_returns_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("no_proxy", "[::1]")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+
+        assert is_available() is False
 
     def test_timeout_returns_empty(self) -> None:
         mock_client = MagicMock()

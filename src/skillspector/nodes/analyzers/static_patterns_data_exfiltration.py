@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import re
 import sys
+from collections.abc import Iterator
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
@@ -28,6 +29,8 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
 from .common import (
+    MARKDOWN_FENCE_CLOSE,
+    MARKDOWN_FENCE_OPEN,
     apply_import_aliases,
     get_context,
     get_context_from_lines,
@@ -36,26 +39,37 @@ from .common import (
     resolve_dotted_name,
 )
 from .pattern_defaults import PatternCategory
+from .static_patterns_tool_misuse import _bounded_shell_tokens
 
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_data_exfiltration"
 USES_PYTHON_AST = True
 
-E1_PATTERNS = [
+_E1_CURL_UPLOAD_PATTERN = (r"curl\s+[^|]*(?:-d|--data|--data-raw|--data-binary)\s+", 0.6)
+_E1_WGET_UPLOAD_PATTERN = (r"wget\s+[^|]*--post-(?:data|file)", 0.6)
+_E1_SHELL_PATTERNS = frozenset({_E1_CURL_UPLOAD_PATTERN, _E1_WGET_UPLOAD_PATTERN})
+
+E1_CODE_PATTERNS = [
     (r"requests\s*\.\s*(?:post|put)\s*\(\s*['\"]https?://", 0.6),
     (r"requests\s*\.\s*(?:post|put)\s*\([^)]*json\s*=", 0.7),
     (r"httpx\s*\.\s*(?:post|put)\s*\(\s*['\"]https?://", 0.6),
     (r"urllib\s*\.\s*request\s*\.\s*urlopen\s*\([^)]*data\s*=", 0.6),
     (r"fetch\s*\(\s*['\"]https?://[^'\"]+['\"][^)]*method\s*:\s*['\"]POST['\"]", 0.6),
-    (r"curl\s+[^|]*(?:-d|--data|--data-raw|--data-binary)\s+", 0.6),
-    (r"wget\s+[^|]*--post-(?:data|file)", 0.6),
+    _E1_CURL_UPLOAD_PATTERN,
+    _E1_WGET_UPLOAD_PATTERN,
     (r"https?://(?:api\.|data\.|collect\.|telemetry\.|analytics\.)[\w.-]+/", 0.5),
+]
+E1_PROSE_PATTERNS = [
     (
         r"(?:send|transmit|post|upload)\s+(?:user\s+)?(?:data|information|context|files?)\s+to\s+(?:https?://|external)",
         0.7,
     ),
 ]
+E1_PATTERNS = E1_CODE_PATTERNS + E1_PROSE_PATTERNS
+_E1_FETCH_COMMAND = re.compile(r"(?:curl|wget)(?=\s)", re.IGNORECASE)
+_E1_UNPROVED_SHELL_SPACE = re.compile(r"(?!\r\n)[^\S \t\n]")
+_E1_UNPROVED_SHELL_SYNTAX = re.compile(r"(?<!\S)--%(?=\s|$)|[{}]|<#")
 E2_PYTHON_FALLBACK_PATTERNS = [
     # Python: for k, v in os.environ.items() — whitespace-tolerant
     (r"for\s+\w+\s*,\s*\w+\s+in\s+os\s*\.\s*environ\s*\.\s*items\s*\(\s*\)", 0.7),
@@ -67,15 +81,18 @@ E2_PYTHON_FALLBACK_PATTERNS = [
     # Require braces so bare ``2 ** os.environ`` (exponentiation) is not flagged.
     (r"\{\s*\*\*\s*os\s*\.\s*environ\s*\}", 0.6),
 ]
-E2_OTHER_PATTERNS = [
+E2_OTHER_CODE_PATTERNS = [
     (r"(?:API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)\s+in\s+(?:key|name|var)", 0.8),
     (r"process\.env\s*\[\s*['\"][^'\"]*(?:KEY|SECRET|TOKEN|PASSWORD)[^'\"]*['\"]\s*\]", 0.7),
     (r"Object\.keys\s*\(\s*process\.env\s*\)", 0.6),
     (r"env\s*\|\s*grep\s+(?:-i\s+)?(?:key|secret|token|password)", 0.8),
     (r"printenv\s+(?:\w*(?:KEY|SECRET|TOKEN|PASSWORD)\w*)", 0.7),
+]
+E2_PROSE_PATTERNS = [
     (r"collect\s+(?:all\s+)?(?:environment\s+variables?|env\s+vars?)", 0.7),
     (r"(?:extract|harvest|gather)\s+(?:api\s+)?keys?\s+from\s+environment", 0.8),
 ]
+E2_OTHER_PATTERNS = E2_OTHER_CODE_PATTERNS + E2_PROSE_PATTERNS
 E2_PATTERNS = E2_PYTHON_FALLBACK_PATTERNS + E2_OTHER_PATTERNS
 
 _ENVIRONMENT_MAPPING_METHOD_CONFIDENCE = {
@@ -86,22 +103,25 @@ _ENVIRONMENT_MAPPING_METHOD_CONFIDENCE = {
 }
 _ENVIRONMENT_COLLECTION_CALLS = frozenset({"dict", "list", "tuple", "set", "frozenset"})
 _ENVIRONMENT_COPY_CALLS = frozenset({"copy.copy", "copy.deepcopy"})
-E3_PATTERNS = [
+E3_CODE_PATTERNS = [
     (r"glob\s*\.\s*glob\s*\([^)]*(?:\.env|\.ssh|\.aws|\.config|credentials)", 0.8),
     (r"os\s*\.\s*walk\s*\([^)]*(?:home|~|/Users|/home)", 0.6),
     (r"Path\s*\.\s*home\s*\(\s*\)\s*\.\s*(?:glob|rglob)\s*\(", 0.7),
+    (r"os\s*\.\s*listdir\s*\([^)]*(?:\.ssh|\.aws|\.config|\.gnupg)", 0.8),
+    (r"scandir\s*\([^)]*(?:home|~|/Users|/home)", 0.6),
+    (r"find\s+[~\$/]\S*\s+.*?-name\s+['\"]?\*(?:\.env|\.pem|\.key|credential)", 0.8),
+    (r"ls\s+-[la]*R?\s+(?:~/|/home/|/Users/)", 0.6),
+]
+E3_PROSE_PATTERNS = [
     (
         r"(?:find|search|scan|enumerate)\s+(?:for\s+)?(?:all\s+)?(?:\.env|credential|secret|key)\s+files?",
         0.8,
     ),
     (r"(?:list|get)\s+(?:all\s+)?files?\s+(?:in|from)\s+(?:home|~|/Users|/home)", 0.6),
-    (r"os\s*\.\s*listdir\s*\([^)]*(?:\.ssh|\.aws|\.config|\.gnupg)", 0.8),
-    (r"scandir\s*\([^)]*(?:home|~|/Users|/home)", 0.6),
-    (r"find\s+[~\$/]\S*\s+.*?-name\s+['\"]?\*(?:\.env|\.pem|\.key|credential)", 0.8),
-    (r"ls\s+-[la]*R?\s+(?:~/|/home/|/Users/)", 0.6),
     (r"(?:recursively|recursive)\s+(?:scan|search|find|list)\s+(?:all\s+)?files?", 0.5),
     (r"walk\s+(?:through\s+)?(?:the\s+)?(?:entire\s+)?(?:file\s*system|directory|home)", 0.6),
 ]
+E3_PATTERNS = E3_CODE_PATTERNS + E3_PROSE_PATTERNS
 E4_PATTERNS = [
     (
         r"(?:send|transmit|upload|log|record)\s+(?:the\s+)?(?:full\s+)?(?:conversation|chat|dialog|session)\s+(?:history|context|log)?",
@@ -141,6 +161,137 @@ E5_PATTERNS = [
     (r"\baz\s+storage\s+blob\s+upload\b", 0.6),  # Azure CLI
     (r"\.upload_blob\s*\(", 0.55),  # Azure SDK
 ]
+
+
+def _e1_shell_regions(content: str, file_type: str) -> tuple[tuple[int, int], ...]:
+    """Identify source regions whose physical separators have shell semantics.
+
+    Host-language strings, YAML folded scalars and Markdown soft wraps can join
+    physical lines. Their existing conservative matcher must remain in charge.
+    Explicit shell fences with the shared 0-3 space marker grammar can provide
+    Markdown proof. Unknown languages and uncertain host contexts cannot.
+    """
+    if file_type == "shell":
+        return ((0, len(content)),)
+    if file_type != "markdown":
+        return ()
+    # CommonMark HTML blocks can contain shell-looking fences as literal text.
+    # Without parsing HTML block ownership, conservatively retain legacy
+    # matching throughout documents with a possible opener or closer, including
+    # markers nested in list/quote containers or following other inline text.
+    if re.search(r"<(?:[/!?]|[A-Za-z])", content) is not None:
+        return ()
+    shell_languages = {"sh", "bash", "shell", "dash", "zsh", "ksh", "console"}
+    regions: list[tuple[int, int]] = []
+    active: tuple[str, int, int, bool] | None = None
+    frontmatter = content.lstrip("\ufeff").startswith(("---\n", "---\r"))
+    offset = 0
+    for physical in re.finditer(r"[^\r\n]*(?:\r\n|\r|\n|$)", content):
+        line = physical[0]
+        physical_line = line.rstrip("\r\n")
+        if frontmatter:
+            if offset and physical_line in {"---", "..."}:
+                frontmatter = False
+        elif active is None:
+            opening = MARKDOWN_FENCE_OPEN.fullmatch(physical_line)
+            if opening is not None:
+                marker = opening[1]
+                info = physical_line[opening.end(1) :].strip().split()
+                active = (
+                    marker[0],
+                    len(marker),
+                    offset + len(line),
+                    bool(info) and info[0].lower() in shell_languages,
+                )
+        else:
+            closing = MARKDOWN_FENCE_CLOSE.fullmatch(physical_line)
+            if closing is not None and closing[1][0] == active[0] and len(closing[1]) >= active[1]:
+                if active[3]:
+                    regions.append((active[2], offset))
+                active = None
+        offset += len(line)
+    if active is not None and active[3]:
+        regions.append((active[2], len(content)))
+    return tuple(regions)
+
+
+def _e1_shell_command_ranges(content: str, file_type: str) -> tuple[tuple[int, int | None], ...]:
+    """Locate proved command boundaries without changing source evidence.
+
+    Upload flags belong to the curl/wget invocation, not a later command or
+    Markdown example. Reuse the bounded shell tokenizer so quoted newlines and
+    backslash continuations remain part of the same invocation. Uncertain syntax
+    retains the existing conservative matcher instead of suppressing evidence.
+    """
+    ranges: list[tuple[int, int | None]] = []
+    previous_end = 0
+    regions = _e1_shell_regions(content, file_type)
+    region_index = 0
+    for fetch in _E1_FETCH_COMMAND.finditer(content):
+        if fetch.start() < previous_end:
+            # An embedded fetch may be an argument or a real nested invocation.
+            # Keep legacy evidence instead of reparsing overlapping suffixes
+            # quadratically when a command contains many curl/wget words.
+            ranges.append((fetch.start(), None))
+            break
+        while region_index < len(regions) and regions[region_index][1] <= fetch.start():
+            region_index += 1
+        if region_index == len(regions) or fetch.start() < regions[region_index][0]:
+            ranges.append((fetch.start(), None))
+            break
+        try:
+            _, end, limited = _bounded_shell_tokens(content, fetch.start(), fetch.end())
+        except (TypeError, ValueError):
+            # The shared security-view decoder can reject unusual ANSI-C
+            # escapes. Keep E1/E2 evidence rather than failing the analyzer.
+            # Deadline and budget exceptions deliberately propagate.
+            ranges.append((fetch.start(), None))
+            break
+        if (
+            limited
+            or end > regions[region_index][1]
+            # A ')' in a nested heredoc body can fool the substitution skipper.
+            # No separator after that point is a proved shell command end.
+            or "<<" in content[fetch.start() : end]
+            # Wrappers and PowerShell expressions can assemble more arguments;
+            # semicolons and hashes can be literal arguments in CMD commands.
+            or content[end : end + 1] in {"'", '"', "`", "(", ")", ";", "#"}
+            # The shared parser's security view treats Unicode/control spaces
+            # as separators. Native shells can keep them inside an argument,
+            # including before a '#' that would otherwise look like a comment.
+            or _E1_UNPROVED_SHELL_SPACE.search(content, fetch.start(), end + 1) is not None
+            # PowerShell stop-parsing, script blocks, hashtables and block
+            # comments can contain separators that do not end the invocation.
+            or _E1_UNPROVED_SHELL_SYNTAX.search(content, fetch.start(), end + 1) is not None
+            # CMD caret continuation is outside the Bourne parser's proof.
+            or re.search(r"\^[ \t]*\r?$", content[fetch.start() : end]) is not None
+        ):
+            # Keep legacy nonoverlapping matching on unproved syntax instead of
+            # repeatedly parsing overlapping suffixes after a parser limit.
+            ranges.append((fetch.start(), None))
+            break
+        ranges.append((fetch.start(), end))
+        previous_end = end
+    return tuple(ranges)
+
+
+def _iter_e1_shell_matches(
+    pattern: str,
+    content: str,
+    command_ranges: tuple[tuple[int, int | None], ...],
+) -> Iterator[re.Match[str]]:
+    compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    covered = 0
+    for start, end in command_ranges:
+        if end is None:
+            yield from compiled.finditer(content, max(start, covered))
+            return
+        if start < covered:
+            continue
+        match = compiled.match(content, start, end)
+        if match is not None:
+            yield match
+            covered = match.end()
 
 
 def _resolve_expression_name(node: ast.expr, aliases: dict[str, str]) -> str | None:
@@ -215,7 +366,7 @@ def _analyze_python_environment_reads(
         emitted.add(node_id)
         lineno = getattr(node, "lineno", 1)
         end_lineno = getattr(node, "end_lineno", None)
-        matched_text = ast.get_source_segment(content, node)
+        matched_text = ast.get_source_segment(content, node) or "os.environ"
         findings.append(
             AnalyzerFinding(
                 rule_id="E2",
@@ -225,7 +376,8 @@ def _analyze_python_environment_reads(
                 confidence=confidence,
                 tags=tag,
                 context=get_context_from_lines(lines, lineno),
-                matched_text=(matched_text or "os.environ")[:200],
+                matched_text=matched_text[:200],
+                complete_match=matched_text,
             )
         )
 
@@ -288,8 +440,17 @@ def analyze(
 
     tag = [PatternCategory.DATA_EXFILTRATION.value]
 
+    shell_command_ranges = _e1_shell_command_ranges(content, file_type)
     for pattern, confidence in E1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        if (pattern, confidence) in _E1_SHELL_PATTERNS:
+            e1_matches = _iter_e1_shell_matches(pattern, content, shell_command_ranges)
+        elif (pattern, confidence) in E1_PROSE_PATTERNS:
+            e1_matches = static_runner.iter_paragraph_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            )
+        else:
+            e1_matches = re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE)
+        for match in e1_matches:
             line_num = get_line_number(content, match.start())
             adj = (
                 min(1.0, confidence + 0.1)
@@ -306,6 +467,7 @@ def analyze(
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     e2_patterns = E2_PATTERNS
@@ -318,7 +480,12 @@ def analyze(
             e2_patterns = E2_OTHER_PATTERNS
 
     for pattern, confidence in e2_patterns:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in E2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -330,10 +497,16 @@ def analyze(
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in E3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in E3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -345,10 +518,13 @@ def analyze(
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in E4_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -360,6 +536,7 @@ def analyze(
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     # E5: cloud-storage exfiltration. Example filtering is delegated to the runner.
@@ -376,6 +553,7 @@ def analyze(
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     return findings
