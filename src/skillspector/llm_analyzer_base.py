@@ -59,6 +59,7 @@ from skillspector.inspection_ledger import (
     LedgerReason,
     LedgerRecordType,
     analyzer_status_for_events,
+    inspection_work_id,
     ledger_event,
     outcome_for_llm_batch_failure,
 )
@@ -926,6 +927,10 @@ class Batch:
     start_line: int = 1
     end_line: int | None = None
     findings: list[Finding] = field(default_factory=list)
+    # Zero-based half-open Unicode-character columns; line endings are excluded.
+    source_start_column: int | None = None
+    source_end_column: int | None = None
+    source_line_length: int | None = None
 
     @property
     def is_chunk(self) -> bool:
@@ -936,6 +941,11 @@ class Batch:
         label = f"File: {self.file_path}"
         if self.is_chunk:
             label += f" (lines {self.start_line}\u2013{self.end_line})"
+        if self.source_start_column is not None:
+            label += (
+                f" (partial source line, columns {self.source_start_column + 1}"
+                f"–{self.source_end_column} of {self.source_line_length} characters)"
+            )
         return label
 
 
@@ -1013,11 +1023,205 @@ def _uncovered_intervals(
     return uncovered
 
 
+def _project_line_fragments(
+    successful: list[tuple[Batch, list]],
+    failures: list[BatchFailure],
+    recovered: list[tuple[Batch, list]] | None = None,
+) -> tuple[list[tuple[Batch, list]], list[BatchFailure], list[tuple[Batch, list]]]:
+    """Project a line only after its successful fragments cover every character.
+
+    The public ledger identifies work by line range. Sibling fragments must not
+    masquerade as successful retries of a different part of that same line.
+    Recovered fields retain findings but never contribute successful coverage.
+    """
+    groups = defaultdict(list)
+    whole_successes = []
+    whole_failures = []
+    partial_findings = []
+    for batch, findings in successful:
+        if batch.source_start_column is None:
+            whole_successes.append((batch, findings))
+        else:
+            groups[(batch.file_path, batch.start_line, batch.end_line)].append(
+                (batch, findings, None)
+            )
+    recovered_by_batch = {id(batch): values for batch, values in recovered or ()}
+    for failure in failures:
+        batch = failure.batch
+        if batch.source_start_column is None:
+            whole_failures.append(failure)
+        else:
+            groups[(batch.file_path, batch.start_line, batch.end_line)].append(
+                (batch, recovered_by_batch.get(id(batch), []), failure)
+            )
+    for (path, start, end), fragments in groups.items():
+        lengths = {batch.source_line_length for batch, _, _ in fragments}
+        total = fragments[0][0].source_line_length
+        valid = (
+            start == end
+            and type(total) is int
+            and total > 0
+            and len(lengths) == 1
+            and all(
+                type(batch.source_start_column) is int
+                and type(batch.source_end_column) is int
+                and 0 <= batch.source_start_column < batch.source_end_column <= total
+                for batch, _, _ in fragments
+            )
+        )
+        covered = 0
+        for left, right in sorted(
+            (batch.source_start_column, batch.source_end_column)
+            for batch, _, failure in fragments
+            if failure is None
+        ):
+            if not valid or left > covered:
+                break
+            covered = max(covered, right)
+        findings = [finding for _, values, _ in fragments for finding in values]
+        original_findings = {
+            finding.finding_id: finding for batch, _, _ in fragments for finding in batch.findings
+        }
+        line = Batch(
+            file_path=path,
+            content="",
+            start_line=start,
+            end_line=end,
+            findings=list(original_findings.values()),
+        )
+        if valid and covered == total:
+            whole_successes.append((line, findings))
+            continue
+        if findings:
+            # Successful fragments still contributed real findings, even though
+            # they cannot establish completion of the original source line.
+            partial_findings.append((line, findings))
+        failed = [failure for _, _, failure in fragments if failure is not None]
+        whole_failures.extend(
+            BatchFailure(line, failure.error_class, failure.reason) for failure in failed
+        )
+        if not failed:
+            whole_failures.append(BatchFailure(line, "IncompleteSourceLineFragments"))
+    return whole_successes, whole_failures, partial_findings
+
+
+def _consolidate_fragment_ledger_events(
+    analyzer_id: str, events: list[InspectionLedgerEvent], batches: list[Batch]
+) -> tuple[list[InspectionLedgerEvent], AnalyzerStatusEvent]:
+    """Keep one terminal line row and separate, non-planned failure facts."""
+    fragmented = {
+        (batch.file_path, batch.start_line, batch.end_line)
+        for batch in batches
+        if batch.source_start_column is not None
+    }
+    groups: dict[str, list[InspectionLedgerEvent]] = defaultdict(list)
+    result: list[InspectionLedgerEvent] = []
+    for event in events:
+        if (event["path"], event["start_line"], event["end_line"]) in fragmented:
+            groups[event["work_id"]].append(event)
+        else:
+            result.append(event)
+    severity = {
+        LedgerOutcome.COMPLETED: 0,
+        LedgerOutcome.SKIPPED: 1,
+        LedgerOutcome.PARTIAL: 2,
+        LedgerOutcome.FAILED: 3,
+    }
+    for rows in groups.values():
+        if len(rows) == 1:
+            result.extend(rows)
+            continue
+        # Recovery warnings also carry distinct incomplete-analysis facts.
+        # Preserve them even when another fragment has an operational failure.
+        failures = [row for row in rows if row.get("reason_code") is not None]
+        primary = cast(
+            InspectionLedgerEvent,
+            dict(max(failures or rows, key=lambda row: severity[row["outcome"]])),
+        )
+        primary["input_finding_ids"] = list(
+            dict.fromkeys(finding_id for row in rows for finding_id in row["input_finding_ids"])
+        )
+        primary["emitted_finding_ids"] = list(
+            dict.fromkeys(finding_id for row in rows for finding_id in row["emitted_finding_ids"])
+        )
+        # Producer findings need one partial origin. A separate failure boundary
+        # retains any fatal fact without creating another planned line outcome.
+        if primary["phase"] != "meta" and primary["emitted_finding_ids"]:
+            primary["outcome"] = LedgerOutcome.PARTIAL
+        result.append(primary)
+        primary_fact = (primary["outcome"], primary.get("reason_code"), primary.get("error_class"))
+        facts = {primary_fact}
+        for failure in failures:
+            fact = (failure["outcome"], failure.get("reason_code"), failure.get("error_class"))
+            if fact in facts:
+                continue
+            facts.add(fact)
+            boundary = ledger_event(
+                analyzer_id=analyzer_id,
+                record_type=LedgerRecordType.SCOPE_BOUNDARY,
+                outcome=failure["outcome"],
+                phase=failure["phase"],
+                path=failure["path"],
+                start_line=failure["start_line"],
+                end_line=failure["end_line"],
+                reason=failure.get("reason_code"),
+                error_class=failure.get("error_class"),
+            )
+            # Scope facts are not planned work, and must not collide with the
+            # original line's ID. Keep the real analyzer in public provenance.
+            boundary["work_id"] = inspection_work_id(
+                f"{analyzer_id}:fragment-failure:{fact[0]}:{fact[1]}:{fact[2]}",
+                failure["path"],
+                failure["start_line"],
+                failure["end_line"],
+            )
+            result.append(boundary)
+    status = analyzer_status_for_events(analyzer_id, result)
+    if any(event["outcome"] == LedgerOutcome.FAILED for event in result):
+        status["status"] = "failed"
+    return result, status
+
+
 def ledger_events_for_batches(
     analyzer_id: str,
     outcome: BatchExecutionResult,
 ) -> tuple[list[InspectionLedgerEvent], AnalyzerStatusEvent]:
     """Project detailed LLM batch execution into terminal ledger evidence."""
+    fragment_batches = [batch for batch, _ in outcome.successful if isinstance(batch, Batch)] + [
+        failure.batch
+        for failure in [*outcome.failures, *outcome.warnings]
+        if isinstance(failure.batch, Batch)
+    ]
+    successful, failures, partial_findings = _project_line_fragments(
+        [(batch, findings) for batch, findings in outcome.successful if isinstance(batch, Batch)],
+        [
+            failure
+            for failure in [*outcome.failures, *outcome.warnings]
+            if isinstance(failure.batch, Batch)
+        ],
+        [(batch, findings) for batch, findings in outcome.recovered if isinstance(batch, Batch)],
+    )
+    outcome = BatchExecutionResult(
+        successful=successful,
+        failures=[
+            failure
+            for failure in failures
+            if failure.reason is not LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+        ],
+        recovered=[
+            *(
+                (batch, values)
+                for batch, values in outcome.recovered
+                if isinstance(batch, Batch) and batch.source_start_column is None
+            ),
+            *partial_findings,
+        ],
+        warnings=[
+            failure
+            for failure in failures
+            if failure.reason is LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+        ],
+    )
     events: list[InspectionLedgerEvent] = []
     successful_ranges: dict[str, list[tuple[int | None, int | None]]] = defaultdict(list)
     for batch, findings in outcome.successful:
@@ -1115,7 +1319,7 @@ def ledger_events_for_batches(
                     )
                 )
 
-    return events, analyzer_status_for_events(analyzer_id, events)
+    return _consolidate_fragment_ledger_events(analyzer_id, events, fragment_batches)
 
 
 # ---------------------------------------------------------------------------
@@ -1549,15 +1753,19 @@ class LLMAnalyzerBase:
                     fits_chunk=fits_chunk,
                 ):
                     chunk_findings = findings_in_range(file_findings, s_line, e_line)
-                    batches.append(
-                        Batch(
-                            file_path=path,
-                            content=chunk_text,
-                            start_line=s_line,
-                            end_line=e_line,
-                            findings=chunk_findings,
-                        )
+                    batch = Batch(
+                        file_path=path,
+                        content=chunk_text,
+                        start_line=s_line,
+                        end_line=e_line,
+                        findings=chunk_findings,
                     )
+                    if s_line == e_line and not self._prompt_fits_budget(
+                        self.build_prompt(batch, **prompt_kwargs)
+                    ):
+                        batches.extend(self._fragment_source_line(batch, **prompt_kwargs))
+                    else:
+                        batches.append(batch)
 
             if max_input_bytes is not None:
                 for batch in batches[first_batch:]:
@@ -1572,6 +1780,52 @@ class LLMAnalyzerBase:
                         )
 
         return batches
+
+    def _fragment_source_line(self, batch: Batch, **prompt_kwargs: object) -> list[Batch]:
+        """Retain an oversized physical line as bounded, overlapping source spans."""
+        logical = batch.content.splitlines()
+        if len(logical) != 1 or not logical[0]:
+            return [batch]
+        body = logical[0]
+        ending = batch.content[len(body) :]
+        result = []
+        start = 0
+        while start < len(body):
+            self._require_time_remaining()
+
+            def fragment(end: int, start: int = start) -> Batch:
+                return Batch(
+                    file_path=batch.file_path,
+                    content=body[start:end] + (ending if end == len(body) else ""),
+                    start_line=batch.start_line,
+                    end_line=batch.end_line,
+                    findings=batch.findings,
+                    source_start_column=start,
+                    source_end_column=end,
+                    source_line_length=len(body),
+                )
+
+            low, high, best = start + 1, len(body), None
+            while low <= high:
+                middle = (low + high) // 2
+                candidate = fragment(middle)
+                if self._prompt_fits_budget(self.build_prompt(candidate, **prompt_kwargs)):
+                    best = middle
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if best is None:
+                # Fixed metadata/one character cannot fit. Preserve the entire
+                # remainder for the unchanged invocation guard to fail closed.
+                result.append(fragment(len(body)))
+                break
+            result.append(fragment(best))
+            if best == len(body):
+                break
+            # Keep boundary instructions/calls together without quadratic
+            # request growth under tiny budgets. Every iteration advances.
+            start = best - min(256, (best - start) // 8)
+        return result
 
     def _fixed_prompt_bytes(
         self,
@@ -1625,6 +1879,12 @@ class LLMAnalyzerBase:
         different ``response_schema`` or raw-string mode.
         """
         if isinstance(response, LLMAnalysisResult):
+            if batch.source_start_column is not None and any(
+                finding.start_line != batch.start_line
+                or (finding.end_line is not None and finding.end_line != batch.end_line)
+                for finding in response.findings
+            ):
+                raise _StructuredResponseValidationError
             return [f.to_finding(batch.file_path) for f in response.findings]
         raise NotImplementedError(
             "Override parse_response for custom response_schema or raw-string mode"

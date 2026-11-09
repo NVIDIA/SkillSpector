@@ -83,16 +83,19 @@ def test_empty_file_stays_empty(analyzer: lab.LLMAnalyzerBase) -> None:
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-async def test_unsplittable_line_is_an_explicit_failure_without_provider_call(
+async def test_unfit_fixed_prompt_is_an_explicit_failure_without_provider_call(
     analyzer: lab.LLMAnalyzerBase, monkeypatch: pytest.MonkeyPatch, asynchronous: bool
 ) -> None:
     provider = MagicMock(side_effect=AssertionError("provider must not be reached"))
     monkeypatch.setattr(lab, "_invoke_with_usage", provider)
     monkeypatch.setattr(lab, "_ainvoke_with_usage", provider)
+    # Long source lines can be fragmented; fixed prompt overhead cannot.
+    analyzer.base_prompt = "Irreducible prompt metadata. " * 5000
     content = "x" * 10000
     batches = analyzer.get_batches(["long"], {"long": content})
     assert len(batches) == 1
     assert batches[0].content == content
+    assert batches[0].source_start_column is None
     if asynchronous:
         outcome = await analyzer.arun_batches_detailed(batches, max_concurrency=1)
     else:
