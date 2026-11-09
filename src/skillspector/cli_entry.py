@@ -20,7 +20,17 @@ from typer.main import get_group
 from skillspector import __version__
 
 
-class _LazyCommandGroup(TyperGroup):
+class _VerbatimArgsGroup(TyperGroup):
+    """Receive arguments exactly as the shell passed them, as on POSIX."""
+
+    def main(self, *args: Any, **kwargs: Any) -> Any:
+        # On Windows, Click expands globs, ~ and environment variables in sys.argv by
+        # default, turning a quoted --exclude 'tests/*' into the matching file names.
+        kwargs.setdefault("windows_expand_args", False)
+        return super().main(*args, **kwargs)
+
+
+class _LazyCommandGroup(_VerbatimArgsGroup):
     """Let eager root options finish before importing the command implementation."""
 
     def _load_commands(self) -> None:
@@ -38,12 +48,6 @@ class _LazyCommandGroup(TyperGroup):
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
         self._load_commands()
         return super().get_command(ctx, cmd_name)
-
-    def main(self, *args: Any, **kwargs: Any) -> Any:
-        # On Windows, Click expands globs, ~ and environment variables in sys.argv by
-        # default, turning a quoted --exclude 'tests/*' into the matching file names.
-        kwargs.setdefault("windows_expand_args", False)
-        return super().main(*args, **kwargs)
 
 
 def version_callback(value: bool) -> None:
@@ -73,8 +77,8 @@ def main(
     """
 
 
-def create_app(*, cls: type[TyperGroup] | None = None) -> typer.Typer:
-    """Share root options and help between the console and implementation apps."""
+def create_app(*, cls: type[_VerbatimArgsGroup] = _VerbatimArgsGroup) -> typer.Typer:
+    """Share root options, help and argv handling between the console and implementation apps."""
     application = typer.Typer(
         name="skillspector",
         help="Security scanner for AI agent skills (LangGraph). Detect vulnerabilities before installation.",

@@ -121,7 +121,14 @@ class _WindowsOs:
         return getattr(os, attribute)
 
 
-def test_entry_point_keeps_exclude_globs_verbatim(tmp_path: Path, monkeypatch, capsys) -> None:
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [_entry_point(), ("skillspector.cli", "app")],
+    ids=["console-script", "python-m"],
+)
+def test_entry_point_keeps_exclude_globs_verbatim(
+    module: str, name: str, tmp_path: Path, monkeypatch, capsys
+) -> None:
     from importlib import import_module
 
     (tmp_path / "SKILL.md").write_text("# Demo\nA harmless example skill.\n", encoding="utf-8")
@@ -136,7 +143,6 @@ def test_entry_point_keeps_exclude_globs_verbatim(tmp_path: Path, monkeypatch, c
         "argv",
         ["skillspector", "scan", ".", "--no-llm", "--format", "json", "--exclude", "tests/*"],
     )
-    module, name = _entry_point()
 
     with pytest.raises(SystemExit) as exited:
         getattr(import_module(module), name)()
