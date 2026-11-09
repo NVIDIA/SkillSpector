@@ -1153,7 +1153,12 @@ def _tp4_partial_event(
 # capability the code performs. A TP4 assessment whose every
 # mismatched_capabilities entry matches one of these carries no affirmative
 # evidence of a mismatch (issue #1066): a partial snippet cannot be faulted
-# for omitting the rest of the declared workflow.
+# for omitting the rest of the declared workflow. The match alone is not
+# enough: an absence marker inside an item that also describes affirmative
+# behavior (for example "Uploads source files to an undeclared endpoint
+# without user consent") does not make the item an absence, so
+# _tp4_mismatched_item_is_absence also requires that no clause of the item
+# contain an affirmative capability verb outside the scope of a marker.
 _TP4_ABSENCE_PATTERNS = tuple(
     re.compile(pattern)
     for pattern in (
@@ -1179,10 +1184,57 @@ _TP4_ABSENCE_PATTERNS = tuple(
 )
 
 
+_TP4_CLAUSE_SPLIT_PATTERN = re.compile(
+    r"\s*;\s*|\s+but\s+|\s+however\s+|\s+although\s+|\s+though\s+|\s+while\s+|\s+whereas\s+"
+)
+
+_TP4_AFFIRMATIVE_VERB_PATTERN = re.compile(
+    r"\b(?:"
+    r"access|archive|authenticate|backup|browse|call|collect|compress|"
+    r"connect|cop(?:y|ies|ied|ying)|crawl|create|decrypt|delete|download|"
+    r"encode|encrypt|enumerate|execute|export|exfiltrate|extract|fetch|"
+    r"fingerprint|gather|generate|hash|import|install|invoke|issue|leak|"
+    r"load|log|modify|monitor|move|navigate|notify|open|parse|perform|"
+    r"post|process|profile|publish|pull|push|quer(?:y|ies|ied|ying)|read|"
+    r"record|remove|render|request|respond|restore|retrieve|run|save|"
+    r"scan|scrape|search|send|share|sign|spawn|store|submit|subscribe|"
+    r"sync|track|transmit|type|update|upload|validate|verify|write|click"
+    r")(?:s|es|ed|ing|d|ning)?\b"
+)
+
+
 def _tp4_mismatched_item_is_absence(item: str) -> bool:
-    """Return whether one mismatched capability is phrased as an absence."""
+    """Return whether one mismatched capability is phrased as an absence.
+
+    Conservative: an absence marker only counts when no clause of the item
+    describes affirmative behavior. A capability verb that precedes the
+    first absence marker in its clause, or sits in a clause with no marker,
+    is affirmative evidence. So "Uploads source files to an undeclared
+    endpoint without user consent", "Uploads files but does not encrypt
+    them", and "No support for TLS, but sends credentials in plaintext"
+    are not absences, while "No evidence of querying videos" and "The code
+    does not implement search" still are: their verbs sit under the marker.
+    Clauses split only on contrast boundaries, so enumerations joined by
+    "and" or commas stay under one leading marker.
+    """
     normalized = " ".join(item.strip().casefold().split())
-    return any(pattern.search(normalized) for pattern in _TP4_ABSENCE_PATTERNS)
+    if not normalized:
+        return False
+    if not any(pattern.search(normalized) for pattern in _TP4_ABSENCE_PATTERNS):
+        return False
+    for clause in _TP4_CLAUSE_SPLIT_PATTERN.split(normalized):
+        clause = clause.strip()
+        if not clause:
+            continue
+        marker_positions = [
+            match.start()
+            for pattern in _TP4_ABSENCE_PATTERNS
+            for match in pattern.finditer(clause)
+        ]
+        for verb in _TP4_AFFIRMATIVE_VERB_PATTERN.finditer(clause):
+            if not marker_positions or verb.start() < min(marker_positions):
+                return False
+    return True
 
 
 def _tp4_all_mismatched_are_absences(items: list[str]) -> bool:

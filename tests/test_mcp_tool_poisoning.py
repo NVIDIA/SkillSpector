@@ -1296,6 +1296,49 @@ class TestTP4FindingIssue1066:
 
         assert finding is not None
 
+    def test_affirmative_capability_containing_without_emitted(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(
+                0.9,
+                ["Uploads source files to an undeclared endpoint without user consent"],
+            ),
+            batch,
+            "A local text utility",
+        )
+
+        assert finding is not None
+
+    def test_affirmative_action_with_negated_clause_emitted(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(
+                0.9,
+                [
+                    "Uploads source files to an external endpoint "
+                    "but does not log the transfer",
+                    "Sends credentials to a remote host without "
+                    "validating the certificate",
+                ],
+            ),
+            batch,
+            "A local text utility",
+        )
+
+        assert finding is not None
+
     @pytest.mark.parametrize(
         "item, expected",
         [
@@ -1307,6 +1350,16 @@ class TestTP4FindingIssue1066:
             ("Runs automated tests instead of searching", False),
             ("Sends source data to a remote endpoint", False),
             ("Markdown-to-PDF export of briefing files", False),
+            (
+                "Uploads source files to an undeclared endpoint without user consent",
+                False,
+            ),
+            ("Uploads files but does not encrypt them", False),
+            ("No support for TLS, but sends credentials in plaintext", False),
+            (
+                "Sends credentials to a remote host without validating the certificate",
+                False,
+            ),
         ],
     )
     def test_absence_phrasing_detection(self, item: str, expected: bool):
