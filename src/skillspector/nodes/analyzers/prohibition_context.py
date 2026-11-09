@@ -35,7 +35,7 @@ _BLANK_LINE = re.compile(r"\n[ \t]*\n")
 # English grammar above and is deliberately narrow: only a negation that
 # immediately governs the matched action exempts it. The negation set is
 # the plain prohibitions 请勿, 请不要, 不要, 不得, 切勿, and 勿, optionally
-# preceded by an agent noun, 请, or a second-person pronoun, with only
+# preceded by an agent noun, 请 or 請, or a second-person pronoun, with only
 # space-like separators (ordinary and ideographic spaces, zero-width and
 # bidi marks) between the characters and before the action. A newline
 # between negation and action does not govern, exactly as in English.
@@ -48,7 +48,7 @@ _CHINESE_DIRECT_PREFIX = re.compile(
     r"(?:\A|(?<=[\n\r.!?;，。！？、]))[ \t\u3000]*"
     r"(?:[-+][ \t\u3000]+|\d+[.)][ \t\u3000]+)?"
     rf"(?:(?:助手|助理|模型){_CHINESE_SEP})?"
-    rf"(?:请{_CHINESE_SEP})?"
+    rf"(?:[请請]{_CHINESE_SEP})?"
     rf"(?:(?:你|您){_CHINESE_SEP})?"
     rf"(?P<negation>{_CHINESE_NEGATION}){_CHINESE_SEP}\Z"
 )
