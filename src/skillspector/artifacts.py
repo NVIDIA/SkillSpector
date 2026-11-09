@@ -13,14 +13,16 @@ from __future__ import annotations
 
 import re
 import tarfile
+import threading
 import unicodedata
 from array import array
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import lru_cache
 from io import StringIO
-from typing import NotRequired
+from typing import NamedTuple, NotRequired
 
 from typing_extensions import TypedDict
 
@@ -1841,13 +1843,76 @@ def _token_bridging_gap_spans_uncached(
     return tuple(spans)
 
 
-@lru_cache(maxsize=_TEXT_PREDICATE_CACHE_SIZE)
+# Admission bound for the gap-span cache. A span costs one tuple plus two
+# integers (about 112 bytes), so 64 entries of at most this many spans retain
+# under 60 MB worst case. Alternating word and gap characters yield about
+# 128,000 spans per 256K window, so dense results are never admitted: they
+# are recomputed per call, which is the pre-cache behavior, while the
+# gap-free and sparse fast paths stay cached.
+_TOKEN_GAP_SPAN_CACHE_MAX_SPANS = 8192
+_TOKEN_GAP_SPAN_CACHE_LOCK = threading.Lock()
+_TOKEN_GAP_SPAN_CACHE: OrderedDict[
+    tuple[str, bool], tuple[tuple[int, int], ...]
+] = OrderedDict()
+_TOKEN_GAP_SPAN_CACHE_STATS = {"hits": 0, "misses": 0}
+
+
+class _TokenGapSpanCacheInfo(NamedTuple):
+    hits: int
+    misses: int
+    maxsize: int
+    currsize: int
+
+
 def _cached_token_bridging_gap_spans(
     text: str,
     require_word_boundaries: bool,
 ) -> tuple[tuple[int, int], ...]:
-    """Memoize one window's gap spans; every analyzer re-derives them per view."""
-    return _token_bridging_gap_spans_uncached(text, require_word_boundaries=require_word_boundaries)
+    """Memoize one window's gap spans; every analyzer re-derives them per view.
+
+    Only sparse results are retained. A dense result is computed fresh on
+    every call and never stored, so attacker-controlled dense text cannot
+    trade the targeted CPU stall for unbounded retained memory.
+    """
+    key = (text, require_word_boundaries)
+    with _TOKEN_GAP_SPAN_CACHE_LOCK:
+        cached = _TOKEN_GAP_SPAN_CACHE.get(key)
+        if cached is not None:
+            _TOKEN_GAP_SPAN_CACHE.move_to_end(key)
+            _TOKEN_GAP_SPAN_CACHE_STATS["hits"] += 1
+            return cached
+        _TOKEN_GAP_SPAN_CACHE_STATS["misses"] += 1
+    spans = _token_bridging_gap_spans_uncached(
+        text, require_word_boundaries=require_word_boundaries
+    )
+    if len(spans) <= _TOKEN_GAP_SPAN_CACHE_MAX_SPANS:
+        with _TOKEN_GAP_SPAN_CACHE_LOCK:
+            _TOKEN_GAP_SPAN_CACHE[key] = spans
+            _TOKEN_GAP_SPAN_CACHE.move_to_end(key)
+            while len(_TOKEN_GAP_SPAN_CACHE) > _TEXT_PREDICATE_CACHE_SIZE:
+                _TOKEN_GAP_SPAN_CACHE.popitem(last=False)
+    return spans
+
+
+def _token_gap_span_cache_clear() -> None:
+    with _TOKEN_GAP_SPAN_CACHE_LOCK:
+        _TOKEN_GAP_SPAN_CACHE.clear()
+        _TOKEN_GAP_SPAN_CACHE_STATS["hits"] = 0
+        _TOKEN_GAP_SPAN_CACHE_STATS["misses"] = 0
+
+
+def _token_gap_span_cache_info() -> _TokenGapSpanCacheInfo:
+    with _TOKEN_GAP_SPAN_CACHE_LOCK:
+        return _TokenGapSpanCacheInfo(
+            hits=_TOKEN_GAP_SPAN_CACHE_STATS["hits"],
+            misses=_TOKEN_GAP_SPAN_CACHE_STATS["misses"],
+            maxsize=_TEXT_PREDICATE_CACHE_SIZE,
+            currsize=len(_TOKEN_GAP_SPAN_CACHE),
+        )
+
+
+_cached_token_bridging_gap_spans.cache_clear = _token_gap_span_cache_clear
+_cached_token_bridging_gap_spans.cache_info = _token_gap_span_cache_info
 
 
 def _token_bridging_gap_spans(
@@ -1860,7 +1925,10 @@ def _token_bridging_gap_spans(
 
     Gap spans are memoized per text, since the same window texts are scanned
     once per static analyzer (around fifteen times per artifact) and the
-    spans are pure functions of the text. The memoized walk runs without
+    spans are pure functions of the text. Only sparse results are retained:
+    windows with more than _TOKEN_GAP_SPAN_CACHE_MAX_SPANS spans are
+    recomputed on every call instead of being cached, so dense text cannot
+    retain unbounded span tuples. The memoized walk runs without
     intermediate deadline checks; that is bounded by the callers, which only
     pass window-bounded text (at most 256K characters), and the deadline is
     still enforced for every span yielded here and by the callers between

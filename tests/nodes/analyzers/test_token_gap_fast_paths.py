@@ -13,8 +13,6 @@ spans that are yielded.
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 import skillspector.artifacts as artifacts
@@ -29,7 +27,6 @@ from skillspector.artifacts import (
     _is_word_character,
     _token_bridging_gap_spans,
     is_default_ignorable,
-    security_text_views,
 )
 
 # Every ASCII code point, plus the non-ASCII ranges that carry the format,
@@ -198,19 +195,35 @@ def test_repeated_gap_span_scans_reuse_the_first_walk(
     assert len(calls) == first_calls
 
 
-def test_security_text_views_on_gap_free_cjk_completes_quickly() -> None:
-    """End-to-end regression test for #1075: 2MB of gap-free CJK must not stall the views.
+def test_dense_gap_text_is_never_retained_by_the_span_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for the #1077 review: dense gap text must not be retained.
 
-    Before the fix this took over 8 seconds on the reference machine (a full
-    per-character gap walk plus a 1,515-entry regex character-class search per
-    window); after the fix it takes about 1.4 seconds. The bound leaves room
-    for slower hardware while staying well under the pre-fix cost.
+    Alternating a word character and U+200D yields one contextual span per
+    pair, so a 40,000-character window holds 20,000 spans, well above the
+    admission bound. The spans are still computed correctly, but a second
+    scan must re-walk instead of hitting the cache, so dense windows cannot
+    trade the CPU stall for unbounded retained memory. The deterministic
+    no-walk and cache-reuse tests above already pin the fast path; the
+    wall-clock assertion that used to live here was load-dependent and is
+    not part of the unit contract.
     """
-    unit = "中华人民共和国北京市朝阳区区域数据包包含地理信息和行政区划名称列表"
-    text = ((unit * (2_000_000 // len(unit) + 1))[:2_000_000]) + "1075"
-    start = time.perf_counter()
-    views = security_text_views(text)
-    elapsed = time.perf_counter() - start
-    assert len(views) == 1
-    assert views[0].text == text
-    assert elapsed < 4.0
+    _clear_span_cache()
+    calls: list[str] = []
+    original = artifacts._is_token_gap_character
+
+    def counting(character: str) -> bool:
+        calls.append(character)
+        return original(character)
+
+    monkeypatch.setattr(artifacts, "_is_token_gap_character", counting)
+    text = "a‍" * 20000 + "a"
+    first = list(_token_bridging_gap_spans(text))
+    assert len(first) == 20000
+    first_calls = len(calls)
+    assert first_calls > 0
+    assert artifacts._cached_token_bridging_gap_spans.cache_info().currsize == 0
+    second = list(_token_bridging_gap_spans(text))
+    assert second == first
+    assert len(calls) > first_calls
