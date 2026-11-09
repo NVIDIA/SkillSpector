@@ -2809,6 +2809,12 @@ def _has_shell_execution_call(
             value = node.child_by_field_name("right")
         elif node.type == "formal_parameters":
             target = node
+        elif node.type == "catch_clause":
+            # A catch parameter binds like a formal parameter, including
+            # destructured forms such as catch ({RegExp}). Without this, a
+            # caught arbitrary constructor could borrow the global RegExp
+            # proof in _ordinary_native_calls.
+            target = node.child_by_field_name("parameter")
         elif node.type == "arrow_function":
             target = node.child_by_field_name("parameter")
         elif node.type == "import_statement":

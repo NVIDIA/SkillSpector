@@ -260,6 +260,18 @@ def test_uncertain_parameter_calls_keep_template_files_partial(source: str) -> N
             id="shadowed-regexp-constructor-exec",
         ),
         pytest.param(
+            "try { step(); } catch ({RegExp}) { const re = new RegExp(); re.exec(`${command}`); }\n",
+            id="catch-destructured-regexp-exec",
+        ),
+        pytest.param(
+            "for (const {RegExp} of sources) { const re = new RegExp(); re.exec(`${command}`); }\n",
+            id="for-of-destructured-regexp-exec",
+        ),
+        pytest.param(
+            "function run({RegExp}) { const re = new RegExp(); re.exec(`${command}`); }\n",
+            id="parameter-destructured-regexp-exec",
+        ),
+        pytest.param(
             "import { formatMessage } from './format.mjs';\n"
             "console.log(formatMessage(`Hello, ${name}`));",
             id="imported-helper-template-argument",

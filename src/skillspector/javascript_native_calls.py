@@ -575,6 +575,19 @@ def _ordinary_native_calls(
                     intrinsic_override = True
                     regexp_prototype_unproven = True
         if node.type in {
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            # Shorthand bindings bind the name too: catch ({RegExp}) and
+            # for (const {RegExp} of ...) bind through
+            # shorthand_property_identifier_pattern, not identifier. Only the
+            # constructor-position identifier itself is exempted, and that
+            # exemption only matches identifier nodes, so a shorthand node
+            # spelling an override name always poisons.
+            if program.text(node).strip("\"'") in override_names:
+                intrinsic_override = True
+                regexp_prototype_unproven = True
+        if node.type in {
             "assignment_expression",
             "augmented_assignment_expression",
             "update_expression",
