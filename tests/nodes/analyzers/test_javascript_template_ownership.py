@@ -145,6 +145,19 @@ def test_shell_execution_forms_keep_template_files_partial(source: str) -> None:
             "export function show(a, ...rest) {\n  const n = Number(a);\n  return `n=${n}`;\n}\n",
             id="rest-parameter-control",
         ),
+        pytest.param(
+            "class Checker {\n"
+            "  check(value, max = Number.MAX_SAFE_INTEGER) {\n"
+            "    const n = Number(value);\n"
+            "    return `n=${n}`;\n"
+            "  }\n"
+            "}\n",
+            id="class-method-default",
+        ),
+        pytest.param(
+            "export function show(a, b = a) {\n  const n = Number(a);\n  return `n=${n}`;\n}\n",
+            id="parameter-referenced-by-later-default",
+        ),
     ],
 )
 def test_parameter_default_values_do_not_keep_template_files_partial(source: str) -> None:
@@ -172,6 +185,10 @@ def test_parameter_default_values_do_not_keep_template_files_partial(source: str
         pytest.param(
             "function f(x = eval) { return `v=${x}`; }",
             id="shell-call-in-default-value",
+        ),
+        pytest.param(
+            "function f(p = cp.exec(`ls ${dir}`)) { return `v=${p}`; }",
+            id="shell-call-expression-in-default-value",
         ),
     ],
 )
