@@ -68,6 +68,30 @@ _FS_FD_METHODS = frozenset(
 )
 
 
+def _regex_receiver_call(program: JavaScriptProgram, value: Node) -> Node | None:
+    """Return the .exec/.test member for a direct regex receiver, else None.
+
+    The call must take no template-string argument: a template argument
+    keeps the conservative reading, same as for a literal receiver.
+    """
+    member = value.parent
+    call = None if member is None else member.parent
+    arguments = None if call is None else call.child_by_field_name("arguments")
+    if (
+        member is not None
+        and member.type == "member_expression"
+        and member.child_by_field_name("object") == value
+        and _callable_member(program, member) in {"exec", "test"}
+        and call is not None
+        and call.type == "call_expression"
+        and call.child_by_field_name("function") == member
+        and arguments is not None
+        and arguments.type != "template_string"
+    ):
+        return member
+    return None
+
+
 def _local_regex_arguments(
     program: JavaScriptProgram,
     references: dict[str, list[Node]],
@@ -453,7 +477,6 @@ def _ordinary_native_calls(
     local_regex_calls: list[Node] = []
     regex_arguments: list[Node] = []
     regex_constructors: list[Node] = []
-    constructed_bindings: set[int] = set()
     override_names = {
         "RegExp",
         "Reflect",
@@ -573,6 +596,16 @@ def _ordinary_native_calls(
             and constructor.type == "identifier"
             and program.text(constructor) == "RegExp"
         ):
+            # A direct .exec/.test call on a constructed regex is owned
+            # like the literal form, and is not an escaping constructor.
+            # It rides local_regex_calls, not regex_calls: the RegExp
+            # constructor name itself sets intrinsic_override, which
+            # clears regex_calls, so a direct append would be wiped.
+            member = _regex_receiver_call(program, node)
+            if member is not None:
+                if _callable_member(program, member) == "exec":
+                    local_regex_calls.append(member)
+                continue
             owner = node.parent
             binding = None if owner is None else owner.child_by_field_name("name")
             declaration = None if owner is None else owner.parent
@@ -589,7 +622,6 @@ def _ordinary_native_calls(
                 and declaration.parent.type in {"program", "statement_block"}
             ):
                 regex_bindings[program.text(binding)] = binding
-                constructed_bindings.add(binding.id)
             else:
                 regex_constructors.append(node)
         if node.type == "regex":
@@ -740,7 +772,7 @@ def _ordinary_native_calls(
                 intrinsic_override = True
                 regexp_prototype_unproven = True
                 break
-            if method == "exec" and binding.id not in constructed_bindings:
+            if method == "exec":
                 named_calls.append(member)
         else:
             local_regex_calls.extend(named_calls)
