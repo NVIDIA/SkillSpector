@@ -47,6 +47,7 @@ from skillspector.inspection_ledger import (
     AnalysisCompleteness,
     ParserCause,
     finalize_ledger,
+    format_recovery_policy_accepted,
     only_missing_reference_exceptions,
     resource_measurements,
     sanitize_parser_diagnostic,
@@ -978,6 +979,9 @@ def _build_sarif(
         "notificationRecordLimit": MAX_FINDING_OUTPUT_RECORDS,
         "notificationsTruncated": False,
     }
+    if completeness.get("warnings"):
+        completeness_projection["acceptedByPolicy"] = format_recovery_policy_accepted(completeness)
+        completeness_projection["assessmentComplete"] = False
 
     if completeness.get("exclude_patterns"):
         completeness_projection["excludePatterns"] = completeness["exclude_patterns"]
@@ -1160,6 +1164,10 @@ def _render_terminal_completeness(
     table.add_column("Value")
     table.add_row("Execution", "successful" if execution_successful else "failed")
     table.add_row("Status", _terminal_text(completeness.get("status", "complete")))
+    if format_recovery_policy_accepted(completeness):
+        table.add_row(
+            "Formatting policy", "Accepted with warning; AI assessment remains incomplete"
+        )
     dependency_inspection = completeness.get("dependency_inspection")
     if isinstance(dependency_inspection, dict):
         table.add_row("Dependency contents", _terminal_text(dependency_inspection.get("status")))
@@ -1203,6 +1211,7 @@ def _render_terminal_completeness(
 
     render_rows("Scope exclusions", completeness.get("scope_exclusions"))
     render_rows("Ledger exceptions", completeness.get("ledger_exceptions"))
+    render_rows("Formatting recovery warnings", completeness.get("warnings"))
     render_rows("Analyzer statuses", completeness.get("analyzer_statuses"))
     limitations = completeness.get("limitations")
     if isinstance(limitations, list) and limitations:
@@ -1437,7 +1446,7 @@ def _llm_degradation_notice(
     failed = attempted - succeeded
     return (
         f"LLM analysis was requested but {failed} of {attempted} LLM call(s) failed - "
-        "results reflect STATIC analysis only for the affected batch(es)."
+        "affected AI assessments are incomplete; completed results are retained."
     )
 
 
@@ -1554,11 +1563,7 @@ def _build_metadata(
             }
         )
         detail = f" Reasons: {'; '.join(reasons)}" if reasons else ""
-        failed = attempted - succeeded
-        meta["llm_error"] = (
-            f"LLM analysis was requested but {failed} of {attempted} LLM call(s) failed; "
-            f"results reflect static analysis only for the affected batch(es).{detail}"
-        )
+        meta["llm_error"] = f"{_llm_degradation_notice(use_llm, llm_call_log)}{detail}"
     elif semantic_runtime_incomplete:
         meta["llm_degraded"] = True
         meta["llm_error"] = (
@@ -1676,6 +1681,17 @@ def _format_json(
         "execution_successful": execution_successful,
     }
     data["analysis_completeness"] = dict(analysis_completeness or {})
+    completeness = analysis_completeness or {}
+    recovery_warnings = completeness.get("warnings")
+    if isinstance(recovery_warnings, list) and recovery_warnings:
+        metadata = cast(dict[str, object], data["metadata"])
+        metadata["llm_assessment_complete"] = False
+        metadata["llm_recovery_policy_accepted"] = format_recovery_policy_accepted(completeness)
+        if any(
+            isinstance(warning, Mapping) and warning.get("phase") == "meta"
+            for warning in recovery_warnings
+        ):
+            metadata["meta_analysis_applied"] = False
     return json.dumps(data, indent=2)
 
 
@@ -1712,6 +1728,10 @@ def _render_markdown_completeness(
     lines.append("|--------|-------|")
     lines.append(f"| Execution | {'successful' if execution_successful else 'failed'} |")
     lines.append(f"| Status | {_markdown_cell(completeness.get('status', 'complete'))} |")
+    if format_recovery_policy_accepted(completeness):
+        lines.append(
+            "| Formatting policy | Accepted with warning; AI assessment remains incomplete |"
+        )
     dependency_inspection = completeness.get("dependency_inspection")
     if isinstance(dependency_inspection, dict):
         lines.append(
@@ -1764,6 +1784,7 @@ def _render_markdown_completeness(
 
     render_rows("Scope Exclusions", completeness.get("scope_exclusions"))
     render_rows("Ledger Exceptions", completeness.get("ledger_exceptions"))
+    render_rows("Formatting Recovery Warnings", completeness.get("warnings"))
     render_rows("Analyzer Statuses", completeness.get("analyzer_statuses"))
     limitations = completeness.get("limitations")
     if isinstance(limitations, list) and limitations:
@@ -2006,6 +2027,16 @@ def report(state: SkillspectorState) -> dict[str, object]:
         if transitive_limitation not in limitations:
             limitations.append(transitive_limitation)
         analysis_completeness["limitations"] = limitations
+        if analysis_completeness.get("policy_accepted") is True:
+            analysis_completeness["policy_accepted"] = False
+            raw_warnings = analysis_completeness.get("warnings")
+            if isinstance(raw_warnings, list):
+                analysis_completeness["warnings"] = [
+                    {**warning, "accepted_by_policy": False}
+                    if isinstance(warning, Mapping)
+                    else warning
+                    for warning in raw_warnings
+                ]
         analysis_completeness["is_complete"] = False
         if analysis_completeness.get("status", "complete") in {
             "complete",
@@ -2063,18 +2094,24 @@ def report(state: SkillspectorState) -> dict[str, object]:
             "LLM analysis was requested but semantic runtime telemetry was incomplete; "
             "results may reflect static analysis only."
         )
+    if format_recovery_policy_accepted(analysis_completeness):
+        degraded_notice = (
+            "The full AI assessment could not be verified after formatting recovery. "
+            "The scan is accepted with a warning by policy; known findings remain."
+        )
     if unavailable_before_execution:
         logger.warning(
             "LLM stage unavailable during preflight; report reflects static analysis only"
         )
-    elif semantic_runtime_incomplete:
+    elif runtime_event is not None:
         logger.warning(
             "LLM stage degraded: semantic runtime telemetry was incomplete; "
             "report may reflect static analysis only"
         )
     elif degraded:
         logger.warning(
-            "LLM stage degraded: %d/%d LLM call(s) failed; report reflects static analysis only",
+            "LLM stage degraded: %d/%d LLM call(s) failed; "
+            "affected AI assessments are incomplete; completed results are retained",
             _attempted - _succeeded,
             _attempted,
         )

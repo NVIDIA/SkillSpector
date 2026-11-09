@@ -24,6 +24,7 @@ from skillspector.inspection_ledger import (
     LedgerRecordType,
     analyzer_status_for_events,
     finalize_ledger,
+    format_recovery_policy_accepted,
     inspection_work_id,
     ledger_event,
 )
@@ -61,6 +62,11 @@ _MAX_PASSIVE_RASTER_PROOFS = 256
 _MAX_PASSIVE_RASTER_TOTAL_BYTES = 128 * 1024 * 1024
 _MAX_PASSIVE_RASTER_SECONDS = 2.0
 _REFERENCE_CAVEAT_REASONS = (LedgerReason.REFERENCE_MISSING, LedgerReason.REFERENCE_UNRESOLVED)
+# Scanner-budget reasons: the TP4 package-wide batch cap, the static
+# per-artifact runtime cap, and per-analyzer finding caps report the
+# scanner's own limits, not properties of the artifact. They are recorded
+# in the completeness ledger, but they must not become scored findings.
+_BUDGET_LIMIT_REASONS = frozenset({LedgerReason.OUTPUT_LIMIT, LedgerReason.RUNTIME_LIMIT})
 _REFERENCE_LIMIT_FIELDS = frozenset(
     f"{prefix}_{unit}"
     for prefix in ("observed", "limit")
@@ -375,6 +381,35 @@ def _has_only_format_limitations(
         and all(
             str(event.get("outcome")) in {"partial", "out_of_scope"}
             and str(event.get("reason_code")) in format_reasons
+            for event in exceptions
+        )
+    )
+
+
+def _has_only_budget_limitations(
+    events: list[Mapping[str, object]],
+) -> bool:
+    """Recognize scanner-budget gaps without hiding artifact-driven gaps.
+
+    Mirrors the format-limitation guard: a target qualifies only when every
+    non-completed ledger event for it carries a budget reason. A missing or
+    unknown reason, a failed or skipped event, a completed event carrying a
+    reason, and any mixed limitation must continue to produce AE1. The
+    completeness ledger still reports the budget gap; only the scored
+    finding is suppressed.
+    """
+    exceptions = [event for event in events if event.get("outcome") != "completed"]
+    return (
+        bool(exceptions)
+        and not any(event.get("fatal") for event in events)
+        and not any(
+            str(event.get("outcome")) == LedgerOutcome.COMPLETED
+            and event.get("reason_code") is not None
+            for event in events
+        )
+        and all(
+            str(event.get("outcome")) in {"partial", "out_of_scope"}
+            and str(event.get("reason_code")) in _BUDGET_LIMIT_REASONS
             for event in exceptions
         )
     )
@@ -803,9 +838,11 @@ def _reference_coverage_findings(
     fatal_paths: set[str] = set()
     exceptions_by_path: dict[str, list[Mapping[str, object]]] = {}
     canonicalization_succeeded = False
+    format_recovery_accepted = False
     if ledger_shape_complete and inventory_shape_complete and status_shape_complete:
         try:
             preexisting_completeness, _ = finalize_ledger(state)
+            format_recovery_accepted = format_recovery_policy_accepted(preexisting_completeness)
             for exception in preexisting_completeness["ledger_exceptions"]:
                 exceptions_by_path.setdefault(str(exception.get("path", "")), []).append(exception)
             fatal_paths = {
@@ -929,6 +966,22 @@ def _reference_coverage_findings(
         )
         if final_disposition not in {"partial", "failed", "out_of_scope"}:
             continue
+        # Accepted AI formatting uncertainty remains a visible coverage warning.
+        # It does not turn already-read text into a HIGH artifact-evasion finding.
+        # The global proof rejects any independent analyzer/accounting gap.
+        if (
+            ledger_evidence_complete
+            and format_recovery_accepted
+            and target_path not in invalid_status_paths
+            and target_path not in duplicate_inventory_paths
+            and inventory_item is not None
+            and disposition == reference_disposition == ArtifactDisposition.ANALYZED
+            and inventory_item.get("content_kind") == ContentKind.TEXT
+            and inventory_item.get("reason") is None
+            and inventory_item.get("inherited_exclusion_reason") is None
+            and inventory_item.get("misleading_extension") is not True
+        ):
+            continue
         if (
             provider_evidence_complete
             and target_path not in invalid_status_paths
@@ -985,6 +1038,26 @@ def _reference_coverage_findings(
                 raw_file_cache,
                 format_verified=format_is_verified(target_path, inventory_item),
             )
+        ):
+            continue
+        # Scanner-budget gaps are not artifact properties: a TP4 batch cap or
+        # a static runtime cap says the scanner stopped, not that the
+        # artifact evaded analysis. The completeness ledger already records
+        # the gap, so scoring it as HIGH AE1 prices the scanner's own
+        # configuration into the artifact's risk score. Suppress AE1 only
+        # when budget reasons are the target's entire gap. This branch
+        # deliberately does not require reference disposition to match the
+        # inventory: analyzer-time limits land after build_context syncs
+        # reference dispositions, so a budget-limited target typically still
+        # carries its resolution-time disposition on the reference. A failed
+        # final disposition still retains AE1.
+        if (
+            ledger_evidence_complete
+            and target_path not in fatal_paths
+            and target_path not in invalid_status_paths
+            and target_path not in duplicate_inventory_paths
+            and final_disposition == "partial"
+            and _has_only_budget_limitations(target_events)
         ):
             continue
         line_value = reference.get("line", 1)
@@ -1113,6 +1186,10 @@ def _reconcile_inspected_containers(state: SkillspectorState) -> dict[str, objec
     if not containers:
         return {}
     completeness, _ = finalize_ledger(state)
+    if format_recovery_policy_accepted(completeness):
+        # Traversal succeeded; the member's AI warning remains in the ledger.
+        # Do not turn accepted formatting uncertainty into an archive-access gap.
+        return {}
     incomplete = {
         str(row["path"])
         for row in completeness["ledger_exceptions"]

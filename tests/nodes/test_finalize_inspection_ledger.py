@@ -24,6 +24,7 @@ from skillspector.inspection_ledger import (
     analyzer_status_event,
     analyzer_status_for_events,
     finalize_ledger,
+    format_recovery_policy_accepted,
     guard_analyzer_node,
     inspection_work_id,
     ledger_event,
@@ -986,6 +987,130 @@ def test_resolved_partial_reference_produces_one_canonically_counted_ae1() -> No
     assert completeness["findings_before_filtering"] == 1
     assert completeness["findings_after_filtering"] == 1
     assert completeness["is_complete"] is False
+
+
+def _budget_limited_state() -> dict:
+    """State mimicking issue #982: TP4 batch cap plus static runtime cap.
+
+    Reference dispositions stay at their resolution-time value because
+    analyzer-time limits land after build_context syncs them, so the
+    budget branch must not depend on disposition equality.
+    """
+    targets = [
+        ("references/active-campaign/README.md", "semantic", "mcp_tool_poisoning"),
+        ("references/acuity-scheduling/README.md", "semantic", "mcp_tool_poisoning"),
+        ("references/snapchat/README.md", "static", "static_patterns_tool_misuse"),
+    ]
+    events = []
+    for index, (target, phase, analyzer_id) in enumerate(targets):
+        if index < 2:
+            events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase=phase,
+                    analyzer_id=analyzer_id,
+                    path=target,
+                    reason=LedgerReason.OUTPUT_LIMIT,
+                    observed_records=257,
+                    limit_records=256,
+                )
+            )
+        else:
+            events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase=phase,
+                    analyzer_id=analyzer_id,
+                    path=target,
+                    reason=LedgerReason.RUNTIME_LIMIT,
+                    observed_seconds=5.01,
+                    limit_seconds=5.0,
+                )
+            )
+    events.append(
+        ledger_event(
+            outcome=LedgerOutcome.COMPLETED,
+            phase="static",
+            analyzer_id="static_patterns_tool_misuse",
+            path="references/active-campaign/README.md",
+        )
+    )
+    return {
+        "components": ["SKILL.md", *[target for target, _, _ in targets]],
+        "findings": [],
+        "effective_finding_ids": [],
+        "artifact_inventory": [
+            {"path": target, "disposition": "analyzed", "content_kind": "text"}
+            for target, _, _ in targets
+        ],
+        "artifact_references": [
+            {
+                "source_path": "SKILL.md",
+                "line": 10 + index,
+                "column": 1,
+                "evidence": f"See [{target}]({target}).",
+                "target_path": target,
+                "status": "resolved",
+                "disposition": "analyzed",
+            }
+            for index, (target, _, _) in enumerate(targets)
+        ],
+        "inspection_ledger": events,
+        "analyzer_status_events": [],
+    }
+
+
+def test_budget_only_references_produce_no_ae1_but_stay_partial() -> None:
+    result = finalize_inspection_ledger(_budget_limited_state())
+
+    assert result["findings"] == []
+    completeness = result["analysis_completeness"]
+    assert completeness["status"] == "partial"
+    assert completeness["is_complete"] is False
+    assert {
+        (event.get("path"), event.get("reason_code")) for event in completeness["ledger_exceptions"]
+    } == {
+        ("references/active-campaign/README.md", LedgerReason.OUTPUT_LIMIT),
+        ("references/acuity-scheduling/README.md", LedgerReason.OUTPUT_LIMIT),
+        ("references/snapchat/README.md", LedgerReason.RUNTIME_LIMIT),
+    }
+
+
+def test_mixed_budget_and_artifact_limitation_keeps_high_ae1() -> None:
+    state = _budget_limited_state()
+    state["inspection_ledger"] = [
+        event for event in state["inspection_ledger"] if event.get("outcome") != "completed"
+    ] + [
+        ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            analyzer_id="static_patterns_tool_misuse",
+            path="references/active-campaign/README.md",
+            reason=LedgerReason.STATIC_PARSE_LIMIT,
+        ),
+    ]
+    result = finalize_inspection_ledger(state)
+
+    ae1 = [finding for finding in result["findings"] if finding.rule_id == "AE1"]
+    assert len(ae1) == 1
+    assert ae1[0].severity == "HIGH"
+    assert ae1[0].confidence == 1.0
+    assert ae1[0].matched_text == "references/active-campaign/README.md"
+
+
+def test_budget_only_with_failed_inventory_keeps_ae1() -> None:
+    state = _budget_limited_state()
+    state["artifact_inventory"] = [
+        {**item, "disposition": "failed"}
+        if item["path"] == "references/snapchat/README.md"
+        else item
+        for item in state["artifact_inventory"]
+    ]
+    result = finalize_inspection_ledger(state)
+
+    ae1 = [finding for finding in result["findings"] if finding.rule_id == "AE1"]
+    assert [finding.matched_text for finding in ae1] == ["references/snapchat/README.md"]
+    assert ae1[0].severity == "HIGH"
 
 
 def test_finalization_coverage_finding_does_not_require_meta_review(
@@ -2415,6 +2540,190 @@ def _self_reference_state(
         ],
         "inspection_ledger": list(events),
     }
+
+
+def _format_recovery_reference_state(path: str = "SKILL.md") -> SkillspectorState:
+    from skillspector.semantic_runtime import required_semantic_analyzer_ids
+
+    finding = Finding(rule_id="TM1", message="Known unsafe command", severity="HIGH", file=path)
+    events = [
+        ledger_event(
+            analyzer_id=analyzer,
+            outcome=(
+                LedgerOutcome.PARTIAL
+                if analyzer == "semantic_security_discovery"
+                else LedgerOutcome.COMPLETED
+            ),
+            phase="semantic",
+            path=path,
+            reason=(
+                LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+                if analyzer == "semantic_security_discovery"
+                else None
+            ),
+        )
+        for analyzer in sorted(required_semantic_analyzer_ids({}))
+    ]
+    calls = [{"node": event["analyzer_id"], "ok": True, "error": None} for event in events]
+    calls.append({"node": "meta_analyzer", "ok": True, "error": None})
+    events.append(
+        ledger_event(
+            analyzer_id="static_patterns_tool_misuse",
+            outcome=LedgerOutcome.COMPLETED,
+            phase="static",
+            path=path,
+            emitted_finding_ids=[finding.finding_id],
+        )
+    )
+    return {
+        "use_llm": True,
+        "components": [path],
+        "findings": [finding],
+        "effective_finding_ids": [finding.finding_id],
+        "artifact_inventory": [
+            {
+                "path": path,
+                "disposition": "analyzed",
+                "content_kind": "text",
+            }
+        ],
+        "artifact_references": [
+            {
+                "source_path": path,
+                "line": 5,
+                "target_path": path,
+                "status": "resolved",
+                "disposition": "analyzed",
+            }
+        ],
+        "inspection_ledger": events,
+        "analyzer_status_events": [
+            analyzer_status_for_events(event["analyzer_id"], [event]) for event in events
+        ],
+        "llm_call_log": calls,
+    }
+
+
+def test_format_recovery_warning_does_not_invent_ae1_or_drop_known_high_finding() -> None:
+    state = _format_recovery_reference_state()
+    assert finalizer_module._reference_coverage_findings(state) == []
+    result = finalize_inspection_ledger(state)
+    assert result["findings"] == []
+    assert result["effective_finding_ids"] == state["effective_finding_ids"]
+    assert state["findings"][0].severity == "HIGH"
+    assert format_recovery_policy_accepted(result["analysis_completeness"])
+    assert result["analysis_completeness"]["is_complete"] is False
+
+
+def test_format_recovery_preserves_existing_missing_reference_caveat() -> None:
+    state = _format_recovery_reference_state()
+    state["artifact_references"].append(
+        {"source_path": "SKILL.md", "line": 3, "target_path": None, "status": "missing"}
+    )
+    state["inspection_ledger"].append(
+        ledger_event(
+            record_type=LedgerRecordType.SYSTEM,
+            outcome=LedgerOutcome.PARTIAL,
+            phase="reference_resolution",
+            path="SKILL.md",
+            start_line=3,
+            end_line=3,
+            reason=LedgerReason.REFERENCE_MISSING,
+        )
+    )
+    result = finalize_inspection_ledger(state)
+    completeness = result["analysis_completeness"]
+    assert format_recovery_policy_accepted(completeness)
+    assert completeness["is_complete"] is False
+    assert completeness["partially_inspected_files"] == 1
+    assert any(
+        row["reason_code"] == "reference_missing" for row in completeness["ledger_exceptions"]
+    )
+    assert result["effective_finding_ids"] == state["effective_finding_ids"]
+    assert result["findings"] == []
+
+
+@pytest.mark.parametrize("static_gap", [False, True])
+def test_format_recovery_does_not_create_archive_gap_but_preserves_static_gaps(
+    static_gap: bool,
+) -> None:
+    member = "bundle.zip!/SKILL.md"
+    state = _format_recovery_reference_state(member)
+    state["components"].append("bundle.zip")
+    state["artifact_inventory"].append(
+        {
+            "path": "bundle.zip",
+            "disposition": "analyzed",
+            "content_kind": "binary",
+            "inspected_members": [member],
+        }
+    )
+    events = [
+        ledger_event(
+            analyzer_id="archive_inspection",
+            phase="static",
+            path="bundle.zip",
+            outcome=LedgerOutcome.COMPLETED,
+        )
+    ]
+    if static_gap:
+        events.append(
+            ledger_event(
+                analyzer_id="static_extra",
+                phase="static",
+                path=member,
+                outcome=LedgerOutcome.PARTIAL,
+                reason=LedgerReason.STATIC_PARSE_LIMIT,
+            )
+        )
+    state["inspection_ledger"].extend(events)
+    state["analyzer_status_events"].extend(
+        analyzer_status_for_events(event["analyzer_id"], [event]) for event in events
+    )
+
+    result = finalize_inspection_ledger(state)
+    inventory = result.get("artifact_inventory", state["artifact_inventory"])
+    container = next(row for row in inventory if row["path"] == "bundle.zip")
+    if static_gap:
+        assert container["reason"] == LedgerReason.ARCHIVE_MEMBER_INCOMPLETE
+        assert not format_recovery_policy_accepted(result["analysis_completeness"])
+    else:
+        assert container["disposition"] == "analyzed"
+        assert format_recovery_policy_accepted(result["analysis_completeness"])
+        assert result["analysis_completeness"]["partially_inspected_files"] == 1
+        assert result["findings"] == []
+        assert result["effective_finding_ids"] == state["effective_finding_ids"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["static_gap", "missing_status", "reference_partial", "binary", "misleading", "inventory_gap"],
+)
+def test_format_recovery_cannot_hide_independent_reference_gaps(mutation: str) -> None:
+    state = _format_recovery_reference_state()
+    if mutation == "static_gap":
+        event = ledger_event(
+            analyzer_id="static_extra",
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            path="SKILL.md",
+            reason=LedgerReason.STATIC_PARSE_LIMIT,
+        )
+        state["inspection_ledger"].append(event)
+        state["analyzer_status_events"].append(analyzer_status_for_events("static_extra", [event]))
+    elif mutation == "missing_status":
+        state["analyzer_status_events"].pop(0)
+    elif mutation == "reference_partial":
+        state["artifact_references"][0]["disposition"] = "partial"
+    elif mutation == "binary":
+        state["artifact_inventory"][0]["content_kind"] = "binary"
+    elif mutation == "misleading":
+        state["artifact_inventory"][0]["misleading_extension"] = True
+    else:
+        state["artifact_inventory"][0]["disposition"] = "partial"
+    assert [
+        finding.rule_id for finding in finalizer_module._reference_coverage_findings(state)
+    ] == ["AE1"]
 
 
 _REFERENCE_CAVEAT_CASES = [

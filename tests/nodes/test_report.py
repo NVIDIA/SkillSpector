@@ -42,6 +42,7 @@ from skillspector.nodes.report import (
     report,
 )
 from skillspector.sarif_models import validate_sarif_report
+from skillspector.semantic_runtime import required_semantic_analyzer_ids
 from skillspector.state import SkillspectorState, llm_call_record
 from skillspector.suppression import Baseline, SuppressionRule
 
@@ -1629,7 +1630,7 @@ def test_report_llm_degraded_when_all_calls_failed(monkeypatch: pytest.MonkeyPat
     assert meta["llm_provenance"]["determinism"]["control_status"] == "configuration_unknown"
     # Distinct error reasons are surfaced (deduped).
     assert "claude empty stdout" in meta["llm_error"]
-    assert "static analysis only" in meta["llm_error"]
+    assert "completed results are retained" in meta["llm_error"]
 
 
 def test_report_degraded_when_some_calls_fail(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2004,7 +2005,7 @@ def test_report_terminal_shows_degraded_warning(monkeypatch: pytest.MonkeyPatch)
     }
     body = report(state)["report_body"]
     assert "Degraded scan" in body
-    assert "STATIC analysis only" in body
+    assert "completed results are retained" in body
 
 
 def test_report_markdown_shows_degraded_warning(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2021,6 +2022,74 @@ def test_report_markdown_shows_degraded_warning(monkeypatch: pytest.MonkeyPatch)
     }
     body = report(state)["report_body"]
     assert "Degraded scan" in body
+
+
+@pytest.mark.parametrize("output_format", ["json", "markdown", "terminal", "sarif"])
+@pytest.mark.parametrize("transitive_truncated", [False, True])
+def test_format_policy_reports_acceptance_without_claiming_complete_inspection(
+    output_format: str,
+    transitive_truncated: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
+    events = [
+        ledger_event(
+            analyzer_id=analyzer,
+            phase="semantic",
+            path="SKILL.md",
+            outcome=(
+                LedgerOutcome.PARTIAL
+                if analyzer == "semantic_security_discovery"
+                else LedgerOutcome.COMPLETED
+            ),
+            reason=(
+                LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+                if analyzer == "semantic_security_discovery"
+                else None
+            ),
+        )
+        for analyzer in sorted(required_semantic_analyzer_ids({}))
+    ]
+    state = {
+        "use_llm": True,
+        "components": ["SKILL.md"],
+        "output_format": output_format,
+        "findings": [],
+        "filtered_findings": [],
+        "manifest": {"name": "format-recovery"},
+        "inspection_ledger": events,
+        "analyzer_status_events": [
+            analyzer_status_for_events(event["analyzer_id"], [event]) for event in events
+        ],
+        "llm_call_log": [llm_call_record(event["analyzer_id"], ok=True) for event in events],
+    }
+    state["analysis_completeness"], _ = finalize_ledger(state)
+    if transitive_truncated:
+        state["transitive_truncation_reasons"] = ["target budget reached"]
+    result = report(state)
+    completeness = result["analysis_completeness"]
+    assert completeness["policy_accepted"] is (not transitive_truncated)
+    assert all(
+        warning["accepted_by_policy"] is (not transitive_truncated)
+        for warning in completeness["warnings"]
+    )
+    assert state["analysis_completeness"]["warnings"][0]["accepted_by_policy"] is True
+    assert completeness["is_complete"] is False
+    assert completeness["status"] == "partial"
+    assert result["risk_recommendation"] == "CAUTION"
+    if output_format == "json":
+        payload = json.loads(result["report_body"])
+        assert payload["metadata"]["llm_assessment_complete"] is False
+        assert payload["metadata"]["llm_recovery_policy_accepted"] is (not transitive_truncated)
+    elif output_format == "sarif":
+        invocation = result["sarif_report"]["runs"][0]["invocations"][0]
+        projection = invocation["properties"]["analysisCompleteness"]
+        assert projection["acceptedByPolicy"] is (not transitive_truncated)
+        assert projection["assessmentComplete"] is False
+    else:
+        assert ("Accepted with warning" in result["report_body"]) is (not transitive_truncated)
+        if not transitive_truncated:
+            assert "assessment remains incomplete" in result["report_body"]
 
 
 def test_report_sarif_carries_degradation_notification() -> None:
@@ -2043,7 +2112,7 @@ def test_report_sarif_carries_degradation_notification() -> None:
     assert invocation["executionSuccessful"] is True  # scan completed; LLM sub-stage degraded
     notification = invocation["toolExecutionNotifications"][0]
     assert notification["level"] == "warning"
-    assert "STATIC analysis only" in notification["message"]["text"]
+    assert "completed results are retained" in notification["message"]["text"]
     # The serialized report_body carries it too, and the doc stays schema-valid.
     body = json.loads(result["report_body"])
     assert body["runs"][0]["invocations"][0]["toolExecutionNotifications"]
@@ -2760,6 +2829,94 @@ def test_preflight_unavailable_log_does_not_claim_runtime_calls_failed(
         "provider_guarantee": False,
         "reason": "LLM analysis was not executed for this scan.",
     }
+
+
+@pytest.mark.parametrize("include_tp4_meta", [False, True])
+def test_accounted_refusal_log_retains_completed_ai_results(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, include_tp4_meta: bool
+) -> None:
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
+    events = []
+    statuses = []
+    calls = []
+    refused = "semantic_security_discovery"
+    for analyzer in sorted(required_semantic_analyzer_ids({})):
+        own_events = [
+            ledger_event(
+                analyzer_id=analyzer,
+                outcome=LedgerOutcome.COMPLETED,
+                phase="semantic",
+                path="SKILL.md",
+            ),
+            ledger_event(
+                analyzer_id=analyzer,
+                outcome=LedgerOutcome.SKIPPED if analyzer == refused else LedgerOutcome.COMPLETED,
+                phase="semantic",
+                path="rules.yaml",
+                reason=LedgerReason.LLM_RESPONSE_REFUSED if analyzer == refused else None,
+            ),
+        ]
+        events.extend(own_events)
+        statuses.append(analyzer_status_for_events(analyzer, own_events))
+        calls.append(llm_call_record(analyzer, ok=analyzer != refused))
+    finding = _finding("TM1", "HIGH")
+    if include_tp4_meta:
+        for analyzer in ("mcp_tool_poisoning", "meta_analyzer"):
+            own_events = [
+                ledger_event(
+                    analyzer_id=analyzer,
+                    outcome=LedgerOutcome.SKIPPED,
+                    phase="meta" if analyzer == "meta_analyzer" else "semantic",
+                    path="SKILL.md",
+                    reason=LedgerReason.LLM_RESPONSE_REFUSED,
+                    input_finding_ids=[finding.finding_id] if analyzer == "meta_analyzer" else (),
+                    emitted_finding_ids=[finding.finding_id] if analyzer == "meta_analyzer" else (),
+                )
+            ]
+            if analyzer == "mcp_tool_poisoning":
+                own_events.insert(
+                    0,
+                    ledger_event(
+                        analyzer_id="mcp_tool_poisoning_static",
+                        outcome=LedgerOutcome.COMPLETED,
+                        phase="static",
+                        path="SKILL.md",
+                    ),
+                )
+            events.extend(own_events)
+            statuses.append(analyzer_status_for_events(analyzer, own_events))
+            calls.append(llm_call_record(analyzer, ok=False))
+    else:
+        calls.append(llm_call_record("meta_analyzer", ok=True))
+    state: SkillspectorState = {
+        "filtered_findings": [finding],
+        "findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_requested": True,
+        "meta_review_required": True,
+        "inspection_ledger": events,
+        "analyzer_status_events": statuses,
+        "llm_call_log": calls,
+    }
+    with caplog.at_level(logging.WARNING, logger="skillspector.nodes.report"):
+        result = report(state)
+    assert "affected AI assessments are incomplete" in caplog.text
+    assert "runtime telemetry was incomplete" not in caplog.text
+    assert "report reflects static analysis only" not in caplog.text
+    payload = json.loads(result["report_body"])
+    metadata = payload["metadata"]
+    assert metadata["llm_degraded"] is True
+    assert metadata["llm_available"] is (not include_tp4_meta)
+    assert metadata["meta_analysis_applied"] is (not include_tp4_meta)
+    assert "completed results are retained" in metadata["llm_error"]
+    assert "static analysis only" not in metadata["llm_error"]
+    assert any(issue["id"] == "TM1" and issue["severity"] == "HIGH" for issue in payload["issues"])
+    assert events[-1]["reason_code"] == LedgerReason.LLM_RESPONSE_REFUSED
+    assert calls[-1]["ok"] is (not include_tp4_meta)
 
 
 def test_non_degraded_clean_scan_stays_safe() -> None:
