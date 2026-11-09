@@ -1142,13 +1142,22 @@ class TestCliPromptByteBudget:
             assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_http_provider_batching_unchanged(self, http_provider: None) -> None:
+    def test_http_provider_serialized_prompts_fit_and_keep_all_lines(
+        self, http_provider: None
+    ) -> None:
         analyzer = self._analyzer()
         content = "".join("z" * 10 + "\n" for _ in range(150_000))
-        budget = max(analyzer._input_budget - estimate_tokens("test"), 1024)
-        expected = [(s, e) for _t, s, e in chunk_file_by_lines(content, budget)]
-        batches = analyzer.get_batches(["big.js"], {"big.js": content})
-        assert [(b.start_line, b.end_line) for b in batches] == expected
+        covered: set[int] = set()
+        for batch in analyzer.get_batches(["big.js"], {"big.js": content}):
+            prompt = analyzer.build_prompt(batch)
+            if analyzer.response_schema is not None:
+                from skillspector.llm_utils import structured_output_instructions
+
+                prompt += structured_output_instructions(analyzer.response_schema)
+            assert (len(prompt.encode("utf-8")) + 3) // 4 <= analyzer._input_budget
+            assert batch.end_line is not None
+            covered.update(range(batch.start_line, batch.end_line + 1))
+        assert covered == set(range(1, 150_001))
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_cli_payload_with_schema_instructions_fits_without_margin(
@@ -3209,6 +3218,12 @@ class TestLLMMetaAnalyzerGetBatches:
         content = "".join("m" * 40 + "\n" for _ in range(30_000))
         findings = [self._make_finding("big.js", line=i) for i in range(1, 30_000, 100)]
         metadata = "d" * 400_000
+        # Exercise the CLI byte cap with an explicit known local counting fixture;
+        # unknown codecs instead use the conservative byte-bound refusal test.
+        import tiktoken
+
+        codec = tiktoken.get_encoding("cl100k_base")
+        analyzer._token_counter = lambda text: len(codec.encode(text, disallowed_special=()))
         batches = analyzer.get_batches(
             ["big.js"], {"big.js": content}, findings, metadata_text=metadata
         )
