@@ -4640,3 +4640,135 @@ def test_plain_recovery_changed_repair_uses_only_original_assessment(monkeypatch
     monkeypatch.setattr(analyzer, "_recover_batch", recovery)
     _run_plain_recovery(analyzer)
     assert recovery.call_args.args[2] == original
+
+
+class TestConfigurableRequestLimits:
+    MODEL = "nvidia/openai/gpt-oss-120b"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_max_batch_input_tokens_caps_model_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_BATCH_INPUT_TOKENS", "5000")
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        assert analyzer._input_budget == 5000
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @pytest.mark.parametrize("value", ["", "  ", "secret-value", "0", "-5", "999999999"])
+    def test_blank_invalid_or_larger_token_cap_keeps_model_budget(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, value: str
+    ) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_MAX_BATCH_INPUT_TOKENS", raising=False)
+        expected = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)._input_budget
+        monkeypatch.setenv("SKILLSPECTOR_MAX_BATCH_INPUT_TOKENS", value)
+        assert LLMAnalyzerBase(base_prompt="test", model=self.MODEL)._input_budget == expected
+        assert "secret-value" not in caplog.text
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_byte_cap_covers_findings_metadata_language_and_schema(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skillspector.llm_utils import structured_output_instructions
+
+        class _MetadataAnalyzer(LLMAnalyzerBase):
+            def build_prompt(self, batch: Batch, **kwargs: object) -> str:
+                listed = "\n".join(f"- {f.rule_id}: {f.message}" for f in batch.findings)
+                return super().build_prompt(batch) + f"\n{kwargs['metadata']}\n{listed}"
+
+        cap = 20_000
+        monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+        monkeypatch.setenv("SKILLSPECTOR_MAX_PROMPT_BYTES", str(cap))
+        monkeypatch.setenv("SKILLSPECTOR_OUTPUT_LANGUAGE", "Japanese")
+        analyzer = _MetadataAnalyzer(base_prompt="test", model=self.MODEL)
+        content = "".join(f"値_{index} = '漢字テキスト'\n" for index in range(2_000))
+        findings = [
+            Finding(rule_id="R1", message="発見 " * 20, file="cjk.py", start_line=line)
+            for line in range(1, 2_001, 100)
+        ]
+        metadata = "メタデータ " * 200
+        batches = analyzer.get_batches(["cjk.py"], {"cjk.py": content}, findings, metadata=metadata)
+
+        assert len(batches) > 1
+        covered: set[int] = set()
+        for batch in batches:
+            prompt = analyzer.build_prompt(batch, metadata=metadata)
+            assert "## Output language" in prompt
+            payload = prompt + structured_output_instructions(LLMAnalysisResult)
+            assert len(payload.encode("utf-8")) <= cap
+            assert batch.end_line is not None
+            assert all(batch.start_line <= f.start_line <= batch.end_line for f in batch.findings)
+            covered.update(range(batch.start_line, batch.end_line + 1))
+        assert covered == set(range(1, 2_001))
+        attributed = {id(f) for batch in batches for f in batch.findings}
+        assert attributed == {id(f) for f in findings}
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_oversized_line_is_size_limited_while_other_batches_run(
+        self, monkeypatch: pytest.MonkeyPatch, async_mode: bool
+    ) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+        monkeypatch.setenv("SKILLSPECTOR_MAX_PROMPT_BYTES", "8000")
+        submitted: list[str] = []
+
+        def answer(_runnable: object, prompt: str, _collector: object) -> LLMAnalysisResult:
+            submitted.append(prompt)
+            return LLMAnalysisResult(findings=[])
+
+        async def aanswer(runnable: object, prompt: str, collector: object) -> LLMAnalysisResult:
+            return answer(runnable, prompt, collector)
+
+        monkeypatch.setattr("skillspector.llm_analyzer_base._invoke_with_usage", answer)
+        monkeypatch.setattr("skillspector.llm_analyzer_base._ainvoke_with_usage", aanswer)
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        cache = {"ok.py": "x = 1\n", "big.py": "a = 1\n" + "漢" * 5_000 + "\nb = 2\n"}
+        batches = analyzer.get_batches(["ok.py", "big.py"], cache)
+        outcome = (
+            await analyzer.arun_batches_detailed(batches)
+            if async_mode
+            else analyzer.run_batches_detailed(batches)
+        )
+
+        assert [(f.batch.file_path, f.reason) for f in outcome.failures] == [
+            ("big.py", LedgerReason.SIZE_LIMIT)
+        ]
+        assert outcome.failures[0].error_class == "PromptSizeLimitError"
+        assert {b.file_path for b, _ in outcome.successful} == {"ok.py", "big.py"}
+        assert len(outcome.successful) == len(batches) - 1
+        assert all(len(prompt.encode("utf-8")) <= 8000 for prompt in submitted)
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_oversized_fixed_prompt_is_size_limited_without_submission(
+        self, monkeypatch: pytest.MonkeyPatch, async_mode: bool
+    ) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+        monkeypatch.setenv("SKILLSPECTOR_MAX_PROMPT_BYTES", "2000")
+        invoke = MagicMock()
+        monkeypatch.setattr("skillspector.llm_analyzer_base._invoke_with_usage", invoke)
+        monkeypatch.setattr("skillspector.llm_analyzer_base._ainvoke_with_usage", invoke)
+        analyzer = LLMAnalyzerBase(base_prompt="p" * 3_000, model=self.MODEL)
+        batches = analyzer.get_batches(["a.py", "b.py"], {"a.py": "x = 1\n", "b.py": "y = 2\n"})
+        outcome = (
+            run_async(analyzer.arun_batches_detailed(batches))
+            if async_mode
+            else analyzer.run_batches_detailed(batches)
+        )
+
+        invoke.assert_not_called()
+        assert [(f.batch.file_path, f.reason) for f in outcome.failures] == [
+            ("a.py", LedgerReason.SIZE_LIMIT),
+            ("b.py", LedgerReason.SIZE_LIMIT),
+        ]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_preflight_uses_the_cli_provider_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skillspector.llm_analyzer_base import PromptSizeLimitError
+
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        monkeypatch.delenv("SKILLSPECTOR_MAX_PROMPT_BYTES", raising=False)
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        runnable = MagicMock()
+        with pytest.raises(PromptSizeLimitError):
+            analyzer._invoke_with_failure_diagnostic(runnable, "z" * (MAX_INPUT_BYTES + 1))
+        runnable.invoke.assert_not_called()
