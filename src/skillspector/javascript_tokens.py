@@ -1638,7 +1638,8 @@ def _is_regexp_constructor(program: JavaScriptProgram, node: Node) -> bool:
     """True only for the global RegExp name used as a new-expression constructor.
 
     Any local binding of the name still poisons the proof through its own
-    identifier node, so this exempts only the constructor position itself.
+    identifier or shorthand binding node, so this exempts only the
+    constructor position itself.
     """
     parent = node.parent
     return (
@@ -1740,7 +1741,19 @@ def _ordinary_native_calls(
             "shorthand_property_identifier_pattern",
         }:
             references.setdefault(program.text(node), []).append(node)
-        if node.type in {"identifier", "property_identifier", "string"}:
+        if node.type in {
+            "identifier",
+            "property_identifier",
+            "string",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            # Shorthand bindings bind the name too: catch ({RegExp}) and
+            # for (const {RegExp} of ...) bind through
+            # shorthand_property_identifier_pattern, not identifier. Only the
+            # constructor-position identifier itself is exempted, and
+            # _is_regexp_constructor only matches identifier nodes, so a
+            # shorthand node spelling an override name always poisons.
             spelling = program.text(node).strip("\"'")
             if spelling in override_names and not _is_regexp_constructor(program, node):
                 intrinsic_override = True
@@ -2076,6 +2089,12 @@ def _has_shell_execution_call(
             value = node.child_by_field_name("right")
         elif node.type == "formal_parameters":
             target = node
+        elif node.type == "catch_clause":
+            # A catch parameter binds like a formal parameter, including
+            # destructured forms such as catch ({RegExp}). Without this, a
+            # caught arbitrary constructor could borrow the global RegExp
+            # proof in _ordinary_native_calls.
+            target = node.child_by_field_name("parameter")
         elif node.type == "arrow_function":
             target = node.child_by_field_name("parameter")
         elif node.type == "import_statement":
