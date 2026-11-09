@@ -207,6 +207,7 @@ def test_cross_file_occurrences_keep_their_report_identity_and_snippet() -> None
             "source_digest",
             "source_url",
             "transitive_depth",
+            "surface",
         }
         for occurrence in compacted[0].to_dict()["occurrences"]
     )

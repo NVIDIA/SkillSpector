@@ -14,6 +14,55 @@ from skillspector.nodes.analyzers import static_runner
 _PADDING = "\n# ordinary padding\n" * 400
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "env",
+        "env -i",
+        "env --",
+        "env -u OTHER",
+        "env -C /tmp",
+        "env NAME=value",
+        "command",
+        "command -p",
+        "command --",
+        "builtin",
+        "builtin --",
+    ],
+)
+@pytest.mark.parametrize("ending", ["", "\n", "; echo ready\n", " | cat\n", " # explanation\n"])
+def test_optional_command_wrappers_without_executable_are_complete(
+    source: str, ending: str
+) -> None:
+    assert not _exhausted(source + ending, "shell")
+
+
+@pytest.mark.parametrize("key", ["command", "builtin", "env"])
+def test_json_key_naming_optional_command_wrapper_is_complete(key: str) -> None:
+    source = '# Output\n\n```json\n{"' + key + '": "echo ready"}\n```\n'
+
+    assert not _exhausted(source, "markdown")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "env -u",
+        "env -C",
+        "env -S",
+        "env --unknown",
+        'env >log bash -c "$CMD"',
+        'command >log bash -c "$CMD"',
+        'builtin >log eval "$CMD"',
+        'env -- >log bash -c "$CMD"',
+        'command -- >log bash -c "$CMD"',
+        'builtin -- >log eval "$CMD"',
+    ],
+)
+def test_commandless_wrapper_refinement_keeps_unresolved_operands_partial(source: str) -> None:
+    assert _exhausted(source, "shell")
+
+
 def _exhausted(content: str, file_type: str, *, complete_context: bool = True) -> bool:
     return tm_module.has_bounded_parse_exhaustion(
         content, lambda: None, file_type=file_type, complete_context=complete_context

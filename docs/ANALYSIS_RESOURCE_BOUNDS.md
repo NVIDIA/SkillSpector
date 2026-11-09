@@ -28,6 +28,29 @@ Failures and unsupported content remain in the completeness ledger. See
 | End-to-end workflow time | 1080 seconds | One graph execution |
 | Cache and context-processing time | 60 seconds | One skill bundle, within the workflow deadline |
 
+Retained inspection-work capacities can be adjusted before starting the scanner:
+
+| Environment variable | Default | Maximum | Unit |
+|---|---:|---:|---|
+| `SKILLSPECTOR_MAX_INSPECTION_LEDGER_EVENTS` | 100,000 | 1,000,000 | Work-accounting records |
+| `SKILLSPECTOR_ARCHIVE_MAX_MEMBERS` | 4,096 | 10,000 | Members across all archives |
+| `SKILLSPECTOR_ARCHIVE_MAX_MEMBER_BYTES` | 1,000,000 | 16 MiB | Bytes in one expanded archive member |
+| `SKILLSPECTOR_MAX_PYTHON_AST_SOURCE_CHARS` | 1,000,000 | 8,000,000 | Characters in one Python source |
+| `SKILLSPECTOR_TP4_MAX_FILES` | 128 | 10,000 | Files admitted to TP4 |
+| `SKILLSPECTOR_TP4_MAX_FILE_CODE_BYTES` | 1 MiB | 16 MiB | UTF-8 bytes in one TP4 source |
+| `SKILLSPECTOR_TP4_MAX_TOTAL_CODE_BYTES` | 4 MiB | 64 MiB | UTF-8 source bytes admitted to TP4 |
+| `SKILLSPECTOR_TP4_MAX_TOTAL_INPUT_BYTES` | 4 MiB | 64 MiB | All serialized TP4 prompt bytes |
+
+Values must be positive decimal integers; byte settings use bytes rather than MiB suffixes.
+Unset or blank values retain the default. Invalid or out-of-range values warn without logging
+the supplied value and retain the default. Settings are read on import and require a process
+restart. A larger ledger retains independent analyzer results for each artifact; the public
+finding-output limit remains 10,000. All other limits still apply, including the shared workflow
+deadline, remaining artifact/byte allowance, Python AST cache budget, per-request token budget,
+TP4 batch limit, archive expansion ratio, depth and inspection time. Raising a capacity does not
+guarantee completion; omitted work remains explicitly incomplete. Larger Python AST settings can
+increase peak memory even though cached source characters remain bounded.
+
 The 64 MiB ceiling accounts for the canonical raw bytes retained for analysis. Local decoded text
 and LLM-safe text are derived only from those bounded bytes; they do not authorize another source
 read allowance. Exact raw bytes from readable nested members consume the remaining portion of the
@@ -37,8 +60,9 @@ overhead or decoded Unicode storage occupies exactly the same amount of memory.
 Files larger than 16 MiB receive a bounded local projection and a `partial` inventory disposition.
 They are not sent to an external model. Lexical static analysis uses 256,000-character windows with
 an 8,192-character overlap. Unicode-derived security views are re-sliced to the same ceiling before
-pattern modules receive them. Whole-file Python AST analysis is limited to 1,000,000 characters, and
-the shared parsed-AST cache retains at most 8,000,000 source characters per scan.
+pattern modules receive them. Whole-file Python AST analysis defaults to 1,000,000 characters;
+`SKILLSPECTOR_MAX_PYTHON_AST_SOURCE_CHARS` sets its bounded per-file ceiling. The shared parsed-AST
+cache retains at most 8,000,000 source characters per scan.
 
 ## Nested containers
 
@@ -48,10 +72,10 @@ Its additional ceilings are:
 | Resource | Ceiling | Scope |
 |---|---:|---|
 | Recursion depth | 3 | One outer-to-inner provenance chain |
-| Members | 1,000 | All outer and nested containers combined |
+| Members | 4,096 | All outer and nested containers combined |
 | Expanded bytes | 25 MiB | All outer and nested containers combined |
 | Central-directory bytes | 4 MiB | One container, before ZIP metadata allocation |
-| Materialized member | 1,000,000 bytes | One member |
+| Materialized member | 1,000,000 bytes (configurable) | One member |
 | Compression ratio | 100:1 | One member |
 | Archive-inspection time | 5 seconds | All outer and nested containers combined |
 
@@ -123,6 +147,7 @@ malicious evasion. Keep required references and use the reason to choose the fix
 
 | Reason | Next step |
 |---|---|
+| `dependency_parse_error` | Correct the malformed dependency manifest or lockfile, then rerun the scan. |
 | `static_parse_limit` | Inspect the expression and analyzer. If valid source is misinterpreted, correct or update the scanner and rerun. |
 | `read_error`, `stat_error`, `file_disappeared`, `missing_file_cache` | Ensure the resolved target remains readable throughout the scan. |
 | `size_limit`, `runtime_limit` | Review the reported bounds and input size; distinguish a scanner performance problem from a legitimate resource ceiling. |
@@ -278,7 +303,7 @@ removes the rejected partial checkout.
 
 | Resource | Ceiling | Scope |
 |---|---:|---|
-| Inspection-ledger events | 10,000 | One graph execution |
+| Inspection-ledger events | 100,000 (configurable) | One graph execution |
 | Build-context ledger events | 10,000 | One bundle context |
 | Static findings | 10,000 | One artifact |
 | Static findings | 10,000 | One analyzer |
@@ -299,8 +324,8 @@ removes the rejected partial checkout.
 | Dependency analysis time | 30 seconds | One analyzer execution, within the workflow deadline |
 | OSV packages / query batches / detail requests | 256 / 4 / 64 | One dependency analysis budget |
 | OSV response bytes / retained results | 4 MiB / 256 | One dependency analysis budget |
-| TP4 source files / batches / findings | 128 / 256 / 64 | One analyzer execution |
-| TP4 source and prompt input | 4 MiB each | One analyzer execution |
+| TP4 source files / batches / findings | 128 / 256 / 64 | One analyzer execution; file and batch capacities are configurable |
+| TP4 source and prompt input | 4 MiB each (configurable) | One analyzer execution |
 | TP4 model input | 32,000 tokens | One batch |
 | Public finding and occurrence records | 10,000 | One report |
 

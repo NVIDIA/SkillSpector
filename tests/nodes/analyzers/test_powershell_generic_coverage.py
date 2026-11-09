@@ -33,15 +33,17 @@ _ENCODED_STAGE = base64.b64encode(
         pytest.param('$payload = "' + "61" * 110 + '"\n', "SC3", id="hex-literal"),
     ],
 )
+@pytest.mark.parametrize("extension", ["ps1", "psm1", "psd1"])
 def test_powershell_classification_preserves_generic_analyzer_coverage(
-    content: str, expected_rule: str
+    content: str, expected_rule: str, extension: str
 ) -> None:
-    """A .ps1 script keeps the hidden-instruction and obfuscation checks of an untyped file."""
-    assert static_runner._infer_file_type("scripts/setup.ps1") == "powershell"
+    """PowerShell keeps the hidden-instruction and obfuscation checks of an untyped file."""
+    path = f"scripts/setup.{extension}"
+    assert static_runner._infer_file_type(path) == "powershell"
     findings_by_type = []
-    for path in ("scripts/setup.generic", "scripts/setup.ps1"):
+    for candidate_path in ("scripts/setup.generic", path):
         result = static_runner.run_static_patterns_with_ledger(
-            {"components": [path], "file_cache": {path: content}},
+            {"components": [candidate_path], "file_cache": {candidate_path: content}},
             [prompt_injection, supply_chain],
         )
         findings_by_type.append(

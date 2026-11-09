@@ -27,6 +27,8 @@ from hashlib import sha256
 from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
+from skillspector.surface import infer_surface
+
 if TYPE_CHECKING:
     from skillspector.state import SkillspectorState
 
@@ -115,6 +117,20 @@ def observe_analyzer_findings(
         _analyzer_finding_observer.reset(token)
 
 
+@contextmanager
+def map_analyzer_findings(mapper: Callable[[AnalyzerFinding], None]) -> Iterator[None]:
+    """Map derived findings before an enclosing resource guard observes them."""
+    parent = _analyzer_finding_observer.get()
+
+    def observe(finding: AnalyzerFinding) -> None:
+        mapper(finding)
+        if parent is not None:
+            parent(finding)
+
+    with observe_analyzer_findings(observe):
+        yield
+
+
 _finding_id_factory: ContextVar[Callable[[], str] | None] = ContextVar(
     "skillspector_finding_id_factory", default=None
 )
@@ -182,6 +198,11 @@ class Finding:
     # Canonical unbound rule+match digest. Never replace it with a source-bound digest.
     match_fingerprint: str | None = None
     occurrences: list[dict[str, object]] = field(default_factory=list)
+    # Reporting-only label for the file surface this finding landed on (see
+    # ``skillspector.surface``). It is advisory metadata: it never changes
+    # severity, confidence, scoring, or the finding count. ``None`` means
+    # "derive from ``file`` at serialization time".
+    surface: str | None = None
 
     def fingerprint(self) -> str | None:
         """Return a full-match fingerprint without exposing the matched payload."""
@@ -285,6 +306,9 @@ class Finding:
             "evidence": dict(self.evidence),
             "match_fingerprint": self.fingerprint(),
             "occurrences": self._serialized_occurrences(),
+            # Exposed, never filtered on: consumers decide what a surface is
+            # worth, so the scanner does not hide a finding on their behalf.
+            "surface": self.surface or infer_surface(self.file),
         }
         if self.transitive_depth:
             data["transitive_depth"] = self.transitive_depth

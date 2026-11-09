@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -321,3 +321,119 @@ def test_large_aggregate_findings_do_not_create_one_request_per_line(
         analyzer._check_prompt_budget(analyzer.build_prompt(batch))
     assert covered == set(range(1, len(lines) + 1))
     assert retained == {f.finding_id for f in findings}
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("limit_source", ["serialized-overhead", "refreshed-client"])
+async def test_field_recovery_keeps_known_findings_when_serialized_request_is_refused(
+    analyzer: lab.LLMAnalyzerBase,
+    monkeypatch: pytest.MonkeyPatch,
+    asynchronous: bool,
+    limit_source: str,
+) -> None:
+    """A completed answer can be retained without submitting an oversized recovery."""
+    source = '{"findings":[{"rule_id":"SSD-1","severity":"HIGH","start_line":1}]}'
+    cause = lab.StructuredOutputParseError(
+        "response lacks a required field",
+        issue=lab.ResponseIssue.INVALID_SCHEMA,
+        recovery_text=source,
+    )
+    invalid = lab._StructuredResponseValidationError(cause.issue)
+    invalid.__cause__ = cause
+    analyzer.recovery_rule_ids = ("SSD-1",)
+    if limit_source == "serialized-overhead":
+        # The initial prompt fits, while repeating it with recovery instructions
+        # exceeds the real byte/token bound despite the old chars/4 estimate.
+        prompt = "x" * (analyzer._input_budget - analyzer._count_prompt_tokens("") - 1)
+        assert analyzer._prompt_fits_budget(prompt)
+    else:
+        from langchain_openai import ChatOpenAI
+
+        prompt = "Assess the original source."
+        monkeypatch.setattr(analyzer, "_token_counter", lambda text: 1)
+        model = MagicMock(spec=ChatOpenAI)
+        model.custom_get_token_ids = lambda text: range(analyzer._input_budget + 1)
+        model.tiktoken_model_name = None
+        model.model_name = "refreshed-recovery-client"
+        monkeypatch.setattr(analyzer, "_model_for_call", lambda: (model, None))
+    monkeypatch.setattr(analyzer, "build_prompt", lambda batch, **kwargs: prompt)
+    rejected = AsyncMock(side_effect=invalid) if asynchronous else MagicMock(side_effect=invalid)
+    monkeypatch.setattr(analyzer, "_ainvoke_batch" if asynchronous else "_invoke_batch", rejected)
+    provider = AsyncMock() if asynchronous else MagicMock()
+    monkeypatch.setattr(
+        lab, "_ainvoke_with_usage" if asynchronous else "_invoke_with_usage", provider
+    )
+    batch = lab.Batch(file_path="source.py", content="original source")
+
+    outcome = (
+        await analyzer.arun_batches_detailed([batch], max_concurrency=1)
+        if asynchronous
+        else analyzer.run_batches_detailed([batch])
+    )
+
+    assert not outcome.successful and not outcome.warnings
+    assert len(outcome.failures) == 1
+    assert outcome.failures[0].error_class == "LLMInputBudgetError"
+    assert outcome.failures[0].reason is lab.LedgerReason.LLM_BATCH_FAILED
+    assert len(outcome.recovered) == 1
+    retained_batch, findings = outcome.recovered[0]
+    assert retained_batch is batch
+    assert len(findings) == 1
+    assert (findings[0].rule_id, findings[0].severity) == ("SSD-1", "HIGH")
+    assert findings[0].evidence["assessment_complete"] is False
+    assert "llm-format-recovery" in findings[0].tags
+    provider.assert_not_called()
+    rejected.assert_called_once()
+    assert analyzer._request_ordinal == 0
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_in_budget_field_recovery_preserves_diagnostics_and_partial_warning(
+    analyzer: lab.LLMAnalyzerBase, monkeypatch: pytest.MonkeyPatch, asynchronous: bool
+) -> None:
+    """Permitted raw recovery keeps the existing diagnostic and warning contracts."""
+    from langchain_core.messages import AIMessage
+
+    source = '{"findings":[{"rule_id":"SSD-1","severity":"HIGH","start_line":1}]}'
+    cause = lab.StructuredOutputParseError(
+        "response lacks a required field",
+        issue=lab.ResponseIssue.INVALID_SCHEMA,
+        recovery_text=source,
+    )
+    invalid = lab._StructuredResponseValidationError(cause.issue)
+    invalid.__cause__ = cause
+    analyzer.recovery_rule_ids = ("SSD-1",)
+    monkeypatch.setattr(analyzer, "build_prompt", lambda batch, **kwargs: "Assess this source.")
+    rejected = AsyncMock(side_effect=invalid) if asynchronous else MagicMock(side_effect=invalid)
+    monkeypatch.setattr(analyzer, "_ainvoke_batch" if asynchronous else "_invoke_batch", rejected)
+    response = AIMessage(content="UNKNOWN", response_metadata={"finish_reason": "stop"})
+    provider = (
+        AsyncMock(return_value=response) if asynchronous else MagicMock(return_value=response)
+    )
+    monkeypatch.setattr(
+        lab, "_ainvoke_with_usage" if asynchronous else "_invoke_with_usage", provider
+    )
+    name = "_ainvoke_with_failure_diagnostic" if asynchronous else "_invoke_with_failure_diagnostic"
+    diagnostic = (
+        AsyncMock(wraps=getattr(analyzer, name))
+        if asynchronous
+        else MagicMock(wraps=getattr(analyzer, name))
+    )
+    monkeypatch.setattr(analyzer, name, diagnostic)
+    batch = lab.Batch(file_path="source.py", content="original source")
+
+    outcome = (
+        await analyzer.arun_batches_detailed([batch], max_concurrency=1)
+        if asynchronous
+        else analyzer.run_batches_detailed([batch])
+    )
+
+    assert not outcome.successful and not outcome.failures
+    assert len(outcome.warnings) == 1
+    assert outcome.warnings[0].reason is lab.LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+    assert len(outcome.recovered) == 1
+    assert outcome.recovered[0][0] is batch
+    assert outcome.recovered[0][1][0].severity == "HIGH"
+    assert outcome.recovered[0][1][0].evidence["assessment_complete"] is False
+    assert provider.call_count > 0
+    assert diagnostic.call_count == provider.call_count == analyzer._request_ordinal
