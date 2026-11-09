@@ -1327,10 +1327,8 @@ class TestTP4FindingIssue1066:
             self._result(
                 0.9,
                 [
-                    "Uploads source files to an external endpoint "
-                    "but does not log the transfer",
-                    "Sends credentials to a remote host without "
-                    "validating the certificate",
+                    "Uploads source files to an external endpoint but does not log the transfer",
+                    "Sends credentials to a remote host without validating the certificate",
                 ],
             ),
             batch,

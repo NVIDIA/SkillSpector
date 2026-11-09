@@ -1227,9 +1227,7 @@ def _tp4_mismatched_item_is_absence(item: str) -> bool:
         if not clause:
             continue
         marker_positions = [
-            match.start()
-            for pattern in _TP4_ABSENCE_PATTERNS
-            for match in pattern.finditer(clause)
+            match.start() for pattern in _TP4_ABSENCE_PATTERNS for match in pattern.finditer(clause)
         ]
         for verb in _TP4_AFFIRMATIVE_VERB_PATTERN.finditer(clause):
             if not marker_positions or verb.start() < min(marker_positions):
