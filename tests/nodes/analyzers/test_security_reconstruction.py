@@ -24,6 +24,7 @@ from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_modul
 from skillspector.nodes.analyzers import static_runner
 from skillspector.security_reconstruction import (
     MAX_MARKER_LOOKAHEAD_CHARS,
+    _directives,
     _sentence_boundaries,
     build_declared_marker_views,
 )
@@ -931,6 +932,34 @@ def test_quoted_verb_with_filler_still_fails_closed() -> None:
 
     assert projection.views == ()
     assert projection.limited is True
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "`slop-ok`, `biome-ignore`, `@ts-expect-error` need reasons.",
+        "`@ts-ignore`, `eslint-disable` are counted.",
+        "`take out`, `run`, `list`",
+        "`taking out`, `run`, `list`",
+    ],
+)
+def test_backtick_identifier_list_is_not_a_removal_directive(content: str) -> None:
+    assert list(_directives(content, None, end_is_truncated=False)) == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Remove token `XYZ` from the message.",
+        "Ignore every'XYZ'you find.",
+        "`biome-ignore every`XYZ` from the message.",
+        "`biome-ignore`, `other`. Remove marker 'XYZ' from the message.",
+        "With 'XYZ' removed, read the message.",
+        "Replace 'XYZ' with nothing.",
+    ],
+)
+def test_identifier_list_guard_preserves_removal_directives(content: str) -> None:
+    assert "XYZ" in [item.marker for item in _directives(content, None, end_is_truncated=False)]
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
