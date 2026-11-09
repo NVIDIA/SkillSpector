@@ -309,9 +309,13 @@ _DEFAULT_IGNORABLE_PATTERN = re.compile(
 )
 _DEFAULT_IGNORABLE_RUN_PATTERN = re.compile(_DEFAULT_IGNORABLE_PATTERN.pattern + "+")
 _REPEATED_CHARACTER_RUN_PATTERN = re.compile(r"(.)\1+")
-_ASCII_CONFUSABLE_PATTERN = re.compile(
-    "[" + "".join(re.escape(chr(codepoint)) for codepoint in ASCII_CONFUSABLE_SKELETON) + "]"
-)
+# The confusable skeleton maps 1,515 code points. A regex character class that
+# large is matched one code point at a time against every range in the class,
+# so searching a long CJK window costs seconds even when nothing matches.
+# Deleting the same set with str.translate is one C-level pass, and the length
+# only changes when a confusable character is actually present, so the check in
+# `_requires_normalized_security_view_uncached` stays exact without the regex.
+_CONFUSABLE_DELETION_TABLE = dict.fromkeys(ASCII_CONFUSABLE_SKELETON)
 _OBFUSCATED_INSTRUCTION_ACTIONS = (
     "ignore",
     "override",
@@ -1714,25 +1718,76 @@ def _letter_spacing_gap_offsets(
 
 
 def _compute_token_gap_character(ch: str) -> bool:
-    return (
-        _is_unconditionally_ignored(ch)
-        or is_default_ignorable(ch)
-        or _is_non_ascii_separator(ch)
-        or ch == "\ufffd"
-    )
+    """Return whether *ch* can start or continue a token-bridging gap run.
+
+    For a non-ASCII character this is one category lookup: the default
+    ignorables and the replacement character are checked first, and the rest
+    is exactly the Cf, Cc and Z categories (unconditionally ignored format and
+    control characters, and non-ASCII separators). ASCII characters keep the
+    precomputed table path in `_is_token_gap_character`, so the allowed format
+    characters (newline, carriage return, tab) stay non-gaps here.
+    """
+    if is_default_ignorable(ch) or ch == "\ufffd":
+        return True
+    if ch.isascii():
+        return _is_unconditionally_ignored(ch)
+    category = unicodedata.category(ch)
+    return category in {"Cf", "Cc"} or category.startswith("Z")
 
 
 _ASCII_TOKEN_GAP_CHARS = frozenset(
     ch for ch in map(chr, range(128)) if _compute_token_gap_character(ch)
 )
 
-# Any character that cannot be a token gap need not be examined at all. Every
-# ASCII character outside this class is settled by the table above, so a text
-# built only from them has no gap spans and the per-character walk below is
-# pure overhead.
-_TOKEN_GAP_CANDIDATE = re.compile(
-    "[^"
-    + "".join(re.escape(ch) for ch in map(chr, range(128)) if ch not in _ASCII_TOKEN_GAP_CHARS)
+# Every character `_is_token_gap_character` accepts, as ranges derived
+# exhaustively from that predicate over U+0000..U+10FFFF (Unicode 15.0
+# runtime; the default-ignorable subset matches the pinned Unicode 15.1.0
+# ranges in `_DEFAULT_IGNORABLE_RANGES`). The old whole-string skip only
+# excluded pure printable-ASCII text, so any CJK or Sinhala window passed it
+# and paid a per-character Python walk even when the text held no gap
+# character at all. This class is the exact gap set, so a non-match proves
+# the walk below would yield nothing. Regenerate the ranges if the Unicode
+# version changes; test_token_gap_fast_paths pins every range boundary.
+_TOKEN_GAP_RANGES = (
+    (0x0000, 0x0008),
+    (0x000B, 0x000C),
+    (0x000E, 0x001F),
+    (0x007F, 0x00A0),
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x115F, 0x1160),
+    (0x1680, 0x1680),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x2000, 0x200F),
+    (0x2028, 0x202F),
+    (0x205F, 0x206F),
+    (0x3000, 0x3000),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFFB),
+    (0xFFFD, 0xFFFD),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+_TOKEN_GAP_CHARACTER = re.compile(
+    "["
+    + "".join(
+        re.escape(chr(start)) if start == end else f"{re.escape(chr(start))}-{re.escape(chr(end))}"
+        for start, end in _TOKEN_GAP_RANGES
+    )
     + "]"
 )
 
@@ -1743,26 +1798,31 @@ def _is_token_gap_character(ch: str) -> bool:
     return _compute_token_gap_character(ch)
 
 
-def _token_bridging_gap_spans(
+def _token_bridging_gap_spans_uncached(
     text: str,
     *,
-    require_word_boundaries: bool = True,
-    check_runtime: Callable[[], None] | None = None,
-) -> Iterator[tuple[int, int]]:
-    """Yield contextual noise runs in one pass without crossing ASCII spaces."""
-    if _TOKEN_GAP_CANDIDATE.search(text) is None:
-        return
+    require_word_boundaries: bool,
+) -> tuple[tuple[int, int], ...]:
+    """Return contextual noise runs in one pass without crossing ASCII spaces.
+
+    This is the walk body of `_token_bridging_gap_spans`, unchanged apart from
+    the prefilter below: the text is only walked when it contains at least one
+    character from the exact gap set, so gap-free mixed-script windows return
+    immediately instead of paying a per-character Python walk. The span cache
+    in `_token_bridging_gap_spans` only ever calls this with texts that pass
+    that check, and the delegating generator re-applies `check_runtime` per
+    yielded span, so a cached span set still respects the caller's deadline.
+    """
+    if _TOKEN_GAP_CHARACTER.search(text) is None:
+        return ()
+    spans: list[tuple[int, int]] = []
     offset = 0
     while offset < len(text):
-        if check_runtime is not None and offset % 4096 == 0:
-            check_runtime()
         if not _is_token_gap_character(text[offset]):
             offset += 1
             continue
         start = offset
         while offset < len(text) and _is_token_gap_character(text[offset]):
-            if check_runtime is not None and offset % 4096 == 0:
-                check_runtime()
             if is_default_ignorable(text[offset]):
                 run = _DEFAULT_IGNORABLE_RUN_PATTERN.match(text, offset)
                 if run is not None:
@@ -1777,7 +1837,41 @@ def _token_bridging_gap_spans(
             else before_is_word or after_is_word
         )
         if is_contextual:
-            yield start, offset
+            spans.append((start, offset))
+    return tuple(spans)
+
+
+@lru_cache(maxsize=_TEXT_PREDICATE_CACHE_SIZE)
+def _cached_token_bridging_gap_spans(
+    text: str,
+    require_word_boundaries: bool,
+) -> tuple[tuple[int, int], ...]:
+    """Memoize one window's gap spans; every analyzer re-derives them per view."""
+    return _token_bridging_gap_spans_uncached(text, require_word_boundaries=require_word_boundaries)
+
+
+def _token_bridging_gap_spans(
+    text: str,
+    *,
+    require_word_boundaries: bool = True,
+    check_runtime: Callable[[], None] | None = None,
+) -> Iterator[tuple[int, int]]:
+    """Yield contextual noise runs in one pass without crossing ASCII spaces.
+
+    Gap spans are memoized per text, since the same window texts are scanned
+    once per static analyzer (around fifteen times per artifact) and the
+    spans are pure functions of the text. The memoized walk runs without
+    intermediate deadline checks; that is bounded by the callers, which only
+    pass window-bounded text (at most 256K characters), and the deadline is
+    still enforced for every span yielded here and by the callers between
+    views. A miss on the largest window measured 0.65 seconds; a hit is free.
+    """
+    for start, end in _cached_token_bridging_gap_spans(
+        text, require_word_boundaries=require_word_boundaries
+    ):
+        if check_runtime is not None:
+            check_runtime()
+        yield start, end
 
 
 def _is_contextual_default_ignorable_offset(text: str, offset: int) -> bool:
@@ -2379,8 +2473,12 @@ def _requires_normalized_security_view_uncached(
     if check_runtime is not None:
         check_runtime()
     # The confusable map has no ASCII keys; avoid a comparatively expensive
-    # regex pass over large plain-ASCII windows.
-    if not text.isascii() and _ASCII_CONFUSABLE_PATTERN.search(text) is not None:
+    # pass over large plain-ASCII windows. The old 1,515-entry regex character
+    # class cost about 0.8 seconds per 284K-character CJK window even when
+    # nothing matched; deleting the same set with str.translate is one C-level
+    # pass, and the length only changes when a confusable is present, so the
+    # result is exact.
+    if not text.isascii() and len(text.translate(_CONFUSABLE_DELETION_TABLE)) != len(text):
         return True
     if text.isprintable():
         return False
