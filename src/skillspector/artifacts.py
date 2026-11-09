@@ -1851,9 +1851,7 @@ def _token_bridging_gap_spans_uncached(
 # gap-free and sparse fast paths stay cached.
 _TOKEN_GAP_SPAN_CACHE_MAX_SPANS = 8192
 _TOKEN_GAP_SPAN_CACHE_LOCK = threading.Lock()
-_TOKEN_GAP_SPAN_CACHE: OrderedDict[
-    tuple[str, bool], tuple[tuple[int, int], ...]
-] = OrderedDict()
+_TOKEN_GAP_SPAN_CACHE: OrderedDict[tuple[str, bool], tuple[tuple[int, int], ...]] = OrderedDict()
 _TOKEN_GAP_SPAN_CACHE_STATS = {"hits": 0, "misses": 0}
 
 
