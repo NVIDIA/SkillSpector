@@ -1183,16 +1183,27 @@ class TestCliPromptByteBudget:
         assert [b.file_path for b in batches] == [path]
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_oversized_single_line_warns_and_is_not_truncated(
-        self, cli_provider: None, caplog: pytest.LogCaptureFixture
+    def test_oversized_single_line_is_fragmented_without_truncation(
+        self, cli_provider: None
     ) -> None:
         analyzer = self._analyzer()
         # Fewer estimated tokens than the budget, more bytes than the cap.
         line = "漢" * (MAX_INPUT_BYTES // 3 + 10)
-        with caplog.at_level("WARNING"):
-            batches = analyzer.get_batches(["min.js"], {"min.js": line + "\n"})
-        assert any(line in batch.content for batch in batches)
-        assert "exceeds the provider input limit" in caplog.text
+        batches = analyzer.get_batches(["min.js"], {"min.js": line + "\n"})
+        assert len(batches) > 1
+        rebuilt = ""
+        covered = 0
+        for batch in batches:
+            start, end = batch.source_start_column, batch.source_end_column
+            assert start is not None and end is not None and start <= covered
+            assert batch.start_line == batch.end_line == 1
+            assert batch.source_line_length == len(line)
+            rebuilt += batch.content[covered - start : end - start]
+            covered = end
+            analyzer._check_prompt_budget(analyzer.build_prompt(batch))
+        assert covered == len(line)
+        assert rebuilt.encode() == line.encode()
+        assert batches[-1].content.endswith("\n")
 
 
 # ---------------------------------------------------------------------------
