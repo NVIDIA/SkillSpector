@@ -56,10 +56,14 @@ from skillspector.providers._agent_cli import (
     _OPENCODE_AGENT_PREFIX,
     _OPENCODE_DENY_ALL,
     _OPENCODE_SUPPORTED_VERSIONS,
+    _OPENCODE_SUPPORTED_VERSIONS_V2,
     AgentCLIError,
     _build_opencode_argv,
     _is_supported_opencode_version,
+    _is_supported_opencode_version_v2,
     _opencode_auth_check,
+    _opencode_config_2x,
+    _parse_opencode_debug_agents,
     _parse_opencode_output,
     _parse_opencode_version,
     _prepare_opencode_env,
@@ -369,6 +373,154 @@ class TestOpencodeVersionRange:
         mock_run.assert_called_once()
 
 
+class TestOpencodeVersionRangeV2:
+    def test_supported_v2_versions_are_an_explicit_verified_set(self) -> None:
+        assert _OPENCODE_SUPPORTED_VERSIONS_V2 == frozenset({(2, 2, 6), (2, 2, 7)})
+
+    @pytest.mark.parametrize("version", ["2.2.6", "2.2.7"])
+    def test_parse_supported_v2_versions(self, version: str) -> None:
+        parsed = _parse_opencode_version(f"{version}\n".encode())
+        assert parsed is not None
+        assert _is_supported_opencode_version_v2(parsed)
+        assert not _is_supported_opencode_version(parsed)
+
+    @pytest.mark.parametrize("raw", [b"2.2.5\n", b"2.2.8\n", b"2.3.0\n", b"2.2.6-1\n"])
+    def test_parse_unsupported_v2_versions_rejected(self, raw: bytes) -> None:
+        parsed = _parse_opencode_version(raw)
+        assert not _is_supported_opencode_version_v2(parsed)
+
+    def _v2_probe_results(self, auth_stdout: bytes) -> list[SimpleNamespace]:
+        # The --version probe in _build_opencode_argv uses Popen directly,
+        # so the mocked subprocess.run calls are the version check and
+        # auth list --format json only.
+        return [
+            _ok_result(b"2.2.6\n"),
+            _ok_result(auth_stdout),
+        ]
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_accepts_v2_with_connections(self, mock_run: MagicMock) -> None:
+        auth_json = (
+            b'[{"id": "anthropic", "name": "Anthropic", "connections": '
+            b'[{"type": "credential", "label": "API key"}]}]'
+        )
+        mock_run.side_effect = self._v2_probe_results(auth_json)
+        assert _opencode_auth_check(OPENCODE_BINARY) == (True, None)
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_uses_auth_list_format_json_on_v2(self, mock_run: MagicMock) -> None:
+        mock_run.side_effect = self._v2_probe_results(b"[]")
+        _opencode_auth_check(OPENCODE_BINARY)
+        assert mock_run.call_args[0][0] == [OPENCODE_BINARY, "auth", "list", "--format", "json"]
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_empty_v2_auth_list_is_fail_closed(self, mock_run: MagicMock) -> None:
+        mock_run.side_effect = self._v2_probe_results(b"[]")
+        ok, reason = _opencode_auth_check(OPENCODE_BINARY)
+        assert ok is False
+        assert "auth login" in (reason or "")
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_unparseable_v2_auth_list_is_fail_closed(self, mock_run: MagicMock) -> None:
+        mock_run.side_effect = self._v2_probe_results(b"not json")
+        ok, reason = _opencode_auth_check(OPENCODE_BINARY)
+        assert ok is False
+        assert "auth login" in (reason or "")
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_rejects_unverified_v2_version(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = _ok_result(b"2.2.8\n")
+        ok, reason = _opencode_auth_check(OPENCODE_BINARY)
+        assert ok is False
+        assert "2.2.6" in (reason or "") and "2.2.7" in (reason or "")
+        mock_run.assert_called_once()
+
+
+class TestParseOpencodeDebugAgents:
+    # Resolved permissions for the probe agent measured live on 2.2.6/2.2.7
+    # (#1084): defaults, then the agent-local deny, then the top-level deny,
+    # then the remaining default denies.
+    MEASURED_PERMS = [
+        {"action": "*", "resource": "*", "effect": "allow"},
+        {"action": "read", "resource": "*.env", "effect": "ask"},
+        {"action": "read", "resource": "*.env.*", "effect": "ask"},
+        {"action": "read", "resource": "*.env.example", "effect": "allow"},
+        {"action": "*", "resource": "*", "effect": "deny"},
+        {"action": "*", "resource": "*", "effect": "deny"},
+        {"action": "browser", "resource": "*", "effect": "deny"},
+        {"action": "skill", "resource": "browser", "effect": "deny"},
+    ]
+
+    def _agents_json(self, agent_name: str, perms: list[dict] | None) -> bytes:
+        agents = [
+            {"id": "build", "name": "Build", "mode": "primary", "permissions": []},
+            {"id": agent_name, "name": agent_name, "mode": "primary", "permissions": perms},
+        ]
+        return json.dumps(agents).encode()
+
+    def test_accepts_measured_deny_ending_list(self) -> None:
+        raw = self._agents_json("ssprobe", self.MEASURED_PERMS)
+        assert _parse_opencode_debug_agents(raw, "ssprobe") is None
+
+    def test_accepts_single_wildcard_deny(self) -> None:
+        raw = self._agents_json("ssprobe", [{"action": "*", "resource": "*", "effect": "deny"}])
+        assert _parse_opencode_debug_agents(raw, "ssprobe") is None
+
+    def test_rejects_missing_agent(self) -> None:
+        raw = self._agents_json("ssprobe", self.MEASURED_PERMS)
+        with pytest.raises(AgentCLIError, match="could not find the selected agent"):
+            _parse_opencode_debug_agents(raw, "other-agent")
+
+    def test_rejects_trailing_allow(self) -> None:
+        perms = self.MEASURED_PERMS + [{"action": "read", "resource": "*.env", "effect": "allow"}]
+        with pytest.raises(AgentCLIError, match="non-deny rule after the final wildcard deny"):
+            _parse_opencode_debug_agents(self._agents_json("ssprobe", perms), "ssprobe")
+
+    def test_rejects_trailing_ask(self) -> None:
+        perms = self.MEASURED_PERMS + [{"action": "read", "resource": "*.env", "effect": "ask"}]
+        with pytest.raises(AgentCLIError, match="non-deny rule after the final wildcard deny"):
+            _parse_opencode_debug_agents(self._agents_json("ssprobe", perms), "ssprobe")
+
+    def test_rejects_last_wildcard_allow(self) -> None:
+        perms = [dict(rule) for rule in self.MEASURED_PERMS]
+        perms[5] = {"action": "*", "resource": "*", "effect": "allow"}
+        with pytest.raises(AgentCLIError, match="last wildcard rule is not a deny"):
+            _parse_opencode_debug_agents(self._agents_json("ssprobe", perms), "ssprobe")
+
+    def test_rejects_malformed_json(self) -> None:
+        with pytest.raises(AgentCLIError, match="malformed JSON"):
+            _parse_opencode_debug_agents(b"not json", "ssprobe")
+
+    def test_rejects_non_list_output(self) -> None:
+        with pytest.raises(AgentCLIError, match="non-list agent set"):
+            _parse_opencode_debug_agents(b'{"id": "ssprobe"}', "ssprobe")
+
+    def test_rejects_missing_permissions(self) -> None:
+        raw = self._agents_json("ssprobe", None)
+        with pytest.raises(AgentCLIError, match="no resolved permissions"):
+            _parse_opencode_debug_agents(raw, "ssprobe")
+
+    def test_rejects_no_wildcard_rule(self) -> None:
+        perms = [{"action": "read", "resource": "*.env", "effect": "deny"}]
+        with pytest.raises(AgentCLIError, match="no wildcard rule"):
+            _parse_opencode_debug_agents(self._agents_json("ssprobe", perms), "ssprobe")
+
+    def test_rejects_malformed_rule(self) -> None:
+        perms = [{"action": "*", "resource": "*"}]
+        with pytest.raises(AgentCLIError, match="malformed permission rule"):
+            _parse_opencode_debug_agents(self._agents_json("ssprobe", perms), "ssprobe")
+
+
+class TestOpencodeConfig2x:
+    def test_project_policy_uses_agents_map_and_deny_lists(self) -> None:
+        config = json.loads(_opencode_config_2x("skillspector-deny-all-abc"))
+        assert "agent" not in config
+        agent = config["agents"]["skillspector-deny-all-abc"]
+        assert agent["mode"] == "primary"
+        assert agent["permissions"] == [{"action": "*", "resource": "*", "effect": "deny"}]
+        assert config["permissions"] == [{"action": "*", "resource": "*", "effect": "deny"}]
+
+
 class TestOpencodeDenyAllPolicy:
     def test_policy_overrides_hostile_ambient_configuration(self, tmp_path: Path) -> None:
         base = {
@@ -527,6 +679,219 @@ class TestOpencodeDenyAllPolicy:
 
         with pytest.raises(AgentCLIError, match="only for versions 1.18.31"):
             run_agent_cli("opencode", "try a boundary runtime", model="")
+        assert list(markers.iterdir()) == []
+
+
+class TestOpencodeDenyAllPolicyV2:
+    @staticmethod
+    def _write_fake_opencode_v2(
+        binary: Path,
+        markers: Path,
+        *,
+        agents_mode: str = "ok",
+        version: str = "2.2.6",
+    ) -> None:
+        """Write a 2.x host simulator with the measured 2.2.6/2.2.7 shapes.
+
+        ``debug agents`` reads the project ``opencode.jsonc`` the preflight
+        wrote into the run directory and resolves the probe agent the way
+        the real 2.2.6 binary does: the built-in defaults, then the
+        agent-local deny, then the top-level deny, then the remaining
+        default denies. ``agents_mode`` perturbs that resolved list (or
+        the output shape) for the fail-closed cases. The ``run`` branch
+        records the invoked argv and the project policy, then performs a
+        marker side effect for any adapter not covered by the project
+        policy, mirroring the 1.x fake.
+        """
+        binary.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json
+                import sys
+                from pathlib import Path
+
+                if sys.argv[1:] == ["--version"]:
+                    print({version!r})
+                    raise SystemExit(0)
+
+                markers = Path({str(markers)!r})
+                defaults = [
+                    {{"action": "*", "resource": "*", "effect": "allow"}},
+                    {{"action": "read", "resource": "*.env", "effect": "ask"}},
+                    {{"action": "read", "resource": "*.env.*", "effect": "ask"}},
+                    {{"action": "read", "resource": "*.env.example", "effect": "allow"}},
+                    {{"action": "question", "resource": "*", "effect": "allow"}},
+                    {{"action": "browser", "resource": "*", "effect": "deny"}},
+                    {{"action": "skill", "resource": "browser", "effect": "deny"}},
+                ]
+
+                def probe_agent():
+                    project = Path.cwd() / "opencode.jsonc"
+                    if not project.exists():
+                        return None
+                    config = json.loads(project.read_text())
+                    agents = config.get("agents", {{}})
+                    if not agents:
+                        return None
+                    name = next(iter(agents))
+                    agent_perms = agents[name].get("permissions", [])
+                    top_perms = config.get("permissions", [])
+                    resolved = defaults[:4] + agent_perms + top_perms + defaults[5:]
+                    return {{"id": name, "name": name, "mode": "primary", "permissions": resolved}}
+
+                if sys.argv[1:] == ["debug", "config"]:
+                    print(json.dumps([{{"type": "directory", "path": str(Path.cwd())}}]))
+                    raise SystemExit(0)
+
+                if sys.argv[1:] == ["debug", "agents"]:
+                    mode = {agents_mode!r}
+                    probe = probe_agent()
+                    if mode == "garbage":
+                        print("not json")
+                        raise SystemExit(0)
+                    if mode == "non-list":
+                        print(json.dumps({{"id": "build"}}))
+                        raise SystemExit(0)
+                    agents = [
+                        {{"id": "build", "name": "Build", "mode": "primary", "permissions": defaults}},
+                    ]
+                    if probe is not None and mode != "missing":
+                        resolved = list(probe["permissions"])
+                        if mode == "trailing-allow":
+                            resolved.append({{"action": "read", "resource": "*.env", "effect": "allow"}})
+                        elif mode == "trailing-ask":
+                            resolved.append({{"action": "read", "resource": "*.env", "effect": "ask"}})
+                        elif mode == "last-wildcard-allow":
+                            for rule in reversed(resolved):
+                                if rule["action"] == "*" and rule["resource"] == "*":
+                                    rule["effect"] = "allow"
+                                    break
+                        elif mode == "no-wildcard":
+                            resolved = [
+                                rule
+                                for rule in resolved
+                                if not (rule["action"] == "*" and rule["resource"] == "*")
+                            ]
+                        probe["permissions"] = resolved
+                        agents.append(probe)
+                    print(json.dumps(agents))
+                    raise SystemExit(0)
+
+                selected = sys.argv[sys.argv.index("--agent") + 1]
+                (markers / "argv").write_text(json.dumps(sys.argv[1:]))
+                project = Path.cwd() / "opencode.jsonc"
+                (markers / "jsonc").write_text(project.read_text() if project.exists() else "")
+                config = json.loads(project.read_text()) if project.exists() else {{}}
+                agent = config.get("agents", {{}}).get(selected, {{}})
+                denied = any(
+                    perm.get("action") == "*"
+                    and perm.get("resource") == "*"
+                    and perm.get("effect") == "deny"
+                    for perm in agent.get("permissions", [])
+                )
+                adapters = ["bash", "read", "edit", "webfetch", "websearch", "mcp_host", "skill", "future_host_tool"]
+                if not denied:
+                    for adapter in adapters:
+                        (markers / adapter).write_text("executed")
+                print(json.dumps({{"type": "text", "part": {{"type": "text", "text": "policy held:" + selected}}}}))
+                """
+            ),
+            encoding="utf-8",
+        )
+        binary.chmod(0o700)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_preflight_accepts_measured_permissions_and_run_holds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        response = run_agent_cli("opencode", "use every host tool", model="")
+        selected = response.removeprefix("policy held:")
+        assert response.startswith("policy held:")
+        assert selected.startswith(f"{_OPENCODE_AGENT_PREFIX}-")
+        assert sorted(path.name for path in markers.iterdir()) == ["argv", "jsonc"]
+        argv = json.loads((markers / "argv").read_text())
+        assert "--pure" not in argv
+        assert argv[argv.index("--agent") + 1] == selected
+        config = json.loads((markers / "jsonc").read_text())
+        assert config["agents"][selected]["permissions"] == [
+            {"action": "*", "resource": "*", "effect": "deny"}
+        ]
+        assert config["permissions"] == [{"action": "*", "resource": "*", "effect": "deny"}]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_preflight_accepts_2_2_7(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers, version="2.2.7")
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        response = run_agent_cli("opencode", "use every host tool", model="")
+        assert response.startswith("policy held:")
+        assert sorted(path.name for path in markers.iterdir()) == ["argv", "jsonc"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_argv_omits_pure_for_2x_binary(self, tmp_path: Path) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers)
+        argv = _build_opencode_argv(str(binary), "", 0)
+        assert "--pure" not in argv
+        assert "--agent" in argv
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    @pytest.mark.parametrize(
+        "agents_mode,match",
+        [
+            ("missing", "could not find the selected agent"),
+            ("trailing-allow", "non-deny rule after the final wildcard deny"),
+            ("trailing-ask", "non-deny rule after the final wildcard deny"),
+            ("last-wildcard-allow", "last wildcard rule is not a deny"),
+            ("garbage", "malformed JSON"),
+            ("non-list", "non-list agent set"),
+            ("no-wildcard", "no wildcard rule"),
+        ],
+    )
+    def test_2x_preflight_rejects_bad_resolved_policy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        agents_mode: str,
+        match: str,
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers, agents_mode=agents_mode)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        with pytest.raises(AgentCLIError, match=match):
+            run_agent_cli("opencode", "try a hostile runtime", model="")
+        assert list(markers.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_rejects_unverified_version_before_inference(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers, version="2.2.8")
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        with pytest.raises(AgentCLIError, match="only for versions 1.18.31") as excinfo:
+            run_agent_cli("opencode", "try a newer runtime", model="")
+        assert "2.2.7" in str(excinfo.value)
         assert list(markers.iterdir()) == []
 
 
