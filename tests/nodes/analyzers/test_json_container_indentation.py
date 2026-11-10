@@ -190,7 +190,7 @@ _INVALID = [
         id="blank-line-ends-nested-quote",
     ),
     pytest.param(
-        _fence("-\t```json", "\t", "\t```", json.dumps([_PLACEHOLDER, "x" * 65_537])),
+        _fence("-\t```json", "\t", "\t```", json.dumps([_PLACEHOLDER, "x" * 131_073])),
         id="oversized-json",
     ),
 ]
@@ -199,6 +199,15 @@ _INVALID = [
 @pytest.mark.parametrize("source", _INVALID)
 def test_unproven_container_cannot_own_json_quotes(source: str) -> None:
     assert reconstruction.validated_json_string_spans(source, lambda: None) == []
+
+
+def test_extended_tab_container_owns_previously_size_limited_value() -> None:
+    values = [_PLACEHOLDER, "x" * 65_537]
+    source = _fence("-\t```json", "\t", "\t```", json.dumps(values))
+    assert 65_536 < len(source) < 131_072
+    assert reconstruction.validated_json_string_spans(source, lambda: None) == _expected_spans(
+        source, values
+    )
 
 
 @pytest.mark.parametrize("opening,prefix,closing", _CONTAINERS[:2])
@@ -240,7 +249,9 @@ def test_ended_tab_container_line_can_open_new_top_level_json_fence(
 
 
 @pytest.mark.parametrize(
-    "count,owned", [(1_000, True), (6_000, False)], ids=["raw-under-limit", "raw-over-limit"]
+    "count,owned",
+    [(1_000, True), (6_000, True), (12_000, False)],
+    ids=["raw-under-legacy-limit", "raw-over-legacy-limit", "raw-over-current-limit"],
 )
 def test_container_size_limit_applies_before_prefix_removal(count: int, owned: bool) -> None:
     values = ["x"] * count
@@ -248,8 +259,8 @@ def test_container_size_limit_applies_before_prefix_removal(count: int, owned: b
     prefix = "\t" * 4
     source = _fence("-\t" * 4 + "```json", prefix, prefix + "```", body)
     raw_body = "".join(prefix + line + "\n" for line in body.split("\n"))
-    assert len(body) < 65_536
-    assert (len(raw_body) <= 65_536) is owned
+    assert len(body) < 131_072
+    assert (len(raw_body) <= 131_072) is owned
     assert reconstruction.validated_json_string_spans(source, lambda: None) == (
         _expected_spans(source, values) if owned else []
     )
