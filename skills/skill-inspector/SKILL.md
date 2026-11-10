@@ -56,14 +56,19 @@ Do not rely on the numeric score alone. A low score can miss semantic risk, and 
    ```powershell
    $report = skillspector scan "$TARGET" --no-llm --format json
    $exitCode = $LASTEXITCODE
-   [IO.File]::WriteAllText("$env:TEMP\skill-inspector-report.json", ($report -join "`n"))
+   try {
+       [IO.File]::WriteAllText("$env:TEMP\skill-inspector-report.json", ($report -join "`n"))
+   } catch {
+       exit 2
+   }
    exit $exitCode
    ```
 
    Capture `$LASTEXITCODE` immediately after the scan and exit with it:
    a successful file write would otherwise mask a failing scan with exit
    code 0, since `WriteAllText` itself succeeds even when the scanner
-   exits non-zero. The string written is the same one the single-line
+   exits non-zero. Conversely, exit 2 if the write itself fails, so a
+   failed write after a successful scan does not exit 0 either. The string written is the same one the single-line
    form passed to `WriteAllText` (stdout lines joined with "`n"), so
    the report stays BOM-free.
 
