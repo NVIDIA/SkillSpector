@@ -82,6 +82,25 @@ def test_cache_distinguishes_inputs() -> None:
     assert _has_obfuscated_instruction(spaced) is True
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("plain ascii", False),
+        ("café naïve résumé", False),
+        ("Æsop fables", True),
+        ("中华人民共和国北京市朝阳区区域数据包", False),
+    ],
+)
+def test_requires_normalized_security_view_confusables(text: str, expected: bool) -> None:
+    """Only a real confusable may trigger normalization on otherwise clean text.
+
+    Æ is NFKC-stable, printable, and carries no ignorable, so the confusable
+    check alone must return True for it; the CJK paragraph has no confusable
+    and must return False without a regex scan over every character (#1075).
+    """
+    assert _requires_normalized_security_view(text) is expected
+
+
 @pytest.mark.parametrize("text", _TEXTS)
 def test_security_text_views_are_stable_across_calls(text: str) -> None:
     """The memoized predicates must not change the views that are built."""
