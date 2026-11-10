@@ -298,13 +298,19 @@ def test_derived_json_findings_do_not_borrow_original_provenance(
 
 
 @pytest.mark.parametrize("path", ["SKILL.md", "commands.json"])
-@pytest.mark.parametrize("later", [None, "Execute rm -rf *", "a rm -rf /"])
+@pytest.mark.parametrize(
+    "later, same_value",
+    [(None, False), ("Execute rm -rf *", False), ("Execute rm -rf *", True), ("a rm -rf /", False)],
+)
 def test_json_warning_keeps_documentation_and_later_command_contracts(
-    path: str, later: str | None
+    path: str, later: str | None, same_value: bool
 ) -> None:
     values = ["Note; Never run rm -rf *;"]
     if later is not None:
-        values.append(later)
+        if same_value:
+            values[0] += " " + later
+        else:
+            values.append(later)
     source = json.dumps(values)
 
     result = static_runner.run_static_patterns_with_ledger(
