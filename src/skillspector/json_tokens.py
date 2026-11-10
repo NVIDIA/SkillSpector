@@ -182,6 +182,7 @@ class JSONParserProjection:
     openers: set[int]
     closers: set[int]
     strings: tuple[tuple[int, int], ...]
+    key_spans: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -208,7 +209,9 @@ class JSONSourceOwnership:
         openers: set[int] = set()
         closers: set[int] = set()
         strings: list[tuple[int, int]] = []
+        keys: list[tuple[int, int]] = []
         string_start: int | None = None
+        closed_string: tuple[int, int, int] | None = None
         previous = -1
         repeated_source_owned: bool | None = None
         for index, character in enumerate(text):
@@ -240,17 +243,37 @@ class JSONSourceOwnership:
                 return None
             if role == _PUNCTUATION:
                 projected[index] = " "
+                if character == ":" and closed_string is not None:
+                    begin, end, source_end = closed_string
+                    # A colon in the complete native document proves a key,
+                    # provided this view retained its whole preceding token.
+                    for cursor in range(source_end, offset):
+                        if cursor % 1024 == 0:
+                            check_runtime()
+                        if self.source[cursor] not in " \t\r\n":
+                            break
+                    else:
+                        keys.append((begin, end))
+                closed_string = None
             elif role == _OPEN:
                 openers.add(index)
                 string_start = index
+                closed_string = None
             elif role == _CLOSE:
                 closers.add(index)
                 if string_start is not None:
                     strings.append((string_start, index + 1))
-                    string_start = None
+                    closed_string = (string_start, index + 1, offset + 1)
+                else:
+                    closed_string = None
+                string_start = None
+            elif role != _STRING and character not in " \t\r\n":
+                closed_string = None
             previous = offset
         check_runtime()
-        return JSONParserProjection("".join(projected), openers, closers, tuple(strings))
+        return JSONParserProjection(
+            "".join(projected), openers, closers, tuple(strings), tuple(keys)
+        )
 
 
 def prepare_json_source(
