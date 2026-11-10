@@ -98,6 +98,42 @@ def test_native_readonly_sed_keeps_its_output_unknown(program: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "arguments, preserved",
+    [
+        (("scripts/setup.sh",), True),
+        (("-bi", "--mime-type", "scripts/setup.sh"), True),
+        (("--", "-C"), True),
+        (("-m", "-C", "scripts/setup.sh"), True),
+        (("--magic-file=-C", "scripts/setup.sh"), True),
+        (("-F", "--compile", "scripts/setup.sh"), True),
+        (("-C", "-m", "definitions"), False),
+        (("--compile", "--magic-file=definitions"), False),
+        (("scripts/setup.sh", "-C"), False),
+        (("-bC", "scripts/setup.sh"), False),
+        (("--comp", "scripts/setup.sh"), False),
+        (("-m", "definitions", "-C"), False),
+        (("--magic-file",), False),
+        ((None,), False),
+    ],
+)
+def test_native_file_requires_readonly_arguments(arguments, preserved) -> None:
+    audit = _audit()
+    result = audit(_command(("file", *arguments)))
+    assert (result is not None) is preserved
+    if preserved:
+        assert result.writes == () and result.stdout is None and result.status is None
+
+
+def test_native_file_readonly_mode_still_accounts_for_redirects() -> None:
+    audit = _audit()
+    result = audit(
+        _command(("file", "scripts/setup.sh"), redirects=(("1>", "scripts/setup.sh"),))
+    )
+    assert result is not None and result.writes == ("scripts/setup.sh",)
+    assert audit.read_source("scripts/setup.sh") is None
+
+
+@pytest.mark.parametrize(
     "argv",
     [
         ("sed", "-n", "e", "scripts/setup.sh"),

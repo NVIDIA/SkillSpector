@@ -25,6 +25,7 @@ from skillspector.shell_helper_argv import (
     _UnresolvedError,
     is_managed_shell_variable,
 )
+from skillspector.shell_sources import readonly_file_arguments
 
 if TYPE_CHECKING:
     from skillspector.shell_sources import ShellSourceResolver
@@ -1967,6 +1968,12 @@ class _EffectAudit:
             return ShellEffectResult(" ".join(args) + "\n" if known else None, True)
         if basename == "printf":
             return ShellEffectResult(request.stdout, True)
+        if basename == "file":
+            return (
+                ShellEffectResult(None, None)
+                if readonly_file_arguments(args, self.tick)
+                else None
+            )
         if basename in {
             "cat",
             "head",
@@ -1984,7 +1991,6 @@ class _EffectAudit:
             "diff",
             "readlink",
             "ls",
-            "file",
             "sleep",
             "wait",
             "id",

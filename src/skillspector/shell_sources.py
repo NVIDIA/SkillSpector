@@ -1197,6 +1197,51 @@ def readonly_sed_program(program: str) -> bool:
     return re.fullmatch(r"[gIp0-9]*", program[cursor:]) is not None
 
 
+def readonly_file_arguments(
+    arguments: tuple[str | None, ...], check_runtime: Callable[[], None]
+) -> bool:
+    """Prove a finite file inspection mode without compiling a magic database."""
+    if len(arguments) > 128:
+        return False
+    options = True
+    cursor = 0
+    while cursor < len(arguments):
+        check_runtime()
+        value = arguments[cursor]
+        if value is None or len(value) > MAX_SHELL_VALUE_CHARS:
+            return False
+        cursor += 1
+        if not options or value == "-" or not value.startswith("-"):
+            continue
+        if value == "--":
+            options = False
+        elif re.fullmatch(r"-[bihLk]+", value) or value in {
+            "--brief",
+            "--mime",
+            "--mime-type",
+            "--mime-encoding",
+            "--dereference",
+            "--no-dereference",
+            "--keep-going",
+        }:
+            continue
+        elif value in {"-m", "--magic-file", "-F", "--separator"}:
+            if cursor == len(arguments):
+                return False
+            check_runtime()
+            operand = arguments[cursor]
+            if operand is None or len(operand) > MAX_SHELL_VALUE_CHARS:
+                return False
+            cursor += 1
+        elif value.startswith(("--magic-file=", "--separator=")):
+            continue
+        else:
+            # Unknown options, abbreviations and clusters cannot hide -C or
+            # --compile. A known option's operand and words after -- are data.
+            return False
+    return True
+
+
 def source_is_unmodified(resolver: ShellSourceResolver, target_path: str, use_offset: int) -> bool:
     """Refuse a cached read after an explicit possible write to its source.
 
@@ -1232,7 +1277,6 @@ def source_is_unmodified(resolver: ShellSourceResolver, target_path: str, use_of
             "readlink",
             "dirname",
             "ls",
-            "file",
             "set",
             "export",
             "exit",
@@ -1522,18 +1566,19 @@ def source_is_unmodified(resolver: ShellSourceResolver, target_path: str, use_of
                         subtree = False
                     if touches(value, subtree=subtree):
                         return False
-            elif name not in readers and name != "sed":
+            elif name == "file":
+                values: list[str | None] = []
                 for _, left, right in arguments:
                     if not current.audit_spend():
                         return False
                     value = resolve(left, right)
-                    # Unknown external destinations do not imply arbitrary
-                    # hidden mutation; an explicit source-path escape does.
-                    if value is None or (
-                        value.kind in {"bundle_path", "literal", "audit_pid_file"}
-                        and touches(value)
-                    ):
-                        return False
+                    values.append(None if value is None else value.text)
+                if not readonly_file_arguments(tuple(values), current.check_runtime):
+                    return False
+            elif name not in readers and name != "sed":
+                # Opaque code and archive operations can write implicit paths.
+                # Only the ordered effects audit may prove their preservation.
+                return False
         for child, consumer_offset in children:
             if consumer_offset < before and not visit(child, len(child.content), depth + 1):
                 return False
