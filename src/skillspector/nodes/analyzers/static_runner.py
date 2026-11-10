@@ -2227,6 +2227,7 @@ def _scan_declared_marker_views(
     prepared_analyses: Mapping[int, object] | None = None,
     parser_diagnostics: list[StaticParserDiagnostic] | None = None,
     python_import_bounds: PythonImportBounds | None = None,
+    parser_file_type: str | None = None,
     parser_analyses: Mapping[int, object] | None = None,
 ) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
@@ -2243,6 +2244,7 @@ def _scan_declared_marker_views(
             ) from exc
 
     check_runtime()
+    bounded_file_type = parser_file_type or _infer_file_type(path)
     projection_limited = False
     bounded_parse_limited = False
     seen_views: set[tuple[str, int, int]] = set()
@@ -2281,7 +2283,7 @@ def _scan_declared_marker_views(
     # The proof covers the whole artifact, so it holds in every window. It is
     # computed only when a loose quoted directive header reaches a quote.
     python_strings = (
-        PythonStringClosers(content, check_runtime) if _infer_file_type(path) == "python" else None
+        PythonStringClosers(content, check_runtime) if bounded_file_type == "python" else None
     )
 
     for owned_start, raw_start in zip(owned_starts, raw_starts, strict=True):
@@ -2440,7 +2442,7 @@ def _scan_declared_marker_views(
                                 module,
                                 marker_view,
                                 check_runtime,
-                                file_type=_infer_file_type(path),
+                                file_type=bounded_file_type,
                                 complete_context=complete_context,
                                 source_start=raw_start,
                                 diagnostics=parser_diagnostics,
@@ -2620,6 +2622,9 @@ def _scan_all_views_with_parser_diagnostics(
         if isinstance(diagnostic, StaticParserDiagnostic):
             parser_diagnostics.append(diagnostic.enclosed(0, len(content)))
         return findings, reason, metrics
+    # Decode ownership uses JSON grammar; rule applicability retains the carrier
+    # type so opaque and unknown bundle fields keep their original security checks.
+    parser_file_type = "json" if _oms_projected else _infer_file_type(path)
     ast_modules = [module for module in pattern_modules if _uses_python_ast(module)]
     lexical_modules = [module for module in pattern_modules if not _uses_python_ast(module)]
     if python_source is None:
@@ -2809,6 +2814,7 @@ def _scan_all_views_with_parser_diagnostics(
                 prepared_analyses=prepared_analyses,
                 parser_diagnostics=parser_diagnostics,
                 python_import_bounds=python_import_bounds,
+                parser_file_type="json" if _oms_projected else None,
                 parser_analyses=parser_analyses,
             )
             bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
@@ -2850,7 +2856,7 @@ def _scan_all_views_with_parser_diagnostics(
                             module,
                             SecurityTextView("raw", content),
                             finding_budget.check_runtime,
-                            file_type=_infer_file_type(path),
+                            file_type=parser_file_type,
                             complete_context=True,
                             diagnostics=parser_diagnostics,
                             path=path,
@@ -2973,10 +2979,12 @@ def _scan_all_views_with_parser_diagnostics(
                         )
                         if callable(exhaustion_hook) and full_view.name != "raw":
                             finding_budget.check_runtime()
-                            module_file_type = _effective_module_file_type(
-                                path,
-                                module,
-                                python_source=python_source,
+                            module_file_type = (
+                                parser_file_type
+                                if _oms_projected
+                                else _effective_module_file_type(
+                                    path, module, python_source=python_source
+                                )
                             )
                             bounded_parse_limited = bounded_parse_limited or bool(
                                 _bounded_parser_incomplete(
