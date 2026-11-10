@@ -1455,7 +1455,7 @@ def _llm_degradation_notice(
     failed = attempted - succeeded
     return (
         f"LLM analysis was requested but {failed} of {attempted} LLM call(s) failed - "
-        "results reflect STATIC analysis only for the affected batch(es)."
+        "affected AI assessments are incomplete; completed results are retained."
     )
 
 
@@ -1572,11 +1572,7 @@ def _build_metadata(
             }
         )
         detail = f" Reasons: {'; '.join(reasons)}" if reasons else ""
-        failed = attempted - succeeded
-        meta["llm_error"] = (
-            f"LLM analysis was requested but {failed} of {attempted} LLM call(s) failed; "
-            f"results reflect static analysis only for the affected batch(es).{detail}"
-        )
+        meta["llm_error"] = f"{_llm_degradation_notice(use_llm, llm_call_log)}{detail}"
     elif semantic_runtime_incomplete:
         meta["llm_degraded"] = True
         meta["llm_error"] = (
@@ -2122,14 +2118,15 @@ def report(state: SkillspectorState) -> dict[str, object]:
         logger.warning(
             "LLM stage unavailable during preflight; report reflects static analysis only"
         )
-    elif semantic_runtime_incomplete:
+    elif runtime_event is not None:
         logger.warning(
             "LLM stage degraded: semantic runtime telemetry was incomplete; "
             "report may reflect static analysis only"
         )
     elif degraded:
         logger.warning(
-            "LLM stage degraded: %d/%d LLM call(s) failed; report reflects static analysis only",
+            "LLM stage degraded: %d/%d LLM call(s) failed; "
+            "affected AI assessments are incomplete; completed results are retained",
             _attempted - _succeeded,
             _attempted,
         )
