@@ -2229,10 +2229,10 @@ def _scan_declared_marker_views(
     complete_context: bool,
     limited_source_offsets: list[int],
     prepared_analyses: Mapping[int, object] | None = None,
+    parser_analyses: Mapping[int, object] | None = None,
     parser_diagnostics: list[StaticParserDiagnostic] | None = None,
     python_import_bounds: PythonImportBounds | None = None,
     parser_file_type: str | None = None,
-    parser_analyses: Mapping[int, object] | None = None,
 ) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
@@ -2687,7 +2687,6 @@ def _scan_all_views_with_parser_diagnostics(
         clock=time.monotonic,
     )
     marker_projection_limited = False
-    limited_source_offsets: list[int] = []
     coalesce_hook = (
         _explicit_module_hook(pattern_modules[0], "coalesce_path_findings")
         if pattern_modules
@@ -2701,6 +2700,7 @@ def _scan_all_views_with_parser_diagnostics(
         if pattern_modules
         else None
     )
+    limited_source_offsets: list[int] = []
     modules_for_windows = lexical_modules or ([] if ast_modules else pattern_modules)
     bounded_parse_limited = False
     marker_owned_starts: tuple[int, ...] = ()
@@ -2810,7 +2810,7 @@ def _scan_all_views_with_parser_diagnostics(
                 if prepare_parser is not None:
                     parser_analyses[id(module)] = prepare_parser(
                         content=content,
-                        file_type=_infer_file_type(path),
+                        file_type="json" if _oms_projected else _infer_file_type(path),
                         check_runtime=finding_budget.check_runtime,
                     )
                     finding_budget.check_runtime()
@@ -2844,12 +2844,12 @@ def _scan_all_views_with_parser_diagnostics(
                 python_source=python_source,
                 defer_projected_output_limit=coalesce is not None,
                 complete_context=whole_artifact_window,
-                limited_source_offsets=limited_source_offsets,
                 prepared_analyses=prepared_analyses,
+                parser_analyses=parser_analyses,
                 parser_diagnostics=parser_diagnostics,
                 python_import_bounds=python_import_bounds,
+                limited_source_offsets=limited_source_offsets,
                 parser_file_type="json" if _oms_projected else None,
-                parser_analyses=parser_analyses,
             )
             bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
