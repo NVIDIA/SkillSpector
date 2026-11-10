@@ -359,9 +359,7 @@ def test_multiline_flow_list_wildcards_keep_the_key_location(
 ) -> None:
     content = f"{key}: {value}\n".replace("\n", newline)
     findings = ea_module.analyze(content, "config.yaml", "yaml")
-    assert [finding.location.start_line for finding in findings if finding.rule_id == "EA1"] == [
-        1
-    ]
+    assert [finding.location.start_line for finding in findings if finding.rule_id == "EA1"] == [1]
 
 
 @pytest.mark.parametrize(
@@ -369,7 +367,7 @@ def test_multiline_flow_list_wildcards_keep_the_key_location(
     [
         'tools:\n\n  "*"\n',
         'tools: ordinary prose\n\n["*"]\n',
-        'tools: [\n  "grep --include=\'*\'"\n]\n',
+        "tools: [\n  \"grep --include='*'\"\n]\n",
         'tools: [\n  {"name": "grep", "pattern": "*"}\n]\n',
         'tools: [\n  ["search", "*"]\n]\n',
         'tools: [\n  "unterminated\n  "*"\n]\n',
