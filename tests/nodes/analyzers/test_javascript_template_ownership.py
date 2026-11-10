@@ -92,6 +92,131 @@ def test_shell_execution_forms_keep_template_files_partial(source: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "export function check(value, max = Number.MAX_SAFE_INTEGER) {\n"
+            "  const n = Number(value);\n"
+            "  return n <= (max ?? Number.MAX_SAFE_INTEGER) ? `ok: ${n}` : `too large: ${n}`;\n"
+            "}\n"
+            "console.log(check(process.argv[2] ?? '0'));\n",
+            id="number-max-safe-integer-default",
+        ),
+        pytest.param(
+            "export function check(value, max) {\n"
+            "  const n = Number(value);\n"
+            "  return n <= (max ?? Number.MAX_SAFE_INTEGER) ? `ok: ${n}` : `too large: ${n}`;\n"
+            "}\n"
+            "console.log(check(process.argv[2] ?? '0'));\n",
+            id="plain-parameter-control",
+        ),
+        pytest.param(
+            "function defaultPath() { return 'a.json'; }\n"
+            "export function load(p = defaultPath()) { return `${p}:${defaultPath()}`; }\n",
+            id="helper-call-default",
+        ),
+        pytest.param(
+            "function defaultPath() { return 'a.json'; }\n"
+            "export function load(p) { return `${p ?? defaultPath()}`; }\n",
+            id="plain-parameter-helper-control",
+        ),
+        pytest.param(
+            "export function show({max = Number.MAX_SAFE_INTEGER} = {}) {\n"
+            "  const n = Number(max);\n"
+            "  return `max=${n}`;\n"
+            "}\n",
+            id="destructured-object-default",
+        ),
+        pytest.param(
+            "export function show([first = Number.MAX_SAFE_INTEGER] = []) {\n"
+            "  const n = Number(first);\n"
+            "  return `n=${n}`;\n"
+            "}\n",
+            id="destructured-array-default",
+        ),
+        pytest.param(
+            "const check = (value, max = Number.MAX_SAFE_INTEGER) => {\n"
+            "  const n = Number(value);\n"
+            "  return `n=${n}`;\n"
+            "};\n",
+            id="arrow-function-default",
+        ),
+        pytest.param(
+            "export function show(a, ...rest) {\n  const n = Number(a);\n  return `n=${n}`;\n}\n",
+            id="rest-parameter-control",
+        ),
+        pytest.param(
+            "class Checker {\n"
+            "  check(value, max = Number.MAX_SAFE_INTEGER) {\n"
+            "    const n = Number(value);\n"
+            "    return `n=${n}`;\n"
+            "  }\n"
+            "}\n",
+            id="class-method-default",
+        ),
+        pytest.param(
+            "export function show(a, b = a) {\n  const n = Number(a);\n  return `n=${n}`;\n}\n",
+            id="parameter-referenced-by-later-default",
+        ),
+    ],
+)
+def test_parameter_default_values_do_not_keep_template_files_partial(source: str) -> None:
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "export function run(cb) { return cb(`rm ${x}`); }",
+            id="uncertain-parameter-call",
+        ),
+        pytest.param(
+            "export function run(cb = getHandler()) { return cb(`rm ${x}`); }",
+            id="uncertain-parameter-with-default-call",
+        ),
+        pytest.param(
+            "export function run({handler = getHandler()} = {}) { return handler(`rm ${x}`); }",
+            id="uncertain-destructured-parameter-call",
+        ),
+        pytest.param(
+            "function f(x = eval) { return `v=${x}`; }",
+            id="shell-call-in-default-value",
+        ),
+        pytest.param(
+            "function f(p = cp.exec(`ls ${dir}`)) { return `v=${p}`; }",
+            id="shell-call-expression-in-default-value",
+        ),
+    ],
+)
+def test_uncertain_parameter_calls_keep_template_files_partial(source: str) -> None:
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is True
+    )
+
+
+def test_ledger_completes_parameter_default_value_template() -> None:
+    path = "scripts/check.mjs"
+    source = (
+        "export function check(value, max = Number.MAX_SAFE_INTEGER) {\n"
+        "  const n = Number(value);\n"
+        "  return n <= (max ?? Number.MAX_SAFE_INTEGER) ? `ok: ${n}` : `too large: ${n}`;\n"
+        "}\n"
+        "console.log(check(process.argv[2] ?? '0'));\n" + _PADDING
+    )
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: source}}, [tm]
+    )
+    row = result["inspection_ledger"][0]
+    assert row["outcome"] is LedgerOutcome.COMPLETED
+    assert "reason_code" not in row
+
+
+@pytest.mark.parametrize(
     "source", ["const value = `unterminated;", "const = `malformed ${value}`;"]
 )
 def test_unproven_javascript_keeps_conservative_parse_result(source: str) -> None:
@@ -760,3 +885,97 @@ def test_executor_member_reads_keep_existing_conservative_coverage(source: str) 
     )
     assert unresolved
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "const match = /^(\\d+)(?:\\.(\\d+))?$/.exec(text);",
+        "const match = /exec/.exec(text); const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);",
+        "const NUMBER = /^[0-9]+$/; const valid = value => NUMBER.test(value); const match = /[0-9]+/.exec(text);",
+        "import {posix} from 'node:path'; const path = posix.join(posix.dirname(source), `${name}.json`);",
+        "import {win32 as p} from 'node:path'; const path = p.join(`${name}`, 'file');",
+        "import {join as makePath} from 'path'; const path = makePath(`${name}`, 'file');",
+        "import {join as run} from 'node:path'; const path = run(`${name}`, 'file');",
+        "function hash(values) { const r = (x, n) => (x >>> n) | (x << (32 - n)); return r(values[0], 7); } function other(r) { return r; }",
+        "function hash(values) { const run = x => x * 2; return run(values[0]); } function other(r) { return r; }",
+        "function first(values) { const r = x => x + 1; return r(values[0]); } function second(r) { return r; }",
+    ],
+)
+@pytest.mark.parametrize("suffix", ["", _PADDING], ids=["short", "padded"])
+def test_proven_native_and_local_numeric_calls_retain_templates(
+    statement: str, suffix: str
+) -> None:
+    source = statement + " console.log(`Value: ${name}`);" + suffix
+    assert javascript_template_spans(source, lambda: None) is not None
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "RegExp.prototype.exec = executor; /x/.exec(text);",
+        "function mutate(x, f) { x['__pro' + 'to__']['e' + 'xec'] = f; } mutate(/x/, handler); /x/.exec(`${command}`);",
+        "mutate(/x/, handler); /x/.exec(`${command}`);",
+        "const NUMBER = /x/; mutate(NUMBER, handler); /x/.exec(`${command}`);",
+        "const NUMBER = /x/; const alias = NUMBER; /x/.exec(`${command}`);",
+        "const NUMBER = /x/; function use(NUMBER) { return NUMBER.test(value); } /x/.exec(`${command}`);",
+        "const NUMBER = /x/; NUMBER.test = handler; /x/.exec(`${command}`);",
+        "const NUMBER = /x/; const method = NUMBER.test; method(value); /x/.exec(`${command}`);",
+        "export const NUMBER = /x/; /x/.exec(`${command}`);",
+        "import {join as eval} from 'node:path'; eval(`${command}`);",
+        "import {posix as p} from 'node:path'; const load = require; const other = load('node:path'); other.posix.join = handler; p.join(`${command}`);",
+        "import {posix as p} from 'node:path'; const other = process.getBuiltinModule('node:path'); other.posix.join = handler; p.join(`${command}`);",
+        "import {posix as p} from 'node:path'; import other from 'node:path/posix'; other.join = handler; p.join(`${command}`);",
+        "import {join as Function} from 'node:path'; Function(`${command}`);",
+        "const prototype = RegExp.prototype; prototype[key] = executor; /x/.exec(text);",
+        "Object.getPrototypeOf(/x/)[key] = executor; /x/.exec(text);",
+        "Object.defineProperty(Object.getPrototypeOf(/x/), key, {value: executor}); /x/.exec(text);",
+        "const expression = /x/; expression[key] = executor; /x/.exec(text);",
+        "(/x/)[key][other] = executor; /x/.exec(text);",
+        "(/x/).constructor.prototype[key] = executor; /x/.exec(text);",
+        "this['Reg' + 'Exp'].prototype[key] = executor; /x/.exec(text);",
+        "const Object = tools; Object.prototype.hasOwnProperty.call(value, key); /x/.exec(text);",
+        "const method = /x/.exec; method(`${command}`);",
+        "tool.exec(`${command}`); /x/.exec(text);",
+        "import {posix} from 'node:path'; posix.join = executor; posix.join(`${command}`);",
+        "import {posix} from 'node:path'; const alias = posix; alias.join = executor; posix.join(`${command}`);",
+        "import {posix} from 'node:path'; mutate(posix); posix.join(`${command}`);",
+        "import {posix} from 'node:path'; function use(posix) { return posix.join(`${command}`); }",
+        "import {posix} from 'node:path'; const method = posix.join; method(`${command}`);",
+        "import {join} from 'node:path'; function use(join) { return join(`${command}`); }",
+        "import {join} from 'unknown'; join(`${command}`);",
+        "function hash(r) { return r(`${command}`); }",
+        "function hash() { let r = x => x + 1; r = source[key]; return r(`${command}`); }",
+        "function hash() { const r = x => x + 1; function use(r) { return r(`${command}`); } return r(1); }",
+        "function hash() { const r = x => x + 1; const alias = r; return alias(`${command}`); } function other(r) { return r; }",
+        "const r = x => x + 1; r = source[key]; r(`${command}`);",
+        "const r = x => executor(x); r(`${command}`); function other(r) { return r; }",
+        "const r = x => object[key]; r(`${command}`); function other(r) { return r; }",
+        "const run = x => x + 1; run.call(executor, `${command}`);",
+        "const eval = x => x + 1; eval(`${command}`);",
+        "const run = x => x + 1; with (tools) { run(`${command}`); }",
+        "import {join as run} from 'node:path'; const alias = run; alias(`${command}`);",
+        "import {posix as p, posix as q} from 'node:path'; q.join = executor; p.join(`${command}`);",
+        "import {posix as p} from 'node:path'; import {posix as q} from 'node:path'; q.join = executor; p.join(`${command}`);",
+        "import path, {posix as p} from 'node:path'; path.posix.join = executor; p.join(`${command}`);",
+        "import {posix as p} from 'node:path'; const other = require('node:path'); other.posix.join = executor; p.join(`${command}`);",
+        "import {posix as p} from 'node:path'; const other = await import('node:path'); other.posix.join = executor; p.join(`${command}`);",
+        "import {join} from 'node:path'; const other = require('node:path'); other.join = executor; syncBuiltinESMExports(); join(`${command}`);",
+        "import {posix} from 'node:path'; with (tools) { posix.join(`${command}`); }",
+    ],
+)
+def test_unproved_native_or_local_callable_overrides_stay_partial(statement: str) -> None:
+    source = statement + " console.log(`Value: ${name}`);"
+    assert javascript_template_spans(source, lambda: None) is None
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+def test_known_native_callee_cannot_hide_security_findings() -> None:
+    source = (
+        'const match = /value/.exec(text); console.log(`Value: ${name}`); tool.exec("rm -rf /");'
+    )
+    assert javascript_template_spans(source, lambda: None) is None
+    assert any(
+        finding.rule_id == "TM1" for finding in tm.analyze(source, "display.js", "javascript")
+    )
