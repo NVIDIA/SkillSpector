@@ -206,20 +206,203 @@ def test_cancellation_after_markdown_owner_collection_propagates(monkeypatch) ->
         tm.bounded_parse_diagnostic(_source("An example `$(...)`."), expired, file_type="yaml")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Existing generated or split command coverage belongs to a separate parser change",
-)
 @pytest.mark.parametrize(
     "message",
     [
-        'Run `sh -c "echo safe"` and later eval "$PAYLOAD".',
         "Run sh -c 'echo `$(...)`'.",
         "Run sh -c 'echo `$(cat command.txt)`'s.",
     ],
 )
-def test_existing_generated_or_split_runtime_consumer_gap(message: str) -> None:
-    assert _scan(message)["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+def test_outer_shell_notation_remains_documentation_with_notice(message: str, monkeypatch) -> None:
+    result = _scan(message)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert not result["findings"]
+    assert len(result["inspection_notices"]) == 1
+    assert result["inspection_notices"][0]["message"] == (
+        "This command pattern is not allowed for inspection; put the command in a code block."
+    )
+    monkeypatch.setattr(tm, "_unsupported_outer_shell_notation_spans", lambda *_: iter(()))
+    without_notice = _scan(message)
+    assert without_notice["inspection_ledger"] == result["inspection_ledger"]
+    assert without_notice["findings"] == result["findings"]
+    assert not without_notice["inspection_notices"]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Run `sh -c 'echo $(...)'`.",
+        "Run ``sh -c 'echo `$(...)`'``.",
+        "```sh\nsh -c 'echo `$(...)`'\n```",
+        "A \"literal sh -c 'echo `$(...)`' tail\" value.",
+        "echo \"literal sh -c 'echo `$(...)`' tail\"",
+        "printf '%s' \"literal sh -c 'echo `$(...)`' tail\"",
+        "Run sh -c 'echo `$(...)` without a closing quote.",
+        "Run sh -c 'echo `$(...)`\n'.",
+    ],
+)
+def test_owned_quoted_or_unproven_notation_gets_no_outer_notice(message: str) -> None:
+    assert not _scan(message)["inspection_notices"]
+
+
+def test_outer_shell_notice_keeps_exact_plain_source_and_conservative_escaped_scalar() -> None:
+    message = "Run sh -c 'echo `$(...)`'."
+    source = _source(message)
+    for content, exact in [
+        (source.replace(json.dumps(message), message), True),
+        (source.replace("`", "\\u0060"), False),
+    ]:
+        result = static_runner.run_static_patterns_with_ledger(
+            {"components": ["rules.yaml"], "file_cache": {"rules.yaml": content}}, [tm, ar]
+        )
+        assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+        assert len(result["inspection_notices"]) == 1
+        notice = result["inspection_notices"][0]
+        observed = content[notice["source_start_offset"] : notice["source_end_offset"]]
+        if exact:
+            assert observed == "sh -c 'echo `$(...)`'"
+        else:
+            assert observed.startswith('"Run ')
+
+
+def test_outer_shell_notice_collection_stays_bounded(monkeypatch) -> None:
+    monkeypatch.setattr(tm, "MAX_FINDING_OUTPUT_RECORDS", 2)
+    message = "Run sh -c 'echo `$(...)`'. " * 3
+    source = _source(message).replace(json.dumps(message), message)
+    prepared = tm.prepare_analysis(source, "yaml", lambda: None)
+    assert prepared is not None
+    assert len(prepared.inspection_notices()) == 2
+
+
+def test_outer_notice_requires_recognized_role_and_retains_real_runtime_and_high() -> None:
+    message = "Run sh -c 'echo `$(...)`'."
+    source = _source(message).replace("rules:", "unknown:")
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["rules.yaml"], "file_cache": {"rules.yaml": source}}, [tm, ar]
+    )
+    assert not result["inspection_notices"]
+    result = _scan(message + ' Run `sh -c "$PAYLOAD"`. rm -rf /.')
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert len(result["inspection_notices"]) == 1
+    assert any(f.rule_id == "TM1" and f.severity == "HIGH" for f in result["findings"])
+
+
+def test_optional_outer_notice_does_not_parse_a_line_past_existing_allowance(monkeypatch) -> None:
+    message = "ordinary " * tm._ROOT_GLOB_COMMAND_CHARS + "Run sh -c 'echo `$(...)`'."
+    begin = message.index("$(")
+
+    def no_parse(*_args, **_kwargs):
+        raise AssertionError("Oversized optional notation must not invoke a word reader")
+
+    monkeypatch.setattr(tm, "_next_shell_invocation_word", no_parse)
+    assert not list(
+        tm._unsupported_outer_shell_notation_spans(
+            message, [(begin, message.index("`", begin))], lambda: None
+        )
+    )
+
+
+def test_outer_shell_notice_does_not_nominate_execution_or_swallow_deadline(monkeypatch) -> None:
+    message = "Run sh -c 'echo `$(...)`'."
+    begin = message.index("$(")
+    ranges = [(begin, message.index("`", begin))]
+    entered = False
+    original = tm._next_shell_invocation_word
+
+    def parse(*args, **kwargs):
+        nonlocal entered
+        entered = True
+        return original(*args, **kwargs)
+
+    def no_consumer(*_args, **_kwargs):
+        raise AssertionError("Notice metadata must not infer an executable consumer")
+
+    def expired():
+        if entered:
+            raise TimeoutError("annotation deadline")
+
+    monkeypatch.setattr(tm, "_command_string_from_clause", no_consumer)
+    assert list(tm._unsupported_outer_shell_notation_spans(message, ranges, lambda: None))
+    monkeypatch.setattr(tm, "_next_shell_invocation_word", parse)
+    with pytest.raises(TimeoutError, match="annotation deadline"):
+        list(tm._unsupported_outer_shell_notation_spans(message, ranges, expired))
+
+
+def test_unowned_prose_command_remains_documentation_with_a_notice() -> None:
+    result = _scan('Run `sh -c "echo safe"` and later eval "$PAYLOAD".')
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert not result["findings"]
+    assert len(result["inspection_notices"]) == 1
+    notice = result["inspection_notices"][0]
+    assert notice["message"] == (
+        "This command pattern is not allowed for inspection; put the command in a code block."
+    )
+    assert notice["path"] == "rules.yaml"
+    source = _source('Run `sh -c "echo safe"` and later eval "$PAYLOAD".')
+    assert source[notice["source_start_offset"] : notice["source_end_offset"]].startswith('"Run ')
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        'Run `eval "$PAYLOAD"`.',
+        'Run `sh -c "$PAYLOAD"`.',
+        'Run `sh -c "echo safe" and later eval "$PAYLOAD"`.',
+        'An eval "$PAYLOAD" mention without an inline example.',
+        'A `value` reference.\n```sh\neval "$PAYLOAD"\n```',
+        "An `eval` reference has no quoted operand.",
+    ],
+)
+def test_native_or_unmatched_forms_do_not_gain_a_prose_notice(message: str) -> None:
+    assert not _scan(message)["inspection_notices"]
+
+
+def test_notice_does_not_clear_owned_runtime_or_high_findings() -> None:
+    result = _scan('Run `sh -c "$PAYLOAD"` and later eval "$OTHER"; rm -rf /.')
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert len(result["inspection_notices"]) == 1
+    assert any(f.rule_id == "TM1" and str(f.severity) == "HIGH" for f in result["findings"])
+
+
+def test_notice_requires_an_actual_semgrep_message_role() -> None:
+    source = _source('Run `sh -c "echo safe"` and later eval "$PAYLOAD".')
+    for content in [source.replace("message:", "pattern:"), source.replace("rules:", "unknown:")]:
+        result = static_runner.run_static_patterns_with_ledger(
+            {"components": ["rules.yaml"], "file_cache": {"rules.yaml": content}}, [tm, ar]
+        )
+        assert not result["inspection_notices"]
+
+
+def test_notice_prepass_keeps_deadline_cancellation() -> None:
+    source = _source('Run `sh -c "echo safe"` and later eval "$PAYLOAD".')
+    prepared = tm.prepare_analysis(source, "yaml", lambda: None)
+    assert prepared is not None
+
+    def expired() -> None:
+        raise TimeoutError("notice deadline")
+
+    with pytest.raises(TimeoutError, match="notice deadline"):
+        tm._PreparedYamlAnalysis(prepared.parser, expired).inspection_notices()
+
+
+def test_plain_scalar_notice_retains_exact_original_offsets() -> None:
+    message = 'Run `sh -c "echo safe"` and later eval "$PAYLOAD".'
+    source = _source(message).replace(json.dumps(message), message)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["rules.yaml"], "file_cache": {"rules.yaml": source}}, [tm, ar]
+    )
+    assert len(result["inspection_notices"]) == 1
+    notice = result["inspection_notices"][0]
+    assert source[notice["source_start_offset"] : notice["source_end_offset"]] == 'eval "'
+    assert notice["start_line"] == notice["end_line"] == 5
+
+
+def test_derived_oms_views_cannot_emit_original_source_notices() -> None:
+    source = _source('Run `sh -c "echo safe"` and later eval "$PAYLOAD".')
+    _findings, _reason, metrics = static_runner._scan_all_views_detailed(
+        "rules.yaml", source, [tm], None, _oms_projected=True
+    )
+    assert not getattr(metrics, "inspection_notices", ())
 
 
 @pytest.mark.parametrize(
