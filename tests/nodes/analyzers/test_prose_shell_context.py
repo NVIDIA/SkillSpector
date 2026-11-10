@@ -113,6 +113,121 @@ def test_quoted_list_literal_ownership_preserves_security_findings():
     assert any(finding.rule_id == "TM1" for finding in tm.analyze(content, "guide.md", "markdown"))
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+@pytest.mark.parametrize(
+    "paragraph",
+    [
+        "> Read `~/guide.md` for the reader's interface.\n",
+        "> Read ``guide.md`` for the reader's interface.\n",
+        "1. Read `guide.md` for the reader's interface.\n",
+        "-\n  Read `guide.md` for the reader's interface.\n",
+        "1.\n   Read `guide.md` for the reader's interface.\n",
+        "3. Read `guide.md` for the interface.\n   The reader's copy identifies the source.\n",
+        "> The reader's guide is described below.\n>\n> Read `guide.md` for the interface.\n",
+    ],
+)
+def test_native_container_paragraphs_keep_exact_literal_boundaries(paragraph, newline):
+    from skillspector.markdown_tokens import quoted_list_spans
+
+    content = ("# Unicode: 日本語 🧪\n\n" + paragraph + "\n" + _OBSERVATIONS).replace("\n", newline)
+    spans = quoted_list_spans(content, lambda: None)
+    assert spans is not None
+    assert spans.code
+    for start, body, close, end in spans.code:
+        assert content[start:body] == content[close:end]
+        assert content[start:body] in {"`", "``"}
+        assert content[body:close] in {"guide.md", "~/guide.md"}
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+    assert result["findings"] == []
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_native_quote_paragraph_recovers_an_established_prose_boundary(monkeypatch):
+    content = (
+        "> The reader's guide is described below.\n>\n"
+        "> Read `guide.md` for the interface.\n\n" + _OBSERVATIONS
+    )
+    with monkeypatch.context() as baseline:
+        # The previous quote+list-only helper grants no role to this paragraph.
+        baseline.setattr(tm, "quoted_list_spans", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
+    assert before is not None
+    assert tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown") is None
+
+
+def test_existing_quoted_list_heading_keeps_its_native_inline_ownership():
+    from skillspector.markdown_tokens import quoted_list_spans
+
+    content = "> - ### Read `guide.md` from the reader's guide.\n\n" + _OBSERVATIONS
+    spans = quoted_list_spans(content, lambda: None)
+    assert spans is not None
+    start = content.index("`guide.md`")
+    assert (start, start + 1, start + 9, start + 10) in spans.code
+    assert tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown") is None
+
+
+@pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("container", ["> ", "1. "])
+def test_native_container_preserves_existing_enclosing_shell_quote_reading(
+    monkeypatch, quote, container
+):
+    content = (
+        f"bash -c {quote}\n"
+        + container
+        + "Read `guide.md` from the reader's copy.\n"
+        + quote
+        + "\n"
+    )
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm, "quoted_list_spans", lambda *args: None)
+        before = tm._markdown_shell_text(content, lambda: None, word_apostrophes=True)
+        before_diagnostic = tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
+    projected = tm._markdown_shell_text(content, lambda: None, word_apostrophes=True)
+    assert projected == before
+    assert "reader's" in projected
+    assert (
+        tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
+        == before_diagnostic
+    )
+
+
+@pytest.mark.parametrize("container", ["> ", "1. "])
+@pytest.mark.parametrize("body", ["$CMD -rf /", 'sh -c "$PAYLOAD"', "$(cat command.txt)"])
+def test_container_runtime_inline_code_keeps_its_existing_fallback(monkeypatch, container, body):
+    from skillspector.markdown_tokens import quoted_list_spans
+
+    content = container + "Run `" + body + "` using the reader's command.\n\n" + _OBSERVATIONS
+    spans = quoted_list_spans(content, lambda: None)
+    assert spans is not None
+    assert spans.code == ()
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm, "quoted_list_spans", lambda *args: None)
+        before = tm._markdown_shell_text(content, lambda: None, word_apostrophes=True)
+        before_diagnostic = tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
+    projected = tm._markdown_shell_text(content, lambda: None, word_apostrophes=True)
+    assert projected == before
+    assert (
+        tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
+        == before_diagnostic
+    )
+
+
+@pytest.mark.parametrize("container", ["> ", "1. "])
+def test_container_literal_ownership_preserves_raw_and_later_high_findings(container):
+    content = container + "Read `guide.md` for the interface.\n\n```sh\nrm -rf /\n```\n"
+    assert any(
+        f.rule_id == "TM1" and f.severity == "HIGH"
+        for f in tm.analyze(content, "guide.md", "markdown")
+    )
+    inline = container + "Run `rm -rf /` on the selected filesystem.\n"
+    assert any(
+        f.rule_id == "TM1" and f.severity == "HIGH"
+        for f in tm.analyze(inline, "guide.md", "markdown")
+    )
+
+
 def test_quoted_list_native_parser_failure_retains_original_text(monkeypatch):
     import builtins
 
