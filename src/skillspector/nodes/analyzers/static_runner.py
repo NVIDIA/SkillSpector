@@ -489,8 +489,8 @@ def _requires_leading_word(source: str) -> bool:
 def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> regex.Pattern[str]:
     """Translate the static-rule grammar while retaining original match offsets.
 
-    Scoped flags and verbose rules need their own grammar support. Reject them
-    as unavailable coverage rather than silently changing detection semantics.
+    Only scoped disable-ignorecase is supported. Reject other scoped flags,
+    comments, and verbose rules rather than changing their semantics.
     """
     if flags & re.VERBOSE:
         raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
@@ -515,6 +515,7 @@ def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> rege
     categories = _python_categories(bool(flags & re.ASCII), ascii_content)
     word = categories["w"]
     parts: list[str] = []
+    group_flags: list[int] = []
     cursor = 0
     while cursor < len(source):
         # Group names are syntax, never case-insensitive literals.
@@ -522,17 +523,30 @@ def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> rege
             if source.startswith("(?P=", cursor) and flags & re.IGNORECASE and not ascii_content:
                 raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
             end = source.index(">" if source.startswith("(?P<", cursor) else ")", cursor) + 1
+            if source.startswith("(?P<", cursor):
+                group_flags.append(flags)
             parts.append(source[cursor:end])
             cursor = end
             continue
         flag_group = re.match(r"\(\?[aiLmsux-]+([:)])", source[cursor:])
         if flag_group is not None:
             if flag_group.group(1) == ":":
-                raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+                if flag_group.group(0) != "(?-i:":
+                    raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+                group_flags.append(flags)
+                flags &= ~re.IGNORECASE
             parts.append(flag_group.group(0))
             cursor += len(flag_group.group(0))
             continue
         char = source[cursor]
+        if source.startswith("(?#", cursor):
+            raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+        if char == "(":
+            group_flags.append(flags)
+        elif char == ")":
+            if not group_flags:
+                raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+            flags = group_flags.pop()
         if char == "\\" and cursor + 1 < len(source):
             code = source[cursor + 1]
             if code in "123456789" and flags & re.IGNORECASE and not ascii_content:
