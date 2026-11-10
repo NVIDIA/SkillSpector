@@ -83,6 +83,7 @@ from skillspector.security_reconstruction import (
     _MAX_JSON_QUOTE_CONTAINER_CHARS,
     MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
     MAX_MARKER_LOOKAHEAD_CHARS,
+    StructuredStringClosers,
     build_declared_marker_views,
     json_quote_capacity_limit,
 )
@@ -2210,12 +2211,12 @@ def _restore_source_lines(
 
 
 def _window_string_closer(
-    python_strings: PythonStringClosers, window_start: int
+    source_closer: Callable[[int], bool], window_start: int
 ) -> Callable[[int], bool]:
     """Answer string-closer queries in one window's source coordinates."""
 
     def closes_string(offset: int) -> bool:
-        return python_strings.closes_string(window_start + offset)
+        return source_closer(window_start + offset)
 
     return closes_string
 
@@ -2305,11 +2306,32 @@ def _scan_declared_marker_views(
             )
         return True
 
-    # A complete Python module proves which quotes close its string literals.
-    # The proof covers the whole artifact, so it holds in every window. It is
-    # computed only when a loose quoted directive header reaches a quote.
-    python_strings = (
-        PythonStringClosers(content, check_runtime) if bounded_file_type == "python" else None
+    # Structural delimiter proof covers the complete artifact, so windows do
+    # not mistake a literal closer for a new marker opener. Compute it lazily.
+    file_type = parser_file_type or _infer_file_type(path)
+    if parser_file_type is None and path.lower().endswith((".html", ".htm")):
+        file_type = "html"
+
+    def shell_quote_closers() -> set[int]:
+        # Reuse the complete-source lexical proof. Unsupported source returns
+        # no closers; the foundational reconstruction layer needs no analyzer import.
+        from skillspector.nodes.analyzers.static_patterns_tool_misuse import (
+            _shell_quoted_candidate_limits,
+        )
+
+        closers: set[int] = set()
+        _shell_quoted_candidate_limits(content, check_runtime, quote_closers=closers)
+        return closers
+
+    source_strings = (
+        PythonStringClosers(content, check_runtime)
+        if file_type == "python"
+        else StructuredStringClosers(
+            content,
+            file_type,
+            check_runtime,
+            shell_quote_closers=shell_quote_closers if file_type == "shell" else None,
+        )
     )
 
     for owned_start, raw_start in zip(owned_starts, raw_starts, strict=True):
@@ -2348,8 +2370,8 @@ def _scan_declared_marker_views(
         # never occurs for Python, but it would not map onto module offsets.
         string_closer = (
             None
-            if python_strings is None or context_prefix
-            else _window_string_closer(python_strings, raw_start)
+            if context_prefix
+            else _window_string_closer(source_strings.closes_string, raw_start)
         )
         for full_view in full_views:
             full_view_limited = False
