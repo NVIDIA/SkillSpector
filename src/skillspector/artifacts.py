@@ -1800,31 +1800,41 @@ def _is_token_gap_character(ch: str) -> bool:
     return _compute_token_gap_character(ch)
 
 
-def _token_bridging_gap_spans_uncached(
+def _iter_token_bridging_gap_spans(
     text: str,
     *,
     require_word_boundaries: bool,
-) -> tuple[tuple[int, int], ...]:
-    """Return contextual noise runs in one pass without crossing ASCII spaces.
+    check_runtime: Callable[[], None] | None = None,
+) -> Iterator[tuple[int, int]]:
+    """Yield contextual noise runs incrementally, checking the deadline.
 
-    This is the walk body of `_token_bridging_gap_spans`, unchanged apart from
-    the prefilter below: the text is only walked when it contains at least one
-    character from the exact gap set, so gap-free mixed-script windows return
-    immediately instead of paying a per-character Python walk. The span cache
-    in `_token_bridging_gap_spans` only ever calls this with texts that pass
-    that check, and the delegating generator re-applies `check_runtime` per
-    yielded span, so a cached span set still respects the caller's deadline.
+    This is the walk body of `_token_bridging_gap_spans`: the text is only
+    walked when it contains at least one character from the exact gap set,
+    so gap-free mixed-script windows return immediately instead of paying
+    a per-character Python walk. The walk streams spans instead of
+    collecting them, and the caller's deadline is checked every 4096
+    offsets, so a dense or oversized input is abandoned promptly and a
+    consumer that only needs early spans never pays for the rest of the
+    walk. Callers pass window-bounded text when they can, but
+    `artifact_integrity._text_signals` may pass a whole cached file here,
+    so the walk itself must stay incremental and deadline-aware.
     """
     if _TOKEN_GAP_CHARACTER.search(text) is None:
-        return ()
-    spans: list[tuple[int, int]] = []
+        return
     offset = 0
+    next_check = 0
     while offset < len(text):
+        if check_runtime is not None and offset >= next_check:
+            check_runtime()
+            next_check += 4096
         if not _is_token_gap_character(text[offset]):
             offset += 1
             continue
         start = offset
         while offset < len(text) and _is_token_gap_character(text[offset]):
+            if check_runtime is not None and offset >= next_check:
+                check_runtime()
+                next_check += 4096
             if is_default_ignorable(text[offset]):
                 run = _DEFAULT_IGNORABLE_RUN_PATTERN.match(text, offset)
                 if run is not None:
@@ -1839,8 +1849,7 @@ def _token_bridging_gap_spans_uncached(
             else before_is_word or after_is_word
         )
         if is_contextual:
-            spans.append((start, offset))
-    return tuple(spans)
+            yield start, offset
 
 
 # Admission bound for the gap-span cache. A span costs one tuple plus two
@@ -1850,9 +1859,17 @@ def _token_bridging_gap_spans_uncached(
 # are recomputed per call, which is the pre-cache behavior, while the
 # gap-free and sparse fast paths stay cached.
 _TOKEN_GAP_SPAN_CACHE_MAX_SPANS = 8192
+# The cache key holds the complete input text, so admission also bounds the
+# text itself. Windows are at most 256K characters; a whole cached file (up
+# to 16 MiB) is never admitted as a key, so successive distinct sparse files
+# cannot leave full artifacts retained across requests. Total retained key
+# text is bounded separately, with LRU eviction, so small windows still
+# share the fast path without unbounded retention.
+_TOKEN_GAP_SPAN_CACHE_MAX_TEXT_CHARS = 262144
+_TOKEN_GAP_SPAN_CACHE_MAX_RETAINED_CHARS = 8 * 1024 * 1024
 _TOKEN_GAP_SPAN_CACHE_LOCK = threading.Lock()
 _TOKEN_GAP_SPAN_CACHE: OrderedDict[tuple[str, bool], tuple[tuple[int, int], ...]] = OrderedDict()
-_TOKEN_GAP_SPAN_CACHE_STATS = {"hits": 0, "misses": 0}
+_TOKEN_GAP_SPAN_CACHE_STATS = {"hits": 0, "misses": 0, "retained_chars": 0}
 
 
 class _TokenGapSpanCacheInfo(NamedTuple):
@@ -1865,12 +1882,19 @@ class _TokenGapSpanCacheInfo(NamedTuple):
 def _cached_token_bridging_gap_spans(
     text: str,
     require_word_boundaries: bool,
-) -> tuple[tuple[int, int], ...]:
-    """Memoize one window's gap spans; every analyzer re-derives them per view.
+    check_runtime: Callable[[], None] | None = None,
+) -> Iterator[tuple[int, int]]:
+    """Yield one window's gap spans, memoizing only sparse small windows.
 
-    Only sparse results are retained. A dense result is computed fresh on
-    every call and never stored, so attacker-controlled dense text cannot
-    trade the targeted CPU stall for unbounded retained memory.
+    Cache hits yield the stored spans. On a miss the walk streams spans
+    incrementally with deadline checks every 4096 offsets, collecting at
+    most _TOKEN_GAP_SPAN_CACHE_MAX_SPANS spans; a denser result is never
+    stored and keeps streaming without first materializing the complete
+    list, so a dense or oversized input cannot trade the CPU stall for
+    unbounded retained memory. Texts longer than
+    _TOKEN_GAP_SPAN_CACHE_MAX_TEXT_CHARS are never admitted either: the
+    key would otherwise retain the whole input. A consumer that stops
+    pulling early simply leaves the entry unstored.
     """
     key = (text, require_word_boundaries)
     with _TOKEN_GAP_SPAN_CACHE_LOCK:
@@ -1878,18 +1902,38 @@ def _cached_token_bridging_gap_spans(
         if cached is not None:
             _TOKEN_GAP_SPAN_CACHE.move_to_end(key)
             _TOKEN_GAP_SPAN_CACHE_STATS["hits"] += 1
-            return cached
-        _TOKEN_GAP_SPAN_CACHE_STATS["misses"] += 1
-    spans = _token_bridging_gap_spans_uncached(
-        text, require_word_boundaries=require_word_boundaries
-    )
-    if len(spans) <= _TOKEN_GAP_SPAN_CACHE_MAX_SPANS:
-        with _TOKEN_GAP_SPAN_CACHE_LOCK:
-            _TOKEN_GAP_SPAN_CACHE[key] = spans
+        else:
+            _TOKEN_GAP_SPAN_CACHE_STATS["misses"] += 1
+    if cached is not None:
+        yield from cached
+        return
+    collected: list[tuple[int, int]] = []
+    dense = False
+    for span in _iter_token_bridging_gap_spans(
+        text,
+        require_word_boundaries=require_word_boundaries,
+        check_runtime=check_runtime,
+    ):
+        if not dense:
+            collected.append(span)
+            if len(collected) > _TOKEN_GAP_SPAN_CACHE_MAX_SPANS:
+                dense = True
+                collected.clear()
+        yield span
+    if dense or len(text) > _TOKEN_GAP_SPAN_CACHE_MAX_TEXT_CHARS:
+        return
+    with _TOKEN_GAP_SPAN_CACHE_LOCK:
+        if key not in _TOKEN_GAP_SPAN_CACHE:
+            _TOKEN_GAP_SPAN_CACHE[key] = tuple(collected)
             _TOKEN_GAP_SPAN_CACHE.move_to_end(key)
-            while len(_TOKEN_GAP_SPAN_CACHE) > _TEXT_PREDICATE_CACHE_SIZE:
-                _TOKEN_GAP_SPAN_CACHE.popitem(last=False)
-    return spans
+            _TOKEN_GAP_SPAN_CACHE_STATS["retained_chars"] += len(text)
+            while (
+                len(_TOKEN_GAP_SPAN_CACHE) > _TEXT_PREDICATE_CACHE_SIZE
+                or _TOKEN_GAP_SPAN_CACHE_STATS["retained_chars"]
+                > _TOKEN_GAP_SPAN_CACHE_MAX_RETAINED_CHARS
+            ):
+                old_key, _old_spans = _TOKEN_GAP_SPAN_CACHE.popitem(last=False)
+                _TOKEN_GAP_SPAN_CACHE_STATS["retained_chars"] -= len(old_key[0])
 
 
 def _token_gap_span_cache_clear() -> None:
@@ -1897,6 +1941,7 @@ def _token_gap_span_cache_clear() -> None:
         _TOKEN_GAP_SPAN_CACHE.clear()
         _TOKEN_GAP_SPAN_CACHE_STATS["hits"] = 0
         _TOKEN_GAP_SPAN_CACHE_STATS["misses"] = 0
+        _TOKEN_GAP_SPAN_CACHE_STATS["retained_chars"] = 0
 
 
 def _token_gap_span_cache_info() -> _TokenGapSpanCacheInfo:
@@ -1923,17 +1968,17 @@ def _token_bridging_gap_spans(
 
     Gap spans are memoized per text, since the same window texts are scanned
     once per static analyzer (around fifteen times per artifact) and the
-    spans are pure functions of the text. Only sparse results are retained:
-    windows with more than _TOKEN_GAP_SPAN_CACHE_MAX_SPANS spans are
-    recomputed on every call instead of being cached, so dense text cannot
-    retain unbounded span tuples. The memoized walk runs without
-    intermediate deadline checks; that is bounded by the callers, which only
-    pass window-bounded text (at most 256K characters), and the deadline is
-    still enforced for every span yielded here and by the callers between
-    views. A miss on the largest window measured 0.65 seconds; a hit is free.
+    spans are pure functions of the text. Only sparse results from texts
+    within the window bound are retained: windows with more than
+    _TOKEN_GAP_SPAN_CACHE_MAX_SPANS spans, and texts longer than
+    _TOKEN_GAP_SPAN_CACHE_MAX_TEXT_CHARS, are recomputed on every call
+    instead of being cached, so dense text cannot retain unbounded span
+    tuples or whole-file keys. A cache miss streams spans with deadline
+    checks every 4096 offsets, so the walk is abandoned promptly and a
+    consumer that only needs early spans never pays for the rest.
     """
     for start, end in _cached_token_bridging_gap_spans(
-        text, require_word_boundaries=require_word_boundaries
+        text, require_word_boundaries=require_word_boundaries, check_runtime=check_runtime
     ):
         if check_runtime is not None:
             check_runtime()

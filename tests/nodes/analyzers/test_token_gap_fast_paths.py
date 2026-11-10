@@ -227,3 +227,102 @@ def test_dense_gap_text_is_never_retained_by_the_span_cache(
     second = list(_token_bridging_gap_spans(text))
     assert second == first
     assert len(calls) > first_calls
+
+
+def test_first_span_arrives_without_walking_dense_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for the #1077 follow-up: cache-miss discovery streams.
+
+    The previous cache filled a complete span tuple before yielding or
+    checking the deadline, so a dense oversized input paid the whole walk
+    up front. Pulling one span must only walk up to that span.
+    """
+    _clear_span_cache()
+    calls: list[str] = []
+    original = artifacts._is_token_gap_character
+
+    def counting(character: str) -> bool:
+        calls.append(character)
+        return original(character)
+
+    monkeypatch.setattr(artifacts, "_is_token_gap_character", counting)
+    text = "a‍" * 20000 + "a"
+    spans = _token_bridging_gap_spans(text)
+    assert next(spans) == (1, 2)
+    assert len(calls) <= 10
+
+
+def test_deadline_is_checked_during_the_walk() -> None:
+    """Regression test for the #1077 follow-up: the walk honors the deadline.
+
+    A tight deadline must abort the walk after a few thousand offsets,
+    instead of first materializing millions of spans and only then failing.
+    """
+    _clear_span_cache()
+    calls = {"count": 0}
+
+    def _tight_deadline() -> None:
+        calls["count"] += 1
+        if calls["count"] >= 3:
+            raise RuntimeError("deadline")
+
+    text = "a‍" * 20000 + "a"
+    pulled = 0
+    with pytest.raises(RuntimeError, match="deadline"):
+        for _span in _token_bridging_gap_spans(text, check_runtime=_tight_deadline):
+            pulled += 1
+    assert pulled < 20000
+
+
+def test_oversized_text_is_never_admitted_to_the_span_cache() -> None:
+    """Regression test for the #1077 follow-up: cache keys must stay small.
+
+    A 1 MiB file with a single default ignorable passes the span-count
+    check, so without a text-length bound its whole content would be
+    retained as a cache key across requests. The spans are still computed.
+    """
+    _clear_span_cache()
+    text = "x" * 1_000_000 + "‍" + "y" * 1000
+    assert list(_token_bridging_gap_spans(text)) == [(1000000, 1000001)]
+    assert artifacts._cached_token_bridging_gap_spans.cache_info().currsize == 0
+
+
+def test_retained_byte_budget_evicts_oldest_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for the #1077 follow-up: total retained text is bounded.
+
+    The entry-count limit alone cannot bound retention when each key holds
+    a whole window of text, so the cache also evicts least-recently-used
+    entries once retained key text passes the byte budget.
+    """
+    _clear_span_cache()
+    monkeypatch.setattr(artifacts, "_TOKEN_GAP_SPAN_CACHE_MAX_RETAINED_CHARS", 10)
+    first = "alpha‍one"
+    second = "beta‍two"
+    assert list(_token_bridging_gap_spans(first)) == [(5, 6)]
+    assert artifacts._cached_token_bridging_gap_spans.cache_info().currsize == 1
+    assert list(_token_bridging_gap_spans(second)) == [(4, 5)]
+    assert artifacts._cached_token_bridging_gap_spans.cache_info().currsize == 1
+    calls: list[str] = []
+    original = artifacts._is_token_gap_character
+
+    def counting(character: str) -> bool:
+        calls.append(character)
+        return original(character)
+
+    monkeypatch.setattr(artifacts, "_is_token_gap_character", counting)
+    assert list(_token_bridging_gap_spans(first)) == [(5, 6)]
+    assert calls, "evicted first entry must be re-walked, not served from cache"
+
+
+def test_cleanup_result_clears_the_span_cache() -> None:
+    """Regression test for the #1077 follow-up: finished scans release keys."""
+    from skillspector.cleanup import cleanup_result
+
+    _clear_span_cache()
+    assert list(_token_bridging_gap_spans("hello‍world")) == [(5, 6)]
+    assert artifacts._cached_token_bridging_gap_spans.cache_info().currsize == 1
+    cleanup_result({})
+    assert artifacts._cached_token_bridging_gap_spans.cache_info().currsize == 0
