@@ -46,6 +46,7 @@ from skillspector.inspection_ledger import (
     RULE_SET_SCOPE,
     AnalysisCompleteness,
     ParserCause,
+    bounded_inspection_notices,
     finalize_ledger,
     format_recovery_policy_accepted,
     only_missing_reference_exceptions,
@@ -1046,6 +1047,8 @@ def _build_sarif(
         analyzers = exception.get("analyzers")
         if isinstance(analyzers, list):
             properties["analyzers"] = list(analyzers)
+        if exception.get("phase") == "documentation":
+            properties["kind"] = "documentation_pattern_notice"
         for key, value in resource_measurements(exception).items():
             prefix, _, unit = key.partition("_")
             properties[prefix + unit.capitalize()] = value
@@ -1097,6 +1100,11 @@ def _build_sarif(
                     properties={"kind": "inspection_limitation"},
                 )
             )
+    notices = completeness.get("notices", [])
+    if isinstance(notices, list):
+        for notice in notices:
+            if isinstance(notice, Mapping):
+                append_notification(notification_from_exception(notice, "note"))
     if notifications_truncated:
         completeness_projection["notificationsTruncated"] = True
         sentinel = SarifNotification(
@@ -1212,6 +1220,7 @@ def _render_terminal_completeness(
     render_rows("Scope exclusions", completeness.get("scope_exclusions"))
     render_rows("Ledger exceptions", completeness.get("ledger_exceptions"))
     render_rows("Formatting recovery warnings", completeness.get("warnings"))
+    render_rows("Inspection notices", completeness.get("notices"))
     render_rows("Analyzer statuses", completeness.get("analyzer_statuses"))
     limitations = completeness.get("limitations")
     if isinstance(limitations, list) and limitations:
@@ -1446,7 +1455,7 @@ def _llm_degradation_notice(
     failed = attempted - succeeded
     return (
         f"LLM analysis was requested but {failed} of {attempted} LLM call(s) failed - "
-        "results reflect STATIC analysis only for the affected batch(es)."
+        "affected AI assessments are incomplete; completed results are retained."
     )
 
 
@@ -1563,11 +1572,7 @@ def _build_metadata(
             }
         )
         detail = f" Reasons: {'; '.join(reasons)}" if reasons else ""
-        failed = attempted - succeeded
-        meta["llm_error"] = (
-            f"LLM analysis was requested but {failed} of {attempted} LLM call(s) failed; "
-            f"results reflect static analysis only for the affected batch(es).{detail}"
-        )
+        meta["llm_error"] = f"{_llm_degradation_notice(use_llm, llm_call_log)}{detail}"
     elif semantic_runtime_incomplete:
         meta["llm_degraded"] = True
         meta["llm_error"] = (
@@ -1789,6 +1794,7 @@ def _render_markdown_completeness(
     render_rows("Scope Exclusions", completeness.get("scope_exclusions"))
     render_rows("Ledger Exceptions", completeness.get("ledger_exceptions"))
     render_rows("Formatting Recovery Warnings", completeness.get("warnings"))
+    render_rows("Inspection Notices", completeness.get("notices"))
     render_rows("Analyzer Statuses", completeness.get("analyzer_statuses"))
     limitations = completeness.get("limitations")
     if isinstance(limitations, list) and limitations:
@@ -1975,6 +1981,11 @@ def report(state: SkillspectorState) -> dict[str, object]:
     analysis_completeness: Mapping[str, object] = (
         supplied_completeness if isinstance(supplied_completeness, Mapping) else empty_completeness
     )
+    if "notices" in analysis_completeness:
+        analysis_completeness = {
+            **analysis_completeness,
+            "notices": bounded_inspection_notices(analysis_completeness["notices"]),
+        }
     execution_successful = bool(
         state.get("execution_successful", analysis_completeness.get("execution_successful", True))
     )
@@ -2107,14 +2118,15 @@ def report(state: SkillspectorState) -> dict[str, object]:
         logger.warning(
             "LLM stage unavailable during preflight; report reflects static analysis only"
         )
-    elif semantic_runtime_incomplete:
+    elif runtime_event is not None:
         logger.warning(
             "LLM stage degraded: semantic runtime telemetry was incomplete; "
             "report may reflect static analysis only"
         )
     elif degraded:
         logger.warning(
-            "LLM stage degraded: %d/%d LLM call(s) failed; report reflects static analysis only",
+            "LLM stage degraded: %d/%d LLM call(s) failed; "
+            "affected AI assessments are incomplete; completed results are retained",
             _attempted - _succeeded,
             _attempted,
         )

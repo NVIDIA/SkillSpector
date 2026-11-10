@@ -48,6 +48,8 @@ from skillspector.llm_analyzer_base import (
     BatchFailure,
     LLMAnalyzerBase,
     LLMRuntimeLimitError,
+    _consolidate_fragment_ledger_events,
+    _project_line_fragments,
     append_output_language_instruction,
     estimate_tokens,
 )
@@ -452,12 +454,20 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
         aligned with the original file.
         """
         sc10_files = {finding.file for finding in findings or [] if finding.rule_id == "SC10"}
+        # Redacted columns can change length and must not claim original-source
+        # provenance. Keep these physical lines whole for redaction and the guard.
+        self._redacted_source_files = sc10_files
         if sc10_files:
             file_cache = {
                 path: redact_text(text) if path in sc10_files else text
                 for path, text in file_cache.items()
             }
         return super().get_batches(file_paths, file_cache, findings, **prompt_kwargs)
+
+    def _fragment_source_line(self, batch: Batch, **prompt_kwargs: object) -> list[Batch]:
+        if batch.file_path in getattr(self, "_redacted_source_files", set()):
+            return [batch]
+        return super()._fragment_source_line(batch, **prompt_kwargs)
 
     def parse_response(  # type: ignore[override]  # Base class permits custom parsed values.
         self,
@@ -619,11 +629,61 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
 
 def _meta_batch_work_id(batch: Batch) -> str:
     """Return the ledger identity for one submitted meta-analysis batch."""
-    return inspection_work_id(
+    identity = inspection_work_id(
         "meta_analyzer",
         batch.file_path,
         batch.start_line if batch.end_line is not None else None,
         batch.end_line,
+    )
+    if batch.source_start_column is not None:
+        # Internal return reconciliation needs a distinct key for each span.
+        # Public ledger identity remains the original source line range.
+        identity += (
+            f":columns:{batch.source_start_column}:{batch.source_end_column}"
+            f":length:{batch.source_line_length}"
+        )
+    return identity
+
+
+def _account_for_missing_meta_batches(
+    batches: list[Batch], outcome: BatchExecutionResult
+) -> BatchExecutionResult:
+    submitted = {_meta_batch_work_id(batch): batch for batch in batches}
+    successful: dict[str, tuple[Batch, list]] = {}
+    for returned, items in outcome.successful:
+        identity = _meta_batch_work_id(returned)
+        if identity in submitted and identity not in successful:
+            successful[identity] = (submitted[identity], items)
+    failures = [
+        BatchFailure(submitted[identity], failure.error_class, failure.reason)
+        for failure in outcome.failures
+        if (identity := _meta_batch_work_id(failure.batch)) in submitted
+    ]
+    warnings = [
+        BatchFailure(submitted[identity], warning.error_class, warning.reason)
+        for warning in outcome.warnings
+        if (identity := _meta_batch_work_id(warning.batch)) in submitted
+    ]
+    recovered = [
+        (submitted[identity], values)
+        for returned, values in outcome.recovered
+        if (identity := _meta_batch_work_id(returned)) in submitted
+    ]
+    observed = set(successful) | {
+        _meta_batch_work_id(failure.batch) for failure in [*failures, *warnings]
+    }
+    return BatchExecutionResult(
+        successful=list(successful.values()),
+        failures=[
+            *failures,
+            *(
+                BatchFailure(batch, "MissingBatchResult")
+                for identity, batch in submitted.items()
+                if identity not in observed
+            ),
+        ],
+        recovered=recovered,
+        warnings=warnings,
     )
 
 
@@ -633,6 +693,27 @@ def _meta_ledger_response(
     filtered: list[Finding],
 ) -> tuple[list[InspectionLedgerEvent], AnalyzerStatusEvent]:
     """Account for each meta batch while preserving fail-closed finding identity."""
+    outcome = _account_for_missing_meta_batches(batches, outcome)
+    projected_successes, projected_failures, _ = _project_line_fragments(
+        [(batch, batch.findings) for batch, _ in outcome.successful],
+        [*outcome.failures, *outcome.warnings],
+    )
+    outcome = BatchExecutionResult(
+        successful=[
+            (replace(batch, findings=findings), []) for batch, findings in projected_successes
+        ],
+        failures=[
+            failure
+            for failure in projected_failures
+            if failure.reason is not LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+        ],
+        recovered=outcome.recovered,
+        warnings=[
+            failure
+            for failure in projected_failures
+            if failure.reason is LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+        ],
+    )
     retained_ids = {finding.finding_id for finding in filtered}
     completed_ids = {
         finding.finding_id for batch, _ in outcome.successful for finding in batch.findings
@@ -687,7 +768,7 @@ def _meta_ledger_response(
         )
     if not events:
         return events, analyzer_status_event(analyzer_id="meta_analyzer", status="completed")
-    return events, analyzer_status_for_events("meta_analyzer", events)
+    return _consolidate_fragment_ledger_events("meta_analyzer", events, batches)
 
 
 def _effective_finding_ids(findings: list[Finding]) -> list[str]:
@@ -919,14 +1000,22 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
                 ],
             )
 
+        detailed = _account_for_missing_meta_batches(batches, detailed)
+        completed_sources, _, _ = _project_line_fragments(
+            [(batch, batch.findings) for batch, _ in detailed.successful],
+            [*detailed.failures, *detailed.warnings],
+        )
+        analysed_ids = {finding.finding_id for _, values in completed_sources for finding in values}
         completed_work_ids = {_meta_batch_work_id(batch) for batch, _ in detailed.successful}
-        analysed_ids: set[str] = set()
         for batch, assessments in batch_results:
-            if _meta_batch_work_id(batch) in completed_work_ids:
-                analysed_ids.update(finding.finding_id for finding in batch.findings)
+            if (
+                batch.source_start_column is not None
+                or _meta_batch_work_id(batch) in completed_work_ids
+            ):
+                # A fragment cannot establish its original line's full context.
+                # Only the complete successful coverage above permits filtering.
                 continue
-            # Partial recovery proves only the returned item assessments, even
-            # when all submitted batches have a partial result.
+            # Preserve main's per-item partial recovery for ordinary batches.
             originals = {finding.finding_id: finding for finding in batch.findings}
             for assessment in assessments:
                 finding_id = assessment.get("finding_id")
