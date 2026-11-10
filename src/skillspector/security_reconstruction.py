@@ -990,13 +990,23 @@ def _quoted_verb_in_string_sequence(text: str, match: re.Match[str]) -> bool:
     as ``['delete', 'run', 'list']`` as an obfuscated directive and fails the
     deterministic layer closed. Matches with any filler between the verb and
     the quote (``delete 'x'``), and quoted verbs not followed by another quoted
-    literal (``mode="omit", flag=...``), are unaffected.
+    literal (``mode="omit", flag=...``), are unaffected. Backtick identifier
+    lists also allow a prefix before the verb, as in ``biome-ignore``.
     """
     quote_index = match.start("quote")
     verb = re.match(_FALLBACK_REMOVAL_VERBS, text[match.start() :], re.IGNORECASE)
     if verb is None or match.start() + verb.end() != quote_index:
         return False
     opener_index = match.start() - 1
+    if text[quote_index] == "`" and (opener_index < 0 or text[opener_index] != "`"):
+        opener_index = text.rfind(
+            "`", max(0, match.start() - MAX_DIRECTIVE_HEADER_CHARS), match.start()
+        )
+        if (
+            opener_index < 0
+            or re.fullmatch(r"[A-Za-z0-9_.@-]+", text[opener_index + 1 : quote_index]) is None
+        ):
+            return False
     if opener_index < 0:
         return False
     opener = text[opener_index]
