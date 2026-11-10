@@ -376,9 +376,8 @@ def test_oms_decoded_window_keeps_unicode_fence_source_coordinates(
     )
     index = view.text.index(instruction)
     assert raw_start + view.source_offset(index) == target_start
-    assert (
-        raw_start + view.source_end_offset(index + len(instruction) - 1)
-        == target_start + len(encoded_instruction)
+    assert raw_start + view.source_end_offset(index + len(instruction) - 1) == target_start + len(
+        encoded_instruction
     )
     assert decoded.owns(static_runner._absolute_source_view(view, source_start=raw_start), _check)
 
