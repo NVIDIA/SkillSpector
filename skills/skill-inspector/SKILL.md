@@ -45,11 +45,16 @@ Do not rely on the numeric score alone. A low score can miss semantic risk, and 
    On Windows, safe file output is unsupported, so `--output` always fails
    (exit code 2) and no report is written. Omit `--output` and redirect
    stdout to a file outside the scan target instead. Use
-   `Set-Content -Encoding utf8`, not `>`, so PowerShell writes UTF-8 JSON
-   rather than UTF-16:
+   `[IO.File]::WriteAllText(...)`, not `>` or `Set-Content -Encoding utf8`:
+   plain `>` writes UTF-16 JSON on PowerShell 5.1, which JSON parsers
+   reject, and `Set-Content -Encoding utf8` writes a UTF-8 BOM on
+   PowerShell 5.1, which Python and Node JSON parsers also reject. The
+   `[IO.File]::WriteAllText(...)` form is BOM-free on both PowerShell 5.1
+   and 7+ (`-Encoding utf8NoBOM` is an alternative, but only on
+   PowerShell 6+):
 
    ```powershell
-   skillspector scan "$TARGET" --no-llm --format json | Set-Content -Encoding utf8 -LiteralPath "$env:TEMP\skill-inspector-report.json"
+   [IO.File]::WriteAllText("$env:TEMP\skill-inspector-report.json", ((skillspector scan "$TARGET" --no-llm --format json) -join "`n"))
    ```
 
    If the command exits non-zero, inspect any partial report and continue manually. Record that the static line was incomplete. On Windows, a non-zero exit from a command using `--output` is a platform refusal, not a scan failure: no partial report exists, so do not look for one or retry the same command.
