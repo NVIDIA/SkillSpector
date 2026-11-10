@@ -78,6 +78,7 @@ from skillspector.nested_artifacts import (
     is_executable_content,
 )
 from skillspector.oms import project_oms_content
+from skillspector.providers import prepare_chat_model_imports
 from skillspector.python_ast import (
     PythonSourceClassification,
     classify_python_source,
@@ -3940,6 +3941,16 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         if target and target in disposition_by_path:
             reference["disposition"] = disposition_by_path[target]
 
+    remaining_seconds = transitive_remaining_seconds(state)
+    if use_llm and remaining_seconds is not None and remaining_seconds > 0:
+        try:
+            prepare_chat_model_imports()
+        except Exception as exc:
+            # Optional eager imports must preserve normal provider failure handling.
+            logger.debug("Could not prepare AI transport imports (%s)", type(exc).__name__)
+        remaining_seconds = transitive_remaining_seconds(state)
+        if remaining_seconds is not None and remaining_seconds <= 0:
+            logger.debug("Workflow deadline reached while preparing AI transport imports")
     model_config = build_model_config() if use_llm else {}
     llm_provenance = (
         capture_llm_provenance(model_config)

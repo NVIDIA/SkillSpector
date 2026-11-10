@@ -47,6 +47,12 @@ class NvBuildProvider:
     DEFAULT_MODEL = "z-ai/glm-5.3"
     SLOT_DEFAULTS: dict[str, str] = {}
 
+    def prepare_chat_model_imports(self) -> None:
+        """Prepare the OpenAI transport without resolving or creating a client."""
+        from skillspector.providers.chat_models import prepare_openai_chat_model_imports
+
+        prepare_openai_chat_model_imports()
+
     def resolve_credentials(self) -> tuple[str, str | None] | None:
         """Return ``(api_key, base_url)`` from ``NVIDIA_INFERENCE_KEY``."""
         api_key = os.environ.get("NVIDIA_INFERENCE_KEY", "").strip()
