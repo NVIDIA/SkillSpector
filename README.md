@@ -216,6 +216,17 @@ See the [contrib guide](contrib/batch_scan/docs/) for details.
 
 ### Comparing MCP Registry snapshots
 
+A named scan fetches only that server's published versions from the official
+registry, then selects entries marked as latest. If none are marked as latest,
+all matching versions are assessed. The server name remains the report source:
+
+```bash
+skillspector scan 'ac.inference.sh/mcp' --mcp-registry --format json --output current.json
+```
+
+Use `https://registry.modelcontextprotocol.io/v0/servers` as the input to scan
+the full catalog. Local registry captures are also supported.
+
 Start with raw registry payload captures (`registry-before.json` and
 `registry-after.json`). Save a scan report as `previous.json`, then compare a
 later scan against that generated local report:
