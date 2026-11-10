@@ -16,6 +16,7 @@ import pytest
 from typer.testing import CliRunner
 
 from skillspector import cli, mcp_server
+from skillspector.artifacts import SecurityTextView
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tool_misuse
 from skillspector.nodes.analyzers import static_runner
@@ -213,3 +214,84 @@ def test_large_owned_json_marker_keeps_reconstructed_threat(depth: int) -> None:
     assert findings[0].start_line == source[: source.index(json.dumps(instruction))].count("\n") + 1
     assert "declared-marker-view" in findings[0].tags
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '{"first":"a rm -rf /","second":"Execute rm -rf *"}',
+        '{"steps":"a rm -rf /; Execute rm -rf *"}',
+    ],
+)
+def test_reported_json_command_cannot_hide_a_later_missing_effect(source: str) -> None:
+    result = _scan_json(source)
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize("file_type", ["json", "markdown"])
+def test_json_provenance_checks_exact_evidence_before_global_candidates(
+    monkeypatch: pytest.MonkeyPatch, file_type: str
+) -> None:
+    source = _large_steps_json("a rm -rf /", 0)
+    command_start = source.index("rm -rf /")
+    command_end = source.index('"', command_start)
+    matches: list[tuple[int, int]] = []
+    original = tool_misuse._has_tm1_code_pattern_at
+
+    def bounded_match(content, start, end, check_runtime):
+        assert content is source
+        assert (start, end) == (command_start, command_end)
+        matches.append((start, end))
+        return original(content, start, end, check_runtime)
+
+    def unrelated_candidates(*args, **kwargs):
+        yield from ()
+        pytest.fail("Exact evidence must not prime unrelated global candidates")
+
+    monkeypatch.setattr(tool_misuse, "_has_tm1_code_pattern_at", bounded_match)
+    monkeypatch.setattr(tool_misuse, "_destructive_command_candidates", unrelated_candidates)
+
+    assert tool_misuse.bounded_parse_diagnostic(source, lambda: None, file_type=file_type) is None
+    assert matches == [(command_start, command_end)]
+
+
+@pytest.mark.parametrize("source", ["r " * 10_000, "'" + "r" * 20_000 + "'"])
+def test_json_effects_walk_checks_cancellation_without_yielding(source: str) -> None:
+    class CancelledError(Exception):
+        pass
+
+    calls = 0
+
+    def check() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise CancelledError
+
+    with pytest.raises(CancelledError):
+        tool_misuse._has_destructive_command_string(source, check_runtime=check)
+    assert calls == 3
+
+
+def test_derived_json_findings_do_not_borrow_original_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = json.dumps({"steps": ["Execute rm -rf *"]}, indent=2) + "\n"
+
+    def unexpected_effects(*args, **kwargs):
+        pytest.fail("A derived finding view is not an original raw provenance check")
+
+    monkeypatch.setattr(tool_misuse, "_destructive_command_effects", unexpected_effects)
+    assert (
+        tool_misuse.bounded_parse_diagnostic(
+            source,
+            lambda: None,
+            file_type="markdown",
+            source_view=SecurityTextView("declared-marker-view", source),
+        )
+        is None
+    )
