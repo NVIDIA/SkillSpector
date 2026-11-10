@@ -10488,12 +10488,18 @@ def _owned_inline_command_diagnostic(
     )
     if remaining_work[0] < 0:
         return limit()
+    property_spans = sorted(value_spans)
+    property_starts = [start for start, _end in property_spans]
     # Explicit eval/shell operands already have POSIX execution semantics.
     value_candidates = () if executing else re.finditer(r"\$\(", content)
     for candidate in value_candidates:
         check_runtime()
         start = candidate.start()
         if not start or content[start - 1] != '"':
+            continue
+        property_index = bisect_right(property_starts, start) - 1
+        if property_index >= 0 and start < property_spans[property_index][1]:
+            # This exact argument already has the narrower property-value proof.
             continue
         # Reuse the existing finite value proof before either a whole quoted
         # word or its nested expression is interpreted as a POSIX command.

@@ -619,6 +619,74 @@ def test_multiple_native_property_values_keep_complete_normal_caller_coverage(
     assert result["findings"] == []
 
 
+@pytest.mark.parametrize("count", [1, 10, 100])
+@pytest.mark.parametrize("prefix", ["", "prefix/"])
+def test_repeated_property_arguments_fit_the_existing_shared_work(count: int, prefix: str) -> None:
+    body = 'Test-Path "' + prefix + "$($item.Name)/" + "p" * 1000 + '"'
+    content = "\n\n".join("`" + body + "`" for _ in range(count))
+    assert len(content) < static_runner.SECURITY_VIEW_WINDOW_CHARS
+    assert tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown") is None
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["paths.md"], "file_cache": {"paths.md": content}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert result["findings"] == []
+
+
+@pytest.mark.parametrize(
+    "body,property_count,replace_probed",
+    [
+        ('Join-Path "$($item.Parent.Name)" "$($item.Name)"', 2, False),
+        ('Write-Output "$($text -replace \'%s\', \'r m\')"', 0, True),
+    ],
+)
+def test_proven_property_arguments_skip_only_the_redundant_replace_probe(
+    monkeypatch, body: str, property_count: int, replace_probed: bool
+) -> None:
+    spans = tuple(
+        tm._powershell_property_argument_spans(
+            body, lambda: None, [8 * len(body) + 8192], bindings_proven=True
+        )
+    )
+    assert len(spans) == property_count
+    observed = []
+    original = tm._is_powershell_replace_value_context
+
+    def replace_value(*args, **kwargs):
+        observed.append(args[1])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tm, "_is_powershell_replace_value_context", replace_value)
+    assert (
+        tm._owned_inline_command_diagnostic(
+            body, lambda: None, [8 * len(body) + 8192], property_argument_spans=spans
+        )
+        is None
+    )
+    assert bool(observed) is replace_probed
+
+
+def test_repeated_property_arguments_keep_later_runtime_and_raw_high() -> None:
+    body = 'Test-Path "$($item.Name)/' + "p" * 1000 + '"'
+    content = "\n\n".join("`" + body + "`" for _ in range(10))
+    content += '\n\nRun `sh -c "$PAYLOAD"`. Run `rm -rf /`.'
+    diagnostic = tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+    assert content.index("sh -c") <= diagnostic.start < diagnostic.end <= len(content)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["paths.md"], "file_cache": {"paths.md": content}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert any(
+        finding.rule_id == "TM1"
+        and finding.severity == "HIGH"
+        and finding.file == "paths.md"
+        and finding.matched_text == "rm -rf /"
+        for finding in result["findings"]
+    )
+
+
 def test_property_structural_reads_are_exact_bounded_quoted_arguments(monkeypatch) -> None:
     observed = []
     original = tm._parse_shell_command_word
