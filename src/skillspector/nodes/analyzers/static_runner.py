@@ -721,11 +721,7 @@ def _linear_command_matches(
             if budget is not None:
                 budget.check_runtime()
             command = next(prefixes, None)
-        if (
-            last_suffix is not None
-            and command is not None
-            and command.end() <= last_suffix.start()
-        ):
+        if last_suffix is not None and command is not None and command.end() <= last_suffix.start():
             match = original.match(content, command.start(), end)
             if match is None:
                 raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
