@@ -855,6 +855,11 @@ def _bounded_parser_incomplete(
     prepared_analysis: object | None = None,
 ) -> bool:
     kwargs = {"file_type": file_type, "complete_context": complete_context}
+    if vars(module).get("USES_PREPARED_PARSER_ANALYSIS") is True:
+        kwargs.update(
+            prepared_analysis=prepared_analysis,
+            source_view=_absolute_source_view(view, source_start=source_start),
+        )
     if vars(module).get("USES_PYTHON_IMPORT_BOUNDS") is True and python_import_bounds is not None:
         kwargs["python_import_check"] = lambda check: python_import_bounds.allows(
             path, view.text, check

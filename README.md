@@ -562,7 +562,7 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
 | E1 | External Transmission | MEDIUM | Sending data to external URLs |
-| E2 | Env Variable Harvesting | HIGH | Enumerating, copying, or searching environment data to collect secrets |
+| E2 | Env Variable Harvesting | HIGH | Enumerating, copying, or searching environment data to collect secrets. A copy traced only to a child process's `env=` is reported LOW |
 | E3 | File System Enumeration | MEDIUM | Scanning directories for sensitive files |
 | E4 | Context Leakage | HIGH | Transmitting conversation context externally |
 
@@ -983,6 +983,13 @@ make format-check
 
 `make test-unit` excludes tests marked `integration` or `provider`. This selection
 does not cover every CI job or guarantee network isolation.
+
+Some unit tests start loopback HTTP servers and local multiprocessing sockets.
+Restricted agent sandboxes can deny these operations. Keep the failing
+command and traceback, and use an appropriately permitted environment for a
+diagnostic rerun. Report that result separately; a passing subset does not make
+the original full target pass. See the
+[contributor onboarding check](docs/validation/CONTRIBUTOR_ONBOARDING.md).
 
 Before submitting a PR, [CONTRIBUTING.md](CONTRIBUTING.md#how-to-contribute)
 requires `make test`. It runs both `test-unit` and `test-integration`; integration

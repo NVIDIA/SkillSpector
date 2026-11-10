@@ -2064,6 +2064,48 @@ class TestTP4Telemetry:
     """TP4 records llm_call_log so the report's degradation detector counts it
     consistently with the semantic analyzers and the meta-analyzer."""
 
+    @pytest.mark.parametrize("kind", ["refused", "mixed", "runtime", "unexpected"])
+    def test_only_explicit_refusals_omit_transport_error(self, monkeypatch, kind) -> None:
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        state["components"].append("second.py")
+        state["file_cache"]["second.py"] = "print(2)"
+        state["component_metadata"].append(
+            {"path": "second.py", "type": "python", "executable": True}
+        )
+        _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+
+        async def outcomes(self, batches, **_kwargs):
+            assert len(batches) >= 2
+            if kind == "unexpected":
+                return BatchExecutionResult(successful=[(batch, []) for batch in batches])
+            failures = []
+            for index, batch in enumerate(batches):
+                reason = LedgerReason.LLM_RESPONSE_REFUSED
+                if kind == "runtime":
+                    reason = LedgerReason.RUNTIME_LIMIT
+                elif kind == "mixed" and index:
+                    reason = LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+                failures.append(
+                    BatchFailure(batch=batch, error_class="ValidationError", reason=reason)
+                )
+            return BatchExecutionResult(failures=failures)
+
+        monkeypatch.setattr(LLMAnalyzerBase, "arun_batches_detailed", outcomes)
+        result = node(state)
+        call = result["llm_call_log"][0]
+        assert call["ok"] is False
+        if kind == "refused":
+            assert call["error"] is None
+            semantic = [
+                event for event in result["inspection_ledger"] if event["phase"] == "semantic"
+            ]
+            assert semantic and all(
+                event["reason_code"] is LedgerReason.LLM_RESPONSE_REFUSED for event in semantic
+            )
+        else:
+            assert "TP4 LLM batch failed" in call["error"]
+        assert result["analyzer_status_events"][0]["status"] != "completed"
+
     def test_successful_call_records_ok_true(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)
         _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
