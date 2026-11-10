@@ -21,8 +21,14 @@ import fnmatch
 import re
 import sys
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from xml.parsers import expat
 
-from skillspector.artifacts import _is_emoji_base, prompt_injection_letter_spacing_view
+from skillspector.artifacts import (
+    SecurityTextView,
+    _is_emoji_base,
+    prompt_injection_letter_spacing_view,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -78,17 +84,54 @@ P1_PATTERNS = [
 # P2: Hidden Instructions. Build the character class from the shared P9
 # constant so hidden-instruction and padding detection cannot drift apart.
 _ZERO_WIDTH_PATTERN = "[" + "".join(sorted(ZERO_WIDTH_CHARS)) + "]"
+# Bidirectional control characters (Trojan Source, CVE-2021-42574). Evaluated
+# unconditionally below, NOT in the markdown-gated P2_PATTERNS list -- see the
+# comment at that check for why.
+# The class is the 9 paired controls only. The direction marks U+200E/U+200F/
+# U+061C are deliberately excluded: they cannot reorder a span the way the
+# paired controls can, which is the same line GCC's -Wbidi-chars draws by
+# default. Do not add them here without revisiting that tradeoff.
+_BIDI_CONTROL_PATTERN = r"[\u202a-\u202e\u2066-\u2069]"
+# Treat separators, lower-to-upper transitions, and acronym-to-PascalCase transitions as
+# identifier boundaries without matching keyword prefixes in ordinary alphanumeric words.
+_P2_IDENTIFIER_START = (
+    r"(?:(?<![^\W_])|(?<=(?-i:[a-z0-9]))(?=(?-i:[A-Z]))|(?<=(?-i:[A-Z]))(?=(?-i:[A-Z][a-z])))"
+)
+_P2_IDENTIFIER_END = (
+    r"(?:(?![^\W_])|(?<=(?-i:[a-z0-9]))(?=(?-i:[A-Z]))|(?<=(?-i:[A-Z]))(?=(?-i:[A-Z][a-z])))"
+)
+# Keywords that are rarely part of ordinary words also match inside run-together
+# text such as PLEASEIGNOREPREVIOUSINSTRUCTIONS, which has no separator or case
+# transition to split on. Keywords that commonly start ordinary words (SYSTEMATIC,
+# POSTGRES, GETTING, target, sending) keep identifier boundaries.
+_P2_COMMENT_KEYWORD = (
+    rf"(?:{_P2_IDENTIFIER_START}(?:system|POST|GET|send){_P2_IDENTIFIER_END}"
+    r"|ignore|instructions?|transmit)"
+)
+# Reference-comment titles need a source delimiter scan, rather than a DOTALL
+# keyword expression that can backtrack past an already closed title.
+_REFERENCE_COMMENT_GAP = r"[ \t]*(?:(?:\r\n|\r|\n)[ \t]*)?"
+_REFERENCE_COMMENT_PATTERN = rf"\[//\]:{_REFERENCE_COMMENT_GAP}#"
+_REFERENCE_COMMENT_OPENING = re.compile(_REFERENCE_COMMENT_PATTERN)
+_REFERENCE_COMMENT_TITLE = re.compile(r"(?:[ \t]+|[ \t]*(?:\r\n|\r|\n)[ \t]*)\(")
+_REFERENCE_COMMENT_SPAN = re.compile(r"[\s\S]*")
+_REFERENCE_COMMENT_KEYWORD = re.compile(_P2_COMMENT_KEYWORD, re.IGNORECASE)
 P2_PATTERNS = [
-    (r"<!--.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?-->", 0.7),
-    (r"\[//\]:\s*#\s*\(.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?\)", 0.8),
+    (
+        # "<!-->" and "<!--->" are abrupt empty comments: the HTML tokenizer
+        # closes them immediately, so the text after them is visible. Never
+        # start a hidden-comment match there.
+        rf"<!--(?!-?>)(?:(?!--!?>).)*?{_P2_COMMENT_KEYWORD}(?:(?!--!?>).)*?--!?>",
+        0.7,
+    ),
+    (_REFERENCE_COMMENT_PATTERN, 0.8),
     (_ZERO_WIDTH_PATTERN, 0.6),
-    (r"[\u202a-\u202e\u2066-\u2069]", 0.85),
     (r"data:text/plain;base64,[A-Za-z0-9+/=]{50,}", 0.7),
 ]
 _SINGLE_CHARACTER_P2_PATTERNS = frozenset(
     {
         _ZERO_WIDTH_PATTERN,
-        r"[\u202a-\u202e\u2066-\u2069]",
+        _BIDI_CONTROL_PATTERN,
     }
 )
 # P3: Exfiltration Commands
@@ -217,6 +260,408 @@ _EMOJI_MODIFIERS = range(0x1F3FB, 0x1F400)
 _VARIATION_SELECTORS = {0xFE0E, 0xFE0F}
 
 
+# P2 structural-benign carve-out. Only structurally proven benign constructs
+# (anchored license-line forms, per-key metadata lines in complete comments
+# near the top of the file or directly after closed frontmatter) may
+# suppress a P2 comment match — and never when the match retains an
+# exfiltration or override signal.
+#
+# Each license fragment must FULLY match one anchored form below. The
+# substring check these replace let space-joined payloads through
+# ("Copyright ... <arbitrary instruction>" with no separators). The
+# holder is capped at six name-like tokens and about 60 characters
+# ("NVIDIA CORPORATION & AFFILIATES" is three); fragments carrying a
+# standalone trigger word never exempt. One trailing period is
+# allowed ("All rights reserved."). Residual: a very short
+# triggerless instruction fits the holder cap ("Copyright 2026 Acme
+# delete everything") — accepted per the anchored-forms spec; the
+# surrounding gates (danger signal first, top-of-file, complete
+# comment, 300 chars) still apply.
+# Shared grammar cores: the year-range + holder cap and the SPDX
+# expression each appear in both a license-line form and a metadata
+# value form. One core per shape so the next cap change edits one place.
+# Name-like tokens carry letters, digits, underscore, and header
+# punctuation only (no colon, slash, tilde, or inner dot — the path
+# grammar needs the dot for the file extension) with at most one
+# inner separator ([-,_]) and an optional trailing dot or comma
+# (Corp., Acme,), so a dot-, comma-, hyphen-, colon-, or
+# slash-joined sentence never counts as tokens.
+_P2_NAME_TOKEN = r"[A-Za-z0-9&'()+_]+(?:[-,_][A-Za-z0-9&'()+_]+)?[.,]?"
+_P2_COPYRIGHT_CORE = (
+    r"(?=.{1,60}\Z)(?:\(c\)\s+|©\s+)?\d{1,4}(?:\s*-\s*\d{1,4})?"
+    r"\s+(?:" + _P2_NAME_TOKEN + r"\s+){0,5}" + _P2_NAME_TOKEN + r"\.?"
+)
+# SPDX ids allow at most two hyphens, plus a third only in a
+# digit-bearing id (versioned compounds such as GPL-3.0-or-later and
+# CC-BY-SA-4.0; all-alpha 3-hyphen runs stay refused). Dots sit only
+# between digits, so dot-joined prose never fits. Length is scoped to
+# the id run so chains and trailing periods never shrink it; chains
+# cap at three ids.
+_P2_SPDX_ID = (
+    r"(?=[A-Za-z0-9.+\-]{1,24}(?![A-Za-z0-9.+\-]))"
+    r"(?:[A-Za-z0-9+]+(?:\.[0-9]+)?(?:-[A-Za-z0-9+]+(?:\.[0-9]+)?){0,2}"
+    r"|(?=[A-Za-z0-9.+\-]*[0-9])[A-Za-z0-9+]+(?:\.[0-9]+)?"
+    r"(?:-[A-Za-z0-9+]+(?:\.[0-9]+)?){0,3})"
+)
+_P2_SPDX_ATOM = _P2_SPDX_ID + r"(?:\s+(?:OR|AND|WITH)\s+" + _P2_SPDX_ID + r"){0,2}"
+_P2_LICENSE_LINE_RES = (
+    re.compile(
+        r"\ACopyright\s+" + _P2_COPYRIGHT_CORE + r"\Z",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\AAll rights reserved\.?\Z", re.IGNORECASE),
+    re.compile(
+        r"\ASPDX-License-Identifier:\s*" + _P2_SPDX_ATOM + r"\.?\Z",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\ALicensed under the\s+(?=.{1,40}\s+License)"
+        r"(?:" + _P2_NAME_TOKEN + r"\s+){0,2}" + _P2_NAME_TOKEN + r"\s+License"
+        r"(?:, Version \d+\.\d+)?\.?\Z",
+        re.IGNORECASE,
+    ),
+)
+_P2_COPYRIGHT_LINE_INDEX = 0
+_P2_SPDX_LINE_INDEX = 2
+_P2_LICENSED_LINE_INDEX = 3
+_P2_OVERRIDE_EXTRA = re.compile(
+    r"system\s+prompt|respond\s+as|override\s+instructions?|you\s+must",
+    re.IGNORECASE,
+)
+_P2_EXFIL_KEYWORD = re.compile(
+    r"\b(send|transmit|post|upload|forward|exfiltrat\w*)\b", re.IGNORECASE
+)
+_P2_EXTERNAL_DEST = re.compile(
+    r"https?://|\bexternal\b|\bwebhook\b|\bendpoint\b"
+    r"|\battacker\b|\bevil\b|\bcollect\b|data:text/plain;base64",
+    re.IGNORECASE,
+)
+_P2_EXFIL_STANDALONE = re.compile(r"\bexfiltrat\w*\b", re.IGNORECASE)
+# Instruction-ish words refuse the benign exemption when they appear
+# anywhere in a value or license fragment, even inside a longer word:
+# all seven of main's P2 comment triggers, matched as raw substrings.
+# Keys are never scanned (system requirements, get started). The cost
+# is ordinary prose that carries a trigger (PostgreSQL carries "post",
+# target and getting_started carry "get"): it reports P2, as it does
+# on main, as does Systems ("system").
+_P2_TRIGGER_SUBSTRING = re.compile(
+    r"(system|instructions?|ignore|post|send|transmit|get)", re.IGNORECASE
+)
+
+
+def _p2_trigger_scan_text(text: str) -> str:
+    """Return a de-obfuscated copy of ``text`` for the danger scans.
+
+    camelCase joints, underscores, and digits become spaces, so
+    IgnorePriorInstructions scans as Ignore Prior Instructions.
+    Only the danger scans use the copy; the exemption trigger check
+    is a raw substring, which needs no de-obfuscation.
+    """
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", text)
+    text = re.sub(r"[0-9_]+", " ", text)
+    return re.sub(r"\s+", " ", text)
+
+
+# Metadata keys observed in benign skill headers plus obvious header keys.
+# Matching is exact (case-insensitive): bare instruction words such as
+# system, instructions, or ignore are never here.
+_P2_BENIGN_METADATA_KEYS = frozenset(
+    {
+        "author",
+        "version",
+        "date",
+        "reviewed",
+        "updated",
+        "status",
+        "tags",
+        "description",
+        "title",
+        "license",
+        "copyright",
+        "requires",
+        "contact",
+        "get started",
+        "system dependencies",
+        "system requirements",
+        "spdx-license-identifier",
+    }
+)
+_P2_METADATA_LINE = re.compile(r"\A([A-Za-z][\w\- ]{0,40}):\s+(\S.*)\Z")
+# Per-key metadata value grammars. Token content is constrained as
+# well as token count: versions are semver-like (with a trailing + or *
+# for "3.10+"-style floors), SPDX atoms are bounded-length ids, names
+# are 1-4 capitalized tokens or an email, requires entries each carry
+# a version unless the value is one bare name (operators may follow
+# the name directly: "python>=3.10"), free-text keys take one short
+# token with at most two inner dots, and get-started paths need a
+# dotted final segment so slash-joined prose no longer fits. A
+# trigger word anywhere inside a value (system, instruction(s),
+# ignore, post, send, transmit, get) refuses exemption; keys are
+# excluded since "system requirements" and "get started" are keys.
+# Known residuals: a bare triggerless package name
+# ("requires: numpy") parses as a package; short triggerless SPDX
+# OR-chains fit the atom cap; a trigger broken inside itself
+# ("ig_nore") carries no contiguous trigger run, so neither this
+# check nor main's regex sees it.
+# Requirement names take a package-name shape: optional @scope/
+# (hyphens allowed in the scope), at most 40 characters, at most two
+# -/_/. separators — a separator-joined sentence never counts as one
+# bare name. Length is scoped to the name run so comma-separated
+# lists never shrink it.
+_P2_REQ_NAME = (
+    r"(?=[A-Za-z0-9_.@/\-]{1,40}(?![A-Za-z0-9_.@/\-]))"
+    r"(?:@[A-Za-z0-9_.\-]+/)?[A-Za-z0-9]+(?:[-_./][A-Za-z0-9]+){0,2}"
+)
+_P2_REQ_VER = r"v?\d+(?:\.\d+){0,3}(?:[-+][0-9A-Za-z.]{1,20})?[+*]?"
+_P2_REQ_OP = r"(?:>=|<=|==|!=|~=|\^|>|<|=|~)"
+_P2_REQ_VER_SUFFIX = r"(?:\s*" + _P2_REQ_OP + r"\s*" + _P2_REQ_VER + r"|\s+" + _P2_REQ_VER + r")"
+_P2_VERSION_RE = re.compile(r"\A" + _P2_REQ_VER + r"\Z")
+_P2_DATE_RE = re.compile(
+    r"\A(?:\d{4}-\d{2}-\d{2}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?"
+    r"|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?"
+    r"|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4})\Z",
+    re.IGNORECASE,
+)
+_P2_NAME_RE = re.compile(r"\A[A-Z][A-Za-z']*(?:\s+[A-Z][A-Za-z']*){0,3}\Z")
+_P2_EMAIL_RE = re.compile(r"\A[\w.+\-]+@[\w.\-]+\.[A-Za-z]{2,}\Z")
+_P2_SPDX_EXPR_RE = re.compile(r"\A" + _P2_SPDX_ATOM + r"\Z")
+_P2_REQUIREMENTS_RE = re.compile(
+    r"\A" + _P2_REQ_NAME + _P2_REQ_VER_SUFFIX + r"?"
+    r"(?:\s*[,;]\s*" + _P2_REQ_NAME + _P2_REQ_VER_SUFFIX + r")*\Z"
+)
+_P2_PATH_VALUE_RE = re.compile(
+    r"\A(?=[\w\-./#:?]{1,80}\Z)(?:https?://[\w\-.~]+(?::\d+)?/)?"
+    r"(?:" + _P2_NAME_TOKEN + r"/){0,3}" + _P2_NAME_TOKEN + r"\.[\w]{1,10}(?:[#?]\S*)?\Z"
+)
+_P2_SINGLE_TOKEN_RE = re.compile(r"\A(?=[A-Za-z0-9.]{1,24}\Z)[A-Za-z0-9]+(?:\.[A-Za-z0-9]+){0,2}\Z")
+_P2_COPYRIGHT_VALUE_RE = re.compile(
+    r"\A" + _P2_COPYRIGHT_CORE + r"\Z",
+    re.IGNORECASE,
+)
+# Every allowlisted key must appear here or in _P2_FREE_TEXT_KEYS
+# (pinned by test_metadata_keys_all_have_grammars).
+_P2_METADATA_VALUE_RES = {
+    "version": (_P2_VERSION_RE,),
+    "date": (_P2_DATE_RE,),
+    "updated": (_P2_DATE_RE,),
+    "reviewed": (_P2_DATE_RE,),
+    "author": (_P2_NAME_RE, _P2_EMAIL_RE),
+    "contact": (_P2_NAME_RE, _P2_EMAIL_RE),
+    "license": (_P2_SPDX_EXPR_RE,),
+    "spdx-license-identifier": (_P2_SPDX_EXPR_RE,),
+    "requires": (_P2_REQUIREMENTS_RE,),
+    "system dependencies": (_P2_REQUIREMENTS_RE,),
+    "system requirements": (_P2_REQUIREMENTS_RE,),
+    "get started": (_P2_PATH_VALUE_RE,),
+    "copyright": (_P2_COPYRIGHT_VALUE_RE,),
+}
+_P2_FREE_TEXT_KEYS = frozenset({"description", "title", "status", "tags"})
+_P2_FRONTMATTER_ADJACENT_LIMIT = 1500
+_P2_BENIGN_COMMENT_MAX_LEN = 300
+
+
+def _p2_comment_inner(matched_text: str) -> str:
+    """Return the inner body of an HTML or reference-style comment match."""
+    text = matched_text.strip()
+    if text.startswith("<!--"):
+        inner = text[4:]
+        if inner.endswith("-->"):
+            inner = inner[:-3]
+        return inner
+    if text.startswith("[//]:"):
+        start = text.find("(")
+        end = text.rfind(")")
+        # Only a bare ``#`` destination leaves the title as the whole hidden
+        # body; any other destination text must be validated with it.
+        if 0 <= start < end and text[5:start].strip() == "#":
+            return text[start + 1 : end]
+        return text
+    return text
+
+
+def _p2_has_danger_signal(inner: str) -> bool:
+    """Return True when a comment body carries override or exfiltration intent.
+
+    Both the raw body and a de-obfuscated copy are scanned: the copy
+    catches camelCase/underscore-joined intent, the raw body keeps
+    digit-bearing patterns exact. Either firing refuses the exemption.
+    """
+    for text in {inner, _p2_trigger_scan_text(inner)}:
+        for pattern_source, _confidence in P1_PATTERNS:
+            if re.search(pattern_source, text, re.IGNORECASE):
+                return True
+        if _P2_OVERRIDE_EXTRA.search(text):
+            return True
+        if _P2_EXFIL_STANDALONE.search(text):
+            return True
+        if _P2_EXFIL_KEYWORD.search(text) and _P2_EXTERNAL_DEST.search(text):
+            return True
+    return False
+
+
+_P2_FRONTMATTER_OPEN = re.compile(r"\A---[ \t]*\r?\n")
+_P2_FRONTMATTER_CLOSE = re.compile(r"(?m)^---\s*$")
+
+
+def _is_frontmatter_adjacent(content: str, match_start: int) -> bool:
+    """Return True when a match sits before any substantive file content."""
+    if match_start > _P2_FRONTMATTER_ADJACENT_LIMIT:
+        return False
+    stripped = content[:match_start].strip()
+    if not stripped:
+        return True
+    open_match = _P2_FRONTMATTER_OPEN.match(stripped)
+    if open_match is None:
+        return False
+    closing = _P2_FRONTMATTER_CLOSE.search(stripped, open_match.end())
+    if closing is None:
+        return False
+    return not stripped[closing.end() :].strip()
+
+
+def _is_license_only_fragment(fragment: str) -> bool:
+    """Return True when the fragment fully matches an anchored license-line form."""
+    if _P2_TRIGGER_SUBSTRING.search(fragment) is not None:
+        return False
+    return any(pattern.match(fragment) is not None for pattern in _P2_LICENSE_LINE_RES)
+
+
+def _is_allowlisted_metadata_fragment(fragment: str) -> bool:
+    """Return True for one key:value line whose value matches its key grammar.
+
+    The key must be allowlisted and the value must fully match that key's
+    narrow form (version token, date, name-or-email, SPDX expression,
+    package[version] list, single path/URL, or single token for
+    free-text keys) — never the old generic token-run shape that let an
+    imperative instruction through on a single dot or digit.
+    """
+    match = _P2_METADATA_LINE.match(fragment.strip())
+    if match is None:
+        return False
+    key = match.group(1).lower()
+    value = match.group(2).strip()
+    if len(value) > 1 and value.endswith("."):
+        value = value[:-1]
+    if _P2_TRIGGER_SUBSTRING.search(value) is not None:
+        return False
+    if key in _P2_FREE_TEXT_KEYS:
+        return _P2_SINGLE_TOKEN_RE.match(value) is not None
+    validators = _P2_METADATA_VALUE_RES.get(key)
+    if not validators:
+        return False
+    return any(pattern.match(value) is not None for pattern in validators)
+
+
+def _is_benign_license_or_metadata_body(inner: str) -> bool:
+    """Return True only when every fragment is license- or metadata-shaped.
+
+    Fragments are split and validated on the raw text: digit-masking
+    never affected split points (digits are not split characters), and
+    validating masked text broke real dates. An allowlisted key may
+    appear only once, so an instruction split across repeated keys
+    still fires.
+    """
+    body = inner.strip()
+    if not body:
+        return False
+    seen_keys: set[str] = set()
+    copyright_lines = 0
+    spdx_lines = 0
+    licensed_lines = 0
+    for fragment in re.split(r"[.!?]+\s+|\n|;", body):
+        fragment = fragment.strip()
+        if not fragment:
+            continue
+        if _is_license_only_fragment(fragment):
+            if _P2_LICENSE_LINE_RES[_P2_COPYRIGHT_LINE_INDEX].match(fragment) is not None:
+                copyright_lines += 1
+                if copyright_lines > 2:
+                    return False
+            elif _P2_LICENSE_LINE_RES[_P2_SPDX_LINE_INDEX].match(fragment) is not None:
+                spdx_lines += 1
+                if spdx_lines > 1:
+                    return False
+            elif _P2_LICENSE_LINE_RES[_P2_LICENSED_LINE_INDEX].match(fragment) is not None:
+                licensed_lines += 1
+                if licensed_lines > 1:
+                    return False
+            continue
+        key_match = _P2_METADATA_LINE.match(fragment)
+        if key_match is not None:
+            key = key_match.group(1).lower()
+            if key in _P2_BENIGN_METADATA_KEYS:
+                if key in seen_keys:
+                    return False
+                seen_keys.add(key)
+                if key == "copyright":
+                    copyright_lines += 1
+                    if copyright_lines > 2:
+                        return False
+        if _is_allowlisted_metadata_fragment(fragment):
+            continue
+        return False
+    return True
+
+
+def _p2_match_is_complete_comment(content: str, match_start: int, match_end: int) -> bool:
+    """Return True only when the match covers exactly one complete comment.
+
+    The P2 patterns can match a prefix of a reference comment (an
+    escaped ``\\)``, an inner paren, or a ``(c)`` ends the match early)
+    or span two HTML comments to reach a keyword. Either way the
+    exemption must not inspect a fragment, so incomplete matches fail
+    closed. A match that stops mid-line while comment text follows is
+    partial; anything after the match on its line must be whitespace.
+    """
+    line_end = content.find("\n", match_end)
+    tail = content[match_end:] if line_end == -1 else content[match_end:line_end]
+    if tail.strip():
+        return False
+    stripped = content[match_start:match_end]
+    if stripped.startswith("<!--"):
+        return stripped.endswith("-->") and "-->" not in stripped[4:-3]
+    if stripped.startswith("[//]:"):
+        open_paren = stripped.find("(")
+        if open_paren == -1:
+            return False
+        depth = 0
+        i = open_paren
+        while i < len(stripped):
+            if stripped[i] == "\\":
+                i += 2
+                continue
+            if stripped[i] == "(":
+                depth += 1
+            elif stripped[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return i == len(stripped) - 1
+            i += 1
+        return False
+    return False
+
+
+def _is_structurally_benign_p2_comment(content: str, match_start: int, matched_text: str) -> bool:
+    """Return True only for structurally proven benign P2 comment matches."""
+    stripped = matched_text.strip()
+    # Cheap positional gate first: only matches in the head of the file
+    # can ever qualify, so skip all string work for later matches.
+    if match_start > _P2_FRONTMATTER_ADJACENT_LIMIT:
+        return False
+    if not (stripped.startswith("<!--") or stripped.startswith("[//]:")):
+        return False
+    if not _p2_match_is_complete_comment(content, match_start, match_start + len(matched_text)):
+        return False
+    inner = _p2_comment_inner(stripped)
+    if _p2_has_danger_signal(inner):
+        return False
+    if not _is_frontmatter_adjacent(content, match_start):
+        return False
+    if len(inner.strip()) > _P2_BENIGN_COMMENT_MAX_LEN:
+        return False
+    return _is_benign_license_or_metadata_body(inner)
+
+
 def _previous_emoji_base(content: str, offset: int) -> bool:
     i = offset - 1
     while i >= 0 and (
@@ -244,14 +689,136 @@ def _zero_width_match_is_safe_emoji_zwj(content: str, offset: int) -> bool:
     )
 
 
+_DRAWINGML_NAMESPACE = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_DRAWINGML_PARAGRAPH_PROPERTIES = frozenset(
+    f"{_DRAWINGML_NAMESPACE}}}{name}"
+    for name in ("pPr", "defPPr", *(f"lvl{level}pPr" for level in range(1, 10)))
+)
+_XML_START_TAG = re.compile(
+    rb"<[^<>\s/]+(?P<attributes>(?:\s+[^<>\s=/'\"]+\s*=\s*(?:\"[^\"]*\"|'[^']*'))*)\s*/?>"
+)
+_XML_ATTRIBUTE = re.compile(rb"\s+([^<>\s=/'\"]+)\s*=\s*([\"'])(.*?)\2", re.DOTALL)
+
+
+def _drawingml_bullet_offsets(content: str, check_runtime: Callable[[], None]) -> frozenset[int]:
+    """Prove literal U+200B bullet formatting without exempting XML text."""
+    if (
+        "\u200b" not in content
+        or len(content) > 1_000_000
+        or not content.removeprefix("\ufeff").lstrip().startswith("<")
+    ):
+        return frozenset()
+    check_runtime()
+    try:
+        raw = content.encode("utf-8")
+    except UnicodeError:
+        return frozenset()
+    if len(raw) > 1_000_000:
+        return frozenset()
+    parser = expat.ParserCreate(namespace_separator="}")
+    stack: list[str] = []
+    offsets: list[int] = []
+    nodes = 0
+
+    def reject(*_args: object) -> None:
+        raise ValueError("Unsupported XML declaration")
+
+    def start(name: str, attributes: dict[str, str]) -> None:
+        nonlocal nodes
+        check_runtime()
+        nodes += 1
+        if nodes > 10_000 or len(stack) >= 64 or len(attributes) > 128:
+            raise ValueError("XML applicability budget exceeded")
+        if stack and stack[-1] == f"{_DRAWINGML_NAMESPACE}}}buChar":
+            raise ValueError("Bullet marker cannot contain child elements")
+        if (
+            name == f"{_DRAWINGML_NAMESPACE}}}buChar"
+            and stack
+            and stack[-1] in _DRAWINGML_PARAGRAPH_PROPERTIES
+            and attributes == {"char": "\u200b"}
+        ):
+            position = parser.CurrentByteIndex
+            tag = _XML_START_TAG.match(raw, position, min(len(raw), position + 4096))
+            if tag is not None:
+                cursor = tag.start("attributes")
+                while attribute := _XML_ATTRIBUTE.match(raw, cursor, tag.end("attributes")):
+                    if attribute.group(1) == b"char" and attribute.group(3) == b"\xe2\x80\x8b":
+                        offsets.append(attribute.start(3))
+                    cursor = attribute.end()
+        stack.append(name)
+
+    def characters(text: str) -> None:
+        if stack and stack[-1] == f"{_DRAWINGML_NAMESPACE}}}buChar" and text:
+            raise ValueError("Bullet marker cannot contain text")
+
+    parser.StartElementHandler = start
+    parser.EndElementHandler = lambda _name: stack.pop()
+    parser.CharacterDataHandler = characters
+    parser.StartDoctypeDeclHandler = reject
+    parser.EntityDeclHandler = reject
+    parser.ExternalEntityRefHandler = reject
+    parser.ProcessingInstructionHandler = reject
+    try:
+        for start_byte in range(0, len(raw), 4096):
+            check_runtime()
+            parser.Parse(raw[start_byte : start_byte + 4096], False)
+        parser.Parse(b"", True)
+    except (expat.ExpatError, ValueError):
+        return frozenset()
+    # Convert ordered UTF-8 positions once, without quadratic prefix decoding.
+    result: set[int] = set()
+    byte_cursor = character_cursor = 0
+    for offset in offsets:
+        check_runtime()
+        character_cursor += len(raw[byte_cursor:offset].decode("utf-8"))
+        result.add(character_cursor)
+        byte_cursor = offset
+    return frozenset(result)
+
+
+@dataclass(frozen=True)
+class _PreparedAnalysis:
+    bullet_offsets: frozenset[int]
+    check_runtime: Callable[[], None]
+
+    def analyze(
+        self, content: str, file_path: str, file_type: str, source_view: SecurityTextView
+    ) -> list[AnalyzerFinding]:
+        return analyze(
+            content,
+            file_path,
+            file_type,
+            self.check_runtime,
+            _safe_zero_width=lambda offset: (
+                source_view.name == "raw"
+                and content[offset] == "\u200b"
+                and source_view.source_offset(offset) in self.bullet_offsets
+            ),
+        )
+
+
+def prepare_analysis(
+    content: str, file_type: str, check_runtime: Callable[[], None]
+) -> _PreparedAnalysis:
+    """Bind bullet ownership to complete canonical source before windowing."""
+    offsets = (
+        _drawingml_bullet_offsets(content, check_runtime) if file_type == "other" else frozenset()
+    )
+    return _PreparedAnalysis(offsets, check_runtime)
+
+
 def _p2_pattern_matches(
     content: str,
     pattern: str,
     check_runtime: Callable[[], None] | None = None,
+    safe_zero_width: Callable[[int], bool] | None = None,
 ) -> Iterator[re.Match[str]]:
     """Yield all structured matches or the first control signal on each line."""
     if check_runtime is not None:
         check_runtime()
+    if pattern == _REFERENCE_COMMENT_PATTERN:
+        yield from _reference_comment_matches(content, check_runtime)
+        return
     compiled = re.compile(pattern, re.IGNORECASE | re.DOTALL)
     if pattern not in _SINGLE_CHARACTER_P2_PATTERNS:
         for match in compiled.finditer(content):
@@ -267,9 +834,11 @@ def _p2_pattern_matches(
         candidate = compiled.search(content, cursor)
         if candidate is None:
             return
-        if pattern == _ZERO_WIDTH_PATTERN and _zero_width_match_is_safe_emoji_zwj(
-            content,
-            candidate.start(),
+        if pattern == _ZERO_WIDTH_PATTERN and (
+            # A leading U+FEFF is a byte-order mark, not hidden text.
+            (candidate.start() == 0 and content[0] == "\ufeff")
+            or _zero_width_match_is_safe_emoji_zwj(content, candidate.start())
+            or (safe_zero_width is not None and safe_zero_width(candidate.start()))
         ):
             cursor = candidate.end()
             continue
@@ -278,6 +847,105 @@ def _p2_pattern_matches(
         if line_break is None:
             return
         cursor = line_break.end()
+
+
+def _reference_comment_matches(
+    content: str,
+    check_runtime: Callable[[], None] | None = None,
+) -> Iterator[re.Match[str]]:
+    """Own the destination and its separated, parenthesized title.
+
+    CommonMark destinations can contain balanced parentheses, while titles
+    require intervening whitespace. Titles allow escapes and line breaks but
+    no blank lines. A keyword already inside an unfinished or malformed title
+    remains conservative evidence; later visible paragraphs cannot supply it.
+    """
+    cursor = 0
+    while cursor < len(content):
+        if check_runtime is not None:
+            check_runtime()
+        opening = _REFERENCE_COMMENT_OPENING.search(content, cursor)
+        if opening is None:
+            return
+        destination_start = opening.end() - 1
+        end = opening.end()
+        depth = 0
+        next_runtime_check = end
+        while end < len(content):
+            if check_runtime is not None and end >= next_runtime_check:
+                check_runtime()
+                next_runtime_check = end + 1024
+            char = content[end]
+            if char in " \t\r\n" or ord(char) < 32 or ord(char) == 127:
+                break
+            if char == "\\" and end + 1 < len(content) and content[end + 1] in "\\()":
+                end += 2
+                continue
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            end += 1
+        destination_valid = depth == 0 and (end == len(content) or content[end] in " \t\r\n")
+        title = _REFERENCE_COMMENT_TITLE.match(content, end) if destination_valid else None
+        if title is None:
+            if destination_valid and _REFERENCE_COMMENT_KEYWORD.search(
+                content, destination_start, end
+            ):
+                match = _REFERENCE_COMMENT_SPAN.match(content, opening.start(), end)
+                assert match is not None
+                yield match
+            cursor = max(end, opening.end())
+            continue
+        title_start = title.end()
+        end = title_start
+        closed = False
+        depth = 0
+        line_has_text = True
+        next_runtime_check = title_start
+        while end < len(content):
+            if check_runtime is not None and end >= next_runtime_check:
+                check_runtime()
+                next_runtime_check = end + 1024
+            char = content[end]
+            if char == "\\" and end + 1 < len(content) and content[end + 1] in "\\()":
+                end += 2
+                line_has_text = True
+                continue
+            if char == "(":
+                depth += 1
+                line_has_text = True
+                end += 1
+                continue
+            if char == ")":
+                if depth:
+                    depth -= 1
+                    line_has_text = True
+                    end += 1
+                    continue
+                end += 1
+                closed = True
+                break
+            if char in "\r\n":
+                if not line_has_text:
+                    break
+                line_has_text = False
+                if char == "\r" and end + 1 < len(content) and content[end + 1] == "\n":
+                    end += 1
+            elif char not in " \t":
+                line_has_text = True
+            end += 1
+        if check_runtime is not None:
+            check_runtime()
+        if _REFERENCE_COMMENT_KEYWORD.search(
+            content, destination_start, end - 1 if closed else end
+        ):
+            match = _REFERENCE_COMMENT_SPAN.match(content, opening.start(), end)
+            assert match is not None
+            yield match
+        cursor = max(end, title_start)
 
 
 def _first_smuggled_tag_offset(
@@ -318,6 +986,8 @@ def analyze(
     file_path: str,
     file_type: str,
     check_runtime: Callable[[], None] | None = None,
+    *,
+    _safe_zero_width: Callable[[int], bool] | None = None,
 ) -> list[AnalyzerFinding]:
     """Analyze content for prompt injection patterns (P1–P4, P9)."""
     findings: list[AnalyzerFinding] = []
@@ -354,10 +1024,17 @@ def analyze(
                     complete_match=match.group(0),
                 )
             )
-    if file_type in ("markdown", "perl", "other"):
+    if file_type in ("markdown", "perl", "powershell", "other"):
+        if _safe_zero_width is None and file_type == "other":
+            _safe_zero_width = _drawingml_bullet_offsets(content, runtime_check).__contains__
         for pattern_source, confidence in P2_PATTERNS:
-            for match in _p2_pattern_matches(content, pattern_source, check_runtime):
+            for match in _p2_pattern_matches(
+                content, pattern_source, check_runtime, _safe_zero_width
+            ):
                 runtime_check()
+                matched_text = match.group(0)
+                if _is_structurally_benign_p2_comment(content, match.start(), matched_text):
+                    continue
                 findings.append(
                     AnalyzerFinding(
                         rule_id="P2",
@@ -454,6 +1131,28 @@ def analyze(
                 context=ctx(tag_offset),
                 matched_text=repr(content[tag_offset : tag_offset + 40]),
                 complete_match=complete_match,
+            )
+        )
+
+    # P2 (extended): Bidirectional control characters (Trojan Source,
+    # CVE-2021-42574). Runs regardless of file_type, like the Tag-block check
+    # above — bidi overrides are exploitable in scripts and config files too
+    # (issue #39). Zero-width detection stays markdown-gated because
+    # ZERO_WIDTH_CHARS includes U+FEFF (BOM), which would false-positive on
+    # every BOM-prefixed source file; the bidi range never overlaps it.
+    for match in _p2_pattern_matches(content, _BIDI_CONTROL_PATTERN, check_runtime):
+        runtime_check()
+        findings.append(
+            AnalyzerFinding(
+                rule_id="P2",
+                message="Hidden Instructions",
+                severity=Severity.HIGH,
+                location=locations.location(match.start(), match.end()),
+                confidence=0.85,
+                tags=tag,
+                context=ctx(match.start()),
+                matched_text=match.group(0)[:200],
+                complete_match=match.group(0),
             )
         )
 

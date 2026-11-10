@@ -52,6 +52,12 @@ the subprocess starts.
 - `output`: optional report path.
 - `noLlm`: default `true`.
 
+Static scans have a 120-second subprocess limit. With `noLlm=false`, the limit
+is 630 seconds, independent of the CLI's default 1080-second workflow budget.
+This tool can therefore stop a scan before its workflow deadline. Session
+cancellation still stops the scan; a longer configured CLI workflow budget does
+not extend this tool limit. Use the CLI directly for longer scans.
+
 Unlike the [Pi extension](PI_EXTENSION.md), this tool has no `provider`, `model`, `yaraRulesDir`, or `verbose` parameters: LLM-backed analysis is configured through the environment instead (see below).
 
 ## LLM-backed analysis
@@ -70,7 +76,7 @@ Use skillspector_scan on ./my-skill with noLlm=false.
 export SKILLSPECTOR_PROVIDER=nv_build
 export NVIDIA_INFERENCE_KEY=nvapi-...
 # Optional; omit to use nv_build's bundled default model.
-# export SKILLSPECTOR_MODEL=z-ai/glm-5.2
+# export SKILLSPECTOR_MODEL=z-ai/glm-5.3
 ```
 
 Other valid providers and their credential variables are listed in the main

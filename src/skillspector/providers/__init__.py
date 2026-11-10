@@ -30,8 +30,9 @@ Selection happens via the ``SKILLSPECTOR_PROVIDER`` env var:
     ollama            → OllamaProvider               (local Ollama instance)
     azure_openai      → AzureOpenAIProvider          (Azure OpenAI Service)
     openai_compatible → OpenAICompatibleProvider     (Groq, Together AI, Mistral, etc.)
+    gemini            → GeminiProvider               (Google Cloud ADC / Workload Identity)
     claude_cli        → ClaudeCLIProvider            (local ``claude`` binary, no API key)
-    codex_cli         → CodexCLIProvider             (local ``codex`` binary, no API key)
+    codex_cli         → CodexCLIProvider             (registered but disabled: host-file reads)
     gemini_cli        → GeminiCLIProvider            (local ``gemini`` binary, no API key)
     opencode_cli      → OpencodeCLIProvider          (local ``opencode`` binary, no API key)
     antigravity_cli   → AntigravityCLIProvider       (local ``agy`` binary; registered
@@ -50,9 +51,7 @@ from __future__ import annotations
 
 import os
 from contextvars import ContextVar, Token
-from typing import NoReturn
-
-from langchain_core.language_models.chat_models import BaseChatModel
+from typing import TYPE_CHECKING, NoReturn
 
 from .base import (
     AgentCLICapable,
@@ -62,7 +61,9 @@ from .base import (
     ModelMetadataProvider,
     has_cli_capability,
 )
-from .nv_build import NvBuildProvider
+
+if TYPE_CHECKING:
+    from langchain_core.language_models.chat_models import BaseChatModel
 
 NO_LLM_API_KEY_MESSAGE = (
     "No LLM API key configured. Set the credential env var for the "
@@ -76,6 +77,10 @@ _INJECTED_PROVIDER: ContextVar[LLMProvider | None] = ContextVar(
     "skillspector_injected_provider",
     default=None,
 )
+
+
+class UnknownProviderError(ValueError):
+    """The configured provider name does not identify a supported provider."""
 
 
 def raise_no_llm_api_key_configured() -> NoReturn:
@@ -96,6 +101,13 @@ def reset_provider(token: Token[LLMProvider | None]) -> None:
 def has_provider_binding() -> bool:
     """Return whether the current context has an injected provider."""
     return _INJECTED_PROVIDER.get() is not None
+
+
+def _nv_build_provider() -> LLMProvider:
+    """Construct the default NVIDIA provider without importing it at package import time."""
+    from .nv_build import NvBuildProvider
+
+    return NvBuildProvider()
 
 
 def _select_active_provider() -> LLMProvider:
@@ -134,8 +146,12 @@ def _select_active_provider() -> LLMProvider:
         from .openai_compatible import OpenAICompatibleProvider
 
         return OpenAICompatibleProvider()
+    if name == "gemini":
+        from .gemini import GeminiProvider
+
+        return GeminiProvider()
     if name == "nv_build":
-        return NvBuildProvider()
+        return _nv_build_provider()
     if name == "claude_cli":
         from .claude_cli import ClaudeCLIProvider
 
@@ -164,12 +180,12 @@ def _select_active_provider() -> LLMProvider:
 
             return NvInferenceProvider()
         except ImportError:
-            return NvBuildProvider()
+            return _nv_build_provider()
 
-    raise ValueError(
+    raise UnknownProviderError(
         f"Unknown SKILLSPECTOR_PROVIDER: {name!r}. "
         "Expected one of: openai, anthropic, anthropic_proxy, bedrock, nv_build, "
-        "ollama, azure_openai, openai_compatible, "
+        "ollama, azure_openai, openai_compatible, gemini, "
         "claude_cli, codex_cli, gemini_cli, opencode_cli, antigravity_cli (or unset)."
     )
 
@@ -218,29 +234,42 @@ def resolve_chat_model_credentials() -> tuple[str, str | None] | None:
     return _openai_fallback_provider().resolve_credentials()
 
 
-def get_model_config_provider() -> ModelMetadataProvider:
+def get_model_config_provider() -> LLMProvider:
     """Return the provider whose model defaults match graph chat-model routing.
 
-    Explicit bindings, CLI providers, and Bedrock's native AWS credential path
-    remain authoritative. Unbound API-key providers use OpenAI metadata only
-    when their own credentials are absent and the OpenAI fallback is configured.
+    Explicit bindings, CLI providers, Bedrock's native AWS credential path,
+    and Gemini's ADC path remain authoritative. Unbound API-key providers use
+    OpenAI metadata only when their own credentials are absent and the OpenAI
+    fallback is configured.
     """
     provider = _select_active_provider()
     from .bedrock import BedrockProvider
+    from .gemini import GeminiProvider
 
     if (
         has_provider_binding()
         or has_cli_capability(provider)
-        or isinstance(provider, BedrockProvider)
+        or isinstance(provider, (BedrockProvider, GeminiProvider))
     ):
         return provider
-    if provider.resolve_credentials() is not None:
+    try:
+        if provider.resolve_credentials() is not None:
+            return provider
+    except ValueError:
         return provider
 
     fallback = _openai_fallback_provider()
     if fallback.resolve_credentials() is not None:
         return fallback
     return provider
+
+
+def prepare_chat_model_imports() -> None:
+    """Prepare only an opted-in, configured transport without creating a client."""
+    provider = get_model_config_provider()
+    prepare = getattr(provider, "prepare_chat_model_imports", None)
+    if callable(prepare) and provider.resolve_credentials() is not None:
+        prepare()
 
 
 def create_chat_model_with_provider(
@@ -309,10 +338,12 @@ __all__ = [
     "LLMProvider",
     "ModelMetadataProvider",
     "NO_LLM_API_KEY_MESSAGE",
+    "UnknownProviderError",
     "create_chat_model",
     "create_chat_model_with_provider",
     "get_active_provider",
     "get_model_config_provider",
+    "prepare_chat_model_imports",
     "get_metadata_provider",
     "has_cli_capability",
     "has_provider_binding",

@@ -181,7 +181,7 @@ async def test_encoded_destination_reporting_preserves_opaque_coverage(
         if not use_llm:
             args.append("--no-llm")
         result = CliRunner().invoke(app, args)
-        assert result.exit_code == 1, result.output
+        assert result.exit_code == (1 if present else 0), result.output
         report = json.loads(result.stdout)
     else:
         verdict = await run_scan(str(tmp_path), use_llm=use_llm, output_format="json")
@@ -191,7 +191,8 @@ async def test_encoded_destination_reporting_preserves_opaque_coverage(
 
     assert report["execution_successful"] is True
     completeness = report["analysis_completeness"]
-    assert completeness["is_complete"] is False
+    assert completeness["is_complete"] is (not present)
+    assert completeness["status"] == ("partial" if present else "complete_with_caveats")
     assert len(completeness["references"]) == 1
     reference = completeness["references"][0]
     assert reference["status"] == ("resolved" if present else "missing")
@@ -199,19 +200,14 @@ async def test_encoded_destination_reporting_preserves_opaque_coverage(
     assert reference["reference_kind"] == ("markdown_image" if marker else "markdown_link")
     assert any(issue["id"] == "AE1" for issue in report["issues"]) is (present and not marker)
     if marker:
-        assert report["risk_assessment"]["recommendation"] == "CAUTION"
+        assert report["risk_assessment"]["recommendation"] == ("CAUTION" if present else "SAFE")
     if present:
         assert completeness["entirely_uninspected_files"] == 1
         assert any(item["path"] == target for item in completeness["ledger_exceptions"])
     if use_llm:
-        # AE1 concerns bytes excluded from the LLM cache. Its locally retained
-        # meta finding keeps the existing conservative runtime caveat, even
-        # though all three semantic analyzers below completed successfully.
-        if marker:
-            assert report["metadata"].get("llm_degraded", False) is False
-        else:
-            assert report["metadata"]["llm_degraded"] is True
-            assert "semantic runtime telemetry was incomplete" in report["metadata"]["llm_error"]
+        # AE1 is a coverage finding added after meta-review; it is not evidence
+        # that the requested LLM review call failed.
+        assert report["metadata"].get("llm_degraded", False) is False
         assert report["metadata"]["llm_calls_succeeded"] >= 3
         assert (
             report["metadata"]["llm_calls_succeeded"] == report["metadata"]["llm_calls_attempted"]

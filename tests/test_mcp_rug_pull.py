@@ -22,6 +22,7 @@ import json
 from skillspector.nodes.analyzers.mcp_rug_pull import node
 from skillspector.nodes.build_context import build_context
 from skillspector.nodes.deduplicate import deduplicate
+from skillspector.nodes.report import report
 from skillspector.state import SkillspectorState
 
 
@@ -47,6 +48,11 @@ def test_rp1_npx_unpinned():
     rp1 = [f for f in result["findings"] if f.rule_id == "RP1"]
     assert len(rp1) == 1
     assert "npx @scope/mcp-server" in rp1[0].matched_text
+    issue = json.loads(report({"filtered_findings": rp1, "output_format": "json"})["report_body"])[
+        "issues"
+    ][0]
+    assert issue["pattern"] == rp1[0].message
+    assert issue["finding"] == "npx @scope/mcp-server"
 
 
 def test_rp1_scans_cached_files_without_a_manifest():
@@ -81,6 +87,32 @@ def test_rp1_npx_pinned_no_finding():
     assert len(rp1) == 0
 
 
+def test_rp1_unrelated_version_pin_does_not_suppress():
+    """A pin on another argument or command on the same line does not pin the package."""
+    for content, expected in (
+        ("npx evil-package --label helper@1.2.3\n", "npx evil-package"),
+        ("npx @scope/mcp-server http://localhost:3000/sse\n", "npx @scope/mcp-server"),
+        ("npx @scope/server-a && npx @scope/server-b@1.2.3\n", "npx @scope/server-a"),
+        ("uvx my-mcp-server --with helper==1.2.3\n", "uvx my-mcp-server"),
+        ("pip install my-mcp-server other-package==1.2.3\n", "pip install my-mcp-server"),
+    ):
+        result = node(_state(file_cache={"setup.sh": content}))
+        rp1 = [f for f in result["findings"] if f.rule_id == "RP1"]
+        assert [f.matched_text for f in rp1] == [expected], content
+
+
+def test_rp1_version_pin_attached_to_package_no_finding():
+    """A pin attached to the package operand still counts when other arguments follow."""
+    for content in (
+        "npx -y @scope/mcp-server@1.2.3 --label helper\n",
+        "npx -p @scope/mcp-server@1.2.3 mcp-server\n",
+        "uvx my-mcp-server==1.2.3 --host 127.0.0.1:8000\n",
+        "pip install my-mcp-server[cli]==1.2.3\n",
+    ):
+        result = node(_state(file_cache={"setup.sh": content}))
+        assert not [f for f in result["findings"] if f.rule_id == "RP1"], content
+
+
 def test_rp1_uvx_unpinned():
     """RP1 detects uvx without ==version."""
     result = node(
@@ -112,6 +144,27 @@ def test_rp1_docker_unpinned():
     )
     rp1 = [f for f in result2["findings"] if f.rule_id == "RP1"]
     assert len(rp1) >= 1
+
+
+def test_rp1_docker_credentials_are_redacted_in_reports():
+    result = node(
+        _state(
+            file_cache={
+                "setup.sh": "docker pull https://deploy:s3cret@registry.example.com/team/image"
+            }
+        )
+    )
+    rp1 = [f for f in result["findings"] if f.rule_id == "RP1"]
+    assert len(rp1) == 1
+
+    json_body = report({"filtered_findings": rp1, "output_format": "json"})["report_body"]
+    issue = json.loads(json_body)["issues"][0]
+    assert "https://***@registry.example.com" in issue["pattern"]
+    assert "https://***@registry.example.com" in issue["finding"]
+    sarif_body = report({"filtered_findings": rp1, "output_format": "sarif"})["report_body"]
+    for body in (json_body, sarif_body):
+        assert "deploy:s3cret" not in body
+        assert "s3cret" not in body
 
 
 def test_rp1_multiple_patterns():

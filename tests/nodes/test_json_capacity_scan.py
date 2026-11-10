@@ -112,3 +112,37 @@ def test_public_capacity_projection_rejects_malformed_metrics(value: object) -> 
     projected = _exception_from_event(event, fatal=False)
     assert "source_start_offset" not in projected
     assert "private source text" not in projected["message"]
+
+
+@pytest.mark.parametrize(
+    "end, owned",
+    [((1 << 63) - 1, True), (1 << 63, False), (1 << 20000, False)],
+    ids=["bounded-offsets", "above-counter-bound", "oversized-offsets"],
+)
+def test_public_capacity_projection_bounds_graph_offsets(end: int, owned: bool) -> None:
+    # Graph metrics can be malformed even though real scanner offsets are bounded.
+    observed, limit = 131073, 131072
+    start = end - observed
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        path="SKILL.md",
+        reason=LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT,
+    )
+    event.update(
+        source_start_offset=start,
+        source_end_offset=end,
+        observed_characters=observed,
+        limit_characters=limit,
+    )
+    projected = _exception_from_event(event, fatal=False)
+    if owned:
+        assert projected["source_start_offset"] == start
+        assert projected["source_end_offset"] == end
+        assert projected["observed_characters"] == observed
+        assert projected["limit_characters"] == limit
+        assert f"[{start}, {end})" in projected["message"]
+    else:
+        assert "source_start_offset" not in projected
+        assert "source_end_offset" not in projected
+        assert "Observed source character span" not in projected["message"]

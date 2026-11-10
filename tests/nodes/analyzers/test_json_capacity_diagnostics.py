@@ -138,7 +138,7 @@ def test_invalid_and_truncated_candidates_never_gain_ownership(size: int, failur
     elif failure == "truncated":
         source = source[:-1] + " "
     else:
-        source = _sized_json(size - 2).replace('"request":"', '"request":"\\q', 1)
+        source = _sized_json(size - 2).replace('"request": "', '"request": "\\q', 1)
     assert len(source) == size
     with pytest.raises(json.JSONDecodeError):
         json.loads(source)

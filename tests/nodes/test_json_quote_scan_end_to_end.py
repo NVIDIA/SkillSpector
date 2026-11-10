@@ -42,7 +42,7 @@ async def test_json_quotes_preserve_public_verdict_across_scan_modes(
     monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", get_chat_model)
     monkeypatch.setattr(graph_module, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     # Availability must be established before graph construction so all real
     # semantic nodes are wired, including in the paired disabled-mode run.
     monkeypatch.setattr(mcp_server, "graph", graph_module.create_graph())

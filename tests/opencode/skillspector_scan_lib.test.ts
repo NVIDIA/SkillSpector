@@ -7,6 +7,7 @@ import assert from "node:assert/strict"
 import path from "node:path"
 import {
   CREDENTIAL_ENV_NAMES,
+  LLM_TIMEOUT_MS,
   MAX_STDERR,
   MAX_STDOUT,
   TIMEOUT_MS,
@@ -86,6 +87,109 @@ describe("redact", () => {
     const out = redact(Object.values(env).join(" "), env)
     for (const value of Object.values(env)) assert.ok(!out.includes(value))
     assert.equal(out.match(/\[REDACTED\]/g)?.length, CREDENTIAL_ENV_NAMES.length)
+  })
+
+  it("redacts one-, two-, and three-character values for every supported credential name", () => {
+    for (const name of CREDENTIAL_ENV_NAMES) {
+      for (const value of ["7", "7x", "7xy"]) {
+        assert.equal(redact(`before ${value} after`, { [name]: value }), "before [REDACTED] after")
+      }
+    }
+  })
+
+  it("redacts whole key-shaped tokens before short or overlapping configured values", () => {
+    for (const value of ["x", "Q7wE"]) {
+      assert.equal(redact(
+        "sk-proj-Q7wErTyxUiOp9AsDfGhJkL sk-ant-Q7wErTyxUiOp9AsDfGhJkL OPENAI_API_KEY=Q7wErTyxUiOp",
+        { OPENAI_API_KEY: value },
+      ), "[REDACTED] [REDACTED] OPENAI_API_KEY=[REDACTED]")
+    }
+  })
+
+  it("merges overlapping known values with shorter key and assignment matches", () => {
+    for (const [secret, input, expected] of [
+      ["alpha,beta", "OPENAI_API_KEY=alpha,beta", "OPENAI_API_KEY=[REDACTED]"],
+      ["alpha,beta", "OPENAI_API_KEY=prefix-alpha,beta", "OPENAI_API_KEY=[REDACTED]"],
+      ["sk-ant-alpha.beta", "sk-ant-alpha.beta", "[REDACTED]"],
+    ]) {
+      const env = { OPENAI_API_KEY: secret }
+      assert.equal(redact(input, env), expected)
+      assert.deepEqual(JSON.parse(redact(JSON.stringify({ code_snippet: input, risk_score: 12 }), env)), {
+        code_snippet: expected,
+        risk_score: 12,
+      })
+    }
+    assert.equal(redact("abcdef", { OPENAI_API_KEY: "abcd", ANTHROPIC_API_KEY: "cdef" }), "[REDACTED]")
+  })
+
+  it("keeps JSON metadata readable and parseable with one-character placeholders", () => {
+    for (const value of ["1", "e", "x"]) {
+      const report = {
+        risk_score: 12,
+        start_line: 1,
+        safe_to_install: true,
+        severity: "medium",
+        code_snippet: `credential ${value} and sk-proj-Q7wErTyxUiOp9AsDfGhJkL`,
+      }
+      assert.deepEqual(JSON.parse(redact(JSON.stringify(report), { OPENAI_API_KEY: value })), {
+        ...report,
+        code_snippet: "credential [REDACTED] and [REDACTED]",
+      })
+    }
+    assert.equal(redact("example xyz x", { OPENAI_API_KEY: "x" }), "example xyz [REDACTED]")
+  })
+
+  it("redacts unrelated credentials directly after a configured value", () => {
+    const env = { NVIDIA_INFERENCE_KEY: "nvapi-ABCD1234efgh" }
+    for (const [tail, expected] of [
+      ["sk-abcdef123456", "[REDACTED]"],
+      ["sk-ant-abcdef123456", "[REDACTED]"],
+      ["OPENAI_API_KEY=second-secret", "[REDACTED]OPENAI_API_KEY=[REDACTED]"],
+    ]) {
+      const input = env.NVIDIA_INFERENCE_KEY + tail
+      assert.equal(redact(input, env), expected)
+      assert.deepEqual(JSON.parse(redact(JSON.stringify({ code_snippet: input, risk_score: 12 }), env)), {
+        code_snippet: expected,
+        risk_score: 12,
+      })
+    }
+    assert.equal(redact("abcdefsk-abcdef123456", {
+      OPENAI_API_KEY: "abcd", ANTHROPIC_API_KEY: "cdef",
+    }), "[REDACTED]")
+    for (const prefix of ["AAAA", "lowercase", "0000", "-_._"]) {
+      assert.equal(redact(`${prefix}OPENAI_API_KEY=second-secret`, {
+        NVIDIA_INFERENCE_KEY: prefix,
+      }), "[REDACTED]OPENAI_API_KEY=[REDACTED]")
+    }
+    assert.equal(redact("abcdefOPENAI_API_KEY=abcdef", {
+      OPENAI_API_KEY: "abcd", ANTHROPIC_API_KEY: "cdef",
+    }), "[REDACTED]OPENAI_API_KEY=[REDACTED]")
+  })
+
+  it("bounds assignment scanning with many overlapping credential boundaries", () => {
+    const input = "A".repeat(128 * 1024) + "!"
+    const started = performance.now()
+    assert.equal(redact(input, { OPENAI_API_KEY: "AAAA" }), "[REDACTED]!")
+    assert.ok(performance.now() - started < 2000, "redaction repeatedly rescanned an uppercase run")
+  })
+
+  it("ignores empty and unset credentials without matching every output position", () => {
+    assert.equal(redact("ordinary output", {
+      OPENAI_API_KEY: "",
+      ANTHROPIC_API_KEY: undefined,
+      NVIDIA_INFERENCE_KEY: " \t\n",
+    }), "ordinary output")
+  })
+
+  it("redacts trimmed, overlapping, and regex-bearing short values in one pass", () => {
+    assert.equal(redact("xyz xy x .* [ R", {
+      OPENAI_API_KEY: " xyz ",
+      ANTHROPIC_API_KEY: "xy",
+      NVIDIA_INFERENCE_KEY: "x",
+      AWS_SECRET_ACCESS_KEY: ".*",
+      AWS_SESSION_TOKEN: "[",
+      AWS_SECURITY_TOKEN: "R",
+    }), "[REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED]")
   })
 
   it("redacts NVIDIA and AWS assignments even when the environment is unavailable", () => {
@@ -219,6 +323,27 @@ describe("formatExecError", () => {
     })
     assert.ok(!out.includes("hunter2"))
   })
+
+  it("redacts short credentials from every failure output path before truncation", () => {
+    for (const value of ["7", "7x", "7xy"]) {
+      const env = { OPENAI_API_KEY: value }
+      const stdout = `${"o".repeat(MAX_STDOUT - 2)} ${value} suffix`
+      const stderr = `${"e".repeat(MAX_STDERR - 2)} ${value} suffix`
+      for (const failure of [
+        { code: 1, stdout, stderr },
+        { code: 2, stdout, stderr },
+        { killed: true, stdout, stderr },
+        { name: "AbortError", stdout, stderr },
+        { code: 9, stdout, stderr },
+        { code: 9, message: stderr },
+        stderr,
+        { code: 2, stderr: `Usage: skillspector\nError: rejected ${value}` },
+      ]) {
+        const out = formatExecError("bin", failure, env)
+        assert.ok(!out.includes("7"), `${value} leaked from ${JSON.stringify(failure).slice(0, 40)}`)
+      }
+    }
+  })
 })
 
 describe("formatSuccess", () => {
@@ -241,6 +366,20 @@ describe("formatSuccess", () => {
     assert.ok(out.includes("stderr:\nbaseline detected"))
     assert.ok(out.includes("[truncated "))
   })
+
+  it("redacts short credentials in both successful streams before truncation", () => {
+    for (const value of ["7", "7x", "7xy"]) {
+      const out = formatSuccess(
+        undefined,
+        `${"o".repeat(MAX_STDOUT - 2)} ${value} suffix`,
+        `${"e".repeat(MAX_STDERR - 2)} ${value} suffix`,
+        { OPENAI_API_KEY: value },
+      )
+      assert.ok(!out.includes("7"))
+      assert.ok(out.includes("stderr:\n"))
+      assert.ok(out.includes("[truncated "))
+    }
+  })
 })
 
 describe("permissioned execution", () => {
@@ -256,6 +395,37 @@ describe("permissioned execution", () => {
       ask,
     }
   }
+
+  it("lets opted-in LLM scans finish the CLI budget while bounding static scans", async () => {
+    for (const noLlm of [undefined, true, false]) {
+      await executeScan(
+        { target: "./skill", noLlm },
+        context(async () => {}),
+        {
+          runFile: async (_bin, _args, options) => {
+            assert.equal(options.timeout, noLlm === false ? 630_000 : 120_000)
+            return { stdout: "complete report", stderr: "" }
+          },
+          env: {},
+        },
+      )
+    }
+  })
+
+  it("reports the actual LLM process limit and retains partial output on timeout", async () => {
+    const out = await executeScan(
+      { target: "./skill", noLlm: false },
+      context(async () => {}),
+      {
+        runFile: async () => {
+          throw { killed: true, stdout: "partial report" }
+        },
+        env: {},
+      },
+    )
+    assert.ok(out.includes("timed out after 630s"))
+    assert.ok(out.includes("partial report"))
+  })
 
   it("requests scoped host, external-path, process, and LLM permissions", async () => {
     const requests: PermissionRequest[] = []
@@ -688,6 +858,7 @@ describe("childProcessEnv", () => {
 describe("constants", () => {
   it("keeps the documented caps", () => {
     assert.equal(TIMEOUT_MS, 120_000)
+    assert.equal(LLM_TIMEOUT_MS, 630_000)
     assert.equal(MAX_STDOUT, 12_000)
     assert.equal(MAX_STDERR, 6_000)
   })
