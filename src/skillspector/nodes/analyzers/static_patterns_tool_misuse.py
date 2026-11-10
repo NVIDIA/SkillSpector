@@ -9781,6 +9781,8 @@ def _has_bounded_parse_exhaustion(
                 content[start + 1 : end - 1], check_runtime
             ):
                 absolute_start = start + 1 + command_start
+                if _is_root_glob_documentation(content, absolute_start, start + 1 + body_start):
+                    continue
                 if _has_tm1_code_pattern_at(
                     content,
                     absolute_start,
