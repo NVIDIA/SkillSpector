@@ -2901,7 +2901,11 @@ def _has_shell_execution_call(
                     pending_names.append(alias)
     for node in program.nodes:
         check_runtime()
-        if node.type in {"identifier", "shorthand_property_identifier"} or (
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        } or (
             node.type == "property_identifier"
             and node.parent is not None
             and node.parent.type == "member_expression"
@@ -2918,6 +2922,9 @@ def _has_shell_execution_call(
                 # separate nodes, including any later invocation or escape.
                 continue
             # Escaped names and extracted callable aliases are not resolved here.
+            # The pattern form is included too: catch ({\u0052egExp}) binds
+            # an escaped name, and it must fail closed like any other
+            # escaped identifier.
             if (
                 "\\" in spelling
                 or spelling == "Reflect"

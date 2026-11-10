@@ -11,7 +11,7 @@ from collections.abc import Callable
 from tree_sitter import Node
 
 from skillspector.javascript_ast import JavaScriptProgram
-from skillspector.javascript_callables import _callable_member
+from skillspector.javascript_callables import _callable_member, _decoded_identifier_text
 
 _PATH_FUNCTIONS = frozenset(
     {
@@ -513,7 +513,9 @@ def _ordinary_native_calls(
         }:
             references.setdefault(program.text(node), []).append(node)
         if node.type in {"identifier", "property_identifier", "string"}:
-            spelling = program.text(node).strip("\"'")
+            # The spelling is decoded first: {\u0052egExp} binds RegExp,
+            # and raw source spelling would miss the override name.
+            spelling = _decoded_identifier_text(program, node).strip("\"'")
             if spelling in {"Proxy", "__defineGetter__", "__defineSetter__"}:
                 process_options_unproven = True
             if spelling in {
@@ -584,7 +586,7 @@ def _ordinary_native_calls(
             # constructor-position identifier itself is exempted, and that
             # exemption only matches identifier nodes, so a shorthand node
             # spelling an override name always poisons.
-            if program.text(node).strip("\"'") in override_names:
+            if _decoded_identifier_text(program, node).strip("\"'") in override_names:
                 intrinsic_override = True
                 regexp_prototype_unproven = True
         if node.type in {
@@ -745,16 +747,29 @@ def _ordinary_native_calls(
                         module_unproven = True
             pending.extend(specifier.named_children)
     for name, binding in regex_bindings.items():
+        # The proof belongs to one binding, so only references that can
+        # resolve to it count. A const inside a function body must not
+        # prove an outer or sibling receiver with the same name: the
+        # final `re` in `function local() { const re = /x/; re.test(t); }
+        # re.exec(...)` is outside that binding's scope, so it is skipped
+        # here and stays unowned. References before the declaration are
+        # refused too, matching the scalar proof's declaration-end rule.
         named_calls: list[Node] = []
         declarator = binding.parent
         declaration = None if declarator is None else declarator.parent
         scope = None if declaration is None else declaration.parent
         for reference in references[name]:
             check_runtime()
-            if scope is None or not scope.start_byte <= reference.start_byte < scope.end_byte:
-                regexp_prototype_unproven = True
-                break
             if reference == binding:
+                continue
+            if (
+                scope is None
+                or declarator is None
+                or not (
+                    scope.start_byte <= reference.start_byte < scope.end_byte
+                    and reference.start_byte > declarator.end_byte
+                )
+            ):
                 continue
             member = reference.parent
             call = None if member is None else member.parent
