@@ -8216,6 +8216,8 @@ def _has_tm1_code_pattern_at(
         if re.compile(pattern, re.IGNORECASE | re.MULTILINE).match(content, start, end):
             return True
     return False
+
+
 def _option_command_end(
     content: str,
     start: int,
