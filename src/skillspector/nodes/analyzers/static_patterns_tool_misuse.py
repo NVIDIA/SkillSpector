@@ -9685,7 +9685,11 @@ def bounded_parse_diagnostic(
     # a later closing quote into an opener, so the prose reading may only
     # resolve a limit of the lexical one, never introduce one.
     return _has_bounded_parse_exhaustion(
-        content, check_runtime, file_type=file_type, word_apostrophes=True
+        content,
+        check_runtime,
+        file_type=file_type,
+        word_apostrophes=True,
+        source_view=source_view,
     )
 
 
