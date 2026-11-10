@@ -126,9 +126,7 @@ def test_native_file_requires_readonly_arguments(arguments, preserved) -> None:
 
 def test_native_file_readonly_mode_still_accounts_for_redirects() -> None:
     audit = _audit()
-    result = audit(
-        _command(("file", "scripts/setup.sh"), redirects=(("1>", "scripts/setup.sh"),))
-    )
+    result = audit(_command(("file", "scripts/setup.sh"), redirects=(("1>", "scripts/setup.sh"),)))
     assert result is not None and result.writes == ("scripts/setup.sh",)
     assert audit.read_source("scripts/setup.sh") is None
 

@@ -1970,9 +1970,7 @@ class _EffectAudit:
             return ShellEffectResult(request.stdout, True)
         if basename == "file":
             return (
-                ShellEffectResult(None, None)
-                if readonly_file_arguments(args, self.tick)
-                else None
+                ShellEffectResult(None, None) if readonly_file_arguments(args, self.tick) else None
             )
         if basename in {
             "cat",

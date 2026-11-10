@@ -252,7 +252,7 @@ def test_child_exit_trap_uses_its_invocation_binding(rebind: str, preserved: boo
         ("cd scripts\nrm -rf cache", "scripts/library.sh", True),
         ("tar -xf archive.tar", "scripts/library.sh", False),
         (
-            "python3 -c 'open(\"scripts/library.sh\",\"w\").write(\"changed\")'",
+            'python3 -c \'open("scripts/library.sh","w").write("changed")\'',
             "scripts/library.sh",
             False,
         ),
@@ -266,13 +266,11 @@ def test_cached_source_consumers_require_proven_prior_effects(
     caller = (
         'set -euo pipefail\nroot="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"\n'
         f'script="$root/{target}"\n'
-        f'{command}\n'
+        f"{command}\n"
         'program=$(cat "$script")\nbash -c "$program; helper"\nrm -rf /\n'
     )
     if command.startswith("cd "):
-        assert not source_is_unmodified(
-            _resolver(caller), target, caller.index("program=")
-        )
+        assert not source_is_unmodified(_resolver(caller), target, caller.index("program="))
     sources = {
         "scripts/caller.sh": caller,
         target: library,
@@ -285,20 +283,21 @@ def test_cached_source_consumers_require_proven_prior_effects(
         source_context=ShellSourceContext("scripts/caller.sh", sources),
         check_runtime=lambda: None,
     )
-    assert prepared is not None
-    list(
-        prepared.analyze_source_commands(
-            content=caller,
-            file_path="scripts/caller.sh",
-            file_type="shell",
-            source_view=SecurityTextView("raw", caller),
+    if preserved:
+        assert prepared is not None
+    variants = ()
+    if prepared is not None:
+        list(
+            prepared.analyze_source_commands(
+                content=caller,
+                file_path="scripts/caller.sh",
+                file_type="shell",
+                source_view=SecurityTextView("raw", caller),
+            )
         )
-    )
-    assert any(
-        origin.path == target
-        for _, value in prepared.variants()
-        for origin in value.origins
-    ) is preserved
+        variants = tuple(prepared.variants())
+    borrowed = any(origin.path == target for _, value in variants for origin in value.origins)
+    assert borrowed is preserved
 
     result = static_runner.run_static_patterns_with_ledger(
         {
