@@ -2285,10 +2285,27 @@ def _scan_declared_marker_views(
     file_type = parser_file_type or _infer_file_type(path)
     if parser_file_type is None and path.lower().endswith((".html", ".htm")):
         file_type = "html"
+
+    def shell_quote_closers() -> set[int]:
+        # Reuse the complete-source lexical proof. Unsupported source returns
+        # no closers; the foundational reconstruction layer needs no analyzer import.
+        from skillspector.nodes.analyzers.static_patterns_tool_misuse import (
+            _shell_quoted_candidate_limits,
+        )
+
+        closers: set[int] = set()
+        _shell_quoted_candidate_limits(content, check_runtime, quote_closers=closers)
+        return closers
+
     source_strings = (
         PythonStringClosers(content, check_runtime)
         if file_type == "python"
-        else StructuredStringClosers(content, file_type, check_runtime)
+        else StructuredStringClosers(
+            content,
+            file_type,
+            check_runtime,
+            shell_quote_closers=shell_quote_closers if file_type == "shell" else None,
+        )
     )
 
     for owned_start, raw_start in zip(owned_starts, raw_starts, strict=True):
