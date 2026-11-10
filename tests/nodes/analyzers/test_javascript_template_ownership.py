@@ -272,6 +272,27 @@ def test_uncertain_parameter_calls_keep_template_files_partial(source: str) -> N
             id="parameter-destructured-regexp-exec",
         ),
         pytest.param(
+            "function local() { const re = /x/; re.test(text); }\nre.exec(`${command}`);\n",
+            id="out-of-scope-regex-receiver-exec",
+        ),
+        pytest.param(
+            "function a() { const re = /x/; re.test(t); }\n"
+            "function b() { re.exec(`${command}`); }\n",
+            id="sibling-function-regex-receiver-exec",
+        ),
+        pytest.param(
+            "function f({\\u0052egExp}) { const re = new RegExp(); re.exec(`${command}`); }\n",
+            id="escaped-shorthand-parameter-regexp-exec",
+        ),
+        pytest.param(
+            "try { step(); } catch ({\\u0052egExp}) { const re = new RegExp(); re.exec(`${command}`); }\n",
+            id="escaped-shorthand-catch-regexp-exec",
+        ),
+        pytest.param(
+            "for (const {\\u0052egExp} of sources) { const re = new RegExp(); re.exec(`${command}`); }\n",
+            id="escaped-shorthand-for-of-regexp-exec",
+        ),
+        pytest.param(
             "import { formatMessage } from './format.mjs';\n"
             "console.log(formatMessage(`Hello, ${name}`));",
             id="imported-helper-template-argument",

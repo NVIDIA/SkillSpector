@@ -1634,6 +1634,33 @@ _PATH_FUNCTIONS = frozenset(
 )
 
 
+_IDENTIFIER_ESCAPE_PATTERN = re.compile(
+    r"\\(?:u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))"
+)
+
+
+def _decoded_identifier_text(program: JavaScriptProgram, node: Node) -> str:
+    """Return the identifier spelling with JS escape sequences resolved.
+
+    ``\\u0052egExp``, ``\\u{52}egExp`` and ``\\x52egExp`` all bind the name
+    RegExp, so raw source spelling cannot be compared against override
+    names or recorded bindings. An invalid escape is left as-is, which
+    keeps the proof fail-closed.
+    """
+    spelling = program.text(node)
+    if "\\" not in spelling:
+        return spelling
+
+    def _replace(match: re.Match[str]) -> str:
+        code_point = next(group for group in match.groups() if group is not None)
+        try:
+            return chr(int(code_point, 16))
+        except (ValueError, OverflowError):
+            return match.group(0)
+
+    return _IDENTIFIER_ESCAPE_PATTERN.sub(_replace, spelling)
+
+
 def _is_regexp_constructor(program: JavaScriptProgram, node: Node) -> bool:
     """True only for the global RegExp name used as a new-expression constructor.
 
@@ -1754,7 +1781,9 @@ def _ordinary_native_calls(
             # constructor-position identifier itself is exempted, and
             # _is_regexp_constructor only matches identifier nodes, so a
             # shorthand node spelling an override name always poisons.
-            spelling = program.text(node).strip("\"'")
+            # The spelling is decoded first: {\u0052egExp} binds RegExp,
+            # and raw source spelling would miss the override name.
+            spelling = _decoded_identifier_text(program, node).strip("\"'")
             if spelling in override_names and not _is_regexp_constructor(program, node):
                 intrinsic_override = True
             if spelling in {"syncBuiltinESMExports", "require", "getBuiltinModule"}:
@@ -1853,9 +1882,28 @@ def _ordinary_native_calls(
                         path_unproven = True
             pending.extend(specifier.named_children)
     for name, binding in regex_bindings.items():
+        # The proof belongs to one binding, so only references that can
+        # resolve to it count. A const inside a function body must not
+        # prove an outer or sibling receiver with the same name: the
+        # final `re` in `function local() { const re = /x/; re.test(t); }
+        # re.exec(...)` is outside that binding's scope, so it is skipped
+        # here and stays unowned. References before the declaration are
+        # refused too, matching the scalar proof's declaration-end rule.
+        declarator = binding.parent
+        declaration = None if declarator is None else declarator.parent
+        scope = None if declaration is None else declaration.parent
         for reference in references[name]:
             check_runtime()
             if reference == binding:
+                continue
+            if (
+                scope is None
+                or declarator is None
+                or not (
+                    scope.start_byte <= reference.start_byte < scope.end_byte
+                    and reference.start_byte > declarator.end_byte
+                )
+            ):
                 continue
             # Only .test/.exec calls on the binding are owned. Any other
             # use, including a second binding of the same name, a parameter
@@ -2049,7 +2097,10 @@ def _pattern_binding_names(
         check_runtime()
         node = pending.pop()
         if node.type in {"identifier", "shorthand_property_identifier_pattern"}:
-            names.add(program.text(node))
+            # Decode escape sequences: {\u0052egExp} binds RegExp, and
+            # the plain constructor name must match the recorded binding
+            # for the uncertain-binding check to see the shadow.
+            names.add(_decoded_identifier_text(program, node))
         elif node.type in {"assignment_pattern", "object_assignment_pattern"}:
             left = node.child_by_field_name("left")
             if left is not None:
@@ -2181,13 +2232,20 @@ def _has_shell_execution_call(
                     pending_names.append(alias)
     for node in program.nodes:
         check_runtime()
-        if node.type in {"identifier", "shorthand_property_identifier"} or (
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        } or (
             node.type == "property_identifier"
             and node.parent is not None
             and node.parent.type == "member_expression"
         ):
             spelling = program.text(node)
             # Escaped names and extracted callable aliases are not resolved here.
+            # The pattern form is included too: catch ({\u0052egExp}) binds
+            # an escaped name, and it must fail closed like any other
+            # escaped identifier.
             if (
                 "\\" in spelling
                 or spelling == "Reflect"
