@@ -30,7 +30,12 @@ _TYPESCRIPT_SHEBANG = re.compile(
     r"(?:node|nodejs|ts-node|tsx|bun|deno)(?=[ \t\r\n]|$)",
     re.IGNORECASE,
 )
-_IDENTIFIER = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
+# One identifier character, literal or written as ``\`` plus an escape. Names
+# are matched whole so that an escape inside a word cannot split it.
+_IDENTIFIER_ESCAPE = r"\\u\{[0-9a-fA-F]{1,6}\}|\\u[0-9a-fA-F]{4}|\\x[0-9a-fA-F]{2}|\\[^\r\n]"
+_ESCAPED_IDENTIFIER = re.compile(
+    rf"(?:[A-Za-z_$]|{_IDENTIFIER_ESCAPE})(?:[A-Za-z0-9_$]|{_IDENTIFIER_ESCAPE})*"
+)
 _EXPRESSION_PREFIX_WORDS = frozenset(
     {
         "return",
@@ -174,7 +179,9 @@ def typescript_template_spans(
     last_closed_control = False
     paren_stack: list[bool] = []
     square_stack: list[int] = []
-    delimiters: list[str] = []
+    # Paired openers and closers, so the closer that ends a scope is known
+    # rather than relying on full-stack counts, which cost time per token.
+    delimiters: list[tuple[str, str]] = []
     spans: list[tuple[int, int]] = []
     values: dict[int, str | None] = {}
     callee: str | None = None
@@ -219,7 +226,9 @@ def typescript_template_spans(
         if last_value == "]":
             return False
         if last_value == "}":
-            return True
+            # A brace ends an expression far more often than a statement, so
+            # the slash after it divides rather than opening a regex.
+            return False
         if last_value == ".":
             return False
         if last_value == ">":
@@ -246,10 +255,10 @@ def typescript_template_spans(
         return _decode_string_source(content[start + 1 : end - 1], check_runtime)
 
     def module_string(span: tuple[int, int]) -> bool:
+        # An undecodable specifier keeps the execution surface: the raw text may
+        # spell a module name, so it can never be read as an ordinary string.
         value = string_value(span)
-        if value is None:
-            return _is_shell_execution_module(content[span[0] : span[1]])
-        return _is_shell_execution_module(value)
+        return value is None or _is_shell_execution_module(value)
 
     def tagged_template() -> bool:
         # ``import ... from`` is a module clause, not a tag; ``import()`` and a
@@ -328,7 +337,7 @@ def typescript_template_spans(
             if content.startswith("${", cursor):
                 # The substitution brace is recorded on the shared delimiter
                 # stack so a later top-level ``}`` cannot close it.
-                delimiters.append("{")
+                delimiters.append(("{", "}"))
                 next_cursor = scan_code(cursor + 2, depth + 1, interpolation=True)
                 if next_cursor is None:
                     return None
@@ -442,17 +451,12 @@ def typescript_template_spans(
                     last_kind == "identifier" and last_value.casefold() in _CONTROL_WORDS
                 )
                 callee = last_value if last_kind == "identifier" else None
-                delimiters.append(character)
+                delimiters.append(("(", ")"))
                 cursor += 1
                 last_kind, last_value, last_closed_control = "punct", "(", False
                 continue
             if character == ")":
-                if (
-                    len(paren_stack) <= paren_floor
-                    or not delimiters
-                    or delimiters[-1] != "("
-                    or delimiters.count("[") > delimiters.count("]")
-                ):
+                if len(paren_stack) <= paren_floor or not delimiters or delimiters[-1][1] != ")":
                     return None
                 delimiters.pop()
                 last_closed_control = paren_stack.pop()
@@ -462,14 +466,13 @@ def typescript_template_spans(
                 continue
             if character == "{":
                 braces += 1
-                delimiters.append("{")
-                paren_stack.append(paren_boundary)
+                delimiters.append(("{", "}"))
                 callee = None
                 cursor += 1
                 last_kind, last_value, last_closed_control = "punct", "{", False
                 continue
             if character == "}":
-                if not delimiters or delimiters[-1] != "{":
+                if not delimiters or delimiters[-1][1] != "}":
                     return None
                 if interpolation and braces == 0:
                     if len(paren_stack) != paren_boundary or len(square_stack) != square_floor:
@@ -479,15 +482,9 @@ def typescript_template_spans(
                     return cursor + 1
                 delimiters.pop()
                 if interpolation:
-                    # A block cannot open inside ``[ ... ]``; that bracket
-                    # would otherwise stay pending while the block closes.
-                    if delimiters.count("[") > delimiters.count("]"):
-                        return None
                     braces -= 1
                 else:
                     if len(square_stack) != square_floor:
-                        return None
-                    if paren_stack.pop() != paren_boundary:
                         return None
                     braces = 0
                 callee = None
@@ -496,18 +493,13 @@ def typescript_template_spans(
                 continue
             if character == "[":
                 square_stack.append(cursor)
-                delimiters.append("[")
+                delimiters.append(("[", "]"))
                 callee = None
                 cursor += 1
                 last_kind, last_value, last_closed_control = "punct", "[", False
                 continue
             if character == "]":
-                if (
-                    len(square_stack) <= square_floor
-                    or not delimiters
-                    or delimiters[-1] != "["
-                    or delimiters.count("(") > delimiters.count(")")
-                ):
+                if len(square_stack) <= square_floor or not delimiters or delimiters[-1][1] != "]":
                     return None
                 delimiters.pop()
                 square_stack.pop()
@@ -568,9 +560,16 @@ def typescript_template_spans(
                 cursor += 1
                 last_kind, last_value, last_closed_control = "punct", character, False
                 continue
-            identifier = _IDENTIFIER.match(content, cursor)
+            identifier = _ESCAPED_IDENTIFIER.match(content, cursor)
             if identifier is not None:
-                word = identifier.group(0)
+                # Names may be spelled with escapes, so the word is decoded
+                # before it is classified; a source that cannot be decoded
+                # keeps its conservative reading because a hidden call is
+                # exactly what the decode is there to find.
+                raw = identifier.group(0)
+                word = raw if "\\" not in raw else _decode_string_source(raw, check_runtime)
+                if word is None:
+                    return None
                 # ``if (...)`` reaches a statement head, so only a control
                 # keyword followed by an argument list is a call here.
                 if execution_name(word) and not (
