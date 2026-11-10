@@ -54,8 +54,18 @@ Do not rely on the numeric score alone. A low score can miss semantic risk, and 
    PowerShell 6+):
 
    ```powershell
-   [IO.File]::WriteAllText("$env:TEMP\skill-inspector-report.json", ((skillspector scan "$TARGET" --no-llm --format json) -join "`n"))
+   $report = skillspector scan "$TARGET" --no-llm --format json
+   $exitCode = $LASTEXITCODE
+   [IO.File]::WriteAllText("$env:TEMP\skill-inspector-report.json", ($report -join "`n"))
+   exit $exitCode
    ```
+
+   Capture `$LASTEXITCODE` immediately after the scan and exit with it:
+   a successful file write would otherwise mask a failing scan with exit
+   code 0, since `WriteAllText` itself succeeds even when the scanner
+   exits non-zero. The string written is the same one the single-line
+   form passed to `WriteAllText` (stdout lines joined with "`n"), so
+   the report stays BOM-free.
 
    If the command exits non-zero, inspect any partial report and continue manually. Record that the static line was incomplete. On Windows, a non-zero exit from a command using `--output` is a platform refusal, not a scan failure: no partial report exists, so do not look for one or retry the same command.
 
