@@ -63,6 +63,18 @@ def test_create_graph_first_preserves_lazy_export(
     _assert_graph_export_invokable()
 
 
+def test_graph_construction_does_not_prepare_a_transport(
+    _graph_import_state: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_preparation() -> None:
+        pytest.fail("Graph construction must remain credential-independent")
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports", unexpected_preparation
+    )
+    assert skillspector.create_graph() is not None
+
+
 def test_mcp_import_first_preserves_lazy_export(_graph_import_state: None) -> None:
     """yashrajp22 #436: importing MCP first keeps the lazy export."""
     importlib.import_module("skillspector.mcp_server")
