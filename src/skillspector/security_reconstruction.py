@@ -957,6 +957,7 @@ _HTML_START_TAG_RE = re.compile(
     rf"<([A-Za-z][A-Za-z0-9:-]*)(?:\s+{_HTML_ATTRIBUTE_RE.pattern})*\s*/?>\Z"
 )
 _BACKTICK_RUN_RE = re.compile(r"`+")
+_MARKDOWN_INLINE_HTML_START_RE = re.compile(r"<[A-Za-z/!?]")
 _HTML_BLOCK_TAG_RE = re.compile(
     r"</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|"
     r"dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|"
@@ -1020,6 +1021,14 @@ def _html_attribute_closers(content: str, check_runtime: Callable[[], None]) -> 
     return closers
 
 
+def _inline_html_may_contain(line: str, start: int, index: int) -> bool:
+    """Return whether an autolink or raw inline HTML may span ``index``."""
+    for tag in _MARKDOWN_INLINE_HTML_START_RE.finditer(line, start, index):
+        if line.find(">", tag.end(), index) < 0:
+            return True
+    return False
+
+
 def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) -> set[int]:
     """Own same-line CommonMark code delimiters outside recognized fenced blocks."""
     closers: set[int] = set()
@@ -1078,6 +1087,7 @@ def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) ->
             fence = opening[1][0], len(opening[1]), context, last_quote
         else:
             opener: re.Match[str] | None = None
+            inline_start = 0
             for run in _BACKTICK_RUN_RE.finditer(line):
                 if opener is None:
                     cursor = run.start() - 1
@@ -1085,10 +1095,16 @@ def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) ->
                         cursor -= 1
                     if (run.start() - 1 - cursor) % 2:
                         continue
+                    # Autolinks and raw inline HTML bind before code spans, so
+                    # a backtick inside one is literal and cannot open a span.
+                    # This helper does not parse them; it withholds ownership.
+                    if _inline_html_may_contain(line, inline_start, run.start()):
+                        return closers
                     opener = run
                 elif len(run[0]) == len(opener[0]):
                     closers.update(range(offset + run.start(), offset + run.end()))
                     opener = None
+                    inline_start = run.end()
             if opener is not None:
                 # A code span can continue on another line. This helper proves
                 # same-line pairs only, so an unmatched run makes later quote
