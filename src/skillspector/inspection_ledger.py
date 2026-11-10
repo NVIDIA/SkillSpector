@@ -155,9 +155,9 @@ class LedgerReason(StrEnum):
     OUTPUT_LIMIT = "output_limit"
     TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
+    JSON_QUOTE_OWNERSHIP_LIMIT = "json_quote_ownership_limit"
     PYTHON_SOURCE_AMBIGUOUS = "python_source_ambiguous"
     PYTHON_SOURCE_DECODE_ERROR = "python_source_decode_error"
-    JSON_QUOTE_OWNERSHIP_LIMIT = "json_quote_ownership_limit"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
 
 
@@ -790,9 +790,9 @@ class InspectionLedgerEvent(ResourceMeasurements):
     message: NotRequired[str]
     error_class: NotRequired[str]
     stage: NotRequired[str]
-    parser_diagnostic: NotRequired[ParserDiagnostic]
     source_start_offset: NotRequired[int]
     source_end_offset: NotRequired[int]
+    parser_diagnostic: NotRequired[ParserDiagnostic]
 
 
 class AnalyzerStatusEvent(TypedDict):
@@ -821,11 +821,11 @@ class InspectionLedgerException(ResourceMeasurements):
     error_class: NotRequired[str]
     analyzers: NotRequired[list[str]]
     fatal: NotRequired[bool]
+    source_start_offset: NotRequired[int]
+    source_end_offset: NotRequired[int]
     scope: NotRequired[str]
     source_identity: NotRequired[str]
     parser_diagnostic: NotRequired[ParserDiagnostic]
-    source_start_offset: NotRequired[int]
-    source_end_offset: NotRequired[int]
 
 
 class AnalysisCompleteness(TypedDict):
@@ -1199,7 +1199,7 @@ def _exception_from_event(
             and type(end) is int
             and type(observed) is int
             and type(limit) is int
-            and 0 <= start < end
+            and 0 <= start < end <= (1 << 63) - 1
             and observed == end - start
             and observed > limit > 0
         ):

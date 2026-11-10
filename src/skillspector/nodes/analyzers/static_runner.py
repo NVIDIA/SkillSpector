@@ -852,9 +852,6 @@ def _bounded_parser_incomplete(
             path, view.text, check
         )
         kwargs["python_stdlib_check"] = python_import_bounds.allows_stdlib
-    if vars(module).get("USES_PREPARED_PARSER_ANALYSIS") is True:
-        kwargs["prepared_analysis"] = prepared_analysis
-        kwargs["source_view"] = _absolute_source_view(view, source_start=source_start)
     detailed_hook = _explicit_analysis_hook(module, "bounded_parse_diagnostic")
     if detailed_hook is not None:
         diagnostic = detailed_hook(view.text, check_runtime, **kwargs)
