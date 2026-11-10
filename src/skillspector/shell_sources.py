@@ -366,8 +366,9 @@ class ShellSourceResolver:
                 cursor = len(self.content) if newline < 0 else newline
                 continue
             if character in "\n;|&":
+                continued_operator = character == "\n" and not words and not redirects and conditional
                 finish(cursor, character in "|&")
-                conditional = character in "|&"
+                conditional = character in "|&" or continued_operator
                 cursor += 1
                 if character == "\n" and pending:
                     for item, (owner, child_scope) in zip(pending, pending_owners, strict=True):
@@ -1549,6 +1550,20 @@ def source_is_unmodified(resolver: ShellSourceResolver, target_path: str, use_of
                         continue
                     if options and value is not None and value.text.startswith("-"):
                         if value.kind != "literal" or not re.fullmatch(r"--?[A-Za-z]+", value.text):
+                            return False
+                        if name == "mv" and not (
+                            re.fullmatch(r"-[finTv]+", value.text)
+                            or value.text
+                            in {
+                                "--force",
+                                "--interactive",
+                                "--no-clobber",
+                                "--no-target-directory",
+                                "--verbose",
+                            }
+                        ):
+                            # Unmodeled options can carry a destination in the
+                            # same word. Leave their effects to the ordered audit.
                             return False
                         continue
                     if name == "dd":

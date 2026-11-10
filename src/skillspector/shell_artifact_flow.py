@@ -149,7 +149,17 @@ class ShellArtifactEffects:
         ):
             self.store.invalidate(None)
             return False
-        return self.store.copy(*arguments)
+        source, destination = arguments
+        artifact = self.store.read(source)
+        if artifact is None:
+            self.store.invalidate(destination)
+            return False
+        previous = self.store.read(destination)
+        if previous is not None:
+            artifact = replace(artifact, executable=previous.executable)
+        elif self.store.exists(destination) is not False:
+            artifact = replace(artifact, executable=None)
+        return self.store.write(destination, artifact)
 
     def redirect_stdout(
         self, destination: str, variants: tuple[ShellArtifact, ...], *, append: bool = False
@@ -784,7 +794,7 @@ class ShellProducer:
                 *(
                     "--"
                     if index == 0 and argument == "--"
-                    else self.path(argument, state, source=True)
+                    else self.path(argument, state)
                     for index, argument in enumerate(arguments)
                 ),
             )
@@ -864,14 +874,12 @@ class ShellProducer:
             output.append(branch)
         return output
 
-    def path(self, value: str, state: _ProducerState, *, source: bool = False) -> str:
+    def path(self, value: str, state: _ProducerState) -> str:
         if value.startswith("/"):
-            return value
-        if source and value in self.context.sources:
             return value
         if state.cwd is None or any(part in {"", ".", ".."} for part in value.split("/")):
             raise _UnresolvedError
-        return state.cwd + "/" + value
+        return value if state.cwd == "." else state.cwd + "/" + value
 
     def mapfile(self, words: tuple[_Token, ...], state: _ProducerState) -> list[_ProducerState]:
         raw = tuple(token.raw for token in words)
@@ -972,7 +980,12 @@ class ShellProducer:
         return [state]
 
     def inspect(
-        self, argv: tuple[str, ...], environment: dict[str, str], outputs: tuple[str, ...]
+        self,
+        argv: tuple[str, ...],
+        environment: dict[str, str],
+        outputs: tuple[str, ...],
+        *,
+        initial_cwd: str | None = None,
     ) -> ShellProducerResult | None:
         """Return a complete successful effect proof, or forget every output."""
         try:
@@ -999,7 +1012,7 @@ class ShellProducer:
                 not in {("set", "-euo", "pipefail"), ("set", "-Eeuo", "pipefail")}
             ):
                 raise _UnresolvedError
-            states = self.run(program, [_ProducerState(environment.copy(), argv)])
+            states = self.run(program, [_ProducerState(environment.copy(), argv, initial_cwd)])
             successful = [state for state in states if not state.stopped]
             if not successful:
                 raise _UnresolvedError

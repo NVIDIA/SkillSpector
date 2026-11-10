@@ -371,7 +371,7 @@ class ShellArtifactAudit:
         }
         context = ShellSourceContext(path, {**self.context.sources, path: source})
         result = ShellProducer(trial, context, self.read_word, self.check_runtime, output).inspect(
-            (destination,), environment, (destination,)
+            (destination,), environment, (destination,), initial_cwd=command.cwd
         )
         if result is None or not self.store.adopt(trial):
             return None
