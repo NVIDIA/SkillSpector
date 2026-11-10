@@ -178,7 +178,7 @@ def test_node_treats_empty_pyproject_toml_as_valid(monkeypatch):
 )
 def test_nested_requirements_manifests_retain_sc4_advisory_findings(monkeypatch, path):
     seen = _capture_osv_packages(monkeypatch)
-    monkeypatch.setattr(supply_chain, "was_osv_reachable", lambda: True)
+    monkeypatch.setattr(supply_chain, "was_osv_reachable", lambda budget=None: True)
     monkeypatch.setattr(
         supply_chain.static_runner,
         "run_static_patterns_with_ledger",

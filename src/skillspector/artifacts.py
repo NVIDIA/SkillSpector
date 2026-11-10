@@ -320,8 +320,10 @@ _OBFUSCATED_INSTRUCTION_ACTIONS = (
     "forget",
 )
 _OBFUSCATED_ACTION_INITIALS = frozenset(action[0] for action in _OBFUSCATED_INSTRUCTION_ACTIONS)
+# An ASCII word character immediately before an idle candidate already makes
+# the exact boundary check reject it; active reconstruction states still walk it.
 _ASCII_OBFUSCATED_ACTION_START_PATTERN = re.compile(
-    "[" + re.escape("".join(sorted(_OBFUSCATED_ACTION_INITIALS))) + "]",
+    r"(?<![A-Za-z0-9_])[" + re.escape("".join(sorted(_OBFUSCATED_ACTION_INITIALS))) + "]",
     re.ASCII | re.IGNORECASE,
 )
 _OBFUSCATED_ACTION_START_PATTERN = re.compile(
