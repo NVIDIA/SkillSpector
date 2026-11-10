@@ -148,9 +148,14 @@ P6_PATTERNS = [
         0.85,
     ),
     # Verb first, all combinations of pronoun, completeness, and system segments.
+    # The bare noun 提示 is excluded from the unqualified variant: it also
+    # means an ordinary notice (提示信息, "notice information"), so an
+    # unqualified 显示提示/输出提示 is ambiguous. Explicit requests stay
+    # covered by the qualified variants below (系统, 完整, 你/您) and by
+    # 提示词, 指令 and 规则 here.
     (
         f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
-        f"(?:{chinese_spaced('提示词')}|{chinese_spaced('提示詞')}|{chinese_spaced('提示')}|{chinese_spaced('指令')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
+        f"(?:{chinese_spaced('提示词')}|{chinese_spaced('提示詞')}|{chinese_spaced('指令')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
         0.85,
     ),
     (
