@@ -792,9 +792,7 @@ class ShellProducer:
             resolved = (
                 name,
                 *(
-                    "--"
-                    if index == 0 and argument == "--"
-                    else self.path(argument, state)
+                    "--" if index == 0 and argument == "--" else self.path(argument, state)
                     for index, argument in enumerate(arguments)
                 ),
             )

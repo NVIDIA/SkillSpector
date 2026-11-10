@@ -366,7 +366,9 @@ class ShellSourceResolver:
                 cursor = len(self.content) if newline < 0 else newline
                 continue
             if character in "\n;|&":
-                continued_operator = character == "\n" and not words and not redirects and conditional
+                continued_operator = (
+                    character == "\n" and not words and not redirects and conditional
+                )
                 finish(cursor, character in "|&")
                 conditional = character in "|&" or continued_operator
                 cursor += 1
