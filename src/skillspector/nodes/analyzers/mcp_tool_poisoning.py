@@ -1185,7 +1185,7 @@ _TP4_ABSENCE_PATTERNS = tuple(
 
 
 _TP4_CLAUSE_SPLIT_PATTERN = re.compile(
-    r"\s*;\s*|\s+but\s+|\s+however\s+|\s+although\s+|\s+though\s+|\s+while\s+|\s+whereas\s+"
+    r"\s*[.!?]+\s+|\s*;\s*|\s+but\s+|\s+however\s+|\s+although\s+|\s+though\s+|\s+while\s+|\s+whereas\s+"
 )
 
 _TP4_AFFIRMATIVE_VERB_PATTERN = re.compile(
@@ -1194,13 +1194,39 @@ _TP4_AFFIRMATIVE_VERB_PATTERN = re.compile(
     r"connect|cop(?:y|ies|ied|ying)|crawl|create|decrypt|delete|download|"
     r"encode|encrypt|enumerate|execute|export|exfiltrate|extract|fetch|"
     r"fingerprint|gather|generate|hash|import|install|invoke|issue|leak|"
-    r"load|log|modify|monitor|move|navigate|notify|open|parse|perform|"
+    r"load|log|modify|monitor|move|navigate|notify|open|parse|perform|persist|"
     r"post|process|profile|publish|pull|push|quer(?:y|ies|ied|ying)|read|"
     r"record|remove|render|request|respond|restore|retrieve|run|save|"
     r"scan|scrape|search|send|share|sign|spawn|store|submit|subscribe|"
     r"sync|track|transmit|type|update|upload|validate|verify|write|click"
     r")(?:s|es|ed|ing|d|ning)?\b"
 )
+
+
+def _tp4_strip_leading_absence_modifier(clause: str) -> str:
+    """Drop a leading absence phrase closed by a comma, if it precedes any verb.
+
+    "Without user consent, uploads source files to a remote endpoint" opens
+    with an absence phrase that only modifies the affirmative main clause,
+    so the marker must not govern the verbs after the comma. The phrase is
+    only dropped when the comma comes before the first capability verb:
+    "No evidence of querying, storing videos" keeps its marker because the
+    verb sits inside the leading phrase.
+    """
+    marker_end = None
+    for pattern in _TP4_ABSENCE_PATTERNS:
+        match = pattern.search(clause)
+        if match is not None and match.start() == 0:
+            marker_end = match.end() if marker_end is None else min(marker_end, match.end())
+    if marker_end is None:
+        return clause
+    comma = clause.find(",", marker_end)
+    if comma == -1:
+        return clause
+    first_verb = _TP4_AFFIRMATIVE_VERB_PATTERN.search(clause)
+    if first_verb is not None and first_verb.start() < comma:
+        return clause
+    return clause[comma + 1 :].strip()
 
 
 def _tp4_mismatched_item_is_absence(item: str) -> bool:
@@ -1214,8 +1240,12 @@ def _tp4_mismatched_item_is_absence(item: str) -> bool:
     them", and "No support for TLS, but sends credentials in plaintext"
     are not absences, while "No evidence of querying videos" and "The code
     does not implement search" still are: their verbs sit under the marker.
-    Clauses split only on contrast boundaries, so enumerations joined by
-    "and" or commas stay under one leading marker.
+    Clauses split on contrast boundaries and sentence boundaries, so
+    enumerations joined by "and" or commas stay under one leading marker
+    while "No support for TLS. Sends credentials in plaintext" keeps its
+    second sentence affirmative. A leading absence phrase closed by a comma
+    ("Without user consent, uploads source files ...") only modifies the
+    main clause and does not govern the verbs after the comma.
     """
     normalized = " ".join(item.strip().casefold().split())
     if not normalized:
@@ -1223,7 +1253,7 @@ def _tp4_mismatched_item_is_absence(item: str) -> bool:
     if not any(pattern.search(normalized) for pattern in _TP4_ABSENCE_PATTERNS):
         return False
     for clause in _TP4_CLAUSE_SPLIT_PATTERN.split(normalized):
-        clause = clause.strip()
+        clause = _tp4_strip_leading_absence_modifier(clause.strip())
         if not clause:
             continue
         marker_positions = [
@@ -1268,8 +1298,9 @@ def _tp4_finding(
     return Finding(
         rule_id="TP4",
         message=message,
-        # TP4 is documented as MEDIUM in the README pattern table; the
-        # confidence-based escalation to HIGH was never documented (issue #1066).
+        # TP4 severity is fixed MEDIUM, matching the README pattern table
+        # and the detailed TP4 guide; there is no confidence-based
+        # escalation to HIGH (issue #1066).
         severity="MEDIUM",
         confidence=result.confidence,
         file=batch.file_path,

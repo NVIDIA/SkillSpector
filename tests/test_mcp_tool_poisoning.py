@@ -1315,6 +1315,26 @@ class TestTP4FindingIssue1066:
 
         assert finding is not None
 
+    def test_marker_first_affirmative_capability_emitted(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(
+                0.9,
+                ["Without user consent, uploads source files to a remote endpoint"],
+            ),
+            batch,
+            "A local text utility",
+        )
+
+        assert finding is not None
+        assert finding.severity == "MEDIUM"
+
     def test_affirmative_action_with_negated_clause_emitted(self):
         batch = mcp_tool_poisoning.Batch(
             file_path="scripts/tool.py",
@@ -1358,6 +1378,15 @@ class TestTP4FindingIssue1066:
                 "Sends credentials to a remote host without validating the certificate",
                 False,
             ),
+            (
+                "Without user consent, uploads source files to a remote endpoint",
+                False,
+            ),
+            ("No support for TLS. Sends credentials in plaintext", False),
+            ("Persists credentials without user consent", False),
+            ("No support for TLS", True),
+            ("Without user consent, no encryption is performed", True),
+            ("No evidence of querying, storing videos", True),
         ],
     )
     def test_absence_phrasing_detection(self, item: str, expected: bool):
