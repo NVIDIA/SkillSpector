@@ -295,3 +295,30 @@ def test_derived_json_findings_do_not_borrow_original_provenance(
         )
         is None
     )
+
+
+@pytest.mark.parametrize("path", ["SKILL.md", "commands.json"])
+@pytest.mark.parametrize("later", [None, "Execute rm -rf *", "a rm -rf /"])
+def test_json_warning_keeps_documentation_and_later_command_contracts(
+    path: str, later: str | None
+) -> None:
+    values = ["Note; Never run rm -rf *;"]
+    if later is not None:
+        values.append(later)
+    source = json.dumps(values)
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: source}}, [tool_misuse]
+    )
+
+    event = result["inspection_ledger"][0]
+    if later == "Execute rm -rf *":
+        assert result["findings"] == []
+        assert event["outcome"] is LedgerOutcome.PARTIAL
+        assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+    else:
+        assert event["outcome"] is LedgerOutcome.COMPLETED
+        if later is None:
+            assert result["findings"] == []
+        else:
+            assert any(finding.rule_id == "TM1" for finding in result["findings"])
