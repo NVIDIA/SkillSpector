@@ -1740,7 +1740,7 @@ def _ordinary_native_calls(
     references: dict[str, list[Node]] = {}
     path_bindings: dict[str, tuple[Node, bool]] = {}
     regex_calls: list[Node] = []
-    regex_bindings: dict[str, Node] = {}
+    regex_bindings: dict[str, list[Node]] = {}
     intrinsic_override = False
     path_unproven = False
     path_imports = 0
@@ -1818,7 +1818,7 @@ def _ordinary_native_calls(
                 if _callable_member(program, member) == "exec":
                     regex_calls.append(member)
             elif (binding := _const_regex_binding(program, node)) is not None:
-                regex_bindings[program.text(binding)] = binding
+                regex_bindings.setdefault(program.text(binding), []).append(binding)
             else:
                 # Even an argument can expose the shared RegExp prototype.
                 intrinsic_override = True
@@ -1834,7 +1834,7 @@ def _ordinary_native_calls(
                     if _callable_member(program, member) == "exec":
                         regex_calls.append(member)
                 elif (binding := _const_regex_binding(program, node)) is not None:
-                    regex_bindings[program.text(binding)] = binding
+                    regex_bindings.setdefault(program.text(binding), []).append(binding)
                 else:
                     # A constructed regex that escapes as a value can expose
                     # the shared RegExp prototype, same as a literal.
@@ -1881,40 +1881,42 @@ def _ordinary_native_calls(
                     else:
                         path_unproven = True
             pending.extend(specifier.named_children)
-    for name, binding in regex_bindings.items():
+    for name, bindings in regex_bindings.items():
         # The proof belongs to one binding, so only references that can
         # resolve to it count. A const inside a function body must not
         # prove an outer or sibling receiver with the same name: the
         # final `re` in `function local() { const re = /x/; re.test(t); }
         # re.exec(...)` is outside that binding's scope, so it is skipped
-        # here and stays unowned. References before the declaration are
-        # refused too, matching the scalar proof's declaration-end rule.
-        declarator = binding.parent
-        declaration = None if declarator is None else declarator.parent
-        scope = None if declaration is None else declaration.parent
-        for reference in references[name]:
-            check_runtime()
-            if reference == binding:
-                continue
-            if (
-                scope is None
-                or declarator is None
-                or not (
-                    scope.start_byte <= reference.start_byte < scope.end_byte
-                    and reference.start_byte > declarator.end_byte
-                )
-            ):
-                continue
-            # Only .test/.exec calls on the binding are owned. Any other
-            # use, including a second binding of the same name, a parameter
-            # or import shadow, an escaping reference, or a template
-            # argument, keeps the conservative reading for the whole file.
-            member = _regex_receiver_call(program, reference)
-            if member is None:
-                intrinsic_override = True
-                break
-            if _callable_member(program, member) == "exec":
-                regex_calls.append(member)
+        # here and stays unowned. Every same-named binding is validated:
+        # a later binding must not overwrite an earlier one, or an escape
+        # of the earlier binding would go unchecked. References before the
+        # declaration are validated too, matching the old loop: a closure
+        # defined before the declaration can run after initialization, so
+        # a mutation or escape there refuses the proof like any other use.
+        for binding in bindings:
+            declarator = binding.parent
+            declaration = None if declarator is None else declarator.parent
+            scope = None if declaration is None else declaration.parent
+            for reference in references[name]:
+                check_runtime()
+                if reference == binding:
+                    continue
+                if (
+                    scope is None
+                    or declarator is None
+                    or not (scope.start_byte <= reference.start_byte < scope.end_byte)
+                ):
+                    continue
+                # Only .test/.exec calls on the binding are owned. Any other
+                # use, including a second binding of the same name, a parameter
+                # or import shadow, an escaping reference, or a template
+                # argument, keeps the conservative reading for the whole file.
+                member = _regex_receiver_call(program, reference)
+                if member is None:
+                    intrinsic_override = True
+                    break
+                if _callable_member(program, member) == "exec":
+                    regex_calls.append(member)
     for reference in references.get("Object", ()):
         parent = reference.parent
         if (
