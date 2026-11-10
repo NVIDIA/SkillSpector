@@ -1335,6 +1335,25 @@ class TestTP4FindingIssue1066:
         assert finding is not None
         assert finding.severity == "MEDIUM"
 
+    def test_comma_separated_list_of_missing_capabilities_suppressed(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(
+                0.9,
+                ["No evidence of network activity, file writes, or remote uploads"],
+            ),
+            batch,
+            "A local text utility",
+        )
+
+        assert finding is None
+
     def test_affirmative_action_with_negated_clause_emitted(self):
         batch = mcp_tool_poisoning.Batch(
             file_path="scripts/tool.py",
@@ -1387,6 +1406,11 @@ class TestTP4FindingIssue1066:
             ("No support for TLS", True),
             ("Without user consent, no encryption is performed", True),
             ("No evidence of querying, storing videos", True),
+            (
+                "No evidence of network activity, file writes, or remote uploads",
+                True,
+            ),
+            ("No support for TLS, sends credentials in plaintext", False),
         ],
     )
     def test_absence_phrasing_detection(self, item: str, expected: bool):

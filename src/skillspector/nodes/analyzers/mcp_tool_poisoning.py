@@ -1211,7 +1211,14 @@ def _tp4_strip_leading_absence_modifier(clause: str) -> str:
     so the marker must not govern the verbs after the comma. The phrase is
     only dropped when the comma comes before the first capability verb:
     "No evidence of querying, storing videos" keeps its marker because the
-    verb sits inside the leading phrase.
+    verb sits inside the leading phrase. The text after the comma must also
+    read as a main clause, not as a continuation of the missing-capability
+    list: the phrase is dropped when it is a "without" modifier, or when
+    the remainder opens with a capability verb ("No support for TLS, sends
+    credentials in plaintext"). A list such as "No evidence of network
+    activity, file writes, or remote uploads" keeps its negation because
+    the remainder opens with a noun, so the whole entry still describes
+    absent behavior.
     """
     marker_end = None
     for pattern in _TP4_ABSENCE_PATTERNS:
@@ -1226,7 +1233,12 @@ def _tp4_strip_leading_absence_modifier(clause: str) -> str:
     first_verb = _TP4_AFFIRMATIVE_VERB_PATTERN.search(clause)
     if first_verb is not None and first_verb.start() < comma:
         return clause
-    return clause[comma + 1 :].strip()
+    remainder = clause[comma + 1 :].strip()
+    is_without_modifier = clause.casefold().startswith("without ")
+    remainder_opens_with_verb = _TP4_AFFIRMATIVE_VERB_PATTERN.match(remainder) is not None
+    if not (is_without_modifier or remainder_opens_with_verb):
+        return clause
+    return remainder
 
 
 def _tp4_mismatched_item_is_absence(item: str) -> bool:
@@ -1245,7 +1257,10 @@ def _tp4_mismatched_item_is_absence(item: str) -> bool:
     while "No support for TLS. Sends credentials in plaintext" keeps its
     second sentence affirmative. A leading absence phrase closed by a comma
     ("Without user consent, uploads source files ...") only modifies the
-    main clause and does not govern the verbs after the comma.
+    main clause and does not govern the verbs after the comma, while a
+    comma-separated list of missing capabilities ("No evidence of network
+    activity, file writes, or remote uploads") stays under its leading
+    negation.
     """
     normalized = " ".join(item.strip().casefold().split())
     if not normalized:
