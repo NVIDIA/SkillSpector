@@ -330,14 +330,14 @@ def test_complete_wildcard_elements_after_quoted_scalars_are_flagged(value: str)
 @pytest.mark.parametrize("quote", ["", "'", '"'])
 @pytest.mark.parametrize("value", ['"*"', '["*"]', '\n  - "*"'])
 def test_unrelated_permission_keys_do_not_grant_tools(key: str, quote: str, value: str) -> None:
-    content = f"{quote}{key}{quote}: {value}\ntools: [\"*\"]\n"
+    content = f'{quote}{key}{quote}: {value}\ntools: ["*"]\n'
     findings = ea_module.analyze(content, "SKILL.md", "markdown")
     assert [finding.location.start_line for finding in findings if finding.rule_id == "EA1"] == [
         content.count("\n")
     ]
 
 
-@pytest.mark.parametrize("key", ['"tools\'', '\'permissions"'])
+@pytest.mark.parametrize("key", ["\"tools'", "'permissions\""])
 def test_mismatched_key_quotes_are_not_wildcard_grants(key: str) -> None:
-    findings = ea_module.analyze(f"{key}: [\"*\"]\n", "config.json", "json")
+    findings = ea_module.analyze(f'{key}: ["*"]\n', "config.json", "json")
     assert not any(finding.rule_id == "EA1" for finding in findings)
