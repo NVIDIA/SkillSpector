@@ -2131,6 +2131,38 @@ def _numeric_local_identifiers(
     return owned
 
 
+def _pattern_binding_names(
+    program: JavaScriptProgram, pattern: Node, check_runtime: Callable[[], None]
+) -> set[str]:
+    """Collect the identifiers bound by a parameter or destructuring pattern.
+
+    Only binding positions count: the left side of assignment patterns, the
+    identifiers inside object and array patterns, and rest targets.
+    Default-value expressions, computed keys, and property names are
+    references, not bindings, so they are never descended into.
+    """
+    names: set[str] = set()
+    pending = [pattern]
+    while pending:
+        check_runtime()
+        node = pending.pop()
+        if node.type in {"identifier", "shorthand_property_identifier_pattern"}:
+            names.add(program.text(node))
+        elif node.type in {"assignment_pattern", "object_assignment_pattern"}:
+            left = node.child_by_field_name("left")
+            if left is not None:
+                pending.append(left)
+        elif node.type == "pair_pattern":
+            value = node.child_by_field_name("value")
+            if value is not None:
+                pending.append(value)
+        elif node.type == "rest_pattern":
+            pending.extend(node.named_children)
+        elif node.type in {"formal_parameters", "object_pattern", "array_pattern"}:
+            pending.extend(node.named_children)
+    return names
+
+
 def _has_shell_execution_call(
     program: JavaScriptProgram, check_runtime: Callable[[], None]
 ) -> bool:
@@ -2201,15 +2233,31 @@ def _has_shell_execution_call(
                     uncertain_bindings.add(name)
             continue
         if target is not None:
-            # Unknown callable origins include computed global members,
-            # injected parameters, aliases and reassigned local bindings.
-            pending = [target]
-            while pending:
-                check_runtime()
-                binding = pending.pop()
-                if binding.type in {"identifier", "shorthand_property_identifier_pattern"}:
-                    uncertain_bindings.add(program.text(binding))
-                pending.extend(binding.named_children)
+            if target.type in {
+                "formal_parameters",
+                "object_pattern",
+                "array_pattern",
+                "assignment_pattern",
+                "object_assignment_pattern",
+                "rest_pattern",
+                "pair_pattern",
+            }:
+                # Parameter and destructuring patterns bind only their
+                # binding positions. Identifiers in default-value
+                # expressions are references, not bindings: recording them
+                # would mark later ordinary calls to the same name as calls
+                # through an unknown callable.
+                uncertain_bindings.update(_pattern_binding_names(program, target, check_runtime))
+            else:
+                # Unknown callable origins include computed global members,
+                # injected parameters, aliases and reassigned local bindings.
+                pending = [target]
+                while pending:
+                    check_runtime()
+                    binding = pending.pop()
+                    if binding.type in {"identifier", "shorthand_property_identifier_pattern"}:
+                        uncertain_bindings.add(program.text(binding))
+                    pending.extend(binding.named_children)
     for names in (
         global_objects,
         imported_callables,

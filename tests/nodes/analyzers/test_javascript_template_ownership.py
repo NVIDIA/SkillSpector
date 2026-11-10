@@ -92,6 +92,131 @@ def test_shell_execution_forms_keep_template_files_partial(source: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "export function check(value, max = Number.MAX_SAFE_INTEGER) {\n"
+            "  const n = Number(value);\n"
+            "  return n <= (max ?? Number.MAX_SAFE_INTEGER) ? `ok: ${n}` : `too large: ${n}`;\n"
+            "}\n"
+            "console.log(check(process.argv[2] ?? '0'));\n",
+            id="number-max-safe-integer-default",
+        ),
+        pytest.param(
+            "export function check(value, max) {\n"
+            "  const n = Number(value);\n"
+            "  return n <= (max ?? Number.MAX_SAFE_INTEGER) ? `ok: ${n}` : `too large: ${n}`;\n"
+            "}\n"
+            "console.log(check(process.argv[2] ?? '0'));\n",
+            id="plain-parameter-control",
+        ),
+        pytest.param(
+            "function defaultPath() { return 'a.json'; }\n"
+            "export function load(p = defaultPath()) { return `${p}:${defaultPath()}`; }\n",
+            id="helper-call-default",
+        ),
+        pytest.param(
+            "function defaultPath() { return 'a.json'; }\n"
+            "export function load(p) { return `${p ?? defaultPath()}`; }\n",
+            id="plain-parameter-helper-control",
+        ),
+        pytest.param(
+            "export function show({max = Number.MAX_SAFE_INTEGER} = {}) {\n"
+            "  const n = Number(max);\n"
+            "  return `max=${n}`;\n"
+            "}\n",
+            id="destructured-object-default",
+        ),
+        pytest.param(
+            "export function show([first = Number.MAX_SAFE_INTEGER] = []) {\n"
+            "  const n = Number(first);\n"
+            "  return `n=${n}`;\n"
+            "}\n",
+            id="destructured-array-default",
+        ),
+        pytest.param(
+            "const check = (value, max = Number.MAX_SAFE_INTEGER) => {\n"
+            "  const n = Number(value);\n"
+            "  return `n=${n}`;\n"
+            "};\n",
+            id="arrow-function-default",
+        ),
+        pytest.param(
+            "export function show(a, ...rest) {\n  const n = Number(a);\n  return `n=${n}`;\n}\n",
+            id="rest-parameter-control",
+        ),
+        pytest.param(
+            "class Checker {\n"
+            "  check(value, max = Number.MAX_SAFE_INTEGER) {\n"
+            "    const n = Number(value);\n"
+            "    return `n=${n}`;\n"
+            "  }\n"
+            "}\n",
+            id="class-method-default",
+        ),
+        pytest.param(
+            "export function show(a, b = a) {\n  const n = Number(a);\n  return `n=${n}`;\n}\n",
+            id="parameter-referenced-by-later-default",
+        ),
+    ],
+)
+def test_parameter_default_values_do_not_keep_template_files_partial(source: str) -> None:
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "export function run(cb) { return cb(`rm ${x}`); }",
+            id="uncertain-parameter-call",
+        ),
+        pytest.param(
+            "export function run(cb = getHandler()) { return cb(`rm ${x}`); }",
+            id="uncertain-parameter-with-default-call",
+        ),
+        pytest.param(
+            "export function run({handler = getHandler()} = {}) { return handler(`rm ${x}`); }",
+            id="uncertain-destructured-parameter-call",
+        ),
+        pytest.param(
+            "function f(x = eval) { return `v=${x}`; }",
+            id="shell-call-in-default-value",
+        ),
+        pytest.param(
+            "function f(p = cp.exec(`ls ${dir}`)) { return `v=${p}`; }",
+            id="shell-call-expression-in-default-value",
+        ),
+    ],
+)
+def test_uncertain_parameter_calls_keep_template_files_partial(source: str) -> None:
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is True
+    )
+
+
+def test_ledger_completes_parameter_default_value_template() -> None:
+    path = "scripts/check.mjs"
+    source = (
+        "export function check(value, max = Number.MAX_SAFE_INTEGER) {\n"
+        "  const n = Number(value);\n"
+        "  return n <= (max ?? Number.MAX_SAFE_INTEGER) ? `ok: ${n}` : `too large: ${n}`;\n"
+        "}\n"
+        "console.log(check(process.argv[2] ?? '0'));\n" + _PADDING
+    )
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: source}}, [tm]
+    )
+    row = result["inspection_ledger"][0]
+    assert row["outcome"] is LedgerOutcome.COMPLETED
+    assert "reason_code" not in row
+
+
+@pytest.mark.parametrize(
     "source", ["const value = `unterminated;", "const = `malformed ${value}`;"]
 )
 def test_unproven_javascript_keeps_conservative_parse_result(source: str) -> None:
