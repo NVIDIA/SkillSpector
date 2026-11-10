@@ -4339,17 +4339,44 @@ class TestConcurrencyIsGlobalAcrossLoops:
         monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "3")
         state = {"live": 0, "peak": 0}
         lock = threading.Lock()
+        all_started = threading.Event()
+        release = threading.Event()
         analyzers = [self._counting_analyzer(state, lock) for _ in range(3)]
         batches = [Batch(file_path="a.py", content="a")]
 
+        async def invoke(*_args, **_kwargs):
+            with lock:
+                state["live"] += 1
+                state["peak"] = max(state["peak"], state["live"])
+                if state["live"] == 3:
+                    all_started.set()
+            try:
+                # Hold each request until all three loops have acquired a permit.
+                while not release.is_set():
+                    await asyncio.sleep(0.001)
+            finally:
+                with lock:
+                    state["live"] -= 1
+            return LLMAnalysisResult(findings=[])
+
+        for analyzer in analyzers:
+            analyzer._structured_llm.ainvoke = AsyncMock(side_effect=invoke)
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(analyzers)) as pool:
-            for f in [pool.submit(self._run_like_a_node, a, list(batches)) for a in analyzers]:
-                f.result()
+            futures = [pool.submit(self._run_like_a_node, a, list(batches)) for a in analyzers]
+            try:
+                started = all_started.wait(5)
+            finally:
+                release.set()
+            for future in futures:
+                future.result(timeout=10)
+            assert started, "three nodes could not acquire three permits"
 
         assert state["peak"] == 3, (
             f"peak was {state['peak']} with a limit of 3 across three nodes: the bound has "
             "become a queue"
         )
+        assert state["live"] == 0, "a permit was never released"
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_a_cancelled_waiter_does_not_strand_its_permit(self, monkeypatch) -> None:
