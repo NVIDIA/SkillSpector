@@ -2650,6 +2650,31 @@ class TestSupplyChainDependencies:
         }
         assert "python" not in result
 
+    @pytest.mark.parametrize(
+        "constraint",
+        [
+            '"1.2.3 || 1.2.4"',
+            '"1.2.3||1.2.4"',
+            '{version = "1.2.3 || 1.2.4"}',
+            '"1.2.3 1.2.4"',
+            '"1.2.*"',
+        ],
+    )
+    def test_pyproject_poetry_non_concrete_constraint_keeps_package_unpinned(
+        self, constraint: str
+    ) -> None:
+        """OR/space/wildcard constraints must not become invalid pins that drop the package."""
+        content = f"[tool.poetry.dependencies]\nrequests = {constraint}\n"
+        assert sc_mod._extract_packages_from_pyproject(content) == [("requests", None, 2)]
+
+    def test_pyproject_poetry_or_constraint_survives_name_based_analysis(self) -> None:
+        """The package stays visible to name-based SC checks (not silently dropped)."""
+        content = '[tool.poetry.dependencies]\nrequests = "1.2.3 || 1.2.4"\n'
+        packages = sc_mod._extract_packages_from_pyproject(content)
+        assert [p[0] for p in packages] == ["requests"]
+        # Same downstream entry point the scanner uses must not raise on the unpinned entry.
+        assert sc_mod._analyze_dependencies(content, "pyproject.toml") is not None
+
     def test_pyproject_poetry_line_numbers(self) -> None:
         content = '[tool.poetry.dependencies]\npython = "^3.11"\nrequests = "2.31.0"\n'
         assert sc_mod._extract_packages_from_pyproject(content) == [("requests", "2.31.0", 3)]

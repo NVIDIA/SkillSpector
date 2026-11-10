@@ -1563,12 +1563,16 @@ def _extract_packages_from_package_json(
     ]
 
 
+# A single concrete version: no whitespace, ``||`` disjunctions, commas or wildcards.
+_POETRY_CONCRETE_VERSION_RE = re.compile(r"[0-9][A-Za-z0-9.!+_-]*")
+
+
 def _poetry_constraint_spec(name: str, constraint: object) -> str:
     """Render a Poetry ``name = constraint`` entry as a PEP 508 string.
 
     Poetry treats a bare version (``"2.31.0"``) as an exact pin, so it becomes
     ``name==2.31.0`` and reaches ``_pinned_version``. Ranges and Poetry-only operators
-    (``^2.28``, ``~2.28``, ``*``, ``>=1,<2``) admit many releases and stay unpinned, as do
+    (``^2.28``, ``~2.28``, ``*``, ``>=1,<2``, ``1.2.3 || 1.2.4``) admit many releases and stay unpinned, as do
     git/path/url dependencies and multiple-constraint lists. Lockfile reconciliation fills
     exact versions from ``poetry.lock`` when present.
     """
@@ -1579,7 +1583,7 @@ def _poetry_constraint_spec(name: str, constraint: object) -> str:
     version = constraint.strip()
     if version.startswith("=="):
         version = version[2:].strip()
-    if version and version[0].isdigit() and "," not in version and "*" not in version:
+    if _POETRY_CONCRETE_VERSION_RE.fullmatch(version):
         return f"{name}=={version}"
     return name
 
