@@ -341,3 +341,40 @@ def test_unrelated_permission_keys_do_not_grant_tools(key: str, quote: str, valu
 def test_mismatched_key_quotes_are_not_wildcard_grants(key: str) -> None:
     findings = ea_module.analyze(f'{key}: ["*"]\n', "config.json", "json")
     assert not any(finding.rule_id == "EA1" for finding in findings)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("key", ["tools", '"permissions"'])
+@pytest.mark.parametrize(
+    "value",
+    [
+        '["*"\n]',
+        '[\n  "*"\n]',
+        '["search",\n  "*"\n]',
+        '[\n  "search",\n  "*",\n  "read"\n]',
+    ],
+)
+def test_multiline_flow_list_wildcards_keep_the_key_location(
+    newline: str, key: str, value: str
+) -> None:
+    content = f"{key}: {value}\n".replace("\n", newline)
+    findings = ea_module.analyze(content, "config.yaml", "yaml")
+    assert [finding.location.start_line for finding in findings if finding.rule_id == "EA1"] == [
+        1
+    ]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'tools:\n\n  "*"\n',
+        'tools: ordinary prose\n\n["*"]\n',
+        'tools: [\n  "grep --include=\'*\'"\n]\n',
+        'tools: [\n  {"name": "grep", "pattern": "*"}\n]\n',
+        'tools: [\n  ["search", "*"]\n]\n',
+        'tools: [\n  "unterminated\n  "*"\n]\n',
+    ],
+)
+def test_multiline_flow_lists_do_not_borrow_unrelated_wildcards(content: str) -> None:
+    findings = ea_module.analyze(content, "config.yaml", "yaml")
+    assert not any(finding.rule_id == "EA1" for finding in findings)
