@@ -41,6 +41,7 @@ from skillspector.artifacts import (
     normalized_security_view,
     security_text_views,
 )
+from skillspector.baseline_tokens import baseline_rule_scalar_roles
 from skillspector.inspection_ledger import (
     ParserCause,
     ParserCheck,
@@ -50,6 +51,7 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.javascript_tokens import JavaScriptTemplateSpans, assertion_template_shell_text
 from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
+from skillspector.json_tokens import JSONSourceOwnership, prepare_json_source
 from skillspector.logging_config import get_logger
 from skillspector.markdown_tokens import quoted_list_spans
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity, map_analyzer_findings
@@ -2888,12 +2890,19 @@ def _plain_quoted_assignment_word(parsed: _ShellCommandWord) -> bool:
     )
 
 
-def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
+def _destructive_command_words(
+    content: str, *, check_runtime: Callable[[], None] | None = None
+) -> Iterator[tuple[int, int]]:
+    if check_runtime is not None:
+        check_runtime()
+    runtime_kwargs = {"check_runtime": check_runtime} if check_runtime is not None else {}
     parsed_through = 0
     parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
     substitution_end_cache: dict[int, int | None] = {}
     backtick_end_cache: dict[int, int | None] = {}
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
+        if check_runtime is not None:
+            check_runtime()
         start = candidate.start()
         if start < parsed_through:
             continue
@@ -2910,6 +2919,7 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
                 parameter_end_cache,
                 substitution_end_cache,
                 backtick_end_cache,
+                **runtime_kwargs,
             )
             if parsed is not None and _plain_quoted_assignment_word(parsed):
                 parsed_through = max(parsed_through, parsed.end)
@@ -2936,6 +2946,7 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
             parameter_end_cache,
             substitution_end_cache,
             backtick_end_cache,
+            **runtime_kwargs,
         )
         if parsed is None:
             continue
@@ -3010,22 +3021,39 @@ def _literal_shell_command_spans(
     return {begin + start: begin + stop for start, stop in spans}
 
 
+def _destructive_command_effects(
+    content: str, check_runtime: Callable[[], None] | None = None
+) -> Iterator[tuple[int, int]]:
+    """Yield commands whose existing operand parser proves destructive effects."""
+    for command_start, body_start in _destructive_command_words(
+        content, check_runtime=check_runtime
+    ):
+        if check_runtime is not None:
+            check_runtime()
+        tokens, _, _ = _bounded_shell_tokens(
+            content, command_start, body_start, check_runtime=check_runtime
+        )
+        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
+            yield command_start, body_start
+
+
 def _has_destructive_command_string(
-    content: str, *, diagnostics: list[StaticParserDiagnostic] | None = None
+    content: str,
+    *,
+    diagnostics: list[StaticParserDiagnostic] | None = None,
+    check_runtime: Callable[[], None] | None = None,
 ) -> bool:
     """Return whether an executable string contains a proven destructive command."""
-    for command_start, body_start in _destructive_command_words(content):
-        tokens, _, _ = _bounded_shell_tokens(content, command_start, body_start)
-        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
-            _note_parser_diagnostic(
-                diagnostics,
-                ParserCause.UNSUPPORTED_SYNTAX,
-                ParserCheck.COMMAND_STRING_EFFECTS,
-                command_start,
-                len(content),
-                ParserUncheckedScope.COMMAND_STRING,
-            )
-            return True
+    for command_start, _ in _destructive_command_effects(content, check_runtime):
+        _note_parser_diagnostic(
+            diagnostics,
+            ParserCause.UNSUPPORTED_SYNTAX,
+            ParserCheck.COMMAND_STRING_EFFECTS,
+            command_start,
+            len(content),
+            ParserUncheckedScope.COMMAND_STRING,
+        )
+        return True
     return False
 
 
@@ -8385,6 +8413,52 @@ def _lexical_shell_has_counterevidence(
     return False
 
 
+def _destructive_command_candidates(
+    candidate_content: str, *, check_runtime: Callable[[], None] | None
+) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
+    seen_commands: set[tuple[int, int]] = set()
+    covered_until = 0
+    for command_start, body_start in _destructive_command_words(
+        candidate_content, check_runtime=check_runtime
+    ):
+        if check_runtime is not None:
+            check_runtime()
+        if command_start < covered_until:
+            continue
+        command_key = (command_start, body_start)
+        if command_key in seen_commands:
+            continue
+        seen_commands.add(command_key)
+        # Documentation is excluded regardless of the shell parse result. Apply
+        # that existing semantic gate first so large manuals do not pay for a
+        # character-by-character shell parse for every explanatory ``rm`` noun.
+        if _is_root_glob_documentation(candidate_content, command_start, body_start):
+            continue
+        tokens, command_end, exhausted = _bounded_shell_tokens(
+            candidate_content,
+            command_start,
+            body_start,
+            check_runtime=check_runtime,
+        )
+        # An unresolved quote cannot own and hide later executable candidates.
+        if not exhausted:
+            covered_until = max(covered_until, command_end)
+        command = candidate_content[command_start:command_end]
+        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
+            yield command_start, command_end, command, 0.9, False, None, None, None
+
+
+def _has_tm1_code_pattern_at(
+    content: str, start: int, end: int, check_runtime: Callable[[], None]
+) -> bool:
+    """Check existing raw patterns at one bounded, proven command position."""
+    for pattern, _ in TM1_CODE_PATTERNS:
+        check_runtime()
+        if re.compile(pattern, re.IGNORECASE | re.MULTILINE).match(content, start, end):
+            return True
+    return False
+
+
 def _option_command_end(
     content: str,
     start: int,
@@ -8554,9 +8628,11 @@ def _tm1_candidates(
     *,
     direct_shell_only: bool = False,
     shell_content: str | None = None,
-    check_runtime: Callable[[], None],
+    check_runtime: Callable[[], None] | None,
     file_type: str = "",
 ) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
+    runtime_check = check_runtime or (lambda: None)
+
     def direct_matches(
         pattern_index: int,
         pattern: str,
@@ -8626,7 +8702,7 @@ def _tm1_candidates(
     ):
         _markdown_shell_text(
             content,
-            check_runtime,
+            runtime_check,
             fence_boundaries=option_markdown_fences,
             fence_regions=option_fence_regions,
             inline_regions=option_host_ranges,
@@ -8656,7 +8732,7 @@ def _tm1_candidates(
             for match in _option_command_matches(
                 pattern,
                 content,
-                check_runtime,
+                runtime_check,
                 option_markdown_fences,
                 option_host_ranges,
                 option_powershell_ranges,
@@ -8700,40 +8776,11 @@ def _tm1_candidates(
                 None,
             )
 
-    def destructive_candidates(
-        candidate_content: str,
-    ) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
-        seen_commands: set[tuple[int, int]] = set()
-        covered_until = 0
-        for command_start, body_start in _destructive_command_words(candidate_content):
-            check_runtime()
-            if command_start < covered_until:
-                continue
-            command_key = (command_start, body_start)
-            if command_key in seen_commands:
-                continue
-            seen_commands.add(command_key)
-            # Documentation is excluded regardless of the shell parse result. Apply
-            # that existing semantic gate first so large manuals do not pay for a
-            # character-by-character shell parse for every explanatory ``rm`` noun.
-            if _is_root_glob_documentation(candidate_content, command_start, body_start):
-                continue
-            tokens, command_end, exhausted = _bounded_shell_tokens(
-                candidate_content,
-                command_start,
-                body_start,
-                check_runtime=check_runtime,
-            )
-            # An unresolved quote cannot own and hide later executable candidates.
-            if not exhausted:
-                covered_until = max(covered_until, command_end)
-            command = candidate_content[command_start:command_end]
-            if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
-                yield command_start, command_end, command, 0.9, False, None, None, None
-
-    destructive_iterators = [destructive_candidates(content)]
+    destructive_iterators = [_destructive_command_candidates(content, check_runtime=check_runtime)]
     if shell_content is not None and shell_content != content:
-        destructive_iterators.append(destructive_candidates(shell_content))
+        destructive_iterators.append(
+            _destructive_command_candidates(shell_content, check_runtime=check_runtime)
+        )
     yield from heapq.merge(
         direct_candidates(),
         ordinary_candidates(),
@@ -9694,7 +9741,9 @@ class _YamlParserAnalysis:
 
 def prepare_parser_analysis(
     content: str, file_type: str, check_runtime: Callable[[], None]
-) -> _YamlParserAnalysis | None:
+) -> JSONSourceOwnership | _YamlParserAnalysis | None:
+    if file_type == "json":
+        return prepare_json_source(content, check_runtime)
     if file_type != "yaml":
         return None
     spans = yaml_source_spans(content, check_runtime)
@@ -9790,10 +9839,10 @@ def has_bounded_parse_exhaustion(
     *,
     file_type: str = "shell",
     complete_context: bool = True,
-    python_import_check: Callable[[Callable[[], None]], bool] | None = None,
-    python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
     prepared_analysis: object | None = None,
     source_view: SecurityTextView | None = None,
+    python_import_check: Callable[[Callable[[], None]], bool] | None = None,
+    python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
 ) -> bool:
     """Return whether the bounded static parser leaves an expression unresolved."""
     return (
@@ -9802,10 +9851,10 @@ def has_bounded_parse_exhaustion(
             check_runtime,
             file_type=file_type,
             complete_context=complete_context,
-            python_import_check=python_import_check,
-            python_stdlib_check=python_stdlib_check,
             prepared_analysis=prepared_analysis,
             source_view=source_view,
+            python_import_check=python_import_check,
+            python_stdlib_check=python_stdlib_check,
         )
         is not None
     )
@@ -10809,10 +10858,10 @@ def bounded_parse_diagnostic(
     *,
     file_type: str = "shell",
     complete_context: bool = True,
-    python_import_check: Callable[[Callable[[], None]], bool] | None = None,
-    python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
     prepared_analysis: object | None = None,
     source_view: SecurityTextView | None = None,
+    python_import_check: Callable[[Callable[[], None]], bool] | None = None,
+    python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
 ) -> StaticParserDiagnostic | None:
     """Explain the existing first incomplete parser scope without reparsing it."""
     if file_type == "markdown":
@@ -10824,6 +10873,8 @@ def bounded_parse_diagnostic(
         check_runtime,
         file_type=file_type,
         complete_context=complete_context,
+        prepared_analysis=prepared_analysis,
+        source_view=source_view,
         python_import_check=python_import_check,
         python_stdlib_check=python_stdlib_check,
     )
@@ -10838,7 +10889,9 @@ def bounded_parse_diagnostic(
         mapped_source = isinstance(
             prepared_analysis, _YamlParserAnalysis
         ) and prepared_analysis.owns(content, source_view, check_runtime)
-        scalar_roles = semgrep_rule_scalar_roles(content, check_runtime)
+        scalar_roles = semgrep_rule_scalar_roles(
+            content, check_runtime
+        ) or baseline_rule_scalar_roles(content, check_runtime)
         for scalar in yaml_spans.scalars:
             check_runtime()
             role = scalar_roles.get(scalar.start)
@@ -10912,6 +10965,8 @@ def _has_bounded_parse_exhaustion(
     file_type: str,
     complete_context: bool = True,
     word_apostrophes: bool = False,
+    prepared_analysis: object | None = None,
+    source_view: SecurityTextView | None = None,
     python_import_check: Callable[[Callable[[], None]], bool] | None = None,
     python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
     native_argument_spans: tuple[tuple[int, int], ...] = (),
@@ -10962,10 +11017,62 @@ def _has_bounded_parse_exhaustion(
         diagnostic = javascript_source.unresolved_execution_diagnostic()
         if diagnostic is not None:
             return diagnostic
-    if file_type in {"json", "markdown"} and complete_context:
+    json_projection = None
+    if file_type == "json":
+        if prepared_analysis is None and complete_context:
+            prepared_analysis = prepare_json_source(content, check_runtime)
+        if isinstance(prepared_analysis, JSONSourceOwnership):
+            view = source_view or SecurityTextView("raw", content)
+            if view.text == content:
+                json_projection = prepared_analysis.project(view, check_runtime)
+    if json_projection is not None:
+        json_strings = list(json_projection.strings)
+        structural_quote_closers = json_projection.closers
+        structural_quote_openers = json_projection.openers
+    elif file_type in {"json", "markdown"} and complete_context:
         json_strings = validated_json_string_spans(content, check_runtime)
         structural_quote_closers = {end - 1 for _, end in json_strings}
         structural_quote_openers = {start for start, _ in json_strings}
+    if json_strings and (source_view is None or source_view.name == "raw"):
+        # The original finding producer is the authority for source provenance.
+        # Both iterators are ordered; retain only one candidate, not a per-file
+        # set or repeated scans of every suffix. Finding construction stays raw.
+        reported_starts = (
+            candidate[0]
+            for candidate in _destructive_command_candidates(content, check_runtime=check_runtime)
+        )
+        reported_start: int | None = -1
+        for start, end in json_strings:
+            check_runtime()
+            for command_start, body_start in _destructive_command_effects(
+                content[start + 1 : end - 1], check_runtime
+            ):
+                absolute_start = start + 1 + command_start
+                if _is_root_glob_documentation(content, absolute_start, start + 1 + body_start):
+                    continue
+                if _has_tm1_code_pattern_at(
+                    content,
+                    absolute_start,
+                    min(end - 1, start + 1 + body_start + _ROOT_GLOB_COMMAND_CHARS),
+                    check_runtime,
+                ):
+                    continue
+                while reported_start is not None and reported_start < absolute_start:
+                    reported_start = next(reported_starts, None)
+                if reported_start == absolute_start:
+                    continue
+                # Structural ownership alone cannot establish provenance for
+                # an embedded command the raw analyzer cannot report. Derived
+                # marker views already carry their reconstructed findings.
+                return StaticParserDiagnostic(
+                    ParserCause.UNSUPPORTED_SYNTAX,
+                    ParserCheck.COMMAND_STRING_EFFECTS,
+                    start,
+                    end,
+                    ParserUncheckedScope.COMMAND_STRING,
+                    location_precision="enclosing_expression",
+                )
+    if json_strings:
         # Raw substitution delimiters must survive Markdown's inline projection.
         json_operand_spans = [
             (start, end)
@@ -11048,6 +11155,10 @@ def _has_bounded_parse_exhaustion(
     )
     if file_type == "python" and complete_context:
         shell_word_content = python_browser_template_shell_text(content, check_runtime)
+    if json_projection is not None:
+        # Only validated host punctuation terminates command words. Every byte
+        # inside strings stays in the parser and original finding views remain raw.
+        shell_word_content = json_projection.text
     quote_limits = None
     if file_type == "shell" and complete_context:
         # A closing delimiter in proven shell source cannot open a new
@@ -11451,7 +11562,7 @@ def analyze(
         content,
         direct_shell_only=_direct_shell_only,
         shell_content=shell_content,
-        check_runtime=runtime_check,
+        check_runtime=check_runtime,
         file_type=file_type,
     ):
         runtime_check()

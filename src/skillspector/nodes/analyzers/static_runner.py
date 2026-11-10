@@ -73,9 +73,12 @@ from skillspector.python_ast import (
 from skillspector.python_import_bounds import PythonImportBounds
 from skillspector.python_tokens import PythonStringClosers
 from skillspector.security_reconstruction import (
+    _MAX_JSON_QUOTE_CONTAINER_CHARS,
     MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
     MAX_MARKER_LOOKAHEAD_CHARS,
+    StructuredStringClosers,
     build_declared_marker_views,
+    json_quote_capacity_limit,
 )
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
 from skillspector.surface import COMMENTS, infer_surface
@@ -2186,12 +2189,12 @@ def _restore_source_lines(
 
 
 def _window_string_closer(
-    python_strings: PythonStringClosers, window_start: int
+    source_closer: Callable[[int], bool], window_start: int
 ) -> Callable[[int], bool]:
     """Answer string-closer queries in one window's source coordinates."""
 
     def closes_string(offset: int) -> bool:
-        return python_strings.closes_string(window_start + offset)
+        return source_closer(window_start + offset)
 
     return closes_string
 
@@ -2224,11 +2227,12 @@ def _scan_declared_marker_views(
     python_source: bool,
     defer_projected_output_limit: bool,
     complete_context: bool,
+    limited_source_offsets: list[int],
     prepared_analyses: Mapping[int, object] | None = None,
+    parser_analyses: Mapping[int, object] | None = None,
     parser_diagnostics: list[StaticParserDiagnostic] | None = None,
     python_import_bounds: PythonImportBounds | None = None,
     parser_file_type: str | None = None,
-    parser_analyses: Mapping[int, object] | None = None,
 ) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
@@ -2279,11 +2283,32 @@ def _scan_declared_marker_views(
             )
         return True
 
-    # A complete Python module proves which quotes close its string literals.
-    # The proof covers the whole artifact, so it holds in every window. It is
-    # computed only when a loose quoted directive header reaches a quote.
-    python_strings = (
-        PythonStringClosers(content, check_runtime) if bounded_file_type == "python" else None
+    # Structural delimiter proof covers the complete artifact, so windows do
+    # not mistake a literal closer for a new marker opener. Compute it lazily.
+    file_type = parser_file_type or _infer_file_type(path)
+    if parser_file_type is None and path.lower().endswith((".html", ".htm")):
+        file_type = "html"
+
+    def shell_quote_closers() -> set[int]:
+        # Reuse the complete-source lexical proof. Unsupported source returns
+        # no closers; the foundational reconstruction layer needs no analyzer import.
+        from skillspector.nodes.analyzers.static_patterns_tool_misuse import (
+            _shell_quoted_candidate_limits,
+        )
+
+        closers: set[int] = set()
+        _shell_quoted_candidate_limits(content, check_runtime, quote_closers=closers)
+        return closers
+
+    source_strings = (
+        PythonStringClosers(content, check_runtime)
+        if file_type == "python"
+        else StructuredStringClosers(
+            content,
+            file_type,
+            check_runtime,
+            shell_quote_closers=shell_quote_closers if file_type == "shell" else None,
+        )
     )
 
     for owned_start, raw_start in zip(owned_starts, raw_starts, strict=True):
@@ -2315,8 +2340,8 @@ def _scan_declared_marker_views(
         # never occurs for Python, but it would not map onto module offsets.
         string_closer = (
             None
-            if python_strings is None or context_prefix
-            else _window_string_closer(python_strings, raw_start)
+            if context_prefix
+            else _window_string_closer(source_strings.closes_string, raw_start)
         )
         for full_view in full_views:
             full_view_limited = False
@@ -2329,6 +2354,13 @@ def _scan_declared_marker_views(
                 validated_string_closer=string_closer,
             )
             projection_limited = projection_limited or reconstruction.limited
+            if (
+                reconstruction.first_limited_source_offset is not None
+                and not limited_source_offsets
+            ):
+                limited_source_offsets.append(
+                    raw_start + reconstruction.first_limited_source_offset
+                )
             for marker_view in reconstruction.views:
                 marker_offsets = marker_view.source_offsets
                 if not marker_offsets:
@@ -2668,6 +2700,7 @@ def _scan_all_views_with_parser_diagnostics(
         if pattern_modules
         else None
     )
+    limited_source_offsets: list[int] = []
     modules_for_windows = lexical_modules or ([] if ast_modules else pattern_modules)
     bounded_parse_limited = False
     marker_owned_starts: tuple[int, ...] = ()
@@ -2777,7 +2810,7 @@ def _scan_all_views_with_parser_diagnostics(
                 if prepare_parser is not None:
                     parser_analyses[id(module)] = prepare_parser(
                         content=content,
-                        file_type=_infer_file_type(path),
+                        file_type="json" if _oms_projected else _infer_file_type(path),
                         check_runtime=finding_budget.check_runtime,
                     )
                     finding_budget.check_runtime()
@@ -2812,10 +2845,11 @@ def _scan_all_views_with_parser_diagnostics(
                 defer_projected_output_limit=coalesce is not None,
                 complete_context=whole_artifact_window,
                 prepared_analyses=prepared_analyses,
+                parser_analyses=parser_analyses,
                 parser_diagnostics=parser_diagnostics,
                 python_import_bounds=python_import_bounds,
+                limited_source_offsets=limited_source_offsets,
                 parser_file_type="json" if _oms_projected else None,
-                parser_analyses=parser_analyses,
             )
             bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
@@ -3301,6 +3335,27 @@ def _scan_all_views_with_parser_diagnostics(
             deferred_output_limit.reason,
             metrics,
         )
+    if limited_source_offsets and not (python_syntax_error or bounded_parse_limited):
+        try:
+            capacity_span = json_quote_capacity_limit(
+                content,
+                finding_budget.check_runtime,
+                containing_offset=limited_source_offsets[0],
+            )
+        except _StaticResourceLimitError as exc:
+            return deduplicated, exc.reason, exc.metrics
+        if capacity_span is not None:
+            start, end = capacity_span
+            return (
+                deduplicated,
+                LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT,
+                {
+                    "observed_characters": end - start,
+                    "limit_characters": _MAX_JSON_QUOTE_CONTAINER_CHARS,
+                    "source_start_offset": start,
+                    "source_end_offset": end,
+                },
+            )
     return (
         deduplicated,
         (
@@ -3886,10 +3941,18 @@ def run_static_patterns_with_ledger(
                     emitted_finding_ids=[finding.finding_id for finding in path_findings],
                     parser_diagnostic=_public_parser_diagnostic(content, path_parser_diagnostic),
                     observed_characters=(
-                        len(content) if partial_reason is LedgerReason.SIZE_LIMIT else None
+                        int(resource_metrics["observed_characters"])
+                        if partial_reason is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT
+                        else len(content)
+                        if partial_reason is LedgerReason.SIZE_LIMIT
+                        else None
                     ),
                     limit_characters=(
-                        MAX_FILE_CHARS if partial_reason is LedgerReason.SIZE_LIMIT else None
+                        int(resource_metrics["limit_characters"])
+                        if partial_reason is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT
+                        else MAX_FILE_CHARS
+                        if partial_reason is LedgerReason.SIZE_LIMIT
+                        else None
                     ),
                     observed_findings=(
                         int(resource_metrics.get("observed_findings", len(path_findings)))
@@ -3916,6 +3979,12 @@ def run_static_patterns_with_ledger(
                         else None
                     ),
                 )
+                if partial_reason is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT:
+                    # Keep the file-level work identity; the diagnostic span is
+                    # not a separately planned inspection range. Finalization
+                    # projects these numeric facts into a safe public message.
+                    event["source_start_offset"] = int(resource_metrics["source_start_offset"])
+                    event["source_end_offset"] = int(resource_metrics["source_end_offset"])
         events.append(event)
 
     return {
