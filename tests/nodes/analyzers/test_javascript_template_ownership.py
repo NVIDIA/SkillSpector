@@ -276,6 +276,20 @@ def test_uncertain_parameter_calls_keep_template_files_partial(source: str) -> N
             id="out-of-scope-regex-receiver-exec",
         ),
         pytest.param(
+            "function check(handler) {\n"
+            "  function patch() { re['exec'] = handler; }\n"
+            "  const re = /x/;\n"
+            "  patch();\n"
+            "  re.exec(`${command}`);\n"
+            "}\n",
+            id="closure-mutated-regex-before-declaration-exec",
+        ),
+        pytest.param(
+            "{ const re = /x/; mutate(re, handler); }\n"
+            "{ const re = /y/; re.exec(`${command}`); }\n",
+            id="duplicate-regex-binding-escape-exec",
+        ),
+        pytest.param(
             "function a() { const re = /x/; re.test(t); }\n"
             "function b() { re.exec(`${command}`); }\n",
             id="sibling-function-regex-receiver-exec",

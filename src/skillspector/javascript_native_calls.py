@@ -467,7 +467,7 @@ def _ordinary_native_calls(
     references: dict[str, list[Node]] = {}
     bindings: dict[str, tuple[Node, str, str, bool]] = {}
     regex_calls: list[Node] = []
-    regex_bindings: dict[str, Node] = {}
+    regex_bindings: dict[str, list[Node]] = {}
     intrinsic_override = False
     module_unproven = False
     imports: dict[str, int] = {}
@@ -636,7 +636,7 @@ def _ordinary_native_calls(
                 and declaration.parent is not None
                 and declaration.parent.type in {"program", "statement_block"}
             ):
-                regex_bindings[program.text(binding)] = binding
+                regex_bindings.setdefault(program.text(binding), []).append(binding)
             else:
                 regex_constructors.append(node)
         if node.type == "regex":
@@ -668,7 +668,7 @@ def _ordinary_native_calls(
                     and declaration.parent is not None
                     and declaration.parent.type in {"program", "statement_block"}
                 ):
-                    regex_bindings[program.text(binding)] = binding
+                    regex_bindings.setdefault(program.text(binding), []).append(binding)
                 else:
                     intrinsic_override = True
                     regexp_prototype_unproven = True
@@ -746,64 +746,66 @@ def _ordinary_native_calls(
                     else:
                         module_unproven = True
             pending.extend(specifier.named_children)
-    for name, binding in regex_bindings.items():
+    for name, binding_nodes in regex_bindings.items():
         # The proof belongs to one binding, so only references that can
         # resolve to it count. A const inside a function body must not
         # prove an outer or sibling receiver with the same name: the
         # final `re` in `function local() { const re = /x/; re.test(t); }
         # re.exec(...)` is outside that binding's scope, so it is skipped
-        # here and stays unowned. References before the declaration are
-        # refused too, matching the scalar proof's declaration-end rule.
-        named_calls: list[Node] = []
-        declarator = binding.parent
-        declaration = None if declarator is None else declarator.parent
-        scope = None if declaration is None else declaration.parent
-        for reference in references[name]:
-            check_runtime()
-            if reference == binding:
-                continue
-            if (
-                scope is None
-                or declarator is None
-                or not (
-                    scope.start_byte <= reference.start_byte < scope.end_byte
-                    and reference.start_byte > declarator.end_byte
-                )
-            ):
-                continue
-            member = reference.parent
-            call = None if member is None else member.parent
-            method = None if member is None else _callable_member(program, member)
-            if (
-                member is not None
-                and member.type == "member_expression"
-                and member.child_by_field_name("object") == reference
-                and method == "lastIndex"
-                and call is not None
-                and call.type == "assignment_expression"
-                and call.child_by_field_name("left") == member
-                and (value := call.child_by_field_name("right")) is not None
-                and value.type == "number"
-            ):
-                continue
-            if not (
-                member is not None
-                and member.type == "member_expression"
-                and member.child_by_field_name("object") == reference
-                and method in {"test", "exec"}
-                and call is not None
-                and call.type == "call_expression"
-                and call.child_by_field_name("function") == member
-                and (arguments := call.child_by_field_name("arguments")) is not None
-                and arguments.type != "template_string"
-            ):
-                intrinsic_override = True
-                regexp_prototype_unproven = True
-                break
-            if method == "exec":
-                named_calls.append(member)
-        else:
-            local_regex_calls.extend(named_calls)
+        # here and stays unowned. Every same-named binding is validated:
+        # a later binding must not overwrite an earlier one, or an escape
+        # of the earlier binding would go unchecked. References before the
+        # declaration are validated too, matching the old loop: a closure
+        # defined before the declaration can run after initialization, so
+        # a mutation or escape there refuses the proof like any other use.
+        for binding in binding_nodes:
+            named_calls: list[Node] = []
+            declarator = binding.parent
+            declaration = None if declarator is None else declarator.parent
+            scope = None if declaration is None else declaration.parent
+            for reference in references[name]:
+                check_runtime()
+                if reference == binding:
+                    continue
+                if (
+                    scope is None
+                    or declarator is None
+                    or not (scope.start_byte <= reference.start_byte < scope.end_byte)
+                ):
+                    continue
+                member = reference.parent
+                call = None if member is None else member.parent
+                method = None if member is None else _callable_member(program, member)
+                if (
+                    member is not None
+                    and member.type == "member_expression"
+                    and member.child_by_field_name("object") == reference
+                    and method == "lastIndex"
+                    and call is not None
+                    and call.type == "assignment_expression"
+                    and call.child_by_field_name("left") == member
+                    and (value := call.child_by_field_name("right")) is not None
+                    and value.type == "number"
+                ):
+                    continue
+                if not (
+                    member is not None
+                    and member.type == "member_expression"
+                    and member.child_by_field_name("object") == reference
+                    and method in {"test", "exec"}
+                    and call is not None
+                    and call.type == "call_expression"
+                    and call.child_by_field_name("function") == member
+                    and (arguments := call.child_by_field_name("arguments")) is not None
+                    and arguments.type != "template_string"
+                ):
+                    intrinsic_override = True
+                    regexp_prototype_unproven = True
+                    break
+                if method == "exec":
+                    named_calls.append(member)
+            else:
+                local_regex_calls.extend(named_calls)
     for reference in references.get("Object", ()):
         parent = reference.parent
         if (
