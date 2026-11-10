@@ -359,11 +359,32 @@ class TestExcessiveAgency:
             "model: claude-sonnet-4-6",
             "python -m claude_tools",
             "cmd --model custom-local-model",
+            "  -m, --model           Claude model to use (default: claude-3-7-sonnet-20250219)",
+            "```\n  -m, --model  Claude model to use (default: claude-3-7-sonnet-20250219)\n```",
+            "  --model, -m   claude-sonnet-4-6 (default)",
+            "  -m  --model   Claude model to use",
+            "Options for `evaluation.py`\n```\n  -m, --model  Claude model to use\n```",
         ],
     )
     def test_ea5_non_actionable_prose_and_body_keys_are_not_flagged(self, content: str) -> None:
         findings = ea_mod.analyze(content, "SKILL.md", "markdown")
         assert not any(finding.rule_id == "EA5" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "continuation",
+        [
+            pytest.param("\\", id="posix_backslash"),
+            pytest.param("`", id="powershell_backtick"),
+            pytest.param("^", id="cmd_caret"),
+        ],
+    )
+    def test_ea5_option_led_continuation_line_is_still_a_command(self, continuation: str) -> None:
+        content = f"aider {continuation}\n  -v --model claude-3-7-sonnet"
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        ea5 = [finding for finding in findings if finding.rule_id == "EA5"]
+        assert len(ea5) == 1
+        assert ea5[0].severity == Severity.HIGH
+        assert ea5[0].location.start_line == 2
 
     def test_ea5_shell_fence_is_actionable(self) -> None:
         content = "```shell\ncodex exec 'Fix the tests'\n```"
@@ -1764,6 +1785,31 @@ guidance = "Set the flag to --no-verify to skip deterministic result verificatio
                 "python",
                 id="rmtree_documentation_placeholder",
             ),
+            pytest.param(
+                "GET    /api/markets/:id             # Get single resource\n"
+                "DELETE /api/markets/:id             # Delete resource",
+                "SKILL.md",
+                "markdown",
+                id="rest_route_table_delete",
+            ),
+            pytest.param(
+                "| DELETE /api/markets/:id | Delete resource |",
+                "SKILL.md",
+                "markdown",
+                id="markdown_table_delete_route",
+            ),
+            pytest.param(
+                "- DELETE /api/v1/users/:id",
+                "SKILL.md",
+                "markdown",
+                id="list_item_delete_route",
+            ),
+            pytest.param(
+                "`DELETE /api/items/{item_id}`",
+                "SKILL.md",
+                "markdown",
+                id="backticked_delete_route",
+            ),
         ],
     )
     def test_tm1_false_positive_not_flagged(
@@ -1778,6 +1824,33 @@ guidance = "Set the flag to --no-verify to skip deterministic result verificatio
             pytest.param('rm "/etc/passwd"', "danger.sh", "shell", id="actual_rm_command"),
             pytest.param(
                 "delete /var/log/important.log", "danger.sh", "shell", id="actual_delete_path"
+            ),
+            pytest.param(
+                "DELETE /etc/shadow", "danger.sh", "shell", id="uppercase_delete_system_root"
+            ),
+            pytest.param(
+                "DELETE /Users/alice/.ssh/id_rsa",
+                "danger.sh",
+                "shell",
+                id="uppercase_delete_macos_users_root",
+            ),
+            pytest.param(
+                "DELETE /Volumes/data/private.txt",
+                "danger.sh",
+                "shell",
+                id="uppercase_delete_macos_volumes_root",
+            ),
+            pytest.param(
+                "| DELETE /Volumes/data/private.txt | Danger |",
+                "SKILL.md",
+                "markdown",
+                id="markdown_table_delete_macos_volumes_root",
+            ),
+            pytest.param(
+                "| DELETE /Users/alice/.ssh/id_rsa | Danger |",
+                "SKILL.md",
+                "markdown",
+                id="markdown_table_delete_macos_users_root",
             ),
             pytest.param('shutil.rmtree("/var/data")', "cleanup.py", "python", id="shutil_rmtree"),
             pytest.param('rm "$ROOT/path"', "cleanup.sh", "shell", id="rm_variable_path"),
@@ -3949,6 +4022,29 @@ class TestSupplyChainHelpers:
         assert "requests" in names
         assert "numpy" in names
         assert "flask" in names
+
+    def test_extract_packages_requirements_strips_leading_bom(self) -> None:
+        # Regression: a UTF-8 BOM at the start of requirements.txt used to
+        # make the first requirement unparseable, silently dropping it from
+        # SC4/OSV analysis (NVIDIA/SkillSpector #962).
+        content = "\ufeffjinja2==2.4.1\nrequests==2.32.0\n"
+        packages = sc_mod._extract_packages_from_requirements(content)
+        assert [(name, version, line) for name, version, line in packages] == [
+            ("jinja2", "2.4.1", 1),
+            ("requests", "2.32.0", 2),
+        ]
+
+    def test_extract_packages_requirements_strips_repeated_leading_bom(self) -> None:
+        # Repeated-prefix regression (review on #963): multiple leading
+        # BOMs must still extract the packages with correct line numbers,
+        # and the strip must stay a single linear prefix operation rather
+        # than a per-character slicing loop.
+        content = "\ufeff\ufeff\ufeffjinja2==2.4.1\nrequests==2.32.0\n"
+        packages = sc_mod._extract_packages_from_requirements(content)
+        assert [(name, version, line) for name, version, line in packages] == [
+            ("jinja2", "2.4.1", 1),
+            ("requests", "2.32.0", 2),
+        ]
 
     def test_pinned_version_only_accepts_exact_concrete_pins(self) -> None:
         # A vulnerability lookup asks "is THIS release affected?", which is only meaningful

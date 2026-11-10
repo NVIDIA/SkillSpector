@@ -23,7 +23,10 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import os
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 from time import monotonic
@@ -191,7 +194,7 @@ def test_build_context_starts_and_returns_default_graph_wide_budget(tmp_path: Pa
 
     budget = result["workflow_resource_budget"]
     assert isinstance(budget, WorkflowResourceBudget)
-    assert DEFAULT_MAX_WORKFLOW_SECONDS == 600.0
+    assert DEFAULT_MAX_WORKFLOW_SECONDS == 1080.0
     assert budget.max_seconds == MAX_WORKFLOW_SECONDS
     assert budget.max_bytes == MAX_WORKFLOW_BYTES == 64 * 1024 * 1024
     assert budget.max_artifacts == MAX_WORKFLOW_ARTIFACTS == 10_000
@@ -208,12 +211,45 @@ def test_build_context_starts_and_returns_default_graph_wide_budget(tmp_path: Pa
         ("0.5", 0.5),
         ("0", DEFAULT_MAX_WORKFLOW_SECONDS),
         ("-1", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("", DEFAULT_MAX_WORKFLOW_SECONDS),
         ("nan", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("inf", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("-inf", DEFAULT_MAX_WORKFLOW_SECONDS),
         ("not-a-number", DEFAULT_MAX_WORKFLOW_SECONDS),
     ],
 )
 def test_workflow_budget_seconds_environment_parsing(value: str | None, expected: float) -> None:
     assert _workflow_max_seconds_from_environment(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, 1080.0), ("0.5", 0.5), ("1800", 1800.0), ("nan", 1080.0)],
+)
+def test_workflow_environment_reaches_graph_and_cli_budgets(
+    value: str | None, expected: float
+) -> None:
+    env = os.environ.copy()
+    name = "SKILLSPECTOR_MAX_WORKFLOW_SECONDS"
+    env.pop(name, None)
+    if value is not None:
+        env[name] = value
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json; from skillspector.state import WorkflowResourceBudget; "
+            "from skillspector.cli import _TransitiveBudget; "
+            "print(json.dumps([WorkflowResourceBudget().max_seconds, "
+            "_TransitiveBudget().max_seconds]))",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    assert json.loads(result.stdout) == [expected, expected]
 
 
 def test_build_context_reuses_supplied_stricter_transitive_budget(tmp_path: Path) -> None:
@@ -874,6 +910,106 @@ def test_build_context_model_config_matches_openai_fallback(
     result = build_context({"skill_path": str(tmp_path)})
 
     assert result["model_config"]["default"] == OpenAIProvider.DEFAULT_MODEL
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_build_context_prepares_transport_only_for_enabled_ai(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports",
+        lambda: calls.append("prepare"),
+    )
+
+    result = build_context({"skill_path": str(tmp_path), "use_llm": enabled})
+
+    assert calls == (["prepare"] if enabled else [])
+    assert result["file_cache"]["SKILL.md"] == "# Example\n"
+    assert bool(result["model_config"]) is enabled
+
+
+def test_build_context_skips_transport_preparation_after_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    budget = WorkflowResourceBudget(max_seconds=0.0)
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports",
+        lambda: pytest.fail("Expired work must not prepare a transport"),
+    )
+
+    result = build_context({"skill_path": str(tmp_path), "workflow_resource_budget": budget})
+
+    assert result["workflow_resource_budget"] is budget
+    assert any(
+        event["reason_code"] == LedgerReason.RUNTIME_LIMIT for event in result["inspection_ledger"]
+    )
+
+
+def test_build_context_transport_preparation_keeps_shared_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    budget = WorkflowResourceBudget(max_seconds=30.0)
+    observed_starts: list[float] = []
+    caplog.set_level(logging.DEBUG, logger="skillspector.nodes.build_context")
+
+    def expire_during_preparation() -> None:
+        assert budget.started_at is not None
+        observed_starts.append(budget.started_at)
+        budget.started_at = monotonic() - budget.max_seconds - 1
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports", expire_during_preparation
+    )
+    result = build_context({"skill_path": str(tmp_path), "workflow_resource_budget": budget})
+
+    assert len(observed_starts) == 1
+    assert result["workflow_resource_budget"] is budget
+    assert budget.remaining_seconds() == 0
+    assert budget.started_at < observed_starts[0]
+    assert result["file_cache"]["SKILL.md"] == "# Example\n"
+    assert "Workflow deadline reached while preparing AI transport imports" in caplog.text
+
+
+def test_build_context_transport_import_failure_preserves_normal_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    caplog.set_level(logging.DEBUG, logger="skillspector.nodes.build_context")
+
+    def failed_preparation() -> None:
+        raise ImportError("private-error-detail")
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports", failed_preparation
+    )
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["model_config"]
+    assert result["file_cache"]["SKILL.md"] == "# Example\n"
+    assert not any(
+        event["reason_code"] == LedgerReason.RUNTIME_LIMIT for event in result["inspection_ledger"]
+    )
+    assert "Could not prepare AI transport imports (ImportError)" in caplog.text
+    assert "private-error-detail" not in caplog.text
+
+
+def test_build_context_transport_preparation_preserves_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+
+    def cancelled_preparation() -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports", cancelled_preparation
+    )
+    with pytest.raises(KeyboardInterrupt):
+        build_context({"skill_path": str(tmp_path)})
 
 
 def test_build_context_inspects_unverified_root_oms_signature(
@@ -1780,7 +1916,7 @@ def test_excluded_artifact_probe_checks_deadline_after_open(
     assert metadata[0]["excluded_inspection_incomplete"] is True
     assert metadata[0]["excluded_from_analysis"] is True
     assert archive_cache == {}
-    assert input_bytes == len("ordinary")
+    assert input_bytes == len("ordinary metadata\n")
     assert len(inventory) == 1
     assert inventory[0]["path"] == "node_modules/README"
     assert inventory[0]["disposition"] == ArtifactDisposition.PARTIAL

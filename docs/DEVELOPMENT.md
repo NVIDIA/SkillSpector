@@ -20,25 +20,22 @@ This guide helps developers understand, run, test, and extend the LangGraph-base
 
 ## 2. Prerequisites and setup
 
-**To get started:** create and activate a virtual environment, then install. All Makefile targets assume the venv is already created and activated.
+Follow the [README development setup](../README.md#setup) for the canonical
+prerequisites, clone, virtual environment, and dependency-installation recipe.
+The supported Python range is defined in [pyproject.toml](../pyproject.toml).
+All Makefile targets assume the virtual environment is already created and activated.
 
-```bash
-# Create venv (use either uv or Python)
-uv venv .venv
-# or: python3 -m venv .venv
+To observe this workflow with a coding agent, use the
+[contributor onboarding check](validation/CONTRIBUTOR_ONBOARDING.md), which
+records setup and check results separately from full PR validation.
 
-source .venv/bin/activate   # On Windows: .venv\Scripts\activate
-
-make install-dev
-```
-
-- **Python**: 3.12+ (see [pyproject.toml](../pyproject.toml)). `make install` and `make install-dev` use **uv** if available (`uv sync` / `uv sync --all-extras`), otherwise **pip** (`pip install -e .` / `pip install -e ".[dev]"`). You must create and activate the virtual environment yourself before running any make target.
+- **Installation**: `make install` and `make install-dev` use **uv** if available (`uv sync` / `uv sync --all-extras`), otherwise **pip** (`pip install -e .` / `pip install -e ".[dev]"`).
 - **Environment**: Optional `.env` in the project root. The LangGraph dev server loads it (see [langgraph.json](../langgraph.json) `"env": ".env"`). Key variables:
   - **`SKILLSPECTOR_PROVIDER`**: Selects the active LLM provider — `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `gemini_cli`, or `opencode_cli`. Defaults to `nv_build` when unset.
   - **Provider credential**: depends on the active provider. Hosted providers use the matching variables in [.env.example](../.env.example); Ollama and CLI providers do not require an API key. See [providers/](../src/skillspector/providers/).
   - **`OPENAI_BASE_URL`**: Override the OpenAI endpoint (e.g. point at Ollama).
   - **`SKILLSPECTOR_MODEL`**: Override default model; see [constants.py](../src/skillspector/constants.py). OpenAI retains `gpt-5.4`; Anthropic retains `claude-opus-4-6` with `claude-sonnet-4-6` for `meta_analyzer`. Sol and Claude 5.5 remain opt-in pending the [live scanner acceptance described in the README](../README.md#llm-analysis).
-  - **`SKILLSPECTOR_TEMPERATURE`**: Optional hosted-provider sampling temperature from `0` to `1`. `gpt-6.1-sol` rejects every explicit value. `claude-opus-5-5` and `claude-sonnet-5-5` accept only `1.0` on the native Anthropic endpoint; other routes reject every explicit value. Unsupported settings on active LLM slots stop the scan before analysis. Static scans skip provider initialization and control validation.
+  - **`SKILLSPECTOR_TEMPERATURE`**: Optional hosted-provider sampling temperature from `0` to `1`. `gpt-6.1-sol` rejects every explicit value. Claude Opus 4.7 and later, Sonnet 5, Fable 5, Mythos 5 and Haiku 5 models (for example `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-5-5`) accept only `1.0` on the native Anthropic endpoint; other routes reject every explicit value. Unsupported settings on active LLM slots stop the scan before analysis. Static scans skip provider initialization and control validation.
   - **`SKILLSPECTOR_SEED`**: Optional integer seed for OpenAI-compatible and Azure OpenAI providers.
 
 - **Logging**: Internal/operational logging uses the stdlib `logging` module. User-facing output (report body, errors, progress) uses Rich `console.print()`.
@@ -58,10 +55,15 @@ All targets assume the virtual environment is **already created and activated**.
 | `make install` | Install the package in production mode |
 | `make install-dev` | Install the package with development dependencies |
 | `make langgraph-dev` | Run LangGraph dev server (opens Studio at `LANGGRAPH_STUDIO_URL`) |
-| `make test` | Run tests |
-| `make test-cov` | Run tests with coverage report (HTML + terminal) |
-| `make lint` | Run linters (ruff only) |
-| `make format` | Format code with ruff (check + fix, then format) |
+| `make test-unit` | Initial test selection: excludes `integration` and `provider` markers |
+| `make test-integration` | Full-graph integration tests; may call a configured LLM provider |
+| `make test` | Run `test-unit` and `test-integration`; the current contributor submission requirement |
+| `make test-provider` | Live provider requests; see [provider prerequisites](#live-provider-tests) |
+| `make test-cov` | The `test-unit` marker selection with coverage (HTML + terminal) |
+| `make test-ci` | The `test-unit` marker selection with coverage (XML + terminal) |
+| `make lint` | Check lint with Ruff |
+| `make format-check` | Check formatting without editing files |
+| `make format` | Apply Ruff lint fixes and formatting in place |
 | `make clean` | Remove build artifacts and cache files |
 | `make build` | Build the package |
 
@@ -221,7 +223,9 @@ Optional state keys: `mode`, `model_config`, `output_format`, `use_llm`. The fin
   - [tests/integration/](../tests/integration/): `test_graph.py`, `test_graph_scanner.py`, `test_meta_analyzer_use_llm.py`
   - [tests/nodes/](../tests/nodes/): `test_build_context.py`, `test_resolve_input.py`, `test_report.py`, `test_llm_analyzer_base.py`
   - [tests/nodes/analyzers/](../tests/nodes/analyzers/): analyzer tests (`test_registry.py`, `test_static_patterns.py`)
-- **Commands**: `make test`, `make test-cov`.
+- **Initial checks**: `make test-unit`, `make lint`, and `make format-check` after following the [canonical setup](../README.md#setup). The unit target excludes tests marked `integration` or `provider`; that selection is not the entire CI gate or a guarantee of network isolation.
+- **Full contributor check**: `make test` runs unit and integration tests, as required by [CONTRIBUTING.md](../CONTRIBUTING.md#how-to-contribute). `make test-integration` invokes the full graph and may send test content to a configured LLM provider; review the environment and provider prerequisites before running it. The initial unit selection does not replace this requirement.
+- **Coverage and live checks**: `make test-cov` and `make test-ci` use the same marker exclusions as `make test-unit`. `make test-provider` makes live requests and needs the corresponding [provider configuration](#live-provider-tests).
 - **Key tests**: [test_graph.py](../tests/integration/test_graph.py) invokes the graph and asserts `findings`, `sarif_report`, `risk_score`, `report_body`; [test_input_handler.py](../tests/unit/test_input_handler.py) covers directory, zip, and single-file resolution; [test_resolve_input.py](../tests/nodes/test_resolve_input.py) covers the resolve_input node; [test_build_context.py](../tests/nodes/test_build_context.py) asserts `component_metadata` and `has_executable_scripts`.
 
 ### CI coverage: public GitHub and internal GitLab
@@ -302,7 +306,7 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | `http://localhost:11434/v1` |
 | `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3`; other provider/model combinations keep their endpoint defaults. `gpt-6.1-sol` accepts only `low`, `medium`, `high`, `xhigh`, or `max`; any other value stops a scan before analysis (exit code 2). | `high` |
 | `SKILLSPECTOR_OUTPUT_LANGUAGE` | Optional short, single-line language label (letters, numbers, spaces, `_`, or `-`; maximum 64 characters) for human-readable LLM finding text. Rule IDs, severity values, paths, code, and other machine-readable values remain unchanged. Unset, blank, or invalid values preserve the default output language. | `Japanese` |
-| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves provider defaults. Lower values reduce variation but do not guarantee identical output. `gpt-6.1-sol` rejects every explicit value. `claude-opus-5-5` and `claude-sonnet-5-5` accept `1.0` on the native Anthropic endpoint only ([API compatibility rule](https://platform.claude.com/docs/en/api/messages/create)). Unsupported settings on active LLM slots stop a scan before analysis (exit code 2); static scans skip provider initialization and these checks. Leave it unset to preserve the default models’ endpoint defaults. | `0` |
+| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves provider defaults. Lower values reduce variation but do not guarantee identical output. `gpt-6.1-sol` rejects every explicit value. Claude Opus 4.7 and later, Sonnet 5, Fable 5, Mythos 5 and Haiku 5 models (for example `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-5-5`) accept `1.0` on the native Anthropic endpoint only ([API compatibility rule](https://platform.claude.com/docs/en/api/messages/create)). Unsupported settings on active LLM slots stop a scan before analysis (exit code 2); static scans skip provider initialization and these checks. Leave it unset to preserve the default models’ endpoint defaults. | `0` |
 | `SKILLSPECTOR_SEED` | Optional integer sampling seed for OpenAI-compatible and Azure OpenAI providers. Provider/model support is best-effort; CLI providers ignore it. | `42` |
 | `ANTHROPIC_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=anthropic`. | `sk-ant-...` |
 | `OLLAMA_BASE_URL` | Optional Ollama endpoint override. | `http://localhost:11434/v1` |
@@ -310,6 +314,7 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 | `AZURE_OPENAI_ENDPOINT` | Azure resource endpoint. | `https://example.openai.azure.com/` |
 | `SKILLSPECTOR_COMPAT_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=openai_compatible`. | `...` |
 | `SKILLSPECTOR_COMPAT_BASE_URL` | OpenAI-compatible endpoint base URL. | `https://api.groq.com/openai/v1` |
+| `SKILLSPECTOR_COMPAT_HEADERS` | Optional JSON object with string header names and values for `openai_compatible`. Applies to sync and async requests; unset or blank adds no headers. Invalid configuration is rejected without exposing header values. May contain gateway API keys, so treat it as a secret. | `{"X-Tenant-ID":"my-tenant","X-API-Key":"gateway-key"}` |
 | `SKILLSPECTOR_MODEL` | Override the active provider's bundled default model (see [README.md](../README.md) for per-provider defaults). CLI providers forward it as `--model`. | `gpt-5.2` |
 
 > **Disabled provider:** `codex_cli` remains registered for compatibility but refuses inference until a complete no-tools policy is verified.
@@ -349,7 +354,7 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
   - `claude_cli/` — **local `claude` binary; no API key**. Uses the CLI's own auth session (`claude auth login`). Set `SKILLSPECTOR_PROVIDER=claude_cli`.
   - `codex_cli/` — **registered but disabled**. Its read-only sandbox permits host-file reads. Select an HTTP API provider or another supported CLI provider for LLM analysis.
   - `gemini_cli/` — **local `gemini` binary; no API key**. Uses the CLI's own auth session. Set `SKILLSPECTOR_PROVIDER=gemini_cli`.
-  - `opencode_cli/` — **local `opencode` 1.18.33 binary; no API key**. Uses the CLI's own auth session (`opencode auth login`) and fails closed on every other runtime version because the deny-all policy is verified against that exact release. Set `SKILLSPECTOR_PROVIDER=opencode_cli`.
+  - `opencode_cli/` — **local `opencode` (verified 1.18.31–1.18.35, 1.19.0–1.19.4) binary; no API key**. Uses the CLI's own auth session (`opencode auth login`) and fails closed on every other runtime version, including prereleases, because the deny-all policy is verified against those exact releases. Set `SKILLSPECTOR_PROVIDER=opencode_cli`.
 
   CLI providers (`claude_cli`, `gemini_cli`, `opencode_cli`) implement the optional `AgentCLICapable` interface (`is_available()` + `complete()`) defined in [providers/base.py](../src/skillspector/providers/base.py). `has_cli_capability(provider)` detects this at runtime. All subprocess calls go through the hardened helper [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py) which enforces: no shell (`shell=False`), untrusted content via stdin only, capability stripping (tools disabled / sandboxed), environment scrubbing (no API keys forwarded), per-call timeout, and fail-closed error handling.
 
@@ -362,7 +367,8 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
 
 ## 11. Linting and formatting
 
-- **Format**: `make format` — Ruff check with auto-fix and Ruff format.
+- **Format**: `make format` — apply Ruff lint fixes and formatting in place.
+- **Check formatting**: `make format-check` — check formatting without editing files.
 - **Lint**: `make lint` — Ruff check.
 - **Config**: [pyproject.toml](../pyproject.toml) (Ruff line-length 100, target Python 3.12).
 
@@ -372,7 +378,8 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
 
 | Task | Command or action |
 |------|-------------------|
-| **Get started** | Create venv (`uv venv .venv` or `python3 -m venv .venv`), then `source .venv/bin/activate`, then `make install-dev`. Re-activate venv in each new terminal. |
+| **Get started** | Follow the [README development setup](../README.md#setup). Re-activate the virtual environment in each new terminal. |
 | **Run workflow** | `skillspector scan <path>` for CLI; `make langgraph-dev` for LangGraph Studio; or `graph.invoke({"input_path": "...", "output_format": "json"})` (or `skill_path`) programmatically |
 | **Add analyzer** | Implement node returning `{"findings": list[Finding]}`, register in `nodes/analyzers/__init__.py` |
-| **Run tests** | `make test`; key integration test: [tests/integration/test_graph.py](../tests/integration/test_graph.py) |
+| **Initial checks** | `make test-unit`, `make lint`, `make format-check`; see [Testing](#7-testing) for scope |
+| **Full contributor tests** | `make test` includes integration tests that may call a configured LLM provider; review [Testing](#7-testing) and provider prerequisites first |

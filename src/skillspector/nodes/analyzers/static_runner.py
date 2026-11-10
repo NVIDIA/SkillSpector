@@ -31,7 +31,7 @@ from array import array
 from bisect import bisect_right
 from collections.abc import Callable, Iterator, Mapping
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from inspect import getattr_static
 from itertools import chain
 from typing import cast
@@ -47,12 +47,25 @@ from skillspector.artifacts import (
     security_text_views,
 )
 from skillspector.inspection_ledger import (
+    MAX_FINDING_OUTPUT_RECORDS,
+    UNSUPPORTED_PROSE_COMMAND_NOTICE,
+    UNSUPPORTED_PROSE_COMMAND_PATTERN,
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
+    ParserCause,
+    ParserCheck,
+    ParserDiagnostic,
+    ParserUncheckedScope,
+    StaticParserDiagnostic,
     analyzer_status_for_events,
     ledger_event,
+)
+from skillspector.json_tokens import (
+    JSONSourceOwnership,
+    prepare_decoded_json_source,
+    prepare_json_source,
 )
 from skillspector.logging_config import get_logger
 from skillspector.models import (
@@ -72,13 +85,18 @@ from skillspector.python_ast import (
     may_be_python_source,
     resolve_python_source_classification,
 )
+from skillspector.python_import_bounds import PythonImportBounds
 from skillspector.python_tokens import PythonStringClosers
 from skillspector.security_reconstruction import (
+    _MAX_JSON_QUOTE_CONTAINER_CHARS,
     MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
     MAX_MARKER_LOOKAHEAD_CHARS,
+    StructuredStringClosers,
     build_declared_marker_views,
+    json_quote_capacity_limit,
 )
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
+from skillspector.surface import COMMENTS, infer_surface
 
 from .common import (
     LINE_BREAK_CHARS,
@@ -101,6 +119,7 @@ _ANALYZER_SEVERITY_ORDER = {
 # Extension -> file type (match v1 InventoryBuilder.FILE_TYPES)
 FILE_TYPES: dict[str, str] = {
     ".md": "markdown",
+    ".mdc": "markdown",
     ".markdown": "markdown",
     ".py": "python",
     ".pyw": "python",
@@ -108,12 +127,16 @@ FILE_TYPES: dict[str, str] = {
     ".bash": "shell",
     ".zsh": "shell",
     ".ps1": "powershell",
+    ".psm1": "powershell",
+    ".psd1": "powershell",
     ".json": "json",
     ".yaml": "yaml",
     ".yml": "yaml",
     ".toml": "toml",
     ".txt": "text",
     ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
     ".ts": "typescript",
     ".rb": "ruby",
     ".pl": "perl",
@@ -332,6 +355,21 @@ _STATIC_PATTERN_SECONDS = 0.25
 _ACTIVE_FINDING_BUDGET: ContextVar[_FindingBudget | None] = ContextVar(
     "static_pattern_finding_budget", default=None
 )
+_DEFERRED_PATTERN_LIMITS: ContextVar[list[_StaticResourceLimitError] | None] = ContextVar(
+    "static_pattern_deferred_limits", default=None
+)
+
+
+def defer_pattern_limit(error: _StaticResourceLimitError) -> None:
+    """Retain one local matcher limit without suppressing the artifact deadline."""
+    budget = _ACTIVE_FINDING_BUDGET.get()
+    if budget is not None:
+        budget.check_runtime()
+    limits = _DEFERRED_PATTERN_LIMITS.get()
+    if limits is None:
+        raise error
+    if not limits:
+        limits.append(error)
 
 
 _CATEGORY_LOCK = threading.Lock()
@@ -434,9 +472,12 @@ def _requires_leading_word(source: str) -> bool:
                 depth -= 1
                 if depth == 0:
                     branches.append(source[branch_start:cursor])
-                    return (cursor + 1 == len(source) or source[cursor + 1] not in "?*{") and all(
-                        _requires_leading_word(branch) for branch in branches
-                    )
+                    if not all(_requires_leading_word(branch) for branch in branches):
+                        return False
+                    following = source[cursor + 1 :]
+                    if following.startswith("?"):
+                        return _requires_leading_word(following[1:])
+                    return not following or following[0] not in "*{"
             elif char == "|" and depth == 1:
                 branches.append(source[branch_start:cursor])
                 branch_start = cursor + 1
@@ -587,6 +628,9 @@ _LINEAR_COMMAND_PATTERNS = frozenset(
         r"wget\s+[^|]*--no-check-certificate",
         r"(?:chmod|chown)\s+[^|]*a\+rwx",
         r"git\s+push\s+[^|]*--force",
+        r"\bgit\s+(?:am|commit|merge|push)\b[^\n|]*--no-verify\b",
+        r"kubectl\s+run\b[^\n]*--privileged",
+        r"--set\b[^\n]*privileged\s*=\s*true",
         r"curl\s+[^|]*(?:-d|--data|--data-raw|--data-binary)\s+",
         r"wget\s+[^|]*--post-(?:data|file)",
         r"curl\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh",
@@ -611,8 +655,16 @@ def _linear_command_parts(
         other_breaks = re.escape(LINE_BREAK_CHARS.replace("\r", "").replace("\n", ""))
         separator = rf"[|&;{other_breaks}]|(?<!\\)\r|\r(?!\n)|(?<!\\)(?<!\\\r)\n"
     else:
-        separator = "\\|" if "[^|]*" in source else "&"
-        wildcard = "[^|]*" if "[^|]*" in source else "[^&]*"
+        wildcard, separator = next(
+            (wildcard, separator)
+            for wildcard, separator in (
+                (r"[^\n|]*", r"[\n|]"),
+                (r"[^\n]*", r"\n"),
+                ("[^|]*", r"\|"),
+                ("[^&]*", "&"),
+            )
+            if wildcard in source
+        )
     prefix, suffix = source.split(wildcard, 1)
     # Lookahead retains overlapping suffix starts. The original anchored match
     # below chooses the same greedy span as the complete Python pattern.
@@ -928,6 +980,11 @@ def _window_view_with_markdown_context(
             if view.right_boundary_recovery_start is not None
             else None
         ),
+        source_end_offsets=(
+            array("I", (max(0, offset - prefix_length) for offset in view.source_end_offsets))
+            if view.source_end_offsets is not None
+            else None
+        ),
     )
 
 
@@ -953,6 +1010,7 @@ def _with_fixed_right_boundary(
         view.source_offsets,
         right_boundary_is_fixed=(view.right_boundary_is_fixed or is_fixed),
         right_boundary_recovery_start=merged_recovery,
+        source_end_offsets=view.source_end_offsets,
     )
 
 
@@ -974,6 +1032,13 @@ def _markdown_context_prefix(
     if transition is not None and transition[3] <= window_end:
         return transition[0] * transition[1] + "\n"
     return ""
+
+
+# Separators that ``str.splitlines()`` honours but CPython's own line numbering
+# does not: vertical tab, form feed, file/group/record separators, NEL, and the
+# Unicode line/paragraph separators. They make the two coordinate systems used
+# below disagree -- see :func:`_refined_surface_line`.
+_EXOTIC_LINE_BREAKS = tuple(ch for ch in LINE_BREAK_CHARS if ch not in "\r\n")
 
 
 def _normalize_license_line(line: str) -> str:
@@ -1159,8 +1224,15 @@ def _is_env_file_reference_in_docs(
 def analyzer_finding_to_finding(
     af: AnalyzerFinding,
     get_remediation_fn: Callable[[str], str] | None = None,
+    *,
+    line_text: str | None = None,
 ) -> Finding:
-    """Convert an AnalyzerFinding (from any analyzer) to graph-state Finding."""
+    """Convert an AnalyzerFinding (from any analyzer) to graph-state Finding.
+
+    ``line_text`` is the matched source line when the caller has it. It only
+    refines a ``code``/``config`` path into the ``comments`` surface, so callers
+    that cannot supply content still receive a path-derived classification.
+    """
     rem_fn = get_remediation_fn or get_remediation
     remediation = af.remediation or rem_fn(af.rule_id)
     category = (af.tags[0] if af.tags else None) or get_category(af.rule_id)
@@ -1188,6 +1260,7 @@ def analyzer_finding_to_finding(
         intent=None,
         evidence=dict(af.evidence),
         match_fingerprint=af.match_fingerprint,
+        surface=infer_surface(af.location.file, line_text),
     )
 
 
@@ -1283,6 +1356,91 @@ class _StaticScanMetrics(dict[str, int | float]):
     """Internal scan metrics with status that must never enter ledger fields."""
 
     fully_scanned_aggregate_overflow: bool = False
+    parser_diagnostic: StaticParserDiagnostic | None = None
+    inspection_notices: tuple[tuple[int, int], ...] = ()
+    pattern_limits: tuple[_StaticResourceLimitError, ...] = ()
+
+
+def _bounded_parser_incomplete(
+    module: object,
+    view: SecurityTextView,
+    check_runtime: Callable[[], None],
+    *,
+    file_type: str,
+    complete_context: bool,
+    source_start: int = 0,
+    diagnostics: list[StaticParserDiagnostic] | None = None,
+    path: str = "",
+    python_import_bounds: PythonImportBounds | None = None,
+    prepared_analysis: object | None = None,
+) -> bool:
+    kwargs = {"file_type": file_type, "complete_context": complete_context}
+    if vars(module).get("USES_PREPARED_PARSER_ANALYSIS") is True:
+        kwargs.update(
+            prepared_analysis=prepared_analysis,
+            source_view=_absolute_source_view(view, source_start=source_start),
+        )
+    if vars(module).get("USES_PYTHON_IMPORT_BOUNDS") is True and python_import_bounds is not None:
+        kwargs["python_import_check"] = lambda check: python_import_bounds.allows(
+            path, view.text, check
+        )
+        kwargs["python_stdlib_check"] = python_import_bounds.allows_stdlib
+    detailed_hook = _explicit_analysis_hook(module, "bounded_parse_diagnostic")
+    if detailed_hook is not None:
+        diagnostic = detailed_hook(view.text, check_runtime, **kwargs)
+        if (
+            isinstance(diagnostic, StaticParserDiagnostic)
+            and diagnostics is not None
+            and not diagnostics
+            and view.text
+        ):
+            begin = max(0, min(diagnostic.start, len(view.text) - 1))
+            end = max(begin + 1, min(diagnostic.end, len(view.text)))
+            source_begin = source_start + view.source_offset(begin)
+            source_end = source_start + view.source_end_offset(end - 1)
+            derived = view.name != "raw" or view.source_offsets is not None
+            diagnostic = replace(
+                diagnostic,
+                start=source_begin,
+                end=source_end,
+                location_precision="enclosing_expression"
+                if derived or begin != diagnostic.start or end != diagnostic.end
+                else diagnostic.location_precision,
+                cause=ParserCause.BOUNDARY_UNRESOLVED
+                if derived and diagnostic.cause is ParserCause.MALFORMED_INPUT
+                else diagnostic.cause,
+                full_input_checked=diagnostic.full_input_checked and complete_context,
+            )
+            diagnostics.append(diagnostic)
+        return bool(diagnostic)
+    hook = getattr(module, "has_bounded_parse_exhaustion", None)
+    return bool(hook(view.text, check_runtime, **kwargs)) if callable(hook) else False
+
+
+def _public_parser_diagnostic(
+    content: str, diagnostic: StaticParserDiagnostic | None
+) -> ParserDiagnostic | None:
+    if diagnostic is None or not content:
+        return None
+    begin = max(0, min(diagnostic.start, len(content) - 1))
+    end = max(begin + 1, min(diagnostic.end, len(content)))
+    line_starts = logical_line_starts(content)
+    result: ParserDiagnostic = {
+        "cause": diagnostic.cause,
+        "check": diagnostic.check,
+        "source_start_offset": begin,
+        "source_end_offset": end,
+        "start_line": bisect_right(line_starts, begin),
+        "end_line": bisect_right(line_starts, end - 1),
+        "unchecked_scope": diagnostic.unchecked_scope,
+        "observed_is_lower_bound": diagnostic.observed_is_lower_bound,
+        "full_input_checked": diagnostic.full_input_checked,
+        "location_precision": diagnostic.location_precision
+        if begin == diagnostic.start and end == diagnostic.end
+        else "enclosing_expression",
+    }
+    result.update(diagnostic.measurements)
+    return result
 
 
 @dataclass
@@ -1442,7 +1600,37 @@ def _convert_analyzer_finding(
         for triage_tag in ("contextual-triage", "likely-benign-context"):
             if triage_tag not in af.tags:
                 af.tags.append(triage_tag)
-    return analyzer_finding_to_finding(af)
+    return analyzer_finding_to_finding(
+        af, line_text=_refined_surface_line(af, path, content, content_lines)
+    )
+
+
+def _refined_surface_line(
+    af: AnalyzerFinding,
+    path: str,
+    content: str,
+    content_lines: list[str],
+) -> str | None:
+    """The matched source line, or ``None`` when line numbering is ambiguous.
+
+    Findings from the pattern modules number lines with
+    :func:`logical_line_starts`, which breaks on ``_EXOTIC_LINE_BREAKS`` as well
+    as CR/LF; Python AST findings use CPython's physical ``\n`` count instead.
+    The two agree only when the source contains none of those extra separators,
+    so for such files the refinement is skipped rather than indexing
+    ``content_lines`` with a line number from the other system -- which would
+    otherwise report a neighbouring line's surface.
+    """
+    if any(ch in content for ch in _EXOTIC_LINE_BREAKS):
+        return None
+    start_line = af.location.start_line
+    end_line = af.location.end_line or start_line
+    start_index = max(0, start_line - 1)
+    end_index = min(len(content_lines), end_line)
+    covered_lines = content_lines[start_index:end_index]
+    if covered_lines and all(infer_surface(path, text) == COMMENTS for text in covered_lines):
+        return covered_lines[0]
+    return None
 
 
 def _scan_path(
@@ -1719,7 +1907,7 @@ def _scan_view_windows(
             return derived_offset
         if derived_offset < len(coordinate_view.source_offsets):
             return coordinate_view.source_offsets[derived_offset]
-        return coordinate_view.source_offsets[-1] + 1 if coordinate_view.source_offsets else 0
+        return coordinate_view.source_end_offset(len(coordinate_view.text) - 1)
 
     for finding in findings:
         finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
@@ -1783,8 +1971,8 @@ def _scan_view_windows(
         if finding.end_line is not None and finding.end_column is not None:
             local_end = _line_start_offset(view.text, finding.end_line) + finding.end_column
             if 0 < local_end <= len(view.text):
-                finding.evidence[_SOURCE_END_EVIDENCE] = (
-                    coordinate_view.source_offset(local_end - 1) + 1
+                finding.evidence[_SOURCE_END_EVIDENCE] = coordinate_view.source_end_offset(
+                    local_end - 1
                 )
     if view.name != "raw":
         for finding in findings:
@@ -1838,6 +2026,9 @@ def _bounded_view_slices(view: SecurityTextView) -> Iterator[SecurityTextView]:
                 view.right_boundary_is_fixed or has_following_slice or fills_ceiling
             ),
             right_boundary_recovery_start=min(recovery_candidates, default=None),
+            source_end_offsets=(
+                view.source_end_offsets[start:end] if view.source_end_offsets is not None else None
+            ),
         )
         if end == len(view.text):
             break
@@ -1866,6 +2057,12 @@ class _AbsoluteSourceView(SecurityTextView):
         offset = self.derived_view.source_offset(index)
         if self.parent_view is not None:
             offset = self.parent_view.source_offset(offset)
+        return self.source_start + offset
+
+    def source_end_offset(self, derived_offset: int) -> int:
+        offset = self.derived_view.source_end_offset(derived_offset)
+        if self.parent_view is not None:
+            offset = self.parent_view.source_end_offset(offset - 1)
         return self.source_start + offset
 
 
@@ -2451,7 +2648,7 @@ def _restore_source_lines(
     def source_end_offset(offset: int) -> int:
         if offset <= 0:
             return view.source_offset(0)
-        return view.source_offset(offset - 1) + 1
+        return view.source_end_offset(offset - 1)
 
     for finding in findings:
         source_start = finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
@@ -2536,14 +2733,30 @@ def _restore_source_lines(
 
 
 def _window_string_closer(
-    python_strings: PythonStringClosers, window_start: int
+    source_closer: Callable[[int], bool], window_start: int
 ) -> Callable[[int], bool]:
     """Answer string-closer queries in one window's source coordinates."""
 
     def closes_string(offset: int) -> bool:
-        return python_strings.closes_string(window_start + offset)
+        return source_closer(window_start + offset)
 
     return closes_string
+
+
+def _python_import_bounds(
+    state: Mapping[str, object], components: list[str], file_cache: Mapping[str, str]
+) -> PythonImportBounds:
+    # Known omitted files still affect import identity. Their absence from the
+    # analyzer work list cannot establish that an import is external.
+    paths = list(components)
+    inventory = state.get("artifact_inventory")
+    if isinstance(inventory, list):
+        paths.extend(
+            path
+            for artifact in inventory
+            if isinstance(artifact, dict) and isinstance(path := artifact.get("path"), str) and path
+        )
+    return PythonImportBounds(paths, file_cache)
 
 
 def _scan_declared_marker_views(
@@ -2558,7 +2771,13 @@ def _scan_declared_marker_views(
     python_source: bool,
     defer_projected_output_limit: bool,
     complete_context: bool,
+    limited_source_offsets: list[int],
     prepared_analyses: Mapping[int, object] | None = None,
+    parser_analyses: Mapping[int, object] | None = None,
+    json_ownership: JSONSourceOwnership | None = None,
+    parser_diagnostics: list[StaticParserDiagnostic] | None = None,
+    python_import_bounds: PythonImportBounds | None = None,
+    parser_file_type: str | None = None,
 ) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
@@ -2574,6 +2793,7 @@ def _scan_declared_marker_views(
             ) from exc
 
     check_runtime()
+    bounded_file_type = parser_file_type or _infer_file_type(path)
     projection_limited = False
     bounded_parse_limited = False
     seen_views: set[tuple[str, int, int]] = set()
@@ -2608,11 +2828,32 @@ def _scan_declared_marker_views(
             )
         return True
 
-    # A complete Python module proves which quotes close its string literals.
-    # The proof covers the whole artifact, so it holds in every window. It is
-    # computed only when a loose quoted directive header reaches a quote.
-    python_strings = (
-        PythonStringClosers(content, check_runtime) if _infer_file_type(path) == "python" else None
+    # Structural delimiter proof covers the complete artifact, so windows do
+    # not mistake a literal closer for a new marker opener. Compute it lazily.
+    file_type = parser_file_type or _infer_file_type(path)
+    if parser_file_type is None and path.lower().endswith((".html", ".htm")):
+        file_type = "html"
+
+    def shell_quote_closers() -> set[int]:
+        # Reuse the complete-source lexical proof. Unsupported source returns
+        # no closers; the foundational reconstruction layer needs no analyzer import.
+        from skillspector.nodes.analyzers.static_patterns_tool_misuse import (
+            _shell_quoted_candidate_limits,
+        )
+
+        closers: set[int] = set()
+        _shell_quoted_candidate_limits(content, check_runtime, quote_closers=closers)
+        return closers
+
+    source_strings = (
+        PythonStringClosers(content, check_runtime)
+        if file_type == "python"
+        else StructuredStringClosers(
+            content,
+            file_type,
+            check_runtime,
+            shell_quote_closers=shell_quote_closers if file_type == "shell" else None,
+        )
     )
 
     for owned_start, raw_start in zip(owned_starts, raw_starts, strict=True):
@@ -2638,26 +2879,44 @@ def _scan_declared_marker_views(
                 check_runtime=check_runtime,
             )
         )
+        if json_ownership is not None and json_ownership.decoded is not None:
+            full_views += json_ownership.decoded.window_views(
+                raw_start,
+                raw_end,
+                check_runtime,
+                right_context=DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
+            )
         across_security_views = len(full_views) > 1
         check_runtime()
         # View offsets are window-relative. Synthetic Markdown fence context
         # never occurs for Python, but it would not map onto module offsets.
         string_closer = (
             None
-            if python_strings is None or context_prefix
-            else _window_string_closer(python_strings, raw_start)
+            if context_prefix
+            else _window_string_closer(source_strings.closes_string, raw_start)
         )
         for full_view in full_views:
             full_view_limited = False
+            decoded_json = full_view.name.startswith("json-decoded-")
+            end_is_truncated = (
+                full_view.right_boundary_is_fixed if decoded_json else raw_end < len(content)
+            )
             reconstruction = build_declared_marker_views(
                 full_view,
                 check_runtime=check_runtime,
                 owned_source_start=owned_source_start,
                 owned_source_end=owned_source_end,
-                source_end_is_truncated=raw_end < len(content),
+                source_end_is_truncated=end_is_truncated,
                 validated_string_closer=string_closer,
             )
             projection_limited = projection_limited or reconstruction.limited
+            if (
+                reconstruction.first_limited_source_offset is not None
+                and not limited_source_offsets
+            ):
+                limited_source_offsets.append(
+                    raw_start + reconstruction.first_limited_source_offset
+                )
             for marker_view in reconstruction.views:
                 marker_offsets = marker_view.source_offsets
                 if not marker_offsets:
@@ -2665,7 +2924,15 @@ def _scan_declared_marker_views(
                 marker_view = _with_fixed_right_boundary(
                     marker_view,
                     reconstruction.limited
-                    or (raw_end < len(content) and marker_offsets[-1] >= len(raw_window) - 1),
+                    or (
+                        end_is_truncated
+                        and marker_offsets[-1]
+                        >= (
+                            full_view.source_end_offset(len(full_view.text) - 1) - 1
+                            if decoded_json
+                            else len(raw_window) - 1
+                        )
+                    ),
                 )
                 marker_key = (
                     marker_view.text,
@@ -2767,11 +3034,17 @@ def _scan_declared_marker_views(
                     if callable(exhaustion_hook):
                         check_runtime()
                         bounded_parse_limited = bounded_parse_limited or bool(
-                            exhaustion_hook(
-                                marker_view.text,
+                            _bounded_parser_incomplete(
+                                module,
+                                marker_view,
                                 check_runtime,
-                                file_type=_infer_file_type(path),
+                                file_type=bounded_file_type,
                                 complete_context=complete_context,
+                                source_start=raw_start,
+                                diagnostics=parser_diagnostics,
+                                path=path,
+                                python_import_bounds=python_import_bounds,
+                                prepared_analysis=(parser_analyses or {}).get(id(module)),
                             )
                         )
 
@@ -2802,6 +3075,69 @@ def _scan_all_views_detailed(
     python_source: bool | None = None,
     readable_binary: bool = False,
     _oms_projected: bool = False,
+    python_import_bounds: PythonImportBounds | None = None,
+) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
+    """Retain first parser evidence alongside every existing terminal scan result."""
+    diagnostics: list[StaticParserDiagnostic] = []
+    notices: list[tuple[int, int]] = []
+    pattern_limits = _DEFERRED_PATTERN_LIMITS.get()
+    if pattern_limits is None:
+        pattern_limits = []
+    limit_token = _DEFERRED_PATTERN_LIMITS.set(pattern_limits)
+
+    def with_diagnostic(metrics: dict[str, int | float]) -> dict[str, int | float]:
+        if not diagnostics and not notices and not pattern_limits:
+            return metrics
+        enriched = _StaticScanMetrics(metrics)
+        enriched.fully_scanned_aggregate_overflow = getattr(
+            metrics, "fully_scanned_aggregate_overflow", False
+        )
+        enriched.parser_diagnostic = diagnostics[0] if diagnostics else None
+        enriched.inspection_notices = tuple(notices)
+        enriched.pattern_limits = tuple(pattern_limits)
+        return enriched
+
+    try:
+        findings, reason, metrics = _scan_all_views_with_parser_diagnostics(
+            path,
+            content,
+            pattern_modules,
+            python_ast_cache_key,
+            max_findings=max_findings,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            python_ast=python_ast,
+            python_source=python_source,
+            readable_binary=readable_binary,
+            _oms_projected=_oms_projected,
+            python_import_bounds=python_import_bounds,
+            parser_diagnostics=diagnostics,
+            inspection_notices=notices,
+        )
+    except _StaticResourceLimitError as exc:
+        exc.metrics = with_diagnostic(exc.metrics)
+        raise
+    finally:
+        _DEFERRED_PATTERN_LIMITS.reset(limit_token)
+    return findings, reason, with_diagnostic(metrics)
+
+
+def _scan_all_views_with_parser_diagnostics(
+    path: str,
+    content: str,
+    pattern_modules: list,
+    python_ast_cache_key: str | None,
+    *,
+    max_findings: int = MAX_FINDINGS_PER_ARTIFACT,
+    timeout_seconds: float | None = None,
+    started_at: float | None = None,
+    python_ast: ParsedPythonFile | None = None,
+    python_source: bool | None = None,
+    readable_binary: bool = False,
+    _oms_projected: bool = False,
+    python_import_bounds: PythonImportBounds | None = None,
+    parser_diagnostics: list[StaticParserDiagnostic],
+    inspection_notices: list[tuple[int, int]],
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Scan bounded raw windows and return any limit with observed/limit metrics."""
     started_at = time.monotonic() if started_at is None else started_at
@@ -2828,6 +3164,7 @@ def _scan_all_views_detailed(
             timeout_seconds=timeout_seconds,
             started_at=started_at,
             python_source=False,
+            python_import_bounds=python_import_bounds,
         )
         findings = [
             finding
@@ -2878,6 +3215,7 @@ def _scan_all_views_detailed(
             # This view is derived JSON metadata, not a Python execution surface.
             python_source=False,
             _oms_projected=True,
+            python_import_bounds=python_import_bounds,
         )
         for finding in findings:
             finding.start_line = finding.end_line = 1
@@ -2887,7 +3225,13 @@ def _scan_all_views_detailed(
             )
             finding.evidence[_SOURCE_START_EVIDENCE] = projection.view.source_offset(0)
             finding.evidence.pop(_SOURCE_END_EVIDENCE, None)
+        diagnostic = getattr(metrics, "parser_diagnostic", None)
+        if isinstance(diagnostic, StaticParserDiagnostic):
+            parser_diagnostics.append(diagnostic.enclosed(0, len(content)))
         return findings, reason, metrics
+    # Decode ownership uses JSON grammar; rule applicability retains the carrier
+    # type so opaque and unknown bundle fields keep their original security checks.
+    parser_file_type = "json" if _oms_projected else _infer_file_type(path)
     ast_modules = [module for module in pattern_modules if _uses_python_ast(module)]
     lexical_modules = [module for module in pattern_modules if not _uses_python_ast(module)]
     if python_source is None:
@@ -2931,6 +3275,7 @@ def _scan_all_views_detailed(
         if pattern_modules
         else None
     )
+    limited_source_offsets: list[int] = []
     modules_for_windows = lexical_modules or ([] if ast_modules else pattern_modules)
     bounded_parse_limited = False
     marker_owned_starts: tuple[int, ...] = ()
@@ -2940,6 +3285,8 @@ def _scan_all_views_detailed(
     source_context: _WindowSourceContext | None = None
     whole_artifact_window = False
     prepared_analyses: dict[int, object] = {}
+    parser_analyses: dict[int, object] = {}
+    json_ownership: JSONSourceOwnership | None = None
     deferred_output_limit: _StaticResourceLimitError | None = None
     deferred_scan_incomplete = False
     defers_mixed_output_limit = bool(
@@ -3035,6 +3382,14 @@ def _scan_all_views_detailed(
         try:
             finding_budget.check_runtime()
             for module in modules_for_windows:
+                prepare_parser = _explicit_analysis_hook(module, "prepare_parser_analysis")
+                if prepare_parser is not None:
+                    parser_analyses[id(module)] = prepare_parser(
+                        content=content,
+                        file_type="json" if _oms_projected else _infer_file_type(path),
+                        check_runtime=finding_budget.check_runtime,
+                    )
+                    finding_budget.check_runtime()
                 prepare = _explicit_analysis_hook(module, "prepare_analysis")
                 if prepare is not None:
                     prepared_analyses[id(module)] = prepare(
@@ -3043,6 +3398,44 @@ def _scan_all_views_detailed(
                         check_runtime=finding_budget.check_runtime,
                     )
                     finding_budget.check_runtime()
+                    notice_hook = getattr(prepared_analyses[id(module)], "inspection_notices", None)
+                    if not _oms_projected and callable(notice_hook):
+                        inspection_notices.extend(notice_hook())
+                        del inspection_notices[MAX_FINDING_OUTPUT_RECORDS:]
+            if (_oms_projected or _infer_file_type(path) == "json") and "\\" in content:
+                json_ownership = next(
+                    (
+                        value
+                        for value in parser_analyses.values()
+                        if isinstance(value, JSONSourceOwnership)
+                    ),
+                    None,
+                )
+                if json_ownership is None:
+                    json_ownership = prepare_json_source(content, finding_budget.check_runtime)
+                if json_ownership is not None:
+                    decoded = prepare_decoded_json_source(
+                        json_ownership, finding_budget.check_runtime
+                    )
+                    if decoded is not None:
+                        json_ownership = replace(json_ownership, decoded=decoded)
+                        for key, value in parser_analyses.items():
+                            if isinstance(value, JSONSourceOwnership) and value.source == content:
+                                parser_analyses[key] = json_ownership
+                        if decoded.unsupported:
+                            bounded_parse_limited = True
+                            begin, end = decoded.unsupported[0]
+                            parser_diagnostics.append(
+                                StaticParserDiagnostic(
+                                    ParserCause.UNSUPPORTED_SYNTAX,
+                                    ParserCheck.JSON_STRING_DECODING,
+                                    begin,
+                                    end,
+                                    ParserUncheckedScope.EXPRESSION,
+                                    full_input_checked=True,
+                                    location_precision="enclosing_expression",
+                                )
+                            )
             source_context = _build_window_source_context(
                 path,
                 content,
@@ -3066,6 +3459,12 @@ def _scan_all_views_detailed(
                 defer_projected_output_limit=coalesce is not None,
                 complete_context=whole_artifact_window,
                 prepared_analyses=prepared_analyses,
+                parser_analyses=parser_analyses,
+                json_ownership=json_ownership,
+                parser_diagnostics=parser_diagnostics,
+                python_import_bounds=python_import_bounds,
+                limited_source_offsets=limited_source_offsets,
+                parser_file_type="json" if _oms_projected else None,
             )
             bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
@@ -3102,11 +3501,16 @@ def _scan_all_views_detailed(
                 if callable(exhaustion_hook):
                     finding_budget.check_runtime()
                     bounded_parse_limited = bounded_parse_limited or bool(
-                        exhaustion_hook(
-                            content,
+                        _bounded_parser_incomplete(
+                            module,
+                            SecurityTextView("raw", content),
                             finding_budget.check_runtime,
-                            file_type=_infer_file_type(path),
+                            file_type=parser_file_type,
                             complete_context=True,
+                            diagnostics=parser_diagnostics,
+                            path=path,
+                            python_import_bounds=python_import_bounds,
+                            prepared_analysis=parser_analyses.get(id(module)),
                         )
                     )
         except _StaticResourceLimitError as exc:
@@ -3197,10 +3601,20 @@ def _scan_all_views_detailed(
             else:
                 right_boundary_recovery_start = None
             try:
-                full_views = security_text_views(
-                    context_prefix + raw_window,
-                    check_runtime=finding_budget.check_runtime,
+                full_views = tuple(
+                    _window_view_with_markdown_context(full_view, len(context_prefix))
+                    for full_view in security_text_views(
+                        context_prefix + raw_window,
+                        check_runtime=finding_budget.check_runtime,
+                    )
                 )
+                if json_ownership is not None and json_ownership.decoded is not None:
+                    full_views += json_ownership.decoded.window_views(
+                        raw_start,
+                        raw_end,
+                        finding_budget.check_runtime,
+                        right_context=_WINDOW_OVERLAP_CHARS,
+                    )
             except _StaticResourceLimitError as exc:
                 return (
                     reconciled_prefix(),
@@ -3209,10 +3623,13 @@ def _scan_all_views_detailed(
                 )
             across_security_views = len(full_views) > 1
             for full_view in full_views:
-                full_view = _window_view_with_markdown_context(full_view, len(context_prefix))
                 full_view = _with_fixed_right_boundary(
                     full_view,
-                    outer_right_boundary_is_fixed,
+                    (
+                        full_view.right_boundary_is_fixed
+                        if full_view.name.startswith("json-decoded-")
+                        else outer_right_boundary_is_fixed
+                    ),
                     right_boundary_recovery_start,
                 )
                 try:
@@ -3222,21 +3639,33 @@ def _scan_all_views_detailed(
                             "has_bounded_parse_exhaustion",
                             None,
                         )
-                        if callable(exhaustion_hook) and full_view.name != "raw":
+                        if (
+                            callable(exhaustion_hook)
+                            and full_view.name != "raw"
+                            and not full_view.name.startswith("json-decoded-")
+                        ):
                             finding_budget.check_runtime()
-                            module_file_type = _effective_module_file_type(
-                                path,
-                                module,
-                                python_source=python_source,
+                            module_file_type = (
+                                parser_file_type
+                                if _oms_projected
+                                else _effective_module_file_type(
+                                    path, module, python_source=python_source
+                                )
                             )
                             bounded_parse_limited = bounded_parse_limited or bool(
-                                exhaustion_hook(
-                                    full_view.text,
+                                _bounded_parser_incomplete(
+                                    module,
+                                    full_view,
                                     finding_budget.check_runtime,
                                     file_type=module_file_type,
                                     # A fragment cannot prove surrounding HTML,
                                     # container, or inline delimiter ownership.
                                     complete_context=whole_artifact_window,
+                                    source_start=raw_start,
+                                    diagnostics=parser_diagnostics,
+                                    path=path,
+                                    python_import_bounds=python_import_bounds,
+                                    prepared_analysis=parser_analyses.get(id(module)),
                                 )
                             )
                 except _StaticResourceLimitError as exc:
@@ -3340,6 +3769,35 @@ def _scan_all_views_detailed(
                             scan_incomplete=True,
                         ):
                             return limited_result(resource_limit)
+                if full_view.name.startswith("json-decoded-"):
+                    # Keep discovered encoded evidence before a completeness
+                    # hook can reach the shared artifact deadline.
+                    try:
+                        for module in modules_for_windows:
+                            if callable(getattr(module, "has_bounded_parse_exhaustion", None)):
+                                bounded_parse_limited = (
+                                    bounded_parse_limited
+                                    or _bounded_parser_incomplete(
+                                        module,
+                                        full_view,
+                                        finding_budget.check_runtime,
+                                        file_type=(
+                                            "json"
+                                            if _oms_projected
+                                            else _effective_module_file_type(
+                                                path, module, python_source=python_source
+                                            )
+                                        ),
+                                        complete_context=whole_artifact_window,
+                                        source_start=raw_start,
+                                        diagnostics=parser_diagnostics,
+                                        path=path,
+                                        python_import_bounds=python_import_bounds,
+                                        prepared_analysis=parser_analyses.get(id(module)),
+                                    )
+                                )
+                    except _StaticResourceLimitError as exc:
+                        return limited_result(exc)
             if deferred_output_limit is not None and not defers_mixed_output_limit:
                 # Alternate projections of this bounded raw window can expose
                 # an earlier source occurrence than its raw view. Once every
@@ -3538,6 +3996,27 @@ def _scan_all_views_detailed(
             deferred_output_limit.reason,
             metrics,
         )
+    if limited_source_offsets and not (python_syntax_error or bounded_parse_limited):
+        try:
+            capacity_span = json_quote_capacity_limit(
+                content,
+                finding_budget.check_runtime,
+                containing_offset=limited_source_offsets[0],
+            )
+        except _StaticResourceLimitError as exc:
+            return deduplicated, exc.reason, exc.metrics
+        if capacity_span is not None:
+            start, end = capacity_span
+            return (
+                deduplicated,
+                LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT,
+                {
+                    "observed_characters": end - start,
+                    "limit_characters": _MAX_JSON_QUOTE_CONTAINER_CHARS,
+                    "source_start_offset": start,
+                    "source_end_offset": end,
+                },
+            )
     return (
         deduplicated,
         (
@@ -3564,6 +4043,7 @@ def _scan_all_views(
     started_at: float | None = None,
     python_ast: ParsedPythonFile | None = None,
     python_source: bool | None = None,
+    python_import_bounds: PythonImportBounds | None = None,
 ) -> list[Finding]:
     findings, _, _ = _scan_all_views_detailed(
         path,
@@ -3575,6 +4055,7 @@ def _scan_all_views(
         started_at=started_at,
         python_ast=python_ast,
         python_source=python_source,
+        python_import_bounds=python_import_bounds,
     )
     return findings
 
@@ -3587,6 +4068,7 @@ def _postprocess_path_findings(
     python_ast: ParsedPythonFile | None = None,
     started_at: float | None = None,
     timeout_seconds: float | None = None,
+    pattern_limits: list[_StaticResourceLimitError] | None = None,
 ) -> list[Finding]:
     """Let one analyzer family reconcile findings after every view has run."""
     hook = (
@@ -3604,19 +4086,16 @@ def _postprocess_path_findings(
         pattern_modules
         and _explicit_module_hook(pattern_modules[0], "POSTPROCESS_USES_RUNTIME_BUDGET") is True
     )
-    if uses_python_ast or uses_runtime_budget:
-        kwargs: dict[str, object] = {}
-        if uses_python_ast:
-            kwargs["python_ast"] = python_ast
-        if uses_runtime_budget:
-            kwargs.update(
-                {
-                    "started_at": started_at,
-                    "timeout_seconds": timeout_seconds,
-                }
-            )
+    kwargs: dict[str, object] = {}
+    if uses_python_ast:
+        kwargs["python_ast"] = python_ast
+    if uses_runtime_budget:
+        kwargs.update({"started_at": started_at, "timeout_seconds": timeout_seconds})
+    token = _DEFERRED_PATTERN_LIMITS.set(pattern_limits)
+    try:
         return cast(list[Finding], hook(content, findings, **kwargs))
-    return cast(list[Finding], hook(content, findings))
+    finally:
+        _DEFERRED_PATTERN_LIMITS.reset(token)
 
 
 def _cleanup_expired_path_findings(
@@ -3656,6 +4135,7 @@ def run_static_patterns(
     file_cache = cast(
         dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
     )
+    python_import_bounds = _python_import_bounds(state, components, file_cache)
     raw_file_cache = cast(Mapping[str, bytes] | None, state.get("raw_file_cache"))
     source_classifications = cast(
         Mapping[str, PythonSourceClassification | str] | None,
@@ -3671,7 +4151,7 @@ def run_static_patterns(
     container_paths = {
         str(metadata.get("path", ""))
         for metadata in cast(list[dict[str, object]], state.get("component_metadata") or [])
-        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx"}
+        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx", "tar", "gzip"}
         and "!/" not in str(metadata.get("path", ""))
     }
     raw_inventory = state.get("artifact_inventory", [])
@@ -3739,7 +4219,7 @@ def run_static_patterns(
             python_source=python_source,
         )
         path_limit = min(MAX_FINDINGS_PER_ARTIFACT, remaining)
-        path_findings, resource_limit, _ = _scan_all_views_detailed(
+        path_findings, resource_limit, resource_metrics = _scan_all_views_detailed(
             path,
             content,
             pattern_modules,
@@ -3750,6 +4230,7 @@ def run_static_patterns(
             python_ast=python_ast,
             python_source=python_source,
             readable_binary=path in readable_binary_paths,
+            python_import_bounds=python_import_bounds,
         )
         runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
         if shared_remaining is not None:
@@ -3758,6 +4239,7 @@ def run_static_patterns(
             resource_limit is LedgerReason.RUNTIME_LIMIT
             or time.monotonic() - path_started_at >= runtime_limit
         )
+        pattern_limits = list(getattr(resource_metrics, "pattern_limits", ()))
         if expired:
             path_findings = _cleanup_expired_path_findings(pattern_modules, path_findings)
         else:
@@ -3768,6 +4250,7 @@ def run_static_patterns(
                 python_ast=python_ast,
                 started_at=path_started_at,
                 timeout_seconds=runtime_limit,
+                pattern_limits=pattern_limits,
             )
             if time.monotonic() - path_started_at >= runtime_limit:
                 path_findings = _cleanup_expired_path_findings(
@@ -3789,6 +4272,7 @@ def run_static_patterns_with_ledger(
     file_cache = cast(
         dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
     )
+    python_import_bounds = _python_import_bounds(state, components, file_cache)
     raw_file_cache = cast(Mapping[str, bytes] | None, state.get("raw_file_cache"))
     source_classifications = cast(
         Mapping[str, PythonSourceClassification | str] | None,
@@ -3807,16 +4291,20 @@ def run_static_patterns_with_ledger(
     container_paths = {
         str(metadata.get("path", ""))
         for metadata in cast(list[dict[str, object]], state.get("component_metadata") or [])
-        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx"}
+        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx", "tar", "gzip"}
         and "!/" not in str(metadata.get("path", ""))
     }
     findings: list[Finding] = []
     events: list[InspectionLedgerEvent] = []
+    notices: list[dict[str, object]] = []
     raw_inventory = state.get("artifact_inventory", [])
     inventory: dict[str, dict[str, object]] = (
         {str(item.get("path", "")): item for item in raw_inventory if isinstance(item, dict)}
         if isinstance(raw_inventory, list)
         else {}
+    )
+    container_paths.update(
+        path for path, artifact in inventory.items() if "inspected_members" in artifact
     )
 
     for path in components:
@@ -3897,9 +4385,10 @@ def run_static_patterns_with_ledger(
                 remaining = MAX_FINDINGS_PER_ANALYZER - len(findings)
                 path_started_at = time.monotonic()
                 shared_remaining = transitive_remaining_seconds(cast(SkillspectorState, state))
-                path_findings: list[Finding]
+                path_findings: list[Finding] = []
                 resource_limit: LedgerReason | None
                 resource_metrics: dict[str, int | float]
+                path_parser_diagnostic: StaticParserDiagnostic | None = None
                 source_classification: PythonSourceClassification | None = None
                 fully_scanned_aggregate_overflow = False
                 postprocessed = False
@@ -3955,7 +4444,31 @@ def run_static_patterns_with_ledger(
                             python_ast=python_ast,
                             python_source=python_source,
                             readable_binary=bool(artifact.get("readable_binary")),
+                            python_import_bounds=python_import_bounds,
                         )
+                        path_parser_diagnostic = getattr(
+                            resource_metrics, "parser_diagnostic", None
+                        )
+                        pattern_limits = list(getattr(resource_metrics, "pattern_limits", ()))
+                        notice_spans = getattr(resource_metrics, "inspection_notices", ())
+                        notice_lines = logical_line_starts(content) if notice_spans else []
+                        for start, end in notice_spans:
+                            if len(notices) >= MAX_FINDING_OUTPUT_RECORDS:
+                                break
+                            if not 0 <= start < end <= len(content):
+                                continue
+                            notices.append(
+                                {
+                                    "reason_code": UNSUPPORTED_PROSE_COMMAND_PATTERN,
+                                    "message": UNSUPPORTED_PROSE_COMMAND_NOTICE,
+                                    "phase": "documentation",
+                                    "path": path,
+                                    "start_line": bisect_right(notice_lines, start),
+                                    "end_line": bisect_right(notice_lines, end - 1),
+                                    "source_start_offset": start,
+                                    "source_end_offset": end,
+                                }
+                            )
                         fully_scanned_aggregate_overflow = bool(
                             resource_limit is LedgerReason.OUTPUT_LIMIT
                             and getattr(
@@ -4004,6 +4517,7 @@ def run_static_patterns_with_ledger(
                                 python_ast=python_ast,
                                 started_at=path_started_at,
                                 timeout_seconds=runtime_limit,
+                                pattern_limits=pattern_limits,
                             )
                             postprocessed = True
                             observed_seconds = max(0.0, time.monotonic() - path_started_at)
@@ -4044,12 +4558,18 @@ def run_static_patterns_with_ledger(
                         ):
                             resource_limit = None
                             resource_metrics = {}
+                        if resource_limit is None and pattern_limits:
+                            resource_limit = pattern_limits[0].reason
+                            resource_metrics = pattern_limits[0].metrics
                     except _StaticResourceLimitError as exc:
                         path_findings = _cleanup_expired_path_findings(
                             pattern_modules, path_findings
                         )
                         resource_limit = exc.reason
                         resource_metrics = exc.metrics
+                        path_parser_diagnostic = path_parser_diagnostic or getattr(
+                            exc.metrics, "parser_diagnostic", None
+                        )
                     except Exception as exc:
                         logger.warning("%s: scan error on %s: %s", analyzer_id, path, exc)
                         event = ledger_event(
@@ -4059,6 +4579,9 @@ def run_static_patterns_with_ledger(
                             path=path,
                             reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
                             error_class=type(exc).__name__,
+                            parser_diagnostic=_public_parser_diagnostic(
+                                content, path_parser_diagnostic
+                            ),
                         )
                         events.append(event)
                         continue
@@ -4080,10 +4603,22 @@ def run_static_patterns_with_ledger(
                     source_classification is PythonSourceClassification.AMBIGUOUS
                     and needs_python_source
                 )
-                partial = resource_limit is not None or oversized_python or ambiguous_python
+                # Reconciliation can clear an aggregate OUTPUT_LIMIT after
+                # coalescing findings; it cannot resolve an earlier parser gap.
+                partial = (
+                    resource_limit is not None
+                    or oversized_python
+                    or ambiguous_python
+                    or path_parser_diagnostic is not None
+                )
                 partial_reason = (
                     resource_limit
                     or (LedgerReason.SIZE_LIMIT if oversized_python else None)
+                    or (
+                        LedgerReason.STATIC_PARSE_LIMIT
+                        if path_parser_diagnostic is not None
+                        else None
+                    )
                     or LedgerReason.PYTHON_SOURCE_AMBIGUOUS
                 )
                 event = ledger_event(
@@ -4093,6 +4628,7 @@ def run_static_patterns_with_ledger(
                     path=path,
                     reason=partial_reason if partial else None,
                     emitted_finding_ids=[finding.finding_id for finding in path_findings],
+                    parser_diagnostic=_public_parser_diagnostic(content, path_parser_diagnostic),
                     observed_characters=(
                         int(resource_metrics["observed_characters"])
                         if "observed_characters" in resource_metrics
@@ -4132,10 +4668,17 @@ def run_static_patterns_with_ledger(
                         else None
                     ),
                 )
+                if partial_reason is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT:
+                    # Keep the file-level work identity; the diagnostic span is
+                    # not a separately planned inspection range. Finalization
+                    # projects these numeric facts into a safe public message.
+                    event["source_start_offset"] = int(resource_metrics["source_start_offset"])
+                    event["source_end_offset"] = int(resource_metrics["source_end_offset"])
         events.append(event)
 
     return {
         "findings": findings,
         "inspection_ledger": events,
+        "inspection_notices": notices,
         "analyzer_status_events": [analyzer_status_for_events(analyzer_id, events)],
     }
