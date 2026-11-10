@@ -23,7 +23,10 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import os
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 from time import monotonic
@@ -191,7 +194,7 @@ def test_build_context_starts_and_returns_default_graph_wide_budget(tmp_path: Pa
 
     budget = result["workflow_resource_budget"]
     assert isinstance(budget, WorkflowResourceBudget)
-    assert DEFAULT_MAX_WORKFLOW_SECONDS == 600.0
+    assert DEFAULT_MAX_WORKFLOW_SECONDS == 1080.0
     assert budget.max_seconds == MAX_WORKFLOW_SECONDS
     assert budget.max_bytes == MAX_WORKFLOW_BYTES == 64 * 1024 * 1024
     assert budget.max_artifacts == MAX_WORKFLOW_ARTIFACTS == 10_000
@@ -208,12 +211,45 @@ def test_build_context_starts_and_returns_default_graph_wide_budget(tmp_path: Pa
         ("0.5", 0.5),
         ("0", DEFAULT_MAX_WORKFLOW_SECONDS),
         ("-1", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("", DEFAULT_MAX_WORKFLOW_SECONDS),
         ("nan", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("inf", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("-inf", DEFAULT_MAX_WORKFLOW_SECONDS),
         ("not-a-number", DEFAULT_MAX_WORKFLOW_SECONDS),
     ],
 )
 def test_workflow_budget_seconds_environment_parsing(value: str | None, expected: float) -> None:
     assert _workflow_max_seconds_from_environment(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, 1080.0), ("0.5", 0.5), ("1800", 1800.0), ("nan", 1080.0)],
+)
+def test_workflow_environment_reaches_graph_and_cli_budgets(
+    value: str | None, expected: float
+) -> None:
+    env = os.environ.copy()
+    name = "SKILLSPECTOR_MAX_WORKFLOW_SECONDS"
+    env.pop(name, None)
+    if value is not None:
+        env[name] = value
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json; from skillspector.state import WorkflowResourceBudget; "
+            "from skillspector.cli import _TransitiveBudget; "
+            "print(json.dumps([WorkflowResourceBudget().max_seconds, "
+            "_TransitiveBudget().max_seconds]))",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    assert json.loads(result.stdout) == [expected, expected]
 
 
 def test_build_context_reuses_supplied_stricter_transitive_budget(tmp_path: Path) -> None:
@@ -876,18 +912,122 @@ def test_build_context_model_config_matches_openai_fallback(
     assert result["model_config"]["default"] == OpenAIProvider.DEFAULT_MODEL
 
 
-def test_build_context_inventories_but_excludes_valid_root_oms_signature(
+@pytest.mark.parametrize("enabled", [True, False])
+def test_build_context_prepares_transport_only_for_enabled_ai(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports",
+        lambda: calls.append("prepare"),
+    )
+
+    result = build_context({"skill_path": str(tmp_path), "use_llm": enabled})
+
+    assert calls == (["prepare"] if enabled else [])
+    assert result["file_cache"]["SKILL.md"] == "# Example\n"
+    assert bool(result["model_config"]) is enabled
+
+
+def test_build_context_skips_transport_preparation_after_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    budget = WorkflowResourceBudget(max_seconds=0.0)
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports",
+        lambda: pytest.fail("Expired work must not prepare a transport"),
+    )
+
+    result = build_context({"skill_path": str(tmp_path), "workflow_resource_budget": budget})
+
+    assert result["workflow_resource_budget"] is budget
+    assert any(
+        event["reason_code"] == LedgerReason.RUNTIME_LIMIT for event in result["inspection_ledger"]
+    )
+
+
+def test_build_context_transport_preparation_keeps_shared_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    budget = WorkflowResourceBudget(max_seconds=30.0)
+    observed_starts: list[float] = []
+    caplog.set_level(logging.DEBUG, logger="skillspector.nodes.build_context")
+
+    def expire_during_preparation() -> None:
+        assert budget.started_at is not None
+        observed_starts.append(budget.started_at)
+        budget.started_at = monotonic() - budget.max_seconds - 1
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports", expire_during_preparation
+    )
+    result = build_context({"skill_path": str(tmp_path), "workflow_resource_budget": budget})
+
+    assert len(observed_starts) == 1
+    assert result["workflow_resource_budget"] is budget
+    assert budget.remaining_seconds() == 0
+    assert budget.started_at < observed_starts[0]
+    assert result["file_cache"]["SKILL.md"] == "# Example\n"
+    assert "Workflow deadline reached while preparing AI transport imports" in caplog.text
+
+
+def test_build_context_transport_import_failure_preserves_normal_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    caplog.set_level(logging.DEBUG, logger="skillspector.nodes.build_context")
+
+    def failed_preparation() -> None:
+        raise ImportError("private-error-detail")
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports", failed_preparation
+    )
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["model_config"]
+    assert result["file_cache"]["SKILL.md"] == "# Example\n"
+    assert not any(
+        event["reason_code"] == LedgerReason.RUNTIME_LIMIT for event in result["inspection_ledger"]
+    )
+    assert "Could not prepare AI transport imports (ImportError)" in caplog.text
+    assert "private-error-detail" not in caplog.text
+
+
+def test_build_context_transport_preparation_preserves_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+
+    def cancelled_preparation() -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports", cancelled_preparation
+    )
+    with pytest.raises(KeyboardInterrupt):
+        build_context({"skill_path": str(tmp_path)})
+
+
+def test_build_context_inspects_unverified_root_oms_signature(
     tmp_path: Path,
 ) -> None:
-    """A real OMS signature is reported as metadata but withheld from analyzers."""
+    """Recognized structure is metadata, never permission to exclude content."""
     (tmp_path / "SKILL.md").write_text("---\nname: signed\n---\n# Signed\n", encoding="utf-8")
     signature_path = _write_real_oms_signature(tmp_path)
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert "skill.oms.sig" not in result["components"]
-    assert "skill.oms.sig" not in result["file_cache"]
-    assert any(
+    assert "skill.oms.sig" in result["components"]
+    assert result["local_file_cache"]["skill.oms.sig"] == signature_path.read_bytes().decode(
+        "utf-8"
+    )
+    assert "https://in-toto.io/Statement/v1" in result["file_cache"]["skill.oms.sig"]
+    assert "skill.oms.sig" in result["llm_components"]
+    assert not any(
         event["path"] == "skill.oms.sig" and event["reason_code"] == "oms_signature"
         for event in result["inspection_ledger"]
     )
@@ -903,8 +1043,8 @@ def test_build_context_inventories_but_excludes_valid_root_oms_signature(
     }
 
 
-def test_build_context_excludes_future_oms_predicate_version(tmp_path: Path) -> None:
-    """OMS predicate revisions remain excluded without relaxing the namespace check."""
+def test_build_context_inspects_future_oms_predicate_version(tmp_path: Path) -> None:
+    """Future predicate versions cannot opt content out of inspection."""
     bundle = json.loads(_OMS_FIXTURE.read_text(encoding="utf-8"))
     payload = json.loads(base64.b64decode(bundle["dsseEnvelope"]["payload"]))
     payload["predicateType"] = "https://model_signing/signature/v1.1"
@@ -915,8 +1055,9 @@ def test_build_context_excludes_future_oms_predicate_version(tmp_path: Path) -> 
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert "skill.oms.sig" not in result["components"]
-    assert any(
+    assert "skill.oms.sig" in result["components"]
+    assert "skill.oms.sig" in result["llm_components"]
+    assert not any(
         event["path"] == "skill.oms.sig" and event["reason_code"] == "oms_signature"
         for event in result["inspection_ledger"]
     )
@@ -945,7 +1086,11 @@ def test_build_context_scans_unrecognized_root_oms_signature(
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert result["file_cache"]["skill.oms.sig"] == content
+    assert result["local_file_cache"]["skill.oms.sig"] == content
+    if invalid_case == "wrong_media_type":
+        assert "https://in-toto.io/Statement/v1" in result["file_cache"]["skill.oms.sig"]
+    else:
+        assert result["file_cache"]["skill.oms.sig"] == content
     signature_meta = next(
         item for item in result["component_metadata"] if item["path"] == "skill.oms.sig"
     )
@@ -958,11 +1103,119 @@ def test_build_context_scans_nested_oms_signature(tmp_path: Path) -> None:
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert result["file_cache"]["nested/skill.oms.sig"] == nested.read_bytes().decode("utf-8")
+    assert result["local_file_cache"]["nested/skill.oms.sig"] == nested.read_bytes().decode("utf-8")
+    assert "https://in-toto.io/Statement/v1" in result["file_cache"]["nested/skill.oms.sig"]
     signature_meta = next(
         item for item in result["component_metadata"] if item["path"] == "nested/skill.oms.sig"
     )
     assert signature_meta["type"] == "other"
+
+
+@pytest.mark.parametrize(
+    "failure", ["certificate", "signature", "oversized_signature", "payload", "dependency", "limit"]
+)
+def test_oms_projection_keeps_unsupported_fields_and_reports_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import sys
+
+    import skillspector.oms as oms
+
+    bundle = json.loads(_OMS_FIXTURE.read_bytes())
+    if failure == "certificate":
+        bundle["verificationMaterial"]["x509CertificateChain"]["certificates"][0]["rawBytes"] = (
+            "YWJj"
+        )
+    elif failure == "signature":
+        sig = bundle["dsseEnvelope"]["signatures"][0]["sig"]
+        bundle["dsseEnvelope"]["signatures"][0]["sig"] = base64.b64encode(
+            base64.b64decode(sig) + b"trailing"
+        ).decode()
+    elif failure == "oversized_signature":
+        from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+
+        bundle["dsseEnvelope"]["signatures"][0]["sig"] = base64.b64encode(
+            encode_dss_signature(1 << 600, 1)
+        ).decode()
+    elif failure == "payload":
+        bundle["dsseEnvelope"]["payload"] = "not-base64"
+    elif failure == "dependency":
+        monkeypatch.setitem(sys.modules, "cryptography", None)
+    else:
+        monkeypatch.setattr(oms, "_MAX_NODES", 3)
+    content = json.dumps(bundle)
+    (tmp_path / "bundle.json").write_text(content)
+    result = build_context({"skill_path": str(tmp_path)})
+    assert result["local_file_cache"]["bundle.json"] == content
+    assert any(event.get("reason_code") == "oms_signature" for event in result["inspection_ledger"])
+    if failure == "certificate":
+        assert "YWJj" in result["file_cache"]["bundle.json"]
+    if failure in {"certificate", "signature", "dependency"}:
+        assert "https://in-toto.io/Statement/v1" in result["file_cache"]["bundle.json"]
+
+
+@pytest.mark.parametrize("escaped_key", [False, True])
+def test_oms_projection_preserves_crlf_and_rejects_duplicate_fields(
+    tmp_path: Path, escaped_key: bool
+) -> None:
+    bundle = json.loads(_OMS_FIXTURE.read_bytes())
+    content = json.dumps(bundle, indent=2).replace("\n", "\r\n")
+    path = tmp_path / "bundle.json"
+    path.write_bytes(content.encode())
+    result = build_context({"skill_path": str(tmp_path)})
+    assert result["local_file_cache"]["bundle.json"] == content
+    assert "https://in-toto.io/Statement/v1" in result["file_cache"]["bundle.json"]
+    duplicate = content[:-1] + ', "dsseEnvelope": {}}'
+    if escaped_key:
+        duplicate = duplicate.replace('"dsseEnvelope"', r'"dss\u0065Envelope"')
+    path.write_bytes(duplicate.encode())
+    result = build_context({"skill_path": str(tmp_path)})
+    assert result["file_cache"]["bundle.json"] == duplicate
+    assert any(event.get("reason_code") == "oms_signature" for event in result["inspection_ledger"])
+
+
+@pytest.mark.parametrize("name", ["skill.oms.sig", "bundle.json"])
+@pytest.mark.parametrize("escaped_key", [False, True])
+def test_oversized_oms_bundle_keeps_an_explicit_projection_gap(tmp_path, name, escaped_key):
+    import skillspector.oms as oms
+
+    bundle = json.loads(_OMS_FIXTURE.read_bytes())
+    bundle["notes"] = "A" * oms._MAX_CHARS
+    content = json.dumps(bundle)
+    if escaped_key:
+        content = content.replace('"dsseEnvelope"', r'"dss\u0065Envelope"')
+    (tmp_path / name).write_text(content)
+
+    result = build_context({"skill_path": str(tmp_path), "use_llm": False})
+
+    assert result["local_file_cache"][name] == content
+    assert any(event.get("reason_code") == "oms_signature" for event in result["inspection_ledger"])
+
+
+@pytest.mark.parametrize("parseable_prefix", [False, True])
+def test_oms_projection_preserves_bounded_provider_view_for_truncated_files(
+    tmp_path, monkeypatch, parseable_prefix
+):
+    from importlib import import_module
+
+    module = import_module("skillspector.nodes.build_context")
+    monkeypatch.setattr(module, "MAX_TOTAL_CACHED_BYTES", 600_000)
+    bundle = json.loads(_OMS_FIXTURE.read_bytes())
+    if parseable_prefix:
+        content = json.dumps(bundle) + " " * 800_000
+    else:
+        bundle["notes"] = "A" * 800_000
+        content = json.dumps(bundle)
+    (tmp_path / "bundle.json").write_text(content)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    view = result["llm_file_cache"]["bundle.json"]
+    assert len(view) <= module.MAX_LLM_TRUNCATED_FILE_CHARS
+    assert "not reviewed by any analyzer" in view
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == "bundle.json")
+    assert artifact["disposition"] == ArtifactDisposition.PARTIAL
+    assert artifact["reason"] == LedgerReason.TOTAL_BYTES_LIMIT.value
 
 
 def test_build_context_skips_skip_dirs(tmp_path: Path) -> None:
@@ -1663,7 +1916,7 @@ def test_excluded_artifact_probe_checks_deadline_after_open(
     assert metadata[0]["excluded_inspection_incomplete"] is True
     assert metadata[0]["excluded_from_analysis"] is True
     assert archive_cache == {}
-    assert input_bytes == len("ordinary")
+    assert input_bytes == len("ordinary metadata\n")
     assert len(inventory) == 1
     assert inventory[0]["path"] == "node_modules/README"
     assert inventory[0]["disposition"] == ArtifactDisposition.PARTIAL

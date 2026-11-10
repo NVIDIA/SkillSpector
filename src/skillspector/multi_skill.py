@@ -74,6 +74,7 @@ class SkillDirectory:
     # Frozen discovery provenance. Re-rooting a dot-prefixed child must not
     # erase the hidden ancestry that keeps its content out of external models.
     local_only: bool = False
+    primary_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,11 +306,11 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
             except OSError as exc:
                 raise _read_error("multi_skill_directory_entry") from exc
 
-            has_manifest = _has_skill_md(child, budget=budget)
-            is_structured = False
+            primary_path = _manifest_file(child)
+            has_manifest = primary_path is not None
             if not has_manifest:
-                is_structured = _is_structured_skill_bundle(child, budget=budget)
-            if not (has_manifest or is_structured):
+                primary_path = _structured_skill_bundle_path(child, budget=budget)
+            if primary_path is None:
                 continue
 
             name = _sanitize_display_component(child.name)
@@ -321,6 +322,7 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
                     name=name,
                     relative_path=_sanitize_display_component(entry.name),
                     local_only=entry.name.startswith("."),
+                    primary_path=primary_path,
                 )
             )
     except _DetectionIncompleteError as exc:
@@ -377,8 +379,8 @@ def _bounded_scandir(
     return sorted(entries, key=lambda item: item.name)
 
 
-def _is_structured_skill_bundle(child_dir: Path, *, budget: _DetectionBudget) -> bool:
-    """Classify an AISOP/AISP child from an aggregate-bounded local cache."""
+def _structured_skill_bundle_path(child_dir: Path, *, budget: _DetectionBudget) -> Path | None:
+    """Find an AISOP/AISP child's primary source in the bounded local cache."""
     component_paths, raw_cache = _structured_candidate_cache(child_dir, budget=budget)
     result = extract_structured_skill_context_from_cache(
         child_dir,
@@ -404,7 +406,7 @@ def _is_structured_skill_bundle(child_dir: Path, *, budget: _DetectionBudget) ->
             )
         )
     budget.check_runtime()
-    return result.context is not None
+    return Path(str(result.context["bundle_path"])) if result.context is not None else None
 
 
 def _structured_candidate_cache(

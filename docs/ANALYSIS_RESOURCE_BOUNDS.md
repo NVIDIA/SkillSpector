@@ -6,6 +6,15 @@ relevant ceiling is reached, the scanner records the limitation and reports part
 
 Values below are implementation defaults. MiB means 1,048,576 bytes.
 
+## Locked npm dependency inspection
+
+`--inspect-dependencies` adds bounded acquisition and a separate static worker for
+each supported, integrity-verified locked artifact. Downloads and decompressed
+tar bytes both consume the remaining shared workflow byte budget. Worker runtime,
+memory, output, member counts, expansion, and source sizes have independent caps.
+Failures and unsupported content remain in the completeness ledger. See
+[dependency inspection limits and supported platforms](DEPENDENCY_CONTENT_INSPECTION.md).
+
 ## Bundle discovery and materialization
 
 | Resource | Ceiling | Scope |
@@ -16,8 +25,31 @@ Values below are implementation defaults. MiB means 1,048,576 bytes.
 | Discovery time | 30 seconds | One skill bundle |
 | Canonical cached source bytes | 64 MiB | Ordinary files and expanded nested members combined |
 | Cached bytes from one filesystem artifact | 16 MiB | One artifact |
-| End-to-end workflow time | 600 seconds | One graph execution |
+| End-to-end workflow time | 1080 seconds | One graph execution |
 | Cache and context-processing time | 60 seconds | One skill bundle, within the workflow deadline |
+
+Retained inspection-work capacities can be adjusted before starting the scanner:
+
+| Environment variable | Default | Maximum | Unit |
+|---|---:|---:|---|
+| `SKILLSPECTOR_MAX_INSPECTION_LEDGER_EVENTS` | 100,000 | 1,000,000 | Work-accounting records |
+| `SKILLSPECTOR_ARCHIVE_MAX_MEMBERS` | 4,096 | 10,000 | Members across all archives |
+| `SKILLSPECTOR_ARCHIVE_MAX_MEMBER_BYTES` | 1,000,000 | 16 MiB | Bytes in one expanded archive member |
+| `SKILLSPECTOR_MAX_PYTHON_AST_SOURCE_CHARS` | 1,000,000 | 8,000,000 | Characters in one Python source |
+| `SKILLSPECTOR_TP4_MAX_FILES` | 128 | 10,000 | Files admitted to TP4 |
+| `SKILLSPECTOR_TP4_MAX_FILE_CODE_BYTES` | 1 MiB | 16 MiB | UTF-8 bytes in one TP4 source |
+| `SKILLSPECTOR_TP4_MAX_TOTAL_CODE_BYTES` | 4 MiB | 64 MiB | UTF-8 source bytes admitted to TP4 |
+| `SKILLSPECTOR_TP4_MAX_TOTAL_INPUT_BYTES` | 4 MiB | 64 MiB | All serialized TP4 prompt bytes |
+
+Values must be positive decimal integers; byte settings use bytes rather than MiB suffixes.
+Unset or blank values retain the default. Invalid or out-of-range values warn without logging
+the supplied value and retain the default. Settings are read on import and require a process
+restart. A larger ledger retains independent analyzer results for each artifact; the public
+finding-output limit remains 10,000. All other limits still apply, including the shared workflow
+deadline, remaining artifact/byte allowance, Python AST cache budget, per-request token budget,
+TP4 batch limit, archive expansion ratio, depth and inspection time. Raising a capacity does not
+guarantee completion; omitted work remains explicitly incomplete. Larger Python AST settings can
+increase peak memory even though cached source characters remain bounded.
 
 The 64 MiB ceiling accounts for the canonical raw bytes retained for analysis. Local decoded text
 and LLM-safe text are derived only from those bounded bytes; they do not authorize another source
@@ -28,8 +60,9 @@ overhead or decoded Unicode storage occupies exactly the same amount of memory.
 Files larger than 16 MiB receive a bounded local projection and a `partial` inventory disposition.
 They are not sent to an external model. Lexical static analysis uses 256,000-character windows with
 an 8,192-character overlap. Unicode-derived security views are re-sliced to the same ceiling before
-pattern modules receive them. Whole-file Python AST analysis is limited to 1,000,000 characters, and
-the shared parsed-AST cache retains at most 8,000,000 source characters per scan.
+pattern modules receive them. Whole-file Python AST analysis defaults to 1,000,000 characters;
+`SKILLSPECTOR_MAX_PYTHON_AST_SOURCE_CHARS` sets its bounded per-file ceiling. The shared parsed-AST
+cache retains at most 8,000,000 source characters per scan.
 
 ## Nested containers
 
@@ -39,10 +72,10 @@ Its additional ceilings are:
 | Resource | Ceiling | Scope |
 |---|---:|---|
 | Recursion depth | 3 | One outer-to-inner provenance chain |
-| Members | 1,000 | All outer and nested containers combined |
+| Members | 4,096 | All outer and nested containers combined |
 | Expanded bytes | 25 MiB | All outer and nested containers combined |
 | Central-directory bytes | 4 MiB | One container, before ZIP metadata allocation |
-| Materialized member | 1,000,000 bytes | One member |
+| Materialized member | 1,000,000 bytes (configurable) | One member |
 | Compression ratio | 100:1 | One member |
 | Archive-inspection time | 5 seconds | All outer and nested containers combined |
 
@@ -69,6 +102,86 @@ output, and time limits are checked before the bounded document is accepted. YAM
 charged for each projected occurrence, so a compact alias graph cannot amplify the returned
 manifest past these limits. A malformed or incomplete claimed frontmatter leaves the manifest
 empty, marks the primary artifact `partial`, and records an allowlisted parse error or limit reason.
+
+## JSON quote ownership
+
+Standalone `.json` artifacts also have a separate, **2,097,152-character** host-syntax
+prepass for command-parser completeness. It reuses the iterative grammar to prove the
+entire original document, then treats only JSON punctuation outside strings as word
+boundaries. The proof carries through bounded windows only with ordered source mappings
+and intact original quote delimiters. String contents and all finding views stay visible;
+individual command-word, reconstruction, archive, output, and runtime limits still apply.
+This allowance does not expand the Markdown/frontmatter quote-ownership limits below.
+Concrete destructive commands inside original JSON strings retain an explicit incomplete
+interpretation until their finding provenance is supported. Existing raw and reconstructed
+findings remain visible; structural syntax ownership cannot turn that gap into a clean scan.
+
+The deterministic instruction parser can distinguish structural JSON quotes from instruction
+delimiters only after validating a complete JSON value within **131,072 source characters**.
+This is a structural capacity limit, independent of file-size and scan-time allowances.
+Candidates through 65,536 characters keep the established bounded JSON decoder path. Larger
+candidates use an iterative syntax validator that does not allocate decoded strings, numbers,
+arrays, or objects. A failed small-input decode is never retried through the larger-input path.
+
+The inclusive ceiling counts characters, not UTF-8 bytes or decoded JSON string lengths:
+
+- Standalone JSON includes surrounding whitespace. After bounded frontmatter, only the body
+  following the closing delimiter is counted.
+- An explicitly labeled, closed JSON fence counts its body, including newlines and raw list or
+  blockquote prefixes. Opening and closing fence lines are excluded.
+- Unicode characters count once; each source character of an escape such as `\u0061` counts.
+  The frontmatter boundary search has its own 65,536-character prefix bound.
+
+The iterative validator reads one complete value and trailing JSON whitespace. It rejects
+invalid escapes, raw controls inside strings, malformed numbers, unmatched delimiters, missing
+separators, trailing commas, and additional values. No quotes acquire ownership before validation
+reaches the end. Validation retains a byte per open container in a non-recursive grammar stack;
+the source ceiling therefore bounds nesting storage, token count, and the number of quote spans.
+There is no separate decoded-value allocation or integer-conversion cost. Deadline/cancellation
+checks occur within whitespace, string, number, and container processing, with fewer than 256
+validation characters between checks. The normalized fence-validation copy has a separate
+524,288-character ceiling to account for tabs expanding into at most four columns. Quote offsets
+continue to refer to the original source. The later quote-span collection is also bounded by
+the source characters and retains its existing runtime checks.
+
+This validates structural quote ownership; it does not exempt string contents from security
+analysis. Real commands and reconstructed instructions still pass through the existing analyzers.
+The unchanged 256,000-character analysis windows and their bounded context remain separate limits.
+A JSON value that straddles a window or exceeds another parser/runtime allowance may remain
+incomplete, even when its total size is below the JSON ownership ceiling. No unvalidated window
+fragment is treated as a complete value.
+
+When marker reconstruction is already incomplete and its first unresolved directive lies in an
+oversized JSON candidate, the ledger reports `json_quote_ownership_limit`. Its message identifies
+the zero-based, end-exclusive source character span `[start, end)`, observed character count,
+limit, and next step; the ledger also retains `observed_characters` and `limit_characters`.
+The exception's `path` identifies the source artifact. It does not assert that the candidate is
+valid JSON or that capacity is the only unresolved instruction issue. Invalid, truncated, and
+oversized candidates never acquire quote ownership. Unrelated parser failures retain their
+existing reason codes; an unclosed fence cannot establish a complete JSON body boundary.
+
+To resolve a capacity limitation, split the input into smaller **complete** JSON values or
+documents, preserve all required content and references, and rescan. Do not truncate the input
+or remove a required reference. Raising the timeout cannot raise this structural ceiling.
+Findings remain visible, and unresolved coverage remains incomplete: CLI `--fail-on-incomplete`
+returns nonzero and the MCP installation gate rejects it, even after successful semantic analysis.
+JSON with no unresolved instruction parsing may still complete without needing quote ownership.
+
+This extends the supported candidate size from 65,536 to 131,072 characters with a different,
+bounded validation algorithm. Previously incomplete valid examples can now complete when the
+remaining analysis also succeeds. Consumers that enumerate ledger reasons must recognize
+`json_quote_ownership_limit` for unresolved candidates exceeding the current ceiling, while
+continuing to reject incomplete reports regardless of reason. Do not add the old generic
+`obfuscated_instruction_text` as a second exception merely to preserve an exact-string predicate.
+That generic reason remains available for separate unresolved instruction parsing.
+
+Historical expectations tied to the 65,536-character ceiling must be retained as versioned
+compatibility evidence. A proposed successor contract may require complete analysis for an
+otherwise supported 65,537-character benign value and move the size-boundary rejection control to
+131,073 characters. Such a dataset migration needs explicit acceptance; it does not retroactively
+turn an old failed contract into a pass or weaken an existing expected-complete requirement.
+Further increases require new resource measurements and review, including dense strings, deep
+nesting, malformed input, cancellation, and analysis-window interactions.
 
 ## Intra-bundle references
 
@@ -114,7 +227,9 @@ malicious evasion. Keep required references and use the reason to choose the fix
 
 | Reason | Next step |
 |---|---|
+| `dependency_parse_error` | Correct the malformed dependency manifest or lockfile, then rerun the scan. |
 | `static_parse_limit` | Inspect the expression and analyzer. If valid source is misinterpreted, correct or update the scanner and rerun. |
+| `json_quote_ownership_limit` | Use the reported source span and 131,072-character bound to split complete JSON values while retaining required content, then rescan. |
 | `read_error`, `stat_error`, `file_disappeared`, `missing_file_cache` | Ensure the resolved target remains readable throughout the scan. |
 | `size_limit`, `runtime_limit` | Review the reported bounds and input size; distinguish a scanner performance problem from a legitimate resource ceiling. |
 | `binary_content`, `opaque_content` | Provide inspectable source or analysis support for the referenced format. |
@@ -122,6 +237,18 @@ malicious evasion. Keep required references and use the reason to choose the fix
 The finding and incomplete-analysis gates remain active until the relevant
 limitations are resolved. Evidence fields are diagnostic facts, not suppression
 instructions.
+
+### Markdown prose apostrophes
+
+In a complete Markdown file, a possessive or contraction such as `reference's`,
+`drivers'` or `don't` in a prose line is punctuation, not a shell single quote
+that stays open through the rest of the file. This applies only when every quote
+on the line is such a word apostrophe, the line has no `$`, backtick, backslash
+or double quote, and the line starts a new shell line: the previous line ends in
+a newline, not a backslash continuation or a Unicode line separator. Headings,
+block quotes, code blocks, HTML blocks, tables, lines inside a pending inline
+code span, and an apostrophe inside a quote or substitution that starts earlier
+keep the lexical reading.
 
 ### Perl literal help text
 
@@ -163,7 +290,14 @@ apostrophe in a comment, is charged only up to the end of that token, never to
 the code that follows. Python code that happens to use a shell wrapper name, as
 in `signal.alarm(timeout)`, is not reparsed as a shell command string. A
 runtime-selected command named in a comment takes operands only from that
-comment.
+comment. One named in a string literal takes operands only from the rest of
+that string's value: the literal's body and the bodies of literals implicitly
+or `+`-concatenated after it. A value that code can still extend or rewrite,
+with `%`, `.format` or another method call, a subscript, repetition, or a
+non-literal operand, keeps the conservative result, also after a closing
+parenthesis. An f-string replacement field among the operands may supply the
+recursive and force options, so a root target beside it also stays
+conservative.
 
 Literal payloads remain visible to every security check. A single string or
 comment that itself holds more unresolved shell text than the parser bound,
@@ -229,7 +363,7 @@ work consume the same allowance.
 | External targets | 32 | One traversal |
 | Downloaded and cached source bytes | 10 MiB | Root and dependencies combined |
 | Discovered and expanded artifacts | 10,000 | Root and dependencies combined |
-| Traversal time | 600 seconds | Root and dependencies combined |
+| Traversal time | 1080 seconds | Root and dependencies combined |
 | Reference source records | 1,024 | One extraction |
 | Reference source bytes | 1,000,000 | One extraction |
 | Raw reference candidates | 4,096 | One extraction |
@@ -250,7 +384,7 @@ removes the rejected partial checkout.
 
 | Resource | Ceiling | Scope |
 |---|---:|---|
-| Inspection-ledger events | 10,000 | One graph execution |
+| Inspection-ledger events | 100,000 (configurable) | One graph execution |
 | Build-context ledger events | 10,000 | One bundle context |
 | Static findings | 10,000 | One artifact |
 | Static findings | 10,000 | One analyzer |
@@ -263,7 +397,7 @@ removes the rejected partial checkout.
 | Retained YARA string instances | 4,096 | One matched rule |
 | Shipped-bytecode discovery entries | 10,000 | One analyzer execution |
 | Shipped-bytecode traversal depth | 64 | One analyzer execution |
-| Shipped-bytecode analysis time | 5 seconds | One analyzer execution, within the workflow deadline |
+| Shipped-bytecode active processing time | 5 seconds | One analyzer execution, within the workflow wall-clock deadline |
 | Dependency manifests | 64 | One analyzer execution |
 | Dependency packages | 256 | One manifest |
 | Dependency packages | 1,024 | One analyzer execution |
@@ -271,8 +405,8 @@ removes the rejected partial checkout.
 | Dependency analysis time | 30 seconds | One analyzer execution, within the workflow deadline |
 | OSV packages / query batches / detail requests | 256 / 4 / 64 | One dependency analysis budget |
 | OSV response bytes / retained results | 4 MiB / 256 | One dependency analysis budget |
-| TP4 source files / batches / findings | 128 / 64 / 64 | One analyzer execution |
-| TP4 source and prompt input | 4 MiB each | One analyzer execution |
+| TP4 source files / batches / findings | 128 / 256 / 64 | One analyzer execution; file and batch capacities are configurable |
+| TP4 source and prompt input | 4 MiB each (configurable) | One analyzer execution |
 | TP4 model input | 32,000 tokens | One batch |
 | Public finding and occurrence records | 10,000 | One report |
 
@@ -319,12 +453,27 @@ A low score or zero findings must not be interpreted as complete coverage when
 
 ## Configuring the aggregate workflow deadline
 
-The scanner limits one complete workflow to 600 seconds by default. Set
+The scanner limits one complete workflow to 1080 seconds (18 minutes) by default. Set
 `SKILLSPECTOR_MAX_WORKFLOW_SECONDS` to a positive finite number of seconds to
 change that aggregate deadline. The setting applies to direct,
 CLI, recursive, and multi-skill scans; byte and artifact ceilings remain in
 effect. Invalid, zero, negative, infinite, or NaN values safely keep the
-600-second default.
+1080-second default. Caller-supplied budgets remain authoritative. External
+process limits, including CI job and integration timeouts, can stop a scan sooner.
+
+## Configuring the TP4 batch limit
+
+TP4 description-behavior analysis allows up to 256 review batches per analyzer
+execution by default. Set `SKILLSPECTOR_TP4_MAX_BATCHES` to a decimal integer from
+1 to 4096 to change this limit. Unset or blank values retain the default. Invalid,
+zero, negative, fractional, or out-of-range values log a warning without echoing
+the supplied text and retain the 256-batch default.
+
+This setting changes only the batch count: source-file, byte, token, finding,
+concurrency, and remaining workflow-time limits still apply. Reaching a limit
+keeps the affected work incomplete; a larger allowance does not guarantee that
+every batch will finish. Set both environment variables before starting the
+SkillSpector process; they are read when their modules are imported.
 
 ## Configuring the static analysis deadline
 

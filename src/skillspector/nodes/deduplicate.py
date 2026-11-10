@@ -13,8 +13,10 @@ from skillspector.logging_config import get_logger
 from skillspector.models import (
     OCCURRENCE_CODE_SNIPPET_KEY,
     OCCURRENCE_FINDING_ID_KEY,
+    OCCURRENCE_FINDING_TEXT_KEY,
     Finding,
 )
+from skillspector.surface import SURFACES, infer_surface
 
 logger = get_logger(__name__)
 
@@ -30,6 +32,7 @@ def _occurrences(finding: Finding) -> list[dict[str, object]]:
                 OCCURRENCE_CODE_SNIPPET_KEY,
                 finding.code_snippet or finding.context,
             )
+            occurrence.setdefault(OCCURRENCE_FINDING_TEXT_KEY, finding.finding)
         return occurrences
     return [
         {
@@ -44,6 +47,7 @@ def _occurrences(finding: Finding) -> list[dict[str, object]]:
             "transitive_depth": finding.transitive_depth,
             OCCURRENCE_FINDING_ID_KEY: finding.finding_id,
             OCCURRENCE_CODE_SNIPPET_KEY: finding.code_snippet or finding.context,
+            OCCURRENCE_FINDING_TEXT_KEY: finding.finding,
         }
     ]
 
@@ -158,7 +162,12 @@ def _output_key(finding: Finding) -> tuple[object, ...]:
                 {
                     key: value
                     for key, value in occurrence.items()
-                    if key not in {OCCURRENCE_FINDING_ID_KEY, OCCURRENCE_CODE_SNIPPET_KEY}
+                    if key
+                    not in {
+                        OCCURRENCE_FINDING_ID_KEY,
+                        OCCURRENCE_CODE_SNIPPET_KEY,
+                        OCCURRENCE_FINDING_TEXT_KEY,
+                    }
                 }
                 for occurrence in finding.occurrences
             ],
@@ -167,6 +176,23 @@ def _output_key(finding: Finding) -> tuple[object, ...]:
             sort_keys=True,
         ),
     )
+
+
+def _occurrence_surface(finding: Finding, occurrence: dict[str, object]) -> str:
+    """Return the surface label to record against one occurrence.
+
+    The finding's own label is reused when the occurrence sits in the finding's
+    file. An occurrence pointing at another file (exact-match dedup aggregates
+    across files) falls back to a path-only inference, because the matched line
+    for that other file is not retained here.
+    """
+    recorded_surface = occurrence.get("surface")
+    if isinstance(recorded_surface, str) and recorded_surface in SURFACES:
+        return recorded_surface
+    file = str(occurrence.get("file", finding.file))
+    if file == finding.file and finding.surface:
+        return finding.surface
+    return infer_surface(file)
 
 
 def deduplicate(findings: list[Finding]) -> list[Finding]:
@@ -197,7 +223,7 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
         _classification_metadata,
     ), group in groups.items():
         representative = min(group, key=_representative_key)
-        occurrences: dict[tuple[object, ...], tuple[object, object]] = {}
+        occurrences: dict[tuple[object, ...], tuple[object, object, object, str]] = {}
         for finding in sorted(group, key=_representative_key):
             for occurrence in _occurrences(finding):
                 location = (
@@ -219,6 +245,8 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
                             OCCURRENCE_CODE_SNIPPET_KEY,
                             finding.code_snippet or finding.context,
                         ),
+                        occurrence.get(OCCURRENCE_FINDING_TEXT_KEY, finding.finding),
+                        _occurrence_surface(finding, occurrence),
                     ),
                 )
         ordered_occurrences = [
@@ -232,8 +260,10 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
                 **({"source_digest": source_digest} if source_digest else {}),
                 **({"source_url": source_url} if source_url else {}),
                 **({"transitive_depth": transitive_depth} if transitive_depth else {}),
+                **({"surface": surface} if surface else {}),
                 OCCURRENCE_FINDING_ID_KEY: report_finding_id,
                 OCCURRENCE_CODE_SNIPPET_KEY: report_code_snippet,
+                OCCURRENCE_FINDING_TEXT_KEY: report_finding_text,
             }
             for (
                 (
@@ -247,7 +277,7 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
                     source_url,
                     transitive_depth,
                 ),
-                (report_finding_id, report_code_snippet),
+                (report_finding_id, report_code_snippet, report_finding_text, surface),
             ) in sorted(
                 occurrences.items(),
                 key=lambda item: (

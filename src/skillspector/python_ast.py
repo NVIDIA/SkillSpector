@@ -37,9 +37,13 @@ from enum import StrEnum
 from threading import RLock
 from uuid import uuid4
 
+from skillspector.resource_limits import bounded_capacity
+
 # Keep this in sync with the existing static-analyzer size gate.  It lives here
 # so prewarming does not parse files that AST consumers will skip anyway.
-MAX_PYTHON_AST_SOURCE_CHARS = 1_000_000
+MAX_PYTHON_AST_SOURCE_CHARS = bounded_capacity(
+    "SKILLSPECTOR_MAX_PYTHON_AST_SOURCE_CHARS", 1_000_000, 8_000_000
+)
 # AST nodes can be substantially larger than their source.  Limit the total
 # source retained as parsed trees for any one scan; files beyond this budget
 # use the existing on-demand behavior rather than retaining unbounded memory.
@@ -1603,7 +1607,27 @@ def classify_python_source(
         if linux_content is None:
             return PythonSourceClassification.AMBIGUOUS
         platform_views.add(_classify_python_source_platforms(path, linux_content))
+    crlf_content = _crlf_shebang_view(content)
+    if crlf_content is not None:
+        platform_views.add(_classify_python_source_platforms(path, crlf_content))
     return full_line if len(platform_views) == 1 else PythonSourceClassification.AMBIGUOUS
+
+
+def _crlf_shebang_view(content: str | bytes | None) -> str | bytes | None:
+    """Return ``content`` with a CRLF shebang line ending read as LF, if it has one.
+
+    The kernel keeps the carriage return in the interpreter name, so direct
+    execution of such a file fails, but ``python3 <script>`` and Windows
+    launchers read the line ending and run it as Python.
+    """
+    line = _bounded_shebang_line(content)
+    if content is None or line is None or not line.startswith("#!") or not line.endswith("\r"):
+        return None
+    if isinstance(content, bytes):
+        end = len(line.encode("utf-8", errors="surrogateescape"))
+        return content[: end - 1] + content[end:] if content[end : end + 1] == b"\n" else None
+    end = len(line)
+    return content[: end - 1] + content[end:] if content[end : end + 1] == "\n" else None
 
 
 def is_python_source(path: str, content: str | bytes | None = None) -> bool:

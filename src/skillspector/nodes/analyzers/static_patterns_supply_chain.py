@@ -66,6 +66,7 @@ from skillspector.inspection_ledger import (
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import (
+    MAX_WORKFLOW_SECONDS,
     AnalyzerNodeResponse,
     SkillspectorState,
     transitive_note_truncation,
@@ -330,6 +331,10 @@ _SC3_HERE_STRING_LITERAL = re.compile(
     re.IGNORECASE,
 )
 _SC3_SHELL_DECODE_COMMAND = re.compile(_SC3_SHELL_DECODER, re.IGNORECASE)
+_SC3_DECODED_DATA_SINK = re.compile(
+    r"(?:[ \t]{1,16}-[A-Za-z0-9-]{1,16}){0,4}[ \t]{0,16}"
+    r"\|(?!\|)&?[ \t]{0,16}sha256sum(?=$|[\s;&|)`])"
+)
 
 
 def _decoded_shell_literal_payloads(content: str) -> list[tuple[int, str]]:
@@ -337,13 +342,29 @@ def _decoded_shell_literal_payloads(content: str) -> list[tuple[int, str]]:
 
     Only an inline echo/printf argument or a here-string is decoded, as base64,
     base32 or (for xxd) hex; an ``openssl enc`` cipher is not applied.
+    Direct checksum consumers are exempt only in a simple shell context without
+    alias, function or dynamic-command syntax. Other flows remain conservative
+    because a saved payload can be executed later.
     Variables, files and downloads stay opaque. Invalid UTF-8 becomes U+FFFD,
     so a stray byte cannot hide the command. Returns ``(offset, text)`` pairs
     in source order.
     """
+    checksum_exemption_allowed: bool | None = None
     decoded: list[tuple[int, str]] = []
     for pattern in (_SC3_PIPED_LITERAL, _SC3_HERE_STRING_LITERAL):
         for match in pattern.finditer(content):
+            if _SC3_DECODED_DATA_SINK.match(content, match.end()) is not None:
+                if checksum_exemption_allowed is None:
+                    # Normalize once: escaped or quoted words can still configure aliases.
+                    tokens = _shell_tokens(content)
+                    checksum_exemption_allowed = tokens is not None and not any(
+                        token in {"alias", "function", "eval", "source", "."}
+                        or token.startswith("sha256sum=")
+                        or any(character.isspace() or character in "()" for character in token)
+                        for token in tokens
+                    )
+                if checksum_exemption_allowed:
+                    continue
             literal = match.group("literal")
             decoder = match.group("decoder").lower()
             try:
@@ -1353,6 +1374,16 @@ def _extract_packages_from_requirements_detailed(
     largest_omitted: int | None = None
     if limit is not None and limit <= 0:
         return results, largest_omitted
+    # decode_text() decodes with plain "utf-8", which never strips a leading
+    # byte-order mark, so a BOM-prefixed requirements.txt would otherwise make
+    # the first requirement unparseable and silently drop it from SC4/OSV
+    # analysis. Strip leading BOMs here, scoped to manifest parsing only:
+    # decode_text() itself stays untouched because other analyzers treat
+    # U+FEFF as a hidden-character injection signal in file bodies.
+    # Single linear prefix strip: a per-character slicing loop here would
+    # copy ~n(n-1)/2 characters for n leading BOMs before any spec limit
+    # is checked, with no cancellation point in this preprocessing step.
+    content = content.lstrip("\ufeff")
     for line_num, line in _logical_requirement_lines(content):
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("-"):
@@ -1477,6 +1508,7 @@ def _extract_packages_from_package_json(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract (package_name, version_or_None, line_number) from package.json content.
 
@@ -1489,7 +1521,9 @@ def _extract_packages_from_package_json(
         return []
     try:
         data = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
         return _extract_packages_from_package_json_scan(content, limit=limit)
     if not isinstance(data, dict):
         return []
@@ -1533,6 +1567,7 @@ def _extract_packages_from_pyproject(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract (package_name, version_or_None, line_number) from pyproject.toml.
 
@@ -1545,7 +1580,9 @@ def _extract_packages_from_pyproject(
         return []
     try:
         data = tomllib.loads(content)
-    except tomllib.TOMLDecodeError:
+    except (ValueError, RecursionError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
         return []
 
     specs: list[str] = []
@@ -1598,15 +1635,236 @@ _LOCKFILE_PACKAGE_BLOCK_RE = re.compile(
     r"(?ms)^\s*\[\[package\]\]\s*$.*?(?=^\s*\[\[package\]\]\s*$|\Z)"
 )
 
+_PIPFILE_METADATA_SECTIONS = frozenset({"source", "requires", "scripts", "pipenv"})
+_PIPFILE_KEY_RE = re.compile(r"""^[ \t]*("(?:\\.|[^"\\])*"|'[^']*'|[A-Za-z0-9_-]+)[ \t]*=""")
+_JSON_TOKEN_RE = re.compile(r'"(?:\\.|[^"\\])*"|[{}\[\]]')
+_JSON_KEY_SUFFIX_RE = re.compile(r"\s*:")
+_TOML_STRING_TOKEN_RE = re.compile(r'''"""|\x27{3}|"(?:\\.|[^"\\])*"|'[^']*'|\#.*''')
+_TOML_MULTILINE_END_RE = {
+    '"""': re.compile(r'(?<!\\)(?:\\\\)*"""'),
+    "'''": re.compile("'''"),
+}
+
+
+def _pipenv_package_lines(
+    content: str, requested: set[tuple[str, str]], *, is_lockfile: bool
+) -> dict[tuple[str, str], int]:
+    """Index package keys once, retaining separate locations for each category."""
+    locations: dict[tuple[str, str], int] = {}
+    if not requested:
+        return locations
+    if is_lockfile:
+        depth = 0
+        section = ""
+        line = 1
+        position = 0
+        for token in _JSON_TOKEN_RE.finditer(content):
+            line += content.count("\n", position, token.start())
+            position = token.start()
+            value = token.group(0)
+            if value in {"{", "["}:
+                depth += 1
+            elif value in {"}", "]"}:
+                depth -= 1
+            elif depth in {1, 2} and _JSON_KEY_SUFFIX_RE.match(content, token.end()):
+                key = json.loads(value)
+                if depth == 1:
+                    section = key
+                elif (section, key) in requested:
+                    locations[(section, key)] = line
+        return locations
+
+    section = ""
+    multiline_quote: str | None = None
+    for line_number, line in enumerate(io.StringIO(content), 1):
+        was_multiline = multiline_quote is not None
+        position = 0
+        if multiline_quote is not None:
+            closing = _TOML_MULTILINE_END_RE[multiline_quote].search(line)
+            if closing is None:
+                continue
+            multiline_quote = None
+            position = closing.end()
+        while token := _TOML_STRING_TOKEN_RE.search(line, position):
+            quote = token.group(0)
+            if quote.startswith("#"):
+                break
+            position = token.end()
+            if quote in _TOML_MULTILINE_END_RE:
+                closing = _TOML_MULTILINE_END_RE[quote].search(line, position)
+                if closing is None:
+                    multiline_quote = quote
+                    break
+                position = closing.end()
+        if was_multiline:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("["):
+            try:
+                header = tomllib.loads(stripped)
+            except tomllib.TOMLDecodeError:
+                section = ""
+                continue
+            section = next(iter(header), "")
+            children = header.get(section)
+            if isinstance(children, dict):
+                for name in children:
+                    if (section, name) in requested:
+                        locations[(section, name)] = line_number
+            continue
+        key_match = _PIPFILE_KEY_RE.match(line)
+        if key_match is None:
+            continue
+        try:
+            key = next(iter(tomllib.loads(f"{key_match.group(1)} = 0")))
+        except tomllib.TOMLDecodeError:
+            continue
+        if (section, key) in requested:
+            locations[(section, key)] = line_number
+    return locations
+
+
+def _extract_packages_from_pipenv(
+    content: str,
+    *,
+    is_lockfile: bool,
+    limit: int | None = None,
+) -> tuple[list[tuple[str, str | None, int]], list[OsvQueryLimitation]]:
+    """Extract bounded Pipenv registry dependencies without executing project code.
+
+    Pipfile uses TOML package tables; Pipfile.lock uses JSON categories containing
+    all resolved direct and transitive packages. Metadata is never a dependency.
+    Non-registry sources and malformed entries remain explicit coverage gaps.
+    """
+    entry_limit = MAX_DEPENDENCY_PACKAGES_PER_FILE if limit is None else max(0, limit)
+    if entry_limit == 0:
+        return [], []
+    try:
+        data = json.loads(content) if is_lockfile else tomllib.loads(content)
+    except (ValueError, RecursionError) as error:
+        return [], [
+            OsvQueryLimitation(
+                reason=LedgerReason.DEPENDENCY_PARSE_ERROR,
+                error_class=type(error).__name__,
+            )
+        ]
+    if not isinstance(data, dict):
+        return [], [OsvQueryLimitation(reason=LedgerReason.DEPENDENCY_PARSE_ERROR)]
+
+    results: list[tuple[str, str | None, int]] = []
+    location_keys: list[tuple[str, str]] = []
+    limitations: list[OsvQueryLimitation] = []
+    limitation_keys: set[tuple[LedgerReason, str | None]] = set()
+
+    def note(limitation: OsvQueryLimitation) -> None:
+        key = (limitation.reason, limitation.error_class)
+        if key not in limitation_keys:
+            limitations.append(limitation)
+            limitation_keys.add(key)
+
+    seen = 0
+    for section, entries in data.items():
+        if section in ({"_meta"} if is_lockfile else _PIPFILE_METADATA_SECTIONS):
+            continue
+        if not isinstance(entries, dict):
+            note(OsvQueryLimitation(reason=LedgerReason.DEPENDENCY_PARSE_ERROR))
+            continue
+        for name, entry in entries.items():
+            seen += 1
+            if seen > entry_limit:
+                note(
+                    OsvQueryLimitation(
+                        reason=LedgerReason.OUTPUT_LIMIT,
+                        observed_records=seen,
+                        limit_records=entry_limit,
+                    )
+                )
+                break
+            if len(name) > MAX_DEPENDENCY_NAME_CHARS:
+                note(
+                    OsvQueryLimitation(
+                        reason=LedgerReason.SIZE_LIMIT,
+                        observed_characters=len(name),
+                        limit_characters=MAX_DEPENDENCY_NAME_CHARS,
+                    )
+                )
+                continue
+            if isinstance(entry, dict):
+                if any(source in entry for source in ("git", "path", "file", "hg", "svn", "bzr")):
+                    note(
+                        OsvQueryLimitation(
+                            reason=LedgerReason.DEPENDENCY_PARSE_ERROR,
+                            error_class="UnsupportedDependencySource",
+                        )
+                    )
+                    continue
+                spec = entry.get("version", "" if is_lockfile else "*")
+            else:
+                spec = entry if not is_lockfile else None
+            if not isinstance(spec, str):
+                requirement = None
+            elif len(spec) > MAX_DEPENDENCY_SPEC_CHARS:
+                note(
+                    OsvQueryLimitation(
+                        reason=LedgerReason.SIZE_LIMIT,
+                        observed_characters=len(spec),
+                        limit_characters=MAX_DEPENDENCY_SPEC_CHARS,
+                    )
+                )
+                continue
+            else:
+                requirement = _extract_python_requirement(
+                    name if spec.strip() == "*" else f"{name}{spec}"
+                )
+            if requirement is None or requirement[0] != name:
+                note(OsvQueryLimitation(reason=LedgerReason.DEPENDENCY_PARSE_ERROR))
+                continue
+            if is_lockfile and requirement[1] is None:
+                note(OsvQueryLimitation(reason=LedgerReason.DEPENDENCY_PARSE_ERROR))
+                continue
+            results.append((*requirement, 1))
+            location_keys.append((section, name))
+        if seen > entry_limit:
+            break
+    locations = _pipenv_package_lines(content, set(location_keys), is_lockfile=is_lockfile)
+    return [
+        (name, version, locations.get(key, 1))
+        for (name, version, _line), key in zip(results, location_keys, strict=True)
+    ], limitations
+
+
+def _is_pipenv_lockfile(file_path: str) -> bool:
+    return Path(file_path).name.lower() == "pipfile.lock"
+
 
 def _normalize_package_name(name: str) -> str:
     """Normalize package names the same way OSV/fallback coverage does."""
     return name.lower().replace("_", "-")
 
 
+def _dependency_filename(file_path: str) -> str:
+    """Return a normalized basename so documentation is not mistaken for a manifest."""
+    return file_path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _is_requirements_file(file_path: str) -> bool:
+    normalized_path = file_path.replace("\\", "/").lower()
+    path_parts = normalized_path.split("/")
+    filename = path_parts[-1]
+    if filename in {"requirements", "requirements.txt", "requirements.in"} or re.fullmatch(
+        r"(?:requirements[-_][a-z0-9_-]+|[a-z0-9][a-z0-9_-]*[-_]requirements)\.(?:txt|in)",
+        filename,
+    ):
+        return True
+    return "requirements" in path_parts[:-1] and bool(
+        re.fullmatch(r"[a-z0-9][a-z0-9_-]*\.(?:txt|in)", filename)
+    )
+
+
 def _is_python_lockfile(file_path: str) -> bool:
-    lower_path = file_path.lower()
-    return "uv.lock" in lower_path or "poetry.lock" in lower_path
+    return _dependency_filename(file_path) in {"uv.lock", "poetry.lock"} or _is_pipenv_lockfile(
+        file_path
+    )
 
 
 def _normalize_npm_package_name(name: str) -> str:
@@ -1621,8 +1879,18 @@ def _normalize_npm_package_name(name: str) -> str:
 
 
 def _is_npm_lockfile(file_path: str) -> bool:
-    lower_path = file_path.lower()
-    return lower_path.endswith(("package-lock.json", "npm-shrinkwrap.json"))
+    return _dependency_filename(file_path) in {"package-lock.json", "npm-shrinkwrap.json"}
+
+
+def _is_dependency_manifest(file_path: str) -> bool:
+    """Recognize supported manifest names, not prose files that merely mention them."""
+    filename = _dependency_filename(file_path)
+    return (
+        _is_requirements_file(file_path)
+        or filename in {"package.json", "pyproject.toml", "setup.py", "pipfile", "pipfile.lock"}
+        or _is_python_lockfile(file_path)
+        or _is_npm_lockfile(file_path)
+    )
 
 
 def _npm_lock_line_index(content: str) -> dict[str, int]:
@@ -1642,7 +1910,11 @@ def _npm_lock_line_index(content: str) -> dict[str, int]:
     return index
 
 
-def _npm_lock_entries(content: str) -> list[tuple[str, str, int, int]]:
+def _npm_lock_entries(
+    content: str,
+    *,
+    on_parse_error: Callable[[str], None] | None = None,
+) -> list[tuple[str, str, int, int]]:
     """Extract (name, version, line, depth) for every install recorded in an npm lockfile.
 
     Covers both layouts: ``lockfileVersion`` 2/3 keep every install under ``packages`` keyed by
@@ -1659,7 +1931,11 @@ def _npm_lock_entries(content: str) -> list[tuple[str, str, int, int]]:
     """
     try:
         data = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, RecursionError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
+        return []
+    except TypeError:
         return []
     if not isinstance(data, dict):
         return []
@@ -1709,12 +1985,14 @@ def _extract_packages_from_npm_lock(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract exact package versions from an npm lockfile."""
     if limit is not None and limit <= 0:
         return []
     found: list[tuple[str, str | None, int]] = [
-        (name, version, line) for name, version, line, _depth in _npm_lock_entries(content)
+        (name, version, line)
+        for name, version, line, _depth in _npm_lock_entries(content, on_parse_error=on_parse_error)
     ]
     return found if limit is None else found[:limit]
 
@@ -1723,13 +2001,16 @@ def _extract_packages_from_toml_lock(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract exact package versions from TOML lockfiles such as uv.lock and poetry.lock."""
     if limit is not None and limit <= 0:
         return []
     try:
         data = tomllib.loads(content)
-    except tomllib.TOMLDecodeError:
+    except (ValueError, RecursionError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
         return []
     packages = data.get("package")
     if not isinstance(packages, list):
@@ -1768,19 +2049,26 @@ def _apply_locked_versions(
     return resolved
 
 
+def _python_lock_scope(file_path: str) -> tuple[str, bool]:
+    """Associate Pipenv locks only with sibling Pipfiles, not other manifests."""
+    path = Path(file_path)
+    return str(path.parent), path.name.lower() in {"pipfile", "pipfile.lock"}
+
+
 def _collect_locked_versions(
     file_cache: dict[str, str],
     components: list[str],
     *,
+    file_path: str = "requirements.txt",
     limit: int = MAX_DEPENDENCY_PACKAGES_PER_SCAN,
 ) -> dict[str, str]:
-    """Build package -> exact version map from Python lockfiles in the project."""
+    """Build the exact version map associated with a Python manifest."""
     locked_versions, _limitations = _collect_locked_versions_detailed(
         file_cache,
         components,
         limit=limit,
     )
-    return locked_versions
+    return locked_versions.get(_python_lock_scope(file_path), {})
 
 
 def _collect_locked_versions_detailed(
@@ -1790,9 +2078,10 @@ def _collect_locked_versions_detailed(
     limit: int = MAX_DEPENDENCY_PACKAGES_PER_SCAN,
     max_files: int | None = None,
     timeout_seconds: float | None = None,
-) -> tuple[dict[str, str], list[tuple[str, OsvQueryLimitation]]]:
+) -> tuple[dict[tuple[str, bool], dict[str, str]], list[tuple[str, OsvQueryLimitation]]]:
     """Build a bounded lock map and identify any manifest whose tail was omitted."""
-    locked_versions: dict[str, str] = {}
+    locked_versions: dict[tuple[str, bool], dict[str, str]] = {}
+    ambiguous_versions: set[tuple[tuple[str, bool], str]] = set()
     limitations: list[tuple[str, OsvQueryLimitation]] = []
     packages_seen = 0
     lockfiles_seen = 0
@@ -1834,7 +2123,7 @@ def _collect_locked_versions_detailed(
             )
             break
         content = file_cache.get(path)
-        if not content:
+        if content is None or (not content and not _is_pipenv_lockfile(path)):
             continue
         remaining = max(0, limit - packages_seen)
         if remaining <= 0:
@@ -1849,11 +2138,17 @@ def _collect_locked_versions_detailed(
                 )
             )
             break
-        packages = _extract_packages_from_toml_lock(
-            content,
-            limit=remaining + 1,
-        )
-        if len(packages) > remaining:
+        if _is_pipenv_lockfile(path):
+            packages, parse_limitations = _extract_packages_from_pipenv(
+                content,
+                is_lockfile=True,
+                limit=remaining + 1,
+            )
+            limitations.extend((path, limitation) for limitation in parse_limitations)
+        else:
+            packages = _extract_packages_from_toml_lock(content, limit=remaining + 1)
+        package_limit_exceeded = len(packages) > remaining
+        if package_limit_exceeded:
             limitations.append(
                 (
                     path,
@@ -1866,10 +2161,24 @@ def _collect_locked_versions_detailed(
             )
             packages = packages[:remaining]
         packages_seen += len(packages)
+        scope = _python_lock_scope(path)
         for name, version, _line_num in packages:
             if version:
-                locked_versions[_normalize_package_name(name)] = version
-        if limitations:
+                project_versions = locked_versions.setdefault(scope, {})
+                normalized_name = _normalize_package_name(name)
+                key = scope, normalized_name
+                if key in ambiguous_versions:
+                    continue
+                previous_version = project_versions.get(normalized_name)
+                if previous_version is not None and previous_version != version:
+                    # Different categories or lockfiles can pin different versions.
+                    # Keep scanning each pin, but do not guess for an unpinned manifest.
+                    project_versions.pop(normalized_name)
+                    ambiguous_versions.add(key)
+                else:
+                    project_versions[normalized_name] = version
+        # File-local parse gaps must not prevent resolution in other projects.
+        if package_limit_exceeded:
             break
     return locked_versions, limitations
 
@@ -1904,7 +2213,7 @@ def _collect_npm_locked_versions(
         if timeout_seconds is not None and time.monotonic() - started_at >= timeout_seconds:
             break
         content = file_cache.get(path)
-        if not content:
+        if content is None:
             continue
         files_read += 1
         for name, version, _line_num, depth in _npm_lock_entries(content):
@@ -2133,10 +2442,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
     tag = [PatternCategory.SUPPLY_CHAIN.value]
 
-    is_dep_file = any(
-        n in file_path.lower()
-        for n in ["requirements", "package.json", "pyproject.toml", "setup.py", "pipfile"]
-    )
+    is_dep_file = _is_dependency_manifest(file_path)
     if is_dep_file:
         for pattern, confidence in SC1_PATTERNS:
             matches = (
@@ -2273,7 +2579,10 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
                 break
     sc3_patterns = (
-        SC3_PATTERNS if file_type in ("python", "javascript", "shell", "perl", "other") else []
+        SC3_PATTERNS
+        if file_type in ("python", "javascript", "shell", "perl", "powershell", "other")
+        or file_path.lower().endswith(".mdc")
+        else []
     )
     if has_shell_decoder:
         sc3_patterns = sc3_patterns + SC3_SHELL_PATTERNS
@@ -2886,14 +3195,15 @@ def _analyze_dependencies_detailed(
     limitations: list[OsvQueryLimitation] = []
     tag = [PatternCategory.SUPPLY_CHAIN.value]
 
-    lower_path = file_path.lower()
-    is_lockfile = _is_python_lockfile(lower_path)
-    is_npm_lock = _is_npm_lockfile(lower_path)
+    filename = _dependency_filename(file_path)
+    is_lockfile = _is_python_lockfile(file_path)
+    is_npm_lock = _is_npm_lockfile(file_path)
     is_python_dep = (
-        any(n in lower_path for n in ["requirements", "pyproject.toml", "setup.py", "pipfile"])
+        _is_requirements_file(file_path)
+        or filename in {"pyproject.toml", "setup.py", "pipfile", "pipfile.lock"}
         or is_lockfile
     )
-    is_npm_dep = "package.json" in lower_path or is_npm_lock
+    is_npm_dep = filename == "package.json" or is_npm_lock
 
     if not is_python_dep and not is_npm_dep:
         return findings, limitations, 0
@@ -2907,11 +3217,34 @@ def _analyze_dependencies_detailed(
     )
     extraction_limit = package_limit + 1
 
+    def record_parse_error(error_class: str) -> None:
+        limitations.append(
+            OsvQueryLimitation(
+                reason=LedgerReason.DEPENDENCY_PARSE_ERROR,
+                error_class=error_class,
+            )
+        )
+
     if is_python_dep:
-        if "pyproject.toml" in lower_path:
-            packages = _extract_packages_from_pyproject(content, limit=extraction_limit)
+        if filename in {"pipfile", "pipfile.lock"}:
+            packages, parse_limitations = _extract_packages_from_pipenv(
+                content,
+                is_lockfile=_is_pipenv_lockfile(file_path),
+                limit=extraction_limit,
+            )
+            limitations.extend(parse_limitations)
+        elif filename == "pyproject.toml":
+            packages = _extract_packages_from_pyproject(
+                content,
+                limit=extraction_limit,
+                on_parse_error=record_parse_error,
+            )
         elif is_lockfile:
-            packages = _extract_packages_from_toml_lock(content, limit=extraction_limit)
+            packages = _extract_packages_from_toml_lock(
+                content,
+                limit=extraction_limit,
+                on_parse_error=record_parse_error,
+            )
         else:
             packages, oversized_spec = _extract_packages_from_requirements_detailed(
                 content,
@@ -2933,10 +3266,18 @@ def _analyze_dependencies_detailed(
         known_legit = _KNOWN_LEGIT_PYPI
     else:
         if is_npm_lock:
-            packages = _extract_packages_from_npm_lock(content, limit=extraction_limit)
+            packages = _extract_packages_from_npm_lock(
+                content,
+                limit=extraction_limit,
+                on_parse_error=record_parse_error,
+            )
         else:
             packages = _apply_locked_versions(
-                _extract_packages_from_package_json(content, limit=extraction_limit),
+                _extract_packages_from_package_json(
+                    content,
+                    limit=extraction_limit,
+                    on_parse_error=record_parse_error,
+                ),
                 npm_locked_versions,
                 _normalize_npm_package_name,
             )
@@ -3016,7 +3357,7 @@ def _analyze_dependencies_detailed(
         logger.debug(
             "SC4: using static fallback for %d uncovered packages", len(uncovered_packages)
         )
-    elif uncovered_packages and not osv_findings and not was_osv_reachable():
+    elif uncovered_packages and not osv_findings and not was_osv_reachable(osv_budget):
         # OSV.dev was unreachable and fallback found nothing — surface the gap
         retain(
             [
@@ -3361,6 +3702,8 @@ _SC8_BYTECODE_SUFFIXES = (".pyc", ".pyo")
 MAX_SC8_DISCOVERED_ENTRIES = 10_000
 MAX_SC8_DIRECTORY_ENTRIES = 10_000
 MAX_SC8_TRAVERSAL_DEPTH = 64
+# Processing budget, measured with ``time.thread_time()`` so that time spent
+# waiting for the GIL behind concurrently running analyzers does not count.
 MAX_SC8_ANALYSIS_SECONDS = 5.0
 MAX_SC8_FINDINGS = 10_000
 MAX_SC8_LIMITATIONS = 256
@@ -3395,7 +3738,14 @@ def _scan_shipped_bytecode(
     timeout_seconds: float | None = None,
     max_findings: int | None = None,
 ) -> _ShippedBytecodeScanResult:
-    """Discover shipped bytecode with deterministic aggregate resource bounds."""
+    """Discover shipped bytecode with deterministic aggregate resource bounds.
+
+    Analyzers run concurrently in one process, so the walk can spend most of
+    its wall-clock time waiting for the GIL. The processing budget therefore
+    counts only this thread's CPU time. Wall-clock time is bounded by the
+    remaining workflow deadline (``timeout_seconds``), or by the full workflow
+    limit for callers outside a workflow.
+    """
     findings: list[Finding] = []
     limitations: list[_SupplementalLimitation] = []
     if not skill_path or not isinstance(skill_path, str):
@@ -3405,10 +3755,11 @@ def _scan_shipped_bytecode(
         return _ShippedBytecodeScanResult(findings, limitations)
 
     started_at = time.monotonic()
-    runtime_limit = max(0.0, MAX_SC8_ANALYSIS_SECONDS)
-    if timeout_seconds is not None:
-        runtime_limit = min(runtime_limit, max(0.0, timeout_seconds))
-    deadline = started_at + runtime_limit
+    active_started_at = time.thread_time()
+    active_limit = max(0.0, MAX_SC8_ANALYSIS_SECONDS)
+    wall_clock_limit = max(
+        0.0, MAX_WORKFLOW_SECONDS if timeout_seconds is None else timeout_seconds
+    )
     requested_finding_limit = MAX_SC8_FINDINGS if max_findings is None else max_findings
     finding_limit = max(0, min(requested_finding_limit, MAX_SC8_FINDINGS))
     discovered_entries = 0
@@ -3432,15 +3783,20 @@ def _scan_shipped_bytecode(
         )
 
     def runtime_exhausted(relative_directory: str) -> bool:
-        now = time.monotonic()
-        if now < deadline:
+        wall_clock_elapsed = max(0.0, time.monotonic() - started_at)
+        active_elapsed = max(0.0, time.thread_time() - active_started_at)
+        if wall_clock_elapsed >= wall_clock_limit:
+            observed_seconds, limit_seconds = wall_clock_elapsed, wall_clock_limit
+        elif active_elapsed >= active_limit:
+            observed_seconds, limit_seconds = active_elapsed, active_limit
+        else:
             return False
         add_limitation(
             _SupplementalLimitation(
                 path=scope_path(relative_directory),
                 reason=LedgerReason.RUNTIME_LIMIT,
-                observed_seconds=max(0.0, now - started_at),
-                limit_seconds=runtime_limit,
+                observed_seconds=observed_seconds,
+                limit_seconds=limit_seconds,
             )
         )
         return True
@@ -3639,6 +3995,7 @@ def _analyze_concealed_executables(
                 concealment_reasons.append("disguised_container")
         concealment = concealment_reasons[0]
         excluded_from_analysis = metadata.get("excluded_from_analysis") is True
+        partially_analyzed_executable = metadata.get("partially_analyzed_executable") is True
         referenced_uninspected = (
             metadata.get("inspection_limitation_reason")
             == LedgerReason.REFERENCED_UNINSPECTED.value
@@ -3651,6 +4008,8 @@ def _analyze_concealed_executables(
                     if referenced_uninspected
                     else "An excluded artifact could not be completely inspected."
                     if inspection_incomplete
+                    else "Readable text was inspected, but binary executable behavior was not analyzed."
+                    if partially_analyzed_executable
                     else "Executable content is excluded from analysis."
                     if excluded_from_analysis
                     else "Executable content is concealed inside a document, hidden, "
@@ -3676,6 +4035,9 @@ def _analyze_concealed_executables(
                     else "A resource, read, or archive-safety limit left excluded content "
                     "outside deterministic inspection coverage."
                     if inspection_incomplete
+                    else "Text-based checks covered the readable projection, but they cannot "
+                    "establish the behavior of the binary executable."
+                    if partially_analyzed_executable
                     else "An executable artifact remains available under the skill install path "
                     "but its content is outside analyzer coverage."
                     if excluded_from_analysis
@@ -3708,6 +4070,7 @@ def _analyze_concealed_executables(
                     "local_only": True,
                     "referenced": metadata.get("referenced") is True,
                     "excluded_from_analysis": excluded_from_analysis,
+                    "partially_analyzed_executable": partially_analyzed_executable,
                     "excluded_inspection_incomplete": inspection_incomplete,
                     "inherited_exclusion_reason": metadata.get("inherited_exclusion_reason"),
                     "inspection_limitation_reason": metadata.get("inspection_limitation_reason"),
@@ -3843,21 +4206,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     dependency_findings_seen = 0
     osv_budget = OsvQueryBudget.create(dependency_remaining_seconds())
     for path in components:
-        lower_path = path.lower()
-        is_dep_file = any(
-            n in lower_path
-            for n in [
-                "requirements",
-                "package.json",
-                "package-lock.json",
-                "npm-shrinkwrap.json",
-                "pyproject.toml",
-                "setup.py",
-                "pipfile",
-                "uv.lock",
-                "poetry.lock",
-            ]
-        )
+        is_dep_file = _is_dependency_manifest(path)
         if not is_dep_file:
             continue
         dependency_files_seen += 1
@@ -3915,12 +4264,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             )
             break
         content = file_cache.get(path)
-        if not content:
+        if content is None:
             continue
         dep_findings, dependency_limitations, packages_seen = _analyze_dependencies_detailed(
             content,
             path,
-            locked_versions,
+            locked_versions.get(_python_lock_scope(path)),
             npm_locked_versions,
             max_packages=min(MAX_DEPENDENCY_PACKAGES_PER_FILE, remaining_packages),
             max_findings=min(MAX_DEPENDENCY_FINDINGS_PER_FILE, remaining_dependency_findings),

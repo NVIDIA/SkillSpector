@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded, local-only inspection of ZIP-compatible nested artifacts.
+"""Bounded, local-only inspection of ZIP, TAR and GZIP nested artifacts.
 
 The inspector never extracts members to disk and never renders, imports, or
-executes their contents.  It recognizes ZIP-compatible content by bytes, gives
+executes their contents.  It recognizes supported content by bytes, gives
 every member a stable virtual path, and returns text projections solely for
 deterministic analyzers.
 """
@@ -15,8 +15,10 @@ import io
 import re
 import stat
 import struct
+import tarfile
 import time
 import zipfile
+import zlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -27,8 +29,9 @@ from skillspector.artifacts import (
     ContentKind,
     classify_artifact,
     has_dex_magic,
+    has_tar_header,
 )
-from skillspector.constants import MAX_FILE_BYTES
+from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES, MAX_FILE_BYTES
 from skillspector.input_handler import (
     _FileOpenError,
     _open_regular_file_no_follow,
@@ -41,14 +44,21 @@ from skillspector.inspection_ledger import (
     LedgerRecordType,
     ledger_event,
 )
+from skillspector.passive_svg import is_structurally_valid_passive_svg
 from skillspector.python_ast import PythonSourceClassification, classify_python_source
+from skillspector.resource_limits import bounded_capacity
 
 ARCHIVE_MAX_DEPTH = 3
-ARCHIVE_MAX_MEMBERS = 1_000
+ARCHIVE_MAX_MEMBERS = bounded_capacity("SKILLSPECTOR_ARCHIVE_MAX_MEMBERS", 4_096, 10_000)
+ARCHIVE_MAX_MEMBER_BYTES = bounded_capacity(
+    "SKILLSPECTOR_ARCHIVE_MAX_MEMBER_BYTES", MAX_FILE_BYTES, MAX_ANALYZABLE_FILE_BYTES
+)
 ARCHIVE_MAX_UNCOMPRESSED_BYTES = 25 * 1024 * 1024
 ARCHIVE_MAX_CENTRAL_DIRECTORY_BYTES = 4 * 1024 * 1024
 ARCHIVE_MAX_COMPRESSION_RATIO = 100
 ARCHIVE_MAX_SECONDS = 5.0
+ARCHIVE_MAX_METADATA_DEPTH = 32
+ARCHIVE_MAX_VIRTUAL_PATH_BYTES = 65535
 
 _ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 _EXECUTABLE_SUFFIXES = frozenset(
@@ -106,6 +116,8 @@ _EXPECTED_SUFFIXES: dict[str, frozenset[str]] = {
     "xlsx": frozenset({".xlsx", ".xlsm", ".xltx", ".xltm"}),
     "pptx": frozenset({".pptx", ".pptm", ".potx", ".potm", ".ppsx", ".ppsm"}),
     "zip": frozenset({".zip"}),
+    "tar": frozenset({".tar"}),
+    "gzip": frozenset({".gz", ".tgz"}),
 }
 
 
@@ -127,7 +139,14 @@ class NestedInspectionResult:
     # Byte-recognized ZIPs at every depth, including ones stopped by a limit.
     # Expected extensions and format mismatches are not content recognition.
     recognized_zip_paths: set[str] = field(default_factory=set)
+    recognized_container_paths: set[str] = field(default_factory=set)
+    # Only complete bounded traversals, including every nested member read.
+    inspected_containers: dict[str, list[str]] = field(default_factory=dict)
     ledger_events: list[InspectionLedgerEvent] = field(default_factory=list)
+    # Keep the actual event objects: disk and virtual paths can share both a
+    # spelling and a work ID, so neither identifies which input produced it.
+    disk_container_events: list[InspectionLedgerEvent] = field(default_factory=list)
+    _active_disk_path: str | None = None
     uncompressed_bytes: int = 0
     # Exceptions can target a top-level container before a virtual artifact row
     # exists. Preserve their canonical disposition so build_context can apply
@@ -150,6 +169,10 @@ class _Budget:
     last_checked_at: float
     members: int = 0
     uncompressed_bytes: int = 0
+    metadata_fields: int = 0
+    gzip_metadata_bytes: int = 0
+    virtual_identity_bytes: int = 0
+    outer_path: str = ""
     halted: bool = False
 
     def expired(self) -> bool:
@@ -178,6 +201,7 @@ _PARTIAL_INVENTORY_REASONS = frozenset(
         LedgerReason.ARCHIVE_DEPTH_LIMIT,
         LedgerReason.ARCHIVE_FORMAT_MISMATCH,
         LedgerReason.ARCHIVE_MEMBER_LIMIT,
+        LedgerReason.ARCHIVE_MEMBER_INCOMPLETE,
         LedgerReason.ARCHIVE_MEMBER_SIZE_LIMIT,
         LedgerReason.ARCHIVE_SIZE_LIMIT,
         LedgerReason.ARCHIVE_TIME_LIMIT,
@@ -191,6 +215,8 @@ _FAILED_INVENTORY_REASONS = frozenset(
         LedgerReason.ARCHIVE_MALFORMED,
         LedgerReason.ARCHIVE_TRUNCATED,
         LedgerReason.ARCHIVE_UNSUPPORTED_COMPRESSION,
+        LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER,
+        LedgerReason.OPAQUE_CONTENT,
     }
 )
 
@@ -329,7 +355,19 @@ def is_zip_content(data: bytes) -> bool:
     return data.startswith(_ZIP_SIGNATURES)
 
 
-_is_zip_signature = is_zip_content
+def _archive_type(data: bytes) -> str | None:
+    if is_zip_content(data):
+        return "zip"
+    if data.startswith(b"\x1f\x8b"):
+        return "gzip"
+    if has_tar_header(data):
+        return "tar"
+    return None
+
+
+def is_archive_content(data: bytes) -> bool:
+    """Recognize supported archives without opening or expanding their contents."""
+    return _archive_type(data) is not None
 
 
 def _is_hidden_path(path: str) -> bool:
@@ -346,7 +384,7 @@ def _container_type(names: list[str]) -> str:
 
 
 def expected_container_type(path: str) -> str | None:
-    """Return the ZIP-family container type implied by a filename, if any."""
+    """Return the supported container type implied by a filename, if any."""
     suffix = Path(path).suffix.lower()
     return next(
         (
@@ -366,6 +404,7 @@ def _safe_member_name(name: str) -> str | None:
     if (
         not normalized
         or "\x00" in normalized
+        or any(0xD800 <= ord(character) <= 0xDFFF for character in normalized)
         or "!/" in normalized
         or normalized.startswith(("/", "//"))
     ):
@@ -376,6 +415,39 @@ def _safe_member_name(name: str) -> str | None:
     if not parts or any(part in ("", ".", "..") for part in parts):
         return None
     return PurePosixPath(*parts).as_posix()
+
+
+def _member_name(
+    name: str, *, directory: bool, seen: dict[str, bool], container: str, budget: _Budget
+) -> tuple[str | None, LedgerReason | None]:
+    """Share path and namespace validation across archive formats."""
+    if directory and name.rstrip("/") == ".":
+        return None, None
+    try:
+        _member_identity_size(container, name, budget)
+    except UnicodeEncodeError:
+        return None, LedgerReason.ARCHIVE_UNSAFE_MEMBER_PATH
+    safe = _safe_member_name(name)
+    if safe is None:
+        return None, LedgerReason.ARCHIVE_UNSAFE_MEMBER_PATH
+    for existing, existing_directory in seen.items():
+        _check_archive_time(budget)
+        parent_file = (
+            not existing_directory
+            and len(existing) < len(safe)
+            and safe.startswith(existing)
+            and safe[len(existing)] == "/"
+        )
+        existing_child = (
+            not directory
+            and len(safe) < len(existing)
+            and existing.startswith(safe)
+            and existing[len(safe)] == "/"
+        )
+        if safe == existing or parent_file or existing_child:
+            return safe, LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH
+    seen[safe] = directory
+    return safe, None
 
 
 def _zip_member_is_link(info: zipfile.ZipInfo) -> bool:
@@ -495,25 +567,17 @@ def has_binary_executable_magic(data: bytes) -> bool:
 def is_executable_content(
     path: str, data: bytes, mode: int = 0, *, complete_content: bool = False
 ) -> bool:
-    """Classify content; only complete declarations may receive the inert exemption."""
+    """Classify content; exemptions require complete, bounded structure proofs."""
     suffix = Path(path).suffix.lower()
     executable_magic = data.startswith(b"#!") or has_binary_executable_magic(data)
     declaration_only = _looks_like_typescript_declaration(
         path, data, complete_content=complete_content
     )
+    passive_svg = suffix == ".svg" and complete_content and is_structurally_valid_passive_svg(data)
     return (
-        (suffix in _EXECUTABLE_SUFFIXES and not declaration_only)
+        (suffix in _EXECUTABLE_SUFFIXES and not declaration_only and not passive_svg)
         or executable_magic
         or bool(mode & 0o111)
-    )
-
-
-def _member_executable(info: zipfile.ZipInfo, safe_name: str, data: bytes) -> bool:
-    return is_executable_content(
-        safe_name,
-        data,
-        info.external_attr >> 16,
-        complete_content=len(data) == info.file_size,
     )
 
 
@@ -559,6 +623,7 @@ def _virtual_type(
     suffix = Path(path).suffix.lower()
     return {
         ".md": "markdown",
+        ".mdc": "markdown",
         ".markdown": "markdown",
         ".py": "python",
         ".pyw": "python",
@@ -571,6 +636,8 @@ def _virtual_type(
         ".toml": "toml",
         ".txt": "text",
         ".js": "javascript",
+        ".mjs": "javascript",
+        ".cjs": "javascript",
         ".ts": "typescript",
         ".rb": "ruby",
         ".go": "go",
@@ -621,27 +688,26 @@ def _exception(
     limit_seconds: float | None = None,
 ) -> None:
     _mark_inventory_exception(result, path=path, reason=reason)
-    result.ledger_events.append(
-        ledger_event(
-            outcome=(
-                LedgerOutcome.PARTIAL
-                if reason in _PARTIAL_INVENTORY_REASONS
-                else LedgerOutcome.SKIPPED
-            ),
-            record_type=LedgerRecordType.SYSTEM,
-            phase="nested_artifact_inspection",
-            path=path,
-            reason=reason,
-            observed_bytes=observed_bytes,
-            limit_bytes=limit_bytes,
-            observed_artifacts=observed_artifacts,
-            limit_artifacts=limit_artifacts,
-            observed_depth=observed_depth,
-            limit_depth=limit_depth,
-            observed_seconds=observed_seconds,
-            limit_seconds=limit_seconds,
-        )
+    event = ledger_event(
+        outcome=(
+            LedgerOutcome.PARTIAL if reason in _PARTIAL_INVENTORY_REASONS else LedgerOutcome.SKIPPED
+        ),
+        record_type=LedgerRecordType.SYSTEM,
+        phase="nested_artifact_inspection",
+        path=path,
+        reason=reason,
+        observed_bytes=observed_bytes,
+        limit_bytes=limit_bytes,
+        observed_artifacts=observed_artifacts,
+        limit_artifacts=limit_artifacts,
+        observed_depth=observed_depth,
+        limit_depth=limit_depth,
+        observed_seconds=observed_seconds,
+        limit_seconds=limit_seconds,
     )
+    result.ledger_events.append(event)
+    if path == result._active_disk_path:
+        result.disk_container_events.append(event)
 
 
 def _time_exception(
@@ -715,6 +781,97 @@ def _add_unreadable_component(
         )
 
 
+def _record_member(
+    data: bytes,
+    *,
+    name: str,
+    mode: int,
+    outer_path: str,
+    container_virtual_path: str,
+    container_type: str,
+    container_ancestry: tuple[str, ...],
+    depth: int,
+    outer_hidden: bool,
+    outer_disguised: bool,
+    concealment_reasons: tuple[str, ...],
+    budget: _Budget,
+    result: NestedInspectionResult,
+    complete_content: bool = True,
+    virtual_path: str | None = None,
+) -> str:
+    """Publish one validated member through the same inventory and local-only route."""
+    if virtual_path is None:
+        virtual_path = _member_path(container_virtual_path, name, budget)
+    if virtual_path in result.file_cache:
+        result.inspected_containers.pop(container_virtual_path, None)
+        _exception(
+            result,
+            path=container_virtual_path,
+            reason=LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH,
+        )
+        return virtual_path
+    nested_type = _archive_type(data)
+    executable = is_executable_content(name, data, mode, complete_content=complete_content)
+    source_classification = classify_python_source(name, data)
+    virtual_type = _virtual_type(name, data, nested_type, source_classification)
+    result.components.append(virtual_path)
+    result.file_cache[virtual_path] = data.decode("utf-8", errors="replace")
+    result.raw_file_cache[virtual_path] = data
+    result.python_source_classifications[virtual_path] = source_classification
+    result.artifact_inventory.append(classify_artifact(virtual_path, data))
+    if not complete_content:
+        _exception(result, path=virtual_path, reason=LedgerReason.ARCHIVE_MEMBER_INCOMPLETE)
+    result.metadata.append(
+        {
+            "path": virtual_path,
+            "type": virtual_type,
+            "lines": 0
+            if virtual_type == "binary"
+            else len(result.file_cache[virtual_path].splitlines()),
+            "executable": executable,
+            "size_bytes": len(data),
+            "outer_path": outer_path,
+            "nested_path": _nested_path(outer_path, virtual_path),
+            "container_type": container_type,
+            "container_ancestry": list(container_ancestry),
+            "container_depth": depth,
+            "hidden": _is_hidden_path(name),
+            "outer_hidden": outer_hidden,
+            "outer_disguised": outer_disguised,
+            "local_only": True,
+            "concealed_executable": executable and bool(concealment_reasons),
+            "concealment_reasons": list(concealment_reasons),
+        }
+    )
+    if nested_type is None:
+        return virtual_path
+    result.recognized_container_paths.add(virtual_path)
+    if nested_type == "zip":
+        result.recognized_zip_paths.add(virtual_path)
+    if depth >= budget.max_depth:
+        _exception(
+            result,
+            path=virtual_path,
+            reason=LedgerReason.ARCHIVE_DEPTH_LIMIT,
+            observed_depth=depth + 1,
+            limit_depth=budget.max_depth,
+        )
+        return virtual_path
+    _inspect_archive_bytes(
+        data,
+        outer_path=outer_path,
+        container_virtual_path=virtual_path,
+        depth=depth + 1,
+        outer_hidden=outer_hidden,
+        outer_disguised=outer_disguised,
+        outer_expected_type=None,
+        ancestor_container_types=container_ancestry,
+        budget=budget,
+        result=result,
+    )
+    return virtual_path
+
+
 def _inspect_zip_bytes(
     data: bytes,
     *,
@@ -728,6 +885,8 @@ def _inspect_zip_bytes(
     budget: _Budget,
     result: NestedInspectionResult,
 ) -> None:
+    initial_exceptions = len(result.ledger_events)
+    member_paths: list[str] = []
     if budget.expired():
         budget.halted = True
         _time_exception(result, path=container_virtual_path, budget=budget)
@@ -835,34 +994,44 @@ def _inspect_zip_bytes(
         if effective_outer_disguised:
             inherited_reason_list.append("disguised_container")
         inherited_reasons = tuple(inherited_reason_list)
-        seen_names: set[str] = set()
+        seen_names: dict[str, bool] = {}
 
         for info in infos:
-            if info.is_dir():
-                continue
             if budget.expired():
                 budget.halted = True
                 _time_exception(result, path=container_virtual_path, budget=budget)
                 return
-            safe_name = _safe_member_name(info.filename)
-            if safe_name is None:
+            directory_member = info.is_dir() and not _zip_member_is_link(info)
+            safe_name, name_reason = _member_name(
+                info.filename,
+                directory=directory_member,
+                seen=seen_names,
+                container=container_virtual_path,
+                budget=budget,
+            )
+            virtual_path = (
+                _member_path(container_virtual_path, safe_name, budget)
+                if safe_name is not None
+                else container_virtual_path
+            )
+            if name_reason is not None:
                 _exception(
                     result,
-                    path=container_virtual_path,
-                    reason=LedgerReason.ARCHIVE_UNSAFE_MEMBER_PATH,
+                    path=virtual_path,
+                    reason=name_reason,
                 )
                 continue
-            virtual_path = f"{container_virtual_path}!/{safe_name}"
-            if safe_name in seen_names or virtual_path in result.file_cache:
+            if safe_name is None or directory_member:
+                continue
+            if virtual_path in result.file_cache:
                 _exception(
                     result,
                     # A different disk container may already own this path.
                     # Attribute that skipped copy to its current container.
-                    path=virtual_path if safe_name in seen_names else container_virtual_path,
+                    path=container_virtual_path,
                     reason=LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH,
                 )
                 continue
-            seen_names.add(safe_name)
             member_path = _nested_path(outer_path, virtual_path)
             concealment_reasons = tuple(
                 dict.fromkeys(
@@ -1027,6 +1196,21 @@ def _inspect_zip_bytes(
                 _exception(result, path=virtual_path, reason=LedgerReason.ARCHIVE_TRUNCATED)
                 continue
 
+            if len(member_data) != info.file_size:
+                _add_unreadable_component(
+                    result,
+                    virtual_path=virtual_path,
+                    outer_path=outer_path,
+                    member_path=member_path,
+                    container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    concealment_reasons=concealment_reasons,
+                    depth=depth,
+                    reason=LedgerReason.ARCHIVE_TRUNCATED,
+                    size_bytes=info.file_size,
+                )
+                _exception(result, path=virtual_path, reason=LedgerReason.ARCHIVE_TRUNCATED)
+                continue
             if len(member_data) > budget.max_member_bytes:
                 _add_unreadable_component(
                     result,
@@ -1109,74 +1293,596 @@ def _inspect_zip_bytes(
                 continue
 
             budget.uncompressed_bytes += len(member_data)
-            nested_zip = _is_zip_signature(member_data)
-            nested_type: str | None = "zip" if nested_zip else None
-
-            executable = _member_executable(info, safe_name, member_data)
-            member_hidden = _is_hidden_path(safe_name)
-            concealed = executable and bool(concealment_reasons)
-            source_classification = classify_python_source(safe_name, member_data)
-            virtual_type = _virtual_type(
-                safe_name,
-                member_data,
-                nested_type,
-                source_classification,
-            )
-            result.components.append(virtual_path)
-            result.file_cache[virtual_path] = member_data.decode("utf-8", errors="replace")
-            result.raw_file_cache[virtual_path] = member_data
-            result.python_source_classifications[virtual_path] = source_classification
-            artifact = classify_artifact(virtual_path, member_data)
-            result.artifact_inventory.append(artifact)
-            result.metadata.append(
-                {
-                    "path": virtual_path,
-                    "type": virtual_type,
-                    "lines": (
-                        0
-                        if virtual_type == "binary"
-                        else len(result.file_cache[virtual_path].splitlines())
-                    ),
-                    "executable": executable,
-                    "size_bytes": len(member_data),
-                    "outer_path": outer_path,
-                    "nested_path": member_path,
-                    "container_type": current_type,
-                    "container_ancestry": list(container_ancestry),
-                    "container_depth": depth,
-                    "hidden": member_hidden,
-                    "outer_hidden": outer_hidden,
-                    "outer_disguised": effective_outer_disguised,
-                    "local_only": True,
-                    "concealed_executable": concealed,
-                    "concealment_reasons": list(concealment_reasons),
-                }
-            )
-
-            if not nested_zip:
-                continue
-            result.recognized_zip_paths.add(virtual_path)
-            if depth >= budget.max_depth:
-                _exception(
-                    result,
-                    path=virtual_path,
-                    reason=LedgerReason.ARCHIVE_DEPTH_LIMIT,
-                    observed_depth=depth + 1,
-                    limit_depth=budget.max_depth,
+            member_paths.append(
+                _record_member(
+                    member_data,
+                    name=safe_name,
+                    mode=info.external_attr >> 16,
+                    outer_path=outer_path,
+                    container_virtual_path=container_virtual_path,
+                    container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    depth=depth,
+                    outer_hidden=outer_hidden,
+                    outer_disguised=effective_outer_disguised,
+                    concealment_reasons=concealment_reasons,
+                    budget=budget,
+                    result=result,
+                    virtual_path=virtual_path,
                 )
-                continue
-            _inspect_zip_bytes(
-                member_data,
-                outer_path=outer_path,
-                container_virtual_path=virtual_path,
-                depth=depth + 1,
-                outer_hidden=outer_hidden,
-                outer_disguised=effective_outer_disguised,
-                outer_expected_type=outer_expected_type,
-                ancestor_container_types=container_ancestry,
-                budget=budget,
-                result=result,
             )
+            if budget.halted:
+                return
+
+    if len(result.ledger_events) == initial_exceptions:
+        result.inspected_containers[container_virtual_path] = member_paths
+
+
+class _ArchiveInspectionError(Exception):
+    def __init__(
+        self, reason: LedgerReason, *, report_path: str | None = None, **metrics: int | float
+    ) -> None:
+        self.reason = reason
+        self.metrics = metrics
+        self.report_path = report_path
+
+
+def _member_identity_size(container: str, name: str, budget: _Budget) -> int:
+    """Bound raw and canonical spellings before normalization or concatenation."""
+
+    def byte_size(value: str) -> int:
+        if value.isascii():
+            return len(value)
+        count = 0
+        for offset in range(0, len(value), 65536):
+            _check_archive_time(budget)
+            count += len(value[offset : offset + 65536].encode("utf-8"))
+        return count
+
+    size = byte_size(container) + 2 + byte_size(name)
+    per_path_limit = min(ARCHIVE_MAX_VIRTUAL_PATH_BYTES, budget.max_central_directory_bytes)
+    if size > per_path_limit:
+        budget.halted = True
+        raise _ArchiveInspectionError(
+            LedgerReason.ARCHIVE_SIZE_LIMIT,
+            report_path=budget.outer_path,
+            observed_bytes=size,
+            limit_bytes=per_path_limit,
+        )
+    return size
+
+
+def _member_path(container: str, name: str, budget: _Budget) -> str:
+    """Reserve exact identities before concatenating attacker-controlled ancestors."""
+    size = _member_identity_size(container, name, budget)
+    observed = budget.virtual_identity_bytes + size
+    if observed > budget.max_central_directory_bytes:
+        budget.halted = True
+        raise _ArchiveInspectionError(
+            LedgerReason.ARCHIVE_SIZE_LIMIT,
+            report_path=budget.outer_path,
+            observed_bytes=observed,
+            limit_bytes=budget.max_central_directory_bytes,
+        )
+    budget.virtual_identity_bytes += size
+    return f"{container}!/{name}"
+
+
+def _check_archive_time(budget: _Budget) -> None:
+    if budget.expired():
+        budget.halted = True
+        raise _ArchiveInspectionError(
+            LedgerReason.ARCHIVE_TIME_LIMIT,
+            observed_seconds=budget.elapsed,
+            limit_seconds=budget.runtime_limit,
+        )
+
+
+def _charge_archive_member(budget: _Budget) -> None:
+    _check_archive_time(budget)
+    if budget.members >= budget.max_members:
+        budget.halted = True
+        raise _ArchiveInspectionError(
+            LedgerReason.ARCHIVE_MEMBER_LIMIT,
+            observed_artifacts=budget.members + 1,
+            limit_artifacts=budget.max_members,
+        )
+    budget.members += 1
+
+
+class _TarReader(io.BytesIO):
+    """Bound stdlib header processing before reads, allocation and chained metadata."""
+
+    def __init__(self, data: bytes, budget: _Budget) -> None:
+        super().__init__(data)
+        self.data = data
+        self.budget = budget
+        self.metadata_bytes = 0
+        self.metadata_depth = 0
+
+    def read(self, size: int = -1) -> bytes:
+        _check_archive_time(self.budget)
+        if size < 0 or self.metadata_bytes + size > self.budget.max_central_directory_bytes:
+            raise _ArchiveInspectionError(
+                LedgerReason.ARCHIVE_SIZE_LIMIT,
+                observed_bytes=self.metadata_bytes + (len(self.data) if size < 0 else size),
+                limit_bytes=self.budget.max_central_directory_bytes,
+            )
+        content = super().read(size)
+        self.metadata_bytes += len(content)
+        return content
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        _check_archive_time(self.budget)
+        absolute = offset + (
+            self.tell() if whence == io.SEEK_CUR else len(self.data) if whence == io.SEEK_END else 0
+        )
+        if absolute < 0 or absolute > len(self.data):
+            raise _ArchiveInspectionError(LedgerReason.ARCHIVE_TRUNCATED)
+        return super().seek(offset, whence)
+
+    def check_pax(self, size: int) -> None:
+        """Bound field expansion and reject sparse semantics before stdlib builds them."""
+        if size < 0 or self.metadata_bytes + size > self.budget.max_central_directory_bytes:
+            raise _ArchiveInspectionError(
+                LedgerReason.ARCHIVE_SIZE_LIMIT,
+                observed_bytes=self.metadata_bytes + max(size, 0),
+                limit_bytes=self.budget.max_central_directory_bytes,
+            )
+        start = self.tell()
+        end = start + size
+        if end > len(self.data):
+            raise _ArchiveInspectionError(LedgerReason.ARCHIVE_TRUNCATED)
+        while start < end:
+            _check_archive_time(self.budget)
+            separator = self.data.find(b" ", start, min(end, start + 12))
+            if separator < 0:
+                raise _ArchiveInspectionError(LedgerReason.ARCHIVE_MALFORMED)
+            digits = self.data[start:separator]
+            if not digits.isdigit():
+                raise _ArchiveInspectionError(LedgerReason.ARCHIVE_MALFORMED)
+            length = int(digits)
+            stop = start + length
+            equals = self.data.find(b"=", separator + 1, min(stop, end))
+            if length < 5 or stop > end or equals <= separator + 1 or self.data[stop - 1] != 10:
+                raise _ArchiveInspectionError(LedgerReason.ARCHIVE_MALFORMED)
+            self.budget.metadata_fields += 1
+            if self.budget.metadata_fields > self.budget.max_members:
+                raise _ArchiveInspectionError(
+                    LedgerReason.ARCHIVE_MEMBER_LIMIT,
+                    observed_artifacts=self.budget.metadata_fields,
+                    limit_artifacts=self.budget.max_members,
+                )
+            key = self.data[separator + 1 : equals]
+            if key.startswith(b"GNU.sparse.") or key == b"SCHILY.realsize":
+                raise _ArchiveInspectionError(LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER)
+            start = stop
+
+
+class _BoundedTarInfo(tarfile.TarInfo):
+    def _proc_member(self, archive: tarfile.TarFile) -> _BoundedTarInfo:
+        """Guard both stdlib header readers and their metadata continuations."""
+        reader = archive.fileobj
+        if not isinstance(reader, _TarReader):
+            raise TypeError("TAR inspection requires a bounded metadata reader")
+        _charge_archive_member(reader.budget)
+        if self.size < 0:
+            raise _ArchiveInspectionError(LedgerReason.ARCHIVE_MALFORMED)
+        if self.type == tarfile.GNUTYPE_SPARSE:
+            raise _ArchiveInspectionError(LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER)
+        reader.metadata_depth += 1
+        try:
+            if reader.metadata_depth > ARCHIVE_MAX_METADATA_DEPTH:
+                raise _ArchiveInspectionError(
+                    LedgerReason.ARCHIVE_DEPTH_LIMIT,
+                    observed_depth=reader.metadata_depth,
+                    limit_depth=ARCHIVE_MAX_METADATA_DEPTH,
+                )
+            if self.type in {tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE}:
+                reader.check_pax(self.size)
+            return super()._proc_member(archive)
+        finally:
+            reader.metadata_depth -= 1
+
+
+def _container_concealment(
+    ancestry: tuple[str, ...], *, hidden: bool, disguised: bool
+) -> tuple[str, ...]:
+    return (
+        *(
+            ("document_container",)
+            if any(kind in {"docx", "xlsx", "pptx"} for kind in ancestry)
+            else ()
+        ),
+        *(("hidden_artifact",) if hidden else ()),
+        *(("disguised_container",) if disguised else ()),
+    )
+
+
+def _inspect_tar_bytes(
+    data: bytes,
+    *,
+    outer_path: str,
+    container_virtual_path: str,
+    depth: int,
+    outer_hidden: bool,
+    outer_disguised: bool | None,
+    outer_expected_type: str | None,
+    ancestor_container_types: tuple[str, ...],
+    budget: _Budget,
+    result: NestedInspectionResult,
+) -> None:
+    initial_exceptions = len(result.ledger_events)
+    disguised = outer_disguised if outer_disguised is not None else outer_expected_type != "tar"
+    ancestry = (*ancestor_container_types, "tar")
+    inherited = _container_concealment(ancestry, hidden=outer_hidden, disguised=disguised)
+    names: dict[str, bool] = {}
+    member_paths: list[str] = []
+    try:
+        with (
+            _TarReader(data, budget) as reader,
+            tarfile.open(
+                fileobj=reader,
+                mode="r:",
+                tarinfo=_BoundedTarInfo,
+                encoding="utf-8",
+                errors="surrogateescape",
+            ) as archive,
+        ):
+            for info in archive:
+                _check_archive_time(budget)
+                safe_name, name_reason = _member_name(
+                    info.name,
+                    directory=info.isdir(),
+                    seen=names,
+                    container=container_virtual_path,
+                    budget=budget,
+                )
+                virtual_path = (
+                    _member_path(container_virtual_path, safe_name, budget)
+                    if safe_name is not None
+                    else container_virtual_path
+                )
+                if name_reason is not None:
+                    _exception(result, path=virtual_path, reason=name_reason)
+                    continue
+                if safe_name is None:
+                    continue
+                if virtual_path in result.file_cache:
+                    _exception(
+                        result,
+                        path=container_virtual_path,
+                        reason=LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH,
+                    )
+                    continue
+                if info.isdir():
+                    continue
+                concealment = (
+                    *inherited,
+                    *(
+                        ("hidden_artifact",)
+                        if _is_hidden_path(safe_name) and "hidden_artifact" not in inherited
+                        else ()
+                    ),
+                )
+                reason: LedgerReason | None = None
+                metrics: dict[str, int] = {}
+                end = info.offset_data + info.size
+                if (
+                    info.type in {tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.CONTTYPE}
+                    and info.size >= 0
+                ):
+                    # Apply effective PAX size overrides to the next header too.
+                    archive.offset = info.offset_data + ((info.size + 511) // 512) * 512
+                if info.issym() or info.islnk():
+                    reason = LedgerReason.ARCHIVE_LINK_MEMBER
+                elif (
+                    info.type not in {tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.CONTTYPE}
+                    or info.sparse is not None
+                ):
+                    reason = LedgerReason.ARCHIVE_UNSUPPORTED_MEMBER
+                elif info.size < 0 or info.offset_data < 0 or end > len(data):
+                    reason = LedgerReason.ARCHIVE_TRUNCATED
+                elif info.size > budget.max_member_bytes:
+                    reason = LedgerReason.ARCHIVE_MEMBER_SIZE_LIMIT
+                    metrics = {"observed_bytes": info.size, "limit_bytes": budget.max_member_bytes}
+                elif budget.uncompressed_bytes + info.size > budget.max_uncompressed_bytes:
+                    reason = LedgerReason.ARCHIVE_SIZE_LIMIT
+                    metrics = {
+                        "observed_bytes": budget.uncompressed_bytes + info.size,
+                        "limit_bytes": budget.max_uncompressed_bytes,
+                    }
+                if reason is not None:
+                    _add_unreadable_component(
+                        result,
+                        virtual_path=virtual_path,
+                        outer_path=outer_path,
+                        member_path=_nested_path(outer_path, virtual_path),
+                        container_type="tar",
+                        container_ancestry=ancestry,
+                        concealment_reasons=concealment,
+                        depth=depth,
+                        reason=reason,
+                        size_bytes=info.size,
+                    )
+                    _exception(result, path=virtual_path, reason=reason, **metrics)
+                    continue
+                budget.uncompressed_bytes += info.size
+                member_paths.append(
+                    _record_member(
+                        data[info.offset_data : end],
+                        name=safe_name,
+                        mode=info.mode,
+                        outer_path=outer_path,
+                        container_virtual_path=container_virtual_path,
+                        container_type="tar",
+                        container_ancestry=ancestry,
+                        depth=depth,
+                        outer_hidden=outer_hidden,
+                        outer_disguised=disguised,
+                        concealment_reasons=concealment,
+                        budget=budget,
+                        result=result,
+                        virtual_path=virtual_path,
+                    )
+                )
+                if budget.halted:
+                    return
+            # TarFile.next() accepts missing trailers and malformed later headers.
+            # Only two terminal blocks plus zero padding prove the suffix inspected.
+            trailer = archive.offset
+            if len(data) - trailer < 1024 or len(data) % tarfile.BLOCKSIZE:
+                raise _ArchiveInspectionError(LedgerReason.ARCHIVE_TRUNCATED)
+            for offset in range(trailer, len(data), 65536):
+                _check_archive_time(budget)
+                if any(memoryview(data)[offset : offset + 65536]):
+                    raise _ArchiveInspectionError(LedgerReason.ARCHIVE_MALFORMED)
+    except _ArchiveInspectionError as exc:
+        _exception(
+            result, path=exc.report_path or container_virtual_path, reason=exc.reason, **exc.metrics
+        )
+        return
+    except (tarfile.TarError, EOFError, OSError, ValueError, OverflowError):
+        _exception(
+            result,
+            path=container_virtual_path,
+            reason=LedgerReason.ARCHIVE_MALFORMED if depth == 1 else LedgerReason.ARCHIVE_TRUNCATED,
+        )
+        return
+    if len(result.ledger_events) == initial_exceptions:
+        result.inspected_containers[container_virtual_path] = member_paths
+
+
+def _gzip_header_end(data: bytes, start: int, budget: _Budget) -> int:
+    """Preflight RFC 1952 metadata before handing any header to zlib."""
+    _check_archive_time(budget)
+
+    def consume(size: int) -> None:
+        observed = budget.gzip_metadata_bytes + size
+        if observed > budget.max_central_directory_bytes:
+            raise _ArchiveInspectionError(
+                LedgerReason.ARCHIVE_SIZE_LIMIT,
+                observed_bytes=observed,
+                limit_bytes=budget.max_central_directory_bytes,
+            )
+        budget.gzip_metadata_bytes = observed
+
+    if len(data) - start < 10:
+        raise _ArchiveInspectionError(LedgerReason.ARCHIVE_TRUNCATED)
+    consume(10)
+    if data[start : start + 2] != b"\x1f\x8b" or data[start + 2] != 8 or data[start + 3] & 0xE0:
+        raise _ArchiveInspectionError(LedgerReason.ARCHIVE_MALFORMED)
+    flags = data[start + 3]
+    cursor = start + 10
+    if flags & 4:
+        if len(data) - cursor < 2:
+            raise _ArchiveInspectionError(LedgerReason.ARCHIVE_TRUNCATED)
+        consume(2)
+        size = struct.unpack_from("<H", data, cursor)[0]
+        cursor += 2
+        if size > len(data) - cursor:
+            raise _ArchiveInspectionError(LedgerReason.ARCHIVE_TRUNCATED)
+        consume(size)
+        cursor += size
+    for flag in (8, 16):
+        if not flags & flag:
+            continue
+        while True:
+            _check_archive_time(budget)
+            remaining = budget.max_central_directory_bytes - budget.gzip_metadata_bytes
+            stop = min(len(data), cursor + min(65536, remaining + 1))
+            terminator = data.find(b"\x00", cursor, stop)
+            end = terminator + 1 if terminator >= 0 else stop
+            consume(end - cursor)
+            cursor = end
+            if terminator >= 0:
+                break
+            if cursor == len(data):
+                raise _ArchiveInspectionError(LedgerReason.ARCHIVE_TRUNCATED)
+    if flags & 2:
+        if len(data) - cursor < 2:
+            raise _ArchiveInspectionError(LedgerReason.ARCHIVE_TRUNCATED)
+        consume(2)
+        cursor += 2
+    return cursor
+
+
+def _inspect_gzip_bytes(
+    data: bytes,
+    *,
+    outer_path: str,
+    container_virtual_path: str,
+    depth: int,
+    outer_hidden: bool,
+    outer_disguised: bool | None,
+    outer_expected_type: str | None,
+    ancestor_container_types: tuple[str, ...],
+    budget: _Budget,
+    result: NestedInspectionResult,
+) -> None:
+    initial_exceptions = len(result.ledger_events)
+    expanded = bytearray()
+    cursor = 0
+    verified_length = 0
+    try:
+        while cursor < len(data):
+            _check_archive_time(budget)
+            if data[cursor] == 0:
+                padding = data[cursor : cursor + 65536]
+                cursor += len(padding) - len(padding.lstrip(b"\x00"))
+                continue
+            if not data.startswith(b"\x1f\x8b", cursor):
+                raise _ArchiveInspectionError(LedgerReason.ARCHIVE_MALFORMED)
+            _charge_archive_member(budget)
+            _gzip_header_end(data, cursor, budget)
+            frame_start, expanded_start = cursor, len(expanded)
+            decoder = zlib.decompressobj(wbits=31)
+            while not decoder.eof:
+                _check_archive_time(budget)
+                stop = min(len(data), cursor + 65536)
+                if stop == cursor:
+                    raise _ArchiveInspectionError(LedgerReason.ARCHIVE_TRUNCATED)
+                remaining = budget.max_uncompressed_bytes - budget.uncompressed_bytes
+                block = decoder.decompress(data[cursor:stop], min(65536, remaining + 1))
+                cursor = stop - len(decoder.unused_data if decoder.eof else decoder.unconsumed_tail)
+                if len(block) > remaining:
+                    raise _ArchiveInspectionError(
+                        LedgerReason.ARCHIVE_SIZE_LIMIT,
+                        observed_bytes=budget.uncompressed_bytes + len(block),
+                        limit_bytes=budget.max_uncompressed_bytes,
+                    )
+                expanded.extend(block)
+                budget.uncompressed_bytes += len(block)
+            compressed = max(1, cursor - frame_start)
+            if len(expanded) - expanded_start > compressed * budget.max_compression_ratio:
+                raise _ArchiveInspectionError(
+                    LedgerReason.ARCHIVE_COMPRESSION_RATIO,
+                    observed_bytes=len(expanded) - expanded_start,
+                    limit_bytes=compressed * budget.max_compression_ratio,
+                )
+            verified_length = len(expanded)
+    except _ArchiveInspectionError as exc:
+        _exception(
+            result, path=exc.report_path or container_virtual_path, reason=exc.reason, **exc.metrics
+        )
+        if not verified_length:
+            return
+        del expanded[verified_length:]
+    except (zlib.error, OverflowError, ValueError):
+        _exception(result, path=container_virtual_path, reason=LedgerReason.ARCHIVE_MALFORMED)
+        if not verified_length:
+            return
+        del expanded[verified_length:]
+    disguised = outer_disguised if outer_disguised is not None else outer_expected_type != "gzip"
+    ancestry = (*ancestor_container_types, "gzip")
+    content = bytes(expanded)
+    if _archive_type(content) is not None:
+        if depth >= budget.max_depth:
+            _exception(
+                result,
+                path=container_virtual_path,
+                reason=LedgerReason.ARCHIVE_DEPTH_LIMIT,
+                observed_depth=depth + 1,
+                limit_depth=budget.max_depth,
+            )
+            return
+        _inspect_archive_bytes(
+            content,
+            outer_path=outer_path,
+            container_virtual_path=container_virtual_path,
+            depth=depth + 1,
+            outer_hidden=outer_hidden,
+            outer_disguised=disguised,
+            outer_expected_type=None,
+            ancestor_container_types=ancestry,
+            budget=budget,
+            result=result,
+        )
+        if len(result.ledger_events) != initial_exceptions:
+            result.inspected_containers.pop(container_virtual_path, None)
+        return
+    if len(content) > budget.max_member_bytes:
+        _exception(
+            result,
+            path=container_virtual_path,
+            reason=LedgerReason.ARCHIVE_MEMBER_SIZE_LIMIT,
+            observed_bytes=len(content),
+            limit_bytes=budget.max_member_bytes,
+        )
+        return
+    name = container_virtual_path.rsplit("/", 1)[-1]
+    name = name[:-3] if name.lower().endswith(".gz") else "content"
+    name = _safe_member_name(name) or "content"
+    path = _record_member(
+        content,
+        name=name,
+        mode=0,
+        outer_path=outer_path,
+        container_virtual_path=container_virtual_path,
+        container_type="gzip",
+        container_ancestry=ancestry,
+        depth=depth,
+        outer_hidden=outer_hidden,
+        outer_disguised=disguised,
+        concealment_reasons=_container_concealment(
+            ancestry, hidden=outer_hidden, disguised=disguised
+        ),
+        budget=budget,
+        result=result,
+        complete_content=len(result.ledger_events) == initial_exceptions,
+    )
+    if len(result.ledger_events) == initial_exceptions:
+        result.inspected_containers[container_virtual_path] = [path]
+
+
+def _inspect_archive_bytes(
+    data: bytes,
+    *,
+    outer_path: str,
+    container_virtual_path: str,
+    depth: int,
+    outer_hidden: bool,
+    outer_disguised: bool | None,
+    outer_expected_type: str | None,
+    ancestor_container_types: tuple[str, ...],
+    budget: _Budget,
+    result: NestedInspectionResult,
+) -> None:
+    kind = _archive_type(data)
+    if kind is None:
+        _exception(result, path=container_virtual_path, reason=LedgerReason.ARCHIVE_FORMAT_MISMATCH)
+        return
+    result.recognized_container_paths.add(container_virtual_path)
+    if kind == "zip":
+        result.recognized_zip_paths.add(container_virtual_path)
+    if depth == 1:
+        _record_outer_metadata(
+            result,
+            path=outer_path,
+            container_type=kind,
+            hidden=outer_hidden,
+            disguised=outer_expected_type != kind,
+        )
+    inspector = {"zip": _inspect_zip_bytes, "tar": _inspect_tar_bytes, "gzip": _inspect_gzip_bytes}[
+        kind
+    ]
+    try:
+        inspector(
+            data,
+            outer_path=outer_path,
+            container_virtual_path=container_virtual_path,
+            depth=depth,
+            outer_hidden=outer_hidden,
+            outer_disguised=outer_disguised,
+            outer_expected_type=outer_expected_type,
+            ancestor_container_types=ancestor_container_types,
+            budget=budget,
+            result=result,
+        )
+    except _ArchiveInspectionError as exc:
+        _exception(
+            result, path=exc.report_path or container_virtual_path, reason=exc.reason, **exc.metrics
+        )
 
 
 def inspect_nested_artifacts(
@@ -1190,7 +1896,7 @@ def inspect_nested_artifacts(
     max_seconds: float | None = None,
     absolute_deadline: float | None = None,
 ) -> NestedInspectionResult:
-    """Inspect ZIP-compatible components under one bundle-wide archive budget.
+    """Inspect supported components under one bundle-wide archive budget.
 
     ``raw_file_cache`` may provide bytes already read under the caller's bundle
     limits. Supplying it avoids a second filesystem read without weakening the
@@ -1224,7 +1930,7 @@ def inspect_nested_artifacts(
         max_members=member_limit,
         max_uncompressed_bytes=byte_limit,
         max_central_directory_bytes=ARCHIVE_MAX_CENTRAL_DIRECTORY_BYTES,
-        max_member_bytes=MAX_FILE_BYTES,
+        max_member_bytes=ARCHIVE_MAX_MEMBER_BYTES,
         max_depth=ARCHIVE_MAX_DEPTH,
         max_compression_ratio=ARCHIVE_MAX_COMPRESSION_RATIO,
         deadline=deadline,
@@ -1233,6 +1939,8 @@ def inspect_nested_artifacts(
         last_checked_at=started_at,
     )
     for path in dict.fromkeys(components):
+        result._active_disk_path = path
+        budget.outer_path = path
         if budget.halted:
             break
         if budget.expired():
@@ -1253,21 +1961,23 @@ def inspect_nested_artifacts(
             except OSError:
                 continue
         if not supplied and size > budget.max_uncompressed_bytes:
-            # Only classify content that begins like ZIP; avoid reading arbitrary
+            # Only classify content that begins like an archive; avoid reading arbitrary
             # large files merely to decide whether they are containers. Caller-
             # supplied bytes were already bounded and charged by the caller;
             # ``max_uncompressed_bytes`` applies to newly expanded members.
             try:
                 with _open_regular_file_no_follow(full_path) as source:
-                    signature = source.read(4)
+                    signature = source.read(1024)
             except (OSError, _FileOpenError, _UnsafeFileError):
                 continue
-            if _is_zip_signature(signature):
-                result.recognized_zip_paths.add(path)
+            if (kind := _archive_type(signature)) is not None:
+                result.recognized_container_paths.add(path)
+                if kind == "zip":
+                    result.recognized_zip_paths.add(path)
                 _record_outer_metadata(
                     result,
                     path=path,
-                    container_type=expected_type or "zip",
+                    container_type=kind,
                     hidden=hidden,
                     disguised=expected_type is None,
                 )
@@ -1298,7 +2008,7 @@ def inspect_nested_artifacts(
                     data = source.read(budget.max_uncompressed_bytes + 1)
             except (OSError, _FileOpenError, _UnsafeFileError):
                 continue
-        if not _is_zip_signature(data):
+        if not is_archive_content(data):
             if expected_type is not None:
                 _record_outer_metadata(
                     result,
@@ -1313,17 +2023,7 @@ def inspect_nested_artifacts(
                     reason=LedgerReason.ARCHIVE_FORMAT_MISMATCH,
                 )
             continue
-        # Record a conservative local-only identity before parsing the central
-        # directory. The bounded inspector refines this after its early checks.
-        result.recognized_zip_paths.add(path)
-        _record_outer_metadata(
-            result,
-            path=path,
-            container_type=expected_type or "zip",
-            hidden=hidden,
-            disguised=expected_type is None,
-        )
-        _inspect_zip_bytes(
+        _inspect_archive_bytes(
             data,
             outer_path=path,
             container_virtual_path=path,
@@ -1336,6 +2036,7 @@ def inspect_nested_artifacts(
             result=result,
         )
 
+    result._active_disk_path = None
     result.components = list(dict.fromkeys(result.components))
     result.uncompressed_bytes = budget.uncompressed_bytes
     _apply_inventory_overrides(result)

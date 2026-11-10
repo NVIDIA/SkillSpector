@@ -775,6 +775,7 @@ class InputHandler:
         self._temp_dir: Path | None = None
         self._transitive_budget = transitive_budget
         self.primary_file_path: str | None = None
+        self.primary_file_parent_path: str | None = None
 
     def resolve(self, input_path: str) -> tuple[Path, str]:
         """
@@ -795,6 +796,7 @@ class InputHandler:
         """
         input_path = input_path.strip()
         self.primary_file_path = None
+        self.primary_file_parent_path = None
 
         git_target = self._github_tree_target(input_path)
         if git_target is not None:
@@ -1709,4 +1711,5 @@ class InputHandler:
                 dest.unlink(missing_ok=True)
                 raise
         self.primary_file_path = file_path.name
+        self.primary_file_parent_path = str(file_path.parent)
         return temp_dir

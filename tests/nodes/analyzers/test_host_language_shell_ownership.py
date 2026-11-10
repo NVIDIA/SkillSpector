@@ -1,26 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Valid Python and Perl syntax must not exhaust the bounded shell parser.
+"""Proven host-language syntax must not exhaust the bounded shell parser.
 
 Python string and comment tokens own their bytes, and Perl ``eval BLOCK`` is
 exception handling rather than a string reparse. Neither may turn ordinary
 host source into a ``static_parse_limit`` result, while genuinely unresolved
-shell text keeps its conservative partial outcome.
+shell text keeps its conservative partial outcome. Verified Node assertion
+messages may own template delimiters without hiding executable string contents.
 """
 
 from __future__ import annotations
 
 import threading
 import warnings
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 
-from skillspector import python_tokens
+from skillspector import python_string_constants, python_tokens
 from skillspector.graph import graph
-from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, ParserCause
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.nodes.analyzers import static_runner
 
@@ -170,6 +171,24 @@ _BENIGN_PYTHON = [
         "# branch runs (and `command -v` is skipped).\n",
         id="comment-runtime-parameter",
     ),
+    # Markdown inline code and parameter names in report strings. Read past
+    # the closing quote, they would take the following code as operands.
+    pytest.param(
+        _OPTION_TEXT + "def report(path, detail):\n"
+        '    return [f"Inspected `{path}` and found {detail}."]\n',
+        id="f-string-inline-code",
+    ),
+    pytest.param(
+        _OPTION_TEXT
+        + "def lines(payload):\n    return [\n"
+        + "".join(f"        f\"- Field {i}: `{{payload['field_{i}']}}`\",\n" for i in range(8))
+        + "    ]\n",
+        id="f-string-inline-code-list",
+    ),
+    pytest.param(
+        _OPTION_TEXT + 'def run():\n    """Run `$TOOL` once, then report."""\n',
+        id="docstring-runtime-parameter",
+    ),
 ]
 
 
@@ -180,6 +199,681 @@ def test_python_literals_and_comments_own_their_bytes(source: str) -> None:
     assert _python(content) is False
     # The same bytes read as shell text remain conservative.
     assert _shell(content) is True
+
+
+def test_concatenated_fstrings_keep_runtime_operand_ambiguity() -> None:
+    content = (
+        _OPTION_TEXT + "def message(tool):\n    return (\n"
+        '        f"{tool} was not found at "\n'
+        '        f"$TOOL_ROOT, $UPSTREAM_ROOT/{tool}, "\n'
+        '        f"or $HOME/.cache/upstreams/{tool} "\n'
+        '        "or elsewhere"\n    )\n' + _TAIL
+    )
+    # The body-start runtime command is now inspected. An empty upstream
+    # parameter can leave a root path, while a replacement field supplies flags.
+    # Concatenation must retain those possible operands even in report strings.
+    assert _python(content) is True
+
+
+_CONSTANT_CHECKOUT_SOURCE = """\
+from urllib.parse import urlparse
+from settings import active_branch
+
+REPOSITORY = "https://example.com/tools/widget.git"
+
+def checkout_name(repository):
+    name = urlparse(repository).path.rstrip("/").rsplit("/", 1)[-1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    return name
+
+CHECKOUT = checkout_name(REPOSITORY)
+
+def message():
+    return (
+        f"$TOOL_ROOT, $UPSTREAM_ROOT/{CHECKOUT}, "
+        f"or $HOME/.cache/upstreams/{CHECKOUT} "
+        f"checked out to {active_branch}"
+    )
+"""
+
+
+@pytest.mark.parametrize("repository", ["widget", "widget/", "widget.git", "widget.git/"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_constant_checkout_fstrings_do_not_invent_runtime_options(
+    repository: str, newline: str
+) -> None:
+    source = _CONSTANT_CHECKOUT_SOURCE.replace("tools/widget.git", f"tools/{repository}")
+    # The branch remains unknown; only the checkout component has a fixed value.
+    content = (_OPTION_TEXT + "# Unicode offset: café\n" + source + _TAIL).replace("\n", newline)
+
+    assert _python(content) is False
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        pytest.param(
+            'REPOSITORY = "https://example.com/tools/widget.git"',
+            "REPOSITORY = supplied_repository",
+            id="unknown-url",
+        ),
+        pytest.param(
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            "REPOSITORY = supplied_repository\nCHECKOUT = checkout_name(REPOSITORY)",
+            id="rebound-url",
+        ),
+        pytest.param(
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            "CHECKOUT = checkout_name(REPOSITORY)\nCHECKOUT = supplied_checkout",
+            id="rebound-result",
+        ),
+        pytest.param(
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            "CHECKOUT = checkout_name(REPOSITORY)\ndel CHECKOUT",
+            id="deleted-result",
+        ),
+        pytest.param("def message():", "def message(CHECKOUT):", id="parameter-shadow"),
+        pytest.param(
+            "def message():",
+            "def message():\n    CHECKOUT = supplied_checkout",
+            id="local-shadow",
+        ),
+        pytest.param(
+            "def message():",
+            "def message():\n    global CHECKOUT\n    CHECKOUT = supplied_checkout",
+            id="global-write",
+        ),
+        pytest.param(
+            "def checkout_name(repository):",
+            "urlparse = external\n\ndef checkout_name(repository):",
+            id="rebound-import",
+        ),
+        pytest.param(
+            "def checkout_name(repository):",
+            "external(urlparse)\n\ndef checkout_name(repository):",
+            id="escaped-import",
+        ),
+        pytest.param(
+            "def checkout_name(repository):",
+            "@external\ndef checkout_name(repository):",
+            id="decorated-helper",
+        ),
+        pytest.param(
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            "checkout_name = external\nCHECKOUT = checkout_name(REPOSITORY)",
+            id="rebound-helper",
+        ),
+        pytest.param(
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            "external(checkout_name)\nCHECKOUT = checkout_name(REPOSITORY)",
+            id="escaped-helper",
+        ),
+        pytest.param(
+            "    return name",
+            "    return checkout_name(repository)",
+            id="recursive-helper",
+        ),
+        pytest.param(
+            "def message():",
+            'globals()["CHECKOUT"] = supplied_checkout\n\ndef message():',
+            id="reflective-write",
+        ),
+        pytest.param(
+            "from urllib.parse import urlparse",
+            'import sys\nsys.modules["urllib.parse"] = external\nfrom urllib.parse import urlparse',
+            id="import-registry-write",
+        ),
+        pytest.param(
+            "from urllib.parse import urlparse",
+            "import sys\nsys.meta_path.insert(0, external)\nfrom urllib.parse import urlparse",
+            id="import-meta-hook",
+        ),
+        pytest.param(
+            "from urllib.parse import urlparse",
+            "import sys\nsys.path_hooks.append(external)\nfrom urllib.parse import urlparse",
+            id="import-path-hook",
+        ),
+        pytest.param(
+            "from urllib.parse import urlparse",
+            'import sys\nsys.path_importer_cache["."] = external\nfrom urllib.parse import urlparse',
+            id="import-cache-write",
+        ),
+        pytest.param(
+            "from urllib.parse import urlparse",
+            '__builtins__["__import__"] = external\nfrom urllib.parse import urlparse',
+            id="builtin-loader-write",
+        ),
+        pytest.param(
+            "def checkout_name(repository):",
+            "def unrelated(urlparse=external(urlparse)):\n    pass\n\ndef checkout_name(repository):",
+            id="import-escape-in-shadowing-default",
+        ),
+        pytest.param(
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            "def unrelated(checkout_name=external(checkout_name)):\n    pass\n"
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            id="helper-escape-in-shadowing-default",
+        ),
+        pytest.param(
+            "def checkout_name(repository):",
+            "def unrelated(urlparse: external(urlparse)):\n    pass\n\ndef checkout_name(repository):",
+            id="import-escape-in-shadowing-annotation",
+        ),
+        pytest.param(
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            "def unrelated(checkout_name: external(checkout_name)):\n    pass\n"
+            "CHECKOUT = checkout_name(REPOSITORY)",
+            id="helper-escape-in-shadowing-annotation",
+        ),
+    ],
+)
+def test_constant_checkout_proof_rejects_unknown_or_changed_bindings(
+    before: str, after: str
+) -> None:
+    assert before in _CONSTANT_CHECKOUT_SOURCE
+    source = _CONSTANT_CHECKOUT_SOURCE.replace(before, after, 1)
+
+    assert _python(_OPTION_TEXT + source + _TAIL) is True
+
+
+@pytest.mark.parametrize("field", ["CHECKOUT!r", "CHECKOUT:>20", "CHECKOUT:{width}"])
+def test_constant_checkout_proof_rejects_unmodeled_field_formatting(field: str) -> None:
+    source = _CONSTANT_CHECKOUT_SOURCE.replace("{CHECKOUT}", "{" + field + "}")
+
+    assert python_string_constants.python_constant_string_fields(source, lambda: None) == ()
+
+
+@pytest.mark.parametrize("extension", [" % detail", ".format(detail)", "[0:]", " + detail"])
+def test_constant_checkout_proof_keeps_extended_string_values_partial(extension: str) -> None:
+    source = _CONSTANT_CHECKOUT_SOURCE.replace("    )\n", "    )" + extension + "\n")
+
+    assert _python(_OPTION_TEXT + source + _TAIL) is True
+
+
+@pytest.mark.parametrize(
+    "checkout",
+    [
+        pytest.param("-rf", id="literal-options"),
+        pytest.param("-rf /", id="literal-root-options"),
+        pytest.param("", id="empty-component"),
+    ],
+)
+def test_constant_field_proof_rejects_unsafe_or_empty_components(checkout: str) -> None:
+    source = _CONSTANT_CHECKOUT_SOURCE.replace(
+        "CHECKOUT = checkout_name(REPOSITORY)", f"CHECKOUT = {checkout!r}"
+    )
+
+    assert python_string_constants.python_constant_string_fields(source, lambda: None) == ()
+    assert _python(_OPTION_TEXT + source + _TAIL) is True
+
+
+def test_constant_checkout_proof_preserves_real_shell_findings() -> None:
+    source = (
+        _OPTION_TEXT
+        + _CONSTANT_CHECKOUT_SOURCE
+        + '\nimport subprocess\nsubprocess.run("rm -rf /", shell=True)\n'
+        + _TAIL
+    )
+
+    assert _python(source) is True
+    result = _ledger("scripts/report.py", source)
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_constant_field_spans_exclude_literal_braces_and_format_specs(newline: str) -> None:
+    content = (
+        "# Unicode offset: café\n"
+        + _CONSTANT_CHECKOUT_SOURCE.replace('f"$TOOL_ROOT', 'f"café $TOOL_ROOT')
+        + 'LITERAL = "{CHECKOUT}"\n'
+        + 'ESCAPED = f"{{CHECKOUT}}"\n'
+        + 'NESTED = f"{unknown:{CHECKOUT}}"\n'
+        + "LAMBDA = f\"{(lambda: f'{CHECKOUT},')()}\"\n"
+        + 'DEBUG = f"{CHECKOUT=}"\n'
+    ).replace("\n", newline)
+
+    fields = python_string_constants.python_constant_string_fields(content, lambda: None)
+
+    assert [(content[start:end], value) for start, end, value in fields] == [
+        ("{CHECKOUT}", "widget"),
+        ("{CHECKOUT}", "widget"),
+    ]
+    first = content.index("{CHECKOUT}")
+    second = content.index("{CHECKOUT}", first + 1)
+    assert [start for start, _, _ in fields] == [first, second]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '    message = f"$TOOL -rf /{CHECKOUT}"\n',
+        '    def message(self, value=f"$TOOL -rf /{CHECKOUT}"):\n        return value\n',
+        '    messages = [value for value in (f"$TOOL -rf /{CHECKOUT}",)]\n',
+    ],
+    ids=["class-body", "method-default", "comprehension-first-iterable"],
+)
+def test_constant_field_proof_refuses_class_lookup_contexts(body: str) -> None:
+    source = 'CHECKOUT = "widget"\nclass Report:\n    CHECKOUT = ""\n' + body
+
+    assert python_string_constants.python_constant_string_fields(source, lambda: None) == ()
+
+
+@pytest.mark.parametrize("warning_filter", ["always", "error"])
+def test_constant_field_proof_suppresses_source_warnings(warning_filter: str) -> None:
+    source = 'PATTERN = "\\d+"\n' + _CONSTANT_CHECKOUT_SOURCE
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter(warning_filter)
+        filters = list(warnings.filters)
+
+        fields = python_string_constants.python_constant_string_fields(source, lambda: None)
+
+        assert [value for _, _, value in fields] == ["widget", "widget"]
+        assert list(warnings.filters) == filters
+    assert caught == []
+
+
+def test_constant_field_proof_bounds_total_output_and_honors_cancellation() -> None:
+    content = 'VALUE = "' + "x" * 4096 + '"\n' + 'f"{VALUE}"\n' * 9
+
+    assert python_string_constants.python_constant_string_fields(content, lambda: None) == ()
+
+    checks = 0
+
+    def cancel() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 4:
+            raise TimeoutError("constant fields deadline")
+
+    with pytest.raises(TimeoutError, match="constant fields deadline"):
+        python_string_constants.python_constant_string_fields(
+            _CONSTANT_CHECKOUT_SOURCE + _TAIL, cancel
+        )
+    assert checks == 4
+
+
+def test_constant_field_proof_respects_bundled_standard_library_override() -> None:
+    checked = []
+
+    def bundled_override(module: str, check_runtime: Callable[[], None]) -> bool:
+        checked.append(module)
+        check_runtime()
+        return False
+
+    assert (
+        python_string_constants.python_constant_string_fields(
+            _CONSTANT_CHECKOUT_SOURCE, lambda: None, stdlib_check=bundled_override
+        )
+        == ()
+    )
+    assert checked == ["urllib"]
+
+
+def _constant_cutoff_source(layout: str, suffix: str, *, field_count: int = 350) -> str:
+    field = "{VERY_LONG_CONSTANT_NAME}"
+    if layout in {"single", "boundary"}:
+        # Short continued lines bound offset work. Align the raw window with
+        # a complete field, so an accidentally cut brace cannot mask the bug.
+        unit = field + "\\\n"
+        padding = " " * ((tm._ROOT_GLOB_COMMAND_CHARS + 1) % len(unit))
+        if layout == "boundary":
+            field_count = (tm._ROOT_GLOB_COMMAND_CHARS + 1 - len(padding)) // len(unit)
+        literals = ['f"$TOOL' + padding + unit * field_count + '"']
+    else:
+        # Keep the opening Python quote away from the shell candidate so it
+        # cannot independently bound the command as a short quoted wrapper.
+        literals = ['f"message: $TOOL "'] + [f'f"{field}"'] * field_count
+    if suffix == "operands":
+        literals.append('" -rf /"')
+        extension = ""
+    else:
+        extension = suffix
+    joiner = "\n        "
+    if layout in {"implicit", "plus"}:
+        joiner = (" +" if layout == "plus" else " ") + "\\\n        "
+    return (
+        _OPTION_TEXT
+        + 'VERY_LONG_CONSTANT_NAME = "x"\n'
+        + "def message(detail):\n    return (\n        "
+        + joiner.join(literals)
+        + "\n    )"
+        + extension
+        + "\n"
+        + _TAIL
+    )
+
+
+@pytest.mark.parametrize(
+    "layout,suffix",
+    [
+        pytest.param("single", "operands", id="initial-literal"),
+        pytest.param("boundary", "operands", id="exact-source-boundary"),
+        pytest.param("implicit", "operands", id="implicit-literals"),
+        pytest.param("plus", "operands", id="plus-literals"),
+        pytest.param("single", ".format(detail)", id="initial-late-format"),
+        pytest.param("implicit", ".format(detail)", id="implicit-late-format"),
+        pytest.param("plus", " % detail", id="late-percent"),
+        pytest.param("plus", " + detail", id="late-unknown-concatenation"),
+    ],
+)
+def test_constant_field_shrinkage_cannot_hide_operand_window_cutoff(
+    layout: str, suffix: str
+) -> None:
+    source = _constant_cutoff_source(layout, suffix)
+    start = source.index("$TOOL")
+    fields = python_string_constants.python_constant_string_fields(source, lambda: None)
+    assert len(fields) >= 300
+    assert {value for _, _, value in fields} == {"x"}
+    ownership = tm._PythonSourceOwnership(source, lambda: None)
+
+    assert ownership.string_value(start, start + len("$TOOL")) is None
+    assert _python(source) is True
+
+
+@pytest.mark.parametrize("layout", ["single", "implicit", "plus"])
+def test_constant_field_shrinkage_within_operand_window_stays_complete(layout: str) -> None:
+    source = _constant_cutoff_source(layout, "", field_count=16)
+    start = source.index("$TOOL")
+    fields = python_string_constants.python_constant_string_fields(source, lambda: None)
+    assert len(fields) == 16
+    ownership = tm._PythonSourceOwnership(source, lambda: None)
+
+    assert ownership.string_value(start, start + len("$TOOL")) is not None
+    assert _python(source) is False
+
+
+@pytest.mark.parametrize(
+    "shadow,body,partial",
+    [
+        pytest.param("urllibish.py", "VALUE = 1\n", False, id="unrelated-module"),
+        pytest.param("urllib.py", "VALUE = 1\n", True, id="module"),
+        pytest.param("urllib/__init__.py", "", True, id="package"),
+        pytest.param(
+            "vendor/urllib/parse.py",
+            "def urlparse(value):\n    return replacement\n",
+            True,
+            id="package-member",
+        ),
+        pytest.param("urllib.cpython-313.so", None, True, id="opaque-extension"),
+        pytest.param("vendor/URLLIB/parse.so", None, True, id="opaque-package-member"),
+    ],
+)
+def test_constant_checkout_full_bundle_requires_native_urllib(
+    shadow: str, body: str | None, partial: bool
+) -> None:
+    source = _OPTION_TEXT + _CONSTANT_CHECKOUT_SOURCE + _TAIL
+    files = {"caller.py": source}
+    if body is not None:
+        files[shadow] = body
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["caller.py", shadow], "file_cache": files}, [tm]
+    )
+    event = next(event for event in result["inspection_ledger"] if event["path"] == "caller.py")
+
+    assert event["outcome"] is (LedgerOutcome.PARTIAL if partial else LedgerOutcome.COMPLETED)
+    if partial:
+        assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "module,opaque,readable,partial",
+    [
+        pytest.param("helpers", "helpers.pyc", False, True, id="bytecode"),
+        pytest.param("helpers", "helpers.pyo", False, True, id="legacy-bytecode"),
+        pytest.param("helpers", "helpers.cpython-313.so", False, True, id="native-abi"),
+        pytest.param("helpers", "helpers.abi3.pyd", False, True, id="native-pyd"),
+        pytest.param("helpers", "helpers.dll", False, True, id="native-dll"),
+        pytest.param("helpers", "helpers/__init__.pyc", False, True, id="bytecode-package"),
+        pytest.param("helpers", "helpers/__init__.abi3.so", False, True, id="native-package"),
+        pytest.param(
+            "helpers", "__pycache__/helpers.cpython-313.pyc", False, True, id="cached-bytecode"
+        ),
+        pytest.param("pkg.helpers", "pkg/helpers.pyc", False, True, id="nested-module"),
+        pytest.param("helpers", "helpers.pyc", True, True, id="readable-bytecode-sibling"),
+        pytest.param("helpers", "helpers.abi3.so", True, True, id="readable-native-sibling"),
+        pytest.param(
+            "pkg.helpers", "pkg/__init__.abi3.so", True, True, id="opaque-ancestor-initializer"
+        ),
+        pytest.param(
+            "pkg.helpers",
+            "pkg/__pycache__/__init__.cpython-313.pyc",
+            True,
+            True,
+            id="cached-ancestor-initializer",
+        ),
+        pytest.param("pkg.helpers", "pkg.pyd", True, True, id="opaque-ancestor-module"),
+        pytest.param(
+            "pkg.helpers", "pkg/__init__.pyc", False, True, id="missing-child-opaque-parent"
+        ),
+        pytest.param("pkg.helpers", "pkg.abi3.so", False, True, id="missing-child-native-parent"),
+        pytest.param("helpers", "helpers_extra.so", False, False, id="unrelated-prefix"),
+        pytest.param("helpers", "vendor/not_helpers.pyc", True, False, id="unrelated-basename"),
+        pytest.param("helpers", "helpers.txt", False, False, id="non-import-artifact"),
+        pytest.param("helpers", None, False, False, id="existing-external-import-limit"),
+    ],
+)
+def test_constant_checkout_full_bundle_refuses_unreadable_import_evidence(
+    module: str, opaque: str | None, readable: bool, partial: bool
+) -> None:
+    source = (
+        _OPTION_TEXT
+        + f"from {module} import output\n"
+        + _CONSTANT_CHECKOUT_SOURCE
+        + "output(message())\n"
+        + _TAIL
+    )
+    files = {"caller.py": source}
+    if readable:
+        files[module.replace(".", "/") + ".py"] = "def output(value):\n    print(value)\n"
+    components = list(files) + ([opaque] if opaque is not None else [])
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": components, "file_cache": files}, [tm]
+    )
+    event = next(event for event in result["inspection_ledger"] if event["path"] == "caller.py")
+
+    # Account for the caller separately from the unreadable artifact's own gap.
+    assert event["outcome"] is (LedgerOutcome.PARTIAL if partial else LedgerOutcome.COMPLETED)
+    if partial:
+        assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "omitted,partial",
+    [
+        ("helpers.pyc", True),
+        ("helpers.py", True),
+        ("urllib/parse.pyc", True),
+        ("helpers_extra.pyc", False),
+    ],
+)
+def test_constant_checkout_uses_known_omitted_import_inventory(omitted: str, partial: bool) -> None:
+    source = (
+        _OPTION_TEXT
+        + "from helpers import output\n"
+        + _CONSTANT_CHECKOUT_SOURCE
+        + "output(message())\n"
+        + _TAIL
+    )
+    result = static_runner.run_static_patterns_with_ledger(
+        {
+            "components": ["caller.py"],
+            "file_cache": {"caller.py": source},
+            "artifact_inventory": [{"path": omitted, "disposition": "partial"}],
+        },
+        [tm],
+    )
+    assert len(result["inspection_ledger"]) == 1
+    event = result["inspection_ledger"][0]
+    assert event["path"] == "caller.py"
+    assert event["outcome"] is (LedgerOutcome.PARTIAL if partial else LedgerOutcome.COMPLETED)
+    if partial:
+        assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize("executor", [False, True], ids=["safe-helper", "shell-initializer"])
+@pytest.mark.parametrize(
+    "initialization",
+    ["install()\n", "def unused(value=install()):\n    pass\n"],
+    ids=["direct-call", "default-call"],
+)
+def test_constant_checkout_full_bundle_checks_imported_initialization(
+    executor: bool, initialization: str
+) -> None:
+    source = (
+        _OPTION_TEXT
+        + "from helpers import output\n"
+        + _CONSTANT_CHECKOUT_SOURCE
+        + "output(message())\n"
+        + _TAIL
+    )
+    files = {
+        "caller.py": source,
+        "helpers.py": "from engine import install\n"
+        + initialization
+        + "def output(value):\n    print(value)\n",
+        "engine.py": (
+            "import subprocess\n"
+            "def install():\n"
+            '    subprocess.run(["bash", "-c", "printf initializing"])\n'
+            if executor
+            else 'def install():\n    print("initializing")\n'
+        ),
+    }
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": list(files), "file_cache": files}, [tm]
+    )
+    event = next(event for event in result["inspection_ledger"] if event["path"] == "caller.py")
+
+    assert event["outcome"] is (LedgerOutcome.PARTIAL if executor else LedgerOutcome.COMPLETED)
+    if executor:
+        assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize("guard", ["flow", "import", "stdlib"])
+def test_refused_constant_proof_preserves_existing_literal_value_bounds(
+    guard: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if guard == "flow":
+        monkeypatch.setattr(tm, "python_string_value_bounds_allowed", lambda content, check: False)
+
+    def import_check(check_runtime: Callable[[], None]) -> bool:
+        check_runtime()
+        return guard != "import"
+
+    def stdlib_check(module: str, check_runtime: Callable[[], None]) -> bool:
+        check_runtime()
+        return guard != "stdlib"
+
+    source = _OPTION_TEXT + _CONSTANT_CHECKOUT_SOURCE + _TAIL
+    start = source.index("$TOOL_ROOT")
+    ownership = tm._PythonSourceOwnership(source, lambda: None, import_check, stdlib_check)
+    value = ownership.string_value(start, start + len("$TOOL_ROOT"))
+
+    assert value is not None
+    assert " -rf {" in value[0]
+    assert tm.has_bounded_parse_exhaustion(
+        source,
+        lambda: None,
+        file_type="python",
+        python_import_check=import_check,
+        python_stdlib_check=stdlib_check,
+    )
+    # Refusing the added proof cannot revoke an existing non-root literal bound.
+    benign = _OPTION_TEXT + 'MESSAGE = "$TOOL -rf build"\n' + _TAIL
+    assert not tm.has_bounded_parse_exhaustion(
+        benign,
+        lambda: None,
+        file_type="python",
+        python_import_check=import_check,
+        python_stdlib_check=stdlib_check,
+    )
+
+
+def test_interrupted_constant_import_proof_does_not_cache_success() -> None:
+    source = _OPTION_TEXT + _CONSTANT_CHECKOUT_SOURCE + _TAIL
+    calls = 0
+
+    def import_check(check_runtime: Callable[[], None]) -> bool:
+        nonlocal calls
+        check_runtime()
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("constant import deadline")
+        return False
+
+    start = source.index("$TOOL_ROOT")
+    ownership = tm._PythonSourceOwnership(source, lambda: None, import_check)
+    with pytest.raises(TimeoutError, match="constant import deadline"):
+        ownership.string_value(start, start + len("$TOOL_ROOT"))
+
+    value = ownership.string_value(start, start + len("$TOOL_ROOT"))
+    assert calls == 2
+    assert value is not None
+    assert " -rf {" in value[0]
+
+
+def test_refused_constant_proof_keeps_typed_diagnostic_source_range() -> None:
+    source = _OPTION_TEXT + _CONSTANT_CHECKOUT_SOURCE + _TAIL
+    diagnostic = tm.bounded_parse_diagnostic(
+        source,
+        lambda: None,
+        file_type="python",
+        python_import_check=lambda check: False,
+    )
+    final_literal = 'f"checked out to {active_branch}"'
+
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.UNSUPPORTED_SYNTAX
+    assert diagnostic.start == source.index('f"$TOOL_ROOT')
+    assert diagnostic.end == source.index(final_literal) + len(final_literal)
+    assert diagnostic.location_precision == "enclosing_expression"
+
+
+@pytest.mark.parametrize("target,partial", [("/", True), ("build", False)])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize("leading", ["", "\n"], ids=["body-start", "next-line"])
+def test_completed_python_word_cannot_claim_a_later_string(
+    target: str, partial: bool, newline: str, leading: str
+) -> None:
+    # A quote in the replacement expression can lexically pair with the next
+    # literal's quote. That apparent completed word must not hide a later
+    # runtime-selected command, even when the literal starts with it.
+    content = (
+        "message = f\"{' '.join(parts)} ready\"\n"
+        f'REPORT = r"""{leading}$TOOL -rf {target}\nlabel(\'value\')\n"""\n'
+    ).replace("\n", newline)
+
+    assert _python(content) is partial
+
+
+@pytest.mark.parametrize(
+    "javascript",
+    [
+        "execSync(`${{obj.cmd}}`);",
+        "run(`${{obj.cmd}}`);",
+        'execSync(`${{obj.cmd}}` + " -rf /");',
+        'const invoke = execSync; invoke(`${{obj.cmd}}` + " -rf /");',
+    ],
+)
+def test_python_constant_text_keeps_embedded_executable_javascript_partial(
+    javascript: str,
+) -> None:
+    assert _python('REPORT = f"""' + javascript + '"""\n') is True
+
+
+@pytest.mark.parametrize("prefix", ["r", "f", "rf"])
+@pytest.mark.parametrize("quote", ['"', '"""'])
+@pytest.mark.parametrize("target,dangerous", [("/", True), ("build", False)])
+def test_short_prefixed_python_commands_keep_raw_findings(
+    prefix: str, quote: str, target: str, dangerous: bool
+) -> None:
+    content = f"COMMAND = {prefix}{quote}rm -rf {target}{quote}\n"
+
+    result = _ledger("scripts/command.py", content)
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"]) is dangerous
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
 @pytest.mark.parametrize("newline", ["\r\n"], ids=["crlf"])
@@ -305,6 +999,88 @@ def test_runtime_command_with_destructive_operands_in_python_comment_stays_parti
     assert _python(_OPTION_TEXT + "# $TOOL -rf /\nvalue = 1\n" + _TAIL) is True
 
 
+@pytest.mark.parametrize(
+    "joiner", ["\n           ", "  # tool\n           + "], ids=["implicit", "plus"]
+)
+@pytest.mark.parametrize(
+    "operands,partial",
+    [('"-rf /"', True), ('"--force --recursive /"', True), ('"-rf build"', False)],
+    ids=["root", "long-options", "relative"],
+)
+def test_runtime_command_takes_operands_from_concatenated_python_literals(
+    joiner: str, operands: str, partial: bool
+) -> None:
+    source = f'COMMAND = (f"run `{{tool}}` "{joiner}{operands})\n'
+
+    assert _python(_OPTION_TEXT + source + _TAIL) is partial
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param('COMMAND = f"run `{tool}` -rf /"\n', id="same-literal"),
+        pytest.param('COMMAND = f"Inspected `{path}` and found %s." % detail\n', id="percent"),
+        pytest.param('COMMAND = "Inspected `$P` and found {}.".format(detail)\n', id="format"),
+        pytest.param('COMMAND = f"Inspected `{path}` and " + detail\n', id="non-literal"),
+        pytest.param('COMMAND = (f"run `{tool}` %s") % "-rf /"\n', id="parenthesized-percent"),
+        pytest.param('COMMAND = ("run $(tool) ") + "-rf /"\n', id="parenthesized-plus"),
+        pytest.param('COMMAND = "run $(tool) "[0:] + "-rf /"\n', id="subscript"),
+        pytest.param('COMMAND = f"run `{tool}` {flag} /"\n', id="replacement-field"),
+    ],
+)
+def test_runtime_command_in_python_string_keeps_undecided_operands_partial(source: str) -> None:
+    # Code can still append operands to a string that is formatted, sliced,
+    # joined with a non-literal, or followed by a method call, also after a
+    # closing parenthesis. A replacement field can supply the options for a
+    # root target.
+    assert _python(_OPTION_TEXT + source + _TAIL) is True
+
+
+@pytest.mark.parametrize(
+    "source,shell_text",
+    [
+        pytest.param('X = f"a `{b}` c"\n', "`{b}` c", id="f-string"),
+        pytest.param(
+            "X = (\"a `{b}` \"  # note\n     + \"c\" \\\n     r'''d''')\n",
+            "`{b}` cd",
+            id="concatenated",
+        ),
+        pytest.param('X = ["a `{b}` ", "c"]\n', "`{b}` ", id="list-items"),
+        pytest.param('X = "a `{b}` " if c else "d"\n', "`{b}` ", id="conditional"),
+        pytest.param('X = "a `{b}` %s" % c\n', None, id="percent"),
+        pytest.param('X = "a `{b}` ".join(c)\n', None, id="method"),
+        pytest.param('X = "a `{b}` " * c\n', None, id="repetition"),
+        pytest.param('X = "a `{b}` " + c\n', None, id="non-literal"),
+        pytest.param('X = ("a `{b}` ") % c\n', None, id="parenthesized"),
+        pytest.param('X = "a `{b}` "[c]\n', None, id="subscript"),
+        pytest.param(
+            'X = f"a `{b}` {c} {{d}}" "{e}" f"{{{g}}}"\n',
+            "`{b}`  -rf {c} {{d}}{e}{{ -rf {g}}}",
+            id="replacement-fields",
+        ),
+    ],
+)
+def test_python_string_value_joins_only_concatenated_literals(
+    source: str, shell_text: str | None
+) -> None:
+    start = source.index("`")
+    value = tm._PythonSourceOwnership(source, lambda: None).string_value(start, start + 5)
+
+    # The shell word and the operands that the rest of the value supplies.
+    assert (value if value is None else value[0][value[1] :]) == shell_text
+
+
+def test_python_closing_quote_starts_no_shell_word() -> None:
+    source = 'X = ("a "\n     "$B -rf /")\n'
+    start = source.index('"\n')
+
+    assert tm._PythonSourceOwnership(source, lambda: None).string_value(start, start + 1) == (
+        "",
+        0,
+        0,
+    )
+
+
 def test_shell_file_with_unmatched_backtick_and_long_tail_stays_partial() -> None:
     content = "#!/bin/sh\necho `date\n" + "echo ordinary line\n" * 300
 
@@ -341,6 +1117,841 @@ def test_python_ownership_keeps_tool_misuse_detection() -> None:
 
     assert any(finding.rule_id == "TM1" for finding in result["findings"])
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+# --- Node assertion diagnostic templates ----------------------------------
+
+
+_JS_ASSERT_IMPORT = 'import check from "node:assert/strict";\n'
+_JS_ASSERT_CALL = 'check.equal(typeof row.name, "string", `${row.key} must be present`);\n'
+
+
+def _javascript(content: str, *, complete_context: bool = True) -> bool:
+    return tm.has_bounded_parse_exhaustion(
+        content, lambda: None, file_type="javascript", complete_context=complete_context
+    )
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        'import check from "node:assert";',
+        'import check from "node:assert/strict";',
+        "import * as check from 'node:assert';",
+        "import * as check from 'node:assert/strict';",
+    ],
+)
+def test_imported_node_assert_message_template_is_complete(declaration: str) -> None:
+    source = declaration + "\n" + _JS_ASSERT_CALL
+
+    assert _javascript(source) is False
+    assert _shell(source) is True
+
+
+@pytest.mark.parametrize(
+    "method,arguments",
+    [
+        ("ok", "valid"),
+        ("equal", "actual, expected"),
+        ("notEqual", "actual, expected"),
+        ("strictEqual", "actual, expected"),
+        ("notStrictEqual", "actual, expected"),
+        ("deepEqual", "actual, expected"),
+        ("notDeepEqual", "actual, expected"),
+        ("deepStrictEqual", "actual, expected"),
+        ("notDeepStrictEqual", "actual, expected"),
+        ("match", "actual, /value/"),
+        ("doesNotMatch", "actual, /value/"),
+        ("throws", "() => work(), undefined"),
+        ("doesNotThrow", "() => work(), undefined"),
+    ],
+)
+def test_node_assert_owns_only_its_message_argument(method: str, arguments: str) -> None:
+    source = _JS_ASSERT_IMPORT + f"check.{method}({arguments}, `${{row.key}} needs a value`);\n"
+
+    assert _javascript(source) is False
+
+
+@pytest.mark.parametrize("suffix", [".js", ".mjs", ".cjs", ".MJS"])
+def test_node_assert_message_ownership_reaches_static_ledger(suffix: str) -> None:
+    result = _ledger("scripts/check" + suffix, _JS_ASSERT_IMPORT + _JS_ASSERT_CALL)
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert not any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_node_assert_template_offsets_preserve_dangerous_neighbor(newline: str) -> None:
+    source = (
+        _JS_ASSERT_IMPORT
+        + "check.ok(ready, `café ${row.key} is ready`);\n"
+        + 'execSync("rm -rf /");\n'
+    ).replace("\n", newline)
+
+    result = _ledger("scripts/check.mjs", source)
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert any(
+        finding.rule_id == "TM1" and finding.start_line == 3 for finding in result["findings"]
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(_JS_ASSERT_CALL, id="unbound-name"),
+        pytest.param(
+            'import check from "custom-assert";\n' + _JS_ASSERT_CALL, id="non-node-import"
+        ),
+        pytest.param(
+            'import { strict as check } from "node:assert";\n' + _JS_ASSERT_CALL,
+            id="unsupported-named-import",
+        ),
+        pytest.param(_JS_ASSERT_IMPORT + "check = run;\n" + _JS_ASSERT_CALL, id="rebound"),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "function verify(check) {\n" + _JS_ASSERT_CALL + "}\n",
+            id="shadowed-parameter",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const alias = check;\n" + _JS_ASSERT_CALL, id="escaped-binding"
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const run = check.equal;\n" + _JS_ASSERT_CALL,
+            id="aliased-method",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const message = `${check}`;\n" + _JS_ASSERT_CALL,
+            id="binding-interpolated-elsewhere",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const message = `${check.equal}`;\n" + _JS_ASSERT_CALL,
+            id="method-interpolated-elsewhere",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal = run;\n" + _JS_ASSERT_CALL,
+            id="method-replacement",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + 'check["equal"] = run;\n' + _JS_ASSERT_CALL,
+            id="computed-replacement",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "Object.assign(check, { equal: run });\n" + _JS_ASSERT_CALL,
+            id="object-mutation",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + 'import alternate from "node:assert";\nalternate.equal = run;\n'
+            + _JS_ASSERT_CALL,
+            id="second-import-alias",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + 'require("node:assert/strict").equal = run;\n' + _JS_ASSERT_CALL,
+            id="require-alias",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + r'import alternate from "node:\u0061ssert";'
+            + "\nalternate.equal = run;\n"
+            + _JS_ASSERT_CALL,
+            id="escaped-module-import",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + r'require("node:\u0061ssert").equal = run;'
+            + "\n"
+            + _JS_ASSERT_CALL,
+            id="escaped-module-require",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + "const of = 1; const n = of / (check.equal = run) / divisor;\n"
+            + _JS_ASSERT_CALL,
+            id="division-after-contextual-keyword",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT
+            + "const n = holder.return / (check.equal = run) / divisor;\n"
+            + _JS_ASSERT_CALL,
+            id="division-after-keyword-property",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + 'check["equal"](a, b, `${row.key} is required`);\n',
+            id="computed-call",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check?.equal(a, b, `${row.key} is required`);\n",
+            id="optional-call",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check(a, `${row.key} is required`);\n",
+            id="unsupported-callable-assert",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(`${row.key}`, b);\n",
+            id="template-is-actual-value",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(a, b, `${row.key}`, extra);\n",
+            id="extra-argument",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(...values, `${row.key}`);\n",
+            id="spread-argument",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(a, b, (`${row.key}`));\n",
+            id="parenthesized-message",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + 'check.equal(a, b, `${row.key}` + " more");\n',
+            id="concatenated-message",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "check.equal(a, b, message = `${row.key}`);\n",
+            id="assigned-message",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const message = `${row.key}`;\n",
+            id="unrelated-assignment",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "function message() { return `${row.key}`; }\n",
+            id="unrelated-return",
+        ),
+        pytest.param("#!/bin/sh\n" + _JS_ASSERT_IMPORT + _JS_ASSERT_CALL, id="shell-shebang"),
+        pytest.param(_JS_ASSERT_IMPORT + _JS_ASSERT_CALL + "/* unfinished", id="unclosed-comment"),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const pattern = /unterminated\n" + _JS_ASSERT_CALL,
+            id="unclosed-regexp",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const pattern = /value/gg;\n" + _JS_ASSERT_CALL,
+            id="invalid-regexp-flags",
+        ),
+        pytest.param(
+            _JS_ASSERT_IMPORT + "const pattern = /value\\\nmore/;\n" + _JS_ASSERT_CALL,
+            id="escaped-newline-in-regexp",
+        ),
+    ],
+)
+def test_unproven_node_assert_binding_or_message_is_not_projected(source: str) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert _javascript(source) is _shell(source)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param("check.equal(a, b, tag`${row.key}`);\n", id="tagged-message"),
+        pytest.param("check.equal(a, b, `${row.key}\n", id="unclosed-template"),
+        pytest.param("check.equal(a, b, `${row.key`);\n", id="unclosed-field"),
+    ],
+)
+def test_unresolved_assertion_templates_report_partial_inspection(statement: str) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = _JS_ASSERT_IMPORT + statement
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert _javascript(source) is True
+    row = _ledger("scripts/check.mjs", source)["inspection_ledger"][0]
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+def test_unproven_node_assert_template_keeps_ledger_partial() -> None:
+    result = _ledger("scripts/check.mjs", _JS_ASSERT_CALL)
+    row = result["inspection_ledger"][0]
+
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "operand",
+    [
+        "value!",
+        "value !",
+        "value /* gap */ !",
+        "value! /* gap */",
+        "holder.value!",
+        "getValue()!",
+        "(value)!",
+        "values[0]!",
+    ],
+)
+@pytest.mark.parametrize("file_type", ["javascript", "typescript"])
+def test_postfix_non_null_assertion_cannot_hide_receiver_mutation(
+    operand: str, file_type: str
+) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = (
+        _JS_ASSERT_IMPORT
+        + f"const n = {operand} / (check.equal = run) / divisor;\n"
+        + _JS_ASSERT_CALL
+    )
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type) is True
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ["!value", "!!value", "!/value/.test(input)", "value != other", "value !== other"],
+)
+def test_prefix_negation_and_inequality_keep_assert_message_ownership(expression: str) -> None:
+    source = _JS_ASSERT_IMPORT + f"const ready = {expression};\n" + _JS_ASSERT_CALL
+
+    assert _javascript(source) is False
+    assert _shell(source) is True
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "",
+        "const n = value! / (check.equal = run) / divisor;\n",
+        "const n = factory<number> / (check.equal = run) / divisor;\n",
+    ],
+)
+def test_typescript_does_not_borrow_javascript_assert_ownership(statement: str) -> None:
+    source = _JS_ASSERT_IMPORT + statement + _JS_ASSERT_CALL
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="typescript") is True
+    result = _ledger("scripts/check.ts", source)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "prefix,message",
+    [
+        ("// check.equal = run;\n", "ready ${row.key}"),
+        ("/* check is a diagnostic receiver */\n", "ready ${row.key}"),
+        (r"""const pattern = /['"]/;""" + "\n", "ready ${row.key}"),
+        ("", r"escaped \` delimiter ${row.key}"),
+        ("", "multiple ${label} and ${row.key} values"),
+    ],
+)
+def test_node_assert_projection_changes_only_proven_delimiters(prefix: str, message: str) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = _JS_ASSERT_IMPORT + prefix + f"check.equal(a, b, `{message}`);\n"
+    opening = source.index("`", len(_JS_ASSERT_IMPORT + prefix))
+    closing = source.rindex("`")
+
+    projected = assertion_template_shell_text(source, lambda: None)
+
+    assert len(projected) == len(source)
+    assert [
+        index
+        for index, pair in enumerate(zip(source, projected, strict=True))
+        if pair[0] != pair[1]
+    ] == [
+        opening,
+        closing,
+    ]
+    assert projected[opening] == projected[closing] == " "
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "execSync(obj.cmd)",
+        "new Command(obj.cmd)",
+        "(target = obj.cmd)",
+        "counter++",
+        "++counter",
+        "obj[key]",
+        "obj?.cmd",
+        "`nested ${obj.cmd}`",
+    ],
+)
+def test_effectful_or_unproven_assert_interpolation_is_not_projected(expression: str) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = _JS_ASSERT_IMPORT + f"check.equal(a, b, `${{{expression}}} ready`);\n"
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert _javascript(source) is _shell(source)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "execSync(`${obj.cmd}`);",
+        "run(`${obj.cmd}`);",
+        "execSync(`${getCmd()}`);",
+        "execSync(`${cmd} -rf /`);",
+        "execSync(`${obj.cmd} -rf /`);",
+        'execSync(`${obj.cmd}` + " -rf /");',
+    ],
+)
+def test_node_assert_message_fix_keeps_unresolved_shell_commands_partial(statement: str) -> None:
+    source = _JS_ASSERT_IMPORT + _JS_ASSERT_CALL + statement + "\n"
+
+    assert _javascript(source) is True
+    result = _ledger("scripts/check.mjs", source)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "sh`${obj.cmd}`;",
+        "sh`${obj.cmd} -rf /`;",
+    ],
+)
+def test_unrecognized_executable_template_consumers_report_partial(statement: str) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = _JS_ASSERT_IMPORT + statement + "\n"
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert _javascript(source) is True
+    row = _ledger("scripts/check.mjs", source)["inspection_ledger"][0]
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "run(`${cmd}`);",
+        "execSync(String.raw`${obj.cmd}`);",
+        'execSync(`${cmd}` + " -rf /");',
+    ],
+)
+@pytest.mark.parametrize("suffix", ["", _TAIL], ids=["short", "padded"])
+def test_known_template_execution_keeps_unresolved_operands_partial(
+    statement: str, suffix: str
+) -> None:
+    source = _JS_ASSERT_IMPORT + statement + "\n" + suffix
+
+    assert _javascript(source) is True
+    result = _ledger("scripts/check.mjs", source)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "execSync(`rm -rf /`);",
+        "check.equal(a, b, `${execSync('rm -rf /')} ready`);",
+        "check.equal(a, b, `rm -rf / ${row.key}`);",
+    ],
+)
+def test_assert_template_ownership_preserves_destructive_text(statement: str) -> None:
+    result = _ledger("scripts/check.mjs", _JS_ASSERT_IMPORT + statement + "\n")
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+def test_node_assert_message_ownership_requires_complete_javascript_context() -> None:
+    source = _JS_ASSERT_IMPORT + _JS_ASSERT_CALL
+
+    assert _javascript(source, complete_context=False) is True
+    assert _shell(source) is True
+
+
+def test_node_assert_template_scan_propagates_runtime_interruptions() -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    def check_runtime() -> None:
+        raise TimeoutError("test runtime bound")
+
+    with pytest.raises(TimeoutError, match="test runtime bound"):
+        assertion_template_shell_text(_JS_ASSERT_IMPORT + _JS_ASSERT_CALL * 1000, check_runtime)
+
+
+def test_oversized_javascript_does_not_gain_template_ownership() -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = _JS_ASSERT_IMPORT + "/*" + "x" * 1_100_000 + "*/\n" + _JS_ASSERT_CALL
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+
+
+# --- Escaped browser list values in Python HTML ----------------------------
+
+_BROWSER_ASSIGNMENT = """panel.innerHTML = `<section>${listMarkup(rows.map((item) => `${item.name} :: ${item.value}`))}</section>`;"""
+_BROWSER_SCRIPT = (
+    """
+const data = JSON.parse(document.getElementById('data').textContent);
+const panel = document.getElementById('panel');
+const rows = data.items;
+function escapeText(value) {
+  return String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+}
+function listMarkup(items, emptyText='None') {
+  if (!items || !items.length) {
+    return `<div class="empty">${escapeText(emptyText)}</div>`;
+  }
+  return `<ul>${items.map((item) => `<li>${escapeText(typeof item === 'string' ? item : JSON.stringify(item))}</li>`).join('')}</ul>`;
+}
+"""
+    + _BROWSER_ASSIGNMENT
+)
+
+
+def _browser_source(script: str = _BROWSER_SCRIPT, *, consumer: str | None = None) -> str:
+    encoded = script.replace("{", "{{").replace("}", "}}")
+    return (
+        "from pathlib import Path\nfrom html import escape\nimport json\n"
+        "def render(data):\n"
+        "    payload = json.dumps(data).replace('</', '<\\\\/')\n"
+        "    label = escape(data['label'])\n"
+        "    return f'''<!doctype html><html><body><p>{label}</p><div id=\"panel\"></div>"
+        '<script id="data" type="application/json">{payload}</script><script>'
+        + encoded
+        + "</script></body></html>'''\n"
+        + (consumer or "Path('page.html').write_text(render(data), encoding='utf-8')")
+        + "\n"
+    )
+
+
+def test_escaped_browser_list_projects_only_selected_backticks() -> None:
+    source = _browser_source()
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+
+    assert _python(source) is False
+    assert (
+        _ledger("scripts/page.py", source)["inspection_ledger"][0]["outcome"]
+        is LedgerOutcome.COMPLETED
+    )
+    changes = [i for i, (a, b) in enumerate(zip(source, projected, strict=True)) if a != b]
+    assert len(changes) == 2
+    assert all(source[i] == "`" and projected[i] == " " for i in changes)
+    assert projected.count("${{") == source.count("${{")
+
+
+def test_escaped_browser_list_keeps_optional_property_reads() -> None:
+    source = _browser_source(_BROWSER_SCRIPT.replace("data.items", "data?.items"))
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+
+    assert _python(source) is False
+    changes = [i for i, (a, b) in enumerate(zip(source, projected, strict=True)) if a != b]
+    assert len(changes) == 2
+    assert all(source[i] == "`" and projected[i] == " " for i in changes)
+    assert "data?.items" in projected
+
+
+def test_escaped_browser_list_keeps_literal_security_findings() -> None:
+    script = _BROWSER_SCRIPT + '\nconst commandText = "rm -rf /";\n'
+    source = _browser_source(script)
+    result = _ledger("scripts/page.py", source)
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+    # Delimiter ownership cannot complete a separate destructive shell candidate.
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+
+
+def test_escaped_browser_list_traces_local_parameters() -> None:
+    assignment = _BROWSER_ASSIGNMENT.replace("rows.map", "values.map")
+    script = _BROWSER_SCRIPT.replace(
+        _BROWSER_ASSIGNMENT,
+        "document.getElementById('filter').value = '';\nfunction renderList(values) {\n"
+        + assignment
+        + "\n}\nrenderList(rows);",
+    )
+    source = _browser_source(script)
+
+    assert _python(source) is False
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+    assert sum(a != b for a, b in zip(source, projected, strict=True)) == 2
+
+
+def test_escaped_browser_list_traces_json_object_entries() -> None:
+    script = _BROWSER_SCRIPT.replace(
+        "const rows = data.items;",
+        "const rows = Object.entries(data.items).map(([name, value]) => ({name, value}));",
+    )
+    source = _browser_source(script)
+
+    assert _python(source) is False
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+    assert sum(a != b for a, b in zip(source, projected, strict=True)) == 2
+
+
+@pytest.mark.parametrize("binding_kind", ["parameter", "local-const"])
+@pytest.mark.parametrize("receiver,partial", [("rows", False), ("external", True)])
+def test_browser_undefined_binding_requires_proven_data(
+    binding_kind: str, receiver: str, partial: bool
+) -> None:
+    assignment = _BROWSER_ASSIGNMENT.replace("rows.map", "undefined.map")
+    if binding_kind == "parameter":
+        replacement = (
+            f"function renderList(undefined) {{\n{assignment}\n}}\nrenderList({receiver});"
+        )
+    else:
+        replacement = (
+            f"function renderList() {{\nconst undefined = {receiver};\n"
+            f"{assignment}\n}}\nrenderList();"
+        )
+    source = _browser_source(_BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, replacement))
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+
+    assert _python(source) is partial
+    if partial:
+        assert projected == source
+        assert (
+            _ledger("scripts/page.py", source)["inspection_ledger"][0]["reason_code"]
+            is LedgerReason.STATIC_PARSE_LIMIT
+        )
+    else:
+        assert sum(a != b for a, b in zip(source, projected, strict=True)) == 2
+
+
+def test_escaped_browser_list_traces_native_filter_values() -> None:
+    script = _BROWSER_SCRIPT.replace(
+        "const rows = data.items;",
+        "function matches(row) {\n"
+        "  const terms = [row.name, ...row.tags].join(' ').trim().toLowerCase();\n"
+        "  return terms.includes(data.query);\n"
+        "}\nconst rows = data.items.filter(matches);",
+    )
+    source = _browser_source(script)
+
+    assert _python(source) is False
+    projected = python_tokens.python_browser_template_shell_text(source, lambda: None)
+    assert sum(a != b for a, b in zip(source, projected, strict=True)) == 2
+
+
+def test_tagged_browser_template_keeps_existing_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    script = _BROWSER_SCRIPT.replace(
+        "`${item.name} :: ${item.value}`", "tag`${item.name} :: ${item.value}`"
+    )
+    source = _browser_source(script)
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+    observed = _python(source)
+    monkeypatch.setattr(tm, "python_browser_template_shell_text", lambda text, check: text)
+    assert _python(source) is observed
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "execSync(rows.map((item) => `${item.name}`));"
+        ),
+        _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, "run(rows.map((item) => `${item.name}`));"),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "const invoke = execSync; invoke(`${data.command}`);"
+        ),
+        _BROWSER_SCRIPT.replace("${item.name} ::", "${run(item.name)} ::"),
+        _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, "panel.innerHTML = `${data.command}`;"),
+        _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, "escapeText = run;\n" + _BROWSER_ASSIGNMENT),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "function display(escapeText) {\n" + _BROWSER_ASSIGNMENT + "\n}"
+        ),
+        _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, "mutate(data);\n" + _BROWSER_ASSIGNMENT),
+        *[
+            _BROWSER_SCRIPT.replace(_BROWSER_ASSIGNMENT, call + "\n" + _BROWSER_ASSIGNMENT)
+            for call in (
+                "external?.(rows);",
+                "external?.method(rows);",
+                "external.method?.(rows);",
+                "external['method']?.(rows);",
+                "external?.['method'](rows);",
+                "external?.['method']?.(rows);",
+                "(external.method)?.(rows);",
+                "external /* call */ ?. (rows);",
+                "external?.(panel);",
+            )
+        ],
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "external.map(() => data);\n" + _BROWSER_ASSIGNMENT
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "function leak(value) { external.map(() => value); }\nleak(data);\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "function invoke(strings, value) { external.map(() => value); }\ninvoke`${data}`;\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "rows.forEach((item) => external.map(() => item));\n" + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "external.map(() => panel);\n" + _BROWSER_ASSIGNMENT
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "external.map(() => document.getElementById('panel'));\n" + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "const holder = {}; holder.value = data; external.map(() => holder.value);\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "const holder = {}; holder.value = panel; external.map(() => holder.value);\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "function renderInto(panel) {\n" + _BROWSER_ASSIGNMENT + "\n}\nrenderInto(external);",
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT, "rows.forEach((panel) => {\n" + _BROWSER_ASSIGNMENT + "\n});"
+        ),
+        _BROWSER_SCRIPT.replace("const rows = data.items;", "const rows = {map: eval};"),
+        _BROWSER_SCRIPT.replace(
+            "const rows = data.items;", "const rows = Object.entries(external);"
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "const terms = external.toLowerCase(); terms.includes(data.query);\n"
+            + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            _BROWSER_ASSIGNMENT,
+            "data.query.toLowerCase(data.query).includes(data.query);\n" + _BROWSER_ASSIGNMENT,
+        ),
+        _BROWSER_SCRIPT.replace(
+            "const rows = data.items;",
+            "const rows = {[\"map\"]: document.getElementById('p').onclick};",
+        ),
+        _BROWSER_SCRIPT.replace("<li>${escapeText", '<li onclick="mutate()">${escapeText'),
+        _BROWSER_SCRIPT.replace("${listMarkup(rows.map", "${execSync(listMarkup(rows.map").replace(
+            "))}</section>", ")))}</section>"
+        ),
+    ],
+    ids=[
+        "exec",
+        "unknown-call",
+        "alias",
+        "executable-field",
+        "unescaped-output",
+        "reassign",
+        "shadow",
+        "data-escape",
+        "optional-call",
+        "optional-member-call",
+        "member-optional-call",
+        "computed-optional-call",
+        "optional-computed-member-call",
+        "optional-computed-optional-call",
+        "grouped-optional-call",
+        "commented-optional-call",
+        "optional-dom-escape",
+        "callback-escape",
+        "forwarded-data-escape",
+        "tagged-local-escape",
+        "forwarded-callback-escape",
+        "dom-receiver-escape",
+        "dom-lookup-escape",
+        "stored-data-escape",
+        "stored-dom-escape",
+        "dom-function-shadow",
+        "dom-callback-shadow",
+        "fake-map",
+        "unknown-object-entries",
+        "unknown-string-receiver",
+        "unexpected-string-argument",
+        "computed-map",
+        "formatter-handler",
+        "formatter-executed",
+    ],
+)
+def test_unproven_browser_consumers_remain_partial(script: str) -> None:
+    source = _browser_source(script)
+
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+    assert _python(source) is True
+    assert (
+        _ledger("scripts/page.py", source)["inspection_ledger"][0]["reason_code"]
+        is LedgerReason.STATIC_PARSE_LIMIT
+    )
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    [
+        "import subprocess\nsubprocess.run(render(data), shell=True)",
+        "unknown(render(data))",
+        "unknown(Path)\nPath('page.html').write_text(render(data))",
+        "unknown(json)\nPath('page.html').write_text(render(data))",
+        "p = Path('page.html')\nunknown(p)\np.write_text(render(data))",
+        "p = Path('page.html')\nunknown(p.write_text)\np.write_text(render(data))",
+        "p = Path('page.html')\nunknown(p.resolve)\np.write_text(render(data))",
+        "p = Path('page.html')\nunknown(p.parent)\np.write_text(render(data))",
+        "p = Path('page.html')\nunknown(p.resolve())\np.write_text(render(data))",
+        "Path.resolve = unknown\nPath('page.html').write_text(render(data))",
+        "(Path('page.html') / unknown).write_text(render(data))",
+        "def outer(Path):\n    def inner():\n        Path('page.html').write_text(render(data))",
+        "[Path('page.html').write_text(render(data)) for Path in commands]",
+    ],
+)
+def test_browser_html_requires_explicit_pathlib_consumers(consumer: str) -> None:
+    consumer = consumer.replace(
+        "write_text(render(data))", "write_text(render(data), encoding='utf-8')"
+    )
+    source = _browser_source(consumer=consumer)
+
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+    assert _python(source) is True
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "render(data)",
+        "render(data), encoding='utf-16'",
+        "render(data), encoding=codec",
+        "render(data), encoding='utf-8', errors='ignore'",
+        "render(data), 'utf-8', 'ignore'",
+    ],
+)
+def test_browser_html_requires_known_utf8_write(arguments: str) -> None:
+    source = _browser_source(consumer=f"Path('page.html').write_text({arguments})")
+
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+    assert _python(source) is True
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("label = escape(data['label'])", "label = data['label']"),
+        ("payload = json.dumps(data).replace('</', '<\\\\/')", "payload = json.dumps(data)"),
+        ("<p>{label}</p>", '<iframe srcdoc="{label}"></iframe>'),
+        ("function escapeText(value)", "function String(value)"),
+    ],
+)
+def test_browser_boundary_and_builtin_changes_do_not_gain_ownership(
+    before: str, after: str
+) -> None:
+    source = _browser_source().replace(before, after)
+
+    assert _python(source) is True
+    assert python_tokens.python_browser_template_shell_text(source, lambda: None) == source
+
+
+def test_browser_ownership_preserves_fragment_bounds_and_cancellation() -> None:
+    source = _browser_source()
+    assert _python(source, complete_context=False) is True
+    assert _python(source.replace("</script></body>", "</body>")) is True
+    assert _python(_browser_source("(" * 150 + _BROWSER_SCRIPT + ")" * 150)) is True
+    oversized = _browser_source("/*" + "x" * 1_100_000 + "*/" + _BROWSER_SCRIPT)
+    assert python_tokens.python_browser_template_shell_text(oversized, lambda: None) == oversized
+
+    def cancel() -> None:
+        raise TimeoutError("browser ownership deadline")
+
+    with pytest.raises(TimeoutError, match="browser ownership deadline"):
+        python_tokens.python_browser_template_shell_text(source, cancel)
 
 
 # --- Whole-scan accounting -------------------------------------------------
