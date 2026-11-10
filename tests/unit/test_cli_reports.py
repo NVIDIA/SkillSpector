@@ -12,6 +12,7 @@ import pytest
 from typer.testing import CliRunner
 
 from skillspector import cli
+from skillspector.file_output import write_text_no_follow
 from skillspector.models import Finding
 from skillspector.nodes.report import report
 from skillspector.report_outputs import parse_reports
@@ -106,17 +107,118 @@ def test_report_paths_are_distinct_and_preserve_equals(tmp_path):
         parse_reports([f"json={path}", f"json={alias}"], ("json",))
 
 
-def test_report_does_not_overwrite_input(tmp_path, monkeypatch):
-    source = tmp_path / "SKILL.md"
-    source.write_text("# Keep me\n")
-    scan = Mock()
+def test_report_paths_use_writer_normalization(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "report.json"
+    reports = parse_reports(["json=missing/../report.json"], ("json",))
+    assert reports == [("json", path)]
+    with pytest.raises(ValueError, match="distinct"):
+        parse_reports(["json=missing/../report.json", "json=report.json"], ("json",))
+    with pytest.raises(ValueError, match="distinct"):
+        parse_reports(["json=report.json"], ("json",), tmp_path / "missing" / ".." / path.name)
+    write_text_no_follow(reports[0][1], '{"ok": true}')
+    assert json.loads(path.read_text()) == {"ok": True}
+    assert not (tmp_path / "missing").exists()
+    os.link(path, tmp_path / "alias.json")
+    with pytest.raises(ValueError, match="distinct"):
+        parse_reports(["json=missing/../alias.json"], ("json",), path)
+
+
+def test_report_paths_retain_untrusted_symlinks(tmp_path):
+    directory = tmp_path / "reports"
+    directory.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(directory, target_is_directory=True)
+    # Do not resolve child symlinks into paths that the no-follow writer permits.
+    destination = alias / "report.json"
+    reports = parse_reports([f"json={destination}"], ("json",))
+    assert reports == [("json", destination)]
+    with pytest.raises(ValueError, match="symlink or is not a directory"):
+        write_text_no_follow(reports[0][1], '{"ok": true}')
+    assert not list(directory.iterdir())
+
+
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize(
+    "input_kind,filename",
+    [
+        ("directory", "SKILL.md"),
+        ("directory", "helper.py"),
+        ("file", "SKILL.md"),
+        ("recursive", "SKILL.md"),
+        ("recursive", "helper.py"),
+    ],
+)
+def test_report_does_not_overwrite_input(tmp_path, monkeypatch, alias, input_kind, filename):
+    skill = tmp_path / "one" if input_kind == "recursive" else tmp_path
+    skill.mkdir(exist_ok=True)
+    (skill / "SKILL.md").write_text("# Example\n")
+    source = skill / filename
+    original = b"# Keep me\r\n# preserved bytes: \xc3\xa4\n"
+    source.write_bytes(original)
+    destination = skill / "missing" / ".." / filename if alias else source
+    assert not (skill / "missing").exists()
+    scan = Mock(side_effect=lambda input_path, format, **kw: scan_result(input_path, format))
     monkeypatch.setattr(cli, "_scan_skill", scan)
-    result = runner.invoke(
-        cli.app, ["scan", str(tmp_path), "--no-llm", "--report", f"json={source}"]
-    )
+    args = [
+        "scan",
+        str(source if input_kind == "file" else tmp_path),
+        "--no-llm",
+        "--report",
+        f"json={destination}",
+    ]
+    if input_kind == "recursive":
+        args.append("--recursive")
+    result = runner.invoke(cli.app, args)
+    assert source.read_bytes() == original
     assert result.exit_code == 2
-    assert source.read_text() == "# Keep me\n"
+    assert "--output points to the input file" in result.output or (
+        "--report must not overwrite" in result.output
+    )
     scan.assert_not_called()
+
+
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize("filename", ["SKILL.md", "helper.py"])
+def test_batch_report_does_not_overwrite_input(tmp_path, monkeypatch, capsys, alias, filename):
+    from contrib.batch_scan import batch_scan
+
+    skill = tmp_path / "one"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("# Example\n")
+    source = skill / filename
+    original = b"# Keep me\r\n# preserved bytes: \xc3\xa4\n"
+    source.write_bytes(original)
+    destination = skill / "missing" / ".." / filename if alias else source
+    assert not (skill / "missing").exists()
+    scan = Mock(
+        return_value=(
+            {
+                "skill": {"name": "example", "language": "en"},
+                "risk_assessment": {"score": 0, "severity": "LOW"},
+                "issues": [],
+            },
+            None,
+            "one",
+        )
+    )
+    pool = Mock(return_value=None)
+    monkeypatch.setattr(batch_scan, "_scan_skill_bounded", scan)
+    monkeypatch.setattr(batch_scan, "create_api_key_pool_from_env", pool)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["batch_scan", str(tmp_path), "--no-llm", "--report", f"json={destination}"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        try:
+            batch_scan.main()
+        finally:
+            assert source.read_bytes() == original
+    assert exc.value.code == 2
+    assert "--report must not overwrite a batch input" in capsys.readouterr().err
+    scan.assert_not_called()
+    pool.assert_not_called()
 
 
 @pytest.mark.parametrize("recursive", [False, True])
