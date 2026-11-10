@@ -41,6 +41,7 @@ from skillspector.artifacts import (
     normalized_security_view,
     security_text_views,
 )
+from skillspector.baseline_tokens import baseline_rule_scalar_roles
 from skillspector.inspection_ledger import (
     ParserCause,
     ParserCheck,
@@ -50,6 +51,7 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.javascript_tokens import JavaScriptTemplateSpans, assertion_template_shell_text
 from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
+from skillspector.json_tokens import JSONSourceOwnership, prepare_json_source
 from skillspector.logging_config import get_logger
 from skillspector.markdown_tokens import quoted_list_spans
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity, map_analyzer_findings
@@ -64,6 +66,7 @@ from skillspector.python_tokens import (
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
 from skillspector.python_tokens import python_string_body as _python_string_body
 from skillspector.security_reconstruction import validated_json_string_spans
+from skillspector.semgrep_tokens import semgrep_rule_scalar_roles
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 from skillspector.yaml_tokens import YamlScalar, YamlSourceSpans, yaml_source_spans
 
@@ -2549,6 +2552,8 @@ def _parse_shell_command_word(
     enclosing_delimiter: str | None = None,
     quoted_printf_allowed: bool = True,
     diagnostics: list[StaticParserDiagnostic] | None = None,
+    backtick_closures: set[tuple[int, int]] | None = None,
+    source_end: int | None = None,
 ) -> _ShellCommandWord | None:
     runtime_check = check_runtime or (lambda: None)
     # The shell recognizes ``NAME=value`` before expansion and never runs the
@@ -2568,7 +2573,7 @@ def _parse_shell_command_word(
     diagnostic: StaticParserDiagnostic | None = None
     unquoted_characters = 0
     cursor = start
-    limit = len(content)
+    limit = min(len(content), source_end) if source_end is not None else len(content)
     while cursor < limit:
         if cursor > start and (cursor - start) % 4096 == 0:
             runtime_check()
@@ -2665,6 +2670,8 @@ def _parse_shell_command_word(
                 )
                 if substitution_end is None:
                     return None
+                if backtick_closures is not None:
+                    backtick_closures.add((cursor, substitution_end))
                 static_value, substitution_limited, substitution_diagnostic = (
                     _printf_substitution_result(
                         content,
@@ -2773,6 +2780,8 @@ def _parse_shell_command_word(
             )
             if substitution_end is None:
                 return None
+            if backtick_closures is not None:
+                backtick_closures.add((cursor, substitution_end))
             static_value, substitution_limited, substitution_diagnostic = (
                 _printf_substitution_result(
                     content,
@@ -2860,12 +2869,19 @@ def _plain_quoted_assignment_word(parsed: _ShellCommandWord) -> bool:
     )
 
 
-def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
+def _destructive_command_words(
+    content: str, *, check_runtime: Callable[[], None] | None = None
+) -> Iterator[tuple[int, int]]:
+    if check_runtime is not None:
+        check_runtime()
+    runtime_kwargs = {"check_runtime": check_runtime} if check_runtime is not None else {}
     parsed_through = 0
     parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
     substitution_end_cache: dict[int, int | None] = {}
     backtick_end_cache: dict[int, int | None] = {}
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
+        if check_runtime is not None:
+            check_runtime()
         start = candidate.start()
         if start < parsed_through:
             continue
@@ -2882,6 +2898,7 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
                 parameter_end_cache,
                 substitution_end_cache,
                 backtick_end_cache,
+                **runtime_kwargs,
             )
             if parsed is not None and _plain_quoted_assignment_word(parsed):
                 parsed_through = max(parsed_through, parsed.end)
@@ -2908,6 +2925,7 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
             parameter_end_cache,
             substitution_end_cache,
             backtick_end_cache,
+            **runtime_kwargs,
         )
         if parsed is None:
             continue
@@ -2982,22 +3000,39 @@ def _literal_shell_command_spans(
     return {begin + start: begin + stop for start, stop in spans}
 
 
+def _destructive_command_effects(
+    content: str, check_runtime: Callable[[], None] | None = None
+) -> Iterator[tuple[int, int]]:
+    """Yield commands whose existing operand parser proves destructive effects."""
+    for command_start, body_start in _destructive_command_words(
+        content, check_runtime=check_runtime
+    ):
+        if check_runtime is not None:
+            check_runtime()
+        tokens, _, _ = _bounded_shell_tokens(
+            content, command_start, body_start, check_runtime=check_runtime
+        )
+        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
+            yield command_start, body_start
+
+
 def _has_destructive_command_string(
-    content: str, *, diagnostics: list[StaticParserDiagnostic] | None = None
+    content: str,
+    *,
+    diagnostics: list[StaticParserDiagnostic] | None = None,
+    check_runtime: Callable[[], None] | None = None,
 ) -> bool:
     """Return whether an executable string contains a proven destructive command."""
-    for command_start, body_start in _destructive_command_words(content):
-        tokens, _, _ = _bounded_shell_tokens(content, command_start, body_start)
-        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
-            _note_parser_diagnostic(
-                diagnostics,
-                ParserCause.UNSUPPORTED_SYNTAX,
-                ParserCheck.COMMAND_STRING_EFFECTS,
-                command_start,
-                len(content),
-                ParserUncheckedScope.COMMAND_STRING,
-            )
-            return True
+    for command_start, _ in _destructive_command_effects(content, check_runtime):
+        _note_parser_diagnostic(
+            diagnostics,
+            ParserCause.UNSUPPORTED_SYNTAX,
+            ParserCheck.COMMAND_STRING_EFFECTS,
+            command_start,
+            len(content),
+            ParserUncheckedScope.COMMAND_STRING,
+        )
+        return True
     return False
 
 
@@ -3374,12 +3409,62 @@ def _is_comment_candidate(
 _HASH_COMMENT_FILE_TYPES = frozenset({"shell", "python", "perl", "ruby", "powershell"})
 
 
+@dataclass(frozen=True)
+class _NativeBacktickOperandBounds:
+    """Disjoint substitutions read from one complete native JSON value."""
+
+    starts: tuple[int, ...]
+    ends: tuple[int, ...]
+    value_end: int | None = None
+
+    @classmethod
+    def from_closures(
+        cls,
+        closures: set[tuple[int, int]],
+        check_runtime: Callable[[], None],
+        *,
+        value_end: int | None = None,
+    ) -> _NativeBacktickOperandBounds | None:
+        ordered = sorted(closures)
+        previous_end = -1
+        for opening, end in ordered:
+            check_runtime()
+            if (
+                opening < previous_end
+                or opening + 1 >= end - 1
+                or (value_end is not None and end >= value_end)
+            ):
+                return None
+            previous_end = end
+        return cls(
+            tuple(start for start, _ in ordered), tuple(end for _, end in ordered), value_end
+        )
+
+    def source_end(self, start: int, word_end: int) -> int | None:
+        index = bisect_left(self.starts, start)
+        if index < len(self.starts) and self.starts[index] == start:
+            # A generated outer head keeps every operand after its substitution.
+            # Only the complete containing native value terminates that scope.
+            return (
+                self.value_end - 1
+                if self.value_end is not None and self.ends[index] <= word_end <= self.value_end - 1
+                else None
+            )
+        index -= 1
+        if index >= 0 and start < word_end <= self.ends[index] - 1:
+            return self.ends[index] - 1
+        return None
+
+
 def _has_shell_command_word_exhaustion(
     content: str,
     check_runtime: Callable[[], None],
     *,
     structural_quote_closers: set[int] | None = None,
     structural_quote_openers: set[int] | None = None,
+    json_key_spans: tuple[tuple[int, int], ...] = (),
+    json_value_spans: tuple[tuple[int, int], ...] = (),
+    native_backtick_bounds: dict[int, _NativeBacktickOperandBounds] | None = None,
     python_source: _PythonSourceOwnership | None = None,
     javascript_source: _JavaScriptTemplateOwnership | None = None,
     powershell: PowerShellSource | None = None,
@@ -3403,6 +3488,7 @@ def _has_shell_command_word_exhaustion(
     quoted_printf_allowed = _quoted_printf_allowed and not _shell_redefines_command(
         content, check_runtime
     )
+
     parsed_through = 0
     # A word that spans lines may pair a heredoc, comment or prose quote with
     # a later command line. Main skips the candidates inside such a word, so
@@ -3429,6 +3515,41 @@ def _has_shell_command_word_exhaustion(
         string.decoded for string in powershell_strings.values()
     )
     json_openers = sorted(structural_quote_openers or ())
+    backtick_values = tuple(
+        span for span in json_value_spans if content.find("`", span[0] + 1, span[1] - 1) >= 0
+    )
+    value_starts = [start for start, _end in backtick_values]
+    backtick_closers: set[int] = set()
+    native_caches: dict[
+        int,
+        tuple[
+            dict[int, _ParameterExpansionEnd],
+            dict[int, int | None],
+            dict[int, int | None],
+        ],
+    ] = {}
+    native_operand_bounds = native_backtick_bounds if native_backtick_bounds is not None else {}
+
+    def retain_operand_bounds(
+        span: tuple[int, int] | None,
+        start: int,
+        parsed: _ShellCommandWord | None,
+        closures: set[tuple[int, int]] | None,
+    ) -> None:
+        if (
+            span is not None
+            and start == span[0]
+            and parsed is not None
+            and not parsed.limited
+            and parsed.end == span[1]
+            and closures
+        ):
+            bounds = _NativeBacktickOperandBounds.from_closures(
+                closures, check_runtime, value_end=span[1]
+            )
+            if bounds is not None:
+                native_operand_bounds[span[0]] = bounds
+
     complete_comments: set[tuple[int, int]] = set()
     word_diagnostics: list[StaticParserDiagnostic] = []
     # Short text without shell-expansion openers cannot trigger these shell-word
@@ -3443,11 +3564,17 @@ def _has_shell_command_word_exhaustion(
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
+        if start in backtick_closers:
+            continue
         if python_word_source is not None and python_word_source.is_string_delimiter(start):
             continue
         if start in owned_word_positions:
             continue
-        if javascript_source is not None and javascript_source.owns(start):
+        if javascript_source is not None and (
+            javascript_source.owns(start) or javascript_source.regex_literal_end(start) is not None
+        ):
+            # Proven native matching patterns have no shell-word semantics.
+            # This candidate owns no later host code or raw finding input.
             continue
         if powershell is not None and powershell.owns(start):
             continue
@@ -3485,6 +3612,27 @@ def _has_shell_command_word_exhaustion(
         ):
             continue
         shadowed = start < shadow_through
+        value_index = bisect_right(value_starts, start) - 1
+        value_span = (
+            backtick_values[value_index]
+            if value_index >= 0 and start < backtick_values[value_index][1]
+            else None
+        )
+        native_backticks: set[tuple[int, int]] | None = set() if value_span else None
+        word_caches = (parameter_end_cache, substitution_end_cache, backtick_end_cache)
+        if value_span is not None:
+            # Endpoints cached against a different EOF cannot prove this value.
+            scoped_caches = native_caches.get(value_span[0])
+            if scoped_caches is None:
+                scoped_caches = ({}, {}, {})
+                native_caches[value_span[0]] = scoped_caches
+            word_caches = scoped_caches
+        word_limit = value_span[1] if value_span is not None else len(content)
+        reader_options = (
+            {"backtick_closures": native_backticks, "source_end": word_limit}
+            if native_backticks is not None
+            else {}
+        )
         if _has_quoted_assignment_prefix(content, start):
             # A quoted NAME=value argument cannot be the command word. Claim
             # only a complete static word; dynamic substitutions must remain
@@ -3493,12 +3641,12 @@ def _has_shell_command_word_exhaustion(
             parsed = _parse_shell_command_word(
                 content,
                 start,
-                parameter_end_cache,
-                substitution_end_cache,
-                backtick_end_cache,
+                *word_caches,
                 check_runtime=check_runtime,
                 owned_word_positions=assignment_positions,
+                **reader_options,
             )
+            retain_operand_bounds(value_span, start, parsed, native_backticks)
             if (
                 parsed is not None
                 and not parsed.dynamic
@@ -3529,9 +3677,7 @@ def _has_shell_command_word_exhaustion(
         parsed = _parse_shell_command_word(
             content,
             start,
-            parameter_end_cache,
-            substitution_end_cache,
-            backtick_end_cache,
+            *word_caches,
             check_runtime=check_runtime,
             owned_word_positions=candidate_word_positions,
             enclosing_delimiter=(
@@ -3539,7 +3685,16 @@ def _has_shell_command_word_exhaustion(
             ),
             quoted_printf_allowed=quoted_printf_allowed,
             diagnostics=word_diagnostics,
+            **reader_options,
         )
+        retain_operand_bounds(value_span, start, parsed, native_backticks)
+        if value_span is not None and native_backticks:
+            for opening, end in native_backticks:
+                check_runtime()
+                if value_span[0] < opening < end - 1 < value_span[1] - 1:
+                    # Only this proven native value owns the matching closer.
+                    # Opening/inner command candidates remain independent.
+                    backtick_closers.add(end - 1)
         if parsed is None:
             substitution_start = (
                 start + 1
@@ -3550,11 +3705,11 @@ def _has_shell_command_word_exhaustion(
                 substitution_end = _skip_command_substitution(
                     content,
                     substitution_start,
-                    len(content),
+                    word_limit,
                     check_runtime,
-                    end_cache=substitution_end_cache,
-                    parameter_end_cache=parameter_end_cache,
-                    backtick_end_cache=backtick_end_cache,
+                    end_cache=word_caches[1],
+                    parameter_end_cache=word_caches[0],
+                    backtick_end_cache=word_caches[2],
                 )
                 if substitution_end is not None and _is_printf_substitution(
                     content,
@@ -3580,7 +3735,7 @@ def _has_shell_command_word_exhaustion(
                     continue
             if content[start] == "`":
                 substitution_end = _skip_backtick_substitution(
-                    content, start, len(content), check_runtime, end_cache=backtick_end_cache
+                    content, start, word_limit, check_runtime, end_cache=word_caches[2]
                 )
                 if (
                     substitution_end is not None
@@ -3724,6 +3879,23 @@ def _has_shell_command_word_exhaustion(
                 # spans and runtime-selected operands keep their existing
                 # conservative treatment.
                 continue
+            if python_word_source is not None and ownership_boundary < parsed.end:
+                # A raw shell word may pair Python delimiters across unrelated
+                # tokens. Recheck only the complete value the native owner proves.
+                value_source_range: list[int] = []
+                value = python_word_source.string_value(
+                    start, parsed.end, source_range=value_source_range
+                )
+                if value is not None:
+                    value_diagnostic = _has_shell_command_word_exhaustion(
+                        value[0],
+                        check_runtime,
+                        _command_string_depth=_command_string_depth,
+                        _quoted_printf_allowed=quoted_printf_allowed,
+                    )
+                    if value_diagnostic is not None:
+                        return value_diagnostic.enclosed(*value_source_range)
+                    continue
             if not _quoted_candidate_is_complete(
                 content, start, quote_limits, check_runtime, quoted_printf_allowed
             ):
@@ -3737,6 +3909,13 @@ def _has_shell_command_word_exhaustion(
                 check_runtime,
                 powershell_strings=powershell_strings,
                 quoted_printf_allowed=quoted_printf_allowed,
+                **(
+                    {"source_end": boundary}
+                    if value_span is not None
+                    and (bounds := native_operand_bounds.get(value_span[0])) is not None
+                    and (boundary := bounds.source_end(start, parsed.end)) is not None
+                    else {}
+                ),
             )
             if parsed.dynamic and may_have_destructive_outer_operands
             else None
@@ -3791,6 +3970,16 @@ def _has_shell_command_word_exhaustion(
         startup_exposure=_startup_exposure,
         startup_diagnostics=_startup_diagnostics,
         xargs_contexts=_xargs_contexts,
+        **(
+            {"json_key_starts": frozenset(start for start, _end in json_key_spans)}
+            if json_key_spans
+            else {}
+        ),
+        **(
+            {"json_value_starts": frozenset(start for start, _end in backtick_values)}
+            if backtick_values
+            else {}
+        ),
     ):
         command_string = command.content
         if command_string is None:
@@ -3884,6 +4073,7 @@ def _has_runtime_command_operand_exhaustion(
     *,
     powershell_strings: Mapping[int, PowerShellString] | None = None,
     quoted_printf_allowed: bool = True,
+    source_end: int | None = None,
 ) -> StaticParserDiagnostic | None:
     """Return whether a runtime-selected command's operands are undecidable."""
     diagnostics: list[StaticParserDiagnostic] = []
@@ -3895,6 +4085,7 @@ def _has_runtime_command_operand_exhaustion(
         powershell_strings=powershell_strings,
         quoted_printf_allowed=quoted_printf_allowed,
         diagnostics=diagnostics,
+        **({"source_end": source_end} if source_end is not None else {}),
     )
     if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
         # Earlier prose (for example "row-first") cannot supply this
@@ -3932,6 +4123,8 @@ def _shell_command_strings(
     startup_exposure: list[bool] | None = None,
     startup_diagnostics: list[StaticParserDiagnostic] | None = None,
     xargs_contexts: tuple[tuple[str, list[bool | None]], ...] = (),
+    json_key_starts: frozenset[int] = frozenset(),
+    json_value_starts: frozenset[int] = frozenset(),
 ) -> Iterator[_ShellCommandString]:
     """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
     nested_substitutions = startup_exposure is not None and ("$(" in content or "`" in content)
@@ -3958,6 +4151,10 @@ def _shell_command_strings(
     )
     for clause_start in clause_starts:
         check_runtime()
+        if clause_start in json_key_starts:
+            # A whole native object key names data, not a wrapper invocation.
+            # Its inner candidates and ordinary finding analysis stay active.
+            continue
         # Substitutions inherit settings but cannot alter their parent shell.
         # Keep each live lexical scope's mutable context so eval still updates
         # subsequent commands in that same scope.
@@ -4002,7 +4199,9 @@ def _shell_command_strings(
                 return
             continue
         body_start, body = scoped_startup[-1][3:5] if scoped_startup else (0, content)
-        if not startup_context[0]:
+        if not startup_context[0] and clause_start not in json_value_starts:
+            # A native scalar's whole quoted value is not a startup-setting
+            # statement. Its ordinary consumer and inner candidates stay live.
             local_diagnostics: list[StaticParserDiagnostic] = []
             startup_context[0] = _shell_clause_sets_startup(
                 body,
@@ -4347,19 +4546,40 @@ def _shell_redefines_command(
     shell_substitutions: bool = False,
 ) -> bool:
     """Do not widen builtin evaluation across an explicit local replacement."""
-    work = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
-    setting_work = [work]
+    return _shell_redefines_primitives(
+        content, check_runtime, frozenset({command}), shell_substitutions=shell_substitutions
+    )
+
+
+def _shell_redefines_primitives(
+    content: str,
+    check_runtime: Callable[[], None],
+    names: frozenset[str],
+    *,
+    candidate_starts: Iterator[int] | None = None,
+    remaining_work: list[int] | None = None,
+    shell_substitutions: bool = False,
+) -> bool:
+    """Retain bounded source binding proof for the selected primitive names."""
+    work_limit = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
+    work = remaining_work if remaining_work is not None else [work_limit]
+    setting_work = remaining_work if remaining_work is not None else [work_limit]
     scope_ends: list[int] = []
     aliases: set[str] = set()
     invoked: set[str] = set()
     backtick_starts: set[int] = set()
-    for start in _nonempty_shell_clause_starts(
-        content,
-        check_runtime,
-        shell_substitutions=shell_substitutions,
-        substitution_scopes=scope_ends,
-        backtick_starts=backtick_starts if shell_substitutions else None,
-    ):
+    starts = (
+        candidate_starts
+        if candidate_starts is not None
+        else _nonempty_shell_clause_starts(
+            content,
+            check_runtime,
+            shell_substitutions=shell_substitutions,
+            substitution_scopes=scope_ends,
+            backtick_starts=backtick_starts if shell_substitutions else None,
+        )
+    )
+    for start in starts:
         check_runtime()
         if start in backtick_starts:
             # The opener is a traversal marker; its body is visited separately.
@@ -4368,7 +4588,7 @@ def _shell_redefines_command(
         if start >= scope_end:
             continue
         source = content[start : min(scope_end, start + _ROOT_GLOB_COMMAND_CHARS + 1)]
-        if command == "xargs" and _shell_clause_sets_startup(
+        if "xargs" in names and _shell_clause_sets_startup(
             source,
             0,
             check_runtime,
@@ -4391,15 +4611,15 @@ def _shell_redefines_command(
                 else:
                     break
             word, end, limited = _next_shell_invocation_word(source, cursor, check_runtime)
-            work -= end - cursor
+            work[0] -= end - cursor
             cursor = end
-            if work < 0 or limited or cursor > _ROOT_GLOB_COMMAND_CHARS:
+            if work[0] < 0 or limited or cursor > _ROOT_GLOB_COMMAND_CHARS:
                 return True
-            if command == "xargs" and re.fullmatch(r"PATH(?:\+)?=.*", word or "", re.DOTALL):
+            if "xargs" in names and re.fullmatch(r"PATH(?:\+)?=.*", word or "", re.DOTALL):
                 return True
             if _SHELL_ASSIGNMENT_PREFIX_RE.match(source, word_start):
                 continue
-            if command == "xargs" and word is not None:
+            if "xargs" in names and word is not None:
                 invoked.add(word)
             if wrapper is not None:
                 if word == "--" or (wrapper == "command" and word == "-p"):
@@ -4412,7 +4632,7 @@ def _shell_redefines_command(
                 continue
             if word in _SHELL_CLAUSE_PREFIX_WORDS or word in {"if", "while", "until"}:
                 continue
-            if command == "xargs":
+            if "xargs" in names:
                 if any(
                     marker in (word or "")
                     for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
@@ -4427,8 +4647,8 @@ def _shell_redefines_command(
                 return True
             if word == "function":
                 name, end, limited = _next_shell_invocation_word(source, cursor, check_runtime)
-                work -= end - cursor
-                if limited or work < 0 or end > _ROOT_GLOB_COMMAND_CHARS or name == command:
+                work[0] -= end - cursor
+                if limited or work[0] < 0 or end > _ROOT_GLOB_COMMAND_CHARS or name in names:
                     return True
                 break
             if word == "alias":
@@ -4438,15 +4658,15 @@ def _shell_redefines_command(
                     if cursor >= len(source) or source[cursor] in "\r\n;|&()#":
                         break
                     alias, end, limited = _next_shell_invocation_word(source, cursor, check_runtime)
-                    work -= end - cursor
+                    work[0] -= end - cursor
                     cursor = end
-                    if limited or work < 0 or cursor > _ROOT_GLOB_COMMAND_CHARS:
+                    if limited or work[0] < 0 or cursor > _ROOT_GLOB_COMMAND_CHARS:
                         return True
                     if alias is None:
                         break
-                    if command == "xargs" and "=" in alias:
+                    if "xargs" in names and "=" in alias:
                         aliases.add(alias.partition("=")[0])
-                    if alias.startswith(command + "=") or any(
+                    if any(alias.startswith(name + "=") for name in names) or any(
                         marker in alias
                         for marker in (
                             _DYNAMIC_SHELL_WORD_SENTINEL,
@@ -4457,7 +4677,7 @@ def _shell_redefines_command(
                 else:
                     return True
                 break
-            if word != command:
+            if word not in names:
                 break
             # Bash accepts line continuations around the empty parameter list.
             for expected in "()":
@@ -4754,6 +4974,9 @@ def _command_string_from_clause(
     xargs_override_cache: list[bool | None] | None = None,
     xargs_source: str | None = None,
     xargs_parent_contexts: tuple[tuple[str, list[bool | None]], ...] = (),
+    data_argument_spans: list[tuple[int, int]] | None = None,
+    output_binding_proven: bool = False,
+    output_argument_end: int | None = None,
 ) -> tuple[bool, str | None]:
     """Resolve a bounded wrapper chain to an ``eval`` or shell command string."""
     cursor = start
@@ -4923,7 +5146,10 @@ def _command_string_from_clause(
             return failed() if wrapper_seen else (False, None)
         if word is None:
             return False, None
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word, re.DOTALL) is not None:
+        if (
+            _SHELL_ASSIGNMENT_PREFIX_RE.match(content, last_word_start) is not None
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word, re.DOTALL) is not None
+        ):
             observe_assignment(word)
             continue
         if xargs_replacements and _DYNAMIC_SHELL_WORD_SENTINEL in word:
@@ -4939,6 +5165,57 @@ def _command_string_from_clause(
             return False, None
         if command in _SHELL_CLAUSE_PREFIX_WORDS:
             continue
+        if (
+            data_argument_spans is not None
+            and output_argument_end is not None
+            and word in {"echo", "printf"}
+        ):
+            if not output_binding_proven or (startup_exposure and startup_exposure[0]):
+                return failed(ParserCause.RUNTIME_DEPENDENT)
+            spans: list[tuple[int, int]] = []
+            format_pending = word == "printf"
+            for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
+                while cursor < output_argument_end:
+                    if content.startswith("\\\r\n", cursor):
+                        cursor += 3
+                    elif content.startswith("\\\n", cursor):
+                        cursor += 2
+                    elif content[cursor] in " \t":
+                        cursor += 1
+                    else:
+                        break
+                if cursor < output_argument_end and content[cursor] in "|&":
+                    # Output may become another command's executable input.
+                    return failed(ParserCause.RUNTIME_DEPENDENT)
+                if cursor >= output_argument_end or content[cursor] in "\r\n;()#":
+                    if format_pending and spans:
+                        return failed(ParserCause.BOUNDARY_UNRESOLVED)
+                    data_argument_spans.extend(spans)
+                    return False, None
+                argument, limited = next_word()
+                if limited or argument is None or cursor > output_argument_end:
+                    return failed(ParserCause.BOUNDARY_UNRESOLVED)
+                if _DYNAMIC_SHELL_WORD_SENTINEL in argument:
+                    return failed(ParserCause.RUNTIME_DEPENDENT)
+                if format_pending:
+                    if argument == "--":
+                        spans.append((last_word_start, cursor))
+                        continue
+                    if argument.startswith("-") or _RUNTIME_SHELL_PARAMETER_SENTINEL in argument:
+                        return failed(ParserCause.UNSUPPORTED_SYNTAX)
+                    if re.search(r"%[-+ #0'.*0-9]*[hjlLtz]*n", argument.replace("%%", "")):
+                        return failed(ParserCause.RUNTIME_DEPENDENT)
+                    format_pending = False
+                spans.append((last_word_start, cursor))
+            return failed(
+                ParserCause.RESOURCE_LIMIT,
+                ParserCheck.WRAPPER_ARGUMENTS,
+                {
+                    "observed_records": _SHELL_COMMAND_STRING_ARGUMENTS,
+                    "limit_records": _SHELL_COMMAND_STRING_ARGUMENTS,
+                },
+                lower_bound=True,
+            )
         if shell_traps and command == "trap":
             body, limited = next_word()
             if body == "--" and not limited:
@@ -6134,6 +6411,8 @@ class _JavaScriptTemplateOwnership:
         self._spans: JavaScriptTemplateSpans | None = None
         self._spans_computed = False
         self._unresolved_executables: list[int] = []
+        self._regex_literals: list[tuple[int, int]] = []
+        self._regex_starts: list[int] = []
 
     def _owned_spans(self) -> JavaScriptTemplateSpans | None:
         if not self._spans_computed:
@@ -6141,7 +6420,9 @@ class _JavaScriptTemplateOwnership:
                 self._content,
                 self._check_runtime,
                 unresolved_executables=self._unresolved_executables,
+                regex_literals=self._regex_literals,
             )
+            self._regex_starts = [start for start, _ in self._regex_literals]
             self._spans_computed = True
         return self._spans
 
@@ -6157,6 +6438,16 @@ class _JavaScriptTemplateOwnership:
             len(self._content),
             ParserUncheckedScope.REMAINING_INPUT,
         )
+
+    def regex_literal_end(self, position: int) -> int | None:
+        """Bound a matching-language candidate by its complete native literal."""
+        self._owned_spans()
+        index = bisect_right(self._regex_starts, position) - 1
+        if index >= 0:
+            start, end = self._regex_literals[index]
+            if start <= position < end:
+                return end
+        return None
 
     def owns(self, position: int) -> bool:
         spans = self._owned_spans()
@@ -6242,6 +6533,7 @@ def _bounded_shell_tokens(
     powershell_strings: Mapping[int, PowerShellString] | None = None,
     quoted_printf_allowed: bool = True,
     diagnostics: list[StaticParserDiagnostic] | None = None,
+    source_end: int | None = None,
 ) -> tuple[tuple[_ShellToken, ...], int, bool]:
     """Return argument words from one security-view-bounded shell command."""
     runtime_check = check_runtime or (lambda: None)
@@ -6264,7 +6556,10 @@ def _bounded_shell_tokens(
     boundary_incomplete = False
     parse_limited = False
     cursor = body_start
-    limit = min(len(content), body_start + _ROOT_GLOB_COMMAND_CHARS)
+    # Only completeness callers supply an enclosing source-proven terminator.
+    # It cannot enlarge the existing argument/work bound or forgive bad syntax.
+    source_limit = min(len(content), source_end) if source_end is not None else len(content)
+    limit = min(source_limit, body_start + _ROOT_GLOB_COMMAND_CHARS)
     wrapper_quote = _command_wrapper_quote(content, command_start)
 
     def boundary_failure(
@@ -6281,9 +6576,9 @@ def _bounded_shell_tokens(
                 "observed_characters": limit - body_start,
                 "limit_characters": _ROOT_GLOB_COMMAND_CHARS,
             }
-            if limit < len(content)
+            if limit < source_limit
             else None,
-            lower_bound=limit < len(content),
+            lower_bound=limit < source_limit,
             full_input_checked=full_input_checked,
         )
         return tuple(tokens), limit, True
@@ -6590,7 +6885,7 @@ def _bounded_shell_tokens(
                     append_piece("$DYNAMIC", dynamic_can_be_empty=True)
                 cursor = parameter_end
                 continue
-            if cursor + 1 == limit and limit < len(content) and content[limit] == "(":
+            if cursor + 1 == limit and limit < source_limit and content[limit] == "(":
                 boundary_incomplete = True
         elif character in "<>" and cursor + 1 < limit and content[cursor + 1] == "(":
             substitution_end = _skip_command_substitution(
@@ -6637,7 +6932,7 @@ def _bounded_shell_tokens(
         elif (
             character == "&"
             and cursor + 1 == limit
-            and limit < len(content)
+            and limit < source_limit
             and content[limit] == ">"
         ):
             boundary_incomplete = True
@@ -6664,7 +6959,7 @@ def _bounded_shell_tokens(
         cursor += 1
     neutral_state = quote is None and not boundary_incomplete and not expect_redirection_target
     known_terminator = (
-        limit < len(content)
+        limit < source_limit
         and neutral_state
         and (
             content[limit] in "\n;|&()"
@@ -6673,11 +6968,13 @@ def _bounded_shell_tokens(
         )
     )
     complete = (
-        limit == len(content) and neutral_state and wrapper_quote is None
+        limit == source_limit
+        and neutral_state
+        and (wrapper_quote is None or source_end is not None)
     ) or known_terminator
     flush(complete=complete)
     if not complete:
-        if limit < len(content) and neutral_state:
+        if limit < source_limit and neutral_state:
             _note_parser_diagnostic(
                 diagnostics,
                 ParserCause.RESOURCE_LIMIT,
@@ -6691,7 +6988,7 @@ def _bounded_shell_tokens(
                 },
                 lower_bound=True,
             )
-        return boundary_failure(full_input_checked=limit == len(content))
+        return boundary_failure(full_input_checked=limit == source_limit)
     return tuple(tokens), limit, not complete or parse_limited
 
 
@@ -8145,6 +8442,52 @@ def _lexical_shell_has_counterevidence(
     return False
 
 
+def _destructive_command_candidates(
+    candidate_content: str, *, check_runtime: Callable[[], None] | None
+) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
+    seen_commands: set[tuple[int, int]] = set()
+    covered_until = 0
+    for command_start, body_start in _destructive_command_words(
+        candidate_content, check_runtime=check_runtime
+    ):
+        if check_runtime is not None:
+            check_runtime()
+        if command_start < covered_until:
+            continue
+        command_key = (command_start, body_start)
+        if command_key in seen_commands:
+            continue
+        seen_commands.add(command_key)
+        # Documentation is excluded regardless of the shell parse result. Apply
+        # that existing semantic gate first so large manuals do not pay for a
+        # character-by-character shell parse for every explanatory ``rm`` noun.
+        if _is_root_glob_documentation(candidate_content, command_start, body_start):
+            continue
+        tokens, command_end, exhausted = _bounded_shell_tokens(
+            candidate_content,
+            command_start,
+            body_start,
+            check_runtime=check_runtime,
+        )
+        # An unresolved quote cannot own and hide later executable candidates.
+        if not exhausted:
+            covered_until = max(covered_until, command_end)
+        command = candidate_content[command_start:command_end]
+        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
+            yield command_start, command_end, command, 0.9, False, None, None, None
+
+
+def _has_tm1_code_pattern_at(
+    content: str, start: int, end: int, check_runtime: Callable[[], None]
+) -> bool:
+    """Check existing raw patterns at one bounded, proven command position."""
+    for pattern, _ in TM1_CODE_PATTERNS:
+        check_runtime()
+        if re.compile(pattern, re.IGNORECASE | re.MULTILINE).match(content, start, end):
+            return True
+    return False
+
+
 def _option_command_end(
     content: str,
     start: int,
@@ -8314,9 +8657,11 @@ def _tm1_candidates(
     *,
     direct_shell_only: bool = False,
     shell_content: str | None = None,
-    check_runtime: Callable[[], None],
+    check_runtime: Callable[[], None] | None,
     file_type: str = "",
 ) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
+    runtime_check = check_runtime or (lambda: None)
+
     def direct_matches(
         pattern_index: int,
         pattern: str,
@@ -8386,7 +8731,7 @@ def _tm1_candidates(
     ):
         _markdown_shell_text(
             content,
-            check_runtime,
+            runtime_check,
             fence_boundaries=option_markdown_fences,
             fence_regions=option_fence_regions,
             inline_regions=option_host_ranges,
@@ -8416,7 +8761,7 @@ def _tm1_candidates(
             for match in _option_command_matches(
                 pattern,
                 content,
-                check_runtime,
+                runtime_check,
                 option_markdown_fences,
                 option_host_ranges,
                 option_powershell_ranges,
@@ -8460,40 +8805,11 @@ def _tm1_candidates(
                 None,
             )
 
-    def destructive_candidates(
-        candidate_content: str,
-    ) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
-        seen_commands: set[tuple[int, int]] = set()
-        covered_until = 0
-        for command_start, body_start in _destructive_command_words(candidate_content):
-            check_runtime()
-            if command_start < covered_until:
-                continue
-            command_key = (command_start, body_start)
-            if command_key in seen_commands:
-                continue
-            seen_commands.add(command_key)
-            # Documentation is excluded regardless of the shell parse result. Apply
-            # that existing semantic gate first so large manuals do not pay for a
-            # character-by-character shell parse for every explanatory ``rm`` noun.
-            if _is_root_glob_documentation(candidate_content, command_start, body_start):
-                continue
-            tokens, command_end, exhausted = _bounded_shell_tokens(
-                candidate_content,
-                command_start,
-                body_start,
-                check_runtime=check_runtime,
-            )
-            # An unresolved quote cannot own and hide later executable candidates.
-            if not exhausted:
-                covered_until = max(covered_until, command_end)
-            command = candidate_content[command_start:command_end]
-            if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
-                yield command_start, command_end, command, 0.9, False, None, None, None
-
-    destructive_iterators = [destructive_candidates(content)]
+    destructive_iterators = [_destructive_command_candidates(content, check_runtime=check_runtime)]
     if shell_content is not None and shell_content != content:
-        destructive_iterators.append(destructive_candidates(shell_content))
+        destructive_iterators.append(
+            _destructive_command_candidates(shell_content, check_runtime=check_runtime)
+        )
     yield from heapq.merge(
         direct_candidates(),
         ordinary_candidates(),
@@ -8657,6 +8973,8 @@ def _markdown_shell_text(
     hardware_apostrophe_ambiguity: list[bool] | None = None,
     hardware_apostrophe_locations: list[tuple[int, int]] | None = None,
     powershell_blocks: list[tuple[int, int]] | None = None,
+    inline_code_ranges: list[tuple[int, int]] | None = None,
+    inline_possessive_apostrophes: set[int] | None = None,
 ) -> str:
     """Mask Markdown delimiters while retaining code and exact source offsets.
 
@@ -8676,6 +8994,7 @@ def _markdown_shell_text(
     """
     output = list(content)
     prose_apostrophes: set[int] = set()
+    inline_possessives: set[int] = set()
     runs: list[tuple[int, int]] = []
     list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
     backtick_runs = re.compile(r"`+")
@@ -8736,6 +9055,18 @@ def _markdown_shell_text(
                 inline_regions.append((end, close_start))
             output[start:end] = " " * (end - start)
             output[close_start:close_end] = " " * (close_end - close_start)
+            if inline_code_ranges is not None:
+                inline_code_ranges.append((end, close_start))
+            if (
+                inline_possessive_apostrophes is not None
+                and content[close_end : close_end + 2].casefold() == "'s"
+                and (
+                    close_end + 2 == len(content)
+                    or re.match(r"[\w'/]", content[close_end + 2]) is None
+                )
+            ):
+                prose_apostrophes.add(close_end)
+                inline_possessives.add(close_end)
         runs.clear()
 
     def prose_without_complete_inline_code(
@@ -9300,6 +9631,8 @@ def _markdown_shell_text(
                 continue
             if cursor in prose_apostrophes:
                 output[cursor] = " "
+                if inline_possessive_apostrophes is not None and cursor in inline_possessives:
+                    inline_possessive_apostrophes.add(cursor)
             elif projected[cursor] in "'\"`$\\":
                 parsed = _parse_shell_command_word(
                     projected,
@@ -9437,7 +9770,9 @@ class _YamlParserAnalysis:
 
 def prepare_parser_analysis(
     content: str, file_type: str, check_runtime: Callable[[], None]
-) -> _YamlParserAnalysis | None:
+) -> JSONSourceOwnership | _YamlParserAnalysis | None:
+    if file_type == "json":
+        return prepare_json_source(content, check_runtime)
     if file_type != "yaml":
         return None
     spans = yaml_source_spans(content, check_runtime)
@@ -9533,10 +9868,10 @@ def has_bounded_parse_exhaustion(
     *,
     file_type: str = "shell",
     complete_context: bool = True,
-    python_import_check: Callable[[Callable[[], None]], bool] | None = None,
-    python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
     prepared_analysis: object | None = None,
     source_view: SecurityTextView | None = None,
+    python_import_check: Callable[[Callable[[], None]], bool] | None = None,
+    python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
 ) -> bool:
     """Return whether the bounded static parser leaves an expression unresolved."""
     return (
@@ -9545,13 +9880,241 @@ def has_bounded_parse_exhaustion(
             check_runtime,
             file_type=file_type,
             complete_context=complete_context,
-            python_import_check=python_import_check,
-            python_stdlib_check=python_stdlib_check,
             prepared_analysis=prepared_analysis,
             source_view=source_view,
+            python_import_check=python_import_check,
+            python_stdlib_check=python_stdlib_check,
         )
         is not None
     )
+
+
+def _message_shell_words(
+    content: str,
+    check_runtime: Callable[[], None],
+    remaining_work: list[int],
+    diagnostics: list[StaticParserDiagnostic],
+) -> Iterator[tuple[int, int, str]]:
+    """Enumerate full words with the existing quote/substitution reader."""
+    cursor = 0
+    while cursor < len(content):
+        check_runtime()
+        word_start = [cursor]
+        word, end, limited = _next_shell_invocation_word(
+            content, cursor, check_runtime, diagnostics=diagnostics, source_start=word_start
+        )
+        remaining_work[0] -= max(1, end - cursor)
+        if remaining_work[0] < 0 or limited:
+            if limited and not diagnostics:
+                diagnostics.append(
+                    StaticParserDiagnostic(
+                        ParserCause.BOUNDARY_UNRESOLVED,
+                        ParserCheck.COMMAND_WORD_BOUNDARY,
+                        word_start[0],
+                        max(word_start[0] + 1, end),
+                        ParserUncheckedScope.COMMAND_WORD,
+                    )
+                )
+            return
+        start = word_start[0]
+        if word is None:
+            if content[start : start + 1] == "#":
+                line_end = LOGICAL_LINE_BREAK.search(content, start)
+                cursor = line_end.end() if line_end else len(content)
+            else:
+                cursor = max(cursor + 1, end + 1)
+            continue
+        cursor = end
+        yield start, end, word
+
+
+def _message_inline_runtime_diagnostic(
+    content: str,
+    check_runtime: Callable[[], None],
+    raw_diagnostic: StaticParserDiagnostic | None,
+) -> StaticParserDiagnostic | None:
+    """Refine an existing, source-owned legacy-backtick limitation only."""
+    if raw_diagnostic is None or (
+        raw_diagnostic.cause is not ParserCause.RUNTIME_DEPENDENT
+        or raw_diagnostic.check is not ParserCheck.PRINTF_INVOCATION
+        or raw_diagnostic.location_precision != "source_span"
+    ):
+        return raw_diagnostic
+    ranges: list[tuple[int, int]] = []
+    possessives: set[int] = set()
+    projected = _markdown_shell_text(
+        content,
+        check_runtime,
+        inline_code_ranges=ranges,
+        inline_possessive_apostrophes=possessives,
+    )
+    if (
+        not ranges
+        or (raw_diagnostic is not None and (raw_diagnostic.start, raw_diagnostic.end) not in ranges)
+        or "`" in projected
+    ):
+        return raw_diagnostic
+    work_limit = 8 * len(content) + _ROOT_GLOB_COMMAND_CHARS
+    remaining_work = [work_limit]
+    raw_words: set[int] = set()
+
+    def limited() -> StaticParserDiagnostic:
+        return raw_diagnostic or StaticParserDiagnostic(
+            ParserCause.RESOURCE_LIMIT,
+            ParserCheck.MARKDOWN_LITERAL_OWNERSHIP,
+            0,
+            len(content),
+            ParserUncheckedScope.REMAINING_INPUT,
+            measurements={
+                "observed_characters": work_limit - remaining_work[0],
+                "limit_characters": work_limit,
+            },
+            observed_is_lower_bound=True,
+        )
+
+    range_starts = [start for start, _end in ranges]
+
+    def inline_end(start: int) -> int | None:
+        index = bisect_right(range_starts, start) - 1
+        return ranges[index][1] if index >= 0 and start < ranges[index][1] else None
+
+    def output_end(start: int, native_starts: set[int]) -> int | None:
+        return inline_end(start) or (len(content) if start in native_starts else None)
+
+    def binding_starts(
+        source: str,
+        native_starts: set[int],
+        lexical_diagnostics: list[StaticParserDiagnostic],
+        projected_source: bool,
+    ) -> Iterator[int]:
+        skip_until = 0
+        for start, _end, word in _message_shell_words(
+            source, check_runtime, remaining_work, lexical_diagnostics
+        ):
+            if start < skip_until:
+                continue
+            if (
+                projected_source
+                and start not in raw_words
+                and start not in native_starts
+                and inline_end(start) is None
+            ):
+                continue
+            if word in {"echo", "printf"}:
+                spans: list[tuple[int, int]] = []
+                source_span = [start, start]
+                # These are structural argument roles, not builtin trust.
+                _command_string_from_clause(
+                    source,
+                    start,
+                    check_runtime,
+                    source_span=source_span,
+                    data_argument_spans=spans,
+                    output_binding_proven=True,
+                    output_argument_end=output_end(start, native_starts),
+                )
+                remaining_work[0] -= max(1, source_span[1] - start)
+                if remaining_work[0] < 0:
+                    return
+                if spans:
+                    skip_until = spans[-1][1]
+            yield start
+
+    # Prose may place execution consumers outside an inline span. Inspect the
+    # original commands first: masking backticks inside a quoted shell -c
+    # argument must not replace executable substitution with display text.
+    raw_consumer_chars = list(content)
+    for apostrophe in possessives:
+        check_runtime()
+        raw_consumer_chars[apostrophe] = " "
+    raw_consumer = "".join(raw_consumer_chars)
+    native_starts = set(_nonempty_shell_clause_starts(raw_consumer, check_runtime))
+    remaining_work[0] -= len(raw_consumer)
+    for source_index, source in enumerate((raw_consumer, projected)):
+        lexical_diagnostics: list[StaticParserDiagnostic] = []
+        output_binding_proven = not _shell_redefines_primitives(
+            source,
+            check_runtime,
+            frozenset({"echo", "printf"}),
+            candidate_starts=binding_starts(
+                source, native_starts, lexical_diagnostics, source_index == 1
+            ),
+            remaining_work=remaining_work,
+        )
+        if lexical_diagnostics:
+            return raw_diagnostic or lexical_diagnostics[0]
+        if remaining_work[0] < 0:
+            return limited()
+        skip_until = 0
+        startup_exposure = [False]
+        startup_diagnostics: list[StaticParserDiagnostic] = []
+        for start, _word_end, _word in _message_shell_words(
+            source, check_runtime, remaining_work, lexical_diagnostics
+        ):
+            if source_index == 0:
+                raw_words.add(start)
+            if start < skip_until:
+                continue
+            if not startup_exposure[0]:
+                startup_exposure[0] = _shell_clause_sets_startup(
+                    source,
+                    start,
+                    check_runtime,
+                    remaining_work,
+                    startup_diagnostics,
+                    work_limit=work_limit,
+                )
+            if remaining_work[0] < 0:
+                return limited()
+            source_span = [start, start]
+            diagnostics: list[StaticParserDiagnostic] = []
+            argument_spans: list[tuple[int, int]] = []
+            found, command = _command_string_from_clause(
+                source,
+                start,
+                check_runtime,
+                startup_exposure=startup_exposure,
+                startup_diagnostics=startup_diagnostics,
+                diagnostics=diagnostics,
+                source_span=source_span,
+                data_argument_spans=argument_spans,
+                output_binding_proven=output_binding_proven,
+                output_argument_end=output_end(start, native_starts),
+            )
+            remaining_work[0] -= max(1, source_span[1] - start)
+            if remaining_work[0] < 0:
+                return limited()
+            if argument_spans:
+                skip_until = argument_spans[-1][1]
+            if not found:
+                continue
+            if command is None:
+                return (
+                    diagnostics[0]
+                    if diagnostics
+                    else raw_diagnostic
+                    or StaticParserDiagnostic(
+                        ParserCause.BOUNDARY_UNRESOLVED,
+                        ParserCheck.COMMAND_STRING_RUNTIME,
+                        start,
+                        max(start + 1, source_span[1]),
+                        ParserUncheckedScope.COMMAND_STRING,
+                    )
+                )
+            remaining_work[0] -= len(command)
+            if remaining_work[0] < 0:
+                return limited()
+            diagnostic = bounded_parse_diagnostic(command, check_runtime, file_type="shell")
+            if diagnostic is not None:
+                return diagnostic.enclosed(start, max(start + 1, source_span[1]))
+        if lexical_diagnostics:
+            return raw_diagnostic or lexical_diagnostics[0]
+        if remaining_work[0] < 0:
+            return limited()
+    diagnostic = bounded_parse_diagnostic(content, check_runtime, file_type="markdown")
+    if diagnostic is not None:
+        return diagnostic
+    return None
 
 
 def bounded_parse_diagnostic(
@@ -9560,10 +10123,10 @@ def bounded_parse_diagnostic(
     *,
     file_type: str = "shell",
     complete_context: bool = True,
-    python_import_check: Callable[[Callable[[], None]], bool] | None = None,
-    python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
     prepared_analysis: object | None = None,
     source_view: SecurityTextView | None = None,
+    python_import_check: Callable[[Callable[[], None]], bool] | None = None,
+    python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
 ) -> StaticParserDiagnostic | None:
     """Explain the existing first incomplete parser scope without reparsing it."""
     exhausted = _has_bounded_parse_exhaustion(
@@ -9571,6 +10134,8 @@ def bounded_parse_diagnostic(
         check_runtime,
         file_type=file_type,
         complete_context=complete_context,
+        prepared_analysis=prepared_analysis,
+        source_view=source_view,
         python_import_check=python_import_check,
         python_stdlib_check=python_stdlib_check,
     )
@@ -9585,11 +10150,33 @@ def bounded_parse_diagnostic(
         mapped_source = isinstance(
             prepared_analysis, _YamlParserAnalysis
         ) and prepared_analysis.owns(content, source_view, check_runtime)
+        scalar_roles = semgrep_rule_scalar_roles(
+            content, check_runtime
+        ) or baseline_rule_scalar_roles(content, check_runtime)
         for scalar in yaml_spans.scalars:
             check_runtime()
-            diagnostic = _has_bounded_parse_exhaustion(
-                scalar.value, check_runtime, file_type="shell", complete_context=True
-            )
+            role = scalar_roles.get(scalar.start)
+            # Proven rule queries are matching-language data, not shell
+            # programs. Finding production still checks their raw/decoded text.
+            diagnostic = None
+            if role != "pattern":
+                diagnostic = bounded_parse_diagnostic(
+                    scalar.value, check_runtime, file_type="shell", complete_context=True
+                )
+                if role == "message" and (
+                    diagnostic is None
+                    or diagnostic.cause
+                    not in {ParserCause.RUNTIME_DEPENDENT, ParserCause.RESOURCE_LIMIT}
+                ):
+                    # Markdown may refine punctuation, but cannot erase an
+                    # independent runtime or resource failure in inline code.
+                    diagnostic = bounded_parse_diagnostic(
+                        scalar.value, check_runtime, file_type="markdown", complete_context=True
+                    )
+                if role == "message":
+                    diagnostic = _message_inline_runtime_diagnostic(
+                        scalar.value, check_runtime, diagnostic
+                    )
             exact_source = content[scalar.body_start : scalar.body_end] == scalar.value
             if diagnostic is not None:
                 return (
@@ -9635,7 +10222,11 @@ def bounded_parse_diagnostic(
     # a later closing quote into an opener, so the prose reading may only
     # resolve a limit of the lexical one, never introduce one.
     return _has_bounded_parse_exhaustion(
-        content, check_runtime, file_type=file_type, word_apostrophes=True
+        content,
+        check_runtime,
+        file_type=file_type,
+        word_apostrophes=True,
+        source_view=source_view,
     )
 
 
@@ -9646,6 +10237,8 @@ def _has_bounded_parse_exhaustion(
     file_type: str,
     complete_context: bool = True,
     word_apostrophes: bool = False,
+    prepared_analysis: object | None = None,
+    source_view: SecurityTextView | None = None,
     python_import_check: Callable[[Callable[[], None]], bool] | None = None,
     python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
 ) -> StaticParserDiagnostic | None:
@@ -9694,10 +10287,83 @@ def _has_bounded_parse_exhaustion(
         diagnostic = javascript_source.unresolved_execution_diagnostic()
         if diagnostic is not None:
             return diagnostic
-    if file_type in {"json", "markdown"} and complete_context:
+    json_projection = None
+    if file_type == "json":
+        if prepared_analysis is None and complete_context:
+            prepared_analysis = prepare_json_source(content, check_runtime)
+        if isinstance(prepared_analysis, JSONSourceOwnership):
+            view = source_view or SecurityTextView("raw", content)
+            if view.text == content:
+                json_projection = prepared_analysis.project(view, check_runtime)
+    if json_projection is not None:
+        json_strings = list(json_projection.strings)
+        structural_quote_closers = json_projection.closers
+        structural_quote_openers = json_projection.openers
+    elif file_type in {"json", "markdown"} and complete_context:
         json_strings = validated_json_string_spans(content, check_runtime)
         structural_quote_closers = {end - 1 for _, end in json_strings}
         structural_quote_openers = {start for start, _ in json_strings}
+    proven_decoded_json = (
+        isinstance(prepared_analysis, JSONSourceOwnership)
+        and prepared_analysis.decoded is not None
+        and source_view is not None
+        and prepared_analysis.decoded.owns(source_view, check_runtime)
+    )
+    if (
+        isinstance(prepared_analysis, JSONSourceOwnership)
+        and prepared_analysis.decoded is not None
+        and source_view is not None
+        and source_view.name.startswith("json-decoded-")
+        and not proven_decoded_json
+    ):
+        return StaticParserDiagnostic(
+            ParserCause.UNSUPPORTED_SYNTAX,
+            ParserCheck.JSON_STRING_DECODING,
+            0,
+            len(content),
+            ParserUncheckedScope.EXPRESSION,
+            location_precision="enclosing_expression",
+        )
+    if json_strings and (source_view is None or source_view.name == "raw" or proven_decoded_json):
+        # The original finding producer is the authority for source provenance.
+        # Both iterators are ordered; retain only one candidate, not a per-file
+        # set or repeated scans of every suffix. Finding construction stays raw.
+        reported_starts = (
+            candidate[0]
+            for candidate in _destructive_command_candidates(content, check_runtime=check_runtime)
+        )
+        reported_start: int | None = -1
+        for start, end in json_strings:
+            check_runtime()
+            for command_start, body_start in _destructive_command_effects(
+                content[start + 1 : end - 1], check_runtime
+            ):
+                absolute_start = start + 1 + command_start
+                if _is_root_glob_documentation(content, absolute_start, start + 1 + body_start):
+                    continue
+                if _has_tm1_code_pattern_at(
+                    content,
+                    absolute_start,
+                    min(end - 1, start + 1 + body_start + _ROOT_GLOB_COMMAND_CHARS),
+                    check_runtime,
+                ):
+                    continue
+                while reported_start is not None and reported_start < absolute_start:
+                    reported_start = next(reported_starts, None)
+                if reported_start == absolute_start:
+                    continue
+                # Structural ownership alone cannot establish provenance for
+                # an embedded command the raw analyzer cannot report. Derived
+                # marker views already carry their reconstructed findings.
+                return StaticParserDiagnostic(
+                    ParserCause.UNSUPPORTED_SYNTAX,
+                    ParserCheck.COMMAND_STRING_EFFECTS,
+                    start,
+                    end,
+                    ParserUncheckedScope.COMMAND_STRING,
+                    location_precision="enclosing_expression",
+                )
+    if json_strings:
         # Raw substitution delimiters must survive Markdown's inline projection.
         json_operand_spans = [
             (start, end)
@@ -9780,6 +10446,23 @@ def _has_bounded_parse_exhaustion(
     )
     if file_type == "python" and complete_context:
         shell_word_content = python_browser_template_shell_text(content, check_runtime)
+    if json_projection is not None:
+        # Only validated host punctuation terminates command words. Every byte
+        # inside strings stays in the parser and original finding views remain raw.
+        shell_word_content = json_projection.text
+    json_keys = frozenset(json_projection.key_spans) if json_projection is not None else frozenset()
+    native_backtick_bounds: dict[int, _NativeBacktickOperandBounds] = {}
+    json_word_roles = (
+        {
+            "json_key_spans": json_projection.key_spans,
+            "json_value_spans": tuple(
+                span for span in json_projection.strings if span not in json_keys
+            ),
+            "native_backtick_bounds": native_backtick_bounds,
+        }
+        if json_projection is not None
+        else {}
+    )
     quote_limits = None
     if file_type == "shell" and complete_context:
         # A closing delimiter in proven shell source cannot open a new
@@ -9816,10 +10499,14 @@ def _has_bounded_parse_exhaustion(
         quote_limits=quote_limits,
         file_type=file_type,
         complete_context=complete_context,
+        **json_word_roles,
     )
     if diagnostic is not None:
         return diagnostic
     json_starts = [start for start, _ in json_operand_spans]
+    native_backtick_starts = sorted(native_backtick_bounds)
+    native_reported_starts: Iterator[int] | None = None
+    native_reported_start: int | None = -1
     covered_until = 0
     powershell_strings = _powershell_string_operands(powershell)
     decoded_starts = sorted(
@@ -9837,6 +10524,14 @@ def _has_bounded_parse_exhaustion(
         if _is_root_glob_documentation(content, command_start, body_start):
             continue
         argument_diagnostics: list[StaticParserDiagnostic] = []
+        native_index = bisect_right(native_backtick_starts, command_start) - 1
+        operand_end = (
+            native_backtick_bounds[native_backtick_starts[native_index]].source_end(
+                command_start, body_start
+            )
+            if native_index >= 0
+            else None
+        )
         tokens, command_end, exhausted = _bounded_shell_tokens(
             content,
             command_start,
@@ -9844,6 +10539,7 @@ def _has_bounded_parse_exhaustion(
             check_runtime=check_runtime,
             diagnostics=argument_diagnostics,
             powershell_strings=powershell_strings,
+            **({"source_end": operand_end} if operand_end is not None else {}),
         )
         if exhausted:
             word = content[command_start:body_start]
@@ -9889,6 +10585,32 @@ def _has_bounded_parse_exhaustion(
                 # has no unknown outer quote that could own its missing closer.
                 diagnostic = replace(diagnostic, cause=ParserCause.MALFORMED_INPUT)
             return diagnostic
+        if (
+            operand_end is not None
+            and (_has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens))
+            and not _has_tm1_code_pattern_at(content, command_start, command_end, check_runtime)
+        ):
+            # Preserve already reported reconstructed heads too. This ordered
+            # producer stays lazy: ordinary exact raw patterns never prime it.
+            if native_reported_starts is None:
+                native_reported_starts = (
+                    item[0]
+                    for item in _destructive_command_candidates(
+                        content, check_runtime=check_runtime
+                    )
+                )
+            while native_reported_start is not None and native_reported_start < command_start:
+                native_reported_start = next(native_reported_starts, None)
+            if native_reported_start != command_start:
+                # A native bound exposed an effect the raw producer did not
+                # report. Keep its provenance explicitly unresolved.
+                return StaticParserDiagnostic(
+                    ParserCause.UNSUPPORTED_SYNTAX,
+                    ParserCheck.COMMAND_STRING_EFFECTS,
+                    command_start,
+                    command_end,
+                    ParserUncheckedScope.COMMAND_ARGUMENTS,
+                )
         brace_diagnostic = _brace_expansion_diagnostic(tokens, command_start, command_end)
         if brace_diagnostic is not None:
             return brace_diagnostic
@@ -10019,6 +10741,13 @@ def _has_bounded_parse_exhaustion(
             check_runtime,
             structural_quote_openers={0},
             structural_quote_closers={len(projected) - 1},
+            **(
+                {"json_key_spans": ((0, len(projected)),)}
+                if (start, end) in json_keys
+                else {"json_value_spans": ((0, len(projected)),)}
+                if json_projection is not None
+                else {}
+            ),
         )
         if diagnostic is not None:
             return diagnostic.shifted(start)
@@ -10175,7 +10904,7 @@ def analyze(
         content,
         direct_shell_only=_direct_shell_only,
         shell_content=shell_content,
-        check_runtime=runtime_check,
+        check_runtime=check_runtime,
         file_type=file_type,
     ):
         runtime_check()
