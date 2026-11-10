@@ -79,6 +79,49 @@ class TestCredentialTypeLabelIsDisclosure:
         assert _pe3_lines(f"**Credential Type(s):** [{adjective} service access {noun}]\n") == []
         assert _pe3_lines(f"**Credential Type(s):** [service access {noun} ({adjective})]\n") == []
 
+    @pytest.mark.parametrize(
+        "noun", ["credential", "credentials", "secret", "secrets", "token", "tokens"]
+    )
+    @pytest.mark.parametrize("service", ["App Store", "Apple App Store", "Example App Store"])
+    def test_app_store_noun_compound_remains_a_disclosure(self, service: str, noun: str) -> None:
+        assert _pe3_lines(f"**Credential Type(s):** [Other [{service} access {noun}]]\n") == []
+
+    @pytest.mark.parametrize("compound", ["App Store", "APP STORE", "app\tstore"])
+    def test_noun_compound_mask_preserves_other_action_positions(self, compound: str) -> None:
+        value = f"Read {compound} access credentials; store them"
+        actions = pe_module._PE3_CREDENTIAL_TYPE_NON_ACTION_COMPOUND.sub(
+            lambda item: " " * len(item.group(0)), value
+        )
+        assert len(actions) == len(value)
+        assert actions.index("Read") == value.index("Read")
+        assert actions.index("store them") == value.index("store them")
+        assert _pe3_lines(f"**Credential Type(s):** [{value}]\n") == [1]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "Read App Store access credentials",
+            "Store App Store access credentials",
+            "App Store access credentials; read them",
+            "App Store access credentials; store them",
+            "Other [App Store access credentials]; store them",
+            "Read only access credentials",
+            "Open access credentials",
+            "Example read only access credentials",
+            "App Store-only access credentials",
+        ],
+    )
+    def test_compound_mask_keeps_actions_and_ambiguous_spaced_phrases(self, value: str) -> None:
+        assert _pe3_lines(f"**Credential Type(s):** [{value}]\n") == [1]
+
+    @pytest.mark.parametrize("source", ["~/.ssh/id_rsa", "~/.aws/credentials", "/etc/shadow"])
+    def test_app_store_noun_cannot_hide_a_sensitive_source(self, source: str) -> None:
+        line = f"**Credential Type(s):** [App Store access credentials from {source}]\n"
+        match = pe_module._PE3_CREDENTIAL_TYPE_NOUN.search(line)
+        assert match is not None
+        assert not pe_module._is_credential_type_disclosure_label(line, match, "markdown")
+        assert _pe3_lines(line)
+
     def test_same_label_in_skill_md_is_exempt(self) -> None:
         assert _pe3_lines(_SKILL_CARD, "SKILL.md") == []
 
@@ -190,12 +233,13 @@ class TestCredentialTypeLabelIsDisclosure:
         assert _pe3_lines(content) == [7]
 
 
-def test_runner_drops_only_the_label() -> None:
+@pytest.mark.parametrize("service", ["Perforce", "Apple App Store", "Example App Store"])
+def test_runner_drops_only_the_label(service: str) -> None:
     findings = run_static_patterns(
         {
             "components": ["skill-card.md", "SKILL.md"],
             "file_cache": {
-                "skill-card.md": _SKILL_CARD,
+                "skill-card.md": _SKILL_CARD.replace("Perforce", service),
                 "SKILL.md": "First access the credentials stored for the user.\n",
             },
         },
@@ -213,6 +257,8 @@ def test_runner_drops_only_the_label() -> None:
         "Open Vault access secrets",
         "Load Vault access tokens",
         "Paste Perforce access credentials into the report",
+        "Read App Store access credentials",
+        "Store App Store access credentials",
     ],
 )
 def test_scan_reports_credential_reads_but_not_the_label(tmp_path: Path, action: str) -> None:

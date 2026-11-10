@@ -225,8 +225,9 @@ _PE3_CREDENTIAL_TYPE_FIELD = re.compile(
 _PE3_CREDENTIAL_TYPE_NOUN = re.compile(
     r"access[ \t]+(?:credentials?|secrets?|tokens?)", re.IGNORECASE
 )
-_PE3_CREDENTIAL_TYPE_ADJECTIVE = re.compile(
-    r"(?<![\w-])(?:read-(?:only|write)|open-(?:source|access))(?![\w-])", re.IGNORECASE
+_PE3_CREDENTIAL_TYPE_NON_ACTION_COMPOUND = re.compile(
+    r"(?<![\w-])(?:read-(?:only|write)|open-(?:source|access)|app[ \t]+store)(?![\w-])",
+    re.IGNORECASE,
 )
 # A field can contain instructions as well as labels. The OAuth action guard
 # below only binds reads to token nouns; disclosures also name credentials and
@@ -828,10 +829,11 @@ def _is_credential_type_disclosure_label(
     if not field.start("value") <= match.start() < match.end() <= field.end("value"):
         return False
     value = field.group("value")
-    # Keep adjective compounds from becoming read/open actions, including in
-    # the shared guards. Spaces preserve word boundaries and distances, and
-    # these adjective masks cannot remove a sensitive path recognized below.
-    actions = _PE3_CREDENTIAL_TYPE_ADJECTIVE.sub(lambda item: " " * len(item.group(0)), value)
+    # Exact adjective compounds and the app store noun are not action verbs.
+    # Same-length spaces retain every other action and sensitive source.
+    actions = _PE3_CREDENTIAL_TYPE_NON_ACTION_COMPOUND.sub(
+        lambda item: " " * len(item.group(0)), value
+    )
     return not (
         _PE3_CREDENTIAL_TYPE_ACTION.search(actions)
         or _PE3_TOKEN_ACTION_CONTEXT.search(actions)
