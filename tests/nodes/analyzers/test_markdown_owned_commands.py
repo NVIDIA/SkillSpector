@@ -637,7 +637,7 @@ def test_repeated_property_arguments_fit_the_existing_shared_work(count: int, pr
     "body,property_count,replace_probed",
     [
         ('Join-Path "$($item.Parent.Name)" "$($item.Name)"', 2, False),
-        ('Write-Output "$($text -replace \'%s\', \'r m\')"', 0, True),
+        ("Write-Output \"$($text -replace '%s', 'r m')\"", 0, True),
     ],
 )
 def test_proven_property_arguments_skip_only_the_redundant_replace_probe(
