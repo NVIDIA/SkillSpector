@@ -3435,6 +3435,7 @@ def _has_shell_command_word_exhaustion(
     quoted_printf_allowed = _quoted_printf_allowed and not _shell_redefines_command(
         content, check_runtime
     )
+
     parsed_through = 0
     # A word that spans lines may pair a heredoc, comment or prose quote with
     # a later command line. Main skips the candidates inside such a word, so
@@ -3537,7 +3538,11 @@ def _has_shell_command_word_exhaustion(
             continue
         if start in owned_word_positions:
             continue
-        if javascript_source is not None and javascript_source.owns(start):
+        if javascript_source is not None and (
+            javascript_source.owns(start) or javascript_source.regex_literal_end(start) is not None
+        ):
+            # Proven native matching patterns have no shell-word semantics.
+            # This candidate owns no later host code or raw finding input.
             continue
         if powershell is not None and powershell.owns(start):
             continue
@@ -3814,6 +3819,23 @@ def _has_shell_command_word_exhaustion(
                 # spans and runtime-selected operands keep their existing
                 # conservative treatment.
                 continue
+            if python_word_source is not None and ownership_boundary < parsed.end:
+                # A raw shell word may pair Python delimiters across unrelated
+                # tokens. Recheck only the complete value the native owner proves.
+                value_source_range: list[int] = []
+                value = python_word_source.string_value(
+                    start, parsed.end, source_range=value_source_range
+                )
+                if value is not None:
+                    value_diagnostic = _has_shell_command_word_exhaustion(
+                        value[0],
+                        check_runtime,
+                        _command_string_depth=_command_string_depth,
+                        _quoted_printf_allowed=quoted_printf_allowed,
+                    )
+                    if value_diagnostic is not None:
+                        return value_diagnostic.enclosed(*value_source_range)
+                    continue
             if not _quoted_candidate_is_complete(
                 content, start, quote_limits, check_runtime, quoted_printf_allowed
             ):
@@ -6340,6 +6362,8 @@ class _JavaScriptTemplateOwnership:
         self._spans: JavaScriptTemplateSpans | None = None
         self._spans_computed = False
         self._unresolved_executables: list[int] = []
+        self._regex_literals: list[tuple[int, int]] = []
+        self._regex_starts: list[int] = []
 
     def _owned_spans(self) -> JavaScriptTemplateSpans | None:
         if not self._spans_computed:
@@ -6347,7 +6371,9 @@ class _JavaScriptTemplateOwnership:
                 self._content,
                 self._check_runtime,
                 unresolved_executables=self._unresolved_executables,
+                regex_literals=self._regex_literals,
             )
+            self._regex_starts = [start for start, _ in self._regex_literals]
             self._spans_computed = True
         return self._spans
 
@@ -6363,6 +6389,16 @@ class _JavaScriptTemplateOwnership:
             len(self._content),
             ParserUncheckedScope.REMAINING_INPUT,
         )
+
+    def regex_literal_end(self, position: int) -> int | None:
+        """Bound a matching-language candidate by its complete native literal."""
+        self._owned_spans()
+        index = bisect_right(self._regex_starts, position) - 1
+        if index >= 0:
+            start, end = self._regex_literals[index]
+            if start <= position < end:
+                return end
+        return None
 
     def owns(self, position: int) -> bool:
         spans = self._owned_spans()
