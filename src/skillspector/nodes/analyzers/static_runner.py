@@ -42,6 +42,9 @@ from skillspector.artifacts import (
     security_text_views,
 )
 from skillspector.inspection_ledger import (
+    MAX_FINDING_OUTPUT_RECORDS,
+    UNSUPPORTED_PROSE_COMMAND_NOTICE,
+    UNSUPPORTED_PROSE_COMMAND_PATTERN,
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
@@ -840,6 +843,7 @@ class _StaticScanMetrics(dict[str, int | float]):
 
     fully_scanned_aggregate_overflow: bool = False
     parser_diagnostic: StaticParserDiagnostic | None = None
+    inspection_notices: tuple[tuple[int, int], ...] = ()
 
 
 def _bounded_parser_incomplete(
@@ -2557,15 +2561,17 @@ def _scan_all_views_detailed(
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Retain first parser evidence alongside every existing terminal scan result."""
     diagnostics: list[StaticParserDiagnostic] = []
+    notices: list[tuple[int, int]] = []
 
     def with_diagnostic(metrics: dict[str, int | float]) -> dict[str, int | float]:
-        if not diagnostics:
+        if not diagnostics and not notices:
             return metrics
         enriched = _StaticScanMetrics(metrics)
         enriched.fully_scanned_aggregate_overflow = getattr(
             metrics, "fully_scanned_aggregate_overflow", False
         )
-        enriched.parser_diagnostic = diagnostics[0]
+        enriched.parser_diagnostic = diagnostics[0] if diagnostics else None
+        enriched.inspection_notices = tuple(notices)
         return enriched
 
     try:
@@ -2583,6 +2589,7 @@ def _scan_all_views_detailed(
             _oms_projected=_oms_projected,
             python_import_bounds=python_import_bounds,
             parser_diagnostics=diagnostics,
+            inspection_notices=notices,
         )
     except _StaticResourceLimitError as exc:
         exc.metrics = with_diagnostic(exc.metrics)
@@ -2605,6 +2612,7 @@ def _scan_all_views_with_parser_diagnostics(
     _oms_projected: bool = False,
     python_import_bounds: PythonImportBounds | None = None,
     parser_diagnostics: list[StaticParserDiagnostic],
+    inspection_notices: list[tuple[int, int]],
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Scan bounded raw windows and return any limit with observed/limit metrics."""
     started_at = time.monotonic() if started_at is None else started_at
@@ -2865,6 +2873,10 @@ def _scan_all_views_with_parser_diagnostics(
                         check_runtime=finding_budget.check_runtime,
                     )
                     finding_budget.check_runtime()
+                    notice_hook = getattr(prepared_analyses[id(module)], "inspection_notices", None)
+                    if not _oms_projected and callable(notice_hook):
+                        inspection_notices.extend(notice_hook())
+                        del inspection_notices[MAX_FINDING_OUTPUT_RECORDS:]
             if (_oms_projected or _infer_file_type(path) == "json") and "\\" in content:
                 json_ownership = next(
                     (
@@ -3759,6 +3771,7 @@ def run_static_patterns_with_ledger(
     }
     findings: list[Finding] = []
     events: list[InspectionLedgerEvent] = []
+    notices: list[dict[str, object]] = []
     raw_inventory = state.get("artifact_inventory", [])
     inventory: dict[str, dict[str, object]] = (
         {str(item.get("path", "")): item for item in raw_inventory if isinstance(item, dict)}
@@ -3911,6 +3924,25 @@ def run_static_patterns_with_ledger(
                         path_parser_diagnostic = getattr(
                             resource_metrics, "parser_diagnostic", None
                         )
+                        notice_spans = getattr(resource_metrics, "inspection_notices", ())
+                        notice_lines = logical_line_starts(content) if notice_spans else []
+                        for start, end in notice_spans:
+                            if len(notices) >= MAX_FINDING_OUTPUT_RECORDS:
+                                break
+                            if not 0 <= start < end <= len(content):
+                                continue
+                            notices.append(
+                                {
+                                    "reason_code": UNSUPPORTED_PROSE_COMMAND_PATTERN,
+                                    "message": UNSUPPORTED_PROSE_COMMAND_NOTICE,
+                                    "phase": "documentation",
+                                    "path": path,
+                                    "start_line": bisect_right(notice_lines, start),
+                                    "end_line": bisect_right(notice_lines, end - 1),
+                                    "source_start_offset": start,
+                                    "source_end_offset": end,
+                                }
+                            )
                         fully_scanned_aggregate_overflow = bool(
                             resource_limit is LedgerReason.OUTPUT_LIMIT
                             and getattr(
@@ -4114,5 +4146,6 @@ def run_static_patterns_with_ledger(
     return {
         "findings": findings,
         "inspection_ledger": events,
+        "inspection_notices": notices,
         "analyzer_status_events": [analyzer_status_for_events(analyzer_id, events)],
     }
