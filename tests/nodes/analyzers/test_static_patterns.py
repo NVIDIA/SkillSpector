@@ -3569,6 +3569,9 @@ def test_linear_command_matching_preserves_native_spans(pattern):
         prefix + "|" + suffix,
         positive.upper(),
         positive.replace(" ", "\u00a0"),
+        positive.replace(" ", "\n", 1),
+        positive.replace(" ", "\r\n", 1),
+        positive.replace(" ", "\n\n", 1),
         prefix,
         suffix,
         positive.replace("PAYLOAD", "x" * 100_000),
@@ -3585,6 +3588,95 @@ def test_linear_command_matching_preserves_native_spans(pattern):
                 )
             ]
             assert actual == expected, (pattern, text[:80], start, end)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "text"),
+    [
+        (
+            r"\bgit\s+(?:am|commit|merge|push)\b[^\n|]*--no-verify\b",
+            "git\nam--no-verify\ngit\r\nmerge --no-verify\ngit push\n--no-verify",
+        ),
+        (
+            r"kubectl\s+run\b[^\n]*--privileged",
+            "kubectl\n\nrun--privileged\nkubectl\r\nrun pod --privileged",
+        ),
+        (
+            r"--set\b[^\n]*privileged\s*=\s*true",
+            "--set --set privileged\n=\ntrue --set privileged=true",
+        ),
+        (
+            r"curl\s+[^&]*-o\s+\S+\s*&&\s*(?:sudo\s+)?(?:ba)?sh",
+            "curl URL -o aa-o &&&&sh | curl URL -o /tmp/y && sh",
+        ),
+        (
+            static_runner._LINEAR_HIDDEN_DIRECTORY_PATTERN,
+            "create \\\n /tmp/.hidden; mkdir \\\r\n /tmp/.cache",
+        ),
+    ],
+)
+def test_linear_command_prefixes_preserve_native_window_ranges(pattern, text):
+    compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    cuts = {0, len(text)}
+    for position, character in enumerate(text):
+        if character in "\r\n|&;":
+            cuts.update((position, position + 1))
+    for match in compiled.finditer(text):
+        for position in match.span():
+            cuts.update((max(0, position - 1), position, min(len(text), position + 1)))
+    for start in sorted(cuts):
+        for end in sorted(cuts):
+            if start > end:
+                continue
+            expected = [
+                (match.span(), match.group(), match.groups())
+                for match in compiled.finditer(text, start, end)
+            ]
+            actual = [
+                (match.span(), match.group(), match.groups())
+                for match in static_runner.iter_pattern_matches(
+                    compiled, text, start=start, end=end
+                )
+            ]
+            assert actual == expected, (pattern, text, start, end)
+
+
+@pytest.mark.parametrize("gap", ["\n", "\r\n", "\n\n"])
+def test_wrapped_kubectl_prefix_keeps_tm4_and_later_raw_finding(gap):
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as module
+
+    content = "kubectl" + gap + "run pod --privileged\nrm -rf /\n"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["install.sh"], "file_cache": {"install.sh": content}}, [module]
+    )
+    assert any(
+        finding.rule_id == "TM4" and finding.start_line == 1 and finding.severity == "HIGH"
+        for finding in result["findings"]
+    )
+    assert any(
+        finding.rule_id == "TM1"
+        and finding.start_line == gap.count("\n") + 2
+        and finding.severity == "HIGH"
+        for finding in result["findings"]
+    )
+    assert all(event["outcome"] == "completed" for event in result["inspection_ledger"])
+
+
+def test_linear_prefix_iterator_rechecks_artifact_deadline_after_match():
+    now = 0.0
+    budget = static_runner._FindingBudget(10, 0.0, 1.0, lambda: now)
+    token = static_runner._ACTIVE_FINDING_BUDGET.set(budget)
+    pattern = re.compile(r"kubectl\s+run\b[^\n]*--privileged", re.IGNORECASE | re.MULTILINE)
+    text = "kubectl\nrun pod --privileged\nkubectl\nrun pod --privileged"
+    try:
+        matches = static_runner.iter_pattern_matches(pattern, text)
+        assert next(matches).span() == next(pattern.finditer(text)).span()
+        now = 2.0
+        with pytest.raises(static_runner._StaticResourceLimitError) as caught:
+            next(matches)
+        assert caught.value.reason is static_runner.LedgerReason.RUNTIME_LIMIT
+    finally:
+        static_runner._ACTIVE_FINDING_BUDGET.reset(token)
 
 
 @pytest.mark.parametrize(

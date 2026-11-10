@@ -694,11 +694,16 @@ def _linear_command_matches(
     precedes it, the original pattern can match at that command in one anchored
     pass. Without such a pair, skip the segment without retrying every command.
     Audited suffixes may consume delimiters, as in a download followed by && sh.
-    Each successful match consumes its segment's last suffix; the total prefix,
-    suffix and anchored scanning is linear in the window length.
+    Prefixes may themselves contain a wildcard delimiter. Keep their iterator
+    separate from segment boundaries, but never reuse a prefix inside a match
+    already returned. Each successful match consumes its segment's last suffix;
+    the total prefix, suffix and anchored scanning is linear in the window length.
     """
     start, end = max(0, start), min(len(content), max(0, end))
     prefix, suffix, separator = _linear_command_parts(original.pattern, original.flags)
+    prefixes = prefix.finditer(content, start, end)
+    command = next(prefixes, None)
+    match_floor = start
     suffixes = suffix.finditer(content, start, end)
     candidate = next(suffixes, None)
     budget = _ACTIVE_FINDING_BUDGET.get()
@@ -712,15 +717,22 @@ def _linear_command_matches(
             if candidate.start() >= start:
                 last_suffix = candidate
             candidate = next(suffixes, None)
-        if last_suffix is not None:
-            command = prefix.search(content, start, last_suffix.start())
-            if command is not None:
-                match = original.match(content, command.start(), end)
-                if match is None:
-                    raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
-                start = max(stop + 1, match.end())
-                yield match
-                continue
+        while command is not None and (command.end() < start or command.start() < match_floor):
+            if budget is not None:
+                budget.check_runtime()
+            command = next(prefixes, None)
+        if (
+            last_suffix is not None
+            and command is not None
+            and command.end() <= last_suffix.start()
+        ):
+            match = original.match(content, command.start(), end)
+            if match is None:
+                raise _StaticResourceLimitError(LedgerReason.RULES_UNAVAILABLE, {})
+            match_floor = match.end()
+            start = max(stop + 1, match.end())
+            yield match
+            continue
         start = stop + 1
 
 
