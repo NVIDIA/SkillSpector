@@ -3963,9 +3963,7 @@ def test_optional_word_prefix_uses_single_leading_boundary():
     from skillspector.nodes.analyzers import static_patterns_anti_refusal as module
 
     pattern = next(
-        pattern
-        for pattern, _ in module.AR1_PATTERNS
-        if pattern.startswith(r"\b(?:you\s+)?must")
+        pattern for pattern, _ in module.AR1_PATTERNS if pattern.startswith(r"\b(?:you\s+)?must")
     )
     compiled = static_runner._timed_pattern(pattern, re.IGNORECASE)
     assert compiled.pattern.startswith("(?<!")
@@ -4091,9 +4089,7 @@ def test_variable_shell_limit_still_reconciles_out_of_scope_bindings(legacy):
 
     content = (
         "import subprocess\ndef configure():\n    flag = True\n"
-        "subprocess.run(cmd, shell=flag)\nother = True\nsubprocess.run('"
-        + "x" * 4200
-        + "')\n"
+        "subprocess.run(cmd, shell=flag)\nother = True\nsubprocess.run('" + "x" * 4200 + "')\n"
     )
     state = {"components": ["tool.py"], "file_cache": {"tool.py": content}}
     if legacy:
