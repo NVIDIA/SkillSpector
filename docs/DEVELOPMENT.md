@@ -25,6 +25,10 @@ prerequisites, clone, virtual environment, and dependency-installation recipe.
 The supported Python range is defined in [pyproject.toml](../pyproject.toml).
 All Makefile targets assume the virtual environment is already created and activated.
 
+To observe this workflow with a coding agent, use the
+[contributor onboarding check](validation/CONTRIBUTOR_ONBOARDING.md), which
+records setup and check results separately from full PR validation.
+
 - **Installation**: `make install` and `make install-dev` use **uv** if available (`uv sync` / `uv sync --all-extras`), otherwise **pip** (`pip install -e .` / `pip install -e ".[dev]"`).
 - **Environment**: Optional `.env` in the project root. The LangGraph dev server loads it (see [langgraph.json](../langgraph.json) `"env": ".env"`). Key variables:
   - **`SKILLSPECTOR_PROVIDER`**: Selects the active LLM provider — `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `gemini_cli`, or `opencode_cli`. Defaults to `nv_build` when unset.

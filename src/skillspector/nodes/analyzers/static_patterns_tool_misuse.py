@@ -52,7 +52,7 @@ from skillspector.javascript_tokens import JavaScriptTemplateSpans, assertion_te
 from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
 from skillspector.logging_config import get_logger
 from skillspector.markdown_tokens import quoted_list_spans
-from skillspector.models import AnalyzerFinding, Finding, Location, Severity
+from skillspector.models import AnalyzerFinding, Finding, Location, Severity, map_analyzer_findings
 from skillspector.powershell_tokens import PowerShellSource, PowerShellString, powershell_source
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_string_constants import python_constant_string_fields
@@ -65,6 +65,7 @@ from skillspector.python_tokens import python_literal_spans as _python_literal_s
 from skillspector.python_tokens import python_string_body as _python_string_body
 from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+from skillspector.yaml_tokens import YamlScalar, YamlSourceSpans, yaml_source_spans
 
 from . import static_runner
 from .common import (
@@ -84,6 +85,7 @@ logger = get_logger(__name__)
 ANALYZER_ID = "static_patterns_tool_misuse"
 USES_RUNTIME_CHECK = True
 USES_PYTHON_IMPORT_BOUNDS = True
+USES_PREPARED_PARSER_ANALYSIS = True
 ANALYZE_USES_POSTPROCESS = True
 POSTPROCESS_USES_PYTHON_AST = True
 POSTPROCESS_USES_RUNTIME_BUDGET = True
@@ -315,6 +317,28 @@ _VARIABLE_SHELL_ASSIGNMENT_RE = re.compile(
 )
 _SHELL_NAME_ARGUMENT_RE = re.compile(r"\bshell\s*=\s*\w+", re.IGNORECASE)
 
+# Option searches are bounded to one command before applying their suffix.
+# Whitespace may include an explicit Bash or PowerShell line continuation.
+_OPTION_COMMAND_SPACE = r"(?:[ \t]|[\\`]\r?\n)+"
+_OPTION_COMMAND_RULES = [
+    (rf"(?:chmod|chown){_OPTION_COMMAND_SPACE}", r"a\+rwx", 0.8),
+    (rf"git{_OPTION_COMMAND_SPACE}push{_OPTION_COMMAND_SPACE}", r"--force", 0.7),
+    (rf"curl{_OPTION_COMMAND_SPACE}", r"-k\b", 0.6),
+    (rf"curl{_OPTION_COMMAND_SPACE}", r"--insecure\b", 0.65),
+    (rf"wget{_OPTION_COMMAND_SPACE}", r"--no-check-certificate", 0.65),
+]
+_OPTION_COMMAND_PREFIXES = {
+    prefix + r"[\s\S]*" + option: re.compile(prefix, re.IGNORECASE)
+    for prefix, option, _ in _OPTION_COMMAND_RULES
+}
+# Host values can fold physical newlines into spaces. Without a shell-region
+# proof, retain the original conservative patterns rather than clipping them.
+_OPTION_COMMAND_HOST_PATTERNS = {
+    pattern: pattern.replace(_OPTION_COMMAND_SPACE, r"\s+").replace(r"[\s\S]*", r"[^|]*")
+    for pattern in _OPTION_COMMAND_PREFIXES
+}
+_OPTION_SHELL_FENCE_LANGUAGES = frozenset({"sh", "bash", "shell", "powershell", "pwsh", "ps1"})
+
 # TM1: Tool Parameter Abuse — dangerous parameter values
 DIRECT_SHELL_TRUE_PATTERNS: tuple[tuple[str, float], ...] = (
     # shell=True is a classic command injection vector
@@ -372,16 +396,14 @@ TM1_CODE_PATTERNS = [
     # unmatched `-- ` tokens, and `[\w=-]*` already absorbs a long option's
     # second dash.
     (r"chmod\s+(?:-[\w=-]*[ \t]+)*[\"']?[+=]?0*[0-7]{2,3}[2367](?![0-9\w])[\"']?", 0.8),
-    (r"(?:chmod|chown)\s+[^|]*a\+rwx", 0.8),
-    # Git force operations
-    (r"git\s+push\s+[^|]*--force", 0.7),
+    *[
+        (prefix + r"[\s\S]*" + option, confidence)
+        for prefix, option, confidence in _OPTION_COMMAND_RULES
+    ],
+    # Other Git force operations
     (r"git\s+reset\s+--hard", 0.65),
     (r"git\s+clean\s+-[fd]+x", 0.7),
     (r"\bgit\s+(?:am|commit|merge|push)\b[^\n|]*--no-verify\b", 0.75),
-    # Curl/wget with unsafe parameters
-    (r"curl\s+[^|]*-k\b", 0.6),
-    (r"curl\s+[^|]*--insecure\b", 0.65),
-    (r"wget\s+[^|]*--no-check-certificate", 0.65),
     # File deletion commands (delete/remove) with explicit path argument
     # Separate from rm pattern: requires \b and a short span to a "/" to avoid
     # matching "remove" in prose; HTTP verb DELETE in REST route tables is
@@ -8123,12 +8145,177 @@ def _lexical_shell_has_counterevidence(
     return False
 
 
+def _option_command_end(
+    content: str,
+    start: int,
+    limit: int,
+    check_runtime: Callable[[], None],
+    *,
+    powershell: bool = False,
+) -> int:
+    """Stop at an unquoted command separator, retaining balanced arguments."""
+    quote: str | None = None
+    ansi_c_quote = False
+    closers: list[str] = []
+    backtick_ends: dict[int, int | None] = {}
+    i = start
+    next_runtime_check = start
+    while i < limit:
+        if i >= next_runtime_check:
+            check_runtime()
+            next_runtime_check = i + 1024
+        ch = content[i]
+        if quote != "'" and content.startswith("${", i):
+            inherited_quote_closed = [False]
+            expansion_end = _skip_parameter_expansion(
+                content,
+                i,
+                limit,
+                check_runtime,
+                backtick_end_cache=backtick_ends,
+                inherited_double_quote=quote == '"',
+                inherited_quote_closed=inherited_quote_closed,
+            )
+            if expansion_end is None:
+                # An unresolved expansion cannot prove a shell separator.
+                # The owning Markdown region still bounds this candidate.
+                return limit
+            if inherited_quote_closed[0]:
+                quote = None
+            i = expansion_end
+            continue
+        if quote != "'" and (
+            content.startswith("$(", i) or quote is None and content.startswith(("<(", ">("), i)
+        ):
+            substitution_end = _skip_command_substitution(
+                content, i, limit, check_runtime, backtick_end_cache=backtick_ends
+            )
+            if substitution_end is None:
+                return limit
+            i = substitution_end
+            continue
+        if quote is not None:
+            if ch == quote:
+                quote = None
+                ansi_c_quote = False
+            elif (quote != "'" or ansi_c_quote) and ch == "\\":
+                i += 2 if content[i + 1 : i + 3] != "\r\n" else 3
+                continue
+            elif quote == '"' and ch == "`":
+                substitution_end = _skip_backtick_substitution(
+                    content, i, limit, check_runtime, end_cache=backtick_ends
+                )
+                if substitution_end is not None:
+                    i = substitution_end
+                else:
+                    # A PowerShell backtick can escape a quote. A balanced
+                    # Bash substitution above owns both of its delimiters.
+                    i += 3 if content[i + 1 : i + 3] == "\r\n" else 2
+                continue
+        elif content.startswith("$'", i):
+            quote = "'"
+            ansi_c_quote = True
+            i += 2
+            continue
+        elif ch in "\\`":
+            # Backticks are also Markdown delimiters. Only a line-ending
+            # backtick proves a continuation without relying on fence labels.
+            if content[i + 1 : i + 3] == "\r\n":
+                i += 3
+                continue
+            if content[i + 1 : i + 2] == "\n" or ch == "\\":
+                i += 2
+                continue
+            substitution_end = _skip_backtick_substitution(
+                content, i, limit, check_runtime, end_cache=backtick_ends
+            )
+            if substitution_end is not None:
+                i = substitution_end
+                continue
+            # An unpaired PowerShell backtick escapes the next character,
+            # including a separator that is literal data in this command.
+            i += 2
+            continue
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "(":
+            closers.append(")")
+        elif powershell and ch == "{":
+            # Hashtable and script-block arguments own their inner separators.
+            # Bash braces do not establish the same argument boundary.
+            closers.append("}")
+        elif closers and ch == closers[-1]:
+            closers.pop()
+        elif not closers and ch in "\r\n;|&":
+            break
+        i += 1
+    return min(i, limit)
+
+
+def _option_command_matches(
+    pattern: str,
+    content: str,
+    check_runtime: Callable[[], None],
+    markdown_fences: list[int],
+    host_ranges: list[tuple[int, int]],
+    powershell_ranges: list[tuple[int, int]],
+) -> Iterator[re.Match[str]]:
+    """Apply an unsafe-option pattern only within each candidate command."""
+    compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    host_compiled = re.compile(_OPTION_COMMAND_HOST_PATTERNS[pattern], re.IGNORECASE | re.MULTILINE)
+    host_starts = [start for start, _ in host_ranges]
+    command_prefix = _OPTION_COMMAND_PREFIXES[pattern]
+    search_prefix = (
+        re.compile(
+            command_prefix.pattern.replace(
+                _OPTION_COMMAND_SPACE, rf"(?:{_OPTION_COMMAND_SPACE}|\s+)"
+            ),
+            re.IGNORECASE,
+        )
+        if host_ranges
+        else command_prefix
+    )
+    powershell_starts = [start for start, _ in powershell_ranges]
+    covered_until = 0
+    for prefix in search_prefix.finditer(content):
+        check_runtime()
+        if prefix.start() < covered_until:
+            continue
+        host_index = bisect_right(host_starts, prefix.start()) - 1
+        if host_index >= 0 and prefix.start() < host_ranges[host_index][1]:
+            match = host_compiled.match(content, prefix.start(), host_ranges[host_index][1])
+            if match is not None:
+                covered_until = match.end()
+                yield match
+            continue
+        fence_index = bisect_right(markdown_fences, prefix.start())
+        limit = markdown_fences[fence_index] if fence_index < len(markdown_fences) else len(content)
+        shell_prefix = command_prefix.match(content, prefix.start(), limit)
+        if shell_prefix is None:
+            continue
+        powershell_index = bisect_right(powershell_starts, prefix.start()) - 1
+        end = _option_command_end(
+            content,
+            shell_prefix.end(),
+            limit,
+            check_runtime,
+            powershell=(
+                powershell_index >= 0 and prefix.start() < powershell_ranges[powershell_index][1]
+            ),
+        )
+        covered_until = end
+        match = compiled.match(content, prefix.start(), end)
+        if match is not None:
+            yield match
+
+
 def _tm1_candidates(
     content: str,
     *,
     direct_shell_only: bool = False,
     shell_content: str | None = None,
     check_runtime: Callable[[], None],
+    file_type: str = "",
 ) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
     def direct_matches(
         pattern_index: int,
@@ -8189,11 +8376,54 @@ def _tm1_candidates(
         yield from direct_candidates()
         return
 
+    option_markdown_fences: list[int] = []
+    option_fence_regions: list[tuple[int, int, str]] = []
+    option_host_ranges: list[tuple[int, int]] = []
+    if file_type == "markdown" and any(
+        prefix.search(content)
+        or re.search(prefix.pattern.replace(_OPTION_COMMAND_SPACE, r"\s+"), content, re.IGNORECASE)
+        for prefix in _OPTION_COMMAND_PREFIXES.values()
+    ):
+        _markdown_shell_text(
+            content,
+            check_runtime,
+            fence_boundaries=option_markdown_fences,
+            fence_regions=option_fence_regions,
+            inline_regions=option_host_ranges,
+        )
+    option_host_ranges.extend(
+        (start, end)
+        for start, end, language in option_fence_regions
+        if language not in _OPTION_SHELL_FENCE_LANGUAGES
+    )
+    option_host_ranges.sort()
+    option_powershell_ranges = (
+        [(0, len(content))]
+        if file_type == "powershell"
+        else [
+            (start, end)
+            for start, end, language in option_fence_regions
+            if language in {"powershell", "pwsh", "ps1"}
+        ]
+    )
+
     def ordinary_matches(
         pattern_index: int,
         pattern: str,
         confidence: float,
     ) -> Iterator[tuple[int, int, re.Match[str], float]]:
+        if pattern in _OPTION_COMMAND_PREFIXES and file_type in {"markdown", "shell", "powershell"}:
+            for match in _option_command_matches(
+                pattern,
+                content,
+                check_runtime,
+                option_markdown_fences,
+                option_host_ranges,
+                option_powershell_ranges,
+            ):
+                yield match.start(), pattern_index, match, confidence
+            return
+        pattern = _OPTION_COMMAND_HOST_PATTERNS.get(pattern, pattern)
         if pattern == _VARIABLE_SHELL_FLAG_PATTERN:
             for match in _variable_shell_matches(content):
                 yield match.start(), pattern_index, match, confidence
@@ -8420,6 +8650,9 @@ def _markdown_shell_text(
     *,
     complete_context: bool = True,
     word_apostrophes: bool = False,
+    fence_boundaries: list[int] | None = None,
+    fence_regions: list[tuple[int, int, str]] | None = None,
+    inline_regions: list[tuple[int, int]] | None = None,
     shell_fence_ranges: list[tuple[int, int]] | None = None,
     hardware_apostrophe_ambiguity: list[bool] | None = None,
     hardware_apostrophe_locations: list[tuple[int, int]] | None = None,
@@ -8432,6 +8665,12 @@ def _markdown_shell_text(
     inside their bodies. Pair equal-length runs in linear time.
     ``word_apostrophes`` selects the prose reading, which also masks the
     possessives and contractions of plain prose lines.
+    ``fence_boundaries`` receives structural opening and closing marker offsets;
+    inline-code delimiters do not establish a fence boundary.
+    ``fence_regions`` receives body bounds and language labels, including
+    unlabelled and unclosed fences, for host-language option matching.
+    ``inline_regions`` receives proven inline-code body bounds, whose physical
+    newlines fold into spaces rather than ending a command.
     ``shell_fence_ranges`` receives closed, explicitly labelled shell bodies
     whose quote ownership can be checked independently of surrounding prose.
     """
@@ -8493,6 +8732,8 @@ def _markdown_shell_text(
                 if (start - escape_start) % 2 == 0:
                     return
         for (start, end), (close_start, close_end) in pairs:
+            if inline_regions is not None:
+                inline_regions.append((end, close_start))
             output[start:end] = " " * (end - start)
             output[close_start:close_end] = " " * (close_end - close_start)
         runs.clear()
@@ -8553,6 +8794,7 @@ def _markdown_shell_text(
     paragraph_open = False
     paragraph_in_list = False
     paragraph_list_indent = 0
+    list_content_indents: list[int] = []
     table_columns: int | None = None
     table_minimum_indent = 0
     table_delimiter_line = -1
@@ -8563,6 +8805,12 @@ def _markdown_shell_text(
         stripped = line.rstrip(LINE_BREAK_CHARS)
         leading = stripped.lstrip(" \t")
         indentation = len(stripped[: len(stripped) - len(leading)].expandtabs(4))
+        # List containers survive blank lines and restore their enclosing
+        # context after a nested item. Literal fence/HTML/quote bodies cannot
+        # establish or discard list ownership.
+        list_context = fence is None and html_end is None and not quoted_block
+        list_index = bisect_right(list_content_indents, indentation)
+        list_base = list_content_indents[list_index - 1] if list_index else 0
         # Interpret list padding in columns, preserving the original offsets.
         # More than four columns after a marker can introduce indented code.
         prefix = len(stripped) - len(leading)
@@ -8573,7 +8821,8 @@ def _markdown_shell_text(
         # ``*`` is a glob, not an inert word, so it never owns it.
         first_marker_is_glob = False
         list_markers = 0
-        if indentation < 4:
+        new_list_indents: list[int] = []
+        if 0 <= indentation - list_base < 4:
             while marker := list_marker.match(stripped, prefix):
                 check_runtime()
                 if (
@@ -8600,6 +8849,7 @@ def _markdown_shell_text(
                 if column - padding_start > 4:
                     list_indented = True
                     break
+                new_list_indents.append(column)
             leading = stripped[prefix:]
         quote_start = indentation < 4 and leading.startswith(">")
         heading = indentation < 4 and re.match(r"#{1,6}(?:[ \t]|$)", leading) is not None
@@ -8613,13 +8863,27 @@ def _markdown_shell_text(
             # Single '-' still starts an empty item; '---' remains thematic.
             separator = False
         html_open = re.match(r"<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|[!?/])", leading)
-        nested_fence_opening = (
-            MARKDOWN_FENCE_OPEN.fullmatch(stripped[prefix:])
-            if paragraph_in_list
+        lazy_list_paragraph = (
+            paragraph_open
+            and paragraph_in_list
+            and not (has_list_marker or quote_start or heading or separator or html_open)
+            and MARKDOWN_FENCE_OPEN.fullmatch(leading) is None
+        )
+        if list_context and leading and not lazy_list_paragraph:
+            del list_content_indents[list_index:]
+        if list_context and not quote_start and not html_open:
+            list_content_indents.extend(new_list_indents)
+        list_content_indent = list_content_indents[-1] if list_content_indents else None
+        list_fence = (
+            list_content_indent is not None
+            and table_columns is None
+            and (paragraph_in_list or line_index > 0 and not lines[line_index - 1].strip())
             and not has_list_marker
-            and not list_indented
-            and 0 <= indentation - paragraph_list_indent <= 3
-            else None
+            and 0 <= indentation - list_content_indent <= 3
+            and MARKDOWN_FENCE_OPEN.fullmatch(leading) is not None
+        )
+        nested_fence_opening = (
+            MARKDOWN_FENCE_OPEN.fullmatch(stripped[prefix:]) if list_fence else None
         )
         continuing_paragraph = False
         if table_columns is not None and (
@@ -8642,6 +8906,10 @@ def _markdown_shell_text(
             # A fenced block inside a list ends when its list container ends.
             # Process this dedented line again as Markdown, rather than letting
             # a prose apostrophe open a shell quote inside the preceding fence.
+            if fence_boundaries is not None:
+                fence_boundaries.append(offset)
+            if fence_regions is not None:
+                fence_regions.append((fence_body_start, offset, fence[3]))
             if (
                 powershell_blocks is not None
                 and complete_context
@@ -8665,6 +8933,10 @@ def _markdown_shell_text(
                 begin, end = closing_fence.span(1)
                 body_start = offset + len(stripped) - len(fence_body)
                 output[body_start + begin : body_start + end] = " " * (end - begin)
+                if fence_boundaries is not None:
+                    fence_boundaries.append(body_start + begin)
+                if fence_regions is not None:
+                    fence_regions.append((fence_body_start, offset, fence[3]))
                 if (
                     powershell_blocks is not None
                     and complete_context
@@ -8756,11 +9028,13 @@ def _markdown_shell_text(
         elif nested_fence_opening:
             mask_inline_delimiters()
             begin, end = nested_fence_opening.span(1)
+            if fence_boundaries is not None:
+                fence_boundaries.append(offset + prefix + begin)
             info = stripped[prefix + end :].strip()
             fence = (
                 nested_fence_opening[1][0],
                 len(nested_fence_opening[1]),
-                paragraph_list_indent,
+                list_content_indent,
                 info.split(maxsplit=1)[0].casefold() if info else "",
             )
             fence_body_start = offset + len(line)
@@ -8772,6 +9046,8 @@ def _markdown_shell_text(
         elif (
             not leading
             or list_indented
+            or indentation >= 4
+            and has_list_marker
             or indentation >= 4
             and not (
                 paragraph_in_list
@@ -8806,6 +9082,8 @@ def _markdown_shell_text(
             if opening:
                 mask_inline_delimiters()
                 begin, end = opening.span(1)
+                if fence_boundaries is not None:
+                    fence_boundaries.append(offset + prefix + begin)
                 info = stripped[prefix + end :].strip()
                 language = info.split(maxsplit=1)[0].casefold() if info else ""
                 fence = (
@@ -8969,6 +9247,8 @@ def _markdown_shell_text(
             paragraph_in_list = False
             paragraph_list_indent = 0
         offset += len(line)
+    if fence is not None and fence_regions is not None:
+        fence_regions.append((fence_body_start, len(content), fence[3]))
     mask_inline_delimiters()
     projected = "".join(output)
     quoted_code: dict[int, tuple[int, int, int]] = {}
@@ -9108,6 +9388,145 @@ def _fenced_powershell_source(
     )
 
 
+def _yaml_source_start(
+    content: str,
+    source_view: SecurityTextView | None,
+    canonical: str,
+    check_runtime: Callable[[], None],
+) -> int | None:
+    if (
+        source_view is None
+        or source_view.name != "raw"
+        or source_view.text != content
+        or not content
+    ):
+        return None
+    start = source_view.source_offset(0)
+    end = start + len(content)
+    if not 0 <= start < end <= len(canonical) or canonical[start:end] != content:
+        return None
+    for offset in range(len(content)):
+        if offset % 4096 == 0:
+            check_runtime()
+        if source_view.source_offset(offset) != start + offset:
+            return None
+    return start
+
+
+@dataclass(frozen=True)
+class _YamlParserAnalysis:
+    content: str
+    spans: YamlSourceSpans
+
+    def can_emit(self, scalar: YamlScalar) -> bool:
+        # A scalar no wider than the overlap fits the raw window owning its
+        # opener. Larger scalars need the complete small-artifact window.
+        return (
+            len(self.content) <= static_runner.SECURITY_VIEW_WINDOW_CHARS
+            or scalar.end - scalar.start <= static_runner._WINDOW_OVERLAP_CHARS
+        )
+
+    def owns(
+        self, content: str, source_view: SecurityTextView | None, check_runtime: Callable[[], None]
+    ) -> bool:
+        return (
+            len(content) == len(self.content)
+            and _yaml_source_start(content, source_view, self.content, check_runtime) == 0
+        )
+
+
+def prepare_parser_analysis(
+    content: str, file_type: str, check_runtime: Callable[[], None]
+) -> _YamlParserAnalysis | None:
+    if file_type != "yaml":
+        return None
+    spans = yaml_source_spans(content, check_runtime)
+    return _YamlParserAnalysis(content, spans) if spans is not None else None
+
+
+def _yaml_scalar_mapper(
+    location: Location, context: str, start: int, scalar: YamlScalar
+) -> Callable[[AnalyzerFinding], None]:
+    occurrence = 0
+
+    def enclose(finding: AnalyzerFinding) -> None:
+        nonlocal occurrence
+        occurrence += 1
+        decoded_line = finding.location.start_line
+        # Decoded coordinates must never escape through an interrupted
+        # finding-budget prefix or Python-specific reconciliation.
+        finding.location = replace(location)
+        finding.context = context
+        finding.evidence = {
+            key: value for key, value in finding.evidence.items() if not key.startswith("_")
+        }
+        finding.evidence.update(
+            {
+                static_runner._VIEW_START_EVIDENCE: start,
+                "yaml_scalar": {
+                    "location_precision": "enclosing_expression",
+                    "source_start_offset": scalar.start,
+                    "source_end_offset": scalar.end,
+                    "decoded_start_line": decoded_line,
+                    "decoded_occurrence": occurrence,
+                },
+            }
+        )
+
+    return enclose
+
+
+@dataclass(frozen=True)
+class _PreparedYamlAnalysis:
+    parser: _YamlParserAnalysis
+    check_runtime: Callable[[], None]
+
+    def analyze(
+        self, content: str, file_path: str, file_type: str, source_view: SecurityTextView
+    ) -> list[AnalyzerFinding]:
+        findings = analyze(
+            content,
+            file_path,
+            file_type,
+            check_runtime=self.check_runtime,
+            defer_variable_reconciliation=True,
+        )
+        if file_type != "yaml":
+            return findings
+        source_start = _yaml_source_start(
+            content, source_view, self.parser.content, self.check_runtime
+        )
+        if source_start is None:
+            return findings
+        locations = SourceLocationIndex(content, file_path)
+        for scalar in self.parser.spans.scalars:
+            self.check_runtime()
+            if not self.parser.can_emit(scalar):
+                continue
+            start, end = scalar.start - source_start, scalar.end - source_start
+            if not 0 <= start < end <= len(content):
+                continue
+            if self.parser.content[scalar.body_start : scalar.body_end] == scalar.value:
+                continue
+            enclose = _yaml_scalar_mapper(
+                locations.location(start, end), get_context(content, start), start, scalar
+            )
+            with map_analyzer_findings(enclose):
+                findings.extend(
+                    analyze(scalar.value, file_path, "shell", check_runtime=self.check_runtime)
+                )
+        return findings
+
+
+def prepare_analysis(
+    content: str, file_type: str, check_runtime: Callable[[], None]
+) -> _PreparedYamlAnalysis | None:
+    if file_type != "yaml":
+        return None
+    parser = prepare_parser_analysis(content, file_type, check_runtime)
+    return _PreparedYamlAnalysis(parser, check_runtime) if parser is not None else None
+
+
 def has_bounded_parse_exhaustion(
     content: str,
     check_runtime: Callable[[], None],
@@ -9116,6 +9535,8 @@ def has_bounded_parse_exhaustion(
     complete_context: bool = True,
     python_import_check: Callable[[Callable[[], None]], bool] | None = None,
     python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
+    prepared_analysis: object | None = None,
+    source_view: SecurityTextView | None = None,
 ) -> bool:
     """Return whether the bounded static parser leaves an expression unresolved."""
     return (
@@ -9126,6 +9547,8 @@ def has_bounded_parse_exhaustion(
             complete_context=complete_context,
             python_import_check=python_import_check,
             python_stdlib_check=python_stdlib_check,
+            prepared_analysis=prepared_analysis,
+            source_view=source_view,
         )
         is not None
     )
@@ -9139,6 +9562,8 @@ def bounded_parse_diagnostic(
     complete_context: bool = True,
     python_import_check: Callable[[Callable[[], None]], bool] | None = None,
     python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
+    prepared_analysis: object | None = None,
+    source_view: SecurityTextView | None = None,
 ) -> StaticParserDiagnostic | None:
     """Explain the existing first incomplete parser scope without reparsing it."""
     exhausted = _has_bounded_parse_exhaustion(
@@ -9151,6 +9576,57 @@ def bounded_parse_diagnostic(
     )
     if exhausted is not None and not complete_context:
         exhausted = replace(exhausted, full_input_checked=False)
+    if file_type == "yaml" and complete_context:
+        # A complete YAML grammar bounds scalars independently. Inspect decoded
+        # text even when raw quoting concealed a runtime command or finding.
+        yaml_spans = yaml_source_spans(content, check_runtime)
+        if yaml_spans is None:
+            return exhausted
+        mapped_source = isinstance(
+            prepared_analysis, _YamlParserAnalysis
+        ) and prepared_analysis.owns(content, source_view, check_runtime)
+        for scalar in yaml_spans.scalars:
+            check_runtime()
+            diagnostic = _has_bounded_parse_exhaustion(
+                scalar.value, check_runtime, file_type="shell", complete_context=True
+            )
+            exact_source = content[scalar.body_start : scalar.body_end] == scalar.value
+            if diagnostic is not None:
+                return (
+                    diagnostic.shifted(scalar.body_start)
+                    if exact_source
+                    else diagnostic.enclosed(scalar.start, scalar.end)
+                )
+            # Folding and escapes may introduce a finding without raw source
+            # provenance. Keep that transformed form partial until a derived
+            # finding view can carry it through the normal reporting path.
+            mapped_scalar = (
+                isinstance(prepared_analysis, _YamlParserAnalysis)
+                and mapped_source
+                and prepared_analysis.can_emit(scalar)
+            )
+            if (
+                not exact_source
+                and not mapped_scalar
+                and analyze(scalar.value, "<yaml-scalar>", "shell", check_runtime=check_runtime)
+            ):
+                return StaticParserDiagnostic(
+                    ParserCause.UNSUPPORTED_SYNTAX,
+                    ParserCheck.COMMAND_STRING_EFFECTS,
+                    scalar.start,
+                    scalar.end,
+                    ParserUncheckedScope.EXPRESSION,
+                )
+        for start, end in yaml_spans.comments:
+            check_runtime()
+            # Comments can instruct an agent too. Prose punctuation has its
+            # own reading, while runtime-dependent commands remain incomplete.
+            diagnostic = bounded_parse_diagnostic(
+                content[start + 1 : end], check_runtime, file_type="markdown"
+            )
+            if diagnostic is not None:
+                return diagnostic.shifted(start + 1)
+        return None
     if not exhausted or file_type != "markdown" or not complete_context:
         return exhausted
     # A possessive such as "reference's" in prose is punctuation, yet the
@@ -9700,6 +10176,7 @@ def analyze(
         direct_shell_only=_direct_shell_only,
         shell_content=shell_content,
         check_runtime=runtime_check,
+        file_type=file_type,
     ):
         runtime_check()
         variable_match = variable_matches.get((match_start, match_end))
