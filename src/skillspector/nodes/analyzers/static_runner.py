@@ -3076,9 +3076,12 @@ def _scan_all_views_with_parser_diagnostics(
             else:
                 right_boundary_recovery_start = None
             try:
-                full_views = security_text_views(
-                    context_prefix + raw_window,
-                    check_runtime=finding_budget.check_runtime,
+                full_views = tuple(
+                    _window_view_with_markdown_context(full_view, len(context_prefix))
+                    for full_view in security_text_views(
+                        context_prefix + raw_window,
+                        check_runtime=finding_budget.check_runtime,
+                    )
                 )
                 if json_ownership is not None and json_ownership.decoded is not None:
                     full_views += json_ownership.decoded.window_views(
@@ -3095,7 +3098,6 @@ def _scan_all_views_with_parser_diagnostics(
                 )
             across_security_views = len(full_views) > 1
             for full_view in full_views:
-                full_view = _window_view_with_markdown_context(full_view, len(context_prefix))
                 full_view = _with_fixed_right_boundary(
                     full_view,
                     (
