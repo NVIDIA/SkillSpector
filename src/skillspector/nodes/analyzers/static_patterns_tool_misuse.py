@@ -10149,7 +10149,28 @@ def _has_bounded_parse_exhaustion(
         json_strings = validated_json_string_spans(content, check_runtime)
         structural_quote_closers = {end - 1 for _, end in json_strings}
         structural_quote_openers = {start for start, _ in json_strings}
-    if json_strings and (source_view is None or source_view.name == "raw"):
+    proven_decoded_json = (
+        isinstance(prepared_analysis, JSONSourceOwnership)
+        and prepared_analysis.decoded is not None
+        and source_view is not None
+        and prepared_analysis.decoded.owns(source_view, check_runtime)
+    )
+    if (
+        isinstance(prepared_analysis, JSONSourceOwnership)
+        and prepared_analysis.decoded is not None
+        and source_view is not None
+        and source_view.name.startswith("json-decoded-")
+        and not proven_decoded_json
+    ):
+        return StaticParserDiagnostic(
+            ParserCause.UNSUPPORTED_SYNTAX,
+            ParserCheck.JSON_STRING_DECODING,
+            0,
+            len(content),
+            ParserUncheckedScope.EXPRESSION,
+            location_precision="enclosing_expression",
+        )
+    if json_strings and (source_view is None or source_view.name == "raw" or proven_decoded_json):
         # The original finding producer is the authority for source provenance.
         # Both iterators are ordered; retain only one candidate, not a per-file
         # set or repeated scans of every suffix. Finding construction stays raw.
