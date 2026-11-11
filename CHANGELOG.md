@@ -1,5 +1,6 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
+* fix(e1): report outbound uploads made with Ruby (`Net::HTTP.post`, `Net::HTTP::Post.new`, HTTParty/RestClient/Faraday `post`/`put`) and Go (`http.Post`, `http.PostForm`, `client.Post("https://...")`, `http.NewRequest` with POST/PUT/PATCH) HTTP clients as External Transmission; read-only `get` requests are not reported
 * fix(pi): accept scans from symlinked workspace roots while preserving the CLI's checks on symlinks below the workspace. Custom YARA rules loaded with `--yara-rules-dir` cannot use `include`; place each rule directly in the selected directory.
 * fix(coverage): account for successfully inspected linked ZIP containers while retaining member failures and archive limits
 * fix(static): stop Markdown code fence lines from reading as an open quote that merges consecutive shell lines into one marker directive (#868)
