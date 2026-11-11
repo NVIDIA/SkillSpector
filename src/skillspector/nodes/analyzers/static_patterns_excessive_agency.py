@@ -49,7 +49,7 @@ EA1_CODE_PATTERNS = [
     # like wildcard grants. Possessive token bodies avoid repartitioning long
     # near-misses; unquoted nested arrays/objects remain outside this grammar.
     (
-        r"(?<![\w'\"-])(?P<key_quote>['\"]?)(?:tools?|permissions?)(?P=key_quote)[ \t]*:[ \t]*"
+        r"(?<![\w'\"-])(?P<key_quote>['\"]?)(?:tools?|permissions?)(?-i:(?P=key_quote))[ \t]*:[ \t]*"
         r"(?:\[(?:[ \t\r\n]*+(?:\"(?:[^\"\\\r\n]++|\\[^\r\n])*+\""
         r"|'(?:[^'\r\n]++|'')*+'|[^\][{},'\"\r\n]++)[ \t\r\n]*+,)*"
         r"[ \t\r\n]*(?:\"\*\"|'\*')(?=[ \t\r\n]*[,\]])"
@@ -62,7 +62,7 @@ EA1_CODE_PATTERNS = [
     # '*' must be standalone, so markdown lists ("- **Read**", "- *note*")
     # do not collide. Later items are out of scope until seen in practice.
     (
-        r"(?<![\w'\"-])(?P<key_quote>['\"]?)(?:tools?|permissions?)(?P=key_quote)[ \t]*:[ \t]*(?:#[^\r\n]*)?\r?\n"
+        r"(?<![\w'\"-])(?P<key_quote>['\"]?)(?:tools?|permissions?)(?-i:(?P=key_quote))[ \t]*:[ \t]*(?:#[^\r\n]*)?\r?\n"
         r"[ \t]*-[ \t]+['\"]?\*(?![\*\w])['\"]?[ \t]*(?:#[^\r\n]*)?\r?$",
         0.85,
     ),
@@ -456,7 +456,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in EA1_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -477,7 +477,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in EA2_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             if (pattern, confidence) in EA2_PROSE_PATTERNS and (
@@ -527,7 +527,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in EA4_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
