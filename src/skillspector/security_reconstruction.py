@@ -2385,6 +2385,10 @@ def _classify_directive(
         )
         if baseline.active or not baseline.limited:
             return baseline
+        if directive.unsupported and ("\n" in directive.marker or "\r" in directive.marker):
+            # A marker crossing physical lines cannot borrow a later literal's
+            # closing quote to clear its original incomplete interpretation.
+            return baseline
 
     clause_start = _previous_sentence_boundary(
         view.text,

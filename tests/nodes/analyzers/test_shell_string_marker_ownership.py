@@ -72,6 +72,40 @@ def test_shell_quote_ownership_preserves_real_removal_instructions(content):
     assert owned == lexical
 
 
+@pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("line_end", ["\n", "\r\n"])
+def test_multiline_comment_marker_cannot_borrow_later_shell_closers(quote, line_end):
+    content = (
+        f"# cleanup: remove --temporary{quote}\n"
+        + "".join(f"echo {quote}status-{index}{quote}\n" for index in range(1400))
+        + "rm -rf /\n"
+    ).replace("\n", line_end)
+    proof = _closers(content)
+    assert not proof.closes_string(content.index(quote))
+    assert proof.closes_string(content.index(f"status-0{quote}") + len("status-0"))
+    lexical = build_declared_marker_views(SecurityTextView("raw", content))
+    owned = build_declared_marker_views(
+        SecurityTextView("raw", content), validated_string_closer=proof.closes_string
+    )
+    assert lexical.limited
+    assert owned == lexical
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["scripts/check.sh"], "file_cache": {"scripts/check.sh": content}}, [tm]
+    )
+    assert any(
+        event["outcome"] is LedgerOutcome.PARTIAL
+        and event["reason_code"] is LedgerReason.OBFUSCATED_INSTRUCTION_TEXT
+        for event in result["inspection_ledger"]
+    )
+    assert any(
+        finding.rule_id == "TM1"
+        and finding.severity == "HIGH"
+        and finding.file == "scripts/check.sh"
+        and finding.start_line == 1402
+        for finding in result["findings"]
+    )
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("separator", ["", " "])
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
