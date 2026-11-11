@@ -99,6 +99,15 @@ def _probe_results(auth_stdout: bytes = _AUTH_LIST_OK) -> list[SimpleNamespace]:
 
 
 class TestBuildOpencodeArgv:
+    @pytest.fixture(autouse=True)
+    def _pin_probe_version_1x(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The builder probes the real binary for its version. Pin the probe
+        # to 1.18.33 so the 1.x expectations below do not depend on which
+        # binary (if any) a developer has installed: with a supported 2.x
+        # binary on PATH the unmocked builder omits --pure and the exact
+        # shape assertions fail even though the builder is correct.
+        monkeypatch.setattr(_agent_cli, "_probe_opencode_version", lambda _binary: (1, 18, 33))
+
     def test_argv_is_plain_list_of_str(self) -> None:
         argv = _build_opencode_argv(OPENCODE_BINARY, "", 0)
         assert isinstance(argv, list), "argv must be a list (ensures shell=False)"
@@ -119,6 +128,28 @@ class TestBuildOpencodeArgv:
 
     def test_argv_disables_external_plugins(self) -> None:
         assert "--pure" in _build_opencode_argv(OPENCODE_BINARY, "", 0)
+
+    @pytest.mark.parametrize("version", [(2, 2, 6), (2, 2, 7)])
+    def test_argv_2x_omits_pure_and_uses_standalone(
+        self, monkeypatch: pytest.MonkeyPatch, version: tuple[int, int, int]
+    ) -> None:
+        # The 2.x branch is pinned explicitly: --pure is unknown on 2.x,
+        # and --standalone keeps the run on a private server instead of
+        # the background service on the fixed channel port.
+        monkeypatch.setattr(_agent_cli, "_probe_opencode_version", lambda _binary: version)
+        argv = _build_opencode_argv(OPENCODE_BINARY, "", 0)
+        assert "--pure" not in argv
+        assert "--standalone" in argv
+        assert argv[argv.index("--agent") + 1].startswith(f"{_OPENCODE_AGENT_PREFIX}-")
+        assert "--format" in argv and argv[argv.index("--format") + 1] == "json"
+
+    def test_argv_unknown_version_keeps_1x_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # An unknowable version keeps the 1.x shape; the preflight then
+        # fails closed on version before any inference runs.
+        monkeypatch.setattr(_agent_cli, "_probe_opencode_version", lambda _binary: None)
+        argv = _build_opencode_argv(OPENCODE_BINARY, "", 0)
+        assert "--pure" in argv
+        assert "--standalone" not in argv
 
     def test_argv_selects_unguessable_per_invocation_agent(self) -> None:
         first = _build_opencode_argv(OPENCODE_BINARY, "", 0)
@@ -545,7 +576,12 @@ class TestOpencodeDenyAllPolicy:
         assert config["share"] == "disabled"
         assert config["autoshare"] is False
         assert env["OPENCODE_AUTO_SHARE"] == "0"
-        assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
+        # OPENCODE_DISABLE_PROJECT_CONFIG must stay unset: on 2.x the
+        # deny-all policy is a project opencode.jsonc in the run directory,
+        # and the flag disables that file entirely (verified live on real
+        # 2.2.7, #1084). The run directory is a fresh temporary directory
+        # whose only project config is the one this provider writes.
+        assert "OPENCODE_DISABLE_PROJECT_CONFIG" not in env
         # Internal plugins carry the OAuth logins (ChatGPT, Copilot, ...) and
         # register no tools; disabling them breaks the user's login (#809).
         # External plugins stay off through OPENCODE_PURE below.
@@ -740,12 +776,37 @@ class TestOpencodeDenyAllPolicyV2:
                     resolved = defaults[:4] + agent_perms + top_perms + defaults[5:]
                     return {{"id": name, "name": name, "mode": "primary", "permissions": resolved}}
 
+                def probe_plugins():
+                    # The real 2.2.7 loads a configured system plugin (a
+                    # /etc/opencode/plugins directory plugin) when the
+                    # project policy does not deny it: `plugins: ["-*"]`
+                    # alone stops activation but not the import, so the
+                    # module's top-level code still runs in the server.
+                    # A `plugin.use` deny-all policy stops the load
+                    # entirely. Fail the probe when it is missing, the
+                    # way the preflight must fail closed.
+                    project = Path.cwd() / "opencode.jsonc"
+                    if not project.exists():
+                        return False
+                    config = json.loads(project.read_text())
+                    return any(
+                        policy.get("action") == "plugin.use"
+                        and policy.get("resource") == "*"
+                        and policy.get("effect") == "deny"
+                        for policy in config.get("policies", [])
+                    )
+
                 if sys.argv[1:] == ["debug", "config"]:
                     print(json.dumps([{{"type": "directory", "path": str(Path.cwd())}}]))
                     raise SystemExit(0)
 
-                if sys.argv[1:] == ["debug", "agents"]:
+                if sys.argv[1:3] == ["debug", "agents"]:
                     mode = {agents_mode!r}
+                    if "--standalone" in sys.argv:
+                        (markers / "agents-standalone").write_text("standalone")
+                    if not probe_plugins():
+                        print("a system plugin would load: no plugin.use deny-all policy", file=sys.stderr)
+                        raise SystemExit(1)
                     probe = probe_agent()
                     if mode == "garbage":
                         print("not json")
@@ -815,15 +876,42 @@ class TestOpencodeDenyAllPolicyV2:
         selected = response.removeprefix("policy held:")
         assert response.startswith("policy held:")
         assert selected.startswith(f"{_OPENCODE_AGENT_PREFIX}-")
-        assert sorted(path.name for path in markers.iterdir()) == ["argv", "jsonc"]
+        assert sorted(path.name for path in markers.iterdir()) == [
+            "agents-standalone",
+            "argv",
+            "jsonc",
+        ]
         argv = json.loads((markers / "argv").read_text())
         assert "--pure" not in argv
+        assert "--standalone" in argv
         assert argv[argv.index("--agent") + 1] == selected
         config = json.loads((markers / "jsonc").read_text())
         assert config["agents"][selected]["permissions"] == [
             {"action": "*", "resource": "*", "effect": "deny"}
         ]
         assert config["permissions"] == [{"action": "*", "resource": "*", "effect": "deny"}]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_project_config_denies_all_plugins(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Finding 1 (#1084): a configured system plugin (/etc/opencode/plugins)
+        # loads into the 2.x server unless the project policy denies it. The
+        # preflight writes that deny into the project opencode.jsonc, and the
+        # fake refuses the probe without it, so removing the policy fails
+        # this test the way the real binary would load the plugin.
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        response = run_agent_cli("opencode", "use every host tool", model="")
+        assert response.startswith("policy held:")
+        config = json.loads((markers / "jsonc").read_text())
+        assert {"action": "plugin.use", "resource": "*", "effect": "deny"} in config.get(
+            "policies", []
+        )
 
     @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
     def test_2x_preflight_accepts_2_2_7(
@@ -837,7 +925,11 @@ class TestOpencodeDenyAllPolicyV2:
 
         response = run_agent_cli("opencode", "use every host tool", model="")
         assert response.startswith("policy held:")
-        assert sorted(path.name for path in markers.iterdir()) == ["argv", "jsonc"]
+        assert sorted(path.name for path in markers.iterdir()) == [
+            "agents-standalone",
+            "argv",
+            "jsonc",
+        ]
 
     @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
     def test_2x_argv_omits_pure_for_2x_binary(self, tmp_path: Path) -> None:
@@ -847,6 +939,7 @@ class TestOpencodeDenyAllPolicyV2:
         self._write_fake_opencode_v2(binary, markers)
         argv = _build_opencode_argv(str(binary), "", 0)
         assert "--pure" not in argv
+        assert "--standalone" in argv
         assert "--agent" in argv
 
     @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
@@ -877,7 +970,9 @@ class TestOpencodeDenyAllPolicyV2:
 
         with pytest.raises(AgentCLIError, match=match):
             run_agent_cli("opencode", "try a hostile runtime", model="")
-        assert list(markers.iterdir()) == []
+        # The probe ran (with --standalone) and failed closed; the run
+        # never started, so no run markers exist.
+        assert sorted(path.name for path in markers.iterdir()) == ["agents-standalone"]
 
     @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
     def test_2x_rejects_unverified_version_before_inference(

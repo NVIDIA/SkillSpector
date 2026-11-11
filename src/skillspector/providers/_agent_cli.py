@@ -498,18 +498,30 @@ _OPENCODE_SUPPORTED_VERSIONS = frozenset(
 # OpenCode 2.x is a separate verified set, never merged into the 1.x set:
 # its policy delivery and preflight differ completely (see
 # _opencode_config_2x and _parse_opencode_debug_agents). On 2.x,
-# OPENCODE_CONFIG_CONTENT is silently ignored and `debug config` prints
-# only a list of configuration sources, so widening the 1.x set would
-# admit a runtime whose deny-all policy cannot be verified that way.
+# OPENCODE_CONFIG_CONTENT is honoured (a content-defined agent resolves
+# with its permissions, verified live on real 2.2.7) and the project
+# opencode.jsonc is the policy file the preflight verifies through
+# `debug agents`; OPENCODE_DISABLE_PROJECT_CONFIG=1 disables that project
+# file entirely, so the child environment must not set it (verified live:
+# with the flag set, a /etc/opencode/plugins marker plugin loads despite
+# the project policy denying it). Widening the 1.x set would admit a
+# runtime whose deny-all policy cannot be verified that way.
 # Evidence per member (live matrix on 2.2.6 and 2.2.7, #1084): a project
 # opencode.jsonc in the working directory is honoured and the probe agent
 # resolves to the deny-ending permission list recorded in the issue;
-# OPENCODE_CONFIG_CONTENT (1.x and 2.x shapes) is ignored; OPENCODE_PERMISSION
-# does not change resolved agent permissions; OPENCODE_DISABLE_PROJECT_CONFIG=1
-# does not block the project file; `run --pure` is an unknown flag (help text,
-# exit 1) so the 2.x argv omits it; `run --format json` keeps the 1.x event
-# envelope; `auth list --format json` prints [] when unauthenticated. Each
-# widening adds one triple with its own evidence, as for 1.x.
+# OPENCODE_PERMISSION does not change resolved agent permissions;
+# `run --pure` is an unknown flag (help text, exit 1) so the 2.x argv omits
+# it; `run --format json` keeps the 1.x event envelope;
+# `auth list --format json` prints [] when unauthenticated. Plugin
+# isolation (finding 1, live on real 2.2.7 with a marker plugin in
+# /etc/opencode/plugins): the system plugin loads without any project control
+# (its code runs in the server); `policies` denying `plugin.use` for `*` stops
+# the load entirely (no import, no activation), but only when the project file
+# is actually read, so the child environment must not disable it. A
+# `plugins: ["-*"]` remove op was tried and rejected: it only stops activation
+# (the module is still imported first) and it empties `debug agents`, which
+# would fail the preflight closed and make 2.x unadmittable. Each widening
+# adds one triple with its own evidence, as for 1.x.
 _OPENCODE_SUPPORTED_VERSIONS_V2 = frozenset(
     {
         (2, 2, 6),
@@ -565,14 +577,35 @@ def _opencode_config(agent_name: str) -> str:
 def _opencode_config_2x(agent_name: str) -> str:
     """Build the 2.x project policy (``opencode.jsonc``) for one agent identity.
 
-    OpenCode 2.x silently ignores ``OPENCODE_CONFIG_CONTENT`` (#1084), so the
-    deny-all policy is delivered as a project ``opencode.jsonc`` in the
-    per-run temporary directory instead. Both the agent-local ``permissions``
-    list and the top-level ``permissions`` list deny every action; the
-    preflight verifies the resolved list through ``debug agents``. The shape
-    is the one measured live on 2.2.6/2.2.7: a user-level config can append
-    rules after the project file, so the file alone proves nothing and the
+    OpenCode 2.x honours ``OPENCODE_CONFIG_CONTENT`` (verified live on real
+    2.2.7: a content-defined agent resolves), but the deny-all policy is
+    delivered as a project ``opencode.jsonc`` in the per-run temporary
+    directory instead, because that is the file the preflight verifies
+    through ``debug agents``. Both the agent-local ``permissions`` list and
+    the top-level ``permissions`` list deny every action; the preflight
+    verifies the resolved list through ``debug agents``. The shape is the
+    one measured live on 2.2.6/2.2.7: a user-level config can append rules
+    after the project file, so the file alone proves nothing and the
     preflight check on the resolved list stays load-bearing.
+
+    External plugins (``#1084``, finding 1): 2.x drops the 1.x isolation
+    hooks (``OPENCODE_PURE``, ``OPENCODE_TEST_MANAGED_CONFIG_DIR``), and the
+    system directory (``/etc/opencode`` on Linux) is still discovered, so a
+    machine-wide ``/etc/opencode/plugins`` plugin stays eligible to load
+    even with an empty inline ``plugin`` list. The control is a ``policies``
+    deny on ``plugin.use`` for every target: the deny is checked in the
+    plugin loader before the module is imported, so a denied plugin's code
+    never runs, however it was configured. Verified live on real 2.2.7 with
+    a marker plugin in ``/etc/opencode/plugins`` (top-level code writes a
+    marker on import, ``setup`` writes a second marker on activation):
+    with this policy neither marker appears, and the probe agent still
+    resolves. A ``plugins: ["-*"]`` remove op was tried and rejected: it
+    only stops activation (the module is still imported first, so on its
+    own it does not close the boundary), and it empties ``debug agents``
+    entirely, which would fail the preflight closed and make 2.x
+    unadmittable. A system-level policy allow outranks this project deny
+    by design, and a system allow is the machine owner's explicit choice,
+    not something this project file can override.
     """
     deny_all = [{"action": "*", "resource": "*", "effect": "deny"}]
     return json.dumps(
@@ -586,6 +619,9 @@ def _opencode_config_2x(agent_name: str) -> str:
                 }
             },
             "permissions": deny_all,
+            "policies": [
+                {"action": "plugin.use", "resource": "*", "effect": "deny"},
+            ],
         },
         separators=(",", ":"),
     )
@@ -677,9 +713,11 @@ def _prepare_opencode_env(
     The real OpenCode authentication store remains available so this CLI
     provider can use the user's existing login. OpenCode's internal plugins stay
     enabled for the same reason: they implement the OAuth logins (ChatGPT,
-    Copilot, GitLab, ...) and register no tools. External plugins remain off
-    through ``--pure`` / ``OPENCODE_PURE``. All mutable config, cache,
-    state, database, and temporary paths are redirected below the invocation's
+    Copilot, GitLab, ...) and register no tools. External plugins stay off
+    through ``--pure`` / ``OPENCODE_PURE`` on 1.x; on 2.x those hooks are
+    gone, so the project policy denies ``plugin.use`` for every target
+    (see ``_opencode_config_2x``). All mutable config, cache, state,
+    database, and temporary paths are redirected below the invocation's
     already-isolated temporary root.
     """
     env = {key: value for key, value in base_env.items() if not key.upper().startswith("OPENCODE_")}
@@ -714,7 +752,15 @@ def _prepare_opencode_env(
             "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
             "OPENCODE_DISABLE_LSP_DOWNLOAD": "1",
             "OPENCODE_DISABLE_MODELS_FETCH": "1",
-            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+            # No OPENCODE_DISABLE_PROJECT_CONFIG here: on 2.x the deny-all
+            # policy is delivered as a project opencode.jsonc in the run's
+            # temporary directory, and that flag disables the project file
+            # entirely (verified live on real 2.2.7, #1084: with the flag
+            # set, a /etc/opencode/plugins marker plugin loads and
+            # activates despite the project policy denying it). The run
+            # directory is a fresh temporary directory whose only project
+            # config is the one this provider writes, so there is no
+            # scanned-project config for the flag to protect against.
             "OPENCODE_DISABLE_PRUNE": "1",
             "OPENCODE_DISABLE_TERMINAL_TITLE": "1",
             "OPENCODE_ENABLE_EXA": "0",
@@ -840,10 +886,12 @@ def _preflight_opencode_policy(
     config with the exact environment and directory prevents a managed
     ``share: auto`` (or another late source) from silently reopening ambient
     capabilities before the inference process is allowed to start.
-    2.x: ``debug config`` no longer prints resolved config, and
-    ``OPENCODE_CONFIG_CONTENT`` is ignored, so the policy is delivered as
-    a project ``opencode.jsonc`` and verified through ``debug agents``,
-    which prints the resolved per-agent permission list (#1084).
+    2.x: ``debug config`` no longer prints resolved config, so the policy is
+    delivered as a project ``opencode.jsonc`` and verified through
+    ``debug agents``, which prints the resolved per-agent permission list
+    (#1084). ``OPENCODE_CONFIG_CONTENT`` is honoured on 2.x too (verified
+    live on real 2.2.7), so the preflight checks the resolved list the
+    server actually computes, not one file's text.
     """
 
     def run_probe(command: list[str], label: str) -> bytes:
@@ -883,7 +931,14 @@ def _preflight_opencode_policy(
             raise AgentCLIError(
                 f"OpenCode policy preflight could not write the project policy: {exc}"
             ) from exc
-        stdout_raw = run_probe([binary, "debug", "agents"], "agents")
+        # --standalone runs a private server on an OS-assigned port for this
+        # command alone (verified on 2.2.6/2.2.7, #1084): the default service
+        # resolver would start a background service on the fixed channel
+        # port, so an ordinary service already using that port, or two
+        # overlapping scans, makes the isolated service fail to bind and
+        # the preflight fail. The standalone server dies with this command
+        # (its stdin lease closes), so no service is left behind.
+        stdout_raw = run_probe([binary, "debug", "agents", "--standalone"], "agents")
         _parse_opencode_debug_agents(stdout_raw, agent_name)
         return
     version_text = version_raw.decode("utf-8", errors="replace").strip()
@@ -948,11 +1003,23 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
     ``--pure``
         Run without external plugins. 1.x only: ``--pure`` is an unknown
         flag on 2.x (verified on 2.2.6/2.2.7, #1084: it prints the ``run``
-        help text and exits 1), so the 2.x argv omits it and relies on
-        ``OPENCODE_PURE=1`` from the child environment instead. The version
-        is probed here so the flag decision is made before the preflight
+        help text and exits 1), so the 2.x argv omits it; plugin isolation
+        on 2.x comes from the project policy instead (``plugin.use`` deny
+        for every target, see ``_opencode_config_2x``). The version is
+        probed here so the flag decision is made before the preflight
         runs; an unknowable version keeps the 1.x shape and the preflight
         fails closed on version.
+
+    ``--standalone`` (2.x only)
+        Run with a private server instead of the background service. The
+        2.x ``run`` otherwise connects to an already-running service when
+        one exists, or starts one on the fixed channel port; either breaks
+        isolation (an ambient service, or a bind collision with one) and
+        leaves a daemon behind. The standalone server listens on an
+        OS-assigned port and dies with this command, so overlapping scans
+        cannot collide and no service is left behind (verified live on
+        2.2.7, #1084: a service already on the default port fails the
+        managed path, two concurrent standalone calls succeed).
 
     ``--agent skillspector-deny-all-<nonce>``
         Select the unguessable per-invocation agent installed through
@@ -987,10 +1054,12 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
     agent_name = f"{_OPENCODE_AGENT_PREFIX}-{secrets.token_hex(16)}"
     version = _probe_opencode_version(binary)
     pure_arg = [] if version is not None and version[0] == 2 else ["--pure"]
+    standalone_arg = ["--standalone"] if version is not None and version[0] == 2 else []
     return [
         binary,
         "run",
         *pure_arg,
+        *standalone_arg,
         "--agent",
         agent_name,
         "--format",
