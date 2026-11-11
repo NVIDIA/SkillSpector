@@ -372,6 +372,11 @@ def _is_true_constant(node: ast.expr) -> bool:
     return isinstance(node, ast.Constant) and node.value is True
 
 
+# ``subprocess.Popen`` takes ``shell`` as its ninth positional argument
+# (args, bufsize, executable, stdin, stdout, stderr, preexec_fn, close_fds, shell, ...).
+_POPEN_SHELL_ARG_INDEX = 8
+
+
 def _subprocess_shell_mode(node: ast.Call, attr: str) -> bool | None:
     """Return the literal shell mode for *node*, or None when it is dynamic."""
     if attr in {"getoutput", "getstatusoutput"}:
@@ -384,6 +389,17 @@ def _subprocess_shell_mode(node: ast.Call, attr: str) -> bool | None:
         if isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, bool):
             return keyword.value.value
         return None
+    if attr == "Popen":
+        # Only ``Popen`` accepts ``shell`` positionally; the other helpers pass
+        # their arguments through as keywords. Starred unpacking makes the slot
+        # index unknowable, so treat that as caller-controlled input.
+        if any(isinstance(argument, ast.Starred) for argument in node.args):
+            return None
+        if len(node.args) > _POPEN_SHELL_ARG_INDEX:
+            positional = node.args[_POPEN_SHELL_ARG_INDEX]
+            if isinstance(positional, ast.Constant) and isinstance(positional.value, bool):
+                return positional.value
+            return None
     return False
 
 

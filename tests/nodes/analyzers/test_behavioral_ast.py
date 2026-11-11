@@ -379,6 +379,47 @@ class TestSubprocessGuidance:
         assert "effective shell mode is not statically known" in explanation
         assert "unknown caller input" not in explanation.lower()
 
+    @pytest.mark.parametrize(
+        ("command", "shell_argument", "expected"),
+        [
+            pytest.param("['echo', '$HOME']", "True", "shell expansion enabled", id="literal-true"),
+            pytest.param("['ls', '-la']", "False", "fixed argument vector", id="literal-false"),
+            pytest.param(
+                "['ls']",
+                "sys.argv[1]",
+                "effective shell mode is not statically known",
+                id="dynamic",
+            ),
+        ],
+    )
+    def test_popen_positional_shell_argument(self, command, shell_argument, expected):
+        """`Popen` takes `shell` as its ninth positional argument, not only as a keyword."""
+        code = (
+            "import subprocess\n"
+            "import sys\n"
+            "subprocess.Popen("
+            f"{command}, -1, None, None, None, None, None, True, {shell_argument})\n"
+        )
+        finding = next(f for f in _run(code) if f.rule_id == "AST4")
+
+        explanation = (finding.explanation or "").lower()
+
+        assert expected in explanation
+        if shell_argument == "False":
+            assert "shell expansion is disabled" in explanation
+        else:
+            assert "shell expansion is disabled" not in explanation
+
+    def test_popen_starred_arguments_are_treated_as_unknown(self):
+        """`Popen(*args)` hides which positional slot `shell` lands in."""
+        code = "import subprocess\nargs = build_args()\nsubprocess.Popen(*args)\n"
+        finding = next(f for f in _run(code) if f.rule_id == "AST4")
+
+        explanation = (finding.explanation or "").lower()
+
+        assert "not statically known" in explanation
+        assert "shell expansion is disabled" not in explanation
+
     def test_guidance_is_distinct_across_the_three_cases(self):
         fixed = _run('import subprocess\nsubprocess.run(["ls"], shell=False)')
         shell = _run(
