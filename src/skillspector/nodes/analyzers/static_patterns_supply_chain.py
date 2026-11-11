@@ -151,6 +151,28 @@ SC2_CODE_PATTERNS = [
     (r"eval\s*\(\s*(?:await\s+)?fetch\s*\(", 0.9),
     (r"new\s+Function\s*\([^)]*fetch\s*\(", 0.9),
     (r"subprocess\.[^(]+\([^)]*(?:curl|wget)\s+https?://", 0.8),
+    # PowerShell download cradles: fetched text piped to, or wrapped by,
+    # Invoke-Expression / a script block / a PowerShell host.
+    (
+        r"(?:\b(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod|curl|wget)[ \t]|\.DownloadString\s*\()"
+        r"[^|\n]*\|\s*(?:iex|Invoke-Expression)\b",
+        0.9,
+    ),
+    (
+        r"\b(?:iex|Invoke-Expression)\b[^\n;|]*?"
+        r"(?:\.DownloadString\s*\(|\(\s*(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b)",
+        0.9,
+    ),
+    (
+        r"\[scriptblock\]::Create\s*\([^\n;|]*?"
+        r"(?:\.DownloadString\s*\(|\(\s*(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b)",
+        0.9,
+    ),
+    (
+        r"(?:\b(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod|curl|wget)[ \t]|\.DownloadString\s*\()"
+        r"[^|\n]*\|\s*(?:pwsh|powershell)(?:\.exe)?\b",
+        0.9,
+    ),
 ]
 SC2_PROSE_PATTERNS = [
     (r"download\s+and\s+(?:run|execute)\s+(?:the\s+)?script", 0.7),

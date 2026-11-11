@@ -1,5 +1,6 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
+* fix(sc2): report PowerShell download cradles (`IEX (New-Object Net.WebClient).DownloadString(...)`, `irm ... | iex`, `iex (irm ...)`, `[scriptblock]::Create((irm ...))`, and fetches piped to `pwsh`/`powershell`) as External Script Fetching; trusted installer hosts keep the existing LOW downgrade
 * fix(pi): accept scans from symlinked workspace roots while preserving the CLI's checks on symlinks below the workspace. Custom YARA rules loaded with `--yara-rules-dir` cannot use `include`; place each rule directly in the selected directory.
 * fix(coverage): account for successfully inspected linked ZIP containers while retaining member failures and archive limits
 * fix(static): stop Markdown code fence lines from reading as an open quote that merges consecutive shell lines into one marker directive (#868)
