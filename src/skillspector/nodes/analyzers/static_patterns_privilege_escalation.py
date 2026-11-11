@@ -107,7 +107,7 @@ PE2_CODE_PATTERNS = [
     # unmatched `-- ` tokens that made the match exponential.  `[\w=-]*` already
     # absorbs the second dash of a long option, so `-` alone covers both.
     (
-        r"chmod\s+(?:-[\w=-]*[ \t]+)*[\"']?[+=]?0*[2-7][0-7]{3}[\"']?(?![0-9\w])",
+        r"chmod\s+(?>(?:-[\w=-]*[ \t]+)*)[\"']?[+=]?0*[2-7][0-7]{3}[\"']?(?![0-9\w])",
         0.8,
     ),
 ]
@@ -1142,7 +1142,7 @@ def analyze(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in PE1_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = line_number(match.start())
@@ -1164,7 +1164,7 @@ def analyze(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in PE2_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = line_number(match.start())
@@ -1189,7 +1189,7 @@ def analyze(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in PE3_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             if match.group(0).casefold() == "keyring":
@@ -1312,7 +1312,9 @@ def analyze(
     # that match multiple patterns (e.g. DockerClient(base_url=".../docker.sock")).
     pe4_best: dict[int, AnalyzerFinding] = {}
     for pattern, confidence in PE4_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = line_number(match.start())
             context = context_at(match.start())
             finding_tags = list(tag)
@@ -1336,7 +1338,9 @@ def analyze(
     # often matches multiple flags (e.g. --privileged + --cap-add=SYS_ADMIN).
     pe5_best: dict[int, AnalyzerFinding] = {}
     for pattern, confidence in PE5_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = line_number(match.start())
             context = context_at(match.start())
             finding_tags = list(tag)
