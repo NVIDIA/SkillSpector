@@ -1077,7 +1077,7 @@ class TestCrossCutting:
         )
 
     def test_tags_present(self):
-        """Any TP finding has 'ASI02' and 'AML.T0080' in tags."""
+        """Any TP finding has 'ASI02' and 'AML.T0110' (AI Agent Tool Poisoning) in tags."""
         state: dict = {
             "manifest": {
                 "name": "test-skill",
@@ -1092,7 +1092,9 @@ class TestCrossCutting:
         assert len(tp_findings) >= 1, "Expected at least one TP finding"
         for f in tp_findings:
             assert "ASI02" in f.tags, f"Expected 'ASI02' in tags, got: {f.tags}"
-            assert "AML.T0080" in f.tags, f"Expected 'AML.T0080' in tags, got: {f.tags}"
+            assert "AML.T0110" in f.tags, f"Expected 'AML.T0110' in tags, got: {f.tags}"
+            # AML.T0080 is AI Agent Context Poisoning (memory and thread), not tool poisoning.
+            assert "AML.T0080" not in f.tags, f"Unexpected 'AML.T0080' in tags, got: {f.tags}"
 
     def test_fixture_triggers_tp1_tp2_tp3(self):
         """mcp_poisoned_tool fixture triggers TP1, TP2, and TP3 findings."""

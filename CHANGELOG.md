@@ -2,6 +2,7 @@
 ### Features/Bug Fixes
 * fix(deps): bump the locked `langgraph` from 1.2.6 to 1.2.20 (and `langgraph-checkpoint` 4.1.1 to 4.3.1, which it requires) past GHSA-3fx2-cqw9-xr3c; the locked `langgraph-sdk` 0.4.10 was already patched (#1078)
 * fix(pi): accept scans from symlinked workspace roots while preserving the CLI's checks on symlinks below the workspace. Custom YARA rules loaded with `--yara-rules-dir` cannot use `include`; place each rule directly in the selected directory.
+* fix(tp): tag TP1-TP4 findings with MITRE ATLAS AML.T0110 (AI Agent Tool Poisoning) instead of AML.T0080 (AI Agent Context Poisoning)
 * fix(coverage): account for successfully inspected linked ZIP containers while retaining member failures and archive limits
 * fix(supply-chain): resolve npm manifest dependencies within their owning lockfile and workspace installation paths
 * fix(supply-chain): stop npm workspace `link: true` and versionless lockfile slots from borrowing an ancestor install's pinned version
