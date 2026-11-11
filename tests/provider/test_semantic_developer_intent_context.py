@@ -134,6 +134,7 @@ def test_semantic_findings_follow_operations_not_domain_labels(
         base_prompt=ANALYZER_PROMPT.format(manifest_section=_format_manifest(manifest)),
         model=model,
         node=ANALYZER_ID,
+        recovery_rule_ids=("SDI-1", "SDI-2", "SDI-3", "SDI-4"),
     )
     batches = analyzer.get_batches(["review.py"], {"review.py": content})
     outcome = analyzer.run_batches_detailed(batches)
