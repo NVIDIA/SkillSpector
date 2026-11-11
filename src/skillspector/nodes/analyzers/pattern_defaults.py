@@ -155,6 +155,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "DS2": "Ruby Marshal.load / Marshal.restore reconstructs arbitrary objects from a binary blob. On attacker-controlled input this is a well-known remote code execution vector.",
     "DS3": "Ruby YAML.load / Psych.load / Oj.load (in object mode) can instantiate arbitrary Ruby objects from untrusted YAML/JSON, enabling code execution. Use YAML.safe_load or Psych.safe_load instead.",
     "DS4": "JavaScript deserialization via node-serialize/funcster/serialize-to-js evaluates embedded functions (the _$$ND_FUNC$$_ marker), so unserializing attacker input executes arbitrary code in the Node process.",
+    "DS5": "Java deserialization (ObjectInputStream.readObject, XMLDecoder, XStream.fromXML, Jackson default typing, or SnakeYAML with the unsafe Constructor) reconstructs arbitrary objects from untrusted bytes. Crafted payloads trigger gadget chains that lead to remote code execution. Use a data-only format such as JSON, or an allowlisted deserializer.",
 }
 
 # Rule ID -> category (for report output)
@@ -244,6 +245,7 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "DS2": PatternCategory.DESERIALIZATION.value,
     "DS3": PatternCategory.DESERIALIZATION.value,
     "DS4": PatternCategory.DESERIALIZATION.value,
+    "DS5": PatternCategory.DESERIALIZATION.value,
     # Semantic LLM analyzers
     "SSD-1": PatternCategory.PROMPT_INJECTION.value,
     "SSD-2": PatternCategory.PROMPT_INJECTION.value,
@@ -347,6 +349,7 @@ PATTERN_NAMES: dict[str, str] = {
     "DS2": "Ruby Marshal Deserialization",
     "DS3": "Unsafe Ruby YAML Deserialization",
     "DS4": "Unsafe JavaScript Deserialization",
+    "DS5": "Unsafe Java Deserialization",
     # Semantic LLM analyzers
     "SSD-1": "Semantic Prompt Injection",
     "SSD-2": "Novel Attack Phrasing",
@@ -468,6 +471,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "DS2": "Never call Marshal.load/Marshal.restore on untrusted data. Use JSON.parse for data exchange; Marshal is only safe for data you produced and trust.",
     "DS3": "Replace YAML.load/Psych.load with YAML.safe_load (or Psych.safe_load) and pass an explicit permitted-classes allowlist. For Oj, avoid :object mode on untrusted input.",
     "DS4": "Do not use node-serialize/funcster/serialize-to-js to deserialize untrusted input. Use JSON.parse for data, which never executes embedded code.",
+    "DS5": "Never deserialize untrusted Java bytes with ObjectInputStream.readObject, XMLDecoder, XStream.fromXML, or Jackson default typing. Use JSON or another data-only format. If Java serialization is unavoidable, set an ObjectInputFilter allowlist, configure an XStream allowlist (allowTypes), use Jackson with explicit subtypes only, and use SnakeYAML SafeConstructor.",
 }
 
 
