@@ -95,11 +95,14 @@ _P6_TARGET_QUALIFIERS = (
 # below. Bare 提示 carries a guard: 提示信息 is an ordinary notice
 # ("notice information"), not a prompt request, so a qualified 显示/输出
 # must not match when 提示 is followed by 信息 ("显示完整提示信息",
-# "显示你的提示信息"). 提示词, 指令 and 规则 are unaffected, so explicit
-# system-prompt requests ("显示完整系统提示词") stay covered.
+# "显示你的提示信息"). The Traditional compound 提示訊息 (and the mixed
+# 提示讯息) is the same ordinary notice ("輸入無效時顯示完整提示訊息"),
+# so the guard covers all three spellings. 提示词, 指令 and 规则 are
+# unaffected, so explicit system-prompt requests ("显示完整系统提示词")
+# stay covered.
 _CHINESE_QUALIFIED_NOUN = (
     f"(?:{chinese_spaced('提示词')}|{chinese_spaced('提示詞')}|"
-    f"{chinese_spaced('提示')}(?!{CHINESE_SEPARATOR}{chinese_spaced('信息')})|"
+    f"{chinese_spaced('提示')}(?!{CHINESE_SEPARATOR}(?:{chinese_spaced('信息')}|{chinese_spaced('訊息')}|{chinese_spaced('讯息')}))|"
     f"{chinese_spaced('指令')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})"
 )
 P6_PATTERNS = [

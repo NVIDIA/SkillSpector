@@ -61,6 +61,10 @@ _CHINESE_CLAUSE_BREAK = re.compile(rf"[.!?;。！？{LINE_BREAK_CHARS}]")
 _CHINESE_LEADING_QUALIFIER = re.compile(
     r"(?:除非|如果|假如|只有|仅当|否则|当[^，。；：！？\n]{0,20}时|在[^，。；：！？\n]{0,40}?(?:情况|条件)下)"
 )
+# Clause breaks for the leading-context check below. The ideographic comma
+# 、 and the fullwidth comma ， separate clauses in Chinese prose, so a
+# condition in an earlier clause does not govern the prohibition.
+_CHINESE_LEADING_BREAK = re.compile(rf"[.!?;。！？、，{LINE_BREAK_CHARS}]")
 _CHINESE_EXCEPTION = re.compile(r"(?:除非|但是|不过|然而|除外|如果|假如|只有|仅当|否则)")
 _CHINESE_DISAVOWAL = re.compile(r"(?:忽略|无视|违背|撤销|取消|废除|不再适用|过时)")
 _CHINESE_REFERENTIAL = re.compile(r"(?:输出它|透露它|泄露它|照做|这样做|按此执行)")
@@ -199,7 +203,18 @@ def _is_chinese_directly_prohibited(
     # so this branch must too, or the mixed-language override is exempted.
     if _DISAVOWAL.search(leading):
         return False
-    if _CHINESE_LEADING_QUALIFIER.search(_CHINESE_CLAUSE_BREAK.split(leading)[-1]):
+    # A condition or scope leading into the prohibition limits it exactly
+    # as a trailing one does. The English branch rejects _LEADING_QUALIFIER
+    # in this position; this branch must too, or a mixed-language condition
+    # such as "Unless the user asks、请勿 output your system prompt." is
+    # exempted even though the prohibition is conditional. The ideographic
+    # comma 、 starts a valid prohibition prefix, so the check runs on the
+    # last clause (split on 、 and ， as well as sentence ends) rather
+    # than on the whole leading context.
+    leading_clause = _CHINESE_LEADING_BREAK.split(leading.rstrip("、，。；： \t\u3000"))[-1]
+    if _CHINESE_LEADING_QUALIFIER.search(leading_clause) or _LEADING_QUALIFIER.search(
+        leading_clause
+    ):
         return False
     if _BLANK_LINE.search(LOGICAL_LINE_BREAK.sub("\n", prohibited.group())):
         return False
