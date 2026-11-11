@@ -44,9 +44,28 @@ logger = get_logger(__name__)
 ANALYZER_ID = "static_patterns_excessive_agency"
 
 # EA1: Unrestricted Tool Access
-# Configuration syntax can span blank lines; prose instructions cannot.
 EA1_CODE_PATTERNS = [
-    (r"(?:tools?|permissions?)\s*:[ \t]*\[?[ \t]*['\"]?\*(?!\*|\w)['\"]?[ \t]*\]?", 0.85),
+    # Consume complete scalar elements so quoted tool arguments cannot look
+    # like wildcard grants. Possessive token bodies avoid repartitioning long
+    # near-misses; unquoted nested arrays/objects remain outside this grammar.
+    (
+        r"(?<![\w'\"-])(?P<key_quote>['\"]?)(?:tools?|permissions?)(?P=key_quote)[ \t]*:[ \t]*"
+        r"(?:\[(?:[ \t\r\n]*+(?:\"(?:[^\"\\\r\n]++|\\[^\r\n])*+\""
+        r"|'(?:[^'\r\n]++|'')*+'|[^\][{},'\"\r\n]++)[ \t\r\n]*+,)*"
+        r"[ \t\r\n]*(?:\"\*\"|'\*')(?=[ \t\r\n]*[,\]])"
+        r"|(?:\"\*\"|'\*')(?=[ \t]*(?:[,}#]|\r?$))"
+        r"|\[?[ \t]*\*(?![\*\w])[ \t]*\]?[ \t]*(?:#[^\r\n]*)?\r?$)",
+        0.85,
+    ),
+    # YAML block list whose first item is the wildcard (#445). Bounded to a
+    # single newline — a blank line still breaks the match — and the item's
+    # '*' must be standalone, so markdown lists ("- **Read**", "- *note*")
+    # do not collide. Later items are out of scope until seen in practice.
+    (
+        r"(?<![\w'\"-])(?P<key_quote>['\"]?)(?:tools?|permissions?)(?P=key_quote)[ \t]*:[ \t]*(?:#[^\r\n]*)?\r?\n"
+        r"[ \t]*-[ \t]+['\"]?\*(?![\*\w])['\"]?[ \t]*(?:#[^\r\n]*)?\r?$",
+        0.85,
+    ),
     (r"tools?\s*:\s*\[\s*['\"]shell['\"].*?['\"](?:file_write|network|http)['\"]", 0.7),
 ]
 EA1_PROSE_PATTERNS = [
@@ -437,7 +456,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in EA1_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -458,7 +477,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in EA2_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             if (pattern, confidence) in EA2_PROSE_PATTERNS and (
@@ -508,7 +527,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in EA4_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())

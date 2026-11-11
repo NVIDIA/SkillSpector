@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import errno
 import os
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -44,6 +45,44 @@ def require_secure_file_output() -> None:
             "Redirect stdout to a new file outside the scan target, and replace "
             "an existing report only after the command succeeds."
         )
+
+
+def restrict_temporary_access(descriptor: int, *, output_kind: str) -> None:
+    """Remove inherited access before a temporary file receives output data."""
+    if os.name == "posix":
+        # Also masks named-user/group ACL grants on POSIX ACL implementations.
+        os.fchmod(descriptor, 0o600)
+    if sys.platform != "darwin":
+        return
+
+    # macOS extended ACL grants are independent of permission bits. Use the
+    # already-open descriptor so clearing them cannot follow a swapped path.
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        init_acl = libc.acl_init
+        set_acl = libc.acl_set_fd_np
+        free_acl = libc.acl_free
+    except AttributeError:
+        # Filesystems/platforms without extended ACL support need only mode bits.
+        return
+    init_acl.argtypes = [ctypes.c_int]
+    init_acl.restype = ctypes.c_void_p
+    set_acl.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    set_acl.restype = ctypes.c_int
+    free_acl.argtypes = [ctypes.c_void_p]
+    free_acl.restype = ctypes.c_int
+    empty_acl = init_acl(0)
+    if not empty_acl:
+        raise OSError(ctypes.get_errno(), f"Could not initialize {output_kind} ACL")
+    try:
+        if set_acl(descriptor, empty_acl, 0x100) != 0:  # ACL_TYPE_EXTENDED
+            error = ctypes.get_errno()
+            if error not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+                raise OSError(error, f"Could not clear inherited {output_kind} ACLs")
+    finally:
+        free_acl(empty_acl)
 
 
 @contextmanager
@@ -118,6 +157,7 @@ def write_text_no_follow(path: str | Path, text: str) -> None:
                 )
                 temporary_name = candidate
                 with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    restrict_temporary_access(stream.fileno(), output_kind="report")
                     stream.write(text)
                 os.replace(
                     temporary_name,

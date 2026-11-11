@@ -107,7 +107,7 @@ PE2_CODE_PATTERNS = [
     # unmatched `-- ` tokens that made the match exponential.  `[\w=-]*` already
     # absorbs the second dash of a long option, so `-` alone covers both.
     (
-        r"chmod\s+(?:-[\w=-]*[ \t]+)*[\"']?[+=]?0*[2-7][0-7]{3}[\"']?(?![0-9\w])",
+        r"chmod\s+(?>(?:-[\w=-]*[ \t]+)*)[\"']?[+=]?0*[2-7][0-7]{3}[\"']?(?![0-9\w])",
         0.8,
     ),
 ]
@@ -224,6 +224,27 @@ _PE3_CREDENTIAL_TYPE_FIELD = re.compile(
 )
 _PE3_CREDENTIAL_TYPE_NOUN = re.compile(
     r"access[ \t]+(?:credentials?|secrets?|tokens?)", re.IGNORECASE
+)
+_PE3_CREDENTIAL_TYPE_NON_ACTION_COMPOUND = re.compile(
+    r"(?<![\w-])(?:read-(?:only|write)|open-(?:source|access)|app[ \t]+store)(?![\w-])",
+    re.IGNORECASE,
+)
+# A field can contain instructions as well as labels. The OAuth action guard
+# below only binds reads to token nouns; disclosures also name credentials and
+# secrets. Check these actions anywhere in the already bounded field value.
+_PE3_CREDENTIAL_TYPE_ACTION = re.compile(
+    r"\b(?:"
+    r"read(?:s|ing)?|open(?:s|ed|ing)?|load(?:s|ed|ing)?|"
+    r"fetch(?:es|ed|ing)?|get(?:s|ting)?|got|grab(?:s|bed|bing)?|"
+    r"retriev(?:e|es|ed|ing)|obtain(?:s|ed|ing)?|collect(?:s|ed|ing)?|"
+    r"stor(?:e|es|ed|ing)|sav(?:e|es|ed|ing)|export(?:s|ed|ing)?|"
+    r"persist(?:s|ed|ing)?|cach(?:e|es|ed|ing)|retain(?:s|ed|ing)?|"
+    r"keep(?:s|ing)?|kept|past(?:e|es|ed|ing)|submit(?:s|ted|ting)?|"
+    r"attach(?:es|ed|ing)?|relay(?:s|ed|ing)?|deliver(?:s|ed|ing)?|"
+    r"put(?:s|ting)?|pass(?:es|ed|ing)?|enter(?:s|ed|ing)?|"
+    r"insert(?:s|ed|ing)?|post(?:s|ed|ing)?|writ(?:e|es|ing|ten)|wrote|"
+    r"shar(?:e|es|ed|ing)|expos(?:e|es|ed|ing)|includ(?:e|es|ed|ing)|stole(?:n)?)\b",
+    re.IGNORECASE,
 )
 _PE3_SAFE_ACCESS_TOKEN_NAVIGATION = re.compile(
     r"(?:^|>|\b(?:navigate|go)\s+to\s+)\s*settings\s*>\s*(?:ci/cd\s*>\s*)?"
@@ -808,8 +829,15 @@ def _is_credential_type_disclosure_label(
     if not field.start("value") <= match.start() < match.end() <= field.end("value"):
         return False
     value = field.group("value")
+    # Exact adjective compounds and the app store noun are not action verbs.
+    # Same-length spaces retain every other action and sensitive source.
+    actions = _PE3_CREDENTIAL_TYPE_NON_ACTION_COMPOUND.sub(
+        lambda item: " " * len(item.group(0)), value
+    )
     return not (
-        _PE3_TOKEN_ACTION_CONTEXT.search(value) or _PE3_TOKEN_SENSITIVE_SOURCE.search(value)
+        _PE3_CREDENTIAL_TYPE_ACTION.search(actions)
+        or _PE3_TOKEN_ACTION_CONTEXT.search(actions)
+        or _PE3_TOKEN_SENSITIVE_SOURCE.search(actions)
     )
 
 
@@ -1114,7 +1142,7 @@ def analyze(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in PE1_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = line_number(match.start())
@@ -1136,7 +1164,7 @@ def analyze(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in PE2_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = line_number(match.start())
@@ -1161,7 +1189,7 @@ def analyze(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in PE3_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             if match.group(0).casefold() == "keyring":
@@ -1284,7 +1312,9 @@ def analyze(
     # that match multiple patterns (e.g. DockerClient(base_url=".../docker.sock")).
     pe4_best: dict[int, AnalyzerFinding] = {}
     for pattern, confidence in PE4_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = line_number(match.start())
             context = context_at(match.start())
             finding_tags = list(tag)
@@ -1308,7 +1338,9 @@ def analyze(
     # often matches multiple flags (e.g. --privileged + --cap-add=SYS_ADMIN).
     pe5_best: dict[int, AnalyzerFinding] = {}
     for pattern, confidence in PE5_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = line_number(match.start())
             context = context_at(match.start())
             finding_tags = list(tag)
