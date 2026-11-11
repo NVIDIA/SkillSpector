@@ -1188,8 +1188,7 @@ _TP4_CLAUSE_SPLIT_PATTERN = re.compile(
     r"\s*[.!?]+\s+|\s*;\s*|\s+but\s+|\s+however\s+|\s+although\s+|\s+though\s+|\s+while\s+|\s+whereas\s+"
 )
 
-_TP4_AFFIRMATIVE_VERB_PATTERN = re.compile(
-    r"\b(?:"
+_TP4_AFFIRMATIVE_VERB_ALTERNATION = (
     r"access|archive|authenticate|backup|browse|call|collect|compress|"
     r"connect|cop(?:y|ies|ied|ying)|crawl|create|decrypt|delete|download|"
     r"encode|encrypt|enumerate|execute|export|exfiltrate|extract|fetch|"
@@ -1199,7 +1198,46 @@ _TP4_AFFIRMATIVE_VERB_PATTERN = re.compile(
     r"record|remove|render|request|respond|restore|retrieve|run|save|"
     r"scan|scrape|search|send|share|sign|spawn|store|submit|subscribe|"
     r"sync|track|transmit|type|update|upload|validate|verify|write|click"
-    r")(?:s|es|ed|ing|d|ning)?\b"
+)
+
+_TP4_AFFIRMATIVE_VERB_PATTERN = re.compile(
+    rf"\b(?:{_TP4_AFFIRMATIVE_VERB_ALTERNATION})(?:s|es|ed|ing|d|ning)?\b"
+)
+
+# A subject-first affirmative clause after a comma ("the code sends
+# credentials in plaintext", "it uploads files"): a determiner or pronoun
+# subject, at most three words of subject noun phrase, then a capability
+# verb with an object after it. A bare noun phrase ("file writes, or remote
+# uploads") has no determiner and its verb is followed by a comma or "or",
+# so a missing-capability list does not match. The object requirement is
+# what separates "the code sends credentials" from a list item such as
+# "the file writes, ...", whose verb has no object.
+_TP4_SUBJECT_FIRST_AFFIRMATIVE_PATTERN = re.compile(
+    rf"^(?:(?:it|they|he|she|this|that)\s+|(?:the|this|that|its|their)\s+"
+    rf"[a-z][a-z\-]*(?:\s+[a-z][a-z\-]*){{0,2}}\s+)"
+    rf"(?:{_TP4_AFFIRMATIVE_VERB_ALTERNATION})(?:s|es|ed|ing|d|ning)?\s+"
+    rf"(?!or\b|and\b)[a-z]"
+)
+
+# A noun-first absence statement ("Search functionality is missing",
+# "Network access is not implemented"): the capability word is the subject
+# noun, not an affirmative verb, so the verb pattern must not read it as
+# behavior. The subject is a single short noun phrase (an optional
+# determiner plus up to three words): a longer subject can hide a finite
+# verb with an object ("The code sends credentials and search is missing"),
+# so it stays with the verb check. Deliberately no "and"-joined subjects:
+# "Search functionality and network access are missing" does not match and
+# stays detection-side, which is the safe direction (an emitted TP4 for a
+# pure absence) versus dropping a real affirmative finding. An optional
+# bounded prepositional tail ("in the workflow") is allowed; anything
+# longer or verb-bearing falls through to the verb check.
+_TP4_NOUN_FIRST_ABSENCE_PATTERN = re.compile(
+    r"^(?:the\s+)?"
+    r"[a-z][a-z\-]*(?:\s+[a-z][a-z\-]*){0,2}"
+    r"\s+(?:is|are|was|were)\s+"
+    r"(?:missing|not\s+implement\w*)"
+    r"(?:\s+(?:in|from|for|of|within)\s+(?:the\s+)?[a-z][a-z\-]*(?:\s+[a-z][a-z\-]*){0,2})?"
+    r"(?:[.!?]+\s*)?$"
 )
 
 
@@ -1213,12 +1251,13 @@ def _tp4_strip_leading_absence_modifier(clause: str) -> str:
     "No evidence of querying, storing videos" keeps its marker because the
     verb sits inside the leading phrase. The text after the comma must also
     read as a main clause, not as a continuation of the missing-capability
-    list: the phrase is dropped when it is a "without" modifier, or when
-    the remainder opens with a capability verb ("No support for TLS, sends
-    credentials in plaintext"). A list such as "No evidence of network
-    activity, file writes, or remote uploads" keeps its negation because
-    the remainder opens with a noun, so the whole entry still describes
-    absent behavior.
+    list: the phrase is dropped when it is a "without" modifier, when the
+    remainder opens with a capability verb ("No support for TLS, sends
+    credentials in plaintext"), or when it opens with a subject-first
+    affirmative clause ("No support for TLS, the code sends credentials in
+    plaintext"). A list such as "No evidence of network activity, file
+    writes, or remote uploads" keeps its negation because the remainder
+    opens with a noun, so the whole entry still describes absent behavior.
     """
     marker_end = None
     for pattern in _TP4_ABSENCE_PATTERNS:
@@ -1236,7 +1275,10 @@ def _tp4_strip_leading_absence_modifier(clause: str) -> str:
     remainder = clause[comma + 1 :].strip()
     is_without_modifier = clause.casefold().startswith("without ")
     remainder_opens_with_verb = _TP4_AFFIRMATIVE_VERB_PATTERN.match(remainder) is not None
-    if not (is_without_modifier or remainder_opens_with_verb):
+    remainder_is_subject_first_clause = (
+        _TP4_SUBJECT_FIRST_AFFIRMATIVE_PATTERN.match(remainder) is not None
+    )
+    if not (is_without_modifier or remainder_opens_with_verb or remainder_is_subject_first_clause):
         return clause
     return remainder
 
@@ -1260,7 +1302,12 @@ def _tp4_mismatched_item_is_absence(item: str) -> bool:
     main clause and does not govern the verbs after the comma, while a
     comma-separated list of missing capabilities ("No evidence of network
     activity, file writes, or remote uploads") stays under its leading
-    negation.
+    negation. A subject-first affirmative clause after the comma ("No support
+    for TLS, the code sends credentials in plaintext") is a separate main
+    clause, not a list item, so the leading phrase is dropped for it. A
+    noun-first absence statement ("Search functionality is missing",
+    "Network access is not implemented") is an absence too: its capability
+    word is the subject noun, not an affirmative verb.
     """
     normalized = " ".join(item.strip().casefold().split())
     if not normalized:
@@ -1270,6 +1317,8 @@ def _tp4_mismatched_item_is_absence(item: str) -> bool:
     for clause in _TP4_CLAUSE_SPLIT_PATTERN.split(normalized):
         clause = _tp4_strip_leading_absence_modifier(clause.strip())
         if not clause:
+            continue
+        if _TP4_NOUN_FIRST_ABSENCE_PATTERN.match(clause) is not None:
             continue
         marker_positions = [
             match.start() for pattern in _TP4_ABSENCE_PATTERNS for match in pattern.finditer(clause)

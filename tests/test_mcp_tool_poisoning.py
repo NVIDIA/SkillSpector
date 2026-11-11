@@ -1296,6 +1296,50 @@ class TestTP4FindingIssue1066:
 
         assert finding is not None
 
+    def test_subject_first_affirmative_after_comma_emitted(self):
+        # Reviewer case (yashrajp22, 2026-11-11): the comma-separated
+        # remainder is a subject-first affirmative clause, not a
+        # missing-capability list item.
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(
+                0.9,
+                ["No support for TLS, the code sends credentials in plaintext"],
+            ),
+            batch,
+            "A local text utility",
+        )
+
+        assert finding is not None
+
+    def test_noun_first_absence_only_suppressed(self):
+        # Reviewer cases (yashrajp22, 2026-11-11): noun-first absence
+        # statements describe omitted workflow steps, not behavior.
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        for item in (
+            "Search functionality is missing",
+            "Network access is not implemented",
+        ):
+            finding = mcp_tool_poisoning._tp4_finding(
+                self._result(0.9, [item]),
+                batch,
+                "A local text utility",
+            )
+
+            assert finding is None
+
     def test_affirmative_capability_containing_without_emitted(self):
         batch = mcp_tool_poisoning.Batch(
             file_path="scripts/tool.py",
@@ -1411,6 +1455,27 @@ class TestTP4FindingIssue1066:
                 True,
             ),
             ("No support for TLS, sends credentials in plaintext", False),
+            # Reviewer cases (yashrajp22, 2026-11-11): a subject-first
+            # affirmative clause after the comma is a separate main clause,
+            # not a list item, so the leading absence phrase must not
+            # govern its verb.
+            ("No support for TLS, the code sends credentials in plaintext", False),
+            ("No support for TLS, the tool uploads files to a remote server", False),
+            ("No support for TLS, it sends credentials in plaintext", False),
+            # Reviewer cases (yashrajp22, 2026-11-11): noun-first absence
+            # statements. "search" and "access" are subject nouns here, not
+            # affirmative verbs.
+            ("Search functionality is missing", True),
+            ("Network access is not implemented", True),
+            ("Search functionality is missing from the workflow", True),
+            # Affirmative controls for the noun-first shape: a hidden finite
+            # verb in a long subject, and an affirmative clause joined to
+            # the absence statement, both stay affirmative.
+            ("The code sends credentials and search is missing", False),
+            (
+                "Network access is not implemented, the code sends credentials in plaintext",
+                False,
+            ),
         ],
     )
     def test_absence_phrasing_detection(self, item: str, expected: bool):
