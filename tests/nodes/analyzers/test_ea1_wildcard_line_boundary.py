@@ -376,3 +376,43 @@ def test_multiline_flow_list_wildcards_keep_the_key_location(
 def test_multiline_flow_lists_do_not_borrow_unrelated_wildcards(content: str) -> None:
     findings = ea_module.analyze(content, "config.yaml", "yaml")
     assert not any(finding.rule_id == "EA1" for finding in findings)
+
+
+@pytest.mark.parametrize("key", ["tools", "permissions"])
+@pytest.mark.parametrize("quote", ["", "'", '"'])
+@pytest.mark.parametrize("value", ['"*"', '["search",\n  "*"\n]', '\n  - "*"'])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_unicode_context_keeps_exact_quoted_key_wildcard_grants(
+    key: str, quote: str, value: str, newline: str
+) -> None:
+    from skillspector.inspection_ledger import LedgerReason
+
+    content = f"# Café 工具\n{quote}{key}{quote}: {value}\n".replace("\n", newline)
+    findings = ea_module.analyze(content, "config.yaml", "yaml")
+    assert [finding.location.start_line for finding in findings if finding.rule_id == "EA1"] == [2]
+    result = ea_module.static_runner.run_static_patterns_with_ledger(
+        {"components": ["config.yaml"], "file_cache": {"config.yaml": content}}, [ea_module]
+    )
+    assert any(
+        finding.rule_id == "EA1" and finding.start_line == 2 for finding in result["findings"]
+    )
+    assert all(
+        event.get("reason_code") is not LedgerReason.RULES_UNAVAILABLE
+        for event in result["inspection_ledger"]
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '"tools\': ["*"]\n',
+        '\'permissions": ["*"]\n',
+        "tools: [\"grep --include='*'\"]\n",
+        'tools: [{"name": "grep", "pattern": "*"}]\n',
+        'tools:\n\n  - "*"\n',
+    ],
+)
+def test_unicode_context_does_not_promote_unowned_wildcards(value: str) -> None:
+    content = "# Café 工具\n" + value
+    findings = ea_module.analyze(content, "config.yaml", "yaml")
+    assert not any(finding.rule_id == "EA1" for finding in findings)

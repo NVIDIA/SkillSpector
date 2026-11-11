@@ -49,7 +49,7 @@ EA1_CODE_PATTERNS = [
     # like wildcard grants. Possessive token bodies avoid repartitioning long
     # near-misses; unquoted nested arrays/objects remain outside this grammar.
     (
-        r"(?<![\w'\"-])(?P<key_quote>['\"]?)(?:tools?|permissions?)(?P=key_quote)[ \t]*:[ \t]*"
+        r"(?<![\w'\"-])(?P<key_quote>['\"]?)(?:tools?|permissions?)(?-i:(?P=key_quote))[ \t]*:[ \t]*"
         r"(?:\[(?:[ \t\r\n]*+(?:\"(?:[^\"\\\r\n]++|\\[^\r\n])*+\""
         r"|'(?:[^'\r\n]++|'')*+'|[^\][{},'\"\r\n]++)[ \t\r\n]*+,)*"
         r"[ \t\r\n]*(?:\"\*\"|'\*')(?=[ \t\r\n]*[,\]])"
@@ -62,7 +62,7 @@ EA1_CODE_PATTERNS = [
     # '*' must be standalone, so markdown lists ("- **Read**", "- *note*")
     # do not collide. Later items are out of scope until seen in practice.
     (
-        r"(?<![\w'\"-])(?P<key_quote>['\"]?)(?:tools?|permissions?)(?P=key_quote)[ \t]*:[ \t]*(?:#[^\r\n]*)?\r?\n"
+        r"(?<![\w'\"-])(?P<key_quote>['\"]?)(?:tools?|permissions?)(?-i:(?P=key_quote))[ \t]*:[ \t]*(?:#[^\r\n]*)?\r?\n"
         r"[ \t]*-[ \t]+['\"]?\*(?![\*\w])['\"]?[ \t]*(?:#[^\r\n]*)?\r?$",
         0.85,
     ),
