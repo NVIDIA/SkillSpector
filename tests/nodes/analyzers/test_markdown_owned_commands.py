@@ -10,6 +10,7 @@ import json
 import pytest
 
 from skillspector.inspection_ledger import LedgerOutcome, ParserCause, ParserCheck
+from skillspector.models import compute_match_fingerprint
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.nodes.analyzers import static_runner
 
@@ -1178,10 +1179,18 @@ def test_nested_shell_option_consumers_keep_exact_raw_continuations(
     command = head + escape + "\n " + tail
     source = "# 比較\n\n````markdown\n```" + language + "\n" + command + "\n```\n````\n"
     expected = command[: command.index(option) + len(option)]
+    start = source.index(command)
+    assert source[start : start + len(expected)] == expected
     findings = [
         finding
         for finding in tm.analyze(source, "guide.md", "markdown")
-        if finding.rule_id == "TM1" and finding.complete_match == expected
+        if finding.rule_id == "TM1"
+        and finding.severity == "HIGH"
+        and finding.matched_text == expected
+        and finding.match_fingerprint == compute_match_fingerprint("TM1", expected)
+        and finding.location.file == "guide.md"
+        and finding.location.start_line == 5
+        and finding.evidence[static_runner._VIEW_START_EVIDENCE] == start
     ]
     assert findings
     assert all(finding.location.start_line == 5 for finding in findings)
@@ -1191,8 +1200,16 @@ def test_nested_shell_option_consumers_keep_exact_raw_continuations(
 def test_nested_native_option_consumer_preserves_a_quoted_pipe(language: str) -> None:
     command = "curl --url 'https://example.invalid/a|b' --insecure"
     source = "````markdown\n```" + language + "\n" + command + "\n```\n````\n"
+    start = source.index(command)
+    assert source[start : start + len(command)] == command
     assert any(
-        finding.rule_id == "TM1" and finding.complete_match == command
+        finding.rule_id == "TM1"
+        and finding.severity == "HIGH"
+        and finding.matched_text == command
+        and finding.match_fingerprint == compute_match_fingerprint("TM1", command)
+        and finding.location.file == "guide.md"
+        and finding.location.start_line == 3
+        and finding.evidence[static_runner._VIEW_START_EVIDENCE] == start
         for finding in tm.analyze(source, "guide.md", "markdown")
     )
 
@@ -1226,12 +1243,18 @@ def test_nested_example_preserves_inner_runtime_and_raw_high_source_coordinates(
         < diagnostic.end
         <= source.index("`.\n", source.index("sh -c"))
     )
+    expected = "rm -rf /"
+    start = source.index(expected)
+    assert source[start : start + len(expected)] == expected
     findings = tm.analyze(source, "guide.md", "markdown")
     assert any(
         finding.rule_id == "TM1"
         and finding.severity == "HIGH"
+        and finding.location.file == "guide.md"
         and finding.location.start_line == 9
-        and finding.complete_match == "rm -rf /"
+        and finding.matched_text == expected
+        and finding.match_fingerprint == compute_match_fingerprint("TM1", expected)
+        and finding.evidence[static_runner._VIEW_START_EVIDENCE] == start
         for finding in findings
     )
 
