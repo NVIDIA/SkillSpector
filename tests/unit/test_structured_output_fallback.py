@@ -22,7 +22,11 @@ from openai import BadRequestError, RateLimitError
 from pydantic import BaseModel
 
 from skillspector.inspection_ledger import LedgerReason
-from skillspector.llm_analyzer_base import llm_call_record_for_outcome
+from skillspector.llm_analyzer_base import (
+    BatchExecutionResult,
+    BatchFailure,
+    llm_call_record_for_outcome,
+)
 from skillspector.llm_utils import (
     bind_structured_output_fallback,
     is_structured_output_rejection,
@@ -115,6 +119,8 @@ def deepseek_like_endpoint(monkeypatch):
             choice = body.get("tool_choice")
             mode = behavior["mode"]
             if fmt.get("type") == "json_schema":
+                if behavior.get("expire_deadline_on_rejection"):
+                    behavior["remaining"] = 0.0
                 self._send_error(400, "This response_format type is unavailable now")
                 return
             if isinstance(choice, dict):
@@ -319,3 +325,150 @@ def test_full_scanner_graph_reports_llm_unavailable_when_fallback_exhausted(
     assert metadata["llm_degraded"] is True
     assert "structured output rejected by provider" in metadata["llm_error"]
     assert report["risk_assessment"]["recommendation"] == "CAUTION"
+
+
+@pytest.mark.asyncio
+async def test_async_two_simultaneous_rejections_both_recover(deepseek_like_endpoint):
+    """Two batches rejected at the same time must each retry with tool calling.
+
+    The shared fallback flag only guides future bindings. A batch whose
+    initial request is still in flight when a sibling batch flips the flag
+    must not be classified as already having tried the fallback.
+    """
+    requests, _behavior = deepseek_like_endpoint
+    analyzer = tp._TP4Analyzer(model=_MODEL, timeout=30.0)
+    batches = [
+        tp.Batch(file_path="one.py", content="Assess the declared formatting behavior."),
+        tp.Batch(file_path="two.py", content="Assess the declared formatting behavior."),
+    ]
+    outcome = await analyzer.arun_batches_detailed(batches, max_concurrency=2)
+    assert len(outcome.successful) == 2
+    assert not outcome.failures
+    assert len(requests) == 4
+    initial = [request for request in requests if request.get("response_format")]
+    assert len(initial) == 2
+    assert all(request["response_format"]["type"] == "json_schema" for request in initial)
+    retries = [request for request in requests if "response_format" not in request]
+    assert len(retries) == 2
+    assert all("tool_choice" not in request for request in retries)
+
+
+def test_mixed_outcome_record_keeps_coverage_failure(deepseek_like_endpoint):
+    """A successful or recovered batch keeps the unavailable error away."""
+    _requests, _behavior = deepseek_like_endpoint
+    ok_batch = tp.Batch(file_path="ok.py", content="Assess the declared formatting behavior.")
+    bad_batch = tp.Batch(file_path="bad.py", content="Assess the declared formatting behavior.")
+    rejection = BatchFailure(
+        bad_batch,
+        "LLMStructuredOutputUnavailableError",
+        LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED,
+    )
+    mixed = BatchExecutionResult(
+        successful=[(ok_batch, [])],
+        failures=[rejection],
+    )
+    record = llm_call_record_for_outcome(tp.ANALYZER_ID, mixed)
+    assert record["ok"] is False
+    assert record["error"] is None
+    recovered_outcome = BatchExecutionResult(
+        recovered=[(ok_batch, [])],
+        failures=[rejection],
+    )
+    record = llm_call_record_for_outcome(tp.ANALYZER_ID, recovered_outcome)
+    assert record["ok"] is False
+    assert record["error"] is None
+    total = BatchExecutionResult(failures=[rejection])
+    record = llm_call_record_for_outcome(tp.ANALYZER_ID, total)
+    assert record["ok"] is False
+    assert record["error"] == STRUCTURED_OUTPUT_UNAVAILABLE_ERROR
+
+
+def _tp4_arguments() -> dict:
+    return {
+        "is_mismatch": False,
+        "confidence": 0.95,
+        "declared_purpose_summary": "Format values",
+        "actual_behavior_summary": "Changes persistent state",
+        "mismatched_capabilities": [],
+        "explanation": "The returned assessment is intentionally controlled.",
+    }
+
+
+def _tp4_state() -> dict:
+    return {
+        "manifest": {"description": "Documentation only."},
+        "file_cache": {
+            "one.py": "def one():\n    return 1\n",
+            "two.py": "def two():\n    return 2\n",
+        },
+        "component_metadata": [
+            {"path": "one.py", "type": "python"},
+            {"path": "two.py", "type": "python"},
+        ],
+        "model_config": {"default": "test-model"},
+    }
+
+
+def test_tp4_mixed_outcome_keeps_coverage_failure(
+    deepseek_like_endpoint, monkeypatch: pytest.MonkeyPatch
+):
+    """TP4 reserves the unavailable error for total rejection, like the record helper."""
+    _requests, _behavior = deepseek_like_endpoint
+
+    async def fake_arun(self, batches, **kwargs):
+        return BatchExecutionResult(
+            successful=[(batches[0], [tp._TP4AnalysisResult(**_tp4_arguments())])],
+            failures=[
+                BatchFailure(
+                    batches[1],
+                    "LLMStructuredOutputUnavailableError",
+                    LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(tp._TP4Analyzer, "arun_batches_detailed", fake_arun)
+    result = tp._check_tp4(_tp4_state())
+    assert result.record["ok"] is False
+    assert result.record["error"] != STRUCTURED_OUTPUT_UNAVAILABLE_ERROR
+    assert "TP4 LLM batch failed" in str(result.record["error"])
+
+
+def test_tp4_total_rejection_keeps_unavailable_error(
+    deepseek_like_endpoint, monkeypatch: pytest.MonkeyPatch
+):
+    """TP4 still reports structured output unavailable when every batch is rejected."""
+    _requests, _behavior = deepseek_like_endpoint
+
+    async def fake_arun(self, batches, **kwargs):
+        return BatchExecutionResult(
+            failures=[
+                BatchFailure(
+                    batch,
+                    "LLMStructuredOutputUnavailableError",
+                    LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED,
+                )
+                for batch in batches
+            ]
+        )
+
+    monkeypatch.setattr(tp._TP4Analyzer, "arun_batches_detailed", fake_arun)
+    result = tp._check_tp4(_tp4_state())
+    assert result.record["ok"] is False
+    assert result.record["error"] == STRUCTURED_OUTPUT_UNAVAILABLE_ERROR
+
+
+def test_expired_deadline_during_first_rejection_sends_no_fallback(deepseek_like_endpoint):
+    """A deadline that expires during the first rejection must stop the retry."""
+    requests, behavior = deepseek_like_endpoint
+    behavior["remaining"] = 30.0
+    behavior["expire_deadline_on_rejection"] = True
+    analyzer = tp._TP4Analyzer(model=_MODEL, timeout=lambda: behavior["remaining"])
+    outcome = analyzer.run_batches_detailed(
+        [tp.Batch(file_path="format.py", content="Assess the declared formatting behavior.")]
+    )
+    assert not outcome.successful
+    assert len(outcome.failures) == 1
+    assert outcome.failures[0].reason is LedgerReason.RUNTIME_LIMIT
+    assert len(requests) == 1
+    assert requests[0]["response_format"]["type"] == "json_schema"

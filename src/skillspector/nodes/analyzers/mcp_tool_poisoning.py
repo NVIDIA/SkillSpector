@@ -1651,6 +1651,8 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
             structured_output_only = (
                 not unexpected_response
                 and bool(batch_outcome.failures)
+                and not batch_outcome.successful
+                and not batch_outcome.recovered
                 and all(
                     failure.reason is LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
                     for failure in batch_outcome.failures
