@@ -110,6 +110,7 @@ async def run_scan(
     *,
     use_llm: bool = True,
     output_format: str = "json",
+    include_report: bool = True,
     allow_local_targets: bool = True,
     yara_rules_dir: str | None = None,
 ) -> dict[str, Any]:
@@ -123,6 +124,9 @@ async def run_scan(
             what actually happened.
         output_format: Format of the embedded ``report`` string. One of
             :data:`VALID_FORMATS`.
+        include_report: Include the rendered ``report`` string (default).
+            Set to ``False`` to return the structured verdict without that field.
+            Analysis and output-format validation still run normally.
         allow_local_targets: Whether local filesystem targets are allowed.
             HTTP MCP calls set this to ``False`` so routable servers do not
             accept caller-controlled local paths or use ambient Git credentials.
@@ -236,7 +240,7 @@ async def run_scan(
         recommendation = result.get("risk_recommendation")
         if not analysis_requirement_met and recommendation == "SAFE":
             recommendation = "CAUTION"
-        return {
+        verdict = {
             "target": target,
             "risk_score": risk_score,
             "severity": result.get("risk_severity"),
@@ -246,7 +250,6 @@ async def run_scan(
             "analysis_completeness": analysis_completeness,
             "accepted_by_policy": accepted_by_policy,
             "findings": [f.to_dict() for f in findings],
-            "report": result.get("report_body") or "",
             # Honest LLM accounting — never silently imply a full semantic scan.
             "llm_requested": use_llm,
             "llm_available": llm_available,
@@ -254,6 +257,9 @@ async def run_scan(
             "scan_mode": "static+llm" if llm_used else "static-only",
             "version": __version__,
         }
+        if include_report:
+            verdict["report"] = result.get("report_body") or ""
+        return verdict
     finally:
         if result is not None:
             cleanup_result(result)
@@ -287,6 +293,7 @@ def build_server(name: str = "skillspector", *, allow_local_targets: bool = Fals
         target: str,
         use_llm: bool = True,
         output_format: str = "json",
+        include_report: bool = True,
     ) -> dict[str, Any]:
         """Scan an AI agent skill for security risks before installing it.
 
@@ -299,11 +306,17 @@ def build_server(name: str = "skillspector", *, allow_local_targets: bool = Fals
         ``llm_used`` / ``scan_mode`` fields report whether the semantic LLM pass
         actually ran, so a low score from a static-only scan is not mistaken for
         a clean full scan.
+
+        ``include_report`` defaults to true. Set it to false to omit the rendered
+        ``report`` string while retaining all structured verdict fields and
+        findings. Details available only in the full report are then omitted.
+        ``output_format`` must still be a supported format.
         """
         return await run_scan(
             target,
             use_llm=use_llm,
             output_format=output_format,
+            include_report=include_report,
             allow_local_targets=allow_local_targets,
         )
 
