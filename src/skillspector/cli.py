@@ -53,7 +53,7 @@ from skillspector.cli_entry import version_callback as version_callback
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.file_output import require_secure_file_output, write_text_no_follow
 from skillspector.graph_proxy import graph
-from skillspector.input_handler import validate_local_input_path
+from skillspector.input_handler import _normalize_root_owned_alias, validate_local_input_path
 from skillspector.inspection_ledger import (
     MAX_INSPECTION_LEDGER_EVENTS,
     LedgerOutcome,
@@ -75,13 +75,18 @@ from skillspector.multi_skill import (
 )
 from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
 from skillspector.nodes.report import report, risk_severity_and_recommendation
+from skillspector.report_outputs import parse_reports
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
 from skillspector.semantic_runtime import (
     has_semantic_runtime_event,
     semantic_runtime_intent,
     semantic_runtime_ledger_event,
 )
-from skillspector.state import MAX_WORKFLOW_BYTES, MAX_WORKFLOW_SECONDS
+from skillspector.state import (
+    MAX_WORKFLOW_BYTES,
+    MAX_WORKFLOW_SECONDS,
+    SkillspectorState,
+)
 from skillspector.suppression import (
     Baseline,
     build_baseline_dict,
@@ -392,6 +397,34 @@ def _write_result(
             print(report_body)
 
 
+def _render_report(result: dict[str, object], format: FormatChoice) -> dict[str, object]:
+    """Reuse the existing report node, never the scan graph, for another format."""
+    return report(cast(SkillspectorState, {**result, "output_format": format.value}))
+
+
+def _validate_additional_report(input_path: Path, output: Path) -> None:
+    _validate_report_destination(input_path, output)
+    if (
+        input_path.is_dir()
+        and output.exists()
+        and output.resolve().is_relative_to(input_path.resolve())
+    ):
+        raise ValueError("--report must not overwrite an existing file in the scan input.")
+
+
+def _write_reports(
+    result: dict[str, object],
+    format: FormatChoice,
+    output: Path | None,
+    reports: list[tuple[FormatChoice, Path]],
+) -> None:
+    _write_result(result, output, format)
+    for report_format, report_output in reports:
+        rendered = result if report_format == format else _render_report(result, report_format)
+        write_text_no_follow(report_output, _result_body(rendered))
+        err_console.print(_literal_line("Report saved to", "", report_output))
+
+
 def _exit_on_unsupported_llm_controls(no_llm: bool) -> None:
     """Exit 2 before any analysis when a configured model rejects a requested control."""
     if no_llm:
@@ -501,6 +534,15 @@ def scan(
             "--output",
             "-o",
             help="Output file path. If not specified, prints to stdout.",
+        ),
+    ] = None,
+    reports: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--report",
+            metavar="FORMAT=PATH",
+            help="Additional file report (repeatable): terminal, json, markdown, sarif. "
+            "Uses the same scan results; --format/--output still select the primary report.",
         ),
     ] = None,
     exclude: Annotated[
@@ -701,6 +743,16 @@ def scan(
         authentication session. codex_cli is registered but disabled because
         its read-only sandbox permits host-file reads; use another provider.
     """
+    try:
+        if output is not None:
+            output = _normalize_root_owned_alias(output)
+        additional_reports = [
+            (FormatChoice(name), path)
+            for name, path in parse_reports(reports, tuple(FormatChoice), output)
+        ]
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--report") from exc
+
     if max_skills is not None and (not recursive or mcp_registry or not Path(input_path).is_dir()):
         err_console.print(
             "[red]Error:[/red] --max-skills requires a local --recursive multi-skill directory"
@@ -722,7 +774,7 @@ def scan(
         )
         raise typer.Exit(code=2)
 
-    if output is not None:
+    if output is not None or additional_reports:
         try:
             require_secure_file_output()
         except ValueError as exc:
@@ -751,7 +803,9 @@ def scan(
                 "--transitive-depth, --transitive-allow-prefix, or --transitive-deny-prefix"
             )
             raise typer.Exit(code=2)
-        if format != FormatChoice.json:
+        if format != FormatChoice.json or any(
+            choice != FormatChoice.json for choice, _ in additional_reports
+        ):
             err_console.print(
                 "[red]Error:[/red] --mcp-registry currently supports only --format json"
             )
@@ -760,17 +814,21 @@ def scan(
             _validate_report_destination(Path(input_path), output)
             if mcp_registry_compare is not None:
                 _validate_report_destination(mcp_registry_compare, output)
+            for _, destination in additional_reports:
+                _validate_additional_report(Path(input_path), destination)
+                if mcp_registry_compare is not None:
+                    _validate_report_destination(mcp_registry_compare, destination)
             result = (
                 scan_registry(input_path, compare_path=mcp_registry_compare)
                 if mcp_registry_compare is not None
                 else scan_registry(input_path)
             )
-            report = json.dumps(result, indent=2)
-            if output:
-                write_text_no_follow(output, report)
-                console.print(_literal_line("Report saved to", "", output))
-            else:
-                print(report)
+            _write_reports(
+                {**result, "report_body": json.dumps(result, indent=2)},
+                format,
+                output,
+                additional_reports,
+            )
             if fail_on_findings and result["findings"]:
                 raise typer.Exit(code=1)
             if result["risk_score"] > RISK_THRESHOLD:
@@ -786,10 +844,19 @@ def scan(
         set_level("DEBUG")
 
     resolved_path = Path(input_path)
+    if baseline is not None:
+        try:
+            for destination in [output, *(path for _, path in additional_reports)]:
+                _validate_report_destination(baseline, destination)
+        except (OSError, ValueError) as e:
+            err_console.print(_error_line(e))
+            raise typer.Exit(code=2) from e
     if not input_path.startswith(("http://", "https://", "git@")):
         try:
             resolved_path = validate_local_input_path(resolved_path)
             _validate_report_destination(resolved_path, output)
+            for _, destination in additional_reports:
+                _validate_additional_report(resolved_path, destination)
         except (OSError, ValueError) as e:
             err_console.print(_error_line(e))
             raise typer.Exit(code=2) from e
@@ -838,6 +905,8 @@ def scan(
                     if inspect_dependencies
                     else _scan_multi_skill
                 )
+                if additional_reports:
+                    scan_multi_skill = partial(scan_multi_skill, reports=additional_reports)
                 scan_multi_skill(
                     detection,
                     format=format,
@@ -902,6 +971,12 @@ def scan(
     if shipped is not None:
         if use_shipped_baseline:
             baseline = shipped
+            try:
+                for destination in [output, *(path for _, path in additional_reports)]:
+                    _validate_report_destination(baseline, destination)
+            except (OSError, ValueError) as e:
+                err_console.print(_error_line(e))
+                raise typer.Exit(code=2) from e
             err_console.print(_literal_line("Applying author-shipped baseline", "yellow", shipped))
             err_console.print(
                 "[dim]Suppressed findings do not count toward the risk score; "
@@ -944,7 +1019,7 @@ def scan(
             transitive_deny_prefix=transitive_deny_prefix,
             pre_scan_ledger_events=pre_scan_ledger_events,
         )
-        _write_result(result, output, format)
+        _write_reports(result, format, output, additional_reports)
 
         if result.get("execution_successful") is False:
             raise typer.Exit(code=2)
@@ -2102,16 +2177,19 @@ def _scan_transitive(
         else _run_graph_scan_for_source
     )
     if max_depth <= 0:
-        report_result = cast(dict[str, object], report(initial_result))
-        report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
-        report_result["transitive_finding_count"] = 0
-        report_result["transitive_sources"] = []
-        report_result["transitive_targets_scanned"] = 0
-        report_result["transitive_bytes_scanned"] = 0
-        report_result["transitive_artifacts_scanned"] = 0
-        report_result["transitive_truncated"] = False
-        report_result["transitive_truncation_reasons"] = []
-        report_result["analysis_completeness"] = initial_result.get("analysis_completeness", {})
+        # Keep canonical scan inputs; the report node returns only a projection.
+        report_result = {
+            **initial_result,
+            "temp_dir_for_cleanup": initial_result.get("temp_dir_for_cleanup"),
+            "transitive_finding_count": 0,
+            "transitive_sources": [],
+            "transitive_targets_scanned": 0,
+            "transitive_bytes_scanned": 0,
+            "transitive_artifacts_scanned": 0,
+            "transitive_truncated": False,
+            "transitive_truncation_reasons": [],
+        }
+        report_result.update(report(report_result))
         return report_result
 
     if traversal is None:
@@ -2581,7 +2659,7 @@ def _scan_transitive(
         merged_result["analysis_completeness"] = completeness
         merged_result["execution_successful"] = completeness["execution_successful"]
         merged_result["effective_finding_ids"] = effective_ids
-    report_result = cast(dict[str, object], report(merged_result))
+    report_result = {**merged_result, **report(merged_result)}
     report_result["analysis_completeness"] = merged_result.get("analysis_completeness", {})
     report_result["meta_review_required"] = merged_meta_review_required
     report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
@@ -3008,6 +3086,7 @@ def _scan_multi_skill(
     fail_on_findings: bool = False,
     max_skills: int | None = None,
     inspect_dependencies: bool = False,
+    reports: list[tuple[FormatChoice, Path]] | None = None,
     **legacy_kwargs: object,
 ) -> None:
     """Scan each detected sub-skill independently and produce a combined report."""
@@ -3020,6 +3099,8 @@ def _scan_multi_skill(
     # Check every discovered input before scan budgets can omit a child.
     for skill in skills:
         _validate_report_destination(skill.primary_path or skill.path, output)
+        for _, destination in reports or []:
+            _validate_additional_report(skill.path, destination)
     progress_console = (
         err_console if output is None and format is not FormatChoice.terminal else console
     )
@@ -3282,184 +3363,211 @@ def _scan_multi_skill(
             "after an aggregate safety limit or skipped as symlinks."
         )
 
-    if format == FormatChoice.json:
-        combined: dict[str, object] = {
-            "multi_skill": True,
-            "skill_count": len(skills),
-            "max_risk_score": max_score,
-            "risk_severity": aggregate_risk_assessment["severity"],
-            "execution_successful": not execution_failed,
-            "risk_recommendation": aggregate_risk_assessment["recommendation"],
-            "analysis_completeness": aggregate_completeness,
-            "skills_scanned": scanned_skill_count,
-            "skills_omitted": skills_omitted_total,
-            "skills_output_omitted": output_omitted_skill_count,
-            "public_finding_records": retained_public_records,
-            "report_characters": retained_report_characters,
-            "transitive_finding_count": transitive_finding_count,
-            "transitive_sources": sorted(transitive_sources),
-            "skills": [],
-        }
-        combined_skills = cast(list[dict[str, object]], combined["skills"])
-        for skill, result in zip(processed_skills, results, strict=True):
-            if "error" in result:
-                combined_skills.append({"name": skill.name, "error": result["error"]})
-            else:
-                payload = _recursive_json_payload(result) or {}
-                finding_count = len(effective_findings(result))
-                entry = {
-                    "name": skill.name,
-                    "path": skill.relative_path,
-                    "risk_score": result.get("risk_score", 0),
-                    "risk_severity": result.get("risk_severity", "LOW"),
-                    "finding_count": finding_count,
-                    "execution_successful": result.get("execution_successful", True),
-                    "transitive_finding_count": result.get("transitive_finding_count", 0),
-                    "transitive_sources": result.get("transitive_sources", []),
+    report_state = (analysis_incomplete, aggregate_completeness, aggregate_risk_assessment)
+    primary_incomplete = analysis_incomplete
+    try:
+        for index, (report_format, report_output) in enumerate(
+            [(format, output), *(reports or [])]
+        ):
+            # Each output starts from the same scan summary, not another format's fallback.
+            analysis_incomplete, aggregate_completeness, aggregate_risk_assessment = report_state
+            report_results = [
+                (
+                    result
+                    if "error" in result or report_format == format
+                    else {**result, **_render_report(result, report_format)}
+                )
+                for result in results
+            ]
+            if report_format == FormatChoice.json:
+                combined: dict[str, object] = {
+                    "multi_skill": True,
+                    "skill_count": len(skills),
+                    "max_risk_score": max_score,
+                    "risk_severity": aggregate_risk_assessment["severity"],
+                    "execution_successful": not execution_failed,
+                    "risk_recommendation": aggregate_risk_assessment["recommendation"],
+                    "analysis_completeness": aggregate_completeness,
+                    "skills_scanned": scanned_skill_count,
+                    "skills_omitted": skills_omitted_total,
+                    "skills_output_omitted": output_omitted_skill_count,
+                    "public_finding_records": retained_public_records,
+                    "report_characters": retained_report_characters,
+                    "transitive_finding_count": transitive_finding_count,
+                    "transitive_sources": sorted(transitive_sources),
+                    "skills": [],
                 }
-                entry.update(payload)
-                entry["name"] = skill.name
-                entry["path"] = skill.relative_path
-                entry["risk_score"] = result.get("risk_score", 0)
-                entry["risk_severity"] = result.get("risk_severity", "LOW")
-                entry["finding_count"] = finding_count
-                entry["execution_successful"] = result.get("execution_successful", True)
-                combined_skills.append(entry)
-                entry["transitive_finding_count"] = result.get("transitive_finding_count", 0)
-                entry["transitive_sources"] = result.get("transitive_sources", [])
-        if output_omitted_skill_count:
-            combined_skills.append(
-                {
-                    "omitted": True,
-                    "omitted_count": output_omitted_skill_count,
-                    "reason": "aggregate_output_limit",
-                }
-            )
-        if unscanned_skill_count:
-            combined_skills.append(
-                {
-                    "omitted": True,
-                    "omitted_count": unscanned_skill_count,
-                    "reason": "aggregate_scan_limit",
-                }
-            )
-        if omitted_symlink_entry_count:
-            combined_skills.append(
-                {
-                    "omitted": True,
-                    "omitted_count": omitted_symlink_entry_count,
-                    "reason": "symlink_not_followed",
-                }
-            )
-        rendered = json.dumps(combined, indent=2)
-        if len(rendered) > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
-            analysis_incomplete = True
-            aggregate_completeness, aggregate_limitations = _mark_recursive_output_limited(
-                aggregate_completeness,
-            )
-            combined = {
-                "multi_skill": True,
-                "skill_count": len(skills),
-                "max_risk_score": max_score,
-                "risk_severity": aggregate_risk_assessment["severity"],
-                "execution_successful": not execution_failed,
-                "risk_recommendation": _multi_skill_risk_assessment(
-                    max_score,
-                    execution_failed=execution_failed,
-                    analysis_incomplete=True,
-                )["recommendation"],
-                "analysis_completeness": aggregate_completeness,
-                "skills_scanned": scanned_skill_count,
-                "skills_omitted": unscanned_skill_count,
-                "skills_output_omitted": scanned_skill_count,
-                "public_finding_records": 0,
-                "transitive_finding_count": transitive_finding_count,
-                "transitive_sources": [],
-                "skills": [
-                    {
-                        "omitted": True,
-                        "omitted_count": scanned_skill_count,
-                        "reason": "aggregate_output_limit",
+                combined_skills = cast(list[dict[str, object]], combined["skills"])
+                for skill, result in zip(processed_skills, report_results, strict=True):
+                    if "error" in result:
+                        combined_skills.append({"name": skill.name, "error": result["error"]})
+                    else:
+                        payload = _recursive_json_payload(result) or {}
+                        finding_count = len(effective_findings(result))
+                        entry = {
+                            "name": skill.name,
+                            "path": skill.relative_path,
+                            "risk_score": result.get("risk_score", 0),
+                            "risk_severity": result.get("risk_severity", "LOW"),
+                            "finding_count": finding_count,
+                            "execution_successful": result.get("execution_successful", True),
+                            "transitive_finding_count": result.get("transitive_finding_count", 0),
+                            "transitive_sources": result.get("transitive_sources", []),
+                        }
+                        entry.update(payload)
+                        entry["name"] = skill.name
+                        entry["path"] = skill.relative_path
+                        entry["risk_score"] = result.get("risk_score", 0)
+                        entry["risk_severity"] = result.get("risk_severity", "LOW")
+                        entry["finding_count"] = finding_count
+                        entry["execution_successful"] = result.get("execution_successful", True)
+                        combined_skills.append(entry)
+                        entry["transitive_finding_count"] = result.get(
+                            "transitive_finding_count", 0
+                        )
+                        entry["transitive_sources"] = result.get("transitive_sources", [])
+                if output_omitted_skill_count:
+                    combined_skills.append(
+                        {
+                            "omitted": True,
+                            "omitted_count": output_omitted_skill_count,
+                            "reason": "aggregate_output_limit",
+                        }
+                    )
+                if unscanned_skill_count:
+                    combined_skills.append(
+                        {
+                            "omitted": True,
+                            "omitted_count": unscanned_skill_count,
+                            "reason": "aggregate_scan_limit",
+                        }
+                    )
+                if omitted_symlink_entry_count:
+                    combined_skills.append(
+                        {
+                            "omitted": True,
+                            "omitted_count": omitted_symlink_entry_count,
+                            "reason": "symlink_not_followed",
+                        }
+                    )
+                rendered = json.dumps(combined, indent=2)
+                if len(rendered) > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
+                    analysis_incomplete = True
+                    aggregate_completeness, aggregate_limitations = _mark_recursive_output_limited(
+                        aggregate_completeness,
+                    )
+                    combined = {
+                        "multi_skill": True,
+                        "skill_count": len(skills),
+                        "max_risk_score": max_score,
+                        "risk_severity": aggregate_risk_assessment["severity"],
+                        "execution_successful": not execution_failed,
+                        "risk_recommendation": _multi_skill_risk_assessment(
+                            max_score,
+                            execution_failed=execution_failed,
+                            analysis_incomplete=True,
+                        )["recommendation"],
+                        "analysis_completeness": aggregate_completeness,
+                        "skills_scanned": scanned_skill_count,
+                        "skills_omitted": unscanned_skill_count,
+                        "skills_output_omitted": scanned_skill_count,
+                        "public_finding_records": 0,
+                        "transitive_finding_count": transitive_finding_count,
+                        "transitive_sources": [],
+                        "skills": [
+                            {
+                                "omitted": True,
+                                "omitted_count": scanned_skill_count,
+                                "reason": "aggregate_output_limit",
+                            }
+                        ],
                     }
-                ],
-            }
-            rendered = json.dumps(combined, indent=2)
-        _ensure_recursive_output_bound(rendered)
-        if output is not None:
-            write_text_no_follow(output, rendered)
-            progress_console.print(_literal_line("Combined report saved to", "green", output))
-        else:
-            sys.stdout.write(rendered)
-    elif format == FormatChoice.sarif:
-        merged_sarif = _multi_skill_sarif_report(
-            processed_skills,
-            results,
-            aggregate_completeness,
-            aggregate_risk_assessment,
-        )
-        rendered = json.dumps(merged_sarif, indent=2)
-        if len(rendered) > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
-            analysis_incomplete = True
-            aggregate_completeness, aggregate_limitations = _mark_recursive_output_limited(
-                aggregate_completeness,
-            )
-            aggregate_risk_assessment = _multi_skill_risk_assessment(
-                max_score,
-                execution_failed=execution_failed,
-                analysis_incomplete=True,
-            )
-            merged_sarif = _multi_skill_sarif_report(
-                [], [], aggregate_completeness, aggregate_risk_assessment
-            )
-            rendered = json.dumps(merged_sarif, indent=2)
-        _ensure_recursive_output_bound(rendered)
-        if output is not None:
-            write_text_no_follow(output, rendered)
-            progress_console.print(_literal_line("Combined report saved to", "green", output))
-        else:
-            sys.stdout.write(rendered)
-    else:
-        sections: list[str] = []
-        for skill, result in zip(processed_skills, results, strict=True):
-            if "error" not in result:
-                sections.append(f"--- {skill.relative_path} ---\n\n{_result_body(result)}")
-        if analysis_incomplete:
-            sections.append(
-                _multi_skill_text_summary(
+                    rendered = json.dumps(combined, indent=2)
+                _ensure_recursive_output_bound(rendered)
+                if report_output is not None:
+                    write_text_no_follow(report_output, rendered)
+                    progress_console.print(
+                        _literal_line("Combined report saved to", "green", report_output)
+                    )
+                else:
+                    sys.stdout.write(rendered)
+            elif report_format == FormatChoice.sarif:
+                merged_sarif = _multi_skill_sarif_report(
+                    processed_skills,
+                    report_results,
                     aggregate_completeness,
                     aggregate_risk_assessment,
                 )
-            )
-        rendered = "\n\n".join(sections)
-        if len(rendered) > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
-            analysis_incomplete = True
-            aggregate_completeness, aggregate_limitations = _mark_recursive_output_limited(
-                aggregate_completeness,
-            )
-            aggregate_risk_assessment = _multi_skill_risk_assessment(
-                max_score,
-                execution_failed=execution_failed,
-                analysis_incomplete=True,
-            )
-            rendered = _multi_skill_text_summary(
-                aggregate_completeness,
-                aggregate_risk_assessment,
-            )
-        _ensure_recursive_output_bound(rendered)
-        if output is not None:
-            write_text_no_follow(output, rendered)
-            progress_console.print(_literal_line("Combined report saved to", "green", output))
-        elif format is FormatChoice.terminal:
-            console.print(rendered, markup=False, emoji=False)
-        else:
-            sys.stdout.write(rendered)
+                rendered = json.dumps(merged_sarif, indent=2)
+                if len(rendered) > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
+                    analysis_incomplete = True
+                    aggregate_completeness, aggregate_limitations = _mark_recursive_output_limited(
+                        aggregate_completeness,
+                    )
+                    aggregate_risk_assessment = _multi_skill_risk_assessment(
+                        max_score,
+                        execution_failed=execution_failed,
+                        analysis_incomplete=True,
+                    )
+                    merged_sarif = _multi_skill_sarif_report(
+                        [], [], aggregate_completeness, aggregate_risk_assessment
+                    )
+                    rendered = json.dumps(merged_sarif, indent=2)
+                _ensure_recursive_output_bound(rendered)
+                if report_output is not None:
+                    write_text_no_follow(report_output, rendered)
+                    progress_console.print(
+                        _literal_line("Combined report saved to", "green", report_output)
+                    )
+                else:
+                    sys.stdout.write(rendered)
+            else:
+                sections: list[str] = []
+                for skill, result in zip(processed_skills, report_results, strict=True):
+                    if "error" not in result:
+                        sections.append(f"--- {skill.relative_path} ---\n\n{_result_body(result)}")
+                if analysis_incomplete:
+                    sections.append(
+                        _multi_skill_text_summary(
+                            aggregate_completeness,
+                            aggregate_risk_assessment,
+                        )
+                    )
+                rendered = "\n\n".join(sections)
+                if len(rendered) > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
+                    analysis_incomplete = True
+                    aggregate_completeness, aggregate_limitations = _mark_recursive_output_limited(
+                        aggregate_completeness,
+                    )
+                    aggregate_risk_assessment = _multi_skill_risk_assessment(
+                        max_score,
+                        execution_failed=execution_failed,
+                        analysis_incomplete=True,
+                    )
+                    rendered = _multi_skill_text_summary(
+                        aggregate_completeness,
+                        aggregate_risk_assessment,
+                    )
+                _ensure_recursive_output_bound(rendered)
+                if report_output is not None:
+                    write_text_no_follow(report_output, rendered)
+                    progress_console.print(
+                        _literal_line("Combined report saved to", "green", report_output)
+                    )
+                elif report_format is FormatChoice.terminal:
+                    console.print(rendered, markup=False, emoji=False)
+                else:
+                    sys.stdout.write(rendered)
 
-    for result in results:
-        cleanup_result(result)
+            if index == 0:
+                primary_incomplete = analysis_incomplete
+    finally:
+        for result in results:
+            cleanup_result(result)
 
     if execution_failed:
         raise typer.Exit(code=2)
-    if fail_on_incomplete and analysis_incomplete:
+    if fail_on_incomplete and primary_incomplete:
         raise typer.Exit(code=1)
     if fail_on_findings and has_findings:
         raise typer.Exit(code=1)
