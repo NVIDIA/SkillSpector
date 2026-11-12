@@ -6,6 +6,9 @@
 import json
 import os
 import sys
+from copy import deepcopy
+from datetime import UTC, datetime
+from importlib import import_module
 from unittest.mock import Mock
 
 import pytest
@@ -13,12 +16,415 @@ from typer.testing import CliRunner
 
 from skillspector import cli
 from skillspector.file_output import write_text_no_follow
+from skillspector.input_handler import InputHandler
 from skillspector.models import Finding
 from skillspector.nodes.report import report
 from skillspector.report_outputs import parse_reports
 from skillspector.sarif_models import validate_sarif_report
+from skillspector.suppression import baseline_from_dict, build_baseline_dict, serialize_baseline
 
 runner = CliRunner()
+
+
+@pytest.fixture
+def transitive_states(tmp_path, monkeypatch):
+    """Fresh source-aware findings, exact suppression, and successful runtime evidence."""
+    report_module = import_module("skillspector.nodes.report")
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 11, 12, tzinfo=UTC)
+
+    monkeypatch.setattr(report_module, "datetime", FixedDatetime)
+    monkeypatch.setattr(report_module, "is_llm_available", lambda **kw: (True, None))
+    semantic_nodes = [
+        name
+        for name, module in cli.ANALYZER_MODULES.items()
+        if getattr(module, "requires_api_key", False)
+    ]
+    target = "https://github.com/example/dependency"
+
+    def factory(primary, depth, degraded=False, incomplete=False, show_suppressed=True):
+        def state(child=False):
+            cache = {"SKILL.md": "# Child" if child else target, "helper.py": "print('safe')"}
+            findings = [
+                Finding(
+                    rule_id="CHILD" if child else "EXEC",
+                    finding_id="child-finding" if child else "root-finding",
+                    severity="LOW" if child else "MEDIUM",
+                    confidence=1.0,
+                    file="helper.py",
+                    message="Child finding" if child else "Executable finding",
+                )
+            ]
+            if not child:
+                findings.append(
+                    Finding(
+                        rule_id="ACCEPTED",
+                        finding_id="accepted-finding",
+                        severity="HIGH",
+                        file="SKILL.md",
+                        message="Accepted",
+                    )
+                )
+            return {
+                "skill_path": str(tmp_path),
+                "manifest": {"name": "state-fixture"},
+                "output_format": primary.value,
+                "findings": findings,
+                "filtered_findings": findings[:1],
+                "components": list(cache),
+                "component_metadata": [
+                    {
+                        "path": path,
+                        "type": "python" if path.endswith(".py") else "markdown",
+                        "executable": path.endswith(".py"),
+                        "lines": 1,
+                        "size_bytes": len(content),
+                    }
+                    for path, content in cache.items()
+                ],
+                "file_cache": cache,
+                "local_file_cache": dict(cache),
+                "has_executable_scripts": True,
+                "use_llm": True,
+                "llm_requested": True,
+                "llm_call_log": [
+                    {"node": node, "ok": not degraded, "error": "failed" if degraded else None}
+                    for node in [*semantic_nodes, "meta_analyzer"]
+                ],
+                "analyzer_status_events": [
+                    {"analyzer_id": node, "status": "failed" if degraded else "completed"}
+                    for node in semantic_nodes
+                ],
+                "analysis_completeness": {
+                    "is_complete": not incomplete,
+                    "execution_successful": True,
+                    "coverage_percent": 50.0 if incomplete else 100.0,
+                },
+            }
+
+        root = state()
+        root["baseline"] = baseline_from_dict(
+            build_baseline_dict(
+                root["findings"][1:],
+                file_cache=root["file_cache"],
+                scanner_version=cli.__version__,
+            )
+        )
+        root["show_suppressed"] = show_suppressed
+        child_scan = Mock(side_effect=lambda **kw: state(child=True))
+        monkeypatch.setattr(cli, "_run_graph_scan_for_source", child_scan)
+        result = cli._scan_transitive(
+            initial_result=root,
+            format=primary,
+            no_llm=False,
+            max_depth=depth,
+            transitive_allow_prefix=[],
+            transitive_deny_prefix=[],
+            baseline=None,
+            show_suppressed=show_suppressed,
+            visited=set(),
+        )
+        assert child_scan.call_count == (1 if depth else 0)
+        return root, result, child_scan
+
+    return factory
+
+
+@pytest.mark.parametrize("depth", [0, 1])
+@pytest.mark.parametrize("primary", list(cli.FormatChoice))
+def test_transitive_reports_preserve_full_state(tmp_path, transitive_states, depth, primary):
+    root, result, child_scan = transitive_states(primary, depth)
+    snapshot = deepcopy(result)
+    # Independent expectation: MEDIUM executable = 10 * 1.3, child LOW = int(5 * 1.3).
+    assert result["risk_score"] == (19 if depth else 13)
+    assert [f.rule_id for f in result["active_findings"]] == (
+        ["EXEC", "CHILD"] if depth else ["EXEC"]
+    )
+    assert len(result["suppressed_findings"]) == 1
+    primary_path = tmp_path / "primary"
+    formats = list(cli.FormatChoice)
+    outputs = [(choice, tmp_path / f"extra-{choice.value}") for choice in formats]
+    outputs += [(formats[0], tmp_path / "repeat")]
+    cli._write_reports(result, primary, primary_path, outputs)
+    assert child_scan.call_count == depth
+    primary_body = primary_path.read_text()
+    original_bodies = {path: path.read_text() for _, path in outputs}
+    fresh_scans = []
+    for choice, path in outputs:
+        _, fresh, fresh_scan = transitive_states(choice, depth)
+        fresh_scans.append(fresh_scan)
+        assert path.read_text() == cli._result_body(fresh)
+    cli._write_reports(result, primary, primary_path, list(reversed(outputs)))
+    assert {path: path.read_text() for _, path in outputs} == original_bodies
+    assert all(scan.call_count == depth for scan in fresh_scans)
+    assert primary_path.read_text() == primary_body == cli._result_body(result)
+    assert result == snapshot  # Deep comparison includes findings, metadata, caches, and telemetry.
+    child_scan.assert_called_once() if depth else child_scan.assert_not_called()
+    assert result["findings"][:2] == root["findings"]  # canonical, not suppressed projection
+    payload = json.loads((tmp_path / "extra-json").read_text())
+    assert payload["risk_assessment"]["score"] == (19 if depth else 13)
+    assert payload["suppressed"][0]["id"] == "ACCEPTED"
+    assert len(payload["components"]) == (4 if depth else 2)
+    assert payload["metadata"]["has_executable_scripts"] is True
+    assert payload["metadata"]["llm_requested"] is True
+    assert payload["metadata"].get("llm_degraded", False) is False
+    assert payload["metadata"]["llm_calls_succeeded"] == len(root["llm_call_log"]) * (depth + 1)
+    assert any(c.get("source_identity") for c in payload["components"]) is bool(depth)
+    validate_sarif_report(json.loads((tmp_path / "extra-sarif").read_text()))
+    assert "Accepted" in (tmp_path / "extra-markdown").read_text()
+    assert "Executable scripts: Yes" in (tmp_path / "extra-terminal").read_text()
+
+
+@pytest.mark.parametrize(
+    "depth,degraded,incomplete,show",
+    [
+        (0, True, False, False),
+        (1, True, False, True),
+        (0, False, True, True),
+    ],
+)
+def test_transitive_extra_reports_retain_runtime_edges(
+    tmp_path,
+    transitive_states,
+    depth,
+    degraded,
+    incomplete,
+    show,
+):
+    _, result, scan = transitive_states(
+        cli.FormatChoice.markdown, depth, degraded, incomplete, show
+    )
+    snapshot = deepcopy(result)
+    rendered = cli._render_report(result, cli.FormatChoice.json)
+    payload = json.loads(rendered["report_body"])
+    assert payload["metadata"]["llm_requested"] is True
+    assert payload["metadata"].get("llm_degraded", False) is degraded
+    assert payload["metadata"]["llm_calls_succeeded"] == (
+        0 if degraded else len(result["llm_call_log"])
+    )
+    assert payload["suppressed_count"] == 1
+    assert {issue["id"] for issue in payload["issues"]} == (
+        {"EXEC", "CHILD"} if depth else {"EXEC"}
+    )
+    if incomplete or (degraded and depth):
+        assert payload["analysis_completeness"]["is_complete"] is False
+    markdown = cli._result_body(cli._render_report(result, cli.FormatChoice.markdown))
+    assert ("Accepted" in markdown) is show
+    assert result == snapshot
+    assert scan.call_count == depth
+
+
+@pytest.fixture
+def baseline_files(tmp_path):
+    def factory(shipped=False):
+        skill = tmp_path / "skill"
+        skill.mkdir()
+        manifest = skill / "SKILL.md"
+        manifest.write_bytes(b"# Preserve input\r\n")
+        baseline = skill / ".skillspector-baseline.yaml" if shipped else tmp_path / "baseline.yaml"
+        data = build_baseline_dict([], file_cache={}, scanner_version=cli.__version__)
+        original = ("# Preserve ä\r\n" + serialize_baseline(data)).encode()
+        baseline.write_bytes(original)
+        return skill, baseline, original
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "local",
+        "http://github.com/example/skill",
+        "https://github.com/example/skill",
+        "git@github.com:example/skill.git",
+    ],
+)
+@pytest.mark.parametrize("option", ["--output", "--report"])
+@pytest.mark.parametrize("alias", ["exact", "missing", "relative", "hardlink"])
+def test_explicit_baseline_collisions_preflight(
+    tmp_path,
+    monkeypatch,
+    baseline_files,
+    source,
+    option,
+    alias,
+):
+    skill, baseline, original = baseline_files()
+    monkeypatch.chdir(tmp_path)
+    destination = baseline
+    if alias == "missing":
+        destination = tmp_path / "missing" / ".." / baseline.name
+    elif alias == "relative":
+        destination = baseline.relative_to(tmp_path)
+    elif alias == "hardlink":
+        destination = tmp_path / "hardlink.yaml"
+        try:
+            os.link(baseline, destination)
+        except OSError as exc:
+            pytest.skip(f"Hardlinks unsupported: {exc}")
+    guards = [
+        Mock(side_effect=AssertionError("preflight must precede scan/fetch/write"))
+        for _ in range(3)
+    ]
+    monkeypatch.setattr(cli, "_scan_skill", guards[0])
+    monkeypatch.setattr(InputHandler, "resolve", guards[1])
+    monkeypatch.setattr(cli, "write_text_no_follow", guards[2])
+    result = runner.invoke(
+        cli.app,
+        [
+            "scan",
+            str(skill) if source == "local" else source,
+            "--no-llm",
+            "--baseline",
+            str(baseline),
+            option,
+            f"json={destination}" if option == "--report" else str(destination),
+        ],
+    )
+    assert baseline.read_bytes() == original
+    assert result.exit_code == 2, result.output
+    assert "--output points to the input file" in result.output
+    for guard in guards:
+        guard.assert_not_called()
+
+
+@pytest.mark.parametrize("option", ["--output", "--report"])
+@pytest.mark.parametrize("alias", [False, True])
+def test_shipped_baseline_collisions_preflight(
+    monkeypatch,
+    baseline_files,
+    option,
+    alias,
+):
+    skill, baseline, original = baseline_files(shipped=True)
+    destination = skill / "missing" / ".." / baseline.name if alias else baseline
+    scan = Mock(side_effect=AssertionError("scan must not run"))
+    writer = Mock(side_effect=AssertionError("write must not run"))
+    monkeypatch.setattr(cli, "_scan_skill", scan)
+    monkeypatch.setattr(cli, "write_text_no_follow", writer)
+    result = runner.invoke(
+        cli.app,
+        [
+            "scan",
+            str(skill),
+            "--no-llm",
+            "--use-shipped-baseline",
+            option,
+            f"json={destination}" if option == "--report" else str(destination),
+        ],
+    )
+    assert baseline.read_bytes() == original
+    assert result.exit_code == 2, result.output
+    assert (
+        "--output points to the input file" in result.output
+        or "--report must not overwrite" in result.output
+    )
+    scan.assert_not_called()
+    writer.assert_not_called()
+
+
+@pytest.mark.parametrize("destination_kind", ["new", "existing", "symlink", "parent_symlink"])
+@pytest.mark.parametrize("option", ["--output", "--report"])
+def test_baseline_outputs_allow_regular_files_but_refuse_symlinks(
+    tmp_path,
+    monkeypatch,
+    baseline_files,
+    destination_kind,
+    option,
+):
+    skill, baseline, original = baseline_files()
+    manifest_bytes = (skill / "SKILL.md").read_bytes()
+    destination = tmp_path / "report.json"
+    protected = tmp_path / "protected.json"
+    protected.write_bytes(b"Preserve symlink target\r\n")
+    if destination_kind == "existing":
+        destination.write_text("Old regular report")
+    elif destination_kind in ("symlink", "parent_symlink"):
+        try:
+            if destination_kind == "symlink":
+                destination.symlink_to(protected)
+            else:
+                (tmp_path / "alias").symlink_to(tmp_path, target_is_directory=True)
+                destination = tmp_path / "alias" / protected.name
+        except OSError as exc:
+            pytest.skip(f"Symlinks unsupported: {exc}")
+    scan = Mock(side_effect=lambda input_path, format, **kw: scan_result(input_path, format))
+    monkeypatch.setattr(cli, "_scan_skill", scan)
+    result = runner.invoke(
+        cli.app,
+        [
+            "scan",
+            str(skill),
+            "--no-llm",
+            "--baseline",
+            str(baseline),
+            "-f",
+            "json",
+            option,
+            f"json={destination}" if option == "--report" else str(destination),
+        ],
+    )
+    assert baseline.read_bytes() == original
+    assert (skill / "SKILL.md").read_bytes() == manifest_bytes
+    assert protected.read_bytes() == b"Preserve symlink target\r\n"
+    scan.assert_called_once()
+    if "symlink" in destination_kind:
+        assert result.exit_code == 2
+        assert "symlink" in result.output or "non-regular output" in result.output
+    else:
+        assert result.exit_code == 0, result.output
+        assert json.loads(destination.read_text())["issues"]
+
+
+@pytest.mark.integration
+def test_offline_transitive_multi_report_cli(tmp_path, monkeypatch):
+    """Run actual ingest, static analyzers, transitive merge, rendering, and secure writing."""
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    inputs = {
+        "SKILL.md": b"---\nname: offline-report\n---\n# Safe skill\n",
+        "helper.py": b"print('safe')\n",
+    }
+    for name, content in inputs.items():
+        (skill / name).write_bytes(content)
+    # Any accidental external fetch is a failure, not an authenticated/network scan.
+    monkeypatch.setattr(InputHandler, "_clone_git", Mock(side_effect=AssertionError("no fetch")))
+    monkeypatch.setattr(
+        InputHandler, "_download_file", Mock(side_effect=AssertionError("no fetch"))
+    )
+    primary = tmp_path / "primary.md"
+    additional = tmp_path / "additional.json"
+    sarif = tmp_path / "additional.sarif"
+    result = runner.invoke(
+        cli.app,
+        [
+            "scan",
+            str(skill),
+            "--no-llm",
+            "--transitive",
+            "-f",
+            "markdown",
+            "-o",
+            str(primary),
+            "--report",
+            f"json={additional}",
+            "--report",
+            f"sarif={sarif}",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(additional.read_text())
+    assert {c["path"] for c in payload["components"]} == set(inputs)
+    assert payload["metadata"]["has_executable_scripts"] is True
+    assert payload["metadata"]["llm_requested"] is False
+    assert payload["metadata"]["transitive_targets_scanned"] == 0
+    assert f"| Score | {payload['risk_assessment']['score']}/100 |" in primary.read_text()
+    validate_sarif_report(json.loads(sarif.read_text()))
+    for name, original in inputs.items():
+        assert (skill / name).read_bytes() == original
 
 
 def scan_result(path, format):
@@ -227,8 +633,15 @@ def test_cleanup_on_additional_write_failure(tmp_path, monkeypatch, recursive):
     skill.mkdir(exist_ok=True)
     (skill / "SKILL.md").write_text("# Example\n")
     state = scan_result(skill, cli.FormatChoice.json)
+    original = (skill / "SKILL.md").read_bytes()
+    baseline = tmp_path / "baseline.yaml"
+    baseline.write_bytes(b"# Preserve baseline\r\n")
+    temp_dir = tmp_path / "skillspector_scan"
+    temp_dir.mkdir()
+    (temp_dir / "temporary.md").write_text("# temporary")
+    state["temp_dir_for_cleanup"] = str(temp_dir)
     monkeypatch.setattr(cli, "_scan_skill", Mock(return_value=state))
-    cleanup = Mock()
+    cleanup = Mock(wraps=cli.cleanup_result)
     monkeypatch.setattr(cli, "cleanup_result", cleanup)
     args = [
         "scan",
@@ -245,6 +658,9 @@ def test_cleanup_on_additional_write_failure(tmp_path, monkeypatch, recursive):
     assert result.exit_code == 2
     json.loads(result.stdout)
     cleanup.assert_called_once_with(state)
+    assert not temp_dir.exists()
+    assert (skill / "SKILL.md").read_bytes() == original
+    assert baseline.read_bytes() == b"# Preserve baseline\r\n"
 
 
 def test_findings_exit_after_all_reports(tmp_path, monkeypatch):

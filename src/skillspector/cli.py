@@ -53,7 +53,7 @@ from skillspector.cli_entry import version_callback as version_callback
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.file_output import require_secure_file_output, write_text_no_follow
 from skillspector.graph_proxy import graph
-from skillspector.input_handler import validate_local_input_path
+from skillspector.input_handler import _normalize_root_owned_alias, validate_local_input_path
 from skillspector.inspection_ledger import (
     MAX_INSPECTION_LEDGER_EVENTS,
     LedgerOutcome,
@@ -744,6 +744,8 @@ def scan(
         its read-only sandbox permits host-file reads; use another provider.
     """
     try:
+        if output is not None:
+            output = _normalize_root_owned_alias(output)
         additional_reports = [
             (FormatChoice(name), path)
             for name, path in parse_reports(reports, tuple(FormatChoice), output)
@@ -842,14 +844,19 @@ def scan(
         set_level("DEBUG")
 
     resolved_path = Path(input_path)
+    if baseline is not None:
+        try:
+            for destination in [output, *(path for _, path in additional_reports)]:
+                _validate_report_destination(baseline, destination)
+        except (OSError, ValueError) as e:
+            err_console.print(_error_line(e))
+            raise typer.Exit(code=2) from e
     if not input_path.startswith(("http://", "https://", "git@")):
         try:
             resolved_path = validate_local_input_path(resolved_path)
             _validate_report_destination(resolved_path, output)
             for _, destination in additional_reports:
                 _validate_additional_report(resolved_path, destination)
-                if baseline is not None:
-                    _validate_report_destination(baseline, destination)
         except (OSError, ValueError) as e:
             err_console.print(_error_line(e))
             raise typer.Exit(code=2) from e
@@ -964,6 +971,12 @@ def scan(
     if shipped is not None:
         if use_shipped_baseline:
             baseline = shipped
+            try:
+                for destination in [output, *(path for _, path in additional_reports)]:
+                    _validate_report_destination(baseline, destination)
+            except (OSError, ValueError) as e:
+                err_console.print(_error_line(e))
+                raise typer.Exit(code=2) from e
             err_console.print(_literal_line("Applying author-shipped baseline", "yellow", shipped))
             err_console.print(
                 "[dim]Suppressed findings do not count toward the risk score; "
@@ -2164,16 +2177,19 @@ def _scan_transitive(
         else _run_graph_scan_for_source
     )
     if max_depth <= 0:
-        report_result = cast(dict[str, object], report(initial_result))
-        report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
-        report_result["transitive_finding_count"] = 0
-        report_result["transitive_sources"] = []
-        report_result["transitive_targets_scanned"] = 0
-        report_result["transitive_bytes_scanned"] = 0
-        report_result["transitive_artifacts_scanned"] = 0
-        report_result["transitive_truncated"] = False
-        report_result["transitive_truncation_reasons"] = []
-        report_result["analysis_completeness"] = initial_result.get("analysis_completeness", {})
+        # Keep canonical scan inputs; the report node returns only a projection.
+        report_result = {
+            **initial_result,
+            "temp_dir_for_cleanup": initial_result.get("temp_dir_for_cleanup"),
+            "transitive_finding_count": 0,
+            "transitive_sources": [],
+            "transitive_targets_scanned": 0,
+            "transitive_bytes_scanned": 0,
+            "transitive_artifacts_scanned": 0,
+            "transitive_truncated": False,
+            "transitive_truncation_reasons": [],
+        }
+        report_result.update(report(report_result))
         return report_result
 
     if traversal is None:
@@ -2643,7 +2659,7 @@ def _scan_transitive(
         merged_result["analysis_completeness"] = completeness
         merged_result["execution_successful"] = completeness["execution_successful"]
         merged_result["effective_finding_ids"] = effective_ids
-    report_result = cast(dict[str, object], report(merged_result))
+    report_result = {**merged_result, **report(merged_result)}
     report_result["analysis_completeness"] = merged_result.get("analysis_completeness", {})
     report_result["meta_review_required"] = merged_meta_review_required
     report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
