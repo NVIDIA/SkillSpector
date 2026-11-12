@@ -287,6 +287,9 @@ def test_unproved_preamble_keeps_cloud_finding(setup: str, transfer: str, newlin
     "setup",
     [
         "#!/bin/sh",
+        "#!/bin/bash",
+        "#!/usr/bin/env bash",
+        "#! /bin/sh -e",
         "# Public files",
         "set -e",
         "set -eu",
@@ -329,6 +332,33 @@ def test_non_newline_break_cannot_hide_a_rebinding_as_a_comment(
         f'{before}{separator}# ; {command}() {{ custom "$@"; }}\n{transfer}\n',
         "download.sh",
         "shell",
+    )
+    assert any(finding.rule_id == "E5" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "shebang",
+    [
+        "#!/usr/bin/env -S PATH=./bin:/usr/bin:/bin bash",
+        "#!/usr/bin/env -S BASH_ENV=./setup.sh bash",
+        "#!/usr/bin/env -S ZDOTDIR=. zsh",
+        "#!/bin/bash --rcfile ./setup.sh",
+        "#!./bin/sh",
+        "#!/usr/bin/env python3",
+    ],
+)
+@pytest.mark.parametrize(
+    "transfer",
+    [
+        "aws s3 cp s3://example-bucket/public.csv /tmp/public.csv",
+        "gsutil cp gs://example-bucket/public.csv /tmp/public.csv",
+    ],
+)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_unsupported_shebang_keeps_cloud_finding(shebang: str, transfer: str, newline: str) -> None:
+    # Executed directly, these shebangs can change PATH or load setup code first.
+    findings = data_exfiltration.analyze(
+        f"{shebang}{newline}{transfer}{newline}", "download.sh", "shell"
     )
     assert any(finding.rule_id == "E5" for finding in findings)
 

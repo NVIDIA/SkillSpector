@@ -201,6 +201,9 @@ _CLOUD_DOWNLOAD_CONTEXT_CHARS = 4_096
 _CLOUD_DOWNLOAD_SAFE_SET = re.compile(
     r"set[ \t]+(?:-[efu]+[ \t]+)*(?:-[efu]+|-[efu]*o[ \t]+pipefail)"
 )
+_CLOUD_DOWNLOAD_SAFE_SHEBANG = re.compile(
+    r"#![ \t]*(?:/usr(?:/local)?)?/bin/(?:env[ \t]+)?(?:ba|da|k|z)?sh(?:[ \t]+-[eu]+)?"
+)
 
 
 def _is_literal_cloud_download(
@@ -232,6 +235,13 @@ def _is_literal_cloud_download(
         # Shells end a line, and so a comment, only at a newline. Splitting at a
         # form feed, lone CR or Unicode separator would hide the rest of that
         # shell line (such as a function rebinding the cloud command) as a comment.
+        return False
+    if preamble.startswith("#!") and (
+        _CLOUD_DOWNLOAD_SAFE_SHEBANG.fullmatch(preamble.split("\n", 1)[0].rstrip(" \t\r")) is None
+    ):
+        # A shebang is not a comment when the file is executed: env -S assignments,
+        # interpreter options or a relative interpreter can change PATH or load
+        # setup code before the transfer runs. Only plain shell interpreters qualify.
         return False
     directory_changed = False
     for line in preamble.split("\n"):
