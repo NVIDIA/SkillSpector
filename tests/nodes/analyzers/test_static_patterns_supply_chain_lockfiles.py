@@ -626,6 +626,46 @@ def test_npm_alias_install_does_not_pin_the_alias_registry_name():
     assert supply_chain._extract_packages_from_npm_lock(content) == [("node-forge", "1.4.2", 1)]
 
 
+@pytest.mark.parametrize("lock_version", [2, 3])
+@pytest.mark.parametrize("lock_name", ["package-lock.json", "npm-shrinkwrap.json"])
+@pytest.mark.parametrize("alias_name", ["lodash", "@scope/helper"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_npm_workspace_alias_shadows_ancestor_registry_pin(
+    lock_version, lock_name, alias_name, reverse
+):
+    content = json.dumps(
+        {
+            "lockfileVersion": lock_version,
+            "packages": {
+                "": {"workspaces": ["packages/*"]},
+                "packages/a": {"name": "a", "version": "1.0.0"},
+                "packages/b": {"name": "b", "version": "1.0.0"},
+                f"node_modules/{alias_name}": {"version": "4.17.20"},
+                "node_modules/ws": {"version": "8.20.0"},
+                f"packages/a/node_modules/{alias_name}": {
+                    "name": "node-forge",
+                    "version": "1.4.2",
+                },
+            },
+        }
+    )
+    cache = {lock_name: content, "packages/a/package.json": "{}", "packages/b/package.json": "{}"}
+    components = list(reversed(cache)) if reverse else list(cache)
+    resolved = supply_chain._collect_npm_locked_versions(cache, components)
+    packages = supply_chain._apply_locked_versions(
+        [(alias_name, None, 3), ("ws", None, 4), ("explicit", "1.0.0", 5)],
+        resolved["packages/a"],
+        supply_chain._normalize_npm_package_name,
+    )
+    assert packages == [(alias_name, None, 3), ("ws", "8.20.0", 4), ("explicit", "1.0.0", 5)]
+    assert resolved["."][alias_name] == "4.17.20"
+    assert resolved["packages/b"][alias_name] == "4.17.20"
+    # Alias targets and ordinary ancestor packages still receive independent audits.
+    audited = supply_chain._extract_packages_from_npm_lock(content)
+    assert ("node-forge", "1.4.2") in [(name, version) for name, version, _line in audited]
+    assert (alias_name, "4.17.20") in [(name, version) for name, version, _line in audited]
+
+
 def test_npm_v1_workspace_uses_recorded_link_and_nearest_locked_install():
     cache = {
         "package-lock.json": json.dumps(

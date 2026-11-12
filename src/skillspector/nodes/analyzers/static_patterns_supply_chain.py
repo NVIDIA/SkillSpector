@@ -2037,7 +2037,7 @@ def _extract_packages_from_toml_lock(
 
 def _apply_locked_versions(
     packages: list[tuple[str, str | None, int]],
-    locked_versions: Mapping[str, str] | None,
+    locked_versions: Mapping[str, str | None] | None,
     normalize: Callable[[str], str] = _normalize_package_name,
 ) -> list[tuple[str, str | None, int]]:
     """Prefer lockfile versions for manifest dependencies without exact versions."""
@@ -2190,14 +2190,14 @@ def _collect_npm_locked_versions(
     *,
     max_files: int | None = None,
     timeout_seconds: float | None = None,
-) -> dict[str, Mapping[str, str]]:
+) -> dict[str, Mapping[str, str | None]]:
     """Resolve manifest pins within their own lockfile's installation tree.
 
     Workspace manifests may use hoisted installs from their lock root, but unrelated
     projects must never borrow those pins. Keep each lockfile's independent vulnerability
     scan separate: nested installs still need auditing even when no manifest resolves to them.
     """
-    locked_versions: dict[str, Mapping[str, str]] = {}
+    locked_versions: dict[str, Mapping[str, str | None]] = {}
     owners = {
         str(Path(path).parent): len(Path(path).parent.parts)
         for path in components
@@ -2235,7 +2235,7 @@ def _collect_npm_locked_versions(
             continue
         if not isinstance(data, dict):
             continue
-        installs: dict[PurePosixPath, dict[str, str]] = {}
+        installs: dict[PurePosixPath, dict[str, str | None]] = {}
         projects = {PurePosixPath(".")}
         packages = data.get("packages")
         if isinstance(packages, dict):
@@ -2260,7 +2260,13 @@ def _collect_npm_locked_versions(
                     and registry_name.strip()
                     and registry_name != name
                 ):
-                    continue  # Alias slots must not borrow their target package's version.
+                    # Keep the occupied slot in the nearest layer so ChainMap cannot
+                    # borrow an unrelated ancestor's registry pin for this alias name.
+                    if separator and (not owner or owner.endswith("/")):
+                        installs.setdefault(PurePosixPath(owner), {})[
+                            _normalize_npm_package_name(name)
+                        ] = None
+                    continue
                 if (
                     separator
                     and (not owner or owner.endswith("/"))
@@ -3251,7 +3257,7 @@ def _analyze_dependencies(
     content: str,
     file_path: str,
     locked_versions: dict[str, str] | None = None,
-    npm_locked_versions: Mapping[str, str] | None = None,
+    npm_locked_versions: Mapping[str, str | None] | None = None,
 ) -> list[AnalyzerFinding]:
     """Run SC4/SC5/SC6 checks on dependency files."""
     findings, _limitations, _packages_seen = _analyze_dependencies_detailed(
@@ -3267,7 +3273,7 @@ def _analyze_dependencies_detailed(
     content: str,
     file_path: str,
     locked_versions: dict[str, str] | None = None,
-    npm_locked_versions: Mapping[str, str] | None = None,
+    npm_locked_versions: Mapping[str, str | None] | None = None,
     *,
     max_packages: int | None = None,
     max_findings: int | None = None,
