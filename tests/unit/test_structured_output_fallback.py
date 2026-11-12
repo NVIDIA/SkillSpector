@@ -18,7 +18,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from openai import BadRequestError, RateLimitError
+from openai import AuthenticationError, BadRequestError, RateLimitError
 from pydantic import BaseModel
 
 from skillspector.inspection_ledger import LedgerReason
@@ -130,6 +130,9 @@ def deepseek_like_endpoint(monkeypatch):
                 return
             if mode == "reject-all":
                 self._send_error(400, "This response_format type is unavailable now")
+                return
+            if mode == "fallback-auth-failure":
+                self._send_error(401, "Incorrect API key provided")
                 return
             tool_name = tools[0]["function"]["name"] if tools else None
             if tool_name == _TP4_TOOL:
@@ -456,6 +459,140 @@ def test_tp4_total_rejection_keeps_unavailable_error(
     result = tp._check_tp4(_tp4_state())
     assert result.record["ok"] is False
     assert result.record["error"] == STRUCTURED_OUTPUT_UNAVAILABLE_ERROR
+
+
+def test_fallback_auth_failure_keeps_real_error(deepseek_like_endpoint):
+    """A fallback failure unrelated to structured output keeps its own error.
+
+    The retry runs inside the handler for the initial json_schema
+    rejection, so the initial 400 sits in the fallback error's implicit
+    context. Classifying the fallback error must stop there instead of
+    reporting the run as structured-output unavailable.
+    """
+    requests, behavior = deepseek_like_endpoint
+    behavior["mode"] = "fallback-auth-failure"
+    analyzer = tp._TP4Analyzer(model=_MODEL, timeout=30.0)
+    outcome = analyzer.run_batches_detailed(
+        [tp.Batch(file_path="format.py", content="Assess the declared formatting behavior.")]
+    )
+    assert not outcome.successful
+    assert len(outcome.failures) == 1
+    assert outcome.failures[0].error_class == "OpenAIAuthenticationError"
+    assert outcome.failures[0].reason is not LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
+    assert len(requests) == 2
+    assert requests[0]["response_format"]["type"] == "json_schema"
+    assert "response_format" not in requests[1]
+    record = llm_call_record_for_outcome(tp.ANALYZER_ID, outcome)
+    assert record["ok"] is False
+    assert record["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_async_fallback_auth_failure_keeps_real_error(deepseek_like_endpoint):
+    """Async path: same stale-context rule as the sync fallback."""
+    requests, behavior = deepseek_like_endpoint
+    behavior["mode"] = "fallback-auth-failure"
+    analyzer = tp._TP4Analyzer(model=_MODEL, timeout=30.0)
+    outcome = await analyzer.arun_batches_detailed(
+        [tp.Batch(file_path="format.py", content="Assess the declared formatting behavior.")]
+    )
+    assert not outcome.successful
+    assert len(outcome.failures) == 1
+    assert outcome.failures[0].error_class == "OpenAIAuthenticationError"
+    assert outcome.failures[0].reason is not LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
+    assert len(requests) == 2
+    assert requests[0]["response_format"]["type"] == "json_schema"
+    assert "response_format" not in requests[1]
+    record = llm_call_record_for_outcome(tp.ANALYZER_ID, outcome)
+    assert record["ok"] is False
+    assert record["error"] is None
+
+
+class _BareFailureRunnable:
+    """Raise a bare provider error with no explicit cause.
+
+    LangChain's OpenAI path wraps SDK errors with an explicit ``__cause__``,
+    which shadows the implicit context, but other providers surface the SDK
+    error unwrapped: raised inside the handler for the initial rejection,
+    its ``__context__`` is that rejection, so the classifier must stop the
+    chain walk there instead of following the stale 400.
+    """
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def invoke(self, _prompt, **_kwargs):
+        raise self._error
+
+    async def ainvoke(self, _prompt, **_kwargs):
+        raise self._error
+
+
+def _bare_auth_error() -> AuthenticationError:
+    body = {
+        "error": {
+            "message": "Incorrect API key provided",
+            "type": "invalid_request_error",
+            "code": "invalid_request_error",
+        }
+    }
+    response = httpx.Response(
+        401,
+        request=httpx.Request("POST", "https://gateway.example/v1/chat/completions"),
+        json=body,
+    )
+    return AuthenticationError("Incorrect API key provided", response=response, body=body)
+
+
+def test_bare_fallback_auth_failure_keeps_real_error(
+    deepseek_like_endpoint, monkeypatch: pytest.MonkeyPatch
+):
+    """An unwrapped fallback auth failure must not become an unavailable error."""
+    requests, _behavior = deepseek_like_endpoint
+    analyzer = tp._TP4Analyzer(model=_MODEL, timeout=30.0)
+    monkeypatch.setattr(
+        analyzer,
+        "_fallback_structured_output",
+        lambda _llm: _BareFailureRunnable(_bare_auth_error()),
+    )
+    outcome = analyzer.run_batches_detailed(
+        [tp.Batch(file_path="format.py", content="Assess the declared formatting behavior.")]
+    )
+    assert not outcome.successful
+    assert len(outcome.failures) == 1
+    assert outcome.failures[0].error_class == "AuthenticationError"
+    assert outcome.failures[0].reason is not LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
+    assert len(requests) == 1
+    assert requests[0]["response_format"]["type"] == "json_schema"
+    record = llm_call_record_for_outcome(tp.ANALYZER_ID, outcome)
+    assert record["ok"] is False
+    assert record["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_async_bare_fallback_auth_failure_keeps_real_error(
+    deepseek_like_endpoint, monkeypatch: pytest.MonkeyPatch
+):
+    """Async path: same rule for an unwrapped fallback failure."""
+    requests, _behavior = deepseek_like_endpoint
+    analyzer = tp._TP4Analyzer(model=_MODEL, timeout=30.0)
+    monkeypatch.setattr(
+        analyzer,
+        "_fallback_structured_output",
+        lambda _llm: _BareFailureRunnable(_bare_auth_error()),
+    )
+    outcome = await analyzer.arun_batches_detailed(
+        [tp.Batch(file_path="format.py", content="Assess the declared formatting behavior.")]
+    )
+    assert not outcome.successful
+    assert len(outcome.failures) == 1
+    assert outcome.failures[0].error_class == "AuthenticationError"
+    assert outcome.failures[0].reason is not LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
+    assert len(requests) == 1
+    assert requests[0]["response_format"]["type"] == "json_schema"
+    record = llm_call_record_for_outcome(tp.ANALYZER_ID, outcome)
+    assert record["ok"] is False
+    assert record["error"] is None
 
 
 def test_expired_deadline_during_first_rejection_sends_no_fallback(deepseek_like_endpoint):

@@ -2086,7 +2086,12 @@ class LLMAnalyzerBase:
                         getattr(retry_exc, "issue", None)
                     ) from retry_exc
                 except Exception as retry_exc:
-                    if is_structured_output_rejection(retry_exc):
+                    # The fallback runs inside the handler for the initial
+                    # rejection, so Python links that rejection as this
+                    # error's implicit context. Stop the walk there: only
+                    # the fallback request's own failure may report the
+                    # run as structured-output unavailable.
+                    if is_structured_output_rejection(retry_exc, stop_before=exc):
                         raise LLMStructuredOutputUnavailableError(
                             "provider rejected structured output (response_format "
                             "unsupported; tool-calling fallback also rejected)"
@@ -2672,7 +2677,12 @@ class LLMAnalyzerBase:
                         getattr(retry_exc, "issue", None)
                     ) from retry_exc
                 except Exception as retry_exc:
-                    if is_structured_output_rejection(retry_exc):
+                    # The fallback runs inside the handler for the initial
+                    # rejection, so Python links that rejection as this
+                    # error's implicit context. Stop the walk there: only
+                    # the fallback request's own failure may report the
+                    # run as structured-output unavailable.
+                    if is_structured_output_rejection(retry_exc, stop_before=exc):
                         raise LLMStructuredOutputUnavailableError(
                             "provider rejected structured output (response_format "
                             "unsupported; tool-calling fallback also rejected)"

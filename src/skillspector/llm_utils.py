@@ -458,19 +458,30 @@ class AgentCLIChatModel:
 STRUCTURED_OUTPUT_METHODS = ("function_calling", "json_schema")
 
 
-def _exception_chain(exc: BaseException) -> list[BaseException]:
-    """Return *exc* followed by its causes, without looping on cycles."""
+def _exception_chain(
+    exc: BaseException, stop_before: BaseException | None = None
+) -> list[BaseException]:
+    """Return *exc* followed by its causes, without looping on cycles.
+
+    *stop_before* ends the walk before that exception, so a retried
+    request is judged on its own failure rather than on the failure it
+    was recovering from.
+    """
     chain: list[BaseException] = []
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
+        if current is stop_before:
+            break
         seen.add(id(current))
         chain.append(current)
         current = current.__cause__ or current.__context__
     return chain
 
 
-def is_structured_output_rejection(exc: BaseException) -> bool:
+def is_structured_output_rejection(
+    exc: BaseException, *, stop_before: BaseException | None = None
+) -> bool:
     """Return whether *exc* is a provider 400 rejecting the structured-output mechanism.
 
     Gateways without JSON-schema structured output (DeepSeek and similar
@@ -481,8 +492,14 @@ def is_structured_output_rejection(exc: BaseException) -> bool:
     the structured-output mechanism, not the model or the prompt, was
     refused. Only that shape qualifies: other 400s (unknown model, bad key,
     context overflow) must not trigger a tool-calling retry.
+
+    *stop_before* ends the chain walk before that exception. A fallback
+    retry runs inside the handler for the initial rejection, so Python
+    links that rejection as the retry error's implicit context; callers
+    pass the initial rejection here so only the retried request's own
+    failure can classify it as a structured-output rejection.
     """
-    for item in _exception_chain(exc):
+    for item in _exception_chain(exc, stop_before):
         status = getattr(item, "status_code", None)
         if status is None:
             status = getattr(item, "status", None)
