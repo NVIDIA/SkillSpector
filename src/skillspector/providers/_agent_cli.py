@@ -719,9 +719,29 @@ def _prepare_opencode_env(
     (see ``_opencode_config_2x``). All mutable config, cache, state,
     database, and temporary paths are redirected below the invocation's
     already-isolated temporary root.
+
+    ``OPENCODE_DISABLE_PROJECT_CONFIG`` is version-specific: it stays
+    set on 1.x and is omitted only on 2.x. On 1.x the deny-all policy
+    travels in ``OPENCODE_CONFIG_CONTENT`` and the flag is the only
+    thing stopping the ancestor configuration walk: a fresh temporary
+    directory can still sit beneath a repository containing
+    ``.opencode``, and without the flag 1.x walks up, finds that
+    project, and runs configuration initialisation there (verified live
+    on real 1.19.4: it writes a missing ``.gitignore`` into the
+    ancestor ``.opencode`` directory before the preflight finishes).
+    On 2.x the deny-all policy is delivered as a project
+    ``opencode.jsonc`` in the run's temporary directory, and the flag
+    disables that file entirely, so it must be omitted there (verified
+    live on real 2.2.7, #1084). An unknowable version keeps the 1.x
+    shape; the preflight fails closed on version before any inference.
     """
     env = {key: value for key, value in base_env.items() if not key.upper().startswith("OPENCODE_")}
     agent_name = _opencode_agent_name(argv)
+    # The flag decision needs the runtime version, which only the binary
+    # knows: probe it here the same way _build_opencode_argv does. A
+    # probe that cannot tell the version keeps the 1.x shape.
+    version = _probe_opencode_version(argv[0])
+    is_v2 = version is not None and version[0] == 2
     config_home = os.path.join(temp_root, "xdg-config")
     config_dir = os.path.join(config_home, "opencode")
     cache_home = os.path.join(temp_root, "xdg-cache")
@@ -752,15 +772,6 @@ def _prepare_opencode_env(
             "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
             "OPENCODE_DISABLE_LSP_DOWNLOAD": "1",
             "OPENCODE_DISABLE_MODELS_FETCH": "1",
-            # No OPENCODE_DISABLE_PROJECT_CONFIG here: on 2.x the deny-all
-            # policy is delivered as a project opencode.jsonc in the run's
-            # temporary directory, and that flag disables the project file
-            # entirely (verified live on real 2.2.7, #1084: with the flag
-            # set, a /etc/opencode/plugins marker plugin loads and
-            # activates despite the project policy denying it). The run
-            # directory is a fresh temporary directory whose only project
-            # config is the one this provider writes, so there is no
-            # scanned-project config for the flag to protect against.
             "OPENCODE_DISABLE_PRUNE": "1",
             "OPENCODE_DISABLE_TERMINAL_TITLE": "1",
             "OPENCODE_ENABLE_EXA": "0",
@@ -787,6 +798,20 @@ def _prepare_opencode_env(
             "XDG_STATE_HOME": state_home,
         }
     )
+    if not is_v2:
+        # 1.x only: keep OPENCODE_DISABLE_PROJECT_CONFIG=1. On 1.x the
+        # policy travels in OPENCODE_CONFIG_CONTENT, and without this
+        # flag the runtime walks up from the run directory and runs
+        # configuration initialisation in any ancestor .opencode
+        # project (verified live on real 1.19.4: it writes a missing
+        # .gitignore into the ancestor directory before the preflight
+        # finishes). On 2.x the flag must stay unset: the deny-all
+        # policy is a project opencode.jsonc in the run directory, and
+        # the flag disables that file entirely (verified live on real
+        # 2.2.7, #1084: with the flag set, a /etc/opencode/plugins
+        # marker plugin loads and activates despite the project policy
+        # denying it).
+        env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
     return env
 
 
@@ -1161,14 +1186,24 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
     """Check opencode is authenticated via ``opencode auth list`` (no inference).
 
     The caller must already have resolved ``binary``. The probe uses the same
-    scrubbed environment as inference, performs no inference, and completes
-    well under 15s. Fail-closed: probe error/timeout, non-zero exit, zero
-    parsed credentials everywhere, or unparseable output all return
+    scrubbed environment as inference, runs inside the same kind of
+    isolated temporary directory (``cwd=tmp_root``), performs no
+    inference, and completes well under 15s. On 2.x it first writes the
+    project policy into that directory and runs ``auth list
+    --standalone --format json``, so the probe uses a private server
+    instead of the background service on the fixed port and a
+    configured project/system plugin cannot load (verified live on real
+    2.2.7: ``auth list --standalone --format json`` prints ``[]`` when
+    unauthenticated). On 1.x the child environment keeps
+    ``OPENCODE_DISABLE_PROJECT_CONFIG=1`` (see
+    ``_prepare_opencode_env``), so the probe cannot walk up to an
+    ancestor project. Fail-closed: probe error/timeout, non-zero exit,
+    zero parsed credentials everywhere, or unparseable output all return
     ``(False, reason)``. 1.x returns ``True`` only when at least one parsed
     credential/environment-key count is positive. 2.x prints no counts, so
-    it runs ``auth list --format json`` and returns ``True`` only when the
-    parsed array of integrations with connections is non-empty (verified
-    on 2.2.6/2.2.7: ``[]`` when unauthenticated, #1084).
+    it runs ``auth list --standalone --format json`` and returns ``True``
+    only when the parsed array of integrations with connections is
+    non-empty (verified on 2.2.6/2.2.7: ``[]`` when unauthenticated, #1084).
     """
     tmp_root = tempfile.mkdtemp(prefix="skillspector_opencode_auth_")
     try:
@@ -1180,6 +1215,7 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
                 capture_output=True,
                 shell=False,
                 timeout=15,
+                cwd=tmp_root,
                 env=child_env,
             )
             version = _parse_opencode_version(version_result.stdout or b"")
@@ -1194,8 +1230,15 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
                     f"{_OPENCODE_SUPPORTED_VERSIONS_V2_TEXT} "
                     "for its verified deny-all policy",
                 )
+            if _is_supported_opencode_version_v2(version):
+                # 2.x only: deliver the project policy into the isolated
+                # directory before the probe, exactly as the preflight
+                # does for inference, so a configured project/system
+                # plugin cannot load during availability. Any write
+                # failure is caught below and fails closed.
+                _write_opencode_project_config(tmp_root, _opencode_agent_name(policy_argv))
             auth_argv = (
-                [binary, "auth", "list", "--format", "json"]
+                [binary, "auth", "list", "--standalone", "--format", "json"]
                 if _is_supported_opencode_version_v2(version)
                 else [binary, "auth", "list"]
             )
@@ -1204,6 +1247,7 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
                 capture_output=True,
                 shell=False,
                 timeout=15,
+                cwd=tmp_root,
                 env=child_env,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:

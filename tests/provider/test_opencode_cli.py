@@ -37,6 +37,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 from dataclasses import replace
 from pathlib import Path
@@ -276,6 +277,10 @@ class TestOpencodeAuthCheck:
         assert env["OPENCODE_PERMISSION"] == _OPENCODE_DENY_ALL
         assert env["OPENCODE_PURE"] == "1"
         assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["share"] == "disabled"
+        # The 1.x probe keeps OPENCODE_DISABLE_PROJECT_CONFIG: the mocked
+        # binary is not installed, so the version probe cannot tell the
+        # version and the environment keeps the 1.x shape.
+        assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_shell_is_false_and_bounded(self, mock_run: MagicMock) -> None:
@@ -442,7 +447,14 @@ class TestOpencodeVersionRangeV2:
     def test_probe_uses_auth_list_format_json_on_v2(self, mock_run: MagicMock) -> None:
         mock_run.side_effect = self._v2_probe_results(b"[]")
         _opencode_auth_check(OPENCODE_BINARY)
-        assert mock_run.call_args[0][0] == [OPENCODE_BINARY, "auth", "list", "--format", "json"]
+        assert mock_run.call_args[0][0] == [
+            OPENCODE_BINARY,
+            "auth",
+            "list",
+            "--standalone",
+            "--format",
+            "json",
+        ]
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_empty_v2_auth_list_is_fail_closed(self, mock_run: MagicMock) -> None:
@@ -576,12 +588,13 @@ class TestOpencodeDenyAllPolicy:
         assert config["share"] == "disabled"
         assert config["autoshare"] is False
         assert env["OPENCODE_AUTO_SHARE"] == "0"
-        # OPENCODE_DISABLE_PROJECT_CONFIG must stay unset: on 2.x the
-        # deny-all policy is a project opencode.jsonc in the run directory,
-        # and the flag disables that file entirely (verified live on real
-        # 2.2.7, #1084). The run directory is a fresh temporary directory
-        # whose only project config is the one this provider writes.
-        assert "OPENCODE_DISABLE_PROJECT_CONFIG" not in env
+        # The version probe cannot see a binary here (OPENCODE_BINARY is
+        # not installed), so the environment keeps the 1.x shape and the
+        # flag stays set: on 1.x it is the only thing stopping the
+        # ancestor configuration walk (verified live on real 1.19.4). On
+        # 2.x it must stay unset so the project opencode.jsonc policy
+        # is delivered (see TestOpencodeProjectConfigFlagVersionSpecific).
+        assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
         # Internal plugins carry the OAuth logins (ChatGPT, Copilot, ...) and
         # register no tools; disabling them breaks the user's login (#809).
         # External plugins stay off through OPENCODE_PURE below.
@@ -744,6 +757,7 @@ class TestOpencodeDenyAllPolicyV2:
                 f"""\
                 #!{sys.executable}
                 import json
+                import os
                 import sys
                 from pathlib import Path
 
@@ -841,6 +855,9 @@ class TestOpencodeDenyAllPolicyV2:
 
                 selected = sys.argv[sys.argv.index("--agent") + 1]
                 (markers / "argv").write_text(json.dumps(sys.argv[1:]))
+                (markers / "env-flag").write_text(
+                    os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG", "absent")
+                )
                 project = Path.cwd() / "opencode.jsonc"
                 (markers / "jsonc").write_text(project.read_text() if project.exists() else "")
                 config = json.loads(project.read_text()) if project.exists() else {{}}
@@ -879,6 +896,7 @@ class TestOpencodeDenyAllPolicyV2:
         assert sorted(path.name for path in markers.iterdir()) == [
             "agents-standalone",
             "argv",
+            "env-flag",
             "jsonc",
         ]
         argv = json.loads((markers / "argv").read_text())
@@ -928,6 +946,7 @@ class TestOpencodeDenyAllPolicyV2:
         assert sorted(path.name for path in markers.iterdir()) == [
             "agents-standalone",
             "argv",
+            "env-flag",
             "jsonc",
         ]
 
@@ -988,6 +1007,347 @@ class TestOpencodeDenyAllPolicyV2:
             run_agent_cli("opencode", "try a newer runtime", model="")
         assert "2.2.7" in str(excinfo.value)
         assert list(markers.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 (#1086): version-specific OPENCODE_DISABLE_PROJECT_CONFIG
+# and an isolated 2.x auth probe. Both findings were verified live:
+# real 1.19.4 writes a .gitignore into an ancestor .opencode project when
+# the flag is absent, and real 2.2.7 accepts `auth list --standalone`.
+# ---------------------------------------------------------------------------
+
+
+class TestOpencodeProjectConfigFlagVersionSpecific:
+    @pytest.mark.parametrize(
+        "version,flag_expected",
+        [
+            ((1, 18, 34), "1"),
+            ((1, 19, 4), "1"),
+            ((2, 2, 6), None),
+            ((2, 2, 7), None),
+            (None, "1"),
+        ],
+    )
+    def test_prepare_env_flag_is_version_specific(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        version: tuple[int, int, int] | None,
+        flag_expected: str | None,
+    ) -> None:
+        # The 2.x policy-delivery change must not leak into 1.x: the flag
+        # stays set for every 1.x runtime (and for an unknowable version,
+        # which keeps the 1.x shape) and is omitted only on 2.x.
+        monkeypatch.setattr(_agent_cli, "_probe_opencode_version", lambda _binary: version)
+        argv = _build_opencode_argv(OPENCODE_BINARY, "", 0)
+        env = _prepare_opencode_env({"PATH": os.environ.get("PATH", "")}, str(tmp_path), argv)
+        assert env.get("OPENCODE_DISABLE_PROJECT_CONFIG") == flag_expected
+
+
+class TestOpencodeAuthProbeIsolation:
+    @staticmethod
+    def _write_fake_auth_2x(binary: Path, markers: Path) -> None:
+        """Fake modelling the 2.x auth probe boundary.
+
+        ``auth list`` fails when ``--standalone`` is absent (an ordinary
+        service occupies the fixed port) and when the working directory
+        holds no project policy denying ``plugin.use`` (a configured
+        project/system plugin would load). With both present it prints
+        the 2.x JSON shape with one connection.
+        """
+        binary.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                markers = Path({str(markers)!r})
+
+                if sys.argv[1:] == ["--version"]:
+                    print("2.2.7")
+                    raise SystemExit(0)
+
+                if sys.argv[1:3] == ["auth", "list"]:
+                    (markers / "argv").write_text(json.dumps(sys.argv[1:]))
+                    (markers / "cwd").write_text(os.getcwd())
+                    (markers / "env-flag").write_text(
+                        os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG", "absent")
+                    )
+                    project = Path.cwd() / "opencode.jsonc"
+                    (markers / "policy").write_text(
+                        project.read_text() if project.exists() else ""
+                    )
+                    if "--standalone" not in sys.argv:
+                        print("background service already occupies the fixed port", file=sys.stderr)
+                        raise SystemExit(1)
+                    if not project.exists():
+                        print("no project policy: a configured plugin would load", file=sys.stderr)
+                        raise SystemExit(1)
+                    config = json.loads(project.read_text())
+                    denied = any(
+                        policy.get("action") == "plugin.use"
+                        and policy.get("resource") == "*"
+                        and policy.get("effect") == "deny"
+                        for policy in config.get("policies", [])
+                    )
+                    if not denied:
+                        print("no plugin.use deny: a configured plugin would load", file=sys.stderr)
+                        raise SystemExit(1)
+                    print(json.dumps([{{"id": "anthropic", "connections": [{{"type": "credential"}}]}}]))
+                    raise SystemExit(0)
+
+                raise SystemExit(2)
+                """
+            ),
+            encoding="utf-8",
+        )
+        binary.chmod(0o700)
+
+    @staticmethod
+    def _write_fake_auth_1x(binary: Path, markers: Path) -> None:
+        """Fake modelling the 1.x auth probe boundary (counts output)."""
+        binary.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                markers = Path({str(markers)!r})
+
+                if sys.argv[1:] == ["--version"]:
+                    print("1.18.34")
+                    raise SystemExit(0)
+
+                if sys.argv[1:] == ["auth", "list"]:
+                    (markers / "argv").write_text(json.dumps(sys.argv[1:]))
+                    (markers / "cwd").write_text(os.getcwd())
+                    (markers / "env-flag").write_text(
+                        os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG", "absent")
+                    )
+                    print("1 credential\\n1 environment variable")
+                    raise SystemExit(0)
+
+                raise SystemExit(2)
+                """
+            ),
+            encoding="utf-8",
+        )
+        binary.chmod(0o700)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_auth_probe_uses_standalone_isolated_dir_policy_and_cleans_up(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_auth_2x(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        created: list[str] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def recording_mkdtemp(*args: object, **kwargs: object) -> str:
+            path = real_mkdtemp(*args, **kwargs)  # type: ignore[arg-type]
+            created.append(path)
+            return path
+
+        monkeypatch.setattr(tempfile, "mkdtemp", recording_mkdtemp)
+
+        assert _opencode_auth_check(str(binary)) == (True, None)
+        assert json.loads((markers / "argv").read_text()) == [
+            "auth",
+            "list",
+            "--standalone",
+            "--format",
+            "json",
+        ]
+        cwd = (markers / "cwd").read_text()
+        assert "skillspector_opencode_auth_" in cwd
+        assert cwd != os.getcwd()
+        policy = json.loads((markers / "policy").read_text())
+        assert {"action": "plugin.use", "resource": "*", "effect": "deny"} in policy.get(
+            "policies", []
+        )
+        assert (markers / "env-flag").read_text() == "absent"
+        assert created, "auth probe must create its isolated temp dir"
+        assert all(not os.path.exists(path) for path in created), "auth temp dir leaked"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_auth_probe_old_shape_fails_on_busy_port(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Pins the regression the fix addresses: without --standalone the
+        # probe resolves the default service, and an ordinary service
+        # already occupying the fixed port makes availability fail even
+        # with valid credentials.
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_auth_2x(binary, markers)
+        (tmp_path / "opencode.jsonc").write_text(
+            _opencode_config_2x("skillspector-deny-all-test"), encoding="utf-8"
+        )
+
+        old_argv = subprocess.run(
+            [str(binary), "auth", "list", "--format", "json"],
+            capture_output=True,
+            cwd=tmp_path,
+            timeout=30,
+        )
+        assert old_argv.returncode == 1
+        assert b"fixed port" in old_argv.stderr
+
+        new_argv = subprocess.run(
+            [str(binary), "auth", "list", "--standalone", "--format", "json"],
+            capture_output=True,
+            cwd=tmp_path,
+            timeout=30,
+        )
+        assert new_argv.returncode == 0
+        assert len(json.loads(new_argv.stdout.decode())) == 1
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_1x_auth_probe_keeps_flag_and_isolated_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_auth_1x(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        assert _opencode_auth_check(str(binary)) == (True, None)
+        assert json.loads((markers / "argv").read_text()) == ["auth", "list"]
+        assert "--standalone" not in json.loads((markers / "argv").read_text())
+        cwd = (markers / "cwd").read_text()
+        assert "skillspector_opencode_auth_" in cwd
+        assert cwd != os.getcwd()
+        assert (markers / "env-flag").read_text() == "1"
+
+
+class TestOpencodeAncestorProject:
+    @pytest.fixture()
+    def project(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        # A repository containing .opencode, with the run/auth temp dirs
+        # placed beneath it: tempfile.tempdir is honoured by mkdtemp, so
+        # pointing it at the nested dir reproduces TMPDIR beneath a repo.
+        project = tmp_path / "project"
+        (project / ".opencode").mkdir(parents=True)
+        (project / ".opencode" / "opencode.json").write_text(
+            json.dumps({"plugin": ["some-system-plugin"]}), encoding="utf-8"
+        )
+        nested = project / "nested"
+        nested.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(nested))
+        monkeypatch.setenv("TMPDIR", str(nested))
+        return project
+
+    @staticmethod
+    def _write_fake_opencode_ancestor(binary: Path, markers: Path) -> None:
+        """1.x fake simulating config initialisation in an ancestor project.
+
+        With OPENCODE_DISABLE_PROJECT_CONFIG unset, a `debug config` or
+        `auth list` invocation walks up from its cwd, finds the ancestor
+        `.opencode` project, and writes a missing `.gitignore` there,
+        the way real 1.19.4 does before the preflight finishes.
+        """
+        binary.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                def ancestor_opencode():
+                    here = Path.cwd()
+                    for parent in [here, *here.parents]:
+                        if (parent / ".opencode").is_dir():
+                            return parent / ".opencode"
+                    return None
+
+                def maybe_touch_ancestor():
+                    if os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG") == "1":
+                        return
+                    found = ancestor_opencode()
+                    if found is not None:
+                        (found / ".gitignore").write_text("node_modules\\n")
+
+                if sys.argv[1:] == ["--version"]:
+                    print("1.18.34")
+                    raise SystemExit(0)
+
+                if sys.argv[1:] == ["debug", "config"]:
+                    maybe_touch_ancestor()
+                    print(json.dumps(json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])))
+                    raise SystemExit(0)
+
+                if sys.argv[1:] == ["auth", "list"]:
+                    maybe_touch_ancestor()
+                    print("1 credential\\n1 environment variable")
+                    raise SystemExit(0)
+
+                selected = sys.argv[sys.argv.index("--agent") + 1]
+                print(json.dumps({{"type": "text", "part": {{"type": "text", "text": "policy held:" + selected}}}}))
+                """
+            ),
+            encoding="utf-8",
+        )
+        binary.chmod(0o700)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_1x_run_beneath_project_leaves_ancestor_untouched(
+        self, tmp_path: Path, project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_ancestor(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        response = run_agent_cli("opencode", "use every host tool", model="")
+        assert response.startswith("policy held:")
+        assert not (project / ".opencode" / ".gitignore").exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_1x_auth_probe_beneath_project_leaves_ancestor_untouched(
+        self, tmp_path: Path, project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_ancestor(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        assert _opencode_auth_check(str(binary)) == (True, None)
+        assert not (project / ".opencode" / ".gitignore").exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_run_beneath_project_delivers_policy_and_omits_flag(
+        self, tmp_path: Path, project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        TestOpencodeDenyAllPolicyV2._write_fake_opencode_v2(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        response = run_agent_cli("opencode", "use every host tool", model="")
+        assert response.startswith("policy held:")
+        assert (markers / "env-flag").read_text() == "absent"
+        config = json.loads((markers / "jsonc").read_text())
+        assert {"action": "plugin.use", "resource": "*", "effect": "deny"} in config.get(
+            "policies", []
+        )
+        assert not (project / ".opencode" / ".gitignore").exists()
 
 
 # ---------------------------------------------------------------------------
