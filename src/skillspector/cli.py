@@ -53,7 +53,7 @@ from skillspector.cli_entry import version_callback as version_callback
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.file_output import require_secure_file_output, write_text_no_follow
 from skillspector.graph_proxy import graph
-from skillspector.input_handler import validate_local_input_path
+from skillspector.input_handler import _normalize_root_owned_alias, validate_local_input_path
 from skillspector.inspection_ledger import (
     MAX_INSPECTION_LEDGER_EVENTS,
     LedgerOutcome,
@@ -351,7 +351,12 @@ def _validate_report_destination(input_path: Path, output: Path | None) -> None:
         return
     if input_path.is_dir():
         input_path = _manifest_file(input_path) or input_path
-    if input_path.is_file() and output.exists() and output.samefile(input_path):
+    # The writer collapses lexical aliases (including missing/..). Retain the
+    # original-path check too: a symlink followed by .. can name a different file.
+    if input_path.is_file() and any(
+        candidate.exists() and candidate.samefile(input_path)
+        for candidate in (output, _normalize_root_owned_alias(output))
+    ):
         raise ValueError("--output points to the input file. Choose a different output path.")
     # Reject an existing directory output before any scan work starts:
     # write_text_no_follow() would refuse it only after the analysis has
@@ -927,6 +932,8 @@ def scan(
 
     result = None
     try:
+        if baseline is not None:
+            _validate_report_destination(baseline, output)
         scan_skill = partial(_scan_skill, exclude_patterns=exclude) if exclude else _scan_skill
         if inspect_dependencies:
             scan_skill = partial(scan_skill, inspect_dependencies=True)
